@@ -1,0 +1,171 @@
+THIRD-PARTY NOTICES
+================================================================================
+
+This is the bootstrap summary of third-party and derived-source obligations for
+the Swift port of Open Grok. It retains the derived-source provenance (source
+revisions, copyrights, upstream URLs, and versions) captured from the
+read-only Rust reference at /tmp/open-grok-reference so that the obligations
+are self-contained at the repository root before any owning target lands.
+
+The complete, machine-generated transitive license inventory (matching
+Package.resolved, vendored code, and assets) is produced and audited by the
+W11-S5 release-validation slice and embedded in release artifacts and the
+in-product notices view. The Swift package currently declares no external
+dependencies; transitive-package obligations accrue as later waves pin and
+audit non-Foundation dependencies (SQLite C API, JavaScript engine, syntax
+grammars, compression/crypto as needed), each wrapped in an OpenGrok target
+with its license/source revision recorded here and in the per-target NOTICE
+files as those targets are integrated.
+
+PART I — DERIVED-SOURCE OBLIGATIONS
+================================================================================
+
+--------------------------------------------------------------------------------
+Open Grok Rust codebase
+--------------------------------------------------------------------------------
+License:  Apache-2.0
+Source:   internal Open Grok Rust workspace (reference for this port)
+This Swift port is a source-level reimplementation of Open Grok's Rust
+crates. Per-target Rust crate mapping is recorded in CRATE_MAP.md.
+Obligation: retain Apache-2.0 license and this NOTICE attribution in source
+            comments, distribution, and the in-product notices view.
+
+--------------------------------------------------------------------------------
+Codex (OpenAI Codex) derived behavior
+--------------------------------------------------------------------------------
+License:        Apache-2.0
+Copyright:      Copyright 2025 OpenAI
+Upstream:       https://github.com/openai/codex
+Source revision: 2be648ba4a6c159a3d80b1c07e7323cbd5efef8f
+Reference NOTICE pins:
+  - crates/codegen/xai-grok-code-mode/NOTICE
+  - crates/codegen/xai-grok-code-mode-protocol/NOTICE
+Used in: OpenGrokCodeMode, OpenGrokJavaScriptRuntime (W6-S1),
+         OpenGrokCodeModeProtocol (W1-S4), and Codex provider/compaction
+         compatibility contracts (W3-S3, W6-S2).
+Obligation: retain the Codex source revision and NOTICE attribution in source
+            comments, distribution, and the in-product notices view. The
+            per-target NOTICE files (W1-S4, W6-S1) reproduce this pin verbatim
+            when those targets are integrated.
+
+--------------------------------------------------------------------------------
+Ratatui (inline terminal behavior)
+--------------------------------------------------------------------------------
+License:  MIT
+Source:   https://github.com/ratatui/ratatui
+Used in:  OpenGrokTerminalCore, OpenGrokTextArea (W2-S5). The Swift terminal
+          stack is a custom reimplementation; Ratatui-derived behavior is
+          differential-tested and NOTICE-attributed rather than vendored.
+Obligation: retain MIT notice and source provenance in source comments,
+            distribution, and the in-product notices view.
+
+--------------------------------------------------------------------------------
+mermaid-to-svg
+--------------------------------------------------------------------------------
+License:    MIT
+Copyright:  Copyright (c) 2025-2026 Denver Technologies, Inc.
+Upstream:   https://github.com/warpdotdev/mermaid-to-svg
+Reference:  third_party/mermaid-to-svg/LICENSE and
+            third_party/mermaid-to-svg/THIRD_PARTY_NOTICES
+Used in:    OpenGrokMermaidLayout, OpenGrokMermaid (W8-S2).
+Obligation: retain MIT notice, copyright, and source provenance.
+
+Further ancestry (mermaid.js, dagre.js, graphlib.js) is listed below under
+"mermaid.js / dagre.js / graphlib.js ancestry" and is reproduced from
+third_party/mermaid-to-svg/THIRD_PARTY_NOTICES in the reference.
+
+--------------------------------------------------------------------------------
+dagre_rust
+--------------------------------------------------------------------------------
+License:    Apache-2.0
+Copyright:  Copyright 2023 Ameer Hamza
+Upstream:   https://github.com/r3alst/dagre-rust
+Version:    0.0.5
+Reference:  third_party/dagre_rust/LICENCE
+Used in:    OpenGrokMermaidLayout (W8-S2). Dagre graph layout algorithms.
+Obligation: retain Apache-2.0 notice, copyright, and source provenance.
+
+--------------------------------------------------------------------------------
+graphlib_rust
+--------------------------------------------------------------------------------
+License:    Apache-2.0
+Upstream:   https://github.com/r3alst/graphlib-rust
+Version:    0.0.2
+Reference:  third_party/graphlib_rust/LICENCE
+Used in:    OpenGrokMermaidLayout (W8-S2). Graph data structures/traversal.
+Obligation: retain Apache-2.0 notice and source provenance.
+
+--------------------------------------------------------------------------------
+ordered_hashmap
+--------------------------------------------------------------------------------
+License:    Apache-2.0
+Upstream:   https://github.com/r3alst/ordered-hashmap
+Version:    0.0.3
+Reference:  third_party/ordered_hashmap/LICENCE
+Used in:    OpenGrokMermaidLayout (W8-S2). Deterministic insertion-ordered
+            map used by diagram layout.
+Obligation: retain Apache-2.0 notice and source provenance.
+
+--------------------------------------------------------------------------------
+mermaid.js / dagre.js / graphlib.js ancestry
+--------------------------------------------------------------------------------
+These are the upstream JavaScript projects whose algorithms are transitively
+ported through mermaid-to-svg / dagre_rust / graphlib_rust. Reproduced from
+third_party/mermaid-to-svg/THIRD_PARTY_NOTICES in the reference.
+
+mermaid.js
+  License:    MIT
+  Copyright:  Copyright (c) 2014 - 2022 Knut Sveidqvist
+  Upstream:   https://github.com/mermaid-js/mermaid
+
+dagre.js
+  License:    MIT
+  Copyright:  Copyright (c) 2012-2014 Chris Pettitt
+  Upstream:   https://github.com/dagrejs/dagre
+
+graphlib.js
+  License:    MIT
+  Copyright:  Copyright (c) 2012-2014 Chris Pettitt
+  Upstream:   https://github.com/dagrejs/graphlib
+
+Obligation: retain MIT notices and upstream provenance alongside the
+            mermaid-to-svg / dagre_rust / graphlib_rust entries.
+
+--------------------------------------------------------------------------------
+Roboto font
+--------------------------------------------------------------------------------
+License:    Apache-2.0
+Copyright:  Copyright 2011 Google Inc. All Rights Reserved.
+Reference:  crates/codegen/xai-grok-mermaid/assets/Roboto-LICENSE.txt
+Used in:    Mermaid SVG rendering (W8-S2). Bundled as a deterministic
+            fallback face so diagram text metrics do not depend on system
+            fonts.
+Obligation: retain the font license (Apache-2.0) and this copyright notice
+            alongside the redistributed font asset.
+
+PART II — TRANSITIVE-PACKAGE OBLIGATIONS
+================================================================================
+
+The Rust reference's THIRD-PARTY-NOTICES enumerates the full cargo dependency
+inventory (MIT, Apache-2.0, BSD-*, ISC, Zlib, Unicode-*, BSL-1.0, MPL-2.0,
+CDLA-Permissive-2.0, Unicode-DFS-2016, and the libgit2 GPL+linking-exception
+bundle; dropped-from-release packages CDDL inferno, EPL colored_json, WTFPL
+terminfo are omitted by design).
+
+The Swift port begins with zero external Swift package dependencies. As later
+waves pin non-Foundation dependencies, each is wrapped in an OpenGrok target,
+license-audited, and recorded here by the owning slice. The W11-S5
+release-validation slice generates the final machine-readable inventory
+matching Package.resolved / vendored code / assets, verifies it against this
+bootstrap summary, and embeds it in release artifacts and the in-product
+notices view.
+
+PART III — LICENSE TEXTS
+================================================================================
+
+The Apache License 2.0 text is in the LICENSE file at the repository root.
+MIT and per-component license texts are reproduced in the W11-S5 generated
+notices artifact and in the per-target NOTICE files as those targets are
+integrated. The Codex NOTICE pin (source revision
+2be648ba4a6c159a3d80b1c07e7323cbd5efef8f) is reproduced verbatim in the
+W1-S4 and W6-S1 per-target NOTICE files when those targets land.

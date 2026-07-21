@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "generatedAt": "2026-07-20",
+  "referenceRevision": "open-grok.21",
+  "files": [
+    {
+      "path": "ProtocolFixtures/acp-methods.json",
+      "sizeBytes": 549,
+      "sha256": "a13778dad6ae5d04978b2e96a87af93a26e0e8962517673f368a7a52a3183722"
+    }
+  ]
+}

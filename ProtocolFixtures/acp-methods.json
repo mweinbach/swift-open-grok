@@ -1,0 +1,25 @@
+{
+  "$schema": "https://agentsdk.com/schemas/acp-methods.json",
+  "referenceRevision": "open-grok.21",
+  "methods": [
+    "initialize",
+    "authenticate",
+    "session/new",
+    "session/load",
+    "session/resume",
+    "session/fork",
+    "session/list",
+    "session/prompt",
+    "session/cancel",
+    "session/setModel",
+    "session/setMode"
+  ],
+  "extensions": {
+    "openGrok": {
+      "product": "Open Grok",
+      "executable": "open-grok",
+      "stateDirectory": ".opengrok",
+      "homeEnvironmentVariable": "OPENGROK_HOME"
+    }
+  }
+}
