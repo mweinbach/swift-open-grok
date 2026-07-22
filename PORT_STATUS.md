@@ -212,5 +212,5 @@ Status legend: **pending** (bootstrap placeholder stub only) · **in-progress** 
 ## Protected artifacts
 
 - `Sources/OpenGrokChatState/CompactionTranscript.swift` JSONValue pattern correction — **do not revert**.
-- Workflow harness `workflows/run-grok45-port.zsh`, `workflows/swift-safe-verify.zsh`, and `.gitignore` entries for `.port-workflow` / scratch builds — retained.
+- Registered workflow `.opengrok/workflows/swift-open-grok-safe-resume.rhai`, legacy harness `workflows/run-grok45-port.zsh`, safe verifier `workflows/swift-safe-verify.zsh`, and `.gitignore` entries for `.port-workflow` / scratch builds — retained.
 - C helper targets `OpenGrokPTYC` and `OpenGrokCrashHandlerC` are required Package.swift edges for R09 shims.

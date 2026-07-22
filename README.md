@@ -107,7 +107,7 @@ Notable foundation targets (non-exhaustive; see `PORT_STATUS.md`):
 | Entry | Role |
 |---|---|
 | `workflows/swift-safe-verify.zsh` | **Only** allowed SwiftPM build/test entry (lock + scratch path) |
-| `workflows/swift-open-grok-safe-resume.js` | Multi-agent resume; workers forbidden from SwiftPM |
+| `.opengrok/workflows/swift-open-grok-safe-resume.rhai` | Registered multi-agent continuation; bounded workers, checkpoint commits, and serialized SwiftPM |
 | `workflows/run-grok45-port.zsh` | Legacy cycle harness; must also use the safe verifier for builds |
 
 ## Protected artifacts
