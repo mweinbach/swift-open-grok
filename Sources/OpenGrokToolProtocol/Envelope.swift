@@ -7,6 +7,7 @@
 // `JsonRpcNotification`, `JsonRpcError`, `JsonRpcResponse`.
 
 import Foundation
+import OpenGrokShared
 
 /// JSON-RPC 2.0 protocol version marker. Serializes as the literal
 /// string `"2.0"` and rejects any other value on deserialize.

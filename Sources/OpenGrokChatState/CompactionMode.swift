@@ -25,7 +25,7 @@ public enum CompactionDetail: String, Sendable, Equatable, Hashable, Defaultable
     /// Case-insensitive; `nil` → caller falls back to default.
     public static func parse(_ s: String) -> CompactionDetail? {
         switch s.trimmingCharacters(in: .whitespaces).lowercased() {
-        case "none": return .none
+        case "none": return CompactionDetail.none
         case "minimal": return .minimal
         case "balanced": return .balanced
         case "verbose": return .verbose

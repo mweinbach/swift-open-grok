@@ -18,9 +18,11 @@
 //   * Paths.swift            — `grokHome`, `defaultGrokHome`, `userGrokHome`,
 //                              `grokApplication`, `systemConfigDir`,
 //                              `claudeManagedSettingsPath`,
-//                              `encodeCwdDirname`, `decodeCwdFromDirname`,
-//                              `sessionsCwdDir`, `ensureSessionsCwdDir`,
-//                              `slugify`.
+//                              `encodeCwdDirname` (urlencoding + BLAKE3),
+//                              `decodeCwdFromDirname`, `sessionsCwdDir`,
+//                              `ensureSessionsCwdDir`, `slugify`.
+//   * Blake3.swift           — pure-Swift BLAKE3 for session-dir parity.
+//   * Ed25519Portable.swift  — pure-Swift Ed25519 verify (Linux/Windows + tests).
 //   * FsAtomic.swift         — `writeAtomically` (temp + rename).
 //   * Shell.swift            — `chainSeparator`, `hasUnixUtilities`,
 //                              `isCommandAvailable`, `ampersandSemantics`,

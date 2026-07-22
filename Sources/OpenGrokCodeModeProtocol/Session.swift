@@ -1,45 +1,27 @@
 // Session.swift
 //
-// Session protocol and lifecycle types for the code-mode runtime. Ported
-// from `crates/codegen/xai-grok-code-mode-protocol/src/session.rs`.
+// Session protocol surface for the code-mode runtime. Ported from
+// `crates/codegen/xai-grok-code-mode-protocol/src/session.rs`.
 //
-// The Rust source uses `tokio::sync::oneshot` channels and boxed
-// `Pin<Box<dyn Future + Send>>` trait objects to model the
-// `StartedCell.initialResponse` future and the `CodeModeSession` /
-// `CodeModeSessionDelegate` / `CodeModeSessionProvider` traits. The Swift
-// port translates that to:
-//   * `CellId` — a `String` newtype (Sendable, Codable, Hashable).
-//   * `CodeModeError` — a `String`-backed `Error` mirroring the Rust
-//     `Result<_, String>` shape. Used as the `Failure` of every
-//     `Result<T, CodeModeError>` returned by the session APIs.
-//   * `StartedCell` — a struct carrying the `cellId` plus an
-//     `async` initial-response closure. The closure is `@Sendable` and
-//     returns `Result<RuntimeResponse, CodeModeError>` (the error
-//     mirrors the Rust `Result<_, String>` shape — the runtime reports
-//     "exec runtime ended unexpectedly" when the underlying oneshot
-//     sender is dropped).
-//   * `CodeModeSessionDelegate` — a `Sendable` protocol with `async`
-//     `invokeTool` / `notify` methods and a synchronous `cellClosed`
-//     callback. Cancellation is expressed via Swift's
-//     `Task.isCancelled` / `Task.checkCancellation()` rather than a
-//     `CancellationToken` parameter — the runtime crate wraps the
-//     delegate's body in a `Task` and cancels it when the cell is
-//     terminated or the session shuts down.
-//   * `CodeModeSession` — a `Sendable` protocol with `async` `execute`,
-//     `wait`, `terminate`, and `shutdown` methods. Each returns
-//     `Result<T, CodeModeError>` to mirror the Rust `Result<_, String>`
-//     shape; the runtime crate typically wraps these in its own typed
-//     errors at the boundary.
-//   * `CodeModeSessionProvider` — a `Sendable` protocol that creates a
-//     `CodeModeSession` for a given delegate. Implementations may share a
-//     remote host process across all sessions created by one provider.
+// The Rust crate is pure protocol: it defines the traits and the
+// `StartedCell` oneshot wrapper, not an in-process JS runtime. The
+// runtime crate (`OpenGrokCodeMode`) implements these protocols with
+// actors.
 //
-// Runtime disposal (the "runtime disposal" criterion in the W1-S4
-// acceptance) is the `shutdown` method on `CodeModeSession`: it
-// terminates every still-running cell, closes the delegate's per-cell
-// state via `CodeModeSessionDelegate.cellClosed`, and frees any
-// resources the session holds (JS isolate, pending tool-call slots,
-// notify queue). The session is unusable after `shutdown` returns.
+// This file ports:
+//   * `CodeModeError` — `String`-backed error mirroring every
+//     `Result<T, String>` returned by the session APIs.
+//   * `CellId` — transparent string newtype.
+//   * `StartedCell` — cell id plus a **one-shot** initial-response
+//     future (matches Rust `initial_response(self)` consuming the cell).
+//   * `CodeModeCancellationToken` — Sendable per-cell cancellation
+//     handle mirroring `tokio_util::sync::CancellationToken`.
+//   * `CodeModeSessionDelegate` / `CodeModeSession` /
+//     `CodeModeSessionProvider` — Sendable async protocols. Delegate
+//     callbacks carry the per-cell cancellation token exactly as in
+//     Rust (`invoke_tool` / `notify`).
+//
+// Runtime disposal is the `shutdown` method on `CodeModeSession`.
 
 import Foundation
 import OpenGrokShared
@@ -48,14 +30,6 @@ import OpenGrokShared
 
 /// A `String`-backed error mirroring the Rust `Result<_, String>` shape
 /// used throughout the code-mode protocol.
-///
-/// The Rust source surfaces human-readable error strings (e.g. "exec
-/// runtime ended unexpectedly") as the `Failure` of every
-/// `Result<T, String>` returned by the session APIs. `CodeModeError`
-/// preserves that shape in Swift: `CodeModeError.message` carries the
-/// original string, and `CodeModeError` conforms to `Error` so it can
-/// be thrown from `async` functions or used as the `Failure` of a
-/// `Result<T, CodeModeError>`.
 public struct CodeModeError: Error, Hashable, Sendable, CustomStringConvertible {
     public let message: String
 
@@ -67,6 +41,12 @@ public struct CodeModeError: Error, Hashable, Sendable, CustomStringConvertible 
 
     /// The canonical "the runtime ended before responding" error.
     public static let runtimeEnded = CodeModeError("exec runtime ended unexpectedly")
+
+    /// Returned when `StartedCell.initialResponse()` is awaited more than
+    /// once (Swift cannot move-consume the value the way Rust does).
+    public static let initialResponseAlreadyConsumed = CodeModeError(
+        "started cell initial response already consumed"
+    )
 }
 
 // MARK: - CellId
@@ -75,7 +55,7 @@ public struct CodeModeError: Error, Hashable, Sendable, CustomStringConvertible 
 ///
 /// Wraps a `String` so callers can pick whatever id scheme they like
 /// (UUIDs, slugs, ...). Serializes as a bare JSON string (matches the
-/// Rust `#[serde(transparent)]`).
+/// Rust `#[serde(transparent)]` / newtype string form).
 public struct CellId: Hashable, Sendable, Codable, Equatable, CustomStringConvertible {
     public let rawValue: String
 
@@ -100,26 +80,40 @@ public struct CellId: Hashable, Sendable, Codable, Equatable, CustomStringConver
 
 /// A cell that has been started by `CodeModeSession.execute`.
 ///
-/// Carries the cell id plus an `async` initial-response closure that the
-/// caller awaits to receive the first `RuntimeResponse` (typically a
-/// `.yielded` with the cell's first output, or a `.result` if the script
-/// finished synchronously).
-///
-/// The closure is `@Sendable` so it can be awaited from any actor. The
-/// `Result<RuntimeResponse, CodeModeError>` shape mirrors the Rust
-/// `Result<RuntimeResponse, String>` produced by the underlying
-/// `oneshot::Receiver` — the error is `CodeModeError.runtimeEnded` when
-/// the runtime drops the sender before responding.
+/// Carries the cell id plus an `async` initial-response future that the
+/// caller awaits to receive the first `RuntimeResponse`. Matches Rust's
+/// oneshot semantics: `initialResponse()` is **one-shot** — a second
+/// await returns `CodeModeError.initialResponseAlreadyConsumed`.
 public struct StartedCell: Sendable {
     public let cellId: CellId
-    private let initialResponseClosure: @Sendable () async -> Result<RuntimeResponse, CodeModeError>
+    private let box: InitialResponseBox
+
+    /// Internal one-shot box. Uses a lock rather than an actor so
+    /// `initialResponse()` can take ownership without re-entrancy into
+    /// the same actor that may be delivering the response.
+    private final class InitialResponseBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pending: (@Sendable () async -> Result<RuntimeResponse, CodeModeError>)?
+
+        init(_ pending: @escaping @Sendable () async -> Result<RuntimeResponse, CodeModeError>) {
+            self.pending = pending
+        }
+
+        func take() -> (@Sendable () async -> Result<RuntimeResponse, CodeModeError>)? {
+            lock.lock()
+            defer { lock.unlock() }
+            let value = pending
+            pending = nil
+            return value
+        }
+    }
 
     public init(
         cellId: CellId,
         initialResponse: @Sendable @escaping () async -> Result<RuntimeResponse, CodeModeError>
     ) {
         self.cellId = cellId
-        self.initialResponseClosure = initialResponse
+        self.box = InitialResponseBox(initialResponse)
     }
 
     /// Construct from a continuation that already produces a
@@ -147,12 +141,134 @@ public struct StartedCell: Sendable {
         }
     }
 
-    /// Await the initial response. Consumes the cell's initial-response
-    /// future (matches the `pub async fn initial_response(self)` Rust
-    /// signature — the cell is no longer usable for the initial-response
-    /// path after this returns).
+    /// Await the initial response. One-shot: consumes the underlying
+    /// future. A second call returns
+    /// `CodeModeError.initialResponseAlreadyConsumed` (deterministic
+    /// duplicate rejection; matches Rust move semantics).
     public func initialResponse() async -> Result<RuntimeResponse, CodeModeError> {
-        await initialResponseClosure()
+        guard let pending = box.take() else {
+            return .failure(.initialResponseAlreadyConsumed)
+        }
+        return await pending()
+    }
+}
+
+// MARK: - CodeModeCancellationToken
+
+/// Per-cell cooperative cancellation handle passed into host callbacks.
+///
+/// Mirrors Rust `tokio_util::sync::CancellationToken` as used by
+/// `CodeModeSessionDelegate::invoke_tool` / `notify` in
+/// `xai-grok-code-mode-protocol`:
+///
+/// * The session/runtime owns one token (or child token) per live cell.
+/// * Nested `invokeTool` / `notify` work receives that token so host
+///   work can observe termination **without** relying only on ambient
+///   `Task.isCancelled`.
+/// * `terminate(cellId)` and `shutdown()` cancel the cell's token
+///   **exactly once**. After cancel, in-flight callbacks observe
+///   `isCancelled == true` / return from `waitUntilCancelled()`.
+/// * `childToken()` creates a linked child that cancels when the parent
+///   cancels; cancelling a child does **not** cancel its parent.
+/// * `cellClosed` is invoked after the cell reaches a terminal state and
+///   callback cleanup has been signalled via this token. The token is
+///   then terminal — further `cancel()` calls are no-ops.
+public final class CodeModeCancellationToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var onCancelHandlers: [(@Sendable () -> Void)] = []
+    private var children: [CodeModeCancellationToken] = []
+
+    public init() {}
+
+    /// Whether `cancel()` has been observed.
+    public var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    /// Create a child token that cancels when this token cancels.
+    /// Cancelling the child does not cancel the parent.
+    public func childToken() -> CodeModeCancellationToken {
+        let child = CodeModeCancellationToken()
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            child.cancel()
+            return child
+        }
+        children.append(child)
+        lock.unlock()
+        return child
+    }
+
+    /// Register a handler invoked exactly once when cancellation fires.
+    /// If the token is already cancelled, the handler runs immediately.
+    public func onCancel(_ handler: @escaping @Sendable () -> Void) {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            handler()
+            return
+        }
+        onCancelHandlers.append(handler)
+        lock.unlock()
+    }
+
+    /// Signal cancellation. Idempotent; wakes every waiter, runs handlers,
+    /// and cancels every child **exactly once**.
+    public func cancel() {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            return
+        }
+        cancelled = true
+        let pending = waiters
+        waiters.removeAll()
+        let handlers = onCancelHandlers
+        onCancelHandlers.removeAll()
+        let kids = children
+        children.removeAll()
+        lock.unlock()
+        for waiter in pending.values {
+            waiter.resume()
+        }
+        for handler in handlers {
+            handler()
+        }
+        for kid in kids {
+            kid.cancel()
+        }
+    }
+
+    /// Suspend until `cancel()` is called. Returns immediately if already
+    /// cancelled. Also returns when the awaiting Swift `Task` is cancelled
+    /// so host dispatch races do not hang.
+    public func waitUntilCancelled() async {
+        if isCancelled || Task.isCancelled { return }
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                // Re-check under the lock so a cancel that races registration
+                // cannot leave this continuation stranded.
+                if cancelled || Task.isCancelled {
+                    lock.unlock()
+                    continuation.resume()
+                    return
+                }
+                waiters[id] = continuation
+                lock.unlock()
+            }
+        } onCancel: { [self] in
+            lock.lock()
+            let cont = waiters.removeValue(forKey: id)
+            lock.unlock()
+            cont?.resume()
+        }
     }
 }
 
@@ -160,43 +276,51 @@ public struct StartedCell: Sendable {
 
 /// Host callbacks used by a code-mode session while cells are executing.
 ///
-/// The runtime crate implements this protocol to surface nested tool
-/// calls (issued from inside the JS isolate) and `notify(...)` messages
-/// back to the host. The session calls `cellClosed` once per cell after
-/// it reaches a terminal state so the delegate can release any per-cell
-/// state (notify queues, pending tool-call maps, ...).
-///
 /// All methods are `Sendable`-constrained so the session can call them
-/// from any actor. Cancellation is expressed via Swift's
-/// `Task.isCancelled` / `Task.checkCancellation()` rather than a
-/// `CancellationToken` parameter — the runtime crate wraps each
-/// `invokeTool` / `notify` body in a `Task` and cancels it when the cell
-/// is terminated or the session shuts down, completing the
-/// continuation exactly once.
+/// from any actor.
+///
+/// ## Cancellation
+///
+/// Both `invokeTool` and `notify` receive an explicit
+/// `CodeModeCancellationToken` for the cell that issued the callback
+/// (mirrors Rust `CancellationToken`). Session implementations **must**
+/// propagate the per-cell token into every nested invocation and
+/// notification so host work can observe `terminate` / `shutdown`
+/// without relying solely on ambient `Task.isCancelled`.
+///
+/// Lifetime:
+/// * Token is live for the duration of the cell.
+/// * `terminate` / natural completion / `shutdown` cancel it exactly once.
+/// * After cancel, callbacks should exit promptly (return
+///   `CodeModeError("cancelled")` or an equivalent terminal error).
+/// * `cellClosed` fires after terminal delivery and token cancel.
 public protocol CodeModeSessionDelegate: Sendable {
     /// Invoke a nested tool call from inside a code-mode cell.
     ///
-    /// Returns the tool result as a `JSONValue` (mirrors Rust's
-    /// `serde_json::Value`), or an error when the tool fails or the call
-    /// is cancelled.
+    /// - Parameter cancellationToken: Per-cell cancellation handle. Cancelled
+    ///   exactly once when the cell is terminated, completes, or the session
+    ///   shuts down.
     func invokeTool(
-        _ invocation: CodeModeNestedToolCall
+        _ invocation: CodeModeNestedToolCall,
+        cancellationToken: CodeModeCancellationToken
     ) async -> Result<JSONValue, CodeModeError>
 
     /// Inject an extra `custom_tool_call_output` for the current `exec`
-    /// call. Returns the empty result on success, or an error when the
-    /// runtime is unable to accept the notification (cell already
-    /// closed, session shutting down, ...).
+    /// call.
+    ///
+    /// - Parameter cancellationToken: Same per-cell handle as `invokeTool`.
     func notify(
         callId: String,
         cellId: CellId,
-        text: String
+        text: String,
+        cancellationToken: CodeModeCancellationToken
     ) async -> Result<Void, CodeModeError>
 
     /// Release delegate state associated with a cell after it reaches a
     /// terminal state. Synchronous — the session calls this once per
     /// cell, after the cell's terminal `RuntimeResponse` has been
-    /// delivered to the caller.
+    /// delivered to the caller (and after the cell's cancellation token
+    /// has been signalled).
     func cellClosed(_ cellId: CellId)
 }
 
@@ -206,15 +330,10 @@ public protocol CodeModeSessionDelegate: Sendable {
 ///
 /// Cells executed in the same session share stored values (the JS
 /// isolate's `store`/`load` global helpers). Separate sessions must keep
-/// those values isolated. Implementations may execute cells in-process
-/// or remotely.
-///
-/// All methods are `Sendable`-constrained and return
-/// `Result<T, CodeModeError>` to mirror the Rust `Result<_, String>`
-/// shape.
+/// those values isolated.
 public protocol CodeModeSession: Sendable {
     /// Start a new cell. Returns a `StartedCell` whose
-    /// `initialResponse()` closure yields the first `RuntimeResponse`.
+    /// `initialResponse()` future yields the first `RuntimeResponse`.
     func execute(_ request: ExecuteRequest) async -> Result<StartedCell, CodeModeError>
 
     /// Resume (or check on) a running cell. Returns a `WaitOutcome` that
@@ -228,8 +347,7 @@ public protocol CodeModeSession: Sendable {
 
     /// Shut the session down. Terminates every still-running cell,
     /// releases all per-cell state, and frees the underlying runtime
-    /// resources (JS isolate, pending tool-call slots, notify queue).
-    /// The session is unusable after this returns.
+    /// resources. The session is unusable after this returns.
     func shutdown() async -> Result<Void, CodeModeError>
 }
 

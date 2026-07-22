@@ -3,12 +3,11 @@
 // Supporting structs/enums referenced from requests, chunks, and events.
 // Ported from `crates/codegen/xai-grok-workspace-types/src/types/*`.
 //
-// Every type in this file is a wire-shape placeholder: the canonical
-// implementations live in other crates today (`OpenGrokHunkTracker`,
-// `OpenGrokShell`, `OpenGrokTools`, ...). We define minimal serializable
-// shapes here so the wire-types crate's API surface compiles end-to-end.
-// Each type carries a `TODO(workspace): align with <canonical type>`
-// comment naming the crate it should eventually be reconciled against.
+// These are the **canonical wire-format contracts** for the workspace
+// stream / ops surface. Runtime crates (`OpenGrokHunkTracker`,
+// `OpenGrokWorkspace`, `OpenGrokShell`, …) may hold richer domain models
+// and convert to/from these DTOs at the boundary; the JSON shapes defined
+// here are the source of truth for encode/decode parity with Rust.
 
 import Foundation
 import OpenGrokShared
@@ -951,16 +950,15 @@ public enum PlanModeDecision: Hashable, Sendable, Codable, Equatable {
     }
 }
 
-// MARK: - plugins.rs (workspace-types local placeholders — distinct from
-// OpenGrokHooksPluginTypes).
+// MARK: - plugins.rs (workspace stream DTOs — distinct from
+// OpenGrokHooksPluginTypes ACP extension DTOs).
 
 /// Plugin metadata surfaced by `OpsChunk.plugins`.
 ///
-/// NOTE: this `source`-keyed `PluginInfo` is the workspace-types local
-/// placeholder, distinct from `OpenGrokHooksPluginTypes.PluginInfo` (the
-/// richer pager-facing DTO keyed by `scope`). The two are intentionally
-/// separate types — the wire shapes diverge — and the canonical plugins
-/// DTO lives in `OpenGrokHooksPluginTypes`.
+/// NOTE: this `source`-keyed `PluginInfo` is the workspace stream DTO,
+/// distinct from `OpenGrokHooksPluginTypes.PluginInfo` (the richer
+/// pager-facing ACP extension DTO keyed by `scope`). The two are
+/// intentionally separate types — the wire shapes diverge.
 public struct PluginInfo: Hashable, Sendable, Codable, Equatable {
     public var id: String
     public var name: String
@@ -1000,11 +998,10 @@ public struct PluginInfo: Hashable, Sendable, Codable, Equatable {
     }
 }
 
-/// Hook metadata surfaced by `OpsChunk.hooks`.
+/// Hook metadata surfaced by `OpsChunk.hooks` / `WorkspaceEvent.hooksChanged`.
 ///
-/// NOTE: workspace-types local placeholder, distinct from
-/// `OpenGrokHooksPluginTypes.HookInfo`. The canonical hooks DTO lives in
-/// `OpenGrokHooksPluginTypes`.
+/// NOTE: workspace stream DTO, distinct from
+/// `OpenGrokHooksPluginTypes.HookInfo` (the richer ACP extension DTO).
 public struct HookInfo: Hashable, Sendable, Codable, Equatable {
     public var id: String
     public var name: String

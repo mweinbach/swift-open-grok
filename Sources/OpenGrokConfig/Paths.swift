@@ -9,25 +9,20 @@
 //   * `userGrokHome` returns `nil` when no home resolves (rather than a
 //     cwd-relative `.opengrok`), so user-tier scans don't mistake a project
 //     tree for the user-global one.
-//   * `encodeCwdDirname` URL-encodes short CWDs (≤255 bytes encoded) and
-//     falls back to a compact `{slug}-{hash16}` form (always ≤57 bytes) for
-//     long CWDs, writing a `.cwd` metadata file so `decodeCwdFromDirname` can
-//     recover the original. The hash function is SHA-256 truncated to 16 hex
-//     chars (Rust uses blake3; the on-disk directory names will differ, but
-//     the format and round-trip semantics are identical — see the module doc
-//     in OpenGrokConfig.swift).
-//   * `ensureSessionsCwdDir` writes the `.cwd` file via `createNew` to avoid
-//     TOCTOU races with parallel session starts.
+//   * `encodeCwdDirname` percent-encodes short CWDs (including `/` → `%2F`,
+//     matching Rust `urlencoding::encode`) when the encoded form is ≤255
+//     bytes, and falls back to a compact `{slug}-{blake3_hex16}` form
+//     (always ≤57 bytes) for long CWDs, writing a `.cwd` metadata file so
+//     `decodeCwdFromDirname` can recover the original.
+//   * `ensureSessionsCwdDir` writes the `.cwd` file via create-new
+//     (O_CREAT|O_EXCL) semantics to avoid TOCTOU races with parallel session
+//     starts, and never overwrites an existing `.cwd`.
 //
 // `defaultGrokHome`, `grokHome`, `userGrokHome`, and `systemConfigDir` accept
 // an injectable `environment` so tests are deterministic without mutating the
-// process environment. The Rust crate caches these in `OnceLock`s for the
-// process lifetime; the Swift port caches them per-process in `static`
-// computed properties (defaults to live env), with `_at` variants that take
-// explicit environment arguments (no caching) for tests.
+// process environment.
 
 import Foundation
-import CryptoKit
 import OpenGrokPaths
 import OpenGrokConfigTypes
 
@@ -151,23 +146,21 @@ private let maxDirnameBytes = 255
 
 /// Encode a CWD string into a filesystem-safe directory name component.
 ///
-/// Short CWDs (URL-encoded form <= 255 bytes) use URL-encoding for backward
-/// compatibility and human readability on disk.
+/// Short CWDs (URL-encoded form <= 255 bytes) use `urlencoding::encode`
+/// parity (percent-encode every non-unreserved byte, **including** `/` as
+/// `%2F`) for backward compatibility and human readability on disk.
 ///
-/// Long CWDs (> 255 bytes encoded) use a compact `{slug}-{hash16}` form that
-/// is always <= 57 bytes. Callers must write a `.cwd` metadata file via
-/// `ensureSessionsCwdDir` so the original CWD can be recovered by
+/// Long CWDs (> 255 bytes encoded) use a compact `{slug}-{blake3_hex16}`
+/// form that is always <= 57 bytes. Callers must write a `.cwd` metadata
+/// file via `ensureSessionsCwdDir` so the original CWD can be recovered by
 /// `decodeCwdFromDirname`.
-///
-/// The hash function is SHA-256 truncated to 16 hex chars (Rust uses blake3
-/// — see the module doc for the divergence rationale).
 public func encodeCwdDirname(_ cwd: String) -> String {
     let urlEncoded = urlEncodePath(cwd)
     if urlEncoded.utf8.count <= maxDirnameBytes {
         return urlEncoded
     }
-    // Compact hash form.
-    let hashHex = sha256Hex16(cwd)
+    // Compact hash form — first 16 hex chars of BLAKE3 (Rust `blake3::hash`).
+    let hashHex = Blake3.hexPrefix(cwd, length: 16)
     let leaf = URL(fileURLWithPath: cwd).lastPathComponent
     var slug = slugify(leaf, maxLen: 40)
     if slug.isEmpty { slug = "workspace" }
@@ -217,10 +210,9 @@ public func sessionsCwdDir(
 /// when hash-based encoding is used (long paths).
 ///
 /// For short paths the `.cwd` file is not written because the directory name
-/// itself is reversible via URL-decoding. The `.cwd` file is written via
-/// `FileHandle` with `O_CREAT|O_EXCL` semantics (Foundation's
-/// `createNew`-equivalent) to avoid TOCTOU races with parallel session
-/// starts.
+/// itself is reversible via URL-decoding. The `.cwd` file is written with
+/// create-new (O_CREAT|O_EXCL) semantics so parallel session starts never
+/// overwrite an existing file.
 public func ensureSessionsCwdDir(
     _ cwd: String,
     environment: [String: String] = ProcessInfo.processInfo.environment
@@ -232,13 +224,17 @@ public func ensureSessionsCwdDir(
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     // Hash-based encoding is in use when the dirname differs from the plain
     // URL-encoded form. Write a `.cwd` file so decode can recover the original
-    // path. O_CREAT|O_EXCL via Data.write options avoids TOCTOU races with
-    // parallel session starts.
+    // path. withoutOverwriting ≈ O_CREAT|O_EXCL.
     if encodedName != urlEncodePath(cwd) {
         let cwdFile = dir.appendingPathComponent(".cwd")
         let data = Data(cwd.utf8)
+        // O_CREAT|O_EXCL: create only if absent. Do not combine with `.atomic`
+        // — Foundation rejects that pairing.
+        if FileManager.default.fileExists(atPath: cwdFile.path) {
+            return dir
+        }
         do {
-            try data.write(to: cwdFile, options: [.atomic, .withoutOverwriting])
+            try data.write(to: cwdFile, options: [.withoutOverwriting])
         } catch let error as NSError {
             // NSFileWriteFileExistsError = 516; treat as AlreadyExists.
             if error.code != NSFileWriteFileExistsError {
@@ -271,19 +267,13 @@ public func slugify(_ input: String, maxLen: Int) -> String {
     return String(trimmed.prefix(maxLen))
 }
 
-// MARK: - URL encoding (path-component, no encoding of `/`)
+// MARK: - URL encoding (urlencoding::encode parity)
 
-/// URL-encode a CWD path for use as a directory name. Encodes everything
-/// except unreserved characters and `/` (so a path like `/Users/foo/bar`
-/// round-trips as `%2FUsers%2Ffoo%2Fbar`-ish on platforms that accept that,
-/// matching the Rust `urlencoding::encode` behavior on path strings).
-///
-/// Rust `urlencoding::encode` does NOT encode `/` (it's in the "unreserved"
-/// set for the path-encoding flavor it uses). Mirroring that here keeps the
-/// short-CWD encoding wire-compatible with the Rust reference.
+/// Percent-encode a CWD path the way Rust `urlencoding::encode` does:
+/// every byte outside the unreserved set `A-Z a-z 0-9 - _ . ~` is encoded,
+/// **including** `/` as `%2F`. This produces a single filesystem-safe
+/// directory name component for short paths.
 func urlEncodePath(_ s: String) -> String {
-    // Encode every byte that's not in the unreserved set; leave `/` alone to
-    // match Rust `urlencoding::encode` for path strings.
     var out = ""
     for byte in s.utf8 {
         let c = Character(Unicode.Scalar(byte))
@@ -294,7 +284,6 @@ func urlEncodePath(_ s: String) -> String {
             || byte == 0x5F // _
             || byte == 0x2E // .
             || byte == 0x7E // ~
-            || byte == 0x2F // /  (left unencoded to match Rust)
         {
             out.append(c)
         } else {
@@ -321,16 +310,10 @@ func urlDecodePath(_ s: String) -> String? {
             bytes.append(v)
             idx = s.index(after: next2)
         } else {
-            bytes.append(UInt8(c.asciiValue ?? 0))
+            guard let ascii = c.asciiValue else { return nil }
+            bytes.append(ascii)
             idx = s.index(after: idx)
         }
     }
     return String(bytes: bytes, encoding: .utf8)
-}
-
-/// SHA-256 of `s`, rendered as 64 hex chars, truncated to the first 16.
-func sha256Hex16(_ s: String) -> String {
-    let digest = SHA256.hash(data: Data(s.utf8))
-    let full = digest.map { String(format: "%02x", $0) }.joined()
-    return String(full.prefix(16))
 }

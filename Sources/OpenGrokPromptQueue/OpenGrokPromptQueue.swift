@@ -228,3 +228,116 @@ extension QueueChanged {
         self.init(sessionId: "", entries: [], runningPromptId: nil)
     }
 }
+
+// MARK: - FIFO prompt queue state machine
+//
+// Actor-owned in-process queue used by session hosts. Wire snapshots
+// are produced as `QueueChanged` for pager subscribers. Ordering is
+// strictly FIFO; edits bump version; stale-version edits are no-ops.
+
+/// Errors from in-process prompt-queue mutations.
+public enum PromptQueueError: Error, Hashable, Sendable {
+    case notFound(id: String)
+    case alreadyRunning
+    case empty
+}
+
+/// Actor-safe FIFO prompt queue. Mirrors the session actor's visible
+/// queue contract without owning the full session runtime.
+public actor PromptQueue {
+    public private(set) var entries: [QueueEntryMeta] = []
+    public private(set) var runningPromptId: String?
+    public let sessionId: String
+
+    public init(sessionId: String) {
+        self.sessionId = sessionId
+    }
+
+    /// Enqueue at the tail. Returns the enqueued entry with its position.
+    @discardableResult
+    public func enqueue(_ entry: QueueEntryMeta) -> QueueEntryWire {
+        entries.append(entry)
+        return wireSnapshot().entries.last!
+    }
+
+    /// Pop the front entry and mark it running. Fails if already running.
+    public func beginNext() throws -> QueueEntryMeta {
+        if runningPromptId != nil {
+            throw PromptQueueError.alreadyRunning
+        }
+        guard !entries.isEmpty else {
+            throw PromptQueueError.empty
+        }
+        let next = entries.removeFirst()
+        runningPromptId = next.id
+        return next
+    }
+
+    /// Clear the running marker after a turn completes.
+    public func completeRunning() {
+        runningPromptId = nil
+    }
+
+    /// Cancel the running prompt without dequeuing remaining work.
+    public func cancelRunning() {
+        runningPromptId = nil
+    }
+
+    /// In-place edit. Stale version is a no-op and returns nil.
+    @discardableResult
+    public func edit(
+        id: String,
+        expectedVersion: UInt64,
+        text: String,
+        kind: String? = nil,
+        editor: String? = nil
+    ) -> QueueEntryMeta? {
+        guard let index = entries.firstIndex(where: { $0.id == id }) else {
+            return nil
+        }
+        guard entries[index].version == expectedVersion else {
+            return nil
+        }
+        entries[index].text = text
+        if let kind {
+            entries[index].kind = kind
+        }
+        entries[index].lastEditor = editor
+        entries[index].version += 1
+        return entries[index]
+    }
+
+    /// Remove a not-yet-running entry by id.
+    @discardableResult
+    public func remove(id: String) throws -> QueueEntryMeta {
+        guard let index = entries.firstIndex(where: { $0.id == id }) else {
+            throw PromptQueueError.notFound(id: id)
+        }
+        return entries.remove(at: index)
+    }
+
+    /// Ordered ids currently queued (not including running).
+    public var orderedIds: [String] {
+        entries.map(\.id)
+    }
+
+    /// Wire snapshot for `x.ai/queue/changed`.
+    public func wireSnapshot() -> QueueChanged {
+        let wires = entries.enumerated().map { index, entry in
+            QueueEntryWire(
+                id: entry.id,
+                version: entry.version,
+                owner: entry.owner,
+                lastEditor: entry.lastEditor,
+                kind: entry.kind,
+                text: entry.text,
+                position: index
+            )
+        }
+        return QueueChanged(
+            sessionId: sessionId,
+            entries: wires,
+            runningPromptId: runningPromptId
+        )
+    }
+}

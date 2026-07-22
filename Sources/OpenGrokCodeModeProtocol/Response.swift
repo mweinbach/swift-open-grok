@@ -54,11 +54,11 @@ public let DEFAULT_IMAGE_DETAIL: ImageDetail = .high
 /// One content item emitted by a code-mode cell, surfaced to the model as
 /// a `function_call_output` content block.
 ///
-/// Adjacently tagged with `tag = "type"` (snake_case variants) to match
-/// the Rust source. The `input_text` variant carries plain text; the
-/// `input_image` variant carries a base64-encoded `data:` URL plus an
-/// optional detail hint (defaults to `DEFAULT_IMAGE_DETAIL` at the
-/// runtime layer when absent).
+/// Internally tagged with `tag = "type"` and snake_case variants
+/// (`#[serde(tag = "type", rename_all = "snake_case")]` in Rust). The
+/// `input_text` variant carries plain text; the `input_image` variant
+/// carries a base64-encoded `data:` URL plus an optional detail hint
+/// (defaults to `DEFAULT_IMAGE_DETAIL` at the runtime layer when absent).
 public enum FunctionCallOutputContentItem: Hashable, Sendable, Codable, Equatable {
     case inputText(text: String)
     case inputImage(imageUrl: String, detail: ImageDetail?)

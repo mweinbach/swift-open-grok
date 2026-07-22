@@ -11,13 +11,17 @@
 // Inert until a public key is provisioned: with no embedded keys the cache
 // marker stays the (best-effort) authority.
 //
-// The Swift port uses CryptoKit's `Curve25519.Signing` for Ed25519
-// verification (macOS 10.15+, iOS 13+). On platforms without CryptoKit the
-// `verificationActive()` returns `false` (dark build) — matching the Rust
-// behavior with no embedded keys.
+// Ed25519 verification is portable:
+//   * Prefer CryptoKit `Curve25519.Signing` when available (Apple platforms).
+//   * Fall back to a pure-Swift verifier (`Ed25519Portable`) so Linux/Windows
+//     and non-CryptoKit builds keep the same fail-closed / dark-build
+//     semantics. With no embedded keys the build is dark either way —
+//     matching Rust with an empty `EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS`.
 
 import Foundation
+#if canImport(CryptoKit)
 import CryptoKit
+#endif
 import OpenGrokConfigTypes
 import OpenGrokCLIChatProxyTypes
 
@@ -181,7 +185,7 @@ public func verifyManagedIdentityClaim(
 }
 
 /// Shared Ed25519 check: select the trusted key named by the signed bytes'
-/// `keyId`, verify.
+/// `keyId`, verify. Uses CryptoKit when present, pure-Swift otherwise.
 fileprivate func verifySignatureWithKeys(
     _ signedPayload: String,
     signatureB64: String,
@@ -195,14 +199,39 @@ fileprivate func verifySignatureWithKeys(
     guard let sig = Data(base64Encoded: trimmed) else {
         throw SigError.badSignatureEncoding
     }
-    let pubKey: Curve25519.Signing.PublicKey
-    do {
-        pubKey = try Curve25519.Signing.PublicKey(rawRepresentation: Data(publicKeyBytes))
-    } catch {
+    guard publicKeyBytes.count == 32, sig.count == 64 else {
         throw SigError.badSignatureEncoding
     }
-    if !pubKey.isValidSignature(sig, for: Data(signedPayload.utf8)) {
+    let message = Data(signedPayload.utf8)
+    let ok = Ed25519Verifier.isValidSignature(
+        sig,
+        for: message,
+        publicKey: Data(publicKeyBytes)
+    )
+    if !ok {
         throw SigError.signatureMismatch
+    }
+}
+
+// MARK: - Portable Ed25519 verifier
+
+/// Thin seam over CryptoKit (preferred) or the pure-Swift Ed25519 verify in
+/// `Ed25519Portable`. Platforms without CryptoKit still verify signed
+/// sidecars; dark-build behavior is controlled solely by the empty
+/// embedded-key set. Both backends implement the same RFC 8032 check.
+enum Ed25519Verifier {
+    static func isValidSignature(_ signature: Data, for message: Data, publicKey: Data) -> Bool {
+        #if canImport(CryptoKit)
+        do {
+            let key = try Curve25519.Signing.PublicKey(rawRepresentation: publicKey)
+            return key.isValidSignature(signature, for: message)
+        } catch {
+            // Fall through to pure-Swift if CryptoKit rejects the key encoding.
+            return Ed25519Portable.isValidSignature(signature, for: message, publicKey: publicKey)
+        }
+        #else
+        return Ed25519Portable.isValidSignature(signature, for: message, publicKey: publicKey)
+        #endif
     }
 }
 

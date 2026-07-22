@@ -44,22 +44,72 @@ public func replaceOrInsertSystemHead(
     }
 }
 
+/// Upsert a memory reminder into the conversation's system message.
+///
+/// If the first item is a `System` message, any previously injected
+/// `<memory-context>` section is replaced in-place; otherwise the reminder is
+/// appended. If no system message exists, a new `System` item is prepended.
+///
+/// Returns `true` when the conversation was changed.
+@discardableResult
+public func injectMemoryReminder(
+    _ items: inout [ConversationItem],
+    reminder: String
+) -> Bool {
+    let reminder = reminder.trimmingCharacters(in: .whitespacesAndNewlines)
+    if reminder.isEmpty { return false }
+
+    if let first = items.first, case .system(var sys) = first {
+        let changed = upsertMemoryReminderText(&sys.content, reminder: reminder)
+        if changed {
+            items[0] = .system(sys)
+        }
+        return changed
+    } else {
+        items.insert(.system(reminder), at: 0)
+        return true
+    }
+}
+
+/// Replace or append a memory-context block in a system prompt string.
+@discardableResult
+public func upsertMemoryReminderText(_ systemPrompt: inout String, reminder: String) -> Bool {
+    let updated: String
+    if let range = systemPrompt.range(of: MEMORY_CONTEXT_OPEN_TAG) {
+        let prefix = String(systemPrompt[..<range.lowerBound]).trimmingTrailingNewlines
+        if prefix.isEmpty {
+            updated = reminder
+        } else {
+            updated = "\(prefix)\n\n\(reminder)"
+        }
+    } else if systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines) == reminder {
+        updated = systemPrompt
+    } else if systemPrompt.isEmpty {
+        updated = reminder
+    } else {
+        updated = "\(systemPrompt.trimmingTrailingNewlines)\n\n\(reminder)"
+    }
+
+    if systemPrompt == updated {
+        return false
+    }
+    systemPrompt = updated
+    return true
+}
+
 // MARK: - String helper
 
 fileprivate extension String {
     /// Trim trailing `\n` and `\r` characters only (interior and leading
     /// whitespace preserved), mirroring Rust `trim_end_matches(['\n', '\r'])`.
+    ///
+    /// Operates on Unicode scalars (not `Character` grapheme clusters) so a
+    /// trailing CRLF (`\r\n`, one Swift `Character`) is fully stripped.
     var trimmingTrailingNewlines: String {
-        var end = endIndex
-        while end > startIndex {
-            let prev = index(before: end)
-            let ch = self[prev]
-            if ch == "\n" || ch == "\r" {
-                end = prev
-            } else {
-                break
-            }
+        var scalars = Array(unicodeScalars)
+        while let last = scalars.last, last == "\n" || last == "\r" {
+            scalars.removeLast()
         }
-        return String(self[startIndex..<end])
+        return String(String.UnicodeScalarView(scalars))
     }
 }

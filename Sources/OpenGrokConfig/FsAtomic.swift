@@ -52,9 +52,10 @@ public func writeAtomically(
     let tmp = dir.appendingPathComponent("\(name).\(pid).\(nonce).tmp")
     let data = Data(contents.utf8)
 
-    // Write the temp file with .withoutOverwriting (O_CREAT|O_EXCL).
+    // Write the temp file with O_CREAT|O_EXCL. Do not combine `.atomic` with
+    // `.withoutOverwriting` — Foundation rejects that pairing.
     do {
-        try data.write(to: tmp, options: [.atomic, .withoutOverwriting])
+        try data.write(to: tmp, options: [.withoutOverwriting])
     } catch {
         // Best-effort cleanup; rethrow the original error.
         try? FileManager.default.removeItem(at: tmp)

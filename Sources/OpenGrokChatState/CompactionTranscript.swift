@@ -276,8 +276,8 @@ func computeTurnStats(_ items: [ConversationItem]) -> TurnStats {
                 toolCounts[tc.name, default: 0] += 1
                 let args = toolArgs(tc.arguments)
                 for key in fileArgKeys {
-                    if case .string(let v)? = args[key], !v.isEmpty {
-                        uniqueFiles.insert(v)
+                    if let v = args[key], case .string(let s) = v, !s.isEmpty {
+                        uniqueFiles.insert(s)
                         break
                     }
                 }

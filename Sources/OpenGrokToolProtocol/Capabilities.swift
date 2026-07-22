@@ -7,6 +7,7 @@
 // kinds, tool scopes, connection kinds, and tool-definition modes.
 
 import Foundation
+import OpenGrokShared
 
 /// Lifecycle hook a tool may opt in to receive.
 ///

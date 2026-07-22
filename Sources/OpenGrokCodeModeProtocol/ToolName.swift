@@ -9,14 +9,14 @@
 // description builder can group tools by namespace and the runtime can
 // route nested calls correctly.
 //
-// `ToolName` is `Hashable`, `Comparable`, and `Codable` (serializes as a
-// bare JSON string via its `description`). `Comparable` orders by
-// `(namespace, name)` so a sorted `Set<ToolName>` is deterministic across
-// runs.
+// Wire form is a JSON object `{ "name": "...", "namespace": "..." | null }`
+// matching Rust's derive(Serialize, Deserialize) on the struct fields —
+// not a flattened string. `Display` still concatenates `namespace + name`
+// for human-readable / JS-identifier surfaces.
 
 import Foundation
 
-public struct ToolName: Hashable, Sendable, Codable, Equatable, Comparable {
+public struct ToolName: Hashable, Sendable, Codable, Equatable, Comparable, CustomStringConvertible {
     public var name: String
     public var namespace: String?
 
@@ -35,45 +35,29 @@ public struct ToolName: Hashable, Sendable, Codable, Equatable, Comparable {
         ToolName(name: name, namespace: namespace)
     }
 
-    // MARK: Codable — bare JSON string ("namespace + name" or just "name").
+    // MARK: Codable — keyed object matching Rust struct serde.
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case namespace
+    }
 
     public init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        let raw = try c.decode(String.self)
-        self = ToolName.parse(raw)
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        // Option without `default`: absent key becomes nil only when the
+        // key is present-as-null or we accept decodeIfPresent for
+        // forward-compatible partial objects. Rust emits `null` for
+        // `None`; accept both null and missing.
+        namespace = try c.decodeIfPresent(String.self, forKey: .namespace)
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        try c.encode(String(describing: self))
-    }
-
-    /// Parse a bare wire string into a `ToolName`, splitting on the
-    /// MCP-style `__` delimiter when present.
-    ///
-    /// The Rust source serializes via `Display` (`namespace + name` when
-    /// namespaced, else `name`); the wire form has no explicit delimiter,
-    /// so the parser falls back to using the full string as the `name`
-    /// when no namespace split is recoverable. Round-trip parity is
-    /// preserved by `encode`/`String(describing:)` re-emitting the same
-    /// form.
-    public static func parse(_ raw: String) -> ToolName {
-        // The Rust `Display` impl concatenates `namespace + name` without
-        // a delimiter, so the wire form is ambiguous on parse. To preserve
-        // round-trip parity for the cases the code-mode runtime actually
-        // produces (MCP-qualified names use `mcp__server__tool` shape, and
-        // the namespace is recorded separately as `mcp__server__`), we
-        // attempt to split on the last `__` boundary only when the
-        // namespace field is recoverable as `mcp__...__`. Otherwise we
-        // keep the full string as the plain name.
-        if let range = raw.range(of: "__", options: .backwards) {
-            let ns = String(raw[raw.startIndex..<range.upperBound])
-            let trailing = String(raw[range.upperBound...])
-            if ns.hasPrefix("mcp__") && !trailing.isEmpty {
-                return ToolName(name: trailing, namespace: ns)
-            }
-        }
-        return ToolName(name: raw, namespace: nil)
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(name, forKey: .name)
+        // Match Rust default Option encoding: always emit the key, with
+        // `null` when namespace is absent.
+        try c.encode(namespace, forKey: .namespace)
     }
 
     // MARK: CustomStringConvertible (matches Rust's `Display`)
@@ -88,9 +72,9 @@ public struct ToolName: Hashable, Sendable, Codable, Equatable, Comparable {
 
     // MARK: Comparable
     //
-    // Mirrors the Rust `Ord` impl: sort by `(namespace, name)` when
-    // namespaced, else by `(name, nil)`. Plain names sort before
-    // namespaced names with the same prefix because the `nil` namespace
+    // Mirrors the Rust `Ord` impl: sort by `(namespace, Some(name))` when
+    // namespaced, else by `(name, None)`. Plain names sort before
+    // namespaced names with the same prefix because the `None` name
     // component compares less than any string.
 
     public static func < (lhs: ToolName, rhs: ToolName) -> Bool {
@@ -111,7 +95,7 @@ public struct ToolName: Hashable, Sendable, Codable, Equatable, Comparable {
         case (nil, nil): return false
         case (nil, _): return true
         case (_, nil): return false
-        case (let l, let r): return l! < r!
+        case let (l?, r?): return l < r
         }
     }
 }

@@ -172,12 +172,23 @@ public struct McpSetupConfig: Hashable, Sendable, Codable, Equatable {
         self.variables = variables
     }
 
-    private enum CodingKeys: String, CodingKey { case fields, variables }
+    /// Accept both `variables` (canonical) and `values` (Rust serde alias).
+    private enum CodingKeys: String, CodingKey {
+        case fields
+        case variables
+        case values
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         fields = try c.decodeIfPresent([McpSetupField].self, forKey: .fields) ?? []
-        variables = try c.decodeIfPresent([String: McpSetupDerivedValue].self, forKey: .variables) ?? [:]
+        // Rust `#[serde(default, alias = "values")]` — prefer `variables`,
+        // fall back to the wire alias used by setup schemas in the wild.
+        if let vars = try c.decodeIfPresent([String: McpSetupDerivedValue].self, forKey: .variables) {
+            variables = vars
+        } else {
+            variables = try c.decodeIfPresent([String: McpSetupDerivedValue].self, forKey: .values) ?? [:]
+        }
     }
 
     public func encode(to encoder: Encoder) throws {

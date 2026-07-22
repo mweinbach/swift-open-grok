@@ -1,12 +1,16 @@
 // OpenGrokSQLiteJournal.swift
 //
-// Open Grok — Swift port. Bootstrap placeholder.
+// Open Grok — Swift port of `xai-sqlite-journal` plus an actor-isolated,
+// schema-versioned record journal for session / worktree / managed-state
+// consumers.
 //
-// This target is predeclared in Package.swift and is owned by exactly one
-// implementation slice per PORT_PLAN.md / CRATE_MAP.md. The owning slice
-// replaces this file with the real port of the corresponding Rust crate(s).
-// No slice other than the owner may edit this directory.
+// Reference: crates/codegen/xai-sqlite-journal
 //
-// Rust crate mapping: see CRATE_MAP.md.
+// Invariants:
+//   * WAL only on local filesystems; TRUNCATE on network mounts.
+//   * Env kill-switch: OPENGROK_SQLITE_JOURNAL_MODE or GROK_SQLITE_JOURNAL_MODE.
+//   * Per-host DB filenames under TRUNCATE so peers never share WAL -shm.
+//   * Actor isolation; explicit transactions; deterministic migrations.
+//   * System SQLite via `import SQLite3` (no third-party package).
 
 import Foundation

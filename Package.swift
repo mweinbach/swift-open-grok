@@ -154,10 +154,10 @@ private func targets() -> [Target] {
     t.append(.target(name: "OpenGrokToolRuntime", dependencies: dep(w0s4, ["OpenGrokToolTypes", "OpenGrokToolProtocol"])))
     t.append(.target(name: "OpenGrokToolsAPI", dependencies: dep(w0s4, ["OpenGrokToolTypes", "OpenGrokToolProtocol", "OpenGrokToolRuntime"])))
     t.append(contentsOf: libs(w1s2, dep(w0s4)))
-    // W1-S3: ChatState builds on SamplingTypes.
+    // W1-S3: ChatState builds on SamplingTypes + TokenEstimation.
     t.append(.target(name: "OpenGrokSamplingTypes", dependencies: dep(w0s4)))
-    t.append(.target(name: "OpenGrokChatState", dependencies: dep(w0s4, ["OpenGrokSamplingTypes"])))
     t.append(.target(name: "OpenGrokTokenEstimation", dependencies: dep(w0s4)))
+    t.append(.target(name: "OpenGrokChatState", dependencies: dep(w0s4, ["OpenGrokSamplingTypes", "OpenGrokTokenEstimation"])))
     t.append(contentsOf: libs(w1s4, dep(w0s4)))
     // W1-S5: Config builds on ConfigTypes.
     t.append(.target(name: "OpenGrokConfigTypes", dependencies: dep(w0s3, w0s4)))
@@ -175,11 +175,21 @@ private func targets() -> [Target] {
     t.append(.target(name: "OpenGrokSecrets", dependencies: dep(w0s2, w0s3, w0s4, w1s5, ["OpenGrokFileUtils"])))
     t.append(contentsOf: libs(w2s3, dep(w0s2, w0s3, w0s4)))
     // W2-S4: TTY base; PTY -> TTY; PTYCLI -> PTY/TTY.
+    // C shims must live in separate targets: SwiftPM rejects mixed-language
+    // Sources/<Target> trees (OpenGrokPTY + OpenGrokCrashHandler).
+    t.append(.target(
+        name: "OpenGrokPTYC",
+        publicHeadersPath: "include"
+    ))
+    t.append(.target(
+        name: "OpenGrokCrashHandlerC",
+        publicHeadersPath: "include"
+    ))
     t.append(.target(name: "OpenGrokTTY", dependencies: dep(w0s2, w0s3, w0s4)))
-    t.append(.target(name: "OpenGrokPTY", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokTTY"])))
+    t.append(.target(name: "OpenGrokPTY", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokTTY", "OpenGrokPTYC"])))
     t.append(.target(name: "OpenGrokPTYCLI", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokPTY", "OpenGrokTTY"])))
     t.append(.target(name: "OpenGrokSystemPower", dependencies: dep(w0s2, w0s3, w0s4)))
-    t.append(.target(name: "OpenGrokCrashHandler", dependencies: dep(w0s2, w0s3, w0s4)))
+    t.append(.target(name: "OpenGrokCrashHandler", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokCrashHandlerC"])))
     // W2-S5: TerminalCore base; TextArea -> TerminalCore.
     t.append(.target(name: "OpenGrokTerminalCore", dependencies: dep(w0s2, w0s4)))
     t.append(.target(name: "OpenGrokTextArea", dependencies: dep(w0s2, w0s4, ["OpenGrokTerminalCore"])))

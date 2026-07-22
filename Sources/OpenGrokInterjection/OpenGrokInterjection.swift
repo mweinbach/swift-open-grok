@@ -281,3 +281,56 @@ public func formatInterjection(_ text: String) -> String {
 
     return "The user sent a message while you were working:\n\(userQuery(truncated))"
 }
+
+// MARK: - Interjection kinds
+//
+// Hosts distinguish mid-turn steering from follow-ups, interrupts, and
+// queued-prompt drains. Core formatting is shared; dequeue order remains
+// FIFO via EventQueue.
+
+/// Why a mid-turn message was buffered.
+public enum InterjectionKind: String, Hashable, Sendable, Codable {
+    /// User steered the in-flight turn.
+    case steer
+    /// User provided a follow-up that should run after the turn.
+    case followUp = "follow_up"
+    /// Hard interrupt requesting cancellation of the current turn.
+    case interrupt
+    /// A queued prompt promoted into the interjection path.
+    case queuedPrompt = "queued_prompt"
+}
+
+/// A pending interjection tagged with its host-visible kind.
+public struct KindedInterjection<Attachment>: Hashable, Sendable, Codable
+where Attachment: Hashable & Sendable & Codable {
+    public var kind: InterjectionKind
+    public var pending: PendingInterjection<Attachment>
+
+    public init(kind: InterjectionKind, text: String, attachments: [Attachment] = []) {
+        self.kind = kind
+        self.pending = PendingInterjection(text: text, attachments: attachments)
+    }
+
+    public init(kind: InterjectionKind, pending: PendingInterjection<Attachment>) {
+        self.kind = kind
+        self.pending = pending
+    }
+}
+
+/// Drain kinded interjections as formatted synthetic user messages,
+/// preserving FIFO order and never merging entries.
+public func drainKindedFormatted<Attachment>(
+    _ buffer: EventQueue<KindedInterjection<Attachment>>,
+    sanitize: (String) -> String = { $0 }
+) -> [(kind: InterjectionKind, formatted: FormattedInterjection<Attachment>)]
+where Attachment: Hashable & Sendable & Codable {
+    buffer.drainAll().map { entry in
+        (
+            kind: entry.kind,
+            formatted: FormattedInterjection(
+                text: formatInterjection(sanitize(entry.pending.text)),
+                attachments: entry.pending.attachments
+            )
+        )
+    }
+}

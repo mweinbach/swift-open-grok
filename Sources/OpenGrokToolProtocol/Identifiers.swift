@@ -13,6 +13,7 @@
 // `#[serde(transparent)]` contract.
 
 import Foundation
+import OpenGrokShared
 
 /// Errors produced by id constructors and validators.
 ///
@@ -276,12 +277,19 @@ public struct ServerId: Hashable, Sendable, CustomStringConvertible, Codable {
     /// Synthesise the deterministic computer-hub-side id for a single-tool
     /// `register_tool` that omits `server_id`. Bypasses the reserved-prefix
     /// check. Mirrors Rust `ServerId::synthesize_for_tool`.
+    ///
+    /// `connectionId` is part of the signature so callers can't omit the
+    /// connection scope they are implicitly relying on, even though the
+    /// current encoding does not mix it in.
     public static func synthesizeForTool(connectionId: ConnectionId, toolId: ToolId) -> ServerId {
-        // The connection_id is part of the signature so callers can't omit
-        // the connection scope they are implicitly relying on, even though
-        // the current encoding does not mix it in.
-        let s = "\(serverIdReservedPrefix)tool:\(toolId)"
-        return try! ServerId(s)
+        _ = connectionId
+        return ServerId(unchecked: "\(serverIdReservedPrefix)tool:\(toolId.rawValue)")
+    }
+
+    /// Unchecked constructor used only by hub-side synthesis paths that
+    /// intentionally produce reserved-prefix ids.
+    fileprivate init(unchecked rawValue: String) {
+        self.rawValue = rawValue
     }
 }
 

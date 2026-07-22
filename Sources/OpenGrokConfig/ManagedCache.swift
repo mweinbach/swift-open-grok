@@ -17,7 +17,16 @@ import OpenGrokCLIChatProxyTypes
 
 /// Sync marker filename; staleness keys on this, not mtimes. Public so removal
 /// code can name it apart from the policy artifacts (removed last).
-public let MANAGED_CONFIG_CACHE_FILE = "managed_config.cache.json"
+///
+/// Wire-compatible with Rust `xai-grok-config::managed_cache::MANAGED_CONFIG_CACHE_FILE`
+/// (`managed_config_cache.json`). The pre-parity Swift misspelling
+/// `managed_config.cache.json` is still accepted on read (see
+/// `readManagedConfigCache`) and migrated to this name on the next write.
+public let MANAGED_CONFIG_CACHE_FILE = "managed_config_cache.json"
+
+/// Legacy pre-R04 marker filename (dot form). Read for migration only;
+/// new writes always use `MANAGED_CONFIG_CACHE_FILE`.
+public let MANAGED_CONFIG_CACHE_FILE_LEGACY = "managed_config.cache.json"
 
 /// What the cache is bound to (one value, so a (team, key) combo can't form).
 /// The deploy-key fingerprint is the only identity verifiable offline.
@@ -421,10 +430,32 @@ fileprivate func confirmedSwitch(recorded: String?, current: String?) -> String?
 /// unreadable: a read blip or torn write mustn't lock out a managed user.
 /// Unreadable/corrupt are logged (a corruption-to-disarm isn't silent) and
 /// self-heal on the next sync.
+///
+/// Prefers the Rust wire name (`managed_config_cache.json`). If only the
+/// legacy Swift misspelling (`managed_config.cache.json`) is present, it is
+/// decoded and best-effort rewritten under the canonical name so subsequent
+/// Rust and Swift processes share the same marker.
 fileprivate func readManagedConfigCache(_ home: URL) -> ManagedConfigCache? {
-    let path = home.appendingPathComponent(MANAGED_CONFIG_CACHE_FILE)
-    guard let data = try? Data(contentsOf: path) else { return nil }
-    return try? JSONDecoder().decode(ManagedConfigCache.self, from: data)
+    let primary = home.appendingPathComponent(MANAGED_CONFIG_CACHE_FILE)
+    if let data = try? Data(contentsOf: primary),
+       let cache = try? JSONDecoder().decode(ManagedConfigCache.self, from: data)
+    {
+        return cache
+    }
+    let legacy = home.appendingPathComponent(MANAGED_CONFIG_CACHE_FILE_LEGACY)
+    guard let data = try? Data(contentsOf: legacy),
+          let cache = try? JSONDecoder().decode(ManagedConfigCache.self, from: data)
+    else {
+        return nil
+    }
+    // Migrate legacy → canonical so cache continuity survives cross-impl.
+    if let json = try? JSONEncoder().encode(cache),
+       let s = String(data: json, encoding: .utf8)
+    {
+        try? writeAtomically(primary, contents: s, mode: nil)
+        try? FileManager.default.removeItem(at: legacy)
+    }
+    return cache
 }
 
 /// True when an artifact the marker recorded serving is now absent. Only

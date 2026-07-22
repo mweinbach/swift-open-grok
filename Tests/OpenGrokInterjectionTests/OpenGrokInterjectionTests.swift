@@ -208,3 +208,23 @@ struct InterjectionBufferTests {
         #expect(decoded == original)
     }
 }
+
+// MARK: - Kinded interjections
+
+@Suite("Kinded interjections")
+struct KindedInterjectionTests {
+    @Test("drain preserves FIFO order across kinds")
+    func drainKindedFIFO() {
+        let buffer = EventQueue<KindedInterjection<String>>()
+        buffer.push(KindedInterjection(kind: .steer, text: "steer", attachments: []))
+        buffer.push(KindedInterjection(kind: .interrupt, text: "stop", attachments: []))
+        buffer.push(KindedInterjection(kind: .followUp, text: "later", attachments: ["img"]))
+        buffer.push(KindedInterjection(kind: .queuedPrompt, text: "queued", attachments: []))
+
+        let drained = drainKindedFormatted(buffer)
+        #expect(drained.map(\.kind) == [.steer, .interrupt, .followUp, .queuedPrompt])
+        #expect(drained[0].formatted.text.contains("steer"))
+        #expect(drained[2].formatted.attachments == ["img"])
+        #expect(buffer.isEmpty)
+    }
+}

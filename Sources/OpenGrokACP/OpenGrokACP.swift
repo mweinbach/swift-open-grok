@@ -8,17 +8,17 @@
 // that let later provider, session, and pager slices compile
 // independently against protocols rather than concrete implementations.
 // Transport implementations (stdio, leader IPC, WebSocket serve, relay)
-// arrive in Wave 7 (`OpenGrokACPRuntime`, W7-S5). The full typed
-// request/response schema (`InitializeRequest`, `PromptRequest`,
-// `SessionNotification`, …) is large and lives in the
-// `agent-client-protocol-schema` Rust crate; the Swift port exposes
-// type-erased JSON envelopes here and lets Wave 7 fill in the typed
-// shapes when the transport layer needs them.
+// arrive in Wave 7 (`OpenGrokACPRuntime`, W7-S5). Typed request and
+// response schemas for core ACP methods, reverse requests, and the
+// Open Grok `x.ai/ask_user_question` extension live alongside the
+// channel primitives in this module.
 //
 // Acceptance:
 //   * ACP JSON-RPC IDs, methods, notifications, reverse requests,
 //     errors, and Open Grok extension metadata match captured Rust
 //     fixtures (`ProtocolFixtures/acp-methods.json`).
+//   * Core methods use typed request/response payloads with typed
+//     dispatch rather than JSONValue-only envelopes.
 //   * Channel cancellation closes pending continuations exactly once
 //     and never resumes a Swift continuation twice.
 //
@@ -160,6 +160,7 @@ public enum OpenGrokACPMethodCatalog {
             || method == ClientMethodNames.terminalKill
             || method == ClientMethodNames.sessionElicitation
             || method == ClientMethodNames.sessionElicitationComplete
+            || method == OpenGrokACPExtMethods.askUserQuestion
     }
 }
 
@@ -438,16 +439,13 @@ public protocol AcpRequest: AcpMethod, Codable {
 
 // MARK: - Type-erased request/response envelopes
 //
-// The full typed ACP schema (InitializeRequest, PromptRequest,
-// SessionNotification, RequestPermissionRequest, …) is large and lives
-// in `agent-client-protocol-schema`. Wave 7 (`OpenGrokACPRuntime`,
-// W7-S5) will fill in the typed shapes when the transport layer needs
-// them. For now, the channel primitives and message envelopes use
-// type-erased JSON payloads so the wire contract is complete and the
-// acceptance criterion (fixture match) is verifiable.
+// Retained for extension methods and transport layers that need a
+// method-name + raw-params path. Core methods use the typed schemas in
+// AcpAgentSchema / AcpClientSchema and the typed AcpAgentMessage /
+// AcpClientMessage enums.
 
 /// A type-erased ACP request envelope: a method name plus the JSON
-/// params payload.
+/// params payload. Prefer typed `AcpRequest` adopters for core methods.
 public struct AcpRequestEnvelope: Hashable, Sendable, Codable {
     public var method: String
     public var params: JSONValue
@@ -542,13 +540,20 @@ public final class AcpArgs<T: AcpRequest>: @unchecked Sendable {
 ///     `oneshot` parity: dropping the sender surfaces as a `RecvFailed`
 ///     `AcpChannelFailure` on the receiver side).
 public final class ResponseChannel<T: Sendable>: @unchecked Sendable {
-    /// Atomic guard ensuring the continuation is resumed at most once.
-    /// `0` = open; `1` = closed (delivered or cancelled).
+    /// Guard ensuring the continuation is resumed at most once.
     private let state = NSLock()
     private var _closed = false
-    /// The stored continuation, set by `awaitResponse()` and consumed
-    /// by `resume(with:)`/`cancel()`. Guarded by `state`.
+    /// Stored continuation, set by `awaitResponse()` and consumed by
+    /// `resume(with:)` / `cancel()`. Guarded by `state`.
     private var continuation: CheckedContinuation<AcpResult<T>, Never>?
+    /// Result delivered before the waiter registered. Tokio oneshot
+    /// buffers this so a race between send and await still delivers.
+    private var pendingResult: AcpResult<T>?
+    /// Optional side-channel observer fired exactly once on first
+    /// delivery. Used by transport bridges so a type-erased
+    /// `ResponseChannel<JSONValue>` can observe typed completion
+    /// without stealing the primary waiter slot.
+    private var firstDeliveryObserver: ((AcpResult<T>) -> Void)?
 
     public init() {}
 
@@ -560,19 +565,52 @@ public final class ResponseChannel<T: Sendable>: @unchecked Sendable {
         cancel()
     }
 
+    /// Register a side-channel observer that fires exactly once when
+    /// the first result is delivered (success, error, or cancel).
+    ///
+    /// If a result is already buffered, the observer is invoked
+    /// immediately. Subsequent deliveries never re-fire. Observers do
+    /// not consume the primary `awaitResponse()` waiter.
+    public func onFirstDelivery(_ observer: @escaping @Sendable (AcpResult<T>) -> Void) {
+        state.lock()
+        if let pending = pendingResult {
+            state.unlock()
+            observer(pending)
+            return
+        }
+        if _closed {
+            // Closed without a buffered success (e.g. cancel already
+            // drained). Surface the same RecvFailed the waiter would see.
+            state.unlock()
+            observer(.failure(acpChannelFailureError(
+                "unable to receive response, channel closed",
+                .recvFailed
+            )))
+            return
+        }
+        firstDeliveryObserver = observer
+        state.unlock()
+    }
+
     /// Await the response. Suspends until `resume(with:)` or
     /// `cancel()` is called, or the channel is deinitialized.
     public func awaitResponse() async -> AcpResult<T> {
         await withCheckedContinuation { (continuation: CheckedContinuation<AcpResult<T>, Never>) in
             state.lock()
             defer { state.unlock() }
+            if let pending = pendingResult {
+                // Result already delivered before the waiter registered.
+                continuation.resume(returning: pending)
+                return
+            }
             if _closed {
-                // Already closed before the awaiter registered —
-                // resume immediately with a RecvFailed error so the
-                // awaiter doesn't hang.
-                continuation.resume(returning: .failure(.internalError(
-                    "unable to receive response, channel closed"
-                ).withData(.string(AcpChannelFailure.recvFailed.tag))))
+                // Closed without a buffered result (e.g. double-await
+                // after a delivered cancel). Surface RecvFailed so the
+                // awaiter never hangs.
+                continuation.resume(returning: .failure(acpChannelFailureError(
+                    "unable to receive response, channel closed",
+                    .recvFailed
+                )))
                 return
             }
             self.continuation = continuation
@@ -590,10 +628,19 @@ public final class ResponseChannel<T: Sendable>: @unchecked Sendable {
             return false
         }
         _closed = true
-        let cont = continuation
-        continuation = nil
-        state.unlock()
-        cont?.resume(returning: result)
+        let observer = firstDeliveryObserver
+        firstDeliveryObserver = nil
+        if let cont = continuation {
+            continuation = nil
+            state.unlock()
+            observer?(result)
+            cont.resume(returning: result)
+        } else {
+            // Buffer until the waiter registers (oneshot race parity).
+            pendingResult = result
+            state.unlock()
+            observer?(result)
+        }
         return true
     }
 
@@ -601,10 +648,38 @@ public final class ResponseChannel<T: Sendable>: @unchecked Sendable {
     /// failure error. Returns `true` if this was the first close.
     @discardableResult
     public func cancel() -> Bool {
-        let error = AcpError.internalError(
-            "unable to receive response, channel cancelled"
-        ).withData(.string(AcpChannelFailure.recvFailed.tag))
-        return resume(with: .failure(error))
+        resume(with: .failure(acpChannelFailureError(
+            "unable to receive response, channel cancelled",
+            .recvFailed
+        )))
+    }
+}
+
+/// Bridge a typed oneshot response into a type-erased JSON-RPC
+/// `ResponseChannel<JSONValue>` exactly once.
+///
+/// Transport layers pass the erased channel into
+/// `decodeAcpAgentMessage` / `decodeAcpClientMessage`; handlers complete
+/// the typed `AcpArgs` channel. This wire bridges success (encoded) and
+/// `AcpError` failure/cancel races into the transport channel.
+public func bridgeTypedResponseChannel<T: Sendable & Encodable>(
+    from typed: ResponseChannel<T>,
+    into erased: ResponseChannel<JSONValue>
+) {
+    typed.onFirstDelivery { result in
+        switch result {
+        case .success(let value):
+            do {
+                let encoded = try JSONValue.encode(value)
+                _ = erased.resume(with: .success(encoded))
+            } catch {
+                _ = erased.resume(with: .failure(
+                    AcpError.internalError("failed to encode ACP response: \(error)")
+                ))
+            }
+        case .failure(let error):
+            _ = erased.resume(with: .failure(error))
+        }
     }
 }
 
@@ -675,153 +750,15 @@ public func acpChannelFailureError(
     )
 }
 
-// MARK: - Message envelopes (AcpAgentMessage / AcpClientMessage)
+// MARK: - Type-erased response reference
 //
-// The Rust enums are large sum types over the typed request/response
-// structs from `agent_client_protocol`. The Swift port uses a
-// type-erased form (`method` + `params` + `AcpArgs`-shaped channel)
-// because the typed structs are not yet ported (Wave 7). The
-// method-name routing is preserved so the gateway/transport layer can
-// dispatch correctly.
-
-/// A message meant FOR the agent (client → agent direction). Carries
-/// the request envelope plus the response channel.
-///
-/// Swift port of `xai_acp_lib::message::AcpAgentMessage`. The Rust
-/// enum has cases `Initialize`, `Authenticate`, `NewSession`,
-/// `LoadSession`, `SetSessionMode`, `Prompt`, `Cancel`, `ExtMethod`,
-/// `ExtNotification`, `SetSessionModel`. The Swift port retains the
-/// method-name dispatch via `AcpRequestEnvelope` and provides
-/// convenience constructors for each case.
-public struct AcpAgentMessage: Hashable, Sendable {
-    public let envelope: AcpRequestEnvelope
-    /// The response channel is a reference type; the message itself
-    /// stays a value type for cheap copy. Equality ignores the
-    /// channel identity (two messages with the same envelope are
-    /// equal, mirroring Rust's `derive` on the case payload).
-    public let response: AcpResponseReference
-
-    public init(envelope: AcpRequestEnvelope, response: AcpResponseReference) {
-        self.envelope = envelope
-        self.response = response
-    }
-
-    public var methodName: String { envelope.methodName }
-
-    // MARK: Convenience constructors for each agent-side method.
-
-    public static func initialize(_ params: JSONValue, response: AcpResponseReference) -> AcpAgentMessage {
-        AcpAgentMessage(envelope: AcpRequestEnvelope(method: AgentMethodNames.initialize, params: params), response: response)
-    }
-    public static func authenticate(_ params: JSONValue, response: AcpResponseReference) -> AcpAgentMessage {
-        AcpAgentMessage(envelope: AcpRequestEnvelope(method: AgentMethodNames.authenticate, params: params), response: response)
-    }
-    public static func newSession(_ params: JSONValue, response: AcpResponseReference) -> AcpAgentMessage {
-        AcpAgentMessage(envelope: AcpRequestEnvelope(method: AgentMethodNames.sessionNew, params: params), response: response)
-    }
-    public static func loadSession(_ params: JSONValue, response: AcpResponseReference) -> AcpAgentMessage {
-        AcpAgentMessage(envelope: AcpRequestEnvelope(method: AgentMethodNames.sessionLoad, params: params), response: response)
-    }
-    public static func setSessionMode(_ params: JSONValue, response: AcpResponseReference) -> AcpAgentMessage {
-        AcpAgentMessage(envelope: AcpRequestEnvelope(method: AgentMethodNames.sessionSetMode, params: params), response: response)
-    }
-    public static func prompt(_ params: JSONValue, response: AcpResponseReference) -> AcpAgentMessage {
-        AcpAgentMessage(envelope: AcpRequestEnvelope(method: AgentMethodNames.sessionPrompt, params: params), response: response)
-    }
-    public static func cancel(_ params: JSONValue, response: AcpResponseReference) -> AcpAgentMessage {
-        AcpAgentMessage(envelope: AcpRequestEnvelope(method: AgentMethodNames.sessionCancel, params: params), response: response)
-    }
-    public static func setSessionModel(_ params: JSONValue, response: AcpResponseReference) -> AcpAgentMessage {
-        AcpAgentMessage(envelope: AcpRequestEnvelope(method: AgentMethodNames.sessionSetModel, params: params), response: response)
-    }
-    public static func extMethod(_ method: String, _ params: JSONValue, response: AcpResponseReference) -> AcpAgentMessage {
-        AcpAgentMessage(envelope: AcpRequestEnvelope(method: method, params: params), response: response)
-    }
-    public static func extNotification(_ method: String, _ params: JSONValue, response: AcpResponseReference) -> AcpAgentMessage {
-        AcpAgentMessage(envelope: AcpRequestEnvelope(method: method, params: params), response: response)
-    }
-
-    // MARK: Hashable / Equatable (ignore the response channel identity)
-
-    public static func == (lhs: AcpAgentMessage, rhs: AcpAgentMessage) -> Bool {
-        lhs.envelope == rhs.envelope
-    }
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(envelope)
-    }
-}
-
-extension AcpAgentMessage: AcpMethod {}
-
-/// A message meant FOR the client (agent → client direction; reverse
-/// requests and notifications).
-///
-/// Swift port of `xai_acp_lib::message::AcpClientMessage`. The Rust
-/// enum has cases `RequestPermission`, `ReadTextFile`,
-/// `WriteTextFile`, `SessionNotification`, `CreateTerminal`,
-/// `TerminalOutput`, `ReleaseTerminal`, `WaitForTerminalExit`,
-/// `KillTerminalCommand`, `ExtMethod`, `ExtNotification`.
-public struct AcpClientMessage: Hashable, Sendable {
-    public let envelope: AcpRequestEnvelope
-    public let response: AcpResponseReference
-
-    public init(envelope: AcpRequestEnvelope, response: AcpResponseReference) {
-        self.envelope = envelope
-        self.response = response
-    }
-
-    public var methodName: String { envelope.methodName }
-
-    // MARK: Convenience constructors for each client-side method.
-
-    public static func requestPermission(_ params: JSONValue, response: AcpResponseReference) -> AcpClientMessage {
-        AcpClientMessage(envelope: AcpRequestEnvelope(method: ClientMethodNames.sessionRequestPermission, params: params), response: response)
-    }
-    public static func readTextFile(_ params: JSONValue, response: AcpResponseReference) -> AcpClientMessage {
-        AcpClientMessage(envelope: AcpRequestEnvelope(method: ClientMethodNames.fsReadTextFile, params: params), response: response)
-    }
-    public static func writeTextFile(_ params: JSONValue, response: AcpResponseReference) -> AcpClientMessage {
-        AcpClientMessage(envelope: AcpRequestEnvelope(method: ClientMethodNames.fsWriteTextFile, params: params), response: response)
-    }
-    public static func sessionNotification(_ params: JSONValue, response: AcpResponseReference) -> AcpClientMessage {
-        AcpClientMessage(envelope: AcpRequestEnvelope(method: ClientMethodNames.sessionUpdate, params: params), response: response)
-    }
-    public static func createTerminal(_ params: JSONValue, response: AcpResponseReference) -> AcpClientMessage {
-        AcpClientMessage(envelope: AcpRequestEnvelope(method: ClientMethodNames.terminalCreate, params: params), response: response)
-    }
-    public static func terminalOutput(_ params: JSONValue, response: AcpResponseReference) -> AcpClientMessage {
-        AcpClientMessage(envelope: AcpRequestEnvelope(method: ClientMethodNames.terminalOutput, params: params), response: response)
-    }
-    public static func releaseTerminal(_ params: JSONValue, response: AcpResponseReference) -> AcpClientMessage {
-        AcpClientMessage(envelope: AcpRequestEnvelope(method: ClientMethodNames.terminalRelease, params: params), response: response)
-    }
-    public static func waitForTerminalExit(_ params: JSONValue, response: AcpResponseReference) -> AcpClientMessage {
-        AcpClientMessage(envelope: AcpRequestEnvelope(method: ClientMethodNames.terminalWaitForExit, params: params), response: response)
-    }
-    public static func killTerminal(_ params: JSONValue, response: AcpResponseReference) -> AcpClientMessage {
-        AcpClientMessage(envelope: AcpRequestEnvelope(method: ClientMethodNames.terminalKill, params: params), response: response)
-    }
-    public static func extMethod(_ method: String, _ params: JSONValue, response: AcpResponseReference) -> AcpClientMessage {
-        AcpClientMessage(envelope: AcpRequestEnvelope(method: method, params: params), response: response)
-    }
-    public static func extNotification(_ method: String, _ params: JSONValue, response: AcpResponseReference) -> AcpClientMessage {
-        AcpClientMessage(envelope: AcpRequestEnvelope(method: method, params: params), response: response)
-    }
-
-    public static func == (lhs: AcpClientMessage, rhs: AcpClientMessage) -> Bool {
-        lhs.envelope == rhs.envelope
-    }
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(envelope)
-    }
-}
-
-extension AcpClientMessage: AcpMethod {}
+// Typed messages live in AcpMessages.swift as sum types over AcpArgs.
+// Transport layers that need a type-erased response delivery path use
+// AcpResponseReference.
 
 /// A type-erased reference to a `ResponseChannel` carrying an
-/// `AcpResponseEnvelope`. The message envelopes hold this so the
-/// gateway/transport layer can deliver responses without knowing the
-/// concrete request type.
+/// `AcpResponseEnvelope`. Gateway/transport layers can deliver
+/// responses without knowing the concrete request type.
 public final class AcpResponseReference: @unchecked Sendable {
     private let respond: (AcpResult<AcpResponseEnvelope>) -> Bool
 
@@ -896,31 +833,51 @@ public typealias AcpAgentChannel = AcpChannel<AcpAgentMessage, AcpClientMessage>
 
 /// Create a linked pair of client/agent channels. Mirrors
 /// `xai_acp_lib::channel::acp_channels`.
+///
+/// Closing either side marks the peer's enqueue path as failed so
+/// subsequent `send` calls return `false` (sendFailed).
 public func acpChannels() -> (AcpClientChannel, AcpAgentChannel) {
     // Client channel: receives AcpClientMessage, sends AcpAgentMessage.
     // Agent channel: receives AcpAgentMessage, sends AcpClientMessage.
-    // The two are linked: client's enqueue pushes onto agent's inbound
-    // and vice versa.
+    final class Gate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var open = true
+        func close() {
+            lock.lock()
+            open = false
+            lock.unlock()
+        }
+        func isOpen() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return open
+        }
+    }
+
+    let clientOpen = Gate()
+    let agentOpen = Gate()
+
     var clientContinuation: AsyncStream<AcpClientMessage>.Continuation!
     var agentContinuation: AsyncStream<AcpAgentMessage>.Continuation!
 
     let clientInbound = AsyncStream<AcpClientMessage> { cont in
         clientContinuation = cont
+        cont.onTermination = { _ in clientOpen.close() }
     }
     let agentInbound = AsyncStream<AcpAgentMessage> { cont in
         agentContinuation = cont
+        cont.onTermination = { _ in agentOpen.close() }
     }
-
-    // Crash-safety: AsyncStream's onTermination callback is the only
-    // place we can detect cancellation; we don't otherwise need it.
-    // The continuations are set above synchronously by AsyncStream's
-    // init.
 
     let clientChannel = AcpChannel<AcpClientMessage, AcpAgentMessage>(
         inbound: clientInbound,
         inboundContinuation: clientContinuation,
         enqueue: { agentMessage in
-            agentContinuation.yield(agentMessage)
+            guard agentOpen.isOpen() else { return false }
+            if case .terminated = agentContinuation.yield(agentMessage) {
+                agentOpen.close()
+                return false
+            }
             return true
         }
     )
@@ -928,67 +885,89 @@ public func acpChannels() -> (AcpClientChannel, AcpAgentChannel) {
         inbound: agentInbound,
         inboundContinuation: agentContinuation,
         enqueue: { clientMessage in
-            clientContinuation.yield(clientMessage)
+            guard clientOpen.isOpen() else { return false }
+            if case .terminated = clientContinuation.yield(clientMessage) {
+                clientOpen.close()
+                return false
+            }
             return true
         }
     )
     return (clientChannel, agentChannel)
 }
 
-/// Send a request through the channel and await the response. Mirrors
-/// `xai_acp_lib::channel::acp_send`.
+/// Send a typed agent request through the client channel and await the
+/// response. Mirrors `xai_acp_lib::channel::acp_send`.
 ///
 /// Failures are classified into `AcpChannelFailure.sendFailed`
 /// (enqueue failed — peer gone) or `AcpChannelFailure.recvFailed`
 /// (response channel dropped before reply). Both surface as
 /// `INTERNAL_ERROR` with the kind tagged in `data`.
-public func acpSend<T: AcpRequest>(
-    _ request: T,
-    on channel: AcpChannel<T.Response, AcpAgentMessage>
-) async -> AcpResult<T.Response> where T.Response == T.Response {
-    // The generic request must be wrapped into an AcpAgentMessage for
-    // transport. This helper is most useful when `T == AcpRequestEnvelope`
-    // and `T.Response == AcpResponseEnvelope`; for other request types
-    // callers should use the higher-level gateway (Wave 7).
-    let responseChannel = ResponseChannel<T.Response>()
-    let args = AcpArgs(request: request, responseChannel: responseChannel)
-    // Encode the request to a JSON payload and wrap in an
-    // AcpAgentMessage envelope.
-    let params: JSONValue
-    do {
-        params = try JSONValue.encode(request)
-    } catch {
-        return .failure(.invalidParams().withData(.string("failed to encode request: \(error)")))
-    }
-    let message = AcpAgentMessage(
-        envelope: AcpRequestEnvelope(method: request.methodName, params: params),
-        response: AcpResponseReference { result in
-            // Decode the envelope's result back into T.Response.
-            switch result {
-            case .success(let env):
-                if let raw = env.result {
-                    do {
-                        let typed = try raw.decode(T.Response.self)
-                        return args.respond(.success(typed))
-                    } catch {
-                        return args.respond(.failure(.invalidParams().withData(.string("failed to decode response: \(error)"))))
-                    }
-                } else {
-                    // `nil` result — decode as the type's default if
-                    // possible, else surface as an error.
-                    return args.respond(.failure(.invalidParams().withData(.string("response had no result body"))))
-                }
-            case .failure(let err):
-                return args.respond(.failure(err))
-            }
+public func acpSend(
+    _ message: AcpAgentMessage,
+    on channel: AcpClientChannel
+) async -> AcpResult<JSONValue> {
+    // For the typed enum path, callers typically hold the AcpArgs and
+    // await its response channel directly. This helper supports the
+    // type-erased envelope path used by tests and gateways.
+    switch message {
+    case .extMethod(let args):
+        let accepted = channel.send(message)
+        if !accepted {
+            return .failure(acpChannelFailureError(
+                "unable to send '\(args.methodName)' request, channel closed",
+                .sendFailed
+            ))
         }
-    )
-    let accepted = channel.send(message)
+        switch await args.response.awaitResponse() {
+        case .success(let response):
+            return .success(response.value)
+        case .failure(let error):
+            return .failure(error)
+        }
+    default:
+        let accepted = channel.send(message)
+        if !accepted {
+            return .failure(acpChannelFailureError(
+                "unable to send '\(message.methodName)' request, channel closed",
+                .sendFailed
+            ))
+        }
+        // Typed cases should await their own AcpArgs.response. Returning
+        // success with null here indicates the message was enqueued; the
+        // concrete response is delivered on the typed channel.
+        return .success(.null)
+    }
+}
+
+/// Send a typed request by wrapping it into an agent message.
+public func acpSendInitialize(
+    _ request: InitializeRequest,
+    on channel: AcpClientChannel
+) async -> AcpResult<InitializeResponse> {
+    let args = AcpArgs(request: request)
+    let accepted = channel.send(.initialize(args))
     if !accepted {
         return .failure(acpChannelFailureError(
             "unable to send '\(request.methodName)' request, channel closed",
             .sendFailed
         ))
     }
-    return await responseChannel.awaitResponse()
+    return await args.response.awaitResponse()
+}
+
+/// Send a typed prompt request and await the response.
+public func acpSendPrompt(
+    _ request: PromptRequest,
+    on channel: AcpClientChannel
+) async -> AcpResult<PromptResponse> {
+    let args = AcpArgs(request: request)
+    let accepted = channel.send(.prompt(args))
+    if !accepted {
+        return .failure(acpChannelFailureError(
+            "unable to send '\(request.methodName)' request, channel closed",
+            .sendFailed
+        ))
+    }
+    return await args.response.awaitResponse()
 }

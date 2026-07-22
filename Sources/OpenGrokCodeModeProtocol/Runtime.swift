@@ -1,70 +1,49 @@
 // Runtime.swift
 //
-// Runtime wire types for the code-mode protocol. Ported from
+// Runtime wire types for the code-mode cell lifecycle. Ported from
 // `crates/codegen/xai-grok-code-mode-protocol/src/runtime.rs`.
 //
-// These types model the lifecycle of a code-mode cell:
-//   * `ExecuteRequest` starts a cell (carrying the JS source, enabled
-//     nested tools, and optional yield-time / max-output-token overrides).
-//   * `RuntimeResponse` is the terminal or interim result of a cell:
-//     `yielded` (still running, more output available), `terminated`
-//     (caller asked to stop), or `result` (the JS finished). The exec
-//     runtime also surfaces `generatedImage` outputs via the same
-//     `content_items` channel.
-//   * `WaitRequest` resumes a running cell, optionally terminating it.
-//   * `WaitOutcome` distinguishes a live cell from a missing cell so the
-//     `wait` tool can surface "stale cell" cases without losing the
-//     terminal response.
-//   * `ExecuteToPendingOutcome` / `WaitToPendingOutcome` /
-//     `WaitToPendingRequest` carry the pending state used by the runtime
-//     to chain `exec` → `wait` → `wait` cycles while a cell is still
-//     running.
-//   * `CodeModeNestedToolCall` records a nested tool invocation issued
-//     from inside the JS isolate (`await tools.<name>(...)`) so the
-//     runtime can route it through the permission gate and the tool
-//     registry.
+// Wire format
+// -----------
+// All enums use **externally tagged** Serde shape (Rust default) with
+// **PascalCase** variant names and **snake_case** field names inside the
+// payload object:
 //
-// Together with `Session.swift`'s `CodeModeSession` / `StartedCell` /
-// `CodeModeSessionDelegate`, this is the complete cell lifecycle:
-// exec → yield → wait → terminate / result → cellClosed. Runtime
-// disposal is the `shutdown` call on the session plus the
-// `CodeModeSessionDelegate.cellClosed` callback per cell.
+//   {"Yielded":{"cell_id":"...","content_items":[...]}}
+//   {"LiveCell":{"Yielded":{...}}}
+//   {"Pending":{"cell_id":"...","content_items":[],"pending_tool_call_ids":[]}}
+//
+// Adjacent / internal tagging would be a wire-format regression against
+// the Rust source of truth.
 
 import Foundation
 import OpenGrokShared
 
-/// Default yield time for an `exec` call (10 s). The exec tool yields
-/// after this interval if the script is still running.
+// MARK: - Defaults
+
+/// Default yield budget (ms) for an `exec` call when the pragma does not
+/// override it. Mirrors `DEFAULT_EXEC_YIELD_TIME_MS` in the Rust crate.
 public let DEFAULT_EXEC_YIELD_TIME_MS: UInt64 = 10_000
 
-/// Default yield time for a `wait` call (10 s). The wait tool yields
-/// after this interval if the cell is still producing output.
+/// Default yield budget (ms) for a `wait` call.
 public let DEFAULT_WAIT_YIELD_TIME_MS: UInt64 = 10_000
 
-/// Default token budget for direct `exec` results (10 000 tokens).
-/// Surplus output is truncated by the runtime; nested tool outputs are
-/// not counted against this budget.
+/// Default max output tokens budget per `exec` call.
 public let DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: Int = 10_000
 
-/// Request to start an `exec` cell.
+// MARK: - Requests
+
+/// Request body for starting a new code-mode cell (`exec`).
 public struct ExecuteRequest: Hashable, Sendable, Codable, Equatable {
-    /// Tool call id issued by the sampler; used to correlate the exec
-    /// call with downstream permission decisions and tool-stream chunks.
     public var toolCallId: String
-    /// Nested tools the cell is allowed to invoke via `await tools.<name>`.
     public var enabledTools: [ToolDefinition]
-    /// Raw JavaScript source text (with the optional `// @exec:` pragma
-    /// already stripped by `parseExecSource`).
     public var source: String
-    /// Override for `DEFAULT_EXEC_YIELD_TIME_MS`. `nil` = use the default.
     public var yieldTimeMs: UInt64?
-    /// Override for `DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL`. `nil` = use
-    /// the default.
     public var maxOutputTokens: Int?
 
     public init(
         toolCallId: String,
-        enabledTools: [ToolDefinition],
+        enabledTools: [ToolDefinition] = [],
         source: String,
         yieldTimeMs: UInt64? = nil,
         maxOutputTokens: Int? = nil
@@ -85,12 +64,12 @@ public struct ExecuteRequest: Hashable, Sendable, Codable, Equatable {
     }
 }
 
-/// Request to resume (or terminate) a running cell.
+/// Request body for resuming (or checking on) a running cell (`wait`).
 public struct WaitRequest: Hashable, Sendable, Codable, Equatable {
     public var cellId: CellId
     public var yieldTimeMs: UInt64
 
-    public init(cellId: CellId, yieldTimeMs: UInt64) {
+    public init(cellId: CellId, yieldTimeMs: UInt64 = DEFAULT_WAIT_YIELD_TIME_MS) {
         self.cellId = cellId
         self.yieldTimeMs = yieldTimeMs
     }
@@ -101,8 +80,7 @@ public struct WaitRequest: Hashable, Sendable, Codable, Equatable {
     }
 }
 
-/// Request to convert a running cell to pending (used internally by the
-/// runtime when chaining `exec` → `wait`).
+/// Request body for the pending-mode wait path.
 public struct WaitToPendingRequest: Hashable, Sendable, Codable, Equatable {
     public var cellId: CellId
 
@@ -115,44 +93,91 @@ public struct WaitToPendingRequest: Hashable, Sendable, Codable, Equatable {
     }
 }
 
-/// Outcome of a `wait` call. Distinguishes a live cell from a missing
-/// (already-closed / never-existed / stale) cell so the `wait` tool can
-/// surface "stale cell" cases without losing the terminal response.
+// MARK: - External-tag Codable helpers
+
+/// Encode/decode helper for Rust-style externally tagged enums:
+/// `{"VariantName": <payload>}` where payload is a keyed object (struct
+/// variant) or a nested externally-tagged value (newtype variant).
+private enum ExternalTagCoding {
+    /// Decode a single-key object and return `(variantName, nestedDecoder)`.
+    static func decodeVariant(from decoder: Decoder) throws -> (String, KeyedDecodingContainer<DynamicCodingKey>) {
+        let c = try decoder.container(keyedBy: DynamicCodingKey.self)
+        guard c.allKeys.count == 1, let key = c.allKeys.first else {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "expected externally tagged single-key object"
+                )
+            )
+        }
+        return (key.stringValue, c)
+    }
+
+    static func encodeVariant<T: Encodable>(
+        _ name: String,
+        payload: T,
+        to encoder: Encoder
+    ) throws {
+        var c = encoder.container(keyedBy: DynamicCodingKey.self)
+        try c.encode(payload, forKey: DynamicCodingKey(name))
+    }
+
+    static func encodeVariantObject(
+        _ name: String,
+        to encoder: Encoder,
+        _ body: (inout KeyedEncodingContainer<DynamicCodingKey>) throws -> Void
+    ) throws {
+        var outer = encoder.container(keyedBy: DynamicCodingKey.self)
+        var inner = outer.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: DynamicCodingKey(name))
+        try body(&inner)
+    }
+}
+
+private struct DynamicCodingKey: CodingKey, Hashable {
+    var stringValue: String
+    var intValue: Int? { nil }
+    init(_ string: String) { stringValue = string }
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { return nil }
+}
+
+// MARK: - WaitOutcome
+
+/// Outcome of a `wait` / `terminate` call.
 ///
-/// The "stale cells" criterion in the W1-S4 acceptance is satisfied by
-/// the `missingCell` case: callers learn that the cell id they tried to
-/// wait on no longer exists (or never did), and the wrapped
-/// `RuntimeResponse` carries whatever final output the runtime observed
-/// before the cell closed.
+/// - `liveCell`: the cell still exists (running or just finished).
+/// - `missingCell`: the cell id is unknown / already disposed ("stale
+///   cells" criterion). The wrapped `RuntimeResponse` carries whatever
+///   terminal output the runtime observed before the cell closed.
+///
+/// Wire: externally tagged PascalCase (`LiveCell` / `MissingCell`).
 public enum WaitOutcome: Hashable, Sendable, Codable, Equatable {
     case liveCell(RuntimeResponse)
     case missingCell(RuntimeResponse)
 
-    private enum Tag: String, Codable {
-        case liveCell = "live_cell"
-        case missingCell = "missing_cell"
-    }
-    private enum CodingKeys: String, CodingKey { case type, data }
-
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let tag = try c.decode(Tag.self, forKey: .type)
-        let response = try c.decode(RuntimeResponse.self, forKey: .data)
-        switch tag {
-        case .liveCell: self = .liveCell(response)
-        case .missingCell: self = .missingCell(response)
+        let (name, c) = try ExternalTagCoding.decodeVariant(from: decoder)
+        let key = DynamicCodingKey(name)
+        switch name {
+        case "LiveCell":
+            self = .liveCell(try c.decode(RuntimeResponse.self, forKey: key))
+        case "MissingCell":
+            self = .missingCell(try c.decode(RuntimeResponse.self, forKey: key))
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: c,
+                debugDescription: "unknown WaitOutcome variant: \(name)"
+            )
         }
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
         case .liveCell(let r):
-            try c.encode(Tag.liveCell, forKey: .type)
-            try c.encode(r, forKey: .data)
+            try ExternalTagCoding.encodeVariant("LiveCell", payload: r, to: encoder)
         case .missingCell(let r):
-            try c.encode(Tag.missingCell, forKey: .type)
-            try c.encode(r, forKey: .data)
+            try ExternalTagCoding.encodeVariant("MissingCell", payload: r, to: encoder)
         }
     }
 
@@ -165,8 +190,12 @@ public enum WaitOutcome: Hashable, Sendable, Codable, Equatable {
     }
 }
 
+// MARK: - ExecuteToPendingOutcome
+
 /// Outcome of an `exec` call when the runtime is in pending mode
 /// (chained `exec` → `wait`).
+///
+/// Wire: externally tagged PascalCase (`Pending` / `Completed`).
 public enum ExecuteToPendingOutcome: Hashable, Sendable, Codable, Equatable {
     /// The cell is still running; the runtime has yielded some output and
     /// a list of pending nested tool call ids that have not yet resolved.
@@ -178,103 +207,98 @@ public enum ExecuteToPendingOutcome: Hashable, Sendable, Codable, Equatable {
     /// The cell finished during the exec call (no need to wait).
     case completed(RuntimeResponse)
 
-    private enum Tag: String, Codable {
-        case pending, completed
-    }
-    private enum CodingKeys: String, CodingKey {
-        case type, data
-        case cellId = "cell_id"
-        case contentItems = "content_items"
-        case pendingToolCallIds = "pending_tool_call_ids"
-    }
-
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let tag = try c.decode(Tag.self, forKey: .type)
-        switch tag {
-        case .pending:
-            let inner = try c.nestedContainer(keyedBy: CodingKeys.self, forKey: .data)
+        let (name, c) = try ExternalTagCoding.decodeVariant(from: decoder)
+        let key = DynamicCodingKey(name)
+        switch name {
+        case "Pending":
+            let inner = try c.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: key)
             self = .pending(
-                cellId: try inner.decode(CellId.self, forKey: .cellId),
-                contentItems: try inner.decode([FunctionCallOutputContentItem].self, forKey: .contentItems),
-                pendingToolCallIds: try inner.decode([String].self, forKey: .pendingToolCallIds)
+                cellId: try inner.decode(CellId.self, forKey: DynamicCodingKey("cell_id")),
+                contentItems: try inner.decode(
+                    [FunctionCallOutputContentItem].self,
+                    forKey: DynamicCodingKey("content_items")
+                ),
+                pendingToolCallIds: try inner.decode(
+                    [String].self,
+                    forKey: DynamicCodingKey("pending_tool_call_ids")
+                )
             )
-        case .completed:
-            self = .completed(try c.decode(RuntimeResponse.self, forKey: .data))
+        case "Completed":
+            self = .completed(try c.decode(RuntimeResponse.self, forKey: key))
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: c,
+                debugDescription: "unknown ExecuteToPendingOutcome variant: \(name)"
+            )
         }
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
         case .pending(let cellId, let contentItems, let pendingToolCallIds):
-            try c.encode(Tag.pending, forKey: .type)
-            var inner = c.nestedContainer(keyedBy: CodingKeys.self, forKey: .data)
-            try inner.encode(cellId, forKey: .cellId)
-            try inner.encode(contentItems, forKey: .contentItems)
-            try inner.encode(pendingToolCallIds, forKey: .pendingToolCallIds)
+            try ExternalTagCoding.encodeVariantObject("Pending", to: encoder) { inner in
+                try inner.encode(cellId, forKey: DynamicCodingKey("cell_id"))
+                try inner.encode(contentItems, forKey: DynamicCodingKey("content_items"))
+                try inner.encode(pendingToolCallIds, forKey: DynamicCodingKey("pending_tool_call_ids"))
+            }
         case .completed(let r):
-            try c.encode(Tag.completed, forKey: .type)
-            try c.encode(r, forKey: .data)
+            try ExternalTagCoding.encodeVariant("Completed", payload: r, to: encoder)
         }
     }
 }
 
+// MARK: - WaitToPendingOutcome
+
 /// Outcome of a `waitToPending` call. Like `WaitOutcome` but for the
 /// pending-mode runtime.
+///
+/// Wire: externally tagged PascalCase (`LiveCell` / `MissingCell`).
 public enum WaitToPendingOutcome: Hashable, Sendable, Codable, Equatable {
     case liveCell(ExecuteToPendingOutcome)
     case missingCell(RuntimeResponse)
 
-    private enum Tag: String, Codable {
-        case liveCell = "live_cell"
-        case missingCell = "missing_cell"
-    }
-    private enum CodingKeys: String, CodingKey { case type, data }
-
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let tag = try c.decode(Tag.self, forKey: .type)
-        switch tag {
-        case .liveCell:
-            self = .liveCell(try c.decode(ExecuteToPendingOutcome.self, forKey: .data))
-        case .missingCell:
-            self = .missingCell(try c.decode(RuntimeResponse.self, forKey: .data))
+        let (name, c) = try ExternalTagCoding.decodeVariant(from: decoder)
+        let key = DynamicCodingKey(name)
+        switch name {
+        case "LiveCell":
+            self = .liveCell(try c.decode(ExecuteToPendingOutcome.self, forKey: key))
+        case "MissingCell":
+            self = .missingCell(try c.decode(RuntimeResponse.self, forKey: key))
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: c,
+                debugDescription: "unknown WaitToPendingOutcome variant: \(name)"
+            )
         }
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
         case .liveCell(let o):
-            try c.encode(Tag.liveCell, forKey: .type)
-            try c.encode(o, forKey: .data)
+            try ExternalTagCoding.encodeVariant("LiveCell", payload: o, to: encoder)
         case .missingCell(let r):
-            try c.encode(Tag.missingCell, forKey: .type)
-            try c.encode(r, forKey: .data)
+            try ExternalTagCoding.encodeVariant("MissingCell", payload: r, to: encoder)
         }
     }
 }
 
+// MARK: - RuntimeResponse
+
 /// Terminal or interim result of a code-mode cell.
 ///
 /// - `yielded`: the cell is still running. The runtime has produced some
-///   output and is yielding control back to the model. The model can
-///   either call `wait` to resume or stop calling and let the cell
-///   finish.
+///   output and is yielding control back to the model.
 /// - `terminated`: the cell was terminated by an explicit `terminate`
-///   call (or by the runtime enforcing a hard limit). No further output
-///   will be produced.
+///   call (or by the runtime enforcing a hard limit).
 /// - `result`: the JS finished naturally. `errorText` carries an error
 ///   message when the script threw.
 ///
-/// The `exec` / `wait` / `terminate` / nested-call lifecycle is the
-/// "exec, yield, wait, terminate, nested calls, structured content,
-/// images, generated images, stale cells, and runtime disposal"
-/// vocabulary required by the W1-S4 acceptance criterion. Structured
-/// content and images / generated images flow through `contentItems`;
-/// stale cells are surfaced via `WaitOutcome.missingCell`; runtime
-/// disposal is `CodeModeSession.shutdown` (see `Session.swift`).
+/// Wire: externally tagged PascalCase (`Yielded` / `Terminated` /
+/// `Result`) with snake_case field names.
 public enum RuntimeResponse: Hashable, Sendable, Codable, Equatable {
     case yielded(cellId: CellId, contentItems: [FunctionCallOutputContentItem])
     case terminated(cellId: CellId, contentItems: [FunctionCallOutputContentItem])
@@ -284,61 +308,66 @@ public enum RuntimeResponse: Hashable, Sendable, Codable, Equatable {
         errorText: String?
     )
 
-    private enum Tag: String, Codable {
-        case yielded, terminated, result
-    }
-    private enum CodingKeys: String, CodingKey {
-        case type, data
-        case cellId = "cell_id"
-        case contentItems = "content_items"
-        case errorText = "error_text"
-    }
-
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let tag = try c.decode(Tag.self, forKey: .type)
-        switch tag {
-        case .yielded:
-            let inner = try c.nestedContainer(keyedBy: CodingKeys.self, forKey: .data)
+        let (name, c) = try ExternalTagCoding.decodeVariant(from: decoder)
+        let key = DynamicCodingKey(name)
+        let inner = try c.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: key)
+        switch name {
+        case "Yielded":
             self = .yielded(
-                cellId: try inner.decode(CellId.self, forKey: .cellId),
-                contentItems: try inner.decode([FunctionCallOutputContentItem].self, forKey: .contentItems)
+                cellId: try inner.decode(CellId.self, forKey: DynamicCodingKey("cell_id")),
+                contentItems: try inner.decode(
+                    [FunctionCallOutputContentItem].self,
+                    forKey: DynamicCodingKey("content_items")
+                )
             )
-        case .terminated:
-            let inner = try c.nestedContainer(keyedBy: CodingKeys.self, forKey: .data)
+        case "Terminated":
             self = .terminated(
-                cellId: try inner.decode(CellId.self, forKey: .cellId),
-                contentItems: try inner.decode([FunctionCallOutputContentItem].self, forKey: .contentItems)
+                cellId: try inner.decode(CellId.self, forKey: DynamicCodingKey("cell_id")),
+                contentItems: try inner.decode(
+                    [FunctionCallOutputContentItem].self,
+                    forKey: DynamicCodingKey("content_items")
+                )
             )
-        case .result:
-            let inner = try c.nestedContainer(keyedBy: CodingKeys.self, forKey: .data)
+        case "Result":
             self = .result(
-                cellId: try inner.decode(CellId.self, forKey: .cellId),
-                contentItems: try inner.decode([FunctionCallOutputContentItem].self, forKey: .contentItems),
-                errorText: try inner.decodeIfPresent(String.self, forKey: .errorText)
+                cellId: try inner.decode(CellId.self, forKey: DynamicCodingKey("cell_id")),
+                contentItems: try inner.decode(
+                    [FunctionCallOutputContentItem].self,
+                    forKey: DynamicCodingKey("content_items")
+                ),
+                // Rust Option without skip_serializing_if emits null;
+                // decodeIfPresent also accepts missing for resilience.
+                errorText: try inner.decodeIfPresent(String.self, forKey: DynamicCodingKey("error_text"))
+            )
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: c,
+                debugDescription: "unknown RuntimeResponse variant: \(name)"
             )
         }
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
         case .yielded(let cellId, let contentItems):
-            try c.encode(Tag.yielded, forKey: .type)
-            var inner = c.nestedContainer(keyedBy: CodingKeys.self, forKey: .data)
-            try inner.encode(cellId, forKey: .cellId)
-            try inner.encode(contentItems, forKey: .contentItems)
+            try ExternalTagCoding.encodeVariantObject("Yielded", to: encoder) { inner in
+                try inner.encode(cellId, forKey: DynamicCodingKey("cell_id"))
+                try inner.encode(contentItems, forKey: DynamicCodingKey("content_items"))
+            }
         case .terminated(let cellId, let contentItems):
-            try c.encode(Tag.terminated, forKey: .type)
-            var inner = c.nestedContainer(keyedBy: CodingKeys.self, forKey: .data)
-            try inner.encode(cellId, forKey: .cellId)
-            try inner.encode(contentItems, forKey: .contentItems)
+            try ExternalTagCoding.encodeVariantObject("Terminated", to: encoder) { inner in
+                try inner.encode(cellId, forKey: DynamicCodingKey("cell_id"))
+                try inner.encode(contentItems, forKey: DynamicCodingKey("content_items"))
+            }
         case .result(let cellId, let contentItems, let errorText):
-            try c.encode(Tag.result, forKey: .type)
-            var inner = c.nestedContainer(keyedBy: CodingKeys.self, forKey: .data)
-            try inner.encode(cellId, forKey: .cellId)
-            try inner.encode(contentItems, forKey: .contentItems)
-            try inner.encodeIfPresent(errorText, forKey: .errorText)
+            try ExternalTagCoding.encodeVariantObject("Result", to: encoder) { inner in
+                try inner.encode(cellId, forKey: DynamicCodingKey("cell_id"))
+                try inner.encode(contentItems, forKey: DynamicCodingKey("content_items"))
+                // Match Rust: always emit error_text (null when nil).
+                try inner.encode(errorText, forKey: DynamicCodingKey("error_text"))
+            }
         }
     }
 
@@ -360,6 +389,8 @@ public enum RuntimeResponse: Hashable, Sendable, Codable, Equatable {
         }
     }
 }
+
+// MARK: - CodeModeNestedToolCall
 
 /// A nested tool call issued from inside a code-mode cell.
 ///
@@ -397,5 +428,24 @@ public struct CodeModeNestedToolCall: Hashable, Sendable, Codable, Equatable {
         case toolName = "tool_name"
         case toolKind = "tool_kind"
         case input
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        cellId = try c.decode(CellId.self, forKey: .cellId)
+        runtimeToolCallId = try c.decode(String.self, forKey: .runtimeToolCallId)
+        toolName = try c.decode(ToolName.self, forKey: .toolName)
+        toolKind = try c.decode(CodeModeToolKind.self, forKey: .toolKind)
+        input = try c.decodeIfPresent(JSONValue.self, forKey: .input)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(cellId, forKey: .cellId)
+        try c.encode(runtimeToolCallId, forKey: .runtimeToolCallId)
+        try c.encode(toolName, forKey: .toolName)
+        try c.encode(toolKind, forKey: .toolKind)
+        // Match Rust Option default: emit null when absent.
+        try c.encode(input, forKey: .input)
     }
 }

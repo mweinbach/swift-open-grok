@@ -269,7 +269,10 @@ struct TOMLParser {
         return i < src.endIndex ? src[i] : nil
     }
 
-    mutating func advance() -> Character {
+    /// Advance the lexer by one character. Returns `Void` so call sites that
+    /// only need the side effect stay warnings-clean under
+    /// `-warnings-as-errors`.
+    mutating func advance() {
         let c = src[pos]
         if c == "\n" {
             line += 1
@@ -278,7 +281,6 @@ struct TOMLParser {
             col += 1
         }
         pos = src.index(after: pos)
-        return c
     }
 
     mutating func skipWhitespaceAndComments() {
@@ -321,12 +323,124 @@ struct TOMLParser {
             if c == "[" {
                 try parseTableHeader()
             } else {
-                try parseKeyValue(into: &root, path: currentPath)
+                // Parse key/value first (mutating lexer state only), then
+                // write into `root` — avoids exclusivity violation from
+                // `parseKeyValue(into: &root, ...)` overlapping self access.
+                try parseKeyValueAtCurrentPath()
             }
             // After a key/value or table header, skip to next non-blank.
             skipWhitespaceAndComments()
         }
         return .table(root)
+    }
+
+    // MARK: Nested table mutation (value-type safe)
+
+    /// Insert `value` at `path` under `table`, creating intermediate tables.
+    /// Returns the updated table. Fails on duplicate leaves or non-table parents.
+    func insertValue(
+        _ value: TOMLValue,
+        into table: TOMLTable,
+        path: [String]
+    ) throws -> TOMLTable {
+        guard let head = path.first else { throw error("empty key path") }
+        var table = table
+        if path.count == 1 {
+            if table[head] != nil {
+                throw error("duplicate key '\(head)'")
+            }
+            table[head] = value
+            return table
+        }
+        var child: TOMLTable
+        if let existing = table[head] {
+            // Descend into a table, or the last element of an array-of-tables.
+            if case let .table(t) = existing {
+                child = t
+            } else if case let .array(arr) = existing, case let .table(t) = arr.last {
+                // Write into the most recent array-of-tables element, then
+                // rebuild the array with the updated last table.
+                let updated = try insertValue(value, into: t, path: Array(path.dropFirst()))
+                var newArr = arr
+                newArr[newArr.count - 1] = .table(updated)
+                table[head] = .array(newArr)
+                return table
+            } else {
+                throw error("duplicate key '\(head)' is not a table")
+            }
+        } else {
+            child = TOMLTable()
+        }
+        child = try insertValue(value, into: child, path: Array(path.dropFirst()))
+        table[head] = .table(child)
+        return table
+    }
+
+    /// Ensure a standard table exists at `path` (create intermediate tables).
+    func ensureTableExists(in table: TOMLTable, path: [String]) throws -> TOMLTable {
+        guard let head = path.first else { return table }
+        var table = table
+        if path.count == 1 {
+            if table[head] == nil {
+                table[head] = .table(TOMLTable())
+            } else if case .table = table[head]! {
+                // already a table — ok (re-entry)
+            } else if case let .array(arr) = table[head]!, case .table = arr.last {
+                // re-entry into last array-of-tables element is allowed
+            } else {
+                throw error("duplicate key '\(head)' is not a table")
+            }
+            return table
+        }
+        if table[head] == nil {
+            table[head] = .table(TOMLTable())
+        }
+        if case let .table(t) = table[head]! {
+            let updated = try ensureTableExists(in: t, path: Array(path.dropFirst()))
+            table[head] = .table(updated)
+            return table
+        }
+        if case var .array(arr) = table[head]!, case let .table(t) = arr.last {
+            let updated = try ensureTableExists(in: t, path: Array(path.dropFirst()))
+            arr[arr.count - 1] = .table(updated)
+            table[head] = .array(arr)
+            return table
+        }
+        throw error("duplicate key '\(head)' is not a table")
+    }
+
+    /// Append a fresh empty table to the array-of-tables at `path`.
+    func appendArrayTable(in table: TOMLTable, path: [String]) throws -> TOMLTable {
+        guard let head = path.first else { throw error("empty table header") }
+        var table = table
+        if path.count == 1 {
+            var arr: [TOMLValue]
+            if table[head] == nil {
+                arr = []
+            } else if case let .array(existing) = table[head]! {
+                arr = existing
+            } else {
+                throw error("key '\(head)' is not an array of tables")
+            }
+            arr.append(.table(TOMLTable()))
+            table[head] = .array(arr)
+            return table
+        }
+        if table[head] == nil {
+            table[head] = .table(TOMLTable())
+        }
+        if case let .table(t) = table[head]! {
+            let updated = try appendArrayTable(in: t, path: Array(path.dropFirst()))
+            table[head] = .table(updated)
+            return table
+        }
+        if case var .array(arr) = table[head]!, case let .table(t) = arr.last {
+            let updated = try appendArrayTable(in: t, path: Array(path.dropFirst()))
+            arr[arr.count - 1] = .table(updated)
+            table[head] = .array(arr)
+            return table
+        }
+        throw error("duplicate key '\(head)' is not a table")
     }
 
     // MARK: Table headers
@@ -349,10 +463,10 @@ struct TOMLParser {
         // Validate path is non-empty (TOML disallows `[]`).
         if path.isEmpty { throw error("empty table header") }
         if isArray {
-            try ensureArrayTable(path: path)
+            root = try appendArrayTable(in: root, path: path)
             currentPath = path
         } else {
-            try ensureTable(path: path)
+            root = try ensureTableExists(in: root, path: path)
             currentPath = path
         }
         // Skip the rest of the line (whitespace + optional comment).
@@ -363,84 +477,23 @@ struct TOMLParser {
         }
     }
 
-    /// Resolve (creating) the table at `path` for a `[a.b.c]` header.
-    mutating func ensureTable(path: [String]) throws {
-        var cur: TOMLTable = root
-        for (i, key) in path.enumerated() {
-            if i == path.count - 1 {
-                if cur[key] == nil {
-                    cur[key] = .table(TOMLTable())
-                } else if case .array = cur[key] {
-                    // Allow re-entry into an array-of-tables element's subtable
-                    // by descending into the last element.
-                    if case let .array(arr) = cur[key]!, case let .table(t) = arr.last! {
-                        cur = t
-                        continue
-                    }
-                }
-                if case .table(let t) = cur[key]! {
-                    cur = t
-                } else {
-                    throw error("duplicate key '\(key)' is not a table")
-                }
-            } else {
-                if cur[key] == nil {
-                    cur[key] = .table(TOMLTable())
-                }
-                if case .table(let t) = cur[key]! {
-                    cur = t
-                } else if case let .array(arr) = cur[key]!, case let .table(t) = arr.last! {
-                    cur = t
-                } else {
-                    throw error("duplicate key '\(key)' is not a table")
-                }
-            }
-        }
-    }
-
-    /// Resolve (appending) the array-of-tables at `path` for a `[[a.b.c]]`
-    /// header. Creates the array if absent, appends a fresh table, and lets
-    /// subsequent key-values populate it.
-    mutating func ensureArrayTable(path: [String]) throws {
-        var cur: TOMLTable = root
-        for (i, key) in path.enumerated() {
-            if i == path.count - 1 {
-                if cur[key] == nil {
-                    cur[key] = .array([])
-                }
-                guard case .array(var arr) = cur[key]! else {
-                    throw error("key '\(key)' is not an array of tables")
-                }
-                let newTable = TOMLTable()
-                arr.append(.table(newTable))
-                cur[key] = .array(arr)
-                // `cur` is now stale; we don't need to continue descending.
-            } else {
-                if cur[key] == nil {
-                    cur[key] = .table(TOMLTable())
-                }
-                if case .table(let t) = cur[key]! {
-                    cur = t
-                } else if case let .array(arr) = cur[key]!, case let .table(t) = arr.last! {
-                    cur = t
-                } else {
-                    throw error("duplicate key '\(key)' is not a table")
-                }
-            }
-        }
-    }
-
     // MARK: Keys
 
     /// Parse a dotted key (`a.b."c"`). Returns the list of key segments.
     mutating func parseDottedKey() throws -> [String] {
         var segments: [String] = []
-        repeat {
+        while true {
             skipInlineWhitespace()
             let seg = try parseKey()
             segments.append(seg)
             skipInlineWhitespace()
-        } while current == "." && (advance() != nil)
+            // Consume the dotted-key separator explicitly (advance is Void).
+            if current == "." {
+                advance()
+                continue
+            }
+            break
+        }
         return segments
     }
 
@@ -463,12 +516,14 @@ struct TOMLParser {
 
     // MARK: Key/value
 
-    /// Parse a `key = value` (or `a.b.c = value`) into `into` at the given
-    /// `path` (the current table's path).
-    mutating func parseKeyValue(into: inout TOMLTable, path: [String]) throws {
+    /// Parse a `key = value` (or `a.b.c = value`) into the current table path
+    /// under `root`. Value-type safe: rebuilds nested tables on write-back.
+    mutating func parseKeyValueAtCurrentPath() throws {
         let keyPath = try parseDottedKey()
         skipInlineWhitespace()
-        guard current == "=" else { throw error("expected '=' after key '\(keyPath.joined(separator: "."))'") }
+        guard current == "=" else {
+            throw error("expected '=' after key '\(keyPath.joined(separator: "."))'")
+        }
         advance()
         skipInlineWhitespace()
         let value = try parseValue()
@@ -478,27 +533,8 @@ struct TOMLParser {
         if let c = current, c != "\n" && c != "\r" {
             throw error("expected newline after value, got '\(c)'")
         }
-        // Navigate to the parent table for `keyPath` (all but last), then set
-        // the leaf. The leaf's parent is resolved relative to `into` (the
-        // current table header's table).
-        var cur: TOMLTable = into
-        for (i, seg) in keyPath.enumerated() {
-            if i == keyPath.count - 1 {
-                if cur[seg] != nil {
-                    throw error("duplicate key '\(seg)'")
-                }
-                cur[seg] = value
-            } else {
-                if cur[seg] == nil {
-                    cur[seg] = .table(TOMLTable())
-                }
-                if case .table(let t) = cur[seg]! {
-                    cur = t
-                } else {
-                    throw error("duplicate key '\(seg)' is not a table")
-                }
-            }
-        }
+        let fullPath = currentPath + keyPath
+        root = try insertValue(value, into: root, path: fullPath)
     }
 
     // MARK: Values
@@ -559,7 +595,7 @@ struct TOMLParser {
 
     mutating func advance4(_ s: String) {
         for _ in 0..<s.count {
-            if !isAtEnd { _ = advance() }
+            if !isAtEnd { advance() }
         }
     }
 
@@ -620,7 +656,7 @@ struct TOMLParser {
         }
         guard sawSep, lookahead.count >= 5 else { return nil }
         // Consume the lookahead.
-        for _ in 0..<lookahead.count { _ = advance() }
+        for _ in 0..<lookahead.count { advance() }
         return lookahead
     }
 
@@ -631,11 +667,11 @@ struct TOMLParser {
         var sign: Int64 = 1
         if current == "-" { sign = -1; advance() }
         else if current == "+" { advance() }
-        // Non-decimal prefixes
+        // Non-decimal prefixes. `parseIntRadix` already returns a `.integer` value.
         if current == "0", let n = next {
-            if n == "x" { return .integer(try parseIntRadix(16, sign: sign, prefixLen: 2)) }
-            if n == "o" { return .integer(try parseIntRadix(8, sign: sign, prefixLen: 2)) }
-            if n == "b" { return .integer(try parseIntRadix(2, sign: sign, prefixLen: 2)) }
+            if n == "x" { return try parseIntRadix(16, sign: sign, prefixLen: 2) }
+            if n == "o" { return try parseIntRadix(8, sign: sign, prefixLen: 2) }
+            if n == "b" { return try parseIntRadix(2, sign: sign, prefixLen: 2) }
         }
         // Decimal int or float. Scan digits + `_`, watching for `.`/`e`/`E`.
         var intDigits = ""
@@ -707,17 +743,29 @@ struct TOMLParser {
     }
 
     mutating func parseFloatWithExp(intPart: String, fracPart: String, sign: Int64) throws -> TOMLValue {
-        var exp = ""
+        var expSuffix = ""
         if current == "e" || current == "E" {
+            expSuffix.append("e")
             advance()
             if current == "+" || current == "-" {
-                exp.append(current!); advance()
+                expSuffix.append(current!); advance()
             }
+            var digits = ""
             while let c = current, c.isNumber {
-                exp.append(c); advance()
+                digits.append(c); advance()
             }
+            if digits.isEmpty { throw error("expected exponent digits") }
+            expSuffix += digits
         }
-        let combined = "\(intPart).\(fracPart)\(exp)"
+        let combined: String
+        if fracPart.isEmpty && expSuffix.isEmpty {
+            combined = intPart
+        } else if fracPart.isEmpty {
+            // Integer with exponent: `1e2` — do not inject a bare '.' before `e`.
+            combined = intPart + expSuffix
+        } else {
+            combined = "\(intPart).\(fracPart)\(expSuffix)"
+        }
         guard let v = Double(combined) else {
             throw error("invalid float '\(combined)'")
         }
@@ -905,18 +953,7 @@ struct TOMLParser {
             advance()
             skipInlineWhitespace()
             let v = try parseValue()
-            // Navigate dotted key into `t`.
-            var cur = t
-            for (i, seg) in keyPath.enumerated() {
-                if i == keyPath.count - 1 {
-                    if cur[seg] != nil { throw error("duplicate key '\(seg)' in inline table") }
-                    cur[seg] = v
-                } else {
-                    if cur[seg] == nil { cur[seg] = .table(TOMLTable()) }
-                    if case .table(let inner) = cur[seg]! { cur = inner }
-                    else { throw error("duplicate key '\(seg)' in inline table") }
-                }
-            }
+            t = try insertValue(v, into: t, path: keyPath)
             skipInlineWhitespace()
             if current == "," { advance(); continue }
             if current == "}" { advance(); return .table(t) }

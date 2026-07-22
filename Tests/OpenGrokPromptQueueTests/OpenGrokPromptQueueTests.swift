@@ -218,3 +218,47 @@ struct PromptQueueTests {
         #expect(meta.lastEditor == nil)
     }
 }
+
+// MARK: - FIFO prompt queue state machine
+
+@Suite("PromptQueue FIFO state machine")
+struct PromptQueueStateMachineTests {
+    @Test("enqueue preserves FIFO order and wire positions")
+    func enqueueFIFO() async {
+        let queue = PromptQueue(sessionId: "sess")
+        _ = await queue.enqueue(QueueEntryMeta(id: "p1", kind: "prompt", text: "one"))
+        _ = await queue.enqueue(QueueEntryMeta(id: "p2", kind: "prompt", text: "two"))
+        let ids = await queue.orderedIds
+        #expect(ids == ["p1", "p2"])
+        let snap = await queue.wireSnapshot()
+        #expect(snap.entries.map(\.position) == [0, 1])
+        #expect(snap.sessionId == "sess")
+    }
+
+    @Test("beginNext marks running and completeRunning clears it")
+    func beginAndComplete() async throws {
+        let queue = PromptQueue(sessionId: "s")
+        _ = await queue.enqueue(QueueEntryMeta(id: "a", kind: "prompt", text: "a"))
+        _ = await queue.enqueue(QueueEntryMeta(id: "b", kind: "prompt", text: "b"))
+        let first = try await queue.beginNext()
+        #expect(first.id == "a")
+        #expect(await queue.runningPromptId == "a")
+        #expect(await queue.orderedIds == ["b"])
+        await queue.completeRunning()
+        #expect(await queue.runningPromptId == nil)
+        let second = try await queue.beginNext()
+        #expect(second.id == "b")
+    }
+
+    @Test("stale version edit is a no-op")
+    func staleEdit() async {
+        let queue = PromptQueue(sessionId: "s")
+        _ = await queue.enqueue(QueueEntryMeta(id: "p1", version: 1, kind: "prompt", text: "old"))
+        let updated = await queue.edit(id: "p1", expectedVersion: 0, text: "new")
+        #expect(updated == nil)
+        let ok = await queue.edit(id: "p1", expectedVersion: 1, text: "new", editor: "bob")
+        #expect(ok?.version == 2)
+        #expect(ok?.text == "new")
+        #expect(ok?.lastEditor == "bob")
+    }
+}

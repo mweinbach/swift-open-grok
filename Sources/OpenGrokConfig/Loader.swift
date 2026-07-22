@@ -125,6 +125,265 @@ public func loadSystemManagedConfig() throws -> TOMLValue {
     return v
 }
 
+// MARK: - Project configuration discovery
+
+/// Relative project-config path segments (under a repo / cwd directory).
+public let PROJECT_CONFIG_DIRNAME = ".opengrok"
+public let PROJECT_CONFIG_FILENAME = "config.toml"
+
+/// Absolute path to `<cwd>/.opengrok/config.toml` (whether or not it exists).
+public func projectConfigPath(cwd: URL) -> URL {
+    cwd.appendingPathComponent(PROJECT_CONFIG_DIRNAME)
+        .appendingPathComponent(PROJECT_CONFIG_FILENAME)
+}
+
+/// Load `<cwd>/.opengrok/config.toml` (with that layer's `[[version_overrides]]`).
+/// Empty table if the file is missing — mirrors Rust shell
+/// `load_project_config`.
+public func loadProjectConfig(cwd: URL) throws -> TOMLValue {
+    try loadConfigFile(at: projectConfigPath(cwd: cwd))
+}
+
+/// Whether `configPath` is the user-global `$OPENGROK_HOME/config.toml` (or
+/// the resolved `userHome/config.toml`). Used so `cwd == $HOME` never
+/// promotes the user tier into a project overlay.
+public func isUserGrokConfigFile(
+    _ configPath: URL,
+    userHome: URL? = nil,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> Bool {
+    let home = userHome ?? userGrokHome(environment: environment)
+    guard let home = home else { return false }
+    let userConfig = home.appendingPathComponent("config.toml")
+    let a = configPath.resolvingSymlinksInPath().standardizedFileURL.path
+    let b = userConfig.resolvingSymlinksInPath().standardizedFileURL.path
+    if a == b { return true }
+    // Also compare non-canonical absolute paths for temp-dir fixtures.
+    return configPath.path == userConfig.path
+        || configPath.standardizedFileURL.path == userConfig.standardizedFileURL.path
+}
+
+/// Directory chain from `cwd` upward. When `stopAt` is set, walking stops at
+/// that ancestor (inclusive) — pass a git root to match Rust
+/// `RepoDirChain` / `find_project_configs`. Without a stop, walks until the
+/// filesystem root, capped by `maxDepth`.
+///
+/// Returned **cwd-first** (nearest first). Callers that want repo-root-first
+/// reverse the array (see `findProjectConfigs`).
+public func projectDirChain(
+    cwd: URL,
+    stopAt: URL? = nil,
+    maxDepth: Int = 64
+) -> [URL] {
+    var out: [URL] = []
+    var current = cwd.standardizedFileURL
+    let stop = stopAt?.standardizedFileURL
+    var depth = 0
+    while depth < maxDepth {
+        out.append(current)
+        if let stop = stop, current.path == stop.path { break }
+        let parent = current.deletingLastPathComponent()
+        if parent.path == current.path { break } // filesystem root
+        current = parent
+        depth += 1
+    }
+    return out
+}
+
+/// Find every existing `.opengrok/config.toml` from `cwd` up to `stopAt`
+/// (git root when known). Returns paths **repo-root-first** (lowest
+/// priority) → cwd (highest), matching Rust
+/// `xai_grok_workspace::project_config::find_project_configs`.
+///
+/// Excludes the user-global config so `cwd == $HOME` does not treat
+/// `~/.opengrok/config.toml` as a project overlay. Path isolation is the
+/// caller's responsibility for trust gates (folder-trust lives in the
+/// shell/workspace layers); this API only discovers files.
+public func findProjectConfigs(
+    cwd: URL,
+    stopAt: URL? = nil,
+    userHome: URL? = nil,
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    maxDepth: Int = 64
+) -> [URL] {
+    let home = userHome ?? userGrokHome(environment: environment)
+    let chain = projectDirChain(cwd: cwd, stopAt: stopAt, maxDepth: maxDepth)
+    // `chain` is cwd-first; reverse so repo root comes first.
+    return chain.reversed().compactMap { dir in
+        let path = projectConfigPath(cwd: dir)
+        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
+        if isUserGrokConfigFile(path, userHome: home, environment: environment) {
+            return nil
+        }
+        return path
+    }
+}
+
+/// Deep-merge every project config (repo-root → cwd) into one table.
+/// Files that fail to parse are skipped (one bad layer never drops others).
+public func loadMergedProjectConfig(
+    cwd: URL,
+    stopAt: URL? = nil,
+    userHome: URL? = nil,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> TOMLValue {
+    var merged = TOMLValue.table(TOMLTable())
+    for path in findProjectConfigs(
+        cwd: cwd, stopAt: stopAt, userHome: userHome, environment: environment
+    ) {
+        do {
+            let layer = try loadConfigFile(at: path)
+            deepMergeTOML(&merged, overrides: layer)
+        } catch {
+            continue
+        }
+    }
+    return merged
+}
+
+// MARK: - Authority composition (shell-facing)
+
+/// Keys that require a process restart after change (mirrors the pager /
+/// settings ownership surface for code-mode, screen mode, and leader).
+/// Exposed so callers can flag dirty restart-required paths without
+/// reimplementing the set.
+public let RESTART_REQUIRED_PATHS: [PatchPath] = [
+    ["features", "code_mode"],
+    ["ui", "screen_mode"],
+    ["cli", "use_leader"],
+    ["cli", "worktree_type"],
+]
+
+/// Whether `patch` touches any restart-required setting path.
+public func touchesRestartRequired(_ patch: TOMLTable) -> Bool {
+    patchTouchesAny(patch, paths: RESTART_REQUIRED_PATHS)
+}
+
+/// Whether the merged table differs on any restart-required path versus
+/// `baseline` (used by reloaders to decide "restart needed").
+public func restartRequiredChanged(from baseline: TOMLValue, to updated: TOMLValue) -> Bool {
+    for path in RESTART_REQUIRED_PATHS {
+        if baseline[path: path] != updated[path: path] { return true }
+    }
+    return false
+}
+
+/// Shell-facing authority stack. Disk managed/user layers come from
+/// `ConfigLayers`; project / environment / CLI are applied by the resolver
+/// that has a cwd and the live process overrides.
+///
+/// Merge order **lowest → highest**:
+/// 1. built-ins (empty table / typed defaults at decode time)
+/// 2. system managed (`/etc/opengrok/managed_config.toml`)
+/// 3. user managed (`$OPENGROK_HOME/managed_config.toml`)
+/// 4. user config (`$OPENGROK_HOME/config.toml`)
+/// 5. project chain (repo-root → cwd `.opengrok/config.toml`)
+/// 6. environment overlay (parsed TOML-shaped overrides)
+/// 7. CLI overlay
+/// 8. requirements (user → system → MDM) — always reapplied last so admin
+///    policy cannot be clobbered by project/env/cli
+///
+/// Mirrors the shell's field-wise precedence (requirements > env > project >
+/// user config) at the deep-merge level used by this crate.
+public struct AuthorityComposition: Sendable {
+    public var systemManaged: TOMLValue
+    public var managed: TOMLValue
+    public var user: TOMLValue
+    public var project: TOMLValue
+    public var environment: TOMLValue
+    public var cli: TOMLValue
+    public var userRequirements: TOMLValue?
+    public var systemRequirements: TOMLValue?
+    public var mdmRequirements: TOMLValue?
+
+    public init(
+        systemManaged: TOMLValue = .table(TOMLTable()),
+        managed: TOMLValue = .table(TOMLTable()),
+        user: TOMLValue = .table(TOMLTable()),
+        project: TOMLValue = .table(TOMLTable()),
+        environment: TOMLValue = .table(TOMLTable()),
+        cli: TOMLValue = .table(TOMLTable()),
+        userRequirements: TOMLValue? = nil,
+        systemRequirements: TOMLValue? = nil,
+        mdmRequirements: TOMLValue? = nil
+    ) {
+        self.systemManaged = systemManaged
+        self.managed = managed
+        self.user = user
+        self.project = project
+        self.environment = environment
+        self.cli = cli
+        self.userRequirements = userRequirements
+        self.systemRequirements = systemRequirements
+        self.mdmRequirements = mdmRequirements
+    }
+
+    /// Build from on-disk `ConfigLayers` plus an optional project merge and
+    /// env/cli overlays.
+    public static func from(
+        layers: ConfigLayers,
+        project: TOMLValue = .table(TOMLTable()),
+        environment: TOMLValue = .table(TOMLTable()),
+        cli: TOMLValue = .table(TOMLTable())
+    ) -> AuthorityComposition {
+        AuthorityComposition(
+            systemManaged: layers.systemManaged,
+            managed: layers.managed,
+            user: layers.user,
+            project: project,
+            environment: environment,
+            cli: cli,
+            userRequirements: layers.userRequirements,
+            systemRequirements: layers.systemRequirements,
+            mdmRequirements: layers.mdmRequirements
+        )
+    }
+
+    /// Effective table after the full authority merge.
+    public func effective() -> TOMLValue {
+        var merged = systemManaged
+        deepMergeTOML(&merged, overrides: managed)
+        deepMergeTOML(&merged, overrides: user)
+        deepMergeTOML(&merged, overrides: project)
+        deepMergeTOML(&merged, overrides: environment)
+        deepMergeTOML(&merged, overrides: cli)
+        if let req = userRequirements { deepMergeTOML(&merged, overrides: req) }
+        if let req = systemRequirements { deepMergeTOML(&merged, overrides: req) }
+        if let req = mdmRequirements { deepMergeTOML(&merged, overrides: req) }
+        return merged
+    }
+}
+
+/// Convenience: load disk layers + project chain for `cwd` and compose with
+/// optional env/cli overlays. Does **not** apply folder-trust gating — the
+/// shell must pass an empty project table when the folder is untrusted.
+public func loadAuthorityComposition(
+    cwd: URL?,
+    stopAt: URL? = nil,
+    environmentOverlay: TOMLValue = .table(TOMLTable()),
+    cliOverlay: TOMLValue = .table(TOMLTable()),
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) throws -> AuthorityComposition {
+    let layers = try ConfigLayers.load(environment: environment)
+    let project: TOMLValue
+    if let cwd = cwd {
+        project = loadMergedProjectConfig(
+            cwd: cwd,
+            stopAt: stopAt,
+            userHome: userGrokHome(environment: environment),
+            environment: environment
+        )
+    } else {
+        project = .table(TOMLTable())
+    }
+    return AuthorityComposition.from(
+        layers: layers,
+        project: project,
+        environment: environmentOverlay,
+        cli: cliOverlay
+    )
+}
+
 // MARK: - ManagedConfigLayer
 
 /// One managed-config layer: the parsed TOML and the file it came from.

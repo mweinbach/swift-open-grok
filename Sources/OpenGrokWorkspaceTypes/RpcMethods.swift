@@ -9,25 +9,22 @@
 //   * `RpcEnvelope` / `RpcError` (envelope.rs) — the response envelope
 //     shared by every `workspace.*` method.
 //   * The `WorkspaceRpc` marker protocol + tool-id constants (mod.rs).
-//   * The most commonly referenced per-method request/response types:
-//     `workspace.info`, `workspace.load_project_config`,
-//     `workspace.load_permissions`, `workspace.load_envrc`,
-//     `workspace.tool_definitions`, `workspace.update_tool_config`,
-//     `workspace.drop_session`, `workspace.configure_mcp`,
-//     `workspace.install_plugin`, `workspace.refresh_plugins`,
-//     `workspace.list_background_tasks`, `workspace.list_todos`,
-//     `workspace.resolve_file_references`, the
-//     `workspace.discover_agents_md` / `workspace.discover_skills` /
-//     `workspace.discover_plugins` discovery methods, and the
-//     `workspace.hook_registry` hook-spec wire mirror.
+//   * Core workspace methods from `rpc/workspace.rs` plus hook-registry
+//     / skills discovery: `workspace.info`, `load_*`, `tool_definitions`,
+//     `update_tool_config`, `drop_session`, `configure_mcp`,
+//     `install_plugin`, `refresh_plugins`, `list_background_tasks`,
+//     `list_todos`, `resolve_file_references`, `discover_*`,
+//     `hook_registry`.
 //
-// Per-method types not yet migrated here (the larger `git.*`, `fs.*`,
-// `code_nav.*`, `deploy.*`, `hunks.*`, `search.*`, `session.*`,
-// `worktree.*` families) live next to their `WorkspaceOp` impls in
-// `OpenGrokWorkspace`; each has exactly one `WorkspaceRpc` impl. The
-// envelope and protocol defined here are the source of truth for
-// dispatch — later slices can lift additional method types into this
-// target without changing the wire contract.
+// Sibling modules in this target complete the Rust `rpc/*` surface:
+//   * `RpcFilesystem.swift` — put/get + `fs_*` + `client_fs_*`
+//   * `RpcGit.swift` — `git_*` / `detect_vcs_kind`
+//   * `RpcWorktree.swift` — worktree lifecycle
+//   * `RpcSearch.swift` — ripgrep + fuzzy
+//   * `RpcSession.swift` — begin/end prompt + rewind
+//   * `RpcHunks.swift` — hunk tracker methods
+//   * `RpcCodeNav.swift` — code navigation / index status
+//   * `RpcCommon.swift` — unit/empty helpers
 
 import Foundation
 import OpenGrokShared
@@ -227,15 +224,13 @@ public struct WorkspaceInfoReq: Hashable, Sendable, Codable, Equatable, Workspac
     public typealias Response = JSONValue
 
     public init(from decoder: Decoder) throws {
-        // Empty struct — tolerate any (or no) payload.
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil() { return }
-        // Ignore any object payload.
+        // Rust empty struct serializes as `{}` (not null). Accept `{}`,
+        // null, or payloads with unknown future fields.
+        _ = try WorkspaceRpcEmptyObject(from: decoder)
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        try c.encodeNil()
+        try WorkspaceRpcEmptyObject().encode(to: encoder)
     }
 }
 
@@ -270,13 +265,12 @@ public struct LoadProjectConfigReq: Hashable, Sendable, Codable, Equatable, Work
     public typealias Response = JSONValue
 
     public init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil() { return }
+        // Rust empty struct → `{}`. Tolerate null / unknown keys.
+        _ = try WorkspaceRpcEmptyObject(from: decoder)
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        try c.encodeNil()
+        try WorkspaceRpcEmptyObject().encode(to: encoder)
     }
 }
 
@@ -290,13 +284,12 @@ public struct LoadPermissionsReq: Hashable, Sendable, Codable, Equatable, Worksp
     public typealias Response = JSONValue
 
     public init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil() { return }
+        // Rust empty struct → `{}`. Tolerate null / unknown keys.
+        _ = try WorkspaceRpcEmptyObject(from: decoder)
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        try c.encodeNil()
+        try WorkspaceRpcEmptyObject().encode(to: encoder)
     }
 }
 
@@ -309,13 +302,12 @@ public struct LoadEnvrcReq: Hashable, Sendable, Codable, Equatable, WorkspaceRpc
     public typealias Response = JSONValue
 
     public init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil() { return }
+        // Rust empty struct → `{}`. Tolerate null / unknown keys.
+        _ = try WorkspaceRpcEmptyObject(from: decoder)
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        try c.encodeNil()
+        try WorkspaceRpcEmptyObject().encode(to: encoder)
     }
 }
 
@@ -458,13 +450,12 @@ public struct InstallPluginReq: Hashable, Sendable, Codable, Equatable, Workspac
     public typealias Response = JSONValue
 
     public init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil() { return }
+        // Rust empty struct → `{}`. Tolerate null / unknown keys.
+        _ = try WorkspaceRpcEmptyObject(from: decoder)
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        try c.encodeNil()
+        try WorkspaceRpcEmptyObject().encode(to: encoder)
     }
 }
 
@@ -476,13 +467,12 @@ public struct RefreshPluginsReq: Hashable, Sendable, Codable, Equatable, Workspa
     public typealias Response = JSONValue
 
     public init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil() { return }
+        // Rust empty struct → `{}`. Tolerate null / unknown keys.
+        _ = try WorkspaceRpcEmptyObject(from: decoder)
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        try c.encodeNil()
+        try WorkspaceRpcEmptyObject().encode(to: encoder)
     }
 }
 
@@ -621,13 +611,12 @@ public struct DiscoverAgentsMdReq: Hashable, Sendable, Codable, Equatable, Works
     public typealias Response = [AgentConfigFile]
 
     public init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil() { return }
+        // Rust empty struct → `{}`. Tolerate null / unknown keys.
+        _ = try WorkspaceRpcEmptyObject(from: decoder)
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        try c.encodeNil()
+        try WorkspaceRpcEmptyObject().encode(to: encoder)
     }
 }
 
@@ -666,13 +655,12 @@ public enum RPCSkills {
         public typealias Response = [SkillInfo]
 
         public init(from decoder: Decoder) throws {
-            let c = try decoder.singleValueContainer()
-            if c.decodeNil() { return }
+            // Rust empty struct → `{}`. Tolerate null / unknown keys.
+            _ = try WorkspaceRpcEmptyObject(from: decoder)
         }
 
         public func encode(to encoder: Encoder) throws {
-            var c = encoder.singleValueContainer()
-            try c.encodeNil()
+            try WorkspaceRpcEmptyObject().encode(to: encoder)
         }
     }
 
@@ -685,13 +673,12 @@ public enum RPCSkills {
         public typealias Response = [JSONValue]
 
         public init(from decoder: Decoder) throws {
-            let c = try decoder.singleValueContainer()
-            if c.decodeNil() { return }
+            // Rust empty struct → `{}`. Tolerate null / unknown keys.
+            _ = try WorkspaceRpcEmptyObject(from: decoder)
         }
 
         public func encode(to encoder: Encoder) throws {
-            var c = encoder.singleValueContainer()
-            try c.encodeNil()
+            try WorkspaceRpcEmptyObject().encode(to: encoder)
         }
     }
 
@@ -905,13 +892,12 @@ public struct HookRegistryReq: Hashable, Sendable, Codable, Equatable, Workspace
     public typealias Response = HookRegistryWire
 
     public init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil() { return }
+        // Rust empty struct → `{}`. Tolerate null / unknown keys.
+        _ = try WorkspaceRpcEmptyObject(from: decoder)
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        try c.encodeNil()
+        try WorkspaceRpcEmptyObject().encode(to: encoder)
     }
 }
 
@@ -1091,5 +1077,25 @@ extension HookEventNameWire: Codable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.singleValueContainer()
         try c.encode(asString)
+    }
+}
+
+/// Enables `HookEventNameWire` as a JSON object key in `HookRegistryWire`
+/// (`{ "hooks": { "<event>": [...] } }`). Mirrors Rust serde's string-key
+/// map encoding for `HookEventName`.
+extension HookEventNameWire: CodingKeyRepresentable {
+    public var codingKey: any CodingKey {
+        HookEventCodingKey(stringValue: asString)!
+    }
+
+    public init?<T: CodingKey>(codingKey: T) {
+        self.init(codingKey.stringValue)
+    }
+
+    private struct HookEventCodingKey: CodingKey {
+        var stringValue: String
+        init?(stringValue: String) { self.stringValue = stringValue }
+        var intValue: Int? { nil }
+        init?(intValue: Int) { return nil }
     }
 }

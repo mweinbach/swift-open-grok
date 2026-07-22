@@ -260,6 +260,11 @@ extension TurnLifecycleContributor {
 /// for struct adopters; both are `Sendable` because the protocols are
 /// `Sendable`-bounded).
 public final class ExtensionRegistryBuilder: @unchecked Sendable {
+    /// Serializes concurrent registration and build snapshotting. The
+    /// builder is `@unchecked Sendable` so hosts may share it across
+    /// tasks while composing extensions; all mutation and snapshot
+    /// reads go through this lock.
+    private let lock = NSLock()
     private var turnLifecycleContributors: [any TurnLifecycleContributor] = []
     private var sessionLifecycleContributors: [any SessionLifecycleContributor] = []
     private var turnInputContributors: [any TurnInputContributor] = []
@@ -268,34 +273,48 @@ public final class ExtensionRegistryBuilder: @unchecked Sendable {
     public init() {}
 
     public func turnLifecycleContributor(_ contributor: any TurnLifecycleContributor) {
+        lock.lock()
+        defer { lock.unlock() }
         turnLifecycleContributors.append(contributor)
     }
 
     public func sessionLifecycleContributor(_ contributor: any SessionLifecycleContributor) {
+        lock.lock()
+        defer { lock.unlock() }
         sessionLifecycleContributors.append(contributor)
     }
 
     public func turnInputContributor(_ contributor: any TurnInputContributor) {
+        lock.lock()
+        defer { lock.unlock() }
         turnInputContributors.append(contributor)
     }
 
     public func commandContributor(_ contributor: any CommandContributor) {
+        lock.lock()
+        defer { lock.unlock() }
         commandContributors.append(contributor)
     }
 
     /// Routes each advertised command to its one owner. Duplicate names
     /// are a composition bug: first registration wins, traps in debug
-    /// builds, logs in release.
+    /// builds (`assertionFailure` / Rust `debug_assert!`), logs in
+    /// release.
     public func build() -> ExtensionRegistry {
+        lock.lock()
+        let turnSnapshot = turnLifecycleContributors
+        let sessionSnapshot = sessionLifecycleContributors
+        let turnInputSnapshot = turnInputContributors
+        let commandSnapshot = commandContributors
+        lock.unlock()
+
         var commandHandlers: [String: any CommandContributor] = [:]
-        for contributor in commandContributors {
+        for contributor in commandSnapshot {
             for spec in contributor.advertisedCommands() {
                 if commandHandlers[spec.name] != nil {
-                    // Mirror Rust: debug_assert!(false, …) panics in
-                    // debug, traces in release. Swift `assertionFailure`
-                    // traps in debug, is a no-op in release. We also
-                    // log via `os_log`-equivalent on the release path
-                    // so the composition bug is observable.
+                    // Mirror Rust `debug_assert!(false, "duplicate command
+                    // contributed: /{name}")` + always-on error log.
+                    // First registration wins; debug traps, release logs.
                     assertionFailure("duplicate command contributed: /\(spec.name)")
                     print("[OpenGrokAgentLifecycle] Duplicate command contributed; first registration wins: /\(spec.name)")
                     continue
@@ -304,10 +323,10 @@ public final class ExtensionRegistryBuilder: @unchecked Sendable {
             }
         }
         return ExtensionRegistry(
-            turnLifecycleContributors: turnLifecycleContributors,
-            sessionLifecycleContributors: sessionLifecycleContributors,
-            turnInputContributors: turnInputContributors,
-            commandContributors: commandContributors,
+            turnLifecycleContributors: turnSnapshot,
+            sessionLifecycleContributors: sessionSnapshot,
+            turnInputContributors: turnInputSnapshot,
+            commandContributors: commandSnapshot,
             commandHandlers: commandHandlers
         )
     }
@@ -551,12 +570,14 @@ public final class LocalExtensionRegistryBuilder {
 
     /// Routes each advertised command to its one owner. Duplicate names
     /// are a composition bug: first registration wins, traps in debug
-    /// builds, logs in release.
+    /// builds (`assertionFailure` / Rust `debug_assert!`), logs in
+    /// release.
     public func build() -> LocalExtensionRegistry {
         var commandHandlers: [String: any LocalCommandContributor] = [:]
         for contributor in commandContributors {
             for spec in contributor.advertisedCommands() {
                 if commandHandlers[spec.name] != nil {
+                    // Mirror Rust `debug_assert!(false, ...)` + error log.
                     assertionFailure("duplicate command contributed: /\(spec.name)")
                     print("[OpenGrokAgentLifecycle] Duplicate command contributed; first registration wins: /\(spec.name)")
                     continue
@@ -632,5 +653,82 @@ public final class LocalExtensionRegistry {
     /// advertised it.
     public func commandHandler(_ name: String) -> (any LocalCommandContributor)? {
         commandHandlers[name]
+    }
+}
+
+// MARK: - Turn phase state machine
+//
+// Host-neutral turn phase tracking used by shell/session hosts. The
+// Rust agent-lifecycle crate owns contributor hooks only; the phase
+// machine itself is the host-shared ordering contract described by
+// PORT_PLAN W1-S2 (queued → running → waiting → cancelling →
+// completed / failed). Invalid regressions are rejected.
+
+/// Ordered turn phases preserved by the lifecycle state machine.
+public enum TurnPhase: String, Hashable, Sendable, Codable, CaseIterable {
+    case queued
+    case running
+    case waiting
+    case cancelling
+    case completed
+    case failed
+}
+
+/// Errors raised by invalid turn-phase transitions.
+public enum TurnPhaseError: Error, Hashable, Sendable {
+    case invalidTransition(from: TurnPhase, to: TurnPhase)
+    case alreadyTerminal(TurnPhase)
+}
+
+/// Actor-safe turn phase tracker. All transitions are serialized.
+public actor TurnPhaseMachine {
+    public private(set) var phase: TurnPhase
+
+    public init(initial: TurnPhase = .queued) {
+        self.phase = initial
+    }
+
+    /// Attempt a transition. Returns the new phase on success.
+    @discardableResult
+    public func transition(to next: TurnPhase) throws -> TurnPhase {
+        if phase == .completed || phase == .failed {
+            throw TurnPhaseError.alreadyTerminal(phase)
+        }
+        guard Self.isAllowed(from: phase, to: next) else {
+            throw TurnPhaseError.invalidTransition(from: phase, to: next)
+        }
+        phase = next
+        return phase
+    }
+
+    /// Whether the machine is in a terminal phase.
+    public var isTerminal: Bool {
+        phase == .completed || phase == .failed
+    }
+
+    /// Allowed transitions. Terminal states have no outgoing edges.
+    public static func isAllowed(from: TurnPhase, to: TurnPhase) -> Bool {
+        if from == to { return true }
+        switch (from, to) {
+        case (.queued, .running),
+             (.queued, .cancelling),
+             (.queued, .failed):
+            return true
+        case (.running, .waiting),
+             (.running, .cancelling),
+             (.running, .completed),
+             (.running, .failed):
+            return true
+        case (.waiting, .running),
+             (.waiting, .cancelling),
+             (.waiting, .completed),
+             (.waiting, .failed):
+            return true
+        case (.cancelling, .completed),
+             (.cancelling, .failed):
+            return true
+        default:
+            return false
+        }
     }
 }

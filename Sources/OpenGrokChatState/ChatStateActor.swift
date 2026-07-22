@@ -28,7 +28,7 @@ import OpenGrokTokenEstimation
 public enum ChatStateCommand: Sendable {
     // ═══ Mutations (fire-and-forget) ═══
     case pushUserMessage(item: ConversationItem)
-    case pushUserMessageAndAck(item: ConversationItem, reply: CheckedContinuation<Void, Never>.Ref)
+    case pushUserMessageAndAck(item: ConversationItem, reply: ActorReply<Void>)
     case pushUserMessageWithRepairReason(item: ConversationItem, reason: DanglingToolCallReason)
     case pushAssistantResponse(item: ConversationItem)
     case pushToolResult(item: ConversationItem)
@@ -41,22 +41,22 @@ public enum ChatStateCommand: Sendable {
         byModel: [(model: String, totals: UsageTotals)],
         attributeToPrompt: Bool,
         incomplete: Bool,
-        reply: CheckedContinuation<Void, Never>.Ref
+        reply: ActorReply<Void>
     )
-    case markUsageIncomplete(prompt: Bool, session: Bool, reply: CheckedContinuation<Void, Never>.Ref)
+    case markUsageIncomplete(prompt: Bool, session: Bool, reply: ActorReply<Void>)
     case incrementPromptIndex
     case updateSamplingConfig(config: SamplingConfig)
     case recordAgentEditedPath(path: String)
     case recordStreamStart(timestampMs: Int64)
     case recordTurnStart(timestampMs: Int64)
     case replaceConversation(items: [ConversationItem], isCompaction: Bool)
-    case replaceSystemHead(prompt: String, reply: CheckedContinuation<Bool, Never>.Ref)
+    case replaceSystemHead(prompt: String, reply: ActorReply<Bool>)
     case cachePromptText(text: String)
     case recordCompactionAt(promptIndex: Int)
     case flush
     case updateCredentials(credentials: Credentials)
     case restoreSnapshot(snapshot: ChatStateSnapshot)
-    case commitRewindSnapshot(snapshot: ChatStateSnapshot, reply: CheckedContinuation<Void, Never>.Ref)
+    case commitRewindSnapshot(snapshot: ChatStateSnapshot, reply: ActorReply<Void>)
     case beginTurnCapture
     case appendHarnessTraceItems(items: [ConversationItem])
     case flushHarnessTraceTurn
@@ -67,60 +67,91 @@ public enum ChatStateCommand: Sendable {
         toolDefinitions: [ToolSpec],
         memoryReminder: String?,
         persistMemoryReminder: Bool,
+        trace: TraceContextBox?,
         convId: String,
         reqId: String,
-        reply: CheckedContinuation<ConversationRequest?, Never>.Ref
+        reply: ActorReply<ConversationRequest>
     )
-    case getConversation(reply: CheckedContinuation<[ConversationItem], Never>.Ref)
-    case getPromptIndex(reply: CheckedContinuation<Int, Never>.Ref)
-    case getLastCompactionPromptIndex(reply: CheckedContinuation<Int?, Never>.Ref)
-    case getTotalTokens(reply: CheckedContinuation<UInt64, Never>.Ref)
-    case getLastTurnUsage(reply: CheckedContinuation<TokenUsage?, Never>.Ref)
-    case getPromptUsage(reply: CheckedContinuation<UsageLedger?, Never>.Ref)
-    case getSessionUsage(reply: CheckedContinuation<UsageLedger, Never>.Ref)
-    case getEstimatedTotalTokens(reply: CheckedContinuation<UInt64, Never>.Ref)
-    case getSamplingConfig(reply: CheckedContinuation<SamplingConfig?, Never>.Ref)
-    case getAgentEditedPaths(reply: CheckedContinuation<[String], Never>.Ref)
-    case getNotificationMeta(reply: CheckedContinuation<NotificationMeta?, Never>.Ref)
-    case snapshot(reply: CheckedContinuation<ChatStateSnapshot?, Never>.Ref)
-    case truncateToPromptIndex(target: Int, reply: CheckedContinuation<Void, Never>.Ref)
-    case checkAutoCompactNeeded(thresholdPercent: UInt8, reply: CheckedContinuation<AutoCompactTrigger?, Never>.Ref)
-    case getCredentials(reply: CheckedContinuation<Credentials, Never>.Ref)
-    case getLastModelMetadata(reply: CheckedContinuation<ModelMetadata, Never>.Ref)
-    case takeTurnMessages(reply: CheckedContinuation<TurnCapture?, Never>.Ref)
-    case takeHarnessTraceTurns(reply: CheckedContinuation<[[ConversationItem]], Never>.Ref)
-    case getConversationLen(reply: CheckedContinuation<Int, Never>.Ref)
-    case hasDanglingToolCalls(reply: CheckedContinuation<Bool, Never>.Ref)
-    case getLastAssistantText(reply: CheckedContinuation<String?, Never>.Ref)
-    case getFirstUserText(reply: CheckedContinuation<String?, Never>.Ref)
-    case getConversationItemAt(index: Int, reply: CheckedContinuation<ConversationItem?, Never>.Ref)
-    case getConversationCounts(reply: CheckedContinuation<ConversationCounts, Never>.Ref)
-    case getSystemMessage(reply: CheckedContinuation<ConversationItem?, Never>.Ref)
+    case getConversation(reply: ActorReply<[ConversationItem]>)
+    case getPromptIndex(reply: ActorReply<Int>)
+    case getLastCompactionPromptIndex(reply: ActorReply<Int?>)
+    case getTotalTokens(reply: ActorReply<UInt64>)
+    case getLastTurnUsage(reply: ActorReply<TokenUsage?>)
+    case getPromptUsage(reply: ActorReply<UsageLedger?>)
+    case getSessionUsage(reply: ActorReply<UsageLedger>)
+    case getEstimatedTotalTokens(reply: ActorReply<UInt64>)
+    case getSamplingConfig(reply: ActorReply<SamplingConfig>)
+    case getAgentEditedPaths(reply: ActorReply<[String]>)
+    case getNotificationMeta(reply: ActorReply<NotificationMeta>)
+    case snapshot(reply: ActorReply<ChatStateSnapshot>)
+    case truncateToPromptIndex(target: Int, reply: ActorReply<Void>)
+    case checkAutoCompactNeeded(thresholdPercent: UInt8, reply: ActorReply<AutoCompactTrigger?>)
+    case getCredentials(reply: ActorReply<Credentials>)
+    case getLastModelMetadata(reply: ActorReply<ModelMetadata>)
+    case takeTurnMessages(reply: ActorReply<TurnCapture?>)
+    case takeHarnessTraceTurns(reply: ActorReply<[[ConversationItem]]>)
+    case getConversationLen(reply: ActorReply<Int>)
+    case hasDanglingToolCalls(reply: ActorReply<Bool>)
+    case getLastAssistantText(reply: ActorReply<String?>)
+    case getFirstUserText(reply: ActorReply<String?>)
+    case getConversationItemAt(index: Int, reply: ActorReply<ConversationItem?>)
+    case getConversationCounts(reply: ActorReply<ConversationCounts>)
+    case getSystemMessage(reply: ActorReply<ConversationItem?>)
 }
 
-// MARK: - Continuation reference helpers
+// MARK: - Exactly-once reply channels
 //
-// Swift's `CheckedContinuation` is not `Sendable` by itself in all contexts;
-// wrapping it in a `@unchecked Sendable` reference lets commands carry reply
-// channels across the actor boundary. The continuation is resumed exactly
-// once (the actor processes commands sequentially).
+// Awaited commands carry an `ActorReply` across the actor boundary. Resume is
+// exactly-once: the actor resumes with a value, or the handle resumes as dead
+// when the command stream has already finished (close / last-handle drop /
+// cancellation). See `ChatStateCancellationToken` for session cancellation.
 
-public extension CheckedContinuation where T: Sendable {
-    final class Ref: @unchecked Sendable {
-        let continuation: CheckedContinuation<T, Never>
-        init(_ continuation: CheckedContinuation<T, Never>) {
-            self.continuation = continuation
-        }
-        func resume(returning value: T) {
-            continuation.resume(returning: value)
-        }
+/// Fail-closed error used when a bill/query cannot be read because the actor
+/// is dead. Distinct from `Ok(nil)` ("no ledger yet") so dead never collapses
+/// to free/empty.
+public struct ChatStateActorDead: Error, Sendable, Equatable {
+    public init() {}
+}
+
+/// Exactly-once reply box for awaited chat-state commands. Mirrors Rust
+/// `oneshot::Sender` drop-on-dead semantics: a closed channel yields `nil`
+/// from `ChatStateHandle` query helpers without hanging.
+public final class ActorReply<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T?, Never>?
+    private var completed = false
+
+    fileprivate init(_ continuation: CheckedContinuation<T?, Never>) {
+        self.continuation = continuation
+    }
+
+    /// Resume with a successful value. Subsequent calls are no-ops.
+    public func resume(returning value: T) {
+        complete(.some(value))
+    }
+
+    /// Resume as actor-dead / cancelled. Subsequent calls are no-ops.
+    fileprivate func resumeDead() {
+        complete(nil)
+    }
+
+    private func complete(_ value: T?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !completed else { return }
+        completed = true
+        let cont = continuation
+        continuation = nil
+        cont?.resume(returning: value)
     }
 }
 
 // MARK: - ChatStateHandle
 
 /// Handle to communicate with `ChatStateActor`. Cheap to copy (`Sendable`
-/// class reference); can be shared across tasks.
+/// class reference); can be shared across tasks. Dropping the last handle
+/// (or calling `close()`) finishes the command stream so the actor shuts
+/// down and in-flight queries complete exactly once as `nil`/false.
 public final class ChatStateHandle: Sendable {
     private let commandStream: AsyncStream<ChatStateCommand>
     private let commandContinuation: AsyncStream<ChatStateCommand>.Continuation
@@ -130,12 +161,20 @@ public final class ChatStateHandle: Sendable {
         self.commandContinuation = continuation
     }
 
+    deinit {
+        commandContinuation.finish()
+    }
+
+    /// Explicitly finish the command stream. Equivalent to dropping the last
+    /// handle; idempotent with `AsyncStream.Continuation.finish()`.
+    public func close() {
+        commandContinuation.finish()
+    }
+
     /// Create a no-op handle that discards all commands. Useful for tests and
     /// situations where chat state tracking is not needed.
     public static func noop() -> ChatStateHandle {
-        // The actor task is never spawned, so commands are simply buffered
-        // and dropped when the stream ends. The continuation is never
-        // resumed, but since no one awaits, that's fine.
+        // The actor task is never spawned, so commands are simply drained.
         let (stream, continuation) = AsyncStream<ChatStateCommand>.makeStream()
         let handle = ChatStateHandle(commandStream: stream, continuation: continuation)
         // Drain the stream in a detached task so the buffer doesn't grow
@@ -290,6 +329,7 @@ public final class ChatStateHandle: Sendable {
         toolDefinitions: [ToolSpec],
         memoryReminder: String?,
         persistMemoryReminder: Bool,
+        trace: TraceContextBox? = nil,
         convId: String,
         reqId: String
     ) async -> ConversationRequest? {
@@ -298,6 +338,7 @@ public final class ChatStateHandle: Sendable {
                 toolDefinitions: toolDefinitions,
                 memoryReminder: memoryReminder,
                 persistMemoryReminder: persistMemoryReminder,
+                trace: trace,
                 convId: convId,
                 reqId: reqId,
                 reply: reply
@@ -314,7 +355,9 @@ public final class ChatStateHandle: Sendable {
     }
 
     public func getLastCompactionPromptIndex() async -> Int? {
-        await query("GetLastCompactionPromptIndex") { reply in .getLastCompactionPromptIndex(reply: reply) } ?? nil
+        await query("GetLastCompactionPromptIndex") { (reply: ActorReply<Int?>) in
+            .getLastCompactionPromptIndex(reply: reply)
+        } ?? nil
     }
 
     public func getTotalTokens() async -> UInt64 {
@@ -322,20 +365,28 @@ public final class ChatStateHandle: Sendable {
     }
 
     public func getLastTurnUsage() async -> TokenUsage? {
-        await query("GetLastTurnUsage") { reply in .getLastTurnUsage(reply: reply) }
+        // Reply payload is itself optional; flatten so actor-dead and "no
+        // usage stashed" both surface as `nil` (matches Rust `.flatten()`).
+        await query("GetLastTurnUsage") { (reply: ActorReply<TokenUsage?>) in
+            .getLastTurnUsage(reply: reply)
+        } ?? nil
     }
 
-    public func tryGetPromptUsage() async -> Result<UsageLedger?, Void> {
-        guard let result = await query("GetPromptUsage") { reply in .getPromptUsage(reply: reply) } else {
-            return .failure(())
-        }
+    public func tryGetPromptUsage() async -> Result<UsageLedger?, ChatStateActorDead> {
+        // Fail-closed: actor-dead is Err, "no ledger" is Ok(nil). Trailing
+        // closure after `await` is illegal in a `guard let` condition.
+        let result = await query("GetPromptUsage", makeCmd: { (reply: ActorReply<UsageLedger?>) in
+            .getPromptUsage(reply: reply)
+        })
+        guard let result else { return .failure(ChatStateActorDead()) }
         return .success(result)
     }
 
-    public func tryGetSessionUsage() async -> Result<UsageLedger, Void> {
-        guard let result = await query("GetSessionUsage") { reply in .getSessionUsage(reply: reply) } else {
-            return .failure(())
-        }
+    public func tryGetSessionUsage() async -> Result<UsageLedger, ChatStateActorDead> {
+        let result = await query("GetSessionUsage", makeCmd: { reply in
+            .getSessionUsage(reply: reply)
+        })
+        guard let result else { return .failure(ChatStateActorDead()) }
         return .success(result)
     }
 
@@ -364,9 +415,9 @@ public final class ChatStateHandle: Sendable {
     }
 
     public func checkAutoCompactNeeded(thresholdPercent: UInt8) async -> AutoCompactTrigger? {
-        await query("CheckAutoCompactNeeded") { reply in
+        await query("CheckAutoCompactNeeded") { (reply: ActorReply<AutoCompactTrigger?>) in
             .checkAutoCompactNeeded(thresholdPercent: thresholdPercent, reply: reply)
-        }
+        } ?? nil
     }
 
     public func getCredentials() async -> Credentials {
@@ -378,7 +429,9 @@ public final class ChatStateHandle: Sendable {
     }
 
     public func takeTurnMessages() async -> TurnCapture? {
-        await query("TakeTurnMessages") { reply in .takeTurnMessages(reply: reply) }
+        await query("TakeTurnMessages") { (reply: ActorReply<TurnCapture?>) in
+            .takeTurnMessages(reply: reply)
+        } ?? nil
     }
 
     public func takeHarnessTraceTurns() async -> [[ConversationItem]] {
@@ -394,15 +447,21 @@ public final class ChatStateHandle: Sendable {
     }
 
     public func getLastAssistantText() async -> String? {
-        await query("GetLastAssistantText") { reply in .getLastAssistantText(reply: reply) }
+        await query("GetLastAssistantText") { (reply: ActorReply<String?>) in
+            .getLastAssistantText(reply: reply)
+        } ?? nil
     }
 
     public func getFirstUserText() async -> String? {
-        await query("GetFirstUserText") { reply in .getFirstUserText(reply: reply) }
+        await query("GetFirstUserText") { (reply: ActorReply<String?>) in
+            .getFirstUserText(reply: reply)
+        } ?? nil
     }
 
     public func getConversationItemAt(index: Int) async -> ConversationItem? {
-        await query("GetConversationItemAt") { reply in .getConversationItemAt(index: index, reply: reply) }
+        await query("GetConversationItemAt") { (reply: ActorReply<ConversationItem?>) in
+            .getConversationItemAt(index: index, reply: reply)
+        } ?? nil
     }
 
     public func getConversationCounts() async -> ConversationCounts {
@@ -410,20 +469,31 @@ public final class ChatStateHandle: Sendable {
     }
 
     public func getSystemMessage() async -> ConversationItem? {
-        await query("GetSystemMessage") { reply in .getSystemMessage(reply: reply) }
+        await query("GetSystemMessage") { (reply: ActorReply<ConversationItem?>) in
+            .getSystemMessage(reply: reply)
+        } ?? nil
     }
 
     // ═══ Internal query helper ═══
 
     /// Send a query to the actor and await the reply. Returns `nil` when the
-    /// actor is dead (channel closed or reply dropped).
+    /// actor is dead (channel closed / finished, or reply never delivered).
     private func query<T: Sendable>(
         _ cmdName: String,
-        makeCmd: (CheckedContinuation<T, Never>.Ref) -> ChatStateCommand
+        makeCmd: (ActorReply<T>) -> ChatStateCommand
     ) async -> T? {
-        await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
-            let ref = CheckedContinuation<T, Never>.Ref(continuation)
-            commandContinuation.yield(makeCmd(ref))
+        await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+            let reply = ActorReply<T>(continuation)
+            let result = commandContinuation.yield(makeCmd(reply))
+            switch result {
+            case .terminated:
+                // Command was discarded; complete the waiter exactly once.
+                reply.resumeDead()
+            case .enqueued, .dropped:
+                break
+            @unknown default:
+                break
+            }
         }
     }
 }
@@ -439,7 +509,11 @@ public actor ChatStateActor {
     private var persistence: any ChatPersistence
     private let commandStream: AsyncStream<ChatStateCommand>
     private let commandContinuation: AsyncStream<ChatStateCommand>.Continuation
-    private var eventContinuation: AsyncStream<ChatStateEvent>.Continuation?
+    /// Cooperative cancellation token (session shutdown). Optional only for
+    /// the theoretical "never cancelled" path; production always supplies one.
+    private let cancellationToken: ChatStateCancellationToken
+    /// Best-effort event sink installed for the lifetime of the run loop.
+    private var eventSink: (@Sendable (ChatStateEvent) -> Void)?
     private var isRunning = false
 
     /// Spawn the actor and return a handle to communicate with it.
@@ -447,14 +521,16 @@ public actor ChatStateActor {
         initialConversation: [ConversationItem],
         samplingConfig: SamplingConfig,
         persistence: any ChatPersistence,
-        eventSink: ((ChatStateEvent) -> Void)? = nil
+        eventSink: (@Sendable (ChatStateEvent) -> Void)? = nil,
+        cancellationToken: ChatStateCancellationToken = ChatStateCancellationToken()
     ) -> ChatStateHandle {
         Self.spawnWithPruning(
             initialConversation: initialConversation,
             samplingConfig: samplingConfig,
             pruningConfig: PruningConfig(),
             persistence: persistence,
-            eventSink: eventSink
+            eventSink: eventSink,
+            cancellationToken: cancellationToken
         )
     }
 
@@ -464,7 +540,8 @@ public actor ChatStateActor {
         samplingConfig: SamplingConfig,
         pruningConfig: PruningConfig,
         persistence: any ChatPersistence,
-        eventSink: ((ChatStateEvent) -> Void)? = nil
+        eventSink: (@Sendable (ChatStateEvent) -> Void)? = nil,
+        cancellationToken: ChatStateCancellationToken = ChatStateCancellationToken()
     ) -> ChatStateHandle {
         let (stream, continuation) = AsyncStream<ChatStateCommand>.makeStream()
         let actor = ChatStateActor(
@@ -473,8 +550,14 @@ public actor ChatStateActor {
             pruningConfig: pruningConfig,
             persistence: persistence,
             commandStream: stream,
-            commandContinuation: continuation
+            commandContinuation: continuation,
+            cancellationToken: cancellationToken
         )
+        // When cancellation wins, finish the command stream so the run loop
+        // can drain remaining buffered commands as actor-dead (exactly once).
+        cancellationToken.onCancel {
+            continuation.finish()
+        }
         // Start the actor's run loop in a detached task.
         Task {
             await actor.run(eventSink: eventSink)
@@ -488,38 +571,119 @@ public actor ChatStateActor {
         pruningConfig: PruningConfig,
         persistence: any ChatPersistence,
         commandStream: AsyncStream<ChatStateCommand>,
-        commandContinuation: AsyncStream<ChatStateCommand>.Continuation
+        commandContinuation: AsyncStream<ChatStateCommand>.Continuation,
+        cancellationToken: ChatStateCancellationToken
     ) {
         self.pruningConfig = pruningConfig
         self.persistence = persistence
         self.commandStream = commandStream
         self.commandContinuation = commandContinuation
+        self.cancellationToken = cancellationToken
         self.state = ChatStateInternalState(
             conversation: initialConversation,
             samplingConfig: samplingConfig
         )
     }
 
-    /// Main actor loop — processes commands until the stream closes.
-    private func run(eventSink: ((ChatStateEvent) -> Void)?) async {
+    /// Main actor loop — processes commands until the stream closes or
+    /// cancellation wins. On cancellation, every remaining buffered command
+    /// with an awaited reply is completed exactly once as actor-dead.
+    private func run(eventSink: (@Sendable (ChatStateEvent) -> Void)?) async {
         isRunning = true
+        self.eventSink = eventSink
         // Repair any dangling tool calls in the initial conversation.
         state.initialize()
         for await cmd in commandStream {
-            await handleCommand(cmd, eventSink: eventSink)
+            if cancellationToken.isCancelled {
+                completeCommandAsDead(cmd)
+                continue
+            }
+            await handleCommand(cmd)
         }
         isRunning = false
+        self.eventSink = nil
+    }
+
+    /// Complete any awaited reply carried by `cmd` as actor-dead. Fire-and-
+    /// forget mutations are discarded. Exactly-once via `ActorReply`.
+    private func completeCommandAsDead(_ cmd: ChatStateCommand) {
+        switch cmd {
+        case .pushUserMessageAndAck(_, let reply):
+            reply.resumeDead()
+        case .recordSubagentUsage(_, _, _, let reply):
+            reply.resumeDead()
+        case .markUsageIncomplete(_, _, let reply):
+            reply.resumeDead()
+        case .replaceSystemHead(_, let reply):
+            reply.resumeDead()
+        case .commitRewindSnapshot(_, let reply):
+            reply.resumeDead()
+        case .buildConversationRequest(_, _, _, _, _, _, let reply):
+            reply.resumeDead()
+        case .getConversation(let reply):
+            reply.resumeDead()
+        case .getPromptIndex(let reply):
+            reply.resumeDead()
+        case .getLastCompactionPromptIndex(let reply):
+            reply.resumeDead()
+        case .getTotalTokens(let reply):
+            reply.resumeDead()
+        case .getLastTurnUsage(let reply):
+            reply.resumeDead()
+        case .getPromptUsage(let reply):
+            reply.resumeDead()
+        case .getSessionUsage(let reply):
+            reply.resumeDead()
+        case .getEstimatedTotalTokens(let reply):
+            reply.resumeDead()
+        case .getSamplingConfig(let reply):
+            reply.resumeDead()
+        case .getAgentEditedPaths(let reply):
+            reply.resumeDead()
+        case .getNotificationMeta(let reply):
+            reply.resumeDead()
+        case .snapshot(let reply):
+            reply.resumeDead()
+        case .truncateToPromptIndex(_, let reply):
+            reply.resumeDead()
+        case .checkAutoCompactNeeded(_, let reply):
+            reply.resumeDead()
+        case .getCredentials(let reply):
+            reply.resumeDead()
+        case .getLastModelMetadata(let reply):
+            reply.resumeDead()
+        case .takeTurnMessages(let reply):
+            reply.resumeDead()
+        case .takeHarnessTraceTurns(let reply):
+            reply.resumeDead()
+        case .getConversationLen(let reply):
+            reply.resumeDead()
+        case .hasDanglingToolCalls(let reply):
+            reply.resumeDead()
+        case .getLastAssistantText(let reply):
+            reply.resumeDead()
+        case .getFirstUserText(let reply):
+            reply.resumeDead()
+        case .getConversationItemAt(_, let reply):
+            reply.resumeDead()
+        case .getConversationCounts(let reply):
+            reply.resumeDead()
+        case .getSystemMessage(let reply):
+            reply.resumeDead()
+        default:
+            break
+        }
     }
 
     /// Send an event to subscribers (best-effort; the sink is the only
     /// consumer in the Swift port).
-    private func sendEvent(_ event: ChatStateEvent, sink: ((ChatStateEvent) -> Void)?) {
-        sink?(event)
+    private func sendEvent(_ event: ChatStateEvent) {
+        eventSink?(event)
     }
 
     // MARK: - Command dispatch
 
-    private func handleCommand(_ cmd: ChatStateCommand, eventSink: ((ChatStateEvent) -> Void)?) async {
+    private func handleCommand(_ cmd: ChatStateCommand) async {
         switch cmd {
         // ═══ Mutations ═══
         case .pushUserMessage(let item):
@@ -546,8 +710,9 @@ public actor ChatStateActor {
             markUsageIncomplete(prompt: prompt, session: session)
             reply.resume(returning: ())
         case .incrementPromptIndex:
+            state.promptUsage = nil
             state.promptIndex += 1
-            sendEvent(.promptIndexChanged(newIndex: state.promptIndex), sink: eventSink)
+            sendEvent(.promptIndexChanged(newIndex: state.promptIndex))
         case .updateSamplingConfig(let config):
             state.samplingConfig = config
         case .recordAgentEditedPath(let path):
@@ -572,8 +737,7 @@ public actor ChatStateActor {
         case .restoreSnapshot(let snapshot):
             restoreSnapshot(snapshot)
         case .commitRewindSnapshot(let snapshot, let reply):
-            restoreSnapshot(snapshot)
-            persistence.replaceHistory(state.conversation)
+            commitRewindSnapshot(snapshot)
             reply.resume(returning: ())
         case .beginTurnCapture:
             state.turnCapture = TurnCaptureState(
@@ -590,12 +754,13 @@ public actor ChatStateActor {
 
         // ═══ Queries ═══
         case .buildConversationRequest(let toolDefinitions, let memoryReminder, let persistMemoryReminder,
-                                       let convId, let reqId, let reply):
+                                       let trace, let convId, let reqId, let reply):
             ensureConversationIntegrity()
             let request = buildConversationRequest(
                 toolDefinitions: toolDefinitions,
                 memoryReminder: memoryReminder,
                 persistMemoryReminder: persistMemoryReminder,
+                trace: trace,
                 convId: convId,
                 reqId: reqId
             )
@@ -691,10 +856,85 @@ public actor ChatStateActor {
         state.estimatedTokensSinceModel += estimated
         persistence.persistMessage(item)
         state.conversation.append(item)
-        // Eager hard-clear pruning omitted in the Swift port for brevity; the
-        // API-copy pruning in buildConversationRequest covers the
-        // context-management path. (W6-S2 OpenGrokCompaction owns the full
-        // pruning pipeline.)
+        // Eager hard-clear of very old tool results bounds retained memory
+        // without waiting for the 50% context-utilization API-copy path.
+        _ = pruneRetainedConversation()
+    }
+
+    /// Eagerly hard-clear tool results from very old turns in the retained
+    /// in-memory conversation. Soft-trim is intentionally not applied here —
+    /// that is a request-copy context-management operation only.
+    ///
+    /// Synthetic `User` items (system reminders, etc.) do not advance
+    /// `promptIndex`, so the effective threshold is raised by
+    /// `totalUserItems - promptIndex` to preserve real-turn age.
+    @discardableResult
+    private func pruneRetainedConversation() -> Int {
+        guard pruningConfig.enabled else { return 0 }
+        // Fast exit: not enough real turns have elapsed for any hard-clear.
+        if state.promptIndex < pruningConfig.hardClearAgeTurns {
+            return 0
+        }
+
+        let totalUserItems = state.conversation.reduce(0) { count, item in
+            if case .user = item { return count + 1 }
+            return count
+        }
+        let syntheticCount = max(0, totalUserItems - state.promptIndex)
+        let effectiveThreshold = pruningConfig.hardClearAgeTurns + syntheticCount
+
+        var cleared = 0
+        var turnFromEnd = 0
+        var seenFirstUser = false
+
+        for i in state.conversation.indices.reversed() {
+            if case .user = state.conversation[i] {
+                if seenFirstUser {
+                    turnFromEnd += 1
+                }
+                seenFirstUser = true
+                continue
+            }
+
+            if turnFromEnd < effectiveThreshold {
+                continue
+            }
+
+            switch state.conversation[i] {
+            case .toolResult(var result):
+                if result.content != HARD_CLEAR_PLACEHOLDER
+                    || !result.images.isEmpty
+                    || !result.orderedContent.isEmpty
+                {
+                    result.content = HARD_CLEAR_PLACEHOLDER
+                    result.images = []
+                    result.orderedContent = []
+                    state.conversation[i] = .toolResult(result)
+                    cleared += 1
+                }
+            case .customToolOutput(var output):
+                let alreadyCleared =
+                    output.content.count == 1
+                    && {
+                        if case .text(let t) = output.content[0] {
+                            return t == HARD_CLEAR_PLACEHOLDER
+                        }
+                        return false
+                    }()
+                if !alreadyCleared {
+                    output.content = [.text(text: HARD_CLEAR_PLACEHOLDER)]
+                    state.conversation[i] = .customToolOutput(output)
+                    cleared += 1
+                }
+            default:
+                break
+            }
+        }
+
+        if cleared > 0 {
+            persistence.replaceHistory(state.conversation)
+        }
+        return cleared
     }
 
     private func pushMessage(_ item: ConversationItem) {
@@ -715,20 +955,23 @@ public actor ChatStateActor {
         state.totalTokens = totalTokens
         state.estimateAtLastResponse = estimateConversationTokens(state.conversation)
         state.estimatedTokensSinceModel = 0
-        sendEvent(.tokensUpdated(totalTokens: totalTokens), sink: nil)
+        sendEvent(.tokensUpdated(totalTokens: totalTokens))
     }
 
     private func recordModelCallUsage(
         modelId: String?, usage: TokenUsage, apiDurationMs: UInt64?, costUsdTicks: Int64?
     ) {
-        let model = modelId ?? "unknown"
-        state.sessionUsage.recordMainLoopCall(
-            modelId: model, usage: usage, apiDurationMs: apiDurationMs, costUsdTicks: costUsdTicks
-        )
+        let model: String = {
+            if let modelId, !modelId.isEmpty { return modelId }
+            return state.samplingConfig.model
+        }()
         if state.promptUsage == nil {
             state.promptUsage = UsageLedger()
         }
         state.promptUsage?.recordMainLoopCall(
+            modelId: model, usage: usage, apiDurationMs: apiDurationMs, costUsdTicks: costUsdTicks
+        )
+        state.sessionUsage.recordMainLoopCall(
             modelId: model, usage: usage, apiDurationMs: apiDurationMs, costUsdTicks: costUsdTicks
         )
     }
@@ -736,58 +979,111 @@ public actor ChatStateActor {
     private func recordSubagentUsage(
         byModel: [(model: String, totals: UsageTotals)], attributeToPrompt: Bool, incomplete: Bool
     ) {
-        state.sessionUsage.recordSubagent(byModel: byModel, incomplete: incomplete)
+        if byModel.isEmpty && !incomplete { return }
         if attributeToPrompt {
             if state.promptUsage == nil {
                 state.promptUsage = UsageLedger()
             }
             state.promptUsage?.recordSubagent(byModel: byModel, incomplete: incomplete)
         }
+        // Session ledger always folds, even when not attributable to the open prompt.
+        state.sessionUsage.recordSubagent(byModel: byModel, incomplete: incomplete)
     }
 
     private func markUsageIncomplete(prompt: Bool, session: Bool) {
-        if prompt { state.promptUsage?.markIncomplete() }
-        if session { state.sessionUsage.markIncomplete() }
+        if prompt {
+            if state.promptUsage == nil {
+                state.promptUsage = UsageLedger()
+            }
+            state.promptUsage?.markIncomplete()
+        }
+        if session {
+            state.sessionUsage.markIncomplete()
+        }
     }
 
+    /// Replace the conversation, re-estimate tokens, and emit reset + token
+    /// events. Compaction carries provider overhead as a ratio of the last
+    /// response estimate (capped at the pre-compaction total).
     private func replaceConversation(_ items: [ConversationItem], isCompaction: Bool) {
         snapshotTurnSlice()
-        state.conversation = items
-        rebaseTurnCaptureOffset()
-        state.totalTokens = estimateConversationTokens(state.conversation)
-        state.estimatedTokensSinceModel = 0
-        state.estimateAtLastResponse = state.totalTokens
-        persistence.replaceHistory(state.conversation)
         if isCompaction, var cap = state.turnCapture {
             cap.compactionOccurred = true
             state.turnCapture = cap
         }
-        sendEvent(.conversationReset(newLen: state.conversation.count), sink: nil)
+        let preReplaceTotal = state.totalTokens
+        persistence.replaceHistory(items)
+        let baseEstimate = estimateConversationTokens(items)
+        var estimatedTokens: UInt64
+        if isCompaction && preReplaceTotal > 0 && state.estimateAtLastResponse > 0 {
+            let ratio = Double(preReplaceTotal) / Double(state.estimateAtLastResponse)
+            estimatedTokens = UInt64((Double(baseEstimate) * ratio).rounded())
+        } else {
+            estimatedTokens = baseEstimate
+        }
+        // Compaction must never appear to increase usage.
+        if isCompaction && preReplaceTotal > 0 {
+            estimatedTokens = min(estimatedTokens, preReplaceTotal)
+        }
+        state.conversation = items
+        state.estimatedTokensSinceModel = 0
+        state.totalTokens = estimatedTokens
+        state.estimateAtLastResponse = estimateConversationTokens(state.conversation)
+        rebaseTurnCaptureOffset()
+        sendEvent(.conversationReset(newLen: state.conversation.count))
+        sendEvent(.tokensUpdated(totalTokens: estimatedTokens))
     }
 
     private func replaceSystemHead(_ prompt: String) -> Bool {
-        let changed = OpenGrokChatState.replaceOrInsertSystemHead(&state.conversation, prompt: prompt)
+        if let first = state.conversation.first, case .system(let sys) = first,
+           canonicalSystemPromptEq(sys.content, prompt) {
+            return false
+        }
+        var conversation = state.conversation
+        let changed = OpenGrokChatState.replaceOrInsertSystemHead(&conversation, prompt: prompt)
         if changed {
-            state.totalTokens = estimateConversationTokens(state.conversation)
-            state.estimateAtLastResponse = state.totalTokens
-            persistence.replaceHistory(state.conversation)
+            // Route through replaceConversation so turn-capture snapshotting
+            // and event emission stay consistent with other replaces.
+            replaceConversation(conversation, isCompaction: false)
         }
         return changed
     }
 
     private func restoreSnapshot(_ snapshot: ChatStateSnapshot) {
+        snapshotTurnSlice()
         state.conversation = snapshot.conversation
+        rebaseTurnCaptureOffset()
         state.samplingConfig = snapshot.samplingConfig
         state.promptIndex = snapshot.promptIndex
         state.totalTokens = snapshot.totalTokens
-        state.estimateAtLastResponse = snapshot.estimateAtLastResponse
+        state.estimatedTokensSinceModel = 0
+        state.estimateAtLastResponse = snapshot.estimateAtLastResponse > 0
+            ? snapshot.estimateAtLastResponse
+            : estimateConversationTokens(state.conversation)
         state.agentEditedPaths = Set(snapshot.agentEditedPaths)
         state.promptTexts = snapshot.promptTexts
         state.streamStartMs = snapshot.streamStartMs
         state.turnStartMs = snapshot.turnStartMs
         state.lastCompactionPromptIndex = snapshot.lastCompactionPromptIndex
         state.credentials = snapshot.credentials
-        state.estimatedTokensSinceModel = 0
+        // Drop abandoned prompt billing; session ledger is lifetime.
+        state.promptUsage = nil
+    }
+
+    /// Install a rewind snapshot as a new canonical timeline: recompute tokens
+    /// from the retained conversation, persist, clear turn capture, and emit
+    /// reset + token events.
+    private func commitRewindSnapshot(_ snapshot: ChatStateSnapshot) {
+        var snap = snapshot
+        let totalTokens = estimateConversationTokens(snap.conversation)
+        snap.totalTokens = totalTokens
+        snap.estimateAtLastResponse = totalTokens
+        let newLen = snap.conversation.count
+        persistence.replaceHistory(snap.conversation)
+        restoreSnapshot(snap)
+        state.turnCapture = nil
+        sendEvent(.conversationReset(newLen: newLen))
+        sendEvent(.tokensUpdated(totalTokens: totalTokens))
     }
 
     // MARK: - Turn capture helpers
@@ -846,7 +1142,8 @@ public actor ChatStateActor {
         state.estimatedTokensSinceModel = 0
         state.estimateAtLastResponse = state.totalTokens
         persistence.replaceHistory(state.conversation)
-        sendEvent(.conversationReset(newLen: state.conversation.count), sink: nil)
+        sendEvent(.conversationReset(newLen: state.conversation.count))
+        sendEvent(.tokensUpdated(totalTokens: state.totalTokens))
     }
 
     private func checkAutoCompactNeeded(thresholdPercent: UInt8) -> AutoCompactTrigger? {
@@ -904,30 +1201,105 @@ public actor ChatStateActor {
         return counts
     }
 
+    /// Build a `ConversationRequest` from the current actor state.
+    ///
+    /// Pipeline (mirrors Rust `request_builder.rs`):
+    /// 1. Optionally persist a memory reminder into actor state
+    /// 2. Evict oldest inline images when body nears 50 MB
+    /// 3. Prune old tool results if over 50% context utilization
+    /// 4. Inject memory reminder into the request clone (if still needed)
+    /// 5. Assemble and return the request (with optional trace context)
+    ///
+    /// The retained conversation is not mutated by steps 2–4 (request-copy
+    /// only). Integrity repair runs on the actor conversation before this
+    /// function is called.
     private func buildConversationRequest(
         toolDefinitions: [ToolSpec],
         memoryReminder: String?,
         persistMemoryReminder: Bool,
+        trace: TraceContextBox?,
         convId: String,
         reqId: String
-    ) -> ConversationRequest? {
-        // The full request-building pipeline (pruning, memory injection,
-        // hosted-tool normalization, provider projection) lives in the
-        // sampler (W3-S3) and shell (W8-S5). The chat-state actor returns a
-        // provider-neutral `ConversationRequest` carrying the current
-        // conversation, tools, and tracking headers.
-        var items = state.conversation
-        if let reminder = memoryReminder, !reminder.isEmpty {
-            items.append(.systemReminder(reminder))
-            if persistMemoryReminder {
-                persistence.persistMessage(.systemReminder(reminder))
+    ) -> ConversationRequest {
+        let needsPrune = shouldPrune(
+            totalTokens: state.totalTokens,
+            contextWindow: state.samplingConfig.contextWindow
+        )
+        var memoryReminder = memoryReminder
+        if let reminder = memoryReminder, persistMemoryReminder {
+            // A live in-place inject can prepend a System item, shifting
+            // indices under an active capture; snapshot + rebase like other
+            // mutators.
+            snapshotTurnSlice()
+            let injected = injectMemoryReminder(&state.conversation, reminder: reminder)
+            if injected {
+                persistence.replaceHistory(state.conversation)
+                // Already on actor state — do not inject again into the clone.
+                memoryReminder = nil
             }
+            rebaseTurnCaptureOffset()
         }
+
+        let bodyBytes = conversationBodyBytes(state.conversation)
+        let inlineImages = inlineImageCount(state.conversation)
+        let needsImageCompaction = bodyBytes >= IMAGE_COMPACT_TRIGGER_BYTES
+        let needsMutation = needsPrune || memoryReminder != nil || needsImageCompaction
+
+        var eviction: ImageEvictionOutcome?
+        let items: [ConversationItem]
+        if needsMutation {
+            var working = state.conversation
+
+            // Step 1: When the body nears the 50 MB ceiling, evict oldest
+            // images down to the low-water mark (hysteresis).
+            if needsImageCompaction {
+                eviction = compactImagesToByteBudget(
+                    &working,
+                    currentBytes: bodyBytes,
+                    targetBytes: IMAGE_COMPACT_RECLAIM_TARGET_BYTES
+                )
+            }
+
+            // Step 2: Prune old tool results if context is > 50% utilized.
+            if needsPrune {
+                pruneConversation(&working, config: pruningConfig)
+            }
+
+            // Step 3: Inject memory reminder into the request clone only.
+            if let reminder = memoryReminder {
+                _ = injectMemoryReminder(&working, reminder: reminder)
+            }
+
+            items = working
+        } else {
+            // Hot path: no pruning, no memory reminder, no image compaction.
+            items = state.conversation
+        }
+
+        // Per-turn image-budget record for local verification. Only on
+        // image-bearing turns to avoid noise.
+        if inlineImages > 0 {
+            sendEvent(.imageBudget(
+                bodyBytes: bodyBytes,
+                triggerBytes: IMAGE_COMPACT_TRIGGER_BYTES,
+                reclaimTargetBytes: IMAGE_COMPACT_RECLAIM_TARGET_BYTES,
+                inlineImages: inlineImages,
+                needsImageCompaction: needsImageCompaction,
+                evicted: eviction?.evicted ?? 0,
+                bodyBytesAfter: eviction?.bodyBytesAfter ?? bodyBytes
+            ))
+        }
+
         return ConversationRequest(
             items: items,
             tools: toolDefinitions,
+            model: state.samplingConfig.model,
+            temperature: state.samplingConfig.temperature,
+            maxOutputTokens: state.samplingConfig.maxCompletionTokens,
+            topP: state.samplingConfig.topP,
             xGrokConvId: convId,
             xGrokReqId: reqId,
+            trace: trace,
             reasoningEffort: state.samplingConfig.reasoningEffort
         )
     }

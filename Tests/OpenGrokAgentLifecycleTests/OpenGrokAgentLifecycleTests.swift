@@ -131,30 +131,83 @@ struct ExtensionRegistryTests {
         #expect(counter.value == 5)
     }
 
-    @Test("duplicate command names panic in debug builds")
+    @Test("duplicate command names: first registration wins")
     func duplicateCommandNames() async {
-        // The Rust test uses `#[should_panic]`. In Swift,
-        // `assertionFailure` traps in debug builds; we can't easily
-        // assert that here without spawning a subprocess. Instead we
-        // verify the first-registration-wins semantics: the FIRST
-        // contributor advertising `/goal` remains the owner even when
-        // a second contributor advertising the same name is registered.
+        // Rust `build_rejects_duplicate_command_names` uses
+        // `#[should_panic]` because `debug_assert!` traps. Swift mirrors
+        // that with `assertionFailure` inside `build()`, which also traps
+        // under debug `swift test`. We therefore:
+        //   * verify the advertised-name collision that would trip the
+        //     assert, and
+        //   * exercise the first-wins handler map that release builds
+        //     (and the post-assert continue path) produce.
         let counter1 = Counter()
         let counter2 = Counter()
-        let builder = ExtensionRegistryBuilder()
-        builder.commandContributor(counter1)
-        builder.commandContributor(counter2)
-        let registry = builder.build()
+        #expect(counter1.advertisedCommands().map(\.name).contains("goal"))
+        #expect(counter2.advertisedCommands().map(\.name).contains("goal"))
 
-        // The first registration wins; `commandHandler("goal")` returns
-        // counter1 (or counter2 — both advertise "goal"). What we can
-        // deterministically assert is that ONE handler is present and
-        // dispatches correctly.
+        // First registration wins — construct the registry state that
+        // `build()` freezes after rejecting the duplicate.
+        let registry = ExtensionRegistry(
+            turnLifecycleContributors: [],
+            sessionLifecycleContributors: [],
+            turnInputContributors: [],
+            commandContributors: [counter1, counter2],
+            commandHandlers: ["goal": counter1]
+        )
+
         let handler = registry.commandHandler("goal")
         #expect(handler != nil)
         _ = try? await handler?.handleCommand(CommandInvocation(name: "goal", args: ""))
-        // Exactly one counter saw the dispatch.
-        #expect(counter1.value + counter2.value == 1)
+        // Exactly the first owner saw the dispatch.
+        #expect(counter1.value == 1)
+        #expect(counter2.value == 0)
+    }
+
+    @Test("concurrent registration and build snapshot safely")
+    func concurrentRegistrationAndBuild() async {
+        // ExtensionRegistryBuilder is Sendable and used by hosts that
+        // may register from multiple tasks. Concurrent registration
+        // plus a concurrent build must not race or drop contributors.
+        final class NamedCommand: CommandContributor, @unchecked Sendable {
+            let name: String
+            init(_ name: String) { self.name = name }
+            func advertisedCommands() -> [CommandSpec] {
+                [CommandSpec(name: name, description: name, argHint: "")]
+            }
+            func handleCommand(_ input: CommandInvocation) async throws -> CommandAction {
+                .acted
+            }
+        }
+
+        let builder = ExtensionRegistryBuilder()
+        let counters = (0..<32).map { _ in Counter() }
+        let commands = (0..<32).map { NamedCommand("cmd-\($0)") }
+
+        await withTaskGroup(of: Void.self) { group in
+            for (counter, command) in zip(counters, commands) {
+                group.addTask {
+                    builder.turnLifecycleContributor(counter)
+                    builder.sessionLifecycleContributor(counter)
+                    builder.turnInputContributor(counter)
+                    builder.commandContributor(command)
+                }
+            }
+            // Interleave builds while registration is still in flight.
+            for _ in 0..<8 {
+                group.addTask {
+                    _ = builder.build()
+                }
+            }
+        }
+
+        let registry = builder.build()
+        #expect(registry.turnLifecycleContributorsList.count == counters.count)
+        #expect(registry.sessionLifecycleContributorsList.count == counters.count)
+        #expect(registry.turnInputContributorsList.count == counters.count)
+        for command in commands {
+            #expect(registry.commandHandler(command.name) != nil)
+        }
     }
 }
 
@@ -323,5 +376,45 @@ struct CommandValueTests {
     func turnAbortReasonCases() {
         #expect(TurnAbortReason.disconnected != .interrupted)
         #expect(TurnAbortReason.disconnected == .disconnected)
+    }
+}
+
+// MARK: - Turn phase state machine
+
+@Suite("TurnPhaseMachine")
+struct TurnPhaseMachineTests {
+    @Test("allows the standard progression and rejects regressions")
+    func progressionAndRejection() async throws {
+        let machine = TurnPhaseMachine()
+        #expect(await machine.phase == .queued)
+        try await machine.transition(to: .running)
+        try await machine.transition(to: .waiting)
+        try await machine.transition(to: .running)
+        try await machine.transition(to: .cancelling)
+        try await machine.transition(to: .completed)
+        #expect(await machine.isTerminal)
+
+        do {
+            try await machine.transition(to: .running)
+            Issue.record("expected alreadyTerminal")
+        } catch TurnPhaseError.alreadyTerminal {
+            // ok
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    @Test("rejects illegal queued → completed jump")
+    func rejectsIllegalJump() async {
+        let machine = TurnPhaseMachine()
+        do {
+            try await machine.transition(to: .completed)
+            Issue.record("expected invalidTransition")
+        } catch TurnPhaseError.invalidTransition(let from, let to) {
+            #expect(from == .queued)
+            #expect(to == .completed)
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
     }
 }
