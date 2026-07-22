@@ -1,0 +1,23 @@
+{
+  "$schema": "open-grok/protocol-fixtures/provenance",
+  "generatedAt": "2026-07-22",
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "note": "Fixtures are provenance-labelled compatibility artifacts for implemented foundation formats. Binary goldens are re-encoded or structurally decoded in tests (OTLP, GCRX, git zlib metadata, hunk/PTY/tracing/storage keys) rather than digest-only validation.",
+  "files": [
+    "PROVENANCE.json",
+    "acp-methods.json",
+    "cli-version-and-home.json",
+    "config-workspace-codemode-keys.json",
+    "crash-gcrx-format.json",
+    "crash-gcrx-sample.bin",
+    "git-loose-blob-hello.zlib",
+    "git-object-and-index.json",
+    "hunk-tracker-snapshot.json",
+    "otlp-export-trace-grpc.bin",
+    "otlp-export-trace-http.pb",
+    "otlp-span-export-shape.json",
+    "pty-process-signals.json",
+    "sqlite-journal-modes.json",
+    "tracing-w3c-traceparent.json"
+  ]
+}

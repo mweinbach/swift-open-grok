@@ -3,7 +3,10 @@
   "blobSha1Example": {
     "content": "hello\n",
     "header": "blob 6\\0",
-    "sha1Hex": "ce013625030ba8dba906f756967f9e9ca394464a"
+    "sha1Hex": "ce013625030ba8dba906f756967f9e9ca394464a",
+    "looseObjectZlibFixture": "ProtocolFixtures/git-loose-blob-hello.zlib",
+    "looseObjectRawSize": 13,
+    "looseObjectZlibSize": 21
   },
   "indexSignature": "DIRC",
   "indexVersions": [
@@ -17,5 +20,9 @@
     "notes": "Explicit non-parity when object is pack-only; no silent empty HEAD tree",
     "supported": false
   },
-  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "provenance": {
+    "source": "generated-from-git-sha1-and-zlib-semantics",
+    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+  }
 }

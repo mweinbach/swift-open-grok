@@ -1,10 +1,11 @@
 # Open Grok Rust-to-Swift Port Plan
 
-**Planning baseline:** 2026-07-20  
-**Destination:** `/Users/mweinbach/Projects/swift-open-grok`  
-**Read-only reference:** `/tmp/open-grok-reference`  
-**SwiftPM baseline:** `swift-tools-version: 6.1`  
+**Planning baseline:** 2026-07-20 (inventory refreshed 2026-07-22 / R10)
+**Destination:** `/Users/mweinbach/Projects/swift-open-grok`
+**Read-only reference:** `/tmp/open-grok-reference`
+**SwiftPM baseline:** `swift-tools-version: 6.1`
 **Reference inventory:** 81 root Cargo workspace members + 1 standalone markdown fuzz crate = **82 crates**.
+**Swift source/test inventory (see `PORT_STATUS.md` counting method):** **98** `Sources/` targets · **42** bootstrap placeholders · **100** `Tests/` targets · **46** zero-test. Workers must not invoke SwiftPM; only `zsh workflows/swift-safe-verify.zsh` via the sole integration agent.
 
 ## Mission
 

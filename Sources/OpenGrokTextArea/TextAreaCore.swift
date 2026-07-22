@@ -113,7 +113,8 @@ private struct UndoState {
 public final class TextArea {
     private var buffer: EditBuffer
     private var wrapCache: (width: Int, lines: [Range<Int>])?
-    private var preferredCol: Int?
+    /// Preferred visual column for vertical motion (cleared on horizontal edits).
+    var preferredColStorage: Int?
     private var elements: [TextElement] = []
     private var nextElementId: UInt64 = 0
     private var killBuffer: String = ""
@@ -122,11 +123,26 @@ public final class TextArea {
     private var clipboardProvider: ClipboardProvider
     private var clipboardNotification: String?
     public var keepSelectionAfterMouseUp: Bool = true
-    private var scrollOverride: Int?
+    /// Internal scroll override (mouse wheel / scrollbar). Cleared on cursor motion.
+    var scrollOverrideStorage: Int?
     public var showScrollbar: Bool = true
+    /// Extra columns reserved between text and scrollbar when visible.
+    public var scrollbarPadding: Int = 0
     public var tabWidth: UInt8 = 4 {
         didSet { if oldValue != tabWidth { wrapCache = nil } }
     }
+
+    // Mouse / interaction state
+    var mouseDownPos: (Int, Int)?
+    var dragAnchor: Int?
+    var dragActive: Bool = false
+    var lastDragScrollMs: Int?
+    var dragScrollSteps: UInt32 = 0
+    var pendingDragScroll: MouseEvent?
+    var clickTracker = ClickTracker()
+    var scrollbarDragging: Bool = false
+    var hoveredElement: ElementId?
+    var pendingElementEvent: TextElementEvent?
 
     public init() {
         buffer = EditBuffer()
@@ -148,15 +164,15 @@ public final class TextArea {
         elements.removeAll()
         _ = buffer.setCursorByte(min(savedCursor, buffer.count))
         wrapCache = nil
-        preferredCol = nil
+        preferredColStorage = nil
         selection = nil
-        scrollOverride = nil
+        scrollOverrideStorage = nil
         postMutate()
     }
 
     public func insertStr(_ text: String) {
         if text.isEmpty { return }
-        scrollOverride = nil
+        scrollOverrideStorage = nil
         if let first = text.first {
             let firstWS = first.isWhitespace
             if undo.lastKind == .insert && undo.lastInsertWS != firstWS {
@@ -187,8 +203,21 @@ public final class TextArea {
         // Snap out of elements
         let snapped = clampPosToNearestBoundary(normalized)
         _ = buffer.setCursorByte(snapped)
-        preferredCol = nil
-        scrollOverride = nil
+        preferredColStorage = nil
+        scrollOverrideStorage = nil
+    }
+
+    /// Set cursor without clearing scroll override (mouse drag / internal).
+    func setCursorInner(_ pos: Int) {
+        _ = buffer.setCursorByte(min(max(0, pos), buffer.count))
+    }
+
+    func clampPosToNearestBoundaryPublic(_ pos: Int) -> Int {
+        clampPosToNearestBoundary(pos)
+    }
+
+    func setClipboardTextPublic(_ text: String) {
+        setClipboardText(text)
     }
 
     // MARK: Selection
@@ -232,7 +261,7 @@ public final class TextArea {
         clipboardProvider = provider
     }
 
-    private func setClipboardText(_ text: String) {
+    func setClipboardText(_ text: String) {
         clipboardProvider.set(text)
         clipboardNotification = text
     }
@@ -388,22 +417,22 @@ public final class TextArea {
     public func moveCursorRight() { applyEditCommand(.moveGraphemeRight, nil) }
 
     public func moveCursorUp() {
-        scrollOverride = nil
+        scrollOverrideStorage = nil
         ensureWrapCache(width: wrapCache?.width ?? 80)
         if let cache = wrapCache, let idx = wrappedLineIndex(cache.lines, cursor) {
             let cur = cache.lines[idx]
-            let targetCol = preferredCol ?? plainDisplayWidth(
+            let targetCol = preferredColStorage ?? plainDisplayWidth(
                 buffer.text.substring(utf8Range: cur.lowerBound..<cursor),
                 tabWidth: tabWidth
             )
             if idx > 0 {
-                preferredCol = preferredCol ?? targetCol
+                preferredColStorage = preferredColStorage ?? targetCol
                 let prev = cache.lines[idx - 1]
                 moveToDisplayCol(on: prev, targetCol: targetCol)
                 return
             } else {
                 _ = buffer.setCursorByte(0)
-                preferredCol = nil
+                preferredColStorage = nil
                 return
             }
         }
@@ -420,32 +449,32 @@ public final class TextArea {
                     j -= 1
                     if bytes[j] == 0x0A { prevStart = j + 1; break }
                 }
-                let targetCol = preferredCol ?? currentDisplayCol()
-                preferredCol = preferredCol ?? targetCol
+                let targetCol = preferredColStorage ?? currentDisplayCol()
+                preferredColStorage = preferredColStorage ?? targetCol
                 moveToDisplayCol(on: prevStart..<prevEnd, targetCol: targetCol)
                 return
             }
         }
         _ = buffer.setCursorByte(0)
-        preferredCol = nil
+        preferredColStorage = nil
     }
 
     public func moveCursorDown() {
-        scrollOverride = nil
+        scrollOverrideStorage = nil
         ensureWrapCache(width: wrapCache?.width ?? 80)
         if let cache = wrapCache, let idx = wrappedLineIndex(cache.lines, cursor) {
             let cur = cache.lines[idx]
-            let targetCol = preferredCol ?? plainDisplayWidth(
+            let targetCol = preferredColStorage ?? plainDisplayWidth(
                 buffer.text.substring(utf8Range: cur.lowerBound..<cursor),
                 tabWidth: tabWidth
             )
             if idx + 1 < cache.lines.count {
-                preferredCol = preferredCol ?? targetCol
+                preferredColStorage = preferredColStorage ?? targetCol
                 moveToDisplayCol(on: cache.lines[idx + 1], targetCol: targetCol)
                 return
             } else {
                 _ = buffer.setCursorByte(buffer.count)
-                preferredCol = nil
+                preferredColStorage = nil
                 return
             }
         }
@@ -460,19 +489,19 @@ public final class TextArea {
                     if bytes[j] == 0x0A { nextEnd = j; break }
                     j += 1
                 }
-                let targetCol = preferredCol ?? currentDisplayCol()
-                preferredCol = preferredCol ?? targetCol
+                let targetCol = preferredColStorage ?? currentDisplayCol()
+                preferredColStorage = preferredColStorage ?? targetCol
                 moveToDisplayCol(on: nextStart..<nextEnd, targetCol: targetCol)
                 return
             }
             i += 1
         }
         _ = buffer.setCursorByte(buffer.count)
-        preferredCol = nil
+        preferredColStorage = nil
     }
 
     public func moveCursorToBeginningOfLine(moveUpAtBOL: Bool) {
-        scrollOverride = nil
+        scrollOverrideStorage = nil
         let bol = beginningOfCurrentLine()
         if moveUpAtBOL && cursor == bol && bol > 0 {
             _ = buffer.setCursorByte(bol - 1)
@@ -481,11 +510,11 @@ public final class TextArea {
         } else {
             _ = buffer.setCursorByte(bol)
         }
-        preferredCol = nil
+        preferredColStorage = nil
     }
 
     public func moveCursorToEndOfLine(moveDownAtEOL: Bool) {
-        scrollOverride = nil
+        scrollOverrideStorage = nil
         let eol = endOfCurrentLine()
         if moveDownAtEOL && cursor == eol && eol < buffer.count {
             _ = buffer.setCursorByte(eol + 1)
@@ -494,7 +523,7 @@ public final class TextArea {
         } else {
             _ = buffer.setCursorByte(eol)
         }
-        preferredCol = nil
+        preferredColStorage = nil
     }
 
     // MARK: Elements
@@ -511,7 +540,7 @@ public final class TextArea {
         let range = start..<(start + expanded.utf8Count)
         elements.append(TextElement(id: id, range: range, kind: kind, displayText: displayText))
         wrapCache = nil
-        preferredCol = nil
+        preferredColStorage = nil
         postMutate()
         return id
     }
@@ -527,7 +556,15 @@ public final class TextArea {
     public func ensureWrapCache(width: Int) {
         let w = max(width, 1)
         if let cache = wrapCache, cache.width == w { return }
-        wrapCache = (w, wrapRanges(buffer.text, width: w))
+        // Match Rust textarea wrap cache: FirstFit (not OptimalFit).
+        let opts = WrapOptions(
+            width: w,
+            breakWords: true,
+            wrapAlgorithm: .firstFit,
+            wordSeparator: .unicodeBreakProperties,
+            wordSplitter: .hyphenSplitter
+        )
+        wrapCache = (w, wrapRanges(buffer.text, options: opts))
     }
 
     public func wrappedLines(width: Int) -> [Range<Int>] {
@@ -615,8 +652,8 @@ public final class TextArea {
         let plan = buffer.planCommand(command, atomic: elementRanges())
         let outcome = applyEditPlan(plan, kind)
         if command.category == .navigation {
-            preferredCol = nil
-            scrollOverride = nil
+            preferredColStorage = nil
+            scrollOverrideStorage = nil
         }
         return outcome
     }
@@ -643,8 +680,8 @@ public final class TextArea {
             }
         }
         if semantic || outcome != .unchanged {
-            preferredCol = nil
-            scrollOverride = nil
+            preferredColStorage = nil
+            scrollOverrideStorage = nil
         }
         if semantic, kind != nil {
             postMutate()
@@ -674,7 +711,7 @@ public final class TextArea {
         }
     }
 
-    private func clampPosToNearestBoundary(_ pos: Int) -> Int {
+    func clampPosToNearestBoundary(_ pos: Int) -> Int {
         for el in elements {
             if pos > el.range.lowerBound && pos < el.range.upperBound {
                 if pos - el.range.lowerBound <= el.range.upperBound - pos {
@@ -726,7 +763,7 @@ public final class TextArea {
         _ = buffer.setCursorByte(pos)
     }
 
-    private func wrappedLineIndex(_ lines: [Range<Int>], _ pos: Int) -> Int? {
+    func wrappedLineIndex(_ lines: [Range<Int>], _ pos: Int) -> Int? {
         for (i, r) in lines.enumerated() {
             if pos >= r.lowerBound && pos <= r.upperBound {
                 // Prefer line where pos is not only the end of previous unless last
@@ -748,7 +785,7 @@ public final class TextArea {
         buffer = EditBuffer.fromParts(text: entry.text, cursorByte: entry.cursor)
         elements = entry.elements
         wrapCache = nil
-        preferredCol = nil
+        preferredColStorage = nil
     }
 
     private func preMutate(_ kind: MutationKind) {

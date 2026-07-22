@@ -24,8 +24,52 @@ public protocol TerminalBackend: AnyObject {
     func appendLines(_ n: Int) throws
     func size() throws -> TerminalSize
     func flush() throws
-    /// Writable byte sink for raw ANSI (scrollback / resize paths).
+    /// Writable byte sink for raw ANSI (scrollback / resize paths / OSC 8).
     var writer: TerminalWriter { get }
+}
+
+extension TerminalBackend {
+    /// Emit cell updates with OSC 8 hyperlink envelopes around runs that share
+    /// a link. Mirrors Rust `emit_frame_with_links`: each linked run is wrapped
+    /// once and `draw` is invoked exactly once per run (no double emission).
+    public func drawWithLinks(
+        _ updates: [CellUpdate],
+        linkIds: [UInt32],
+        linkTable: [LinkRef],
+        area: TerminalRect
+    ) throws {
+        guard !updates.isEmpty else { return }
+        let width = max(area.width, 1)
+
+        func resolve(_ x: Int, _ y: Int) -> LinkRef? {
+            let idx = (y - area.y) * width + (x - area.x)
+            return resolveLink(ids: linkIds, table: linkTable, index: idx)
+        }
+
+        var i = 0
+        while i < updates.count {
+            let link = resolve(updates[i].x, updates[i].y)
+            var j = i + 1
+            while j < updates.count {
+                if resolve(updates[j].x, updates[j].y) != link { break }
+                j += 1
+            }
+            let run = Array(updates[i..<j])
+            if let link {
+                try writer.write(string: ANSIOutput.osc8Open(url: link.url, id: link.id))
+                do {
+                    try draw(run)
+                } catch {
+                    try? writer.write(string: ANSIOutput.osc8Close)
+                    throw error
+                }
+                try writer.write(string: ANSIOutput.osc8Close)
+            } else {
+                try draw(run)
+            }
+            i = j
+        }
+    }
 }
 
 /// Appendable byte writer used by scrollback/resize helpers.

@@ -1,0 +1,29 @@
+{
+  "$schema": "open-grok/protocol-fixtures/tracing-w3c-traceparent",
+  "traceparentFormat": "00-<32-hex-trace-id>-<16-hex-span-id>-01",
+  "sampleTraceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "sampleTraceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "sampleSpanId": "00f067aa0ba902b7",
+  "correlationKeys": [
+    "sessionID",
+    "turnID",
+    "toolCallID",
+    "provider",
+    "requestID",
+    "childAgentID",
+    "parentSpanID"
+  ],
+  "redactedByDefault": [
+    "authorization",
+    "prompt",
+    "api_key",
+    "cookie",
+    "set-cookie",
+    "path"
+  ],
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "provenance": {
+    "source": "OpenGrokTracing W3C traceparent + TraceCorrelation",
+    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+  }
+}

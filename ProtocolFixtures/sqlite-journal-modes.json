@@ -1,0 +1,23 @@
+{
+  "$schema": "open-grok/protocol-fixtures/sqlite-journal-modes",
+  "journalModes": [
+    "WAL",
+    "TRUNCATE"
+  ],
+  "pragmaValues": {
+    "WAL": "WAL",
+    "TRUNCATE": "TRUNCATE"
+  },
+  "envOverrides": [
+    "OPENGROK_SQLITE_JOURNAL_MODE",
+    "GROK_SQLITE_JOURNAL_MODE"
+  ],
+  "networkFSUsesTruncate": true,
+  "localFSUsesWAL": true,
+  "truncateHostSuffixPattern": ".h-<host>",
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "provenance": {
+    "source": "OpenGrokSQLiteJournal.JournalMode vs xai-sqlite-journal",
+    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+  }
+}

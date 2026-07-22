@@ -123,20 +123,20 @@ struct ProductTelemetryPrivacyTests {
         )
         await client.track(eventName: "session.start", requestID: "r1")
         await client.trackMixpanel(event: "session.start")
-        client.exportOpenTelemetry(name: "span")
+        await client.exportOpenTelemetry(name: "span")
         #expect(product.totalBytes == 0)
         #expect(mix.totalBytes == 0)
         #expect(otel.totalBytes == 0)
     }
 
-    @Test func otelIndependentOfProductMode() {
+    @Test func otelIndependentOfProductMode() async {
         let otel = RecordingExportSink(allowed: true)
         let client = TelemetryClient(
             mode: .disabled,
             config: TelemetryConfig(openTelemetryEnabled: true),
             otelExport: otel
         )
-        client.exportOpenTelemetry(name: "span", attributes: ["k": .string("v")])
+        await client.exportOpenTelemetry(name: "span", attributes: ["k": .string("v")])
         #expect(otel.totalBytes > 0)
     }
 
@@ -161,28 +161,28 @@ struct ProductTelemetryPrivacyTests {
         #expect(mix.totalBytes == 0)
     }
 
-    @Test func independentOTELDisable() {
+    @Test func independentOTELDisable() async {
         let otel = RecordingExportSink()
         let client = TelemetryClient(
             mode: .enabled,
             config: TelemetryConfig(openTelemetryEnabled: false),
             otelExport: otel
         )
-        client.exportOpenTelemetry(
+        await client.exportOpenTelemetry(
             name: "http",
             attributes: ["authorization": .string("Bearer secret")]
         )
         #expect(otel.totalBytes == 0)
     }
 
-    @Test func otelDropsDenylistedAttributes() {
+    @Test func otelDropsDenylistedAttributes() async {
         let otel = RecordingExportSink(allowed: true)
         let client = TelemetryClient(
             mode: .enabled,
             config: TelemetryConfig(openTelemetryEnabled: true),
             otelExport: otel
         )
-        client.exportOpenTelemetry(
+        await client.exportOpenTelemetry(
             name: "tool",
             attributes: [
                 "http.request.method": .string("POST"),
@@ -329,7 +329,7 @@ struct ExternalOTELTests {
         #expect(cfg != nil)
     }
 
-    @Test func providerVetoEmitsZeroBytes() throws {
+    @Test func providerVetoEmitsZeroBytes() async throws {
         let sink = RecordingExportSink(allowed: true)
         let cfg = ExternalOtelConfig(
             metricsExporter: .none,
@@ -346,7 +346,7 @@ struct ExternalOTELTests {
             transport: MockHTTPTransport(),
             recording: sink
         )
-        let ok = try exporter.exportSpan(
+        let ok = try await exporter.exportSpan(
             name: "sample",
             attributes: ["k": .string("v")],
             provider: "openai"
@@ -355,7 +355,7 @@ struct ExternalOTELTests {
         #expect(sink.totalBytes == 0)
         #expect(sink.payloads.isEmpty)
 
-        let allowed = try exporter.exportSpan(
+        let allowed = try await exporter.exportSpan(
             name: "sample",
             attributes: ["k": .string("v")],
             provider: "xai"
@@ -364,7 +364,7 @@ struct ExternalOTELTests {
         #expect(sink.totalBytes > 0)
     }
 
-    @Test func allowListRequiresProvider() throws {
+    @Test func allowListRequiresProvider() async throws {
         let sink = RecordingExportSink(allowed: true)
         let cfg = ExternalOtelConfig(
             metricsExporter: .none,
@@ -377,9 +377,9 @@ struct ExternalOTELTests {
             exportPolicy: OTELExportPolicy(allowedProviders: ["xai"])
         )
         let exporter = OTLPExporter(config: cfg, recording: sink)
-        #expect(try exporter.exportSpan(name: "n", provider: nil) == false)
+        #expect(try await exporter.exportSpan(name: "n", provider: nil) == false)
         #expect(sink.totalBytes == 0)
-        #expect(try exporter.exportSpan(name: "n", provider: "xai"))
+        #expect(try await exporter.exportSpan(name: "n", provider: "xai"))
         #expect(sink.totalBytes > 0)
     }
 
@@ -431,6 +431,12 @@ struct ExternalOTELTests {
         #expect(wire != nil)
         guard let wire else { return }
         #expect(wire.request.headers["Content-Type"] == OTLPWire.grpcContentType)
+        #expect(wire.request.headers["TE"] == "trailers")
+        // Collector-compatible TraceService Export RPC path (not bare origin).
+        #expect(
+            wire.request.url.absoluteString
+                == "https://collector.example:4317" + OTLPWire.grpcTraceExportPath
+        )
         // 1-byte flag + 4-byte length prefix around the protobuf body.
         #expect(wire.request.body?.count == wire.body.count + 5)
         #expect(wire.request.body?.first == 0)
@@ -438,6 +444,7 @@ struct ExternalOTELTests {
         if let framed = wire.request.body, let inner = OTLPWire.unframeGRPC(framed) {
             #expect(inner == wire.body)
             #expect(OTLPWire.looksLikeExportTraceProtobuf(inner))
+            #expect(OTLPWire.protobufContainsUTF8(inner, "g"))
         } else {
             Issue.record("expected unframeable gRPC protobuf frame")
         }
@@ -458,13 +465,80 @@ struct ExternalOTELTests {
             spansHeaders: [OTLPHeader(name: "x-api-tenant", value: "acme")]
         )
         let exporter = OTLPExporter(config: cfg, transport: mock)
-        #expect(try exporter.exportSpan(name: "turn", provider: "xai"))
+        #expect(try await exporter.exportSpan(name: "turn", provider: "xai"))
         #expect(mock.recordedRequests.count == 1)
         #expect(mock.recordedRequests[0].headers["x-api-tenant"] == "acme")
         #expect(mock.recordedRequests[0].headers["Content-Type"] == OTLPWire.httpProtobufContentType)
+        #expect(mock.recordedRequests[0].url.path.hasSuffix("/v1/traces"))
+        if let body = mock.recordedRequests[0].body {
+            #expect(OTLPWire.looksLikeExportTraceProtobuf(body))
+            #expect(OTLPWire.protobufContainsUTF8(body, "turn"))
+        } else {
+            Issue.record("expected HTTP protobuf body")
+        }
     }
 
-    @Test func clientProviderVetoBeforeSerialize() {
+    /// In-process collector compatibility: non-recording MockHTTPTransport
+    /// executes the async export path, receives a TraceService Export frame,
+    /// and decodes a real `ExportTraceServiceRequest` protobuf (Rust
+    /// `external_otlp_grpc` analogue at the request/decode layer).
+    @Test func mockGRPCCollectorDecodesExportTraceServiceRequest() async throws {
+        let mock = MockHTTPTransport(responses: [
+            .init(
+                metadata: HTTPResponseMetadata(
+                    statusCode: 200,
+                    headers: ["grpc-status": "0", "content-type": OTLPWire.grpcContentType]
+                ),
+                body: Data()
+            )
+        ])
+        let cfg = ExternalOtelConfig(
+            metricsExporter: .none,
+            logsExporter: .none,
+            spansExporter: .otlp,
+            transport: .grpc,
+            logsEndpoint: "http://127.0.0.1:4317",
+            metricsEndpoint: "http://127.0.0.1:4317",
+            spansEndpoint: "http://127.0.0.1:4317"
+        )
+        let exporter = OTLPExporter(config: cfg, transport: mock)
+        #expect(
+            try await exporter.exportSpan(
+                name: "collector_compat",
+                attributes: ["http.request.method": .string("GET")],
+                provider: "xai"
+            )
+        )
+        #expect(mock.recordedRequests.count == 1)
+        let request = mock.recordedRequests[0]
+        #expect(request.headers["Content-Type"] == OTLPWire.grpcContentType)
+        #expect(request.headers["TE"] == "trailers")
+        #expect(request.url.path == OTLPWire.grpcTraceExportPath)
+        guard let framed = request.body, let inner = OTLPWire.unframeGRPC(framed) else {
+            Issue.record("collector must receive a gRPC-framed protobuf body")
+            return
+        }
+        #expect(OTLPWire.looksLikeExportTraceProtobuf(inner))
+        #expect(OTLPWire.protobufContainsUTF8(inner, "collector_compat"))
+        #expect(OTLPWire.protobufContainsUTF8(inner, "GET"))
+        #expect(OTLPWire.protobufContainsUTF8(inner, "xai"))
+        // Reject non-zero grpc-status.
+        let reject = MockHTTPTransport(responses: [
+            .init(
+                metadata: HTTPResponseMetadata(
+                    statusCode: 200,
+                    headers: ["grpc-status": "13"]
+                ),
+                body: Data()
+            )
+        ])
+        let rejecting = OTLPExporter(config: cfg, transport: reject)
+        #expect(
+            try await rejecting.exportSpan(name: "fail", provider: "xai") == false
+        )
+    }
+
+    @Test func clientProviderVetoBeforeSerialize() async {
         let otel = RecordingExportSink(allowed: true)
         let cfg = ExternalOtelConfig(
             metricsExporter: .none,
@@ -482,7 +556,7 @@ struct ExternalOTELTests {
             otelExport: otel,
             externalOTLP: OTLPExporter(config: cfg, recording: otel)
         )
-        client.exportOpenTelemetry(
+        await client.exportOpenTelemetry(
             name: "blocked",
             attributes: ["prompt": .string("secret")],
             provider: "openai"
@@ -544,6 +618,45 @@ struct ExternalOTELTests {
         )
         #expect(json.first == UInt8(ascii: "{"))
         #expect(body != json)
+    }
+
+    /// Golden fixture bytes must match a fixed-timestamp re-encode and decode
+    /// as ExportTraceServiceRequest (semantic, not digest-only validation).
+    @Test func goldenOTLPFixturesMatchEncoder() throws {
+        let fixturesRoot = packageRootURL()
+            .appendingPathComponent("ProtocolFixtures", isDirectory: true)
+        let httpURL = fixturesRoot.appendingPathComponent("otlp-export-trace-http.pb")
+        let grpcURL = fixturesRoot.appendingPathComponent("otlp-export-trace-grpc.bin")
+        let httpGolden = try Data(contentsOf: httpURL)
+        let grpcGolden = try Data(contentsOf: grpcURL)
+        let attrs: [String: JSONValue] = [
+            "http.request.method": .string("GET"),
+            "provider": .string("xai"),
+        ]
+        let fixedNanos: UInt64 = 1_700_000_000_000_000_000
+        let encoded = try OTLPWire.encodeSpanEnvelope(
+            name: "collector_golden",
+            attributes: attrs,
+            nowNanos: fixedNanos
+        )
+        #expect(encoded == httpGolden)
+        #expect(OTLPWire.looksLikeExportTraceProtobuf(httpGolden))
+        #expect(OTLPWire.protobufContainsUTF8(httpGolden, "collector_golden"))
+        let framed = OTLPWire.frameGRPC(payload: encoded)
+        #expect(framed == grpcGolden)
+        #expect(OTLPWire.unframeGRPC(grpcGolden) == httpGolden)
+    }
+
+    private func packageRootURL() -> URL {
+        var url = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 {
+            let pkg = url.appendingPathComponent("Package.swift")
+            if FileManager.default.fileExists(atPath: pkg.path) {
+                return url
+            }
+            url.deleteLastPathComponent()
+        }
+        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     }
 }
 

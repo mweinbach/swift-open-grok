@@ -1,0 +1,11 @@
+[
+  {"text": "hello world foo", "width": 8, "optimal": ["hello", "world", "foo"], "first": ["hello", "world", "foo"]},
+  {"text": "hello-world", "width": 8, "optimal": ["hello-", "world"], "first": ["hello-", "world"]},
+  {"text": "a  b", "width": 10, "optimal": ["a  b"], "first": ["a  b"]},
+  {"text": "你好世界", "width": 4, "optimal": ["你好", "世界"], "first": ["你好", "世界"]},
+  {"text": "", "width": 10, "optimal": [""], "first": [""]},
+  {"text": "word", "width": 10, "optimal": ["word"], "first": ["word"]},
+  {"text": "supercalifragilistic", "width": 5, "optimal": ["super", "calif", "ragil", "istic"], "first": ["super", "calif", "ragil", "istic"]},
+  {"text": "one\ntwo three", "width": 8, "optimal": ["one", "two", "three"], "first": ["one", "two", "three"]},
+  {"text": "This is a demo of the short last line penalty.", "width": 37, "optimal": ["This is a demo of the short last", "line penalty."], "first": ["This is a demo of the short last line", "penalty."]}
+]

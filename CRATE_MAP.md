@@ -1,7 +1,10 @@
 # Rust Crate to SwiftPM Target Map
 
-**Baseline:** 2026-07-20  
+**Baseline:** 2026-07-20 (inventory refreshed 2026-07-22 / R10)
 **Count:** 81 root workspace packages from `cargo metadata` plus `xai-grok-markdown-fuzz` in its own nested workspace = **82 total**.
+
+**SwiftPM source/test inventory (committed tree, same method as `PORT_STATUS.md`):**
+**98** `Sources/` targets · **42** bootstrap placeholders (≤15 non-comment LOC; C helpers excluded) · **100** `Tests/` targets · **46** zero-test · **54** with ≥1 test.
 
 ## Mapping rules
 

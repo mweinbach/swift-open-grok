@@ -512,11 +512,15 @@ public struct TelemetryClient: Sendable {
     ///
     /// Privacy gates and provider isolation apply *before* serialization so
     /// disabled/vetoed events emit zero bytes.
+    ///
+    /// Network export awaits the transport so the async `HTTPTransport.send`
+    /// contract is honored. Callers that must not block can wrap this in a
+    /// `Task` (best-effort fire-and-forget).
     public func exportOpenTelemetry(
         name: String,
         attributes: [String: JSONValue] = [:],
         provider: String? = nil
-    ) {
+    ) async {
         // Independent gates: product OTEL config and/or external exporter.
         let productOTEL = isOpenTelemetryEnabled
         let external = externalOTLP
@@ -554,7 +558,11 @@ public struct TelemetryClient: Sendable {
         if let external, externalActive {
             // Network export uses the external collector seam only — never
             // shares headers with the product events pipeline.
-            try? external.exportSpan(name: name, attributes: attrs, provider: provider)
+            _ = try? await external.exportSpan(
+                name: name,
+                attributes: attrs,
+                provider: provider
+            )
             return
         }
 
@@ -567,11 +575,8 @@ public struct TelemetryClient: Sendable {
         else {
             return
         }
-        // Fire-and-forget best effort; failures must not affect the session.
-        let transport = self.transport
-        Task {
-            _ = try? await transport.send(request)
-        }
+        // Best effort; failures must not affect the session.
+        _ = try? await transport.send(request)
     }
 
     /// Build the product OTLP HTTP request for `config.openTelemetryEndpoint`
@@ -1067,6 +1072,13 @@ extension ExternalOtelConfig {
 /// are real `ExportTraceServiceRequest` protobuf messages (not JSON mislabeled
 /// as `application/x-protobuf`). A JSON diagnostic twin remains available for
 /// human-readable golden fixtures.
+///
+/// gRPC export shapes the unary TraceService/MetricsService/LogsService Export
+/// RPC (path + `application/grpc+proto` + 5-byte framing + TE trailers) and
+/// validates `grpc-status` when the transport surfaces it. Full HTTP/2 trailer
+/// delivery depends on the concrete `HTTPTransport` (URLSession may omit
+/// trailers); mock/collector tests exercise the request shape and protobuf
+/// decode end-to-end.
 public enum OTLPWire {
     /// Content-Type for OTLP HTTP/protobuf.
     public static let httpProtobufContentType = "application/x-protobuf"
@@ -1075,15 +1087,32 @@ public enum OTLPWire {
     /// gRPC content-type for protobuf payloads.
     public static let grpcContentType = "application/grpc+proto"
 
+    /// OTLP gRPC TraceService Export RPC path (collector-compatible).
+    public static let grpcTraceExportPath =
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export"
+    /// OTLP gRPC MetricsService Export RPC path.
+    public static let grpcMetricsExportPath =
+        "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export"
+    /// OTLP gRPC LogsService Export RPC path.
+    public static let grpcLogsExportPath =
+        "/opentelemetry.proto.collector.logs.v1.LogsService/Export"
+
     /// Encode a real OTLP `ExportTraceServiceRequest` protobuf body for one span.
     ///
     /// This is the canonical export body for both product and external OTLP
     /// HTTP/protobuf and (pre-framing) gRPC paths.
+    ///
+    /// - Parameter nowNanos: Optional fixed timestamp for hermetic golden fixtures.
     public static func encodeSpanEnvelope(
         name: String,
-        attributes: [String: JSONValue]
+        attributes: [String: JSONValue],
+        nowNanos: UInt64? = nil
     ) throws -> Data {
-        OTLPProtobuf.encodeExportTraceServiceRequest(name: name, attributes: attributes)
+        OTLPProtobuf.encodeExportTraceServiceRequest(
+            name: name,
+            attributes: attributes,
+            nowNanos: nowNanos
+        )
     }
 
     /// Human-readable JSON twin of the span envelope (not used on the wire for
@@ -1142,6 +1171,75 @@ public enum OTLPWire {
         OTLPProtobuf.looksLikeExportTraceServiceRequest(body)
     }
 
+    /// Extract a span name embedded in an `ExportTraceServiceRequest` body
+    /// (best-effort UTF-8 scan used by collector-compatibility tests).
+    public static func protobufContainsUTF8(_ body: Data, _ needle: String) -> Bool {
+        guard !needle.isEmpty else { return false }
+        return String(decoding: body, as: UTF8.self).contains(needle)
+    }
+
+    /// gRPC Export RPC path for a signal.
+    public static func grpcExportRPCPath(for signal: OTLPSignal) -> String {
+        switch signal {
+        case .spans: return grpcTraceExportPath
+        case .metrics: return grpcMetricsExportPath
+        case .logs: return grpcLogsExportPath
+        }
+    }
+
+    /// Resolve the absolute export URL, appending the Trace/Metrics/Logs
+    /// Service Export RPC path for gRPC when the configured endpoint is only
+    /// the collector origin (Rust/tonic parity).
+    public static func resolveExportURL(
+        endpoint: String,
+        signal: OTLPSignal,
+        transport: OtlpTransport
+    ) -> URL? {
+        let trimmed = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        switch transport {
+        case .httpProtobuf:
+            return URL(string: trimmed)
+        case .grpc:
+            let rpc = grpcExportRPCPath(for: signal)
+            // Keep a fully-specified RPC URL if the caller already supplied one.
+            if trimmed.contains("TraceService/Export")
+                || trimmed.contains("MetricsService/Export")
+                || trimmed.contains("LogsService/Export")
+            {
+                return URL(string: trimmed)
+            }
+            let root = trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
+            return URL(string: root + rpc)
+        }
+    }
+
+    /// Validate a collector response for the selected transport.
+    ///
+    /// - HTTP/protobuf: 2xx.
+    /// - gRPC: HTTP 200 and, when present, `grpc-status: 0`. Missing
+    ///   `grpc-status` is accepted only as a transport limitation (trailers
+    ///   not exposed); non-zero status is always a failure.
+    public static func acceptsExportResponse(
+        _ response: HTTPResponse,
+        transport: OtlpTransport
+    ) -> Bool {
+        switch transport {
+        case .httpProtobuf:
+            return (200..<300).contains(response.metadata.statusCode)
+        case .grpc:
+            guard response.metadata.statusCode == 200 else { return false }
+            let status = response.metadata.headers.first {
+                $0.key.lowercased() == "grpc-status"
+            }?.value
+            if let status {
+                return status.trimmingCharacters(in: .whitespacesAndNewlines) == "0"
+            }
+            // Trailer may be absent when the HTTP stack does not surface it.
+            return true
+        }
+    }
+
     /// HTTP request description for a signal export (no I/O).
     public static func makeExportRequest(
         config: ExternalOtelConfig,
@@ -1155,7 +1253,13 @@ public enum OTLPWire {
         case .spans: exporter = config.spansExporter
         }
         guard exporter == .otlp else { return nil }
-        guard let url = URL(string: config.endpoint(for: signal)) else { return nil }
+        guard let url = resolveExportURL(
+            endpoint: config.endpoint(for: signal),
+            signal: signal,
+            transport: config.transport
+        ) else {
+            return nil
+        }
 
         var headers: [String: String] = [:]
         switch config.transport {
@@ -1164,6 +1268,9 @@ public enum OTLPWire {
         case .grpc:
             headers["Content-Type"] = grpcContentType
             headers["TE"] = "trailers"
+            // gRPC requires an explicit HTTP/2-style content subtype; some
+            // collectors also accept `application/grpc`.
+            headers["grpc-accept-encoding"] = "identity"
         }
         for h in config.headers(for: signal) {
             headers[h.name] = h.value
@@ -1215,13 +1322,17 @@ public struct OTLPExporter: Sendable {
         !exportPolicy.forceDisable && config.isActive
     }
 
-    /// Export a span if policy allows. Returns `false` when vetoed (0 bytes).
+    /// Export a span if policy allows. Returns `false` when vetoed (0 bytes)
+    /// or when the collector rejects the export.
+    ///
+    /// Awaits `HTTPTransport.send` so the async transport contract compiles
+    /// and executes (including non-recording mock collectors).
     @discardableResult
     public func exportSpan(
         name: String,
         attributes: [String: JSONValue] = [:],
         provider: String? = nil
-    ) throws -> Bool {
+    ) async throws -> Bool {
         guard isActive else { return false }
         guard config.spansExporter == .otlp || config.spansExporter == .console else {
             return false
@@ -1263,15 +1374,16 @@ public struct OTLPExporter: Sendable {
         ) else {
             return false
         }
-        _ = try transport.send(request)
-        return true
+        let response = try await transport.send(request)
+        return OTLPWire.acceptsExportResponse(response, transport: config.transport)
     }
 
     /// Build (but do not send) the wire request for collector/mock tests.
     public func makeSpanWireRequest(
         name: String,
         attributes: [String: JSONValue] = [:],
-        provider: String? = nil
+        provider: String? = nil,
+        nowNanos: UInt64? = nil
     ) throws -> (request: HTTPRequest, body: Data)? {
         guard isActive else { return nil }
         guard exportPolicy.allows(provider: provider) else { return nil }
@@ -1286,7 +1398,11 @@ public struct OTLPExporter: Sendable {
         if let provider {
             attrs["provider"] = .string(provider)
         }
-        let body = try OTLPWire.encodeSpanEnvelope(name: name, attributes: attrs)
+        let body = try OTLPWire.encodeSpanEnvelope(
+            name: name,
+            attributes: attrs,
+            nowNanos: nowNanos
+        )
         guard let request = OTLPWire.makeExportRequest(
             config: config,
             signal: .spans,

@@ -13,11 +13,35 @@
     "user",
     "defaults"
   ],
-  "notes": "Key-name fixtures for implemented foundation contracts (not full corpus dumps)",
-  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
   "workspacePermissionOrder": [
     "deny",
     "ask",
     "allow"
-  ]
+  ],
+  "implementedKeySets": {
+    "configAuthority": [
+      "explicit",
+      "managed",
+      "project",
+      "user",
+      "defaults"
+    ],
+    "workspacePermission": [
+      "deny",
+      "ask",
+      "allow"
+    ],
+    "codeModeMessageKind": [
+      "request",
+      "response",
+      "notification",
+      "error"
+    ]
+  },
+  "notes": "Checked-in key-order fixtures for implemented foundation contracts (Rust reference revision pinned).",
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "provenance": {
+    "source": "OpenGrokConfigTypes/OpenGrokWorkspaceTypes/OpenGrokCodeModeProtocol enums",
+    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+  }
 }

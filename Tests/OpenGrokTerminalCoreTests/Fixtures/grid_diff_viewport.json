@@ -1,0 +1,11 @@
+{
+  "diff": [
+    {"prev": "    ", "next": "ab  ", "width": 4, "height": 1, "changed": [[0,0,"a"],[1,0,"b"]]}
+  ],
+  "viewport": {
+    "inlineGrowFrom": {"y": 21, "height": 3, "screenHeight": 24, "newHeight": 24, "minAppended": 21}
+  },
+  "links": {
+    "emit": {"text": "AB", "url": "https://x.ai", "expectOpen": "\u001b]8;;https://x.ai\u0007", "expectClose": "\u001b]8;;\u0007"}
+  }
+}

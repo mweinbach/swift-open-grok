@@ -3,7 +3,16 @@
   "contentTypeGrpc": "application/grpc+proto",
   "contentTypeHttpProtobuf": "application/x-protobuf",
   "exportMessage": "opentelemetry.proto.collector.trace.v1.ExportTraceServiceRequest",
-  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "grpcExportRPCPath": "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+  "grpcFraming": "1-byte compression flag (0) + 4-byte big-endian length + protobuf",
+  "goldenHttpProtobuf": "ProtocolFixtures/otlp-export-trace-http.pb",
+  "goldenGrpcFramed": "ProtocolFixtures/otlp-export-trace-grpc.bin",
+  "goldenFixedUnixNanos": 1700000000000000000,
+  "goldenSpanName": "collector_golden",
+  "sampleAttributes": {
+    "http.request.method": "GET",
+    "provider": "xai"
+  },
   "requiredSpanFields": [
     "trace_id",
     "span_id",
@@ -11,13 +20,15 @@
     "start_time_unix_nano",
     "end_time_unix_nano"
   ],
-  "sampleAttributes": {
-    "http.request.method": "GET",
-    "provider": "xai"
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "provenance": {
+    "source": "generated-from-swift-OTLPProtobuf-encoder-semantics",
+    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+    "note": "Binary goldens match OpenGrokTelemetry.OTLPProtobuf with fixed nowNanos; not a hand-authored JSON summary of field names only."
   },
   "wireNotes": [
     "HTTP/protobuf body is real protobuf (field 1 = resource_spans), not JSON",
-    "gRPC frames protobuf with 1-byte flag + 4-byte big-endian length",
+    "gRPC uses TraceService Export RPC path + framed protobuf + TE: trailers",
     "provider/privacy vetoes must run before any serialization"
   ]
 }

@@ -12,5 +12,9 @@
   "legacyHomeForbidden": "~/.grok",
   "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
   "testVersionEnv": "GROK_TEST_VERSION",
-  "unimplementedStayUnavailable": true
+  "unimplementedStayUnavailable": true,
+  "provenance": {
+    "source": "OpenGrokVersion/OpenGrokCLI semantics vs Rust xai-grok-version",
+    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+  }
 }

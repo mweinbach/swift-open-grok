@@ -1,0 +1,24 @@
+{
+  "$schema": "open-grok/protocol-fixtures/pty-process-signals",
+  "processSignals": {
+    "terminate": 15,
+    "kill": 9,
+    "interrupt": 2,
+    "hangup": 1,
+    "windowChange": 28
+  },
+  "exitKinds": [
+    "code",
+    "signal",
+    "stillRunning"
+  ],
+  "platformSeams": {
+    "darwinLinux": "OpenGrokPTYC setsid+TIOCSCTTY spawn shim",
+    "windows": "ConPTY/Job Objects later; typed unsupported"
+  },
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "provenance": {
+    "source": "OpenGrokPTY.ProcessSignal portableValue vs ptyctl",
+    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+  }
+}

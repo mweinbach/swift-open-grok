@@ -1,0 +1,38 @@
+{
+  "$schema": "open-grok/protocol-fixtures/hunk-tracker-snapshot",
+  "schemaVersion": 1,
+  "sampleSnapshot": {
+    "schemaVersion": 1,
+    "sessionId": "sess-fixture-1",
+    "fileStates": {},
+    "turnIndex": {},
+    "sessionStats": {
+      "acceptedHunks": 0,
+      "rejectedHunks": 0,
+      "acceptedLinesAdded": 0,
+      "acceptedLinesRemoved": 0,
+      "rejectedLinesAdded": 0,
+      "rejectedLinesRemoved": 0
+    }
+  },
+  "hunkSourceTypes": [
+    "agentEdit",
+    "externalEditOnAgentFile",
+    "external"
+  ],
+  "lineInfoKeys": [
+    "oldStart",
+    "oldCount",
+    "newStart",
+    "newCount"
+  ],
+  "dateEncoding": "iso8601",
+  "jsonOutputFormatting": [
+    "sortedKeys"
+  ],
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "provenance": {
+    "source": "OpenGrokHunkTracker.HunkTrackerSnapshot Codable wire",
+    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+  }
+}

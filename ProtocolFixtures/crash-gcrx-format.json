@@ -1,0 +1,31 @@
+{
+  "$schema": "open-grok/protocol-fixtures/crash-gcrx-format",
+  "magic": "GCRX",
+  "magicBytes": [
+    71,
+    67,
+    82,
+    88
+  ],
+  "version": 1,
+  "headerSize": 64,
+  "maxFrames": 64,
+  "versionStringLength": 32,
+  "layout": "magic(4)+version(1)+signal(1)+si_code(4)+si_addr(8)+pid(4)+timestamp(8)+n_frames(2)+app_version(32)+frames(n*8)",
+  "endianness": "little",
+  "sampleFixture": "ProtocolFixtures/crash-gcrx-sample.bin",
+  "sample": {
+    "signal": 11,
+    "siCode": 1,
+    "siAddr": "0x1000",
+    "pid": 4242,
+    "timestamp": 1700000000,
+    "nFrames": 0,
+    "appVersion": "0.1.220-open-grok.21"
+  },
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "provenance": {
+    "source": "OpenGrokCrashHandler.CrashBlobFormat / CrashBlob.serialize",
+    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+  }
+}

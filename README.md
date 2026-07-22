@@ -11,10 +11,11 @@ or written).
 > and infrastructure targets are present. **The integrated package build is not
 > verified green** at the current HEAD — workers must **not** invoke SwiftPM
 > directly. The sole integration path is the serialized safe verifier below.
-> See `PORT_STATUS.md`, `PORT_PLAN.md`, and `CRATE_MAP.md` for exact scope,
-> placeholder counts, and remaining product gaps. Roughly half of production
-> targets remain bootstrap placeholders (later waves: providers, tools runtime,
-> sandbox, TUI, sessions, MCP, etc.).
+> See `PORT_STATUS.md`, `PORT_PLAN.md`, and `CRATE_MAP.md` for exact scope and
+> remaining product gaps. Inventory (committed tree): **98** production source
+> targets, **42** bootstrap placeholders (≤15 non-comment LOC, excluding C
+> helpers), **100** test targets, **46** zero-test targets. Later waves still
+> own providers, tools runtime, sandbox, TUI, sessions, MCP, etc.
 
 ## Build and test (serialized safe verifier only)
 
@@ -46,18 +47,29 @@ explicitly **not yet implemented** and must not be presented as working.
 
 ## Protocol fixture validation
 
-Checked-in fixtures under `ProtocolFixtures/` cover ACP method names plus
-foundation shapes (OTLP export content types, Git object/index, CLI version and
-`OPENGROK_HOME`, config/workspace/Code Mode key orders). Validate without network:
+Checked-in fixtures under `ProtocolFixtures/` are provenance-labelled against
+Rust ref `9739c4a2ad23cfea14312a481169757f3da494f4` and cover:
+
+- ACP method names
+- Binary OTLP `ExportTraceServiceRequest` (HTTP protobuf + gRPC-framed) goldens
+- Git loose-object zlib + pack non-parity notes
+- CLI version / `OPENGROK_HOME` / bootstrap command surface
+- Config authority, workspace permission, Code Mode message kinds
+- Tracing W3C `traceparent`, SQLite journal modes, hunk snapshot schema, PTY
+  portable signals, crash GCRX binary sample
+
+Validate without network (via the safe verifier only when SwiftPM is required):
 
 ```sh
-swift package ogrok-validate-protocols
+zsh workflows/swift-safe-verify.zsh build   # then, if needed:
+# swift package --scratch-path .build/workflow-safe ogrok-validate-protocols
 ```
 
-Regeneration (deterministic, network-free):
+Prefer tests that re-encode/decode goldens (telemetry + BuildSupport) over
+digest-only checks. Regeneration (deterministic, network-free):
 
 ```sh
-scripts/regenerate-protocol-manifest.sh
+scripts/regenerate-protocol-manifest.sh --reference-revision 9739c4a2ad23cfea14312a481169757f3da494f4
 ```
 
 ## Package layout
@@ -88,7 +100,7 @@ Notable foundation targets (non-exhaustive; see `PORT_STATUS.md`):
 | Linux | Intended full support; zlib via `COpenGrokZlib`; SQLite via system SQLite3; Secret Service incomplete |
 | Windows | Compile-checked branches only where present; ConPTY / Credential Manager / Job Objects later |
 | Packed Git objects | Explicit `packedObjectUnsupported` — not silent success |
-| OTLP export | Real `ExportTraceServiceRequest` protobuf + gRPC framing (not JSON labeled protobuf) |
+| OTLP export | Real `ExportTraceServiceRequest` protobuf; gRPC TraceService Export path + framing + `grpc-status` (not JSON labeled protobuf) |
 
 ## Workflows
 

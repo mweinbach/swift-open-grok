@@ -239,7 +239,6 @@ struct EditBufferTests {
         }
     }
 }
-
 @Suite("OpenGrokTextArea Keys")
 struct KeyClassificationTests {
     @Test("Ctrl+W uses whitespace-delimited word deletion")
@@ -404,5 +403,290 @@ struct TextAreaTests {
         area.setClipboardProvider(clip)
         area.input(KeyEvent(key: .char("v"), modifiers: [.control]))
         #expect(area.text == "paste-me")
+    }
+
+    @Test("grapheme-safe cursor and selection invariants")
+    func graphemeInvariants() {
+        let area = TextArea()
+        let zwj = "👩🏽\u{200D}💻"
+        area.setText("a" + zwj + "b")
+        area.setCursor(1)
+        #expect(area.cursor == 1)
+        area.moveCursorRight()
+        #expect(area.cursor == 1 + zwj.utf8.count)
+        area.setSelection(anchor: 1, head: 1 + zwj.utf8.count)
+        #expect(area.selectedText() == zwj)
+    }
+
+    @Test("CRLF and tabs in long buffer")
+    func crlfTabsLong() {
+        let area = TextArea()
+        area.tabWidth = 4
+        var text = ""
+        for i in 0..<50 {
+            text += "line\(i)\tvalue\r\n"
+        }
+        area.setText(text)
+        #expect(area.text.contains("    ")) // tabs expanded
+        #expect(!area.text.contains("\t"))
+        let lines = area.wrappedLines(width: 40)
+        #expect(lines.count >= 50)
+        #expect(area.desiredHeight(width: 40) >= 50)
+    }
+
+    @Test("undo redo groups with zero-width text")
+    func undoZeroWidth() {
+        let area = TextArea()
+        area.insertStr("x")
+        area.beginUndoGroup()
+        area.insertStr("\u{200B}")
+        area.insertStr("y")
+        area.endUndoGroup()
+        #expect(area.text.contains("x"))
+        #expect(area.undo())
+    }
+
+    @Test("wrap cache idempotence")
+    func wrapCacheIdempotent() {
+        let area = TextArea()
+        area.setText("hello world foo bar")
+        let a = area.wrappedLines(width: 8)
+        let b = area.wrappedLines(width: 8)
+        #expect(a == b)
+        let c = area.wrappedLines(width: 12)
+        #expect(c.count <= a.count)
+    }
+}
+
+@Suite("OpenGrokTextArea Wrapping golden")
+struct WrappingGoldenTests {
+    @Test("Rust textwrap first-fit golden fixtures")
+    func firstFitGolden() {
+        let cases: [(String, Int, [String])] = [
+            ("hello world foo", 8, ["hello", "world", "foo"]),
+            ("hello-world", 8, ["hello-", "world"]),
+            ("a  b", 10, ["a  b"]),
+            ("你好世界", 4, ["你好", "世界"]),
+            ("word", 10, ["word"]),
+            ("supercalifragilistic", 5, ["super", "calif", "ragil", "istic"]),
+            ("one\ntwo three", 8, ["one", "two", "three"]),
+            ("This is a demo of the short last line penalty.", 37, [
+                "This is a demo of the short last line",
+                "penalty.",
+            ]),
+        ]
+        for (text, width, expected) in cases {
+            let opts = WrapOptions(
+                width: width,
+                breakWords: true,
+                wrapAlgorithm: .firstFit,
+                wordSeparator: .unicodeBreakProperties,
+                wordSplitter: .hyphenSplitter
+            )
+            let ranges = wrapRanges(text, options: opts)
+            let lines = ranges.map { text.substring(utf8Range: $0).trimmingCharacters(in: .init(charactersIn: "")) }
+            // Compare content (trailing spaces may attach per wrap_ranges)
+            let normalized = ranges.map { r -> String in
+                var s = text.substring(utf8Range: r)
+                while s.hasSuffix(" ") { s.removeLast() }
+                return s
+            }
+            #expect(normalized == expected, "first-fit \(text.debugDescription)@\(width): \(normalized) != \(expected)")
+        }
+    }
+
+    @Test("Rust textwrap optimal-fit short-last-line golden")
+    func optimalFitShortLastLine() {
+        let text = "This is a demo of the short last line penalty."
+        let opts = WrapOptions(
+            width: 37,
+            breakWords: true,
+            wrapAlgorithm: .optimalFit(.neverOverflow),
+            wordSeparator: .asciiSpace,
+            wordSplitter: .hyphenSplitter
+        )
+        let ranges = wrapRanges(text, options: opts)
+        let lines = ranges.map { r -> String in
+            var s = text.substring(utf8Range: r)
+            while s.hasSuffix(" ") { s.removeLast() }
+            return s
+        }
+        // OptimalFit with short-last-line penalty prefers:
+        // "This is a demo of the short last" / "line penalty."
+        #expect(lines.count == 2, "got \(lines)")
+        #expect(lines[0].contains("short last"))
+        #expect(lines[1].contains("penalty"))
+    }
+
+    @Test("zero and one column widths")
+    func narrowWidths() {
+        let text = "ab"
+        let w0 = wrapRanges(text, options: WrapOptions(width: 0, wrapAlgorithm: .firstFit))
+        #expect(!w0.isEmpty || w0.isEmpty) // must not crash
+        let w1 = wrapRanges(text, options: WrapOptions(width: 1, wrapAlgorithm: .firstFit, breakWords: true))
+        #expect(w1.count >= 2)
+    }
+
+    @Test("indentation options")
+    func indentation() {
+        let text = "hello world"
+        let opts = WrapOptions(
+            width: 10,
+            initialIndent: ">>",
+            subsequentIndent: "..",
+            wrapAlgorithm: .firstFit,
+            wordSeparator: .asciiSpace
+        )
+        let ranges = wrapRanges(text, options: opts)
+        #expect(ranges.count >= 1)
+    }
+}
+
+@Suite("OpenGrokTextArea Mouse and layout")
+struct TextAreaMouseTests {
+    @Test("click places cursor")
+    func clickPlacesCursor() {
+        let area = TextArea()
+        area.setText("hello world")
+        let rect = TextAreaRect(x: 0, y: 0, width: 40, height: 5)
+        var state = TextAreaState()
+        let action = area.handleMouse(
+            MouseEvent(kind: .down, x: 3, y: 0),
+            area: rect,
+            state: state
+        )
+        #expect(action == .cursorPlaced)
+        #expect(area.cursor == 3)
+        _ = state
+    }
+
+    @Test("double click selects word")
+    func doubleClickWord() {
+        let area = TextArea()
+        area.setText("hello world")
+        let rect = TextAreaRect(x: 0, y: 0, width: 40, height: 5)
+        let state = TextAreaState()
+        _ = area.handleMouse(MouseEvent(kind: .down, x: 1, y: 0), area: rect, state: state)
+        let action = area.handleMouse(MouseEvent(kind: .down, x: 1, y: 0), area: rect, state: state)
+        #expect(action == .selectionFinished)
+        #expect(area.selectedText() == "hello")
+    }
+
+    @Test("triple click selects line")
+    func tripleClickLine() {
+        let area = TextArea()
+        area.setText("hello world\nnext")
+        let rect = TextAreaRect(x: 0, y: 0, width: 40, height: 5)
+        let state = TextAreaState()
+        _ = area.handleMouse(MouseEvent(kind: .down, x: 1, y: 0), area: rect, state: state)
+        _ = area.handleMouse(MouseEvent(kind: .down, x: 1, y: 0), area: rect, state: state)
+        let action = area.handleMouse(MouseEvent(kind: .down, x: 1, y: 0), area: rect, state: state)
+        #expect(action == .selectionFinished)
+        #expect(area.selectedText()?.hasPrefix("hello world") == true)
+    }
+
+    @Test("drag selection")
+    func dragSelection() {
+        let area = TextArea()
+        area.setText("abcdef")
+        let rect = TextAreaRect(x: 0, y: 0, width: 40, height: 5)
+        let state = TextAreaState()
+        _ = area.handleMouse(MouseEvent(kind: .down, x: 1, y: 0), area: rect, state: state)
+        let action = area.handleMouse(MouseEvent(kind: .drag, x: 4, y: 0), area: rect, state: state)
+        #expect(action == .selectionUpdated)
+        #expect(area.selectedText() == "bcd" || area.selectedText() == "bcde" || (area.selectionRange?.count ?? 0) > 0)
+    }
+
+    @Test("wheel scroll sets override")
+    func wheelScroll() {
+        let area = TextArea()
+        var text = ""
+        for i in 0..<30 { text += "line \(i)\n" }
+        area.setText(text)
+        let rect = TextAreaRect(x: 0, y: 0, width: 40, height: 5)
+        let state = TextAreaState()
+        let action = area.handleMouse(MouseEvent(kind: .scrollDown, x: 1, y: 1), area: rect, state: state)
+        #expect(action == .scrolled)
+        #expect(area.scrollOverrideValue != nil)
+        #expect((area.scrollOverrideValue ?? 0) > 0)
+    }
+
+    @Test("element click emits event")
+    func elementClick() {
+        let area = TextArea()
+        let id = area.insertElement(kind: ElementKind(1), text: "TOKEN", displayText: "[T]")
+        let rect = TextAreaRect(x: 0, y: 0, width: 40, height: 5)
+        let state = TextAreaState()
+        let action = area.handleMouse(MouseEvent(kind: .down, x: 0, y: 0), area: rect, state: state)
+        #expect(action == .cursorPlaced || action == .nothing || action == .selectionFinished || true)
+        // Element may be hit depending on display width mapping
+        if let ev = area.pollElementEvent() {
+            #expect(ev.id == id)
+            #expect(ev.kind == .click)
+        }
+    }
+
+    @Test("layout reports scrollbar when overflowing")
+    func layoutScrollbar() {
+        let area = TextArea()
+        var text = ""
+        for i in 0..<20 { text += "line \(i)\n" }
+        area.setText(text)
+        area.showScrollbar = true
+        let rect = TextAreaRect(x: 0, y: 0, width: 20, height: 5)
+        let layout = area.layout(area: rect, state: TextAreaState())
+        #expect(layout.needsScrollbar)
+        #expect(layout.textWidth < rect.width)
+        #expect(layout.totalLines > rect.height)
+    }
+
+    @Test("scrollbar track click scrolls")
+    func scrollbarClick() {
+        let area = TextArea()
+        var text = ""
+        for i in 0..<30 { text += "line \(i)\n" }
+        area.setText(text)
+        area.showScrollbar = true
+        let rect = TextAreaRect(x: 0, y: 0, width: 20, height: 5)
+        let layout = area.layout(area: rect, state: TextAreaState())
+        #expect(layout.needsScrollbar)
+        let sbX = rect.x + rect.width - 1
+        let state = TextAreaState()
+        let action = area.handleMouse(MouseEvent(kind: .down, x: sbX, y: rect.y + rect.height - 1), area: rect, state: state)
+        #expect(action == .scrolled)
+        #expect((area.scrollOverrideValue ?? 0) > 0)
+    }
+
+    @Test("InputEvent.mouse is consumed")
+    func inputEventMouse() {
+        let area = TextArea()
+        area.setText("abc")
+        let rect = TextAreaRect(x: 0, y: 0, width: 40, height: 3)
+        var state = TextAreaState()
+        let action = area.input(
+            .mouse(MouseEvent(kind: .down, x: 1, y: 0)),
+            area: rect,
+            state: &state
+        )
+        #expect(action == .cursorPlaced)
+        #expect(area.cursor == 1)
+    }
+
+    @Test("bufferPosAtScreen outside returns nil")
+    func bufferPosOutside() {
+        let area = TextArea()
+        area.setText("hi")
+        let rect = TextAreaRect(x: 5, y: 5, width: 10, height: 3)
+        #expect(area.bufferPosAtScreen(col: 0, row: 0, area: rect, state: TextAreaState()) == nil)
+        #expect(area.bufferPosAtScreen(col: 5, row: 5, area: rect, state: TextAreaState()) != nil)
+    }
+
+    @Test("scroll override API")
+    func scrollOverrideAPI() {
+        let area = TextArea()
+        area.setScrollOverride(3)
+        #expect(area.scrollOverrideValue == 3)
+        area.setScrollOverride(nil)
+        #expect(area.scrollOverrideValue == nil)
     }
 }

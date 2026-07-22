@@ -289,9 +289,9 @@ Strict rules:
 - Do not spawn subagents; you are already the implementation agent.
 - Preserve Open Grok branding, OPENGROK_HOME isolation, provider credential/cache separation, cancellation and ordering invariants, and platform-neutral protocols with explicit Darwin/Linux/Windows adapters.
 - Translate meaningful Rust tests and fixtures. Remove bootstrap placeholders only when replacing them with complete behavior.
-- Run focused clean target builds/tests. Report blockers honestly.
+- Do NOT invoke SwiftPM directly (no swift build / swift test / swift package / xcodebuild, no alternate build cache). Only the serialized integration agent may run zsh workflows/swift-safe-verify.zsh. Perform static verification only and report blockers honestly.
 
-Finish with a concise handoff listing changed files, tests run, and remaining blockers.
+Finish with a concise handoff listing changed files, static verification performed, and remaining blockers.
 EOF
 
     run_text_agent "grok-4.5" "$prompt_file" "$CYCLE_DIR/implementations/$slice_id.txt" "$CYCLE_DIR/logs/$slice_id-implement.log" 40 &
@@ -324,7 +324,7 @@ Rust reference: $REFERENCE
 Slice: $slice_file
 Implementation handoff: $CYCLE_DIR/implementations/$slice_id.txt
 
-Do not edit files and do not spawn subagents. Compare the Swift code with the named Rust crates and acceptance criteria. Run focused clean builds/tests where useful. Review semantic parity, strict-concurrency safety, cancellation and exactly-once behavior, provider/auth/path isolation, error mapping, persistence/wire compatibility, test quality, Windows seams, and remaining placeholders.
+Do not edit files and do not spawn subagents. Compare the Swift code with the named Rust crates and acceptance criteria. Do NOT invoke SwiftPM directly (no swift build / swift test / swift package / xcodebuild); only the serialized integration agent may run zsh workflows/swift-safe-verify.zsh. Review statically: semantic parity, strict-concurrency safety, cancellation and exactly-once behavior, provider/auth/path isolation, error mapping, persistence/wire compatibility, test quality, Windows seams, and remaining placeholders.
 
 Return only JSON matching the supplied schema. Mark pass only when the slice is meaningfully complete.
 EOF
@@ -365,9 +365,9 @@ Rust reference: $REFERENCE
 Exclusive slice: $CYCLE_DIR/slices/$slice_id.json
 Terra findings: $review_file
 
-Fix every critical/high/medium issue and all low issues affecting parity, portability, safety, or tests. Edit only the slice's ownedPaths. Do not spawn subagents, commit, reset, or touch another slice. Re-read the Rust implementation where needed and run focused clean builds/tests.
+Fix every critical/high/medium issue and all low issues affecting parity, portability, safety, or tests. Edit only the slice's ownedPaths. Do not spawn subagents, commit, reset, or touch another slice. Re-read the Rust implementation where needed. Do NOT invoke SwiftPM directly (no swift build / swift test / swift package / xcodebuild); only the serialized integration agent may run zsh workflows/swift-safe-verify.zsh. Perform static verification only.
 
-Finish with a concise handoff listing fixes and verification.
+Finish with a concise handoff listing fixes and static verification.
 EOF
 
     run_text_agent "grok-4.5" "$prompt_file" "$CYCLE_DIR/fixes/$slice_id.txt" "$CYCLE_DIR/logs/$slice_id-fix.log" 32 &

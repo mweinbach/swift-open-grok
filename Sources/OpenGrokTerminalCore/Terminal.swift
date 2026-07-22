@@ -88,6 +88,11 @@ public final class Terminal {
         TerminalFrame(viewportArea: viewportArea, buffer: buffers[current], count: frameCount)
     }
 
+    /// Commit a rendered frame buffer into the current backing store without flushing.
+    public func commitFrameBuffer(_ buffer: CellBuffer) {
+        buffers[current] = buffer
+    }
+
     // MARK: - Links
 
     public func setFrameLinks(_ spans: [LinkSpan]) {
@@ -129,6 +134,10 @@ public final class Terminal {
         return !updates.isEmpty
     }
 
+    /// Diff + emit the current frame with OSC 8 hyperlinks (Rust `flush_with_links`).
+    ///
+    /// Linked runs are wrapped once around a single `backend.draw` call; glyphs
+    /// are never double-emitted.
     @discardableResult
     public func flushWithLinks() throws -> Bool {
         let cur = current
@@ -147,16 +156,12 @@ public final class Terminal {
         if let last = updates.last {
             lastKnownCursorPos = TerminalPoint(x: last.x, y: last.y)
         }
-        // Prefer OSC 8 aware stream through the writer, and also draw symbols.
-        let data = CellStreamEncoder.encode(
-            updates: updates,
+        try backend.drawWithLinks(
+            updates,
             linkIds: linkIds[cur],
             linkTable: linkTables[cur],
             area: buffers[cur].area
         )
-        try backend.writer.write(bytes: Array(data))
-        // Also emit bare symbols for recording backends that only look at draw().
-        try backend.draw(updates)
         return !updates.isEmpty
     }
 
@@ -164,13 +169,35 @@ public final class Terminal {
 
     @discardableResult
     public func draw(_ render: (inout TerminalFrame) throws -> Void) throws -> CompletedFrame {
+        try drawInternal(withLinks: false, links: [], render)
+    }
+
+    /// Atomic render path: commit the rendered buffer, apply hyperlink spans,
+    /// emit OSC 8 during the same frame flush, then swap buffers.
+    @discardableResult
+    public func drawWithLinks(
+        _ links: [LinkSpan],
+        _ render: (inout TerminalFrame) throws -> Void
+    ) throws -> CompletedFrame {
+        try drawInternal(withLinks: true, links: links, render)
+    }
+
+    private func drawInternal(
+        withLinks: Bool,
+        links: [LinkSpan],
+        _ render: (inout TerminalFrame) throws -> Void
+    ) throws -> CompletedFrame {
         try autoresize()
         var frame = getFrame()
         try render(&frame)
         buffers[current] = frame.buffer
-        let cursorPosition = frame.cursorPosition
-        _ = try flush()
-        if let position = cursorPosition {
+        if withLinks {
+            setFrameLinks(links)
+            _ = try flushWithLinks()
+        } else {
+            _ = try flush()
+        }
+        if let position = frame.cursorPosition {
             try showCursor()
             try setCursorPosition(position)
         } else {

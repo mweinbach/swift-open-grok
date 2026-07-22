@@ -5,28 +5,78 @@
   "files": [
     {
       "path": "ProtocolFixtures/acp-methods.json",
-      "sizeBytes": 549,
-      "sha256": "a13778dad6ae5d04978b2e96a87af93a26e0e8962517673f368a7a52a3183722"
-    },
-    {
-      "path": "ProtocolFixtures/otlp-span-export-shape.json",
-      "sizeBytes": 776,
-      "sha256": "42eaa4613853996e14a60f108a7e231827a78458fa6f7ae9fa56c1825a84ab28"
-    },
-    {
-      "path": "ProtocolFixtures/git-object-and-index.json",
-      "sizeBytes": 625,
-      "sha256": "992cf1136eef553fdb283e4f1d6ac8ed079b4d6c979dd65f15dc0b53bfc10501"
+      "sizeBytes": 732,
+      "sha256": "c30d1167caca873b1c3192a47a9696003a535bf8cd1d9e3b8f42902272093b39"
     },
     {
       "path": "ProtocolFixtures/cli-version-and-home.json",
-      "sizeBytes": 476,
-      "sha256": "bc04d6405300e366ecc2fb438b9eae7a405799dbcc9e6cb7818191d97e2cf121"
+      "sizeBytes": 647,
+      "sha256": "57e5c8957676c3c4196c3bddbf68e9ff757e7b694563301b487802257443d263"
     },
     {
       "path": "ProtocolFixtures/config-workspace-codemode-keys.json",
-      "sizeBytes": 512,
-      "sha256": "29905a5f7873e94dcf2c3262ab3e394382b3ef083b16448e374fd7993176c3a4"
+      "sizeBytes": 1045,
+      "sha256": "4b21c8466c793f28119696d8f807d771efabafb971608b8afaf2b99bc0b3db20"
+    },
+    {
+      "path": "ProtocolFixtures/crash-gcrx-format.json",
+      "sizeBytes": 853,
+      "sha256": "f33d1506feb41f5d9e38c66dfa130bcfa22397f8548306ae71276b1954a3a22c"
+    },
+    {
+      "path": "ProtocolFixtures/crash-gcrx-sample.bin",
+      "sizeBytes": 64,
+      "sha256": "2fe75302987a1327442ddbf786fc3ce8e0fb3a17e0283eac3723f44ad6ca5ec2"
+    },
+    {
+      "path": "ProtocolFixtures/git-loose-blob-hello.zlib",
+      "sizeBytes": 21,
+      "sha256": "93aeb3c1fad42d632b7848d4010daf85939a0238a98702abb03a44209151f375"
+    },
+    {
+      "path": "ProtocolFixtures/git-object-and-index.json",
+      "sizeBytes": 913,
+      "sha256": "eae1e53cd271d8a02c3bb17c53aa23eeb16e0897151088f31a041612fd454521"
+    },
+    {
+      "path": "ProtocolFixtures/hunk-tracker-snapshot.json",
+      "sizeBytes": 913,
+      "sha256": "9d8a19c9d11204be06faeeaca5243ea12bf117f21e7001e4f908d4b66ccd0e41"
+    },
+    {
+      "path": "ProtocolFixtures/otlp-export-trace-grpc.bin",
+      "sizeBytes": 172,
+      "sha256": "22633804288704f0aaf15479734326b5882db6e94fa4e0c68be183f71e9a120b"
+    },
+    {
+      "path": "ProtocolFixtures/otlp-export-trace-http.pb",
+      "sizeBytes": 167,
+      "sha256": "3fd9c9fe98578e05f76e5cec32c4ce6af4a312cd6f42223839f40a3d447ee6a4"
+    },
+    {
+      "path": "ProtocolFixtures/otlp-span-export-shape.json",
+      "sizeBytes": 1483,
+      "sha256": "c1b9ba44b19b7f3a8086b4d2004f06c98e36f9c2e248e36d76fab1925e79de6b"
+    },
+    {
+      "path": "ProtocolFixtures/PROVENANCE.json",
+      "sizeBytes": 926,
+      "sha256": "f9690c273a615c190d273b32053c4204becf27d69e420ab4b3e410d36557f76a"
+    },
+    {
+      "path": "ProtocolFixtures/pty-process-signals.json",
+      "sizeBytes": 632,
+      "sha256": "887283a66e560c7781a2b11f2545fa4837255e2543b340f8c8ae50ef6124cbd6"
+    },
+    {
+      "path": "ProtocolFixtures/sqlite-journal-modes.json",
+      "sizeBytes": 615,
+      "sha256": "fc7bce6e00eb4d81b8b96d6e31b55435597c62771461cb8d9a9b2362fcfdf2c9"
+    },
+    {
+      "path": "ProtocolFixtures/tracing-w3c-traceparent.json",
+      "sizeBytes": 811,
+      "sha256": "3c5e66e00b89bcd4477d98bdb82297534b5124194f3f2ddf59237ae4d72d4809"
     }
   ]
 }

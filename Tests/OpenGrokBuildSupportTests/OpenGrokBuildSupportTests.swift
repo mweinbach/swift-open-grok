@@ -104,12 +104,19 @@ struct OpenGrokBuildSupportTests {
     }
 
     @Test("Validator detects a stale digest")
-    func fixtureValidatorStaleDigest() {
+    func fixtureValidatorStaleDigest() throws {
+        let url = packageRoot.appendingPathComponent("ProtocolFixtures/acp-methods.json")
+        let data = try Data(contentsOf: url)
+        let actualDigest = SHA256.hexDigest(Array(data))
         let bad = GeneratedManifest(
             generatedAt: "2026-07-20",
-            referenceRevision: "open-grok.21",
+            referenceRevision: "9739c4a2ad23cfea14312a481169757f3da494f4",
             files: [
-                GeneratedFixtureEntry(path: "ProtocolFixtures/acp-methods.json", sizeBytes: 549, sha256: "deadbeef")
+                GeneratedFixtureEntry(
+                    path: "ProtocolFixtures/acp-methods.json",
+                    sizeBytes: data.count,
+                    sha256: "deadbeef"
+                )
             ]
         )
         let result = FixtureValidator.validate(manifest: bad, packageRoot: packageRoot, allowUnexpectedFiles: true)
@@ -117,7 +124,11 @@ struct OpenGrokBuildSupportTests {
             Issue.record("Expected stale result")
             return
         }
-        #expect(issues.contains(.digestMismatch(path: "ProtocolFixtures/acp-methods.json", expected: "deadbeef", actual: "a13778dad6ae5d04978b2e96a87af93a26e0e8962517673f368a7a52a3183722")))
+        #expect(issues.contains(.digestMismatch(
+            path: "ProtocolFixtures/acp-methods.json",
+            expected: "deadbeef",
+            actual: actualDigest
+        )))
     }
 
     @Test("Validator detects a missing fixture file")
@@ -565,6 +576,108 @@ struct OpenGrokBuildSupportTests {
         #expect(FixtureValidator.isUnder(inside, root: root))
         #expect(FixtureValidator.isUnder(same, root: root))
         #expect(!FixtureValidator.isUnder(outside, root: root))
+    }
+
+    // MARK: - Semantic fixture payloads (not digest-only)
+
+    @Test("OTLP golden protobuf is real ExportTraceServiceRequest bytes")
+    func otlpGoldenIsProtobufNotJSON() throws {
+        let http = try Data(contentsOf: packageRoot
+            .appendingPathComponent("ProtocolFixtures/otlp-export-trace-http.pb"))
+        let grpc = try Data(contentsOf: packageRoot
+            .appendingPathComponent("ProtocolFixtures/otlp-export-trace-grpc.bin"))
+        #expect(http.first == 0x0A)
+        #expect(http.first != UInt8(ascii: "{"))
+        #expect(String(decoding: http, as: UTF8.self).contains("collector_golden"))
+        #expect(grpc.count == http.count + 5)
+        #expect(grpc.first == 0)
+        let len = (UInt32(grpc[1]) << 24) | (UInt32(grpc[2]) << 16)
+            | (UInt32(grpc[3]) << 8) | UInt32(grpc[4])
+        #expect(Int(len) == http.count)
+        #expect(grpc.subdata(in: 5..<grpc.count) == http)
+
+        let shape = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: packageRoot
+                .appendingPathComponent("ProtocolFixtures/otlp-span-export-shape.json"))
+        ) as? [String: Any]
+        #expect(shape?["grpcExportRPCPath"] as? String
+            == "/opentelemetry.proto.collector.trace.v1.TraceService/Export")
+        #expect(shape?["goldenHttpProtobuf"] as? String
+            == "ProtocolFixtures/otlp-export-trace-http.pb")
+    }
+
+    @Test("Crash GCRX sample has magic/version and matching meta fixture")
+    func crashGCRXSampleSemantic() throws {
+        let blob = try Data(contentsOf: packageRoot
+            .appendingPathComponent("ProtocolFixtures/crash-gcrx-sample.bin"))
+        #expect(blob.count >= 64)
+        #expect(Array(blob.prefix(4)) == [0x47, 0x43, 0x52, 0x58]) // GCRX
+        #expect(blob[4] == 1)
+        #expect(blob[5] == 11) // SIGSEGV sample
+        let meta = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: packageRoot
+                .appendingPathComponent("ProtocolFixtures/crash-gcrx-format.json"))
+        ) as? [String: Any]
+        #expect(meta?["magic"] as? String == "GCRX")
+        #expect(meta?["version"] as? Int == 1)
+        #expect(meta?["headerSize"] as? Int == 64)
+    }
+
+    @Test("Git loose-object fixture decompresses to blob hello")
+    func gitLooseBlobSemantic() throws {
+        let zlibBytes = try Data(contentsOf: packageRoot
+            .appendingPathComponent("ProtocolFixtures/git-loose-blob-hello.zlib"))
+        #expect(!zlibBytes.isEmpty)
+        let meta = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: packageRoot
+                .appendingPathComponent("ProtocolFixtures/git-object-and-index.json"))
+        ) as? [String: Any]
+        let example = meta?["blobSha1Example"] as? [String: Any]
+        #expect(example?["sha1Hex"] as? String
+            == "ce013625030ba8dba906f756967f9e9ca394464a")
+        #expect(example?["looseObjectZlibSize"] as? Int == zlibBytes.count)
+        #expect((meta?["packedObjects"] as? [String: Any])?["supported"] as? Bool == false)
+    }
+
+    @Test("Foundation format fixtures cover tracing storage hunk PTY crash")
+    func foundationFormatFixturesPresent() throws {
+        let required = [
+            "tracing-w3c-traceparent.json",
+            "sqlite-journal-modes.json",
+            "hunk-tracker-snapshot.json",
+            "pty-process-signals.json",
+            "crash-gcrx-format.json",
+            "crash-gcrx-sample.bin",
+            "otlp-export-trace-http.pb",
+            "otlp-export-trace-grpc.bin",
+            "PROVENANCE.json",
+        ]
+        for name in required {
+            let url = packageRoot.appendingPathComponent("ProtocolFixtures/\(name)")
+            #expect(FileManager.default.fileExists(atPath: url.path), "missing \(name)")
+        }
+        let pty = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: packageRoot
+                .appendingPathComponent("ProtocolFixtures/pty-process-signals.json"))
+        ) as? [String: Any]
+        let signals = pty?["processSignals"] as? [String: Int]
+        #expect(signals?["terminate"] == 15)
+        #expect(signals?["kill"] == 9)
+        let tracing = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: packageRoot
+                .appendingPathComponent("ProtocolFixtures/tracing-w3c-traceparent.json"))
+        ) as? [String: Any]
+        #expect((tracing?["sampleTraceparent"] as? String)?.hasPrefix("00-") == true)
+        let hunk = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: packageRoot
+                .appendingPathComponent("ProtocolFixtures/hunk-tracker-snapshot.json"))
+        ) as? [String: Any]
+        #expect(hunk?["schemaVersion"] as? Int == 1)
+        let storage = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: packageRoot
+                .appendingPathComponent("ProtocolFixtures/sqlite-journal-modes.json"))
+        ) as? [String: Any]
+        #expect((storage?["journalModes"] as? [String])?.contains("WAL") == true)
     }
 
     // MARK: - ProtoBuilder API (issue 1: functional parity port)
