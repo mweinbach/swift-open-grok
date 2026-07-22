@@ -2,14 +2,18 @@
 //
 // Pure Git object/tree reader (loose objects + commit/tree parse).
 // Used to compare stage-0 index entries against HEAD without shelling out.
+//
+// Portability:
+// - SHA-1 via pure-Swift `PortableSHA1` (no CryptoKit).
+// - zlib via Apple Compression when available, else system zlib (`COpenGrokZlib`).
+// - Packed objects: explicit `packedObjectUnsupported` non-parity error.
 
 import Foundation
-import CryptoKit
 #if canImport(Compression)
 import Compression
 #endif
-#if os(Linux)
-import Glibc
+#if canImport(COpenGrokZlib)
+import COpenGrokZlib
 #endif
 
 /// A path entry from a Git tree (recursively flattened).
@@ -75,8 +79,24 @@ public struct GitObjectStore: Sendable {
             return try parseObject(inflated)
         }
 
-        // Best-effort: scan pack indices is out of pure minimal scope; report missing.
+        // Pack reading is not implemented. When pack files exist, report an
+        // explicit non-parity error so callers never treat a pack-only object
+        // as a soft "missing HEAD" success.
+        if Self.hasPackFiles(gitDir: gitDir) {
+            throw GitStatusError.packedObjectUnsupported(oid: hex)
+        }
         throw GitStatusError.io("object not found: \(hex)")
+    }
+
+    /// True when `.git/objects/pack` contains at least one `*.pack` file.
+    public static func hasPackFiles(gitDir: String) -> Bool {
+        let packDir = (gitDir as NSString)
+            .appendingPathComponent("objects")
+        let packs = (packDir as NSString).appendingPathComponent("pack")
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: packs) else {
+            return false
+        }
+        return names.contains { $0.hasSuffix(".pack") }
     }
 
     /// Load HEAD commit's tree as a flat path → (mode, oid) map.
@@ -157,7 +177,17 @@ public struct GitObjectStore: Sendable {
 
 func inflateZlib(_ data: Data) throws -> Data {
     #if canImport(Compression)
-    return try data.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> Data in
+    return try inflateZlibCompression(data)
+    #elseif canImport(COpenGrokZlib)
+    return try inflateZlibSystem(data)
+    #else
+    throw GitStatusError.io("zlib inflate unavailable on this platform")
+    #endif
+}
+
+#if canImport(Compression)
+private func inflateZlibCompression(_ data: Data) throws -> Data {
+    try data.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> Data in
         guard let base = src.baseAddress else { return Data() }
         var dstCapacity = max(data.count * 4, 4096)
         for _ in 0..<6 {
@@ -181,19 +211,15 @@ func inflateZlib(_ data: Data) throws -> Data {
         }
         throw GitStatusError.io("zlib inflate failed")
     }
-    #elseif os(Linux)
-    return try inflateZlibLinux(data)
-    #else
-    throw GitStatusError.io("zlib inflate unavailable on this platform")
-    #endif
 }
+#endif
 
-#if os(Linux)
-private func inflateZlibLinux(_ data: Data) throws -> Data {
+#if canImport(COpenGrokZlib)
+private func inflateZlibSystem(_ data: Data) throws -> Data {
     var stream = z_stream()
     var status = inflateInit_(&stream, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
     guard status == Z_OK else { throw GitStatusError.io("inflateInit failed") }
-    defer { inflateEnd(&stream) }
+    defer { _ = inflateEnd(&stream) }
 
     var output = Data()
     var input = data
@@ -227,9 +253,7 @@ public func writeLooseObject(gitDir: String, type: String, payload: Data) throws
     header.append(0)
     var full = Data(header)
     full.append(payload)
-    var hasher = Insecure.SHA1()
-    hasher.update(data: full)
-    let oid = Data(hasher.finalize())
+    let oid = PortableSHA1.hash(full)
     let hex = GitObjectStore.hexFromOID(oid)
     let dir = ((gitDir as NSString)
         .appendingPathComponent("objects") as NSString)
@@ -246,7 +270,17 @@ public func writeLooseObject(gitDir: String, type: String, payload: Data) throws
 
 func deflateZlib(_ data: Data) throws -> Data {
     #if canImport(Compression)
-    return try data.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> Data in
+    return try deflateZlibCompression(data)
+    #elseif canImport(COpenGrokZlib)
+    return try deflateZlibSystem(data)
+    #else
+    throw GitStatusError.io("zlib deflate unavailable")
+    #endif
+}
+
+#if canImport(Compression)
+private func deflateZlibCompression(_ data: Data) throws -> Data {
+    try data.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> Data in
         guard let base = src.baseAddress else { return Data() }
         let dstCapacity = data.count + data.count / 10 + 64
         var dst = Data(count: dstCapacity)
@@ -265,19 +299,20 @@ func deflateZlib(_ data: Data) throws -> Data {
         dst.count = written
         return dst
     }
-    #elseif os(Linux)
-    return try deflateZlibLinux(data)
-    #else
-    throw GitStatusError.io("zlib deflate unavailable")
-    #endif
 }
+#endif
 
-#if os(Linux)
-private func deflateZlibLinux(_ data: Data) throws -> Data {
+#if canImport(COpenGrokZlib)
+private func deflateZlibSystem(_ data: Data) throws -> Data {
     var stream = z_stream()
-    var status = deflateInit_(&stream, Z_DEFAULT_COMPRESSION, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
+    var status = deflateInit_(
+        &stream,
+        Z_DEFAULT_COMPRESSION,
+        ZLIB_VERSION,
+        Int32(MemoryLayout<z_stream>.size)
+    )
     guard status == Z_OK else { throw GitStatusError.io("deflateInit failed") }
-    defer { deflateEnd(&stream) }
+    defer { _ = deflateEnd(&stream) }
 
     var output = Data()
     var input = data
@@ -370,9 +405,7 @@ public func encodeGitIndex(entries: [GitIndexEntry]) -> Data {
         }
     }
     // trailing checksum (sha1 of content so far)
-    var hasher = Insecure.SHA1()
-    hasher.update(data: data)
-    data.append(Data(hasher.finalize()))
+    data.append(PortableSHA1.hash(data))
     return data
 }
 

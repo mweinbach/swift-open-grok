@@ -336,7 +336,15 @@ struct DispatchTests {
         #expect(terminals.count == 1)
         if case .failure(let err) = terminals.first {
             #expect(err.kind == .custom)
-            #expect(err.variantName == "custom" || err.detail.contains("terminal") || true)
+            #expect(err.variantName == "custom")
+            #expect(err.detail.contains("terminal") || err.detail.contains("stream"))
+            if case .object(let map)? = err.details, case .string(let code) = map["code"] {
+                #expect(code == "stream_no_terminal")
+            } else {
+                Issue.record("expected details.code == stream_no_terminal")
+            }
+        } else {
+            Issue.record("expected custom stream_no_terminal failure")
         }
     }
 }

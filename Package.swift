@@ -173,7 +173,24 @@ private func targets() -> [Target] {
     t.append(.target(name: "OpenGrokFileUtils", dependencies: dep(w0s2, w0s3, w0s4, w1s5)))
     t.append(.target(name: "OpenGrokSQLiteJournal", dependencies: dep(w0s2, w0s3, w0s4, w1s5, ["OpenGrokFileUtils"])))
     t.append(.target(name: "OpenGrokSecrets", dependencies: dep(w0s2, w0s3, w0s4, w1s5, ["OpenGrokFileUtils"])))
-    t.append(contentsOf: libs(w2s3, dep(w0s2, w0s3, w0s4)))
+    // W2-S3: FSNotify / CodebaseGraph / HunkTracker share base deps; GitStatus
+    // depends on a thin C zlib shim for portable inflate/deflate when Apple
+    // Compression is unavailable (notably Linux). Apple hosts prefer Compression.
+    t.append(.target(
+        name: "COpenGrokZlib",
+        path: "Sources/COpenGrokZlib",
+        publicHeadersPath: "include",
+        linkerSettings: [
+            .linkedLibrary("z"),
+        ]
+    ))
+    t.append(.target(name: "OpenGrokFSNotify", dependencies: dep(w0s2, w0s3, w0s4)))
+    t.append(.target(
+        name: "OpenGrokGitStatus",
+        dependencies: dep(w0s2, w0s3, w0s4, ["COpenGrokZlib"])
+    ))
+    t.append(.target(name: "OpenGrokCodebaseGraph", dependencies: dep(w0s2, w0s3, w0s4)))
+    t.append(.target(name: "OpenGrokHunkTracker", dependencies: dep(w0s2, w0s3, w0s4)))
     // W2-S4: TTY base; PTY -> TTY; PTYCLI -> PTY/TTY.
     // C shims must live in separate targets: SwiftPM rejects mixed-language
     // Sources/<Target> trees (OpenGrokPTY + OpenGrokCrashHandler).

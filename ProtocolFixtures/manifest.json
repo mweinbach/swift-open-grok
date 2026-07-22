@@ -1,12 +1,32 @@
 {
   "version": 1,
-  "generatedAt": "2026-07-20",
-  "referenceRevision": "open-grok.21",
+  "generatedAt": "2026-07-22",
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
   "files": [
     {
       "path": "ProtocolFixtures/acp-methods.json",
       "sizeBytes": 549,
       "sha256": "a13778dad6ae5d04978b2e96a87af93a26e0e8962517673f368a7a52a3183722"
+    },
+    {
+      "path": "ProtocolFixtures/otlp-span-export-shape.json",
+      "sizeBytes": 776,
+      "sha256": "42eaa4613853996e14a60f108a7e231827a78458fa6f7ae9fa56c1825a84ab28"
+    },
+    {
+      "path": "ProtocolFixtures/git-object-and-index.json",
+      "sizeBytes": 625,
+      "sha256": "992cf1136eef553fdb283e4f1d6ac8ed079b4d6c979dd65f15dc0b53bfc10501"
+    },
+    {
+      "path": "ProtocolFixtures/cli-version-and-home.json",
+      "sizeBytes": 476,
+      "sha256": "bc04d6405300e366ecc2fb438b9eae7a405799dbcc9e6cb7818191d97e2cf121"
+    },
+    {
+      "path": "ProtocolFixtures/config-workspace-codemode-keys.json",
+      "sizeBytes": 512,
+      "sha256": "29905a5f7873e94dcf2c3262ab3e394382b3ef083b16448e374fd7993176c3a4"
     }
   ]
 }

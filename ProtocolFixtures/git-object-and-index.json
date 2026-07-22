@@ -1,0 +1,21 @@
+{
+  "$schema": "open-grok/protocol-fixtures/git-object-and-index",
+  "blobSha1Example": {
+    "content": "hello\n",
+    "header": "blob 6\\0",
+    "sha1Hex": "ce013625030ba8dba906f756967f9e9ca394464a"
+  },
+  "indexSignature": "DIRC",
+  "indexVersions": [
+    2,
+    3,
+    4
+  ],
+  "looseObjectLayout": "objects/xx/yyyy... zlib-wrapped deflate of (type SP size NUL payload)",
+  "packedObjects": {
+    "errorCase": "packedObjectUnsupported",
+    "notes": "Explicit non-parity when object is pack-only; no silent empty HEAD tree",
+    "supported": false
+  },
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+}

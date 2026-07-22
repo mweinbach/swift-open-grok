@@ -409,6 +409,11 @@ struct ExternalOTELTests {
             $0.lowercased() == "authorization"
         }))
         #expect(!wire.body.isEmpty)
+        // Must be real protobuf — never JSON mislabeled as x-protobuf.
+        #expect(OTLPWire.looksLikeExportTraceProtobuf(wire.body))
+        #expect(wire.body.first != UInt8(ascii: "{"))
+        // Span name bytes are embedded as a length-delimited UTF-8 field.
+        #expect(String(decoding: wire.body, as: UTF8.self).contains("http_request"))
     }
 
     @Test func grpcWireFramesPayload() throws {
@@ -426,9 +431,16 @@ struct ExternalOTELTests {
         #expect(wire != nil)
         guard let wire else { return }
         #expect(wire.request.headers["Content-Type"] == OTLPWire.grpcContentType)
-        // 1-byte flag + 4-byte length prefix.
+        // 1-byte flag + 4-byte length prefix around the protobuf body.
         #expect(wire.request.body?.count == wire.body.count + 5)
         #expect(wire.request.body?.first == 0)
+        #expect(OTLPWire.looksLikeExportTraceProtobuf(wire.body))
+        if let framed = wire.request.body, let inner = OTLPWire.unframeGRPC(framed) {
+            #expect(inner == wire.body)
+            #expect(OTLPWire.looksLikeExportTraceProtobuf(inner))
+        } else {
+            Issue.record("expected unframeable gRPC protobuf frame")
+        }
     }
 
     @Test func mockCollectorRecordsExport() async throws {
@@ -495,8 +507,12 @@ struct ExternalOTELTests {
         #expect(
             request?.url.absoluteString == "https://otel.product.example/v1/traces"
         )
-        #expect(request?.headers["Content-Type"] == OTLPWire.httpJSONContentType)
+        #expect(request?.headers["Content-Type"] == OTLPWire.httpProtobufContentType)
         #expect(request?.body?.isEmpty == false)
+        if let body = request?.body {
+            #expect(OTLPWire.looksLikeExportTraceProtobuf(body))
+            #expect(body.first != UInt8(ascii: "{"))
+        }
 
         // Disabled product OTEL must not build a request (zero-byte invariant).
         let off = TelemetryClient(
@@ -508,6 +524,26 @@ struct ExternalOTELTests {
             transport: MockHTTPTransport()
         )
         #expect(try off.makeProductOTLPRequest(name: "x", attributes: [:]) == nil)
+    }
+
+    @Test func protobufIsNotJSONBytes() throws {
+        let body = try OTLPWire.encodeSpanEnvelope(
+            name: "collector_golden",
+            attributes: [
+                "http.request.method": .string("GET"),
+                "retry": .bool(false),
+                "count": .number(2),
+            ]
+        )
+        #expect(OTLPWire.looksLikeExportTraceProtobuf(body))
+        #expect(body.first == 0x0A)
+        // JSON twin remains available for diagnostics but is never the wire body.
+        let json = try OTLPWire.encodeSpanJSONEnvelope(
+            name: "collector_golden",
+            attributes: ["http.request.method": .string("GET")]
+        )
+        #expect(json.first == UInt8(ascii: "{"))
+        #expect(body != json)
     }
 }
 

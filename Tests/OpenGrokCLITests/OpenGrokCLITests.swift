@@ -37,6 +37,19 @@ struct OpenGrokCLITests {
         #expect(!out.contents.contains(OpenGrokCLIVersion.compiled))
     }
 
+    @Test("empty GROK_TEST_VERSION override returns empty version (OpenGrokVersion parity)")
+    func emptyVersionOverride() {
+        let (streams, out, _) = CLIStreams.buffered()
+        let code = CLIRunner.main(
+            ["version"],
+            environment: ["GROK_TEST_VERSION": ""],
+            streams: streams
+        )
+        #expect(code == 0)
+        #expect(OpenGrokCLIVersion.installed(environment: ["GROK_TEST_VERSION": ""]) == "")
+        #expect(!out.contents.contains(OpenGrokCLIVersion.compiled))
+    }
+
     // MARK: - Help
 
     @Test("help prints usage on stdout and exits 0")

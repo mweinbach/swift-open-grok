@@ -1,0 +1,23 @@
+{
+  "$schema": "open-grok/protocol-fixtures/otlp-span-export-shape",
+  "contentTypeGrpc": "application/grpc+proto",
+  "contentTypeHttpProtobuf": "application/x-protobuf",
+  "exportMessage": "opentelemetry.proto.collector.trace.v1.ExportTraceServiceRequest",
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "requiredSpanFields": [
+    "trace_id",
+    "span_id",
+    "name",
+    "start_time_unix_nano",
+    "end_time_unix_nano"
+  ],
+  "sampleAttributes": {
+    "http.request.method": "GET",
+    "provider": "xai"
+  },
+  "wireNotes": [
+    "HTTP/protobuf body is real protobuf (field 1 = resource_spans), not JSON",
+    "gRPC frames protobuf with 1-byte flag + 4-byte big-endian length",
+    "provider/privacy vetoes must run before any serialization"
+  ]
+}

@@ -1,38 +1,49 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-07-22
-**Overall state:** Wave 0 foundations and Wave 1–2 contract/infrastructure slices R01–R09 have substantial target-level implementations. **Integrated package build is not green yet** after three safe-verify fix iterations; remaining failure last seen in `OpenGrokHTTP` async locking (fix applied after the third verify, not re-verified under the three-iteration cap). Executable product and full `swift test` remain blocked.
+**As of:** 2026-07-22 (R10 foundation baseline pass)
+**Overall state:** Wave 0 foundations and Wave 1–2 contract/infrastructure slices R01–R09 have substantial target-level implementations. **Integrated package build is still not verified green** under the sole safe verifier for the current working tree after R10 static foundation fixes (OTLP protobuf wire, GitStatus portable SHA-1/zlib, CLI version parity, fixtures/docs). Executable product and full `swift test` remain blocked until the integration agent re-runs `zsh workflows/swift-safe-verify.zsh`.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `9739c4a2ad23cfea14312a481169757f3da494f4` (`/tmp/open-grok-reference` when present).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`).
+**Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
-## Honest integration snapshot (2026-07-22)
+## Honest integration snapshot (2026-07-22 / R10)
 
 | Check | Result |
 |---|---|
-| `zsh workflows/swift-safe-verify.zsh build` (iter 1) | **Fail** — mixed-language `Sources/OpenGrokPTY` (Swift + C) rejected by SwiftPM |
-| `zsh workflows/swift-safe-verify.zsh build` (iter 2) | **Fail** — `OpenGrokCrashHandlerC` missing `sys/stat.h` for `fchmod`; then `HookEventCodingKey` double-init; then `OpenGrokSystemPower` concurrency/IOKit API errors |
-| `zsh workflows/swift-safe-verify.zsh build` (iter 3) | **Fail** — `BoundedStreamMailbox.next()` called `NSLock` directly from async (`OpenGrokHTTP`) |
-| Post-iter-3 static fix | HTTP mailbox rewritten to nonisolated `withLock` Box; **not re-verified** (3-iteration cap) |
-| `swift build --build-tests` / `swift test` / product | **Not run** after green build |
-| Executable version/help/paths smokes | **Blocked** until product builds |
+| `zsh workflows/swift-safe-verify.zsh build` (prior iter 1–3) | **Fail** historically (PTY mixed language → crash C/`HookEvent`/`SystemPower` → HTTP `NSLock` in async) |
+| Post-iter-3 HTTP lock-box fix | Present in tree; **not re-verified** under the three-iteration cap before R10 |
+| R10 static foundation fixes (this pass) | OTLP real protobuf + gRPC framing; GitStatus pure SHA-1 + `COpenGrokZlib`; pack non-parity error; CLI version → `OpenGrokVersion` (empty override); ToolRuntime vacuous assert removed; Executable tests; ProtocolFixtures expanded; README/workflows truth |
+| `swift build --build-tests` / `swift test` / product | **Not run in R10** (workers forbidden; sole integration agent owns verify) |
+| Executable version/help/paths smokes | **Blocked** until product builds; composition tests cover CLI surface |
 | CompactionTranscript.swift JSONValue correction | **Preserved** (do not revert) |
+| Placeholder production targets | **~50 / 97** still bootstrap placeholders (later waves) |
+| Zero-test test targets | **~55** still empty/placeholder outside foundation work; `OpenGrokExecutableTests` now has real suites |
 
-### Integration fixes landed this cycle (integration agent)
+### R10 foundation changes (static; pending integrated verify)
 
-- Split C shims into `OpenGrokPTYC` and `OpenGrokCrashHandlerC` targets; Swift modules import them. `Package.swift` edges updated.
+- `OpenGrokTelemetry`: `ExportTraceServiceRequest` protobuf encoder; product + external HTTP use `application/x-protobuf` with real protobuf; gRPC frames protobuf payloads; JSON twin only for diagnostics.
+- `OpenGrokGitStatus`: removed CryptoKit; pure-Swift `PortableSHA1`; C target `COpenGrokZlib` (links libz) declared in `Package.swift`; pack-only objects throw `packedObjectUnsupported` (not silent empty HEAD).
+- `OpenGrokCLI` version delegates to `OpenGrokVersion.installed` (empty `GROK_TEST_VERSION` parity).
+- Tests: ToolRuntime `stream_no_terminal` assertion fixed; executable composition suites; telemetry protobuf golden checks; git SHA-1/pack tests.
+- `ProtocolFixtures/`: OTLP, git object/index, CLI version/home, config/workspace/Code Mode key fixtures + updated manifest.
+- Docs/workflows: README no longer claims green Wave 0-only tree; `run-grok45-port.zsh` must use safe verifier.
+
+### Integration fixes already in tree (prior cycle)
+
+- Split C shims into `OpenGrokPTYC` and `OpenGrokCrashHandlerC`; `Package.swift` edges updated.
 - Crash C shim: include `<sys/stat.h>` for `fchmod`.
 - `HookEventNameWire` CodingKey helper: single failable `init?(stringValue:)`.
-- `OpenGrokSystemPower`: `nonisolated(unsafe)` active context under lock; IOKit run-loop source optional unwrap; `QualityOfService.utility`.
-- `OpenGrokHTTP` `BoundedStreamMailbox`: async-safe nonisolated lock box (post-verify fix).
+- `OpenGrokSystemPower`: concurrency/IOKit fixes.
+- `OpenGrokHTTP` `BoundedStreamMailbox`: async-safe nonisolated lock box.
 
 ## Implementation status by wave
 
 | Wave | Goal | Status | Entry condition |
 |---|---|---|---|
 | 0 | Bootstrap, branding, and shared foundations | Target-green for W0 libraries | Planning artifacts accepted |
-| 1 | Protocols, domain models, and configuration | **In progress / target-level** — R01–R05 implemented with focused harnesses reported by slice owners; integrated graph not green | Wave 0 required slices present |
-| 2 | HTTP, storage, FS/Git/graph, PTY/TTY/power/crash | **In progress** — R06–R09 substantial ports + remediations; integrated verify incomplete | Wave 1 contracts usable |
+| 1 | Protocols, domain models, and configuration | **In progress / target-level** — R01–R05; integrated graph not green | Wave 0 required slices present |
+| 2 | HTTP, storage, FS/Git/graph, PTY/TTY/power/crash | **In progress** — R06–R09 + R10 wire/portability fixes; integrated verify incomplete | Wave 1 contracts usable |
 | 3–11 | Providers through distribution | Mostly scaffold/stub | Prior waves integrated and green |
 
 ## Slice status legend
@@ -46,10 +57,11 @@
 
 ## Ownership rules
 
-- Integration / R04 may edit `Package.swift`, `PORT_STATUS.md`, and root workflow/status files when listed in ownedPaths.
+- Integration / R10 may edit `Package.swift`, `PORT_STATUS.md`, root workflow/status files, `ProtocolFixtures`, and plugins when listed in ownedPaths.
 - Every other slice owns exactly the paths listed in `PORT_PLAN.md`; no two slices share a `Sources/<Target>/` or `Tests/<Target>Tests/` path.
 - Same-wave slices use earlier-wave protocols and test fakes. They do not create imports on same-wave concrete targets.
 - Status changes must name the slice ID, target-scoped checks, integrated checks, and any known parity divergence.
+- **Workers never invoke SwiftPM directly**; only `zsh workflows/swift-safe-verify.zsh` via the sole integration verifier.
 
 ## Architecture decisions locked for the port
 
@@ -64,15 +76,31 @@
 - Platforms: macOS and Linux full support targets; Windows continuously compiled with dedicated adapters and only explicit genuine capability gaps.
 - Licensing: Apache-2.0 first-party; preserve all derived-source revisions and third-party notices in source, distribution, and notices UI.
 - **C shims:** platform C helpers live in pure-C targets (`OpenGrokPTYC`, `OpenGrokCrashHandlerC`); SwiftPM does not allow mixed-language source trees in one target.
+- **OTLP:** export bodies are real protobuf (`ExportTraceServiceRequest`), never JSON labeled `application/x-protobuf`.
+- **Git status:** portable pure-Swift SHA-1; zlib via Compression (Apple) or linked `COpenGrokZlib`/libz; pack-only objects are explicit non-parity.
 
 ## Known verification blockers
 
-1. **Integrated build not green after 3 safe-verify iterations.** Last compile failure was `OpenGrokHTTP` `NSLock` in async; fix applied but not re-verified. Next agent must re-run `zsh workflows/swift-safe-verify.zsh build` and clear any subsequent errors.
-2. **`swift build --build-tests` / `swift test` / product** not reached. Historical blockers included TTY test `fork()` (reported fixed in R09 remediation) and package-wide graph compile failures.
-3. **Executable product not emitted:** `open-grok` depends on Shell/Pager composition; version/help/paths smokes blocked until product graph builds.
-4. **Many placeholders remain** for later-wave runtime (providers, MCP runtime, TUI, session persistence, sandbox, etc.).
-5. **Portability gaps:** Windows ConPTY/Credential Manager/LockFileEx and full Linux Secret Service remain seams; git pack-object HEAD comparison and full tree-sitter not in Package.swift.
-6. **Target-green ≠ product parity:** focused slice harnesses do not prove integrated package green.
+1. **Integrated build not re-verified** after HTTP async-lock + R10 foundation edits. Next sole integration agent must run `zsh workflows/swift-safe-verify.zsh build` then `build-tests`, `test`, and product smokes.
+2. **Executable product not emitted until graph green:** `open-grok` depends on Shell/Pager composition stubs still present for later waves.
+3. **Many placeholders remain** for later-wave runtime (providers, MCP runtime, TUI, session persistence, sandbox, etc.) — ~50 production stubs.
+4. **Portability gaps remaining:** Windows ConPTY/Credential Manager/LockFileEx; full Linux Secret Service; pack object reading; full tree-sitter not in Package.swift.
+5. **Target-green ≠ product parity:** focused slice harnesses do not prove integrated package green.
+6. **Linux CI** still absent; SQLite/`COpenGrokZlib` strategy declared but not CI-proven here.
+
+## Verifier command record (required for green claims)
+
+Only these commands may ground a green build/test claim:
+
+```sh
+zsh workflows/swift-safe-verify.zsh build
+zsh workflows/swift-safe-verify.zsh build-tests
+zsh workflows/swift-safe-verify.zsh test
+zsh workflows/swift-safe-verify.zsh build --product open-grok
+```
+
+Record: commit ID, `swift --version`, platform, test totals, and exit codes when verify succeeds.
+
 
 ## Per-crate port status (all 82 Rust crates accounted for)
 
@@ -99,7 +127,7 @@ Status legend: **pending** (bootstrap placeholder stub only) · **in-progress** 
 | 17 | `xai-fast-worktree` | `OpenGrokFastWorktree` | pending | W4-S2 stub. |
 | 18 | `xai-file-utils` | `OpenGrokFileUtils` | target-green | R07 + remediation. |
 | 19 | `xai-fsnotify` | `OpenGrokFSNotify` | in-progress | R08 native adapters remediations. |
-| 20 | `xai-gix-status` | `OpenGrokGitStatus` | in-progress | R08 pure status + loose object store. |
+| 20 | `xai-gix-status` | `OpenGrokGitStatus` | in-progress | R08 + R10 portable SHA-1, COpenGrokZlib, pack non-parity. |
 | 21 | `xai-grok-agent` | `OpenGrokAgentDefinitions` | pending | W5-S6 stub. |
 | 22 | `xai-grok-announcements` | `OpenGrokAnnouncements` | pending | W5-S6 stub. |
 | 23 | `xai-grok-auth` | `OpenGrokAuth` | pending | W3-S1 stub. |
@@ -119,7 +147,7 @@ Status legend: **pending** (bootstrap placeholder stub only) · **in-progress** 
 | 37 | `xai-grok-mermaid` | `OpenGrokMermaid` | pending | W8-S2 stub. |
 | 38 | `xai-grok-models` | `OpenGrokModels` | pending | W3-S2 stub. |
 | 39 | `xai-grok-pager` | multi-target | pending | W8–W10 stubs. |
-| 40 | `xai-grok-pager-bin` | `OpenGrokCLI`, `OpenGrokExecutable`, `OpenGrokDistributionSupport` | in-progress | Bootstrap CLI; product blocked by graph. |
+| 40 | `xai-grok-pager-bin` | `OpenGrokCLI`, `OpenGrokExecutable`, `OpenGrokDistributionSupport` | in-progress | Bootstrap CLI + R10 version parity/exec tests; product blocked by graph. |
 | 41 | `xai-grok-pager-minimal` | `OpenGrokPagerMinimal` | pending | W9-S5 stub. |
 | 42 | `xai-grok-pager-pty-harness` | `OpenGrokPagerPTYHarness`, `OpenGrokPagerPTYTests` | pending | W11-S3 stub. |
 | 43 | `xai-grok-pager-render` | `OpenGrokPagerRender` | pending | W8-S3 stub. |
@@ -134,7 +162,7 @@ Status legend: **pending** (bootstrap placeholder stub only) · **in-progress** 
 | 52 | `xai-grok-shell-base` | `OpenGrokShellBase` | pending | W6-S4 stub. |
 | 53 | `xai-grok-shell-session-support` | `OpenGrokShellSessionSupport` | pending | W6-S4 stub. |
 | 54 | `xai-grok-subagent-resolution` | `OpenGrokSubagentResolution` | pending | W6-S5 stub. |
-| 55 | `xai-grok-telemetry` | `OpenGrokTelemetry` | target-green | R06 + remediation (OTLP seams). |
+| 55 | `xai-grok-telemetry` | `OpenGrokTelemetry` | target-green | R06 + R10 real OTLP protobuf/gRPC wire. |
 | 56 | `xai-grok-test-support` | `OpenGrokTestSupport` | ported | W0-S2. |
 | 57 | `xai-grok-tools` | multi-target | pending | W5 stubs. |
 | 58 | `xai-grok-tools-api` | `OpenGrokToolsAPI` | target-green | R01. |

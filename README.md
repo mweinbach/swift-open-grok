@@ -7,41 +7,54 @@ the Open Grok branding while keeping all runtime/configuration state isolated
 to `$OPENGROK_HOME` or `~/.opengrok` (the legacy `~/.grok` path is never read
 or written).
 
-> **Status:** Bootstrap (Wave 0) integrated. The package manifest predeclares
-> every planned target and dependency edge; most targets are placeholders until
-> their owning implementation slices land. See `PORT_PLAN.md`, `CRATE_MAP.md`,
-> and `PORT_STATUS.md` for the full 12-wave architecture and per-slice
-> ownership.
+> **Status (2026-07-22):** Wave 0 foundations plus substantial R01–R09 contract
+> and infrastructure targets are present. **The integrated package build is not
+> verified green** at the current HEAD — workers must **not** invoke SwiftPM
+> directly. The sole integration path is the serialized safe verifier below.
+> See `PORT_STATUS.md`, `PORT_PLAN.md`, and `CRATE_MAP.md` for exact scope,
+> placeholder counts, and remaining product gaps. Roughly half of production
+> targets remain bootstrap placeholders (later waves: providers, tools runtime,
+> sandbox, TUI, sessions, MCP, etc.).
 
-## Build and test
+## Build and test (serialized safe verifier only)
 
 Requires a Swift 6.1+ toolchain (developed against Swift 6.4).
 
-```sh
-swift build                      # build all targets
-swift build --product open-grok  # build the executable
-swift test                       # run all tests
-swift test --filter OpenGrokCLI  # run a target's tests
-```
-
-The executable:
+**Do not run `swift build` / `swift test` / `swift package` directly** from
+worker agents or ad-hoc scripts that share this workspace. Use the lock +
+scratch-path wrapper so only one process owns the SwiftPM cache:
 
 ```sh
-.build/debug/open-grok --version
-.build/debug/open-grok help
-OPENGROK_HOME=/tmp/og .build/debug/open-grok paths
+zsh workflows/swift-safe-verify.zsh build
+zsh workflows/swift-safe-verify.zsh build-tests
+zsh workflows/swift-safe-verify.zsh test
+zsh workflows/swift-safe-verify.zsh build --product open-grok
 ```
+
+After a green product build, executable smokes:
+
+```sh
+# Paths depend on the verifier scratch path (default `.build/workflow-safe`).
+.build/workflow-safe/debug/open-grok --version
+.build/workflow-safe/debug/open-grok help
+OPENGROK_HOME=/tmp/og .build/workflow-safe/debug/open-grok paths
+```
+
+The bootstrap CLI surface is **version / help / paths** only. Other product
+commands (`login`, `sessions`, `models`, ACP serve, interactive TUI, …) remain
+explicitly **not yet implemented** and must not be presented as working.
 
 ## Protocol fixture validation
 
-A read-only, sandboxed command plugin validates checked-in generated protocol
-fixtures without network access and fails when they are stale:
+Checked-in fixtures under `ProtocolFixtures/` cover ACP method names plus
+foundation shapes (OTLP export content types, Git object/index, CLI version and
+`OPENGROK_HOME`, config/workspace/Code Mode key orders). Validate without network:
 
 ```sh
 swift package ogrok-validate-protocols
 ```
 
-Regeneration (deterministic, network-free) is performed by the helper script:
+Regeneration (deterministic, network-free):
 
 ```sh
 scripts/regenerate-protocol-manifest.sh
@@ -49,45 +62,48 @@ scripts/regenerate-protocol-manifest.sh
 
 ## Package layout
 
-`Package.swift` is owned by the bootstrap/integration slice (W0-S1) and
-predeclares **all** Swift targets and dependency edges so that later parallel
-implementation slices never edit the manifest — they only replace the
-placeholder sources in their owned `Sources/<Target>/` and
-`Tests/<Target>Tests/` directories.
+`Package.swift` is owned by the integration slice (R10 / W0-S1 lineage) and
+predeclares **all** Swift targets and dependency edges so parallel
+implementation slices only replace sources under their owned
+`Sources/<Target>/` and `Tests/<Target>Tests/` directories.
 
-Bootstrap-implemented (real) targets:
+Notable foundation targets (non-exhaustive; see `PORT_STATUS.md`):
 
-| Target | Slice | Contents |
-|---|---|---|
-| `OpenGrokBuildSupport` | W0-S1 | Branding, pure-Swift SHA-256, fixture manifest + validator, protoc discovery contract |
-| `OpenGrokProtoBuildPlugin` | W0-S1 | Read-only `ogrok-validate-protocols` command plugin |
-| `OpenGrokCLI` | W10-S2 (bootstrap) | Minimal CLI: `version`, `help`, `paths`, `OPENGROK_HOME` resolution, exit codes |
-| `OpenGrokExecutable` | W11-S1 (bootstrap) | The `open-grok` executable product |
-| `OpenGrokTerminalCore` | W2-S5 | Platform-neutral cell grid, capabilities, input events |
-| `OpenGrokTTY` / `OpenGrokPTY` | W2-S4 | TTY raw-mode + PTY/process/signal contracts |
-| `OpenGrokFSNotify` | W2-S3 | Filesystem watcher contract |
-| `OpenGrokSecrets` | W2-S2 | Secure credential store contract |
-| `OpenGrokSandbox` | W4-S1 | Sandbox policy/enforcement contract |
-| `OpenGrokSystemPower` | W2-S4 | Power-inhibition lease contract |
-| `OpenGrokCrashHandler` | W2-S4 | Crash capture/redaction contract |
-| `OpenGrokWebMediaTools` | W5-S2 | Clipboard provider contract |
+| Area | Targets |
+|---|---|
+| Branding / version / paths | `OpenGrokVersion`, `OpenGrokPaths`, `OpenGrokEnvironment`, `OpenGrokCLI` |
+| Tool contracts | `OpenGrokToolTypes`, `OpenGrokToolProtocol`, `OpenGrokToolRuntime`, `OpenGrokToolsAPI` |
+| ACP / agent contracts | `OpenGrokACP`, lifecycle, interjection, prompt queue |
+| Config / workspace types | `OpenGrokConfigTypes`, `OpenGrokConfig`, `OpenGrokWorkspaceTypes`, hooks/plugin types, Code Mode protocol |
+| HTTP / telemetry | `OpenGrokHTTP`, `OpenGrokCircuitBreaker`, `OpenGrokTracing`, `OpenGrokTelemetry` (OTLP **protobuf** wire) |
+| Storage / secrets / FS | `OpenGrokFileUtils`, `OpenGrokSQLiteJournal`, `OpenGrokSecrets`, `OpenGrokFSNotify` |
+| Git / graph / hunks | `OpenGrokGitStatus` (portable SHA-1, declared zlib, explicit pack non-parity), graph, hunk tracker |
+| PTY / TTY / power / crash | `OpenGrokPTY` + `OpenGrokPTYC`, `OpenGrokTTY`, `OpenGrokSystemPower`, `OpenGrokCrashHandler` + C shim |
 
-All other predeclared targets contain compilable placeholder sources so the
-whole package builds green; their owning slices replace the placeholders.
+## Portability seams (honest)
 
-## Platform strategy
+| Seam | Status |
+|---|---|
+| macOS | Primary development host; Seatbelt/sandbox still later-wave |
+| Linux | Intended full support; zlib via `COpenGrokZlib`; SQLite via system SQLite3; Secret Service incomplete |
+| Windows | Compile-checked branches only where present; ConPTY / Credential Manager / Job Objects later |
+| Packed Git objects | Explicit `packedObjectUnsupported` — not silent success |
+| OTLP export | Real `ExportTraceServiceRequest` protobuf + gRPC framing (not JSON labeled protobuf) |
 
-Core logic is platform-neutral and uses Foundation value/network/file APIs. OS
-seams (terminal, PTY/TTY, process, signals, filesystem watchers, credentials,
-sandbox, power, crash) are isolated behind protocols with `#if os(macOS)`,
-`#if os(Linux)`, and `#if os(Windows)` adapters, and report typed
-`unsupported` errors for genuine capability gaps rather than silently
-weakening behavior. No AppKit, UIKit, or SwiftUI dependency is permitted in
-domain/terminal-core targets.
+## Workflows
 
-## Licensing
+| Entry | Role |
+|---|---|
+| `workflows/swift-safe-verify.zsh` | **Only** allowed SwiftPM build/test entry (lock + scratch path) |
+| `workflows/swift-open-grok-safe-resume.js` | Multi-agent resume; workers forbidden from SwiftPM |
+| `workflows/run-grok45-port.zsh` | Legacy cycle harness; must also use the safe verifier for builds |
 
-Apache-2.0. See `LICENSE`, `NOTICE`, and `THIRD-PARTY-NOTICES`. Derived-source
-obligations (Codex, Ratatui, Mermaid/Dagre/Graphlib/ordered_hashmap/
-mermaid-to-svg, Roboto) are retained; the full transitive inventory is
-generated by the W11-S5 release-validation slice.
+## Protected artifacts
+
+- `Sources/OpenGrokChatState/CompactionTranscript.swift` JSONValue pattern correction — do not revert.
+- C helper targets `OpenGrokPTYC` and `OpenGrokCrashHandlerC` are required for R09 shims.
+- Branding remains **Open Grok** / `open-grok`; state under `OPENGROK_HOME` / `~/.opengrok` only.
+
+## License
+
+Apache-2.0 for first-party code. Preserve third-party notices for derived sources.

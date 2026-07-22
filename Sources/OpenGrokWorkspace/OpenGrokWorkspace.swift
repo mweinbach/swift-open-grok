@@ -1,12 +1,10 @@
 // OpenGrokWorkspace.swift
 //
-// Open Grok — Swift port. Bootstrap placeholder.
+// Core workspace library (Swift port of `xai-grok-workspace`):
+// permissions, path boundary, folder trust, and local ops.
 //
-// This target is predeclared in Package.swift and is owned by exactly one
-// implementation slice per PORT_PLAN.md / CRATE_MAP.md. The owning slice
-// replaces this file with the real port of the corresponding Rust crate(s).
-// No slice other than the owner may edit this directory.
-//
-// Rust crate mapping: see CRATE_MAP.md.
+// Full FS/VCS/hub server runtime continues to land in later slices; this
+// target establishes the enforceable security boundary required before
+// concrete tools and the session runtime are implemented.
 
 import Foundation

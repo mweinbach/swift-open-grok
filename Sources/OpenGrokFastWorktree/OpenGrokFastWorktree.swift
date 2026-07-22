@@ -1,12 +1,15 @@
 // OpenGrokFastWorktree.swift
 //
-// Open Grok — Swift port. Bootstrap placeholder.
+// High-performance git worktree creation (Swift port of `xai-fast-worktree`).
 //
-// This target is predeclared in Package.swift and is owned by exactly one
-// implementation slice per PORT_PLAN.md / CRATE_MAP.md. The owning slice
-// replaces this file with the real port of the corresponding Rust crate(s).
-// No slice other than the owner may edit this directory.
+// Pipeline:
+//   1. Discover source repo + validate refs
+//   2. Protect the primary checkout
+//   3. `git worktree add --no-checkout` (linked) or full copy (standalone)
+//   4. Parallel/CoW file population
+//   5. Cleanup / prune orphans under a pool root
 //
-// Rust crate mapping: see CRATE_MAP.md.
+// Linux BTRFS/overlay snapshot delegation is typed and fail-closed when forced
+// without a privileged delegate.
 
 import Foundation

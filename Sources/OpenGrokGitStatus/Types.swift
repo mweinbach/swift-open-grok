@@ -135,4 +135,8 @@ public enum GitStatusError: Error, Equatable, Sendable {
     case unsupportedIndexVersion(Int)
     case io(String)
     case cancelled
+    /// Object is not present as a loose object. Pack reading is not implemented;
+    /// callers must treat this as an explicit non-parity result rather than a
+    /// silent empty HEAD comparison.
+    case packedObjectUnsupported(oid: String)
 }

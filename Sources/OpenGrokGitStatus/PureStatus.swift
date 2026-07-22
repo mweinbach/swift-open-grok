@@ -5,7 +5,6 @@
 // worktree — without shelling out.
 
 import Foundation
-import CryptoKit
 
 /// Pure-path Git status scanner.
 public struct PureGitStatusScanner: Sendable {
@@ -59,10 +58,25 @@ public struct PureGitStatusScanner: Sendable {
         }
 
         // HEAD tree for staged comparisons (pure object store; no shell).
+        // Pack-only objects surface as `packedObjectUnsupported` (explicit
+        // non-parity) rather than being swallowed into an empty HEAD tree.
         let store = GitObjectStore(gitDir: gitDir)
         let headTree: [String: GitTreeEntry]
         if let head = meta.headCommit {
-            headTree = (try? store.loadHeadTree(headCommitHex: head)) ?? [:]
+            do {
+                headTree = try store.loadHeadTree(headCommitHex: head)
+            } catch let error as GitStatusError {
+                switch error {
+                case .packedObjectUnsupported:
+                    throw error
+                default:
+                    // Corrupt/missing loose objects degrade to empty HEAD so
+                    // worktree/index status can still surface.
+                    headTree = [:]
+                }
+            } catch {
+                headTree = [:]
+            }
         } else {
             headTree = [:]
         }
@@ -470,11 +484,7 @@ func isWorktreeDirty(entry: GitIndexEntry, absolutePath: String) -> Bool {
 public func gitBlobSHA1(_ data: Data) -> Data {
     var header = Array("blob \(data.count)".utf8)
     header.append(0)
-    var hasher = Insecure.SHA1()
-    hasher.update(data: Data(header))
-    hasher.update(data: data)
-    let digest = hasher.finalize()
-    return Data(digest)
+    return PortableSHA1.hash(Data(header), data)
 }
 
 // MARK: - Ignore

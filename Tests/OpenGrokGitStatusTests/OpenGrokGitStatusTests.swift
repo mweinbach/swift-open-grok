@@ -81,6 +81,41 @@ struct OpenGrokGitStatusTests {
         #expect(hex == "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0")
     }
 
+    @Test("portable SHA-1 empty and multi-chunk match single buffer")
+    func portableSHA1Parity() {
+        let empty = PortableSHA1.hash(Data())
+        #expect(empty.map { String(format: "%02x", $0) }.joined() == "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+        let a = Data("abc".utf8)
+        #expect(
+            PortableSHA1.hash(a).map { String(format: "%02x", $0) }.joined()
+                == "a9993e364706816aba3e25717850c26c9cd0d89d"
+        )
+        #expect(PortableSHA1.hash(Data("ab".utf8), Data("c".utf8)) == PortableSHA1.hash(a))
+    }
+
+    @Test("pack-only missing loose object raises packedObjectUnsupported")
+    func packedObjectUnsupported() throws {
+        let root = try makeSeedRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gitDir = root.appendingPathComponent(".git").path
+        let packDir = URL(fileURLWithPath: gitDir)
+            .appendingPathComponent("objects/pack")
+        try FileManager.default.createDirectory(at: packDir, withIntermediateDirectories: true)
+        // Presence of a .pack file (even empty) marks the repo as pack-bearing.
+        try Data().write(to: packDir.appendingPathComponent("pack-deadbeef.pack"))
+        let oid = Data(repeating: 0xAB, count: 20)
+        let store = GitObjectStore(gitDir: gitDir)
+        do {
+            _ = try store.readObject(oid: oid)
+            Issue.record("expected packedObjectUnsupported")
+        } catch GitStatusError.packedObjectUnsupported(let hex) {
+            #expect(hex.count == 40)
+            #expect(hex.hasPrefix("ab"))
+        } catch {
+            Issue.record("unexpected \(error)")
+        }
+    }
+
     @Test("not a repository errors")
     func notARepo() {
         let temp = FileManager.default.temporaryDirectory

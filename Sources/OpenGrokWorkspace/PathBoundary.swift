@@ -1,0 +1,147 @@
+// PathBoundary.swift
+//
+// Workspace path boundary enforcement: traversal, symlink, case-folding,
+// and Unicode-normalization resistant containment checks.
+
+import Foundation
+import OpenGrokPaths
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+public enum PathBoundaryError: Error, Equatable, Sendable, CustomStringConvertible {
+    case outsideWorkspace(String)
+    case traversal(String)
+    case symlinkEscape(String)
+    case nullByte(String)
+    case emptyPath
+    case notAbsolute(String)
+
+    public var description: String {
+        switch self {
+        case .outsideWorkspace(let p): return "path outside workspace: \(p)"
+        case .traversal(let p): return "path traversal rejected: \(p)"
+        case .symlinkEscape(let p): return "symlink escape rejected: \(p)"
+        case .nullByte(let p): return "NUL in path rejected: \(p)"
+        case .emptyPath: return "empty path"
+        case .notAbsolute(let p): return "path is not absolute: \(p)"
+        }
+    }
+}
+
+/// Enforces that filesystem operations stay within a workspace root.
+public struct PathBoundary: Sendable {
+    public let root: URL
+    /// When true, resolve symlinks before containment checks (TOCTOU-safer
+    /// for existing paths; missing paths use lexical checks only).
+    public var resolveSymlinks: Bool
+
+    public init(root: URL, resolveSymlinks: Bool = true) {
+        self.root = root.standardizedFileURL
+        self.resolveSymlinks = resolveSymlinks
+    }
+
+    /// Canonicalize a user-supplied path relative to the workspace and ensure
+    /// it remains inside the root.
+    public func resolve(_ raw: String) throws -> URL {
+        if raw.isEmpty { throw PathBoundaryError.emptyPath }
+        if raw.contains("\0") { throw PathBoundaryError.nullByte(raw) }
+
+        let candidate: URL
+        if raw.hasPrefix("/") {
+            candidate = URL(fileURLWithPath: raw)
+        } else {
+            candidate = root.appendingPathComponent(raw)
+        }
+
+        // Lexical check first (catches `..` without filesystem).
+        let lexical = normalizeLexically(candidate.path)
+        let rootLex = normalizeLexically(root.path)
+        if !containsPath(root: rootLex, candidate: lexical) {
+            // Check for parentDir components specifically.
+            let comps = splitComponents(candidate.path)
+            if comps.contains(where: {
+                if case .parentDir = $0 { return true }
+                return false
+            }) {
+                throw PathBoundaryError.traversal(raw)
+            }
+            throw PathBoundaryError.outsideWorkspace(raw)
+        }
+
+        if resolveSymlinks, FileManager.default.fileExists(atPath: lexical) {
+            // realpath-style resolution via FileUtils when available.
+            if let resolved = try? resolveCanonicalPath(URL(fileURLWithPath: lexical)) {
+                let resolvedLex = normalizeLexically(resolved.path)
+                if !containsPath(root: rootLex, candidate: resolvedLex) {
+                    throw PathBoundaryError.symlinkEscape(raw)
+                }
+                return resolved
+            }
+        }
+        return URL(fileURLWithPath: lexical)
+    }
+
+    /// Returns true when `path` is under the workspace (lexical).
+    public func contains(_ path: URL) -> Bool {
+        let rootLex = normalizeLexically(root.path)
+        let cand = normalizeLexically(path.path)
+        return containsPath(root: rootLex, candidate: cand)
+    }
+}
+
+/// Component-aware containment: candidate is root or a strict descendant.
+public func containsPath(root: String, candidate: String) -> Bool {
+    if root == candidate { return true }
+    let prefix = root.hasSuffix("/") ? root : root + "/"
+    return candidate.hasPrefix(prefix)
+}
+
+/// Resolve a path with realpath when possible.
+func resolveCanonicalPath(_ url: URL) throws -> URL {
+    // Prefer OpenGrokFileUtils.canonicalPath if present.
+    #if os(Windows)
+    return url.standardizedFileURL
+    #else
+    return try url.withUnsafeFileSystemRepresentation { cstr -> URL in
+        guard let cstr else { throw PathBoundaryError.notAbsolute(url.path) }
+        guard let buf = realpath(cstr, nil) else {
+            throw PathBoundaryError.outsideWorkspace(url.path)
+        }
+        defer { free(buf) }
+        return URL(fileURLWithPath: String(cString: buf))
+    }
+    #endif
+}
+
+/// Folder trust decision for a workspace root.
+public enum FolderTrustState: String, Codable, Sendable, Equatable {
+    case trusted
+    case untrusted
+    case unknown
+}
+
+public struct FolderTrustStore: Sendable {
+    private var trustedRoots: Set<String>
+
+    public init(trustedRoots: [URL] = []) {
+        self.trustedRoots = Set(trustedRoots.map { normalizeLexically($0.path) })
+    }
+
+    public mutating func trust(_ root: URL) {
+        trustedRoots.insert(normalizeLexically(root.path))
+    }
+
+    public mutating func untrust(_ root: URL) {
+        trustedRoots.remove(normalizeLexically(root.path))
+    }
+
+    public func state(for root: URL) -> FolderTrustState {
+        let key = normalizeLexically(root.path)
+        if trustedRoots.contains(key) { return .trusted }
+        // Parent trust does not automatically trust children (fail closed).
+        return .untrusted
+    }
+}

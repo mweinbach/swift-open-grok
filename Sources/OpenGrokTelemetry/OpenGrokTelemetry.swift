@@ -586,12 +586,14 @@ public struct TelemetryClient: Sendable {
         else {
             return nil
         }
+        // Product OTEL uses the same OTLP HTTP/protobuf body as external export
+        // so collectors never receive JSON labeled as protobuf.
         let body = try OTLPWire.encodeSpanEnvelope(name: name, attributes: attributes)
         return HTTPRequest(
             method: .post,
             url: url,
             headers: [
-                "Content-Type": OTLPWire.httpJSONContentType,
+                "Content-Type": OTLPWire.httpProtobufContentType,
             ],
             body: body,
             timeout: TimeInterval(10),
@@ -1061,19 +1063,32 @@ extension ExternalOtelConfig {
 
 /// Pure OTLP wire helpers (HTTP/protobuf and gRPC framing seams).
 ///
-/// Serialization is hermetic and testable without network I/O. Full protobuf
-/// codecs live behind these seams; the portable path emits a compact protobuf-
-/// compatible length-delimited envelope plus a JSON diagnostic twin for tests.
+/// Serialization is hermetic and testable without network I/O. Export bodies
+/// are real `ExportTraceServiceRequest` protobuf messages (not JSON mislabeled
+/// as `application/x-protobuf`). A JSON diagnostic twin remains available for
+/// human-readable golden fixtures.
 public enum OTLPWire {
     /// Content-Type for OTLP HTTP/protobuf.
     public static let httpProtobufContentType = "application/x-protobuf"
-    /// Content-Type for OTLP HTTP/JSON (test/debug).
+    /// Content-Type for OTLP HTTP/JSON (diagnostic / alternate path).
     public static let httpJSONContentType = "application/json"
     /// gRPC content-type for protobuf payloads.
     public static let grpcContentType = "application/grpc+proto"
 
-    /// Build the OTLP JSON span envelope used by hermetic privacy tests.
+    /// Encode a real OTLP `ExportTraceServiceRequest` protobuf body for one span.
+    ///
+    /// This is the canonical export body for both product and external OTLP
+    /// HTTP/protobuf and (pre-framing) gRPC paths.
     public static func encodeSpanEnvelope(
+        name: String,
+        attributes: [String: JSONValue]
+    ) throws -> Data {
+        OTLPProtobuf.encodeExportTraceServiceRequest(name: name, attributes: attributes)
+    }
+
+    /// Human-readable JSON twin of the span envelope (not used on the wire for
+    /// `application/x-protobuf` exports).
+    public static func encodeSpanJSONEnvelope(
         name: String,
         attributes: [String: JSONValue]
     ) throws -> Data {
@@ -1096,7 +1111,7 @@ public enum OTLPWire {
         return try encodeJSON(envelope)
     }
 
-    /// Length-prefixed protobuf-compatible body (gRPC-Web / OTLP framing).
+    /// Length-prefixed gRPC framing over a protobuf payload.
     ///
     /// Format: 1-byte compression flag (0) + 4-byte big-endian length + payload.
     public static func frameGRPC(payload: Data) -> Data {
@@ -1106,6 +1121,25 @@ public enum OTLPWire {
         withUnsafeBytes(of: &length) { out.append(contentsOf: $0) }
         out.append(payload)
         return out
+    }
+
+    /// Decode the gRPC data frame header; returns nil when the frame is short
+    /// or compressed (flag != 0). Used by collector-compatibility tests.
+    public static func unframeGRPC(_ framed: Data) -> Data? {
+        guard framed.count >= 5, framed[0] == 0 else { return nil }
+        let len =
+            (UInt32(framed[1]) << 24)
+            | (UInt32(framed[2]) << 16)
+            | (UInt32(framed[3]) << 8)
+            | UInt32(framed[4])
+        guard framed.count >= 5 + Int(len) else { return nil }
+        return framed.subdata(in: 5..<(5 + Int(len)))
+    }
+
+    /// True when `body` is a plausible `ExportTraceServiceRequest` protobuf
+    /// (field 1 length-delimited `resource_spans` present, not JSON).
+    public static func looksLikeExportTraceProtobuf(_ body: Data) -> Bool {
+        OTLPProtobuf.looksLikeExportTraceServiceRequest(body)
     }
 
     /// HTTP request description for a signal export (no I/O).

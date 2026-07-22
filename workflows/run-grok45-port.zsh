@@ -397,13 +397,18 @@ Cycle artifacts: $CYCLE_DIR
 
 Read the input state, slice definitions, implementation handoffs, Terra reviews, and remediation handoffs. Inspect the integrated source tree. Fix only cross-target defects caused or exposed by this cycle, including Package.swift dependency edges, imports, shared type mismatches, strict-concurrency errors, and inaccurate PORT_STATUS.md claims. Preserve unrelated working-tree changes. Do not spawn subagents, commit, reset, or expand into future slices.
 
-Run swift build --build-tests and focused tests. Leave PORT_STATUS.md factually accurate even if the overall port remains incomplete. Finish with a concise integration handoff.
+Use ONLY the serialized safe verifier for all SwiftPM work (never bare swift build/test/package):
+  zsh workflows/swift-safe-verify.zsh build
+  zsh workflows/swift-safe-verify.zsh build-tests
+  zsh workflows/swift-safe-verify.zsh test
+  zsh workflows/swift-safe-verify.zsh build --product open-grok
+Leave PORT_STATUS.md factually accurate even if the overall port remains incomplete. Finish with a concise integration handoff.
 EOF
   run_text_agent "grok-4.5" "$integration_prompt" "$CYCLE_DIR/integration.txt" "$CYCLE_DIR/logs/integration.log" 36
 
-  print "Cycle $cycle: running orchestrator build and tests"
-  (cd "$ROOT" && swift build --build-tests) > "$CYCLE_DIR/logs/swift-build.log" 2>&1 || true
-  (cd "$ROOT" && swift test) > "$CYCLE_DIR/logs/swift-test.log" 2>&1 || true
+  print "Cycle $cycle: running orchestrator safe-verify build and tests"
+  (cd "$ROOT" && zsh workflows/swift-safe-verify.zsh build-tests) > "$CYCLE_DIR/logs/swift-build.log" 2>&1 || true
+  (cd "$ROOT" && zsh workflows/swift-safe-verify.zsh test) > "$CYCLE_DIR/logs/swift-test.log" 2>&1 || true
 
   audit_prompt="$CYCLE_DIR/prompts/audit.md"
   cat > "$audit_prompt" <<EOF

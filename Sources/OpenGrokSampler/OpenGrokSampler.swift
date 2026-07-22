@@ -1,12 +1,21 @@
 // OpenGrokSampler.swift
 //
-// Open Grok — Swift port. Bootstrap placeholder.
+// Open Grok — Swift port of `xai-grok-sampler`
+// (`crates/codegen/xai-grok-sampler`).
 //
-// This target is predeclared in Package.swift and is owned by exactly one
-// implementation slice per PORT_PLAN.md / CRATE_MAP.md. The owning slice
-// replaces this file with the real port of the corresponding Rust crate(s).
-// No slice other than the owner may edit this directory.
+// Layered sampling runtime:
+//   * Layer 1 — `SamplingClient` posts streaming / non-streaming requests
+//     through an injected `HTTPTransport` (no concrete Auth/Models imports).
+//   * Layer 2 — pure stream transforms emit `SamplingEvent`s with exactly-one
+//     terminal completion (Completed or Failed).
+//   * Layer 3 — `SamplerActor` / `SamplerHandle` own concurrent requests,
+//     retry classification, cancellation, and Codex sticky-routing turn state.
 //
-// Rust crate mapping: see CRATE_MAP.md.
+// Authentication and model catalog policy are injected via protocols
+// (`BearerResolver`, config snapshots). Provider transport policy is selected
+// by `ModelProvider` through `providerAdapter(_:)`.
 
 import Foundation
+import OpenGrokHTTP
+import OpenGrokSamplingTypes
+import OpenGrokShared

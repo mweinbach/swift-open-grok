@@ -1,0 +1,23 @@
+{
+  "$schema": "open-grok/protocol-fixtures/config-workspace-codemode-keys",
+  "codeModeMessageKinds": [
+    "request",
+    "response",
+    "notification",
+    "error"
+  ],
+  "configAuthorityOrder": [
+    "explicit",
+    "managed",
+    "project",
+    "user",
+    "defaults"
+  ],
+  "notes": "Key-name fixtures for implemented foundation contracts (not full corpus dumps)",
+  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "workspacePermissionOrder": [
+    "deny",
+    "ask",
+    "allow"
+  ]
+}
