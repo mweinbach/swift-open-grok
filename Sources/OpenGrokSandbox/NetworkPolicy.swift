@@ -255,3 +255,106 @@ private struct IPv4Address {
         }
     }
 }
+
+// MARK: - Child Network Filter Integration
+
+/// Install a Linux seccomp BPF filter blocking network syscalls in pre-exec child launch paths.
+/// Returns true on Linux if installed successfully, or false/no-op on other OS targets.
+@discardableResult
+public func installChildNetworkFilter() throws -> Bool {
+    #if os(Linux)
+    return try installLinuxSeccompNetworkFilter()
+    #else
+    return false
+    #endif
+}
+
+#if os(Linux)
+import Glibc
+
+private struct SockFilter {
+    var code: UInt16
+    var jt: UInt8
+    var jf: UInt8
+    var k: UInt32
+}
+
+private struct SockFprog {
+    var len: UInt16
+    var filter: UnsafeMutablePointer<SockFilter>?
+}
+
+private func installLinuxSeccompNetworkFilter() throws -> Bool {
+    let BPF_LD: UInt16 = 0x00
+    let BPF_W: UInt16 = 0x00
+    let BPF_ABS: UInt16 = 0x20
+    let BPF_JMP: UInt16 = 0x05
+    let BPF_JEQ: UInt16 = 0x10
+    let BPF_K: UInt16 = 0x00
+    let BPF_RET: UInt16 = 0x06
+
+    let SECCOMP_RET_ALLOW: UInt32 = 0x7fff_0000
+    let SECCOMP_RET_ERRNO: UInt32 = 0x0005_0000
+    let EPERM_VAL: UInt32 = 1
+
+    let PR_SET_NO_NEW_PRIVS: Int32 = 38
+    let PR_SET_SECCOMP: Int32 = 22
+    let SECCOMP_MODE_FILTER: UInt = 2
+
+    #if arch(x86_64)
+    let blockedSyscalls: [UInt32] = [42 /* connect */, 49 /* bind */, 44 /* sendto */, 46 /* sendmsg */, 50 /* listen */, 43 /* accept */, 288 /* accept4 */]
+    #elseif arch(arm64)
+    let blockedSyscalls: [UInt32] = [203 /* connect */, 200 /* bind */, 206 /* sendto */, 211 /* sendmsg */, 201 /* listen */, 202 /* accept */, 242 /* accept4 */]
+    #else
+    let blockedSyscalls: [UInt32] = [42, 49, 44, 46, 50, 43, 288]
+    #endif
+
+    var instructions: [SockFilter] = []
+    let totalChecks = blockedSyscalls.count
+
+    // 1. Load syscall number (seccomp_data.nr at offset 0)
+    instructions.append(SockFilter(code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 0))
+
+    // 2. Check each blocked syscall
+    for (i, sysNo) in blockedSyscalls.enumerated() {
+        let remaining = totalChecks - i - 1
+        instructions.append(SockFilter(
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: UInt8(remaining + 1),
+            jf: 0,
+            k: sysNo
+        ))
+    }
+
+    // 3. Default: ALLOW
+    instructions.append(SockFilter(code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW))
+
+    // 4. Blocked: ERRNO(EPERM)
+    instructions.append(SockFilter(code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO | EPERM_VAL))
+
+    let res = instructions.withUnsafeMutableBufferPointer { buf -> Int32 in
+        var prog = SockFprog(len: UInt16(buf.count), filter: buf.baseAddress)
+        if prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return -1
+        }
+        return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0)
+    }
+
+    if res != 0 {
+        throw SandboxError.enforcementFailed("Failed to install Linux seccomp network filter (errno: \(errno))")
+    }
+    return true
+}
+#endif
+
+extension ChildNetworkPolicy {
+    /// Enforce child network policy on current/child process prior to exec.
+    public func enforceInChildProcess() throws {
+        switch self {
+        case .unrestricted:
+            break
+        case .blocked, .websites:
+            try installChildNetworkFilter()
+        }
+    }
+}

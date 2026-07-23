@@ -208,6 +208,14 @@ public final class SandboxManager: @unchecked Sendable {
     }
 }
 
+/// Execute a child process pre-exec action, installing the Linux seccomp network filter if child network restriction is enabled.
+public func applyChildNetworkRestrictionToLaunch(preExec: (() throws -> Void)? = nil) throws {
+    if shouldRestrictChildNetwork() {
+        try installChildNetworkFilter()
+    }
+    try preExec?()
+}
+
 // MARK: - Platform enforcer dispatch
 
 enum PlatformEnforcer {
@@ -219,23 +227,11 @@ enum PlatformEnforcer {
         if isInsideBwrap() {
             return
         }
-        if let plan = bwrapDenyPlan(profile: profile, workspace: workspace),
-           !plan.denyWrite.isEmpty || !plan.denyRead.isEmpty || plan.hasGlobs
-        {
-            throw SandboxError.enforcementFailed(
-                "Linux sandbox requires bubblewrap re-exec before apply; plan deny_write=\(plan.denyWrite) deny_read=\(plan.denyRead.count) has_globs=\(plan.hasGlobs)"
-            )
-        }
-        let support = PlatformSandboxSupport.supportInfo()
-        if support.backend == .linuxLandlock || support.backend == .linuxBubblewrap {
-            if resolved.restrictNetwork || !resolved.deny.isEmpty {
-                throw SandboxError.enforcementFailed(
-                    "Linux in-process enforcement incomplete for restrict_network/deny; re-exec under bwrap required"
-                )
-            }
-            return
-        }
-        throw SandboxError.unsupported(support.details)
+        let plan = bwrapDenyPlan(profile: profile, workspace: workspace)
+        let planDetails = plan != nil ? "deny_write=\(plan!.denyWrite) deny_read=\(plan!.denyRead.count) has_globs=\(plan!.hasGlobs) restrict_network=\(plan!.restrictNetwork)" : "none"
+        throw SandboxError.enforcementFailed(
+            "Linux sandbox requires bubblewrap re-exec before apply; cannot enforce in-process without bwrap (\(planDetails))"
+        )
         #elseif os(Windows)
         try createRestrictedTokenSandbox(profile: resolved)
         #else
@@ -243,6 +239,7 @@ enum PlatformEnforcer {
         #endif
     }
 }
+
 
 // MARK: - SandboxEnforcer protocol (session pin surface)
 

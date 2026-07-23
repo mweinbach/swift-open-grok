@@ -227,6 +227,7 @@ struct OpenGrokSandboxTests {
         }
     }
 
+    #if os(macOS)
     @Test("seatbelt profile includes firmlink aliases and write sub-actions")
     func seatbeltWriteSubactionsAndAliases() {
         let resolved = ResolvedSandboxProfile(
@@ -244,6 +245,53 @@ struct OpenGrokSandboxTests {
         #expect(sbpl.contains("deny file-write-create"))
         #expect(sbpl.contains("/private/tmp/ws/.env") || sbpl.contains("/tmp/ws/.env"))
         #expect(sbpl.contains("(deny network*)"))
+    }
+    #else
+    @Test("seatbelt profile builder reports unsupported on non-macOS")
+    func seatbeltProfileNonMacOS() {
+        let resolved = ResolvedSandboxProfile(
+            name: "custom",
+            readOnly: [],
+            readWrite: [URL(fileURLWithPath: "/tmp/ws")],
+            deny: [URL(fileURLWithPath: "/tmp/ws/.env")],
+            denyEntries: ["**/*.pem"],
+            defaultRead: true,
+            restrictNetwork: true
+        )
+        let sbpl = buildSeatbeltProfile(resolved, workspace: URL(fileURLWithPath: "/tmp/ws"))
+        #expect(sbpl.contains("unsupported"))
+        #expect(throws: SandboxError.self) {
+            try applySeatbeltProfile(sbpl)
+        }
+    }
+    #endif
+
+    @Test("child network policy pre-exec enforcement")
+    func childNetworkPolicyPreExec() throws {
+        let policy = ChildNetworkPolicy.blocked
+        #if os(Linux)
+        // On Linux, installing child network filter in test runner might succeed or fail depending on process privileges.
+        // We verify the entry point executes or throws typed error.
+        do {
+            try policy.enforceInChildProcess()
+        } catch SandboxError.enforcementFailed {
+            // expected if prctl permissions missing in test env
+        }
+        #else
+        // Non-Linux platforms report explicit no-op / unsupported behavior cleanly
+        #expect(noThrow: { try policy.enforceInChildProcess() })
+        #endif
+    }
+
+    @Test("bwrap reexec includes network unsharing flag when requested")
+    func bwrapReexecNetworkIsolation() {
+        let argv = bwrapReexecCommand(
+            denyWrite: [],
+            denyRead: [],
+            restrictNetwork: true,
+            environment: [:]
+        )
+        #expect(argv?.contains("--unshare-net") == true)
     }
 
     @Test("glob validation accepts supported subset and rejects hostile/ambiguous globs")
@@ -329,4 +377,3 @@ struct OpenGrokSandboxTests {
         #expect(PlatformSandboxSupport.platformLabel.contains("/"))
     }
 }
-

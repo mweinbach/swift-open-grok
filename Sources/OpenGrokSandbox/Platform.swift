@@ -116,14 +116,11 @@ public enum PlatformSandboxSupport {
 
 // MARK: - Seatbelt SBPL
 
-#if os(macOS)
-// MARK: - Seatbelt SBPL
-
 /// Specific Seatbelt write sub-actions denied for a denied path.
 public let seatbeltWriteDenyActions: [String] = [
     "file-write-data",
-    "file-write-create",
     "file-write-unlink",
+    "file-write-create",
     "file-write-mode",
     "file-write-owner",
     "file-write-flags",
@@ -131,6 +128,7 @@ public let seatbeltWriteDenyActions: [String] = [
     "file-write-setugid",
 ]
 
+#if os(macOS)
 /// Build a Seatbelt profile language (SBPL) string for the resolved profile.
 public func buildSeatbeltProfile(_ resolved: ResolvedSandboxProfile, workspace: URL? = nil) -> String {
     var lines: [String] = [
@@ -204,6 +202,15 @@ public func buildSeatbeltProfile(_ resolved: ResolvedSandboxProfile, workspace: 
 
     return lines.joined(separator: "\n")
 }
+#else
+/// Build a Seatbelt profile language (SBPL) string for the resolved profile.
+/// On non-macOS platforms, returns an explicit unsupported profile string.
+public func buildSeatbeltProfile(_ resolved: ResolvedSandboxProfile, workspace: URL? = nil) -> String {
+    _ = resolved
+    _ = workspace
+    return "; Seatbelt SBPL is unsupported on non-macOS platforms"
+}
+#endif
 
 private func seatbeltEscape(_ path: String) -> String {
     path
@@ -242,6 +249,12 @@ public func applySeatbeltProfile(_ sbpl: String) throws {
         throw SandboxError.enforcementFailed(message)
     }
 }
+#else
+/// Apply a Seatbelt profile. On non-macOS platforms, throws `SandboxError.unsupported`.
+public func applySeatbeltProfile(_ sbpl: String) throws {
+    _ = sbpl
+    throw SandboxError.unsupported("macOS Seatbelt (sandbox_init) is not supported on non-macOS platforms")
+}
 #endif
 
 // MARK: - Bubblewrap plan (Linux)
@@ -251,11 +264,13 @@ public struct BwrapDenyPlan: Sendable, Equatable {
     public var denyWrite: [String]
     public var denyRead: [String]
     public var hasGlobs: Bool
+    public var restrictNetwork: Bool
 
-    public init(denyWrite: [String], denyRead: [String], hasGlobs: Bool) {
+    public init(denyWrite: [String], denyRead: [String], hasGlobs: Bool, restrictNetwork: Bool = false) {
         self.denyWrite = denyWrite
         self.denyRead = denyRead
         self.hasGlobs = hasGlobs
+        self.restrictNetwork = restrictNetwork
     }
 }
 
@@ -347,6 +362,7 @@ public func expandDenyGlobs(
 public func bwrapReexecCommand(
     denyWrite: [String],
     denyRead: [String],
+    restrictNetwork: Bool = false,
     environment: [String: String] = ProcessInfo.processInfo.environment,
     arguments: [String] = Array(CommandLine.arguments.dropFirst()),
     executable: URL? = nil
@@ -359,6 +375,9 @@ public func bwrapReexecCommand(
         selfExe = CommandLine.arguments.first ?? "/proc/self/exe"
     }
     var argv: [String] = ["bwrap", "--bind", "/", "/"]
+    if restrictNetwork {
+        argv.append("--unshare-net")
+    }
     for path in denyWrite {
         if FileManager.default.fileExists(atPath: path) {
             argv.append(contentsOf: ["--ro-bind", path, path])
@@ -391,8 +410,10 @@ public func bwrapDenyPlan(
     }
     var denyRead: [String] = []
     var hasGlobs = false
+    var restrictNet = profile.restrictsNetwork
     if profile != .off {
         if let resolved = try? profile.resolve(workspace: workspace, config: cfg) {
+            restrictNet = resolved.restrictNetwork
             let (exact, globs) = partitionDenyEntries(resolved.denyEntries)
             hasGlobs = !globs.isEmpty
             for entry in exact {
@@ -415,7 +436,7 @@ public func bwrapDenyPlan(
         }
     }
     let uniqueRead = Array(Set(denyRead)).sorted()
-    return BwrapDenyPlan(denyWrite: denyWrite, denyRead: uniqueRead, hasGlobs: hasGlobs)
+    return BwrapDenyPlan(denyWrite: denyWrite, denyRead: uniqueRead, hasGlobs: hasGlobs, restrictNetwork: restrictNet)
 }
 
 // MARK: - Windows seams (compile-checked)
@@ -436,4 +457,3 @@ public func createJobObjectSandbox(profile: ResolvedSandboxProfile) throws {
         "Windows Job Object sandbox is not yet implemented; refusing to run unsandboxed"
     )
 }
-
