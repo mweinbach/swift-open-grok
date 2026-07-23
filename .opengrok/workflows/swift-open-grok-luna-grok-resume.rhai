@@ -431,6 +431,8 @@ if args.resume_from_preserved_integration == true {
     let direct_allowed_paths = integration_paths(preserved_slices);
     direct_allowed_paths.push("Sources/OpenGrokTerminalCore/");
     direct_allowed_paths.push("Tests/OpenGrokTerminalCoreTests/");
+    direct_allowed_paths.push("Sources/OpenGrokTextArea/");
+    direct_allowed_paths.push("Tests/OpenGrokTextAreaTests/");
     let direct_integration_context = #{
         workspace: workspace,
         reference: reference,
@@ -446,6 +448,7 @@ if args.resume_from_preserved_integration == true {
     direct_integration_prompt += "\n</integration-json>\n\n";
     direct_integration_prompt += "Use the highest available reasoning rigor. Act as the sole integration fixer and the only workflow agent allowed to compile or test Swift. Inspect the actual committed tree and fix cross-target defects exposed by R12-R15, editing only allowedPaths. ";
     direct_integration_prompt += "First resolve the known OpenGrokTerminalCore CellStyle/CellAttributes Hashable compile blocker with the smallest semantically correct change and focused tests if needed. ";
+    direct_integration_prompt += "If that fix is already committed, next resolve the OpenGrokTextArea TextAreaCore.swift invalid redeclaration between the private undo state and public undo() API. Preserve the public undo()/redo() API, use the smallest clear internal rename, update all internal references, and add or adjust focused tests only when needed. ";
     direct_integration_prompt += "Do not expand into future slices. Preserve unrelated commits and CompactionTranscript.swift. Do not commit, reset, rebase, push, branch, or launch subagents. ";
     direct_integration_prompt += "Never invoke SwiftPM/Xcode directly, clean caches, or create another scratch path. Use only zsh workflows/swift-safe-verify.zsh build, build-tests, test, focused filters, and build --product open-grok. ";
     direct_integration_prompt += "Run sequentially with at most three fix-and-verify iterations. Update PORT_STATUS.md truthfully with exact commands and outcomes. Return complete only when available verification passes; otherwise return partial or blocked.";
