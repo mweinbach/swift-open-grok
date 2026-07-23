@@ -1305,3 +1305,159 @@ struct CompactionAndReasoningCapabilitiesTests {
     }
 }
 
+// MARK: - Codex Model Catalog Parity Remediation (Luna Review)
+
+@Suite("Codex model catalog parity remediation")
+struct CodexParityRemediationTests {
+    @Test func codexCacheIdentityMismatchIsCacheMiss() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-cache-identity-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        var entry = ModelEntry.fallback(slug: "gpt-5.6-sol", endpoints: .default)
+        entry.info.provider = .codex
+
+        let catalog = CodexModelsCatalog(
+            models: [
+                CodexCatalogModel(priority: 1, visibility: .list, entry: entry)
+            ],
+            accountFingerprint: "account-123"
+        )
+
+        let manager = CodexModelsCacheManager(
+            grokHome: dir,
+            versionProvider: { "grok-1.0" },
+            clientVersionProvider: { "0.144.5" },
+            baseURLProvider: { "https://chatgpt.com/backend-api/codex" }
+        )
+
+        try manager.persist(catalog)
+
+        // Baseline: matching identity loads successfully.
+        #expect(manager.loadFresh(expectedAccountFingerprint: "account-123") != nil)
+
+        // Open Grok version mismatch -> cache miss.
+        #expect(manager.loadFresh(
+            expectedAccountFingerprint: "account-123",
+            openGrokVersion: "grok-2.0"
+        ) == nil)
+
+        // Codex client version mismatch -> cache miss.
+        #expect(manager.loadFresh(
+            expectedAccountFingerprint: "account-123",
+            clientVersion: "0.145.0"
+        ) == nil)
+
+        // Endpoint origin mismatch -> cache miss.
+        #expect(manager.loadFresh(
+            expectedAccountFingerprint: "account-123",
+            baseURL: "https://custom-proxy.example.com/backend-api/codex"
+        ) == nil)
+
+        // Account fingerprint mismatch -> cache miss.
+        #expect(manager.loadFresh(expectedAccountFingerprint: "account-456") == nil)
+    }
+
+    @Test func codexSupportedInApiForcedFalseAndNotSelectableWithoutSession() throws {
+        let json = """
+        {
+          "models": [
+            {
+              "slug": "gpt-5.6-sol",
+              "display_name": "GPT-5.6 Sol",
+              "visibility": "list",
+              "supported_in_api": true,
+              "priority": 1
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let parsed = try parseCodexModelsResponse(json)
+        #expect(parsed.count == 1)
+        #expect(parsed[0].entry.info.supportedInApi == false)
+
+        let catalog = CodexModelsCatalog(
+            models: parsed,
+            accountFingerprint: "account-123"
+        )
+
+        var input = CatalogResolutionInput()
+        let assembled = resolveModelCatalog(input: input, codexCatalog: catalog)
+        let availableNoSession = availableModels(catalog: assembled, hasXaiSession: false, hasCodexSession: false)
+        #expect(availableNoSession["gpt-5.6-sol"] == nil)
+
+        let availableWithSession = availableModels(catalog: assembled, hasXaiSession: false, hasCodexSession: true)
+        #expect(availableWithSession["gpt-5.6-sol"] != nil)
+    }
+
+    @Test func codexUnknownToolModeRemovesModelFromParsedResult() throws {
+        let json = """
+        {
+          "models": [
+            {
+              "slug": "gpt-valid-1",
+              "display_name": "Valid Code Mode",
+              "visibility": "list",
+              "tool_mode": "code_mode_only",
+              "priority": 1
+            },
+            {
+              "slug": "gpt-unknown-mode",
+              "display_name": "Unknown Tool Mode Model",
+              "visibility": "list",
+              "tool_mode": "unsupported_futuristic_mode",
+              "priority": 2
+            },
+            {
+              "slug": "gpt-valid-2",
+              "display_name": "No Tool Mode Specified",
+              "visibility": "list",
+              "priority": 3
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let parsed = try parseCodexModelsResponse(json)
+        let slugs = parsed.map(\.slug)
+        #expect(slugs == ["gpt-valid-1", "gpt-valid-2"])
+        #expect(!slugs.contains("gpt-unknown-mode"))
+        #expect(parsed[0].entry.info.toolMode == .codeModeOnly)
+        #expect(parsed[1].entry.info.toolMode == nil)
+    }
+
+    @Test func codexParsedModelsSortedByPriority() throws {
+        let json = """
+        {
+          "models": [
+            {
+              "slug": "low-priority-wire-first",
+              "display_name": "Priority 10",
+              "visibility": "list",
+              "priority": 10
+            },
+            {
+              "slug": "high-priority-wire-second",
+              "display_name": "Priority 1",
+              "visibility": "list",
+              "priority": 1
+            },
+            {
+              "slug": "medium-priority-wire-third",
+              "display_name": "Priority 5",
+              "visibility": "list",
+              "priority": 5
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let parsed = try parseCodexModelsResponse(json)
+        let slugs = parsed.map(\.slug)
+        #expect(slugs == ["high-priority-wire-second", "medium-priority-wire-third", "low-priority-wire-first"])
+    }
+}
+
+

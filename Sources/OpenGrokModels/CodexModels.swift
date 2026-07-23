@@ -5,6 +5,7 @@
 
 import Foundation
 import OpenGrokSamplingTypes
+import OpenGrokVersion
 
 public enum CodexModels {
     public static let cacheFileName = "codex_models_cache.json"
@@ -28,6 +29,35 @@ public enum CodexModels {
             return false
         }
         return host == "chatgpt.com" || host == "chat.openai.com" || host == "api.openai.com"
+    }
+
+    public static func cacheEndpointIdentity(_ baseURL: String) -> (origin: String, baseURL: String)? {
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        var normalized = trimmed
+        while normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+
+        guard let url = URL(string: normalized),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased() else {
+            return nil
+        }
+
+        let portString: String
+        if let port = url.port {
+            if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
+                portString = ""
+            } else {
+                portString = ":\(port)"
+            }
+        } else {
+            portString = ""
+        }
+        let origin = "\(scheme)://\(host)\(portString)"
+        return (origin, normalized)
     }
 
     public static func clientVersion(
@@ -159,7 +189,9 @@ public func parseCodexModelsResponse(
           let arr = root["models"] as? [[String: Any]] else {
         throw ModelsError.remoteMalformed("codex models response missing models array")
     }
-    return arr.compactMap { parseCodexWireModel($0, baseURL: baseURL) }
+    var models = arr.compactMap { parseCodexWireModel($0, baseURL: baseURL) }
+    models.sort { $0.priority < $1.priority }
+    return models
 }
 
 private func parseCodexWireModel(_ obj: [String: Any], baseURL: String) -> CodexCatalogModel? {
@@ -189,7 +221,6 @@ private func parseCodexWireModel(_ obj: [String: Any], baseURL: String) -> Codex
 
     let visibilityRaw = (obj["visibility"] as? String)?.lowercased() ?? "none"
     let visibility = CodexModelVisibility(rawValue: visibilityRaw) ?? .none
-    let supportedInApi = obj["supported_in_api"] as? Bool ?? false
     let priority = (obj["priority"] as? NSNumber)?.int32Value ?? 0
     let contextWindow = (obj["context_window"] as? NSNumber)?.int64Value
     let maxContextWindow = (obj["max_context_window"] as? NSNumber)?.int64Value
@@ -204,7 +235,16 @@ private func parseCodexWireModel(_ obj: [String: Any], baseURL: String) -> Codex
         effectiveContext = NEW_MODEL_DEFAULT_CONTEXT_WINDOW
     }
 
-    let toolMode = WireCodec.toolMode(obj["tool_mode"] as? String)
+    let toolMode: ToolMode?
+    if let rawToolMode = obj["tool_mode"] as? String {
+        guard let mode = WireCodec.toolMode(rawToolMode) else {
+            return nil
+        }
+        toolMode = mode
+    } else {
+        toolMode = nil
+    }
+
     let multiAgent = obj["multi_agent_version"] as? String
     let supportsSummary = obj["supports_reasoning_summary_parameter"] as? Bool ?? true
     let defaultSummary = WireCodec.reasoningSummary(obj["default_reasoning_summary"] as? String)
@@ -222,7 +262,9 @@ private func parseCodexWireModel(_ obj: [String: Any], baseURL: String) -> Codex
     info.codexMultiAgentV2 = multiAgent == "v2"
     info.agentType = "codex"
     info.contextWindow = effectiveContext
-    info.supportedInApi = supportedInApi
+    // The Codex transport is OAuth-only in Open Grok; supportedInApi describes
+    // upstream API-key availability, which is forced false locally to require a Codex session.
+    info.supportedInApi = false
     info.hidden = !visibility.isListVisible
     info.reasoningEfforts = efforts
     info.supportsReasoningEffort = !efforts.isEmpty
@@ -248,26 +290,42 @@ private func parseCodexWireModel(_ obj: [String: Any], baseURL: String) -> Codex
 
 public struct CodexModelsCacheDocument: Sendable, Equatable, Codable {
     public var fetchedAt: Date
-    public var etag: String?
+    public var openGrokVersion: String
+    public var clientVersion: String
+    public var baseOrigin: String
+    public var baseURL: String
     public var accountFingerprint: String
+    public var etag: String?
     public var models: [CodexCachedModel]
 
     public init(
         fetchedAt: Date,
-        etag: String?,
+        openGrokVersion: String,
+        clientVersion: String,
+        baseOrigin: String,
+        baseURL: String,
         accountFingerprint: String,
+        etag: String? = nil,
         models: [CodexCachedModel]
     ) {
         self.fetchedAt = fetchedAt
-        self.etag = etag
+        self.openGrokVersion = openGrokVersion
+        self.clientVersion = clientVersion
+        self.baseOrigin = baseOrigin
+        self.baseURL = baseURL
         self.accountFingerprint = accountFingerprint
+        self.etag = etag
         self.models = models
     }
 
     public enum CodingKeys: String, CodingKey {
         case fetchedAt = "fetched_at"
-        case etag
+        case openGrokVersion = "open_grok_version"
+        case clientVersion = "client_version"
+        case baseOrigin = "base_origin"
+        case baseURL = "base_url"
         case accountFingerprint = "account_fingerprint"
+        case etag
         case models
     }
 }
@@ -292,10 +350,22 @@ public struct CodexCachedModel: Sendable, Equatable, Codable {
 public struct CodexModelsCacheManager: Sendable {
     public let path: URL
     public let ttl: TimeInterval
+    public let versionProvider: @Sendable () -> String
+    public let clientVersionProvider: @Sendable () -> String
+    public let baseURLProvider: @Sendable () -> String
 
-    public init(grokHome: URL, ttl: TimeInterval = CodexModels.cacheTTLSeconds) {
+    public init(
+        grokHome: URL,
+        ttl: TimeInterval = CodexModels.cacheTTLSeconds,
+        versionProvider: @escaping @Sendable () -> String = { OpenGrokVersion.installed() },
+        clientVersionProvider: @escaping @Sendable () -> String = { CodexModels.clientVersion() },
+        baseURLProvider: @escaping @Sendable () -> String = { CodexModels.defaultInferenceBaseURL }
+    ) {
         self.path = grokHome.appendingPathComponent(CodexModels.cacheFileName)
         self.ttl = ttl
+        self.versionProvider = versionProvider
+        self.clientVersionProvider = clientVersionProvider
+        self.baseURLProvider = baseURLProvider
     }
 
     public func isFresh(_ doc: CodexModelsCacheDocument, now: Date = Date()) -> Bool {
@@ -305,14 +375,31 @@ public struct CodexModelsCacheManager: Sendable {
 
     public func loadFresh(
         expectedAccountFingerprint: String,
+        openGrokVersion: String? = nil,
+        clientVersion: String? = nil,
+        baseURL: String? = nil,
         now: Date = Date()
     ) -> CodexModelsCatalog? {
-        guard let data = try? Data(contentsOf: path),
-              let doc = try? JSONDecoder().decode(CodexModelsCacheDocument.self, from: data),
-              doc.accountFingerprint == expectedAccountFingerprint,
-              isFresh(doc, now: now) else {
+        let targetOpenGrokVersion = openGrokVersion ?? versionProvider()
+        let targetClientVersion = clientVersion ?? clientVersionProvider()
+        let targetBaseURL = baseURL ?? baseURLProvider()
+
+        guard let (expectedOrigin, expectedNormalizedBaseURL) = CodexModels.cacheEndpointIdentity(targetBaseURL),
+              let data = try? Data(contentsOf: path) else {
             return nil
         }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let doc = try? decoder.decode(CodexModelsCacheDocument.self, from: data) else {
+            return nil
+        }
+
+        if doc.openGrokVersion != targetOpenGrokVersion { return nil }
+        if doc.clientVersion != targetClientVersion { return nil }
+        if doc.baseOrigin != expectedOrigin || doc.baseURL != expectedNormalizedBaseURL { return nil }
+        if doc.accountFingerprint != expectedAccountFingerprint { return nil }
+        if !isFresh(doc, now: now) { return nil }
+
         let models: [CodexCatalogModel] = doc.models.compactMap { cached in
             let visibility = CodexModelVisibility(rawValue: cached.visibility) ?? .none
             return CodexCatalogModel(
@@ -331,7 +418,21 @@ public struct CodexModelsCacheManager: Sendable {
         )
     }
 
-    public func persist(_ catalog: CodexModelsCatalog, now: Date = Date()) throws {
+    public func persist(
+        _ catalog: CodexModelsCatalog,
+        openGrokVersion: String? = nil,
+        clientVersion: String? = nil,
+        baseURL: String? = nil,
+        now: Date = Date()
+    ) throws {
+        let targetOpenGrokVersion = openGrokVersion ?? versionProvider()
+        let targetClientVersion = clientVersion ?? clientVersionProvider()
+        let targetBaseURL = baseURL ?? baseURLProvider()
+
+        guard let (origin, normalizedBaseURL) = CodexModels.cacheEndpointIdentity(targetBaseURL) else {
+            throw ModelsError.remoteMalformed("Invalid base URL for cache identity: \(targetBaseURL)")
+        }
+
         let models = catalog.models.map { m in
             CodexCachedModel(
                 priority: m.priority,
@@ -344,8 +445,12 @@ public struct CodexModelsCacheManager: Sendable {
         }
         let doc = CodexModelsCacheDocument(
             fetchedAt: now,
-            etag: catalog.etag,
+            openGrokVersion: targetOpenGrokVersion,
+            clientVersion: targetClientVersion,
+            baseOrigin: origin,
+            baseURL: normalizedBaseURL,
             accountFingerprint: catalog.accountFingerprint,
+            etag: catalog.etag,
             models: models
         )
         let encoder = JSONEncoder()
@@ -359,3 +464,4 @@ public struct CodexModelsCacheManager: Sendable {
         try? FileManager.default.removeItem(at: path)
     }
 }
+
