@@ -77,9 +77,9 @@ public struct InferenceLatencyStats: Codable, Sendable, Equatable, Hashable {
     ///   - chunkTimestamps: recorded on each content-bearing chunk
     ///   - streamEnd: captured after the stream is fully exhausted
     public static func fromTimestamps(
-        streamStart: ContinuousClock.Instant,
-        chunkTimestamps: [ContinuousClock.Instant],
-        streamEnd: ContinuousClock.Instant
+        streamStart: MonotonicInstant,
+        chunkTimestamps: [MonotonicInstant],
+        streamEnd: MonotonicInstant
     ) -> InferenceLatencyStats {
         let ttlb = UInt64(max(0, (streamEnd - streamStart).components.seconds * 1000
             + (streamEnd - streamStart).components.attoseconds / 1_000_000_000_000_000))
@@ -89,15 +89,13 @@ public struct InferenceLatencyStats: Codable, Sendable, Equatable, Hashable {
         }
 
         let ttfbDuration = chunkTimestamps[0] - streamStart
-        let ttfb = UInt64(max(0, ttfbDuration.components.seconds * 1000
-            + ttfbDuration.components.attoseconds / 1_000_000_000_000_000))
+        let ttfb = ttfbDuration.nanoseconds / 1_000_000
 
         var intervals: [UInt64] = []
         if chunkTimestamps.count >= 2 {
             for i in 1..<chunkTimestamps.count {
                 let d = chunkTimestamps[i] - chunkTimestamps[i - 1]
-                let ms = UInt64(max(0, d.components.seconds * 1000
-                    + d.components.attoseconds / 1_000_000_000_000_000))
+                let ms = d.nanoseconds / 1_000_000
                 intervals.append(ms)
             }
         }

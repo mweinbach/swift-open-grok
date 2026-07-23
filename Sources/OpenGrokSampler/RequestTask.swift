@@ -29,7 +29,7 @@ func runRequestTask(
     completion: CompletionBox?,
     codexTurnState: CodexTurnStateCell
 ) async {
-    let idleTimeout = Duration.seconds(
+    let idleTimeout = MonotonicDuration.seconds(
         Int64(config.idleTimeoutSecs ?? DEFAULT_IDLE_TIMEOUT_SECS)
     )
     let maxRetries = resolveMaxRetries(
@@ -120,7 +120,7 @@ func runRequestTask(
                     maxRetries: doomMaxRetries,
                     error: error
                 )
-                try? await Task.sleep(for: backoff)
+                try? await backoff.sleep()
                 continue
             }
             if !(await applyRetryDecision(
@@ -197,13 +197,13 @@ private func applyRetryDecision(
     case .retry(let backoff):
         retryCount += 1
         emitRetrying(eventContinuation, requestId: requestId, attempt: retryCount, maxRetries: maxRetries, error: err)
-        try? await Task.sleep(for: backoff)
+        try? await backoff.sleep()
         return true
 
     case .retryWithBackoff(let backoff, _):
         retryCount += 1
         emitRetrying(eventContinuation, requestId: requestId, attempt: retryCount, maxRetries: maxRetries, error: err)
-        try? await Task.sleep(for: backoff)
+        try? await backoff.sleep()
         return true
 
     case .retryWithImageStrip:
@@ -220,7 +220,7 @@ private func applyRetryDecision(
     case .retryWithClientRebuild(let backoff):
         retryCount += 1
         emitRetrying(eventContinuation, requestId: requestId, attempt: retryCount, maxRetries: maxRetries, error: err)
-        try? await Task.sleep(for: backoff)
+        try? await backoff.sleep()
         var http1Config = config
         http1Config.forceHTTP1 = true
         if let fresh = try? SamplingClient(
@@ -248,7 +248,7 @@ private func runOneAttempt(
     client: SamplingClient,
     request: ConversationRequest,
     requestId: RequestId,
-    idleTimeout: Duration,
+    idleTimeout: MonotonicDuration,
     eventContinuation: AsyncStream<SamplingEvent>.Continuation,
     cancelToken: CancellationToken,
     doomCheck: DoomLoopRecoveryPolicy?

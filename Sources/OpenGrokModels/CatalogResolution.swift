@@ -202,10 +202,12 @@ public func resolveModelCatalog(
             entry.info.userSelectable = true
             catalog[key] = entry
         }
-    case .success(let Some(allowed)):
-        for (key, var entry) in catalog.pairs() {
-            entry.info.userSelectable = allowed.matches(key: key, model: entry.model)
-            catalog[key] = entry
+    case .success(let allowed):
+        if let allowed {
+            for (key, var entry) in catalog.pairs() {
+                entry.info.userSelectable = allowed.matches(key: key, model: entry.model)
+                catalog[key] = entry
+            }
         }
     case .failure:
         // Fail closed: nothing selectable.
@@ -549,4 +551,3 @@ public func resolveAuxiliaryModelSamplingConfig(
 
     return nil
 }
-

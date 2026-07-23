@@ -198,7 +198,7 @@ public final class SamplingClient: @unchecked Sendable {
     public func conversationCollect(
         _ request: ConversationRequest,
         requestId: RequestId = .random(),
-        idleTimeout: Duration = .seconds(300)
+        idleTimeout: MonotonicDuration = .seconds(300)
     ) async throws -> ConversationResponse {
         switch defaults.apiBackend {
         case .chatCompletions:

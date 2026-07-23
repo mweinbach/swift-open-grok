@@ -48,7 +48,7 @@ public enum SamplingErrorKind: String, Codable, Sendable, Equatable, Hashable {
 // MARK: - Error info
 
 /// Serializable mirror of ``SamplingError`` for UI / event channels.
-public struct SamplingErrorInfo: Codable, Sendable, Equatable {
+public struct SamplingErrorInfo: Codable, Sendable, Equatable, Error {
     public var kind: SamplingErrorKind
     public var statusCode: UInt16?
     public var message: String

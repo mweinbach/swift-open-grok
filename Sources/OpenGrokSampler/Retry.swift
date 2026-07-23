@@ -43,7 +43,7 @@ private final class JitterSeq: @unchecked Sendable {
 private let jitterSeq = JitterSeq()
 
 /// Backoff for doom-loop resamples: near-immediate with a small jitter.
-public func doomLoopBackoff(retryCount: UInt32) -> Duration {
+public func doomLoopBackoff(retryCount: UInt32) -> MonotonicDuration {
     var hasher = Hasher()
     hasher.combine(jitterSeq.next())
     hasher.combine(retryCount)
@@ -52,7 +52,7 @@ public func doomLoopBackoff(retryCount: UInt32) -> Duration {
 }
 
 /// Exponential backoff (2s, 4s, 8s, ..., capped 30s) with +/-20% jitter.
-public func retryBackoffWithJitter(retryCount: UInt32) -> Duration {
+public func retryBackoffWithJitter(retryCount: UInt32) -> MonotonicDuration {
     let shift = retryCount > 0 ? retryCount - 1 : 0
     let baseMs: UInt64
     if shift >= 63 {
@@ -73,13 +73,13 @@ public func retryBackoffWithJitter(retryCount: UInt32) -> Duration {
 /// What the actor should do next given a sampling error and retry context.
 public enum RetryDecision: Sendable {
     /// Retry with exponential backoff.
-    case retry(backoff: Duration)
+    case retry(backoff: MonotonicDuration)
     /// Retry honoring Retry-After (or jittered backoff).
-    case retryWithBackoff(backoff: Duration, isRateLimited: Bool)
+    case retryWithBackoff(backoff: MonotonicDuration, isRateLimited: Bool)
     /// Retry after stripping inline images (413 / image processing).
     case retryWithImageStrip
     /// Retry after rebuilding the HTTP client with HTTP/1.1 (first retry).
-    case retryWithClientRebuild(backoff: Duration)
+    case retryWithClientRebuild(backoff: MonotonicDuration)
     /// Emit the error to the session (auth refresh, encrypted-content mismatch).
     case emitToSession(SamplingError)
     /// Fatal: no further retries.
@@ -123,7 +123,7 @@ public func classifyError(
         if nextAttempt >= effectiveCap {
             return .fatal(err)
         }
-        let backoff: Duration
+        let backoff: MonotonicDuration
         if let secs = err.retryAfter {
             backoff = .seconds(Int64(secs))
         } else {
@@ -136,7 +136,7 @@ public func classifyError(
         if nextAttempt >= maxRetries {
             return .fatal(err)
         }
-        let backoff: Duration
+        let backoff: MonotonicDuration
         if let secs = err.retryAfter {
             backoff = .seconds(Int64(secs))
         } else {

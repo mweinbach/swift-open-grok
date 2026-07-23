@@ -1,7 +1,7 @@
 # Swift Open Grok Port Status
 
 **As of:** 2026-07-23 (Luna R12–R15 integration verification)
-**Overall state:** R12–R15 remain present at integration head `23a23bed3cbab6200bad42e5ecb1996232a359b4`. The TerminalCore `Hashable` blocker, TextArea undo redeclaration, and Sandbox Swift 6 mutable-global diagnostics were already clear in the committed tree. This pass fixed the OpenGrokModels invalid-glob error type and explicit equality for tuple-backed fields, then reached additional R14 sampler compile blockers within the three-iteration cap.
+**Overall state:** R12–R15 remain present at integration head `8aeff086290632f551b57127c5aa866e29f9ce09`. TerminalCore `Hashable`, TextArea undo, Sandbox synchronized-global, and Telemetry JSONNumber fixes were already present. This pass added the macOS 12-compatible sampler timing abstraction, `SamplingErrorInfo: Error`, and corrected model optional-result pattern matching. Integrated verification remains partial because the final permitted build exposed an unrelated trailing-token artifact in `CatalogResolution.swift` after the build command; that artifact was removed afterward but not reverified under the three-iteration cap.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `9739c4a2ad23cfea14312a481169757f3da494f4` (`/tmp/open-grok-reference` when present).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`).
@@ -11,14 +11,14 @@
 
 | Command | Outcome |
 |---|---|
-| `zsh workflows/swift-safe-verify.zsh build` (iteration 1) | **Exit 1** — committed TerminalCore `CellStyle`/`CellAttributes` `Hashable` and TextArea undo fixes were already present; compilation stopped in OpenGrokModels at `ModelGlobSet.swift:18` because `[String]` does not conform to `Error`, and at tuple-backed Equatable conformances. |
-| `zsh workflows/swift-safe-verify.zsh build` (iteration 2) | **Exit 1** — OpenGrokModels changes compiled far enough to reveal a duplicate existing `ModelInfo.==` implementation introduced by the remediation append; no new TerminalCore, TextArea, Sandbox, or Telemetry blocker was reported. |
-| `zsh workflows/swift-safe-verify.zsh build` (iteration 3) | **Exit 1** — OpenGrokModels compiled; OpenGrokSampler then failed on `SamplingErrorInfo` not conforming to `Error` and macOS 12 deployment diagnostics for `ContinuousClock`/`Duration` in `Metrics.swift`, `Retry.swift`, `RequestTask.swift`, `SamplingClient.swift`, `StreamMessages.swift`, and `StreamResponses.swift`. |
-| `zsh workflows/swift-safe-verify.zsh build-tests` | **Not run** — the final integrated `build` failed within the allowed three iterations. |
+| `zsh workflows/swift-safe-verify.zsh build` (iteration 1) | **Exit 1** — committed TerminalCore/TextArea/Sandbox/Telemetry fixes were present; OpenGrokSampler failed on `SamplingErrorInfo` not conforming to `Error` and macOS 12 deployment diagnostics for `ContinuousClock`/`Duration`. |
+| `zsh workflows/swift-safe-verify.zsh build` (iteration 2) | **Exit 1** — sampler timing edits progressed; OpenGrokModels exposed invalid `Some(...)` optional-pattern syntax and a pre-existing trailing-token artifact in `StreamChatCompletions.swift`. |
+| `zsh workflows/swift-safe-verify.zsh build` (iteration 3) | **Exit 1** — sampler and model sources compiled past the prior blockers; OpenGrokModels stopped on the analogous trailing-token artifact at the end of `CatalogResolution.swift`. The artifact was removed after this command, but no fourth build was permitted. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` | **Not run** — the final integrated `build` did not pass within the three-iteration cap. |
 | `zsh workflows/swift-safe-verify.zsh test` | **Not run** — test products were not built. |
-| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — the final integrated `build` failed. |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — the final integrated `build` did not pass. |
 
-Integration is **partial**. `CompactionTranscript.swift` remains untouched. The requested model fixes are present, but integrated verification is blocked by R14 sampler errors outside the completed model remediation; `build-tests`, `test`, and the product smoke were not run.
+Integration is **partial**. `CompactionTranscript.swift` remains untouched. The post-build trailing-token cleanup is present but unverified; `build-tests`, `test`, and the product smoke were not run.
 
 
 ## Inventory counting method (reproducible)

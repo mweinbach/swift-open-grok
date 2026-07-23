@@ -167,7 +167,7 @@ public func streamResponses(
     rawStream: AsyncStream<Result<ResponsesStreamEvent, SamplingError>>,
     modelMetadata: ResponseModelMetadata?,
     requestId: RequestId,
-    idleTimeout: Duration,
+    idleTimeout: MonotonicDuration,
     doomLoop: DoomLoopSignalCollector? = nil,
     clientCustomToolNames: [String] = []
 ) -> AsyncStream<SamplingEvent> {
@@ -185,15 +185,15 @@ public func streamResponsesWithClientCustomTools(
     rawStream: AsyncStream<Result<ResponsesStreamEvent, SamplingError>>,
     modelMetadata: ResponseModelMetadata?,
     requestId: RequestId,
-    idleTimeout: Duration,
+    idleTimeout: MonotonicDuration,
     doomLoop: DoomLoopSignalCollector?,
     clientCustomToolNames: [String]
 ) -> AsyncStream<SamplingEvent> {
     let customNameSet = Set(clientCustomToolNames)
     return AsyncStream { continuation in
         let task = Task {
-            let streamStart = ContinuousClock.now
-            var chunkTimestamps: [ContinuousClock.Instant] = []
+            let streamStart = MonotonicInstant.now
+            var chunkTimestamps: [MonotonicInstant] = []
 
             continuation.yield(.streamStarted(
                 requestId: requestId,
@@ -211,7 +211,7 @@ public func streamResponsesWithClientCustomTools(
             var reasoningSummaryParts: [ReasoningUnitKey: String] = [:]
             var lastReasoningUnit: ReasoningUnitKey?
             var completedOutputItems: [UInt32: JSONValue] = [:]
-            var lastContentChunkAt = ContinuousClock.now
+            var lastContentChunkAt = MonotonicInstant.now
             var outputToToolIndex: [UInt32: UInt32] = [:]
             var funcArgsStarted: Set<UInt32> = []
             var customInputStarted: Set<UInt32> = []
@@ -235,7 +235,7 @@ public func streamResponsesWithClientCustomTools(
                 do {
                     next = try await withTimeout(idleTimeout) { await iterator.next() }
                 } catch is TimeoutError {
-                    let err = SamplingError.idleTimeout(elapsedSecs: UInt64(idleTimeout.components.seconds))
+                    let err = SamplingError.idleTimeout(elapsedSecs: idleTimeout.wholeSeconds)
                     continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
                     continuation.finish()
                     return
@@ -501,8 +501,8 @@ public func streamResponsesWithClientCustomTools(
 
                 if hasContent {
                     lastContentChunkAt = .now
-                } else if ContinuousClock.now - lastContentChunkAt > idleTimeout {
-                    let err = SamplingError.idleTimeout(elapsedSecs: UInt64(idleTimeout.components.seconds))
+                } else if MonotonicInstant.now - lastContentChunkAt > idleTimeout {
+                    let err = SamplingError.idleTimeout(elapsedSecs: idleTimeout.wholeSeconds)
                     continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
                     continuation.finish()
                     return

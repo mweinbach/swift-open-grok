@@ -13,11 +13,11 @@ public func streamChatCompletions(
     rawStream: AsyncStream<Result<ChatCompletionChunk, SamplingError>>,
     modelMetadata: ResponseModelMetadata?,
     requestId: RequestId,
-    idleTimeout: Duration
+    idleTimeout: MonotonicDuration
 ) -> AsyncStream<SamplingEvent> {
     AsyncStream { continuation in
         let task = Task {
-            let streamStart = ContinuousClock.now
+            let streamStart = MonotonicInstant.now
             var chunkTimestamps: [ContinuousClock.Instant] = []
 
             continuation.yield(.streamStarted(
@@ -45,7 +45,7 @@ public func streamChatCompletions(
 
             var chunkIndex: UInt64 = 0
             var messageChunkCount: UInt64 = 0
-            var lastContentChunkAt = ContinuousClock.now
+            var lastContentChunkAt = MonotonicInstant.now
 
             var iterator = rawStream.makeAsyncIterator()
             while true {
@@ -55,7 +55,7 @@ public func streamChatCompletions(
                         await iterator.next()
                     }
                 } catch is TimeoutError {
-                    let err = SamplingError.idleTimeout(elapsedSecs: UInt64(idleTimeout.components.seconds))
+                    let err = SamplingError.idleTimeout(elapsedSecs: idleTimeout.wholeSeconds)
                     continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
                     continuation.finish()
                     return
@@ -172,8 +172,8 @@ public func streamChatCompletions(
 
                 if chunkHasContent {
                     lastContentChunkAt = .now
-                } else if ContinuousClock.now - lastContentChunkAt > idleTimeout {
-                    let err = SamplingError.idleTimeout(elapsedSecs: UInt64(idleTimeout.components.seconds))
+                } else if MonotonicInstant.now - lastContentChunkAt > idleTimeout {
+                    let err = SamplingError.idleTimeout(elapsedSecs: idleTimeout.wholeSeconds)
                     continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
                     continuation.finish()
                     return
@@ -234,7 +234,7 @@ public func streamChatCompletions(
 struct TimeoutError: Error {}
 
 func withTimeout<T: Sendable>(
-    _ timeout: Duration,
+    _ timeout: MonotonicDuration,
     operation: @escaping @Sendable () async -> T
 ) async throws -> T {
     try await withThrowingTaskGroup(of: T.self) { group in
@@ -242,7 +242,7 @@ func withTimeout<T: Sendable>(
             await operation()
         }
         group.addTask {
-            try await Task.sleep(for: timeout)
+            try await timeout.sleep()
             throw TimeoutError()
         }
         let result = try await group.next()!
