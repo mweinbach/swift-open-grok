@@ -20,6 +20,8 @@ public enum ResponsesStreamEvent: Sendable, Equatable {
     case reasoningTextDelta(delta: String, itemId: String, outputIndex: UInt32)
     case functionCallArgumentsDelta(delta: String, itemId: String, outputIndex: UInt32)
     case functionCallArgumentsDone(arguments: String, itemId: String, outputIndex: UInt32)
+    case customToolCallInputDelta(delta: String, itemId: String, outputIndex: UInt32)
+    case customToolCallInputDone(input: String, itemId: String, outputIndex: UInt32)
     case outputItemAdded(outputIndex: UInt32, item: JSONValue)
     case outputItemDone(outputIndex: UInt32, item: JSONValue)
     case completed(response: JSONValue)
@@ -79,6 +81,18 @@ public enum ResponsesStreamEvent: Sendable, Equatable {
                 itemId: raw["item_id"]?.stringValue ?? "",
                 outputIndex: UInt32(raw["output_index"]?.intValue ?? 0)
             )
+        case "response.custom_tool_call_input.delta":
+            return .customToolCallInputDelta(
+                delta: raw["delta"]?.stringValue ?? "",
+                itemId: raw["item_id"]?.stringValue ?? raw["call_id"]?.stringValue ?? "",
+                outputIndex: UInt32(raw["output_index"]?.intValue ?? 0)
+            )
+        case "response.custom_tool_call_input.done":
+            return .customToolCallInputDone(
+                input: raw["input"]?.stringValue ?? raw["text"]?.stringValue ?? "",
+                itemId: raw["item_id"]?.stringValue ?? raw["call_id"]?.stringValue ?? "",
+                outputIndex: UInt32(raw["output_index"]?.intValue ?? 0)
+            )
         case "response.output_item.added":
             return .outputItemAdded(
                 outputIndex: UInt32(raw["output_index"]?.intValue ?? 0),
@@ -89,12 +103,15 @@ public enum ResponsesStreamEvent: Sendable, Equatable {
                 outputIndex: UInt32(raw["output_index"]?.intValue ?? 0),
                 item: raw["item"] ?? .null
             )
-        case "response.completed":
-            return .completed(response: raw["response"] ?? .null)
+        case "response.completed", "response.done":
+            let resp = (raw["response"] != nil && raw["response"] != .null) ? raw["response"]! : raw
+            return .completed(response: resp)
         case "response.failed":
-            return .failed(response: raw["response"] ?? .null)
+            let resp = (raw["response"] != nil && raw["response"] != .null) ? raw["response"]! : raw
+            return .failed(response: resp)
         case "response.incomplete":
-            return .incomplete(response: raw["response"] ?? .null)
+            let resp = (raw["response"] != nil && raw["response"] != .null) ? raw["response"]! : raw
+            return .incomplete(response: resp)
         case "error", "response.error":
             let message = raw["message"]?.stringValue
                 ?? raw["error"]?["message"]?.stringValue
@@ -131,6 +148,8 @@ public func responsesEventHasMeaningfulContent(_ event: ResponsesStreamEvent) ->
     case .reasoningTextDelta(let d, _, _): return !d.isEmpty
     case .functionCallArgumentsDelta(let d, _, _): return !d.isEmpty
     case .functionCallArgumentsDone(let a, _, _): return !a.isEmpty
+    case .customToolCallInputDelta(let d, _, _): return !d.isEmpty
+    case .customToolCallInputDone(let input, _, _): return !input.isEmpty
     case .outputItemAdded, .outputItemDone, .completed, .failed, .incomplete, .error:
         return true
     case .other:
@@ -194,6 +213,8 @@ public func streamResponsesWithClientCustomTools(
             var completedOutputItems: [UInt32: JSONValue] = [:]
             var lastContentChunkAt = ContinuousClock.now
             var outputToToolIndex: [UInt32: UInt32] = [:]
+            var funcArgsStarted: Set<UInt32> = []
+            var customInputStarted: Set<UInt32> = []
             var nextToolIndex: UInt32 = 0
             var citationFilter = DisplayCitationFilter()
             var streamedText = ""
@@ -323,19 +344,22 @@ public func streamResponsesWithClientCustomTools(
                     }
 
                 case .functionCallArgumentsDelta(let delta, _, let outputIndex):
-                    let toolIndex = outputToToolIndex[outputIndex] ?? {
-                        let idx = nextToolIndex
-                        nextToolIndex += 1
-                        outputToToolIndex[outputIndex] = idx
-                        return idx
-                    }()
-                    continuation.yield(.toolCallDelta(
-                        requestId: requestId,
-                        toolIndex: toolIndex,
-                        id: nil,
-                        name: nil,
-                        argumentsDelta: delta
-                    ))
+                    if !delta.isEmpty {
+                        let toolIndex = outputToToolIndex[outputIndex] ?? {
+                            let idx = nextToolIndex
+                            nextToolIndex += 1
+                            outputToToolIndex[outputIndex] = idx
+                            return idx
+                        }()
+                        funcArgsStarted.insert(outputIndex)
+                        continuation.yield(.toolCallDelta(
+                            requestId: requestId,
+                            toolIndex: toolIndex,
+                            id: nil,
+                            name: nil,
+                            argumentsDelta: delta
+                        ))
+                    }
 
                 case .functionCallArgumentsDone(let arguments, _, let outputIndex):
                     let toolIndex = outputToToolIndex[outputIndex] ?? {
@@ -344,9 +368,52 @@ public func streamResponsesWithClientCustomTools(
                         outputToToolIndex[outputIndex] = idx
                         return idx
                     }()
-                    // Only emit if no prior deltas (terminal-only path).
-                    _ = arguments
-                    _ = toolIndex
+                    if !funcArgsStarted.contains(outputIndex) && !arguments.isEmpty {
+                        continuation.yield(.toolCallDelta(
+                            requestId: requestId,
+                            toolIndex: toolIndex,
+                            id: nil,
+                            name: nil,
+                            argumentsDelta: arguments
+                        ))
+                    }
+
+                case .customToolCallInputDelta(let delta, _, let outputIndex):
+                    if !delta.isEmpty {
+                        let toolIndex = outputToToolIndex[outputIndex] ?? {
+                            let idx = nextToolIndex
+                            nextToolIndex += 1
+                            outputToToolIndex[outputIndex] = idx
+                            return idx
+                        }()
+                        customInputStarted.insert(outputIndex)
+                        continuation.yield(.toolCallDelta(
+                            requestId: requestId,
+                            toolIndex: toolIndex,
+                            id: nil,
+                            name: nil,
+                            argumentsDelta: delta
+                        ))
+                    }
+
+                case .customToolCallInputDone(let input, let itemId, let outputIndex):
+                    if let toolIndex = outputToToolIndex[outputIndex] {
+                        if !customInputStarted.contains(outputIndex) && !input.isEmpty {
+                            continuation.yield(.toolCallDelta(
+                                requestId: requestId,
+                                toolIndex: toolIndex,
+                                id: nil,
+                                name: nil,
+                                argumentsDelta: input
+                            ))
+                        }
+                    } else if !itemId.isEmpty {
+                        continuation.yield(.backendToolCallStarted(
+                            requestId: requestId,
+                            callId: itemId,
+                            name: "x_search"
+                        ))
+                    }
 
                 case .outputItemAdded(let outputIndex, let item):
                     let itemType = item["type"]?.stringValue
@@ -357,6 +424,10 @@ public func streamResponsesWithClientCustomTools(
                         let id = item["call_id"]?.stringValue ?? item["id"]?.stringValue
                         let name = item["name"]?.stringValue
                         let args = item["arguments"]?.stringValue ?? item["input"]?.stringValue
+                        if let args, !args.isEmpty {
+                            funcArgsStarted.insert(outputIndex)
+                            customInputStarted.insert(outputIndex)
+                        }
                         continuation.yield(.toolCallDelta(
                             requestId: requestId,
                             toolIndex: toolIndex,

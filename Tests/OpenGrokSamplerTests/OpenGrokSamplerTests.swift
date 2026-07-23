@@ -702,6 +702,13 @@ struct DoomLoopCollectorTests {
         collector.disarmAbort()
         #expect(collector.abortTriggers() == nil)
     }
+
+    @Test("absorb malformed check event logs diagnostic once and swallows")
+    func malformedLogging() {
+        let collector = DoomLoopSignalCollector()
+        #expect(collector.absorb(eventName: DOOM_LOOP_CHECK_EVENT_TYPE, data: "not valid json"))
+        #expect(collector.take().isEmpty)
+    }
 }
 
 // MARK: - Messages L2
@@ -761,6 +768,108 @@ struct StreamMessagesTests {
             #expect(info.message.contains("boom"))
         } else {
             Issue.record("expected failed")
+        }
+    }
+
+    @Test("thinking block preserves encrypted reasoning signature")
+    func thinkingSignature() async {
+        let events: [Result<MessageStreamEvent, SamplingError>] = [
+            .success(.messageStart(message: MessagesResponse(
+                id: "m1", type: "message", role: "assistant",
+                content: [], model: "claude", usage: MessagesUsage(inputTokens: 10, outputTokens: 0)
+            ))),
+            .success(.contentBlockStart(index: 0, contentBlock: .thinking(thinking: "deliberating", signature: "sig_enc_123"))),
+            .success(.contentBlockStop(index: 0)),
+            .success(.messageDelta(
+                delta: MessageDeltaBody(stopReason: .endTurn),
+                usage: MessageDeltaUsage(outputTokens: 5, inputTokens: 10)
+            )),
+            .success(.messageStop),
+        ]
+        var out: [SamplingEvent] = []
+        for await e in streamMessages(
+            rawStream: makeResultStream(events),
+            modelMetadata: nil,
+            requestId: RequestId("msg"),
+            idleTimeout: .seconds(60)
+        ) {
+            out.append(e)
+        }
+        if case .completed(_, let response, _) = out.last {
+            guard let reasoningItem = response.reasoningItems().first else {
+                Issue.record("expected reasoning item")
+                return
+            }
+            #expect(reasoningItem.encryptedContent == "sig_enc_123")
+            #expect(reasoningItem.summary.first?.text == "deliberating")
+        } else {
+            Issue.record("expected completed")
+        }
+    }
+
+    @Test("start-populated text block emits first token immediately")
+    func textBlockStartFirstToken() async {
+        let events: [Result<MessageStreamEvent, SamplingError>] = [
+            .success(.messageStart(message: MessagesResponse(
+                id: "m1", type: "message", role: "assistant",
+                content: [], model: "claude", usage: MessagesUsage(inputTokens: 10, outputTokens: 0)
+            ))),
+            .success(.contentBlockStart(index: 0, contentBlock: .text(text: "Inline text", cacheControl: nil))),
+            .success(.contentBlockStop(index: 0)),
+            .success(.messageDelta(
+                delta: MessageDeltaBody(stopReason: .endTurn),
+                usage: MessageDeltaUsage(outputTokens: 2, inputTokens: 10)
+            )),
+            .success(.messageStop),
+        ]
+        var out: [SamplingEvent] = []
+        for await e in streamMessages(
+            rawStream: makeResultStream(events),
+            modelMetadata: nil,
+            requestId: RequestId("msg"),
+            idleTimeout: .seconds(60)
+        ) {
+            out.append(e)
+        }
+        let firstTokenEvents = out.filter { if case .firstToken = $0 { return true }; return false }
+        #expect(firstTokenEvents.count == 1)
+        if case .completed(_, let response, _) = out.last {
+            #expect(response.assistantText() == "Inline text")
+        } else {
+            Issue.record("expected completed")
+        }
+    }
+
+    @Test("multiple text blocks insert newline separator")
+    func multiTextBlockNewline() async {
+        let events: [Result<MessageStreamEvent, SamplingError>] = [
+            .success(.messageStart(message: MessagesResponse(
+                id: "m1", type: "message", role: "assistant",
+                content: [], model: "claude", usage: MessagesUsage(inputTokens: 10, outputTokens: 0)
+            ))),
+            .success(.contentBlockStart(index: 0, contentBlock: .text(text: "First block", cacheControl: nil))),
+            .success(.contentBlockStop(index: 0)),
+            .success(.contentBlockStart(index: 1, contentBlock: .text(text: "Second block", cacheControl: nil))),
+            .success(.contentBlockStop(index: 1)),
+            .success(.messageDelta(
+                delta: MessageDeltaBody(stopReason: .endTurn),
+                usage: MessageDeltaUsage(outputTokens: 4, inputTokens: 10)
+            )),
+            .success(.messageStop),
+        ]
+        var out: [SamplingEvent] = []
+        for await e in streamMessages(
+            rawStream: makeResultStream(events),
+            modelMetadata: nil,
+            requestId: RequestId("msg"),
+            idleTimeout: .seconds(60)
+        ) {
+            out.append(e)
+        }
+        if case .completed(_, let response, _) = out.last {
+            #expect(response.assistantText() == "First block\nSecond block")
+        } else {
+            Issue.record("expected completed")
         }
     }
 }
@@ -865,6 +974,46 @@ struct StreamResponsesTests {
             #expect(response.stopReason == .toolCalls)
         } else {
             Issue.record("expected completed")
+        }
+    }
+
+    @Test("response.done decodes as terminal completed response")
+    func responseDoneDecoding() throws {
+        let doneJSON = """
+        {"type":"response.done","response":{"id":"resp_done","status":"completed","model":"test-codex","output":[{"type":"message","role":"assistant","content":"Done!"}]}}
+        """
+        let event = try ResponsesStreamEvent.decode(data: doneJSON)
+        if case .completed(let resp) = event {
+            #expect(resp["id"]?.stringValue == "resp_done" || resp["response"]?["id"]?.stringValue == "resp_done")
+        } else {
+            Issue.record("expected completed event for response.done")
+        }
+    }
+
+    @Test("custom tool call argument streaming and done handling")
+    func customToolCallInputStreaming() throws {
+        let deltaJSON = """
+        {"type":"response.custom_tool_call_input.delta","call_id":"custom_call_1","delta":"ls -la","output_index":0}
+        """
+        let eventDelta = try ResponsesStreamEvent.decode(data: deltaJSON)
+        if case .customToolCallInputDelta(let delta, let itemId, let index) = eventDelta {
+            #expect(delta == "ls -la")
+            #expect(itemId == "custom_call_1")
+            #expect(index == 0)
+        } else {
+            Issue.record("expected customToolCallInputDelta")
+        }
+
+        let doneJSON = """
+        {"type":"response.custom_tool_call_input.done","call_id":"custom_call_1","input":"ls -la","output_index":0}
+        """
+        let eventDone = try ResponsesStreamEvent.decode(data: doneJSON)
+        if case .customToolCallInputDone(let input, let itemId, let index) = eventDone {
+            #expect(input == "ls -la")
+            #expect(itemId == "custom_call_1")
+            #expect(index == 0)
+        } else {
+            Issue.record("expected customToolCallInputDone")
         }
     }
 }

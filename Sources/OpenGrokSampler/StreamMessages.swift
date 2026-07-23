@@ -56,7 +56,7 @@ public func streamMessages(
 
             var assistantText = ""
             var assistantToolCalls: [ToolCall] = []
-            var assistantReasoning: String?
+            var assistantReasoning: ReasoningItem?
 
             var chunkIndex: UInt64 = 0
             var messageChunkCount: UInt64 = 0
@@ -115,6 +115,10 @@ public func streamMessages(
                         }
                     case .text(let text, _):
                         blocks[index] = MessagesBlockState(kind: .text, textAcc: text)
+                        if !text.isEmpty && !firstTokenEmitted {
+                            firstTokenEmitted = true
+                            continuation.yield(.firstToken(requestId: requestId))
+                        }
                     case .toolUse(let id, let name, _):
                         let toolIndex = nextToolIndex
                         nextToolIndex += 1
@@ -191,12 +195,27 @@ public func streamMessages(
                     guard let state = blocks.removeValue(forKey: index) else { break }
                     switch state.kind {
                     case .text:
-                        assistantText += state.textAcc
+                        if !state.textAcc.isEmpty {
+                            if !assistantText.isEmpty {
+                                assistantText += "\n"
+                            }
+                            assistantText += state.textAcc
+                        }
                     case .thinking:
-                        if assistantReasoning == nil {
-                            assistantReasoning = state.thinkingAcc
-                        } else {
-                            assistantReasoning! += "\n\n" + state.thinkingAcc
+                        if !state.thinkingAcc.isEmpty || !state.signature.isEmpty {
+                            let summary: [SummaryPart] = state.thinkingAcc.isEmpty
+                                ? []
+                                : [.summaryText(text: state.thinkingAcc)]
+                            let encryptedContent: String? = state.signature.isEmpty
+                                ? nil
+                                : state.signature
+                            assistantReasoning = ReasoningItem(
+                                id: "",
+                                summary: summary,
+                                content: nil,
+                                encryptedContent: encryptedContent,
+                                status: nil
+                            )
                         }
                     case .toolUse:
                         assistantToolCalls.append(ToolCall(
@@ -276,8 +295,8 @@ public func streamMessages(
             }
 
             var items: [ConversationItem] = []
-            if let reasoning = assistantReasoning, !reasoning.isEmpty {
-                items.append(.reasoning(synthesizedReasoningItem(reasoning)))
+            if let reasoning = assistantReasoning {
+                items.append(.reasoning(reasoning))
             }
             items.append(.assistant(AssistantItem(
                 content: assistantText,

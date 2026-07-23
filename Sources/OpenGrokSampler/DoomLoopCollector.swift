@@ -4,7 +4,10 @@
 // Mirrors Rust `doom_loop.rs`.
 
 import Foundation
+import os
 import OpenGrokSamplingTypes
+
+private let logger = os.Logger(subsystem: "OpenGrokSampler", category: "DoomLoopCollector")
 
 /// Cheap-to-clone accumulator shared between the SSE decoder and the
 /// stream transform of one request attempt.
@@ -94,6 +97,7 @@ public final class DoomLoopSignalCollector: @unchecked Sendable {
         defer { lock.unlock() }
         if !state.malformedLogged {
             state.malformedLogged = true
+            logger.debug("doom-loop check payload malformed or empty; ignoring")
         }
     }
 }
