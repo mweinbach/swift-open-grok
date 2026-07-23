@@ -389,30 +389,9 @@ private func driveL2(
     captured: ErrorCell,
     doomCheck: DoomLoopRecoveryPolicy?
 ) async -> AttemptOutcome {
-    var iterator = l2.makeAsyncIterator()
-    while true {
+    for await event in l2 {
         if cancelToken.isCancelled || Task.isCancelled {
             return .cancelled
-        }
-
-        let next: SamplingEvent? = await withTaskGroup(of: SamplingEvent?.self) { group in
-            group.addTask { await iterator.next() }
-            group.addTask {
-                await cancelToken.cancelled()
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first ?? nil
-        }
-
-        // Distinguish cancel vs stream end: if cancel token fired, prefer cancelled.
-        if cancelToken.isCancelled || Task.isCancelled {
-            return .cancelled
-        }
-
-        guard let event = next else {
-            return .failed(error: .eventStreamError("stream dropped without terminal event"))
         }
 
         switch event {
@@ -441,6 +420,11 @@ private func driveL2(
             eventContinuation.yield(event)
         }
     }
+
+    if cancelToken.isCancelled || Task.isCancelled {
+        return .cancelled
+    }
+    return .failed(error: .eventStreamError("stream dropped without terminal event"))
 }
 
 private func buildEmptyContext(

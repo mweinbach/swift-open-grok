@@ -1,24 +1,25 @@
 # Swift Open Grok Port Status
 
 **As of:** 2026-07-23 (Luna R12–R15 integration verification)
-**Overall state:** R12–R15 remain present at integration head `8aeff086290632f551b57127c5aa866e29f9ce09`. TerminalCore `Hashable`, TextArea undo, Sandbox synchronized-global, and Telemetry JSONNumber fixes were already present. This pass added the macOS 12-compatible sampler timing abstraction, `SamplingErrorInfo: Error`, and corrected model optional-result pattern matching. Integrated verification remains partial because the final permitted build exposed an unrelated trailing-token artifact in `CatalogResolution.swift` after the build command; that artifact was removed afterward but not reverified under the three-iteration cap.
+**Overall state:** R12–R15 remain present at committed integration head `089d77894edf74bbdb9beaccb0113e1a39f48269`. This pass made only sampler compatibility edits within the allowed paths: the two remaining `ContinuousClock.Instant` timestamp arrays now use `MonotonicInstant`, and the L2 event driver no longer captures a non-Sendable async-stream iterator in a sending task-group closure. The integrated verification is **partial**: the final permitted build still fails on a pre-existing Swift 6 Sendable diagnostic in `StreamMessages.swift` around its timeout closure.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `9739c4a2ad23cfea14312a481169757f3da494f4` (`/tmp/open-grok-reference` when present).
-**Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`).
+**Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
 ## Luna integration verification snapshot (2026-07-23; serialized remediation, iteration 3 of 3)
 
 | Command | Outcome |
 |---|---|
-| `zsh workflows/swift-safe-verify.zsh build` (iteration 1) | **Exit 1** — committed TerminalCore/TextArea/Sandbox/Telemetry fixes were present; OpenGrokSampler failed on `SamplingErrorInfo` not conforming to `Error` and macOS 12 deployment diagnostics for `ContinuousClock`/`Duration`. |
-| `zsh workflows/swift-safe-verify.zsh build` (iteration 2) | **Exit 1** — sampler timing edits progressed; OpenGrokModels exposed invalid `Some(...)` optional-pattern syntax and a pre-existing trailing-token artifact in `StreamChatCompletions.swift`. |
-| `zsh workflows/swift-safe-verify.zsh build` (iteration 3) | **Exit 1** — sampler and model sources compiled past the prior blockers; OpenGrokModels stopped on the analogous trailing-token artifact at the end of `CatalogResolution.swift`. The artifact was removed after this command, but no fourth build was permitted. |
-| `zsh workflows/swift-safe-verify.zsh build-tests` | **Not run** — the final integrated `build` did not pass within the three-iteration cap. |
-| `zsh workflows/swift-safe-verify.zsh test` | **Not run** — test products were not built. |
-| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — the final integrated `build` did not pass. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` (initial verification) | **Exit 1** — OpenGrokSampler first failed because `StreamChatCompletions.swift` passed `[ContinuousClock.Instant]` to the new monotonic metrics API. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` (iteration 1) | **Exit 1** — after the timestamp correction, OpenGrokSampler exposed a Swift 6 sending-closure diagnostic in `RequestTask.swift` from capturing its mutable async-stream iterator. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` (iteration 2) | **Exit 1** — the attempted actor wrapper still failed because Swift forbids calling the iterator's mutating async `next()` through an actor-isolated property and reported the unhandled throwing call. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` (iteration 3) | **Exit 1** — the L2 driver was changed to sequential `for await` consumption and compiled past `RequestTask.swift`; the remaining blocker is `StreamMessages.swift:72`, where the timeout helper's `@Sendable` closure captures non-Sendable/mutated `AsyncStream.Iterator`. |
+| `zsh workflows/swift-safe-verify.zsh build` | **Not run** — the three allowed fix-and-verify iterations were consumed by the sanctioned `build-tests` checks. |
+| `zsh workflows/swift-safe-verify.zsh test` | **Not run** — integrated build-tests did not pass. |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — integrated build-tests did not pass. |
 
-Integration is **partial**. `CompactionTranscript.swift` remains untouched. The post-build trailing-token cleanup is present but unverified; `build-tests`, `test`, and the product smoke were not run.
+Integration is **partial**. `CompactionTranscript.swift` remains untouched. No Swift tests or product smoke were run because the permitted build-tests verification did not pass within the three-iteration cap.
 
 
 ## Inventory counting method (reproducible)

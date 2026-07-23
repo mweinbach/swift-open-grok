@@ -18,7 +18,7 @@ public func streamChatCompletions(
     AsyncStream { continuation in
         let task = Task {
             let streamStart = MonotonicInstant.now
-            var chunkTimestamps: [ContinuousClock.Instant] = []
+            var chunkTimestamps: [MonotonicInstant] = []
 
             continuation.yield(.streamStarted(
                 requestId: requestId,
