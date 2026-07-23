@@ -49,22 +49,7 @@ public func streamChatCompletions(
 
             var iterator = rawStream.makeAsyncIterator()
             while true {
-                let next: Result<ChatCompletionChunk, SamplingError>?
-                do {
-                    next = try await withTimeout(idleTimeout) {
-                        await iterator.next()
-                    }
-                } catch is TimeoutError {
-                    let err = SamplingError.idleTimeout(elapsedSecs: idleTimeout.wholeSeconds)
-                    continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
-                    continuation.finish()
-                    return
-                } catch {
-                    let err = SamplingError.eventStreamError(String(describing: error))
-                    continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
-                    continuation.finish()
-                    return
-                }
+                let next = await iterator.next()
 
                 guard let next else { break }
 

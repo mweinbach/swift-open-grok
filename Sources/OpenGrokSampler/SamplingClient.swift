@@ -45,7 +45,7 @@ public final class SamplingClient: @unchecked Sendable {
         transport: any HTTPTransport = URLSessionHTTPTransport(),
         codexTurnState: CodexTurnStateCell? = nil
     ) throws {
-        let adapter = providerAdapter(config.provider)
+        let adapter = OpenGrokSampler.providerAdapter(config.provider)
         try adapter.validateBackend(config.apiBackend)
 
         let turnState: CodexTurnStateCell? =
@@ -348,14 +348,15 @@ public final class SamplingClient: @unchecked Sendable {
 
         let adapter = providerAdapter
         let turnState = codexTurnState
+        let initialBody = earlyBody
 
         let resultStream = AsyncStream<Result<T, SamplingError>> { continuation in
             let task = Task {
                 var parser = SSEParser()
                 // Process any body bytes that arrived before/with metadata.
-                if !earlyBody.isEmpty {
+                if !initialBody.isEmpty {
                     do {
-                        let events = try parser.push(earlyBody)
+                        let events = try parser.push(initialBody)
                         if !(await Self.emitSSEEvents(
                             events,
                             adapter: adapter,

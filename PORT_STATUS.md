@@ -1,7 +1,7 @@
 # Swift Open Grok Port Status
 
 **As of:** 2026-07-23 (Luna R12–R15 integration verification)
-**Overall state:** R12–R15 remain present at committed integration head `089d77894edf74bbdb9beaccb0113e1a39f48269`. This pass made only sampler compatibility edits within the allowed paths: the two remaining `ContinuousClock.Instant` timestamp arrays now use `MonotonicInstant`, and the L2 event driver no longer captures a non-Sendable async-stream iterator in a sending task-group closure. The integrated verification is **partial**: the final permitted build still fails on a pre-existing Swift 6 Sendable diagnostic in `StreamMessages.swift` around its timeout closure.
+**Overall state:** R12–R15 remain present at committed integration head `f1fbbbbfbde8cbe52850bb07aab6548bbd4fd0c0`. This pass made focused sampler compatibility edits within the allowed paths: qualified the provider adapter lookup, removed the three L2 timeout task-race captures of mutable async-stream iterators, and snapshotted early SSE body data before task handoff. The integrated verification is **partial**: the final permitted build-tests run still fails on a Swift 6 sending-closure diagnostic in `SamplingClient.swift`.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `9739c4a2ad23cfea14312a481169757f3da494f4` (`/tmp/open-grok-reference` when present).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
@@ -11,10 +11,10 @@
 
 | Command | Outcome |
 |---|---|
-| `zsh workflows/swift-safe-verify.zsh build-tests` (initial verification) | **Exit 1** — OpenGrokSampler first failed because `StreamChatCompletions.swift` passed `[ContinuousClock.Instant]` to the new monotonic metrics API. |
-| `zsh workflows/swift-safe-verify.zsh build-tests` (iteration 1) | **Exit 1** — after the timestamp correction, OpenGrokSampler exposed a Swift 6 sending-closure diagnostic in `RequestTask.swift` from capturing its mutable async-stream iterator. |
-| `zsh workflows/swift-safe-verify.zsh build-tests` (iteration 2) | **Exit 1** — the attempted actor wrapper still failed because Swift forbids calling the iterator's mutating async `next()` through an actor-isolated property and reported the unhandled throwing call. |
-| `zsh workflows/swift-safe-verify.zsh build-tests` (iteration 3) | **Exit 1** — the L2 driver was changed to sequential `for await` consumption and compiled past `RequestTask.swift`; the remaining blocker is `StreamMessages.swift:72`, where the timeout helper's `@Sendable` closure captures non-Sendable/mutated `AsyncStream.Iterator`. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` (initial verification) | **Exit 1** — OpenGrokSampler failed in `SamplingClient.swift` because the instance property shadowed the module-level `providerAdapter` function. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` (iteration 1) | **Exit 1** — after qualifying `OpenGrokSampler.providerAdapter`, Swift 6 reported non-Sendable/mutated `AsyncStream.Iterator` captures in `StreamChatCompletions.swift`. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` (iteration 2) | **Exit 1** — after removing the Chat Completions task-race closure, the equivalent diagnostics remained in the other L2 stream loops. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` (iteration 3) | **Exit 1** — after replacing all three L2 timeout task-race calls with single-owner direct iterator consumption, compilation reached `SamplingClient.swift:353`, where the SSE task captures mutable `earlyBody`; this was subsequently corrected by introducing an immutable `initialBody` snapshot, but no fourth verifier run was permitted. |
 | `zsh workflows/swift-safe-verify.zsh build` | **Not run** — the three allowed fix-and-verify iterations were consumed by the sanctioned `build-tests` checks. |
 | `zsh workflows/swift-safe-verify.zsh test` | **Not run** — integrated build-tests did not pass. |
 | `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — integrated build-tests did not pass. |
