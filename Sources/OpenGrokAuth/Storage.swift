@@ -148,6 +148,19 @@ public func tryLockAuthFile(at authJSONPath: URL) throws -> AdvisoryLock {
     )
 }
 
+/// Acquire blocking advisory lock for codex-auth.json.
+public func tryLockCodexAuthFile(at codexAuthPath: URL) throws -> AdvisoryLock {
+    let lockPath = codexAuthPath.deletingLastPathComponent()
+        .appendingPathComponent(OpenGrokAuthPaths.codexAuthLockFileName)
+    let parent = lockPath.deletingLastPathComponent()
+    try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+    return try AdvisoryFileLock.acquire(
+        at: lockPath,
+        options: AdvisoryLockOptions(nonBlocking: false, create: true, mode: 0o600)
+    )
+}
+
+
 // MARK: - API key scopes
 
 /// Read `xai::api_key` from auth.json.

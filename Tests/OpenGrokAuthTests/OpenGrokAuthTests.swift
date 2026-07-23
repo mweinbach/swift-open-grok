@@ -1040,6 +1040,156 @@ struct CodexIsolationTests {
         let store = try loadCodexStore(at: codexPath)
         #expect(store?.tokens?.refreshToken == "durable-refresh-token")
     }
+
+    @Test func codexBrowserLoginFlow() async throws {
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let codexPath = home.appendingPathComponent("codex-auth.json")
+        let idToken = buildTestJWT(payload: ["email": "browser@openai.com"])
+        let okExchangeJSON = """
+        {"id_token":"\(idToken)","access_token":"browser-access","refresh_token":"browser-refresh","account_id":"browser-acct"}
+        """
+        let transport = MockHTTPTransport(responses: [
+            .init(metadata: HTTPResponseMetadata(statusCode: 200), body: Data(okExchangeJSON.utf8)),
+        ])
+
+        let endpoints = CodexEndpoints(issuer: "https://auth.example")
+        let creds = try await loginCodexBrowser(
+            authFile: codexPath,
+            endpoints: endpoints,
+            transport: transport,
+            callbackPort: 1455,
+            openBrowser: { authURL in
+                guard let components = URLComponents(url: authURL, resolvingAgainstBaseURL: false),
+                      let state = components.queryItems?.first(where: { $0.name == "state" })?.value
+                else { return }
+                guard let cbURL = URL(string: "http://127.0.0.1:1455/auth/callback?code=mock-code&state=\(state)") else { return }
+                let task = URLSession.shared.dataTask(with: cbURL)
+                task.resume()
+            }
+        )
+
+        #expect(creds.accessToken == "browser-access")
+        #expect(creds.accountID == "browser-acct")
+        #expect(isCodexLoggedIn(at: codexPath))
+    }
+
+    @Test func codexDeviceLoginFlow() async throws {
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let codexPath = home.appendingPathComponent("codex-auth.json")
+        let idToken = buildTestJWT(payload: ["email": "device@openai.com"])
+        let userCodeJSON = """
+        {"device_auth_id":"dev-123","user_code":"CODE-456","interval":1}
+        """
+        let tokenCodeJSON = """
+        {"authorization_code":"auth-code-789","code_verifier":"verifier-1","code_challenge":"challenge-1"}
+        """
+        let okExchangeJSON = """
+        {"id_token":"\(idToken)","access_token":"device-access","refresh_token":"device-refresh","account_id":"device-acct"}
+        """
+        let transport = MockHTTPTransport(responses: [
+            .init(metadata: HTTPResponseMetadata(statusCode: 200), body: Data(userCodeJSON.utf8)),
+            .init(metadata: HTTPResponseMetadata(statusCode: 403), body: Data()), // pending poll
+            .init(metadata: HTTPResponseMetadata(statusCode: 200), body: Data(tokenCodeJSON.utf8)),
+            .init(metadata: HTTPResponseMetadata(statusCode: 200), body: Data(okExchangeJSON.utf8)),
+        ])
+
+        let endpoints = CodexEndpoints(issuer: "https://auth.example")
+        let creds = try await loginCodexDevice(
+            authFile: codexPath,
+            endpoints: endpoints,
+            transport: transport,
+            timeoutSeconds: 30
+        )
+
+        #expect(creds.accessToken == "device-access")
+        #expect(creds.accountID == "device-acct")
+        #expect(isCodexLoggedIn(at: codexPath))
+    }
+
+    @Test func codexLockingAcquiredForMutations() throws {
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let codexPath = home.appendingPathComponent("codex-auth.json")
+
+        let lock = try lockCodexAuthFile(at: codexPath)
+        let lockPath = home.appendingPathComponent("codex-auth.json.lock")
+        #expect(FileManager.default.fileExists(atPath: lockPath.path))
+        lock.release()
+    }
+
+    @Test func codexLogoutReturnsFalseForMissingFile() async throws {
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let codexPath = home.appendingPathComponent("codex-auth.json")
+        let removed = try await logoutCodex(at: codexPath)
+        #expect(removed == false)
+    }
+
+    @Test func codexReservedHeaderRemovalIsCaseInsensitive() {
+        let creds = CodexCredentials(
+            accessToken: "new-access",
+            accountID: "acct-99",
+            accountIsFedramp: true
+        )
+        var headers = [
+            "CHATGPT-ACCOUNT-ID": "old-account",
+            "x-openai-fedramp": "false",
+            "X-Grok-Build-Codex-Auth-Anchor": "anchor-1",
+            "X-GROK-BUILD-CODEX-ACCOUNT-ANCHOR": "anchor-2",
+            "Authorization": "Bearer old-token",
+            "Custom-Header": "keep-me",
+        ]
+        applyCodexAuthHeaders(from: creds, to: &headers)
+
+        #expect(headers["Authorization"] == "Bearer new-access")
+        #expect(headers["ChatGPT-Account-ID"] == "acct-99")
+        #expect(headers["X-OpenAI-Fedramp"] == "true")
+        #expect(headers["Custom-Header"] == "keep-me")
+        #expect(headers["CHATGPT-ACCOUNT-ID"] == nil)
+        #expect(headers["x-openai-fedramp"] == nil)
+        #expect(headers["X-Grok-Build-Codex-Auth-Anchor"] == nil)
+        #expect(headers["X-GROK-BUILD-CODEX-ACCOUNT-ANCHOR"] == nil)
+    }
+
+    @Test func persistCodexTokensValidation() throws {
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let codexPath = home.appendingPathComponent("codex-auth.json")
+
+        // Malformed JWT
+        #expect(throws: AuthError.self) {
+            try persistCodexTokens(
+                at: codexPath,
+                idToken: "invalid-jwt",
+                accessToken: "access",
+                refreshToken: "refresh"
+            )
+        }
+
+        let validJWT = buildTestJWT(payload: ["sub": "user"])
+
+        // Empty access token
+        #expect(throws: AuthError.self) {
+            try persistCodexTokens(
+                at: codexPath,
+                idToken: validJWT,
+                accessToken: "  ",
+                refreshToken: "refresh"
+            )
+        }
+
+        // Empty refresh token
+        #expect(throws: AuthError.self) {
+            try persistCodexTokens(
+                at: codexPath,
+                idToken: validJWT,
+                accessToken: "access",
+                refreshToken: ""
+            )
+        }
+    }
 }
 
 private func acctID(_ idToken: String) -> String? {

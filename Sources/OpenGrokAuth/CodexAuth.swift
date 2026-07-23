@@ -417,9 +417,14 @@ public func codexAuthFileURL(
     OpenGrokAuthPaths.codexAuthFileURL(environment: environment)
 }
 
+/// Acquire advisory lock for codex-auth.json (codex-auth.json.lock).
+public func lockCodexAuthFile(at codexAuthPath: URL) throws -> AdvisoryLock {
+    try tryLockCodexAuthFile(at: codexAuthPath)
+}
+
 /// Load Codex store. Never reads or writes xAI auth.json.
 public func loadCodexStore(at path: URL) throws -> CodexAuthStore? {
-    try? SecureFile.ensureOwnerOnlyPermissions(at: path)
+    try SecureFile.ensureOwnerOnlyPermissions(at: path)
     let data: Data
     do {
         data = try Data(contentsOf: path)
@@ -498,11 +503,13 @@ public func applyCodexAuthHeaders(
     from credentials: CodexCredentials,
     to headers: inout [String: String]
 ) {
-    for h in codexReservedAuthHeaders {
-        headers.removeValue(forKey: h)
-        // Also clear common capitalizations used on the wire.
-        headers.removeValue(forKey: "ChatGPT-Account-ID")
-        headers.removeValue(forKey: "X-OpenAI-Fedramp")
+    let reservedSet = Set(codexReservedAuthHeaders.map { $0.lowercased() })
+    let keysToRemove = headers.keys.filter { key in
+        let lower = key.lowercased()
+        return lower == "authorization" || reservedSet.contains(lower)
+    }
+    for key in keysToRemove {
+        headers.removeValue(forKey: key)
     }
     headers["Authorization"] = "Bearer \(credentials.accessToken)"
     if let accountID = credentials.accountID {
@@ -530,6 +537,27 @@ public func resolveCodexBearer(
     return CodexResolvedBearer(bearer: credentials.accessToken, extraHeaders: extra)
 }
 
+// MARK: - Token Validation
+
+/// Validate ID token JWT and required token fields before persistence.
+public func validateCodexTokens(
+    idToken: String,
+    accessToken: String,
+    refreshToken: String
+) throws {
+    guard !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        throw AuthError.protocolError("Codex access token is empty")
+    }
+    guard !refreshToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        throw AuthError.protocolError("Codex refresh token is empty")
+    }
+    guard !idToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          decodeJWTPayload(idToken) != nil
+    else {
+        throw AuthError.protocolError("invalid or malformed Codex ID token")
+    }
+}
+
 // MARK: - Login / logout / refresh
 
 /// Persist a successful Codex OAuth token set. Does not touch auth.json.
@@ -541,6 +569,14 @@ public func persistCodexTokens(
     accountID: String? = nil,
     now: Date = Date()
 ) throws {
+    try validateCodexTokens(
+        idToken: idToken,
+        accessToken: accessToken,
+        refreshToken: refreshToken
+    )
+    let lock = try lockCodexAuthFile(at: path)
+    defer { lock.release() }
+
     let resolvedAccount = accountID ?? accountIDFromIDToken(idToken)
     let store = CodexAuthStore(
         authMode: "chatgpt",
@@ -556,13 +592,13 @@ public func persistCodexTokens(
     try saveCodexStore(store, at: path)
 }
 
-/// Logout Codex only. Best-effort revoke; always removes local file.
+/// Logout Codex only. Best-effort revoke; always removes local file under lock.
 @discardableResult
 public func logoutCodex(
     at path: URL,
     endpoints: CodexEndpoints = .fromEnvironment(),
     transport: (any HTTPTransport)? = nil
-) async -> Bool {
+) async throws -> Bool {
     let store = try? loadCodexStore(at: path)
     if let tokens = store?.tokens, let transport {
         let token: String
@@ -594,10 +630,25 @@ public func logoutCodex(
             _ = try? await transport.send(request)
         }
     }
-    let existed = FileManager.default.fileExists(atPath: path.path)
-    try? FileManager.default.removeItem(at: path)
-    clearPermanentCodexRefreshFailure(path: path)
-    return existed || store != nil
+
+    let lock = try lockCodexAuthFile(at: path)
+    defer { lock.release() }
+
+    do {
+        try FileManager.default.removeItem(at: path)
+        clearPermanentCodexRefreshFailure(path: path)
+        return true
+    } catch {
+        let nsErr = error as NSError
+        let isNotFound = (nsErr.domain == NSCocoaErrorDomain && nsErr.code == NSFileNoSuchFileError)
+            || (nsErr.domain == NSPOSIXErrorDomain && nsErr.code == Int(ENOENT))
+            || !FileManager.default.fileExists(atPath: path.path)
+        if isNotFound {
+            clearPermanentCodexRefreshFailure(path: path)
+            return false
+        }
+        throw error
+    }
 }
 
 /// Refresh Codex tokens. Force=false respects freshness window.
@@ -608,6 +659,15 @@ public func refreshCodexCredentials(
     force: Bool = false
 ) async throws -> CodexCredentials? {
     try Task.checkCancellation()
+    guard let initial = try loadCodexStore(at: path) else { return nil }
+    if !force && accessTokenIsFresh(initial) {
+        return try loadCodexCredentials(at: path)
+    }
+
+    let lock = try lockCodexAuthFile(at: path)
+    defer { lock.release() }
+
+    // Re-read store state after acquiring lock
     guard var store = try loadCodexStore(at: path) else { return nil }
     if !force && accessTokenIsFresh(store) {
         return try loadCodexCredentials(at: path)
@@ -642,6 +702,10 @@ public func refreshCodexCredentials(
         idempotency: .nonIdempotent
     )
     let response = try await transport.send(request)
+
+    // Check cancellation immediately after transport returns
+    try Task.checkCancellation()
+
     if !(200..<300).contains(response.metadata.statusCode) {
         let code = oauthErrorCode(from: response.body)
         let permanent = response.metadata.statusCode == 401
@@ -675,8 +739,17 @@ public func refreshCodexCredentials(
     if let refresh = json["refresh_token"] as? String {
         tokens.refreshToken = refresh
     }
+
+    try validateCodexTokens(
+        idToken: tokens.idToken,
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken
+    )
+
     store.tokens = tokens
     store.lastRefresh = Date()
+
+    try Task.checkCancellation()
     try saveCodexStore(store, at: path)
     return try loadCodexCredentials(at: path)
 }
