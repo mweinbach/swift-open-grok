@@ -824,3 +824,63 @@ public struct ConfigModelOverride: Sendable, Equatable {
         return entry
     }
 }
+
+// MARK: - Explicit equality for insertion-ordered tuple fields
+
+private func equalStringPairs(_ lhs: [(String, String)], _ rhs: [(String, String)]) -> Bool {
+    lhs.count == rhs.count && zip(lhs, rhs).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 }
+}
+
+extension ModelEntryConfig {
+    public static func == (lhs: ModelEntryConfig, rhs: ModelEntryConfig) -> Bool {
+        lhs.id == rhs.id && lhs.model == rhs.model && lhs.baseURL == rhs.baseURL &&
+        lhs.apiBaseURL == rhs.apiBaseURL && lhs.name == rhs.name &&
+        lhs.description == rhs.description && lhs.contextWindow == rhs.contextWindow &&
+        lhs.temperature == rhs.temperature && lhs.topP == rhs.topP &&
+        lhs.maxCompletionTokens == rhs.maxCompletionTokens && lhs.apiBackend == rhs.apiBackend &&
+        lhs.provider == rhs.provider && lhs.envKey == rhs.envKey && lhs.apiKey == rhs.apiKey &&
+        lhs.toolMode == rhs.toolMode && lhs.multiAgentVersion == rhs.multiAgentVersion &&
+        lhs.codexMultiAgentV2 == rhs.codexMultiAgentV2 && lhs.authScheme == rhs.authScheme &&
+        lhs.agentType == rhs.agentType && lhs.inferenceIdleTimeoutSecs == rhs.inferenceIdleTimeoutSecs &&
+        lhs.maxRetries == rhs.maxRetries && lhs.hidden == rhs.hidden &&
+        lhs.supportedInApi == rhs.supportedInApi && lhs.reasoningEffort == rhs.reasoningEffort &&
+        lhs.supportsReasoningEffort == rhs.supportsReasoningEffort &&
+        lhs.reasoningEfforts == rhs.reasoningEfforts &&
+        lhs.supportsReasoningSummaryParameter == rhs.supportsReasoningSummaryParameter &&
+        lhs.defaultReasoningSummary == rhs.defaultReasoningSummary &&
+        lhs.supportsBackendSearch == rhs.supportsBackendSearch &&
+        lhs.compactionsRemaining == rhs.compactionsRemaining &&
+        lhs.compactionAtTokens == rhs.compactionAtTokens &&
+        lhs.showModelFingerprint == rhs.showModelFingerprint &&
+        lhs.autoCompactThresholdPercent == rhs.autoCompactThresholdPercent &&
+        lhs.systemPromptLabel == rhs.systemPromptLabel &&
+        lhs.streamToolCalls == rhs.streamToolCalls && lhs.useConcise == rhs.useConcise &&
+        equalStringPairs(lhs.extraHeaders, rhs.extraHeaders) &&
+        lhs.lazinessDetector == rhs.lazinessDetector
+    }
+}
+
+extension ConfigModelOverride {
+    public static func == (lhs: ConfigModelOverride, rhs: ConfigModelOverride) -> Bool {
+        lhs.model == rhs.model && lhs.baseURL == rhs.baseURL && lhs.name == rhs.name &&
+        lhs.description == rhs.description && lhs.apiKey == rhs.apiKey && lhs.envKey == rhs.envKey &&
+        lhs.apiBaseURL == rhs.apiBaseURL && lhs.maxCompletionTokens == rhs.maxCompletionTokens &&
+        lhs.temperature == rhs.temperature && lhs.topP == rhs.topP && lhs.apiBackend == rhs.apiBackend &&
+        lhs.provider == rhs.provider && lhs.authScheme == rhs.authScheme && lhs.toolMode == rhs.toolMode &&
+        equalStringPairs(lhs.extraHeaders, rhs.extraHeaders) && lhs.contextWindow == rhs.contextWindow &&
+        lhs.autoCompactThresholdPercent == rhs.autoCompactThresholdPercent &&
+        lhs.systemPromptLabel == rhs.systemPromptLabel && lhs.useConcise == rhs.useConcise &&
+        lhs.agentType == rhs.agentType && lhs.inferenceIdleTimeoutSecs == rhs.inferenceIdleTimeoutSecs &&
+        lhs.maxRetries == rhs.maxRetries && lhs.hidden == rhs.hidden &&
+        lhs.supportedInApi == rhs.supportedInApi && lhs.reasoningEffort == rhs.reasoningEffort &&
+        lhs.supportsReasoningEffort == rhs.supportsReasoningEffort &&
+        lhs.reasoningEfforts == rhs.reasoningEfforts &&
+        lhs.supportsReasoningSummaryParameter == rhs.supportsReasoningSummaryParameter &&
+        lhs.defaultReasoningSummary == rhs.defaultReasoningSummary &&
+        lhs.supportsBackendSearch == rhs.supportsBackendSearch &&
+        lhs.compactionsRemaining == rhs.compactionsRemaining &&
+        lhs.compactionAtTokens == rhs.compactionAtTokens &&
+        lhs.showModelFingerprint == rhs.showModelFingerprint &&
+        lhs.streamToolCalls == rhs.streamToolCalls
+    }
+}

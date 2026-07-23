@@ -15,7 +15,7 @@ public struct ModelGlobSet: Sendable {
 
     /// Compile a filter list (`nil` for None/empty). Invalid patterns return
     /// the bad pattern list in the error.
-    public static func compile(_ patterns: [String]?) -> Result<ModelGlobSet?, [String]> {
+    public static func compile(_ patterns: [String]?) -> Result<ModelGlobSet?, ModelsError> {
         guard let patterns, !patterns.isEmpty else { return .success(nil) }
         var compiled: [CompiledGlob] = []
         var invalid: [String] = []
@@ -26,7 +26,7 @@ public struct ModelGlobSet: Sendable {
                 invalid.append(pat)
             }
         }
-        if !invalid.isEmpty { return .failure(invalid) }
+        if !invalid.isEmpty { return .failure(.invalidGlob(field: "models", patterns: invalid)) }
         return .success(ModelGlobSet(patterns: compiled))
     }
 

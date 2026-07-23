@@ -140,3 +140,49 @@ public struct CatalogResolutionInput: Sendable, Equatable {
 
     public static let `default` = CatalogResolutionInput()
 }
+
+private func equalConfigOverridePairs(
+    _ lhs: [(String, ConfigModelOverride)],
+    _ rhs: [(String, ConfigModelOverride)]
+) -> Bool {
+    lhs.count == rhs.count &&
+    zip(lhs, rhs).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 }
+}
+
+extension ModelsSectionConfig {
+    public static func == (lhs: ModelsSectionConfig, rhs: ModelsSectionConfig) -> Bool {
+        lhs.default == rhs.default &&
+        lhs.kimiEndpoint == rhs.kimiEndpoint &&
+        lhs.preCampaignDefault == rhs.preCampaignDefault &&
+        lhs.defaultIsCampaignDriven == rhs.defaultIsCampaignDriven &&
+        lhs.defaultReasoningEffort == rhs.defaultReasoningEffort &&
+        lhs.webSearch == rhs.webSearch &&
+        lhs.sessionSummary == rhs.sessionSummary &&
+        lhs.recap == rhs.recap &&
+        lhs.memory == rhs.memory &&
+        lhs.imageDescription == rhs.imageDescription &&
+        lhs.promptSuggestion == rhs.promptSuggestion &&
+        lhs.allowedModels == rhs.allowedModels &&
+        lhs.hiddenModels == rhs.hiddenModels &&
+        lhs.disabledModels == rhs.disabledModels &&
+        lhs.agentType == rhs.agentType &&
+        equalStringPairs(lhs.extraHeaders, rhs.extraHeaders) &&
+        lhs.temperature == rhs.temperature &&
+        lhs.topP == rhs.topP &&
+        lhs.maxCompletionTokens == rhs.maxCompletionTokens &&
+        lhs.maxRetries == rhs.maxRetries &&
+        lhs.inferenceIdleTimeoutSecs == rhs.inferenceIdleTimeoutSecs &&
+        lhs.streamToolCalls == rhs.streamToolCalls
+    }
+}
+
+extension CatalogResolutionInput {
+    public static func == (lhs: CatalogResolutionInput, rhs: CatalogResolutionInput) -> Bool {
+        lhs.endpoints == rhs.endpoints &&
+        lhs.models == rhs.models &&
+        equalConfigOverridePairs(lhs.configModels, rhs.configModels) &&
+        lhs.defaultModelOverride == rhs.defaultModelOverride &&
+        lhs.remoteDefaultModel == rhs.remoteDefaultModel &&
+        lhs.reasoningEffortOverride == rhs.reasoningEffortOverride
+    }
+}

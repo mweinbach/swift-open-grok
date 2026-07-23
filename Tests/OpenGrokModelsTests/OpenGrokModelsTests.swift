@@ -173,8 +173,8 @@ struct CatalogResolutionTests {
 
     @Test func invalidGlobFailsClosed() {
         switch ModelGlobSet.compile(["grok["]) {
-        case .failure(let bad):
-            #expect(bad == ["grok["])
+        case .failure(let error):
+            #expect(error == .invalidGlob(field: "models", patterns: ["grok["]))
         case .success:
             Issue.record("expected invalid glob rejection")
         }

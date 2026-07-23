@@ -189,7 +189,10 @@ public func resolveModelCatalog(
     switch ModelGlobSet.compile(input.models.disabledModels) {
     case .success(let Some(disabled)):
         catalog.retain { key, entry in !disabled.matches(key: key, model: entry.model) }
-    default:
+    case .failure:
+        // Invalid deny patterns fail closed by leaving the catalog empty.
+        catalog = OrderedModelMap()
+    case .success(nil):
         break
     }
 
