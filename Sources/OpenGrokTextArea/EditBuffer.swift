@@ -562,8 +562,8 @@ private func normalizeReplacementRange(
     let rawEnd = min(max(range.lowerBound, range.upperBound), text.utf8Count)
     if rawStart == rawEnd {
         let cursor = text.normalizeExternalCursor(byte: rawStart)
-        let cursor = normalizeCursorForAtomicRanges(cursor, atomic)
-        return cursor..<cursor
+        let normalizedCursor = normalizeCursorForAtomicRanges(cursor, atomic)
+        return normalizedCursor..<normalizedCursor
     }
     var normalized = text.floorGraphemeBoundary(byte: rawStart)..<text.ceilGraphemeBoundary(byte: rawEnd)
     while true {

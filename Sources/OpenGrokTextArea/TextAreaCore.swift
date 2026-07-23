@@ -118,7 +118,7 @@ public final class TextArea {
     private var elements: [TextElement] = []
     private var nextElementId: UInt64 = 0
     private var killBuffer: String = ""
-    private var undo = UndoState()
+    private var undoState = UndoState()
     private var selection: Selection?
     private var clipboardProvider: ClipboardProvider
     private var clipboardNotification: String?
@@ -175,13 +175,13 @@ public final class TextArea {
         scrollOverrideStorage = nil
         if let first = text.first {
             let firstWS = first.isWhitespace
-            if undo.lastKind == .insert && undo.lastInsertWS != firstWS {
-                undo.lastKind = nil
+            if undoState.lastKind == .insert && undoState.lastInsertWS != firstWS {
+                undoState.lastKind = nil
             }
         }
         applyEditReplacement(cursor..<cursor, text, .insert)
         if let last = text.last {
-            undo.lastInsertWS = last.isWhitespace
+            undoState.lastInsertWS = last.isWhitespace
         }
     }
 
@@ -189,7 +189,7 @@ public final class TextArea {
         if text.isEmpty { return }
         applyEditReplacement(pos..<pos, text, .insert)
         if let last = text.last {
-            undo.lastInsertWS = last.isWhitespace
+            undoState.lastInsertWS = last.isWhitespace
         }
     }
 
@@ -410,7 +410,7 @@ public final class TextArea {
         guard !killBuffer.isEmpty else { return }
         let text = killBuffer
         applyEditReplacement(cursor..<cursor, text, .insert)
-        if let last = text.last { undo.lastInsertWS = last.isWhitespace }
+        if let last = text.last { undoState.lastInsertWS = last.isWhitespace }
     }
 
     public func moveCursorLeft() { applyEditCommand(.moveGraphemeLeft, nil) }
@@ -583,55 +583,55 @@ public final class TextArea {
     // MARK: Undo / redo
 
     public func clearHistory() {
-        undo.stack.removeAll()
-        undo.redo.removeAll()
-        undo.lastKind = nil
+        undoState.stack.removeAll()
+        undoState.redo.removeAll()
+        undoState.lastKind = nil
     }
 
     @discardableResult
     public func undo() -> Bool {
-        guard let entry = undo.stack.popLast() else { return false }
-        undo.redo.append(snapshot())
+        guard let entry = undoState.stack.popLast() else { return false }
+        undoState.redo.append(snapshot())
         restore(entry)
-        undo.lastKind = nil
+        undoState.lastKind = nil
         return true
     }
 
     @discardableResult
     public func redo() -> Bool {
-        guard let entry = undo.redo.popLast() else { return false }
-        undo.stack.append(snapshot())
+        guard let entry = undoState.redo.popLast() else { return false }
+        undoState.stack.append(snapshot())
         restore(entry)
-        undo.lastKind = nil
+        undoState.lastKind = nil
         return true
     }
 
-    public var canUndo: Bool { !undo.stack.isEmpty }
-    public var canRedo: Bool { !undo.redo.isEmpty }
+    public var canUndo: Bool { !undoState.stack.isEmpty }
+    public var canRedo: Bool { !undoState.redo.isEmpty }
 
     public func beginUndoGroup() {
-        if undo.groupDepth == 0 {
-            undo.groupCheckpoint = snapshot()
+        if undoState.groupDepth == 0 {
+            undoState.groupCheckpoint = snapshot()
         }
-        undo.groupDepth += 1
+        undoState.groupDepth += 1
     }
 
     public func endUndoGroup() {
-        guard undo.groupDepth > 0 else { return }
-        undo.groupDepth -= 1
-        if undo.groupDepth == 0, let cp = undo.groupCheckpoint {
+        guard undoState.groupDepth > 0 else { return }
+        undoState.groupDepth -= 1
+        if undoState.groupDepth == 0, let cp = undoState.groupCheckpoint {
             pushUndo(cp)
-            undo.groupCheckpoint = nil
-            undo.redo.removeAll()
+            undoState.groupCheckpoint = nil
+            undoState.redo.removeAll()
         }
     }
 
     public func cancelUndoGroup() {
-        guard undo.groupDepth > 0 else { return }
-        undo.groupDepth = 0
-        if let cp = undo.groupCheckpoint {
+        guard undoState.groupDepth > 0 else { return }
+        undoState.groupDepth = 0
+        if let cp = undoState.groupCheckpoint {
             restore(cp)
-            undo.groupCheckpoint = nil
+            undoState.groupCheckpoint = nil
         }
     }
 
@@ -789,34 +789,34 @@ public final class TextArea {
     }
 
     private func preMutate(_ kind: MutationKind) {
-        if undo.groupDepth > 0 { return }
+        if undoState.groupDepth > 0 { return }
         let shouldCheckpoint: Bool
-        if undo.lastKind == nil {
+        if undoState.lastKind == nil {
             shouldCheckpoint = true
         } else if kind == .kill || kind == .element || kind == .replace {
             shouldCheckpoint = true
-        } else if undo.lastKind != kind {
+        } else if undoState.lastKind != kind {
             shouldCheckpoint = true
-        } else if undo.lastCursor != cursor {
+        } else if undoState.lastCursor != cursor {
             shouldCheckpoint = true
         } else {
             shouldCheckpoint = false
         }
         if shouldCheckpoint {
             pushUndo(snapshot())
-            undo.redo.removeAll()
+            undoState.redo.removeAll()
         }
-        undo.lastKind = kind
+        undoState.lastKind = kind
     }
 
     private func postMutate() {
-        undo.lastCursor = cursor
+        undoState.lastCursor = cursor
     }
 
     private func pushUndo(_ entry: UndoEntry) {
-        undo.stack.append(entry)
-        if undo.stack.count > undo.maxDepth {
-            undo.stack.removeFirst(undo.stack.count - undo.maxDepth)
+        undoState.stack.append(entry)
+        if undoState.stack.count > undoState.maxDepth {
+            undoState.stack.removeFirst(undoState.stack.count - undoState.maxDepth)
         }
     }
 }

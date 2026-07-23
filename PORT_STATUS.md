@@ -1,22 +1,24 @@
 # Swift Open Grok Port Status
 
 **As of:** 2026-07-23 (Luna R12–R15 integration verification)
-**Overall state:** R12–R15 are present at commit `77849f20cb0f8df31a52b7d0ead8bf48e4606ca7`. The known `OpenGrokTerminalCore` `CellStyle`/`CellAttributes` `Hashable` blocker was fixed in the authorized path, but the serialized integrated build remains **blocked** by a separate compile error in `Sources/OpenGrokTextArea/TextAreaCore.swift:592`: the `undo()` method conflicts with the stored property `undo`. That target is outside the allowed integration paths, so no fix was made there.
+**Overall state:** R12–R15 are present at commit `5d95fae5bd554e8dc9f14d25b82d20cadf228a3e`. The known `OpenGrokTerminalCore` `CellStyle`/`CellAttributes` `Hashable` blocker and the `OpenGrokTextArea` `undo()` redeclaration were fixed in the authorized paths, but the serialized integrated build remains **blocked** by Swift 6 concurrency diagnostics for mutable global sandbox state in `Sources/OpenGrokSandbox/Manager.swift:31-33` (`globalSandbox`, `configuredProfileName`, and `autoAllowBash`).
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `9739c4a2ad23cfea14312a481169757f3da494f4` (`/tmp/open-grok-reference` when present).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`).
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
-## Luna integration verification snapshot (2026-07-23; iteration 1 of 3)
+## Luna integration verification snapshot (2026-07-23; iteration 3 of 3)
 
 | Command | Outcome |
 |---|---|
-| `zsh workflows/swift-safe-verify.zsh build` | **Exit 1** — the `CellStyle`/`CellAttributes` `Hashable` diagnostic is cleared; compilation next stops at `Sources/OpenGrokTextArea/TextAreaCore.swift:592` because `undo()` is an invalid redeclaration of stored property `undo`. |
-| `zsh workflows/swift-safe-verify.zsh build-tests` | **Not run** — prerequisite integrated `build` failed. |
+| `zsh workflows/swift-safe-verify.zsh build` (iteration 1) | **Exit 1** — `CellStyle`/`CellAttributes` `Hashable` was already clear; compilation stopped at `Sources/OpenGrokTextArea/TextAreaCore.swift:592` because `undo()` redeclared stored property `undo`. |
+| `zsh workflows/swift-safe-verify.zsh build` (iteration 2) | **Exit 1** — after the private undo-state rename, compilation stopped at `Sources/OpenGrokTextArea/EditBuffer.swift:565` because `cursor` was redeclared in the zero-width replacement-range path. |
+| `zsh workflows/swift-safe-verify.zsh build` (iteration 3) | **Exit 1** — after the focused range-variable rename, compilation reached `OpenGrokSandbox` and stopped on Swift 6 concurrency-safety errors for mutable global state at `Sources/OpenGrokSandbox/Manager.swift:31-33`: `globalSandbox`, `configuredProfileName`, and `autoAllowBash`. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` | **Not run** — prerequisite integrated `build` failed and the three-iteration budget was exhausted. |
 | `zsh workflows/swift-safe-verify.zsh test` | **Not run** — test products could not be built. |
 | `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — prerequisite integrated `build` failed. |
 
-The current blocker is outside the authorized R12–R15 integration paths. `CompactionTranscript.swift` remains untouched.
+Integration is **partial**. `CompactionTranscript.swift` remains untouched. No focused tests or later verification commands were run after the final build failure.
 
 
 ## Inventory counting method (reproducible)
@@ -217,8 +219,8 @@ Status legend: **pending** (bootstrap placeholder stub only) · **in-progress** 
 
 ## Next action
 
-1. Re-run `zsh workflows/swift-safe-verify.zsh build` to verify the HTTP async-lock fix and clear any subsequent integrated errors (iteration budget was exhausted at three).
-2. Then `build-tests`, focused R04–R09 test filters, full `test`, and `build --product open-grok` with executable smokes.
+1. Resolve the Swift 6 concurrency-safety diagnostics for the three synchronized mutable globals in `Sources/OpenGrokSandbox/Manager.swift`.
+2. Resume the serialized verifier with `zsh workflows/swift-safe-verify.zsh build`, then run `build-tests`, focused filters, full `test`, and `build --product open-grok` with executable smokes.
 3. Keep CompactionTranscript.swift and workflow artifacts intact.
 
 ## Protected artifacts
