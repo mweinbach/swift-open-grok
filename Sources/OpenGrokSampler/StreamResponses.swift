@@ -219,7 +219,7 @@ public func streamResponsesWithClientCustomTools(
             var citationFilter = DisplayCitationFilter()
             var streamedText = ""
 
-            var iterator = rawStream.makeAsyncIterator()
+            let iterator = AsyncStreamIteratorRelay(rawStream)
             while true {
                 if let triggers = doomLoop?.abortTriggers() {
                     let err = SamplingError.doomLoopDetected(

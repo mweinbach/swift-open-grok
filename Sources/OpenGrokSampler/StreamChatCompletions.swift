@@ -47,7 +47,7 @@ public func streamChatCompletions(
             var messageChunkCount: UInt64 = 0
             var lastContentChunkAt = MonotonicInstant.now
 
-            var iterator = rawStream.makeAsyncIterator()
+            let iterator = AsyncStreamIteratorRelay(rawStream)
             while true {
                 let next = await iterator.next()
 
@@ -217,6 +217,85 @@ public func streamChatCompletions(
 // MARK: - Timeout helper
 
 struct TimeoutError: Error {}
+
+private actor StreamMailbox<Element: Sendable> {
+    private var values: [Element] = []
+    private var waiter: CheckedContinuation<Element?, Never>?
+    private var finished = false
+
+    func offer(_ value: Element) {
+        guard !finished else { return }
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: value)
+        } else {
+            values.append(value)
+        }
+    }
+
+    func finish() {
+        guard !finished else { return }
+        finished = true
+        waiter?.resume(returning: nil)
+        waiter = nil
+    }
+
+    func next() async -> Element? {
+        if !values.isEmpty { return values.removeFirst() }
+        if finished { return nil }
+        return await withCheckedContinuation { continuation in
+            waiter = continuation
+        }
+    }
+}
+
+private struct StreamRelayFailure: Error, Sendable {
+    let message: String
+}
+
+/// A producer task exclusively owns the source iterator; consumers receive
+/// through a bounded mailbox and may race mailbox delivery against timeout.
+final actor AsyncStreamIteratorRelay<Element: Sendable> {
+    private let mailbox = StreamMailbox<Element>()
+    private let producer: Task<Void, Never>
+
+    init(_ stream: AsyncStream<Element>) {
+        let mailbox = self.mailbox
+        self.producer = Task {
+            var iterator = stream.makeAsyncIterator()
+            while let value = await iterator.next() { await mailbox.offer(value) }
+            await mailbox.finish()
+        }
+    }
+
+    func next() async -> Element? { await mailbox.next() }
+}
+
+final actor AsyncThrowingStreamIteratorRelay<Element: Sendable> {
+    private let mailbox = StreamMailbox<Result<Element, StreamRelayFailure>>()
+    private let producer: Task<Void, Never>
+
+    init(_ stream: AsyncThrowingStream<Element, Error>) {
+        let mailbox = self.mailbox
+        self.producer = Task {
+            do {
+                var iterator = stream.makeAsyncIterator()
+                while let value = try await iterator.next() { await mailbox.offer(.success(value)) }
+            } catch {
+                await mailbox.offer(.failure(StreamRelayFailure(message: String(describing: error))))
+            }
+            await mailbox.finish()
+        }
+    }
+
+    func next() async throws -> Element? {
+        guard let result = await mailbox.next() else { return nil }
+        switch result {
+        case .success(let value): return value
+        case .failure(let error): throw error
+        }
+    }
+}
 
 func withTimeout<T: Sendable>(
     _ timeout: MonotonicDuration,

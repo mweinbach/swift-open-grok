@@ -19,7 +19,7 @@
 | `zsh workflows/swift-safe-verify.zsh test` | **Not run** — integrated build-tests did not pass. |
 | `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — integrated build-tests did not pass. |
 
-Integration is **partial**. `CompactionTranscript.swift` remains untouched. No Swift tests or product smoke were run because the permitted build-tests verification did not pass within the three-iteration cap.
+Integration is **partial**. `CompactionTranscript.swift` remains untouched. The final build-tests run did not pass; the model helper visibility fix is unverified, and no Swift tests or product smoke were run.
 
 
 ## Inventory counting method (reproducible)

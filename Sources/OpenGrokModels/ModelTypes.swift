@@ -827,7 +827,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
 
 // MARK: - Explicit equality for insertion-ordered tuple fields
 
-private func equalStringPairs(_ lhs: [(String, String)], _ rhs: [(String, String)]) -> Bool {
+func equalStringPairs(_ lhs: [(String, String)], _ rhs: [(String, String)]) -> Bool {
     lhs.count == rhs.count && zip(lhs, rhs).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 }
 }
 

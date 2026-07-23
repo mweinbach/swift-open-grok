@@ -303,7 +303,7 @@ public final class SamplingClient: @unchecked Sendable {
         )
 
         let httpStream = transport.stream(request)
-        var iterator = httpStream.makeAsyncIterator()
+        let iterator = AsyncThrowingStreamIteratorRelay(httpStream)
 
         // Wait for metadata first so non-2xx fails before any decoded event.
         var metadata: ResponseModelMetadata?

@@ -65,7 +65,7 @@ public func streamMessages(
             var nextToolIndex: UInt32 = 0
             var blockToToolIndex: [UInt32: UInt32] = [:]
 
-            var iterator = rawStream.makeAsyncIterator()
+            let iterator = AsyncStreamIteratorRelay(rawStream)
             while true {
                 let next = await iterator.next()
                 guard let next else { break }
