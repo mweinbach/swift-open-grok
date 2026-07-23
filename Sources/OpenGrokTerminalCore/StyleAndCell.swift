@@ -49,7 +49,7 @@ public struct TerminalCapability: Sendable, Equatable, Codable {
 }
 
 /// A cell style modifier (bit flags).
-public struct CellStyle: Sendable, Equatable, Codable, OptionSet {
+public struct CellStyle: Sendable, Equatable, Hashable, Codable, OptionSet {
     public let rawValue: Int
     public init(rawValue: Int) { self.rawValue = rawValue }
     public static let bold = CellStyle(rawValue: 1 << 0)

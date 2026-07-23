@@ -12,6 +12,8 @@ struct OpenGrokTerminalCoreTests {
         let cell = Cell(grapheme: "A", style: [.bold, .underline], displayWidth: 1)
         #expect(cell.grapheme == "A")
         #expect(cell.style.contains(.bold))
+        let attributes = cell.attributes
+        #expect(Set([attributes]).contains(attributes))
     }
 
     @Test("Input events are Sendable and equatable")

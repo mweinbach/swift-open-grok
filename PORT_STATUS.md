@@ -1,22 +1,22 @@
 # Swift Open Grok Port Status
 
 **As of:** 2026-07-23 (Luna R12–R15 integration verification)
-**Overall state:** R12–R15 are present at commit `e5b9959744dbaca2b2d83c22dfdc29cfd7fa938b`, but integrated verification is **blocked** by an unrelated pre-existing compile error outside the allowed integration paths: `Sources/OpenGrokTerminalCore/StyleAndCell.swift:66` declares `CellAttributes: Hashable` while `CellStyle` is not `Hashable`. The sole safe verifier was run for `build` and `build-tests`; both exited 1 before R12–R15 tests could execute. No source fix was made because `OpenGrokTerminalCore/` is outside the authorized paths.
+**Overall state:** R12–R15 are present at commit `77849f20cb0f8df31a52b7d0ead8bf48e4606ca7`. The known `OpenGrokTerminalCore` `CellStyle`/`CellAttributes` `Hashable` blocker was fixed in the authorized path, but the serialized integrated build remains **blocked** by a separate compile error in `Sources/OpenGrokTextArea/TextAreaCore.swift:592`: the `undo()` method conflicts with the stored property `undo`. That target is outside the allowed integration paths, so no fix was made there.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `9739c4a2ad23cfea14312a481169757f3da494f4` (`/tmp/open-grok-reference` when present).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`).
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
-## Luna integration verification snapshot (2026-07-23)
+## Luna integration verification snapshot (2026-07-23; iteration 1 of 3)
 
 | Command | Outcome |
 |---|---|
-| `zsh workflows/swift-safe-verify.zsh build` | **Exit 1** — compile stopped at `Sources/OpenGrokTerminalCore/StyleAndCell.swift:66`: `CellAttributes` cannot synthesize `Hashable` because `CellStyle` is not `Hashable`. |
-| `zsh workflows/swift-safe-verify.zsh build-tests` | **Exit 1** — same `OpenGrokTerminalCore/StyleAndCell.swift:66` error before test products were built. |
-| `zsh workflows/swift-safe-verify.zsh test` | **Not run** — prerequisite `build-tests` failed; no R12–R15 tests were executable. |
-| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — prerequisite integrated build failed. |
+| `zsh workflows/swift-safe-verify.zsh build` | **Exit 1** — the `CellStyle`/`CellAttributes` `Hashable` diagnostic is cleared; compilation next stops at `Sources/OpenGrokTextArea/TextAreaCore.swift:592` because `undo()` is an invalid redeclaration of stored property `undo`. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` | **Not run** — prerequisite integrated `build` failed. |
+| `zsh workflows/swift-safe-verify.zsh test` | **Not run** — test products could not be built. |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — prerequisite integrated `build` failed. |
 
-The blocker is outside the authorized R12–R15 integration paths, so this pass made no Swift source fix. `CompactionTranscript.swift` remains untouched.
+The current blocker is outside the authorized R12–R15 integration paths. `CompactionTranscript.swift` remains untouched.
 
 
 ## Inventory counting method (reproducible)
