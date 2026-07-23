@@ -1,13 +1,13 @@
 # Swift Open Grok Port Status
 
 **As of:** 2026-07-23 (Luna R12–R15 integration verification)
-**Overall state:** R12–R15 are present at integration head `de9f2f1bb26ff6656f976c5cd5a33810706ddf78`. The known `OpenGrokTerminalCore` `CellStyle`/`CellAttributes` `Hashable` blocker, the `OpenGrokTextArea` `undo()` redeclaration, and the Swift 6 mutable sandbox-global diagnostics were addressed in the authorized paths. The serialized integrated build remains **blocked** by an unrelated existing `Sources/OpenGrokTelemetry/OTLPProtobuf.swift` `JSONNumber` type mismatch (first reported at line 104).
+**Overall state:** R12–R15 remain present at integration head `4480c47ce3c6a93cf2b76ae6618167291ebee2e5`. The TerminalCore Hashable blocker, TextArea undo redeclaration, and Sandbox Swift 6 mutable-global diagnostics were already resolved in the committed tree. This integration pass corrected the OTLP `JSONNumber` handling, but the three-iteration verification cap ended with the integrated build blocked by additional R14/R13 compile defects.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `9739c4a2ad23cfea14312a481169757f3da494f4` (`/tmp/open-grok-reference` when present).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`).
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
-## Luna integration verification snapshot (2026-07-23; sandbox-state remediation, iteration 1 of 1)
+## Luna integration verification snapshot (2026-07-23; serialized remediation, iteration 3 of 3)
 
 | Command | Outcome |
 |---|---|

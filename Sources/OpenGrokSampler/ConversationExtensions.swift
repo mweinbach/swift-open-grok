@@ -5,6 +5,7 @@
 // OpenGrokSamplingTypes (strip_images, etc.).
 
 import Foundation
+import OpenGrokShared
 import OpenGrokSamplingTypes
 
 extension ConversationRequest {

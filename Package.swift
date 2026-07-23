@@ -214,7 +214,7 @@ private func targets() -> [Target] {
     // ---- Wave 3 ----
     t.append(contentsOf: libs(w3s1, dep(w0s2, w0s3, w0s4, w1s5, w2s1, w2s2)))
     t.append(contentsOf: libs(w3s2, dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s1)))
-    t.append(contentsOf: libs(w3s3, dep(w0s2, w0s4, w1s1, w1s3, w1s5, w2s1)))
+    t.append(contentsOf: libs(w3s3, dep(w0s2, w0s3, w0s4, w1s1, w1s3, w1s5, w2s1)))
 
     // ---- Wave 4 ----
     t.append(contentsOf: libs(w4s1, dep(w0s2, w0s3, w1s4, w1s5, w2s2, w2s4)))

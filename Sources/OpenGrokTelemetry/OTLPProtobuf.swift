@@ -98,15 +98,22 @@ enum OTLPProtobuf {
         case .bool(let b):
             // bool_value = 2
             appendVarintField(2, b ? 1 : 0, into: &any)
-        case .number(let n):
-            // Prefer int_value when the double is a safe integer (exact in Double
-            // mantissa / int64). Otherwise emit IEEE-754 double_value.
-            if n.rounded() == n, n >= -9_007_199_254_740_991, n <= 9_007_199_254_740_991 {
-                // int_value = 3 (int64 is plain varint of two's complement bits)
-                appendVarintField(3, zigzagNotNeededInt64(Int64(n)), into: &any)
-            } else {
-                // double_value = 4 (fixed64 IEEE-754)
-                appendFixed64Field(4, n.bitPattern, into: &any)
+        case .number(let number):
+            // OTLP AnyValue exposes a signed int64 or an IEEE-754 double.
+            // Preserve JSONNumber's integer/float distinction. A UInt64 that
+            // exceeds Int64 cannot be represented by OTLP int_value without
+            // overflow, so it is emitted as a double instead.
+            switch number {
+            case .int64(let value):
+                appendVarintField(3, zigzagNotNeededInt64(value), into: &any)
+            case .uint64(let value):
+                if let signed = Int64(exactly: value) {
+                    appendVarintField(3, zigzagNotNeededInt64(signed), into: &any)
+                } else {
+                    appendFixed64Field(4, Double(value).bitPattern, into: &any)
+                }
+            case .double(let value):
+                appendFixed64Field(4, value.bitPattern, into: &any)
             }
         case .string(let s):
             // string_value = 1
@@ -184,7 +191,14 @@ enum OTLPProtobuf {
         switch value {
         case .null: return Data("null".utf8)
         case .bool(let b): return Data((b ? "true" : "false").utf8)
-        case .number(let n): return Data(String(n).utf8)
+        case .number(let number):
+            let text: String
+            switch number {
+            case .int64(let value): text = String(value)
+            case .uint64(let value): text = String(value)
+            case .double(let value): text = String(describing: value)
+            }
+            return Data(text.utf8)
         case .string(let s): return Data(s.utf8)
         case .array(let items):
             var d = Data("[".utf8)

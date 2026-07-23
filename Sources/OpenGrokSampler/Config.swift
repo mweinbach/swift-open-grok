@@ -24,6 +24,12 @@ public enum AuthScheme: String, Codable, Sendable, Equatable, Hashable {
 ///
 /// `extraHeaders` must come from the same authenticated state as `bearer`.
 public struct ResolvedBearerAuth: Sendable, Equatable {
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.bearer == rhs.bearer &&
+        lhs.extraHeaders.elementsEqual(rhs.extraHeaders, by: {
+            $0.name == $1.name && $0.value == $1.value
+        })
+    }
     public var bearer: String
     public var extraHeaders: [(name: String, value: String)]
 

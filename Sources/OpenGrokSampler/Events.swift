@@ -5,6 +5,7 @@
 
 import Foundation
 import OpenGrokSamplingTypes
+import OpenGrokShared
 
 // MARK: - Channel
 
