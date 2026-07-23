@@ -14,6 +14,22 @@ public enum CodexModels {
     public static let cacheTTLSeconds: TimeInterval = 300
     public static let defaultEffectiveContextWindowPercent: Int64 = 95
 
+    public static func isTrustedInferenceBaseURL(_ baseURL: String) -> Bool {
+        let candidate = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let defaultTrimmed = defaultInferenceBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if candidate.isEmpty || candidate == defaultTrimmed {
+            return true
+        }
+        guard let url = URL(string: baseURL),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "https",
+              let host = url.host?.lowercased() else {
+            return false
+        }
+        return host == "chatgpt.com" || host == "chat.openai.com" || host == "api.openai.com"
+    }
+
     public static func clientVersion(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> String {

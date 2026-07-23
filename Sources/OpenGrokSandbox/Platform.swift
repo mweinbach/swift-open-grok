@@ -117,8 +117,22 @@ public enum PlatformSandboxSupport {
 // MARK: - Seatbelt SBPL
 
 #if os(macOS)
+// MARK: - Seatbelt SBPL
+
+/// Specific Seatbelt write sub-actions denied for a denied path.
+public let seatbeltWriteDenyActions: [String] = [
+    "file-write-data",
+    "file-write-create",
+    "file-write-unlink",
+    "file-write-mode",
+    "file-write-owner",
+    "file-write-flags",
+    "file-write-times",
+    "file-write-setugid",
+]
+
 /// Build a Seatbelt profile language (SBPL) string for the resolved profile.
-public func buildSeatbeltProfile(_ resolved: ResolvedSandboxProfile) -> String {
+public func buildSeatbeltProfile(_ resolved: ResolvedSandboxProfile, workspace: URL? = nil) -> String {
     var lines: [String] = [
         "(version 1)",
         "(deny default)",
@@ -153,15 +167,33 @@ public func buildSeatbeltProfile(_ resolved: ResolvedSandboxProfile) -> String {
         lines.append("(allow file-read* file-write* (subpath \"\(escaped)\"))")
     }
 
+    // Exact deny paths with macOS firmlink alias expansion and write sub-actions
     for path in resolved.deny {
-        let escaped = seatbeltEscape(path.path)
-        lines.append("(deny file-read* file-write* (subpath \"\(escaped)\"))")
+        let aliases = macosDenyAliases(path)
+        for alias in aliases {
+            let escaped = seatbeltEscape(alias.path)
+            let filter = denyPathIsDir(alias) ? "(subpath \"\(escaped)\")" : "(literal \"\(escaped)\")"
+            lines.append("(deny file-read* \(filter))")
+            lines.append("(deny file-write* \(filter))")
+            for action in seatbeltWriteDenyActions {
+                lines.append("(deny \(action) \(filter))")
+            }
+        }
     }
 
-    // Glob deny entries as regexes (best-effort; macOS Seatbelt enforces at runtime).
-    for entry in resolved.denyEntries where entry.contains("*") || entry.contains("?") {
-        let regex = globToSeatbeltRegex(entry)
-        lines.append("(deny file-read* file-write* (regex #\"\(regex)\"))")
+    // Glob deny entries as regexes covering all firmlink root aliases and write sub-actions
+    let ws = workspace ?? URL(fileURLWithPath: "/")
+    for entry in resolved.denyEntries where isGlobPattern(entry) {
+        if let regexes = try? globToSeatbeltRegexes(workspace: ws, glob: entry) {
+            for regex in regexes {
+                let filter = "(regex #\"\(regex)\"#)"
+                lines.append("(deny file-read* \(filter))")
+                lines.append("(deny file-write* \(filter))")
+                for action in seatbeltWriteDenyActions {
+                    lines.append("(deny \(action) \(filter))")
+                }
+            }
+        }
     }
 
     if resolved.restrictNetwork {
@@ -179,38 +211,7 @@ private func seatbeltEscape(_ path: String) -> String {
         .replacingOccurrences(of: "\"", with: "\\\"")
 }
 
-private func globToSeatbeltRegex(_ glob: String) -> String {
-    var out = "^"
-    var i = glob.startIndex
-    while i < glob.endIndex {
-        let ch = glob[i]
-        if ch == "*" {
-            let next = glob.index(after: i)
-            if next < glob.endIndex, glob[next] == "*" {
-                out += ".*"
-                i = glob.index(after: next)
-                continue
-            }
-            out += "[^/]*"
-            i = next
-            continue
-        }
-        if ch == "?" {
-            out += "[^/]"
-            i = glob.index(after: i)
-            continue
-        }
-        // Escape regex metacharacters.
-        if "\\.[]{}()+-^$|".contains(ch) {
-            out.append("\\")
-        }
-        out.append(ch)
-        i = glob.index(after: i)
-    }
-    out += "$"
-    return out
-}
-
+#if os(macOS)
 /// Apply a Seatbelt SBPL profile via `sandbox_init`. Irreversible.
 public func applySeatbeltProfile(_ sbpl: String) throws {
     typealias SandboxInitFn = @convention(c) (UnsafePointer<CChar>, UInt64, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Int32
@@ -264,6 +265,84 @@ public func isInsideBwrap(environment: [String: String] = ProcessInfo.processInf
     environment[bwrapEnvVar] != nil
 }
 
+/// Create a zero-permission placeholder path for bwrap read-deny bind-overs.
+public func bwrapBlockedPlaceholder(
+    name: String,
+    wantDir: Bool,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> URL? {
+    let pid = ProcessInfo.processInfo.processIdentifier
+    let path = sandboxGrokHome(environment: environment).appendingPathComponent("\(name).\(pid)")
+    let parent = path.deletingLastPathComponent()
+    try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+    if wantDir {
+        try? FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+    } else {
+        if !FileManager.default.fileExists(atPath: path.path) {
+            FileManager.default.createFile(atPath: path.path, contents: Data())
+        }
+    }
+    #if canImport(Darwin) || canImport(Glibc)
+    chmod(path.path, 0000)
+    #endif
+    return path
+}
+
+/// Expand deny globs into concrete existing matching file paths on Linux.
+public func expandDenyGlobs(
+    workspace: URL,
+    globs: [String],
+    maxDepth: Int = 64,
+    maxMatches: Int = 4096,
+    maxEntries: Int = 200000
+) -> [String]? {
+    var matches: [String] = []
+    var visited = 0
+    let fm = FileManager.default
+    for glob in globs {
+        if (try? validateDenyGlob(glob)) == nil {
+            return nil
+        }
+        let (root, tail) = splitGlobRoot(workspace: workspace, glob: glob)
+        guard fm.fileExists(atPath: root.path) else { continue }
+        let tailRegexStr = globTailToRegex(tail)
+        guard let regex = try? NSRegularExpression(pattern: "^\(tailRegexStr)$") else { return nil }
+        guard let enumerator = fm.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsPackageDescendants],
+            errorHandler: { _, error in
+                let nsError = error as NSError
+                // Skip permission denied errors, fail closed on other errors
+                if nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileReadNoPermissionError {
+                    return true
+                }
+                return false
+            }
+        ) else { return nil }
+
+        for case let fileURL as URL in enumerator {
+            visited += 1
+            if visited > maxEntries { return nil }
+            if enumerator.level > maxDepth { return nil }
+
+            let relPath: String
+            if root.path == "/" {
+                relPath = String(fileURL.path.dropFirst())
+            } else {
+                relPath = String(fileURL.path.dropFirst(root.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            }
+
+            let range = NSRange(location: 0, length: relPath.utf16.count)
+            if regex.firstMatch(in: relPath, options: [], range: range) != nil {
+                matches.append(fileURL.path)
+                if matches.count > maxMatches { return nil }
+            }
+        }
+    }
+    return Array(Set(matches)).sorted()
+}
+
 /// Build argv for `bwrap` re-exec. Returns `nil` if already inside bwrap.
 public func bwrapReexecCommand(
     denyWrite: [String],
@@ -286,9 +365,12 @@ public func bwrapReexecCommand(
         }
     }
     for path in denyRead {
-        // Bind-over with a zero-permission placeholder path when available;
-        // otherwise still emit the bind target so callers see intent.
-        argv.append(contentsOf: ["--ro-bind", path, path])
+        let isDir = denyPathIsDir(URL(fileURLWithPath: path))
+        if let placeholder = bwrapBlockedPlaceholder(name: isDir ? "sandbox-blocked-dir" : "sandbox-blocked", wantDir: isDir, environment: environment) {
+            argv.append(contentsOf: ["--ro-bind", placeholder.path, path])
+        } else {
+            argv.append(contentsOf: ["--ro-bind", path, path])
+        }
     }
     argv.append(contentsOf: ["--dev-bind", "/dev", "/dev", "--proc", "/proc"])
     argv.append(contentsOf: ["--", selfExe])
@@ -302,7 +384,6 @@ public func bwrapDenyPlan(
     workspace: URL,
     config: SandboxConfig? = nil
 ) -> BwrapDenyPlan? {
-    #if os(Linux)
     let cfg = config ?? loadSandboxConfig(workspace: workspace)
     var denyWrite: [String] = []
     if isDevboxBased(profile: profile, config: cfg) {
@@ -312,32 +393,33 @@ public func bwrapDenyPlan(
     var hasGlobs = false
     if profile != .off {
         if let resolved = try? profile.resolve(workspace: workspace, config: cfg) {
-            for entry in resolved.denyEntries {
-                if entry.contains("*") || entry.contains("?") {
-                    hasGlobs = true
-                } else if entry.hasPrefix("/") {
-                    denyRead.append(entry)
-                } else {
-                    denyRead.append(workspace.appendingPathComponent(entry).path)
-                }
+            let (exact, globs) = partitionDenyEntries(resolved.denyEntries)
+            hasGlobs = !globs.isEmpty
+            for entry in exact {
+                let pathStr = entry.hasPrefix("/") ? entry : workspace.appendingPathComponent(entry).path
+                denyRead.append(pathStr)
             }
             for d in resolved.deny {
                 if !denyRead.contains(d.path) {
                     denyRead.append(d.path)
                 }
             }
+            if hasGlobs {
+                if let expanded = expandDenyGlobs(workspace: workspace, globs: globs) {
+                    denyRead.append(contentsOf: expanded)
+                } else {
+                    // Fail closed if glob expansion failed or exceeded limits
+                    return nil
+                }
+            }
         }
     }
-    return BwrapDenyPlan(denyWrite: denyWrite, denyRead: denyRead, hasGlobs: hasGlobs)
-    #else
-    _ = (profile, workspace, config)
-    return nil
-    #endif
+    let uniqueRead = Array(Set(denyRead)).sorted()
+    return BwrapDenyPlan(denyWrite: denyWrite, denyRead: uniqueRead, hasGlobs: hasGlobs)
 }
 
 // MARK: - Windows seams (compile-checked)
 
-#if os(Windows)
 /// Placeholder for restricted-token creation. Always returns unsupported
 /// until the Windows backend is implemented.
 public func createRestrictedTokenSandbox(profile: ResolvedSandboxProfile) throws {
@@ -354,4 +436,4 @@ public func createJobObjectSandbox(profile: ResolvedSandboxProfile) throws {
         "Windows Job Object sandbox is not yet implemented; refusing to run unsandboxed"
     )
 }
-#endif
+

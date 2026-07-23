@@ -881,6 +881,165 @@ struct CodexIsolationTests {
         #expect(!String(describing: t).contains("access-secret-value"))
         #expect(!String(describing: t).contains("refresh-secret-value"))
     }
+
+    @Test func codexAuthStoreMatchesCodexRustJSONShape() throws {
+        let store = CodexAuthStore(
+            authMode: "chatgpt",
+            openaiAPIKey: nil,
+            tokens: CodexTokenData(
+                idToken: "header.payload.signature",
+                accessToken: "access",
+                refreshToken: "refresh",
+                accountID: "account-1"
+            ),
+            lastRefresh: Date(timeIntervalSince1970: 1772575524)
+        )
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        let data = try encoder.encode(store)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        #expect((json?["auth_mode"] as? String) == "chatgpt")
+        #expect(json?["OPENAI_API_KEY"] == nil)
+        let tokensObj = json?["tokens"] as? [String: Any]
+        #expect((tokensObj?["access_token"] as? String) == "access")
+        #expect((tokensObj?["account_id"] as? String) == "account-1")
+        let decoded = try AuthJSON.decoder.decode(CodexAuthStore.self, from: data)
+        #expect(decoded == store)
+    }
+
+    @Test func codexTokenUsageProfileMatchesBackendShape() throws {
+        let json = """
+        {
+            "lifetime_tokens": 123,
+            "peak_daily_tokens": 45,
+            "longest_running_turn_sec": 67,
+            "current_streak_days": 2,
+            "longest_streak_days": 5,
+            "daily_usage_buckets": [{"start_date": "2026-07-15", "tokens": 42}]
+        }
+        """
+        let stats = try JSONDecoder().decode(CodexTokenUsageStats.self, from: Data(json.utf8))
+        #expect(stats.lifetimeTokens == 123)
+        #expect(stats.dailyUsageBuckets?.first?.tokens == 42)
+    }
+
+    @Test func codexUsageAcceptsQuotaWindowsCreditsAndExtraLimits() throws {
+        let json = """
+        {
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 25.0,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 100,
+                    "reset_at": 200
+                },
+                "secondary_window": {
+                    "used_percent": 50.0,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 300,
+                    "reset_at": 400
+                }
+            },
+            "credits": {
+                "has_credits": true,
+                "unlimited": false,
+                "balance": "12.50"
+            },
+            "additional_rate_limits": [{
+                "limit_name": "review",
+                "metered_feature": "review",
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false
+                }
+            }]
+        }
+        """
+        let usage = try JSONDecoder().decode(CodexUsageSnapshot.self, from: Data(json.utf8))
+        #expect(usage.planType == "pro")
+        #expect(usage.rateLimit?.secondaryWindow?.usedPercent == 50.0)
+        #expect(usage.credits?.balance == "12.50")
+        #expect(usage.additionalRateLimits.count == 1)
+
+        let nullLimitsJSON = """
+        {"additional_rate_limits": null}
+        """
+        let noLimits = try JSONDecoder().decode(CodexUsageSnapshot.self, from: Data(nullLimitsJSON.utf8))
+        #expect(noLimits.additionalRateLimits.isEmpty)
+    }
+
+    @Test func codexOnlyStartupNeverReadsXAICredentials() throws {
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let authPath = home.appendingPathComponent("auth.json")
+        let codexPath = home.appendingPathComponent("codex-auth.json")
+
+        // Intentionally create a corrupt/invalid auth.json that would fail if read.
+        try "{corrupt-auth-json".write(to: authPath, atomically: true, encoding: .utf8)
+
+        // Persist valid Codex tokens in codex-auth.json.
+        let idToken = buildTestJWT(payload: ["sub": "user-codex"])
+        try persistCodexTokens(
+            at: codexPath,
+            idToken: idToken,
+            accessToken: "valid-codex-access",
+            refreshToken: "valid-codex-refresh"
+        )
+
+        // Verify Codex-only startup check succeeds without reading/failing on auth.json.
+        #expect(codexOnlyHeadlessReady(codexAuthFile: codexPath))
+        let creds = try loadCodexCredentials(at: codexPath)
+        #expect(creds?.accessToken == "valid-codex-access")
+
+        // auth.json was not mutated or read by Codex functions.
+        let rawAuth = try String(contentsOf: authPath, encoding: .utf8)
+        #expect(rawAuth == "{corrupt-auth-json")
+    }
+
+    @Test func cancellationPreservesLastDurableCredentialInCodexRefresh() async throws {
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let codexPath = home.appendingPathComponent("codex-auth.json")
+
+        let staleAccess = buildTestJWT(payload: [
+            "exp": Int(Date().addingTimeInterval(-100).timeIntervalSince1970),
+        ])
+        try persistCodexTokens(
+            at: codexPath,
+            idToken: buildTestJWT(payload: [:]),
+            accessToken: staleAccess,
+            refreshToken: "durable-refresh-token"
+        )
+
+        let cancelTransport = MockHTTPTransport(responses: [])
+        let endpoints = CodexEndpoints(issuer: "https://auth.example")
+
+        let task = Task {
+            try await refreshCodexCredentials(
+                at: codexPath,
+                endpoints: endpoints,
+                transport: cancelTransport,
+                force: true
+            )
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            Issue.record("expected cancellation error")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            // Cancellation check might raise AuthError or CancellationError
+        }
+
+        // Verify file content still retains the original durable refresh token.
+        let store = try loadCodexStore(at: codexPath)
+        #expect(store?.tokens?.refreshToken == "durable-refresh-token")
+    }
 }
 
 private func acctID(_ idToken: String) -> String? {

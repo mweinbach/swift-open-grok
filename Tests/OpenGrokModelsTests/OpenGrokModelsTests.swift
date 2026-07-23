@@ -955,3 +955,353 @@ struct ValidateSelectableTests {
         }
     }
 }
+
+// MARK: - Remote Codex Refresh Isolation
+
+@Suite("Remote Codex refresh isolation")
+struct RemoteCodexRefreshIsolationTests {
+    final class ScriptedCodexTransport: CodexModelsTransport, @unchecked Sendable {
+        var models: [CodexCatalogModel]
+        var etag: String?
+        var callCount = 0
+
+        init(models: [CodexCatalogModel], etag: String? = nil) {
+            self.models = models
+            self.etag = etag
+        }
+
+        func fetchCodexModels(
+            cancellation: CancellationToken?
+        ) async throws -> (models: [CodexCatalogModel], etag: String?) {
+            try cancellation?.throwIfCancelled()
+            callCount += 1
+            return (models, etag)
+        }
+    }
+
+    func tempHome() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opengrok-isolation-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    @Test func remoteCodexRefreshCannotMutateOrInspectXaiState() async throws {
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        var gptEntry = ModelEntry.fallback(slug: "gpt-5.6-super", endpoints: .default)
+        gptEntry.info.provider = .codex
+        gptEntry.info.apiBackend = .responses
+        gptEntry.info.agentType = "codex"
+        gptEntry.info.contextWindow = 353_000
+
+        let codexTransport = ScriptedCodexTransport(
+            models: [
+                CodexCatalogModel(
+                    priority: 10,
+                    visibility: .list,
+                    autoCompactTokenLimit: 300_000,
+                    resolvedContextWindow: 353_000,
+                    entry: gptEntry
+                )
+            ],
+            etag: "\"codex-etag-1\""
+        )
+        let xaiTransport = ModelsManagerTests.ScriptedXaiTransport(
+            result: FetchModelsResult(models: [], etag: nil)
+        )
+
+        let mgr = ModelsManager(
+            credentials: EmptyCredentialSnapshot(
+                hasXaiSession: true,
+                hasCodexSession: true,
+                codexAccountFingerprint: "fingerprint-alpha"
+            ),
+            grokHome: home,
+            xaiTransport: xaiTransport,
+            codexTransport: codexTransport,
+            versionProvider: { "ver-1" }
+        )
+
+        // Baseline: grok-4.5 exists in catalog with 500,000 context window.
+        let beforeSnap = mgr.catalogSnapshot()
+        let grokBefore = beforeSnap["grok-4.5"]
+        #expect(grokBefore != nil)
+        #expect(grokBefore?.info.provider == .xai)
+        #expect(grokBefore?.info.contextWindow == 500_000)
+
+        // Perform remote Codex refresh.
+        try await mgr.refreshCodex(strategy: .online)
+
+        #expect(codexTransport.callCount == 1)
+        #expect(xaiTransport.callCount == 0) // xAI transport was NOT called.
+
+        let afterSnap = mgr.catalogSnapshot()
+        // Remote Codex entry was added.
+        #expect(afterSnap["gpt-5.6-super"] != nil)
+        #expect(afterSnap["gpt-5.6-super"]?.info.provider == .codex)
+
+        // xAI entry remains completely unmutated.
+        let grokAfter = afterSnap["grok-4.5"]
+        #expect(grokAfter != nil)
+        #expect(grokAfter?.info.provider == .xai)
+        #expect(grokAfter?.info.contextWindow == 500_000)
+
+        // Disk cache isolation check: codex_models_cache.json exists, models_cache.json DOES NOT exist.
+        let codexCacheFile = home.appendingPathComponent(CodexModels.cacheFileName)
+        let xaiCacheFile = home.appendingPathComponent(MODELS_CACHE_FILE)
+        #expect(FileManager.default.fileExists(atPath: codexCacheFile.path))
+        #expect(!FileManager.default.fileExists(atPath: xaiCacheFile.path))
+
+        // Now perform xAI refresh with live data.
+        let liveXaiConfig = ModelEntryConfig(
+            id: "grok-live-new",
+            model: "grok-live-new",
+            baseURL: "https://cli-chat-proxy.grok.com/v1",
+            contextWindow: 400_000,
+            apiBackend: .responses,
+            provider: .xai
+        )
+        xaiTransport.result = FetchModelsResult(models: [liveXaiConfig], etag: "\"xai-etag-1\"")
+        try await mgr.refreshXai(strategy: .online)
+
+        #expect(xaiTransport.callCount == 1)
+        #expect(FileManager.default.fileExists(atPath: xaiCacheFile.path))
+
+        // Codex catalog model is still present in snapshot.
+        let finalSnap = mgr.catalogSnapshot()
+        #expect(finalSnap["gpt-5.6-super"] != nil)
+        #expect(finalSnap["grok-live-new"] != nil)
+
+        // Identity change clear invalidates both caches.
+        mgr.clear(identityChange: true)
+        #expect(!FileManager.default.fileExists(atPath: codexCacheFile.path))
+        #expect(!FileManager.default.fileExists(atPath: xaiCacheFile.path))
+    }
+
+    @Test func crossProviderPartitionMergeIsIsolated() {
+        var codexRemote = OrderedModelMap()
+        var codexEntry = ModelEntry.fallback(slug: "gpt-5.6-sol", endpoints: .default)
+        codexEntry.info.provider = .codex
+        codexRemote["gpt-5.6-sol"] = codexEntry
+
+        // Malicious or broken payload: non-Codex entry inside Codex remote partition.
+        var poisonEntry = ModelEntry.fallback(slug: "grok-hacked", endpoints: .default)
+        poisonEntry.info.provider = .xai
+        codexRemote["grok-hacked"] = poisonEntry
+
+        let codexCatalog = CodexModelsCatalog(
+            models: [
+                CodexCatalogModel(priority: 1, visibility: .list, entry: codexEntry),
+                CodexCatalogModel(priority: 1, visibility: .list, entry: poisonEntry),
+            ],
+            accountFingerprint: "fingerprint-1"
+        )
+
+        let catalog = resolveModelCatalog(input: .default, codexCatalog: codexCatalog)
+        #expect(catalog["gpt-5.6-sol"] != nil)
+        // Poisoned xAI entry from Codex transport must NOT enter the catalog under xAI or overwrite xAI models.
+        #expect(catalog["grok-hacked"] == nil)
+        #expect(catalog["grok-4.5"]?.info.provider == .xai)
+    }
+}
+
+// MARK: - Auxiliary model routing
+
+@Suite("Auxiliary model routing")
+struct AuxiliaryModelRoutingTests {
+    @Test func customAuxiliaryEndpointRequiresItsOwnCredential() {
+        let endpoints = EndpointsConfig.default
+        var catalog = OrderedModelMap()
+        var entry = ModelEntry.fallback(slug: "custom-helper", endpoints: endpoints)
+        entry.info.provider = .xai
+        entry.info.baseURL = "https://custom.example.test/v1"
+        catalog["helper"] = entry
+
+        let rejected = resolveAuxiliaryModelSamplingConfig(
+            modelID: "helper",
+            catalog: catalog,
+            endpoints: endpoints,
+            sessionKey: "xai-session-secret"
+        )
+        #expect(rejected == nil) // Session credential NOT sent to custom URL.
+
+        entry.apiKey = "custom-endpoint-key"
+        catalog["helper"] = entry
+
+        let resolved = resolveAuxiliaryModelSamplingConfig(
+            modelID: "helper",
+            catalog: catalog,
+            endpoints: endpoints,
+            sessionKey: "xai-session-secret"
+        )
+        #expect(resolved != nil)
+        #expect(resolved?.baseURL == "https://custom.example.test/v1")
+        #expect(resolved?.apiKey == "custom-endpoint-key")
+    }
+
+    @Test func firstPartyAuxiliaryEndpointCanUseXaiSessionAuth() {
+        let endpoints = EndpointsConfig.default
+        let catalog = defaultModelEntries()
+
+        let resolved = resolveAuxiliaryModelSamplingConfig(
+            modelID: "grok-4.5",
+            catalog: catalog,
+            endpoints: endpoints,
+            sessionKey: "xai-session-key"
+        )
+        #expect(resolved != nil)
+        #expect(resolved?.provider == .xai)
+        #expect(resolved?.apiKey == "xai-session-key")
+    }
+
+    @Test func customCodexEndpointCannotInheritChatgptOauth() {
+        let endpoints = EndpointsConfig.default
+        var catalog = OrderedModelMap()
+        var entry = ModelEntry.fallback(slug: "custom-codex-helper", endpoints: endpoints)
+        entry.info.provider = .codex
+        entry.info.baseURL = "https://codex-proxy.example.test/v1"
+        catalog["helper"] = entry
+
+        let rejected = resolveAuxiliaryModelSamplingConfig(
+            modelID: "helper",
+            catalog: catalog,
+            endpoints: endpoints,
+            sessionKey: "codex-oauth-token"
+        )
+        #expect(rejected == nil)
+
+        entry.apiKey = "custom-codex-key"
+        catalog["helper"] = entry
+
+        let resolved = resolveAuxiliaryModelSamplingConfig(
+            modelID: "helper",
+            catalog: catalog,
+            endpoints: endpoints,
+            sessionKey: "codex-oauth-token"
+        )
+        #expect(resolved != nil)
+        #expect(resolved?.baseURL == "https://codex-proxy.example.test/v1")
+        #expect(resolved?.apiKey == "custom-codex-key")
+    }
+
+    @Test func specialtyModelRolesResolveDefaults() {
+        let catalog = defaultModelEntries()
+        let webAux = resolveAuxiliaryModelSamplingConfig(
+            modelID: defaultWebSearchModel(),
+            catalog: catalog,
+            sessionKey: "session-bearer"
+        )
+        #expect(webAux != nil)
+        #expect(webAux?.routingModel == "grok-4.20-multi-agent")
+
+        let summaryAux = resolveAuxiliaryModelSamplingConfig(
+            modelID: defaultSessionSummaryModel(),
+            catalog: catalog,
+            sessionKey: "session-bearer"
+        )
+        #expect(summaryAux != nil)
+        #expect(summaryAux?.routingModel == "grok-4.5")
+    }
+}
+
+// MARK: - Trusted endpoint validation
+
+@Suite("Trusted endpoint validation")
+struct TrustedEndpointValidationTests {
+    @Test func isXaiApiBearerURLValidations() {
+        #expect(isXaiApiBearerURL("https://api.x.ai/v1"))
+        #expect(isXaiApiBearerURL("https://cli-chat-proxy.grok.com/v1"))
+        #expect(isXaiApiBearerURL("https://subdomain.x.ai/v1"))
+        #expect(!isXaiApiBearerURL("http://api.x.ai/v1")) // HTTP rejected
+        #expect(!isXaiApiBearerURL("https://localhost:11434/v1")) // Loopback rejected
+        #expect(!isXaiApiBearerURL("https://127.0.0.1:11434/v1")) // IPv4 loopback rejected
+        #expect(!isXaiApiBearerURL("https://[::1]:11434/v1")) // IPv6 loopback rejected
+        #expect(!isXaiApiBearerURL("https://evil-x.ai.example/v1")) // Suffix attack rejected
+    }
+
+    @Test func codexIsTrustedInferenceBaseURLValidations() {
+        #expect(CodexModels.isTrustedInferenceBaseURL("https://chatgpt.com/backend-api/codex"))
+        #expect(CodexModels.isTrustedInferenceBaseURL("https://chat.openai.com/backend-api/codex"))
+        #expect(CodexModels.isTrustedInferenceBaseURL(""))
+        #expect(!CodexModels.isTrustedInferenceBaseURL("https://codex-proxy.evil.com/v1"))
+        #expect(!CodexModels.isTrustedInferenceBaseURL("http://chatgpt.com/backend-api/codex"))
+    }
+
+    @Test func trustedBuiltInSessionEndpointAllProviders() {
+        #expect(trustedBuiltInSessionEndpoint(provider: .xai, baseURL: "https://api.x.ai/v1"))
+        #expect(!trustedBuiltInSessionEndpoint(provider: .xai, baseURL: "https://untrusted.com/v1"))
+
+        #expect(trustedBuiltInSessionEndpoint(provider: .codex, baseURL: "https://chatgpt.com/backend-api/codex"))
+        #expect(!trustedBuiltInSessionEndpoint(provider: .codex, baseURL: "https://codex.custom.org"))
+
+        #expect(trustedBuiltInSessionEndpoint(provider: .kimi, baseURL: "https://api.moonshot.ai/v1"))
+        #expect(trustedBuiltInSessionEndpoint(provider: .kimi, baseURL: "https://api.kimi.com/coding/v1"))
+        #expect(!trustedBuiltInSessionEndpoint(provider: .kimi, baseURL: "https://custom-kimi.org"))
+
+        #expect(trustedBuiltInSessionEndpoint(provider: .fireworks, baseURL: "https://api.fireworks.ai/inference/v1"))
+        #expect(!trustedBuiltInSessionEndpoint(provider: .fireworks, baseURL: "https://custom-fireworks.org"))
+    }
+}
+
+// MARK: - Compaction & reasoning capabilities
+
+@Suite("Compaction & reasoning capabilities")
+struct CompactionAndReasoningCapabilitiesTests {
+    @Test func autoCompactTokenLimitAndResolvedLimit() {
+        var entry = ModelEntry.fallback(slug: "gpt-test", endpoints: .default)
+        entry.info.provider = .codex
+
+        let modelWithContextAndLimit = CodexCatalogModel(
+            priority: 1,
+            visibility: .list,
+            autoCompactTokenLimit: 250_000,
+            resolvedContextWindow: 353_000,
+            entry: entry
+        )
+        // 90% of 353,000 = 317,700. min(250,000, 317,700) = 250,000
+        #expect(modelWithContextAndLimit.resolvedAutoCompactTokenLimit() == 250_000)
+
+        let modelContextOnly = CodexCatalogModel(
+            priority: 1,
+            visibility: .list,
+            autoCompactTokenLimit: nil,
+            resolvedContextWindow: 353_000,
+            entry: entry
+        )
+        // 90% of 353,000 = 317,700
+        #expect(modelContextOnly.resolvedAutoCompactTokenLimit() == 317_700)
+    }
+
+    @Test func compactionMetadataFieldsPreservation() {
+        let map = defaultModelEntries()
+        let grok = map["grok-4.5"]!
+        #expect(grok.info.autoCompactThresholdPercent == 80)
+        #expect(grok.info.compactionAtTokens == .enabled(true))
+        #expect(grok.info.compactionsRemaining == .fixed(1))
+    }
+
+    @Test func modelOffersReasoningEffortAndDeriveFields() {
+        var info = ModelInfo.fallback(slug: "test-model")
+        info.reasoningEfforts = [
+            ReasoningEffortOption(id: "low", value: .low, label: "Low", description: nil, isDefault: false),
+            ReasoningEffortOption(id: "high", value: .high, label: "High", description: nil, isDefault: true),
+        ]
+        info.deriveReasoningEffortFields()
+        #expect(info.supportsReasoningEffort)
+        #expect(info.reasoningEffort == .high)
+
+        #expect(modelOffersReasoningEffort(info, effort: .low))
+        #expect(modelOffersReasoningEffort(info, effort: .high))
+        #expect(!modelOffersReasoningEffort(info, effort: .max))
+    }
+
+    @Test func codexMultiAgentV2Flag() {
+        let map = defaultModelEntries()
+        #expect(map["gpt-5.6-sol"]?.info.codexMultiAgentV2 == true)
+        #expect(map["gpt-5.6-terra"]?.info.codexMultiAgentV2 == true)
+        #expect(map["gpt-5.6-luna"]?.info.codexMultiAgentV2 == false)
+    }
+}
+

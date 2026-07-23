@@ -300,6 +300,60 @@ struct ProviderTests {
         #expect(xaiHeaders["x-grok-client-version"] == "1.0")
     }
 
+    @Test("codex instruction roles extraction into instructions property")
+    func codexInstructionRoles() {
+        var body: JSONValue = .object([
+            "input": .array([
+                .object(["type": .string("message"), "role": .string("system"), "content": .string("Leading System Instruction 1")]),
+                .object(["type": .string("message"), "role": .string("system"), "content": .string("Leading System Instruction 2")]),
+                .object(["type": .string("message"), "role": .string("user"), "content": .string("User Prompt")]),
+                .object(["type": .string("message"), "role": .string("system"), "content": .string("Subsequent System Message")]),
+            ])
+        ])
+        let policy = ResponsesRequestPolicy(multiAgentV2: false, localEffort: nil, reasoningSummary: nil)
+        patchCodexResponsesRequest(&body, policy: policy)
+
+        #expect(body["instructions"]?.stringValue == "Leading System Instruction 1\n\nLeading System Instruction 2")
+        guard case .array(let input) = body["input"] else {
+            Issue.record("input should be an array")
+            return
+        }
+        #expect(input.count == 2)
+        #expect(input[0]["role"]?.stringValue == "user")
+        #expect(input[1]["role"]?.stringValue == "developer")
+        #expect(input[1]["content"]?.stringValue == "Subsequent System Message")
+    }
+
+    @Test("codex multi-agent v2 mode tag insertion")
+    func codexMultiAgentV2() {
+        var body: JSONValue = .object([
+            "input": .array([
+                .object(["type": .string("message"), "role": .string("user"), "content": .string("Hello")]),
+            ])
+        ])
+        let policyUltra = ResponsesRequestPolicy(multiAgentV2: true, localEffort: .ultra, reasoningSummary: nil)
+        patchCodexResponsesRequest(&body, policy: policyUltra)
+
+        #expect(body["reasoning"]?["effort"]?.stringValue == "max")
+
+        guard case .array(let input) = body["input"] else {
+            Issue.record("input should be array")
+            return
+        }
+        #expect(input.count == 2)
+        #expect(input[0]["role"]?.stringValue == "developer")
+        #expect(input[0]["content"]?.arrayValue?.first?["text"]?.stringValue?.contains(PROACTIVE_MULTI_AGENT_MODE_TEXT) == true)
+        #expect(input[1]["role"]?.stringValue == "user")
+    }
+
+    @Test("codex prompt cache key matches session id")
+    func codexPromptCacheKey() {
+        let key = CodexProvider().promptCacheKey(sessionId: "session-123")
+        #expect(key == "session-123")
+        let nilKey = XaiProvider().promptCacheKey(sessionId: "session-123")
+        #expect(nilKey == nil)
+    }
+
     @Test("codex turn state first-write-wins")
     func turnState() {
         let cell = CodexTurnStateCell()

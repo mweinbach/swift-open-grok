@@ -433,15 +433,46 @@ func patchCodexResponsesRequest(_ body: inout JSONValue, policy: ResponsesReques
         }
     }
 
-    if let effort = policy.localEffort {
+    if policy.localEffort == .max || policy.localEffort == .ultra {
         ensureReasoningObject(&body)
         if case .object(var obj) = body {
             var reasoning = obj["reasoning"]?.objectValue ?? [:]
-            reasoning["effort"] = .string(effort.asString)
+            reasoning["effort"] = .string("max")
             obj["reasoning"] = .object(reasoning)
             body = .object(obj)
         }
     }
+
+    guard policy.multiAgentV2 else { return }
+
+    let modeText = (policy.localEffort == .ultra)
+        ? PROACTIVE_MULTI_AGENT_MODE_TEXT
+        : EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT
+    let rendered = "\(MULTI_AGENT_MODE_OPEN_TAG)\(modeText)\(MULTI_AGENT_MODE_CLOSE_TAG)"
+
+    guard case .object(var obj) = body,
+          case .array(var input) = obj["input"]
+    else { return }
+
+    input.removeAll(where: { isMultiAgentModeItem($0) })
+
+    let modeItem: JSONValue = .object([
+        "type": .string("message"),
+        "role": .string("developer"),
+        "content": .array([
+            .object([
+                "type": .string("input_text"),
+                "text": .string(rendered),
+            ]),
+        ]),
+    ])
+
+    let lastIsUser = input.last?["role"]?.stringValue == "user"
+    let insertAt = lastIsUser ? max(0, input.count - 1) : input.count
+    input.insert(modeItem, at: insertAt)
+
+    obj["input"] = .array(input)
+    body = .object(obj)
 }
 
 private func ensureReasoningObject(_ body: inout JSONValue) {
@@ -452,18 +483,80 @@ private func ensureReasoningObject(_ body: inout JSONValue) {
     }
 }
 
-/// Codex instruction roles: map system → developer on the Responses input list.
+/// Codex instruction roles: extract leading system instructions to `instructions`
+/// and map subsequent system messages to `developer` on the Responses input list.
 private func patchCodexInstructionRoles(_ body: inout JSONValue) {
     guard case .object(var obj) = body else { return }
-    guard case .array(var input) = obj["input"] else { return }
-    for i in input.indices {
-        guard case .object(var item) = input[i] else { continue }
-        if item["role"]?.stringValue == "system" {
-            item["role"] = .string("developer")
-            input[i] = .object(item)
+    guard case .array(let input) = obj["input"] else { return }
+
+    var leadingInstructions: [String] = []
+    var inLeadingPrefix = true
+    var projected: [JSONValue] = []
+
+    for var item in input {
+        let isSystem = item["role"]?.stringValue == "system"
+        if !isSystem {
+            inLeadingPrefix = false
+            projected.append(item)
+            continue
+        }
+
+        if inLeadingPrefix,
+           let text = responsesMessageText(item)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !text.isEmpty
+        {
+            leadingInstructions.append(text)
+            continue
+        }
+
+        if case .object(var itemObj) = item {
+            itemObj["role"] = .string("developer")
+            item = .object(itemObj)
+        }
+        projected.append(item)
+    }
+
+    obj["input"] = .array(projected)
+
+    if !leadingInstructions.isEmpty {
+        let leading = leadingInstructions.joined(separator: "\n\n")
+        let existingInstructions = obj["instructions"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if existingInstructions == nil || existingInstructions?.isEmpty == true {
+            obj["instructions"] = .string(leading)
         }
     }
-    obj["input"] = .array(input)
+
     body = .object(obj)
 }
+
+private func responsesMessageText(_ item: JSONValue) -> String? {
+    guard let content = item["content"] else { return nil }
+    switch content {
+    case .string(let text):
+        return text
+    case .array(let parts):
+        let text = parts.compactMap { part -> String? in
+            part["text"]?.stringValue
+        }.joined(separator: "\n")
+        return text.isEmpty ? nil : text
+    default:
+        return nil
+    }
+}
+
+private func isMultiAgentModeItem(_ item: JSONValue) -> Bool {
+    guard item["role"]?.stringValue == "developer" else { return false }
+    guard let content = item["content"] else { return false }
+    switch content {
+    case .string(let text):
+        return text.contains(MULTI_AGENT_MODE_OPEN_TAG)
+    case .array(let parts):
+        return parts.contains { part in
+            part["text"]?.stringValue?.contains(MULTI_AGENT_MODE_OPEN_TAG) == true
+        }
+    default:
+        return false
+    }
+}
+
 

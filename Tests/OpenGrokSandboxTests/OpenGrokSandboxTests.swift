@@ -200,23 +200,127 @@ struct OpenGrokSandboxTests {
         #expect(logger.snapshot().count == 2)
     }
 
-    #if os(macOS)
-    @Test("seatbelt profile includes deny and network rules")
-    func seatbeltSBPL() {
+    @Test("validateResume throws modePinningViolation on downgrade attempt")
+    func validateResumeDowngrade() {
+        let enforcer = PlatformSandboxEnforcer()
+        #expect(throws: SandboxError.self) {
+            try enforcer.validateResume(persisted: .restricted, candidate: .readOnly)
+        }
+        #expect(throws: SandboxError.self) {
+            try enforcer.validateResume(persisted: .restricted, candidate: .none)
+        }
+        #expect(throws: SandboxError.self) {
+            try enforcer.validateResume(persisted: .readOnly, candidate: .none)
+        }
+        #expect(noThrow: {
+            try enforcer.validateResume(persisted: .readOnly, candidate: .restricted)
+        })
+    }
+
+    @Test("rejectTraversableRoot rejects NUL bytes and empty components")
+    func rejectHostileRoots() {
+        #expect(throws: SandboxError.self) {
+            try rejectTraversableRoot(URL(fileURLWithPath: "/workspace/..\0"))
+        }
+        #expect(throws: SandboxError.self) {
+            try rejectTraversableRoot(URL(fileURLWithPath: "/workspace/../etc"))
+        }
+    }
+
+    @Test("seatbelt profile includes firmlink aliases and write sub-actions")
+    func seatbeltWriteSubactionsAndAliases() {
         let resolved = ResolvedSandboxProfile(
-            name: "workspace",
+            name: "custom",
             readOnly: [],
             readWrite: [URL(fileURLWithPath: "/tmp/ws")],
             deny: [URL(fileURLWithPath: "/tmp/ws/.env")],
+            denyEntries: ["**/*.pem"],
+            defaultRead: true,
+            restrictNetwork: true
+        )
+        let sbpl = buildSeatbeltProfile(resolved, workspace: URL(fileURLWithPath: "/tmp/ws"))
+        #expect(sbpl.contains("deny file-write-data"))
+        #expect(sbpl.contains("deny file-write-unlink"))
+        #expect(sbpl.contains("deny file-write-create"))
+        #expect(sbpl.contains("/private/tmp/ws/.env") || sbpl.contains("/tmp/ws/.env"))
+        #expect(sbpl.contains("(deny network*)"))
+    }
+
+    @Test("glob validation accepts supported subset and rejects hostile/ambiguous globs")
+    func globValidation() throws {
+        #expect(noThrow: { try validateDenyGlob("**/*.pem") })
+        #expect(noThrow: { try validateDenyGlob("secrets/**") })
+        #expect(noThrow: { try validateDenyGlob("[a-z].rs") })
+        #expect(noThrow: { try validateDenyGlob("[!a]b") })
+
+        #expect(throws: SandboxError.self) { try validateDenyGlob("{a,b}") }
+        #expect(throws: SandboxError.self) { try validateDenyGlob("a\\b") }
+        #expect(throws: SandboxError.self) { try validateDenyGlob("a**b") }
+        #expect(throws: SandboxError.self) { try validateDenyGlob("[[:alpha:]]") }
+    }
+
+    @Test("glob to seatbelt regex translation")
+    func globRegexTranslation() throws {
+        let regexes = try globToSeatbeltRegexes(workspace: URL(fileURLWithPath: "/ws"), glob: "**/*.pem")
+        #expect(!regexes.isEmpty)
+        #expect(regexes.contains(where: { $0.contains("(.*/)?") }))
+    }
+
+    @Test("bwrap plan for devbox write-denies /data")
+    func bwrapPlanDevbox() {
+        let ws = URL(fileURLWithPath: "/tmp/devbox-ws")
+        let plan = bwrapDenyPlan(profile: .devbox, workspace: ws)
+        #expect(plan != nil)
+        #expect(plan?.denyWrite.contains("/data") == true)
+    }
+
+    @Test("bwrap blocked placeholder creates zero-permission path")
+    func bwrapPlaceholder() {
+        let env = ["OPENGROK_HOME": "/tmp/opengrok-test-placeholder-\(UUID().uuidString)"]
+        defer { try? FileManager.default.removeItem(atPath: env["OPENGROK_HOME"]!) }
+        let filePlaceholder = bwrapBlockedPlaceholder(name: "test-file", wantDir: false, environment: env)
+        #expect(filePlaceholder != nil)
+        #expect(FileManager.default.fileExists(atPath: filePlaceholder!.path))
+    }
+
+    @Test("windows sandbox creation functions throw unsupported")
+    func windowsSeamsUnsupported() {
+        let resolved = ResolvedSandboxProfile(
+            name: "test",
+            readOnly: [],
+            readWrite: [],
+            deny: [],
             defaultRead: true,
             restrictNetwork: false
         )
-        let sbpl = buildSeatbeltProfile(resolved)
-        #expect(sbpl.contains("(version 1)"))
-        #expect(sbpl.contains("deny file-read*"))
-        #expect(sbpl.contains("allow network*"))
+        #expect(throws: SandboxError.self) {
+            try createRestrictedTokenSandbox(profile: resolved)
+        }
+        #expect(throws: SandboxError.self) {
+            try createJobObjectSandbox(profile: resolved)
+        }
     }
-    #endif
+
+    @Test("YOLO mode autoAllowBash prompting control does not disable process-wide sandbox")
+    func yoloModeControls() {
+        setAutoAllowBash(true)
+        // shouldAutoAllowBash is true only when sandbox is applied
+        #expect(shouldAutoAllowBash() == isSandboxActive())
+        setAutoAllowBash(false)
+        #expect(!shouldAutoAllowBash())
+    }
+
+    @Test("sandboxProfileConflictWarnings generates project collision warning")
+    func profileConflictWarningFormat() {
+        let global = SandboxConfig(profiles: [
+            "custom": ProfileConfig(extends: "workspace", deny: [".env"])
+        ])
+        let project = SandboxConfig(profiles: [
+            "custom": ProfileConfig(extends: "workspace", deny: [])
+        ])
+        let conflicts = mismatchedProfileNames(global: global, project: project)
+        #expect(conflicts == ["custom"])
+    }
 
     @Test("support info is platform-labeled")
     func supportInfo() {
@@ -225,3 +329,4 @@ struct OpenGrokSandboxTests {
         #expect(PlatformSandboxSupport.platformLabel.contains("/"))
     }
 }
+

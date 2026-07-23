@@ -213,13 +213,9 @@ public final class SandboxManager: @unchecked Sendable {
 enum PlatformEnforcer {
     static func apply(resolved: ResolvedSandboxProfile, workspace: URL, profile: ProfileName) throws {
         #if os(macOS)
-        let sbpl = buildSeatbeltProfile(resolved)
+        let sbpl = buildSeatbeltProfile(resolved, workspace: workspace)
         try applySeatbeltProfile(sbpl)
         #elseif os(Linux)
-        // In-process Landlock ruleset application is a follow-on; for now we
-        // require that either we are already inside bwrap, or the caller will
-        // re-exec via `bwrapReexecCommand`. Soft-apply records the profile when
-        // already confined; otherwise fail closed for non-off.
         if isInsideBwrap() {
             return
         }
@@ -230,12 +226,8 @@ enum PlatformEnforcer {
                 "Linux sandbox requires bubblewrap re-exec before apply; plan deny_write=\(plan.denyWrite) deny_read=\(plan.denyRead.count) has_globs=\(plan.hasGlobs)"
             )
         }
-        // No deny mounts required: Landlock soft mode records applied when
-        // support claims landlock, else fail closed.
         let support = PlatformSandboxSupport.supportInfo()
         if support.backend == .linuxLandlock || support.backend == .linuxBubblewrap {
-            // Soft acknowledge: process remains unrestricted until re-exec /
-            // landlock ruleset wiring. Prefer fail closed for restricted modes.
             if resolved.restrictNetwork || !resolved.deny.isEmpty {
                 throw SandboxError.enforcementFailed(
                     "Linux in-process enforcement incomplete for restrict_network/deny; re-exec under bwrap required"
@@ -288,6 +280,18 @@ public protocol SandboxEnforcer: Sendable {
     func apply(_ profile: SandboxProfile) async throws
     /// Returns `true` if `mode` cannot weaken on resume given `persisted`.
     func canResume(persisted: SandboxMode, candidate: SandboxMode) -> Bool
+    /// Validate resume capability, throwing `SandboxError.modePinningViolation` on downgrade.
+    func validateResume(persisted: SandboxMode, candidate: SandboxMode) throws
+}
+
+public extension SandboxEnforcer {
+    func validateResume(persisted: SandboxMode, candidate: SandboxMode) throws {
+        guard canResume(persisted: persisted, candidate: candidate) else {
+            throw SandboxError.modePinningViolation(
+                "resumed sandbox mode '\(candidate)' weakens persisted mode '\(persisted)'"
+            )
+        }
+    }
 }
 
 /// Real platform enforcer replacing the bootstrap scaffold.
@@ -395,3 +399,4 @@ public struct BootstrapSandboxEnforcer: SandboxEnforcer {
         candidate.rank >= persisted.rank
     }
 }
+

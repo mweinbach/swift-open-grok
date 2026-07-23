@@ -35,9 +35,13 @@ enum AuthJSON {
         let d = JSONDecoder()
         d.dateDecodingStrategy = .custom { decoder in
             let c = try decoder.singleValueContainer()
-            let s = try c.decode(String.self)
-            if let date = AuthJSON.fractional.date(from: s) ?? AuthJSON.plain.date(from: s) {
-                return date
+            if let s = try? c.decode(String.self) {
+                if let date = AuthJSON.fractional.date(from: s) ?? AuthJSON.plain.date(from: s) {
+                    return date
+                }
+            }
+            if let num = try? c.decode(Double.self) {
+                return Date(timeIntervalSince1970: num)
             }
             throw DecodingError.dataCorruptedError(in: c, debugDescription: "invalid date")
         }

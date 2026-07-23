@@ -424,3 +424,126 @@ private func applyGlobalScalarDefaults(
         resolved[key] = entry
     }
 }
+
+// MARK: - Trusted endpoint & Auxiliary model policy
+
+/// Single source of truth for whether an endpoint URL is trusted to receive built-in session bearer material.
+public func trustedBuiltInSessionEndpoint(provider: ModelProvider, baseURL: String) -> Bool {
+    switch provider.profile.sessionAuth {
+    case .apiKeyOnly:
+        if provider == .kimi {
+            return KimiModels.isTrustedAPIBaseURL(baseURL)
+        }
+        if provider == .fireworks {
+            return FireworksModels.isTrustedAPIBaseURL(baseURL)
+        }
+        return false
+    case .xaiSession:
+        return isXaiApiBearerURL(baseURL)
+    case .codexOAuth:
+        return CodexModels.isTrustedInferenceBaseURL(baseURL)
+    }
+}
+
+/// Standalone sampling configuration resolved for an auxiliary model (web search, image description, session summary).
+public struct AuxiliaryModelSamplingConfig: Sendable, Equatable {
+    public var modelID: String
+    public var routingModel: String
+    public var baseURL: String
+    public var apiKey: String?
+    public var provider: ModelProvider
+    public var apiBackend: ApiBackend
+    public var toolMode: ToolMode?
+
+    public init(
+        modelID: String,
+        routingModel: String,
+        baseURL: String,
+        apiKey: String?,
+        provider: ModelProvider,
+        apiBackend: ApiBackend,
+        toolMode: ToolMode? = nil
+    ) {
+        self.modelID = modelID
+        self.routingModel = routingModel
+        self.baseURL = baseURL
+        self.apiKey = apiKey
+        self.provider = provider
+        self.apiBackend = apiBackend
+        self.toolMode = toolMode
+    }
+}
+
+/// Resolve a standalone sampling configuration for an auxiliary model slug (image description,
+/// session summary, web search), resolved through the catalog so a `[model.*]` override
+/// redirects it to its own endpoint, credentials, and routing model.
+///
+/// Enforces provider isolation: session bearer tokens are sent only to trusted first-party endpoints.
+/// Custom/third-party auxiliary endpoints require endpoint-owned credentials (`apiKey` or `envKey`).
+public func resolveAuxiliaryModelSamplingConfig(
+    modelID: String,
+    catalog: OrderedModelMap,
+    endpoints: EndpointsConfig = .default,
+    sessionKey: String? = nil,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> AuxiliaryModelSamplingConfig? {
+    let catalogEntry = findModelByID(catalog, modelID: modelID)
+    if let entry = catalogEntry {
+        let isTrusted = trustedBuiltInSessionEndpoint(
+            provider: entry.info.provider,
+            baseURL: entry.info.baseURL
+        )
+        let hasOwn = entry.hasOwnCredentials(environment: environment)
+
+        if !isTrusted && !hasOwn {
+            return nil
+        }
+
+        let resolvedKey: String?
+        if hasOwn {
+            resolvedKey = entry.ownCredential(environment: environment)
+        } else if isTrusted && entry.info.provider == .xai {
+            resolvedKey = sessionKey
+                ?? environment["XAI_API_KEY"]
+                ?? endpoints.deploymentKey
+        } else if isTrusted && entry.info.provider == .codex {
+            resolvedKey = sessionKey
+        } else {
+            resolvedKey = nil
+        }
+
+        guard let apiKey = resolvedKey, !apiKey.isEmpty else {
+            return nil
+        }
+
+        return AuxiliaryModelSamplingConfig(
+            modelID: modelID,
+            routingModel: entry.info.model,
+            baseURL: entry.info.baseURL,
+            apiKey: apiKey,
+            provider: entry.info.provider,
+            apiBackend: entry.info.apiBackend,
+            toolMode: entry.info.toolMode
+        )
+    }
+
+    let defaultBase = endpoints.resolveInferenceBaseURL()
+    if isXaiApiBearerURL(defaultBase) {
+        if let bearer = sessionKey
+            ?? environment["XAI_API_KEY"]
+            ?? endpoints.deploymentKey,
+           !bearer.isEmpty {
+            return AuxiliaryModelSamplingConfig(
+                modelID: modelID,
+                routingModel: modelID,
+                baseURL: defaultBase,
+                apiKey: bearer,
+                provider: .xai,
+                apiBackend: .responses
+            )
+        }
+    }
+
+    return nil
+}
+

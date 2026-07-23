@@ -115,29 +115,22 @@ public func streamMessages(
                         }
                     case .text(let text, _):
                         blocks[index] = MessagesBlockState(kind: .text, textAcc: text)
-                    case .toolUse(let id, let name, let input):
+                    case .toolUse(let id, let name, _):
                         let toolIndex = nextToolIndex
                         nextToolIndex += 1
                         blockToToolIndex[index] = toolIndex
-                        let args: String
-                        if let data = try? WireJSONEncoder.make().encode(input),
-                           let s = String(data: data, encoding: .utf8) {
-                            args = s
-                        } else {
-                            args = "{}"
-                        }
                         blocks[index] = MessagesBlockState(
                             kind: .toolUse,
                             toolName: name,
                             toolId: id,
-                            argsAcc: args
+                            argsAcc: ""
                         )
                         continuation.yield(.toolCallDelta(
                             requestId: requestId,
                             toolIndex: toolIndex,
                             id: id,
                             name: name,
-                            argumentsDelta: args
+                            argumentsDelta: nil
                         ))
                     case .image, .toolResult:
                         break
@@ -267,6 +260,15 @@ public func streamMessages(
                     continuation.finish()
                     return
                 }
+            }
+
+            if finalStopReason == .length {
+                continuation.yield(.failed(
+                    requestId: requestId,
+                    error: SamplingErrorInfo(from: .maxTokensTruncation)
+                ))
+                continuation.finish()
+                return
             }
 
             if !assistantToolCalls.isEmpty {

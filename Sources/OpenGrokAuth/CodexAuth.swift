@@ -182,6 +182,187 @@ public struct CodexResolvedBearer: Sendable, Equatable {
     }
 }
 
+// MARK: - Usage / Quota Models
+
+public struct CodexRateLimitWindow: Codable, Sendable, Equatable {
+    public var usedPercent: Double
+    public var limitWindowSeconds: Int64
+    public var resetAfterSeconds: Int64
+    public var resetAt: Int64
+
+    public init(usedPercent: Double, limitWindowSeconds: Int64, resetAfterSeconds: Int64, resetAt: Int64) {
+        self.usedPercent = usedPercent
+        self.limitWindowSeconds = limitWindowSeconds
+        self.resetAfterSeconds = resetAfterSeconds
+        self.resetAt = resetAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case usedPercent = "used_percent"
+        case limitWindowSeconds = "limit_window_seconds"
+        case resetAfterSeconds = "reset_after_seconds"
+        case resetAt = "reset_at"
+    }
+}
+
+public struct CodexRateLimit: Codable, Sendable, Equatable {
+    public var allowed: Bool
+    public var limitReached: Bool
+    public var primaryWindow: CodexRateLimitWindow?
+    public var secondaryWindow: CodexRateLimitWindow?
+
+    public init(
+        allowed: Bool = false,
+        limitReached: Bool = false,
+        primaryWindow: CodexRateLimitWindow? = nil,
+        secondaryWindow: CodexRateLimitWindow? = nil
+    ) {
+        self.allowed = allowed
+        self.limitReached = limitReached
+        self.primaryWindow = primaryWindow
+        self.secondaryWindow = secondaryWindow
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case allowed
+        case limitReached = "limit_reached"
+        case primaryWindow = "primary_window"
+        case secondaryWindow = "secondary_window"
+    }
+}
+
+public struct CodexCredits: Codable, Sendable, Equatable {
+    public var hasCredits: Bool
+    public var unlimited: Bool
+    public var balance: String?
+
+    public init(hasCredits: Bool = false, unlimited: Bool = false, balance: String? = nil) {
+        self.hasCredits = hasCredits
+        self.unlimited = unlimited
+        self.balance = balance
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case hasCredits = "has_credits"
+        case unlimited
+        case balance
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.hasCredits = try container.decodeIfPresent(Bool.self, forKey: .hasCredits) ?? false
+        self.unlimited = try container.decodeIfPresent(Bool.self, forKey: .unlimited) ?? false
+        if let str = try? container.decodeIfPresent(String.self, forKey: .balance) {
+            self.balance = str
+        } else if let num = try? container.decodeIfPresent(Double.self, forKey: .balance) {
+            self.balance = String(num)
+        } else {
+            self.balance = nil
+        }
+    }
+}
+
+public struct CodexAdditionalRateLimit: Codable, Sendable, Equatable {
+    public var limitName: String?
+    public var meteredFeature: String?
+    public var rateLimit: CodexRateLimit?
+
+    public init(limitName: String? = nil, meteredFeature: String? = nil, rateLimit: CodexRateLimit? = nil) {
+        self.limitName = limitName
+        self.meteredFeature = meteredFeature
+        self.rateLimit = rateLimit
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case limitName = "limit_name"
+        case meteredFeature = "metered_feature"
+        case rateLimit = "rate_limit"
+    }
+}
+
+public struct CodexUsageSnapshot: Codable, Sendable, Equatable {
+    public var planType: String?
+    public var rateLimit: CodexRateLimit?
+    public var credits: CodexCredits?
+    public var additionalRateLimits: [CodexAdditionalRateLimit]
+
+    public init(
+        planType: String? = nil,
+        rateLimit: CodexRateLimit? = nil,
+        credits: CodexCredits? = nil,
+        additionalRateLimits: [CodexAdditionalRateLimit] = []
+    ) {
+        self.planType = planType
+        self.rateLimit = rateLimit
+        self.credits = credits
+        self.additionalRateLimits = additionalRateLimits
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case planType = "plan_type"
+        case rateLimit = "rate_limit"
+        case credits
+        case additionalRateLimits = "additional_rate_limits"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.planType = try container.decodeIfPresent(String.self, forKey: .planType)
+        self.rateLimit = try container.decodeIfPresent(CodexRateLimit.self, forKey: .rateLimit)
+        self.credits = try container.decodeIfPresent(CodexCredits.self, forKey: .credits)
+        self.additionalRateLimits = (try container.decodeIfPresent([CodexAdditionalRateLimit]?.self, forKey: .additionalRateLimits)) ?? []
+    }
+}
+
+public struct CodexTokenUsageDailyBucket: Codable, Sendable, Equatable {
+    public var startDate: String
+    public var tokens: Int64
+
+    public init(startDate: String, tokens: Int64) {
+        self.startDate = startDate
+        self.tokens = tokens
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case startDate = "start_date"
+        case tokens
+    }
+}
+
+public struct CodexTokenUsageStats: Codable, Sendable, Equatable {
+    public var lifetimeTokens: Int64?
+    public var peakDailyTokens: Int64?
+    public var longestRunningTurnSec: Int64?
+    public var currentStreakDays: Int64?
+    public var longestStreakDays: Int64?
+    public var dailyUsageBuckets: [CodexTokenUsageDailyBucket]?
+
+    public init(
+        lifetimeTokens: Int64? = nil,
+        peakDailyTokens: Int64? = nil,
+        longestRunningTurnSec: Int64? = nil,
+        currentStreakDays: Int64? = nil,
+        longestStreakDays: Int64? = nil,
+        dailyUsageBuckets: [CodexTokenUsageDailyBucket]? = nil
+    ) {
+        self.lifetimeTokens = lifetimeTokens
+        self.peakDailyTokens = peakDailyTokens
+        self.longestRunningTurnSec = longestRunningTurnSec
+        self.currentStreakDays = currentStreakDays
+        self.longestStreakDays = longestStreakDays
+        self.dailyUsageBuckets = dailyUsageBuckets
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case lifetimeTokens = "lifetime_tokens"
+        case peakDailyTokens = "peak_daily_tokens"
+        case longestRunningTurnSec = "longest_running_turn_sec"
+        case currentStreakDays = "current_streak_days"
+        case longestStreakDays = "longest_streak_days"
+        case dailyUsageBuckets = "daily_usage_buckets"
+    }
+}
+
 // MARK: - Endpoints
 
 public struct CodexEndpoints: Sendable, Equatable {

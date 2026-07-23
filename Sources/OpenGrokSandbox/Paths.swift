@@ -97,3 +97,52 @@ public func pathIsUnderRoot(candidate: String, root: String) -> Bool {
     let prefix = base.hasSuffix("/") ? base : base + "/"
     return cand.hasPrefix(prefix)
 }
+
+/// Toggle the macOS `/private` firmlink prefix for `/tmp`, `/var`, `/etc`
+/// (e.g. `/private/tmp/x` <-> `/tmp/x`). Returns `nil` for unaffected paths.
+public func togglePrivatePrefix(_ path: String) -> String? {
+    for dir in ["tmp", "var", "etc"] {
+        let privatePrefix = "/private/\(dir)"
+        if path == privatePrefix || path.hasPrefix("\(privatePrefix)/") {
+            let rest = String(path.dropFirst(privatePrefix.count))
+            return "/\(dir)\(rest)"
+        }
+        let publicPrefix = "/\(dir)"
+        if path == publicPrefix || path.hasPrefix("\(publicPrefix)/") {
+            let rest = String(path.dropFirst(publicPrefix.count))
+            return "/private/\(dir)\(rest)"
+        }
+    }
+    return nil
+}
+
+/// All literal paths a deny rule must cover on macOS: the as-given path, its
+/// canonical form, and the `/private` firmlink alias of each (e.g. `/tmp/x` <->
+/// `/private/tmp/x`) so a deny cannot be bypassed via an alias.
+public func macosDenyAliases(_ path: URL) -> [URL] {
+    var urls: [URL] = [path]
+    let canonical = path.resolvingSymlinksInPath()
+    if canonical.path != path.path {
+        urls.append(canonical)
+    }
+    let snapshot = urls
+    for url in snapshot {
+        if let aliasStr = togglePrivatePrefix(url.path) {
+            let aliasURL = URL(fileURLWithPath: aliasStr)
+            if !urls.contains(where: { $0.path == aliasURL.path }) {
+                urls.append(aliasURL)
+            }
+        }
+    }
+    return urls
+}
+
+/// Whether a deny path should be treated as a directory.
+public func denyPathIsDir(_ url: URL) -> Bool {
+    var isDir: ObjCBool = false
+    if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) {
+        return isDir.boolValue
+    }
+    return url.path.hasSuffix("/")
+}
+

@@ -360,3 +360,161 @@ public func isDevboxBased(profile: ProfileName, config: SandboxConfig) -> Bool {
     default: return false
     }
 }
+
+// MARK: - Glob validation & translation
+
+/// Whether a raw deny entry is a glob pattern rather than an exact path.
+public func isGlobPattern(_ entry: String) -> Bool {
+    entry.contains("*") || entry.contains("?") || entry.contains("[")
+}
+
+/// Split raw deny entries into exact paths and glob patterns.
+public func partitionDenyEntries(_ deny: [String]) -> (exact: [String], globs: [String]) {
+    var exact: [String] = []
+    var globs: [String] = []
+    for entry in deny {
+        if isGlobPattern(entry) {
+            globs.append(entry)
+        } else {
+            exact.append(entry)
+        }
+    }
+    return (exact, globs)
+}
+
+/// Validate a deny glob on BOTH platforms so a pattern is interpreted identically or rejected.
+public func validateDenyGlob(_ glob: String) throws {
+    if let c = glob.first(where: { $0 == "{" || $0 == "}" || $0 == "\\" }) {
+        throw SandboxError.profileInvalid(
+            "deny glob '\(glob)' uses unsupported metacharacter '\(c)' (brace alternation and backslash-escapes are not supported; use separate deny entries)"
+        )
+    }
+    for comp in glob.split(separator: "/", omittingEmptySubsequences: false) {
+        if comp.contains("**") && comp != "**" {
+            throw SandboxError.profileInvalid(
+                "deny glob '\(glob)': '**' must be its own path component (got segment '\(comp)')"
+            )
+        }
+    }
+    let chars = Array(glob)
+    var i = 0
+    while i < chars.count {
+        if chars[i] != "[" {
+            i += 1
+            continue
+        }
+        var j = i + 1
+        if j < chars.count && (chars[j] == "!" || chars[j] == "^") {
+            j += 1
+        }
+        if j < chars.count && chars[j] == "]" {
+            throw SandboxError.profileInvalid("deny glob '\(glob)': a literal ']' as first class member is unsupported")
+        }
+        var closed = false
+        while j < chars.count {
+            if chars[j] == "]" {
+                closed = true
+                break
+            }
+            if chars[j] == "[" {
+                throw SandboxError.profileInvalid("deny glob '\(glob)': nested '[' / POSIX '[[:...:]]' classes are unsupported")
+            }
+            j += 1
+        }
+        if !closed {
+            throw SandboxError.profileInvalid("deny glob '\(glob)': unterminated character class")
+        }
+        i = j + 1
+    }
+}
+
+/// Split a glob into its literal root directory and glob tail.
+public func splitGlobRoot(workspace: URL, glob: String) -> (root: URL, tail: String) {
+    if !glob.hasPrefix("/") {
+        return (workspace, glob)
+    }
+    let abs = String(glob.dropFirst())
+    var root = URL(fileURLWithPath: "/")
+    var tailComps: [String] = []
+    var inTail = false
+    for comp in abs.split(separator: "/", omittingEmptySubsequences: false) {
+        let compStr = String(comp)
+        if inTail {
+            tailComps.append(compStr)
+        } else if isGlobPattern(compStr) {
+            inTail = true
+            tailComps.append(compStr)
+        } else if !compStr.isEmpty {
+            root.appendPathComponent(compStr)
+        }
+    }
+    return (root, tailComps.joined(separator: "/"))
+}
+
+/// Translate a glob tail into a Seatbelt regex pattern body.
+public func globTailToRegex(_ tail: String) -> String {
+    var out = ""
+    let chars = Array(tail)
+    var i = 0
+    while i < chars.count {
+        let c = chars[i]
+        if c == "*" {
+            if i + 1 < chars.count && chars[i + 1] == "*" {
+                if i + 2 < chars.count && chars[i + 2] == "/" {
+                    out += "(.*/)?"; i += 3; continue
+                } else {
+                    out += ".*"; i += 2; continue
+                }
+            } else {
+                out += "[^/]*"; i += 1; continue
+            }
+        } else if c == "?" {
+            out += "[^/]"; i += 1; continue
+        } else if c == "[" {
+            out.append("[")
+            i += 1
+            if i < chars.count && (chars[i] == "!" || chars[i] == "^") {
+                out.append("^")
+                i += 1
+            }
+            while i < chars.count && chars[i] != "]" {
+                let cc = chars[i]
+                if "\\.[]{}()+-^$|".contains(cc) {
+                    out.append("\\")
+                }
+                out.append(cc)
+                i += 1
+            }
+            if i < chars.count && chars[i] == "]" {
+                out.append("]")
+                i += 1
+            }
+            continue
+        } else {
+            if "\\.[]{}()+-^$|".contains(c) {
+                out.append("\\")
+            }
+            out.append(c)
+            i += 1
+        }
+    }
+    return out
+}
+
+/// Generate Seatbelt regexes for all alias forms of root.
+public func globToSeatbeltRegexes(workspace: URL, glob: String) throws -> [String] {
+    try validateDenyGlob(glob)
+    let (root, tail) = splitGlobRoot(workspace: workspace, glob: glob)
+    let tailRegex = globTailToRegex(tail)
+    let aliases = macosDenyAliases(root)
+    var regexes: [String] = []
+    for alias in aliases {
+        let escapedRoot = alias.path
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let sep = escapedRoot.hasSuffix("/") ? "" : "/"
+        regexes.append("^\(escapedRoot)\(sep)\(tailRegex)$")
+    }
+    return regexes
+}
+

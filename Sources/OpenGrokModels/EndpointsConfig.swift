@@ -59,9 +59,29 @@ public struct EndpointsConfig: Sendable, Equatable {
     }
 }
 
+/// True when `url` is a trusted first-party xAI endpoint that can safely receive
+/// an xAI session bearer token or XAI_API_KEY. Requires HTTPS and non-loopback host.
+public func isXaiApiBearerURL(_ url: String) -> Bool {
+    guard let parsed = URL(string: url),
+          let scheme = parsed.scheme?.lowercased(),
+          scheme == "https",
+          let host = parsed.host?.lowercased() else {
+        return false
+    }
+    // Reject loopback hosts
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host.hasPrefix("127.") {
+        return false
+    }
+    if host == "cli-chat-proxy.grok.com" || host == "x.ai" || host.hasSuffix(".x.ai") {
+        return true
+    }
+    return false
+}
+
 private func blankAsUnset(_ opt: String?) -> String? {
     guard let s = opt?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else {
         return nil
     }
     return s
 }
+
