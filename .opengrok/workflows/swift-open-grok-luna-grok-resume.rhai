@@ -433,6 +433,8 @@ if args.resume_from_preserved_integration == true {
     direct_allowed_paths.push("Tests/OpenGrokTerminalCoreTests/");
     direct_allowed_paths.push("Sources/OpenGrokTextArea/");
     direct_allowed_paths.push("Tests/OpenGrokTextAreaTests/");
+    direct_allowed_paths.push("Sources/OpenGrokTelemetry/");
+    direct_allowed_paths.push("Tests/OpenGrokTelemetryTests/");
     let direct_integration_context = #{
         workspace: workspace,
         reference: reference,
@@ -450,6 +452,7 @@ if args.resume_from_preserved_integration == true {
     direct_integration_prompt += "First resolve the known OpenGrokTerminalCore CellStyle/CellAttributes Hashable compile blocker with the smallest semantically correct change and focused tests if needed. ";
     direct_integration_prompt += "If that fix is already committed, next resolve the OpenGrokTextArea TextAreaCore.swift invalid redeclaration between the private undo state and public undo() API. Preserve the public undo()/redo() API, use the smallest clear internal rename, update all internal references, and add or adjust focused tests only when needed. ";
     direct_integration_prompt += "If those fixes are already committed, next resolve the Swift 6 concurrency-safety diagnostics for globalSandbox, configuredProfileName, and autoAllowBash in OpenGrokSandbox/Manager.swift. Preserve the synchronous public API and NSLock-protected semantics by moving mutable process state behind a single lock-owning Sendable reference container. Do not use nonisolated(unsafe), @MainActor, or unsynchronized globals as shortcuts. Add focused concurrency/state tests if needed. ";
+    direct_integration_prompt += "If that fix is already committed, next resolve the OpenGrokTelemetry/OTLPProtobuf.swift compile errors caused by treating OpenGrokShared.JSONNumber as Double. Preserve JSONNumber's int64, uint64, and double distinctions when choosing OTLP AnyValue int_value versus double_value; do not silently overflow UInt64 into Int64 or lose integer precision. Update deterministic JSON bytes consistently and add focused protobuf tests for signed integers, unsigned integers, safe/unsafe integer ranges, and fractional doubles as needed. ";
     direct_integration_prompt += "Do not expand into future slices. Preserve unrelated commits and CompactionTranscript.swift. Do not commit, reset, rebase, push, branch, or launch subagents. ";
     direct_integration_prompt += "Never invoke SwiftPM/Xcode directly, clean caches, or create another scratch path. Use only zsh workflows/swift-safe-verify.zsh build, build-tests, test, focused filters, and build --product open-grok. ";
     direct_integration_prompt += "Run sequentially with at most three fix-and-verify iterations. Update PORT_STATUS.md truthfully with exact commands and outcomes. Return complete only when available verification passes; otherwise return partial or blocked.";
