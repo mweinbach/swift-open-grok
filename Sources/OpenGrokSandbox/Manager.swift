@@ -27,82 +27,88 @@ private final class GlobalSandboxState: @unchecked Sendable {
     }
 }
 
-private let globalLock = NSLock()
-private var globalSandbox: GlobalSandboxState?
-private var configuredProfileName: String?
-private var autoAllowBash: Bool = false
+private final class GlobalSandboxStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sandbox: GlobalSandboxState?
+    private var configuredProfileName: String?
+    private var autoAllowBash = false
+
+    func withLock<T>(_ body: (inout GlobalSandboxState?, inout String?, inout Bool) throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body(&sandbox, &configuredProfileName, &autoAllowBash)
+    }
+}
+
+private let globalSandboxStore = GlobalSandboxStore()
 
 /// Whether known Linux child launch paths should install a network filter.
 public func shouldRestrictChildNetwork() -> Bool {
-    globalLock.lock()
-    defer { globalLock.unlock() }
-    return globalSandbox?.restrictNetworkAtKnownLinuxLaunches ?? false
+    globalSandboxStore.withLock { sandbox, _, _ in
+        sandbox?.restrictNetworkAtKnownLinuxLaunches ?? false
+    }
 }
 
 /// Whether bash commands should be auto-approved when the sandbox is active.
 public func shouldAutoAllowBash() -> Bool {
-    globalLock.lock()
-    defer { globalLock.unlock() }
-    return autoAllowBash && (globalSandbox?.applied ?? false)
+    globalSandboxStore.withLock { sandbox, _, autoAllow in
+        autoAllow && (sandbox?.applied ?? false)
+    }
 }
 
 public func setAutoAllowBash(_ enabled: Bool) {
-    globalLock.lock()
-    defer { globalLock.unlock() }
-    autoAllowBash = enabled
+    globalSandboxStore.withLock { _, _, autoAllow in
+        autoAllow = enabled
+    }
 }
 
 /// Record the resolved sandbox profile at process startup (including `"off"`).
 public func setConfiguredProfile(_ name: String) {
-    globalLock.lock()
-    defer { globalLock.unlock() }
-    if configuredProfileName == nil {
-        configuredProfileName = name
+    globalSandboxStore.withLock { _, configuredProfileName, _ in
+        if configuredProfileName == nil {
+            configuredProfileName = name
+        }
     }
 }
 
 public func configuredProfile() -> String? {
-    globalLock.lock()
-    defer { globalLock.unlock() }
-    return configuredProfileName
+    globalSandboxStore.withLock { _, configuredProfileName, _ in
+        configuredProfileName
+    }
 }
 
 /// Whether the sandbox was successfully applied to this process.
 public func isSandboxActive() -> Bool {
-    globalLock.lock()
-    defer { globalLock.unlock() }
-    return globalSandbox?.applied ?? false
+    globalSandboxStore.withLock { sandbox, _, _ in
+        sandbox?.applied ?? false
+    }
 }
 
 /// The active sandbox profile name, or `nil` if not applied.
 public func activeProfileName() -> String? {
-    globalLock.lock()
-    defer { globalLock.unlock() }
-    guard let state = globalSandbox, state.applied else { return nil }
-    return state.profile
+    globalSandboxStore.withLock { sandbox, _, _ in
+        guard let state = sandbox, state.applied else { return nil }
+        return state.profile
+    }
 }
 
 /// Log a sandbox violation. No-op if sandbox is not active.
 public func logSandboxViolation(target: String, operation: String) {
-    globalLock.lock()
-    let state = globalSandbox
-    globalLock.unlock()
+    let state = globalSandboxStore.withLock { sandbox, _, _ in sandbox }
     guard let state else { return }
     state.logger.log(.fsViolation(profile: state.profile, target: target, operation: operation))
     try? state.logger.flushToDisk()
 }
 
 public func flushSandboxEvents() {
-    globalLock.lock()
-    let state = globalSandbox
-    globalLock.unlock()
+    let state = globalSandboxStore.withLock { sandbox, _, _ in sandbox }
     try? state?.logger.flushToDisk()
 }
 
 public func sandboxMetrics() -> SandboxMetrics? {
-    globalLock.lock()
-    defer { globalLock.unlock() }
-    return globalSandbox?.logger.metrics
+    globalSandboxStore.withLock { sandbox, _, _ in
+        sandbox?.logger.metrics
+    }
 }
 
 func restrictNetworkAtKnownLinuxLaunches(applied: Bool, configured: Bool) -> Bool {
@@ -200,11 +206,11 @@ public final class SandboxManager: @unchecked Sendable {
                 configured: netRestricted
             )
         )
-        globalLock.lock()
-        if globalSandbox == nil {
-            globalSandbox = state
+        globalSandboxStore.withLock { sandbox, _, _ in
+            if sandbox == nil {
+                sandbox = state
+            }
         }
-        globalLock.unlock()
     }
 }
 

@@ -1,24 +1,25 @@
 # Swift Open Grok Port Status
 
 **As of:** 2026-07-23 (Luna R12–R15 integration verification)
-**Overall state:** R12–R15 are present at commit `5d95fae5bd554e8dc9f14d25b82d20cadf228a3e`. The known `OpenGrokTerminalCore` `CellStyle`/`CellAttributes` `Hashable` blocker and the `OpenGrokTextArea` `undo()` redeclaration were fixed in the authorized paths, but the serialized integrated build remains **blocked** by Swift 6 concurrency diagnostics for mutable global sandbox state in `Sources/OpenGrokSandbox/Manager.swift:31-33` (`globalSandbox`, `configuredProfileName`, and `autoAllowBash`).
+**Overall state:** R12–R15 are present at integration head `de9f2f1bb26ff6656f976c5cd5a33810706ddf78`. The known `OpenGrokTerminalCore` `CellStyle`/`CellAttributes` `Hashable` blocker, the `OpenGrokTextArea` `undo()` redeclaration, and the Swift 6 mutable sandbox-global diagnostics were addressed in the authorized paths. The serialized integrated build remains **blocked** by an unrelated existing `Sources/OpenGrokTelemetry/OTLPProtobuf.swift` `JSONNumber` type mismatch (first reported at line 104).
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `9739c4a2ad23cfea14312a481169757f3da494f4` (`/tmp/open-grok-reference` when present).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`).
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
-## Luna integration verification snapshot (2026-07-23; iteration 3 of 3)
+## Luna integration verification snapshot (2026-07-23; sandbox-state remediation, iteration 1 of 1)
 
 | Command | Outcome |
 |---|---|
 | `zsh workflows/swift-safe-verify.zsh build` (iteration 1) | **Exit 1** — `CellStyle`/`CellAttributes` `Hashable` was already clear; compilation stopped at `Sources/OpenGrokTextArea/TextAreaCore.swift:592` because `undo()` redeclared stored property `undo`. |
 | `zsh workflows/swift-safe-verify.zsh build` (iteration 2) | **Exit 1** — after the private undo-state rename, compilation stopped at `Sources/OpenGrokTextArea/EditBuffer.swift:565` because `cursor` was redeclared in the zero-width replacement-range path. |
-| `zsh workflows/swift-safe-verify.zsh build` (iteration 3) | **Exit 1** — after the focused range-variable rename, compilation reached `OpenGrokSandbox` and stopped on Swift 6 concurrency-safety errors for mutable global state at `Sources/OpenGrokSandbox/Manager.swift:31-33`: `globalSandbox`, `configuredProfileName`, and `autoAllowBash`. |
-| `zsh workflows/swift-safe-verify.zsh build-tests` | **Not run** — prerequisite integrated `build` failed and the three-iteration budget was exhausted. |
-| `zsh workflows/swift-safe-verify.zsh test` | **Not run** — test products could not be built. |
-| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — prerequisite integrated `build` failed. |
+| `zsh workflows/swift-safe-verify.zsh build` (prior integration iteration 3) | **Exit 1** — after the focused range-variable rename, compilation reached `OpenGrokSandbox` and stopped on Swift 6 concurrency-safety errors for mutable global state at `Sources/OpenGrokSandbox/Manager.swift:31-33`: `globalSandbox`, `configuredProfileName`, and `autoAllowBash`. |
+| `zsh workflows/swift-safe-verify.zsh build` (sandbox-state remediation, iteration 1) | **Exit 1** — sandbox compiled past the prior concurrency diagnostics; compilation stopped at `Sources/OpenGrokTelemetry/OTLPProtobuf.swift:104` and related lines because `JSONNumber` is used as a `Double` without conversion. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` | **Not run** — prerequisite integrated `build` failed on unrelated `OpenGrokTelemetry/OTLPProtobuf.swift` errors. |
+| `zsh workflows/swift-safe-verify.zsh test` | **Not run** — test products could not be built because integrated `build` failed. |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — prerequisite integrated `build` failed on unrelated `OpenGrokTelemetry/OTLPProtobuf.swift` errors. |
 
-Integration is **partial**. `CompactionTranscript.swift` remains untouched. No focused tests or later verification commands were run after the final build failure.
+Integration is **partial**. `CompactionTranscript.swift` remains untouched. The sandbox concurrency diagnostics no longer occur; the approved integrated build still fails before test-product generation on the unrelated `OpenGrokTelemetry/OTLPProtobuf.swift` `JSONNumber` errors, so `build-tests`, `test`, and the product smoke were not run.
 
 
 ## Inventory counting method (reproducible)
