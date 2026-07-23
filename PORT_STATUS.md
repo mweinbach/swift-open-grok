@@ -1,11 +1,23 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-07-22 (R10 foundation remediation)
-**Overall state:** Wave 0 foundations and Wave 1–2 contract/infrastructure slices R01–R09 have substantial target-level implementations. **Integrated package build is still not verified green** under the sole safe verifier for the current working tree after R10 static foundation fixes (async OTLP export, collector-shaped gRPC TraceService path, real binary ProtocolFixtures, exact inventory counts, workflow SwiftPM ban). Executable product and full `swift test` remain blocked until the integration agent re-runs `zsh workflows/swift-safe-verify.zsh`.
+**As of:** 2026-07-23 (Luna R12–R15 integration verification)
+**Overall state:** R12–R15 are present at commit `e5b9959744dbaca2b2d83c22dfdc29cfd7fa938b`, but integrated verification is **blocked** by an unrelated pre-existing compile error outside the allowed integration paths: `Sources/OpenGrokTerminalCore/StyleAndCell.swift:66` declares `CellAttributes: Hashable` while `CellStyle` is not `Hashable`. The sole safe verifier was run for `build` and `build-tests`; both exited 1 before R12–R15 tests could execute. No source fix was made because `OpenGrokTerminalCore/` is outside the authorized paths.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `9739c4a2ad23cfea14312a481169757f3da494f4` (`/tmp/open-grok-reference` when present).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`).
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
+
+## Luna integration verification snapshot (2026-07-23)
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh build` | **Exit 1** — compile stopped at `Sources/OpenGrokTerminalCore/StyleAndCell.swift:66`: `CellAttributes` cannot synthesize `Hashable` because `CellStyle` is not `Hashable`. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` | **Exit 1** — same `OpenGrokTerminalCore/StyleAndCell.swift:66` error before test products were built. |
+| `zsh workflows/swift-safe-verify.zsh test` | **Not run** — prerequisite `build-tests` failed; no R12–R15 tests were executable. |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — prerequisite integrated build failed. |
+
+The blocker is outside the authorized R12–R15 integration paths, so this pass made no Swift source fix. `CompactionTranscript.swift` remains untouched.
+
 
 ## Inventory counting method (reproducible)
 
