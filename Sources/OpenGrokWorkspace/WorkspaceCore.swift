@@ -1,7 +1,8 @@
 // WorkspaceCore.swift
 //
 // Workspace configuration, handle, and operation boundary.
-// Partial port of `xai-grok-workspace` focused on security-critical seams.
+// Partial port of `xai-grok-workspace` focused on security-critical seams:
+// permission pipeline, path boundary, path/resource locks, remote fail-closed.
 
 import Foundation
 import OpenGrokPaths
@@ -18,6 +19,7 @@ public enum WorkspaceRuntimeError: Error, Equatable, Sendable, CustomStringConve
     case io(String)
     case remoteUnavailable(String)
     case unsupported(String)
+    case processDenied(String)
 
     public var description: String {
         switch self {
@@ -29,6 +31,7 @@ public enum WorkspaceRuntimeError: Error, Equatable, Sendable, CustomStringConve
         case .io(let d): return "io: \(d)"
         case .remoteUnavailable(let d): return "remote unavailable: \(d)"
         case .unsupported(let d): return "unsupported: \(d)"
+        case .processDenied(let d): return "process denied: \(d)"
         }
     }
 }
@@ -76,37 +79,98 @@ public enum CapabilityMode: String, Codable, Sendable, Equatable {
     case restricted
 }
 
+// MARK: - Process mediation request
+
+public struct ProcessSpawnRequest: Sendable, Equatable {
+    public var command: String
+    public var arguments: [String]
+    public var workingDirectory: String?
+    public var toolCallId: String
+
+    public init(
+        command: String,
+        arguments: [String] = [],
+        workingDirectory: String? = nil,
+        toolCallId: String
+    ) {
+        self.command = command
+        self.arguments = arguments
+        self.workingDirectory = workingDirectory
+        self.toolCallId = toolCallId
+    }
+
+    public var bashForm: String {
+        if arguments.isEmpty { return command }
+        let args = arguments.map { arg -> String in
+            if arg.contains(" ") || arg.contains("\"") {
+                return "\"\(arg.replacingOccurrences(of: "\"", with: "\\\""))\""
+            }
+            return arg
+        }
+        return ([command] + args).joined(separator: " ")
+    }
+}
+
 // MARK: - Workspace ops boundary
 
-/// Local workspace operations with permission + path boundary enforcement.
+/// Local workspace operations with permission + path boundary + resource locks.
 ///
-/// Every filesystem operation crosses the same permission and path-boundary
-/// checks. Local fallback must never bypass a denied or unavailable remote
-/// policy.
+/// Every filesystem / process operation crosses the same permission pipeline
+/// and path-boundary checks. Local fallback must never bypass a denied or
+/// unavailable remote policy. YOLO never disables `requireSandbox`.
 public actor LocalWorkspaceOps {
     public nonisolated let root: URL
     public nonisolated let boundary: PathBoundary
     public let permissions: PermissionHandle
+    public let pipeline: PermissionPipeline
+    public let locks: PathResourceLockManager
     public let config: WorkspaceConfig
     /// When set, remote policy is authoritative; local fallback must not bypass.
     public private(set) var remotePolicyAvailable: Bool
     public private(set) var remotePolicyDenied: Bool
+    public var folderTrust: FolderTrustStore
+    public func currentPlanMode() async -> PlanModeTracker {
+        await pipeline.planMode
+    }
 
-    public init(config: WorkspaceConfig, remotePolicyAvailable: Bool = false) {
+    public init(
+        config: WorkspaceConfig,
+        remotePolicyAvailable: Bool = false,
+        hooks: any PreToolUseHookRunner = FailOpenPreToolUseHookRunner(),
+        folderTrust: FolderTrustStore = FolderTrustStore()
+    ) {
         self.config = config
         self.root = config.root
         self.boundary = PathBoundary(root: config.root)
-        self.permissions = PermissionHandle(
+        let perms = PermissionHandle(
             config: config.permissionConfig,
+            yoloPinReason: config.yoloPinReason,
+            shellCwd: config.root.path
+        )
+        self.permissions = perms
+        self.pipeline = PermissionPipeline(
+            permissions: perms,
+            hooks: hooks,
+            remotePolicyDenied: false,
+            remotePolicyAvailable: remotePolicyAvailable,
+            requireSandbox: config.requireSandbox,
+            isolation: config.isolation,
             yoloPinReason: config.yoloPinReason
         )
+        self.locks = PathResourceLockManager()
         self.remotePolicyAvailable = remotePolicyAvailable
         self.remotePolicyDenied = false
+        self.folderTrust = folderTrust
     }
 
-    public func setRemotePolicy(available: Bool, denied: Bool = false) {
+    public func setRemotePolicy(available: Bool, denied: Bool = false) async {
         remotePolicyAvailable = available
         remotePolicyDenied = denied
+        await pipeline.setRemotePolicy(available: available, denied: denied)
+    }
+
+    public func setPlanMode(_ tracker: PlanModeTracker) async {
+        await pipeline.setPlanMode(tracker)
     }
 
     public nonisolated func resolvePath(_ raw: String) throws -> URL {
@@ -117,75 +181,124 @@ public actor LocalWorkspaceOps {
         }
     }
 
+    /// Full prepare path (plan gate → hooks → plan auto-approve → engine).
+    public func prepareAccess(
+        access: AccessKind,
+        toolName: String,
+        toolCallId: String,
+        applyPatchLabel: Bool = false
+    ) async -> PreparedToolAccess {
+        await pipeline.prepare(
+            PrepareToolAccessRequest(
+                access: access,
+                toolName: toolName,
+                toolCallId: toolCallId,
+                applyPatchLabel: applyPatchLabel
+            )
+        )
+    }
+
     public func requestPermission(
         access: AccessKind,
         toolName: String,
         toolCallId: String
     ) async -> PermissionDecision {
-        // Local fallback must never bypass a denied or unavailable remote policy.
-        if remotePolicyDenied {
-            return .policyDeny("remote policy denied this operation")
-        }
-        if config.requireSandbox && remotePolicyAvailable == false
-            && config.isolation == .sandbox
-        {
-            // Remote sandbox policy missing — fail closed rather than open local.
-            return .policyDeny("sandbox policy unavailable; refusing local fallback")
-        }
-        return await permissions.request(
+        let prepared = await prepareAccess(
             access: access,
             toolName: toolName,
             toolCallId: toolCallId
         )
+        return prepared.decision
     }
 
     public func readFile(path: String, toolCallId: String) async throws -> Data {
         let url = try resolvePath(path)
-        let decision = await requestPermission(
+        let prepared = await prepareAccess(
             access: .read(url.path),
             toolName: "read_file",
             toolCallId: toolCallId
         )
-        try ensureAllowed(decision)
+        try ensureAllowed(prepared.decision)
+        let token = await locks.acquirePath(url.path)
         do {
-            return try Data(contentsOf: url)
+            let data = try Data(contentsOf: url)
+            await token.release()
+            return data
         } catch {
+            await token.release()
             throw WorkspaceRuntimeError.io("\(error)")
         }
     }
 
     public func writeFile(path: String, data: Data, toolCallId: String) async throws {
         let url = try resolvePath(path)
-        let decision = await requestPermission(
+        let prepared = await prepareAccess(
             access: .edit(url.path),
             toolName: "write",
             toolCallId: toolCallId
         )
-        try ensureAllowed(decision)
+        try ensureAllowed(prepared.decision)
+        // Path lock for mutations (serialize concurrent edits on same path).
+        let token = await locks.acquirePath(url.path)
         do {
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
             try data.write(to: url, options: .atomic)
+            await token.release()
         } catch {
+            await token.release()
             throw WorkspaceRuntimeError.io("\(error)")
         }
     }
 
     public func listDirectory(path: String, toolCallId: String) async throws -> [String] {
         let url = try resolvePath(path)
-        let decision = await requestPermission(
+        let prepared = await prepareAccess(
             access: .read(url.path),
             toolName: "list_dir",
             toolCallId: toolCallId
         )
-        try ensureAllowed(decision)
+        try ensureAllowed(prepared.decision)
+        let token = await locks.acquirePath(url.path)
         do {
-            return try FileManager.default.contentsOfDirectory(atPath: url.path)
+            let entries = try FileManager.default.contentsOfDirectory(atPath: url.path)
+            await token.release()
+            return entries
         } catch {
+            await token.release()
             throw WorkspaceRuntimeError.io("\(error)")
         }
+    }
+
+    /// Mediated process spawn: permission + resource lock; never local fallback
+    /// when remote policy is denied or sandbox policy is unavailable.
+    public func authorizeProcess(_ request: ProcessSpawnRequest) async throws {
+        if remotePolicyDenied {
+            throw WorkspaceRuntimeError.processDenied("remote policy denied this operation")
+        }
+        if config.requireSandbox && !remotePolicyAvailable && config.isolation == .sandbox {
+            throw WorkspaceRuntimeError.sandboxRequired(
+                "sandbox policy unavailable; refusing local process fallback"
+            )
+        }
+        // YOLO pin never clears requireSandbox (checked above).
+        let prepared = await prepareAccess(
+            access: .bash(request.bashForm),
+            toolName: "bash",
+            toolCallId: request.toolCallId
+        )
+        try ensureAllowed(prepared.decision)
+        // Hold process resource lock for the duration of authorization handoff.
+        let token = await locks.acquireProcess(request.toolCallId)
+        await token.release()
+    }
+
+    /// Whether project-scoped MCP/hooks are allowed for this workspace root.
+    /// Folder trust does **not** inherit to child workspace roots.
+    public func projectScopeAllowed() -> Bool {
+        projectScopeAllowed(workspaceRoot: root, trustStore: folderTrust)
     }
 
     private func ensureAllowed(_ decision: PermissionDecision) throws {

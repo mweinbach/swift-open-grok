@@ -53,9 +53,15 @@ public actor PermissionHandle {
     public private(set) var bashPrefixGrants: [String]
     public private(set) var bashDisallows: [String]
     public private(set) var allowAll: Bool
+    public private(set) var allowEditsForSession: Bool
+    public private(set) var editPolicy: EditPolicy
+    /// Workspace cwd used for shell file-access path resolution.
+    public var shellCwd: String
     public var prompter: any PermissionPrompter
     public var classifier: (any PermissionClassifier)?
     public private(set) var events: [PermissionEvent]
+    /// Last matched rule source for auditing (deny/ask/allow).
+    public private(set) var lastMatchedRuleSource: PermissionRuleSource?
 
     public init(
         config: PermissionConfig = PermissionConfig(),
@@ -63,12 +69,12 @@ public actor PermissionHandle {
         autoMode: Bool = false,
         yoloPinReason: String? = nil,
         allowAll: Bool = false,
+        shellCwd: String = FileManager.default.currentDirectoryPath,
         prompter: any PermissionPrompter = HeadlessPermissionPrompter()
     ) {
         var cfg = config
-        if let pin = yoloPinReason {
+        if yoloPinReason != nil {
             cfg.rules = clampRulesForYoloPin(cfg.rules)
-            _ = pin
         }
         self.config = cfg
         self.policy = CompiledPolicy(config: cfg)
@@ -79,12 +85,17 @@ public actor PermissionHandle {
         self.bashPrefixGrants = []
         self.bashDisallows = []
         self.allowAll = allowAll
+        self.allowEditsForSession = false
+        self.editPolicy = .ask
+        self.shellCwd = shellCwd
         self.prompter = prompter
         self.classifier = nil
         self.events = []
+        self.lastMatchedRuleSource = nil
     }
 
     public func setYoloMode(_ enabled: Bool) {
+        // Authoritative re-clamp under pin — no optimistic true window.
         if yoloPinReason != nil {
             yoloMode = false
             return
@@ -96,6 +107,14 @@ public actor PermissionHandle {
     public func setAutoMode(_ enabled: Bool) {
         autoMode = enabled
         if enabled { yoloMode = false }
+    }
+
+    public func setAllowEditsForSession(_ enabled: Bool) {
+        allowEditsForSession = enabled
+    }
+
+    public func setEditPolicy(_ policy: EditPolicy) {
+        editPolicy = policy
     }
 
     public func replaceConfig(_ config: PermissionConfig) {
@@ -112,6 +131,9 @@ public actor PermissionHandle {
         if case .bash(let cmd) = grant.access, grant.scope != .once {
             bashPrefixGrants.append(grant.pattern ?? cmd)
         }
+        if case .edit = grant.access, grant.scope == .session {
+            allowEditsForSession = true
+        }
     }
 
     public func disallowBashPrefix(_ prefix: String) {
@@ -121,6 +143,7 @@ public actor PermissionHandle {
     public func resetState() {
         sessionGrants.removeAll()
         bashPrefixGrants.removeAll()
+        allowEditsForSession = false
         // keep disallows / pin / config
     }
 
@@ -130,6 +153,7 @@ public actor PermissionHandle {
         toolName: String,
         toolCallId: String
     ) async -> PermissionDecision {
+        lastMatchedRuleSource = nil
         if allowAll {
             record(
                 access: access,
@@ -143,10 +167,15 @@ public actor PermissionHandle {
             return .allow
         }
 
-        // 1. Compiled policy direct evaluate.
-        if let decision = policy.evaluate(access) {
-            switch decision {
-            case .policyDeny(let reason):
+        var policyForcedPrompt = false
+        var shellFileForcedPrompt = false
+
+        // 1. Compiled policy direct evaluate (deny > ask > allow).
+        if let matched = policy.evaluateWithSource(access) {
+            lastMatchedRuleSource = matched.ruleSource
+            switch matched.decision {
+            case .policyDeny(let reason), .reject(let reason):
+                let decision = PermissionDecision.policyDeny(reason)
                 record(
                     access: access, toolName: toolName, toolCallId: toolCallId,
                     decision: decision, autoApproved: false, userPrompted: false,
@@ -154,29 +183,26 @@ public actor PermissionHandle {
                 )
                 return decision
             case .ask:
-                // Force prompt path (blocks YOLO).
-                return await promptPath(
-                    access: access, toolName: toolName, toolCallId: toolCallId,
-                    reason: "policy_ask"
-                )
+                policyForcedPrompt = true
             case .allow:
+                // Policy allow on the whole access short-circuits (YOLO not needed).
                 record(
                     access: access, toolName: toolName, toolCallId: toolCallId,
                     decision: .allow, autoApproved: true, userPrompted: false,
                     reason: "policy_allow"
                 )
                 return .allow
-            default:
+            case .followupMessage, .cancelled:
                 record(
                     access: access, toolName: toolName, toolCallId: toolCallId,
-                    decision: decision, autoApproved: false, userPrompted: false,
+                    decision: matched.decision, autoApproved: false, userPrompted: false,
                     reason: "policy"
                 )
-                return decision
+                return matched.decision
             }
         }
 
-        // 2. Bash segment policy (escalation only).
+        // 2. Bash segment policy + shell file-access escalation (never Allow).
         if case .bash(let cmd) = access {
             if let bashDecision = policy.evaluateBashCommandPolicy(cmd) {
                 switch bashDecision {
@@ -188,18 +214,38 @@ public actor PermissionHandle {
                     )
                     return bashDecision
                 case .ask:
-                    return await promptPath(
+                    policyForcedPrompt = true
+                default:
+                    break
+                }
+            }
+            if let shellDecision = policy.evaluateShellFileAccess(cmd, cwd: shellCwd) {
+                switch shellDecision {
+                case .policyDeny, .reject:
+                    record(
                         access: access, toolName: toolName, toolCallId: toolCallId,
-                        reason: "bash_ask"
+                        decision: shellDecision, autoApproved: false, userPrompted: false,
+                        reason: "shell_file_access"
                     )
+                    return shellDecision
+                case .ask:
+                    shellFileForcedPrompt = true
+                    policyForcedPrompt = true
                 default:
                     break
                 }
             }
         }
 
-        // 3. YOLO / always-approve (unless shell-forced ask already returned).
-        if yoloMode && yoloPinReason == nil {
+        // Protected edit paths always force prompt (not YOLO-bypassable for safety lists
+        // but YOLO still allows — Rust YOLO short-circuits after policy/shell ask).
+        var protectedEdit = false
+        if case .edit(let path) = access {
+            protectedEdit = protectedEditPath(path)
+        }
+
+        // 3. YOLO / always-approve (blocked by policy/shell Ask; pin keeps false).
+        if yoloMode && yoloPinReason == nil && !policyForcedPrompt {
             record(
                 access: access, toolName: toolName, toolCallId: toolCallId,
                 decision: .allow, autoApproved: true, userPrompted: false,
@@ -208,18 +254,81 @@ public actor PermissionHandle {
             return .allow
         }
 
-        // 4. Session grants.
-        if matchesSessionGrant(access) {
-            record(
-                access: access, toolName: toolName, toolCallId: toolCallId,
-                decision: .allow, autoApproved: true, userPrompted: false,
-                reason: "session_grant"
-            )
-            return .allow
+        // 4. Session grants (before auto classifier). Shell-file forced asks
+        // still prompt; protected edits still prompt.
+        if matchesSessionGrant(access), !shellFileForcedPrompt {
+            let blockProtected: Bool
+            if case .edit = access, protectedEdit {
+                blockProtected = true
+            } else {
+                blockProtected = false
+            }
+            if !blockProtected {
+                record(
+                    access: access, toolName: toolName, toolCallId: toolCallId,
+                    decision: .allow, autoApproved: true, userPrompted: false,
+                    reason: "session_grant"
+                )
+                return .allow
+            }
         }
 
-        // 5. Bash safe/dangerous/grants classification.
-        if case .bash(let cmd) = access {
+        // 5. Built-in auto-allows / bash safe classification.
+        if !policyForcedPrompt {
+            switch access {
+            case .read, .grep, .webSearch:
+                record(
+                    access: access, toolName: toolName, toolCallId: toolCallId,
+                    decision: .allow, autoApproved: true, userPrompted: false,
+                    reason: "safe_command"
+                )
+                return .allow
+            case .edit:
+                if allowEditsForSession && !protectedEdit {
+                    record(
+                        access: access, toolName: toolName, toolCallId: toolCallId,
+                        decision: .allow, autoApproved: true, userPrompted: false,
+                        reason: "persisted_grant"
+                    )
+                    return .allow
+                }
+                if editPolicy == .reject {
+                    let d = PermissionDecision.reject("edits prohibited")
+                    record(
+                        access: access, toolName: toolName, toolCallId: toolCallId,
+                        decision: d, autoApproved: false, userPrompted: false,
+                        reason: "session_deny"
+                    )
+                    return d
+                }
+            case .bash(let cmd):
+                let seg = evaluateBashSegments(
+                    cmd,
+                    grants: bashPrefixGrants,
+                    disallows: bashDisallows
+                )
+                if let reason = seg.reason, reason == "disallow" {
+                    let d = PermissionDecision.reject("bash prefix disallowed")
+                    record(
+                        access: access, toolName: toolName, toolCallId: toolCallId,
+                        decision: d, autoApproved: false, userPrompted: false,
+                        reason: "session_deny"
+                    )
+                    return d
+                }
+                if seg.autoAllow && !seg.needsPrompt {
+                    record(
+                        access: access, toolName: toolName, toolCallId: toolCallId,
+                        decision: .allow, autoApproved: true, userPrompted: false,
+                        reason: "safe_command"
+                    )
+                    return .allow
+                }
+            case .mcpTool, .webFetch:
+                break
+            }
+        } else if case .bash(let cmd) = access {
+            // Still honor hard disallow under ask floor.
             let seg = evaluateBashSegments(
                 cmd,
                 grants: bashPrefixGrants,
@@ -234,18 +343,10 @@ public actor PermissionHandle {
                 )
                 return d
             }
-            if seg.autoAllow {
-                record(
-                    access: access, toolName: toolName, toolCallId: toolCallId,
-                    decision: .allow, autoApproved: true, userPrompted: false,
-                    reason: "safe_command"
-                )
-                return .allow
-            }
         }
 
-        // 6. Auto mode classifier.
-        if autoMode, let classifier {
+        // 6. Auto mode classifier (not when policy forced prompt).
+        if autoMode, !policyForcedPrompt, let classifier {
             let classified = await classifier.classify(access: access, toolName: toolName)
             if case .allow = classified {
                 record(
@@ -278,12 +379,12 @@ public actor PermissionHandle {
         case .auto:
             return await promptPath(
                 access: access, toolName: toolName, toolCallId: toolCallId,
-                reason: "auto_needs_user"
+                reason: policyForcedPrompt ? "policy_ask" : "auto_needs_user"
             )
         case .ask:
             return await promptPath(
                 access: access, toolName: toolName, toolCallId: toolCallId,
-                reason: "needs_user"
+                reason: policyForcedPrompt ? "policy_ask" : "needs_user"
             )
         }
     }
@@ -375,7 +476,8 @@ public actor PermissionHandle {
             decision: decisionStr,
             rejectReason: rejectReason,
             decisionReason: reason,
-            permissionMode: yoloMode ? "always-approve" : (autoMode ? "auto" : "ask")
+            permissionMode: yoloMode ? "always-approve" : (autoMode ? "auto" : "ask"),
+            ruleSource: lastMatchedRuleSource?.rawValue
         ))
     }
 }

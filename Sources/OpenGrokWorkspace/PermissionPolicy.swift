@@ -25,43 +25,43 @@ public struct CompiledPolicy: Sendable {
 
     /// Evaluate using deny > ask > allow precedence (order-independent).
     public func evaluate(_ access: AccessKind) -> PermissionDecision? {
-        var matchedAsk = false
-        var matchedAllow = false
+        evaluateWithSource(access)?.decision
+    }
+
+    /// Evaluate and retain auditable rule source provenance.
+    public func evaluateWithSource(_ access: AccessKind) -> PolicyMatch? {
+        var matchedAsk: PermissionRule?
+        var matchedAllow: PermissionRule?
 
         for rule in config.rules {
             guard toolFilterMatches(access, rule.tool) else { continue }
             guard patternMatches(access, rule: rule) else { continue }
             switch rule.action {
             case .deny:
-                let toolLabel: String
-                switch rule.tool {
-                case .any: toolLabel = "any tool"
-                case .bash: toolLabel = "bash"
-                case .edit: toolLabel = "edit"
-                case .read: toolLabel = "read"
-                case .grep: toolLabel = "grep"
-                case .mcp: toolLabel = "mcp"
-                case .webFetch: toolLabel = "web_fetch"
-                case .webSearch: toolLabel = "web_search"
-                }
+                let toolLabel = toolFilterLabel(rule.tool)
                 let reason: String
                 if let pattern = rule.pattern {
                     reason = "Denied by permission policy: deny rule on \(toolLabel) matching \"\(pattern)\""
                 } else {
                     reason = "Denied by permission policy: deny rule on \(toolLabel)"
                 }
-                // Policy deny surfaces as PolicyDeny to callers that distinguish;
-                // the Rust evaluate returns Reject for policy deny in the low-level
-                // evaluator, and the manager maps it. We return policyDeny for clarity.
-                return .policyDeny(reason)
+                return PolicyMatch(
+                    decision: .policyDeny(reason),
+                    ruleSource: rule.source,
+                    pattern: rule.pattern
+                )
             case .ask:
-                matchedAsk = true
+                if matchedAsk == nil { matchedAsk = rule }
             case .allow:
-                matchedAllow = true
+                if matchedAllow == nil { matchedAllow = rule }
             }
         }
-        if matchedAsk { return .ask }
-        if matchedAllow { return .allow }
+        if let ask = matchedAsk {
+            return PolicyMatch(decision: .ask, ruleSource: ask.source, pattern: ask.pattern)
+        }
+        if let allow = matchedAllow {
+            return PolicyMatch(decision: .allow, ruleSource: allow.source, pattern: allow.pattern)
+        }
         return nil
     }
 
@@ -98,6 +98,19 @@ public struct CompiledPolicy: Sendable {
         case .some(.allow), .none: return nil
         case .some(let other): return other
         }
+    }
+}
+
+func toolFilterLabel(_ filter: ToolFilter) -> String {
+    switch filter {
+    case .any: return "any tool"
+    case .bash: return "bash"
+    case .edit: return "edit"
+    case .read: return "read"
+    case .grep: return "grep"
+    case .mcp: return "mcp"
+    case .webFetch: return "web_fetch"
+    case .webSearch: return "web_search"
     }
 }
 

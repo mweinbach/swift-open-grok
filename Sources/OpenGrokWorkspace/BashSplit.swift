@@ -16,37 +16,104 @@ public let setupCommands: Set<String> = [
     "cd", "export", "sleep", "true", ":", "shift", "umask", "ulimit",
 ]
 
-/// Dangerous commands that always need a prompt even with remembered grants.
-public let dangerousCommands: Set<String> = [
-    "rm", "rmdir", "dd", "mkfs", "shutdown", "reboot", "halt", "poweroff",
-    "kill", "killall", "pkill", "chmod", "chown", "chgrp", "sudo", "su",
-    "mount", "umount", "mkfs.ext4", "mkfs.xfs", "userdel", "passwd",
+/// Dangerous command **prefixes** (word-boundary matched). Always need a
+/// prompt even with remembered grants. Mirrors Rust `is_dangerous_command_words`.
+public let dangerousCommandPrefixes: [String] = [
+    "rm", "chmod", "chown", "chgrp", "chattr",
+    "pkill", "kill", "killall", "git push",
+]
+
+/// Additional high-risk commands (word-boundary) that force a prompt.
+public let extendedDangerousPrefixes: [String] = [
+    "rmdir", "dd", "mkfs", "shutdown", "reboot", "halt", "poweroff",
+    "sudo", "su", "mount", "umount", "userdel", "passwd",
     "curl", "wget", "nc", "ncat", "bash", "sh", "zsh", "python", "python3",
     "perl", "ruby", "node", "osascript",
 ]
 
-/// Built-in safe commands for auto-allow when no deny/ask matches.
+/// Built-in always-safe command prefixes (word-boundary). CWE-183: `tr`
+/// must not match `truncate`; `git` must not match `gitleaks`.
+public let alwaysSafeCommandPrefixes: [String] = [
+    "ls", "cat", "pwd", "date", "whoami", "hostname", "uptime", "ps",
+    "git status", "git branch", "git log", "git diff", "git ls-files",
+    "git show", "git rev-parse",
+    "grep", "rg",
+    "cargo check",
+    "kubectl get", "kubectl logs", "kubectl describe",
+    "head", "tail", "wc", "sort", "uniq", "tr", "cut",
+]
+
+/// Broader safe list for classification (word-boundary on first token only).
 public let safeCommands: Set<String> = [
     "ls", "pwd", "echo", "cat", "head", "tail", "wc", "true", "false",
-    "date", "whoami", "hostname", "uname", "which", "type", "git",
+    "date", "whoami", "hostname", "uname", "which", "type",
     "rg", "grep", "find", "fd", "bat", "less", "more", "file", "stat",
     "diff", "sort", "uniq", "tr", "cut", "awk", "sed", "jq",
 ]
 
+/// CWE-183 word-boundary prefix match: equal, or pattern followed by space.
+public func matchesCommandPrefix(_ cmd: String, pattern: String) -> Bool {
+    if cmd == pattern { return true }
+    if cmd.hasPrefix(pattern) {
+        let idx = cmd.index(cmd.startIndex, offsetBy: pattern.count)
+        return idx < cmd.endIndex && cmd[idx] == " "
+    }
+    return false
+}
+
+/// True when `rg` is invoked with `--pre` / `--pre=` (exec preprocessor).
+public func rgHasPreFlag(_ words: [String]) -> Bool {
+    words.contains { $0 == "--pre" || $0.hasPrefix("--pre=") }
+}
+
+public func isDangerousCommandWords(_ words: [String]) -> Bool {
+    guard !words.isEmpty else { return false }
+    let joined = words.joined(separator: " ")
+    for p in dangerousCommandPrefixes where matchesCommandPrefix(joined, pattern: p) {
+        return true
+    }
+    for p in extendedDangerousPrefixes where matchesCommandPrefix(joined, pattern: p) {
+        return true
+    }
+    return false
+}
+
+public func isAlwaysSafeCommandWords(_ words: [String]) -> Bool {
+    guard !words.isEmpty else { return false }
+    if rgHasPreFlag(words) { return false }
+    let joined = words.joined(separator: " ")
+    for p in alwaysSafeCommandPrefixes where matchesCommandPrefix(joined, pattern: p) {
+        return true
+    }
+    return false
+}
+
+/// Legacy name kept for callers.
+public let dangerousCommands: Set<String> = Set(
+    dangerousCommandPrefixes.map { $0.split(separator: " ").first.map(String.init) ?? $0 }
+        + extendedDangerousPrefixes.map { $0.split(separator: " ").first.map(String.init) ?? $0 }
+)
+
 /// Split a script on `&&`, `||`, `;`, `|`, newlines into word-only segments.
 /// Returns `nil` when high-risk constructs are detected (fail closed).
 public func allCommandsFromScript(_ script: String) -> [[String]]? {
-    // Fail closed on common high-risk constructs.
-    let hostile = ["$(", "`", "${", "<(", ">(", "\n(", " monads"]
-    // Subshells / substitutions / control flow heuristics.
+    // Fail closed on common high-risk constructs (subshells / substitutions /
+    // process substitution / control flow / bare background).
     if script.contains("$(") || script.contains("`") || script.contains("${") {
         return nil
     }
-    if script.contains(" while ") || script.contains(" for ") || script.contains(" if ") {
+    if script.contains("<(") || script.contains(">(") {
         return nil
+    }
+    // Control-flow keywords (word-ish): fail closed.
+    let lower = " \(script.lowercased()) "
+    for kw in [" while ", " for ", " if ", " until ", " case ", " select ", " function "] {
+        if lower.contains(kw) { return nil }
     }
     // Bare background `&` that is not `&&` or `2>&1`-style.
     if hasBareAmpersand(script) { return nil }
+    // Parenthesized subshells: `( cmd )` at statement level.
+    if hasBareSubshellParens(script) { return nil }
 
     var segments: [[String]] = []
     var current = ""
@@ -116,10 +183,26 @@ public func allCommandsFromScript(_ script: String) -> [[String]]? {
         }
         current.append(ch)
         i = script.index(after: i)
-        _ = hostile
     }
     flush()
     return segments
+}
+
+/// Detect `( … )` subshells outside quotes (fail closed).
+private func hasBareSubshellParens(_ script: String) -> Bool {
+    var inSingle = false
+    var inDouble = false
+    var escape = false
+    for ch in script {
+        if escape { escape = false; continue }
+        if ch == "\\" && !inSingle { escape = true; continue }
+        if ch == "'" && !inDouble { inSingle.toggle(); continue }
+        if ch == "\"" && !inSingle { inDouble.toggle(); continue }
+        if !inSingle && !inDouble && (ch == "(" || ch == ")") {
+            return true
+        }
+    }
+    return false
 }
 
 private func hasBareAmpersand(_ script: String) -> Bool {
@@ -183,8 +266,28 @@ func tokenizeWords(_ segment: String) -> [String] {
         current.append(ch)
     }
     if !current.isEmpty { words.append(current) }
-    // Drop VAR=value prefixes for primary word extraction.
-    return words
+    // Drop leading VAR=value prefixes for primary word extraction.
+    return stripLeadingEnvAssignments(words)
+}
+
+/// Whether a token looks like a shell `NAME=VALUE` assignment.
+public func isEnvAssignment(_ tok: String) -> Bool {
+    guard let eq = tok.firstIndex(of: "=") else { return false }
+    let name = tok[..<eq]
+    guard !name.isEmpty else { return false }
+    let first = name.unicodeScalars.first!
+    guard first == "_" || CharacterSet.letters.contains(first) else { return false }
+    return name.unicodeScalars.allSatisfy {
+        $0 == "_" || CharacterSet.alphanumerics.contains($0)
+    }
+}
+
+func stripLeadingEnvAssignments(_ words: [String]) -> [String] {
+    var w = words
+    while let first = w.first, isEnvAssignment(first) {
+        w.removeFirst()
+    }
+    return w
 }
 
 /// Peel peelable wrappers (`timeout`, `env`, …). Does NOT peel sudo/xargs/nohup.
@@ -279,22 +382,30 @@ public func evaluateBashSegments(
         return BashSegmentEvaluation(needsPrompt: true, autoAllow: false, reason: "unparseable")
     }
     var allSafe = true
+    var anyDangerous = false
     for words in segments {
         let unwrapped = unwrapWrappers(words)
         guard let first = unwrapped.first else { continue }
         let base = (first as NSString).lastPathComponent
         if setupCommands.contains(base) { continue }
         let joined = unwrapped.joined(separator: " ")
-        if disallows.contains(where: { joined.hasPrefix($0) }) {
+        // CWE-183: word-boundary on disallow / grant prefixes.
+        if disallows.contains(where: { matchesCommandPrefix(joined, pattern: $0) }) {
             return BashSegmentEvaluation(needsPrompt: false, autoAllow: false, reason: "disallow")
         }
-        if dangerousCommands.contains(base) {
-            return BashSegmentEvaluation(needsPrompt: true, autoAllow: false, reason: "dangerous:\(base)")
-        }
-        let granted = grants.contains(where: { joined.hasPrefix($0) })
-        if !(granted || safeCommands.contains(base)) {
+        if isDangerousCommandWords(unwrapped) {
+            anyDangerous = true
             allSafe = false
+            continue
         }
+        let granted = grants.contains(where: { matchesCommandPrefix(joined, pattern: $0) })
+        if granted || isAlwaysSafeCommandWords(unwrapped) || safeCommands.contains(base) {
+            continue
+        }
+        allSafe = false
+    }
+    if anyDangerous {
+        return BashSegmentEvaluation(needsPrompt: true, autoAllow: false, reason: "dangerous")
     }
     if allSafe {
         return BashSegmentEvaluation(needsPrompt: false, autoAllow: true, reason: "safe")

@@ -123,23 +123,36 @@ public enum FolderTrustState: String, Codable, Sendable, Equatable {
     case unknown
 }
 
+/// Exact-match trust registration for workspace roots.
+///
+/// **Does not inherit to children:** trusting `/proj` leaves `/proj/sub` as a
+/// separate untrusted workspace root for project-scope MCP/hooks. Durable
+/// cascade lookups live on `DurableTrustStore` (optional).
 public struct FolderTrustStore: Sendable {
     private var trustedRoots: Set<String>
+    private var untrustedRoots: Set<String>
 
     public init(trustedRoots: [URL] = []) {
         self.trustedRoots = Set(trustedRoots.map { normalizeLexically($0.path) })
+        self.untrustedRoots = []
     }
 
     public mutating func trust(_ root: URL) {
-        trustedRoots.insert(normalizeLexically(root.path))
+        let key = normalizeLexically(root.path)
+        if isUnsafeTrustRoot(key) { return }
+        trustedRoots.insert(key)
+        untrustedRoots.remove(key)
     }
 
     public mutating func untrust(_ root: URL) {
-        trustedRoots.remove(normalizeLexically(root.path))
+        let key = normalizeLexically(root.path)
+        trustedRoots.remove(key)
+        untrustedRoots.insert(key)
     }
 
     public func state(for root: URL) -> FolderTrustState {
         let key = normalizeLexically(root.path)
+        if untrustedRoots.contains(key) { return .untrusted }
         if trustedRoots.contains(key) { return .trusted }
         // Parent trust does not automatically trust children (fail closed).
         return .untrusted

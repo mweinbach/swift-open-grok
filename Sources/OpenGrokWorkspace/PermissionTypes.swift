@@ -185,6 +185,8 @@ public struct PermissionEvent: Codable, Sendable, Equatable {
     public var timestamp: Date
     public var decisionReason: String?
     public var permissionMode: String?
+    /// Auditable rule provenance when a policy rule matched.
+    public var ruleSource: String?
 
     public init(
         toolId: String,
@@ -199,7 +201,8 @@ public struct PermissionEvent: Codable, Sendable, Equatable {
         rejectReason: String? = nil,
         timestamp: Date = Date(),
         decisionReason: String? = nil,
-        permissionMode: String? = nil
+        permissionMode: String? = nil,
+        ruleSource: String? = nil
     ) {
         self.toolId = toolId
         self.toolName = toolName
@@ -214,6 +217,24 @@ public struct PermissionEvent: Codable, Sendable, Equatable {
         self.timestamp = timestamp
         self.decisionReason = decisionReason
         self.permissionMode = permissionMode
+        self.ruleSource = ruleSource
+    }
+}
+
+/// Policy match with auditable rule source.
+public struct PolicyMatch: Sendable, Equatable {
+    public var decision: PermissionDecision
+    public var ruleSource: PermissionRuleSource?
+    public var pattern: String?
+
+    public init(
+        decision: PermissionDecision,
+        ruleSource: PermissionRuleSource? = nil,
+        pattern: String? = nil
+    ) {
+        self.decision = decision
+        self.ruleSource = ruleSource
+        self.pattern = pattern
     }
 }
 
