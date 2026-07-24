@@ -168,29 +168,119 @@ public struct WorktreeBuilder: Sendable {
 
     // MARK: - Modes
 
+    /// Forced BTRFS/overlay is Linux-only. On Linux, force without a delegate
+    /// fails closed; with a delegate, the snapshot path is taken later (and
+    /// fails closed on delegate error — no silent CoW fallback). Auto without
+    /// a delegate is a no-op skip.
     private func rejectForcedPrivilegedModesWithoutDelegate() throws {
-        if btrfsMode == .force && snapshotDelegate == nil {
+        if btrfsMode == .force {
             #if os(Linux)
-            throw FastWorktreeError.unsupported(
-                "BTRFS snapshot force mode requires privileged delegate (not available in this build)"
-            )
+            if snapshotDelegate == nil {
+                throw FastWorktreeError.unsupported(
+                    "BTRFS snapshot force mode requires privileged delegate (not available in this build)"
+                )
+            }
             #else
+            // Even with an injected delegate, force remains typed unsupported
+            // off Linux (no BTRFS/overlay surface on macOS/other).
             throw FastWorktreeError.unsupported("BTRFS snapshots are Linux-only")
             #endif
         }
-        if overlayMode == .force && snapshotDelegate == nil {
+        if overlayMode == .force {
             #if os(Linux)
-            throw FastWorktreeError.unsupported(
-                "overlay force mode requires privileged mount delegate (not available in this build)"
-            )
+            if snapshotDelegate == nil {
+                throw FastWorktreeError.unsupported(
+                    "overlay force mode requires privileged mount delegate (not available in this build)"
+                )
+            }
             #else
             throw FastWorktreeError.unsupported("overlay snapshots are Linux-only")
             #endif
         }
-        // Auto without delegate: never silently attempt privileged ops.
-        // (No-op; we simply skip fast paths.)
-        _ = btrfsMode
-        _ = overlayMode
+    }
+
+    /// When force + delegate (Linux), create via the privileged snapshot path
+    /// and fail closed on any error. Returns `nil` when the snapshot path is
+    /// not applicable (auto without success, disabled, non-force).
+    private func tryPrivilegedSnapshotCreate(
+        identity: GitRepoIdentity,
+        commit: String,
+        isCancelled: () -> Bool,
+        onProgress: ((WorktreeProgress) -> Void)?
+    ) throws -> WorktreeReport? {
+        #if os(Linux)
+        let forceSnapshot = btrfsMode == .force || overlayMode == .force
+        let autoSnapshot = (btrfsMode == .auto || overlayMode == .auto) && snapshotDelegate != nil
+        guard forceSnapshot || autoSnapshot, let delegate = snapshotDelegate else {
+            return nil
+        }
+
+        let sourceRoot = identity.toplevel ?? identity.operationRoot
+        onProgress?(.addingWorktree)
+        do {
+            let snap = try delegate.createSnapshot(source: sourceRoot, dest: dest)
+            var reclaimArmed = true
+            defer {
+                if reclaimArmed {
+                    onProgress?(.reclaiming)
+                    _ = try? delegate.deleteSnapshot(worktreePath: dest)
+                    reclaimPartialWorktree(source: nil, dest: dest)
+                }
+            }
+
+            if isCancelled() { throw FastWorktreeError.cancelled }
+
+            onProgress?(.finalizing)
+            try finalizeSnapshotWorkingTree(commit: commit, cwd: snap.worktreePath)
+
+            if isCancelled() { throw FastWorktreeError.cancelled }
+
+            reclaimArmed = false
+            clearPartialMarker(at: dest)
+            onProgress?(.complete)
+            return WorktreeReport(
+                worktreePath: dest,
+                commit: commit,
+                creationMode: creationMode,
+                isBareSource: identity.isBare,
+                wasDetached: gitRef != "HEAD" || identity.isDetached,
+                usedCow: false
+            )
+        } catch {
+            if forceSnapshot {
+                // Force: fail closed — never fall through to file-copy.
+                // Best-effort reclaim if the delegate left partial state.
+                _ = try? delegate.deleteSnapshot(worktreePath: dest)
+                reclaimPartialWorktree(source: nil, dest: dest)
+                if let e = error as? FastWorktreeError { throw e }
+                throw FastWorktreeError.unsupported("privileged snapshot failed: \(error)")
+            }
+            // Auto: soft-fall through to copy strategies.
+            return nil
+        }
+        #else
+        _ = (identity, commit, isCancelled, onProgress)
+        return nil
+        #endif
+    }
+
+    private func finalizeSnapshotWorkingTree(commit: String, cwd: URL) throws {
+        switch workingTree {
+        case .preserveWorkingTree:
+            break
+        case .cleanTracked:
+            let r = try runGit(["reset", "--hard", commit], cwd: cwd)
+            if r.exitCode != 0 { throw FastWorktreeError.gitFailed(r.stderr) }
+        case .cleanAll:
+            let r = try runGit(["reset", "--hard", commit], cwd: cwd)
+            if r.exitCode != 0 { throw FastWorktreeError.gitFailed(r.stderr) }
+            let c = try runGit(["clean", "-fd"], cwd: cwd)
+            if c.exitCode != 0 { throw FastWorktreeError.gitFailed(c.stderr) }
+        }
+        if gitRef != "HEAD" {
+            let co = try runGit(["checkout", gitRef], cwd: cwd)
+            if co.exitCode != 0 { throw FastWorktreeError.gitFailed(co.stderr) }
+        }
     }
 
     private func createGitCheckout(
@@ -199,6 +289,15 @@ public struct WorktreeBuilder: Sendable {
         isCancelled: () -> Bool,
         onProgress: ((WorktreeProgress) -> Void)?
     ) throws -> WorktreeReport {
+        if let snap = try tryPrivilegedSnapshotCreate(
+            identity: identity,
+            commit: commit,
+            isCancelled: isCancelled,
+            onProgress: onProgress
+        ) {
+            return snap
+        }
+
         let opRoot = identity.operationRoot
         try FileManager.default.createDirectory(
             at: dest.deletingLastPathComponent(),
@@ -218,6 +317,15 @@ public struct WorktreeBuilder: Sendable {
             throw error
         }
 
+        // Armed from immediately after materialization until successful disarm.
+        var reclaimArmed = true
+        defer {
+            if reclaimArmed {
+                onProgress?(.reclaiming)
+                reclaimPartialWorktree(source: opRoot, dest: dest)
+            }
+        }
+
         try writePartialMarker(
             PartialWorktreeMarker(
                 sourcePath: opRoot.path,
@@ -229,13 +337,10 @@ public struct WorktreeBuilder: Sendable {
             at: dest
         )
 
-        if isCancelled() {
-            onProgress?(.reclaiming)
-            reclaimPartialWorktree(source: opRoot, dest: dest)
-            throw FastWorktreeError.cancelled
-        }
+        if isCancelled() { throw FastWorktreeError.cancelled }
 
         clearPartialMarker(at: dest)
+        reclaimArmed = false
         onProgress?(.complete)
         return WorktreeReport(
             worktreePath: dest,
@@ -252,6 +357,15 @@ public struct WorktreeBuilder: Sendable {
         isCancelled: () -> Bool,
         onProgress: ((WorktreeProgress) -> Void)?
     ) throws -> WorktreeReport {
+        if let snap = try tryPrivilegedSnapshotCreate(
+            identity: identity,
+            commit: commit,
+            isCancelled: isCancelled,
+            onProgress: onProgress
+        ) {
+            return snap
+        }
+
         let opRoot = identity.operationRoot
         try FileManager.default.createDirectory(
             at: dest.deletingLastPathComponent(),
@@ -271,6 +385,16 @@ public struct WorktreeBuilder: Sendable {
             throw error
         }
 
+        // PartialWorktreeGuard: armed after worktree add until clear+disarm.
+        // Covers marker write, copy, finalize, ignored copy, and cancel.
+        var reclaimArmed = true
+        defer {
+            if reclaimArmed {
+                onProgress?(.reclaiming)
+                reclaimPartialWorktree(source: opRoot, dest: dest)
+            }
+        }
+
         try writePartialMarker(
             PartialWorktreeMarker(
                 sourcePath: opRoot.path,
@@ -282,11 +406,7 @@ public struct WorktreeBuilder: Sendable {
             at: dest
         )
 
-        if isCancelled() {
-            onProgress?(.reclaiming)
-            reclaimPartialWorktree(source: opRoot, dest: dest)
-            throw FastWorktreeError.cancelled
-        }
+        if isCancelled() { throw FastWorktreeError.cancelled }
 
         var copyReport = CopyReport()
         var dirty: DirtyFilesReport?
@@ -306,71 +426,55 @@ public struct WorktreeBuilder: Sendable {
 
             if workingTree != .cleanAll {
                 onProgress?(.copying(filesCopied: 0))
-                do {
-                    copyReport = try copyTree(
-                        from: root,
-                        to: dest,
-                        options: CopyEngineOptions(
-                            skipGitDirectory: true,
-                            skipFiles: skipFiles,
-                            preferCow: preferCow
-                        ),
-                        isCancelled: isCancelled,
-                        onProgress: { n in onProgress?(.copying(filesCopied: n)) }
-                    )
-                } catch {
-                    onProgress?(.reclaiming)
-                    reclaimPartialWorktree(source: opRoot, dest: dest)
-                    throw error
-                }
+                // Primary unignored population respects project .gitignore
+                // (Rust ParallelCopyConfig.respect_gitignore = true).
+                copyReport = try copyTree(
+                    from: root,
+                    to: dest,
+                    options: CopyEngineOptions(
+                        skipGitDirectory: true,
+                        skipFiles: skipFiles,
+                        preferCow: preferCow,
+                        respectGitignore: true
+                    ),
+                    isCancelled: isCancelled,
+                    onProgress: { n in onProgress?(.copying(filesCopied: n)) }
+                )
             }
             copyReport.dirtyFiles = dirty
 
             onProgress?(.finalizing)
-            if workingTree == .cleanTracked || workingTree == .cleanAll {
-                let co = try runGit(["checkout", "--force", commit, "--", "."], cwd: dest)
-                if co.exitCode != 0 {
-                    copyReport.issues.append(co.stderr)
-                }
-                if workingTree == .cleanAll {
-                    _ = try? runGit(["clean", "-fd"], cwd: dest)
-                }
-            } else {
-                // Preserve: copy source index so staged state is reflected.
-                _ = try? copyGitIndex(from: root, to: dest)
-            }
+            try finalizeLinkedWorkingTree(root: root, commit: commit)
         } else {
-            // Bare: finalize with checkout of tracked files.
+            // Bare: rebuild tracked files via reset --hard (index after --no-checkout).
             onProgress?(.finalizing)
-            let co = try runGit(["checkout", "--force", commit, "--", "."], cwd: dest)
-            if co.exitCode != 0 {
-                copyReport.issues.append(co.stderr)
+            let r = try runGit(["reset", "--hard", commit], cwd: dest)
+            if r.exitCode != 0 {
+                throw FastWorktreeError.gitFailed(r.stderr)
             }
         }
 
-        if isCancelled() {
-            onProgress?(.reclaiming)
-            reclaimPartialWorktree(source: opRoot, dest: dest)
-            throw FastWorktreeError.cancelled
-        }
+        if isCancelled() { throw FastWorktreeError.cancelled }
 
         var ignored: CopyReport?
         if case .copy(let patterns) = ignoredFiles, let root = identity.toplevel {
             onProgress?(.copyingIgnored)
-            ignored = try? copyTree(
+            ignored = try copyTree(
                 from: root,
                 to: dest,
                 options: CopyEngineOptions(
                     skipGitDirectory: true,
                     skipPatterns: patterns,
                     preferCow: preferCow,
-                    ignoredOnly: true
+                    ignoredOnly: true,
+                    respectGitignore: false
                 ),
                 isCancelled: isCancelled
             )
         }
 
         clearPartialMarker(at: dest)
+        reclaimArmed = false
         onProgress?(.complete)
         return WorktreeReport(
             worktreePath: dest,
@@ -384,12 +488,47 @@ public struct WorktreeBuilder: Sendable {
         )
     }
 
+    /// Finalize linked worktree index / clean modes. Propagates hard git
+    /// failures so the reclaim guard tears down the partial tree (Rust
+    /// `finalize_worktree`).
+    private func finalizeLinkedWorkingTree(root: URL, commit: String) throws {
+        switch workingTree {
+        case .preserveWorkingTree:
+            // Preserve: copy source index so staged state is reflected.
+            try copyGitIndex(from: root, to: dest)
+        case .cleanTracked:
+            // `git reset --hard` rebuilds the index after --no-checkout.
+            let r = try runGit(["reset", "--hard", commit], cwd: dest)
+            if r.exitCode != 0 {
+                throw FastWorktreeError.gitFailed(r.stderr)
+            }
+        case .cleanAll:
+            let r = try runGit(["reset", "--hard", commit], cwd: dest)
+            if r.exitCode != 0 {
+                throw FastWorktreeError.gitFailed(r.stderr)
+            }
+            let c = try runGit(["clean", "-fd"], cwd: dest)
+            if c.exitCode != 0 {
+                throw FastWorktreeError.gitFailed(c.stderr)
+            }
+        }
+    }
+
     private func createStandalone(
         identity: GitRepoIdentity,
         commit: String,
         isCancelled: () -> Bool,
         onProgress: ((WorktreeProgress) -> Void)?
     ) throws -> WorktreeReport {
+        if let snap = try tryPrivilegedSnapshotCreate(
+            identity: identity,
+            commit: commit,
+            isCancelled: isCancelled,
+            onProgress: onProgress
+        ) {
+            return snap
+        }
+
         guard let root = identity.toplevel else {
             throw FastWorktreeError.bareRepositoryUnsupported("standalone")
         }
@@ -419,6 +558,15 @@ public struct WorktreeBuilder: Sendable {
         }
         try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
 
+        // Armed from dest materialization until successful clear+disarm.
+        var reclaimArmed = true
+        defer {
+            if reclaimArmed {
+                onProgress?(.reclaiming)
+                reclaimPartialWorktree(source: nil, dest: dest)
+            }
+        }
+
         try writePartialMarker(
             PartialWorktreeMarker(
                 sourcePath: root.path,
@@ -430,27 +578,16 @@ public struct WorktreeBuilder: Sendable {
             at: dest
         )
 
-        if isCancelled() {
-            onProgress?(.reclaiming)
-            reclaimPartialWorktree(source: nil, dest: dest)
-            throw FastWorktreeError.cancelled
-        }
+        if isCancelled() { throw FastWorktreeError.cancelled }
 
         onProgress?(.copying(filesCopied: 0))
         let destGit = dest.appendingPathComponent(".git")
-        let gitReport: CopyReport
-        do {
-            gitReport = try copyGitDir(
-                from: realGit,
-                to: destGit,
-                preferCow: preferCow,
-                isCancelled: isCancelled
-            )
-        } catch {
-            onProgress?(.reclaiming)
-            reclaimPartialWorktree(source: nil, dest: dest)
-            throw error
-        }
+        let gitReport = try copyGitDir(
+            from: realGit,
+            to: destGit,
+            preferCow: preferCow,
+            isCancelled: isCancelled
+        )
 
         onProgress?(.scanningDirty)
         let dirty = try? getModifiedFiles(repoPath: root)
@@ -462,56 +599,65 @@ public struct WorktreeBuilder: Sendable {
             skipFiles = dirty?.allDirtyPaths ?? []
         }
 
-        var copyReport: CopyReport
-        do {
-            copyReport = try copyTree(
-                from: root,
-                to: dest,
-                options: CopyEngineOptions(
-                    skipGitDirectory: true,
-                    skipFiles: skipFiles,
-                    preferCow: preferCow
-                ),
-                isCancelled: isCancelled,
-                onProgress: { n in onProgress?(.copying(filesCopied: n)) }
-            )
-        } catch {
-            onProgress?(.reclaiming)
-            reclaimPartialWorktree(source: nil, dest: dest)
-            throw error
-        }
+        var copyReport = try copyTree(
+            from: root,
+            to: dest,
+            options: CopyEngineOptions(
+                skipGitDirectory: true,
+                skipFiles: skipFiles,
+                preferCow: preferCow,
+                respectGitignore: true
+            ),
+            isCancelled: isCancelled,
+            onProgress: { n in onProgress?(.copying(filesCopied: n)) }
+        )
         copyReport.merge(gitReport)
         copyReport.dirtyFiles = dirty
 
         onProgress?(.finalizing)
-        do {
-            switch workingTree {
-            case .preserveWorkingTree:
-                break
-            case .cleanTracked:
-                let r = try runGit(["reset", "--hard", commit], cwd: dest)
-                if r.exitCode != 0 { throw FastWorktreeError.gitFailed(r.stderr) }
-            case .cleanAll:
-                let r = try runGit(["reset", "--hard", commit], cwd: dest)
-                if r.exitCode != 0 { throw FastWorktreeError.gitFailed(r.stderr) }
-                _ = try runGit(["clean", "-fd"], cwd: dest)
+        switch workingTree {
+        case .preserveWorkingTree:
+            // Leave CoW'd .git/HEAD / index branch state intact (Rust:
+            // no checkout when git_ref == "HEAD").
+            break
+        case .cleanTracked:
+            let r = try runGit(["reset", "--hard", commit], cwd: dest)
+            if r.exitCode != 0 { throw FastWorktreeError.gitFailed(r.stderr) }
+        case .cleanAll:
+            let r = try runGit(["reset", "--hard", commit], cwd: dest)
+            if r.exitCode != 0 { throw FastWorktreeError.gitFailed(r.stderr) }
+            let c = try runGit(["clean", "-fd"], cwd: dest)
+            if c.exitCode != 0 { throw FastWorktreeError.gitFailed(c.stderr) }
+        }
+
+        // Phase 5 (Rust execute_standalone_worktree): checkout only when the
+        // caller requested a ref other than HEAD, so a promote/rename over the
+        // primary checkout keeps the source branch association.
+        if gitRef != "HEAD" {
+            let co = try runGit(["checkout", gitRef], cwd: dest)
+            if co.exitCode != 0 {
+                throw FastWorktreeError.gitFailed(co.stderr)
             }
-            if gitRef != "HEAD" {
-                let co = try runGit(["checkout", "--detach", commit], cwd: dest)
-                if co.exitCode != 0 {
-                    throw FastWorktreeError.gitFailed(co.stderr)
-                }
-            } else {
-                // Ensure detached HEAD at the same commit.
-                let co = try runGit(["checkout", "--detach", commit], cwd: dest)
-                if co.exitCode != 0 {
-                    throw FastWorktreeError.gitFailed(co.stderr)
-                }
-            }
-        } catch {
-            onProgress?(.reclaiming)
-            reclaimPartialWorktree(source: nil, dest: dest)
-            throw error
+        }
+
+        if isCancelled() { throw FastWorktreeError.cancelled }
+
+        // Phase 6: optional ignored-files copy (parity with linked + Rust).
+        var ignored: CopyReport?
+        if case .copy(let patterns) = ignoredFiles {
+            onProgress?(.copyingIgnored)
+            ignored = try copyTree(
+                from: root,
+                to: dest,
+                options: CopyEngineOptions(
+                    skipGitDirectory: true,
+                    skipPatterns: patterns,
+                    preferCow: preferCow,
+                    ignoredOnly: true,
+                    respectGitignore: false
+                ),
+                isCancelled: isCancelled
+            )
         }
 
         // Source marker for consumers (Rust record_main_repo_marker).
@@ -520,16 +666,22 @@ public struct WorktreeBuilder: Sendable {
             try? root.path.write(to: marker, atomically: true, encoding: .utf8)
         }
 
+        // Reflect whether dest HEAD is still a symbolic branch ref.
+        let symbolic = try runGit(["symbolic-ref", "-q", "HEAD"], cwd: dest)
+        let detached = symbolic.exitCode != 0
+
         clearPartialMarker(at: dest)
+        reclaimArmed = false
         onProgress?(.complete)
         return WorktreeReport(
             worktreePath: dest,
             commit: commit,
             unignoredCopy: copyReport,
+            ignoredCopy: ignored,
             creationMode: .standalone,
             isBareSource: false,
-            wasDetached: true,
-            usedCow: copyReport.usedCow
+            wasDetached: detached,
+            usedCow: copyReport.usedCow || (ignored?.usedCow ?? false)
         )
     }
 
@@ -539,11 +691,11 @@ public struct WorktreeBuilder: Sendable {
         let srcIndex = srcGit.appendingPathComponent("index")
         let dstIndex = dstGit.appendingPathComponent("index")
         guard FileManager.default.fileExists(atPath: srcIndex.path) else { return }
-        try? FileManager.default.createDirectory(
+        try FileManager.default.createDirectory(
             at: dstGit,
             withIntermediateDirectories: true
         )
-        _ = try? copyFile(from: srcIndex, to: dstIndex, preferCow: preferCow)
+        _ = try copyFile(from: srcIndex, to: dstIndex, preferCow: preferCow)
     }
 
     private func worktreeGitDir(for worktree: URL) throws -> URL {

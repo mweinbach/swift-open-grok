@@ -814,4 +814,330 @@ struct OpenGrokFastWorktreeTests {
         #expect(phases.contains(.complete))
         _ = try removeWorktree(source: root, dest: dest)
     }
+
+    // MARK: - Review gap fixtures (R16 remediation)
+
+    @Test("default skip excludes gitignore'd untracked files from linked preserve")
+    func gitignoreSkippedUnderDefaultSkip() throws {
+        guard gitAvailable else { return }
+        let root = try tempDir("og-gitignore-skip")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try initRepo(at: root)
+        try commitFile(at: root, name: "tracked.txt", contents: "keep", message: "init")
+        try "node_modules/\nbuild/\n*.log\n".write(
+            to: root.appendingPathComponent(".gitignore"),
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try runGit(["add", ".gitignore"], cwd: root)
+        _ = try runGit(["commit", "-m", "ignore"], cwd: root)
+
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("node_modules/pkg"),
+            withIntermediateDirectories: true
+        )
+        try "secret".write(
+            to: root.appendingPathComponent("node_modules/pkg/index.js"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "cache".write(
+            to: root.appendingPathComponent("debug.log"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "visible".write(
+            to: root.appendingPathComponent("notes.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let dest = root.deletingLastPathComponent()
+            .appendingPathComponent("og-gitignore-dest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dest) }
+
+        let report = try WorktreeBuilder(
+            source: root,
+            dest: dest,
+            workingTree: .preserveWorkingTree,
+            ignoredFiles: .skip,
+            creationMode: .linked
+        ).create()
+
+        #expect(FileManager.default.fileExists(
+            atPath: dest.appendingPathComponent("tracked.txt").path
+        ))
+        #expect(FileManager.default.fileExists(
+            atPath: dest.appendingPathComponent("notes.txt").path
+        ))
+        #expect(!FileManager.default.fileExists(
+            atPath: dest.appendingPathComponent("debug.log").path
+        ))
+        #expect(!FileManager.default.fileExists(
+            atPath: dest.appendingPathComponent("node_modules/pkg/index.js").path
+        ))
+        #expect(report.ignoredCopy == nil)
+
+        // Under IgnoredFilesMode.copy the gitignored artifacts must appear.
+        let dest2 = root.deletingLastPathComponent()
+            .appendingPathComponent("og-gitignore-copy-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dest2) }
+        let report2 = try WorktreeBuilder(
+            source: root,
+            dest: dest2,
+            workingTree: .preserveWorkingTree,
+            ignoredFiles: .copy(skipPatterns: []),
+            creationMode: .linked
+        ).create()
+        #expect(FileManager.default.fileExists(
+            atPath: dest2.appendingPathComponent("debug.log").path
+        ))
+        #expect(FileManager.default.fileExists(
+            atPath: dest2.appendingPathComponent("node_modules/pkg/index.js").path
+        ))
+        #expect(report2.ignoredCopy != nil)
+
+        _ = try removeWorktree(source: root, dest: dest)
+        _ = try removeWorktree(source: root, dest: dest2)
+    }
+
+    @Test("standalone HEAD from branched source keeps symbolic-ref HEAD")
+    func standaloneHeadKeepsBranch() throws {
+        guard gitAvailable else { return }
+        let root = try tempDir("og-standalone-branch")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try initRepo(at: root)
+        try commitFile(at: root, name: "a.txt", contents: "1", message: "init")
+        _ = try runGit(["branch", "-M", "main"], cwd: root)
+
+        let symbolicSrc = try runGit(["symbolic-ref", "-q", "HEAD"], cwd: root)
+        #expect(symbolicSrc.exitCode == 0)
+        let srcBranch = symbolicSrc.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(srcBranch == "refs/heads/main")
+
+        let dest = root.deletingLastPathComponent()
+            .appendingPathComponent("og-standalone-branch-dest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dest) }
+
+        let report = try WorktreeBuilder(
+            source: root,
+            dest: dest,
+            gitRef: "HEAD",
+            workingTree: .preserveWorkingTree,
+            creationMode: .standalone
+        ).create()
+
+        let symbolic = try runGit(["symbolic-ref", "-q", "HEAD"], cwd: dest)
+        #expect(symbolic.exitCode == 0, "standalone HEAD preserve must not detach")
+        let branch = symbolic.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(branch == "refs/heads/main")
+        #expect(report.wasDetached == false)
+        #expect(FileManager.default.fileExists(atPath: dest.appendingPathComponent("a.txt").path))
+    }
+
+    @Test("standalone IgnoredFilesMode.copy brings ignored artifacts")
+    func standaloneIgnoredCopy() throws {
+        guard gitAvailable else { return }
+        let root = try tempDir("og-standalone-ignored")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try initRepo(at: root)
+        try commitFile(at: root, name: "a.txt", contents: "1", message: "init")
+        try "secret.log\n".write(
+            to: root.appendingPathComponent(".gitignore"),
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try runGit(["add", ".gitignore"], cwd: root)
+        _ = try runGit(["commit", "-m", "ignore"], cwd: root)
+        try "noise".write(
+            to: root.appendingPathComponent("secret.log"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let destSkip = root.deletingLastPathComponent()
+            .appendingPathComponent("og-sa-skip-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: destSkip) }
+        _ = try WorktreeBuilder(
+            source: root,
+            dest: destSkip,
+            ignoredFiles: .skip,
+            creationMode: .standalone
+        ).create()
+        #expect(!FileManager.default.fileExists(
+            atPath: destSkip.appendingPathComponent("secret.log").path
+        ))
+
+        let destCopy = root.deletingLastPathComponent()
+            .appendingPathComponent("og-sa-copy-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: destCopy) }
+        let report = try WorktreeBuilder(
+            source: root,
+            dest: destCopy,
+            ignoredFiles: .copy(skipPatterns: []),
+            creationMode: .standalone
+        ).create()
+        #expect(FileManager.default.fileExists(
+            atPath: destCopy.appendingPathComponent("secret.log").path
+        ))
+        #expect(report.ignoredCopy != nil)
+    }
+
+    @Test("linked finalize git failure reclaims and throws")
+    func linkedFinalizeFailureReclaims() throws {
+        guard gitAvailable else { return }
+        let root = try tempDir("og-finalize-fail")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try initRepo(at: root)
+        try commitFile(at: root, name: "a.txt", contents: "1", message: "init")
+
+        let dest = root.deletingLastPathComponent()
+            .appendingPathComponent("og-finalize-dest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dest) }
+
+        var sawReclaim = false
+        do {
+            _ = try WorktreeBuilder(
+                source: root,
+                dest: dest,
+                workingTree: .cleanTracked,
+                creationMode: .linked
+            ).create(
+                onProgress: { p in
+                    if case .finalizing = p {
+                        // Corrupt the linked worktree registration so
+                        // `git reset --hard` fails hard during finalize.
+                        if let gitdir = readWorktreeGitdir(worktreePath: dest) {
+                            try? FileManager.default.removeItem(at: gitdir)
+                        }
+                        let gitFile = dest.appendingPathComponent(".git")
+                        try? FileManager.default.removeItem(at: gitFile)
+                    }
+                    if case .reclaiming = p { sawReclaim = true }
+                }
+            )
+            Issue.record("expected finalize failure to throw")
+        } catch let error as FastWorktreeError {
+            switch error {
+            case .gitFailed, .io:
+                break
+            default:
+                Issue.record("expected .gitFailed/.io, got \(error)")
+            }
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+        #expect(sawReclaim)
+        #expect(!FileManager.default.fileExists(atPath: dest.appendingPathComponent(".git").path)
+            || !FileManager.default.fileExists(atPath: dest.path))
+        let listed = try listLinkedWorktrees(source: root)
+        #expect(!listed.contains(where: {
+            $0.path.standardizedFileURL.path == dest.standardizedFileURL.path
+        }))
+    }
+
+    @Test("forced BTRFS with delegate remains unsupported on non-Linux")
+    func forcedBtrfsWithDelegateNoSilentSuccess() throws {
+        final class RecordingDelegate: PrivilegedSnapshotDelegate, @unchecked Sendable {
+            var createCalled = false
+            func createSnapshot(source: URL, dest: URL) throws -> DelegateSnapshotResult {
+                createCalled = true
+                return DelegateSnapshotResult(snapshotPath: dest, worktreePath: dest)
+            }
+            func deleteSnapshot(worktreePath: URL) throws -> RemoveReport {
+                RemoveReport(path: worktreePath, removed: true)
+            }
+        }
+        let tmp = try tempDir("og-btrfs-delegate")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let dest = tmp.appendingPathComponent("wt")
+        let delegate = RecordingDelegate()
+        let builder = WorktreeBuilder(
+            source: tmp,
+            dest: dest,
+            btrfsMode: .force,
+            snapshotDelegate: delegate
+        )
+        do {
+            _ = try builder.create()
+            Issue.record("expected unsupported even with delegate on this platform")
+        } catch let error as FastWorktreeError {
+            guard case .unsupported = error else {
+                Issue.record("expected .unsupported, got \(error)")
+                return
+            }
+        } catch {
+            Issue.record("unexpected \(error)")
+        }
+        #if !os(Linux)
+        #expect(!delegate.createCalled, "force must not invoke delegate off Linux")
+        #endif
+    }
+
+    @Test("forced overlay with delegate remains unsupported on non-Linux")
+    func forcedOverlayWithDelegateNoSilentSuccess() throws {
+        final class RecordingDelegate: PrivilegedSnapshotDelegate, @unchecked Sendable {
+            var createCalled = false
+            func createSnapshot(source: URL, dest: URL) throws -> DelegateSnapshotResult {
+                createCalled = true
+                return DelegateSnapshotResult(snapshotPath: dest, worktreePath: dest)
+            }
+            func deleteSnapshot(worktreePath: URL) throws -> RemoveReport {
+                RemoveReport(path: worktreePath, removed: true)
+            }
+        }
+        let tmp = try tempDir("og-overlay-delegate")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let dest = tmp.appendingPathComponent("wt")
+        let delegate = RecordingDelegate()
+        let builder = WorktreeBuilder(
+            source: tmp,
+            dest: dest,
+            overlayMode: .force,
+            snapshotDelegate: delegate
+        )
+        do {
+            _ = try builder.create()
+            Issue.record("expected unsupported even with delegate on this platform")
+        } catch let error as FastWorktreeError {
+            guard case .unsupported = error else {
+                Issue.record("expected .unsupported, got \(error)")
+                return
+            }
+        } catch {
+            Issue.record("unexpected \(error)")
+        }
+        #if !os(Linux)
+        #expect(!delegate.createCalled, "force must not invoke delegate off Linux")
+        #endif
+    }
+
+    @Test("executable mode 0o755 survives CoW and non-CoW copy")
+    func executableBitPreserved() throws {
+        let root = try tempDir("og-exec-bit")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let src = root.appendingPathComponent("src")
+        try FileManager.default.createDirectory(at: src, withIntermediateDirectories: true)
+        let script = src.appendingPathComponent("run.sh")
+        try "#!/bin/sh\necho hi\n".write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: script.path
+        )
+
+        for preferCow in [true, false] {
+            let dst = root.appendingPathComponent("dst-\(preferCow)")
+            _ = try copyTree(
+                from: src,
+                to: dst,
+                options: CopyEngineOptions(skipGitDirectory: true, preferCow: preferCow)
+            )
+            let perms = try FileManager.default.attributesOfItem(
+                atPath: dst.appendingPathComponent("run.sh").path
+            )[.posixPermissions] as? NSNumber
+            let mode = perms?.uint16Value ?? 0
+            #expect((mode & 0o111) != 0, "executable bits must survive preferCow=\(preferCow)")
+            #expect((mode & 0o755) == 0o755 || (mode & 0o111) == 0o111)
+        }
+    }
 }

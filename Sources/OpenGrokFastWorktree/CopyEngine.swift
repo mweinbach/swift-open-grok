@@ -26,19 +26,25 @@ public struct CopyEngineOptions: Sendable {
     public var preferCow: Bool
     /// When true, only copy paths that git reports as ignored.
     public var ignoredOnly: Bool
+    /// When true, skip untracked paths matching project `.gitignore` (Rust
+    /// `respect_gitignore` / WalkBuilder.git_ignore). Tracked files always copy
+    /// (git-aware). Does not consult global excludes or `.git/info/exclude`.
+    public var respectGitignore: Bool
 
     public init(
         skipGitDirectory: Bool = true,
         skipPatterns: [String] = [],
         skipFiles: Set<String> = [],
         preferCow: Bool = true,
-        ignoredOnly: Bool = false
+        ignoredOnly: Bool = false,
+        respectGitignore: Bool = false
     ) {
         self.skipGitDirectory = skipGitDirectory
         self.skipPatterns = skipPatterns
         self.skipFiles = skipFiles
         self.preferCow = preferCow
         self.ignoredOnly = ignoredOnly
+        self.respectGitignore = respectGitignore
     }
 }
 
@@ -66,9 +72,16 @@ public func copyTree(
         throw FastWorktreeError.io("failed to enumerate \(source.path)")
     }
 
-    // Precompute ignored set when requested (uses git check-ignore via path walk).
-    let ignoredSet: Set<String>? = options.ignoredOnly
-        ? (try? collectIgnoredRelativePaths(repo: source))
+    // Precompute ignored paths for ignoredOnly and/or respectGitignore.
+    // ignoredOnly uses --exclude-standard (all ignore sources) so the optional
+    // "copy ignored artifacts" phase is complete. respectGitignore uses only
+    // project `.gitignore` files (matching Rust WalkBuilder.git_ignore with
+    // git_global/git_exclude disabled).
+    let ignoredOnlySet: Set<String>? = options.ignoredOnly
+        ? try collectIgnoredRelativePaths(repo: source, projectGitignoreOnly: false)
+        : nil
+    let gitignoreSkips: GitignoreSkipInfo? = options.respectGitignore && !options.ignoredOnly
+        ? try collectGitignoreSkipInfo(repo: source)
         : nil
 
     while let item = enumerator.nextObject() as? URL {
@@ -99,7 +112,7 @@ public func copyTree(
             continue
         }
 
-        if let ignoredSet {
+        if let ignoredSet = ignoredOnlySet {
             // ignoredOnly: skip paths not in the ignored set.
             let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
             if isDir {
@@ -113,6 +126,20 @@ public func copyTree(
                 }
                 // Create dir if this dir itself is ignored or is a parent of one.
             } else if !ignoredSet.contains(rel) {
+                report.filesSkipped += 1
+                continue
+            }
+        } else if let skips = gitignoreSkips {
+            // respectGitignore: skip untracked ignored files/dirs; tracked files
+            // never appear in the skip sets so they always copy.
+            let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+            if isDir {
+                if skips.shouldSkipDirectory(rel) {
+                    enumerator.skipDescendants()
+                    report.filesSkipped += 1
+                    continue
+                }
+            } else if skips.files.contains(rel) {
                 report.filesSkipped += 1
                 continue
             }
@@ -298,6 +325,14 @@ func copyFile(from source: URL, to dest: URL, preferCow: Bool) throws -> Bool {
         try FileManager.default.removeItem(at: dest)
     }
     try FileManager.default.copyItem(at: source, to: dest)
+    // Explicitly re-apply POSIX mode so executable bits survive even when the
+    // host copy primitive is mode-lossy (matches CoW path behavior).
+    if let perms = try? FileManager.default.attributesOfItem(atPath: source.path)[.posixPermissions] {
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: perms],
+            ofItemAtPath: dest.path
+        )
+    }
     return false
 }
 
@@ -314,12 +349,31 @@ func relativePath(of item: URL, from source: URL) -> String {
         .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
 }
 
-/// Collect ignored relative paths via `git ls-files --others -i --exclude-standard`.
-func collectIgnoredRelativePaths(repo: URL) throws -> Set<String> {
-    let result = try runGit(
-        ["ls-files", "--others", "-i", "--exclude-standard"],
-        cwd: repo
-    )
+/// Collect ignored untracked relative paths.
+///
+/// - `projectGitignoreOnly == false` (default): `--exclude-standard` (project
+///   `.gitignore` + `.git/info/exclude` + global excludes). Used for the
+///   optional ignored-files copy phase.
+/// - `projectGitignoreOnly == true`: only per-directory `.gitignore` files,
+///   with global excludes neutralized — matches Rust `git_ignore` without
+///   `git_global` / `git_exclude`.
+func collectIgnoredRelativePaths(
+    repo: URL,
+    projectGitignoreOnly: Bool = false
+) throws -> Set<String> {
+    let args: [String]
+    if projectGitignoreOnly {
+        // Neutralize global excludes; do not pass --exclude-standard (which
+        // would also load .git/info/exclude).
+        args = [
+            "-c", "core.excludesFile=/dev/null",
+            "ls-files", "--others", "-i",
+            "--exclude-per-directory=.gitignore",
+        ]
+    } else {
+        args = ["ls-files", "--others", "-i", "--exclude-standard"]
+    }
+    let result = try runGit(args, cwd: repo)
     guard result.exitCode == 0 else {
         throw FastWorktreeError.gitFailed(result.stderr)
     }
@@ -327,6 +381,58 @@ func collectIgnoredRelativePaths(repo: URL) throws -> Set<String> {
         .split(separator: "\n", omittingEmptySubsequences: true)
         .map(String.init)
     return Set(paths)
+}
+
+/// Gitignore skip sets for the primary unignored copy phase.
+struct GitignoreSkipInfo: Sendable {
+    /// Untracked ignored files (and non-directory entries).
+    var files: Set<String>
+    /// Fully-ignored directories (e.g. `node_modules`, `target`) so the walker
+    /// can `skipDescendants` without enumerating every nested artifact.
+    var directories: Set<String>
+
+    func shouldSkipDirectory(_ rel: String) -> Bool {
+        if directories.contains(rel) { return true }
+        // Ancestor fully-ignored dir (should be rare if skipDescendants works).
+        let parts = rel.split(separator: "/")
+        var prefix = ""
+        for part in parts {
+            if !prefix.isEmpty { prefix += "/" }
+            prefix += part
+            if directories.contains(prefix) { return true }
+        }
+        return false
+    }
+}
+
+/// Collect project-`.gitignore` skip info for `respectGitignore` (no global /
+/// exclude file). Tracked files never appear here, so force-added paths that
+/// match a pattern still copy — git-aware parity with the intent of Rust's
+/// primary unignored population phase.
+func collectGitignoreSkipInfo(repo: URL) throws -> GitignoreSkipInfo {
+    let files = try collectIgnoredRelativePaths(repo: repo, projectGitignoreOnly: true)
+
+    // `--directory` collapses fully-ignored trees to a single trailing-slash entry.
+    let dirsResult = try runGit(
+        [
+            "-c", "core.excludesFile=/dev/null",
+            "ls-files", "--others", "-i", "--directory",
+            "--exclude-per-directory=.gitignore",
+        ],
+        cwd: repo
+    )
+    guard dirsResult.exitCode == 0 else {
+        throw FastWorktreeError.gitFailed(dirsResult.stderr)
+    }
+    var directories = Set<String>()
+    for line in dirsResult.stdout.split(separator: "\n", omittingEmptySubsequences: true) {
+        let raw = String(line)
+        if raw.hasSuffix("/") {
+            directories.insert(String(raw.dropLast()))
+        }
+    }
+
+    return GitignoreSkipInfo(files: files, directories: directories)
 }
 
 /// Simple glob: `*` does not cross `/`; `**` matches across segments.
