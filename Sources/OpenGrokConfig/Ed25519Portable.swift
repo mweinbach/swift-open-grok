@@ -182,23 +182,20 @@ struct Fe {
     }
 
     static func fromBytes(_ s: [UInt8]) -> Fe {
-        func load3(_ i: Int) -> Int64 {
-            Int64(s[i]) | (Int64(s[i + 1]) << 8) | (Int64(s[i + 2]) << 16)
-        }
         func load4(_ i: Int) -> Int64 {
             Int64(s[i]) | (Int64(s[i + 1]) << 8) | (Int64(s[i + 2]) << 16) | (Int64(s[i + 3]) << 24)
         }
         var h = Fe.zero
         h[0] = load4(0) & 0x3ffffff
-        h[1] = (load3(4) >> 2) & 0x1ffffff
-        h[2] = (load4(7) >> 3) & 0x3ffffff
-        h[3] = (load3(11) >> 5) & 0x1ffffff
-        h[4] = (load4(14) >> 6) & 0x3ffffff
-        h[5] = (load3(18) >> 1) & 0x1ffffff
-        h[6] = (load4(21) >> 2) & 0x3ffffff
-        h[7] = (load3(25) >> 4) & 0x1ffffff
-        h[8] = (load4(28) >> 5) & 0x3ffffff
-        h[9] = (load3(31) >> 6) & 0x1ffffff
+        h[1] = (load4(3) >> 2) & 0x1ffffff
+        h[2] = (load4(6) >> 3) & 0x3ffffff
+        h[3] = (load4(9) >> 5) & 0x1ffffff
+        h[4] = (load4(12) >> 6) & 0x3ffffff
+        h[5] = load4(16) & 0x1ffffff
+        h[6] = (load4(19) >> 1) & 0x3ffffff
+        h[7] = (load4(22) >> 3) & 0x1ffffff
+        h[8] = (load4(25) >> 4) & 0x3ffffff
+        h[9] = (load4(28) >> 6) & 0x1ffffff
         return h
     }
 
@@ -385,8 +382,8 @@ struct Fe {
         for _ in 1..<50 { t2 = t2.squared() }
         t1 = t2 * t1
         t1 = t1.squared()
-        for _ in 1..<5 { t1 = t1.squared() }
-        return t1 * t0
+        t1 = t1.squared()
+        return t1 * self
     }
 
     func inverted() -> Fe {
@@ -512,7 +509,7 @@ struct GeP2 {
         let G = YnX
         let F = YmX
         let H = B - F
-        return GeP1P1(X: E * H, Y: G * F, Z: F * G, T: E * G)
+        return GeP1P1(X: E, Y: G, Z: F, T: H)
     }
 
     func toBytes() -> [UInt8] {
@@ -552,7 +549,7 @@ enum Ge {
         let F = D - C
         let G = D + C
         let H = A + B
-        return GeP1P1(X: E * F, Y: G * H, Z: F * G, T: E * H)
+        return GeP1P1(X: E, Y: H, Z: G, T: F)
     }
 
     static func sub(_ p: GeP3, _ q: GeCached) -> GeP1P1 {
@@ -567,7 +564,7 @@ enum Ge {
         let F = D + C
         let G = D - C
         let H = A + B
-        return GeP1P1(X: E * F, Y: G * H, Z: F * G, T: E * H)
+        return GeP1P1(X: E, Y: H, Z: G, T: F)
     }
 
     static func madd(_ p: GeP3, _ q: GePrecomp) -> GeP1P1 {
@@ -616,9 +613,9 @@ enum Ge {
                 t = sub(t.toP3(), Ai[Int((-aslide[i]) / 2)])
             }
             if bslide[i] > 0 {
-                t = madd(t.toP3(), Bi[Int(bslide[i] / 2)])
+                t = add(t.toP3(), Bi[Int(bslide[i] / 2)])
             } else if bslide[i] < 0 {
-                t = msub(t.toP3(), Bi[Int((-bslide[i]) / 2)])
+                t = sub(t.toP3(), Bi[Int((-bslide[i]) / 2)])
             }
             r = t.toP2()
             i -= 1
@@ -637,7 +634,7 @@ private func precomputeOddMultiples(_ A: GeP3) -> [GeCached] {
     return Ai
 }
 
-private func baseOddMultiples() -> [GePrecomp] {
+private func baseOddMultiples() -> [GeCached] {
     // Basepoint compressed y = 4/5.
     let by: [UInt8] = [
         0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
@@ -646,20 +643,12 @@ private func baseOddMultiples() -> [GePrecomp] {
         0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
     ]
     guard let B = GeP3.fromBytes(by) else {
-        return Array(repeating: GePrecomp(yplusx: .one, yminusx: .one, xy2d: .zero), count: 8)
+        return Array(
+            repeating: GeCached(YplusX: .one, YminusX: .one, Z: .one, T2d: .zero),
+            count: 8
+        )
     }
-    func toPre(_ p: GeP3) -> GePrecomp {
-        GePrecomp(yplusx: p.Y + p.X, yminusx: p.Y - p.X, xy2d: p.T * FE_D2)
-    }
-    var Bi = [GePrecomp](repeating: GePrecomp(yplusx: .one, yminusx: .one, xy2d: .zero), count: 8)
-    Bi[0] = toPre(B)
-    let B2 = B.toP2().dbl().toP3()
-    var cur = B
-    for i in 1..<8 {
-        cur = Ge.add(B2, cur.toCached()).toP3()
-        Bi[i] = toPre(cur)
-    }
-    return Bi
+    return precomputeOddMultiples(B)
 }
 
 private func slide(_ a: [UInt8]) -> [Int8] {
@@ -760,12 +749,12 @@ private func scReduce(_ s: [UInt8]) -> [UInt8] {
     var s15 = 2097151 & (load3(39) >> 3)
     var s16 = 2097151 & load3(42)
     var s17 = 2097151 & (load4(44) >> 5)
-    var s18 = 2097151 & (load3(47) >> 2)
-    var s19 = 2097151 & (load4(49) >> 7)
-    var s20 = 2097151 & (load4(52) >> 4)
-    var s21 = 2097151 & (load3(55) >> 1)
-    var s22 = 2097151 & (load4(57) >> 6)
-    var s23 = (load4(60) >> 3)
+    let s18 = 2097151 & (load3(47) >> 2)
+    let s19 = 2097151 & (load4(49) >> 7)
+    let s20 = 2097151 & (load4(52) >> 4)
+    let s21 = 2097151 & (load3(55) >> 1)
+    let s22 = 2097151 & (load4(57) >> 6)
+    let s23 = (load4(60) >> 3)
 
     s11 &+= s23 * 666643
     s12 &+= s23 * 470296

@@ -1,25 +1,24 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-07-23 (Luna R12–R15 integration verification)
-**Overall state:** R12–R15 remain present at committed integration head `f1fbbbbfbde8cbe52850bb07aab6548bbd4fd0c0`. This pass made focused sampler compatibility edits within the allowed paths: qualified the provider adapter lookup, removed the three L2 timeout task-race captures of mutable async-stream iterators, and snapshotted early SSE body data before task handoff. The integrated verification is **partial**: the final permitted build-tests run still fails on a Swift 6 sending-closure diagnostic in `SamplingClient.swift`.
+**As of:** 2026-07-23 (Luna-assisted integration completion)
+**Overall state:** The uncommitted worktree atop checkpoint `1aca496ee0b6c59172371f3fc4a3a926fcb25821` is integrated-verifier green on macOS. The package build, all test bundles, the full test suite, the explicit `open-grok` product build, and executable smokes pass. This remains an incomplete source port rather than a full Rust-parity release.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `9739c4a2ad23cfea14312a481169757f3da494f4` (`/tmp/open-grok-reference` when present).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
-## Luna integration verification snapshot (2026-07-23; serialized remediation, iteration 3 of 3)
+## Luna integration verification snapshot (2026-07-23; resumed serialized remediation)
 
 | Command | Outcome |
 |---|---|
-| `zsh workflows/swift-safe-verify.zsh build-tests` (initial verification) | **Exit 1** — OpenGrokSampler failed in `SamplingClient.swift` because the instance property shadowed the module-level `providerAdapter` function. |
-| `zsh workflows/swift-safe-verify.zsh build-tests` (iteration 1) | **Exit 1** — after qualifying `OpenGrokSampler.providerAdapter`, Swift 6 reported non-Sendable/mutated `AsyncStream.Iterator` captures in `StreamChatCompletions.swift`. |
-| `zsh workflows/swift-safe-verify.zsh build-tests` (iteration 2) | **Exit 1** — after removing the Chat Completions task-race closure, the equivalent diagnostics remained in the other L2 stream loops. |
-| `zsh workflows/swift-safe-verify.zsh build-tests` (iteration 3) | **Exit 1** — after replacing all three L2 timeout task-race calls with single-owner direct iterator consumption, compilation reached `SamplingClient.swift:353`, where the SSE task captures mutable `earlyBody`; this was subsequently corrected by introducing an immutable `initialBody` snapshot, but no fourth verifier run was permitted. |
-| `zsh workflows/swift-safe-verify.zsh build` | **Not run** — the three allowed fix-and-verify iterations were consumed by the sanctioned `build-tests` checks. |
-| `zsh workflows/swift-safe-verify.zsh test` | **Not run** — integrated build-tests did not pass. |
-| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Not run** — integrated build-tests did not pass. |
+| `git diff --check` | **Exit 0**. |
+| `zsh workflows/swift-safe-verify.zsh build` | **Exit 0**. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` | **Exit 0**. |
+| `zsh workflows/swift-safe-verify.zsh test` | **Exit 0** — 100 Swift Testing runs, 1,672 tests, no failures; 100 legacy XCTest runners reported 0 cases. |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Exit 0**. |
+| `open-grok --version`, `help`, and isolated `paths` smokes | **Pass** — version `0.1.220-open-grok.21`; state remained under `/tmp/open-grok-smoke-home`. |
 
-Integration is **partial**. `CompactionTranscript.swift` remains untouched. The final build-tests run did not pass; the model helper visibility fix is unverified, and no Swift tests or product smoke were run.
+Integration verification is green for the current worktree. `CompactionTranscript.swift` and workflow artifacts remain intact. SwiftPM reports four non-failing warnings for fixture files not declared as resources. The executable remains bootstrap-only despite the green product build.
 
 
 ## Inventory counting method (reproducible)
@@ -45,7 +44,7 @@ Counts are mechanical over the committed tree (no Package.swift parsing):
 | Placeholder production targets | **42 / 98** bootstrap placeholders (≤15 non-comment LOC; see counting method) |
 | Zero-test test targets | **46 / 100** (no `@Test` / `func test*`); **54** targets have executable tests |
 
-### R10 foundation changes (static; pending integrated verify)
+### R10 foundation changes (integrated-verified)
 
 - `OpenGrokTelemetry`: `ExportTraceServiceRequest` protobuf encoder; product + external HTTP use `application/x-protobuf` with real protobuf; gRPC uses TraceService Export RPC path + framed protobuf + `grpc-status` validation; `exportSpan`/`exportOpenTelemetry` are async and await `HTTPTransport.send`; JSON twin only for diagnostics.
 - `OpenGrokGitStatus`: removed CryptoKit; pure-Swift `PortableSHA1`; C target `COpenGrokZlib` (links libz) declared in `Package.swift`; pack-only objects throw `packedObjectUnsupported` (not silent empty HEAD).
@@ -67,8 +66,8 @@ Counts are mechanical over the committed tree (no Package.swift parsing):
 | Wave | Goal | Status | Entry condition |
 |---|---|---|---|
 | 0 | Bootstrap, branding, and shared foundations | Target-green for W0 libraries | Planning artifacts accepted |
-| 1 | Protocols, domain models, and configuration | **In progress / target-level** — R01–R05; integrated graph not green | Wave 0 required slices present |
-| 2 | HTTP, storage, FS/Git/graph, PTY/TTY/power/crash | **In progress** — R06–R09 + R10 wire/portability fixes; integrated verify incomplete | Wave 1 contracts usable |
+| 1 | Protocols, domain models, and configuration | **In progress** — R01–R05 plus later remediation; current package graph green | Wave 0 required slices present |
+| 2 | HTTP, storage, FS/Git/graph, PTY/TTY/power/crash | **In progress** — R06–R10 plus later remediation; current package graph green | Wave 1 contracts usable |
 | 3–11 | Providers through distribution | Mostly scaffold/stub | Prior waves integrated and green |
 
 ## Slice status legend
@@ -104,14 +103,14 @@ Counts are mechanical over the committed tree (no Package.swift parsing):
 - **OTLP:** export bodies are real protobuf (`ExportTraceServiceRequest`), never JSON labeled `application/x-protobuf`.
 - **Git status:** portable pure-Swift SHA-1; zlib via Compression (Apple) or linked `COpenGrokZlib`/libz; pack-only objects are explicit non-parity.
 
-## Known verification blockers
+## Known remaining gaps
 
-1. **Integrated build not re-verified** after HTTP async-lock + R10 foundation edits. Next sole integration agent must run `zsh workflows/swift-safe-verify.zsh build` then `build-tests`, `test`, and product smokes.
-2. **Executable product not emitted until graph green:** `open-grok` depends on Shell/Pager composition stubs still present for later waves.
+1. **No current macOS verifier blocker:** the serialized package, tests, product build, and executable smokes are green in this worktree.
+2. **Executable remains bootstrap-only:** Shell/Pager/TUI/provider/session commands are still later-wave work even though the product now builds.
 3. **Many placeholders remain** for later-wave runtime (providers, MCP runtime, TUI, session persistence, sandbox, etc.) — **42 / 98** production bootstrap stubs (counting method above).
 4. **Portability gaps remaining:** Windows ConPTY/Credential Manager/LockFileEx; full Linux Secret Service; pack object reading; full tree-sitter not in Package.swift; OTLP gRPC uses collector-shaped TraceService Export requests (path + framing + `grpc-status`) over `HTTPTransport` rather than a dedicated HTTP/2 tonic client—trailers depend on the transport surfacing them.
-5. **Target-green ≠ product parity:** focused slice harnesses do not prove integrated package green.
-6. **Linux CI** still absent; SQLite/`COpenGrokZlib` strategy declared but not CI-proven here.
+5. **Package-green ≠ Rust parity:** focused and integrated Swift tests do not prove full source-port behavior.
+6. **Native Linux and Windows CI** remain absent; declared platform strategies are not CI-proven here.
 
 ## Verifier command record (required for green claims)
 
@@ -138,8 +137,8 @@ Status legend: **pending** (bootstrap placeholder stub only) · **in-progress** 
 | 3 | `mermaid-to-svg` | `OpenGrokMermaidLayout`, `OpenGrokMermaid` | pending | W8-S2 stub. |
 | 4 | `ordered_hashmap` | `OpenGrokMermaidLayout` | pending | W8-S2 stub. |
 | 5 | `prod-mc-cli-chat-proxy-types` | `OpenGrokCLIChatProxyTypes` | ported | W0-S4. |
-| 6 | `ptyctl` | `OpenGrokPTY` (+ `OpenGrokPTYC`) | in-progress | R09 + remediations; C spawn shim target. |
-| 7 | `ptyctl-cli` | `OpenGrokPTYCLI` | in-progress | R09 diagnostics. |
+| 6 | `ptyctl` | `OpenGrokPTY` (+ `OpenGrokPTYC`) | in-progress | R09 + remediations; process-group readiness, signal masks, and cancellation-aware waits verified green. |
+| 7 | `ptyctl-cli` | `OpenGrokPTYCLI` | in-progress | R09 diagnostics; full 14-test lifecycle suite green. |
 | 8 | `xai-acp-lib` | `OpenGrokACP` | target-green | R02. |
 | 9 | `xai-agent-lifecycle` | `OpenGrokAgentLifecycle` | target-green | R02. |
 | 10 | `xai-chat-state` | `OpenGrokChatState` | target-green | R03; CompactionTranscript preserved. |
@@ -149,13 +148,13 @@ Status legend: **pending** (bootstrap placeholder stub only) · **in-progress** 
 | 14 | `xai-computer-hub-mcp-adapter` | `OpenGrokComputerHubMCPAdapter` | pending | W5-S4 stub. |
 | 15 | `xai-computer-hub-sdk` | `OpenGrokComputerHubSDK` | pending | W4-S4 stub. |
 | 16 | `xai-crash-handler` | `OpenGrokCrashHandler` (+ `OpenGrokCrashHandlerC`) | in-progress | R09 C sigaction/alt-stack shim. |
-| 17 | `xai-fast-worktree` | `OpenGrokFastWorktree` | pending | W4-S2 stub. |
+| 17 | `xai-fast-worktree` | `OpenGrokFastWorktree` | in-progress | Glob matching and remediation tests integrated. |
 | 18 | `xai-file-utils` | `OpenGrokFileUtils` | target-green | R07 + remediation. |
 | 19 | `xai-fsnotify` | `OpenGrokFSNotify` | in-progress | R08 native adapters remediations. |
 | 20 | `xai-gix-status` | `OpenGrokGitStatus` | in-progress | R08 + R10 portable SHA-1, COpenGrokZlib, pack non-parity. |
 | 21 | `xai-grok-agent` | `OpenGrokAgentDefinitions` | pending | W5-S6 stub. |
 | 22 | `xai-grok-announcements` | `OpenGrokAnnouncements` | pending | W5-S6 stub. |
-| 23 | `xai-grok-auth` | `OpenGrokAuth` | pending | W3-S1 stub. |
+| 23 | `xai-grok-auth` | `OpenGrokAuth` | in-progress | Codex credential JSON encoding remediation integrated. |
 | 24 | `xai-grok-code-mode` | `OpenGrokCodeMode`, `OpenGrokJavaScriptRuntime` | pending | W6-S1 stub. |
 | 25 | `xai-grok-code-mode-protocol` | `OpenGrokCodeModeProtocol` | target-green | R05 + remediation. |
 | 26 | `xai-grok-compaction` | `OpenGrokCompaction` | pending | W6-S2 stub. |
@@ -163,22 +162,22 @@ Status legend: **pending** (bootstrap placeholder stub only) · **in-progress** 
 | 28 | `xai-grok-config-types` | `OpenGrokConfigTypes` | target-green | R04 + remediation fixtures. |
 | 29 | `xai-grok-env` | `OpenGrokEnvironment` | ported | W0-S3. |
 | 30 | `xai-grok-hooks` | `OpenGrokHooks` | pending | W5-S5 stub. |
-| 31 | `xai-grok-http` | `OpenGrokHTTP` | in-progress | R06 + remediation; integrated async lock fix pending re-verify. |
+| 31 | `xai-grok-http` | `OpenGrokHTTP` | in-progress | R06 + remediation; integrated async lock fix verified green. |
 | 32 | `xai-grok-markdown` | `OpenGrokMarkdown` | pending | W8-S1 stub. |
 | 33 | `xai-grok-markdown-core` | `OpenGrokMarkdownCore` | pending | W8-S1 stub. |
 | 34 | `xai-grok-markdown-fuzz` | `OpenGrokFuzzingTests` | pending | W11-S4 stub. |
 | 35 | `xai-grok-mcp` | `OpenGrokMCP` | pending | W5-S4 stub. |
 | 36 | `xai-grok-memory` | `OpenGrokMemory` | pending | W6-S3 stub. |
 | 37 | `xai-grok-mermaid` | `OpenGrokMermaid` | pending | W8-S2 stub. |
-| 38 | `xai-grok-models` | `OpenGrokModels` | pending | W3-S2 stub. |
+| 38 | `xai-grok-models` | `OpenGrokModels` | in-progress | Metadata decoding and CFBoolean/NSNumber remediation integrated. |
 | 39 | `xai-grok-pager` | multi-target | pending | W8–W10 stubs. |
-| 40 | `xai-grok-pager-bin` | `OpenGrokCLI`, `OpenGrokExecutable`, `OpenGrokDistributionSupport` | in-progress | Bootstrap CLI + R10 version parity/exec tests; product blocked by graph. |
+| 40 | `xai-grok-pager-bin` | `OpenGrokCLI`, `OpenGrokExecutable`, `OpenGrokDistributionSupport` | in-progress | Bootstrap CLI + R10 version parity/exec tests; explicit product build and smokes green. |
 | 41 | `xai-grok-pager-minimal` | `OpenGrokPagerMinimal` | pending | W9-S5 stub. |
 | 42 | `xai-grok-pager-pty-harness` | `OpenGrokPagerPTYHarness`, `OpenGrokPagerPTYTests` | pending | W11-S3 stub. |
 | 43 | `xai-grok-pager-render` | `OpenGrokPagerRender` | pending | W8-S3 stub. |
 | 44 | `xai-grok-paths` | `OpenGrokPaths` | ported | W0-S3. |
 | 45 | `xai-grok-plugin-marketplace` | `OpenGrokPluginMarketplace` | pending | W5-S5 stub. |
-| 46 | `xai-grok-sampler` | `OpenGrokSampler` | pending | W3-S3 stub. |
+| 46 | `xai-grok-sampler` | `OpenGrokSampler` | in-progress | Provider lookup plus stream timeout/cancellation ownership remediations integrated. |
 | 47 | `xai-grok-sampling-types` | `OpenGrokSamplingTypes` | target-green | R03. |
 | 48 | `xai-grok-sandbox` | `OpenGrokSandbox` | in-progress | Scaffold. |
 | 49 | `xai-grok-secrets` | `OpenGrokSecrets` | target-green | R07 + remediation. |
@@ -194,8 +193,8 @@ Status legend: **pending** (bootstrap placeholder stub only) · **in-progress** 
 | 59 | `xai-grok-update` | `OpenGrokUpdate` | pending | W5-S6 stub. |
 | 60 | `xai-grok-version` | `OpenGrokVersion` | ported | W0-S3 + build plugin. |
 | 61 | `xai-grok-voice` | `OpenGrokVoice` | pending | W5-S6 stub. |
-| 62 | `xai-grok-workspace` | `OpenGrokWorkspace` | pending | W4-S3 stub. |
-| 63 | `xai-grok-workspace-client` | `OpenGrokWorkspaceClient` | pending | W4-S4 stub. |
+| 62 | `xai-grok-workspace` | `OpenGrokWorkspace` | in-progress | RPC null-unit decoding and BashSplit wrappers integrated. |
+| 63 | `xai-grok-workspace-client` | `OpenGrokWorkspaceClient` | in-progress | Workspace RPC client remediation integrated. |
 | 64 | `xai-grok-workspace-types` | `OpenGrokWorkspaceTypes` | target-green | R05 + remediation; CodingKey fix in integration. |
 | 65 | `xai-hooks-plugins-types` | `OpenGrokHooksPluginTypes` | target-green | R05 + remediation. |
 | 66 | `xai-hunk-tracker` | `OpenGrokHunkTracker` | in-progress | R08 + remediation. |
@@ -204,7 +203,7 @@ Status legend: **pending** (bootstrap placeholder stub only) · **in-progress** 
 | 69 | `xai-prompt-queue` | `OpenGrokPromptQueue` | target-green | R02. |
 | 70 | `xai-proto-build` | `OpenGrokBuildSupport`, `OpenGrokProtoBuildPlugin` | ported | W0-S1. |
 | 71 | `xai-ratatui-inline` | `OpenGrokTerminalCore` | in-progress | Scaffold; W2-S5. |
-| 72 | `xai-ratatui-textarea` | `OpenGrokTextArea` | pending | W2-S5 stub. |
+| 72 | `xai-ratatui-textarea` | `OpenGrokTextArea` | in-progress | Editing behavior and overflow-safe optimal wrapping remediations integrated. |
 | 73 | `xai-sqlite-journal` | `OpenGrokSQLiteJournal` | target-green | R07 + remediation. |
 | 74 | `xai-system-power` | `OpenGrokSystemPower` | in-progress | R09 + integration concurrency/IOKit fixes. |
 | 75 | `xai-test-utils` | `OpenGrokTestUtilities` | ported | W0-S2. |
@@ -220,9 +219,9 @@ Status legend: **pending** (bootstrap placeholder stub only) · **in-progress** 
 
 ## Next action
 
-1. Resolve the Swift 6 concurrency-safety diagnostics for the three synchronized mutable globals in `Sources/OpenGrokSandbox/Manager.swift`.
-2. Resume the serialized verifier with `zsh workflows/swift-safe-verify.zsh build`, then run `build-tests`, focused filters, full `test`, and `build --product open-grok` with executable smokes.
-3. Keep CompactionTranscript.swift and workflow artifacts intact.
+1. Continue the next `PORT_PLAN.md` implementation slices, prioritizing provider, session, shell, pager, and TUI placeholders.
+2. Add native Linux and Windows CI, then close platform-specific capability gaps.
+3. Preserve `CompactionTranscript.swift`, workflow artifacts, and serialized verifier discipline.
 
 ## Protected artifacts
 

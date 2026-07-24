@@ -204,8 +204,8 @@ struct CredentialHeaderTests {
             token: "tok",
             userID: "u",
             teamID: "t",
-            organizationID: "o",
-            apiKeyID: nil
+            apiKeyID: nil,
+            organizationID: "o"
         )
         let headers = CollectorAuthHeaders(snapshot: snap, needsTokenAuthHeader: true)
         var h: [String: String] = [:]
@@ -654,16 +654,16 @@ struct ProtocolSeamTests {
             transport: transport
         )
         #expect(device.userCode == "ABCD-EFGH")
-        var slept = 0
+        let sleepCount = CallCounter()
         let tokens = try await pollDeviceCodeToken(
             issuer: "https://auth.x.ai",
             clientID: "c",
             device: device,
             transport: transport,
-            sleep: { _ in slept += 1 }
+            sleep: { _ in sleepCount.increment() }
         )
         #expect(tokens.accessToken == "at")
-        #expect(slept >= 1)
+        #expect(sleepCount.count >= 1)
     }
 
     @Test func deviceCodeCancellation() async throws {
@@ -894,9 +894,7 @@ struct CodexIsolationTests {
             ),
             lastRefresh: Date(timeIntervalSince1970: 1772575524)
         )
-        let encoder = JSONEncoder()
-        let decoder = JSONDecoder()
-        let data = try encoder.encode(store)
+        let data = try AuthJSON.encoder.encode(store)
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         #expect((json?["auth_mode"] as? String) == "chatgpt")
         #expect(json?["OPENAI_API_KEY"] == nil)

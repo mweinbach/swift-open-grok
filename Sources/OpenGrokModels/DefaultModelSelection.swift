@@ -85,7 +85,7 @@ public func resolveDefaultModel(
         switch ModelGlobSet.compile(input.models.allowedModels) {
         case .success(nil):
             entry.info.userSelectable = true
-        case .success(let Some(set)):
+        case .success(.some(let set)):
             entry.info.userSelectable = set.matches(key: bundled, model: bundled)
         case .failure:
             entry.info.userSelectable = false

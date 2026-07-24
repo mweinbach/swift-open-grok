@@ -6,6 +6,7 @@
 //   CLI flag > ENV var > config.toml > remote settings > these defaults
 
 import Foundation
+import CoreFoundation
 import OpenGrokSamplingTypes
 
 /// Specialty model role used for auxiliary tasks.
@@ -219,18 +220,22 @@ private func parseDefaultModelJSON(_ obj: [String: Any]) throws -> DefaultModelJ
     }
 
     let compactionsRemaining: CompactionsRemaining?
-    if let b = obj["compactions_remaining"] as? Bool {
-        compactionsRemaining = .dynamic(b)
-    } else if let n = obj["compactions_remaining"] as? NSNumber {
-        compactionsRemaining = .fixed(n.uint8Value)
+    if let n = obj["compactions_remaining"] as? NSNumber {
+        if CFGetTypeID(n) == CFBooleanGetTypeID() {
+            compactionsRemaining = .dynamic(n.boolValue)
+        } else {
+            compactionsRemaining = .fixed(n.uint8Value)
+        }
     } else {
         compactionsRemaining = nil
     }
     let compactionAtTokens: CompactionAtTokens?
-    if let b = obj["compaction_at_tokens"] as? Bool {
-        compactionAtTokens = .enabled(b)
-    } else if let n = obj["compaction_at_tokens"] as? NSNumber {
-        compactionAtTokens = .fixed(n.uint64Value)
+    if let n = obj["compaction_at_tokens"] as? NSNumber {
+        if CFGetTypeID(n) == CFBooleanGetTypeID() {
+            compactionAtTokens = .enabled(n.boolValue)
+        } else {
+            compactionAtTokens = .fixed(n.uint64Value)
+        }
     } else {
         compactionAtTokens = nil
     }

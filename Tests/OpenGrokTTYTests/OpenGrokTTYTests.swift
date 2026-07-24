@@ -69,7 +69,10 @@ struct OpenGrokTTYTests {
 
             var restored = termios()
             #expect(tcgetattr(slave, &restored) == 0)
-            #expect(termiosMatches(original, restored))
+            #expect(
+                termiosMatches(original, restored),
+                "original=\(termiosSummary(original)) restored=\(termiosSummary(restored))"
+            )
         }
         #endif
     }
@@ -101,7 +104,10 @@ struct OpenGrokTTYTests {
 
             var restored = termios()
             #expect(tcgetattr(slave, &restored) == 0)
-            #expect(termiosMatches(original, restored), "original cooked restored after final release")
+            #expect(
+                termiosMatches(original, restored),
+                "original=\(termiosSummary(original)) restored=\(termiosSummary(restored))"
+            )
         }
         #endif
     }
@@ -124,7 +130,10 @@ struct OpenGrokTTYTests {
 
             var restored = termios()
             #expect(tcgetattr(slave, &restored) == 0)
-            #expect(termiosMatches(original, restored))
+            #expect(
+                termiosMatches(original, restored),
+                "original=\(termiosSummary(original)) restored=\(termiosSummary(restored))"
+            )
         }
         #endif
     }
@@ -210,10 +219,11 @@ struct OpenGrokTTYTests {
             var st: Int32 = 0
             _ = waitpid(p, &st, 0)
         }
-        _ = try scope.enroll(pid: UInt32(p))
+        let group = try scope.enroll(pid: UInt32(p))
         scope.killAll()
         scope.killAll()
         #expect(await childDied(p))
+        _ = group
         #endif
     }
 
@@ -228,6 +238,7 @@ struct OpenGrokTTYTests {
             _ = waitpid(p, &st, 0)
         }
         var group: ProcessGroup? = try scope.enroll(pid: UInt32(p))
+        #expect(group != nil)
         #expect(scope.liveCount == 1)
         group = nil
         #expect(scope.liveCount == 0)
@@ -366,11 +377,17 @@ struct OpenGrokTTYTests {
     }
 
     private func termiosMatches(_ a: termios, _ b: termios) -> Bool {
-        // Compare the fields that cfmakeraw mutates.
-        a.c_iflag == b.c_iflag
+        // PENDIN is a kernel-managed status bit and may be set after restoring
+        // canonical mode on a PTY even though the configured local flags match.
+        let stableLocalMask = ~tcflag_t(PENDIN)
+        return a.c_iflag == b.c_iflag
             && a.c_oflag == b.c_oflag
             && a.c_cflag == b.c_cflag
-            && a.c_lflag == b.c_lflag
+            && (a.c_lflag & stableLocalMask) == (b.c_lflag & stableLocalMask)
+    }
+
+    private func termiosSummary(_ value: termios) -> String {
+        "iflag=\(value.c_iflag) oflag=\(value.c_oflag) cflag=\(value.c_cflag) lflag=\(value.c_lflag)"
     }
     #endif
 }

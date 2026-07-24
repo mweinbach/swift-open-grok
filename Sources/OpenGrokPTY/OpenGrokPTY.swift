@@ -225,7 +225,8 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
     private var outputContinuation: AsyncThrowingStream<Data, Error>.Continuation?
     private var readerTask: Task<Void, Never>?
     private var waiterTask: Task<Void, Never>?
-    private var waitContinuations: [CheckedContinuation<ProcessExit, Error>] = []
+    private var nextWaiterID: UInt64 = 1
+    private var waitContinuations: [UInt64: CheckedContinuation<ProcessExit, Error>] = [:]
     private var accumulated = Data()
 
     init(
@@ -356,17 +357,43 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
         if let done = snapshotExitIfDone() {
             return done
         }
-        return try await withCheckedThrowingContinuation { cont in
-            let immediate: ProcessExit? = self.state.withLock {
-                if self.exitStatus != .stillRunning {
-                    return self.exitStatus
+        let waiterID: UInt64 = state.withLock {
+            let id = nextWaiterID
+            nextWaiterID &+= 1
+            return id
+        }
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { cont in
+                enum Action {
+                    case wait
+                    case exit(ProcessExit)
+                    case cancelled
                 }
-                self.waitContinuations.append(cont)
-                return nil
+                let action: Action = self.state.withLock {
+                    if self.exitStatus != .stillRunning {
+                        return .exit(self.exitStatus)
+                    }
+                    if Task.isCancelled {
+                        return .cancelled
+                    }
+                    self.waitContinuations[waiterID] = cont
+                    return .wait
+                }
+                switch action {
+                case .wait:
+                    break
+                case .exit(let exit):
+                    cont.resume(returning: exit)
+                case .cancelled:
+                    cont.resume(throwing: CancellationError())
+                }
             }
-            if let immediate {
-                cont.resume(returning: immediate)
+        } onCancel: {
+            let continuation = self.state.withLock {
+                self.waitContinuations.removeValue(forKey: waiterID)
             }
+            continuation?.resume(throwing: CancellationError())
         }
     }
 
@@ -508,7 +535,7 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
         let waiters: [CheckedContinuation<ProcessExit, Error>] = state.withLock {
             guard exitStatus == .stillRunning else { return [] }
             exitStatus = exit
-            let w = waitContinuations
+            let w = Array(waitContinuations.values)
             waitContinuations.removeAll()
             return w
         }
@@ -585,7 +612,7 @@ public struct PosixPTYAdapter: PTYAdapter, SignalHandling, Sendable {
             )
             _ = sysClose(slave)
             let group = ProcessGroup()
-            try? group.attach(pid: UInt32(pid))
+            try group.attach(pid: UInt32(pid))
             scope?.register(group)
             return PosixPTYProcess(
                 identifier: "pid:\(pid)",
@@ -626,7 +653,7 @@ public struct PosixPTYAdapter: PTYAdapter, SignalHandling, Sendable {
             _ = sysClose(devnull)
             _ = sysClose(outPipe[1])
             let group = ProcessGroup()
-            try? group.attach(pid: UInt32(pid))
+            try group.attach(pid: UInt32(pid))
             scope?.register(group)
             return PosixPTYProcess(
                 identifier: "pid:\(pid)",

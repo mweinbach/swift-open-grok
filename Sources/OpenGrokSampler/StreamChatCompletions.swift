@@ -48,10 +48,33 @@ public func streamChatCompletions(
             var lastContentChunkAt = MonotonicInstant.now
 
             let iterator = AsyncStreamIteratorRelay(rawStream)
-            while true {
-                let next = await iterator.next()
+            defer { iterator.cancel() }
+            streamLoop: while true {
+                guard let idleBudget = remainingIdleTimeout(
+                    since: lastContentChunkAt,
+                    limit: idleTimeout
+                ) else {
+                    let err = SamplingError.idleTimeout(elapsedSecs: idleTimeout.wholeSeconds)
+                    continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
+                    continuation.finish()
+                    return
+                }
 
-                guard let next else { break }
+                let next: Result<ChatCompletionChunk, SamplingError>
+                switch await iterator.next(timeout: idleBudget) {
+                case .value(let value):
+                    next = value
+                case .finished:
+                    break streamLoop
+                case .timedOut:
+                    let err = SamplingError.idleTimeout(elapsedSecs: idleTimeout.wholeSeconds)
+                    continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
+                    continuation.finish()
+                    return
+                case .cancelled:
+                    continuation.finish()
+                    return
+                }
 
                 let chunk: ChatCompletionChunk
                 switch next {
@@ -157,7 +180,7 @@ public func streamChatCompletions(
 
                 if chunkHasContent {
                     lastContentChunkAt = .now
-                } else if MonotonicInstant.now - lastContentChunkAt > idleTimeout {
+                } else if remainingIdleTimeout(since: lastContentChunkAt, limit: idleTimeout) == nil {
                     let err = SamplingError.idleTimeout(elapsedSecs: idleTimeout.wholeSeconds)
                     continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
                     continuation.finish()
@@ -214,20 +237,42 @@ public func streamChatCompletions(
     }
 }
 
-// MARK: - Timeout helper
+func remainingIdleTimeout(
+    since lastContentAt: MonotonicInstant,
+    limit: MonotonicDuration,
+    now: MonotonicInstant = .now
+) -> MonotonicDuration? {
+    let elapsed = now - lastContentAt
+    guard elapsed < limit else { return nil }
+    return MonotonicDuration(nanoseconds: limit.nanoseconds - elapsed.nanoseconds)
+}
 
-struct TimeoutError: Error {}
+enum StreamMailboxRead<Element: Sendable>: Sendable {
+    case value(Element)
+    case finished
+    case timedOut
+    case cancelled
+}
 
 private actor StreamMailbox<Element: Sendable> {
+    private struct Waiter {
+        let id: UInt64
+        let continuation: CheckedContinuation<StreamMailboxRead<Element>, Never>
+    }
+
     private var values: [Element] = []
-    private var waiter: CheckedContinuation<Element?, Never>?
+    private var waiter: Waiter?
+    private var timeoutTask: Task<Void, Never>?
+    private var nextWaiterID: UInt64 = 0
     private var finished = false
 
     func offer(_ value: Element) {
         guard !finished else { return }
         if let waiter {
             self.waiter = nil
-            waiter.resume(returning: value)
+            timeoutTask?.cancel()
+            timeoutTask = nil
+            waiter.continuation.resume(returning: .value(value))
         } else {
             values.append(value)
         }
@@ -236,16 +281,56 @@ private actor StreamMailbox<Element: Sendable> {
     func finish() {
         guard !finished else { return }
         finished = true
-        waiter?.resume(returning: nil)
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        waiter?.continuation.resume(returning: .finished)
         waiter = nil
     }
 
-    func next() async -> Element? {
-        if !values.isEmpty { return values.removeFirst() }
-        if finished { return nil }
-        return await withCheckedContinuation { continuation in
-            waiter = continuation
+    func next(timeout: MonotonicDuration? = nil) async -> StreamMailboxRead<Element> {
+        if Task.isCancelled { return .cancelled }
+        if !values.isEmpty { return .value(values.removeFirst()) }
+        if finished { return .finished }
+
+        precondition(waiter == nil)
+        let waiterID = nextWaiterID
+        nextWaiterID &+= 1
+
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                waiter = Waiter(id: waiterID, continuation: continuation)
+                if let timeout {
+                    timeoutTask = Task { [weak self] in
+                        do {
+                            try await timeout.sleep()
+                        } catch {
+                            return
+                        }
+                        await self?.timeOutWaiter(id: waiterID)
+                    }
+                }
+                if Task.isCancelled {
+                    cancelWaiter(id: waiterID)
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: waiterID) }
         }
+    }
+
+    private func cancelWaiter(id: UInt64) {
+        guard let waiter, waiter.id == id else { return }
+        self.waiter = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        waiter.continuation.resume(returning: .cancelled)
+    }
+
+    private func timeOutWaiter(id: UInt64) {
+        guard let waiter, waiter.id == id else { return }
+        self.waiter = nil
+        timeoutTask = nil
+        waiter.continuation.resume(returning: .timedOut)
     }
 }
 
@@ -254,64 +339,84 @@ private struct StreamRelayFailure: Error, Sendable {
 }
 
 /// A producer task exclusively owns the source iterator; consumers receive
-/// through a bounded mailbox and may race mailbox delivery against timeout.
-final actor AsyncStreamIteratorRelay<Element: Sendable> {
-    private let mailbox = StreamMailbox<Element>()
+/// through a mailbox that supports cancellation-aware timed reads.
+final class AsyncStreamIteratorRelay<Element: Sendable>: Sendable {
+    private let mailbox: StreamMailbox<Element>
     private let producer: Task<Void, Never>
 
     init(_ stream: AsyncStream<Element>) {
-        let mailbox = self.mailbox
+        let mailbox = StreamMailbox<Element>()
+        self.mailbox = mailbox
         self.producer = Task {
             var iterator = stream.makeAsyncIterator()
-            while let value = await iterator.next() { await mailbox.offer(value) }
-            await mailbox.finish()
-        }
-    }
-
-    func next() async -> Element? { await mailbox.next() }
-}
-
-final actor AsyncThrowingStreamIteratorRelay<Element: Sendable> {
-    private let mailbox = StreamMailbox<Result<Element, StreamRelayFailure>>()
-    private let producer: Task<Void, Never>
-
-    init(_ stream: AsyncThrowingStream<Element, Error>) {
-        let mailbox = self.mailbox
-        self.producer = Task {
-            do {
-                var iterator = stream.makeAsyncIterator()
-                while let value = try await iterator.next() { await mailbox.offer(.success(value)) }
-            } catch {
-                await mailbox.offer(.failure(StreamRelayFailure(message: String(describing: error))))
+            while !Task.isCancelled, let value = await iterator.next() {
+                await mailbox.offer(value)
             }
             await mailbox.finish()
         }
     }
 
-    func next() async throws -> Element? {
-        guard let result = await mailbox.next() else { return nil }
-        switch result {
-        case .success(let value): return value
-        case .failure(let error): throw error
+    deinit {
+        producer.cancel()
+    }
+
+    func next() async -> Element? {
+        switch await mailbox.next() {
+        case .value(let value): return value
+        case .finished, .timedOut, .cancelled: return nil
         }
+    }
+
+    func next(timeout: MonotonicDuration) async -> StreamMailboxRead<Element> {
+        await mailbox.next(timeout: timeout)
+    }
+
+    func cancel() {
+        producer.cancel()
+        Task { await mailbox.finish() }
     }
 }
 
-func withTimeout<T: Sendable>(
-    _ timeout: MonotonicDuration,
-    operation: @escaping @Sendable () async -> T
-) async throws -> T {
-    try await withThrowingTaskGroup(of: T.self) { group in
-        group.addTask {
-            await operation()
+final class AsyncThrowingStreamIteratorRelay<Element: Sendable>: Sendable {
+    private let mailbox: StreamMailbox<Result<Element, StreamRelayFailure>>
+    private let producer: Task<Void, Never>
+
+    init(_ stream: AsyncThrowingStream<Element, Error>) {
+        let mailbox = StreamMailbox<Result<Element, StreamRelayFailure>>()
+        self.mailbox = mailbox
+        self.producer = Task {
+            do {
+                var iterator = stream.makeAsyncIterator()
+                while !Task.isCancelled, let value = try await iterator.next() {
+                    await mailbox.offer(.success(value))
+                }
+            } catch {
+                if !Task.isCancelled {
+                    await mailbox.offer(.failure(StreamRelayFailure(message: String(describing: error))))
+                }
+            }
+            await mailbox.finish()
         }
-        group.addTask {
-            try await timeout.sleep()
-            throw TimeoutError()
+    }
+
+    deinit {
+        producer.cancel()
+    }
+
+    func next() async throws -> Element? {
+        switch await mailbox.next() {
+        case .value(let result):
+            switch result {
+            case .success(let value): return value
+            case .failure(let error): throw error
+            }
+        case .finished:
+            return nil
+        case .cancelled:
+            throw CancellationError()
+        case .timedOut:
+            throw StreamRelayFailure(message: "stream read timed out")
         }
-        let result = try await group.next()!
-        group.cancelAll()
-        return result
     }
 }
 

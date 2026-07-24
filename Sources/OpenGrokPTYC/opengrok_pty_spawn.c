@@ -11,6 +11,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -88,24 +89,62 @@ int opengrok_spawn_with_fds(
         return EINVAL;
     }
 
+    int ready_pipe[2];
+    if (pipe(ready_pipe) != 0) {
+        return errno ? errno : EIO;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
-        return errno ? errno : EAGAIN;
+        int err = errno ? errno : EAGAIN;
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        return err;
     }
 
     if (pid == 0) {
         /* ---- child ---- */
+        close(ready_pipe[0]);
+        int setup_error = 0;
         if (new_session) {
             if (setsid() < 0) {
-                /* EPERM: already a session leader; continue best-effort. */
+                setup_error = errno ? errno : EPERM;
             }
-            if (set_ctty && stdin_fd >= 0) {
+            if (setup_error == 0 && set_ctty && stdin_fd >= 0) {
 #ifdef TIOCSCTTY
-                (void)ioctl(stdin_fd, TIOCSCTTY, 0);
+                if (ioctl(stdin_fd, TIOCSCTTY, 0) != 0) {
+                    setup_error = errno ? errno : EIO;
+                }
 #endif
             }
         } else if (new_pgroup) {
-            (void)setpgid(0, 0);
+            if (setpgid(0, 0) != 0) {
+                setup_error = errno ? errno : EPERM;
+            }
+        }
+
+        sigset_t empty_mask;
+        if (sigemptyset(&empty_mask) != 0
+            || sigprocmask(SIG_SETMASK, &empty_mask, NULL) != 0) {
+            setup_error = errno ? errno : EIO;
+        }
+
+        signal(SIGPIPE, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGTSTP, SIG_DFL);
+        signal(SIGTTIN, SIG_DFL);
+        signal(SIGTTOU, SIG_DFL);
+
+        ssize_t written;
+        do {
+            written = write(ready_pipe[1], &setup_error, sizeof(setup_error));
+        } while (written < 0 && errno == EINTR);
+        close(ready_pipe[1]);
+        if (written != (ssize_t)sizeof(setup_error) || setup_error != 0) {
+            _exit(127);
         }
 
         if (cwd != NULL && cwd[0] != '\0') {
@@ -149,15 +188,24 @@ int opengrok_spawn_with_fds(
             }
         }
 
-        signal(SIGPIPE, SIG_DFL);
-        signal(SIGINT, SIG_DFL);
-        signal(SIGQUIT, SIG_DFL);
-        signal(SIGTSTP, SIG_DFL);
-        signal(SIGTTIN, SIG_DFL);
-        signal(SIGTTOU, SIG_DFL);
-
         execve(path, argv, envp);
         _exit(127);
+    }
+
+    close(ready_pipe[1]);
+    int setup_error = EIO;
+    ssize_t received;
+    do {
+        received = read(ready_pipe[0], &setup_error, sizeof(setup_error));
+    } while (received < 0 && errno == EINTR);
+    close(ready_pipe[0]);
+    if (received != (ssize_t)sizeof(setup_error) || setup_error != 0) {
+        if (setup_error == 0) {
+            setup_error = EIO;
+        }
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+        return setup_error;
     }
 
     *out_pid = pid;

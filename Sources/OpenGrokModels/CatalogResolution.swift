@@ -187,7 +187,7 @@ public func resolveModelCatalog(
     )
 
     switch ModelGlobSet.compile(input.models.disabledModels) {
-    case .success(let Some(disabled)):
+    case .success(.some(let disabled)):
         catalog.retain { key, entry in !disabled.matches(key: key, model: entry.model) }
     case .failure:
         // Invalid deny patterns fail closed by leaving the catalog empty.
@@ -218,7 +218,7 @@ public func resolveModelCatalog(
     }
 
     switch ModelGlobSet.compile(input.models.hiddenModels) {
-    case .success(let Some(hidden)):
+    case .success(.some(let hidden)):
         for (key, var entry) in catalog.pairs() {
             if hidden.matches(key: key, model: entry.model) {
                 entry.info.hidden = true

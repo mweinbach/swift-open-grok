@@ -8,6 +8,21 @@ import OpenGrokToolProtocol
 import OpenGrokToolRuntime
 import OpenGrokToolTypes
 
+private final class ReconnectEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [ReconnectEvent] = []
+
+    func append(_ event: ReconnectEvent) {
+        lock.withLock {
+            events.append(event)
+        }
+    }
+
+    var snapshot: [ReconnectEvent] {
+        lock.withLock { events }
+    }
+}
+
 @Suite("OpenGrokComputerHubSDK")
 struct ComputerHubSDKTests {
     @Test("connection pool refcount")
@@ -27,10 +42,11 @@ struct ComputerHubSDKTests {
     func reconnectHandlers() throws {
         let key = PrincipalKey(url: "wss://hub", userId: try UserId("u"))
         let conn = HubConnection(key: key, connected: true)
-        var events: [ReconnectEvent] = []
-        conn.onReconnect { events.append($0) }
+        let recorder = ReconnectEventRecorder()
+        conn.onReconnect { recorder.append($0) }
         conn.markDisconnected(reason: "drop")
         conn.markConnected()
+        let events = recorder.snapshot
         #expect(events.count == 2)
         #expect(events[0] == .disconnected(reason: "drop"))
         #expect(events[1] == .reconnected)
@@ -106,7 +122,8 @@ struct ComputerHubSDKTests {
     @Test("isWorkspaceUnavailable re-export")
     func unavailableReexport() {
         let err = ToolError.custom(code: workspaceUnavailableSubcode, detail: "gone")
-        #expect(isWorkspaceUnavailable(err))
+        let unavailable = OpenGrokComputerHubSDK.isWorkspaceUnavailable(err)
+        #expect(unavailable)
     }
 }
 

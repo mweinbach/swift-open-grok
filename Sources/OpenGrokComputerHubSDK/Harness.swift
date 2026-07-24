@@ -72,13 +72,13 @@ public final class ToolHarness: @unchecked Sendable {
         ctx: ToolCallContext = ToolCallContext()
     ) async -> ToolStream<TypedToolOutput> {
         let token = CancellationToken()
-        cancelTokens.lock()
-        activeCancels[ctx.callId] = token
-        cancelTokens.unlock()
+        cancelTokens.withLock {
+            activeCancels[ctx.callId] = token
+        }
         defer {
-            cancelTokens.lock()
-            activeCancels.removeValue(forKey: ctx.callId)
-            cancelTokens.unlock()
+            _ = cancelTokens.withLock {
+                activeCancels.removeValue(forKey: ctx.callId)
+            }
         }
 
         if token.isCancelled {
@@ -115,9 +115,9 @@ public final class ToolHarness: @unchecked Sendable {
     }
 
     public func cancel(callId: ToolCallId) {
-        cancelTokens.lock()
-        activeCancels[callId]?.cancel()
-        cancelTokens.unlock()
+        cancelTokens.withLock {
+            activeCancels[callId]?.cancel()
+        }
     }
 }
 
@@ -130,7 +130,7 @@ public struct ToolHarnessBuilder {
     public init() {}
 
     public func withLocal(_ tool: any ToolDyn, registration: ToolRegistration) -> ToolHarnessBuilder {
-        var c = self
+        let c = self
         c.local.registerDyn(tool, registration: registration)
         return c
     }

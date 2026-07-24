@@ -129,8 +129,10 @@ public struct CodexCatalogModel: Sendable, Equatable {
         let contextLimit = resolvedContextWindow.map { ($0 * 9) / 10 }
         let resolved: Int64?
         switch (contextLimit, autoCompactTokenLimit) {
-        case let (Some(cl), Some(cfg)): resolved = min(cfg, cl)
-        case let (Some(cl), nil): resolved = cl
+        case let (.some(contextLimit), .some(configuredLimit)):
+            resolved = min(configuredLimit, contextLimit)
+        case let (.some(contextLimit), nil):
+            resolved = contextLimit
         case let (nil, cfg): resolved = cfg
         }
         guard let resolved else { return nil }
@@ -464,4 +466,3 @@ public struct CodexModelsCacheManager: Sendable {
         try? FileManager.default.removeItem(at: path)
     }
 }
-

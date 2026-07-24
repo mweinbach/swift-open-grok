@@ -104,8 +104,8 @@ struct CatalogResolutionTests {
             ConfigModelOverride(
                 model: "custom-model",
                 baseURL: "https://example.com/v1",
-                contextWindow: 123_456,
-                provider: .kimi
+                provider: .kimi,
+                contextWindow: 123_456
             )
         )]
         let catalog = resolveModelCatalog(input: input)
@@ -231,8 +231,8 @@ struct CatalogResolutionTests {
             ConfigModelOverride(
                 model: "shared-slug",
                 baseURL: "https://api.moonshot.ai/v1",
-                contextWindow: 100_000,
-                provider: .kimi
+                provider: .kimi,
+                contextWindow: 100_000
             )
         )]
         // Apply config first via list resolve, then merge prefetched xAI.
@@ -1459,5 +1459,4 @@ struct CodexParityRemediationTests {
         #expect(slugs == ["high-priority-wire-second", "medium-priority-wire-third", "low-priority-wire-first"])
     }
 }
-
 

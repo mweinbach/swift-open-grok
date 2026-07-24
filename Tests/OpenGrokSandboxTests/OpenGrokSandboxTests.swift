@@ -212,9 +212,9 @@ struct OpenGrokSandboxTests {
         #expect(throws: SandboxError.self) {
             try enforcer.validateResume(persisted: .readOnly, candidate: .none)
         }
-        #expect(noThrow: {
+        #expect(throws: Never.self) {
             try enforcer.validateResume(persisted: .readOnly, candidate: .restricted)
-        })
+        }
     }
 
     @Test("rejectTraversableRoot rejects NUL bytes and empty components")
@@ -279,7 +279,7 @@ struct OpenGrokSandboxTests {
         }
         #else
         // Non-Linux platforms report explicit no-op / unsupported behavior cleanly
-        #expect(noThrow: { try policy.enforceInChildProcess() })
+        #expect(throws: Never.self) { try policy.enforceInChildProcess() }
         #endif
     }
 
@@ -296,10 +296,10 @@ struct OpenGrokSandboxTests {
 
     @Test("glob validation accepts supported subset and rejects hostile/ambiguous globs")
     func globValidation() throws {
-        #expect(noThrow: { try validateDenyGlob("**/*.pem") })
-        #expect(noThrow: { try validateDenyGlob("secrets/**") })
-        #expect(noThrow: { try validateDenyGlob("[a-z].rs") })
-        #expect(noThrow: { try validateDenyGlob("[!a]b") })
+        #expect(throws: Never.self) { try validateDenyGlob("**/*.pem") }
+        #expect(throws: Never.self) { try validateDenyGlob("secrets/**") }
+        #expect(throws: Never.self) { try validateDenyGlob("[a-z].rs") }
+        #expect(throws: Never.self) { try validateDenyGlob("[!a]b") }
 
         #expect(throws: SandboxError.self) { try validateDenyGlob("{a,b}") }
         #expect(throws: SandboxError.self) { try validateDenyGlob("a\\b") }

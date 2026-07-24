@@ -66,9 +66,33 @@ public func streamMessages(
             var blockToToolIndex: [UInt32: UInt32] = [:]
 
             let iterator = AsyncStreamIteratorRelay(rawStream)
-            while true {
-                let next = await iterator.next()
-                guard let next else { break }
+            defer { iterator.cancel() }
+            streamLoop: while true {
+                guard let idleBudget = remainingIdleTimeout(
+                    since: lastContentChunkAt,
+                    limit: idleTimeout
+                ) else {
+                    let err = SamplingError.idleTimeout(elapsedSecs: idleTimeout.wholeSeconds)
+                    continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
+                    continuation.finish()
+                    return
+                }
+
+                let next: Result<MessageStreamEvent, SamplingError>
+                switch await iterator.next(timeout: idleBudget) {
+                case .value(let value):
+                    next = value
+                case .finished:
+                    break streamLoop
+                case .timedOut:
+                    let err = SamplingError.idleTimeout(elapsedSecs: idleTimeout.wholeSeconds)
+                    continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
+                    continuation.finish()
+                    return
+                case .cancelled:
+                    continuation.finish()
+                    return
+                }
 
                 let event: MessageStreamEvent
                 switch next {
@@ -260,7 +284,7 @@ public func streamMessages(
 
                 if hasContent {
                     lastContentChunkAt = .now
-                } else if MonotonicInstant.now - lastContentChunkAt > idleTimeout {
+                } else if remainingIdleTimeout(since: lastContentChunkAt, limit: idleTimeout) == nil {
                     let err = SamplingError.idleTimeout(elapsedSecs: idleTimeout.wholeSeconds)
                     continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
                     continuation.finish()

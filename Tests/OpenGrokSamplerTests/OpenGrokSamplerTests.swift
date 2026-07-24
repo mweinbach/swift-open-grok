@@ -11,6 +11,96 @@ import OpenGrokHTTP
 import OpenGrokSamplingTypes
 import OpenGrokShared
 
+private final class PendingStreamSource<Element: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: AsyncStream<Element>.Continuation?
+    private var terminated = false
+
+    func stream() -> AsyncStream<Element> {
+        AsyncStream { continuation in
+            lock.withLock {
+                self.continuation = continuation
+            }
+            continuation.onTermination = { [weak self] _ in
+                self?.markTerminated()
+            }
+        }
+    }
+
+    func finish() {
+        let continuation = lock.withLock {
+            let continuation = self.continuation
+            self.continuation = nil
+            return continuation
+        }
+        continuation?.finish()
+    }
+
+    var isTerminated: Bool {
+        lock.withLock { terminated }
+    }
+
+    private func markTerminated() {
+        lock.withLock {
+            terminated = true
+        }
+    }
+}
+
+private final class CompletionFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+
+    func markCompleted() {
+        lock.withLock {
+            completed = true
+        }
+    }
+
+    var isCompleted: Bool {
+        lock.withLock { completed }
+    }
+}
+
+private func collectSamplingEvents(_ stream: AsyncStream<SamplingEvent>) async -> [SamplingEvent] {
+    var events: [SamplingEvent] = []
+    for await event in stream {
+        events.append(event)
+    }
+    return events
+}
+
+private func waitUntil(
+    timeout: MonotonicDuration = .milliseconds(500),
+    condition: @escaping @Sendable () -> Bool
+) async -> Bool {
+    let startedAt = MonotonicInstant.now
+    while MonotonicInstant.now - startedAt < timeout {
+        if condition() { return true }
+        try? await Task.sleep(nanoseconds: 1_000_000)
+    }
+    return condition()
+}
+
+private func expectPromptCancellation<Element: Sendable>(
+    stream: AsyncStream<SamplingEvent>,
+    source: PendingStreamSource<Element>
+) async {
+    let completion = CompletionFlag()
+    let consumer = Task {
+        for await _ in stream {}
+        completion.markCompleted()
+    }
+    try? await Task.sleep(nanoseconds: 20_000_000)
+    consumer.cancel()
+    let consumerStopped = await waitUntil { completion.isCompleted }
+    let sourceStopped = await waitUntil { source.isTerminated }
+    source.finish()
+    _ = await consumer.result
+    #expect(consumerStopped)
+    #expect(sourceStopped)
+}
+
 // MARK: - RequestId
 
 @Suite("RequestId")
@@ -1015,6 +1105,105 @@ struct StreamResponsesTests {
         } else {
             Issue.record("expected customToolCallInputDone")
         }
+    }
+}
+
+@Suite("Stream timeout and cancellation")
+struct StreamTimeoutAndCancellationTests {
+    @Test("chat completions times out while awaiting the next chunk")
+    func chatTimeout() async {
+        let source = PendingStreamSource<Result<ChatCompletionChunk, SamplingError>>()
+        let events = await collectSamplingEvents(streamChatCompletions(
+            rawStream: source.stream(),
+            modelMetadata: nil,
+            requestId: RequestId("chat-timeout"),
+            idleTimeout: .milliseconds(30)
+        ))
+        let sourceStopped = await waitUntil { source.isTerminated }
+        if case .failed(_, let info) = events.last {
+            #expect(info.kind == .idleTimeout)
+        } else {
+            Issue.record("expected idle timeout")
+        }
+        #expect(sourceStopped)
+    }
+
+    @Test("messages times out while awaiting the next event")
+    func messagesTimeout() async {
+        let source = PendingStreamSource<Result<MessageStreamEvent, SamplingError>>()
+        let events = await collectSamplingEvents(streamMessages(
+            rawStream: source.stream(),
+            modelMetadata: nil,
+            requestId: RequestId("messages-timeout"),
+            idleTimeout: .milliseconds(30)
+        ))
+        let sourceStopped = await waitUntil { source.isTerminated }
+        if case .failed(_, let info) = events.last {
+            #expect(info.kind == .idleTimeout)
+        } else {
+            Issue.record("expected idle timeout")
+        }
+        #expect(sourceStopped)
+    }
+
+    @Test("responses times out while awaiting the next event")
+    func responsesTimeout() async {
+        let source = PendingStreamSource<Result<ResponsesStreamEvent, SamplingError>>()
+        let events = await collectSamplingEvents(streamResponses(
+            rawStream: source.stream(),
+            modelMetadata: nil,
+            requestId: RequestId("responses-timeout"),
+            idleTimeout: .milliseconds(30)
+        ))
+        let sourceStopped = await waitUntil { source.isTerminated }
+        if case .failed(_, let info) = events.last {
+            #expect(info.kind == .idleTimeout)
+        } else {
+            Issue.record("expected idle timeout")
+        }
+        #expect(sourceStopped)
+    }
+
+    @Test("chat completions cancellation reaches the source")
+    func chatCancellation() async {
+        let source = PendingStreamSource<Result<ChatCompletionChunk, SamplingError>>()
+        await expectPromptCancellation(
+            stream: streamChatCompletions(
+                rawStream: source.stream(),
+                modelMetadata: nil,
+                requestId: RequestId("chat-cancel"),
+                idleTimeout: .seconds(60)
+            ),
+            source: source
+        )
+    }
+
+    @Test("messages cancellation reaches the source")
+    func messagesCancellation() async {
+        let source = PendingStreamSource<Result<MessageStreamEvent, SamplingError>>()
+        await expectPromptCancellation(
+            stream: streamMessages(
+                rawStream: source.stream(),
+                modelMetadata: nil,
+                requestId: RequestId("messages-cancel"),
+                idleTimeout: .seconds(60)
+            ),
+            source: source
+        )
+    }
+
+    @Test("responses cancellation reaches the source")
+    func responsesCancellation() async {
+        let source = PendingStreamSource<Result<ResponsesStreamEvent, SamplingError>>()
+        await expectPromptCancellation(
+            stream: streamResponses(
+                rawStream: source.stream(),
+                modelMetadata: nil,
+                requestId: RequestId("responses-cancel"),
+                idleTimeout: .seconds(60)
+            ),
+            source: source
+        )
     }
 }
 

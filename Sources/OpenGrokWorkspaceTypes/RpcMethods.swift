@@ -99,10 +99,10 @@ public enum RpcEnvelope<T: Codable & Sendable & Hashable & Equatable>: Hashable,
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        if let v = try c.decodeIfPresent(T.self, forKey: .ok) {
-            self = .ok(v)
-        } else if let e = try c.decodeIfPresent(RpcError.self, forKey: .err) {
-            self = .err(e)
+        if c.contains(.ok) {
+            self = .ok(try c.decode(T.self, forKey: .ok))
+        } else if c.contains(.err) {
+            self = .err(try c.decode(RpcError.self, forKey: .err))
         } else {
             throw DecodingError.dataCorruptedError(forKey: .ok, in: c, debugDescription: "RpcEnvelope must have either `ok` or `err`")
         }

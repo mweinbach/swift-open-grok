@@ -588,28 +588,38 @@ private func wrapOptimalFit(
             } else {
                 width += words[j - 1].whitespaceWidth + words[j].width
             }
-            var gap = lineW - width
+            let gap = lineW - width
             var c = cost[i]
             if gap < 0 {
                 // overflow
                 let over = -gap
                 let add = over.multipliedReportingOverflow(by: penalties.overflowPenalty)
                 if add.overflow { continue }
-                c = c.addingReportingOverflow(add.partialValue).partialValue
-            } else {
+                let total = c.addingReportingOverflow(add.partialValue)
+                if total.overflow { continue }
+                c = total.partialValue
+            } else if j + 1 < n {
                 let gapCost = gap.multipliedReportingOverflow(by: gap)
                 if gapCost.overflow { continue }
-                c = c.addingReportingOverflow(gapCost.partialValue).partialValue
+                let total = c.addingReportingOverflow(gapCost.partialValue)
+                if total.overflow { continue }
+                c = total.partialValue
             }
-            c = c.addingReportingOverflow(penalties.nlinePenalty).partialValue
+            let lineCost = c.addingReportingOverflow(penalties.nlinePenalty)
+            if lineCost.overflow { continue }
+            c = lineCost.partialValue
             if words[j].endsWithHyphen {
-                c = c.addingReportingOverflow(penalties.hyphenPenalty).partialValue
+                let hyphenCost = c.addingReportingOverflow(penalties.hyphenPenalty)
+                if hyphenCost.overflow { continue }
+                c = hyphenCost.partialValue
             }
             // short last line
             if j + 1 == n && i == j {
                 let frac = max(penalties.shortLastLineFraction, 1)
                 if words[j].width * frac < lineW {
-                    c = c.addingReportingOverflow(penalties.shortLastLinePenalty).partialValue
+                    let shortLineCost = c.addingReportingOverflow(penalties.shortLastLinePenalty)
+                    if shortLineCost.overflow { continue }
+                    c = shortLineCost.partialValue
                 }
             }
             if c < cost[j + 1] {

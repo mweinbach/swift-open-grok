@@ -218,6 +218,9 @@ struct OrderedPendingEvents {
 
     mutating func enqueue(path: String, kind: WatchEventKind) {
         switch (kinds[path], kind) {
+        case (nil, .remove):
+            order.append(path)
+            kinds[path] = .remove
         case (_, .remove):
             kinds[path] = .remove
         case (.create?, .modify):

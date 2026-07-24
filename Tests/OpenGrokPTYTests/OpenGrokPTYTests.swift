@@ -10,6 +10,18 @@ import Darwin
 import Glibc
 #endif
 
+private func collectPTYOutput(_ stream: AsyncThrowingStream<Data, Error>) async -> Data {
+    var collected = Data()
+    do {
+        for try await chunk in stream {
+            collected.append(chunk)
+        }
+    } catch {
+        // EOF and cancellation terminate collection.
+    }
+    return collected
+}
+
 @Suite("OpenGrokPTY")
 struct OpenGrokPTYTests {
     @Test("ProcessSpec and exit/signal value types")
@@ -43,16 +55,9 @@ struct OpenGrokPTYTests {
             )
         )
         let stream = process.output()
-        var collected = Data()
-        let reader = Task {
-            do {
-                for try await chunk in stream {
-                    collected.append(chunk)
-                }
-            } catch { /* eof */ }
-        }
+        let reader = Task { await collectPTYOutput(stream) }
         let exit = try await process.waitForExit()
-        _ = await reader.value
+        let collected = await reader.value
         #expect(exit == .code(0))
         let text = String(decoding: collected, as: UTF8.self)
         #expect(text.contains("hello-from-pty"))
@@ -72,15 +77,10 @@ struct OpenGrokPTYTests {
                 initialSize: TerminalSize(width: 80, height: 24)
             )
         )
-        var collected = Data()
         let stream = process.output()
-        let reader = Task {
-            for try await chunk in stream {
-                collected.append(chunk)
-            }
-        }
+        let reader = Task { await collectPTYOutput(stream) }
         let exit = try await process.waitForExit()
-        _ = try? await reader.value
+        let collected = await reader.value
         #expect(exit == .code(0))
         let text = String(decoding: collected, as: UTF8.self)
         #expect(text.contains("CTTY_OK"))
@@ -99,15 +99,10 @@ struct OpenGrokPTYTests {
                 usePTY: false
             )
         )
-        var collected = Data()
         let stream = process.output()
-        let reader = Task {
-            for try await chunk in stream {
-                collected.append(chunk)
-            }
-        }
+        let reader = Task { await collectPTYOutput(stream) }
         let exit = try await process.waitForExit()
-        _ = try? await reader.value
+        let collected = await reader.value
         #expect(exit == .code(0))
         #expect(String(decoding: collected, as: UTF8.self).contains("pipe-out"))
         #endif
@@ -208,15 +203,10 @@ struct OpenGrokPTYTests {
                 initialSize: TerminalSize(width: 80, height: 24)
             )
         )
-        var collected = Data()
         let stream = process.output()
-        let reader = Task {
-            for try await chunk in stream {
-                collected.append(chunk)
-            }
-        }
+        let reader = Task { await collectPTYOutput(stream) }
         _ = try await process.waitForExit()
-        _ = try? await reader.value
+        let collected = await reader.value
         let text = String(decoding: collected, as: UTF8.self)
         #expect(text.contains("env-ok"))
         #expect(text.contains(tmp.lastPathComponent) || text.contains(tmp.path))
@@ -240,15 +230,10 @@ struct OpenGrokPTYTests {
                 usePTY: false
             )
         )
-        var collected = Data()
         let stream = process.output()
-        let reader = Task {
-            for try await chunk in stream {
-                collected.append(chunk)
-            }
-        }
+        let reader = Task { await collectPTYOutput(stream) }
         _ = try await process.waitForExit()
-        _ = try? await reader.value
+        let collected = await reader.value
         let text = String(decoding: collected, as: UTF8.self)
         #expect(text.contains(tmp.lastPathComponent) || text.contains(tmp.path))
         #endif
@@ -303,15 +288,10 @@ struct OpenGrokPTYTests {
                 initialSize: TerminalSize(width: 80, height: 24)
             )
         )
-        var collected = Data()
         let stream = process.output()
-        let reader = Task {
-            for try await chunk in stream {
-                collected.append(chunk)
-            }
-        }
+        let reader = Task { await collectPTYOutput(stream) }
         _ = try await process.waitForExit()
-        _ = try? await reader.value
+        let collected = await reader.value
         #expect(collected.count > 100)
         let text = String(decoding: collected, as: UTF8.self)
         #expect(text.contains("café") || text.contains("x"))
@@ -329,14 +309,14 @@ struct OpenGrokPTYTests {
                 command: "/bin/sh",
                 arguments: ["-c", "sleep 60 & wait"],
                 usePTY: true,
-                newProcessGroup: true,
-                initialSize: TerminalSize(width: 40, height: 10)
+                initialSize: TerminalSize(width: 40, height: 10),
+                newProcessGroup: true
             )
         )
         try await Task.sleep(nanoseconds: 100_000_000)
         await process.cancel()
         let exit = try await process.waitForExit()
-        #expect(exit != .stillRunning)
+        #expect(exit != ProcessExit.stillRunning)
         scope.killAll()
         #endif
     }

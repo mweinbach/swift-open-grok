@@ -118,7 +118,7 @@ public final class WorkspaceClient: @unchecked Sendable {
             "params": params,
         ])
 
-        let work: () async -> Result<TypedToolOutput, ToolError> = {
+        let work: @Sendable () async -> Result<TypedToolOutput, ToolError> = {
             let stream = await self.harness.call(
                 toolId: toolId,
                 args: args,
@@ -200,7 +200,7 @@ public final class ConnectedFlag: @unchecked Sendable {
 private func withTimeout(
     ms: UInt64,
     method: String,
-    _ work: @escaping () async -> Result<TypedToolOutput, ToolError>
+    _ work: @escaping @Sendable () async -> Result<TypedToolOutput, ToolError>
 ) async -> Result<TypedToolOutput, ToolError> {
     await withTaskGroup(of: Result<TypedToolOutput, ToolError>?.self) { group in
         group.addTask {

@@ -400,11 +400,12 @@ private final class HitCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
     func increment() {
-        lock.lock(); value += 1; lock.unlock()
+        lock.withLock {
+            value += 1
+        }
     }
     var count: Int {
-        lock.lock(); defer { lock.unlock() }
-        return value
+        lock.withLock { value }
     }
 }
 
@@ -472,13 +473,13 @@ private final class RecordingDelegate: CodeModeSessionDelegate, @unchecked Senda
         _ invocation: CodeModeNestedToolCall,
         cancellationToken: CodeModeCancellationToken
     ) async -> Result<JSONValue, CodeModeError> {
-        lock.lock()
-        invokeTokens.append(cancellationToken)
-        lock.unlock()
+        lock.withLock {
+            invokeTokens.append(cancellationToken)
+        }
         await cancellationToken.waitUntilCancelled()
-        lock.lock()
-        invokeCancelHits += 1
-        lock.unlock()
+        lock.withLock {
+            invokeCancelHits += 1
+        }
         return .failure(CodeModeError("cancelled"))
     }
 
@@ -488,20 +489,20 @@ private final class RecordingDelegate: CodeModeSessionDelegate, @unchecked Senda
         text: String,
         cancellationToken: CodeModeCancellationToken
     ) async -> Result<Void, CodeModeError> {
-        lock.lock()
-        notifyTokens.append(cancellationToken)
-        lock.unlock()
+        lock.withLock {
+            notifyTokens.append(cancellationToken)
+        }
         await cancellationToken.waitUntilCancelled()
-        lock.lock()
-        notifyCancelHits += 1
-        lock.unlock()
+        lock.withLock {
+            notifyCancelHits += 1
+        }
         return .failure(CodeModeError("cancelled"))
     }
 
     func cellClosed(_ cellId: CellId) {
-        lock.lock()
-        closedCells.append(cellId)
-        lock.unlock()
+        lock.withLock {
+            closedCells.append(cellId)
+        }
     }
 }
 
@@ -527,16 +528,18 @@ private final class HarnessSession: CodeModeSession, @unchecked Sendable {
     }
 
     func execute(_ request: ExecuteRequest) async -> Result<StartedCell, CodeModeError> {
-        lock.lock()
-        if shutDown {
-            lock.unlock()
+        let id = lock.withLock { () -> CellId? in
+            guard !shutDown else {
+                return nil
+            }
+            let id = CellId(String(nextId))
+            nextId += 1
+            cells[id.rawValue] = CellState(token: CodeModeCancellationToken())
+            return id
+        }
+        guard let id else {
             return .failure(CodeModeError("session shut down"))
         }
-        let id = CellId(String(nextId))
-        nextId += 1
-        let token = CodeModeCancellationToken()
-        cells[id.rawValue] = CellState(token: token)
-        lock.unlock()
 
         let started = StartedCell.fromResponseContinuation(cellId: id) {
             // First yield so the caller can attach nested work.
@@ -574,27 +577,35 @@ private final class HarnessSession: CodeModeSession, @unchecked Sendable {
     }
 
     func wait(_ request: WaitRequest) async -> Result<WaitOutcome, CodeModeError> {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let state = cells[request.cellId.rawValue] else {
-            let missing = RuntimeResponse.result(
-                cellId: request.cellId,
-                contentItems: [],
-                errorText: "stale cell"
-            )
-            return .success(.missingCell(missing))
+        lock.withLock {
+            guard let state = cells[request.cellId.rawValue] else {
+                let missing = RuntimeResponse.result(
+                    cellId: request.cellId,
+                    contentItems: [],
+                    errorText: "stale cell"
+                )
+                return .success(.missingCell(missing))
+            }
+            if let terminal = state.terminal {
+                return .success(.liveCell(terminal))
+            }
+            return .success(.liveCell(.yielded(cellId: request.cellId, contentItems: [])))
         }
-        if let terminal = state.terminal {
-            return .success(.liveCell(terminal))
-        }
-        return .success(.liveCell(.yielded(cellId: request.cellId, contentItems: [])))
     }
 
     func terminate(_ cellId: CellId) async -> Result<WaitOutcome, CodeModeError> {
-        let token: CodeModeCancellationToken?
-        lock.lock()
-        guard var state = cells[cellId.rawValue] else {
-            lock.unlock()
+        let termination = lock.withLock { () -> (CodeModeCancellationToken, RuntimeResponse)? in
+            guard var state = cells[cellId.rawValue] else {
+                return nil
+            }
+            let terminal = RuntimeResponse.terminated(cellId: cellId, contentItems: [
+                .inputText(text: "terminated")
+            ])
+            state.terminal = terminal
+            cells[cellId.rawValue] = state
+            return (state.token, terminal)
+        }
+        guard let (token, terminal) = termination else {
             let missing = RuntimeResponse.result(
                 cellId: cellId,
                 contentItems: [],
@@ -602,27 +613,20 @@ private final class HarnessSession: CodeModeSession, @unchecked Sendable {
             )
             return .success(.missingCell(missing))
         }
-        token = state.token
-        let terminal = RuntimeResponse.terminated(cellId: cellId, contentItems: [
-            .inputText(text: "terminated")
-        ])
-        state.terminal = terminal
-        cells[cellId.rawValue] = state
-        lock.unlock()
 
         // Cancel exactly once via the token; further cancel() is a no-op.
-        token?.cancel()
-        token?.cancel()
+        token.cancel()
+        token.cancel()
 
         closeIfNeeded(cellId)
         return .success(.liveCell(terminal))
     }
 
     func shutdown() async -> Result<Void, CodeModeError> {
-        lock.lock()
-        shutDown = true
-        let entries = cells
-        lock.unlock()
+        let entries = lock.withLock {
+            shutDown = true
+            return cells
+        }
         for (id, state) in entries {
             state.token.cancel()
             closeIfNeeded(CellId(id))
@@ -631,21 +635,23 @@ private final class HarnessSession: CodeModeSession, @unchecked Sendable {
     }
 
     private func token(for cellId: CellId) -> CodeModeCancellationToken? {
-        lock.lock()
-        defer { lock.unlock() }
-        return cells[cellId.rawValue]?.token
+        lock.withLock {
+            cells[cellId.rawValue]?.token
+        }
     }
 
     private func closeIfNeeded(_ cellId: CellId) {
-        lock.lock()
-        guard var state = cells[cellId.rawValue], !state.closed else {
-            lock.unlock()
-            return
+        let shouldClose = lock.withLock {
+            guard var state = cells[cellId.rawValue], !state.closed else {
+                return false
+            }
+            state.closed = true
+            cells[cellId.rawValue] = state
+            return true
         }
-        state.closed = true
-        cells[cellId.rawValue] = state
-        lock.unlock()
-        delegate.cellClosed(cellId)
+        if shouldClose {
+            delegate.cellClosed(cellId)
+        }
     }
 }
 

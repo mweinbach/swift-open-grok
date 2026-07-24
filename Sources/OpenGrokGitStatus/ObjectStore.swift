@@ -169,7 +169,7 @@ public struct GitObjectStore: Sendable {
             throw GitStatusError.io("bad object header: \(header)")
         }
         let payloadStart = inflated.index(after: nul)
-        return (type, inflated[payloadStart...])
+        return (type, Data(inflated[payloadStart...]))
     }
 }
 

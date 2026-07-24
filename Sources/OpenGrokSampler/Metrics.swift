@@ -81,8 +81,7 @@ public struct InferenceLatencyStats: Codable, Sendable, Equatable, Hashable {
         chunkTimestamps: [MonotonicInstant],
         streamEnd: MonotonicInstant
     ) -> InferenceLatencyStats {
-        let ttlb = UInt64(max(0, (streamEnd - streamStart).components.seconds * 1000
-            + (streamEnd - streamStart).components.attoseconds / 1_000_000_000_000_000))
+        let ttlb = (streamEnd - streamStart).nanoseconds / 1_000_000
 
         if chunkTimestamps.isEmpty {
             return InferenceLatencyStats(timeToLastByteMs: ttlb)

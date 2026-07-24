@@ -310,13 +310,13 @@ struct TextAreaTests {
         area.moveCursorLeft()
         #expect(area.cursor == 4)
         area.deleteBackward()
-        #expect(area.text == "hell")
+        #expect(area.text == "helo")
         #expect(area.canUndo)
         #expect(area.undo())
         #expect(area.text == "hello")
         #expect(area.canRedo)
         #expect(area.redo())
-        #expect(area.text == "hell")
+        #expect(area.text == "helo")
     }
 
     @Test("input classifies and inserts")
@@ -335,6 +335,7 @@ struct TextAreaTests {
     func killYank() {
         let area = TextArea()
         area.setText("hello world")
+        area.setCursor(area.text.utf8.count)
         area.deleteBackwardUnixWord()
         #expect(area.text == "hello ")
         area.yank()
@@ -514,7 +515,7 @@ struct WrappingGoldenTests {
         // OptimalFit with short-last-line penalty prefers:
         // "This is a demo of the short last" / "line penalty."
         #expect(lines.count == 2, "got \(lines)")
-        #expect(lines[0].contains("short last"))
+        #expect(lines[0].contains("short last"), "got \(lines)")
         #expect(lines[1].contains("penalty"))
     }
 
@@ -523,7 +524,7 @@ struct WrappingGoldenTests {
         let text = "ab"
         let w0 = wrapRanges(text, options: WrapOptions(width: 0, wrapAlgorithm: .firstFit))
         #expect(!w0.isEmpty || w0.isEmpty) // must not crash
-        let w1 = wrapRanges(text, options: WrapOptions(width: 1, wrapAlgorithm: .firstFit, breakWords: true))
+        let w1 = wrapRanges(text, options: WrapOptions(width: 1, breakWords: true, wrapAlgorithm: .firstFit))
         #expect(w1.count >= 2)
     }
 

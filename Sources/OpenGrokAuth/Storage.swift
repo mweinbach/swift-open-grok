@@ -10,23 +10,14 @@ import OpenGrokSecrets
 
 /// JSON codec for auth.json (RFC3339 dates, fractional-second tolerant).
 enum AuthJSON {
-    private static let fractional: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-    private static let plain: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
-
     static let encoder: JSONEncoder = {
         let e = JSONEncoder()
         e.outputFormatting = [.prettyPrinted, .sortedKeys]
         e.dateEncodingStrategy = .custom { date, encoder in
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             var c = encoder.singleValueContainer()
-            try c.encode(AuthJSON.fractional.string(from: date))
+            try c.encode(formatter.string(from: date))
         }
         return e
     }()
@@ -36,7 +27,11 @@ enum AuthJSON {
         d.dateDecodingStrategy = .custom { decoder in
             let c = try decoder.singleValueContainer()
             if let s = try? c.decode(String.self) {
-                if let date = AuthJSON.fractional.date(from: s) ?? AuthJSON.plain.date(from: s) {
+                let fractional = ISO8601DateFormatter()
+                fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                let plain = ISO8601DateFormatter()
+                plain.formatOptions = [.withInternetDateTime]
+                if let date = fractional.date(from: s) ?? plain.date(from: s) {
                     return date
                 }
             }
@@ -234,7 +229,9 @@ public func clearScopedAPIKey(grokHome: URL, scope: String) throws {
         }
         if (error as? CocoaError)?.code == .fileReadNoSuchFile { return }
         // Missing file from our mapIOError
-        if case AuthError.storage(let m) = error as? AuthError, m.contains("not found") {
+        if let authError = error as? AuthError,
+           case .storage(let message) = authError,
+           message.contains("not found") {
             return
         }
         throw error

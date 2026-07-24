@@ -7,6 +7,7 @@ import Foundation
 import OpenGrokShared
 import OpenGrokToolProtocol
 import OpenGrokToolRuntime
+import OpenGrokToolTypes
 
 /// Scope `LocalTransport.authorize` grants.
 public let localInvokeScope = "tool.invoke"

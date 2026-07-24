@@ -83,7 +83,7 @@ struct OpenGrokPTYCLITests {
         let deadline = Date().addingTimeInterval(3)
         var saw = false
         while Date() < deadline {
-            if session.outputString().contains("interactive-ok") {
+            if await session.outputString().contains("interactive-ok") {
                 saw = true
                 break
             }
@@ -96,7 +96,7 @@ struct OpenGrokPTYCLITests {
         var sawSize = false
         let sizeDeadline = Date().addingTimeInterval(3)
         while Date() < sizeDeadline {
-            if session.outputString().contains("30 100") {
+            if await session.outputString().contains("30 100") {
                 sawSize = true
                 break
             }
@@ -194,13 +194,17 @@ struct OpenGrokPTYCLITests {
         let result = try await runner.run(
             PTYCLIRunConfig(
                 command: ["/bin/sh", "-c", "printf 'before-close\\n'; exec 1>&-; sleep 0.1; exit 0"],
-                usePTY: false,
-                timeoutSeconds: 3
+                timeoutSeconds: 3,
+                usePTY: false
             )
         )
         #expect(!result.timedOut)
-        #expect(result.exit != .stillRunning)
-        #expect(result.outputString.contains("before-close") || result.output.isEmpty || result.exit == .code(0))
+        #expect(result.exit != ProcessExit.stillRunning)
+        #expect(
+            result.outputString.contains("before-close")
+                || result.output.isEmpty
+                || result.exit == ProcessExit.code(0)
+        )
         await runner.shutdown()
         #endif
     }
@@ -223,7 +227,7 @@ struct OpenGrokPTYCLITests {
         try await session.resize(width: 100, height: 40)
         let exit = try await session.waitForExit()
         #expect(exit == .code(0))
-        let out = session.outputString()
+        let out = await session.outputString()
         #expect(out.contains("line-0"))
         #expect(out.contains("line-29") || out.contains("line-2"))
         await runner.shutdown()

@@ -7,10 +7,12 @@ the Open Grok branding while keeping all runtime/configuration state isolated
 to `$OPENGROK_HOME` or `~/.opengrok` (the legacy `~/.grok` path is never read
 or written).
 
-> **Status (2026-07-22):** Wave 0 foundations plus substantial R01–R09 contract
-> and infrastructure targets are present. **The integrated package build is not
-> verified green** at the current HEAD — workers must **not** invoke SwiftPM
-> directly. The sole integration path is the serialized safe verifier below.
+> **Status (2026-07-23):** Wave 0 foundations plus substantial R01–R15 contract
+> and infrastructure targets are present. The integrated package build, all
+> test bundles, the **1,672-test** Swift Testing suite, and the explicit
+> `open-grok` product build are green in the current worktree atop checkpoint
+> `1aca496ee0b6c59172371f3fc4a3a926fcb25821`. Workers must still **not** invoke
+> SwiftPM directly; the sole integration path is the serialized verifier below.
 > See `PORT_STATUS.md`, `PORT_PLAN.md`, and `CRATE_MAP.md` for exact scope and
 > remaining product gaps. Inventory (committed tree): **98** production source
 > targets, **42** bootstrap placeholders (≤15 non-comment LOC, excluding C
@@ -36,9 +38,9 @@ After a green product build, executable smokes:
 
 ```sh
 # Paths depend on the verifier scratch path (default `.build/workflow-safe`).
-.build/workflow-safe/debug/open-grok --version
-.build/workflow-safe/debug/open-grok help
-OPENGROK_HOME=/tmp/og .build/workflow-safe/debug/open-grok paths
+.build/workflow-safe/out/Products/Debug/open-grok --version
+.build/workflow-safe/out/Products/Debug/open-grok help
+OPENGROK_HOME=/tmp/og .build/workflow-safe/out/Products/Debug/open-grok paths
 ```
 
 The bootstrap CLI surface is **version / help / paths** only. Other product

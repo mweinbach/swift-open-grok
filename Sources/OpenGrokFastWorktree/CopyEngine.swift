@@ -139,72 +139,50 @@ func globMatch(pattern: String, text: String) -> Bool {
 }
 
 private func fnmatchStyle(pattern: String, text: String) -> Bool {
-    // Convert glob to a simple recursive matcher.
-    return matchGlob(Array(pattern), Array(text))
+    matchGlob(Array(pattern), Array(text))
+}
+
+private struct GlobMatchState: Hashable {
+    let patternIndex: Int
+    let textIndex: Int
 }
 
 private func matchGlob(_ pat: [Character], _ text: [Character]) -> Bool {
-    var pi = 0
-    var ti = 0
-    var starPi = -1
-    var starTi = -1
-    var starCross = false
+    var memo: [GlobMatchState: Bool] = [:]
 
-    while ti < text.count {
-        if pi < pat.count {
-            if pat[pi] == "*" {
-                let next = pi + 1
-                if next < pat.count, pat[next] == "*" {
-                    // **
-                    starPi = next + 1
-                    starTi = ti
-                    starCross = true
-                    pi = starPi
-                    continue
-                }
-                starPi = pi + 1
-                starTi = ti
-                starCross = false
-                pi = starPi
-                continue
-            }
-            if pat[pi] == "?" || pat[pi] == text[ti] {
-                if pat[pi] == "?", text[ti] == "/" { /* ? does not match / */ }
-                else {
-                    pi += 1
-                    ti += 1
-                    continue
-                }
-            }
+    func matches(patternIndex: Int, textIndex: Int) -> Bool {
+        let state = GlobMatchState(patternIndex: patternIndex, textIndex: textIndex)
+        if let cached = memo[state] {
+            return cached
         }
-        if starPi >= 0 {
-            if !starCross && text[starTi] == "/" {
-                // single-star cannot consume past /
-                // advance past this slash only if pattern allows
+
+        let result: Bool
+        if patternIndex == pat.count {
+            result = textIndex == text.count
+        } else if pat[patternIndex] == "*" {
+            let isDoubleStar = patternIndex + 1 < pat.count && pat[patternIndex + 1] == "*"
+            let nextPatternIndex = patternIndex + (isDoubleStar ? 2 : 1)
+            if matches(patternIndex: nextPatternIndex, textIndex: textIndex) {
+                result = true
+            } else if textIndex < text.count,
+                      isDoubleStar || text[textIndex] != "/"
+            {
+                result = matches(patternIndex: patternIndex, textIndex: textIndex + 1)
+            } else {
+                result = false
             }
-            starTi += 1
-            ti = starTi
-            pi = starPi
-            if !starCross && ti < text.count && text[ti - 1] == "/" && starPi > 0 {
-                // give up this star span
-            }
-            if !starCross {
-                // ensure we don't cross /
-                var j = starTi
-                while j < ti {
-                    if j < text.count && text[j] == "/" && j != starTi {
-                        return false
-                    }
-                    j += 1
-                }
-            }
-            continue
+        } else if textIndex < text.count,
+                  pat[patternIndex] == text[textIndex]
+                    || (pat[patternIndex] == "?" && text[textIndex] != "/")
+        {
+            result = matches(patternIndex: patternIndex + 1, textIndex: textIndex + 1)
+        } else {
+            result = false
         }
-        return false
+
+        memo[state] = result
+        return result
     }
-    while pi < pat.count, pat[pi] == "*" {
-        pi += 1
-        if pi < pat.count, pat[pi] == "*" { pi += 1 }
-    }
-    return pi == pat.count
+
+    return matches(patternIndex: 0, textIndex: 0)
 }

@@ -7,6 +7,7 @@
 import Foundation
 import Testing
 @testable import OpenGrokHTTP
+import OpenGrokShared
 @testable import OpenGrokTelemetry
 @testable import OpenGrokTracing
 
@@ -191,10 +192,10 @@ struct ProductTelemetryPrivacyTests {
             ]
         )
         #expect(otel.totalBytes > 0)
-        let text = String(data: otel.payloads[0], encoding: .utf8) ?? ""
-        #expect(text.contains("POST"))
-        #expect(!text.contains("Bearer secret"))
-        #expect(!text.contains("do not leak"))
+        let payload = otel.payloads[0]
+        #expect(OTLPWire.protobufContainsUTF8(payload, "POST"))
+        #expect(!OTLPWire.protobufContainsUTF8(payload, "Bearer secret"))
+        #expect(!OTLPWire.protobufContainsUTF8(payload, "do not leak"))
     }
 
     @Test func productVetoBeforeSerialize() async {
@@ -606,7 +607,7 @@ struct ExternalOTELTests {
             attributes: [
                 "http.request.method": .string("GET"),
                 "retry": .bool(false),
-                "count": .number(2),
+                "count": .number(.int64(2)),
             ]
         )
         #expect(OTLPWire.looksLikeExportTraceProtobuf(body))

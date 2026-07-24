@@ -3,6 +3,23 @@ import Foundation
 import Testing
 @testable import OpenGrokSystemPower
 
+private final class PowerEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [PowerEvent] = []
+
+    func append(_ event: PowerEvent) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+
+    var snapshot: [PowerEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+}
+
 @Suite("OpenGrokSystemPower")
 struct OpenGrokSystemPowerTests {
     @Test("PowerEvent is equatable")
@@ -52,12 +69,9 @@ struct OpenGrokSystemPowerTests {
 
     @Test("macOS listener registers via IOKit and stops cleanly")
     func macOSListenerRegisters() async throws {
-        var events: [PowerEvent] = []
-        let lock = NSLock()
+        let recorder = PowerEventRecorder()
         let listener = SystemPowerListener.start { event in
-            lock.lock()
-            events.append(event)
-            lock.unlock()
+            recorder.append(event)
         }
         // On a normal developer machine IORegisterForSystemPower succeeds.
         // Sandboxes may deny it — tolerate nil without failing the suite.
@@ -67,7 +81,7 @@ struct OpenGrokSystemPowerTests {
             listener.invalidate()
             try await Task.sleep(nanoseconds: 50_000_000)
         }
-        _ = events
+        _ = recorder.snapshot
     }
     #endif
 

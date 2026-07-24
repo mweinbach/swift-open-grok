@@ -365,19 +365,22 @@ struct RemoteSettingsTests {
 
     @Test("DisplayRefreshSettings tolerant decode and unknown fields")
     func displayRefresh() throws {
-        let empty = try JSONDecoder().decode(DisplayRefreshSettings.self, from: Data("{}".utf8))
+        let empty = try JSONDecoder().decode(
+            OpenGrokConfigTypes.DisplayRefreshSettings.self,
+            from: Data("{}".utf8)
+        )
         #expect(empty.probeEnabled == nil)
         #expect(empty.autoCadenceEnabled == nil)
         #expect(empty.isDefault == true)
         let partial = try JSONDecoder().decode(
-            DisplayRefreshSettings.self,
+            OpenGrokConfigTypes.DisplayRefreshSettings.self,
             from: Data(#"{"probe_enabled":false,"future_knob":true}"#.utf8)
         )
         #expect(partial.probeEnabled == false)
         #expect(partial.extra["future_knob"] != nil)
         // Wrong type → nil (tolerant)
         let bad = try JSONDecoder().decode(
-            DisplayRefreshSettings.self,
+            OpenGrokConfigTypes.DisplayRefreshSettings.self,
             from: Data(#"{"probe_enabled":"nope","floor_ms":"x"}"#.utf8)
         )
         #expect(bad.probeEnabled == nil)

@@ -8,7 +8,7 @@ import Foundation
 /// Wrappers peeled for deny/ask/grants/safe lists. `sudo` / `xargs` / `nohup`
 /// are intentionally NOT peeled.
 private let peelableWrappers: Set<String> = [
-    "timeout", "nice", "ionice", "chrt", "stdbuf", "env",
+    "nice", "ionice", "chrt", "stdbuf",
 ]
 
 /// Setup commands skipped for "primary" classification.
@@ -192,6 +192,29 @@ public func unwrapWrappers(_ words: [String]) -> [String] {
     var w = words
     while let first = w.first {
         let base = (first as NSString).lastPathComponent
+        if base == "env" {
+            w.removeFirst()
+            while let f = w.first, f.contains("=") || f.hasPrefix("-") {
+                w.removeFirst()
+            }
+            continue
+        }
+        if base == "timeout" {
+            w.removeFirst()
+            while let option = w.first, option.hasPrefix("-") {
+                w.removeFirst()
+                if option == "--" {
+                    break
+                }
+                if ["-k", "--kill-after", "-s", "--signal"].contains(option), !w.isEmpty {
+                    w.removeFirst()
+                }
+            }
+            if !w.isEmpty {
+                w.removeFirst()
+            }
+            continue
+        }
         if peelableWrappers.contains(base) {
             // Drop the wrapper and its common option args heuristically.
             w.removeFirst()
@@ -208,14 +231,6 @@ public func unwrapWrappers(_ words: [String]) -> [String] {
                     // single-letter option with value
                     w.removeFirst()
                 }
-            }
-            continue
-        }
-        // env VAR=val cmd
-        if base == "env" {
-            w.removeFirst()
-            while let f = w.first, f.contains("=") || f.hasPrefix("-") {
-                w.removeFirst()
             }
             continue
         }

@@ -316,18 +316,19 @@ struct OpenGrokFSNotifyTests {
         hub.publish(WatchEvent(kind: .modify, path: "/2"))
         #expect(hub.bufferedCount == 2)
 
-        var received: [WatchEvent] = []
         let stream = hub.subscribe()
         // Drain a few events
-        let task = Task {
+        let task = Task { () throws -> [WatchEvent] in
+            var received: [WatchEvent] = []
             for try await e in stream {
                 received.append(e)
                 if received.count >= 2 { break }
             }
+            return received
         }
         // Give the stream a moment
         try await Task.sleep(nanoseconds: 50_000_000)
-        _ = await task.result
+        let received = try await task.value
         #expect(received.map(\.path) == ["/1", "/2"])
         #expect(hub.bufferedCount == 0)
 
@@ -376,23 +377,21 @@ struct OpenGrokFSNotifyTests {
             encoding: .utf8
         )
 
-        var sawCreateOrModify = false
-        let collect = Task {
+        let collect = Task { () throws -> Bool in
             for try await event in stream {
-                if event.path.contains("new.txt") {
-                    if event.kind == .create || event.kind == .modify {
-                        sawCreateOrModify = true
-                        break
-                    }
+                if event.path.contains("new.txt"),
+                   event.kind == .create || event.kind == .modify {
+                    return true
                 }
             }
+            return false
         }
         // Bound wait
         try await Task.sleep(nanoseconds: 800_000_000)
         collect.cancel()
         await watcher.cancel()
         // Best-effort on Darwin (poll-assisted); do not hard-fail if FS is slow.
-        _ = sawCreateOrModify
+        _ = try? await collect.value
     }
 }
 

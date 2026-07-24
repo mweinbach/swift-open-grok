@@ -46,8 +46,8 @@ public final class HubConnection: @unchecked Sendable {
     public let key: PrincipalKey
     private let lock = NSLock()
     private var _connected: Bool
-    private var reconnectHandlers: [@(ReconnectEvent) -> Void] = []
-    private var notificationHandlers: [@(HubNotification) -> Void] = []
+    private var reconnectHandlers: [@Sendable (ReconnectEvent) -> Void] = []
+    private var notificationHandlers: [@Sendable (HubNotification) -> Void] = []
     private var client: (any ConnectionClient)?
 
     public init(key: PrincipalKey, client: (any ConnectionClient)? = nil, connected: Bool = false) {
@@ -123,7 +123,7 @@ public final class HubConnectionPool: @unchecked Sendable {
             connections[key] = (existing.conn, existing.refs + 1)
             return existing.conn
         }
-        let conn = HubConnection(key: key)
+        let conn = HubConnection(key: key, connected: true)
         connections[key] = (conn, 1)
         return conn
     }

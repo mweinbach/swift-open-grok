@@ -310,7 +310,10 @@ public struct CodexUsageSnapshot: Codable, Sendable, Equatable {
         self.planType = try container.decodeIfPresent(String.self, forKey: .planType)
         self.rateLimit = try container.decodeIfPresent(CodexRateLimit.self, forKey: .rateLimit)
         self.credits = try container.decodeIfPresent(CodexCredits.self, forKey: .credits)
-        self.additionalRateLimits = (try container.decodeIfPresent([CodexAdditionalRateLimit]?.self, forKey: .additionalRateLimits)) ?? []
+        self.additionalRateLimits = try container.decodeIfPresent(
+            [CodexAdditionalRateLimit].self,
+            forKey: .additionalRateLimits
+        ) ?? []
     }
 }
 
@@ -524,7 +527,7 @@ public func resolveCodexBearer(
     credentials: CodexCredentials,
     expectedIdentity: CodexAuthIdentity?
 ) -> CodexResolvedBearer? {
-    if let expected, credentials.identity != expected {
+    if let expectedIdentity, credentials.identity != expectedIdentity {
         return nil
     }
     var extra: [String: String] = [:]
