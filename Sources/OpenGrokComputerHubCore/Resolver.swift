@@ -1,7 +1,7 @@
 // Resolver.swift
 //
-// CompoundResolver with local-shadows-remote rule. Ported from
-// `xai-computer-hub-core/src/resolver.rs`.
+// CompoundResolver with local-shadows-remote rule + inner-dispatch.
+// Ported from `xai-computer-hub-core/src/resolver.rs` + `inner.rs`.
 
 import Foundation
 import OpenGrokShared
@@ -45,6 +45,11 @@ public enum ResolvedTool: Sendable {
 
     public var isLocal: Bool {
         if case .local = self { return true }
+        return false
+    }
+
+    public var isRemote: Bool {
+        if case .remote = self { return true }
         return false
     }
 }
@@ -91,6 +96,21 @@ public final class InMemoryToolRegistry: ToolRegistry, @unchecked Sendable {
         var map = bySession[sessionId] ?? [:]
         map[handle.id()] = (handle, registration)
         bySession[sessionId] = map
+    }
+
+    public func unregister(sessionId: SessionId, toolId: ToolId) {
+        lock.lock()
+        defer { lock.unlock() }
+        bySession[sessionId]?[toolId] = nil
+        if bySession[sessionId]?.isEmpty == true {
+            bySession[sessionId] = nil
+        }
+    }
+
+    public func dropSession(_ sessionId: SessionId) {
+        lock.lock()
+        defer { lock.unlock() }
+        bySession[sessionId] = nil
     }
 
     public func get(
@@ -142,6 +162,65 @@ public final class CompoundResolver: @unchecked Sendable {
                 )
             )
         }
+        // Payload bound from declared capabilities.
+        if let denied = admitCall(
+            principal: Principal.new(try! UserId("resolver")),
+            requiredScopes: [],
+            capabilities: resolved.handle.capabilities(),
+            args: args
+        ) {
+            return terminalOnly(Result<TypedToolOutput, ToolError>.failure(denied))
+        }
         return await resolved.handle.execute(ctx: ctx, args: args)
+    }
+}
+
+// MARK: - Inner dispatch
+
+/// Resolver-backed `ToolDispatch` for tools that call other tools.
+///
+/// Holds the resolver by unowned reference pattern via a weak box so the
+/// hub can tear down without orphaning cancelable tasks. When the
+/// resolver is gone, inner calls fail with `computer_hub_dropped`.
+public final class InnerDispatchForResolver: ToolDispatch, @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var resolver: CompoundResolver?
+    public let sessionId: SessionId
+
+    public init(resolver: CompoundResolver, sessionId: SessionId) {
+        self.resolver = resolver
+        self.sessionId = sessionId
+    }
+
+    public func detach() {
+        lock.lock()
+        resolver = nil
+        lock.unlock()
+    }
+
+    public func call(
+        toolId: ToolId,
+        args: JSONValue,
+        ctx: ToolCallContext
+    ) async -> ToolStream<TypedToolOutput> {
+        lock.lock()
+        let r = resolver
+        lock.unlock()
+        guard let r else {
+            return terminalOnly(
+                Result<TypedToolOutput, ToolError>.failure(
+                    .custom(
+                        code: "computer_hub_dropped",
+                        detail: "computer hub dropped before inner call could execute"
+                    )
+                )
+            )
+        }
+        return await r.resolveAndDispatch(
+            sessionId: sessionId,
+            toolId: toolId,
+            args: args,
+            ctx: ctx
+        )
     }
 }

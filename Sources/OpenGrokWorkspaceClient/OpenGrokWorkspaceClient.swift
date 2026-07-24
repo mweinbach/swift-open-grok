@@ -2,8 +2,8 @@
 //
 // Typed client for hub-proxied `workspace.*` RPC methods (Swift port of
 // `xai-grok-workspace-client`). Wire types live in OpenGrokWorkspaceTypes;
-// this target adds the connected-state latch, generic RPC core, and
-// transport-fatal disconnect mapping.
+// this target adds the connected-state latch, generic RPC core, transport-
+// fatal disconnect mapping, and typed helpers.
 
 import Foundation
 import OpenGrokComputerHubCore
@@ -23,6 +23,7 @@ public enum WorkspaceClientError: Error, Equatable, Sendable, CustomStringConver
     case timeout(method: String, afterMs: UInt64)
     case decode(method: String, detail: String)
     case rpc(RpcError)
+    case workspaceUnavailable(ToolError)
 
     public var description: String {
         switch self {
@@ -36,6 +37,8 @@ public enum WorkspaceClientError: Error, Equatable, Sendable, CustomStringConver
             return "\(method): response decode: \(detail)"
         case .rpc(let e):
             return "workspace rpc error: \(e)"
+        case .workspaceUnavailable(let e):
+            return "workspace unavailable: \(e.detail)"
         }
     }
 }
@@ -58,6 +61,10 @@ public func consumeStreamTerminal(
 }
 
 /// Whether a `ToolError` indicates a fatal transport failure.
+///
+/// Returns `true` for:
+/// - `networkError` — direct transport failure
+/// - `custom` with `details.code == "protocol_error"` — half-closed WS
 public func isTransportFatal(_ err: ToolError) -> Bool {
     switch err.kind {
     case .networkError:
@@ -80,6 +87,9 @@ public func isTransportFatal(_ err: ToolError) -> Bool {
 /// Typed client over a bound `ToolHarness` for `workspace.*` RPCs.
 ///
 /// Clones share the harness and the connected latch via reference types.
+/// After a fatal transport error the latch stays `false` until
+/// `markConnected()` (e.g. from an SDK `onReconnect` callback sharing the
+/// same `ConnectedFlag`).
 public final class WorkspaceClient: @unchecked Sendable {
     public let harness: ToolHarness
     private let connected: ConnectedFlag
@@ -89,6 +99,15 @@ public final class WorkspaceClient: @unchecked Sendable {
         self.harness = harness
         self.connected = connected
         self.deadlineMs = nil
+    }
+
+    /// Share a pre-created connected flag so an SDK reconnect callback
+    /// holding the same flag can reset it.
+    public static func withConnectedFlag(
+        harness: ToolHarness,
+        connected: ConnectedFlag
+    ) -> WorkspaceClient {
+        WorkspaceClient(harness: harness, connected: connected)
     }
 
     public func withDeadline(ms: UInt64) -> WorkspaceClient {
@@ -101,6 +120,22 @@ public final class WorkspaceClient: @unchecked Sendable {
 
     public func markDisconnected() { connected.set(false) }
     public func markConnected() { connected.set(true) }
+
+    /// Wire this client to a hub connection so reconnect restores the latch
+    /// and transport-fatal disconnects clear it.
+    public func attachReconnect(to connection: HubConnection) {
+        connection.onReconnect { [weak self] event in
+            guard let self else { return }
+            switch event {
+            case .disconnected:
+                self.markDisconnected()
+            case .reconnected:
+                self.markConnected()
+            case .reconnecting, .giveUp:
+                break
+            }
+        }
+    }
 
     /// Untyped RPC: `{"method": .., "params": ..}` through `workspace_rpc`.
     public func rpcRaw(method: String, params: JSONValue) async throws -> JSONValue {
@@ -141,6 +176,9 @@ public final class WorkspaceClient: @unchecked Sendable {
             if isTransportFatal(err) {
                 markDisconnected()
             }
+            if OpenGrokComputerHubCore.isWorkspaceUnavailable(err) {
+                throw WorkspaceClientError.workspaceUnavailable(err)
+            }
             if err.kind == .timeout {
                 throw WorkspaceClientError.timeout(method: method, afterMs: deadlineMs ?? 0)
             }
@@ -170,6 +208,45 @@ public final class WorkspaceClient: @unchecked Sendable {
         case .failure(let rpcErr):
             throw WorkspaceClientError.rpc(rpcErr)
         }
+    }
+
+    // MARK: Typed helpers (Rust WorkspaceClient surface)
+
+    /// `workspace.info` decoded into the typed shape.
+    public func info() async throws -> WorkspaceInfo {
+        let raw = try await rpc(WorkspaceInfoReq())
+        do {
+            return try raw.decode(WorkspaceInfo.self)
+        } catch {
+            throw WorkspaceClientError.decode(
+                method: WorkspaceInfoReq.method,
+                detail: "\(error)"
+            )
+        }
+    }
+
+    public func gitStatus() async throws -> JSONValue {
+        try await rpc(GitStatusReq())
+    }
+
+    public func fsList(_ req: FsListReq) async throws -> FsListData {
+        try await rpc(req)
+    }
+
+    public func fsExists(_ req: FsExistsReq) async throws -> FsExistsData {
+        try await rpc(req)
+    }
+
+    public func fsReadFile(_ req: FsReadFileReq) async throws -> FsReadFileData {
+        try await rpc(req)
+    }
+
+    public func fsWriteFile(_ req: FsWriteFileReq) async throws {
+        let _: WorkspaceRpcUnit = try await rpc(req)
+    }
+
+    public func fsDeleteFile(_ req: FsDeleteFileReq) async throws {
+        let _: WorkspaceRpcUnit = try await rpc(req)
     }
 }
 
@@ -218,7 +295,6 @@ private func withTimeout(
                 group.cancelAll()
                 break
             } else if first == nil {
-                // timeout won
                 first = .failure(.timeout(
                     toolId: try! ToolId(WORKSPACE_RPC_TOOL_ID),
                     detail: "\(method) timed out after \(ms)ms"
