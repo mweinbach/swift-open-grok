@@ -57,9 +57,9 @@ let preflight_schema = #{
 let delta_schema = #{
     "type": "object",
     "additionalProperties": false,
-    "required": ["ready", "summary", "pinnedRevision", "upstreamRevision", "changedCrates", "changedContracts", "changedTests", "changedFixtures", "affectedSwiftTargets", "items", "criticalIssues"],
+    "required": ["analysisComplete", "summary", "pinnedRevision", "upstreamRevision", "changedCrates", "changedContracts", "changedTests", "changedFixtures", "affectedSwiftTargets", "items", "criticalIssues"],
     "properties": #{
-        "ready": #{ "type": "boolean" },
+        "analysisComplete": #{ "type": "boolean" },
         "summary": #{ "type": "string", "minLength": 1 },
         "pinnedRevision": #{ "type": "string", "minLength": 40, "maxLength": 40 },
         "upstreamRevision": #{ "type": "string", "minLength": 40, "maxLength": 40 },
@@ -368,11 +368,11 @@ delta_prompt += json_encode(delta_context);
 delta_prompt += "\n</delta-context-json>\n\n";
 delta_prompt += "Use read-only Git and file inspection in the Rust reference. Compare pinnedRevision..upstreamRevision exactly. Do not edit, build, test, commit, or launch subagents. ";
 delta_prompt += "Classify changed crates, public contracts, workflow/runtime behavior, providers/auth/models, streaming/tool wire formats, CLI/session behavior, security/platform behavior, tests, fixtures, and release gates. ";
-delta_prompt += "Map material deltas to affected Swift targets, consolidate them into bounded actionable items, and identify critical sequencing constraints.";
+    delta_prompt += "Map material deltas to affected Swift targets, consolidate them into bounded actionable items, and identify critical sequencing constraints. Set analysisComplete true when this audit completed successfully, even when the Swift port itself is not ready for parity; describe port readiness in summary and criticalIssues.";
 let delta_result = agent(delta_prompt, luna_options("Luna exact upstream delta audit", "Upstream Delta", "read-only", delta_schema));
 if delta_result == () || delta_result.success != true || delta_result.output == () { pause("infra", "Upstream delta audit failed."); }
 let delta = delta_result.output;
-if delta.ready != true || delta.pinnedRevision != pinned_revision || delta.upstreamRevision != upstream_revision || delta.items.len() == 0 { pause("verification", "Upstream delta audit returned an unusable result."); }
+if delta.analysisComplete != true || delta.pinnedRevision != pinned_revision || delta.upstreamRevision != upstream_revision || delta.items.len() == 0 { pause("verification", "Upstream delta audit returned an unusable result."); }
 
 phase("Audit");
 let initial_prior = #{ summary: "Fresh audit from the actual committed Swift tree after exact upstream preflight." };
