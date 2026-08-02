@@ -7,11 +7,13 @@ the Open Grok branding while keeping all runtime/configuration state isolated
 to `$OPENGROK_HOME` or `~/.opengrok` (the legacy `~/.grok` path is never read
 or written).
 
-> **Status (2026-07-23):** Wave 0 foundations plus substantial R01–R15 contract
-> and infrastructure targets are present. The integrated package build, all
-> test bundles, the **1,672-test** Swift Testing suite, and the explicit
-> `open-grok` product build are green in the current worktree atop checkpoint
-> `1aca496ee0b6c59172371f3fc4a3a926fcb25821`. Workers must still **not** invoke
+> **Status (2026-08-02):** The committed port is clean at checkpoint
+> `1c4ed0c55e0c39722925d026af46b8ed0936be65`, including R16–R19 work that
+> postdates the older status snapshot. The last recorded full verifier results
+> remain historical until rerun at this checkpoint. Continuation work must also
+> reconcile Rust baseline `9739c4a2ad23cfea14312a481169757f3da494f4` with
+> exact upstream revision `c1bca4020bad3b8058984d49388ac150e3ce7fd7`.
+> Workers must still **not** invoke
 > SwiftPM directly; the sole integration path is the serialized verifier below.
 > See `PORT_STATUS.md`, `PORT_PLAN.md`, and `CRATE_MAP.md` for exact scope and
 > remaining product gaps. Inventory (committed tree): **98** production source
@@ -109,7 +111,7 @@ Notable foundation targets (non-exhaustive; see `PORT_STATUS.md`):
 | Entry | Role |
 |---|---|
 | `workflows/swift-safe-verify.zsh` | **Only** allowed SwiftPM build/test entry (lock + scratch path) |
-| `.opengrok/workflows/swift-open-grok-safe-resume.rhai` | Registered multi-agent continuation; bounded workers, checkpoint commits, and serialized SwiftPM |
+| `.opengrok/workflows/swift-open-grok-luna-continuation.rhai` | Canonical Luna `xhigh` continuation; exact upstream reconciliation, safe checkpoints, and serialized SwiftPM |
 | `workflows/run-grok45-port.zsh` | Legacy cycle harness; must also use the safe verifier for builds |
 
 ## Protected artifacts
