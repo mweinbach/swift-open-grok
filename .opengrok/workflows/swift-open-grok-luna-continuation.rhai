@@ -261,7 +261,7 @@ fn checkpoint(workspace, cycle, stage, base_head, allowed_paths, commit_schema) 
     prompt += "\n</checkpoint-json>\n\n";
     prompt += "Use terminal and Git only. Do not edit source files, build, test, amend, reset, rebase, branch, push, clean, or launch subagents. ";
     prompt += "Require HEAD to equal baseHead. Inspect tracked, untracked, staged, and deleted paths. Every changed path must be allowed. ";
-    prompt += "Never use git add -A or git add . Stage only explicit allowedPaths pathspecs, verify staged paths, and run git diff --cached --check. ";
+    prompt += "Never use git add -A or git add . Stage only explicit allowedPaths pathspecs, verify staged paths, and run git diff --cached --check. Capture stagedPaths before committing when possible; after commit the staging area may be empty, but changedPaths must list the committed delta. ";
     prompt += "If nothing is staged, return no_changes with head and commit equal to baseHead. Otherwise commit once with requiredMessage. ";
     prompt += "Return exact changedPaths, stagedPaths, remainingDirtyPaths, revisions, message, status, and summary. The worktree must be clean after success.";
     let result = agent(prompt, luna_options("Luna checkpoint " + stage, "Integrate", "execute", commit_schema));
@@ -275,7 +275,7 @@ fn checkpoint(workspace, cycle, stage, base_head, allowed_paths, commit_schema) 
         if output.head != base_head || output.commit != base_head || output.stagedPaths.len() != 0 { return (); }
         return output;
     }
-    if output.status != "committed" || output.head == base_head || output.head != output.commit || output.stagedPaths.len() == 0 { return (); }
+    if output.status != "committed" || output.head == base_head || output.head != output.commit || output.changedPaths.len() == 0 { return (); }
     output
 }
 
