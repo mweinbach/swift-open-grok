@@ -1961,17 +1961,144 @@ private final class FileHandlePagerTerminalSink: PagerTerminalSink, @unchecked S
     }
 }
 
+private struct LivePagerConversationState {
+    private(set) var items: [PagerConversationItem] = []
+    private var activeAssistantIndex: Int?
+    private var toolIndicesByCallID: [String: Int] = [:]
+
+    mutating func startTurn(prompt: String) {
+        toolIndicesByCallID.removeAll(keepingCapacity: true)
+        items.append(.message(PagerMessage(role: .user, text: prompt)))
+        items.append(.message(PagerMessage(
+            role: .assistant,
+            text: "",
+            isStreaming: true
+        )))
+        activeAssistantIndex = items.indices.last
+    }
+
+    mutating func appendMessage(_ message: PagerMessage) {
+        items.append(.message(message))
+    }
+
+    mutating func appendAssistant(_ text: String) {
+        guard let activeAssistantIndex,
+              items.indices.contains(activeAssistantIndex),
+              case .message(var message) = items[activeAssistantIndex]
+        else {
+            items.append(.message(PagerMessage(
+                role: .assistant,
+                text: text,
+                isStreaming: true
+            )))
+            self.activeAssistantIndex = items.indices.last
+            return
+        }
+        message.text += text
+        message.isStreaming = true
+        items[activeAssistantIndex] = .message(message)
+    }
+
+    mutating func finishAssistant(removingIfEmpty: Bool = false) {
+        guard let activeAssistantIndex,
+              items.indices.contains(activeAssistantIndex),
+              case .message(var message) = items[activeAssistantIndex]
+        else { return }
+        if removingIfEmpty, message.text.isEmpty {
+            items.remove(at: activeAssistantIndex)
+            self.activeAssistantIndex = nil
+            return
+        }
+        message.isStreaming = false
+        items[activeAssistantIndex] = .message(message)
+        self.activeAssistantIndex = nil
+    }
+
+    mutating func apply(_ tool: OpenGrokPagerToolUpdate) {
+        let card = PagerToolCard(
+            name: tool.name,
+            input: tool.input,
+            output: tool.output,
+            state: Self.renderState(for: tool.state)
+        )
+        if let index = toolIndicesByCallID[tool.callID], items.indices.contains(index) {
+            items[index] = .tool(card)
+        } else {
+            finishAssistant(removingIfEmpty: true)
+            items.append(.tool(card))
+            toolIndicesByCallID[tool.callID] = items.indices.last
+        }
+    }
+
+    var transcript: String {
+        let lines = items.flatMap(Self.transcriptLines(for:))
+        return lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+    }
+
+    static func transcript(for tool: OpenGrokPagerToolUpdate) -> String {
+        transcriptLines(for: .tool(PagerToolCard(
+            name: tool.name,
+            input: tool.input,
+            output: tool.output,
+            state: renderState(for: tool.state)
+        ))).joined(separator: "\n") + "\n"
+    }
+
+    private static func renderState(for state: OpenGrokPagerToolState) -> PagerToolState {
+        switch state {
+        case .running: return .running
+        case .succeeded: return .succeeded
+        case .failed: return .failed
+        case .cancelled: return .cancelled
+        }
+    }
+
+    private static func transcriptLines(for item: PagerConversationItem) -> [String] {
+        switch item {
+        case .message(let message):
+            let label: String
+            switch message.role {
+            case .user: label = "You"
+            case .assistant: label = "Grok"
+            case .system: label = "System"
+            case .reasoning: label = "Reasoning"
+            case .error: label = "Error"
+            }
+            return ["\(label): \(message.text)"]
+        case .tool(let tool):
+            var lines = ["Tool \(tool.name) [\(transcriptState(tool.state))]"]
+            if !tool.input.isEmpty {
+                lines.append("  input: \(tool.input)")
+            }
+            if let output = tool.output, !output.isEmpty {
+                lines.append("  result: \(output)")
+            }
+            return lines
+        case .separator(let text):
+            return [text]
+        }
+    }
+
+    private static func transcriptState(_ state: PagerToolState) -> String {
+        switch state {
+        case .pending: return "pending"
+        case .running: return "running"
+        case .succeeded: return "done"
+        case .failed: return "failed"
+        case .cancelled: return "cancelled"
+        }
+    }
+}
+
 private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private let mode: OpenGrokPagerMode
     private let terminal: OpenGrokLiveTerminal
     private let sink: any PagerTerminalSink
     private let renderer: PagerTerminalRenderer
 
-    private var conversation: [PagerConversationItem] = []
+    private var conversation = LivePagerConversationState()
     private var prompt = OpenGrokPagerInteractivePromptState()
     private var status = PagerStatusLine(text: "Starting")
-    private var activeAssistantIndex: Int?
-    private var toolIndicesByCallID: [String: Int] = [:]
     private var terminalSize: OpenGrokTerminalCore.TerminalSize
     private var restored = false
 
@@ -2021,14 +2148,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         case .promptChanged(let prompt):
             self.prompt = prompt
         case .turnStarted(let request):
-            toolIndicesByCallID.removeAll(keepingCapacity: true)
-            conversation.append(.message(PagerMessage(role: .user, text: request.prompt)))
-            conversation.append(.message(PagerMessage(
-                role: .assistant,
-                text: "",
-                isStreaming: true
-            )))
-            activeAssistantIndex = conversation.indices.last
+            conversation.startTurn(prompt: request.prompt)
             status = PagerStatusLine(text: "Thinking", isStreaming: true)
         case .session(let event):
             apply(event)
@@ -2044,7 +2164,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             status = PagerStatusLine(text: "Cancelled")
         case .failed(let message):
             finishAssistant()
-            conversation.append(.message(PagerMessage(role: .error, text: message)))
+            conversation.appendMessage(PagerMessage(role: .error, text: message))
             status = PagerStatusLine(text: "Failed")
         case .shutdown:
             status = PagerStatusLine(text: "Shutdown")
@@ -2091,65 +2211,19 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     }
 
     private func appendAssistant(_ text: String) {
-        guard let activeAssistantIndex,
-              conversation.indices.contains(activeAssistantIndex),
-              case .message(var message) = conversation[activeAssistantIndex]
-        else {
-            conversation.append(.message(PagerMessage(
-                role: .assistant,
-                text: text,
-                isStreaming: true
-            )))
-            self.activeAssistantIndex = conversation.indices.last
-            return
-        }
-        message.text += text
-        message.isStreaming = true
-        conversation[activeAssistantIndex] = .message(message)
+        conversation.appendAssistant(text)
     }
 
     private func finishAssistant(removingIfEmpty: Bool = false) {
-        guard let activeAssistantIndex,
-              conversation.indices.contains(activeAssistantIndex),
-              case .message(var message) = conversation[activeAssistantIndex]
-        else { return }
-        if removingIfEmpty, message.text.isEmpty {
-            conversation.remove(at: activeAssistantIndex)
-            self.activeAssistantIndex = nil
-            return
-        }
-        message.isStreaming = false
-        conversation[activeAssistantIndex] = .message(message)
-        self.activeAssistantIndex = nil
+        conversation.finishAssistant(removingIfEmpty: removingIfEmpty)
     }
 
     private func apply(_ tool: OpenGrokPagerToolUpdate) {
-        let card = PagerToolCard(
-            name: tool.name,
-            input: tool.input,
-            output: tool.output,
-            state: renderState(for: tool.state)
-        )
-        if let index = toolIndicesByCallID[tool.callID], conversation.indices.contains(index) {
-            conversation[index] = .tool(card)
-        } else {
-            finishAssistant(removingIfEmpty: true)
-            conversation.append(.tool(card))
-            toolIndicesByCallID[tool.callID] = conversation.indices.last
-        }
+        conversation.apply(tool)
         status = PagerStatusLine(
             text: "Tool \(tool.name) \(toolStatusText(tool.state))",
             isStreaming: tool.state == .running
         )
-    }
-
-    private func renderState(for state: OpenGrokPagerToolState) -> PagerToolState {
-        switch state {
-        case .running: return .running
-        case .succeeded: return .succeeded
-        case .failed: return .failed
-        case .cancelled: return .cancelled
-        }
     }
 
     private func toolStatusText(_ state: OpenGrokPagerToolState) -> String {
@@ -2165,7 +2239,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         try renderer.render(PagerRenderState(
             size: terminalSize,
             header: PagerHeader(title: "Open Grok", subtitle: "Interactive"),
-            conversation: conversation,
+            conversation: conversation.items,
             status: status,
             input: PagerInputState(
                 text: prompt.text,
@@ -2181,44 +2255,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         ))
     }
 
-    private var transcript: String {
-        var lines: [String] = []
-        for item in conversation {
-            switch item {
-            case .message(let message):
-                let label: String
-                switch message.role {
-                case .user: label = "You"
-                case .assistant: label = "Grok"
-                case .system: label = "System"
-                case .reasoning: label = "Reasoning"
-                case .error: label = "Error"
-                }
-                lines.append("\(label): \(message.text)")
-            case .tool(let tool):
-                lines.append("Tool \(tool.name) [\(transcriptState(tool.state))]")
-                if !tool.input.isEmpty {
-                    lines.append("  input: \(tool.input)")
-                }
-                if let output = tool.output, !output.isEmpty {
-                    lines.append("  result: \(output)")
-                }
-            case .separator(let text):
-                lines.append(text)
-            }
-        }
-        return lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
-    }
-
-    private func transcriptState(_ state: PagerToolState) -> String {
-        switch state {
-        case .pending: return "pending"
-        case .running: return "running"
-        case .succeeded: return "done"
-        case .failed: return "failed"
-        case .cancelled: return "cancelled"
-        }
-    }
+    private var transcript: String { conversation.transcript }
 }
 
 private struct SilentLiveInteractiveOutput: OpenGrokPagerInteractiveOutputAdapter, Sendable {
@@ -2254,16 +2291,19 @@ private actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
     private let prompt: String
     private let renderEngine = PagerRenderEngine()
 
+    private var conversation = LivePagerConversationState()
     private var output = ""
     private var status = "Starting"
     private var inlineBegan = false
     private var inlineEnded = false
+    private var inlineNeedsAssistantPrefix = false
     private var restored = false
 
     init(mode: OpenGrokPagerMode, terminal: OpenGrokLiveTerminal, prompt: String) {
         self.mode = mode
         self.terminal = terminal
         self.prompt = prompt
+        conversation.startTurn(prompt: prompt)
     }
 
     func begin() async throws {
@@ -2289,22 +2329,35 @@ private actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
             status = lifecycle.rawValue
         case .output(let text):
             output += text
+            conversation.appendAssistant(text)
             status = "Responding"
             if mode == .inline {
+                if inlineNeedsAssistantPrefix {
+                    inlineNeedsAssistantPrefix = false
+                    try await terminal.write("Grok: ")
+                }
                 try await terminal.write(text)
             }
         case .status(let value):
             status = value
         case .tool(let tool):
+            conversation.apply(tool)
             status = "Tool \(tool.name) \(tool.state.rawValue)"
+            if mode == .inline, tool.state != .running {
+                try await terminal.write("\n")
+                try await terminal.write(LivePagerConversationState.transcript(for: tool))
+                inlineNeedsAssistantPrefix = true
+            }
         case .permissionRequested(let request):
             status = "Permission required: \(request.prompt)"
         case .completed:
+            conversation.finishAssistant()
             status = "Completed"
             if mode == .inline {
                 try await finishInline()
             }
         case .cancelled:
+            conversation.finishAssistant()
             status = "Cancelled"
             if mode == .inline {
                 try await finishInline()
@@ -2337,10 +2390,7 @@ private actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
                 height: terminalSize.height
             ),
             header: PagerHeader(title: "Open Grok", subtitle: "Interactive"),
-            conversation: [
-                .message(PagerMessage(role: .user, text: prompt)),
-                .message(PagerMessage(role: .assistant, text: output, isStreaming: status == "Responding"))
-            ],
+            conversation: conversation.items,
             status: PagerStatusLine(text: status, isStreaming: status == "Thinking" || status == "Responding"),
             input: PagerInputState(
                 prompt: "",
@@ -2368,11 +2418,7 @@ private actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
     }
 
     private var finalTranscript: String {
-        var transcript = "You: \(prompt)\nGrok: \(output)"
-        if !transcript.hasSuffix("\n") {
-            transcript += "\n"
-        }
-        return transcript
+        conversation.transcript
     }
 }
 

@@ -1451,6 +1451,49 @@ struct ParityCompositionTests {
         #expect(!terminal.output.contains("\u{1B}[?1049h"))
     }
 
+    @Test("non-TTY fallback preserves structured tool cards")
+    func inlineFallbackToolCards() async {
+        let terminal = ParityTerminalFixture(tty: false, size: nil)
+        let backend = ParityShellCommandBackend()
+        let sampler = ParityToolLoopSamplerFixture()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() },
+            makeProcessBackend: { backend },
+            terminal: terminal.terminal
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, err) = CLIStreams.buffered()
+
+        let code = await CLIRunner.run(
+            ["interactive", "--prompt", "use the terminal", "--cwd", root.path],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let output = terminal.output
+        let toolRange = output.range(of: "Tool run_terminal_cmd [done]")
+        let answerRange = output.range(of: "Grok: final answer after tool output")
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(out.contents.isEmpty)
+        #expect(err.contents.isEmpty)
+        #expect(output.contains(#"input: {"command":"printf tool-output","description":"parity tool"}"#))
+        #expect(output.contains("result: tool output"))
+        #expect(toolRange != nil)
+        #expect(answerRange != nil)
+        if let toolRange, let answerRange {
+            #expect(toolRange.lowerBound < answerRange.lowerBound)
+        }
+        #expect(!output.contains("\u{1B}[?1049h"))
+    }
+
     @Test("Ctrl-C cancels the live turn and restores the terminal")
     func ctrlCCancellation() async {
         let terminal = ParityTerminalFixture(tty: true, size: OpenGrokLiveTerminalSize(width: 60, height: 12))
