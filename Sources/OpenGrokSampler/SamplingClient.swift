@@ -525,7 +525,12 @@ public final class SamplingClient: @unchecked Sendable {
     private func makeURL(path: String) throws -> URL {
         let base = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
         let p = path.hasPrefix("/") ? path : "/" + path
-        guard let url = URL(string: base + p) else {
+        let basePath = URL(string: base)?.path
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
+        let endpointPath = !basePath.isEmpty && p.hasPrefix("/v1/")
+            ? String(p.dropFirst(3))
+            : p
+        guard let url = URL(string: base + endpointPath) else {
             throw SamplingError.invalidConfiguration("invalid base URL: \(baseURL)")
         }
         return url

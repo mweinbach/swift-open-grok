@@ -1247,7 +1247,44 @@ struct ClientHermeticTests {
         )
         #expect(response.assistantText() == "Hi")
         #expect(transport.recordedRequests.count == 1)
+        #expect(transport.recordedRequests[0].url.absoluteString == "https://api.example.test/v1/chat/completions")
         #expect(transport.recordedRequests[0].headers["Authorization"] == "Bearer test-key")
+    }
+
+    @Test("API prefix base URL does not duplicate v1")
+    func apiPrefixURL() async throws {
+        let chunk = #"{"id":"1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}"#
+        let transport = MockHTTPTransport(responses: [
+            .init(
+                metadata: HTTPResponseMetadata(
+                    statusCode: 200,
+                    headers: ["Content-Type": "text/event-stream"]
+                ),
+                body: sseBody([chunk])
+            ),
+        ])
+        let client = try SamplingClient(
+            config: SamplerConfig(
+                apiKey: "test-key",
+                baseURL: "https://api.fireworks.ai/inference/v1",
+                model: "accounts/fireworks/models/test",
+                apiBackend: .chatCompletions,
+                provider: .fireworks
+            ),
+            transport: transport
+        )
+
+        let response = try await client.conversationCollect(
+            ConversationRequest(items: [.user("hello")]),
+            idleTimeout: .seconds(30)
+        )
+
+        #expect(response.assistantText() == "ok")
+        #expect(transport.recordedRequests.count == 1)
+        #expect(
+            transport.recordedRequests[0].url.absoluteString
+                == "https://api.fireworks.ai/inference/v1/chat/completions"
+        )
     }
 
     @Test("401 emits auth error and scrubs bearer")
@@ -1300,7 +1337,7 @@ struct ClientHermeticTests {
         ])
         let config = SamplerConfig(
             apiKey: "k",
-            baseURL: "https://api.moonshot.test",
+            baseURL: "https://api.moonshot.test/v1",
             model: "kimi",
             temperature: 0.9,
             topP: 0.5,
@@ -1312,6 +1349,7 @@ struct ClientHermeticTests {
         let req = ConversationRequest(items: [.user("hi")], temperature: 0.9, topP: 0.5)
         _ = try? await client.conversationCollect(req, idleTimeout: .seconds(5))
         #expect(transport.recordedRequests.count == 1)
+        #expect(transport.recordedRequests[0].url.absoluteString == "https://api.moonshot.test/v1/chat/completions")
         if let body = transport.recordedRequests[0].body,
            let json = try? JSONDecoder().decode(JSONValue.self, from: body)
         {
