@@ -19,8 +19,107 @@ private final class InvocationRecorder: @unchecked Sendable {
     }
 }
 
+private final class TerminalRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = Data()
+
+    func append(_ data: Data) {
+        lock.lock()
+        storage.append(data)
+        lock.unlock()
+    }
+
+    var string: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(decoding: storage, as: UTF8.self)
+    }
+}
+
 @Suite("OpenGrokExecutable composition")
 struct OpenGrokExecutableTests {
+    @Test("live interactive composition renders and restores full-screen terminal")
+    func liveInteractiveFullScreenComposition() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let terminalRecorder = TerminalRecorder()
+        let terminal = OpenGrokLiveTerminal(
+            isTTY: { true },
+            size: { OpenGrokLiveTerminalSize(width: 60, height: 12) },
+            write: { terminalRecorder.append($0) }
+        )
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in
+                OpenGrokLiveSampler { _, emit in
+                    await emit(.status("thinking"))
+                    await emit(.output("interactive answer"))
+                    return OpenGrokLiveSamplingResponse(output: "interactive answer", stopReason: "stop")
+                }
+            },
+            terminal: terminal
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, err) = CLIStreams.buffered()
+
+        let code = await CLIRunner.run(
+            ["interactive", "--prompt", "show the pager", "--fullscreen"],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(out.contents.isEmpty)
+        #expect(err.contents.isEmpty)
+        #expect(terminalRecorder.string.contains("\u{1B}[?1049h"))
+        #expect(terminalRecorder.string.contains("Open Grok"))
+        #expect(terminalRecorder.string.contains("\u{1B}[?1049l"))
+        #expect(terminalRecorder.string.hasSuffix("You: show the pager\nGrok: interactive answer\n"))
+    }
+
+    @Test("live interactive composition falls back inline without a TTY")
+    func liveInteractiveInlineComposition() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let terminalRecorder = TerminalRecorder()
+        let terminal = OpenGrokLiveTerminal(
+            isTTY: { false },
+            size: { nil },
+            write: { terminalRecorder.append($0) }
+        )
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in
+                OpenGrokLiveSampler { _, emit in
+                    await emit(.output("inline answer"))
+                    return OpenGrokLiveSamplingResponse(output: "inline answer")
+                }
+            },
+            terminal: terminal
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, err) = CLIStreams.buffered()
+
+        let code = await CLIRunner.run(
+            ["interactive", "--prompt", "show inline"],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(out.contents.isEmpty)
+        #expect(err.contents.isEmpty)
+        #expect(terminalRecorder.string == "You: show inline\nGrok: inline answer\n")
+    }
+
     @Test("live headless composition runs prompt through shell and pager")
     func liveHeadlessComposition() async {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

@@ -1,12 +1,16 @@
 import Foundation
 import OpenGrokModels
+import OpenGrokPager
 import OpenGrokPagerMinimal
+import OpenGrokPagerRender
 import OpenGrokProviderSession
 import OpenGrokSampler
 import OpenGrokSamplingTypes
 import OpenGrokShared
 import OpenGrokShell
 import OpenGrokShellBase
+import OpenGrokTerminalCore
+import OpenGrokTTY
 
 public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     public let model: String
@@ -115,16 +119,75 @@ public struct OpenGrokLiveSampler: Sendable {
 
 public struct OpenGrokLiveCompositionDependencies: Sendable {
     public let makeSampler: @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler
+    public let terminal: OpenGrokLiveTerminal
 
     public init(
-        makeSampler: @escaping @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler
+        makeSampler: @escaping @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler,
+        terminal: OpenGrokLiveTerminal = .production
     ) {
         self.makeSampler = makeSampler
+        self.terminal = terminal
     }
 
     public static let production = OpenGrokLiveCompositionDependencies(
-        makeSampler: OpenGrokLiveSampler.production(configuration:)
+        makeSampler: OpenGrokLiveSampler.production(configuration:),
+        terminal: .production
     )
+}
+
+public struct OpenGrokLiveTerminalSize: Sendable, Equatable {
+    public let width: Int
+    public let height: Int
+
+    public init(width: Int, height: Int) {
+        self.width = max(1, width)
+        self.height = max(1, height)
+    }
+}
+
+public struct OpenGrokLiveTerminal: Sendable {
+    private let isTTYOperation: @Sendable () -> Bool
+    private let sizeOperation: @Sendable () -> OpenGrokLiveTerminalSize?
+    private let writeOperation: @Sendable (Data) async throws -> Void
+
+    public init(
+        isTTY: @escaping @Sendable () -> Bool,
+        size: @escaping @Sendable () -> OpenGrokLiveTerminalSize?,
+        write: @escaping @Sendable (Data) async throws -> Void
+    ) {
+        self.isTTYOperation = isTTY
+        self.sizeOperation = size
+        self.writeOperation = write
+    }
+
+    public func isTTY() -> Bool {
+        isTTYOperation()
+    }
+
+    public func size() -> OpenGrokLiveTerminalSize? {
+        sizeOperation()
+    }
+
+    public func write(_ string: String) async throws {
+        try await writeOperation(Data(string.utf8))
+    }
+
+    public func write(_ data: Data) async throws {
+        try await writeOperation(data)
+    }
+
+    public static var production: OpenGrokLiveTerminal {
+        let adapter = PlatformTTYAdapter()
+        return OpenGrokLiveTerminal(
+            isTTY: { adapter.isATTY() },
+            size: {
+                adapter.size().map {
+                    OpenGrokLiveTerminalSize(width: $0.width, height: $0.height)
+                }
+            },
+            write: { data in try await adapter.write(data) }
+        )
+    }
 }
 
 extension OpenGrokApplication {
@@ -151,7 +214,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             guard case .launch(let options) = command else {
                 throw CLIApplicationError.unsupported(route: command.routeName)
             }
-            guard options.mode == .minimal || options.mode == .headless else {
+            guard options.mode == .interactive || options.mode == .minimal || options.mode == .headless else {
                 throw CLIApplicationError.unsupported(route: options.mode.rawValue)
             }
             try Self.validateUnsupportedOptions(options)
@@ -184,28 +247,60 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 cwd: cwd,
                 providerConfiguration: providerConfiguration
             )
-            let pager = OpenGrokPagerMinimal(
-                runtime: runtime,
-                renderer: PlainLivePagerRenderer(),
-                output: LivePagerOutput(streams: context.streams, format: options.outputFormat)
-            )
-            let task = Task {
-                try await pager.run(OpenGrokPagerMinimalRequest(
-                    prompt: prompt,
-                    sessionID: sessionID,
-                    metadata: ["mode": options.mode.rawValue]
-                ))
-            }
-            return CLIApplicationSession(
-                waitForExit: {
-                    _ = try await task.value
-                },
-                shutdown: {
-                    task.cancel()
-                    await pager.shutdown()
-                    _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+            if options.mode == .interactive {
+                let pagerMode = try Self.resolveInteractivePagerMode(
+                    options: options,
+                    terminal: dependencies.terminal
+                )
+                let pager = OpenGrokPager(
+                    runtime: runtime,
+                    frontendFactory: LiveInteractiveFrontendFactory(
+                        terminal: dependencies.terminal,
+                        prompt: prompt
+                    )
+                )
+                let task = Task {
+                    try await pager.run(OpenGrokPagerRequest(
+                        prompt: prompt,
+                        mode: pagerMode,
+                        sessionID: sessionID,
+                        metadata: ["mode": options.mode.rawValue]
+                    ))
                 }
-            )
+                return CLIApplicationSession(
+                    waitForExit: {
+                        _ = try await task.value
+                    },
+                    shutdown: {
+                        task.cancel()
+                        await pager.shutdown()
+                        _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                    }
+                )
+            } else {
+                let pager = OpenGrokPagerMinimal(
+                    runtime: runtime,
+                    renderer: PlainLivePagerRenderer(),
+                    output: LivePagerOutput(streams: context.streams, format: options.outputFormat)
+                )
+                let task = Task {
+                    try await pager.run(OpenGrokPagerMinimalRequest(
+                        prompt: prompt,
+                        sessionID: sessionID,
+                        metadata: ["mode": options.mode.rawValue]
+                    ))
+                }
+                return CLIApplicationSession(
+                    waitForExit: {
+                        _ = try await task.value
+                    },
+                    shutdown: {
+                        task.cancel()
+                        await pager.shutdown()
+                        _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                    }
+                )
+            }
         }
     }
 
@@ -219,9 +314,31 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         if options.common.mcpConfig != nil || options.common.workflow != nil {
             throw CLIApplicationError.unsupported(route: "MCP and workflows")
         }
-        if options.common.leader || options.common.noLeader || options.fullscreen {
+        if options.common.leader || options.common.noLeader {
             throw CLIApplicationError.unsupported(route: "interactive composition options")
         }
+        if options.mode == .interactive && options.outputFormat != .plain {
+            throw CLIApplicationError.unsupported(route: "interactive structured output")
+        }
+        if options.noAltScreen && options.fullscreen {
+            throw CLIApplicationError.failed("--no-alt-screen and --fullscreen cannot be used together")
+        }
+    }
+
+    private static func resolveInteractivePagerMode(
+        options: CLIExecutionOptions,
+        terminal: OpenGrokLiveTerminal
+    ) throws -> OpenGrokPagerMode {
+        if options.noAltScreen {
+            return .inline
+        }
+        if options.fullscreen {
+            guard terminal.isTTY() else {
+                throw CLIApplicationError.failed("--fullscreen requires an attached terminal")
+            }
+            return .fullScreen
+        }
+        return terminal.isTTY() ? .fullScreen : .inline
     }
 
     private static func resolvePrompt(
@@ -375,7 +492,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     }
 }
 
-private struct LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, Sendable {
+private struct LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPagerRuntimeAdapter, Sendable {
     let shell: OpenGrokShell
     let cwd: URL
     let providerConfiguration: ProviderSessionConfiguration
@@ -397,6 +514,12 @@ private struct LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, Send
             request: OpenGrokShellTurnRequest(text: request.prompt)
         )
         return LivePagerSession(shell: shell, handle: handle, shellEvents: shellEvents)
+    }
+
+    func makeSession(
+        for request: OpenGrokPagerRequest
+    ) async throws -> any OpenGrokPagerSessionAdapter {
+        try await makeSession(for: request.sessionRequest)
     }
 }
 
@@ -467,6 +590,151 @@ private struct PlainLivePagerRenderer: OpenGrokPagerMinimalRenderAdapter, Sendab
     func begin() async throws {}
     func render(_ event: OpenGrokPagerMinimalEvent) async throws {}
     func restoreTerminal() async throws {}
+}
+
+private struct LiveInteractiveFrontendFactory: OpenGrokPagerFrontendFactory, Sendable {
+    let terminal: OpenGrokLiveTerminal
+    let prompt: String
+
+    func makeFrontend(for mode: OpenGrokPagerMode) async throws -> any OpenGrokPagerFrontend {
+        guard mode == .fullScreen || mode == .inline else {
+            throw CLIApplicationError.unsupported(route: "interactive pager mode \(mode.rawValue)")
+        }
+        return OpenGrokPagerForwardingFrontend(
+            renderer: LiveInteractivePagerRenderer(mode: mode, terminal: terminal, prompt: prompt),
+            output: SilentLivePagerOutput()
+        )
+    }
+}
+
+private actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
+    private let mode: OpenGrokPagerMode
+    private let terminal: OpenGrokLiveTerminal
+    private let prompt: String
+    private let renderEngine = PagerRenderEngine()
+
+    private var output = ""
+    private var status = "Starting"
+    private var inlineBegan = false
+    private var inlineEnded = false
+    private var restored = false
+
+    init(mode: OpenGrokPagerMode, terminal: OpenGrokLiveTerminal, prompt: String) {
+        self.mode = mode
+        self.terminal = terminal
+        self.prompt = prompt
+    }
+
+    func begin() async throws {
+        switch mode {
+        case .fullScreen:
+            try await terminal.write("\u{1B}[?1049h\u{1B}[?25l")
+            try await renderFullScreen()
+        case .inline:
+            inlineBegan = true
+            try await terminal.write("You: \(prompt)\nGrok: ")
+        case .minimal, .plain:
+            throw CLIApplicationError.unsupported(route: "interactive pager mode \(mode.rawValue)")
+        }
+    }
+
+    func render(_ event: OpenGrokPagerEvent) async throws {
+        switch event {
+        case .lifecycle(.starting):
+            status = "Starting"
+        case .lifecycle(.running):
+            status = "Thinking"
+        case .lifecycle(let lifecycle):
+            status = lifecycle.rawValue
+        case .output(let text):
+            output += text
+            status = "Responding"
+            if mode == .inline {
+                try await terminal.write(text)
+            }
+        case .status(let value):
+            status = value
+        case .permissionRequested(let request):
+            status = "Permission required: \(request.prompt)"
+        case .completed:
+            status = "Completed"
+            if mode == .inline {
+                try await finishInline()
+            }
+        case .cancelled:
+            status = "Cancelled"
+            if mode == .inline {
+                try await finishInline()
+            }
+        }
+        if mode == .fullScreen {
+            try await renderFullScreen()
+        }
+    }
+
+    func restoreTerminal() async throws {
+        guard !restored else { return }
+        restored = true
+        switch mode {
+        case .fullScreen:
+            try await terminal.write(TerminalRestore.fullRestore)
+            try await terminal.write(finalTranscript)
+        case .inline:
+            try await finishInline()
+        case .minimal, .plain:
+            break
+        }
+    }
+
+    private func renderFullScreen() async throws {
+        let terminalSize = terminal.size() ?? OpenGrokLiveTerminalSize(width: 80, height: 24)
+        let result = renderEngine.render(PagerRenderState(
+            size: OpenGrokTerminalCore.TerminalSize(
+                width: terminalSize.width,
+                height: terminalSize.height
+            ),
+            header: PagerHeader(title: "Open Grok", subtitle: "Interactive"),
+            conversation: [
+                .message(PagerMessage(role: .user, text: prompt)),
+                .message(PagerMessage(role: .assistant, text: output, isStreaming: status == "Responding"))
+            ],
+            status: PagerStatusLine(text: status, isStreaming: status == "Thinking" || status == "Responding"),
+            input: PagerInputState(
+                prompt: "",
+                text: "",
+                isFocused: false,
+                cursorVisible: false,
+                maximumHeight: 1
+            ),
+            footer: PagerFooter(leading: "Ctrl-C cancel", trailing: "Swift port")
+        ))
+        let frame = ANSIOutput.beginSynchronizedUpdate
+            + ANSIOutput.moveTo(column: 0, row: 0)
+            + result.snapshot(includeTrailingSpaces: true)
+            + ANSIOutput.clearFromCursorDown
+            + ANSIOutput.endSynchronizedUpdate
+        try await terminal.write(frame)
+    }
+
+    private func finishInline() async throws {
+        guard inlineBegan, !inlineEnded else { return }
+        inlineEnded = true
+        if !output.hasSuffix("\n") {
+            try await terminal.write("\n")
+        }
+    }
+
+    private var finalTranscript: String {
+        var transcript = "You: \(prompt)\nGrok: \(output)"
+        if !transcript.hasSuffix("\n") {
+            transcript += "\n"
+        }
+        return transcript
+    }
+}
+
+private struct SilentLivePagerOutput: OpenGrokPagerOutputAdapter, Sendable {
+    func forward(_ event: OpenGrokPagerEvent) async throws {}
 }
 
 private actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
