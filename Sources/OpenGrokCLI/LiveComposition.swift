@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokFileTools
 import OpenGrokModels
 import OpenGrokPager
 import OpenGrokPagerMinimal
@@ -10,6 +11,7 @@ import OpenGrokShared
 import OpenGrokShell
 import OpenGrokShellBase
 import OpenGrokTerminalCore
+import OpenGrokToolRegistry
 import OpenGrokTTY
 
 public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
@@ -999,6 +1001,8 @@ private struct LiveToolExecutor: Sendable {
     let tools: [ToolSpec]
     let workingDirectory: URL
     private let composition: OpenGrokShellToolRuntimeComposition
+    private let fileToolBridge: ToolBridge
+    private let fileToolNames: Set<String>
 
     init(
         processBackend: any ShellProcessBackend,
@@ -1013,9 +1017,31 @@ private struct LiveToolExecutor: Sendable {
             sessionID: sessionID,
             workingDirectory: workingDirectory
         )
+        let standardizedWorkingDirectory = workingDirectory.standardizedFileURL
+        let fileToolBridge = ToolBridge(toolset: try FileToolPack.finalizePreset(
+            .explore,
+            resources: ToolResources(
+                cwd: standardizedWorkingDirectory.path,
+                sessionFolder: standardizedWorkingDirectory.path,
+                sessionId: sessionID,
+                agentId: "main",
+                allowedRoots: [standardizedWorkingDirectory.path]
+            )
+        ))
+        let fileToolDefinitions = fileToolBridge.toolDefinitions()
         self.composition = composition
-        self.workingDirectory = workingDirectory.standardizedFileURL
-        self.tools = [Self.runTerminalTool]
+        self.fileToolBridge = fileToolBridge
+        self.fileToolNames = Set(fileToolDefinitions.map(\.name))
+        self.workingDirectory = standardizedWorkingDirectory
+        self.tools = [Self.runTerminalTool] + fileToolDefinitions.map { definition in
+            ToolSpec(
+                name: definition.name,
+                description: definition.description,
+                parameters: definition.argumentsSchema ?? .object([
+                    "type": .string("object")
+                ])
+            )
+        }
     }
 
     func invoke(
@@ -1033,6 +1059,29 @@ private struct LiveToolExecutor: Sendable {
             return .failure(.invalidCall(
                 "tool arguments are not valid JSON: \(error)"
             ))
+        }
+
+        if fileToolNames.contains(call.name) {
+            if Task.isCancelled {
+                return .failure(.cancelled)
+            }
+            switch await fileToolBridge.call(
+                name: call.name,
+                args: args,
+                callId: call.callId
+            ) {
+            case .success(let result):
+                return .success(OpenGrokShellToolCallResult(
+                    value: result.output.value,
+                    promptText: result.promptText
+                ))
+            case .failure(let error):
+                return .failure(.failed(error.description))
+            }
+        }
+
+        guard call.name == Self.runTerminalTool.name else {
+            return .failure(.unsupported("unknown tool '\(call.name)'"))
         }
 
         do {
@@ -1068,6 +1117,10 @@ private struct LiveToolExecutor: Sendable {
                     "type": .string("integer"),
                     "description": .string("Optional timeout in milliseconds.")
                 ]),
+                "output_byte_limit": .object([
+                    "type": .string("integer"),
+                    "description": .string("Maximum captured output bytes before truncation.")
+                ]),
                 "description": .object([
                     "type": .string("string"),
                     "description": .string("Short explanation of the command.")
@@ -1075,6 +1128,13 @@ private struct LiveToolExecutor: Sendable {
                 "is_background": .object([
                     "type": .string("boolean"),
                     "description": .string("Run as a background task.")
+                ]),
+                "environment": .object([
+                    "type": .string("object"),
+                    "description": .string("Optional environment variables for the command."),
+                    "additionalProperties": .object([
+                        "type": .string("string")
+                    ])
                 ])
             ]),
             "required": .array([.string("command")]),

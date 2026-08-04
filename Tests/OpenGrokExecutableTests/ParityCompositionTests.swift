@@ -176,6 +176,57 @@ private final class ParityToolLoopSamplerFixture: @unchecked Sendable {
     }
 }
 
+private final class ParityFileToolSamplerFixture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [OpenGrokLiveSamplingRequest] = []
+    private let arguments: String
+
+    init(arguments: String) {
+        self.arguments = arguments
+    }
+
+    var recordedRequests: [OpenGrokLiveSamplingRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+
+    func makeSampler() -> OpenGrokLiveSampler {
+        let fixture = self
+        return OpenGrokLiveSampler { request, emit in
+            let requestIndex = fixture.record(request)
+            if requestIndex == 0 {
+                let call = ToolCall(
+                    id: "file-call-1",
+                    name: "read_file",
+                    arguments: fixture.arguments
+                )
+                return OpenGrokLiveSamplingResponse(
+                    output: "",
+                    stopReason: "tool_calls",
+                    items: [.assistant(AssistantItem(content: "", toolCalls: [call]))]
+                )
+            }
+
+            let toolResult = request.items.compactMap { item -> ToolResultItem? in
+                guard case .toolResult(let result) = item else { return nil }
+                return result
+            }.last
+            let answer = "file tool result: \(toolResult?.content ?? "missing")"
+            await emit(.output(answer))
+            return OpenGrokLiveSamplingResponse(output: answer, stopReason: "stop")
+        }
+    }
+
+    private func record(_ request: OpenGrokLiveSamplingRequest) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let index = requests.count
+        requests.append(request)
+        return index
+    }
+}
+
 private actor ParityProviderSession: OpenGrokShellProviderSession {
     private var activeTurnID: String?
     private(set) var completedTurnIDs: [String] = []
@@ -548,7 +599,10 @@ struct ParityCompositionTests {
         #expect(err.contents.contains("running tool run_terminal_cmd"))
         #expect(out.contents.contains("final answer after tool output"))
         #expect(samplerRequests.count == 2)
-        #expect(samplerRequests.first?.tools.map(\.name) == ["run_terminal_cmd"])
+        #expect(samplerRequests.first?.tools.map(\.name).contains("run_terminal_cmd") == true)
+        #expect(samplerRequests.first?.tools.map(\.name).contains("read_file") == true)
+        #expect(samplerRequests.first?.tools.map(\.name).contains("list_dir") == true)
+        #expect(samplerRequests.first?.tools.map(\.name).contains("grep") == true)
         #expect(samplerRequests.last?.items.contains { item in
             guard case .toolResult(let result) = item else { return false }
             return result.toolCallId == "call-1"
@@ -559,6 +613,92 @@ struct ParityCompositionTests {
         #expect(processRequests.first?.workingDirectory == root.standardizedFileURL)
         #expect(processRequests.first?.toolCallID == "call-1")
         #expect(processRequests.first?.ownerSessionID != nil)
+    }
+
+    @Test("live headless composition executes sandboxed read-only file tools")
+    func liveHeadlessFileToolComposition() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try? "file tool contents\n".write(
+            to: root.appendingPathComponent("sample.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let sampler = ParityFileToolSamplerFixture(
+            arguments: #"{"target_file":"sample.txt"}"#
+        )
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, err) = CLIStreams.buffered()
+
+        let code = await CLIRunner.run(
+            ["headless", "--prompt", "read the file", "--cwd", root.path],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let requests = sampler.recordedRequests
+        let toolResult = requests.last?.items.compactMap { item -> ToolResultItem? in
+            guard case .toolResult(let result) = item else { return nil }
+            return result
+        }.last
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(err.contents.contains("running tool read_file"))
+        #expect(out.contents.contains("file tool contents"))
+        #expect(requests.count == 2)
+        #expect(Set(requests.first?.tools.map(\.name) ?? []) == Set([
+            "run_terminal_cmd", "read_file", "list_dir", "grep"
+        ]))
+        #expect(toolResult?.toolCallId == "file-call-1")
+        #expect(toolResult?.content.contains("file tool contents") == true)
+    }
+
+    @Test("live file tools reject paths outside the working directory")
+    func liveFileToolSandbox() async {
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = parent.appendingPathComponent("workspace")
+        defer { try? FileManager.default.removeItem(at: parent) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try? "outside secret\n".write(
+            to: parent.appendingPathComponent("outside.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let sampler = ParityFileToolSamplerFixture(
+            arguments: #"{"target_file":"../outside.txt"}"#
+        )
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, _) = CLIStreams.buffered()
+
+        let code = await CLIRunner.run(
+            ["headless", "--prompt", "escape the workspace", "--cwd", root.path],
+            environment: [
+                "HOME": parent.path,
+                "OPENGROK_HOME": parent.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let toolResult = sampler.recordedRequests.last?.items.compactMap { item -> ToolResultItem? in
+            guard case .toolResult(let result) = item else { return nil }
+            return result
+        }.last
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(out.contents.contains("outside secret") == false)
+        #expect(toolResult?.content.contains("failed") == true)
     }
 
     @Test("live interactive composition reuses one session across typed turns")
