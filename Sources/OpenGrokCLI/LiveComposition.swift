@@ -120,19 +120,44 @@ public struct OpenGrokLiveSampler: Sendable {
 public struct OpenGrokLiveCompositionDependencies: Sendable {
     public let makeSampler: @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler
     public let terminal: OpenGrokLiveTerminal
+    public let makeInteractiveInput: @Sendable () async throws -> OpenGrokLiveInteractiveInput?
+    public let makeTerminalSink: @Sendable () -> (any PagerTerminalSink)?
 
     public init(
         makeSampler: @escaping @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler,
-        terminal: OpenGrokLiveTerminal = .production
+        terminal: OpenGrokLiveTerminal = .production,
+        makeInteractiveInput: @escaping @Sendable () async throws -> OpenGrokLiveInteractiveInput? = { nil },
+        makeTerminalSink: @escaping @Sendable () -> (any PagerTerminalSink)? = { nil }
     ) {
         self.makeSampler = makeSampler
         self.terminal = terminal
+        self.makeInteractiveInput = makeInteractiveInput
+        self.makeTerminalSink = makeTerminalSink
     }
 
     public static let production = OpenGrokLiveCompositionDependencies(
         makeSampler: OpenGrokLiveSampler.production(configuration:),
-        terminal: .production
+        terminal: .production,
+        makeInteractiveInput: OpenGrokLiveInteractiveInput.production,
+        makeTerminalSink: { FileHandlePagerTerminalSink() }
     )
+}
+
+public struct OpenGrokLiveInteractiveInput: Sendable {
+    public let events: AsyncThrowingStream<InputEvent, Error>
+    private let closeOperation: @Sendable () async -> Void
+
+    public init(
+        events: AsyncThrowingStream<InputEvent, Error>,
+        close: @escaping @Sendable () async -> Void
+    ) {
+        self.events = events
+        self.closeOperation = close
+    }
+
+    public func close() async {
+        await closeOperation()
+    }
 }
 
 public struct OpenGrokLiveTerminalSize: Sendable, Equatable {
@@ -190,6 +215,179 @@ public struct OpenGrokLiveTerminal: Sendable {
     }
 }
 
+extension OpenGrokLiveInteractiveInput {
+    public static func production() async throws -> OpenGrokLiveInteractiveInput? {
+        let inputTTY = PlatformTTYAdapter(fd: 0)
+        guard inputTTY.isATTY() else { return nil }
+
+        let lease = try await inputTTY.enterRawMode()
+        let input: any TerminalInput
+        do {
+            input = try PlatformTerminalInput()
+        } catch {
+            await lease.release()
+            throw error
+        }
+
+        var continuation: AsyncThrowingStream<InputEvent, Error>.Continuation!
+        let events = AsyncThrowingStream<InputEvent, Error> { continuation = $0 }
+        let emitter = LiveInteractiveInputEmitter(continuation: continuation)
+        let resizeSource: any TerminalResizeSource = PlatformTerminalResizeMonitor(fd: 1)
+        let resource = LiveInteractiveInputResource(
+            input: input,
+            resizeSource: resizeSource,
+            lease: lease
+        )
+        let inputTask = Task {
+            var pasteBuffer: String?
+            do {
+                while let event = try await input.readEvent() {
+                    switch event {
+                    case .pasteStart:
+                        pasteBuffer = ""
+                    case .pasteEnd:
+                        if let pasteBuffer {
+                            emitter.yield(.paste(pasteBuffer))
+                        }
+                        pasteBuffer = nil
+                    case .text(let text):
+                        if pasteBuffer != nil {
+                            pasteBuffer?.append(text)
+                        } else {
+                            for character in text {
+                                emitter.yield(.key(KeyEvent(
+                                    key: .char(character),
+                                    character: character
+                                )))
+                            }
+                        }
+                    default:
+                        for translated in translate(event) {
+                            emitter.yield(translated)
+                        }
+                    }
+                }
+                if let pasteBuffer, !pasteBuffer.isEmpty {
+                    emitter.yield(.paste(pasteBuffer))
+                }
+                emitter.finish()
+            } catch TerminalInputError.cancelled {
+                emitter.finish()
+            } catch TerminalInputError.closed {
+                emitter.finish()
+            } catch is CancellationError {
+                emitter.finish()
+            } catch {
+                emitter.finish(throwing: error)
+            }
+        }
+        let resizeTask = Task {
+            for await size in resizeSource.events() {
+                emitter.yield(.resize(OpenGrokTerminalCore.TerminalSize(
+                    width: size.width,
+                    height: size.height
+                )))
+            }
+        }
+        await resource.install(inputTask: inputTask, resizeTask: resizeTask)
+        return OpenGrokLiveInteractiveInput(
+            events: events,
+            close: { await resource.close() }
+        )
+    }
+
+    private static func translate(_ event: TerminalInputEvent) -> [InputEvent] {
+        switch event {
+        case .key(let key):
+            return translate(key)
+        case .control(let control):
+            return [translate(control)]
+        case .resize(let size):
+            return [.resize(OpenGrokTerminalCore.TerminalSize(
+                width: size.width,
+                height: size.height
+            ))]
+        case .text, .pasteStart, .pasteEnd, .unknown:
+            return []
+        }
+    }
+
+    private static func translate(_ key: TerminalKey) -> [InputEvent] {
+        switch key {
+        case .character(let text, let modifiers):
+            return text.map { character in
+                .key(KeyEvent(
+                    key: .char(character),
+                    modifiers: translate(modifiers),
+                    character: character
+                ))
+            }
+        case .named(let named, let modifiers):
+            let keyCode: KeyCode
+            switch named {
+            case .up: keyCode = .up
+            case .down: keyCode = .down
+            case .left: keyCode = .left
+            case .right: keyCode = .right
+            case .home: keyCode = .home
+            case .end: keyCode = .end
+            case .pageUp: keyCode = .pageUp
+            case .pageDown: keyCode = .pageDown
+            case .insert: keyCode = .insert
+            case .delete: keyCode = .delete
+            case .function(let number): keyCode = .f(number)
+            }
+            return [.key(KeyEvent(key: keyCode, modifiers: translate(modifiers)))]
+        }
+    }
+
+    private static func translate(_ control: TerminalControlKey) -> InputEvent {
+        switch control {
+        case .null:
+            return .key(KeyEvent(key: .null))
+        case .character(let byte):
+            let scalarValue = byte >= 1 && byte <= 26 ? Int(byte) + 96 : Int(byte)
+            let character = Character(String(UnicodeScalar(scalarValue)!))
+            return .key(KeyEvent(
+                key: .char(character),
+                modifiers: .control,
+                character: character
+            ))
+        case .backspace, .delete:
+            return .key(KeyEvent(key: .backspace))
+        case .tab:
+            return .key(KeyEvent(key: .tab))
+        case .enter:
+            return .key(KeyEvent(key: .enter))
+        case .escape:
+            return .key(KeyEvent(key: .escape))
+        case .eof:
+            return controlCharacter("d")
+        case .interrupt:
+            return controlCharacter("c")
+        case .suspend:
+            return controlCharacter("z")
+        }
+    }
+
+    private static func controlCharacter(_ character: Character) -> InputEvent {
+        .key(KeyEvent(
+            key: .char(character),
+            modifiers: .control,
+            character: character
+        ))
+    }
+
+    private static func translate(_ modifiers: TerminalKeyModifiers) -> KeyModifiers {
+        var translated: KeyModifiers = []
+        if modifiers.contains(.shift) { translated.insert(.shift) }
+        if modifiers.contains(.control) { translated.insert(.control) }
+        if modifiers.contains(.alt) { translated.insert(.alt) }
+        if modifiers.contains(.meta) { translated.insert(.meta) }
+        return translated
+    }
+}
+
 extension OpenGrokApplication {
     public static func live(
         dependencies: OpenGrokLiveCompositionDependencies = .production,
@@ -219,7 +417,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             }
             try Self.validateUnsupportedOptions(options)
 
-            let prompt = try Self.resolvePrompt(options, environment: context.environment)
+            let prompt = try Self.resolvePrompt(
+                options,
+                environment: context.environment,
+                required: options.mode != .interactive
+            )
             let cwd = try Self.resolveWorkingDirectory(options.common.cwd)
             let openGrokHome = Self.resolveOpenGrokHome(environment: context.environment)
             let sessionID = options.sessionID ?? UUID().uuidString
@@ -236,7 +438,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             )
             let shell = OpenGrokShell(configuration: OpenGrokShellConfiguration(
                 openGrokHome: openGrokHome,
-                processBackend: UnavailableLiveShellProcessBackend(),
+                processBackend: LocalShellProcessBackend(),
                 providerFactory: ProviderSessionFactoryAdapter(),
                 turnDriver: ProviderSessionTurnDriver(
                     sampler: LiveShellSamplingDriver(sampler: sampler)
@@ -252,6 +454,68 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     options: options,
                     terminal: dependencies.terminal
                 )
+                let interactiveInput = dependencies.terminal.isTTY()
+                    ? try await dependencies.makeInteractiveInput()
+                    : nil
+                if let interactiveInput, let terminalSink = dependencies.makeTerminalSink() {
+                    let renderer = LiveInteractiveControllerRenderer(
+                        mode: pagerMode,
+                        terminal: dependencies.terminal,
+                        sink: terminalSink
+                    )
+                    let controller = OpenGrokPagerInteractiveController(
+                        input: interactiveInput.events,
+                        runtime: runtime,
+                        renderer: renderer,
+                        output: SilentLiveInteractiveOutput()
+                    )
+                    let request = OpenGrokPagerRequest(
+                        prompt: prompt,
+                        mode: pagerMode,
+                        sessionID: sessionID,
+                        metadata: ["mode": options.mode.rawValue]
+                    )
+                    let task = Task {
+                        do {
+                            let result: OpenGrokPagerInteractiveResult
+                            if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                result = try await controller.run(request)
+                            } else {
+                                let initialSession = try await runtime.makeSession(for: request)
+                                result = try await controller.run(
+                                    initialSession: initialSession,
+                                    request: request
+                                )
+                            }
+                            await interactiveInput.close()
+                            return result
+                        } catch {
+                            await interactiveInput.close()
+                            throw error
+                        }
+                    }
+                    return CLIApplicationSession(
+                        waitForExit: {
+                            _ = try await withTaskCancellationHandler {
+                                try await task.value
+                            } onCancel: {
+                                task.cancel()
+                            }
+                        },
+                        shutdown: {
+                            task.cancel()
+                            await controller.shutdown()
+                            await interactiveInput.close()
+                            _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                        }
+                    )
+                }
+                if let interactiveInput {
+                    await interactiveInput.close()
+                }
+                guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw CLIApplicationError.failed("interactive mode requires terminal input or a prompt")
+                }
                 let pager = OpenGrokPager(
                     runtime: runtime,
                     frontendFactory: LiveInteractiveFrontendFactory(
@@ -269,7 +533,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 }
                 return CLIApplicationSession(
                     waitForExit: {
-                        _ = try await task.value
+                        _ = try await withTaskCancellationHandler {
+                            try await task.value
+                        } onCancel: {
+                            task.cancel()
+                        }
                     },
                     shutdown: {
                         task.cancel()
@@ -292,7 +560,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 }
                 return CLIApplicationSession(
                     waitForExit: {
-                        _ = try await task.value
+                        _ = try await withTaskCancellationHandler {
+                            try await task.value
+                        } onCancel: {
+                            task.cancel()
+                        }
                     },
                     shutdown: {
                         task.cancel()
@@ -343,7 +615,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
 
     private static func resolvePrompt(
         _ options: CLIExecutionOptions,
-        environment: [String: String]
+        environment: [String: String],
+        required: Bool = true
     ) throws -> String {
         let prompt: String
         if let direct = options.prompt {
@@ -359,6 +632,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             prompt = try decodePromptJSON(json)
         } else if let inherited = environment["OPENGROK_PROMPT"], !inherited.isEmpty {
             prompt = inherited
+        } else if !required {
+            return ""
         } else {
             throw CLIApplicationError.failed("\(options.mode.rawValue) mode requires a prompt")
         }
@@ -492,10 +767,21 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     }
 }
 
-private struct LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPagerRuntimeAdapter, Sendable {
+private actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPagerRuntimeAdapter {
     let shell: OpenGrokShell
     let cwd: URL
     let providerConfiguration: ProviderSessionConfiguration
+    private var createdSessionID: SessionID?
+
+    init(
+        shell: OpenGrokShell,
+        cwd: URL,
+        providerConfiguration: ProviderSessionConfiguration
+    ) {
+        self.shell = shell
+        self.cwd = cwd
+        self.providerConfiguration = providerConfiguration
+    }
 
     func makeSession(
         for request: OpenGrokPagerMinimalRequest
@@ -503,12 +789,19 @@ private struct LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, Open
         _ = try await shell.start()
         let shellEvents = await shell.events()
         let sessionID = SessionID(request.sessionID ?? providerConfiguration.sessionID)
-        _ = try await shell.createSession(OpenGrokShellSessionRequest(
-            sessionID: sessionID,
-            cwd: cwd,
-            providerConfiguration: providerConfiguration,
-            restorePersistedState: false
-        ))
+        if let createdSessionID {
+            guard createdSessionID == sessionID else {
+                throw CLIApplicationError.failed("interactive runtime cannot switch session IDs")
+            }
+        } else {
+            _ = try await shell.createSession(OpenGrokShellSessionRequest(
+                sessionID: sessionID,
+                cwd: cwd,
+                providerConfiguration: providerConfiguration,
+                restorePersistedState: false
+            ))
+            createdSessionID = sessionID
+        }
         let handle = try await shell.submitTurn(
             sessionID: sessionID,
             request: OpenGrokShellTurnRequest(text: request.prompt)
@@ -582,7 +875,270 @@ private final class LivePagerSession: OpenGrokPagerMinimalSessionAdapter, @unche
 
     func close() async {
         eventTask.cancel()
-        _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+    }
+}
+
+private actor LiveInteractiveInputResource {
+    private let input: any TerminalInput
+    private let resizeSource: any TerminalResizeSource
+    private let lease: any RawModeLease
+    private var inputTask: Task<Void, Never>?
+    private var resizeTask: Task<Void, Never>?
+    private var closed = false
+
+    init(
+        input: any TerminalInput,
+        resizeSource: any TerminalResizeSource,
+        lease: any RawModeLease
+    ) {
+        self.input = input
+        self.resizeSource = resizeSource
+        self.lease = lease
+    }
+
+    func install(
+        inputTask: Task<Void, Never>,
+        resizeTask: Task<Void, Never>
+    ) {
+        self.inputTask = inputTask
+        self.resizeTask = resizeTask
+    }
+
+    func close() async {
+        guard !closed else { return }
+        closed = true
+        await input.close()
+        resizeSource.stop()
+        inputTask?.cancel()
+        resizeTask?.cancel()
+        if let inputTask {
+            _ = await inputTask.value
+        }
+        if let resizeTask {
+            _ = await resizeTask.value
+        }
+        await lease.release()
+    }
+}
+
+private final class LiveInteractiveInputEmitter: @unchecked Sendable {
+    private let continuation: AsyncThrowingStream<InputEvent, Error>.Continuation
+
+    init(continuation: AsyncThrowingStream<InputEvent, Error>.Continuation) {
+        self.continuation = continuation
+    }
+
+    func yield(_ event: InputEvent) {
+        continuation.yield(event)
+    }
+
+    func finish(throwing error: Error? = nil) {
+        continuation.finish(throwing: error)
+    }
+}
+
+private final class FileHandlePagerTerminalSink: PagerTerminalSink, @unchecked Sendable {
+    let capabilities = PagerTerminalCapabilities.standard
+    private let handle: FileHandle
+    private let lock = NSLock()
+
+    init(handle: FileHandle = .standardOutput) {
+        self.handle = handle
+    }
+
+    func write(bytes: [UInt8]) throws {
+        guard !bytes.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        try handle.write(contentsOf: Data(bytes))
+    }
+
+    func flush() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try handle.synchronize()
+    }
+}
+
+private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
+    private let mode: OpenGrokPagerMode
+    private let terminal: OpenGrokLiveTerminal
+    private let sink: any PagerTerminalSink
+    private let renderer: PagerTerminalRenderer
+
+    private var conversation: [PagerConversationItem] = []
+    private var prompt = OpenGrokPagerInteractivePromptState()
+    private var status = PagerStatusLine(text: "Starting")
+    private var activeAssistantIndex: Int?
+    private var restored = false
+
+    init(
+        mode: OpenGrokPagerMode,
+        terminal: OpenGrokLiveTerminal,
+        sink: any PagerTerminalSink
+    ) {
+        self.mode = mode
+        self.terminal = terminal
+        self.sink = sink
+        let terminalHeight = terminal.size()?.height ?? 12
+        self.renderer = PagerTerminalRenderer(
+            sink: sink,
+            configuration: PagerTerminalRendererConfiguration(
+                mode: mode == .fullScreen
+                    ? .fullscreen
+                    : .inline(height: max(1, min(12, terminalHeight))),
+                useAlternateScreen: mode == .fullScreen,
+                useSynchronizedOutput: true
+            )
+        )
+    }
+
+    func begin() async throws {
+        try renderer.start()
+        try renderState()
+    }
+
+    func render(_ event: OpenGrokPagerInteractiveEvent) async throws {
+        switch event {
+        case .lifecycle(let lifecycle):
+            status = PagerStatusLine(
+                text: lifecycle.rawValue.capitalized,
+                isStreaming: lifecycle == .running
+            )
+        case .promptChanged(let prompt):
+            self.prompt = prompt
+        case .turnStarted(let request):
+            conversation.append(.message(PagerMessage(role: .user, text: request.prompt)))
+            conversation.append(.message(PagerMessage(
+                role: .assistant,
+                text: "",
+                isStreaming: true
+            )))
+            activeAssistantIndex = conversation.indices.last
+            status = PagerStatusLine(text: "Thinking", isStreaming: true)
+        case .session(let event):
+            apply(event)
+        case .turnFinished(let result):
+            finishAssistant()
+            status = PagerStatusLine(text: result.lifecycle.rawValue.capitalized)
+        case .notice(let message):
+            status = PagerStatusLine(text: message)
+        case .eof:
+            status = PagerStatusLine(text: "End of input")
+        case .cancelled:
+            finishAssistant()
+            status = PagerStatusLine(text: "Cancelled")
+        case .failed(let message):
+            finishAssistant()
+            conversation.append(.message(PagerMessage(role: .error, text: message)))
+            status = PagerStatusLine(text: "Failed")
+        case .shutdown:
+            status = PagerStatusLine(text: "Shutdown")
+        }
+        try renderState()
+    }
+
+    func restoreTerminal() async throws {
+        guard !restored else { return }
+        restored = true
+        try renderer.restore()
+        if mode == .fullScreen {
+            try sink.write(transcript)
+            try sink.flush()
+        }
+    }
+
+    private func apply(_ event: OpenGrokPagerEvent) {
+        switch event {
+        case .lifecycle(let lifecycle):
+            status = PagerStatusLine(
+                text: lifecycle.rawValue.capitalized,
+                isStreaming: lifecycle == .running
+            )
+        case .output(let text):
+            appendAssistant(text)
+            status = PagerStatusLine(text: "Responding", isStreaming: true)
+        case .status(let text):
+            status = PagerStatusLine(text: text, isStreaming: true)
+        case .permissionRequested(let request):
+            status = PagerStatusLine(
+                text: "Permission required",
+                detail: request.prompt
+            )
+        case .completed:
+            finishAssistant()
+            status = PagerStatusLine(text: "Completed")
+        case .cancelled:
+            finishAssistant()
+            status = PagerStatusLine(text: "Cancelled")
+        }
+    }
+
+    private func appendAssistant(_ text: String) {
+        guard let activeAssistantIndex,
+              conversation.indices.contains(activeAssistantIndex),
+              case .message(var message) = conversation[activeAssistantIndex]
+        else { return }
+        message.text += text
+        message.isStreaming = true
+        conversation[activeAssistantIndex] = .message(message)
+    }
+
+    private func finishAssistant() {
+        guard let activeAssistantIndex,
+              conversation.indices.contains(activeAssistantIndex),
+              case .message(var message) = conversation[activeAssistantIndex]
+        else { return }
+        message.isStreaming = false
+        conversation[activeAssistantIndex] = .message(message)
+        self.activeAssistantIndex = nil
+    }
+
+    private func renderState() throws {
+        let size = terminal.size() ?? OpenGrokLiveTerminalSize(width: 80, height: 24)
+        try renderer.render(PagerRenderState(
+            size: OpenGrokTerminalCore.TerminalSize(
+                width: size.width,
+                height: size.height
+            ),
+            header: PagerHeader(title: "Open Grok", subtitle: "Interactive"),
+            conversation: conversation,
+            status: status,
+            input: PagerInputState(
+                text: prompt.text,
+                cursorCharacterOffset: prompt.cursorOffset,
+                isFocused: true,
+                cursorVisible: true,
+                maximumHeight: 4
+            ),
+            footer: PagerFooter(
+                leading: "Enter send · Ctrl-C cancel · Ctrl-D exit",
+                trailing: "Swift port"
+            )
+        ))
+    }
+
+    private var transcript: String {
+        var lines: [String] = []
+        for item in conversation {
+            guard case .message(let message) = item else { continue }
+            let label: String
+            switch message.role {
+            case .user: label = "You"
+            case .assistant: label = "Grok"
+            case .system: label = "System"
+            case .reasoning: label = "Reasoning"
+            case .error: label = "Error"
+            }
+            lines.append("\(label): \(message.text)")
+        }
+        return lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+    }
+}
+
+private struct SilentLiveInteractiveOutput: OpenGrokPagerInteractiveOutputAdapter, Sendable {
+    func forward(_ event: OpenGrokPagerInteractiveEvent) async throws {
+        _ = event
     }
 }
 
@@ -847,26 +1403,4 @@ private actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
         )
         return String(decoding: data, as: UTF8.self) + "\n"
     }
-}
-
-private actor UnavailableLiveShellProcessBackend: ShellProcessBackend {
-    func run(_ request: ShellCommandRequest) async throws -> ShellCommandResult {
-        throw ShellError.unsupported(capability: .processExecution, platform: "live Swift composition")
-    }
-
-    func runBackground(_ request: ShellCommandRequest) async throws -> ShellBackgroundHandle {
-        throw ShellError.unsupported(capability: .processExecution, platform: "live Swift composition")
-    }
-
-    func getTask(_ taskID: String) async -> ShellTaskSnapshot? { nil }
-    func killTask(_ taskID: String) async -> ShellKillOutcome { .notFound }
-    func killForegroundCommands() async {}
-    func killForegroundCommands(ownerSessionID: String) async {}
-    func killAllBackgroundTasks() async {}
-    func killAllBackgroundTasks(ownerSessionID: String) async {}
-    func warmShell(at cwd: URL) async {}
-    func backgroundForegroundCommand(toolCallID: String) async -> Bool { false }
-    func waitForCompletion(_ taskID: String, timeout: ShellDuration?) async -> ShellTaskSnapshot? { nil }
-    func listTasks() async -> [ShellTaskSnapshot] { [] }
-    func shellCWD() async -> URL? { nil }
 }
