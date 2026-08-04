@@ -282,7 +282,7 @@ private func targets() -> [Target] {
     // W10-S2 (OpenGrokCLI) also needs branding/paths/env/version, shared
     // identifiers, and configuration — declared here so the frozen manifest
     // already has every edge the real CLI parser will require.
-    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s5, w3s1, w3s2, w5s4, w5s5, w5s6, w8s4, w8s5, w9s5)))
+    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w3s1, w3s2, w3s3, w5s4, w5s5, w5s6, w6s4, w7s3, w8s4, w8s5, w9s5)))
 
     // ---- Wave 11 (libraries + executable) ----
     t.append(contentsOf: libs(w11s1Lib, dep(w0s1, w0s3, w2s2, w5s6, w10s1, w10s2)))
