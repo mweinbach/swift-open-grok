@@ -39,12 +39,23 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
     public let turnID: String
     public let model: String
     public let prompt: String
+    public let items: [ConversationItem]
+    public let tools: [ToolSpec]
 
-    public init(sessionID: String, turnID: String, model: String, prompt: String) {
+    public init(
+        sessionID: String,
+        turnID: String,
+        model: String,
+        prompt: String,
+        items: [ConversationItem]? = nil,
+        tools: [ToolSpec] = []
+    ) {
         self.sessionID = sessionID
         self.turnID = turnID
         self.model = model
         self.prompt = prompt
+        self.items = items ?? [.user(prompt)]
+        self.tools = tools
     }
 }
 
@@ -56,10 +67,30 @@ public enum OpenGrokLiveSamplingEvent: Sendable, Equatable {
 public struct OpenGrokLiveSamplingResponse: Sendable, Equatable {
     public let output: String
     public let stopReason: String?
+    public let items: [ConversationItem]
+    public let toolCalls: [ToolCall]
 
-    public init(output: String, stopReason: String? = nil) {
+    public init(
+        output: String,
+        stopReason: String? = nil,
+        items: [ConversationItem]? = nil,
+        toolCalls: [ToolCall] = []
+    ) {
         self.output = output
         self.stopReason = stopReason
+        let resolvedItems = items ?? [.assistant(AssistantItem(
+            content: output,
+            toolCalls: toolCalls
+        ))]
+        self.items = resolvedItems
+        if toolCalls.isEmpty {
+            self.toolCalls = resolvedItems.reversed().compactMap { item in
+                guard case .assistant(let assistant) = item else { return nil }
+                return assistant.toolCalls
+            }.first ?? []
+        } else {
+            self.toolCalls = toolCalls
+        }
     }
 }
 
@@ -100,7 +131,9 @@ public struct OpenGrokLiveSampler: Sendable {
         return OpenGrokLiveSampler { request, emit in
             await emit(.status("sampling"))
             let response = try await client.conversationCollect(ConversationRequest(
-                items: [.user(request.prompt)],
+                items: request.items,
+                tools: request.tools,
+                toolChoice: request.tools.isEmpty ? nil : .auto,
                 model: request.model,
                 xGrokReqId: request.turnID,
                 xGrokSessionId: request.sessionID
@@ -111,7 +144,9 @@ public struct OpenGrokLiveSampler: Sendable {
             }
             return OpenGrokLiveSamplingResponse(
                 output: output,
-                stopReason: response.stopReason?.asString
+                stopReason: response.stopReason?.asString,
+                items: response.items,
+                toolCalls: response.assistant()?.toolCalls ?? []
             )
         }
     }
@@ -119,17 +154,22 @@ public struct OpenGrokLiveSampler: Sendable {
 
 public struct OpenGrokLiveCompositionDependencies: Sendable {
     public let makeSampler: @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler
+    public let makeProcessBackend: @Sendable () -> any ShellProcessBackend
     public let terminal: OpenGrokLiveTerminal
     public let makeInteractiveInput: @Sendable () async throws -> OpenGrokLiveInteractiveInput?
     public let makeTerminalSink: @Sendable () -> (any PagerTerminalSink)?
 
     public init(
         makeSampler: @escaping @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler,
+        makeProcessBackend: @escaping @Sendable () -> any ShellProcessBackend = {
+            LocalShellProcessBackend()
+        },
         terminal: OpenGrokLiveTerminal = .production,
         makeInteractiveInput: @escaping @Sendable () async throws -> OpenGrokLiveInteractiveInput? = { nil },
         makeTerminalSink: @escaping @Sendable () -> (any PagerTerminalSink)? = { nil }
     ) {
         self.makeSampler = makeSampler
+        self.makeProcessBackend = makeProcessBackend
         self.terminal = terminal
         self.makeInteractiveInput = makeInteractiveInput
         self.makeTerminalSink = makeTerminalSink
@@ -137,6 +177,7 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
 
     public static let production = OpenGrokLiveCompositionDependencies(
         makeSampler: OpenGrokLiveSampler.production(configuration:),
+        makeProcessBackend: { LocalShellProcessBackend() },
         terminal: .production,
         makeInteractiveInput: OpenGrokLiveInteractiveInput.production,
         makeTerminalSink: { FileHandlePagerTerminalSink() }
@@ -436,12 +477,21 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 openGrokHome: openGrokHome,
                 environment: context.environment
             )
+            let processBackend = dependencies.makeProcessBackend()
+            let toolExecutor = try await LiveToolExecutor(
+                processBackend: processBackend,
+                sessionID: sessionID,
+                workingDirectory: cwd
+            )
             let shell = OpenGrokShell(configuration: OpenGrokShellConfiguration(
                 openGrokHome: openGrokHome,
-                processBackend: LocalShellProcessBackend(),
+                processBackend: processBackend,
                 providerFactory: ProviderSessionFactoryAdapter(),
                 turnDriver: ProviderSessionTurnDriver(
-                    sampler: LiveShellSamplingDriver(sampler: sampler)
+                    sampler: LiveShellSamplingDriver(
+                        sampler: sampler,
+                        toolExecutor: toolExecutor
+                    )
                 )
             ))
             let runtime = LivePagerRuntimeAdapter(
@@ -507,6 +557,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             await controller.shutdown()
                             await interactiveInput.close()
                             _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                            await toolExecutor.shutdown()
                         }
                     )
                 }
@@ -543,6 +594,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         task.cancel()
                         await pager.shutdown()
                         _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                        await toolExecutor.shutdown()
                     }
                 )
             } else {
@@ -570,6 +622,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         task.cancel()
                         await pager.shutdown()
                         _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                        await toolExecutor.shutdown()
                     }
                 )
             }
@@ -739,31 +792,335 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     }
 }
 
+private struct LiveToolExecutor: Sendable {
+    let tools: [ToolSpec]
+    let workingDirectory: URL
+    private let composition: OpenGrokShellToolRuntimeComposition
+
+    init(
+        processBackend: any ShellProcessBackend,
+        sessionID: String,
+        workingDirectory: URL
+    ) async throws {
+        let composition = OpenGrokShellToolRuntimeComposition(
+            processBackend: processBackend,
+            runtime: LiveRunTerminalToolRuntime()
+        )
+        try await composition.registerSession(
+            sessionID: sessionID,
+            workingDirectory: workingDirectory
+        )
+        self.composition = composition
+        self.workingDirectory = workingDirectory.standardizedFileURL
+        self.tools = [Self.runTerminalTool]
+    }
+
+    func invoke(
+        sessionID: String,
+        workingDirectory: URL,
+        call: ToolCall
+    ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
+        let args: JSONValue
+        do {
+            args = try JSONDecoder().decode(
+                JSONValue.self,
+                from: Data(call.arguments.utf8)
+            )
+        } catch {
+            return .failure(.invalidCall(
+                "tool arguments are not valid JSON: \(error)"
+            ))
+        }
+
+        do {
+            return try await composition.invoke(
+                sessionID: sessionID,
+                workingDirectory: workingDirectory,
+                name: call.name,
+                args: args,
+                callID: call.callId
+            )
+        } catch is CancellationError {
+            return .failure(.cancelled)
+        } catch {
+            return .failure(.failed(String(describing: error)))
+        }
+    }
+
+    func shutdown() async {
+        await composition.shutdown()
+    }
+
+    private static let runTerminalTool = ToolSpec(
+        name: "run_terminal_cmd",
+        description: "Run a validated shell command in the workspace with bounded output and cancellable process cleanup.",
+        parameters: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "command": .object([
+                    "type": .string("string"),
+                    "description": .string("Shell command to execute.")
+                ]),
+                "timeout_ms": .object([
+                    "type": .string("integer"),
+                    "description": .string("Optional timeout in milliseconds.")
+                ]),
+                "description": .object([
+                    "type": .string("string"),
+                    "description": .string("Short explanation of the command.")
+                ]),
+                "is_background": .object([
+                    "type": .string("boolean"),
+                    "description": .string("Run as a background task.")
+                ])
+            ]),
+            "required": .array([.string("command")]),
+            "additionalProperties": .bool(false)
+        ])
+    )
+}
+
+private struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
+    func invoke(
+        _ call: OpenGrokShellToolCall,
+        using process: any OpenGrokShellProcessExecution
+    ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
+        guard call.name == "run_terminal_cmd" else {
+            return .failure(.unsupported("unknown tool '\(call.name)'"))
+        }
+        guard case .object(let object) = call.args,
+              case .string(let command)? = object["command"],
+              !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return .failure(.invalidCall("run_terminal_cmd requires a non-empty command"))
+        }
+
+        let timeoutMilliseconds = Self.integer(object["timeout_ms"])
+            .map { max(1, min(3_600_000, $0)) }
+            ?? 30_000
+        let outputByteLimit = Self.integer(object["output_byte_limit"])
+            .map { max(1, min(1_000_000, $0)) }
+            ?? 30_000
+        let isBackground = Self.boolean(object["is_background"]) ?? false
+        let description = Self.string(object["description"])
+        let environment = Self.stringDictionary(object["environment"])
+        let request = ShellCommandRequest(
+            command: command,
+            workingDirectory: process.workingDirectory,
+            environment: environment,
+            timeout: .milliseconds(Int64(timeoutMilliseconds)),
+            outputByteLimit: outputByteLimit,
+            toolCallID: call.callID,
+            autoBackgroundOnTimeout: true,
+            foregroundBlockBudget: .seconds(10),
+            ownerSessionID: call.sessionID,
+            description: description
+        )
+
+        do {
+            if isBackground {
+                let handle = try await process.runBackground(request)
+                let value: JSONValue = .object([
+                    "type": .string("background"),
+                    "task_id": .string(handle.taskID),
+                    "output_file": handle.outputFile.map {
+                        .string($0.path)
+                    } ?? .null,
+                    "pid": handle.processID.map {
+                        .number(.int64(Int64($0)))
+                    } ?? .null
+                ])
+                return .success(OpenGrokShellToolCallResult(
+                    value: value,
+                    promptText: "Background task \(handle.taskID) started."
+                ))
+            }
+
+            let result = try await process.run(request)
+            let value: JSONValue = .object([
+                "type": .string(result.backgrounded ? "backgrounded" : "foreground"),
+                "combined_output": .string(result.combinedOutput),
+                "exit_code": result.exitCode.map {
+                    .number(.int64(Int64($0)))
+                } ?? .null,
+                "signal": result.signal.map(JSONValue.string) ?? .null,
+                "truncated": .bool(result.truncated),
+                "timed_out": .bool(result.timedOut),
+                "cancelled": .bool(result.cancelled),
+                "output_file": result.outputFile.map {
+                    .string($0.path)
+                } ?? .null,
+                "total_bytes": .number(.int64(Int64(result.totalBytes))),
+                "pid": result.processID.map {
+                    .number(.int64(Int64($0)))
+                } ?? .null,
+                "task_id": result.taskID.map(JSONValue.string) ?? .null
+            ])
+            return .success(OpenGrokShellToolCallResult(
+                value: value,
+                promptText: Self.promptText(for: result)
+            ))
+        } catch is CancellationError {
+            return .failure(.cancelled)
+        } catch {
+            return .failure(.failed(String(describing: error)))
+        }
+    }
+
+    func cancel(_ call: OpenGrokShellToolCall) async {
+        _ = call
+    }
+
+    private static func integer(_ value: JSONValue?) -> Int? {
+        guard let value else { return nil }
+        switch value {
+        case .number(let number):
+            if let integer = number.int64Value {
+                return Int(exactly: integer)
+            }
+            if let integer = number.uint64Value {
+                return Int(exactly: integer)
+            }
+            return nil
+        case .string(let string):
+            return Int(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        default:
+            return nil
+        }
+    }
+
+    private static func boolean(_ value: JSONValue?) -> Bool? {
+        guard let value else { return nil }
+        switch value {
+        case .bool(let boolean):
+            return boolean
+        case .string(let string):
+            switch string.lowercased() {
+            case "true", "1", "yes": return true
+            case "false", "0", "no": return false
+            default: return nil
+            }
+        default:
+            return nil
+        }
+    }
+
+    private static func string(_ value: JSONValue?) -> String? {
+        guard case .string(let string)? = value else { return nil }
+        return string
+    }
+
+    private static func stringDictionary(_ value: JSONValue?) -> [String: String] {
+        guard case .object(let object)? = value else { return [:] }
+        return object.reduce(into: [:]) { result, entry in
+            if case .string(let value) = entry.value {
+                result[entry.key] = value
+            }
+        }
+    }
+
+    private static func promptText(for result: ShellCommandResult) -> String {
+        var lines: [String] = []
+        if !result.combinedOutput.isEmpty {
+            lines.append(result.combinedOutput)
+        } else {
+            lines.append("(command produced no output)")
+        }
+        if let exitCode = result.exitCode {
+            lines.append("Exit code: \(exitCode)")
+        }
+        if let signal = result.signal {
+            lines.append("Signal: \(signal)")
+        }
+        if result.timedOut {
+            lines.append("The command timed out.")
+        }
+        if result.cancelled {
+            lines.append("The command was cancelled.")
+        }
+        if result.truncated {
+            lines.append("Output was truncated; full output: \(result.outputFile?.path ?? "unavailable")")
+        }
+        if let taskID = result.taskID {
+            lines.append("Background task: \(taskID)")
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
 private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     let sampler: OpenGrokLiveSampler
+    let toolExecutor: LiveToolExecutor
 
     func sample(
         context: OpenGrokShellProviderTurnContext,
         request: OpenGrokShellTurnRequest,
         emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
     ) async throws -> OpenGrokShellSamplingResult {
-        let response = try await sampler.sample(OpenGrokLiveSamplingRequest(
-            sessionID: context.sessionID,
-            turnID: context.turnID,
-            model: context.modelID,
-            prompt: request.text
-        )) { event in
-            switch event {
-            case .output(let text):
-                await emit(.assistantText(text))
-            case .status(let status):
-                await emit(.status(status))
+        var items: [ConversationItem] = [.user(request.text)]
+        var toolRoundCount = 0
+
+        while true {
+            try Task.checkCancellation()
+            let response = try await sampler.sample(OpenGrokLiveSamplingRequest(
+                sessionID: context.sessionID,
+                turnID: context.turnID,
+                model: context.modelID,
+                prompt: request.text,
+                items: items,
+                tools: toolExecutor.tools
+            )) { event in
+                switch event {
+                case .output(let text):
+                    await emit(.assistantText(text))
+                case .status(let status):
+                    await emit(.status(status))
+                }
+            }
+            items.append(contentsOf: response.items)
+
+            guard !response.toolCalls.isEmpty else {
+                return OpenGrokShellSamplingResult(
+                    output: response.output,
+                    stopReason: response.stopReason
+                )
+            }
+            guard toolRoundCount < 16 else {
+                throw CLIApplicationError.failed(
+                    "tool loop exceeded 16 rounds"
+                )
+            }
+            toolRoundCount += 1
+
+            for call in response.toolCalls {
+                try Task.checkCancellation()
+                await emit(.status("running tool \(call.name)"))
+                let result = await toolExecutor.invoke(
+                    sessionID: context.sessionID,
+                    workingDirectory: toolExecutorWorkingDirectory,
+                    call: call
+                )
+                let content: String
+                switch result {
+                case .success(let result):
+                    content = result.promptText
+                    await emit(.status("tool \(call.name) completed"))
+                case .failure(.cancelled):
+                    throw CancellationError()
+                case .failure(let error):
+                    content = "Tool \(call.name) failed: \(error.description)"
+                    await emit(.status("tool \(call.name) failed"))
+                }
+                items.append(.toolResult(ToolResultItem(
+                    toolCallId: call.callId,
+                    content: content
+                )))
             }
         }
-        return OpenGrokShellSamplingResult(
-            output: response.output,
-            stopReason: response.stopReason
-        )
+    }
+
+    private var toolExecutorWorkingDirectory: URL {
+        toolExecutor.workingDirectory
     }
 }
 

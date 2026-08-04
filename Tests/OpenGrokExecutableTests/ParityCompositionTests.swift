@@ -1,6 +1,7 @@
 import Foundation
 import OpenGrokPager
 import OpenGrokPagerRender
+import OpenGrokSamplingTypes
 import OpenGrokShell
 import OpenGrokShellBase
 import OpenGrokTerminalCore
@@ -105,6 +106,52 @@ private final class ParitySamplerFixture: @unchecked Sendable {
         requests.append(request)
         return responses.removeValue(forKey: request.prompt)
             ?? OpenGrokLiveSamplingResponse(output: "missing response")
+    }
+}
+
+private final class ParityToolLoopSamplerFixture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [OpenGrokLiveSamplingRequest] = []
+
+    var recordedRequests: [OpenGrokLiveSamplingRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+
+    func makeSampler() -> OpenGrokLiveSampler {
+        let fixture = self
+        return OpenGrokLiveSampler { request, emit in
+            let requestIndex = fixture.record(request)
+            if requestIndex == 0 {
+                let call = ToolCall(
+                    id: "call-1",
+                    name: "run_terminal_cmd",
+                    arguments: #"{"command":"printf tool-output","description":"parity tool"}"#
+                )
+                return OpenGrokLiveSamplingResponse(
+                    output: "",
+                    stopReason: "tool_calls",
+                    items: [.assistant(AssistantItem(content: "", toolCalls: [call]))]
+                )
+            }
+
+            let toolResult = request.items.compactMap { item -> ToolResultItem? in
+                guard case .toolResult(let result) = item else { return nil }
+                return result
+            }.last
+            let answer = "final answer after \(toolResult?.content ?? "missing tool result")"
+            await emit(.output(answer))
+            return OpenGrokLiveSamplingResponse(output: answer, stopReason: "stop")
+        }
+    }
+
+    private func record(_ request: OpenGrokLiveSamplingRequest) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let index = requests.count
+        requests.append(request)
+        return index
     }
 }
 
@@ -362,6 +409,50 @@ private struct ParityShellCommandTool: Sendable {
 
 @Suite("OpenGrok executable parity composition")
 struct ParityCompositionTests {
+    @Test("live headless composition executes provider tool calls and resamples")
+    func liveHeadlessToolLoopComposition() async {
+        let backend = ParityShellCommandBackend()
+        let sampler = ParityToolLoopSamplerFixture()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() },
+            makeProcessBackend: { backend }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, err) = CLIStreams.buffered()
+
+        let code = await CLIRunner.run(
+            ["headless", "--prompt", "use the terminal", "--cwd", root.path],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let samplerRequests = sampler.recordedRequests
+        let processRequests = await backend.requests
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(err.contents.contains("running tool run_terminal_cmd"))
+        #expect(out.contents.contains("final answer after tool output"))
+        #expect(samplerRequests.count == 2)
+        #expect(samplerRequests.first?.tools.map(\.name) == ["run_terminal_cmd"])
+        #expect(samplerRequests.last?.items.contains { item in
+            guard case .toolResult(let result) = item else { return false }
+            return result.toolCallId == "call-1"
+                && result.content.contains("tool output")
+        } == true)
+        #expect(processRequests.count == 1)
+        #expect(processRequests.first?.command == "printf tool-output")
+        #expect(processRequests.first?.workingDirectory == root.standardizedFileURL)
+        #expect(processRequests.first?.toolCallID == "call-1")
+        #expect(processRequests.first?.ownerSessionID != nil)
+    }
+
     @Test("live interactive composition reuses one session across typed turns")
     func liveInteractiveMultiTurnComposition() async {
         let terminal = ParityTerminalFixture(
