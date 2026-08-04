@@ -1,22 +1,15 @@
-// CLIRunner.swift
-//
-// The testable CLI entry point. `main` returns a deterministic exit code and
-// writes only requested output to `streams.out`, with diagnostics to
-// `streams.err` — matching the W10-S2 acceptance that stdout contains only
-// requested machine/user output while diagnostics use stderr.
-
 import Foundation
+import OpenGrokModels
 
 public enum CLIRunner {
-    /// Exit codes used by the bootstrap CLI.
     public enum ExitCode: Int32, Sendable {
         case success = 0
+        case failure = 1
         case usage = 2
         case notImplemented = 3
+        case cancelled = 130
     }
 
-    /// Execute the bootstrap CLI against `args` (arguments after the program
-    /// name), `environment`, and `streams`. Returns the process exit code.
     @discardableResult
     public static func main(
         _ args: [String],
@@ -25,27 +18,171 @@ public enum CLIRunner {
     ) -> Int32 {
         let command = CLICommandParser.parse(args)
         switch command {
-        case .version:
-            streams.out("Open Grok \(OpenGrokCLIVersion.installed(environment: environment))\n")
+        case .version(let json):
+            writeVersion(json: json, environment: environment, streams: streams)
             return ExitCode.success.rawValue
         case .help:
             streams.out(OpenGrokHelp.text)
             return ExitCode.success.rawValue
-        case .paths:
-            let home = OpenGrokHomeResolver.resolve(environment: environment)
-            let managed = OpenGrokHomeResolver.managedBinaryURL(environment: environment)
-            streams.out("OPENGROK_HOME: \(home.path)\n")
-            streams.out("managed binary: \(managed.path)\n")
-            streams.out("project state: .opengrok\n")
+        case .paths(let json):
+            writePaths(json: json, environment: environment, streams: streams)
             return ExitCode.success.rawValue
-        case .notYetImplemented(let name):
-            streams.err("open-grok: '\(name)' is part of the Open Grok CLI but is not yet implemented in the bootstrap build.\n")
-            streams.err("It will be provided by the W10-S2 CLI target.\n")
-            return ExitCode.notImplemented.rawValue
-        case .unknown(let token):
-            streams.err("open-grok: unknown command or flag '\(token)'.\n")
-            streams.err("Run 'open-grok help' for usage.\n")
+        case .models(let options):
+            writeModels(options: options, streams: streams)
+            return ExitCode.success.rawValue
+        case .invalid(let error):
+            writeUsageError(error, streams: streams)
             return ExitCode.usage.rawValue
+        default:
+            writeUnsupported(command, streams: streams)
+            return ExitCode.notImplemented.rawValue
         }
+    }
+
+    @discardableResult
+    public static func run(
+        _ args: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        streams: CLIStreams,
+        application: OpenGrokApplication = .unavailable
+    ) async -> Int32 {
+        let command = CLICommandParser.parse(args)
+        switch command {
+        case .version(let json):
+            writeVersion(json: json, environment: environment, streams: streams)
+            return ExitCode.success.rawValue
+        case .help:
+            streams.out(OpenGrokHelp.text)
+            return ExitCode.success.rawValue
+        case .paths(let json):
+            writePaths(json: json, environment: environment, streams: streams)
+            return ExitCode.success.rawValue
+        case .models(let options):
+            writeModels(options: options, streams: streams)
+            return ExitCode.success.rawValue
+        case .invalid(let error):
+            writeUsageError(error, streams: streams)
+            return ExitCode.usage.rawValue
+        default:
+            do {
+                try await application.run(command: command, environment: environment, streams: streams)
+                return ExitCode.success.rawValue
+            } catch is CancellationError {
+                streams.err("open-grok: operation cancelled.\n")
+                return ExitCode.cancelled.rawValue
+            } catch let error as CLIApplicationError {
+                streams.err("open-grok: \(error.description).\n")
+                return error.isUnsupported ? ExitCode.notImplemented.rawValue : ExitCode.failure.rawValue
+            } catch {
+                streams.err("open-grok: \(error).\n")
+                return ExitCode.failure.rawValue
+            }
+        }
+    }
+
+    private static func writeVersion(json: Bool, environment: [String: String], streams: CLIStreams) {
+        let version = OpenGrokCLIVersion.installed(environment: environment)
+        if json {
+            writeJSON(VersionOutput(version: version), streams: streams)
+        } else {
+            streams.out("Open Grok \(version)\n")
+        }
+    }
+
+    private static func writePaths(json: Bool, environment: [String: String], streams: CLIStreams) {
+        let home = OpenGrokHomeResolver.resolve(environment: environment)
+        let managed = OpenGrokHomeResolver.managedBinaryURL(environment: environment)
+        let output = PathsOutput(
+            opengrokHome: home.path,
+            managedBinary: managed.path,
+            projectState: ".opengrok"
+        )
+        if json {
+            writeJSON(output, streams: streams)
+        } else {
+            streams.out("OPENGROK_HOME: \(output.opengrokHome)\n")
+            streams.out("managed binary: \(output.managedBinary)\n")
+            streams.out("project state: \(output.projectState)\n")
+        }
+    }
+
+    private static func writeModels(options: CLIModelsOptions, streams: CLIStreams) {
+        let catalog = embeddedDefaultModels()
+        let visibleModels = catalog.models.filter { !$0.hidden && $0.supportedInApi }.map(\.model)
+        switch options.action {
+        case .default:
+            if options.json {
+                writeJSON(DefaultModelOutput(model: catalog.default), streams: streams)
+            } else {
+                streams.out("\(catalog.default)\n")
+            }
+        case .list:
+            if options.json {
+                writeJSON(ModelsOutput(defaultModel: catalog.default, models: visibleModels), streams: streams)
+            } else {
+                streams.out("Default: \(catalog.default)\n")
+                for model in visibleModels {
+                    streams.out("\(model)\n")
+                }
+            }
+        }
+    }
+
+    private static func writeUnsupported(_ command: CLICommand, streams: CLIStreams) {
+        streams.err("open-grok: route '\(command.routeName)' is recognized but unavailable in this Swift composition.\n")
+        streams.err("No success path is installed for this capability.\n")
+    }
+
+    private static func writeUsageError(_ error: CLIParseError, streams: CLIStreams) {
+        streams.err("open-grok: \(error.description).\n")
+        streams.err("Run 'open-grok help' for usage.\n")
+    }
+
+    private static func writeJSON<T: Encodable>(_ value: T, streams: CLIStreams) {
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            let data = try encoder.encode(value)
+            streams.out(String(decoding: data, as: UTF8.self) + "\n")
+        } catch {
+            streams.err("open-grok: failed to encode output: \(error).\n")
+        }
+    }
+}
+
+private extension CLIApplicationError {
+    var isUnsupported: Bool {
+        if case .unsupported = self { return true }
+        return false
+    }
+}
+
+private struct VersionOutput: Encodable {
+    let version: String
+}
+
+private struct PathsOutput: Encodable {
+    let opengrokHome: String
+    let managedBinary: String
+    let projectState: String
+
+    enum CodingKeys: String, CodingKey {
+        case opengrokHome = "opengrok_home"
+        case managedBinary = "managed_binary"
+        case projectState = "project_state"
+    }
+}
+
+private struct DefaultModelOutput: Encodable {
+    let model: String
+}
+
+private struct ModelsOutput: Encodable {
+    let defaultModel: String
+    let models: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case defaultModel = "default"
+        case models
     }
 }

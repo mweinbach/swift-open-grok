@@ -1,34 +1,60 @@
-// Help.swift
-//
-// Bootstrap help text. The full command/flag documentation is W10-S2; this
-// surface lists the bootstrap commands and the intended W10-S2 command names.
-
 import Foundation
 
 public enum OpenGrokHelp {
     public static let text = """
-    Open Grok — usage (bootstrap build)
+    Open Grok — command line
 
-    SYNOPSIS
-      open-grok [command] [options]
+    USAGE
+      open-grok [MODE|COMMAND] [OPTIONS]
 
-    BOOTSTRAP COMMANDS
-      version, --version   Print the Open Grok version and exit.
-      help, -h, --help     Print this help and exit.
-      paths                Print the resolved OPENGROK_HOME and managed binary path.
+    MODES
+      interactive              Start the full interactive application.
+      minimal                   Start the scrollback/minimal application.
+      headless -p PROMPT       Run one headless prompt.
+      acp                       Run the ACP stdio entry point.
+      agent stdio|headless     Select an agent transport explicitly.
+      serve                     Run the agent WebSocket server.
+      leader                    Run the shared leader process.
 
-    ENVIRONMENT
-      OPENGROK_HOME        Override the state directory (default: ~/.opengrok).
-      GROK_TEST_VERSION    Override the reported version (test only).
+    SESSION AND MODEL COMMANDS
+      session list|new|resume|restore|export [ID]
+      models [default] [--json]
 
-    STATE ISOLATION
-      All runtime and configuration state is isolated to $OPENGROK_HOME or
-      ~/.opengrok. The legacy ~/.grok path is never read or written.
+    INTEGRATION COMMANDS
+      plugin list|install|remove|update TARGET
+      mcp list|add|remove|test TARGET
+      workflow list|run|resume TARGET
 
-    FULL COMMAND SURFACE (ported by W10-S2)
-      inspect, login, logout, mcp, plugin, memory, models, sessions, setup,
-      share, wrap, export, trace, update, completions, worktree, workspace,
-      dashboard, agent — plus interactive, minimal, headless, and ACP modes.
+    UTILITY COMMANDS
+      version, --version       Print version information.
+      help, -h, --help         Print this help.
+      paths                    Print resolved Open Grok state paths.
+      inspect, doctor          Inspect the current workspace or environment.
+      completions SHELL        Generate shell completion input.
+      login, logout, setup, wrap, export, trace, update, dashboard, workspace
+
+    COMMON OPTIONS
+      --cwd PATH               Set the working directory.
+      -m, --model MODEL        Select a model.
+      --provider NAME          Select a provider profile.
+      --profile NAME           Select an agent/profile configuration.
+      --plugin-dir DIR         Add a process-scoped plugin directory.
+      --mcp-config PATH        Select MCP configuration.
+      --workflow NAME          Select a workflow.
+      --leader / --no-leader   Select shared-leader behavior.
+
+    HEADLESS OPTIONS
+      -p, --prompt TEXT        Use a text prompt.
+      --prompt-json JSON       Use ACP content blocks encoded as JSON.
+      --prompt-file PATH       Read a text or JSON prompt file.
+      --output-format FORMAT   plain, json, streaming-json, or streaming-messages-json.
+      --resume ID              Resume a session.
+      --continue               Continue the latest session.
+      --session-id ID          Select or create a session ID.
+
+    STATE
+      OPENGROK_HOME overrides the state directory; otherwise ~/.opengrok is used.
+      The legacy ~/.grok directory is never read or written.
 
     """
 }

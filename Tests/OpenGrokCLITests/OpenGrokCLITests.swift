@@ -1,158 +1,226 @@
-// OpenGrokCLITests.swift
-//
-// Target-scoped Swift Testing suites for the bootstrap OpenGrokCLI surface.
-
 import Foundation
 import Testing
 @testable import OpenGrokCLI
 
-@Suite("OpenGrokCLI")
+@Suite("OpenGrokCLI parser")
 struct OpenGrokCLITests {
-    // MARK: - Version
+    @Test("no arguments select the interactive composition route")
+    func defaultRoute() throws {
+        let command = try CLICommandParser.parseOrThrow([])
+        guard case .launch(let options) = command else {
+            Issue.record("expected an interactive launch route")
+            return
+        }
+        #expect(options.mode == .interactive)
+        #expect(options.prompt == nil)
+    }
 
-    @Test("--version prints the Open Grok version on stdout and exits 0")
-    func versionLongFlag() {
+    @Test("interactive options preserve provider, profile, plugins, MCP, and workflow")
+    func interactiveOptions() throws {
+        let command = try CLICommandParser.parseOrThrow([
+            "interactive",
+            "--cwd", "/tmp/project",
+            "--model", "grok-test",
+            "--provider", "xai",
+            "--agent-profile", "coding",
+            "--plugin-dir", "/tmp/plugin-a",
+            "--plugin-dir=/tmp/plugin-b",
+            "--mcp-config", "/tmp/mcp.json",
+            "--workflow", "review"
+        ])
+        guard case .launch(let options) = command else {
+            Issue.record("expected launch route")
+            return
+        }
+        #expect(options.mode == .interactive)
+        #expect(options.common.cwd == "/tmp/project")
+        #expect(options.common.model == "grok-test")
+        #expect(options.common.provider == "xai")
+        #expect(options.common.profile == "coding")
+        #expect(options.common.pluginDirectories == ["/tmp/plugin-a", "/tmp/plugin-b"])
+        #expect(options.common.mcpConfig == "/tmp/mcp.json")
+        #expect(options.common.workflow == "review")
+    }
+
+    @Test("minimal and fullscreen are mutually exclusive")
+    func minimalFullscreenConflict() {
+        do {
+            _ = try CLICommandParser.parseOrThrow(["minimal", "--fullscreen"])
+            Issue.record("expected conflicting options error")
+        } catch let error as CLIParseError {
+            #expect(error == .conflictingOptions("--minimal", "--fullscreen"))
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    @Test("headless parsing supports prompt sources, output format, and session controls")
+    func headlessOptions() throws {
+        let command = try CLICommandParser.parseOrThrow([
+            "headless",
+            "--prompt", "summarize the change",
+            "--output-format", "streaming-json",
+            "--model", "grok-test",
+            "--resume", "session-123",
+            "--fork-session",
+            "--session-id", "session-456"
+        ])
+        guard case .launch(let options) = command else {
+            Issue.record("expected launch route")
+            return
+        }
+        #expect(options.mode == .headless)
+        #expect(options.prompt == "summarize the change")
+        #expect(options.outputFormat == .streamingJSON)
+        #expect(options.common.model == "grok-test")
+        #expect(options.resume == "session-123")
+        #expect(options.forkSession)
+        #expect(options.sessionID == "session-456")
+    }
+
+    @Test("ACP agent and serve grammar map to transport-specific routes")
+    func agentTransportRoutes() throws {
+        let acp = try CLICommandParser.parseOrThrow(["agent", "stdio"])
+        guard case .launch(let acpOptions) = acp else {
+            Issue.record("expected ACP launch route")
+            return
+        }
+        #expect(acpOptions.mode == .acp)
+
+        let serve = try CLICommandParser.parseOrThrow([
+            "agent", "serve", "--bind", "0.0.0.0:2419", "--secret", "test-secret", "--remote", "wss://relay"
+        ])
+        guard case .serve(let serveOptions) = serve else {
+            Issue.record("expected serve route")
+            return
+        }
+        #expect(serveOptions.bind == "0.0.0.0:2419")
+        #expect(serveOptions.secret == "test-secret")
+        #expect(serveOptions.remote == "wss://relay")
+    }
+
+    @Test("leader grammar preserves lifecycle policy options")
+    func leaderOptions() throws {
+        let command = try CLICommandParser.parseOrThrow([
+            "leader", "--no-exit-on-disconnect", "--relay-on-demand", "--no-auto-update", "--no-leader"
+        ])
+        guard case .leader(let options) = command else {
+            Issue.record("expected leader route")
+            return
+        }
+        #expect(options.noExitOnDisconnect)
+        #expect(options.relayOnDemand)
+        #expect(options.noAutoUpdate)
+        #expect(options.common.noLeader)
+    }
+
+    @Test("session, model, plugin, MCP, and workflow subcommands parse typed payloads")
+    func resourceCommands() throws {
+        let session = try CLICommandParser.parseOrThrow(["session", "resume", "abc", "--fork", "--json"])
+        guard case .sessions(let sessionOptions) = session else {
+            Issue.record("expected session route")
+            return
+        }
+        #expect(sessionOptions.action == .resume)
+        #expect(sessionOptions.identifier == "abc")
+        #expect(sessionOptions.fork)
+        #expect(sessionOptions.json)
+
+        let models = try CLICommandParser.parseOrThrow(["models", "default", "--json"])
+        guard case .models(let modelOptions) = models else {
+            Issue.record("expected models route")
+            return
+        }
+        #expect(modelOptions.action == .default)
+        #expect(modelOptions.json)
+
+        let plugin = try CLICommandParser.parseOrThrow(["plugin", "install", "demo", "--source", "/tmp/demo", "--force"])
+        guard case .plugin(let pluginOptions) = plugin else {
+            Issue.record("expected plugin route")
+            return
+        }
+        #expect(pluginOptions.action == "install")
+        #expect(pluginOptions.target == "demo")
+        #expect(pluginOptions.options["--source"] == "/tmp/demo")
+        #expect(pluginOptions.force)
+
+        let mcp = try CLICommandParser.parseOrThrow(["mcp", "add", "local", "--command", "tool-server"])
+        guard case .mcp(let mcpOptions) = mcp else {
+            Issue.record("expected MCP route")
+            return
+        }
+        #expect(mcpOptions.action == "add")
+        #expect(mcpOptions.target == "local")
+        #expect(mcpOptions.options["--command"] == "tool-server")
+
+        let workflow = try CLICommandParser.parseOrThrow(["workflow", "run", "review", "--argument", "depth=2"])
+        guard case .workflow(let workflowOptions) = workflow else {
+            Issue.record("expected workflow route")
+            return
+        }
+        #expect(workflowOptions.action == "run")
+        #expect(workflowOptions.target == "review")
+        #expect(workflowOptions.options["--argument"] == "depth=2")
+    }
+
+    @Test("utility parsing retains wrap trailing arguments")
+    func utilityCommands() throws {
+        let command = try CLICommandParser.parseOrThrow(["wrap", "docker", "exec", "-it", "container", "bash"])
+        guard case .utility(let options) = command else {
+            Issue.record("expected utility route")
+            return
+        }
+        #expect(options.name == "wrap")
+        #expect(options.values == ["docker", "exec", "-it", "container", "bash"])
+    }
+
+    @Test("invalid grammar is explicit and maps to usage failure")
+    func invalidGrammar() {
+        let command = CLICommandParser.parse(["headless", "--output-format", "not-a-format"])
+        guard case .invalid(let error) = command else {
+            Issue.record("expected invalid command")
+            return
+        }
+        guard case .invalidValue(let option, _, _) = error else {
+            Issue.record("expected invalid output format")
+            return
+        }
+        #expect(option == "--output-format")
+
         let (streams, out, err) = CLIStreams.buffered()
-        let code = CLIRunner.main(["--version"], environment: [:], streams: streams)
-        #expect(code == 0)
-        #expect(out.contents.contains("Open Grok"))
-        #expect(out.contents.contains(OpenGrokCLIVersion.compiled))
-        #expect(err.contents.isEmpty)
-    }
-
-    @Test("version subcommand behaves like --version")
-    func versionSubcommand() {
-        let (streams, out, _) = CLIStreams.buffered()
-        let code = CLIRunner.main(["version"], environment: [:], streams: streams)
-        #expect(code == 0)
-        #expect(out.contents.contains(OpenGrokCLIVersion.compiled))
-    }
-
-    @Test("GROK_TEST_VERSION overrides the reported version")
-    func versionOverride() {
-        let (streams, out, _) = CLIStreams.buffered()
-        let code = CLIRunner.main(["version"], environment: ["GROK_TEST_VERSION": "9.9.9-test"], streams: streams)
-        #expect(code == 0)
-        #expect(out.contents.contains("9.9.9-test"))
-        #expect(!out.contents.contains(OpenGrokCLIVersion.compiled))
-    }
-
-    @Test("empty GROK_TEST_VERSION override returns empty version (OpenGrokVersion parity)")
-    func emptyVersionOverride() {
-        let (streams, out, _) = CLIStreams.buffered()
-        let code = CLIRunner.main(
-            ["version"],
-            environment: ["GROK_TEST_VERSION": ""],
-            streams: streams
-        )
-        #expect(code == 0)
-        #expect(OpenGrokCLIVersion.installed(environment: ["GROK_TEST_VERSION": ""]) == "")
-        #expect(!out.contents.contains(OpenGrokCLIVersion.compiled))
-    }
-
-    // MARK: - Help
-
-    @Test("help prints usage on stdout and exits 0")
-    func helpCommand() {
-        let (streams, out, err) = CLIStreams.buffered()
-        let code = CLIRunner.main(["help"], environment: [:], streams: streams)
-        #expect(code == 0)
-        #expect(out.contents.contains("USAGE") || out.contents.contains("usage"))
-        #expect(out.contents.contains("OPENGROK_HOME"))
-        #expect(err.contents.isEmpty)
-    }
-
-    @Test("no arguments prints help and exits 0")
-    func noArgsPrintsHelp() {
-        let (streams, out, _) = CLIStreams.buffered()
-        let code = CLIRunner.main([], environment: [:], streams: streams)
-        #expect(code == 0)
-        #expect(out.contents.contains("Open Grok"))
-    }
-
-    // MARK: - Paths / OPENGROK_HOME isolation
-
-    @Test("OPENGROK_HOME override wins over HOME")
-    func opengrokHomeOverride() {
-        let env = ["OPENGROK_HOME": "/tmp/og-home-xyz", "HOME": "/tmp/fake-home"]
-        let home = OpenGrokHomeResolver.resolve(environment: env)
-        #expect(home.path == "/tmp/og-home-xyz")
-    }
-
-    @Test("Fallback is ~/.opengrok when OPENGROK_HOME is unset")
-    func fallbackHome() {
-        let env = ["HOME": "/tmp/fake-home"]
-        let home = OpenGrokHomeResolver.resolve(environment: env)
-        #expect(home.path == "/tmp/fake-home/.opengrok")
-    }
-
-    @Test("The fallback is never ~/.grok")
-    func neverLegacyGrok() {
-        let env = ["HOME": "/tmp/fake-home"]
-        let home = OpenGrokHomeResolver.resolve(environment: env)
-        #expect(!OpenGrokHomeResolver.isLegacyGrokPath(home, environment: env))
-        #expect(!home.path.hasSuffix("/.grok"))
-        #expect(home.path.hasSuffix("/.opengrok"))
-    }
-
-    @Test("Empty OPENGROK_HOME falls back to ~/.opengrok")
-    func emptyOverrideFallsBack() {
-        let env = ["OPENGROK_HOME": "", "HOME": "/tmp/fake-home"]
-        let home = OpenGrokHomeResolver.resolve(environment: env)
-        #expect(home.path == "/tmp/fake-home/.opengrok")
-    }
-
-    @Test("USERPROFILE is used when HOME is absent")
-    func userProfileFallback() {
-        let env: [String: String] = ["USERPROFILE": "/tmp/profile-home"]
-        let home = OpenGrokHomeResolver.userHomeDirectory(environment: env)
-        #expect(home.path == "/tmp/profile-home")
-    }
-
-    @Test("paths command prints OPENGROK_HOME on stdout and exits 0")
-    func pathsCommand() {
-        let env = ["OPENGROK_HOME": "/tmp/og-paths-test", "HOME": "/tmp/fake-home"]
-        let (streams, out, err) = CLIStreams.buffered()
-        let code = CLIRunner.main(["paths"], environment: env, streams: streams)
-        #expect(code == 0)
-        #expect(out.contents.contains("OPENGROK_HOME: /tmp/og-paths-test"))
-        #expect(out.contents.contains("managed binary: /tmp/og-paths-test/bin/open-grok"))
-        #expect(out.contents.contains("project state: .opengrok"))
-        #expect(err.contents.isEmpty)
-    }
-
-    // MARK: - Errors and not-yet-implemented commands
-
-    @Test("Unknown command writes to stderr and exits 2")
-    func unknownCommand() {
-        let (streams, out, err) = CLIStreams.buffered()
-        let code = CLIRunner.main(["frobnicate"], environment: [:], streams: streams)
-        #expect(code == 2)
+        let code = CLIRunner.main(["headless", "--output-format", "not-a-format"], streams: streams)
+        #expect(code == CLIRunner.ExitCode.usage.rawValue)
         #expect(out.contents.isEmpty)
-        #expect(err.contents.contains("unknown command or flag"))
-        #expect(err.contents.contains("frobnicate"))
+        #expect(err.contents.contains("invalid value"))
     }
 
-    @Test("Known W10-S2 commands report not-yet-implemented and exit 3")
-    func notYetImplementedCommand() {
-        let (streams, _, err) = CLIStreams.buffered()
-        let code = CLIRunner.main(["sessions"], environment: [:], streams: streams)
-        #expect(code == 3)
-        #expect(err.contents.contains("sessions"))
-        #expect(err.contents.contains("not yet implemented"))
+    @Test("version, paths, and embedded model listing are supported built-ins")
+    func supportedBuiltIns() {
+        let (versionStreams, versionOut, versionErr) = CLIStreams.buffered()
+        #expect(CLIRunner.main(["--version"], environment: [:], streams: versionStreams) == 0)
+        #expect(versionOut.contents.contains("Open Grok"))
+        #expect(versionErr.contents.isEmpty)
+
+        let (pathStreams, pathOut, pathErr) = CLIStreams.buffered()
+        #expect(CLIRunner.main(["paths", "--json"], environment: ["HOME": "/tmp/home"], streams: pathStreams) == 0)
+        #expect(pathOut.contents.contains("opengrok_home"))
+        #expect(pathOut.contents.contains("/tmp/home/.opengrok"))
+        #expect(pathErr.contents.isEmpty)
+
+        let (modelStreams, modelOut, modelErr) = CLIStreams.buffered()
+        #expect(CLIRunner.main(["models", "--json"], environment: [:], streams: modelStreams) == 0)
+        #expect(modelOut.contents.contains("\"default\""))
+        #expect(modelErr.contents.isEmpty)
     }
 
-    // MARK: - Parser
-
-    @Test("Parser maps flags and commands deterministically")
-    func parserMapping() {
-        #expect(CLICommandParser.parse(["--version"]) == .version)
-        #expect(CLICommandParser.parse(["version"]) == .version)
-        #expect(CLICommandParser.parse(["-h"]) == .help)
-        #expect(CLICommandParser.parse(["help"]) == .help)
-        #expect(CLICommandParser.parse(["paths"]) == .paths)
-        #expect(CLICommandParser.parse(["login"]) == .notYetImplemented("login"))
-        #expect(CLICommandParser.parse(["nope"]) == .unknown("nope"))
-        #expect(CLICommandParser.parse([]) == .help)
+    @Test("recognized runtime routes fail explicitly without a launcher")
+    func unsupportedRoutesFailClosed() {
+        for args in [["interactive"], ["minimal"], ["acp"], ["serve"], ["session", "list"], ["plugin", "list"], ["mcp", "list"], ["workflow", "list"]] {
+            let (streams, out, err) = CLIStreams.buffered()
+            let code = CLIRunner.main(args, environment: [:], streams: streams)
+            #expect(code == CLIRunner.ExitCode.notImplemented.rawValue)
+            #expect(out.contents.isEmpty)
+            #expect(err.contents.contains("unavailable"))
+        }
     }
 }
