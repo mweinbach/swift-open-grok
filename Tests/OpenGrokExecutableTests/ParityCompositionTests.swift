@@ -668,6 +668,91 @@ struct ParityCompositionTests {
         #expect(requests.map(\.prompt) == ["profile question", "override question"])
     }
 
+    @Test("live agent profiles filter the advertised tool surface")
+    func liveAgentProfileToolPolicy() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let state = root.appendingPathComponent("state", isDirectory: true)
+        let agents = state.appendingPathComponent("agents", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: agents, withIntermediateDirectories: true)
+        try """
+        ---
+        name: reader
+        description: Read-only profile
+        agentsMd: false
+        capabilityMode: read-only
+        tools: read_file, grep
+        disallowedTools: grep
+        ---
+        Read only.
+        """.write(
+            to: agents.appendingPathComponent("reader.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try """
+        ---
+        name: executor
+        description: Terminal-only profile
+        agentsMd: false
+        capabilityMode: execute
+        tools: run_terminal_command
+        ---
+        Execute commands.
+        """.write(
+            to: agents.appendingPathComponent("executor.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let sampler = ParitySamplerFixture(responses: [
+            "read question": OpenGrokLiveSamplingResponse(output: "read answer"),
+            "execute question": OpenGrokLiveSamplingResponse(output: "execute answer")
+        ])
+        let application = OpenGrokApplication.live(
+            dependencies: OpenGrokLiveCompositionDependencies(
+                makeSampler: { _ in sampler.makeSampler() }
+            ),
+            control: .never
+        )
+        let environment = [
+            "HOME": root.path,
+            "OPENGROK_HOME": state.path,
+            "XAI_API_KEY": "test-key"
+        ]
+
+        let (readerStreams, _, readerError) = CLIStreams.buffered()
+        let readerCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "read question",
+                "--cwd", root.path,
+                "--profile", "reader"
+            ],
+            environment: environment,
+            streams: readerStreams,
+            application: application
+        )
+        let (executorStreams, _, executorError) = CLIStreams.buffered()
+        let executorCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "execute question",
+                "--cwd", root.path,
+                "--profile", "executor"
+            ],
+            environment: environment,
+            streams: executorStreams,
+            application: application
+        )
+
+        let requests = sampler.recordedRequests
+        #expect(readerCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(executorCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(readerError.contents == "open-grok: sampling\n")
+        #expect(executorError.contents == "open-grok: sampling\n")
+        #expect(requests[0].tools.map(\.name) == ["read_file"])
+        #expect(requests[1].tools.map(\.name) == ["run_terminal_cmd"])
+    }
+
     @Test("live headless composition executes provider tool calls and resamples")
     func liveHeadlessToolLoopComposition() async {
         let backend = ParityShellCommandBackend()

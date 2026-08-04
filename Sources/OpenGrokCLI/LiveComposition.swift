@@ -496,7 +496,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             let toolExecutor = try await LiveToolExecutor(
                 processBackend: processBackend,
                 sessionID: sessionID,
-                workingDirectory: cwd
+                workingDirectory: cwd,
+                toolPolicy: agentProfile?.toolPolicy
             )
             let conversationHistory = LiveConversationHistory(
                 record: conversationRecord,
@@ -936,7 +937,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         ).trimmingCharacters(in: .whitespacesAndNewlines)
         return LiveAgentProfile(
             model: definition.model.modelID,
-            systemPrompt: composedPrompt.isEmpty ? nil : composedPrompt
+            systemPrompt: composedPrompt.isEmpty ? nil : composedPrompt,
+            toolPolicy: LiveAgentToolPolicy(definition: definition)
         )
     }
 
@@ -1120,7 +1122,8 @@ private struct LiveToolExecutor: Sendable {
     init(
         processBackend: any ShellProcessBackend,
         sessionID: String,
-        workingDirectory: URL
+        workingDirectory: URL,
+        toolPolicy: LiveAgentToolPolicy?
     ) async throws {
         let composition = OpenGrokShellToolRuntimeComposition(
             processBackend: processBackend,
@@ -1142,11 +1145,17 @@ private struct LiveToolExecutor: Sendable {
             )
         ))
         let fileToolDefinitions = fileToolBridge.toolDefinitions()
+        let allowedFileToolDefinitions = fileToolDefinitions.filter {
+            toolPolicy?.allows(liveToolName: $0.name) ?? true
+        }
+        let terminalTools = toolPolicy?.allows(liveToolName: Self.runTerminalTool.name) == false
+            ? []
+            : [Self.runTerminalTool]
         self.composition = composition
         self.fileToolBridge = fileToolBridge
-        self.fileToolNames = Set(fileToolDefinitions.map(\.name))
+        self.fileToolNames = Set(allowedFileToolDefinitions.map(\.name))
         self.workingDirectory = standardizedWorkingDirectory
-        self.tools = [Self.runTerminalTool] + fileToolDefinitions.map { definition in
+        self.tools = terminalTools + allowedFileToolDefinitions.map { definition in
             ToolSpec(
                 name: definition.name,
                 description: definition.description,
@@ -1548,6 +1557,55 @@ private actor LiveConversationStore {
 private struct LiveAgentProfile: Sendable, Equatable {
     let model: String?
     let systemPrompt: String?
+    let toolPolicy: LiveAgentToolPolicy
+}
+
+private struct LiveAgentToolPolicy: Sendable, Equatable {
+    let configuredTools: [String]
+    let allowlist: [String]
+    let denylist: [String]
+    let sessionAllowlist: [String]?
+    let sessionDenylist: [String]
+    let capabilityMode: AgentCapabilityMode?
+
+    init(definition: AgentDefinition) {
+        configuredTools = definition.toolConfig.toolNames
+        allowlist = definition.tools
+        denylist = definition.disallowedTools
+        sessionAllowlist = definition.sessionToolsAllowlist
+        sessionDenylist = definition.sessionToolsDenylist ?? []
+        capabilityMode = definition.capabilityMode
+    }
+
+    func allows(liveToolName: String) -> Bool {
+        let aliases = Self.aliases(for: liveToolName)
+        guard Self.matches(configuredTools, aliases: aliases) else { return false }
+        if !allowlist.isEmpty, !Self.matches(allowlist, aliases: aliases) { return false }
+        if Self.matches(denylist, aliases: aliases) { return false }
+        if Self.matches(sessionDenylist, aliases: aliases) { return false }
+        if let sessionAllowlist, !Self.matches(sessionAllowlist, aliases: aliases) { return false }
+        guard let capabilityMode else { return true }
+        switch capabilityMode {
+        case .readOnly, .readWrite:
+            return liveToolName != "run_terminal_cmd"
+        case .execute, .all:
+            return true
+        }
+    }
+
+    private static func aliases(for liveToolName: String) -> Set<String> {
+        if liveToolName == "run_terminal_cmd" {
+            return [liveToolName, "run_terminal_command"]
+        }
+        return [liveToolName]
+    }
+
+    private static func matches(_ entries: [String], aliases: Set<String>) -> Bool {
+        entries.contains { entry in
+            let shortName = entry.split(separator: ":").last.map(String.init) ?? entry
+            return aliases.contains(entry) || aliases.contains(shortName)
+        }
+    }
 }
 
 private actor LiveConversationHistory {
