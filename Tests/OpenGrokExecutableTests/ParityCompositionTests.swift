@@ -636,6 +636,65 @@ struct ParityCompositionTests {
         ))
     }
 
+    @Test("live interactive composition redraws after terminal resize")
+    func liveInteractiveResizeComposition() async {
+        let terminal = ParityTerminalFixture(
+            tty: true,
+            size: OpenGrokLiveTerminalSize(width: 60, height: 12)
+        )
+        let sampler = ParitySamplerFixture(responses: [
+            "resize question": OpenGrokLiveSamplingResponse(output: "resized answer")
+        ])
+        let input = AsyncThrowingStream<InputEvent, Error> { continuation in
+            Task {
+                continuation.yield(.resize(TerminalSize(width: 40, height: 8)))
+                for event in Self.typed("resize question") + [.key(KeyEvent(key: .enter))] {
+                    continuation.yield(event)
+                }
+                await Self.waitForTerminalOutput("resized answer", terminal: terminal)
+                continuation.yield(.key(KeyEvent(
+                    key: .char("d"),
+                    modifiers: .control,
+                    character: "d"
+                )))
+                continuation.finish()
+            }
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() },
+            terminal: terminal.terminal,
+            makeInteractiveInput: {
+                OpenGrokLiveInteractiveInput(events: input, close: {})
+            },
+            makeTerminalSink: {
+                ParityTerminalSink(terminal: terminal)
+            }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, err) = CLIStreams.buffered()
+
+        let code = await CLIRunner.run(
+            ["interactive"],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let fullScreenClearCount = terminal.output.components(separatedBy: "\u{1B}[2J").count - 1
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(out.contents.isEmpty)
+        #expect(err.contents.isEmpty)
+        #expect(sampler.recordedRequests.map(\.prompt) == ["resize question"])
+        #expect(fullScreenClearCount >= 2)
+        #expect(terminal.output.hasSuffix("You: resize question\nGrok: resized answer\n"))
+    }
+
     @Test("injected input drives multiple sampler-backed turns")
     func multipleInteractiveTurns() async throws {
         let input = ParityInputFixture([

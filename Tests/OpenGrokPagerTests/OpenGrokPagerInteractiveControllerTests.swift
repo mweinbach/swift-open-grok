@@ -104,6 +104,36 @@ struct OpenGrokPagerInteractiveControllerTests {
         let events = await output.events
         #expect(events.contains(.eof))
     }
+
+    @Test("resize reaches renderer during editing and active turns")
+    func resizeReachesRenderer() async throws {
+        let editingSize = TerminalSize(width: 100, height: 40)
+        let runningSize = TerminalSize(width: 70, height: 20)
+        let session = TestInteractiveSession(sessionID: "resize-session")
+        let runtime = TestInteractiveRuntime(sessions: [session])
+        let renderer = RecordingInteractiveRenderer()
+        let output = RecordingInteractiveOutput()
+        let input = makeInputStream([
+            .resize(editingSize),
+            .paste("wait"),
+            .key(KeyEvent(key: .enter)),
+            .resize(runningSize),
+        ])
+        let controller = OpenGrokPagerInteractiveController(
+            input: input,
+            runtime: runtime,
+            renderer: renderer,
+            output: output
+        )
+
+        let result = try await controller.run(.init(prompt: "", mode: .inline))
+
+        #expect(result.lifecycle == .eof)
+        #expect(await renderer.sizes == [editingSize, runningSize])
+        #expect(await session.cancelCount == 1)
+        #expect(await session.closeCount == 1)
+        #expect(await renderer.restoreCount == 1)
+    }
 }
 
 private actor TestInteractiveSession: OpenGrokPagerSessionAdapter {
@@ -156,6 +186,7 @@ private actor TestInteractiveRuntime: OpenGrokPagerRuntimeAdapter {
 
 private actor RecordingInteractiveRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private(set) var events: [OpenGrokPagerInteractiveEvent] = []
+    private(set) var sizes: [TerminalSize] = []
     private(set) var beginCount = 0
     private(set) var restoreCount = 0
 
@@ -165,6 +196,10 @@ private actor RecordingInteractiveRenderer: OpenGrokPagerInteractiveRenderAdapte
 
     func render(_ event: OpenGrokPagerInteractiveEvent) {
         events.append(event)
+    }
+
+    func resize(to size: TerminalSize) {
+        sizes.append(size)
     }
 
     func restoreTerminal() {

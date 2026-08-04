@@ -92,7 +92,14 @@ public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {
 public protocol OpenGrokPagerInteractiveRenderAdapter: Sendable {
     func begin() async throws
     func render(_ event: OpenGrokPagerInteractiveEvent) async throws
+    func resize(to size: TerminalSize) async throws
     func restoreTerminal() async throws
+}
+
+extension OpenGrokPagerInteractiveRenderAdapter {
+    public func resize(to size: TerminalSize) async throws {
+        _ = size
+    }
 }
 
 public protocol OpenGrokPagerInteractiveOutputAdapter: Sendable {

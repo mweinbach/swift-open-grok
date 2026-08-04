@@ -14,6 +14,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case submit
         case cancel
         case eof
+        case resize(TerminalSize)
         case ignored
     }
 
@@ -59,7 +60,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 return value.isEmpty ? .ignored : .changed
             case .key(let key):
                 return apply(key)
-            case .mouse, .focusGained, .focusLost, .resize:
+            case .resize(let size):
+                return .resize(size)
+            case .mouse, .focusGained, .focusLost:
                 return .ignored
             }
         }
@@ -463,7 +466,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         await mailbox.send(.control(.cancel), priority: true)
                     case .eof:
                         await mailbox.send(.control(.eof), priority: true)
-                    case .none, .some(.changed), .some(.submit), .some(.ignored):
+                    case .none, .some(.changed), .some(.submit), .some(.resize), .some(.ignored):
                         await mailbox.send(.input(read))
                     }
                 case .end, .failure, .cancelled:
@@ -604,6 +607,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         case .eof:
                             try await emit(.eof)
                             outcome = .eof
+                        case .resize(let size):
+                            try await renderer.resize(to: size)
+                            await inputPumpGate.resume()
                         case .ignored:
                             await inputPumpGate.resume()
                             continue
@@ -755,6 +761,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 case .input(let read):
                     switch read {
                     case .element(let event):
+                        if case .resize(let size) = event {
+                            try await renderer.resize(to: size)
+                            await inputPumpGate.resume()
+                            continue
+                        }
                         switch Self.controlAction(for: event) {
                         case .cancel:
                             await cancelActiveSession()
@@ -762,7 +773,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         case .eof:
                             await cancelActiveSession()
                             turnOutcome = .eof
-                        case .none, .some(.changed), .some(.submit), .some(.ignored):
+                        case .none, .some(.changed), .some(.submit), .some(.resize), .some(.ignored):
                             pendingInput.append(event)
                             await inputPumpGate.resume()
                         }

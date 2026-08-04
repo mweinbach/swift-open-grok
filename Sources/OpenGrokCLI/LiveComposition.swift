@@ -1553,6 +1553,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     private var prompt = OpenGrokPagerInteractivePromptState()
     private var status = PagerStatusLine(text: "Starting")
     private var activeAssistantIndex: Int?
+    private var terminalSize: OpenGrokTerminalCore.TerminalSize
     private var restored = false
 
     init(
@@ -1563,13 +1564,17 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         self.mode = mode
         self.terminal = terminal
         self.sink = sink
-        let terminalHeight = terminal.size()?.height ?? 12
+        let size = terminal.size() ?? OpenGrokLiveTerminalSize(width: 80, height: 24)
+        self.terminalSize = OpenGrokTerminalCore.TerminalSize(
+            width: size.width,
+            height: size.height
+        )
         self.renderer = PagerTerminalRenderer(
             sink: sink,
             configuration: PagerTerminalRendererConfiguration(
                 mode: mode == .fullScreen
                     ? .fullscreen
-                    : .inline(height: max(1, min(12, terminalHeight))),
+                    : .inline(height: max(1, min(12, size.height))),
                 useAlternateScreen: mode == .fullScreen,
                 useSynchronizedOutput: true
             )
@@ -1578,6 +1583,12 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
 
     func begin() async throws {
         try renderer.start()
+        try renderState()
+    }
+
+    func resize(to size: OpenGrokTerminalCore.TerminalSize) async throws {
+        terminalSize = size
+        try renderer.resize(to: size)
         try renderState()
     }
 
@@ -1678,12 +1689,8 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     }
 
     private func renderState() throws {
-        let size = terminal.size() ?? OpenGrokLiveTerminalSize(width: 80, height: 24)
         try renderer.render(PagerRenderState(
-            size: OpenGrokTerminalCore.TerminalSize(
-                width: size.width,
-                height: size.height
-            ),
+            size: terminalSize,
             header: PagerHeader(title: "Open Grok", subtitle: "Interactive"),
             conversation: conversation,
             status: status,
