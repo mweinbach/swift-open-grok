@@ -191,6 +191,59 @@ private final class ParityToolLoopSamplerFixture: @unchecked Sendable {
     }
 }
 
+private final class ParityParallelToolLoopSamplerFixture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [OpenGrokLiveSamplingRequest] = []
+
+    var recordedRequests: [OpenGrokLiveSamplingRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+
+    func makeSampler() -> OpenGrokLiveSampler {
+        let fixture = self
+        return OpenGrokLiveSampler { request, emit in
+            let requestIndex = fixture.record(request)
+            if requestIndex == 0 {
+                let calls = [
+                    ToolCall(
+                        id: "call-slow",
+                        name: "run_terminal_cmd",
+                        arguments: #"{"command":"slow","description":"slow parity tool"}"#
+                    ),
+                    ToolCall(
+                        id: "call-fast",
+                        name: "run_terminal_cmd",
+                        arguments: #"{"command":"fast","description":"fast parity tool"}"#
+                    )
+                ]
+                return OpenGrokLiveSamplingResponse(
+                    output: "",
+                    stopReason: "tool_calls",
+                    items: [.assistant(AssistantItem(content: "", toolCalls: calls))]
+                )
+            }
+
+            let results = request.items.compactMap { item -> ToolResultItem? in
+                guard case .toolResult(let result) = item else { return nil }
+                return result
+            }
+            let answer = "parallel results: \(results.map(\.content).joined(separator: ", "))"
+            await emit(.output(answer))
+            return OpenGrokLiveSamplingResponse(output: answer, stopReason: "stop")
+        }
+    }
+
+    private func record(_ request: OpenGrokLiveSamplingRequest) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let index = requests.count
+        requests.append(request)
+        return index
+    }
+}
+
 private final class ParityFileToolSamplerFixture: @unchecked Sendable {
     private let lock = NSLock()
     private var requests: [OpenGrokLiveSamplingRequest] = []
@@ -461,6 +514,43 @@ private actor ParityShellCommandBackend: ShellProcessBackend {
     func run(_ request: ShellCommandRequest) async throws -> ShellCommandResult {
         requests.append(request)
         return ShellCommandResult(combinedOutput: "tool output", stdout: "tool output", exitCode: 0)
+    }
+
+    func runBackground(_ request: ShellCommandRequest) async throws -> ShellBackgroundHandle {
+        requests.append(request)
+        return ShellBackgroundHandle(taskID: "background-tool")
+    }
+
+    func getTask(_ taskID: String) async -> ShellTaskSnapshot? { nil }
+    func killTask(_ taskID: String) async -> ShellKillOutcome { .notFound }
+    func killForegroundCommands() async {}
+    func killForegroundCommands(ownerSessionID: String) async {}
+    func killAllBackgroundTasks() async {}
+    func killAllBackgroundTasks(ownerSessionID: String) async {}
+    func warmShell(at cwd: URL) async {}
+    func backgroundForegroundCommand(toolCallID: String) async -> Bool { false }
+    func waitForCompletion(_ taskID: String, timeout: ShellDuration?) async -> ShellTaskSnapshot? { nil }
+    func listTasks() async -> [ShellTaskSnapshot] { [] }
+    func shellCWD() async -> URL? { nil }
+}
+
+private actor ParityConcurrentShellCommandBackend: ShellProcessBackend {
+    private(set) var requests: [ShellCommandRequest] = []
+    private(set) var maximumConcurrentRuns = 0
+    private var activeRuns = 0
+
+    func run(_ request: ShellCommandRequest) async throws -> ShellCommandResult {
+        requests.append(request)
+        activeRuns += 1
+        maximumConcurrentRuns = max(maximumConcurrentRuns, activeRuns)
+        if request.command == "slow" {
+            try await Task.sleep(nanoseconds: 100_000_000)
+        } else {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        activeRuns -= 1
+        let output = "\(request.command) output"
+        return ShellCommandResult(combinedOutput: output, stdout: output, exitCode: 0)
     }
 
     func runBackground(_ request: ShellCommandRequest) async throws -> ShellBackgroundHandle {
@@ -798,6 +888,48 @@ struct ParityCompositionTests {
         #expect(processRequests.first?.workingDirectory == root.standardizedFileURL)
         #expect(processRequests.first?.toolCallID == "call-1")
         #expect(processRequests.first?.ownerSessionID != nil)
+    }
+
+    @Test("live tool rounds execute concurrently and preserve result order")
+    func liveParallelToolLoopComposition() async {
+        let backend = ParityConcurrentShellCommandBackend()
+        let sampler = ParityParallelToolLoopSamplerFixture()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() },
+            makeProcessBackend: { backend }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, err) = CLIStreams.buffered()
+
+        let code = await CLIRunner.run(
+            ["headless", "--prompt", "run both", "--cwd", root.path],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let samplerRequests = sampler.recordedRequests
+        let resultItems = samplerRequests.last?.items.compactMap { item -> ToolResultItem? in
+            guard case .toolResult(let result) = item else { return nil }
+            return result
+        } ?? []
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(err.contents.contains("running tool run_terminal_cmd"))
+        #expect(out.contents.contains("parallel results: slow output\nExit code: 0, fast output\nExit code: 0"))
+        #expect(await backend.maximumConcurrentRuns == 2)
+        #expect(Set(await backend.requests.map(\.command)) == Set(["slow", "fast"]))
+        #expect(resultItems.map(\.toolCallId) == ["call-slow", "call-fast"])
+        #expect(resultItems.map(\.content) == [
+            "slow output\nExit code: 0",
+            "fast output\nExit code: 0"
+        ])
     }
 
     @Test("live streaming JSON reports structured tool lifecycle events")

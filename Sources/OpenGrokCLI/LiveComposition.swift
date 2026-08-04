@@ -1693,57 +1693,86 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 )
             }
             toolRoundCount += 1
+            items.append(contentsOf: try await executeToolCalls(
+                response.toolCalls,
+                sessionID: context.sessionID,
+                emit: emit
+            ))
+        }
+    }
 
-            for call in response.toolCalls {
-                try Task.checkCancellation()
-                await emit(.tool(OpenGrokShellToolUpdate(
-                    callID: call.callId,
-                    name: call.name,
-                    input: call.arguments,
-                    state: .running
-                )))
-                await emit(.status("running tool \(call.name)"))
-                let result = await toolExecutor.invoke(
-                    sessionID: context.sessionID,
-                    workingDirectory: toolExecutorWorkingDirectory,
-                    call: call
-                )
-                let content: String
-                switch result {
-                case .success(let result):
-                    content = result.promptText
-                    await emit(.tool(OpenGrokShellToolUpdate(
-                        callID: call.callId,
-                        name: call.name,
-                        input: call.arguments,
-                        output: content,
-                        state: .succeeded
-                    )))
-                    await emit(.status("tool \(call.name) completed"))
-                case .failure(.cancelled):
-                    await emit(.tool(OpenGrokShellToolUpdate(
-                        callID: call.callId,
-                        name: call.name,
-                        input: call.arguments,
-                        output: "Cancelled",
-                        state: .cancelled
-                    )))
-                    throw CancellationError()
-                case .failure(let error):
-                    content = "Tool \(call.name) failed: \(error.description)"
-                    await emit(.tool(OpenGrokShellToolUpdate(
-                        callID: call.callId,
-                        name: call.name,
-                        input: call.arguments,
-                        output: content,
-                        state: .failed
-                    )))
-                    await emit(.status("tool \(call.name) failed"))
+    private func executeToolCalls(
+        _ calls: [ToolCall],
+        sessionID: String,
+        emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
+    ) async throws -> [ConversationItem] {
+        for call in calls {
+            try Task.checkCancellation()
+            await emit(.tool(OpenGrokShellToolUpdate(
+                callID: call.callId,
+                name: call.name,
+                input: call.arguments,
+                state: .running
+            )))
+            await emit(.status("running tool \(call.name)"))
+        }
+
+        return try await withThrowingTaskGroup(
+            of: (Int, ToolResultItem).self,
+            returning: [ConversationItem].self
+        ) { group in
+            for (index, call) in calls.enumerated() {
+                group.addTask {
+                    let result = await toolExecutor.invoke(
+                        sessionID: sessionID,
+                        workingDirectory: toolExecutorWorkingDirectory,
+                        call: call
+                    )
+                    let content: String
+                    switch result {
+                    case .success(let result):
+                        content = result.promptText
+                        await emit(.tool(OpenGrokShellToolUpdate(
+                            callID: call.callId,
+                            name: call.name,
+                            input: call.arguments,
+                            output: content,
+                            state: .succeeded
+                        )))
+                        await emit(.status("tool \(call.name) completed"))
+                    case .failure(.cancelled):
+                        await emit(.tool(OpenGrokShellToolUpdate(
+                            callID: call.callId,
+                            name: call.name,
+                            input: call.arguments,
+                            output: "Cancelled",
+                            state: .cancelled
+                        )))
+                        throw CancellationError()
+                    case .failure(let error):
+                        content = "Tool \(call.name) failed: \(error.description)"
+                        await emit(.tool(OpenGrokShellToolUpdate(
+                            callID: call.callId,
+                            name: call.name,
+                            input: call.arguments,
+                            output: content,
+                            state: .failed
+                        )))
+                        await emit(.status("tool \(call.name) failed"))
+                    }
+                    return (index, ToolResultItem(
+                        toolCallId: call.callId,
+                        content: content
+                    ))
                 }
-                items.append(.toolResult(ToolResultItem(
-                    toolCallId: call.callId,
-                    content: content
-                )))
+            }
+
+            var orderedResults = Array<ToolResultItem?>(repeating: nil, count: calls.count)
+            for try await (index, result) in group {
+                orderedResults[index] = result
+            }
+            return orderedResults.compactMap { result in
+                result.map(ConversationItem.toolResult)
             }
         }
     }
