@@ -1588,6 +1588,12 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
 
             for call in response.toolCalls {
                 try Task.checkCancellation()
+                await emit(.tool(OpenGrokShellToolUpdate(
+                    callID: call.callId,
+                    name: call.name,
+                    input: call.arguments,
+                    state: .running
+                )))
                 await emit(.status("running tool \(call.name)"))
                 let result = await toolExecutor.invoke(
                     sessionID: context.sessionID,
@@ -1598,11 +1604,32 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 switch result {
                 case .success(let result):
                     content = result.promptText
+                    await emit(.tool(OpenGrokShellToolUpdate(
+                        callID: call.callId,
+                        name: call.name,
+                        input: call.arguments,
+                        output: content,
+                        state: .succeeded
+                    )))
                     await emit(.status("tool \(call.name) completed"))
                 case .failure(.cancelled):
+                    await emit(.tool(OpenGrokShellToolUpdate(
+                        callID: call.callId,
+                        name: call.name,
+                        input: call.arguments,
+                        output: "Cancelled",
+                        state: .cancelled
+                    )))
                     throw CancellationError()
                 case .failure(let error):
                     content = "Tool \(call.name) failed: \(error.description)"
+                    await emit(.tool(OpenGrokShellToolUpdate(
+                        callID: call.callId,
+                        name: call.name,
+                        input: call.arguments,
+                        output: content,
+                        state: .failed
+                    )))
                     await emit(.status("tool \(call.name) failed"))
                 }
                 items.append(.toolResult(ToolResultItem(
@@ -1693,6 +1720,21 @@ private final class LivePagerSession: OpenGrokPagerMinimalSessionAdapter, @unche
                         switch update.kind {
                         case .assistantText(let text): continuation.yield(.output(text))
                         case .status(let status): continuation.yield(.status(status))
+                        case .tool(let tool):
+                            let state: OpenGrokPagerToolState
+                            switch tool.state {
+                            case .running: state = .running
+                            case .succeeded: state = .succeeded
+                            case .failed: state = .failed
+                            case .cancelled: state = .cancelled
+                            }
+                            continuation.yield(.tool(OpenGrokPagerToolUpdate(
+                                callID: tool.callID,
+                                name: tool.name,
+                                input: tool.input,
+                                output: tool.output,
+                                state: state
+                            )))
                         }
                     case .turnCompleted(let result) where result.turnID == handle.turnID:
                         continuation.yield(.completed(OpenGrokPagerMinimalCompletion(
@@ -1821,6 +1863,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     private var prompt = OpenGrokPagerInteractivePromptState()
     private var status = PagerStatusLine(text: "Starting")
     private var activeAssistantIndex: Int?
+    private var toolIndicesByCallID: [String: Int] = [:]
     private var terminalSize: OpenGrokTerminalCore.TerminalSize
     private var restored = false
 
@@ -1870,6 +1913,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         case .promptChanged(let prompt):
             self.prompt = prompt
         case .turnStarted(let request):
+            toolIndicesByCallID.removeAll(keepingCapacity: true)
             conversation.append(.message(PagerMessage(role: .user, text: request.prompt)))
             conversation.append(.message(PagerMessage(
                 role: .assistant,
@@ -1922,6 +1966,8 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             status = PagerStatusLine(text: "Responding", isStreaming: true)
         case .status(let text):
             status = PagerStatusLine(text: text, isStreaming: true)
+        case .tool(let tool):
+            apply(tool)
         case .permissionRequested(let request):
             status = PagerStatusLine(
                 text: "Permission required",
@@ -1940,20 +1986,71 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         guard let activeAssistantIndex,
               conversation.indices.contains(activeAssistantIndex),
               case .message(var message) = conversation[activeAssistantIndex]
-        else { return }
+        else {
+            conversation.append(.message(PagerMessage(
+                role: .assistant,
+                text: text,
+                isStreaming: true
+            )))
+            self.activeAssistantIndex = conversation.indices.last
+            return
+        }
         message.text += text
         message.isStreaming = true
         conversation[activeAssistantIndex] = .message(message)
     }
 
-    private func finishAssistant() {
+    private func finishAssistant(removingIfEmpty: Bool = false) {
         guard let activeAssistantIndex,
               conversation.indices.contains(activeAssistantIndex),
               case .message(var message) = conversation[activeAssistantIndex]
         else { return }
+        if removingIfEmpty, message.text.isEmpty {
+            conversation.remove(at: activeAssistantIndex)
+            self.activeAssistantIndex = nil
+            return
+        }
         message.isStreaming = false
         conversation[activeAssistantIndex] = .message(message)
         self.activeAssistantIndex = nil
+    }
+
+    private func apply(_ tool: OpenGrokPagerToolUpdate) {
+        let card = PagerToolCard(
+            name: tool.name,
+            input: tool.input,
+            output: tool.output,
+            state: renderState(for: tool.state)
+        )
+        if let index = toolIndicesByCallID[tool.callID], conversation.indices.contains(index) {
+            conversation[index] = .tool(card)
+        } else {
+            finishAssistant(removingIfEmpty: true)
+            conversation.append(.tool(card))
+            toolIndicesByCallID[tool.callID] = conversation.indices.last
+        }
+        status = PagerStatusLine(
+            text: "Tool \(tool.name) \(toolStatusText(tool.state))",
+            isStreaming: tool.state == .running
+        )
+    }
+
+    private func renderState(for state: OpenGrokPagerToolState) -> PagerToolState {
+        switch state {
+        case .running: return .running
+        case .succeeded: return .succeeded
+        case .failed: return .failed
+        case .cancelled: return .cancelled
+        }
+    }
+
+    private func toolStatusText(_ state: OpenGrokPagerToolState) -> String {
+        switch state {
+        case .running: return "running"
+        case .succeeded: return "completed"
+        case .failed: return "failed"
+        case .cancelled: return "cancelled"
+        }
     }
 
     private func renderState() throws {
@@ -1979,18 +2076,40 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     private var transcript: String {
         var lines: [String] = []
         for item in conversation {
-            guard case .message(let message) = item else { continue }
-            let label: String
-            switch message.role {
-            case .user: label = "You"
-            case .assistant: label = "Grok"
-            case .system: label = "System"
-            case .reasoning: label = "Reasoning"
-            case .error: label = "Error"
+            switch item {
+            case .message(let message):
+                let label: String
+                switch message.role {
+                case .user: label = "You"
+                case .assistant: label = "Grok"
+                case .system: label = "System"
+                case .reasoning: label = "Reasoning"
+                case .error: label = "Error"
+                }
+                lines.append("\(label): \(message.text)")
+            case .tool(let tool):
+                lines.append("Tool \(tool.name) [\(transcriptState(tool.state))]")
+                if !tool.input.isEmpty {
+                    lines.append("  input: \(tool.input)")
+                }
+                if let output = tool.output, !output.isEmpty {
+                    lines.append("  result: \(output)")
+                }
+            case .separator(let text):
+                lines.append(text)
             }
-            lines.append("\(label): \(message.text)")
         }
         return lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+    }
+
+    private func transcriptState(_ state: PagerToolState) -> String {
+        switch state {
+        case .pending: return "pending"
+        case .running: return "running"
+        case .succeeded: return "done"
+        case .failed: return "failed"
+        case .cancelled: return "cancelled"
+        }
     }
 }
 
@@ -2068,6 +2187,8 @@ private actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
             }
         case .status(let value):
             status = value
+        case .tool(let tool):
+            status = "Tool \(tool.name) \(tool.state.rawValue)"
         case .permissionRequested(let request):
             status = "Permission required: \(request.prompt)"
         case .completed:
@@ -2191,7 +2312,7 @@ private actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
             streams.err("open-grok: permission required: \(request.prompt)\n")
         case .cancelled:
             streams.err("open-grok: cancelled\n")
-        case .lifecycle:
+        case .lifecycle, .tool:
             break
         }
     }
@@ -2209,7 +2330,7 @@ private actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
             ]))
         case .cancelled:
             streams.out(try Self.jsonLine(["type": "cancelled"]))
-        case .lifecycle, .status, .permissionRequested:
+        case .lifecycle, .status, .tool, .permissionRequested:
             break
         }
     }
@@ -2241,7 +2362,7 @@ private actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
                 "id": request.id,
                 "prompt": request.prompt
             ]))
-        case .lifecycle, .status, .permissionRequested:
+        case .lifecycle, .status, .tool, .permissionRequested:
             break
         }
     }

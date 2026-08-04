@@ -47,10 +47,40 @@ public struct OpenGrokPagerMinimalPermissionRequest: Sendable, Equatable {
     }
 }
 
+public enum OpenGrokPagerToolState: String, Sendable, Equatable {
+    case running
+    case succeeded
+    case failed
+    case cancelled
+}
+
+public struct OpenGrokPagerToolUpdate: Sendable, Equatable {
+    public var callID: String
+    public var name: String
+    public var input: String
+    public var output: String?
+    public var state: OpenGrokPagerToolState
+
+    public init(
+        callID: String,
+        name: String,
+        input: String,
+        output: String? = nil,
+        state: OpenGrokPagerToolState
+    ) {
+        self.callID = callID
+        self.name = name
+        self.input = input
+        self.output = output
+        self.state = state
+    }
+}
+
 public enum OpenGrokPagerMinimalEvent: Sendable, Equatable {
     case lifecycle(OpenGrokPagerMinimalLifecycle)
     case output(String)
     case status(String)
+    case tool(OpenGrokPagerToolUpdate)
     case permissionRequested(OpenGrokPagerMinimalPermissionRequest)
     case completed(OpenGrokPagerMinimalCompletion)
     case cancelled
@@ -265,7 +295,7 @@ public actor OpenGrokPagerMinimal {
                 terminalLifecycle = .cancelled
             case .completed:
                 terminalLifecycle = .completed
-            case .lifecycle, .output, .status, .permissionRequested:
+            case .lifecycle, .output, .status, .tool, .permissionRequested:
                 continue
             }
 
@@ -293,7 +323,7 @@ private extension OpenGrokPagerMinimalEvent {
         switch self {
         case .completed, .cancelled:
             return true
-        case .lifecycle, .output, .status, .permissionRequested:
+        case .lifecycle, .output, .status, .tool, .permissionRequested:
             return false
         }
     }

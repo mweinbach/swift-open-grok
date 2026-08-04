@@ -7,6 +7,21 @@ struct OpenGrokPagerMinimalTests {
     @Test("forwards transcript events and restores the terminal once")
     func forwardsTranscriptAndRestores() async throws {
         let session = TestSession(sessionID: "session-1")
+        let runningTool = OpenGrokPagerToolUpdate(
+            callID: "call-1",
+            name: "read_file",
+            input: #"{"target_file":"sample.txt"}"#,
+            state: .running
+        )
+        let completedTool = OpenGrokPagerToolUpdate(
+            callID: "call-1",
+            name: "read_file",
+            input: #"{"target_file":"sample.txt"}"#,
+            output: "file contents",
+            state: .succeeded
+        )
+        await session.emit(.tool(runningTool))
+        await session.emit(.tool(completedTool))
         await session.emit(.output("hello"))
         await session.emit(.completed(.init(sessionID: "session-1", summary: "done")))
 
@@ -19,7 +34,7 @@ struct OpenGrokPagerMinimalTests {
 
         #expect(result.lifecycle == .completed)
         #expect(result.sessionID == "session-1")
-        #expect(result.forwardedEventCount == 4)
+        #expect(result.forwardedEventCount == 6)
         #expect(result.terminalRestored)
         #expect(await session.closeCount == 1)
         #expect(await renderer.beginCount == 1)
@@ -27,6 +42,8 @@ struct OpenGrokPagerMinimalTests {
         #expect(await output.events == [
             .lifecycle(.starting),
             .lifecycle(.running),
+            .tool(runningTool),
+            .tool(completedTool),
             .output("hello"),
             .completed(.init(sessionID: "session-1", summary: "done"))
         ])

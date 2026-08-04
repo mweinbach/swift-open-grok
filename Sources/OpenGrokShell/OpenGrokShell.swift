@@ -122,9 +122,39 @@ public struct OpenGrokShellTurnRequest: Sendable, Equatable {
     }
 }
 
+public enum OpenGrokShellToolState: String, Sendable, Equatable {
+    case running
+    case succeeded
+    case failed
+    case cancelled
+}
+
+public struct OpenGrokShellToolUpdate: Sendable, Equatable {
+    public let callID: String
+    public let name: String
+    public let input: String
+    public let output: String?
+    public let state: OpenGrokShellToolState
+
+    public init(
+        callID: String,
+        name: String,
+        input: String,
+        output: String? = nil,
+        state: OpenGrokShellToolState
+    ) {
+        self.callID = callID
+        self.name = name
+        self.input = input
+        self.output = output
+        self.state = state
+    }
+}
+
 public enum OpenGrokShellTurnUpdateKind: Sendable, Equatable {
     case assistantText(String)
     case status(String)
+    case tool(OpenGrokShellToolUpdate)
 }
 
 public struct OpenGrokShellTurnUpdate: Sendable, Equatable {

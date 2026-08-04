@@ -615,6 +615,71 @@ struct ParityCompositionTests {
         #expect(processRequests.first?.ownerSessionID != nil)
     }
 
+    @Test("live interactive composition renders structured tool cards")
+    func liveInteractiveToolCardComposition() async {
+        let backend = ParityShellCommandBackend()
+        let sampler = ParityToolLoopSamplerFixture()
+        let terminal = ParityTerminalFixture(
+            tty: true,
+            size: OpenGrokLiveTerminalSize(width: 80, height: 20)
+        )
+        let input = AsyncThrowingStream<InputEvent, Error> { continuation in
+            Task {
+                for event in Self.typed("use a tool") + [.key(KeyEvent(key: .enter))] {
+                    continuation.yield(event)
+                }
+                await Self.waitForTerminalOutput("final answer after tool output", terminal: terminal)
+                continuation.yield(.key(KeyEvent(
+                    key: .char("d"),
+                    modifiers: .control,
+                    character: "d"
+                )))
+                continuation.finish()
+            }
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() },
+            makeProcessBackend: { backend },
+            terminal: terminal.terminal,
+            makeInteractiveInput: {
+                OpenGrokLiveInteractiveInput(events: input, close: {})
+            },
+            makeTerminalSink: {
+                ParityTerminalSink(terminal: terminal)
+            }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, err) = CLIStreams.buffered()
+
+        let code = await CLIRunner.run(
+            ["interactive", "--cwd", root.path],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let output = terminal.output
+        let toolRange = output.range(of: "Tool run_terminal_cmd [done]")
+        let answerRange = output.range(of: "Grok: final answer after tool output")
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(out.contents.isEmpty)
+        #expect(err.contents.isEmpty)
+        #expect(output.contains(#"input: {"command":"printf tool-output","description":"parity tool"}"#))
+        #expect(output.contains("result: tool output"))
+        #expect(toolRange != nil)
+        #expect(answerRange != nil)
+        if let toolRange, let answerRange {
+            #expect(toolRange.lowerBound < answerRange.lowerBound)
+        }
+    }
+
     @Test("live headless composition executes sandboxed read-only file tools")
     func liveHeadlessFileToolComposition() async {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
