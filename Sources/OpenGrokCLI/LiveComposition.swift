@@ -2456,6 +2456,15 @@ private actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
             ]))
         case .status(let status) where !messagesOnly:
             streams.out(try Self.jsonLine(["type": "status", "status": status]))
+        case .tool(let tool):
+            streams.out(try Self.jsonLine([
+                "type": "tool",
+                "call_id": tool.callID,
+                "name": tool.name,
+                "input": tool.input,
+                "output": tool.output as Any,
+                "state": tool.state.rawValue
+            ]))
         case .completed(let completion):
             streams.out(try Self.jsonLine([
                 "type": "completed",
@@ -2470,7 +2479,7 @@ private actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
                 "id": request.id,
                 "prompt": request.prompt
             ]))
-        case .lifecycle, .status, .tool, .permissionRequested:
+        case .lifecycle, .status, .permissionRequested:
             break
         }
     }

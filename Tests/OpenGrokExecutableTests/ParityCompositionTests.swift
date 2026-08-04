@@ -800,6 +800,58 @@ struct ParityCompositionTests {
         #expect(processRequests.first?.ownerSessionID != nil)
     }
 
+    @Test("live streaming JSON reports structured tool lifecycle events")
+    func liveStreamingJSONToolLifecycleComposition() async {
+        for outputFormat in ["streaming-json", "streaming-messages-json"] {
+            let backend = ParityShellCommandBackend()
+            let sampler = ParityToolLoopSamplerFixture()
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let dependencies = OpenGrokLiveCompositionDependencies(
+                makeSampler: { _ in sampler.makeSampler() },
+                makeProcessBackend: { backend }
+            )
+            let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+            let (streams, out, _) = CLIStreams.buffered()
+
+            let code = await CLIRunner.run(
+                [
+                    "headless", "--prompt", "use the terminal",
+                    "--cwd", root.path,
+                    "--output-format", outputFormat
+                ],
+                environment: [
+                    "HOME": root.path,
+                    "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                    "XAI_API_KEY": "test-key"
+                ],
+                streams: streams,
+                application: application
+            )
+
+            let records = out.contents.split(separator: "\n").compactMap { line in
+                try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            }
+            let toolRecords = records.filter { $0["type"] as? String == "tool" }
+
+            #expect(code == CLIRunner.ExitCode.success.rawValue)
+            #expect(toolRecords.count == 2)
+            #expect(toolRecords[0]["call_id"] as? String == "call-1")
+            #expect(toolRecords[0]["name"] as? String == "run_terminal_cmd")
+            #expect(toolRecords[0]["input"] as? String == #"{"command":"printf tool-output","description":"parity tool"}"#)
+            #expect(toolRecords[0]["state"] as? String == "running")
+            #expect(toolRecords[0]["output"] is NSNull)
+            #expect(toolRecords[1]["call_id"] as? String == "call-1")
+            #expect(toolRecords[1]["state"] as? String == "succeeded")
+            #expect((toolRecords[1]["output"] as? String)?.contains("tool output") == true)
+            #expect(records.contains { $0["type"] as? String == "completed" })
+            if outputFormat == "streaming-messages-json" {
+                #expect(records.contains { $0["type"] as? String == "status" } == false)
+            }
+        }
+    }
+
     @Test("live interactive composition renders structured tool cards")
     func liveInteractiveToolCardComposition() async {
         let backend = ParityShellCommandBackend()
