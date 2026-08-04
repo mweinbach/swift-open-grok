@@ -150,7 +150,7 @@ public struct ToolRegistryBuilder: Sendable {
                 errors.append(
                     RequirementError(
                         tool: toolConfig.id,
-                        message: message,
+                        message: message.message,
                         fieldPath: "behavior_version",
                         badValue: .string(toolConfig.behaviorVersion ?? ""),
                         category: "behavior_version"
@@ -217,13 +217,13 @@ public struct ToolRegistryBuilder: Sendable {
         config: ToolServerConfig,
         resources: ToolResources,
         options: FinalizeOptions = .unrestricted
-    ) -> Result<FinalizedToolset, [RequirementError]> {
+    ) -> Result<FinalizedToolset, RequirementErrors> {
         // 1. Capability filter (deterministic drop by kind).
         var filtered = options.capabilityMode.filter(backfillKinds(config))
 
         // 2. Validate remaining config against catalog.
         let errors = validateConfig(filtered)
-        if !errors.isEmpty { return .failure(errors) }
+        if !errors.isEmpty { return .failure(RequirementErrors(errors)) }
 
         let presetName = filtered.behaviorPreset ?? "current"
         var finalized: [FinalizedTool] = []

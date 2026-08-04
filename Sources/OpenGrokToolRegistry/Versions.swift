@@ -131,30 +131,40 @@ public func isLegacyContract(_ contractVersion: String?) -> Bool {
     contractVersion == "legacy-0.4.10"
 }
 
+public struct VersionResolutionError: Error, Sendable, Hashable, Equatable, CustomStringConvertible {
+    public var message: String
+
+    public init(_ message: String) {
+        self.message = message
+    }
+
+    public var description: String { message }
+}
+
 /// Resolve contract version for a managed tool. Unmanaged tools return `nil`.
 public func resolveVersion(
     presetName: String,
     fqToolId: String,
     override: String?
-) -> Result<String?, String> {
+) -> Result<String?, VersionResolutionError> {
     guard isVersionManaged(fqToolId) else {
         if let override, !override.isEmpty {
-            return .failure(
+            return .failure(VersionResolutionError(
                 "behavior_version is only valid for version-managed tools; \(fqToolId) is unmanaged"
-            )
+            ))
         }
         return .success(nil)
     }
     guard let preset = lookupPreset(presetName) else {
-        return .failure("unknown behavior_preset: \"\(presetName)\"")
+        return .failure(VersionResolutionError("unknown behavior_preset: \"\(presetName)\""))
     }
     let entry = toolVersionRegistry.first { $0.fqToolId == fqToolId }
     let supported = Set(entry?.versions.map(\.version) ?? ["current"])
     if let override {
         guard supported.contains(override) else {
-            return .failure(
+            return .failure(VersionResolutionError(
                 "unsupported behavior_version \"\(override)\" for \(fqToolId); supported: \(supported.sorted())"
-            )
+            ))
         }
         return .success(override)
     }

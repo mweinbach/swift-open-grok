@@ -438,22 +438,27 @@ private final class MockConnectionClient: ConnectionClient, @unchecked Sendable 
     }
 
     func request(_ request: JsonRpcRequest<JSONValue>) async throws -> JsonRpcResponse<JSONValue> {
+        let next = try dequeueResponse(for: request)
+        switch next {
+        case .success(var response):
+            response.id = request.id
+            response.sessionId = request.sessionId
+            return response
+        case .failure(let error):
+            throw error
+        }
+    }
+
+    private func dequeueResponse(
+        for request: JsonRpcRequest<JSONValue>
+    ) throws -> Result<JsonRpcResponse<JSONValue>, ToolError> {
         lock.lock()
+        defer { lock.unlock() }
         capturedRequests.append(request)
         guard !responses.isEmpty else {
-            lock.unlock()
             throw ToolError.custom(code: "mock_response_missing", detail: "no response staged")
         }
-        let next = responses.removeFirst()
-        lock.unlock()
-        switch next {
-        case .success(var resp):
-            resp.id = request.id
-            resp.sessionId = request.sessionId
-            return resp
-        case .failure(let err):
-            throw err
-        }
+        return responses.removeFirst()
     }
 
     func notify(_ notification: JsonRpcNotification<JSONValue>) async throws {
@@ -461,13 +466,17 @@ private final class MockConnectionClient: ConnectionClient, @unchecked Sendable 
     }
 
     func subscribeProgress(toolCallId: ToolCallId) async -> AsyncStream<ToolCallProgressFrame> {
-        lock.lock()
-        let frames = progress[toolCallId] ?? []
-        lock.unlock()
-        return AsyncStream { cont in
-            for f in frames { cont.yield(f) }
-            cont.finish()
+        let frames = progressFrames(for: toolCallId)
+        return AsyncStream { continuation in
+            for frame in frames { continuation.yield(frame) }
+            continuation.finish()
         }
+    }
+
+    private func progressFrames(for toolCallId: ToolCallId) -> [ToolCallProgressFrame] {
+        lock.lock()
+        defer { lock.unlock() }
+        return progress[toolCallId] ?? []
     }
 }
 

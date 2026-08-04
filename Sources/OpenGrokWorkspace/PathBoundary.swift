@@ -59,7 +59,17 @@ public struct PathBoundary: Sendable {
         // Lexical check first (catches `..` without filesystem).
         let lexical = normalizeLexically(candidate.path)
         let rootLex = normalizeLexically(root.path)
-        if !containsPath(root: rootLex, candidate: lexical) {
+        let containmentRoot: String
+        if resolveSymlinks,
+           let resolvedRoot = try? resolveCanonicalPath(URL(fileURLWithPath: rootLex))
+        {
+            containmentRoot = normalizeLexically(resolvedRoot.path)
+        } else {
+            containmentRoot = rootLex
+        }
+        if !containsPath(root: rootLex, candidate: lexical),
+           !containsPath(root: containmentRoot, candidate: lexical)
+        {
             // Check for parentDir components specifically.
             let comps = splitComponents(candidate.path)
             if comps.contains(where: {
@@ -75,7 +85,7 @@ public struct PathBoundary: Sendable {
             // realpath-style resolution via FileUtils when available.
             if let resolved = try? resolveCanonicalPath(URL(fileURLWithPath: lexical)) {
                 let resolvedLex = normalizeLexically(resolved.path)
-                if !containsPath(root: rootLex, candidate: resolvedLex) {
+                if !containsPath(root: containmentRoot, candidate: resolvedLex) {
                     throw PathBoundaryError.symlinkEscape(raw)
                 }
                 return resolved

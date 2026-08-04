@@ -215,7 +215,12 @@ public enum ApplyPatchParser {
             switch hunk {
             case .deleteFile:
                 return false
-            case .addFile(let path, _), .updateFile(let path, let move, _):
+            case .addFile(let path, _):
+                let abs = (path as NSString).standardizingPath
+                if abs != plan && (abs as NSString).lastPathComponent != planName {
+                    return false
+                }
+            case .updateFile(let path, let move, _):
                 if move != nil { return false }
                 let abs = (path as NSString).standardizingPath
                 if abs != plan && (abs as NSString).lastPathComponent != planName {

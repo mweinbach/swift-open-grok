@@ -135,6 +135,22 @@ public struct RequirementError: Error, Codable, Sendable, Hashable, Equatable, C
     }
 }
 
+public struct RequirementErrors: Error, Codable, Sendable, Hashable, Equatable, RandomAccessCollection, CustomStringConvertible {
+    public typealias Element = RequirementError
+    public typealias Index = Int
+
+    public var errors: [RequirementError]
+
+    public init(_ errors: [RequirementError]) {
+        self.errors = errors
+    }
+
+    public var startIndex: Int { errors.startIndex }
+    public var endIndex: Int { errors.endIndex }
+    public subscript(position: Int) -> RequirementError { errors[position] }
+    public var description: String { errors.map(\.summary).joined(separator: "\n") }
+}
+
 /// Named toolset presets used by agents (selection helpers, not the full agent crate).
 public enum NamedToolsetPreset: String, Sendable, Hashable, CaseIterable {
     case grokBuild = "grok-build"

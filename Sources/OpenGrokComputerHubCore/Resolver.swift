@@ -203,9 +203,7 @@ public final class InnerDispatchForResolver: ToolDispatch, @unchecked Sendable {
         args: JSONValue,
         ctx: ToolCallContext
     ) async -> ToolStream<TypedToolOutput> {
-        lock.lock()
-        let r = resolver
-        lock.unlock()
+        let r = currentResolver()
         guard let r else {
             return terminalOnly(
                 Result<TypedToolOutput, ToolError>.failure(
@@ -222,5 +220,11 @@ public final class InnerDispatchForResolver: ToolDispatch, @unchecked Sendable {
             args: args,
             ctx: ctx
         )
+    }
+
+    private func currentResolver() -> CompoundResolver? {
+        lock.lock()
+        defer { lock.unlock() }
+        return resolver
     }
 }

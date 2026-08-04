@@ -612,8 +612,8 @@ struct LocalMediationTests {
         let config = WorkspaceConfig(
             root: root,
             isolation: .sandbox,
-            requireSandbox: true,
-            yoloPinReason: nil
+            yoloPinReason: nil,
+            requireSandbox: true
         )
         let ops = LocalWorkspaceOps(config: config, remotePolicyAvailable: false)
         let d = await ops.requestPermission(

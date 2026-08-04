@@ -298,7 +298,7 @@ public actor LocalWorkspaceOps {
     /// Whether project-scoped MCP/hooks are allowed for this workspace root.
     /// Folder trust does **not** inherit to child workspace roots.
     public func projectScopeAllowed() -> Bool {
-        projectScopeAllowed(workspaceRoot: root, trustStore: folderTrust)
+        OpenGrokWorkspace.projectScopeAllowed(workspaceRoot: root, trustStore: folderTrust)
     }
 
     private func ensureAllowed(_ decision: PermissionDecision) throws {

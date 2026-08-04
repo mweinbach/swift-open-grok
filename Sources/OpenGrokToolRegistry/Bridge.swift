@@ -39,7 +39,7 @@ public final class ToolBridge: @unchecked Sendable {
         case .success(let set):
             return ToolBridge(toolset: set)
         case .failure(let errors):
-            throw ToolBridgeError.finalizeFailed(errors)
+            throw ToolBridgeError.finalizeFailed(errors.errors)
         }
     }
 

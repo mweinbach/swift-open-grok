@@ -81,6 +81,7 @@ private func targets() -> [Target] {
     let w6s3 = ["OpenGrokMemory", "OpenGrokGoalState"]
     let w6s4 = ["OpenGrokShellBase", "OpenGrokShellSessionSupport"]
     let w6s5 = ["OpenGrokSubagentResolution"]
+    let w6s6 = ["OpenGrokWorkflow"]
 
     // Wave 7.
     let w7s1 = ["OpenGrokSessionRuntime"]
@@ -229,7 +230,7 @@ private func targets() -> [Target] {
     // W5-S1: ToolRegistry base; FileTools -> ToolRegistry.
     t.append(.target(name: "OpenGrokToolRegistry", dependencies: dep(w0s2, w1s1, w1s3, w1s4, w2s2, w2s3, w4s3)))
     t.append(.target(name: "OpenGrokFileTools", dependencies: dep(w0s2, w1s1, w1s3, w1s4, w2s2, w2s3, w4s3, ["OpenGrokToolRegistry"])))
-    t.append(contentsOf: libs(w5s2, dep(w0s2, w1s1, w1s3, w2s1, w2s4, w3s3, w4s3, w4s4)))
+    t.append(contentsOf: libs(w5s2, dep(w0s2, w0s4, w1s1, w1s3, w2s1, w2s4, w3s3, w4s3, w4s4)))
     t.append(contentsOf: libs(w5s3, dep(w0s2, w1s1, w1s2, w1s4, w4s2, w4s3)))
     // W5-S4: MCP base; ComputerHubMCPAdapter -> MCP.
     t.append(.target(name: "OpenGrokMCP", dependencies: dep(w0s2, w0s3, w1s1, w1s4, w1s5, w2s1, w2s2, w4s4)))
@@ -248,10 +249,11 @@ private func targets() -> [Target] {
     // W6-S4: ShellBase base; ShellSessionSupport -> ShellBase.
     t.append(.target(name: "OpenGrokShellBase", dependencies: dep(w0s2, w0s3, w0s4, w1s1, w1s2, w1s3, w1s4, w1s5, w2s1, w2s2, w3s1, w3s2, w3s3, w4s3, w5s1)))
     t.append(.target(name: "OpenGrokShellSessionSupport", dependencies: dep(w0s2, w0s3, w0s4, w1s1, w1s2, w1s3, w1s4, w1s5, w2s1, w2s2, w3s1, w3s2, w3s3, w4s3, w5s1, ["OpenGrokShellBase"])))
-    t.append(contentsOf: libs(w6s5, dep(w0s2, w0s4, w1s4, w1s5, w4s2, w5s6)))
+    t.append(contentsOf: libs(w6s5, dep(w0s2, w0s4, w1s1, w1s4, w1s5, w4s2, w5s6)))
+    t.append(.target(name: "OpenGrokWorkflow", dependencies: dep(w0s4, ["OpenGrokToolTypes"])))
 
     // ---- Wave 7 ----
-    t.append(contentsOf: libs(w7s1, dep(w0s2, w1s1, w1s2, w1s3, w2s1, w3s3, w4s3, w5s1, w5s2, w5s3, w6s1, w6s4)))
+    t.append(contentsOf: libs(w7s1, dep(w0s2, w1s1, w1s2, w1s3, w2s1, w3s3, w4s3, w5s1, w5s2, w5s3, w6s1, w6s4, w6s6, w7s2, w7s4)))
     t.append(contentsOf: libs(w7s2, dep(w0s2, w0s3, w0s4, w1s3, w2s2, w6s2, w6s3, w6s4)))
     t.append(contentsOf: libs(w7s3, dep(w0s2, w1s3, w1s5, w3s1, w3s2, w3s3, w5s2, w6s1, w6s2, w6s3, w6s4)))
     t.append(contentsOf: libs(w7s4, dep(w0s2, w1s2, w1s3, w4s2, w4s3, w5s3, w6s4, w6s5)))
@@ -330,7 +332,11 @@ private func targets() -> [Target] {
     t.append(contentsOf: tests(w4s3))
     t.append(contentsOf: tests(["OpenGrokComputerHubCore", "OpenGrokComputerHubSDK", "OpenGrokWorkspaceClient"]))
     t.append(contentsOf: tests(["OpenGrokToolRegistry", "OpenGrokFileTools"]))
-    t.append(contentsOf: tests(w5s2))
+    t.append(.testTarget(
+        name: "OpenGrokExecutionToolsTests",
+        dependencies: dep(["OpenGrokExecutionTools", "OpenGrokTTY"])
+    ))
+    t.append(contentsOf: tests(["OpenGrokWebMediaTools"]))
     t.append(contentsOf: tests(w5s3))
     t.append(contentsOf: tests(["OpenGrokMCP", "OpenGrokComputerHubMCPAdapter"]))
     t.append(contentsOf: tests(["OpenGrokHooks", "OpenGrokPluginMarketplace"]))
@@ -340,11 +346,21 @@ private func targets() -> [Target] {
     t.append(contentsOf: tests(w6s3))
     t.append(contentsOf: tests(["OpenGrokShellBase", "OpenGrokShellSessionSupport"]))
     t.append(contentsOf: tests(w6s5))
-    t.append(contentsOf: tests(w7s1))
+    t.append(.testTarget(
+        name: "OpenGrokWorkflowTests",
+        dependencies: dep(["OpenGrokWorkflow", "OpenGrokShared", "OpenGrokToolTypes"])
+    ))
+    t.append(.testTarget(
+        name: "OpenGrokSessionRuntimeTests",
+        dependencies: dep(["OpenGrokSessionRuntime", "OpenGrokSessionPersistence", "OpenGrokWorkflow"])
+    ))
     t.append(contentsOf: tests(w7s2))
     t.append(contentsOf: tests(w7s3))
     t.append(contentsOf: tests(w7s4))
-    t.append(contentsOf: tests(w7s5))
+    t.append(.testTarget(
+        name: "OpenGrokACPRuntimeTests",
+        dependencies: dep(["OpenGrokACPRuntime", "OpenGrokShared"])
+    ))
     t.append(contentsOf: tests(["OpenGrokMarkdownCore", "OpenGrokMarkdown"]))
     t.append(contentsOf: tests(["OpenGrokMermaidLayout", "OpenGrokMermaid"]))
     t.append(contentsOf: tests(w8s3))

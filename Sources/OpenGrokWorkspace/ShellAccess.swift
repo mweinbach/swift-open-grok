@@ -286,7 +286,7 @@ func redirectTargets(_ script: String) -> [(String, ShellFileMode)] {
 public func protectedEditPath(_ path: String) -> Bool {
     let lexical = normalizeLexically(path)
     let parts = lexical.split(separator: "/").map { $0.lowercased() }
-    let file = parts.last.map(String.init) ?? ""
+    let file = parts.last.map { String($0) } ?? ""
     let startup: Set<String> = [
         ".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".profile",
         ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout",

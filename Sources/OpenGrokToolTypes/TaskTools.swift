@@ -329,42 +329,6 @@ public struct OrderedResumeAgentMap: Codable, Sendable, Hashable {
     }
 }
 
-// MARK: - WorkflowToolInput
-
-/// Input for the `workflow` tool — runs a JavaScript orchestration script
-/// that spawns and coordinates subagents deterministically.
-///
-/// Mirrors Rust `WorkflowToolInput`.
-public struct WorkflowToolInput: Codable, Sendable, Hashable {
-    public var script: String?
-    public var scriptPath: String?
-    public var args: JSONValue?
-    public var tokenBudget: UInt64?
-    public var resumeFromRunId: String?
-
-    private enum CodingKeys: String, CodingKey {
-        case script
-        case scriptPath = "script_path"
-        case args
-        case tokenBudget = "token_budget"
-        case resumeFromRunId = "resume_from_run_id"
-    }
-
-    public init(
-        script: String? = nil,
-        scriptPath: String? = nil,
-        args: JSONValue? = nil,
-        tokenBudget: UInt64? = nil,
-        resumeFromRunId: String? = nil
-    ) {
-        self.script = script
-        self.scriptPath = scriptPath
-        self.args = args
-        self.tokenBudget = tokenBudget
-        self.resumeFromRunId = resumeFromRunId
-    }
-}
-
 // MARK: - Sentinel helpers
 
 /// `true` when `s` is not a model-emitted placeholder (`""`, `"null"`,

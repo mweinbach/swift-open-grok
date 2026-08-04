@@ -238,7 +238,8 @@ struct WorkspaceClientTests {
             _ = try await client.rpcRaw(method: "workspace.info", params: .object([:]))
             Issue.record("expected workspaceUnavailable")
         } catch WorkspaceClientError.workspaceUnavailable(let err) {
-            #expect(OpenGrokComputerHubCore.isWorkspaceUnavailable(err))
+            let unavailable = OpenGrokComputerHubCore.isWorkspaceUnavailable(err)
+            #expect(unavailable)
             // workspace_unavailable is not transport-fatal
             #expect(client.isConnected)
         } catch {

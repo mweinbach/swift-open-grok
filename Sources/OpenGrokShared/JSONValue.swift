@@ -104,6 +104,12 @@ public enum JSONValue: Codable, Hashable, Sendable, Equatable {
         return nil
     }
 
+    /// The numeric value as a `UInt64`, if this is a non-negative integer.
+    public var uint64Value: UInt64? {
+        if case .number(let n) = self { return n.uint64Value }
+        return nil
+    }
+
     /// The array, if this is `.array`.
     public var arrayValue: [JSONValue]? {
         if case .array(let v) = self { return v }

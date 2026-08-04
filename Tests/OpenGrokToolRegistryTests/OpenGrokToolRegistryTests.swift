@@ -249,7 +249,7 @@ struct ToolRegistryTests {
 }
 
 private func unwrap(
-    _ result: Result<FinalizedToolset, [RequirementError]>
+    _ result: Result<FinalizedToolset, RequirementErrors>
 ) throws -> FinalizedToolset {
     switch result {
     case .success(let s): return s

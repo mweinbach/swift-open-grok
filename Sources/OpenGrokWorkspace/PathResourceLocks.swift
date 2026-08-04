@@ -15,10 +15,9 @@ public enum ResourceLockKind: Sendable, Equatable {
 }
 
 /// RAII-style async lock token. Release is idempotent.
-public final class ResourceLockToken: @unchecked Sendable {
+public actor ResourceLockToken {
     private let manager: PathResourceLockManager
     private let kind: ResourceLockKind
-    private let lock = NSLock()
     private var released = false
 
     init(manager: PathResourceLockManager, kind: ResourceLockKind) {
@@ -27,15 +26,13 @@ public final class ResourceLockToken: @unchecked Sendable {
     }
 
     public func release() async {
-        lock.lock()
-        let already = released
+        guard !released else { return }
         released = true
-        lock.unlock()
-        guard !already else { return }
         await manager.release(kind)
     }
 
     deinit {
+        guard !released else { return }
         // Best-effort: if caller forgot to release, schedule async release.
         let manager = self.manager
         let kind = self.kind

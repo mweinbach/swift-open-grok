@@ -89,7 +89,7 @@ public enum FileToolPack {
         switch builder.finalize(config: config, resources: resources, options: options) {
         case .success(let set): return set
         case .failure(let errors):
-            throw ToolBridgeError.finalizeFailed(errors)
+            throw ToolBridgeError.finalizeFailed(errors.errors)
         }
     }
 }

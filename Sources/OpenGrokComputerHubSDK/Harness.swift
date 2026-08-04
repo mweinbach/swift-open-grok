@@ -95,14 +95,10 @@ public final class ToolHarness: @unchecked Sendable {
         ctx: ToolCallContext = ToolCallContext()
     ) async -> ToolStream<TypedToolOutput> {
         let token = CancellationToken()
-        cancelTokens.lock()
-        activeCancels[ctx.callId] = token
-        cancelTokens.unlock()
+        setActiveCancel(token, callId: ctx.callId)
         cancelRegistry.register(callId: ctx.callId, token: token)
         defer {
-            cancelTokens.lock()
-            activeCancels[ctx.callId] = nil
-            cancelTokens.unlock()
+            setActiveCancel(nil, callId: ctx.callId)
             cancelRegistry.deregister(callId: ctx.callId)
         }
 
@@ -166,9 +162,19 @@ public final class ToolHarness: @unchecked Sendable {
 
     public func cancel(callId: ToolCallId) {
         cancelRegistry.cancel(callId: callId)
+        activeCancel(callId: callId)?.cancel()
+    }
+
+    private func setActiveCancel(_ token: CancellationToken?, callId: ToolCallId) {
         cancelTokens.lock()
-        activeCancels[callId]?.cancel()
+        activeCancels[callId] = token
         cancelTokens.unlock()
+    }
+
+    private func activeCancel(callId: ToolCallId) -> CancellationToken? {
+        cancelTokens.lock()
+        defer { cancelTokens.unlock() }
+        return activeCancels[callId]
     }
 }
 

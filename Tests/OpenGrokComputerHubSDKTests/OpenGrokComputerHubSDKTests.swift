@@ -36,6 +36,33 @@ private final class NotificationRecorder: @unchecked Sendable {
     }
 }
 
+private final class LockedValue<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+
+    func set(_ value: Value) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.value = value
+    }
+
+    func modify(_ body: (inout Value) -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        body(&value)
+    }
+
+    var snapshot: Value {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 @Suite("OpenGrokComputerHubSDK")
 struct ComputerHubSDKTests {
     @Test("connection pool refcount")
@@ -148,14 +175,16 @@ struct ComputerHubSDKTests {
         let session = try SessionId("sess-1")
         demux.registerSessionInbox(session)
 
-        var response: Result<JsonRpcResponse<JSONValue>, ClientError>?
-        demux.registerResponseWaiter(requestId: "req-1", sessionId: session) { response = $0 }
+        let response = LockedValue<Result<JsonRpcResponse<JSONValue>, ClientError>?>(nil)
+        demux.registerResponseWaiter(requestId: "req-1", sessionId: session) { response.set($0) }
 
         let callId = ToolCallId.newV7()
         demux.registerProgressWaiter(toolCallId: callId)
 
-        var notifs: [JSONValue] = []
-        demux.onNotification { notifs.append($0) }
+        let notifs = LockedValue<[JSONValue]>([])
+        demux.onNotification { notification in
+            notifs.modify { $0.append(notification) }
+        }
 
         // Response route.
         let respFrame: JSONValue = .object([
@@ -164,7 +193,7 @@ struct ComputerHubSDKTests {
             "result": .object(["ok": .bool(true)]),
         ])
         #expect(demux.route(respFrame) == .response)
-        #expect(response != nil)
+        #expect(response.snapshot != nil)
 
         // Progress route.
         let progressFrame: JSONValue = .object([
@@ -205,7 +234,7 @@ struct ComputerHubSDKTests {
             "params": .object(["x": .number(.int64(1))]),
         ])
         #expect(demux.route(connNotif) == .notification)
-        #expect(notifs.count == 1)
+        #expect(notifs.snapshot.count == 1)
 
         // Unknown progress after unregister.
         demux.unregisterProgressWaiter(toolCallId: callId)
@@ -216,13 +245,13 @@ struct ComputerHubSDKTests {
     func demuxFailSession() throws {
         let demux = Demux()
         let session = try SessionId("s")
-        var got: ClientError?
+        let got = LockedValue<ClientError?>(nil)
         demux.registerResponseWaiter(requestId: "c1", sessionId: session) { result in
-            if case .failure(let e) = result { got = e }
+            if case .failure(let error) = result { got.set(error) }
         }
         let n = demux.failCallsForSession(session, error: .networkError("gone"))
         #expect(n == 1)
-        #expect(got == .networkError("gone"))
+        #expect(got.snapshot == .networkError("gone"))
     }
 
     @Test("hub connection notification demux fanout")
