@@ -513,6 +513,14 @@ struct ParityCompositionTests {
         #expect(err.contents.isEmpty)
         #expect(requests.map(\.prompt) == ["first question", "second question"])
         #expect(Set(requests.map(\.sessionID)).count == 1)
+        #expect(requests.first?.items == [
+            .user("first question")
+        ])
+        #expect(requests.last?.items == [
+            .user("first question"),
+            .assistant(AssistantItem(content: "first answer")),
+            .user("second question")
+        ])
         #expect(terminal.output.contains("\u{1B}[?1049h"))
         #expect(terminal.output.contains("\u{1B}[?1049l"))
         #expect(terminal.output.hasSuffix(

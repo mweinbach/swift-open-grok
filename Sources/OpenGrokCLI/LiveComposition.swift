@@ -483,6 +483,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 sessionID: sessionID,
                 workingDirectory: cwd
             )
+            let conversationHistory = LiveConversationHistory()
             let shell = OpenGrokShell(configuration: OpenGrokShellConfiguration(
                 openGrokHome: openGrokHome,
                 processBackend: processBackend,
@@ -490,7 +491,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 turnDriver: ProviderSessionTurnDriver(
                     sampler: LiveShellSamplingDriver(
                         sampler: sampler,
-                        toolExecutor: toolExecutor
+                        toolExecutor: toolExecutor,
+                        conversationHistory: conversationHistory
                     )
                 )
             ))
@@ -1048,16 +1050,34 @@ private struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
     }
 }
 
+private actor LiveConversationHistory {
+    private var itemsBySessionID: [String: [ConversationItem]] = [:]
+
+    func itemsForTurn(sessionID: String, prompt: String) -> [ConversationItem] {
+        var items = itemsBySessionID[sessionID] ?? []
+        items.append(.user(prompt))
+        return items
+    }
+
+    func commit(sessionID: String, items: [ConversationItem]) {
+        itemsBySessionID[sessionID] = items
+    }
+}
+
 private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     let sampler: OpenGrokLiveSampler
     let toolExecutor: LiveToolExecutor
+    let conversationHistory: LiveConversationHistory
 
     func sample(
         context: OpenGrokShellProviderTurnContext,
         request: OpenGrokShellTurnRequest,
         emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
     ) async throws -> OpenGrokShellSamplingResult {
-        var items: [ConversationItem] = [.user(request.text)]
+        var items = await conversationHistory.itemsForTurn(
+            sessionID: context.sessionID,
+            prompt: request.text
+        )
         var toolRoundCount = 0
 
         while true {
@@ -1080,6 +1100,11 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             items.append(contentsOf: response.items)
 
             guard !response.toolCalls.isEmpty else {
+                try Task.checkCancellation()
+                await conversationHistory.commit(
+                    sessionID: context.sessionID,
+                    items: items
+                )
                 return OpenGrokShellSamplingResult(
                     output: response.output,
                     stopReason: response.stopReason
