@@ -112,6 +112,7 @@ private final class ParitySamplerFixture: @unchecked Sendable {
 private final class ParitySamplingConfigurationFixture: @unchecked Sendable {
     private let lock = NSLock()
     private var configurations: [OpenGrokLiveSamplingConfiguration] = []
+    private var requests: [OpenGrokLiveSamplingRequest] = []
 
     var recordedConfigurations: [OpenGrokLiveSamplingConfiguration] {
         lock.lock()
@@ -119,14 +120,28 @@ private final class ParitySamplingConfigurationFixture: @unchecked Sendable {
         return configurations
     }
 
+    var recordedRequests: [OpenGrokLiveSamplingRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+
     func makeSampler(configuration: OpenGrokLiveSamplingConfiguration) -> OpenGrokLiveSampler {
         lock.lock()
         configurations.append(configuration)
         lock.unlock()
-        return OpenGrokLiveSampler { _, emit in
+        let fixture = self
+        return OpenGrokLiveSampler { request, emit in
+            fixture.record(request)
             await emit(.output("provider answer"))
             return OpenGrokLiveSamplingResponse(output: "provider answer", stopReason: "stop")
         }
+    }
+
+    private func record(_ request: OpenGrokLiveSamplingRequest) {
+        lock.lock()
+        requests.append(request)
+        lock.unlock()
     }
 }
 
@@ -566,6 +581,91 @@ struct ParityCompositionTests {
             #expect(configuration?.apiBackend == providerCase.apiBackend)
             #expect(configuration?.apiKey == providerCase.apiKey)
         }
+    }
+
+    @Test("live composition applies agent profiles with CLI model precedence")
+    func liveAgentProfileComposition() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let state = root.appendingPathComponent("state", isDirectory: true)
+        let agents = state.appendingPathComponent("agents", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: agents, withIntermediateDirectories: true)
+        try "workspace instructions".write(
+            to: root.appendingPathComponent("AGENTS.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try """
+        ---
+        name: coding
+        description: Coding profile
+        model: glm-5.2
+        ---
+        Follow the profile prompt.
+        """.write(
+            to: agents.appendingPathComponent("coding.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let fixture = ParitySamplingConfigurationFixture()
+        let application = OpenGrokApplication.live(
+            dependencies: OpenGrokLiveCompositionDependencies(
+                makeSampler: fixture.makeSampler(configuration:)
+            ),
+            control: .never
+        )
+        let environment = [
+            "HOME": root.path,
+            "OPENGROK_HOME": state.path,
+            "XAI_API_KEY": "xai-key",
+            "FIREWORKS_API_KEY": "fireworks-key"
+        ]
+
+        let (profileStreams, _, profileError) = CLIStreams.buffered()
+        let profileCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "profile question",
+                "--cwd", root.path,
+                "--profile", "coding"
+            ],
+            environment: environment,
+            streams: profileStreams,
+            application: application
+        )
+        let (overrideStreams, _, overrideError) = CLIStreams.buffered()
+        let overrideCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "override question",
+                "--cwd", root.path,
+                "--profile", "coding",
+                "--model", "grok-4.5"
+            ],
+            environment: environment,
+            streams: overrideStreams,
+            application: application
+        )
+
+        let configurations = fixture.recordedConfigurations
+        let requests = fixture.recordedRequests
+        let systemPrompt: String? = {
+            guard case .system(let item)? = requests.first?.items.first else { return nil }
+            return item.content
+        }()
+        #expect(profileCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(overrideCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(profileError.contents.isEmpty)
+        #expect(overrideError.contents.isEmpty)
+        #expect(configurations.map(\.provider) == [.fireworks, .xai])
+        #expect(configurations.map(\.model) == [
+            "accounts/fireworks/models/glm-5p2",
+            "grok-4.5"
+        ])
+        #expect(systemPrompt?.contains("Follow the profile prompt.") == true)
+        #expect(systemPrompt?.contains("workspace instructions") == true)
+        #expect(systemPrompt?.contains("## From:") == true)
+        #expect(systemPrompt?.contains("AGENTS.md") == true)
+        #expect(requests.map(\.prompt) == ["profile question", "override question"])
     }
 
     @Test("live headless composition executes provider tool calls and resamples")

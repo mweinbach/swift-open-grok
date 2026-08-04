@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokAgentDefinitions
 import OpenGrokFileTools
 import OpenGrokModels
 import OpenGrokPager
@@ -466,6 +467,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 required: options.mode != .interactive
             )
             let cwd = try Self.resolveWorkingDirectory(options.common.cwd)
+            let agentProfile = try Self.resolveAgentProfile(
+                named: options.common.profile,
+                workingDirectory: cwd,
+                environment: context.environment
+            )
             let openGrokHome = Self.resolveOpenGrokHome(environment: context.environment)
             let conversationStore = LiveConversationStore(openGrokHome: openGrokHome)
             let conversationRecord = try await Self.resolveConversationRecord(
@@ -476,6 +482,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             let sessionID = conversationRecord.sessionID
             let samplingConfiguration = try Self.resolveSamplingConfiguration(
                 options: options,
+                profileModel: agentProfile?.model,
                 environment: context.environment
             )
             let sampler = try dependencies.makeSampler(samplingConfiguration)
@@ -503,7 +510,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     sampler: LiveShellSamplingDriver(
                         sampler: sampler,
                         toolExecutor: toolExecutor,
-                        conversationHistory: conversationHistory
+                        conversationHistory: conversationHistory,
+                        systemPrompt: agentProfile?.systemPrompt
                     )
                 )
             ))
@@ -643,8 +651,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     }
 
     private static func validateUnsupportedOptions(_ options: CLIExecutionOptions) throws {
-        if options.common.profile != nil || !options.common.pluginDirectories.isEmpty {
-            throw CLIApplicationError.unsupported(route: "profiles and plugins")
+        if !options.common.pluginDirectories.isEmpty {
+            throw CLIApplicationError.unsupported(route: "plugins")
         }
         if options.common.mcpConfig != nil || options.common.workflow != nil {
             throw CLIApplicationError.unsupported(route: "MCP and workflows")
@@ -828,6 +836,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
 
     private static func resolveSamplingConfiguration(
         options: CLIExecutionOptions,
+        profileModel: String?,
         environment: [String: String]
     ) throws -> OpenGrokLiveSamplingConfiguration {
         let requestedProvider = try options.common.provider.map(resolveProvider)
@@ -836,7 +845,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         }
 
         let embedded = embeddedDefaultModels()
-        let requestedModel = options.common.model
+        let requestedModel = options.common.model ?? profileModel
         let knownModel = requestedModel.flatMap { requested in
             embedded.models.first { model in
                 (model.id ?? model.model) == requested || model.model == requested
@@ -900,6 +909,34 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             apiKey: apiKey,
             provider: provider,
             apiBackend: apiBackend
+        )
+    }
+
+    private static func resolveAgentProfile(
+        named name: String?,
+        workingDirectory: URL,
+        environment: [String: String]
+    ) throws -> LiveAgentProfile? {
+        guard let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        guard let definition = AgentDefinition.byName(
+            name,
+            in: workingDirectory,
+            environment: environment
+        ) else {
+            throw CLIApplicationError.failed("agent profile '\(name)' was not found")
+        }
+        let instructionFiles = definition.agentsMd
+            ? AgentInstructionDiscovery(environment: environment).discover(at: workingDirectory)
+            : []
+        let composedPrompt = definition.composePrompt(
+            basePrompt: "",
+            agentsMdFiles: instructionFiles
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        return LiveAgentProfile(
+            model: definition.model.modelID,
+            systemPrompt: composedPrompt.isEmpty ? nil : composedPrompt
         )
     }
 
@@ -1508,6 +1545,11 @@ private actor LiveConversationStore {
     }
 }
 
+private struct LiveAgentProfile: Sendable, Equatable {
+    let model: String?
+    let systemPrompt: String?
+}
+
 private actor LiveConversationHistory {
     private var record: LiveConversationRecord
     private let store: LiveConversationStore
@@ -1537,6 +1579,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     let sampler: OpenGrokLiveSampler
     let toolExecutor: LiveToolExecutor
     let conversationHistory: LiveConversationHistory
+    let systemPrompt: String?
 
     func sample(
         context: OpenGrokShellProviderTurnContext,
@@ -1547,6 +1590,13 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             sessionID: context.sessionID,
             prompt: request.text
         )
+        if let systemPrompt,
+           !items.contains(where: {
+               if case .system = $0 { return true }
+               return false
+           }) {
+            items.insert(.system(systemPrompt), at: 0)
+        }
         var toolRoundCount = 0
 
         while true {
