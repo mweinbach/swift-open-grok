@@ -184,6 +184,7 @@ struct MarketplaceScanningTests {
         try write(#"{"name":"demo","version":"1.2.0"}"#, to: plugin.appendingPathComponent("plugin.json"))
         try write("# skill", to: plugin.appendingPathComponent("skills/one/SKILL.md"))
         try FileManager.default.createDirectory(at: plugin.appendingPathComponent("agents"), withIntermediateDirectories: true)
+        try write("# agent", to: plugin.appendingPathComponent("agents/demo.md"))
         try write("{}", to: plugin.appendingPathComponent("hooks/hooks.json"))
         try write("{}", to: plugin.appendingPathComponent(".mcp.json"))
 

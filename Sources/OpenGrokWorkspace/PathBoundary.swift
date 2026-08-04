@@ -59,16 +59,18 @@ public struct PathBoundary: Sendable {
         // Lexical check first (catches `..` without filesystem).
         let lexical = normalizeLexically(candidate.path)
         let rootLex = normalizeLexically(root.path)
+        let lexicalKey = normalizeForContainment(lexical)
+        let rootKey = normalizeForContainment(rootLex)
         let containmentRoot: String
         if resolveSymlinks,
            let resolvedRoot = try? resolveCanonicalPath(URL(fileURLWithPath: rootLex))
         {
-            containmentRoot = normalizeLexically(resolvedRoot.path)
+            containmentRoot = normalizeForContainment(resolvedRoot.path)
         } else {
-            containmentRoot = rootLex
+            containmentRoot = rootKey
         }
-        if !containsPath(root: rootLex, candidate: lexical),
-           !containsPath(root: containmentRoot, candidate: lexical)
+        if !containsPath(root: rootKey, candidate: lexicalKey),
+           !containsPath(root: containmentRoot, candidate: lexicalKey)
         {
             // Check for parentDir components specifically.
             let comps = splitComponents(candidate.path)
@@ -84,7 +86,7 @@ public struct PathBoundary: Sendable {
         if resolveSymlinks, FileManager.default.fileExists(atPath: lexical) {
             // realpath-style resolution via FileUtils when available.
             if let resolved = try? resolveCanonicalPath(URL(fileURLWithPath: lexical)) {
-                let resolvedLex = normalizeLexically(resolved.path)
+                let resolvedLex = normalizeForContainment(resolved.path)
                 if !containsPath(root: containmentRoot, candidate: resolvedLex) {
                     throw PathBoundaryError.symlinkEscape(raw)
                 }
@@ -96,10 +98,26 @@ public struct PathBoundary: Sendable {
 
     /// Returns true when `path` is under the workspace (lexical).
     public func contains(_ path: URL) -> Bool {
-        let rootLex = normalizeLexically(root.path)
-        let cand = normalizeLexically(path.path)
+        let rootLex = normalizeForContainment(root.path)
+        let cand = normalizeForContainment(path.path)
         return containsPath(root: rootLex, candidate: cand)
     }
+}
+
+private func normalizeForContainment(_ path: String) -> String {
+    let normalized = normalizeLexically(path)
+    #if os(macOS)
+    for directory in ["tmp", "var", "etc"] {
+        let privatePrefix = "/private/\(directory)"
+        if normalized == privatePrefix {
+            return "/\(directory)"
+        }
+        if normalized.hasPrefix(privatePrefix + "/") {
+            return String(normalized.dropFirst("/private".count))
+        }
+    }
+    #endif
+    return normalized
 }
 
 /// Component-aware containment: candidate is root or a strict descendant.
