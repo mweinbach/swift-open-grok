@@ -109,6 +109,27 @@ private final class ParitySamplerFixture: @unchecked Sendable {
     }
 }
 
+private final class ParitySamplingConfigurationFixture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var configurations: [OpenGrokLiveSamplingConfiguration] = []
+
+    var recordedConfigurations: [OpenGrokLiveSamplingConfiguration] {
+        lock.lock()
+        defer { lock.unlock() }
+        return configurations
+    }
+
+    func makeSampler(configuration: OpenGrokLiveSamplingConfiguration) -> OpenGrokLiveSampler {
+        lock.lock()
+        configurations.append(configuration)
+        lock.unlock()
+        return OpenGrokLiveSampler { _, emit in
+            await emit(.output("provider answer"))
+            return OpenGrokLiveSamplingResponse(output: "provider answer", stopReason: "stop")
+        }
+    }
+}
+
 private final class ParityToolLoopSamplerFixture: @unchecked Sendable {
     private let lock = NSLock()
     private var requests: [OpenGrokLiveSamplingRequest] = []
@@ -409,6 +430,93 @@ private struct ParityShellCommandTool: Sendable {
 
 @Suite("OpenGrok executable parity composition")
 struct ParityCompositionTests {
+    @Test("live composition resolves built-in API-key provider profiles")
+    func liveProviderProfiles() async {
+        struct ProviderCase {
+            let arguments: [String]
+            let environment: [String: String]
+            let provider: ModelProvider
+            let model: String
+            let baseURL: String
+            let apiBackend: ApiBackend
+            let apiKey: String
+        }
+
+        let cases = [
+            ProviderCase(
+                arguments: ["headless", "--prompt", "hello"],
+                environment: ["XAI_API_KEY": "xai-key"],
+                provider: .xai,
+                model: "grok-4.5",
+                baseURL: "https://api.x.ai/v1",
+                apiBackend: .responses,
+                apiKey: "xai-key"
+            ),
+            ProviderCase(
+                arguments: ["headless", "--prompt", "hello", "--provider", "kimi"],
+                environment: [
+                    "OPENGROK_KIMI_API_BASE_URL": "https://api.kimi.com/coding/v1",
+                    "MOONSHOT_API_KEY": "wrong-platform-key",
+                    "KIMI_CODE_API_KEY": "kimi-code-key"
+                ],
+                provider: .kimi,
+                model: "kimi-for-coding",
+                baseURL: "https://api.kimi.com/coding/v1",
+                apiBackend: .chatCompletions,
+                apiKey: "kimi-code-key"
+            ),
+            ProviderCase(
+                arguments: ["headless", "--prompt", "hello", "--model", "kimi-for-coding"],
+                environment: ["KIMI_CODE_API_KEY": "kimi-code-key"],
+                provider: .kimi,
+                model: "kimi-for-coding",
+                baseURL: "https://api.kimi.com/coding/v1",
+                apiBackend: .chatCompletions,
+                apiKey: "kimi-code-key"
+            ),
+            ProviderCase(
+                arguments: ["headless", "--prompt", "hello", "--provider", "fireworks"],
+                environment: ["FIREWORKS_API_KEY": "fireworks-key"],
+                provider: .fireworks,
+                model: "accounts/fireworks/models/glm-5p2",
+                baseURL: "https://api.fireworks.ai/inference/v1",
+                apiBackend: .chatCompletions,
+                apiKey: "fireworks-key"
+            ),
+        ]
+
+        for providerCase in cases {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let fixture = ParitySamplingConfigurationFixture()
+            let dependencies = OpenGrokLiveCompositionDependencies(
+                makeSampler: fixture.makeSampler(configuration:)
+            )
+            let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+            let (streams, out, err) = CLIStreams.buffered()
+            var environment = providerCase.environment
+            environment["HOME"] = root.path
+            environment["OPENGROK_HOME"] = root.appendingPathComponent("state").path
+
+            let code = await CLIRunner.run(
+                providerCase.arguments,
+                environment: environment,
+                streams: streams,
+                application: application
+            )
+
+            let configuration = fixture.recordedConfigurations.first
+            #expect(code == CLIRunner.ExitCode.success.rawValue)
+            #expect(err.contents.isEmpty)
+            #expect(out.contents.contains("provider answer"))
+            #expect(configuration?.provider == providerCase.provider)
+            #expect(configuration?.model == providerCase.model)
+            #expect(configuration?.baseURL == providerCase.baseURL)
+            #expect(configuration?.apiBackend == providerCase.apiBackend)
+            #expect(configuration?.apiKey == providerCase.apiKey)
+        }
+    }
+
     @Test("live headless composition executes provider tool calls and resamples")
     func liveHeadlessToolLoopComposition() async {
         let backend = ParityShellCommandBackend()
@@ -468,11 +576,11 @@ struct ParityCompositionTests {
                 for event in Self.typed("first question") + [.key(KeyEvent(key: .enter))] {
                     continuation.yield(event)
                 }
-                try? await Task.sleep(nanoseconds: 20_000_000)
+                await Self.waitForTerminalOutput("first answer", terminal: terminal)
                 for event in Self.typed("second question") + [.key(KeyEvent(key: .enter))] {
                     continuation.yield(event)
                 }
-                try? await Task.sleep(nanoseconds: 20_000_000)
+                await Self.waitForTerminalOutput("second answer", terminal: terminal)
                 continuation.yield(.key(KeyEvent(
                     key: .char("d"),
                     modifiers: .control,
@@ -737,6 +845,18 @@ struct ParityCompositionTests {
     private static func typed(_ text: String) -> [InputEvent] {
         text.map { character in
             .key(KeyEvent(key: .char(character), character: character))
+        }
+    }
+
+    private static func waitForTerminalOutput(
+        _ text: String,
+        terminal: ParityTerminalFixture
+    ) async {
+        for _ in 0..<1_000 {
+            if terminal.output.contains(text) {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
         }
     }
 }

@@ -752,22 +752,218 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         options: CLIExecutionOptions,
         environment: [String: String]
     ) throws -> OpenGrokLiveSamplingConfiguration {
-        let provider = options.common.provider?.lowercased() ?? "xai"
-        guard provider == "xai" else {
-            throw CLIApplicationError.unsupported(route: "provider \(provider)")
+        let requestedProvider = try options.common.provider.map(resolveProvider)
+        if requestedProvider == .codex {
+            throw CLIApplicationError.unsupported(route: "Codex OAuth provider")
         }
-        guard let apiKey = environment["XAI_API_KEY"], !apiKey.isEmpty else {
-            throw CLIApplicationError.failed("XAI_API_KEY is required for the live Swift composition")
+
+        let embedded = embeddedDefaultModels()
+        let requestedModel = options.common.model
+        let knownModel = requestedModel.flatMap { requested in
+            embedded.models.first { model in
+                (model.id ?? model.model) == requested || model.model == requested
+            }
         }
-        let model = options.common.model ?? defaultModel()
-        let baseURL = environment["GROK_XAI_API_BASE_URL"]
-            .flatMap { $0.isEmpty ? nil : $0 }
-            ?? XAI_API_BASE_URL_DEFAULT
+        if let requestedProvider, let knownModel, knownModel.provider != requestedProvider {
+            throw CLIApplicationError.failed(
+                "model '\(requestedModel ?? knownModel.model)' belongs to provider \(knownModel.provider.asString), not \(requestedProvider.asString)"
+            )
+        }
+
+        let provider = requestedProvider ?? knownModel?.provider ?? .xai
+        guard provider != .codex else {
+            throw CLIApplicationError.unsupported(route: "Codex OAuth provider")
+        }
+        let selectedModel = try knownModel ?? defaultModelProfile(
+            provider: provider,
+            embedded: embedded,
+            environment: environment
+        )
+        let selectedProfile = requestedModel == nil || knownModel != nil
+            ? selectedModel
+            : nil
+        let model = knownModel == nil
+            ? (requestedModel ?? selectedModel.model)
+            : selectedModel.model
+        let apiBackend = selectedProfile?.apiBackend ?? defaultBackend(provider: provider)
+        guard provider.profile.supportsBackend(apiBackend) else {
+            throw CLIApplicationError.failed(
+                "provider \(provider.asString) does not support \(apiBackend.rawValue)"
+            )
+        }
+        let baseURL = resolveProviderBaseURL(
+            provider: provider,
+            model: selectedProfile,
+            environment: environment
+        )
+        if provider == .kimi,
+           let modelBaseURL = selectedProfile?.baseURL,
+           let modelEndpoint = KimiModels.endpoint(forBaseURL: modelBaseURL),
+           let resolvedEndpoint = KimiModels.endpoint(forBaseURL: baseURL),
+           modelEndpoint != resolvedEndpoint {
+            throw CLIApplicationError.failed(
+                "Kimi model '\(model)' cannot use endpoint \(baseURL)"
+            )
+        }
+        let apiKey = try resolveProviderAPIKey(
+            provider: provider,
+            model: selectedProfile,
+            baseURL: baseURL,
+            environment: environment
+        )
+        guard let apiKey else {
+            throw CLIApplicationError.failed(
+                "\(providerCredentialDescription(provider)) is required for provider \(provider.asString)"
+            )
+        }
         return OpenGrokLiveSamplingConfiguration(
             model: model,
             baseURL: baseURL,
-            apiKey: apiKey
+            apiKey: apiKey,
+            provider: provider,
+            apiBackend: apiBackend
         )
+    }
+
+    private static func resolveProvider(_ value: String) throws -> ModelProvider {
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "xai", "grok":
+            return .xai
+        case "codex", "openai", "openai_codex":
+            return .codex
+        case "kimi", "moonshot", "moonshot_ai":
+            return .kimi
+        case "fireworks", "fireworks_ai":
+            return .fireworks
+        default:
+            throw CLIApplicationError.unsupported(route: "provider \(value)")
+        }
+    }
+
+    private static func defaultModelProfile(
+        provider: ModelProvider,
+        embedded: EmbeddedDefaultModels,
+        environment: [String: String]
+    ) throws -> DefaultModelJSON {
+        if provider == .xai,
+           let model = embedded.models.first(where: {
+               ($0.id ?? $0.model) == embedded.default || $0.model == embedded.default
+           }) {
+            return model
+        }
+        if provider == .kimi,
+           let override = nonEmptyEnvironmentValue(KimiModels.apiBaseURLEnv, environment: environment) {
+            guard let endpoint = KimiModels.endpoint(forBaseURL: override) else {
+                throw CLIApplicationError.failed(
+                    "unsupported Kimi API base URL: \(override)"
+                )
+            }
+            if let model = embedded.models.first(where: {
+                $0.provider == .kimi
+                    && $0.baseURL.flatMap(KimiModels.endpoint(forBaseURL:)) == endpoint
+            }) {
+                return model
+            }
+        }
+        guard let model = embedded.models.first(where: { $0.provider == provider }) else {
+            throw CLIApplicationError.failed(
+                "no embedded default model for provider \(provider.asString)"
+            )
+        }
+        return model
+    }
+
+    private static func defaultBackend(provider: ModelProvider) -> ApiBackend {
+        switch provider {
+        case .xai:
+            return .chatCompletions
+        case .codex:
+            return .responses
+        case .kimi, .fireworks:
+            return .chatCompletions
+        }
+    }
+
+    private static func resolveProviderBaseURL(
+        provider: ModelProvider,
+        model: DefaultModelJSON?,
+        environment: [String: String]
+    ) -> String {
+        let overrideKey: String
+        let fallback: String
+        switch provider {
+        case .xai:
+            overrideKey = "GROK_XAI_API_BASE_URL"
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? XAI_API_BASE_URL_DEFAULT
+        case .codex:
+            overrideKey = "GROK_CODEX_INFERENCE_BASE_URL"
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? CodexModels.defaultInferenceBaseURL
+        case .kimi:
+            overrideKey = KimiModels.apiBaseURLEnv
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? KimiModels.platformAPIBaseURL
+        case .fireworks:
+            overrideKey = FireworksModels.apiBaseURLEnv
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? FireworksModels.apiBaseURLDefault
+        }
+        return nonEmptyEnvironmentValue(overrideKey, environment: environment)
+            ?? fallback
+    }
+
+    private static func resolveProviderAPIKey(
+        provider: ModelProvider,
+        model: DefaultModelJSON?,
+        baseURL: String,
+        environment: [String: String]
+    ) throws -> String? {
+        if provider == .kimi {
+            guard let endpoint = KimiModels.endpoint(forBaseURL: baseURL) else {
+                throw CLIApplicationError.failed(
+                    "unsupported Kimi API base URL: \(baseURL)"
+                )
+            }
+            return nonEmptyEnvironmentValue(endpoint.apiKeyEnv, environment: environment)
+        }
+        if let credential = model?.envKey?.resolveValue(environment: environment)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !credential.isEmpty {
+            return credential
+        }
+        let keys: [String]
+        switch provider {
+        case .xai:
+            keys = ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"]
+        case .codex:
+            keys = ["OPENAI_API_KEY"]
+        case .kimi:
+            keys = []
+        case .fireworks:
+            keys = [FireworksModels.apiKeyEnv]
+        }
+        return keys.lazy.compactMap { key in
+            nonEmptyEnvironmentValue(key, environment: environment)
+        }.first
+    }
+
+    private static func nonEmptyEnvironmentValue(
+        _ key: String,
+        environment: [String: String]
+    ) -> String? {
+        environment[key]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    private static func providerCredentialDescription(_ provider: ModelProvider) -> String {
+        switch provider {
+        case .xai:
+            return "XAI_API_KEY"
+        case .codex:
+            return "Codex OAuth credentials"
+        case .kimi:
+            return "MOONSHOT_API_KEY or KIMI_CODE_API_KEY"
+        case .fireworks:
+            return "FIREWORKS_API_KEY"
+        }
     }
 
     private static func makeProviderConfiguration(
@@ -776,11 +972,16 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         openGrokHome: URL,
         environment: [String: String]
     ) -> ProviderSessionConfiguration {
-        let endpoints = EndpointsConfig(
-            xaiApiBaseURL: sampling.baseURL,
-            modelsBaseURL: sampling.baseURL
+        let entry = ModelEntry(
+            info: ModelInfo(
+                model: sampling.model,
+                baseURL: sampling.baseURL,
+                apiBackend: sampling.apiBackend,
+                provider: sampling.provider
+            ),
+            apiKey: sampling.apiKey,
+            apiBaseURL: sampling.baseURL
         )
-        let entry = ModelEntry.fallback(slug: sampling.model, endpoints: endpoints)
         return ProviderSessionConfiguration(
             sessionID: sessionID,
             modelCatalog: [sampling.model: entry],

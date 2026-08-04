@@ -192,12 +192,12 @@ struct OpenGrokExecutableTests {
         #expect(object["session_id"] as? String != nil)
     }
 
-    @Test("live composition rejects providers that are not wired")
+    @Test("live composition rejects Codex until OAuth is wired")
     func liveUnsupportedProvider() async {
         let application = OpenGrokApplication.live(control: .never)
         let (streams, out, err) = CLIStreams.buffered()
         let code = await CLIRunner.run(
-            ["headless", "--prompt", "hello", "--provider", "kimi"],
+            ["headless", "--prompt", "hello", "--provider", "codex"],
             environment: ["XAI_API_KEY": "test-key"],
             streams: streams,
             application: application
@@ -205,7 +205,7 @@ struct OpenGrokExecutableTests {
 
         #expect(code == CLIRunner.ExitCode.notImplemented.rawValue)
         #expect(out.contents.isEmpty)
-        #expect(err.contents.contains("provider kimi"))
+        #expect(err.contents.contains("Codex OAuth provider"))
     }
 
     @Test("async dispatch owns startup, wait, and shutdown")
