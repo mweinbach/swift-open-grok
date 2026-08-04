@@ -701,6 +701,215 @@ struct ParityCompositionTests {
         #expect(toolResult?.content.contains("failed") == true)
     }
 
+    @Test("live sessions resume canonical history across launches")
+    func liveSessionResumeComposition() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let workspace = root.appendingPathComponent("workspace")
+        let state = root.appendingPathComponent("state")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        let sampler = ParitySamplerFixture(responses: [
+            "first persisted question": OpenGrokLiveSamplingResponse(output: "first persisted answer"),
+            "second persisted question": OpenGrokLiveSamplingResponse(output: "second persisted answer")
+        ])
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let environment = [
+            "HOME": root.path,
+            "OPENGROK_HOME": state.path,
+            "XAI_API_KEY": "test-key"
+        ]
+
+        let (firstStreams, _, _) = CLIStreams.buffered()
+        let firstCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "first persisted question",
+                "--cwd", workspace.path,
+                "--session-id", "persisted-session"
+            ],
+            environment: environment,
+            streams: firstStreams,
+            application: application
+        )
+        let (secondStreams, _, _) = CLIStreams.buffered()
+        let secondCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "second persisted question",
+                "--cwd", workspace.path,
+                "--resume", "persisted-session"
+            ],
+            environment: environment,
+            streams: secondStreams,
+            application: application
+        )
+
+        let requests = sampler.recordedRequests
+        #expect(firstCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(secondCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(requests.map(\.sessionID) == ["persisted-session", "persisted-session"])
+        #expect(requests.last?.items == [
+            .user("first persisted question"),
+            .assistant(AssistantItem(content: "first persisted answer")),
+            .user("second persisted question")
+        ])
+        #expect(FileManager.default.fileExists(
+            atPath: state.appendingPathComponent("sessions/persisted-session.json").path
+        ))
+    }
+
+    @Test("live continue selects the latest session for the working directory")
+    func liveSessionContinueComposition() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let workspace = root.appendingPathComponent("workspace")
+        let otherWorkspace = root.appendingPathComponent("other-workspace")
+        let state = root.appendingPathComponent("state")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: otherWorkspace, withIntermediateDirectories: true)
+        let sampler = ParitySamplerFixture(responses: [
+            "workspace question": OpenGrokLiveSamplingResponse(output: "workspace answer"),
+            "other question": OpenGrokLiveSamplingResponse(output: "other answer"),
+            "continued question": OpenGrokLiveSamplingResponse(output: "continued answer")
+        ])
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let environment = [
+            "HOME": root.path,
+            "OPENGROK_HOME": state.path,
+            "XAI_API_KEY": "test-key"
+        ]
+
+        let (workspaceStreams, _, _) = CLIStreams.buffered()
+        let workspaceCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "workspace question",
+                "--cwd", workspace.path,
+                "--session-id", "workspace-session"
+            ],
+            environment: environment,
+            streams: workspaceStreams,
+            application: application
+        )
+        let (otherStreams, _, _) = CLIStreams.buffered()
+        let otherCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "other question",
+                "--cwd", otherWorkspace.path,
+                "--session-id", "other-session"
+            ],
+            environment: environment,
+            streams: otherStreams,
+            application: application
+        )
+        let (continueStreams, _, _) = CLIStreams.buffered()
+        let continueCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "continued question",
+                "--cwd", workspace.path,
+                "--continue"
+            ],
+            environment: environment,
+            streams: continueStreams,
+            application: application
+        )
+
+        let requests = sampler.recordedRequests
+        #expect(workspaceCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(otherCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(continueCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(requests.last?.sessionID == "workspace-session")
+        #expect(requests.last?.items == [
+            .user("workspace question"),
+            .assistant(AssistantItem(content: "workspace answer")),
+            .user("continued question")
+        ])
+    }
+
+    @Test("live session forks copy history without mutating the source")
+    func liveSessionForkComposition() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let workspace = root.appendingPathComponent("workspace")
+        let state = root.appendingPathComponent("state")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        let sampler = ParitySamplerFixture(responses: [
+            "source question": OpenGrokLiveSamplingResponse(output: "source answer"),
+            "fork question": OpenGrokLiveSamplingResponse(output: "fork answer"),
+            "source follow-up": OpenGrokLiveSamplingResponse(output: "source follow-up answer")
+        ])
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let environment = [
+            "HOME": root.path,
+            "OPENGROK_HOME": state.path,
+            "XAI_API_KEY": "test-key"
+        ]
+
+        let (sourceStreams, _, _) = CLIStreams.buffered()
+        let sourceCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "source question",
+                "--cwd", workspace.path,
+                "--session-id", "source-session"
+            ],
+            environment: environment,
+            streams: sourceStreams,
+            application: application
+        )
+        let (forkStreams, _, _) = CLIStreams.buffered()
+        let forkCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "fork question",
+                "--cwd", workspace.path,
+                "--resume", "source-session",
+                "--fork-session",
+                "--session-id", "fork-session"
+            ],
+            environment: environment,
+            streams: forkStreams,
+            application: application
+        )
+        let (resumeStreams, _, _) = CLIStreams.buffered()
+        let resumeCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "source follow-up",
+                "--cwd", workspace.path,
+                "--resume", "source-session"
+            ],
+            environment: environment,
+            streams: resumeStreams,
+            application: application
+        )
+
+        let requests = sampler.recordedRequests
+        let forkURL = state.appendingPathComponent("sessions/fork-session.json")
+        let forkObject = (try? Data(contentsOf: forkURL)).flatMap {
+            try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+        }
+        #expect(sourceCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(forkCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(resumeCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(requests[1].sessionID == "fork-session")
+        #expect(requests[1].items == [
+            .user("source question"),
+            .assistant(AssistantItem(content: "source answer")),
+            .user("fork question")
+        ])
+        #expect(requests[2].sessionID == "source-session")
+        #expect(requests[2].items == [
+            .user("source question"),
+            .assistant(AssistantItem(content: "source answer")),
+            .user("source follow-up")
+        ])
+        #expect(forkObject?["parentSessionID"] as? String == "source-session")
+    }
+
     @Test("live interactive composition reuses one session across typed turns")
     func liveInteractiveMultiTurnComposition() async {
         let terminal = ParityTerminalFixture(

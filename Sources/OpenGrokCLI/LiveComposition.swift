@@ -467,7 +467,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             )
             let cwd = try Self.resolveWorkingDirectory(options.common.cwd)
             let openGrokHome = Self.resolveOpenGrokHome(environment: context.environment)
-            let sessionID = options.sessionID ?? UUID().uuidString
+            let conversationStore = LiveConversationStore(openGrokHome: openGrokHome)
+            let conversationRecord = try await Self.resolveConversationRecord(
+                options: options,
+                workingDirectory: cwd,
+                store: conversationStore
+            )
+            let sessionID = conversationRecord.sessionID
             let samplingConfiguration = try Self.resolveSamplingConfiguration(
                 options: options,
                 environment: context.environment
@@ -485,7 +491,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 sessionID: sessionID,
                 workingDirectory: cwd
             )
-            let conversationHistory = LiveConversationHistory()
+            let conversationHistory = LiveConversationHistory(
+                record: conversationRecord,
+                store: conversationStore
+            )
             let shell = OpenGrokShell(configuration: OpenGrokShellConfiguration(
                 openGrokHome: openGrokHome,
                 processBackend: processBackend,
@@ -634,9 +643,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     }
 
     private static func validateUnsupportedOptions(_ options: CLIExecutionOptions) throws {
-        if options.resume != nil || options.continueSession || options.forkSession {
-            throw CLIApplicationError.unsupported(route: "session restoration")
-        }
         if options.common.profile != nil || !options.common.pluginDirectories.isEmpty {
             throw CLIApplicationError.unsupported(route: "profiles and plugins")
         }
@@ -748,6 +754,76 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         return URL(fileURLWithPath: home, isDirectory: true)
             .appendingPathComponent(".opengrok", isDirectory: true)
             .standardizedFileURL
+    }
+
+    private static func resolveConversationRecord(
+        options: CLIExecutionOptions,
+        workingDirectory: URL,
+        store: LiveConversationStore
+    ) async throws -> LiveConversationRecord {
+        if options.continueSession, options.resume != nil {
+            throw CLIApplicationError.failed("--resume and --continue cannot be used together")
+        }
+
+        let requestedResumeID = options.resume?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sourceRecord: LiveConversationRecord?
+        if let requestedResumeID, !requestedResumeID.isEmpty {
+            sourceRecord = try await store.load(sessionID: requestedResumeID)
+        } else if options.resume != nil || options.continueSession || options.forkSession {
+            sourceRecord = try await store.latest(workingDirectory: workingDirectory)
+        } else {
+            sourceRecord = nil
+        }
+
+        if options.forkSession {
+            guard let sourceRecord else {
+                throw CLIApplicationError.failed("no session is available to fork")
+            }
+            let destinationID = options.sessionID ?? UUID().uuidString
+            try LiveConversationStore.validateSessionID(destinationID)
+            guard destinationID != sourceRecord.sessionID else {
+                throw CLIApplicationError.failed("forked session ID must differ from the source session")
+            }
+            if try await store.loadIfPresent(sessionID: destinationID) != nil {
+                throw CLIApplicationError.failed("session already exists: \(destinationID)")
+            }
+            return LiveConversationRecord(
+                sessionID: destinationID,
+                workingDirectory: workingDirectory.standardizedFileURL.path,
+                parentSessionID: sourceRecord.sessionID,
+                createdAt: Date(),
+                updatedAt: Date(),
+                items: sourceRecord.items
+            )
+        }
+
+        if var sourceRecord {
+            if let requestedSessionID = options.sessionID,
+               requestedSessionID != sourceRecord.sessionID {
+                throw CLIApplicationError.failed(
+                    "--session-id requires --fork-session when restoring a different session"
+                )
+            }
+            sourceRecord.workingDirectory = workingDirectory.standardizedFileURL.path
+            return sourceRecord
+        }
+
+        if let requestedSessionID = options.sessionID {
+            try LiveConversationStore.validateSessionID(requestedSessionID)
+            if var existing = try await store.loadIfPresent(sessionID: requestedSessionID) {
+                existing.workingDirectory = workingDirectory.standardizedFileURL.path
+                return existing
+            }
+            return LiveConversationRecord.new(
+                sessionID: requestedSessionID,
+                workingDirectory: workingDirectory
+            )
+        }
+
+        return LiveConversationRecord.new(
+            sessionID: UUID().uuidString,
+            workingDirectory: workingDirectory
+        )
     }
 
     private static func resolveSamplingConfiguration(
@@ -1311,17 +1387,149 @@ private struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
     }
 }
 
+private struct LiveConversationRecord: Codable, Sendable, Equatable {
+    var sessionID: String
+    var workingDirectory: String
+    var parentSessionID: String?
+    var createdAt: Date
+    var updatedAt: Date
+    var items: [ConversationItem]
+
+    static func new(sessionID: String, workingDirectory: URL) -> LiveConversationRecord {
+        let now = Date()
+        return LiveConversationRecord(
+            sessionID: sessionID,
+            workingDirectory: workingDirectory.standardizedFileURL.path,
+            parentSessionID: nil,
+            createdAt: now,
+            updatedAt: now,
+            items: []
+        )
+    }
+}
+
+private actor LiveConversationStore {
+    private let sessionsDirectory: URL
+    private let fileManager: FileManager
+
+    init(openGrokHome: URL, fileManager: FileManager = .default) {
+        self.sessionsDirectory = openGrokHome
+            .appendingPathComponent("sessions", isDirectory: true)
+            .standardizedFileURL
+        self.fileManager = fileManager
+    }
+
+    static func validateSessionID(_ sessionID: String) throws {
+        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+        guard !sessionID.isEmpty,
+              sessionID.count <= 128,
+              sessionID != ".",
+              sessionID != "..",
+              sessionID.allSatisfy(allowed.contains)
+        else {
+            throw CLIApplicationError.failed("invalid session ID: \(sessionID)")
+        }
+    }
+
+    func load(sessionID: String) throws -> LiveConversationRecord {
+        guard let record = try loadIfPresent(sessionID: sessionID) else {
+            throw CLIApplicationError.failed("session not found: \(sessionID)")
+        }
+        return record
+    }
+
+    func loadIfPresent(sessionID: String) throws -> LiveConversationRecord? {
+        try Self.validateSessionID(sessionID)
+        let url = fileURL(sessionID: sessionID)
+        guard fileManager.fileExists(atPath: url.path) else { return nil }
+        do {
+            let data = try Data(contentsOf: url)
+            let record = try JSONDecoder().decode(LiveConversationRecord.self, from: data)
+            guard record.sessionID == sessionID else {
+                throw CLIApplicationError.failed("session file ID mismatch: \(sessionID)")
+            }
+            return record
+        } catch let error as CLIApplicationError {
+            throw error
+        } catch {
+            throw CLIApplicationError.failed("failed to load session \(sessionID): \(error)")
+        }
+    }
+
+    func latest(workingDirectory: URL) throws -> LiveConversationRecord? {
+        guard fileManager.fileExists(atPath: sessionsDirectory.path) else { return nil }
+        let expectedDirectory = workingDirectory.standardizedFileURL.path
+        let urls: [URL]
+        do {
+            urls = try fileManager.contentsOfDirectory(
+                at: sessionsDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            throw CLIApplicationError.failed("failed to list sessions: \(error)")
+        }
+
+        return urls
+            .filter { $0.pathExtension == "json" }
+            .compactMap { url -> LiveConversationRecord? in
+                guard let data = try? Data(contentsOf: url),
+                      let record = try? JSONDecoder().decode(LiveConversationRecord.self, from: data),
+                      URL(fileURLWithPath: record.workingDirectory).standardizedFileURL.path == expectedDirectory
+                else { return nil }
+                return record
+            }
+            .max { lhs, rhs in
+                if lhs.updatedAt == rhs.updatedAt {
+                    return lhs.sessionID < rhs.sessionID
+                }
+                return lhs.updatedAt < rhs.updatedAt
+            }
+    }
+
+    func save(_ record: LiveConversationRecord) throws {
+        try Self.validateSessionID(record.sessionID)
+        do {
+            try fileManager.createDirectory(
+                at: sessionsDirectory,
+                withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            let data = try encoder.encode(record)
+            try data.write(to: fileURL(sessionID: record.sessionID), options: .atomic)
+        } catch {
+            throw CLIApplicationError.failed("failed to save session \(record.sessionID): \(error)")
+        }
+    }
+
+    private func fileURL(sessionID: String) -> URL {
+        sessionsDirectory.appendingPathComponent(sessionID).appendingPathExtension("json")
+    }
+}
+
 private actor LiveConversationHistory {
-    private var itemsBySessionID: [String: [ConversationItem]] = [:]
+    private var record: LiveConversationRecord
+    private let store: LiveConversationStore
+
+    init(record: LiveConversationRecord, store: LiveConversationStore) {
+        self.record = record
+        self.store = store
+    }
 
     func itemsForTurn(sessionID: String, prompt: String) -> [ConversationItem] {
-        var items = itemsBySessionID[sessionID] ?? []
+        var items = sessionID == record.sessionID ? record.items : []
         items.append(.user(prompt))
         return items
     }
 
-    func commit(sessionID: String, items: [ConversationItem]) {
-        itemsBySessionID[sessionID] = items
+    func commit(sessionID: String, items: [ConversationItem]) async throws {
+        guard sessionID == record.sessionID else {
+            throw CLIApplicationError.failed("conversation session mismatch: \(sessionID)")
+        }
+        record.items = items
+        record.updatedAt = Date()
+        try await store.save(record)
     }
 }
 
@@ -1362,7 +1570,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
 
             guard !response.toolCalls.isEmpty else {
                 try Task.checkCancellation()
-                await conversationHistory.commit(
+                try await conversationHistory.commit(
                     sessionID: context.sessionID,
                     items: items
                 )
