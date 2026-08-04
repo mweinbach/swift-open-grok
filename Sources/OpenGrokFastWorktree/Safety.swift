@@ -16,7 +16,7 @@ public struct WorktreeSafetyPolicy: Sendable {
 
     public init(primaryCheckout: URL?, allowedPoolRoot: URL? = nil) {
         self.primaryCheckout = primaryCheckout?.standardizedFileURL
-        self.allowedPoolRoot = allowedPoolRoot?.standardizedFileURL
+        self.allowedPoolRoot = allowedPoolRoot?.standardizedFileURL.resolvingSymlinksInPath()
     }
 
     public func validateDestination(_ dest: URL) throws {

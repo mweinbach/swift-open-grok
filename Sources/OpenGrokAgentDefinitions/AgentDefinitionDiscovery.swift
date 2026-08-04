@@ -105,14 +105,14 @@ public struct AgentDefinitionDiscovery: Sendable {
             }
         }
 
-        if let builtIn = AgentDefinition.builtIn(named: name) {
-            return builtIn
-        }
-
         for (directory, scope) in userAgentDirectories() {
             if let definition = loadDefinition(named: name, from: directory, scope: scope) {
                 return definition
             }
+        }
+
+        if let builtIn = AgentDefinition.builtIn(named: name) {
+            return builtIn
         }
         return nil
     }

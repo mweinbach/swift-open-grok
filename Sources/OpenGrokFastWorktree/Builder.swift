@@ -844,7 +844,7 @@ private func scanPoolForCleanup(
         at: poolRoot,
         includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
         options: [.skipsHiddenFiles]
-    ) else { return }
+    ).map({ poolRoot.appendingPathComponent($0.lastPathComponent) }) else { return }
 
     for child in children {
         // Symlink worktrees (incl. dangling).
@@ -908,7 +908,7 @@ private func scanPoolForCleanup(
                 at: child,
                 includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles]
-            ) {
+            ).map({ child.appendingPathComponent($0.lastPathComponent) }) {
                 for sub in subs {
                     let subHasGit = FileManager.default.fileExists(
                         atPath: sub.appendingPathComponent(".git").path
@@ -952,7 +952,7 @@ private func scanPoolLocal(
         at: poolRoot,
         includingPropertiesForKeys: [.isDirectoryKey],
         options: [.skipsHiddenFiles]
-    ) else { return }
+    ).map({ poolRoot.appendingPathComponent($0.lastPathComponent) }) else { return }
 
     for child in children {
         let isPartial = isRecoverablePartialWorktree(child)

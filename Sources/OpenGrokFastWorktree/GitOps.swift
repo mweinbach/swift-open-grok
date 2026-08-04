@@ -25,7 +25,7 @@ public func discoverGitRepo(at path: URL) throws -> GitRepoIdentity {
     if isBare {
         // Bare: git-dir is the repo; no working tree root.
         if !commonDir.hasPrefix("/") {
-            commonDir = URL(fileURLWithPath: commonDir, relativeTo: path)
+            commonDir = path.appendingPathComponent(commonDir)
                 .standardizedFileURL.path
         }
         toplevel = nil

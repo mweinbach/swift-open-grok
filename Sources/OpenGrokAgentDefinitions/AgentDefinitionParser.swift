@@ -206,7 +206,11 @@ private enum AgentFrontmatterParser {
             return .object(object)
         }
         if (value.hasPrefix("\"") && value.hasSuffix("\"")) || (value.hasPrefix("'") && value.hasSuffix("'")) { return .string(unquote(value)) }
-        if let number = Decimal(string: value, locale: Locale(identifier: "en_US_POSIX")) { return .number(number) }
+        let numericPattern = #"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"#
+        if value.range(of: numericPattern, options: .regularExpression) != nil,
+           let number = Decimal(string: value, locale: Locale(identifier: "en_US_POSIX")) {
+            return .number(number)
+        }
         return .string(value)
     }
 

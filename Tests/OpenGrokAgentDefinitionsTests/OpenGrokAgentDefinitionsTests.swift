@@ -113,6 +113,7 @@ struct OpenGrokAgentDefinitionsTests {
         try writeAgent("duplicate", description: "root", to: rootAgents)
         try writeAgent("duplicate", description: "user", to: userAgents)
         try writeAgent("bundled-only", description: "bundled", to: bundledAgents)
+        try writeAgent("explore", description: "bundled explore", to: bundledAgents)
         try writeAgent("explore", description: "user explore", to: userAgents)
 
         let discovery = AgentDefinitionDiscovery(environment: [
@@ -123,7 +124,7 @@ struct OpenGrokAgentDefinitionsTests {
         #expect(definitions.first(where: { $0.name == "duplicate" })?.description == "nested")
         #expect(definitions.first(where: { $0.name == "duplicate" })?.scope == .project)
         #expect(discovery.byName("bundled-only", in: nested)?.scope == .bundled)
-        #expect(discovery.byName("explore", in: nested)?.scope == .builtIn)
+        #expect(discovery.byName("explore", in: nested)?.description == "user explore")
         #expect(discovery.allSubagents(at: nested).first(where: { $0.name == "explore" })?.source == .builtin(.explore))
     }
 
