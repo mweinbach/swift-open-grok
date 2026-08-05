@@ -76,6 +76,10 @@ public enum ProductToolKind: String, Codable, Sendable, Hashable, CaseIterable {
     case memoryGet = "memory_get"
     case task
     case agentSwarm = "agent_swarm"
+    /// Team-scoped mailbox tools (`list_agents`, `send_message`,
+    /// `followup_task`, `wait_agent`). Rust `ToolKind::AgentCollaboration`
+    /// (`xai-grok-tools/src/types/tool.rs:92`).
+    case agentCollaboration = "agent_collaboration"
     case workflow
     case enterPlan = "enter_plan"
     case exitPlan = "exit_plan"

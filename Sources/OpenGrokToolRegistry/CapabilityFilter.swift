@@ -59,7 +59,11 @@ public enum ToolCapabilityMode: String, Codable, Sendable, Hashable, CaseIterabl
     public static func kindAllowed(mode: ToolCapabilityMode, kind: ProductToolKind) -> Bool {
         if mode == .all { return true }
         switch kind {
-        case .plan, .enterPlan, .exitPlan, .askUser, .skill, .searchTool, .goalUpdate:
+        // Meta tools: always allowed. `agentCollaboration` joined this arm in
+        // `xai-grok-workspace/src/capability.rs:130-133` — peer messaging is
+        // orthogonal to read/write/execute authority.
+        case .plan, .enterPlan, .exitPlan, .askUser, .skill, .searchTool, .goalUpdate,
+             .agentCollaboration:
             return true
         case .read, .memoryGet, .memorySearch:
             return mode == .readOnly || mode == .readWrite || mode == .execute

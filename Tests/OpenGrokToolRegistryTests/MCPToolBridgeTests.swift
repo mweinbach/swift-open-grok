@@ -89,10 +89,10 @@ private func allowAllPipeline(hooks: (any PreToolUseHookRunner)? = nil) -> Permi
 
 @Suite("MCP tool naming")
 struct MCPToolNamingTests {
-    @Test("a qualified name is server, delimiter, tool")
+    @Test("a provider-safe server name is used verbatim")
     func qualifiedName() {
-        #expect(mcpQualifiedToolName(server: "linear", tool: "save_issue") == "linear__save_issue")
-        #expect(mcpServerToolPrefix("linear") == "linear__")
+        #expect(qualifiedMCPToolName(server: "linear", tool: "save_issue") == "linear__save_issue")
+        #expect(mcpToolNamePrefix("linear") == "linear__")
     }
 
     @Test("a qualified name round-trips")
@@ -119,9 +119,91 @@ struct MCPToolNamingTests {
     @Test("two servers exposing the same tool name stay distinct")
     func distinctPerServer() {
         #expect(
-            mcpQualifiedToolName(server: "a", tool: "search")
-                != mcpQualifiedToolName(server: "b", tool: "search")
+            qualifiedMCPToolName(server: "a", tool: "search")
+                != qualifiedMCPToolName(server: "b", tool: "search")
         )
+    }
+
+    @Test("tool name validation matches the cross-provider rules")
+    func validatesToolNames() {
+        #expect(validateMCPToolName("linear__save_issue"))
+        #expect(validateMCPToolName("_leading_underscore"))
+        #expect(validateMCPToolName("with-hyphen"))
+        // Must start with a letter or underscore.
+        #expect(!validateMCPToolName("123"))
+        #expect(!validateMCPToolName("-leading"))
+        // No dots, spaces, or colons.
+        #expect(!validateMCPToolName("has.dot"))
+        #expect(!validateMCPToolName("has space"))
+        #expect(!validateMCPToolName("has:colon"))
+        #expect(!validateMCPToolName(""))
+        // 64 is the cap.
+        #expect(validateMCPToolName(String(repeating: "a", count: 64)))
+        #expect(!validateMCPToolName(String(repeating: "a", count: 65)))
+    }
+
+    @Test("a provider-invalid server name is hex-encoded, not dropped")
+    func encodesInvalidServerNames() {
+        // Pinned by the Rust test: "DS Dev" -> _mcp_445320446576.
+        #expect(encodeMCPServerNamespace("DS Dev") == "_mcp_445320446576")
+        #expect(
+            qualifiedMCPToolName(server: "DS Dev", tool: "inspect_turn")
+                == "_mcp_445320446576__inspect_turn"
+        )
+
+        // Each of these previously caused the tool to be skipped entirely.
+        for server in ["123", "server:scope", "server__part", "foo_"] {
+            let qualified = try? #require(qualifiedMCPToolName(server: server, tool: "tool"))
+            #expect(qualified?.hasPrefix(encodedMCPServerPrefix) == true)
+            #expect(validateMCPToolName(qualified ?? ""))
+            // The original name survives the round trip.
+            #expect(parseMCPToolName(qualified ?? "")?.server == server)
+            #expect(parseMCPToolName(qualified ?? "")?.tool == "tool")
+        }
+    }
+
+    @Test("a server literally named like an encoded namespace cannot collide")
+    func reservedPrefixIsEscaped() {
+        let server = "_mcp_445320446576"
+        let qualified = try? #require(qualifiedMCPToolName(server: server, tool: "inspect_turn"))
+        // It must NOT collide with the encoded alias for "DS Dev".
+        #expect(qualified != "_mcp_445320446576__inspect_turn")
+        #expect(parseMCPToolName(qualified ?? "")?.server == server)
+    }
+
+    @Test("decoding leaves anything that is not a well-formed encoding alone")
+    func decodeFallsBack() {
+        // No prefix.
+        #expect(decodeMCPServerNamespace("linear") == "linear")
+        // Empty and odd-length hex.
+        #expect(decodeMCPServerNamespace("_mcp_") == "_mcp_")
+        #expect(decodeMCPServerNamespace("_mcp_44532") == "_mcp_44532")
+        // Bad hex digit.
+        #expect(decodeMCPServerNamespace("_mcp_zz") == "_mcp_zz")
+        // Valid hex that is not valid UTF-8.
+        #expect(decodeMCPServerNamespace("_mcp_ff") == "_mcp_ff")
+    }
+
+    @Test("a qualified name longer than 64 characters has no representation")
+    func lengthCeiling() {
+        // Pinned by the Rust test: 61 + "__" + 1 == 64 fits, 62 does not.
+        let server61 = "a" + String(repeating: "b", count: 60)
+        let server62 = "a" + String(repeating: "b", count: 61)
+        #expect(server61.count == 61)
+
+        let fits = try? #require(qualifiedMCPToolName(server: server61, tool: "b"))
+        #expect(fits?.count == 64)
+        #expect(qualifiedMCPToolName(server: server62, tool: "b") == nil)
+    }
+
+    @Test("a tool name that reintroduces a delimiter has no representation")
+    func toolNameCannotAddDelimiter() {
+        // Every pair the Rust registration test expects to be skipped.
+        #expect(qualifiedMCPToolName(server: "server", tool: "tool__part") == nil)
+        #expect(qualifiedMCPToolName(server: "foo", tool: "_bar") == nil)
+        #expect(qualifiedMCPToolName(server: "foo_", tool: "_bar") == nil)
+        #expect(qualifiedMCPToolName(server: "", tool: "tool") == nil)
+        #expect(qualifiedMCPToolName(server: "server", tool: "") == nil)
     }
 }
 
@@ -195,15 +277,67 @@ struct MCPToolRegistrationTests {
         #expect(registration.skipped.count == 2)
     }
 
-    @Test("a server whose own name is unusable registers nothing")
-    func unusableServerNameRejected() async {
+    @Test("a server whose name is not provider-safe is encoded and still registers")
+    func unsafeServerNameIsEncoded() async {
         let toolset = makeToolset()
-        let provider = StubProvider(serverName: "bad name", tools: [
+        let provider = StubProvider(serverName: "DS Dev", tools: [
+            MCPBridgedTool(name: "inspect_turn", description: "")
+        ])
+
+        let registration = await MCPToolBridge.register(provider: provider, into: toolset)
+        #expect(!registration.isFailure)
+        #expect(registration.registeredNames == ["_mcp_445320446576__inspect_turn"])
+        #expect(toolset.tool(named: "_mcp_445320446576__inspect_turn") != nil)
+    }
+
+    @Test("an encoded server's tools are still callable and reach the raw tool name")
+    func encodedServerCallsThrough() async {
+        let toolset = makeToolset(pipeline: allowAllPipeline())
+        var provider = StubProvider(serverName: "DS Dev", tools: [
+            MCPBridgedTool(name: "inspect_turn", description: "")
+        ])
+        provider.result = MCPBridgedCallResult(text: "inspected")
+        await MCPToolBridge.register(provider: provider, into: toolset)
+
+        let outcome = await toolset.prepareAndCall(
+            clientName: "_mcp_445320446576__inspect_turn",
+            args: .object([:])
+        )
+        guard case .success = outcome else {
+            Issue.record("expected success, got \(outcome)")
+            return
+        }
+        // The server sees its own unqualified name, not the encoded alias.
+        #expect(provider.calls.all.first?.name == "inspect_turn")
+    }
+
+    @Test("unregister finds an encoded server's tools by its encoded prefix")
+    func unregisterHandlesEncodedServers() async {
+        let toolset = makeToolset()
+        await MCPToolBridge.register(
+            provider: StubProvider(serverName: "DS Dev", tools: [
+                MCPBridgedTool(name: "inspect_turn", description: "")
+            ]),
+            into: toolset
+        )
+        #expect(MCPToolBridge.registeredNames(for: "DS Dev", in: toolset).count == 1)
+
+        MCPToolBridge.unregister(server: "DS Dev", from: toolset)
+        #expect(toolset.clientNames.isEmpty)
+    }
+
+    @Test("a server that can represent no tool at all registers nothing")
+    func serverWithNoRepresentableTools() async {
+        let toolset = makeToolset()
+        // An empty server name cannot produce a valid qualified name for any
+        // tool, so every tool is skipped individually.
+        let provider = StubProvider(serverName: "", tools: [
             MCPBridgedTool(name: "tool", description: "")
         ])
 
         let registration = await MCPToolBridge.register(provider: provider, into: toolset)
-        #expect(registration.isFailure)
+        #expect(registration.registeredNames.isEmpty)
+        #expect(registration.skipped["tool"] != nil)
         #expect(toolset.clientNames.isEmpty)
     }
 

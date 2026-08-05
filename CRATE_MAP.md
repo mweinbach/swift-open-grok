@@ -1,7 +1,7 @@
 # Rust Crate to SwiftPM Target Map
 
 **Baseline:** 2026-07-20 (inventory and reference pin refreshed 2026-08-04)
-**Reference pin:** `xai-org/grok-build` at `80dff0a9dcb24121b976b9f920fbe442af40ea88` (re-pinned 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4`). `ProtocolFixtures/` were captured at the **old** ref and must be recaptured; see `PORT_STATUS.md`.
+**Reference pin:** `xai-org/grok-build` at `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (re-pinned **2026-08-05** from `80dff0a9dcb24121b976b9f920fbe442af40ea88`, itself re-pinned 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4`). `ProtocolFixtures/` were captured at the **old** `9739c4a2…` ref and must be recaptured; see `PORT_STATUS.md`.
 **Count:** **83** root workspace packages from `cargo metadata` plus `xai-grok-markdown-fuzz` in its own nested workspace = **84 total** (was 82; the re-pin added `xai-workflow` and `xai-grok-extra-ca`).
 
 **SwiftPM source/test inventory (committed tree, same method as `PORT_STATUS.md`, recounted 2026-08-04):**

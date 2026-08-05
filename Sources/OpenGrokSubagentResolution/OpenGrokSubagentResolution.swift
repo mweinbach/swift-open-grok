@@ -1,5 +1,7 @@
 import Foundation
 import OpenGrokAgentDefinitions
+import enum OpenGrokToolTypes.AgentCollaborationTool
+import enum OpenGrokToolTypes.AgentOrchestrationSurface
 import enum OpenGrokToolTypes.SubagentIsolationMode
 
 public typealias AgentDefinition = OpenGrokAgentDefinitions.AgentDefinition
@@ -1475,6 +1477,10 @@ private func toolIsAllowed(_ id: String, under mode: SubagentCapabilityMode) -> 
     let name = id.split(separator: ":").last.map(String.init)?.lowercased() ?? id.lowercased()
     if mode == .all { return true }
     if !isKnownToolName(name) { return true }
+    // Every `SubagentCapabilityMode` allow-list carries
+    // `ToolKind::AgentCollaboration` (task/types.rs:505, 531, 550, 577): peer
+    // messaging is orthogonal to read/write/execute authority.
+    if isCollaborationTool(name) { return true }
     if isReadTool(name) { return true }
     if isLifecycleTool(name) { return true }
     if isWebTool(name) || isMemoryTool(name) { return true }
@@ -1514,9 +1520,48 @@ private func isLifecycleTool(_ name: String) -> Bool {
     ["get_command_or_subagent_output", "get_task_output", "wait_commands_or_subagents", "wait_tasks", "kill_command_or_subagent", "kill_task"].contains(name)
 }
 
-private func isNestedSpawnTool(_ id: String) -> Bool {
+func isNestedSpawnTool(_ id: String) -> Bool {
     let name = id.split(separator: ":").last.map(String.init)?.lowercased() ?? id.lowercased()
     return ["spawn_subagent", "task", "agent_swarm", "workflow"].contains(name)
+}
+
+/// The four team-scoped mailbox tools. Deliberately *not* part of
+/// `isNestedSpawnTool`: stripping nested spawn tools from a child keeps its
+/// mailbox, which is what `strip_nested_spawn_tools_*` asserts upstream
+/// (`xai-grok-tools/.../task/types.rs:1387-1424`).
+func isCollaborationTool(_ id: String) -> Bool {
+    let name = id.split(separator: ":").last.map(String.init)?.lowercased() ?? id.lowercased()
+    return AgentCollaborationTool.allCases.contains { $0.toolID == name }
+}
+
+/// Apply the host's subagent-enablement gate to a toolset.
+///
+/// Mirrors Rust `AgentBuilder::build`'s spawn-tool block
+/// (`xai-grok-agent/src/builder.rs:839-897`, commits 7957721e + ad95b111):
+/// with subagents disabled, `task`, `agent_swarm`, `workflow` **and** the four
+/// collaboration tools are stripped together; with subagents enabled, any
+/// collaboration tool missing from the toolset is appended, so the mailbox
+/// presence tracks `subagents_enabled` exactly.
+///
+/// The three orchestration surfaces stay individually addressable here —
+/// stripping is by id, never by a collapsed "spawn-ish" class — which is the
+/// invariant `task_agent_swarm_and_workflow_stay_three_distinct_surfaces`
+/// locks upstream (`.../task/types.rs:1436-1496`).
+public func applySubagentEnablement(
+    toolNames: [String],
+    subagentsEnabled: Bool
+) -> [String] {
+    guard subagentsEnabled else {
+        return toolNames.filter { !isNestedSpawnTool($0) && !isCollaborationTool($0) }
+    }
+    var names = toolNames
+    for tool in AgentCollaborationTool.allCases where !names.contains(where: {
+        let short = $0.split(separator: ":").last.map(String.init)?.lowercased() ?? $0.lowercased()
+        return short == tool.toolID
+    }) {
+        names.append(tool.toolID)
+    }
+    return names
 }
 
 private func isPlanTool(_ id: String) -> Bool {

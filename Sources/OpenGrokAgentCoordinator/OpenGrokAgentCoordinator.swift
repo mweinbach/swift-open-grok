@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokToolTypes
 
 public enum OpenGrokChildOwner: String, Codable, Sendable, Hashable {
     case task
@@ -203,7 +204,60 @@ public actor OpenGrokAgentCoordinator {
     private var usage: [String: UInt64] = [:]
     private var usageNotApplied = Set<String>()
 
+    // MARK: Team-scoped mailboxes
+    //
+    // Rust `SubagentCoordinator` gained `mailboxes` / `mailbox_waiters` in
+    // commit 7957721e (task/coordinator.rs:53-54, 78-89). The Swift actor keeps
+    // the same two maps under the same `(team_scope_id, agent_id)` key.
+
+    struct MailboxKey: Hashable, Sendable {
+        var teamScopeID: String
+        var agentID: String
+
+        init(_ identity: AgentMailboxIdentity) {
+            self.teamScopeID = identity.teamScopeID
+            self.agentID = identity.agentID
+        }
+
+        init(teamScopeID: String, agentID: String) {
+            self.teamScopeID = teamScopeID
+            self.agentID = agentID
+        }
+    }
+
+    private struct MailboxWaiter {
+        var token: UInt64
+        var resume: (WaitAgentMessagesOutput) -> Void
+    }
+
+    private var mailboxes: [MailboxKey: [AgentMailboxMessage]] = [:]
+    private var mailboxWaiters: [MailboxKey: MailboxWaiter] = [:]
+    private var nextWaiterToken: UInt64 = 0
+
+    /// Live-delivery seam for follow-up messages, mirroring Rust
+    /// `ChildControl::deliver_followup` (coordinator_state.rs:41-43) and
+    /// `ChildRunner::deliver_root_followup` (coordinator_state.rs:124-130).
+    /// Returns `true` when the host handed the message to a running turn.
+    /// The Rust defaults return `false`, and so does this one.
+    private var deliverFollowup: @Sendable (String, AgentMailboxMessage) -> Bool = { _, _ in false }
+
+    /// Observer for every accepted send, mirroring Rust
+    /// `ChildRunner::on_agent_message` (coordinator_state.rs:132-138).
+    private var onAgentMessage: @Sendable (AgentMailboxMessage, AgentMessageDeliveryStatus) -> Void = { _, _ in }
+
     public init() {}
+
+    /// Install the host's live-delivery and observation hooks. Without them the
+    /// coordinator is pure store-and-poll: sends queue and `waitAgentMessages`
+    /// drains, which is exactly the Rust behaviour when neither `deliver_*`
+    /// override is provided.
+    public func installMailboxHooks(
+        deliverFollowup: @escaping @Sendable (String, AgentMailboxMessage) -> Bool,
+        onAgentMessage: @escaping @Sendable (AgentMailboxMessage, AgentMessageDeliveryStatus) -> Void = { _, _ in }
+    ) {
+        self.deliverFollowup = deliverFollowup
+        self.onAgentMessage = onAgentMessage
+    }
 
     @discardableResult
     public func spawn(
@@ -251,6 +305,14 @@ public actor OpenGrokAgentCoordinator {
         blockedSessions.remove(sessionID)
         suppressedAutoWakeSessions.remove(sessionID)
         completions.removeAll { $0.parentSessionID == sessionID }
+        // Rust `SubagentEvent::TeardownSession` drops the team's mailboxes and
+        // closes its waiters as timed out (coordinator.rs:369-384).
+        mailboxes = mailboxes.filter { $0.key.teamScopeID != sessionID }
+        let closing = mailboxWaiters.filter { $0.key.teamScopeID == sessionID }
+        for (key, waiter) in closing {
+            mailboxWaiters.removeValue(forKey: key)
+            waiter.resume(WaitAgentMessagesOutput(messages: [], timedOut: true))
+        }
         let ids = active.values.filter { $0.request.parentSessionID == sessionID }.map { $0.request.id }
         for id in ids {
             active[id]?.cancellationRequested = true
@@ -364,6 +426,239 @@ public actor OpenGrokAgentCoordinator {
     }
 
     private func scopeKey(sessionID: String, promptID: String) -> String { "\(sessionID)\n\(promptID)" }
+
+    // MARK: - Mailbox operations
+
+    /// Roster of the calling agent's collaboration team: the root first, then
+    /// every child of that team sorted by agent id.
+    ///
+    /// Mirrors Rust `SubagentCoordinator::list_agents`
+    /// (task/coordinator.rs:536-593). Rust reports `pending`, `active`, and
+    /// `completed` children separately; this coordinator has no distinct
+    /// pending phase — `spawn` publishes into `active` immediately — so the
+    /// pending rows have no Swift counterpart. `subagent_type`, `description`,
+    /// and `worktree_path` are likewise absent: `OpenGrokChildRequest` does not
+    /// carry them yet, and the wire omits `nil` optionals exactly as serde's
+    /// `skip_serializing_if` does.
+    public func listAgents(identity: AgentMailboxIdentity) -> ListAgentsOutput {
+        var agents = [
+            AgentRosterEntry(
+                agentID: identity.teamScopeID,
+                isRoot: true,
+                status: "running",
+                description: "Root agent"
+            )
+        ]
+        let scope = identity.teamScopeID
+        var children: [AgentRosterEntry] = active.values
+            .filter { $0.request.parentSessionID == scope }
+            .map { child in
+                AgentRosterEntry(
+                    agentID: child.request.id,
+                    isRoot: false,
+                    status: "running",
+                    subagentType: nil,
+                    description: nil,
+                    resumedFrom: child.request.resumeFrom
+                )
+            }
+        children.append(contentsOf: completed.values
+            .filter { $0.request.parentSessionID == scope }
+            .map { summary in
+                AgentRosterEntry(
+                    agentID: summary.request.id,
+                    isRoot: false,
+                    status: summary.state,
+                    subagentType: nil,
+                    description: nil,
+                    resumedFrom: summary.request.resumeFrom
+                )
+            })
+        children.sort { $0.agentID < $1.agentID }
+        agents.append(contentsOf: children)
+        return ListAgentsOutput(teamScopeID: scope, agents: agents)
+    }
+
+    /// Resolve a model-supplied target to a team member id.
+    ///
+    /// Mirrors Rust `resolve_message_target` (task/coordinator.rs:595-635):
+    /// `"root"` (case-insensitive) and the scope id both name the root, a
+    /// self-send is rejected, and anything else must belong to this team.
+    private func resolveMessageTarget(
+        identity: AgentMailboxIdentity,
+        target rawTarget: String
+    ) throws -> String {
+        let trimmed = rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw AgentMailboxError.emptyTarget }
+        let target = (trimmed.lowercased() == "root" || trimmed == identity.teamScopeID)
+            ? identity.teamScopeID
+            : trimmed
+        if target == identity.agentID { throw AgentMailboxError.selfSend }
+        if target == identity.teamScopeID { return target }
+        let belongsToTeam =
+            active[target]?.request.parentSessionID == identity.teamScopeID
+            || completed[target]?.request.parentSessionID == identity.teamScopeID
+        guard belongsToTeam else {
+            throw AgentMailboxError.unknownTarget(
+                target: target,
+                teamScopeID: identity.teamScopeID
+            )
+        }
+        return target
+    }
+
+    /// Deliver or queue one peer message.
+    ///
+    /// Mirrors Rust `send_agent_message` (task/coordinator.rs:637-700): a
+    /// parked `wait_agent` takes the message directly, a follow-up first tries
+    /// the host's live-delivery hook, and everything else lands in the
+    /// recipient's mailbox for the next `wait_agent` to drain.
+    public func sendAgentMessage(
+        identity: AgentMailboxIdentity,
+        target rawTarget: String,
+        message: AgentMailboxMessage
+    ) throws -> AgentMessageSendOutput {
+        guard message.teamScopeID == identity.teamScopeID,
+              message.fromAgentID == identity.agentID
+        else { throw AgentMailboxError.identityMismatch }
+
+        let target = try resolveMessageTarget(identity: identity, target: rawTarget)
+        var stamped = message
+        stamped.toAgentID = target
+
+        if target != identity.teamScopeID,
+           completed[target]?.request.parentSessionID == identity.teamScopeID {
+            throw AgentMailboxError.targetFinished(target)
+        }
+
+        let key = MailboxKey(teamScopeID: identity.teamScopeID, agentID: target)
+        let status: AgentMessageDeliveryStatus
+        if let waiter = mailboxWaiters.removeValue(forKey: key) {
+            waiter.resume(WaitAgentMessagesOutput(messages: [stamped], timedOut: false))
+            status = .delivered
+        } else if stamped.kind.wakesRecipient {
+            if deliverFollowup(target, stamped) {
+                status = .delivered
+            } else if target == identity.teamScopeID || active[target] != nil {
+                // Rust queues an undelivered follow-up only for a target still
+                // in `pending`. This coordinator has no pending phase, so the
+                // equivalent "known to the team but not yet holding a live
+                // turn" set is the root plus the active children.
+                try enqueue(key: key, message: stamped)
+                status = .queued
+            } else {
+                throw AgentMailboxError.targetUnavailable(target)
+            }
+        } else {
+            try enqueue(key: key, message: stamped)
+            status = .queued
+        }
+
+        onAgentMessage(stamped, status)
+        return AgentMessageSendOutput(
+            messageID: stamped.messageID,
+            targetAgentID: target,
+            status: status
+        )
+    }
+
+    /// Mirrors Rust `enqueue_agent_message` (task/coordinator.rs:702-716).
+    private func enqueue(key: MailboxKey, message: AgentMailboxMessage) throws {
+        var mailbox = mailboxes[key] ?? []
+        guard mailbox.count < agentMailboxMaxQueuedMessages else {
+            throw AgentMailboxError.mailboxFull
+        }
+        mailbox.append(message)
+        mailboxes[key] = mailbox
+    }
+
+    /// Drain this agent's inbox, parking for `timeoutMS` when it is empty.
+    ///
+    /// Mirrors Rust `wait_agent_messages` (task/coordinator.rs:718-763):
+    /// queued messages return immediately (up to 20, FIFO), `timeout_ms == 0`
+    /// is a non-blocking poll, and a second waiter for the same mailbox
+    /// displaces the first, which returns empty and *not* timed out.
+    public func waitAgentMessages(
+        identity: AgentMailboxIdentity,
+        timeoutMS: UInt64
+    ) async -> WaitAgentMessagesOutput {
+        let key = MailboxKey(identity)
+        if var mailbox = mailboxes[key], !mailbox.isEmpty {
+            let drained = Array(mailbox.prefix(agentMailboxMaxDrainMessages))
+            mailbox.removeFirst(drained.count)
+            if mailbox.isEmpty {
+                mailboxes.removeValue(forKey: key)
+            } else {
+                mailboxes[key] = mailbox
+            }
+            return WaitAgentMessagesOutput(messages: drained, timedOut: false)
+        }
+        if timeoutMS == 0 {
+            return WaitAgentMessagesOutput(messages: [], timedOut: true)
+        }
+
+        nextWaiterToken &+= 1
+        let token = nextWaiterToken
+        // A newly parked waiter displaces the previous one, which returns empty
+        // and not timed out (Rust coordinator.rs:753-762).
+        mailboxWaiters.removeValue(forKey: key)?
+            .resume(WaitAgentMessagesOutput(messages: [], timedOut: false))
+        let expiry = expireTask(key: key, token: token, timeoutMS: timeoutMS)
+
+        let output: WaitAgentMessagesOutput = await withCheckedContinuation { continuation in
+            let box = ContinuationBox(continuation)
+            mailboxWaiters[key] = MailboxWaiter(token: token) { output in
+                box.resume(output)
+            }
+        }
+        expiry.cancel()
+        return output
+    }
+
+    /// Arm the deadline that closes a parked waiter as timed out. Rust folds
+    /// the deadline into the coordinator's `select` loop
+    /// (task/coordinator.rs:1142, 1189-1202); the Swift actor uses a detached
+    /// sleep that no-ops when the waiter has already been answered.
+    @discardableResult
+    private func expireTask(key: MailboxKey, token: UInt64, timeoutMS: UInt64) -> Task<Void, Never> {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: timeoutMS * 1_000_000)
+            await self?.expireWaiter(key: key, token: token)
+        }
+    }
+
+    private func expireWaiter(key: MailboxKey, token: UInt64) {
+        guard let waiter = mailboxWaiters[key], waiter.token == token else { return }
+        mailboxWaiters.removeValue(forKey: key)
+        waiter.resume(WaitAgentMessagesOutput(messages: [], timedOut: true))
+    }
+
+    /// Queued (undrained) message count for a mailbox — test/inspection seam.
+    public func queuedMessageCount(identity: AgentMailboxIdentity) -> Int {
+        mailboxes[MailboxKey(identity)]?.count ?? 0
+    }
+
+    /// Number of `wait_agent` calls currently parked — test/inspection seam.
+    public var parkedWaiterCount: Int { mailboxWaiters.count }
+}
+
+/// One-shot wrapper so a `CheckedContinuation` can be stored in the actor's
+/// waiter map and resumed from whichever path answers first.
+private final class ContinuationBox: @unchecked Sendable {
+    private var continuation: CheckedContinuation<WaitAgentMessagesOutput, Never>?
+    private let lock = NSLock()
+
+    init(_ continuation: CheckedContinuation<WaitAgentMessagesOutput, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(_ output: WaitAgentMessagesOutput) {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(returning: output)
+    }
 }
 
 private extension UInt64 {

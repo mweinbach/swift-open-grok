@@ -139,6 +139,13 @@ public enum SyntheticReason: String, Codable, Sendable, Equatable, Hashable {
     case goalSummary
     case goalClassifierNudge
     case schedulerFired
+    /// Mailbox message routed from another agent in the same collaboration
+    /// team. Wakes the agent. Model-authored input, never user consent.
+    /// Rust `SyntheticReason::AgentMessage`
+    /// (`xai-grok-sampling-types/src/conversation.rs:126-128`, commit
+    /// aa39b8cf) — tagged distinctly from `subagentCompleted` so trace
+    /// tooling and compaction can tell peer traffic from lifecycle auto-wakes.
+    case agentMessage
     case unknown
 
     public init(from decoder: Decoder) throws {
@@ -153,7 +160,7 @@ public enum SyntheticReason: String, Codable, Sendable, Equatable, Hashable {
     public var startsPromptTurn: Bool {
         switch self {
         case .taskCompleted, .subagentCompleted, .notificationDrain,
-             .goalClassifierNudge, .schedulerFired:
+             .goalClassifierNudge, .schedulerFired, .agentMessage:
             return true
         case .compactionMeta, .systemReminder, .projectInstructions,
              .autoContinue, .autoRecovery, .interjection,

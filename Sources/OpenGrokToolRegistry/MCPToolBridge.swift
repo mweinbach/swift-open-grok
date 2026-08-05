@@ -5,12 +5,15 @@
 //
 // Naming follows the Rust convention: a bridged tool is registered under
 // `{server}__{tool}` — server name, the two-underscore delimiter, then the raw
-// tool name. See `MCP_TOOL_NAME_DELIMITER` in
-// `crates/codegen/xai-grok-workspace-types/src/lib.rs:94` and the registration
-// site `McpTool::into_registration` in
-// `crates/codegen/xai-grok-mcp/src/servers.rs:1291-1334`. There is no `mcp__`
-// prefix; two servers exposing the same raw tool name get distinct entries
-// because the server name is part of the key.
+// tool name. There is no `mcp__` prefix; two servers exposing the same raw tool
+// name get distinct entries because the server name is part of the key.
+//
+// A server name that is not a provider-safe identifier is hex-encoded into the
+// reserved `_mcp_` namespace rather than causing the tool to be dropped, so
+// servers called `"DS Dev"` or `"123"` still reach the model. Ported from
+// `crates/codegen/xai-grok-mcp/src/servers.rs:47-155` at pin 9ed09e2a; the
+// delimiter's canonical home is `MCP_TOOL_NAME_DELIMITER` in
+// `OpenGrokWorkspaceTypes` (Rust: `xai-grok-workspace-types`).
 //
 // This file deliberately does NOT import `OpenGrokMCP`. The registry sits below
 // MCP in the dependency graph, so the concrete client is injected through
@@ -22,44 +25,128 @@ import OpenGrokToolProtocol
 import OpenGrokToolRuntime
 import OpenGrokToolTypes
 import OpenGrokWorkspace
+import OpenGrokWorkspaceTypes
 
 // MARK: - Naming
 
-/// Separator between the server name and the raw tool name.
-public let mcpToolNameDelimiter = "__"
+/// Reserved namespace prefix for hex-encoded server names.
+public let encodedMCPServerPrefix = "_mcp_"
 
-/// Qualified registry name for a tool on `server`.
-public func mcpQualifiedToolName(server: String, tool: String) -> String {
-    server + mcpToolNameDelimiter + tool
+/// Whether `name` satisfies the strictest cross-provider tool-name rules:
+/// `^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$`.
+///
+/// Must start with a letter or underscore (Gemini), allows only alphanumerics,
+/// underscores, and hyphens — no dots (Anthropic/OpenAI) — and caps at 64
+/// characters. Mirrors `validate_tool_name` (`servers.rs:81-100`).
+public func validateMCPToolName(_ name: String) -> Bool {
+    let characters = Array(name)
+    guard !characters.isEmpty, characters.count <= 64 else { return false }
+    guard let first = characters[0] as Character?,
+          first.isASCII, first.isLetter || first == "_" else { return false }
+    return characters.dropFirst().allSatisfy { character in
+        character.isASCII
+            && (character.isLetter || character.isNumber
+                || character == "_" || character == "-")
+    }
 }
 
-/// Prefix used to unregister every tool belonging to `server`.
-public func mcpServerToolPrefix(_ server: String) -> String {
-    server + mcpToolNameDelimiter
+/// Server name as it appears in a qualified tool name.
+///
+/// Used verbatim only when it cannot be confused with an encoded namespace, has
+/// no embedded delimiter, does not end in `_` (which would create an ambiguous
+/// `___` boundary against the delimiter), and is itself a valid tool name.
+/// Otherwise every UTF-8 byte is hex-encoded behind `_mcp_`. Mirrors
+/// `encode_mcp_server_namespace` (`servers.rs:102-119`).
+public func encodeMCPServerNamespace(_ serverName: String) -> String {
+    if !serverName.hasPrefix(encodedMCPServerPrefix),
+       !serverName.contains(MCP_TOOL_NAME_DELIMITER),
+       !serverName.hasSuffix("_"),
+       validateMCPToolName(serverName) {
+        return serverName
+    }
+    var encoded = encodedMCPServerPrefix
+    for byte in Array(serverName.utf8) {
+        encoded += String(format: "%02x", byte)
+    }
+    return encoded
 }
 
-/// Split a qualified name back into its server and tool halves.
+/// Reverse `encodeMCPServerNamespace`. Anything that is not a well-formed
+/// encoding — absent prefix, empty or odd-length hex, a bad hex digit, or bytes
+/// that are not valid UTF-8 — is returned unchanged rather than treated as an
+/// error. Mirrors `decode_mcp_server_namespace` (`servers.rs:121-140`).
+public func decodeMCPServerNamespace(_ namespace: String) -> String {
+    guard namespace.hasPrefix(encodedMCPServerPrefix) else { return namespace }
+    // Byte-oriented like the Rust original, so a multi-byte character in the
+    // hex region fails the same way rather than splitting differently.
+    let hex = Array(namespace.dropFirst(encodedMCPServerPrefix.count).utf8)
+    guard !hex.isEmpty, hex.count % 2 == 0 else { return namespace }
+
+    var bytes: [UInt8] = []
+    bytes.reserveCapacity(hex.count / 2)
+    for index in stride(from: 0, to: hex.count, by: 2) {
+        guard let pair = String(bytes: [hex[index], hex[index + 1]], encoding: .utf8),
+              let byte = UInt8(pair, radix: 16) else {
+            return namespace
+        }
+        bytes.append(byte)
+    }
+    guard let decoded = String(bytes: bytes, encoding: .utf8) else { return namespace }
+    return decoded
+}
+
+/// Prefix every tool on `server` is registered under, and the prefix used to
+/// unregister them. Mirrors `mcp_tool_name_prefix` (`servers.rs:142-148`).
+public func mcpToolNamePrefix(_ server: String) -> String {
+    encodeMCPServerNamespace(server) + MCP_TOOL_NAME_DELIMITER
+}
+
+/// Qualified registry name for a tool on `server`, or `nil` when no
+/// provider-safe name can represent it.
+///
+/// Mirrors `qualified_mcp_tool_name` (`servers.rs:150-155`): the result must
+/// both split cleanly and be a valid tool name, which is what rejects an
+/// over-long pair or a tool whose own name reintroduces a delimiter.
+public func qualifiedMCPToolName(server: String, tool: String) -> String? {
+    let qualified = mcpToolNamePrefix(server) + tool
+    guard parseMCPQualifiedToolName(qualified) != nil else { return nil }
+    guard validateMCPToolName(qualified) else { return nil }
+    return qualified
+}
+
+/// Split a qualified name into its raw server-namespace and tool halves.
 ///
 /// Rejects names with no delimiter and names with more than one delimiter
 /// boundary, so an ambiguous `a___b` (which could split two ways) is refused
-/// rather than silently mis-attributed. Mirrors `parse_mcp_qualified_name`
-/// (`crates/codegen/xai-grok-mcp/src/servers.rs:1063-1080`).
+/// rather than silently mis-attributed. The server half is returned still
+/// encoded — use `parseMCPToolName` for the original name. Mirrors
+/// `parse_mcp_qualified_name` (`servers.rs:1120-1138`).
 public func parseMCPQualifiedToolName(_ name: String) -> (server: String, tool: String)? {
-    let characters = Array(name)
-    let delimiter = Array(mcpToolNameDelimiter)
-    guard characters.count > delimiter.count else { return nil }
+    let bytes = Array(name.utf8)
+    let delimiter = Array(MCP_TOOL_NAME_DELIMITER.utf8)
+    guard bytes.count >= delimiter.count else { return nil }
 
+    // Overlapping byte windows, so `___` correctly yields two boundaries.
     var boundaries: [Int] = []
-    for start in 0...(characters.count - delimiter.count) where
-        Array(characters[start..<(start + delimiter.count)]) == delimiter {
+    for start in 0...(bytes.count - delimiter.count)
+    where Array(bytes[start..<(start + delimiter.count)]) == delimiter {
         boundaries.append(start)
+        if boundaries.count > 1 { return nil }
     }
-    guard boundaries.count == 1, let boundary = boundaries.first else { return nil }
+    guard let boundary = boundaries.first else { return nil }
 
-    let server = String(characters[0..<boundary])
-    let tool = String(characters[(boundary + delimiter.count)...])
+    let server = String(decoding: bytes[0..<boundary], as: UTF8.self)
+    let tool = String(decoding: bytes[(boundary + delimiter.count)...], as: UTF8.self)
     guard !server.isEmpty, !tool.isEmpty else { return nil }
+    guard (try? ToolId(name)) != nil else { return nil }
     return (server, tool)
+}
+
+/// Split a qualified name, decoding the server half back to the name the user
+/// configured. Mirrors `parse_mcp_tool_name` (`servers.rs:1141-1144`).
+public func parseMCPToolName(_ name: String) -> (server: String, tool: String)? {
+    guard let parsed = parseMCPQualifiedToolName(name) else { return nil }
+    return (decodeMCPServerNamespace(parsed.server), parsed.tool)
 }
 
 // MARK: - Provider seam
@@ -221,12 +308,9 @@ public enum MCPToolBridge {
         into toolset: FinalizedToolset
     ) async -> MCPBridgeRegistration {
         let server = provider.serverName
-        guard isUsableNameSegment(server) else {
-            return MCPBridgeRegistration(
-                serverName: server,
-                failure: "server name '\(server)' is not a usable tool-name segment"
-            )
-        }
+        // A server name that is not provider-safe is hex-encoded rather than
+        // rejected, so naming is decided per tool below, never per server.
+        //
         // Mutation surface is unknown for MCP tools, so they are never part of
         // a read-only session.
         if toolset.options.capabilityMode == .readOnly {
@@ -254,13 +338,10 @@ public enum MCPToolBridge {
                 skipped[tool.name] = "hidden by the server"
                 continue
             }
-            guard isUsableNameSegment(tool.name) else {
-                skipped[tool.name] = "tool name is not a usable tool-name segment"
-                continue
-            }
-            let clientName = mcpQualifiedToolName(server: server, tool: tool.name)
-            guard let toolId = try? ToolId(clientName) else {
-                skipped[tool.name] = "qualified name '\(clientName)' is not a valid tool id"
+            guard let clientName = qualifiedMCPToolName(server: server, tool: tool.name),
+                  let toolId = try? ToolId(clientName) else {
+                skipped[tool.name] =
+                    "no provider-safe qualified name exists for '\(server)' + '\(tool.name)'"
                 continue
             }
             guard toolset.options.nameFilters.admits(clientName: clientName) else {
@@ -307,7 +388,7 @@ public enum MCPToolBridge {
 
     /// Drop every tool belonging to `server`. Safe when nothing is registered.
     public static func unregister(server: String, from toolset: FinalizedToolset) {
-        toolset.unregister(prefix: mcpServerToolPrefix(server))
+        toolset.unregister(prefix: mcpToolNamePrefix(server))
     }
 
     /// Qualified names currently registered for `server`.
@@ -315,18 +396,7 @@ public enum MCPToolBridge {
         for server: String,
         in toolset: FinalizedToolset
     ) -> [String] {
-        let prefix = mcpServerToolPrefix(server)
+        let prefix = mcpToolNamePrefix(server)
         return toolset.clientNames.filter { $0.hasPrefix(prefix) }
-    }
-
-    /// A segment is usable when it is a legal tool-id segment and contains no
-    /// delimiter of its own — an embedded `__` would make the qualified name
-    /// ambiguous to split.
-    static func isUsableNameSegment(_ segment: String) -> Bool {
-        guard !segment.isEmpty, !segment.contains(mcpToolNameDelimiter) else { return false }
-        return segment.allSatisfy { character in
-            character.isASCII && (character.isLetter || character.isNumber
-                || character == "_" || character == "-")
-        }
     }
 }

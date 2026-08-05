@@ -2,7 +2,7 @@
 
 **Planning baseline:** 2026-07-20 (inventory and reference pin refreshed 2026-08-04)
 **Destination:** `/Users/mweinbach/Projects/swift-open-grok`
-**Read-only reference:** `xai-org/grok-build` at `80dff0a9dcb24121b976b9f920fbe442af40ea88` (re-pinned 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4`), local clone `/Users/mweinbach/Projects/grok-build`; `/tmp/open-grok-reference` when present. `ProtocolFixtures/` were captured at the **old** ref and must be recaptured against the new pin before grounding any parity claim — see `PORT_STATUS.md`.
+**Read-only reference:** `xai-org/grok-build` at `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (re-pinned **2026-08-05** from `80dff0a9dcb24121b976b9f920fbe442af40ea88`, itself re-pinned 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4`), local clone `/Users/mweinbach/Projects/grok-build`; `/tmp/open-grok-reference` when present. `ProtocolFixtures/` were captured at the **old** `9739c4a2…` ref and must be recaptured against the current pin before grounding any parity claim — see `PORT_STATUS.md`.
 **SwiftPM baseline:** `swift-tools-version: 6.1`
 **Reference inventory:** 83 root Cargo workspace members + 1 standalone markdown fuzz crate = **84 crates** (was 82; the re-pin added `xai-workflow` and `xai-grok-extra-ca`).
 **Swift source/test inventory (see `PORT_STATUS.md` counting method, recounted 2026-08-04):** **99** `Sources/` targets · **8** matching the ≤15-LOC placeholder rule, of which **7** are genuine placeholders and one is the thin `OpenGrokExecutable` `main` · **101** `Tests/` targets · **12** zero-test. The former **98 / 42 / 100 / 46** figures are superseded. Workers must not invoke SwiftPM; only `zsh workflows/swift-safe-verify.zsh` via the sole integration agent.
