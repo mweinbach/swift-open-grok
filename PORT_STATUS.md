@@ -3,8 +3,8 @@
 **As of:** 2026-08-04 (inventory + functional audit refresh; reference re-pinned)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` now launches a working full-screen TUI agent rather than a bootstrap shell. This remains an incomplete source port rather than a full Rust-parity release: a large share of the implemented library surface is not reachable from the executable, and all non-launch CLI routes still refuse.
 **Destination was empty at baseline:** yes.
-**Reference:** `xai-org/grok-build` at `80dff0a9dcb24121b976b9f920fbe442af40ea88` (re-pinned 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` (`/tmp/open-grok-reference` when present).
-**Fixture pin caveat:** every artifact under `ProtocolFixtures/` was captured at the **old** ref `9739c4a2…` and its provenance/manifest still name that ref. Fixtures are **not** re-captured against `80dff0a9…` and must be re-captured before any fixture-grounded parity claim against the new baseline.
+**Reference:** `xai-org/grok-build` at `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (re-pinned **2026-08-05** from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`. The prior 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` (`/tmp/open-grok-reference` when present).
+**Fixture pin caveat:** every artifact under `ProtocolFixtures/` was captured at the **old** ref `9739c4a2…` and its provenance/manifest still name that ref. Fixtures are **not** re-captured against `80dff0a9…`, and the 2026-08-05 move to `9ed09e2a…` did not recapture them either; they must be re-captured before any fixture-grounded parity claim against the current baseline.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
@@ -114,7 +114,7 @@ This is the port's largest honesty gap and the reason "91 non-placeholder target
 - `OpenGrokGitStatus`: removed CryptoKit; pure-Swift `PortableSHA1`; C target `COpenGrokZlib` (links libz) declared in `Package.swift`; pack-only objects throw `packedObjectUnsupported` (not silent empty HEAD).
 - `OpenGrokCLI` version delegates to `OpenGrokVersion.installed` (empty `GROK_TEST_VERSION` parity).
 - Tests: ToolRuntime assertion fixed; executable composition suites; telemetry MockHTTPTransport gRPC collector-compat + golden fixture re-encode; BuildSupport semantic fixture decode.
-- `ProtocolFixtures/`: binary OTLP HTTP/gRPC goldens, git loose-object zlib, GCRX crash sample, tracing/storage/hunk/PTY/crash format fixtures + provenance + manifest at ref `9739c4a2…` — **still pinned to the old ref after the 2026-08-04 re-pin to `80dff0a9…`; recapture required**.
+- `ProtocolFixtures/`: binary OTLP HTTP/gRPC goldens, git loose-object zlib, GCRX crash sample, tracing/storage/hunk/PTY/crash format fixtures + provenance + manifest at ref `9739c4a2…` — **still pinned to the old ref after the 2026-08-04 re-pin to `80dff0a9…` and the 2026-08-05 re-pin to `9ed09e2a…`; recapture required**.
 - Docs/workflows: exact inventory; worker/reviewer/remediation prompts forbid bare SwiftPM; only integration may run `workflows/swift-safe-verify.zsh`.
 
 ### Integration fixes already in tree (prior cycle)
@@ -688,6 +688,45 @@ Test count 2677 → **2889** (+212). **Zero placeholder targets remain.**
 Remaining known gaps: `serve`/`leader` transport; LiveCodeMode's dead
 `[features] code_mode` fallback read (flagged to the Code Mode surface);
 inference-backed PTY harness scenarios; Linux/Windows CI.
+
+#### Build-out wave 6 — 2026-08-05 (re-pin to 9ed09e2a; serve; providers; harness)
+
+Reference re-pinned `80dff0a9` → **`9ed09e2a`** (upstream HEAD, +14 commits).
+Six commits (`4f0cef9`, `25dbcc6`, `8c59511`, `3613187` + hookups):
+
+- `open-grok serve` hosts ACP over a strict RFC 6455 WebSocket server
+  (loopback + required secret matching upstream's posture; live-socket tests
+  scrape port and secret from the startup banner). Leader/relay client role
+  remains documented-unsupported.
+- Inference-backed PTY harness scenarios run the built binary against a mock
+  server with zero silent skips; the endpoints seam gained its config leg with
+  upstream's real precedence (config file > env > compiled default — the
+  drift ledger's `ae8bebef` citation for this was wrong and is corrected in
+  INTEGRATION-harness.md).
+- From the new pin: team-scoped subagent mailboxes (agent_collaboration kind),
+  task/agent_swarm/workflow locked as three surfaces, swarm follow-up cancel
+  fix, and `_mcp_` hex-encoding for provider-unsafe MCP server names.
+- Providers: DeepSeek (+V4 Flash Responses dialect), OpenCode Go (+stream
+  tolerance), Wafer AI (dynamic catalog), /fast service-tier surface, OpenAI
+  image tools with the Codex-OAuth isolation boundary, always-parseable
+  x-grok-client-version.
+
+Final gates (clean scratch, Swift 6.3.3):
+
+| Command | Exit |
+|---|---|
+| `swift-safe-verify.zsh test` (default parallel) | **0** — 3126 tests / 468 suites, 25.4s |
+| `swift-safe-verify.zsh test --no-parallel` | **0** — 3126 tests / 468 suites, 154.4s |
+| `swift-safe-verify.zsh build --product open-grok` | **0** |
+
+Test count 2889 → **3126** (+237). Known gaps carried forward: the /model
+provider-qualified selector rewrite from 9ed09e2a (assignment crossed the
+provider agent's completion); catalog HTTP fetch wiring into ModelsManager
+(parsing/cache types done and tested); image_gen/image_edit registry
+registration; leader/relay client role; Linux/Windows CI. Operational: the
+shared build scratch can be poisoned by interleaved agent builds (symptom:
+inexplicable SIGSEGV that passes under a private scratch) — wipe
+`.build/workflow-safe` before final gates.
 
 
 ## Per-crate port status (all 84 Rust crates accounted for)
