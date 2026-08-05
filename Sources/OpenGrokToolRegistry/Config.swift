@@ -158,6 +158,8 @@ public enum NamedToolsetPreset: String, Sendable, Hashable, CaseIterable {
     case codex = "codex"
     case explore = "explore"
     case plan = "plan"
+    /// Read + search + mutation bundle for a live coding session.
+    case build = "build"
     case openCode = "opencode"
     case hashline = "hashline"
 }
@@ -188,6 +190,14 @@ public func toolServerConfig(
         ids = ["GrokBuild:read_file", "GrokBuild:list_dir", "GrokBuild:grep"]
     case .plan:
         ids = ["GrokBuild:read_file", "GrokBuild:list_dir", "GrokBuild:grep"]
+    case .build:
+        // Standard (non-hashline) read/search bundle plus the mutation tools.
+        // Mutation kinds are dropped automatically under `.readOnly` capability.
+        ids = [
+            "GrokBuild:read_file", "GrokBuild:list_dir", "GrokBuild:grep",
+            "OpenCode:glob", "GrokBuild:view_image",
+            "GrokBuild:search_replace", "OpenCode:write", "Codex:apply_patch",
+        ]
     case .openCode:
         ids = [
             "OpenCode:read", "OpenCode:edit", "OpenCode:write",

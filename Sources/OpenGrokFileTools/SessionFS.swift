@@ -15,6 +15,7 @@ public enum SessionFSError: Error, Sendable, Equatable, CustomStringConvertible 
     case isDirectory(String)
     case notDirectory(String)
     case outsideWorkspace(String)
+    case symlinkEscape(String)
     case io(String)
     case binaryFile(String)
     case staleContext(String)
@@ -28,6 +29,7 @@ public enum SessionFSError: Error, Sendable, Equatable, CustomStringConvertible 
         case .isDirectory(let p): return "File path is a directory: \(p)"
         case .notDirectory(let p): return "Not a directory: \(p)"
         case .outsideWorkspace(let p): return "Path escapes workspace: \(p)"
+        case .symlinkEscape(let p): return "Symlink target escapes workspace: \(p)"
         case .io(let m): return m
         case .binaryFile(let p): return "Binary file cannot be edited as text: \(p)"
         case .staleContext(let m): return m
@@ -50,14 +52,30 @@ public enum SessionFS {
     }
 
     /// Reject paths that escape `allowedRoots` when roots are configured.
+    ///
+    /// Containment is delegated to `PathBoundary`, so traversal, NUL bytes,
+    /// case folding, Unicode normalization, and symlink targets that point
+    /// outside the root are all rejected. Paths that do not exist yet are
+    /// checked lexically (the parent directory is created on write).
     public static func enforceRoots(_ absolute: String, roots: [String]) throws {
         guard !roots.isEmpty else { return }
         let path = (absolute as NSString).standardizingPath
+        var sawSymlinkEscape = false
         for root in roots {
-            let r = (root as NSString).standardizingPath
-            if path == r || path.hasPrefix(r.hasSuffix("/") ? r : r + "/") {
+            let boundary = PathBoundary(
+                root: URL(fileURLWithPath: (root as NSString).standardizingPath)
+            )
+            do {
+                _ = try boundary.resolve(path)
                 return
+            } catch let error as PathBoundaryError {
+                if case .symlinkEscape = error { sawSymlinkEscape = true }
+            } catch {
+                continue
             }
+        }
+        if sawSymlinkEscape {
+            throw SessionFSError.symlinkEscape(path)
         }
         throw SessionFSError.outsideWorkspace(path)
     }
