@@ -111,21 +111,16 @@ func stripDomainPrefix(_ pattern: String) -> (pattern: String, mode: PatternMode
     return (pattern, .glob)
 }
 
+/// Three ordered literal replacements, matching `rules.rs:277`.
+///
+/// A generic "strip the backslash before any character" loop is wrong here:
+/// `Bash(find . -name \*.rs)` must keep its `\*` so the pattern stays a
+/// literal asterisk. Stripping it turns the pattern into a glob, which widens
+/// allow rules and narrows deny rules.
 func unescapeRuleContent(_ s: String) -> String {
-    var out = ""
-    var escape = false
-    for ch in s {
-        if escape {
-            out.append(ch)
-            escape = false
-        } else if ch == "\\" {
-            escape = true
-        } else {
-            out.append(ch)
-        }
-    }
-    if escape { out.append("\\") }
-    return out
+    s.replacingOccurrences(of: "\\(", with: "(")
+        .replacingOccurrences(of: "\\)", with: ")")
+        .replacingOccurrences(of: "\\\\", with: "\\")
 }
 
 func findFirstUnescaped(_ s: String, _ target: Character) -> String.Index? {

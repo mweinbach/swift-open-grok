@@ -282,32 +282,180 @@ func redirectTargets(_ script: String) -> [(String, ShellFileMode)] {
     return results
 }
 
-/// Whether an absolute edit path should always prompt (startup files, ssh, hooks).
-public func protectedEditPath(_ path: String) -> Bool {
-    let lexical = normalizeLexically(path)
-    let parts = lexical.split(separator: "/").map { $0.lowercased() }
-    let file = parts.last.map { String($0) } ?? ""
-    let startup: Set<String> = [
-        ".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".profile",
-        ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout",
-        ".kshrc", ".cshrc", ".tcshrc", ".login", ".logout", ".inputrc",
-    ]
-    if startup.contains(file) { return true }
-    if parts.contains(".ssh") { return true }
-    if parts.contains(".git") {
-        if let gitIdx = parts.firstIndex(of: ".git"),
-           gitIdx + 1 < parts.count,
-           parts[gitIdx + 1] == "hooks"
-        {
-            return true
+// MARK: - Protected edit targets
+
+/// Why an edit must still prompt even under `acceptEdits`. Ported from
+/// `ProtectedEditReason` (`shell_access.rs:327-341`).
+///
+/// Every variant is a code-execution-on-next-session vector: writing one of
+/// these files installs something that runs later without a separate execution
+/// approval, so the edit approval has to carry that warning.
+public enum ProtectedEditReason: String, Sendable, Equatable, Hashable, Codable {
+    case hookRoot = "hook_root"
+    case gitHooks = "git_hooks"
+    case ssh
+    case startupFile = "startup_file"
+    case etc
+    case grokConfig = "grok_config"
+    case grokSandbox = "grok_sandbox"
+    case claudeSettings = "claude_settings"
+    case cursorHooks = "cursor_hooks"
+    /// Fail-closed / unclassified sensitive path; no user copy (shell_access.rs:389).
+    case sensitive
+
+    /// Wire discriminator for the ACP `ProtectedEditPermission` payload.
+    public var kind: String { rawValue }
+
+    /// User-facing explanation, verbatim from `description()`
+    /// (`shell_access.rs:359-390`).
+    public var explanation: String? {
+        switch self {
+        case .hookRoot:
+            return "Note: This edit contains changes to hooks, which can be executed as code on later sessions without a separate execution approval."
+        case .gitHooks:
+            return "Note: This edit contains changes to Git hooks, which can run automatically on commit, push, or other Git actions without a separate execution approval."
+        case .ssh:
+            return "Note: This edit contains changes under `.ssh`, which can affect credentials and authentication for future sessions."
+        case .startupFile:
+            return "Note: This edit contains changes to a shell startup file, which can run automatically in future terminals without a separate execution approval."
+        case .etc:
+            return "Note: This edit contains changes under `/etc`, which is system configuration and can affect this machine beyond the current project."
+        case .grokConfig:
+            return "Note: This edit contains changes to Open Grok config, which can alter permissions, tools, and other behavior in later sessions."
+        case .grokSandbox:
+            return "Note: This edit contains changes to the Open Grok sandbox config, which can loosen filesystem and network restrictions on commands."
+        case .claudeSettings:
+            return "Note: This edit contains changes to Claude-compatible settings, which can install hooks or change permission mode without a separate execution approval."
+        case .cursorHooks:
+            return "Note: This edit contains changes to Cursor hooks, which can run automatically in later sessions without a separate execution approval."
+        case .sensitive:
+            return nil
         }
     }
+}
+
+/// Shell startup files (`STARTUP_FILES`, shell_access.rs:444-462).
+private let protectedStartupFiles: Set<String> = [
+    ".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".profile",
+    ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout",
+    ".kshrc", ".cshrc", ".tcshrc", ".login", ".logout", ".inputrc", ".xprofile",
+]
+
+/// Config filenames that are protected when they sit directly inside a
+/// `.opengrok` directory or directly inside the user grok home
+/// (`protected_grok_config_file_with_home`, shell_access.rs:504-529).
+private let protectedGrokConfigFiles: Set<String> = [
+    "config.toml", "managed_config.toml", "requirements.toml",
+]
+
+/// Full protection classification for an edit target.
+///
+/// Mirrors `edit_target_protection` (shell_access.rs:416-432): a relative path
+/// is `.sensitive` (unclassifiable, fail closed), otherwise the lexical form is
+/// checked, then the symlink-resolved form, then `/etc` containment.
+public func editTargetProtection(
+    _ path: String,
+    userGrokHome: String? = nil
+) -> ProtectedEditReason? {
+    guard path.hasPrefix("/") else { return .sensitive }
+    let lexical = normalizeLexically(path)
+    if let reason = protectedEditReason(lexical, userGrokHome: userGrokHome) {
+        return reason
+    }
+    let resolved = URL(fileURLWithPath: lexical).resolvingSymlinksInPath().path
+    if resolved != lexical,
+       let reason = protectedEditReason(normalizeLexically(resolved), userGrokHome: userGrokHome) {
+        return reason
+    }
+    if resolved == "/etc" || resolved.hasPrefix("/etc/") { return .sensitive }
+    return nil
+}
+
+/// Classify one already-normalized absolute path. Check order is Rust's
+/// (`protected_edit_reason`, shell_access.rs:434-496); first match wins.
+public func protectedEditReason(
+    _ path: String,
+    userGrokHome: String? = nil
+) -> ProtectedEditReason? {
+    let lexical = normalizeLexically(path)
+    let parts = lexical.split(separator: "/").map { $0.lowercased() }
+    let file = parts.last ?? ""
+
+    // 1. `.opengrok/hooks/**`, `.opengrok/hooks-paths`, `$OPENGROK_HOME/hooks`.
+    if adjacentPair(parts, ".opengrok", "hooks") { return .hookRoot }
     if parts.count >= 2,
        parts[parts.count - 2] == ".opengrok",
-       parts[parts.count - 1] == "config.toml"
-    {
+       parts[parts.count - 1] == "hooks-paths" {
+        return .hookRoot
+    }
+    if let home = userGrokHome {
+        let normalizedHome = normalizeLexically(home)
+        let hookRoot = (normalizedHome as NSString).appendingPathComponent("hooks")
+        if lexical == hookRoot || lexical.hasPrefix(hookRoot + "/") { return .hookRoot }
+        if lexical == (normalizedHome as NSString).appendingPathComponent("hooks-paths") {
+            return .hookRoot
+        }
+    }
+
+    // 2/3. Claude-compatible settings and Cursor hooks.
+    if parts.count >= 2, parts[parts.count - 2] == ".claude",
+       file == "settings.json" || file == "settings.local.json" {
+        return .claudeSettings
+    }
+    if parts.count >= 2, parts[parts.count - 2] == ".cursor", file == "hooks.json" {
+        return .cursorHooks
+    }
+
+    // 4. `.git/hooks/**` and the `.git/modules/**/hooks` submodule form.
+    if adjacentPair(parts, ".git", "hooks") { return .gitHooks }
+    if let gitIndex = parts.firstIndex(of: ".git"),
+       gitIndex + 1 < parts.count,
+       parts[gitIndex + 1] == "modules",
+       parts[(gitIndex + 2)...].dropFirst().contains("hooks") {
+        return .gitHooks
+    }
+
+    // 5/6. Credentials and shell startup files.
+    if parts.contains(".ssh") { return .ssh }
+    if protectedStartupFiles.contains(file) { return .startupFile }
+
+    // 7. Grok config / sandbox config, in `.opengrok/` or the user grok home.
+    let configReason: ProtectedEditReason?
+    if protectedGrokConfigFiles.contains(file) {
+        configReason = .grokConfig
+    } else if file == "sandbox.toml" {
+        configReason = .grokSandbox
+    } else {
+        configReason = nil
+    }
+    if let configReason {
+        let inDotGrok = parts.count >= 2 && parts[parts.count - 2] == ".opengrok"
+        var inGrokHome = false
+        if let home = userGrokHome {
+            let parent = (lexical as NSString).deletingLastPathComponent
+            let normalizedHome = normalizeLexically(home)
+            inGrokHome = parent == normalizedHome
+                || parent == URL(fileURLWithPath: normalizedHome).resolvingSymlinksInPath().path
+        }
+        if inDotGrok || inGrokHome { return configReason }
+    }
+
+    // 8. System configuration.
+    if lexical == "/etc" || lexical.hasPrefix("/etc/") { return .etc }
+    return nil
+}
+
+/// Whether `parts` contains `first` immediately followed by `second`.
+private func adjacentPair(_ parts: [String], _ first: String, _ second: String) -> Bool {
+    guard parts.count >= 2 else { return false }
+    for index in 0..<(parts.count - 1) where parts[index] == first && parts[index + 1] == second {
         return true
     }
-    if lexical == "/etc" || lexical.hasPrefix("/etc/") { return true }
     return false
+}
+
+/// Whether an absolute edit path should always prompt. Boolean façade over
+/// `protectedEditReason` for the call sites that only branch on it.
+public func protectedEditPath(_ path: String, userGrokHome: String? = nil) -> Bool {
+    protectedEditReason(path, userGrokHome: userGrokHome) != nil
 }

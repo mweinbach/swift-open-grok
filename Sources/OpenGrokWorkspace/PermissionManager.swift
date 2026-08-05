@@ -5,6 +5,11 @@
 // without the full actor runtime (session wiring lands later).
 
 import Foundation
+import OpenGrokConfig
+
+/// Resolved once: `protectedEditPath` needs it on every edit request, and the
+/// answer cannot change within a process.
+let userGrokHomePath: String? = userGrokHome()?.path
 
 /// Interactive prompter seam. Headless implementations return deny/cancel.
 public protocol PermissionPrompter: Sendable {
@@ -77,7 +82,12 @@ public actor PermissionHandle {
             cfg.rules = clampRulesForYoloPin(cfg.rules)
         }
         self.config = cfg
-        self.policy = CompiledPolicy(config: cfg)
+        // Path rules anchor against the session cwd, so a rule written
+        // `Edit(src/**)` matches the absolute path a tool actually receives.
+        self.policy = CompiledPolicy(
+            config: cfg,
+            pathContext: PathRuleContext(cwd: shellCwd)
+        )
         self.yoloMode = yoloPinReason != nil ? false : yoloMode
         self.autoMode = autoMode
         self.yoloPinReason = yoloPinReason
@@ -123,7 +133,10 @@ public actor PermissionHandle {
             cfg.rules = clampRulesForYoloPin(cfg.rules)
         }
         self.config = cfg
-        self.policy = CompiledPolicy(config: cfg)
+        self.policy = CompiledPolicy(
+            config: cfg,
+            pathContext: PathRuleContext(cwd: shellCwd)
+        )
     }
 
     public func grant(_ grant: SessionGrant) {
@@ -241,7 +254,10 @@ public actor PermissionHandle {
         // but YOLO still allows — Rust YOLO short-circuits after policy/shell ask).
         var protectedEdit = false
         if case .edit(let path) = access {
-            protectedEdit = protectedEditPath(path)
+            // Passing the user grok home is what makes
+            // `$OPENGROK_HOME/config.toml` and `$OPENGROK_HOME/hooks/**`
+            // protected, not just the `.opengrok/` forms.
+            protectedEdit = protectedEditPath(path, userGrokHome: userGrokHomePath)
         }
 
         // 3. YOLO / always-approve (blocked by policy/shell Ask; pin keeps false).

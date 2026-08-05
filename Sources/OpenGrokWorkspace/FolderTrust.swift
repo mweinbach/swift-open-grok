@@ -7,6 +7,7 @@
 // for parity with Rust `trust.rs` when loading `trusted_folders.toml`.
 
 import Foundation
+import OpenGrokConfig
 import OpenGrokPaths
 
 // FolderTrustState + FolderTrustStore live in PathBoundary.swift (exact-match).
@@ -76,6 +77,13 @@ public func repoConfigsPresent(at cwd: URL) -> Bool {
         ".claude/settings.local.json",
         ".opengrok/hooks.toml",
         ".opengrok/mcp.toml",
+        // `.opengrok/config.toml` belongs here: it can declare `[mcp_servers]`
+        // — the exact table `LiveMCPComposition.connectConfiguredServers` reads
+        // and spawns from — and `[permission]` rules that would widen this
+        // session's own policy. Omitting it meant a repo carrying only a
+        // config.toml scanned as "no code-exec config", resolved to trusted,
+        // and had both honoured without anyone being asked.
+        ".opengrok/config.toml",
         ".envrc",
         "CLAUDE.md",
     ]
@@ -107,7 +115,9 @@ public struct DurableTrustStore: Sendable {
         }
     }
 
-    private var folders: [String: Record]
+    /// The recorded decisions, keyed by normalized absolute path. Exposed so
+    /// `PersistentFolderTrustStore` can serialize them.
+    public private(set) var folders: [String: Record]
 
     public init(folders: [String: Record] = [:]) {
         self.folders = folders
@@ -160,4 +170,134 @@ public func projectScopeAllowed(
     trustStore: FolderTrustStore
 ) -> Bool {
     trustStore.state(for: workspaceRoot) == .trusted
+}
+
+// MARK: - Persistence (`trusted_folders.toml`)
+
+/// Filename of the folder-trust store (`TRUST_FILE_NAME`, trust.rs:38).
+public let trustedFoldersFileName = "trusted_folders.toml"
+
+/// Path to the store, always under the **user** grok home.
+///
+/// Deliberately not `grokHome()`: a cloned repo carrying its own `./.opengrok`
+/// must not be able to declare itself trusted (trust.rs:104-113). Returns nil
+/// when no user home resolves, which the store reads as "trust nothing,
+/// persist nothing".
+public func trustedFoldersPath(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> URL? {
+    userGrokHome(environment: environment)?.appendingPathComponent(trustedFoldersFileName)
+}
+
+/// Durable folder-trust store backed by `trusted_folders.toml`.
+///
+/// On-disk shape (trust.rs:8-13, 41-55):
+/// ```toml
+/// [folders."/abs/repo/root"]
+/// trusted = true
+/// decided_at = 1780000000
+/// ```
+/// Longest-matching-path-prefix wins and trust cascades to subdirectories;
+/// over-broad keys (`$HOME`, filesystem root, relative paths) are dropped on
+/// read so a corrupted store cannot trust the world.
+public struct PersistentFolderTrustStore: Sendable {
+    private var store: DurableTrustStore
+    private let path: URL?
+    private let home: String?
+
+    public init(
+        path: URL?,
+        home: String? = ProcessInfo.processInfo.environment["HOME"]
+    ) {
+        self.path = path
+        self.home = home
+        self.store = PersistentFolderTrustStore.decode(path: path, home: home)
+    }
+
+    public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+        self.init(
+            path: trustedFoldersPath(environment: environment),
+            home: environment["HOME"]
+        )
+    }
+
+    private static func decode(path: URL?, home: String?) -> DurableTrustStore {
+        guard let path,
+              let text = try? String(contentsOf: path, encoding: .utf8),
+              let document = try? parseTOML(text),
+              case .table(let root) = document,
+              case .table(let folders)? = root["folders"]
+        else { return DurableTrustStore() }
+
+        var records: [String: DurableTrustStore.Record] = [:]
+        for (rawPath, entry) in folders.pairs {
+            guard case .table(let fields) = entry else { continue }
+            guard case .boolean(let trusted)? = fields["trusted"] else { continue }
+            let key = normalizeLexically(rawPath)
+            if isUnsafeTrustRoot(key, home: home) { continue }
+            var decidedAt: Date?
+            if case .integer(let seconds)? = fields["decided_at"] {
+                decidedAt = Date(timeIntervalSince1970: TimeInterval(seconds))
+            }
+            records[key] = DurableTrustStore.Record(trusted: trusted, decidedAt: decidedAt)
+        }
+        return DurableTrustStore(folders: records)
+    }
+
+    public func isTrusted(_ folder: URL) -> Bool {
+        store.isTrusted(folder)
+    }
+
+    /// Record a decision and flush. A store with no resolvable home silently
+    /// keeps the decision in memory only — never a hard failure at a prompt.
+    public mutating func record(_ folder: URL, trusted: Bool) throws {
+        if trusted {
+            store.setTrusted(folder, home: home)
+        } else {
+            store.setUntrusted(folder, home: home)
+        }
+        try flush()
+    }
+
+    /// Serialize to `trusted_folders.toml` with `0600`, atomically.
+    public func flush() throws {
+        guard let path else { return }
+        var folders = TOMLTable()
+        for (folder, record) in store.folders {
+            var fields = TOMLTable()
+            fields["trusted"] = .boolean(record.trusted)
+            if let decidedAt = record.decidedAt {
+                fields["decided_at"] = .integer(Int64(decidedAt.timeIntervalSince1970))
+            }
+            folders[folder] = .table(fields)
+        }
+        var root = TOMLTable()
+        root["folders"] = .table(folders)
+        try? FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try writeAtomically(path, contents: TOMLEncoder.encode(.table(root)), mode: 0o600)
+    }
+}
+
+// MARK: - Feature gate
+
+/// Whether folder trust is enforced.
+///
+/// Precedence (workspace `folder_trust.rs:157-181`): env `GROK_FOLDER_TRUST` >
+/// user config `[folder_trust] enabled` > managed config `[folder_trust]
+/// enabled` > default **true**. Note the table is `[folder_trust]`, not
+/// `[features]`.
+public func folderTrustEnabled(
+    document: TOMLValue?,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> Bool {
+    if let fromEnv = envBool("GROK_FOLDER_TRUST", environment: environment) {
+        return fromEnv
+    }
+    if case .boolean(let enabled)? = document?[path: ["folder_trust", "enabled"]] {
+        return enabled
+    }
+    return true
 }

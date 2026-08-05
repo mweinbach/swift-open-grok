@@ -55,31 +55,80 @@ public enum FileToolAccessPolicy: Sendable {
         if case .allowAll = self { return true }
         return false
     }
+
+    /// Whether a user is present to answer a prompt. Drives the folder-trust
+    /// decision, where "no one to ask" must resolve to untrusted rather than
+    /// to a prompt nothing will paint.
+    public var isInteractive: Bool {
+        if case .prompt = self { return true }
+        return false
+    }
 }
 
 /// Builds session resources for the file tool pack.
 public enum FileToolSession {
+    /// Fold the user's resolved `[permission]` / `.claude/settings.json` policy
+    /// into the preset a caller picked.
+    ///
+    /// Rules are purely additive — evaluation is deny > ask > allow and is
+    /// order-independent, so a config allow rule can never override the
+    /// preset's synthetic `deny Edit`. The prompt policy takes whichever side
+    /// is more restrictive so a config `defaultMode` cannot loosen a session
+    /// that was started deny-only.
+    static func mergedConfig(
+        preset: PermissionConfig,
+        resolved: ResolvedPermissions?
+    ) -> PermissionConfig {
+        guard let resolved else { return preset }
+        var merged = resolved.config
+        merged.rules.append(contentsOf: preset.rules)
+        if preset.promptPolicy == .deny { merged.promptPolicy = .deny }
+        return merged
+    }
+
     /// Construct a `PermissionPipeline` for `policy`, rooted at `workspaceRoot`.
     ///
     /// `hooks` is the PreToolUse injection point (fail-open by contract) and
     /// `planMode` the plan gate; both default to no-ops until the live session
-    /// supplies real ones.
+    /// supplies real ones. `resolved` carries the rules sourced from config and
+    /// Claude-compatible settings; without it the engine runs over an empty
+    /// policy, which is what it did before this was wired.
     public static func makePipeline(
         policy: FileToolAccessPolicy,
         workspaceRoot: String,
         planMode: PlanModeTracker? = nil,
-        hooks: any PreToolUseHookRunner = FailOpenPreToolUseHookRunner()
+        hooks: any PreToolUseHookRunner = FailOpenPreToolUseHookRunner(),
+        resolved: ResolvedPermissions? = nil
     ) -> PermissionPipeline {
+        // The blanket-approval request (`OPENGROK_ALLOW_WRITES=1`) maps to
+        // `yoloMode`, not `allowAll`, whenever a real policy was resolved.
+        //
+        // `allowAll` short-circuits `PermissionHandle.request` at step 1, before
+        // the policy is consulted, so it would silently ignore a user's own
+        // `deny = ["Bash(rm:*)"]`. Rust's always-approve is evaluated *after*
+        // deny/ask (manager step 3 runs only when `!policyForcedPrompt`, and a
+        // policy deny has already returned), so an explicit deny rule wins over
+        // blanket approval there. This matches that ordering. With no resolved
+        // policy there are no rules, so the two are equivalent.
+        let hasPolicy = resolved.map { !$0.config.rules.isEmpty } ?? false
+        // Either the `OPENGROK_ALLOW_WRITES` bypass or `--always-approve`.
+        // `resolved.alwaysApprove` is already false when a pin vetoed the flag.
+        let blanketApproval =
+            (policy.allowsAll || resolved?.alwaysApprove == true)
+            && resolved?.yoloPinReason == nil
         let permissions = PermissionHandle(
-            config: policy.permissionConfig,
-            allowAll: policy.allowsAll,
+            config: mergedConfig(preset: policy.permissionConfig, resolved: resolved),
+            yoloMode: blanketApproval && hasPolicy,
+            yoloPinReason: resolved?.yoloPinReason,
+            allowAll: blanketApproval && !hasPolicy,
             shellCwd: workspaceRoot,
             prompter: policy.prompter
         )
         return PermissionPipeline(
             permissions: permissions,
             planMode: planMode ?? PlanModeTracker(sessionDirectory: workspaceRoot),
-            hooks: hooks
+            hooks: hooks,
+            yoloPinReason: resolved?.yoloPinReason
         )
     }
 
@@ -96,7 +145,8 @@ public enum FileToolSession {
         hooks: any PreToolUseHookRunner = FailOpenPreToolUseHookRunner(),
         hunkTracker: HunkTrackerActor? = nil,
         promptIndex: Int = 0,
-        allowedRoots: [String]? = nil
+        allowedRoots: [String]? = nil,
+        resolved: ResolvedPermissions? = nil
     ) -> ToolResources {
         let root = (workspaceRoot as NSString).standardizingPath
         return ToolResources(
@@ -106,13 +156,18 @@ public enum FileToolSession {
                 policy: policy,
                 workspaceRoot: root,
                 planMode: planMode,
-                hooks: hooks
+                hooks: hooks,
+                resolved: resolved
             ),
             hunkTracker: hunkTracker,
             promptIndex: promptIndex,
             sessionId: sessionId,
             agentId: agentId,
-            allowedRoots: allowedRoots ?? [root]
+            // `additionalDirectories` from Claude-compatible settings widen the
+            // boundary `SessionFS.enforceRoots` checks. Rust parses the key but
+            // does not act on it (resolution.rs:605); honouring it here is the
+            // only way a user can grant a second root at all.
+            allowedRoots: allowedRoots ?? ([root] + (resolved?.additionalDirectories ?? []))
         )
     }
 }

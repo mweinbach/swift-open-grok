@@ -4,15 +4,42 @@
 // `xai-grok-workspace/src/permission/policy.rs`.
 
 import Foundation
+import OpenGrokPaths
+
+/// How a path-shaped rule pattern and a path-shaped access are anchored before
+/// they are compared. Ported from the `resolve_following_symlinks` /
+/// `resolved_path_is_within_root` handling in
+/// `xai-grok-workspace/src/permission/shell_access.rs`.
+///
+/// Without this a rule written `Edit(src/**)` never matches the absolute path
+/// a tool actually receives, and a symlink out of the workspace escapes every
+/// deny rule. Both sides are resolved and compared in the same frame; the raw
+/// forms are still compared first so a pattern that was already absolute (or
+/// that intentionally matches a relative argument) keeps working.
+public struct PathRuleContext: Sendable, Equatable {
+    /// The request's working directory — relative patterns anchor here.
+    public var cwd: String
+    /// Used for `~` expansion; defaults to the process home.
+    public var home: String?
+
+    public init(cwd: String, home: String? = nil) {
+        self.cwd = cwd
+        self.home = home ?? ProcessInfo.processInfo.environment["HOME"]
+    }
+}
 
 /// Permission policy with pattern matchers.
 public struct CompiledPolicy: Sendable {
     public let config: PermissionConfig
     public let hasFileRestrictions: Bool
     public let hasBashCommandRestrictions: Bool
+    /// When set, path patterns and path accesses are both anchored before
+    /// comparison. Nil keeps the raw-string behaviour.
+    public let pathContext: PathRuleContext?
 
-    public init(config: PermissionConfig) {
+    public init(config: PermissionConfig, pathContext: PathRuleContext? = nil) {
         self.config = config
+        self.pathContext = pathContext
         self.hasFileRestrictions = config.rules.contains { rule in
             (rule.action == .deny || rule.action == .ask)
                 && (rule.tool == .read || rule.tool == .edit || rule.tool == .any)
@@ -35,7 +62,7 @@ public struct CompiledPolicy: Sendable {
 
         for rule in config.rules {
             guard toolFilterMatches(access, rule.tool) else { continue }
-            guard patternMatches(access, rule: rule) else { continue }
+            guard patternMatches(access, rule: rule, pathContext: pathContext) else { continue }
             switch rule.action {
             case .deny:
                 let toolLabel = toolFilterLabel(rule.tool)
@@ -144,7 +171,75 @@ func toolFilterMatches(_ access: AccessKind, _ filter: ToolFilter) -> Bool {
     }
 }
 
-func patternMatches(_ access: AccessKind, rule: PermissionRule) -> Bool {
+/// Expand a leading `~` / `~/…` against `home`.
+func expandTildePath(_ path: String, home: String?) -> String {
+    guard path == "~" || path.hasPrefix("~/") else { return path }
+    guard let home, !home.isEmpty else { return path }
+    if path == "~" { return home }
+    return (home as NSString).appendingPathComponent(String(path.dropFirst(2)))
+}
+
+/// Anchor `path` to `cwd`. A leading `//` is the DSL's absolute-from-root
+/// form and collapses to a single `/`.
+func anchorPath(_ path: String, context: PathRuleContext) -> String {
+    let expanded = expandTildePath(path, home: context.home)
+    if expanded.hasPrefix("//") {
+        return normalizeLexically(String(expanded.dropFirst()))
+    }
+    if expanded.hasPrefix("/") {
+        return normalizeLexically(expanded)
+    }
+    return normalizeLexically((context.cwd as NSString).appendingPathComponent(expanded))
+}
+
+/// Resolve symlinks so a link out of the workspace cannot dodge a deny rule.
+/// Falls back to the lexical form when the path does not exist yet — a Write
+/// to a not-yet-created file must still be matchable.
+func canonicalizePath(_ path: String) -> String {
+    let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+    return normalizeLexically(resolved)
+}
+
+/// Every form of a path-shaped access worth comparing against a pattern that
+/// was anchored the same way.
+func pathMatchCandidates(_ path: String, context: PathRuleContext?) -> [String] {
+    guard let context else { return [path] }
+    var out = [path]
+    let anchored = anchorPath(path, context: context)
+    if anchored != path { out.append(anchored) }
+    let canonical = canonicalizePath(anchored)
+    if canonical != anchored { out.append(canonical) }
+    return out
+}
+
+/// A path-context glob comparison that anchors both sides in the same frame.
+///
+/// Raw-vs-raw is tried first (preserving every pattern that already worked),
+/// then anchored-vs-anchored, then canonical-vs-canonical. Forms are never
+/// cross-multiplied: an anchored pattern is only ever compared with an
+/// anchored path, so anchoring cannot invent a match Rust would not make.
+func pathPatternMatches(
+    path: String,
+    pattern: String,
+    context: PathRuleContext?
+) -> Bool {
+    if globMatches(text: path, pattern: pattern, pathContext: true) { return true }
+    guard let context else { return false }
+    let anchoredPattern = anchorPath(pattern, context: context)
+    let anchoredPath = anchorPath(path, context: context)
+    if globMatches(text: anchoredPath, pattern: anchoredPattern, pathContext: true) {
+        return true
+    }
+    let canonicalPattern = canonicalizePath(anchoredPattern)
+    let canonicalPath = canonicalizePath(anchoredPath)
+    return globMatches(text: canonicalPath, pattern: canonicalPattern, pathContext: true)
+}
+
+func patternMatches(
+    _ access: AccessKind,
+    rule: PermissionRule,
+    pathContext: PathRuleContext? = nil
+) -> Bool {
     guard let pattern = rule.pattern else { return true }
     if pattern == "*" { return true }
 
@@ -154,13 +249,13 @@ func patternMatches(_ access: AccessKind, rule: PermissionRule) -> Bool {
         let cmd = String(cmd.drop(while: { $0.isWhitespace }))
         return cmd.hasPrefix(pattern) || globMatches(text: cmd, pattern: pattern, pathContext: false)
     case .edit(let path):
-        return globMatches(text: path, pattern: pattern, pathContext: true)
+        return pathPatternMatches(path: path, pattern: pattern, context: pathContext)
     case .read(let path):
         guard let path else { return false }
-        return globMatches(text: path, pattern: pattern, pathContext: true)
+        return pathPatternMatches(path: path, pattern: pattern, context: pathContext)
     case .grep(let path, _):
         guard let path else { return false }
-        return globMatches(text: path, pattern: pattern, pathContext: true)
+        return pathPatternMatches(path: path, pattern: pattern, context: pathContext)
     case .mcpTool(let name, _):
         return globMatches(text: name, pattern: pattern, pathContext: false)
     case .webFetch(let url):
