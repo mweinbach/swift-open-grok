@@ -645,6 +645,50 @@ config path vs `RESTART_REQUIRED_PATHS` naming `["features","code_mode"]`
 needs reconciling; `LocalShellProcessBackendTests.swift:194` remains a
 load-sensitive budget flake (one pre-fix serial occurrence, green since).
 
+#### Build-out wave 5 — 2026-08-05 (workflows live, ACP/sessions, Mermaid, debt zero)
+
+Five slices, committed individually (`55ed589`, `77d2d71`, `9fe1c47`,
+`241dd40`):
+
+- Workflows execute with **real child subagents** — capability-clamped to the
+  parent session's tool policy at surface construction, budget-exhaustion ends
+  a run before spawning, journals persist under OPENGROK_HOME, and `/workflows`
+  watches live runs.
+- `sessions list|show|delete` (async and scoped sync paths) and `open-grok acp`
+  stdio work against the built product; the launch stack is factored into
+  foundation + agent stack so ACP prompts drive the same turn-driver instance
+  as the TUI (identical gating/hooks/MCP; fail-closed writes via absent
+  permission presenter). `serve`/`leader` remain unwired pending a WebSocket
+  server transport (documented in INTEGRATION-acp.md).
+- Mermaid flowcharts and state diagrams render via a deterministic dagre port;
+  unsupported families are enumerated and fall back to showing the source.
+- Every "known trap" above is closed: JSONValue ambiguity removed;
+  restart-required config tracking was a **live bug** (the old path named a
+  nonexistent `[features]` table, so `[ui] code_mode` edits never flagged
+  restart) — reconciled to upstream's per-setting registry; `mcp add/remove`
+  write config (upstream discards comments by design; the port matches);
+  the shell-backend flake is deterministic via a test sentinel; the PTY
+  harness is real (transport/capture scenarios against the built binary;
+  inference scenarios blocked on an env-pointed provider seam, documented).
+- New test traps recorded: `--filter` matches TYPE names not display names
+  (zero-match still exits 0); under `swiftpm-testing-helper`, Bundle-based
+  resource lookup silently skips scenarios while reporting green — anchor to
+  compile-time `#filePath`; CRLF-as-one-Character bit a second subsystem
+  (VirtualScreen).
+
+Final gates over the committed tree (Swift 6.3.3):
+
+| Command | Exit |
+|---|---|
+| `swift-safe-verify.zsh test` (default parallel) | **0** — 2889 tests / 429 suites, 26.2s |
+| `swift-safe-verify.zsh test --no-parallel` | **0** — 2889 tests / 429 suites, 154.8s |
+| `swift-safe-verify.zsh build --product open-grok` | **0** |
+
+Test count 2677 → **2889** (+212). **Zero placeholder targets remain.**
+Remaining known gaps: `serve`/`leader` transport; LiveCodeMode's dead
+`[features] code_mode` fallback read (flagged to the Code Mode surface);
+inference-backed PTY harness scenarios; Linux/Windows CI.
+
 
 ## Per-crate port status (all 84 Rust crates accounted for)
 
