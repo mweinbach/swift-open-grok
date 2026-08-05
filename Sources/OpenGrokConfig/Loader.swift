@@ -247,8 +247,29 @@ public func loadMergedProjectConfig(
 /// settings ownership surface for code-mode, screen mode, and leader).
 /// Exposed so callers can flag dirty restart-required paths without
 /// reimplementing the set.
+///
+/// Upstream has no path list of its own: `restart_required` is a per-setting
+/// flag on the settings registry, and each setting names the config key it
+/// persists to. This array is the projection of that registry onto config
+/// paths, so every entry must cite the upstream key it mirrors.
+///
+/// - `["ui", "code_mode"]` — `xai-grok-pager/src/settings/defs.rs:1010`
+///   ("SHELL-owned `[ui].code_mode`", `restart_required: true`), written by
+///   `xai-grok-shell/src/util/config/settings_writes.rs:488`
+///   (`set_code_mode` → `cfg.ui.code_mode`). Pinned upstream by
+///   `xai-grok-pager/tests/settings_e2e.rs:537`
+///   (`code_mode_registry_contract_is_restart_required_and_direct_by_default`).
+///   It is **not** `["features", "code_mode"]`; no `[features]` table exists
+///   upstream.
+/// - `["ui", "screen_mode"]` —
+///   `xai-grok-pager/src/app/dispatch/settings/setters.rs:510`
+///   ("Persist `[ui].screen_mode` … Restart-required").
+/// - `["cli", "use_leader"]` — `xai-grok-shell/src/util/config/persist.rs:1089`
+///   ("Some(true) must round-trip to `[cli].use_leader`").
+/// - `["cli", "worktree_type"]` — `[cli] worktree_type`, decoded by
+///   `OpenGrokConfigTypes/RemoteSettings.swift:754`.
 public let RESTART_REQUIRED_PATHS: [PatchPath] = [
-    ["features", "code_mode"],
+    ["ui", "code_mode"],
     ["ui", "screen_mode"],
     ["cli", "use_leader"],
     ["cli", "worktree_type"],

@@ -294,7 +294,13 @@ private func targets() -> [Target] {
     // ---- Wave 11 (libraries + executable) ----
     t.append(contentsOf: libs(w11s1Lib, dep(w0s1, w0s3, w2s2, w5s6, w10s1, w10s2)))
     t.append(contentsOf: libs(w11s3Lib, dep(w10s1, w10s2, w2s4, w2s5, w0s2)))
-    t.append(contentsOf: libs(w11s5Lib, dep(w10s1, w10s2, ["OpenGrokSandbox", "OpenGrokAuth", "OpenGrokTelemetry", "OpenGrokUpdate", "OpenGrokMermaid", "OpenGrokTerminalCore", "OpenGrokCodeMode"])))
+    // `OpenGrokDistributionSupport` is on this edge so `OpenGrokReleaseValidation`
+    // can reach the package's single SHA-256 (`ReleaseChecksum.generate`, which
+    // wraps `OpenGrokBuildSupport.SHA256`) and the single release-version rule
+    // (`ReleaseVersion.isValid`). Without it, `ChecksumValidation` could only
+    // take a digest it was handed and `SmokeValidation` had to carry a second
+    // copy of the version pattern.
+    t.append(contentsOf: libs(w11s5Lib, dep(w10s1, w10s2, ["OpenGrokSandbox", "OpenGrokAuth", "OpenGrokTelemetry", "OpenGrokUpdate", "OpenGrokMermaid", "OpenGrokTerminalCore", "OpenGrokCodeMode", "OpenGrokDistributionSupport"])))
     t.append(.executableTarget(
         name: "OpenGrokExecutable",
         dependencies: dep(["OpenGrokCLI", "OpenGrokPager", "OpenGrokPagerMinimal", "OpenGrokShell", "OpenGrokVersion", "OpenGrokDistributionSupport"])
@@ -389,7 +395,9 @@ private func targets() -> [Target] {
 
     // ---- Standalone Wave 11 test/harness targets ----
     t.append(.testTarget(name: "OpenGrokCompatibilityTests", dependencies: dep(["OpenGrokPager", "OpenGrokCLI", "OpenGrokTestSupport", "OpenGrokTestUtilities", "OpenGrokACP", "OpenGrokToolProtocol", "OpenGrokSamplingTypes", "OpenGrokSampler", "OpenGrokShell"])))
-    t.append(.testTarget(name: "OpenGrokPagerPTYTests", dependencies: dep(["OpenGrokPagerPTYHarness"])))
+    // `OpenGrokPTY`/`OpenGrokTTY` are direct here because the scenarios name
+    // `ProcessExit` and `TerminalSize` in their own assertions.
+    t.append(.testTarget(name: "OpenGrokPagerPTYTests", dependencies: dep(["OpenGrokPagerPTYHarness", "OpenGrokPTY", "OpenGrokTTY"])))
     t.append(.testTarget(name: "OpenGrokFuzzingTests", dependencies: dep(["OpenGrokPager", "OpenGrokCLI", "OpenGrokMarkdownCore", "OpenGrokMarkdown", "OpenGrokSampler", "OpenGrokToolRegistry", "OpenGrokFileTools", "OpenGrokShell"])))
     t.append(.testTarget(name: "OpenGrokPerformanceTests", dependencies: dep(["OpenGrokPager", "OpenGrokCLI", "OpenGrokMarkdown", "OpenGrokSampler", "OpenGrokShell", "OpenGrokMemory"])))
     t.append(.testTarget(name: "OpenGrokSecurityTests", dependencies: dep(["OpenGrokReleaseValidation", "OpenGrokPager", "OpenGrokCLI", "OpenGrokSandbox", "OpenGrokAuth"])))

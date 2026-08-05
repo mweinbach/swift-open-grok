@@ -276,22 +276,188 @@ public enum LiveMCPComposition {
             try runList(options: options, environment: environment, streams: streams)
         case "get":
             try runGet(options: options, environment: environment, streams: streams)
-        case "add", "remove":
-            // Reading config is `TOMLValue`-based and there is no TOML
-            // serializer in the config layer, so a write would have to
-            // rewrite the user's file from a parsed tree and would lose
-            // comments and formatting. Refusing is better than corrupting.
-            throw CLIApplicationError.failed(
-                """
-                `mcp \(options.action)` is not available yet: the config layer can read \
-                config.toml but cannot write it back.
-                Edit the [mcpServers] table in your config file directly, then run \
-                `open-grok mcp list` to confirm it parses.
-                """
-            )
+        case "add":
+            try runAdd(options: options, environment: environment, streams: streams)
+        case "remove":
+            try runRemove(options: options, environment: environment, streams: streams)
         default:
             throw CLIApplicationError.failed(
                 "unknown `mcp` subcommand '\(options.action)' (expected: \(actions.sorted().joined(separator: ", ")))"
+            )
+        }
+    }
+
+    // MARK: add / remove
+
+    /// The config file `add` / `remove` edit.
+    ///
+    /// Upstream picks between user and project scope with `--scope`
+    /// (`mcp_cmd.rs:478`, `scope_target`). This CLI's resource parser has no
+    /// `--scope` flag, so the default is user scope and `--config <path>`
+    /// selects an explicit file instead.
+    static func editTarget(
+        options: CLIResourceOptions,
+        environment: [String: String],
+        cwd: URL
+    ) throws -> URL {
+        if let explicit = options.options["--config"], !explicit.isEmpty {
+            let url = URL(fileURLWithPath: explicit, relativeTo: cwd)
+            return url.standardizedFileURL
+        }
+        guard let home = userGrokHome(environment: environment) else {
+            throw CLIApplicationError.failed(
+                "cannot resolve the user config directory; pass --config <path> to choose a file"
+            )
+        }
+        return home.appendingPathComponent("config.toml")
+    }
+
+    /// Read a config file as a raw TOML document for editing.
+    ///
+    /// Mirrors upstream (`mcp.rs:865-868`): an unparseable file yields an empty
+    /// root rather than failing, because the write replaces the document
+    /// wholesale. A *missing* file returns `nil` so the two callers can differ —
+    /// `add` treats it as an empty document, `remove` reports "not found"
+    /// instead of writing a stub.
+    static func loadForEdit(at path: URL) -> TOMLValue? {
+        guard let text = try? String(contentsOf: path, encoding: .utf8) else {
+            return nil
+        }
+        return (try? parseTOML(text)) ?? .table(TOMLTable())
+    }
+
+    /// A `KEY=VALUE` positional, per upstream's `looks_like_env_pair`
+    /// (`mcp_cmd.rs:458`): a non-empty name before the first `=`.
+    static func envPair(_ token: String) -> (String, String)? {
+        guard let separator = token.firstIndex(of: "="), separator != token.startIndex else {
+            return nil
+        }
+        return (String(token[..<separator]), String(token[token.index(after: separator)...]))
+    }
+
+    /// Build the server config from the parsed CLI surface.
+    ///
+    /// `--url` (or `--transport http`/`sse`) selects the streamable-HTTP
+    /// transport; otherwise the leading `KEY=VALUE` positionals become `env`
+    /// and the remainder is the command and its arguments, matching upstream's
+    /// `resolve_add` (`mcp_cmd.rs:275`).
+    static func resolveAdd(options: CLIResourceOptions) throws -> McpServerConfig {
+        let transportType = options.options["--transport"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if let url = options.options["--url"], !url.isEmpty {
+            return McpServerConfig(
+                transport: .streamableHttp(
+                    url: url,
+                    transportType: transportType,
+                    bearerTokenEnvVar: nil,
+                    headers: nil,
+                    oauthClientId: nil,
+                    oauthClientSecretEnvVar: nil,
+                    oauthScopes: nil
+                )
+            )
+        }
+
+        var tokens = options.values
+        if let command = options.options["--command"], !command.isEmpty {
+            tokens.insert(command, at: 0)
+        }
+
+        var env: [String: String] = [:]
+        while let first = tokens.first, let pair = envPair(first) {
+            env[pair.0] = pair.1
+            tokens.removeFirst()
+        }
+
+        guard let command = tokens.first, !command.isEmpty else {
+            throw CLIApplicationError.failed(
+                """
+                `mcp add` needs a transport: pass a command (\
+                `open-grok mcp add NAME -- npx server`) or `--url <endpoint>`.
+                """
+            )
+        }
+        if transportType == "http" || transportType == "sse" {
+            throw CLIApplicationError.failed(
+                "`--transport \(transportType!)` needs `--url <endpoint>`, not a command"
+            )
+        }
+        return McpServerConfig(
+            transport: .stdio(
+                command: command,
+                args: Array(tokens.dropFirst()),
+                env: env.isEmpty ? nil : env,
+                cwd: nil
+            )
+        )
+    }
+
+    static func runAdd(
+        options: CLIResourceOptions,
+        environment: [String: String],
+        streams: CLIStreams,
+        cwd: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    ) throws {
+        guard let name = options.target, !name.isEmpty else {
+            throw CLIApplicationError.failed("`mcp add` needs a server name")
+        }
+        let path = try editTarget(options: options, environment: environment, cwd: cwd)
+        let config = try resolveAdd(options: options)
+
+        var root = loadForEdit(at: path) ?? .table(TOMLTable())
+        let replacing = mcpServerIsDefined(name, in: root)
+        if replacing && !options.force {
+            throw CLIApplicationError.failed(
+                "MCP server '\(name)' already exists in \(path.path); pass --force to replace it"
+            )
+        }
+        do {
+            try upsertMCPServer(name, config: config, in: &root)
+            try writeConfigFile(root, to: path)
+        } catch {
+            throw CLIApplicationError.failed(
+                "could not update \(path.path): \(error)"
+            )
+        }
+        streams.out(
+            "\(replacing ? "Replaced" : "Added") MCP server '\(name)' in \(path.path)\n"
+        )
+    }
+
+    static func runRemove(
+        options: CLIResourceOptions,
+        environment: [String: String],
+        streams: CLIStreams,
+        cwd: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    ) throws {
+        guard let name = options.target, !name.isEmpty else {
+            throw CLIApplicationError.failed("`mcp remove` needs a server name")
+        }
+        let path = try editTarget(options: options, environment: environment, cwd: cwd)
+
+        guard var root = loadForEdit(at: path) else {
+            throw CLIApplicationError.failed("no MCP server named '\(name)' in \(path.path)")
+        }
+        let removed: Bool
+        do {
+            removed = try removeMCPServer(name, from: &root)
+            if removed { try writeConfigFile(root, to: path) }
+        } catch {
+            throw CLIApplicationError.failed("could not update \(path.path): \(error)")
+        }
+        guard removed else {
+            throw CLIApplicationError.failed("no MCP server named '\(name)' in \(path.path)")
+        }
+        streams.out("Removed MCP server '\(name)' from \(path.path)\n")
+
+        // A scoped delete can leave the name defined in another layer, where it
+        // still resolves for sessions (upstream `mcp_cmd.rs:672-682`).
+        if let survivors = try? loadDeclarations(environment: environment, cwd: cwd),
+           let survivor = survivors.servers.first(where: { $0.name == name }) {
+            streams.err(
+                "note: '\(name)' is still defined in the \(survivor.scope ?? "merged") config\n"
             )
         }
     }

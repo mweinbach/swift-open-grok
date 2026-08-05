@@ -323,7 +323,11 @@ public enum LiveSessionsComposition {
     ) throws {
         let id = try requireIdentifier(options, action: "show")
         guard let session = try catalog.load(sessionID: id) else {
-            throw CLIApplicationError.failed("No session found with id \(id).")
+            // No trailing period: `CLIRunner` appends one when it renders the
+            // error, and Rust's period-terminated wording at
+            // `sessions_cmd.rs:192` belongs to `delete`, which prints to
+            // stdout rather than throwing.
+            throw CLIApplicationError.failed("no session found with id \(id)")
         }
         if options.json {
             streams.out(try encodeJSON(payload(for: session)) + "\n")

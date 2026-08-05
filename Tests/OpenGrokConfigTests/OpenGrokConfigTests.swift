@@ -700,8 +700,50 @@ struct AuthorityCompositionTests {
         let updated = try parseTOML("[ui]\nscreen_mode = \"minimal\"\n")
         #expect(restartRequiredChanged(from: baseline, to: updated) == true)
         #expect(restartRequiredChanged(from: baseline, to: baseline) == false)
-        let patch = try parseTOMLTable("features = { code_mode = true }")
+        let patch = try parseTOMLTable("ui = { code_mode = \"code_mode\" }")
         #expect(touchesRestartRequired(patch) == true)
+    }
+
+    /// Pins `RESTART_REQUIRED_PATHS` to the upstream settings registry.
+    ///
+    /// Upstream carries no path list — `restart_required` is a per-setting
+    /// flag and each setting names the config key it writes. Code Mode lives
+    /// at `[ui] code_mode`, cited by:
+    ///
+    /// - `xai-grok-pager/src/settings/defs.rs:1010-1012` — the registry entry
+    ///   is commented "SHELL-owned `[ui].code_mode`" and carries
+    ///   `restart_required: true`.
+    /// - `xai-grok-pager/src/settings/registry.rs:846-847` — the current value
+    ///   resolves from `ui.code_mode`.
+    /// - `xai-grok-shell/src/util/config/settings_writes.rs:488-490` —
+    ///   `set_code_mode` persists `cfg.ui.code_mode`.
+    /// - `xai-grok-pager/tests/settings_e2e.rs:537-545` — upstream's own
+    ///   contract test asserts `meta.restart_required` for key `code_mode`.
+    ///
+    /// There is no `[features]` table upstream; an earlier spelling of
+    /// `["features", "code_mode"]` here matched nothing on disk, so a
+    /// `[ui] code_mode` edit never flagged restart-required.
+    @Test("restart-required paths pin the upstream settings registry")
+    func restartRequiredPathsPinUpstream() throws {
+        #expect(
+            RESTART_REQUIRED_PATHS == [
+                ["ui", "code_mode"],
+                ["ui", "screen_mode"],
+                ["cli", "use_leader"],
+                ["cli", "worktree_type"],
+            ]
+        )
+        #expect(!RESTART_REQUIRED_PATHS.contains(["features", "code_mode"]))
+
+        // The path must match the table `[ui] code_mode` actually decodes from,
+        // so an edit to the real key is detected.
+        let before = try parseTOML("[ui]\ncode_mode = \"direct\"\n")
+        let after = try parseTOML("[ui]\ncode_mode = \"code_mode_only\"\n")
+        #expect(restartRequiredChanged(from: before, to: after) == true)
+
+        // A `[features]` table is not a config surface and must not trigger.
+        let features = try parseTOMLTable("features = { code_mode = true }")
+        #expect(touchesRestartRequired(features) == false)
     }
 }
 

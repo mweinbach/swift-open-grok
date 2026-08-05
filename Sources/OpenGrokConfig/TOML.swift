@@ -964,9 +964,12 @@ struct TOMLParser {
 
 // MARK: - TOMLEncoder
 
-/// A best-effort TOML serializer. Used for round-trip tests and diagnostics.
-/// Top-level must be a `TOMLValue.table`. Tables nest; arrays render one
-/// element per line when they contain tables.
+/// A TOML serializer. Top-level must be a `TOMLValue.table`. Tables nest;
+/// an array whose elements are all tables renders as `[[array-of-tables]]`.
+///
+/// This is the config write path (see `ConfigWrite.swift`), matching
+/// upstream's `toml::to_string_pretty` re-serialize rather than a
+/// format-preserving edit: key order is preserved, comments are not.
 public enum TOMLEncoder {
     public static func encode(_ value: TOMLValue) -> String {
         var out = ""
@@ -993,17 +996,22 @@ public enum TOMLEncoder {
                 out += "\(escapeKey(k)) = \(encodeInline(v))\n"
             }
         }
-        // Then nested tables.
+        // Then nested tables. A blank line separates each header from what
+        // precedes it, but never leads the document.
+        func header(_ text: String, into out: inout String) {
+            if !out.isEmpty { out += "\n" }
+            out += text + "\n"
+        }
         for (k, inner) in nestedTables {
             let path = prefix + [k]
-            out += "\n[\(path.map(escapeKey).joined(separator: "."))]\n"
+            header("[\(path.map(escapeKey).joined(separator: "."))]", into: &out)
             encodeTable(inner, into: &out, prefix: path)
         }
         for (k, arr) in nestedArrayTables {
             let path = prefix + [k]
             for el in arr {
                 if case let .table(t) = el {
-                    out += "\n[[\(path.map(escapeKey).joined(separator: "."))]]\n"
+                    header("[[\(path.map(escapeKey).joined(separator: "."))]]", into: &out)
                     encodeTable(t, into: &out, prefix: path)
                 }
             }
@@ -1029,10 +1037,23 @@ public enum TOMLEncoder {
     }
 
     static func escapeKey(_ k: String) -> String {
-        // Bare-key charset: A-Za-z0-9-_.
-        if !k.isEmpty && k.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }) {
-            return k
+        // Bare-key charset is ASCII-only: A-Za-z0-9_-. `Character.isLetter`
+        // and `.isNumber` are true for non-ASCII scalars (e.g. "é", "٣"), so
+        // testing them alone would emit an unquoted key TOML cannot parse.
+        let isBare = k.allSatisfy { c in
+            guard let ascii = c.asciiValue else { return false }
+            switch ascii {
+            case UInt8(ascii: "A")...UInt8(ascii: "Z"),
+                 UInt8(ascii: "a")...UInt8(ascii: "z"),
+                 UInt8(ascii: "0")...UInt8(ascii: "9"):
+                return true
+            case UInt8(ascii: "_"), UInt8(ascii: "-"):
+                return true
+            default:
+                return false
+            }
         }
+        if !k.isEmpty && isBare { return k }
         return escapeBasicString(k)
     }
 

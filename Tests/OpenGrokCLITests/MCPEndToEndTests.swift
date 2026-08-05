@@ -497,28 +497,121 @@ struct MCPCLIRouteTests {
         }
     }
 
-    @Test("mcp add and remove explain that config writing is unavailable")
+    /// `add` and `remove` used to refuse outright, because the config layer had
+    /// no serializer. They are implemented now, so this covers the round trip
+    /// through the user config file rather than the old refusal wording.
+    @Test("mcp add writes a server that list and remove then see")
+    func addThenRemoveRoundTrips() throws {
+        let (root, environment) = try home("")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let (addStreams, addOut, _) = CLIStreams.buffered()
+        try LiveMCPComposition.run(
+            options: CLIResourceOptions(
+                action: "add",
+                target: "files",
+                values: ["mcp-files", "--root", "/tmp"]
+            ),
+            environment: environment,
+            streams: addStreams
+        )
+        #expect(addOut.contents.contains("files"))
+
+        // The write landed in the user config, and `list` reads it back.
+        let written = try String(
+            contentsOf: root.appendingPathComponent("config.toml"), encoding: .utf8
+        )
+        #expect(written.contains("[mcp_servers.files]"))
+        #expect(written.contains("command = \"mcp-files\""))
+
+        let (listStreams, listOut, _) = CLIStreams.buffered()
+        try LiveMCPComposition.run(
+            options: CLIResourceOptions(action: "list"),
+            environment: environment,
+            streams: listStreams
+        )
+        #expect(listOut.contents.contains("files"))
+
+        let (removeStreams, removeOut, _) = CLIStreams.buffered()
+        try LiveMCPComposition.run(
+            options: CLIResourceOptions(action: "remove", target: "files"),
+            environment: environment,
+            streams: removeStreams
+        )
+        #expect(removeOut.contents.contains("Removed"))
+        let after = try String(
+            contentsOf: root.appendingPathComponent("config.toml"), encoding: .utf8
+        )
+        #expect(!after.contains("mcp_servers"))
+    }
+
+    /// Adding over an existing name needs `--force`, so a stray `mcp add`
+    /// cannot silently replace a hand-written entry.
+    @Test("mcp add refuses to overwrite an existing server without --force")
+    func addRefusesToClobber() throws {
+        let (root, environment) = try home("""
+        [mcp_servers.files]
+        command = "original"
+        """)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let (streams, _, _) = CLIStreams.buffered()
+        var caught: CLIApplicationError?
+        do {
+            try LiveMCPComposition.run(
+                options: CLIResourceOptions(
+                    action: "add", target: "files", values: ["replacement"]
+                ),
+                environment: environment,
+                streams: streams
+            )
+        } catch let error as CLIApplicationError {
+            caught = error
+        }
+        let error = try #require(caught)
+        #expect(error.description.contains("already exists"))
+        #expect(error.description.contains("--force"))
+
+        // The original entry survived the refusal.
+        let written = try String(
+            contentsOf: root.appendingPathComponent("config.toml"), encoding: .utf8
+        )
+        #expect(written.contains("original"))
+    }
+
+    /// The actionable-error path is kept for input that cannot be satisfied.
+    @Test("mcp add and remove still fail actionably on bad input")
     func addAndRemoveAreActionable() throws {
         let (root, environment) = try home("")
         defer { try? FileManager.default.removeItem(at: root) }
 
-        for action in ["add", "remove"] {
-            let (streams, _, _) = CLIStreams.buffered()
-            var caught: CLIApplicationError?
-            do {
-                try LiveMCPComposition.run(
-                    options: CLIResourceOptions(action: action, target: "files"),
-                    environment: environment,
-                    streams: streams
-                )
-            } catch let error as CLIApplicationError {
-                caught = error
-            }
-            let error = try #require(caught)
-            // The message must tell the user what to do instead.
-            #expect(error.description.contains("cannot write it back"))
-            #expect(error.description.contains("mcpServers"))
+        // `add` with neither a command nor a URL has no transport to record.
+        let (addStreams, _, _) = CLIStreams.buffered()
+        var addError: CLIApplicationError?
+        do {
+            try LiveMCPComposition.run(
+                options: CLIResourceOptions(action: "add", target: "files"),
+                environment: environment,
+                streams: addStreams
+            )
+        } catch let error as CLIApplicationError {
+            addError = error
         }
+        #expect(try #require(addError).description.contains("needs a transport"))
+
+        // `remove` of a name that was never declared says so.
+        let (removeStreams, _, _) = CLIStreams.buffered()
+        var removeError: CLIApplicationError?
+        do {
+            try LiveMCPComposition.run(
+                options: CLIResourceOptions(action: "remove", target: "files"),
+                environment: environment,
+                streams: removeStreams
+            )
+        } catch let error as CLIApplicationError {
+            removeError = error
+        }
+        #expect(try #require(removeError).description.contains("no MCP server named 'files'"))
     }
 
     @Test("an unknown subcommand lists the ones that exist")

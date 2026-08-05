@@ -30,20 +30,6 @@
 import Foundation
 import OpenGrokShared
 
-/// Local extension adding `uint64Value` to `JSONValue` to mirror the
-/// `OpenGrokCLIChatProxyTypes.JSONValue.uint64Value` accessor. The
-/// `OpenGrokShared.JSONValue` exposes only `int64Value` directly;
-/// `uint64Value` lives on its `JSONNumber` payload. The code-mode
-/// pragma parser needs `UInt64` semantics (yield_time_ms is u64 in the
-/// Rust source), so this extension bridges the gap without modifying
-/// `OpenGrokShared`.
-extension OpenGrokShared.JSONValue {
-    public var uint64Value: UInt64? {
-        if case .number(let n) = self { return n.uint64Value }
-        return nil
-    }
-}
-
 /// First-line pragma prefix recognized by `parseExecSource`.
 public let CODE_MODE_PRAGMA_PREFIX: String = "// @exec:"
 

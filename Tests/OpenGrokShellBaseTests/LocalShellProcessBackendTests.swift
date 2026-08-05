@@ -171,11 +171,29 @@ struct LocalShellProcessBackendTests {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let backend = LocalShellProcessBackend()
+
+        // The child blocks on a sentinel file this test creates rather than on
+        // a fixed `sleep`. With a timed child, "still running when we snapshot
+        // it" was a race the test lost whenever scheduling slipped past the
+        // sleep — a load-sensitive flake. Gating on the sentinel makes the
+        // still-running window last until the test chooses to end it, so the
+        // `completed == false` assertion below proves what it always meant to:
+        // the work really was handed to the background, not run to completion
+        // in the foreground. The bounded loop is a safety net so a regression
+        // fails the request timeout instead of hanging.
+        let release = directory.appendingPathComponent("release")
+        let command = """
+            for _ in $(seq 1 400); do
+              [ -f '\(release.path)' ] && break
+              sleep 0.05
+            done
+            printf 'finished'
+            """
         let result = try await backend.run(
             ShellCommandRequest(
-                command: "sleep 1; printf 'finished'",
+                command: command,
                 workingDirectory: directory,
-                timeout: .seconds(5),
+                timeout: .seconds(30),
                 toolCallID: "call-auto-background",
                 autoBackgroundOnTimeout: true,
                 foregroundBlockBudget: .milliseconds(50),
@@ -190,7 +208,9 @@ struct LocalShellProcessBackendTests {
         let running = await backend.getTask(taskID)
         #expect(running?.isBackgrounded == true)
         #expect(running?.completed == false)
-        let completed = await backend.waitForCompletion(taskID, timeout: .seconds(5))
+
+        try Data().write(to: release)
+        let completed = await backend.waitForCompletion(taskID, timeout: .seconds(30))
         #expect(completed?.completed == true)
         #expect(completed?.output == "finished")
         #endif

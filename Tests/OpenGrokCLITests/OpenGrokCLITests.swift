@@ -213,14 +213,105 @@ struct OpenGrokCLITests {
         #expect(modelErr.contents.isEmpty)
     }
 
+    /// Routes that genuinely need the async launcher must say so rather than
+    /// exiting zero.
+    ///
+    /// `mcp` is deliberately absent: `LiveMCPComposition.run` is synchronous,
+    /// so `CLIRunner.main` serves it directly and it no longer needs a
+    /// launcher. `mcpRunsOnTheSyncPath` below covers that.
+    ///
+    /// `session list` is absent for the same reason
+    /// (`sessionsRunOnTheSyncPath`). `session new` takes its place here: it
+    /// belongs to the launch path, so it must still fail closed — that is what
+    /// proves the sync case is scoped to the three read/delete actions rather
+    /// than swallowing the whole route. `acp` and `serve` stay because they
+    /// genuinely need the async seam.
     @Test("recognized runtime routes fail explicitly without a launcher")
     func unsupportedRoutesFailClosed() {
-        for args in [["interactive"], ["minimal"], ["acp"], ["serve"], ["session", "list"], ["plugin", "list"], ["mcp", "list"], ["workflow", "list"]] {
+        for args in [["interactive"], ["minimal"], ["acp"], ["serve"], ["session", "new"], ["plugin", "list"], ["workflow", "list"]] {
             let (streams, out, err) = CLIStreams.buffered()
             let code = CLIRunner.main(args, environment: [:], streams: streams)
             #expect(code == CLIRunner.ExitCode.notImplemented.rawValue)
             #expect(out.contents.isEmpty)
             #expect(err.contents.contains("unavailable"))
         }
+    }
+
+    /// The `mcp` route runs on the synchronous path with no application seam.
+    @Test("mcp runs on the sync path instead of reporting notImplemented")
+    func mcpRunsOnTheSyncPath() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("cli-mcp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = ["OPENGROK_HOME": root.path, "HOME": root.path]
+
+        let (streams, out, _) = CLIStreams.buffered()
+        let code = CLIRunner.main(["mcp", "list"], environment: environment, streams: streams)
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(out.contents.contains("No MCP servers configured."))
+
+        // A bad subcommand on the same path is still a failure, not a silent zero.
+        let (badStreams, _, badErr) = CLIStreams.buffered()
+        let badCode = CLIRunner.main(
+            ["mcp", "nonsense"], environment: environment, streams: badStreams
+        )
+        #expect(badCode == CLIRunner.ExitCode.failure.rawValue)
+        #expect(badErr.contents.contains("nonsense"))
+    }
+
+    /// `sessions list|show|delete` runs on the synchronous path, following the
+    /// same precedent as `mcp`: `LiveSessionsComposition.run` is synchronous,
+    /// so `CLIRunner.main` serves it with no application seam.
+    @Test("sessions list, show and delete run on the sync path")
+    func sessionsRunOnTheSyncPath() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("cli-sessions-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("sessions"), withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = ["OPENGROK_HOME": root.path, "HOME": root.path]
+
+        // Empty store: the route answers rather than reporting notImplemented.
+        let (listStreams, listOut, _) = CLIStreams.buffered()
+        let listCode = CLIRunner.main(
+            ["sessions", "list"], environment: environment, streams: listStreams
+        )
+        #expect(listCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(listOut.contents == "No sessions found.\n")
+
+        // A session written the way a live run writes one, then read back.
+        let record = """
+            {"sessionID":"cli-demo","workingDirectory":"/work/repo",\
+            "createdAt":740000000,"updatedAt":740000500,\
+            "items":[{"type":"user","content":[{"type":"text","text":"Ship the parser"}]}]}
+            """
+        try Data(record.utf8).write(
+            to: root.appendingPathComponent("sessions/cli-demo.json")
+        )
+
+        let (showStreams, showOut, _) = CLIStreams.buffered()
+        let showCode = CLIRunner.main(
+            ["sessions", "show", "cli-demo"], environment: environment, streams: showStreams
+        )
+        #expect(showCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(showOut.contents.contains("Session:    cli-demo"))
+        #expect(showOut.contents.contains("Ship the parser"))
+
+        let (deleteStreams, deleteOut, _) = CLIStreams.buffered()
+        let deleteCode = CLIRunner.main(
+            ["sessions", "delete", "cli-demo"], environment: environment, streams: deleteStreams
+        )
+        #expect(deleteCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(deleteOut.contents == "Deleted session cli-demo\n")
+
+        // An unknown id is a failure on the same path, not a silent zero.
+        let (badStreams, _, badErr) = CLIStreams.buffered()
+        let badCode = CLIRunner.main(
+            ["sessions", "show", "ghost"], environment: environment, streams: badStreams
+        )
+        #expect(badCode == CLIRunner.ExitCode.failure.rawValue)
+        #expect(badErr.contents.contains("ghost"))
     }
 }

@@ -25,6 +25,7 @@
 // only inside the isolated root.
 
 import Foundation
+import OpenGrokDistributionSupport
 
 /// Smoke assertions over a release binary's `--version` output and the paths an
 /// isolated install touched.
@@ -46,35 +47,13 @@ public enum SmokeValidation {
     /// Whether `candidate` matches the reference's release version pattern:
     /// `^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$`.
     ///
-    /// Duplicated from the shell scripts rather than imported: this target has
-    /// no `Package.swift` edge to `OpenGrokDistributionSupport`, where
-    /// `ReleaseVersion.isValid` implements the same rule. Adding that edge
-    /// collapses the two.
+    /// Forwards to `ReleaseVersion.isValid`, which owns that pattern. This
+    /// target used to carry a second copy because it had no dependency edge to
+    /// `OpenGrokDistributionSupport`; the edge now exists, so the rule has one
+    /// implementation. Unlike `ReleaseVersion.init(_:)` this does not strip a
+    /// leading `v` — `--version` output is scanned for a bare version token.
     public static func isWellFormedVersion(_ candidate: String) -> Bool {
-        var rest = Substring(candidate)
-
-        for index in 0..<3 {
-            let digits = rest.prefix { $0.isASCII && $0.isNumber }
-            if digits.isEmpty { return false }
-            rest = rest.dropFirst(digits.count)
-            if index < 2 {
-                guard rest.first == "." else { return false }
-                rest = rest.dropFirst()
-            }
-        }
-
-        if rest.isEmpty { return true }
-        guard rest.first == "-" else { return false }
-        rest = rest.dropFirst()
-
-        while true {
-            let group = rest.prefix { $0.isASCII && ($0.isNumber || $0.isLetter) }
-            if group.isEmpty { return false }
-            rest = rest.dropFirst(group.count)
-            if rest.isEmpty { return true }
-            guard rest.first == "." || rest.first == "-" else { return false }
-            rest = rest.dropFirst()
-        }
+        ReleaseVersion.isValid(candidate)
     }
 
     /// Validate `--version` output against the release being built.

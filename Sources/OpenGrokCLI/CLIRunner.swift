@@ -30,6 +30,45 @@ public enum CLIRunner {
         case .models(let options):
             writeModels(options: options, streams: streams)
             return ExitCode.success.rawValue
+        case .mcp(let options):
+            // `LiveMCPComposition.run` is synchronous, so the `mcp` route needs
+            // nothing from the async application seam and no longer has to
+            // report itself unsupported on this path.
+            do {
+                try LiveMCPComposition.run(
+                    options: options, environment: environment, streams: streams
+                )
+                return ExitCode.success.rawValue
+            } catch let error as CLIApplicationError {
+                streams.err("open-grok: \(error.description).\n")
+                return error.isUnsupported
+                    ? ExitCode.notImplemented.rawValue
+                    : ExitCode.failure.rawValue
+            } catch {
+                streams.err("open-grok: \(error).\n")
+                return ExitCode.failure.rawValue
+            }
+        // `sessions list|show|delete` reads and writes the session directory
+        // synchronously, so like `mcp` it needs nothing from the async
+        // application seam. The `where` clause is load-bearing: `new`,
+        // `resume`, `restore` and `export` belong to the launch path, so they
+        // must keep falling through to the fail-closed default rather than
+        // being silently accepted here.
+        case .sessions(let options) where LiveSessionsComposition.actions.contains(options.action):
+            do {
+                try LiveSessionsComposition.run(
+                    options: options, environment: environment, streams: streams
+                )
+                return ExitCode.success.rawValue
+            } catch let error as CLIApplicationError {
+                streams.err("open-grok: \(error.description).\n")
+                return error.isUnsupported
+                    ? ExitCode.notImplemented.rawValue
+                    : ExitCode.failure.rawValue
+            } catch {
+                streams.err("open-grok: \(error).\n")
+                return ExitCode.failure.rawValue
+            }
         case .invalid(let error):
             writeUsageError(error, streams: streams)
             return ExitCode.usage.rawValue

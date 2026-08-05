@@ -116,12 +116,25 @@ struct PagerPTYScenarioTests {
 
 @Suite("Virtual screen")
 struct VirtualScreenTests {
-    @Test("printable text and newlines land on the grid")
+    @Test("printable text and CRLF land on the grid")
     func plainText() {
         var screen = VirtualScreen(width: 10, height: 3)
-        screen.feed("hello\nworld")
+        screen.feed("hello\r\nworld")
         #expect(screen.lines == ["hello", "world", ""])
         #expect(screen.text == "hello\nworld")
+    }
+
+    /// A bare line feed moves down a row but does **not** return to column
+    /// zero — that is `\r`'s job. This is real terminal behaviour and the
+    /// reason PTY output arrives as CRLF: the tty driver's ONLCR translates
+    /// `\n` to `\r\n` on the way out, so the harness sees both bytes. Treating
+    /// a lone `\n` as "next line, column zero" would silently mis-render any
+    /// output that relies on the distinction, so it is pinned here.
+    @Test("a bare line feed keeps the column")
+    func bareLineFeedKeepsColumn() {
+        var screen = VirtualScreen(width: 10, height: 2)
+        screen.feed("hello\nworld")
+        #expect(screen.lines == ["hello", "     world"])
     }
 
     @Test("carriage return overwrites the current row")
@@ -170,7 +183,7 @@ struct VirtualScreenTests {
     @Test("output longer than the screen scrolls the top away")
     func scrolling() {
         var screen = VirtualScreen(width: 5, height: 2)
-        screen.feed("one\ntwo\nthree")
+        screen.feed("one\r\ntwo\r\nthree")
         #expect(screen.lines == ["two", "three"])
     }
 

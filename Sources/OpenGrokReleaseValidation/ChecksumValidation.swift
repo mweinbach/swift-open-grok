@@ -17,6 +17,7 @@
 // failure that leaves nothing installed.
 
 import Foundation
+import OpenGrokDistributionSupport
 
 /// One artifact and the sidecar that claims to describe it.
 public struct ChecksumClaim: Sendable, Hashable {
@@ -122,5 +123,66 @@ public enum ChecksumValidation {
             report.merge(validate(claim))
         }
         return report
+    }
+
+    // MARK: - Hashing artifacts directly
+
+    /// Build a claim by hashing `data` here rather than trusting a digest the
+    /// caller computed.
+    ///
+    /// The digest comes from `ReleaseChecksum.generate`, which wraps the
+    /// package's single SHA-256 (`OpenGrokBuildSupport.SHA256`), so validation
+    /// and sidecar generation can never diverge on the hash. Before the
+    /// `OpenGrokDistributionSupport` dependency edge existed this target could
+    /// only accept `actualDigest` as an input.
+    public static func claim(
+        artifactName: String,
+        contents data: Data,
+        sidecarContents: String
+    ) -> ChecksumClaim {
+        ChecksumClaim(
+            artifactName: artifactName,
+            sidecarContents: sidecarContents,
+            actualDigest: ReleaseChecksum.generate(
+                for: data, artifactName: artifactName
+            )?.digest ?? ""
+        )
+    }
+
+    /// Verify an artifact on disk against the sidecar beside it.
+    ///
+    /// A file that cannot be read is a failure, not a skip: the gate must not
+    /// pass because an artifact was missing.
+    public static func validate(
+        artifactName: String,
+        at artifact: URL,
+        sidecar: URL
+    ) -> ReleaseValidationReport {
+        var report = ReleaseValidationReport()
+        guard let data = try? Data(contentsOf: artifact) else {
+            report.record(ReleaseValidationFinding(
+                id: "checksum.unreadableArtifact",
+                severity: .failure,
+                subject: artifactName,
+                message: "could not read artifact at \(artifact.path)"
+            ))
+            return report
+        }
+        guard let sidecarContents = try? String(contentsOf: sidecar, encoding: .utf8) else {
+            report.record(ReleaseValidationFinding(
+                id: "checksum.unreadableSidecar",
+                severity: .failure,
+                subject: artifactName,
+                message: "could not read checksum sidecar at \(sidecar.path)"
+            ))
+            return report
+        }
+        return validate(
+            claim(
+                artifactName: artifactName,
+                contents: data,
+                sidecarContents: sidecarContents
+            )
+        )
     }
 }
