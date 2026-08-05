@@ -519,6 +519,11 @@ public func projectResponsesRequestBody(
     if let key = adapter.promptCacheKey(sessionId: req.xGrokSessionId) {
         body["prompt_cache_key"] = .string(key)
     }
+    // Standard routing is the absence of the field, not `service_tier:
+    // "default"`, so only a concrete tier id reaches the wire.
+    if let tier = normalizedServiceTier(req.serviceTier) {
+        body["service_tier"] = .string(tier)
+    }
 
     var value = JSONValue.object(body)
     adapter.patchResponsesRequest(&value, policy: policy)
@@ -538,6 +543,7 @@ public struct SamplingClientDefaults: Sendable {
     public var idleTimeoutSecs: UInt64?
     public var codexMultiAgentV2: Bool
     public var reasoningEffort: ReasoningEffort?
+    public var serviceTier: String?
     public var reasoningSummary: ReasoningSummary?
     public var doomLoopRecovery: DoomLoopRecoveryPolicy?
 
@@ -553,6 +559,7 @@ public struct SamplingClientDefaults: Sendable {
         self.idleTimeoutSecs = config.idleTimeoutSecs
         self.codexMultiAgentV2 = config.codexMultiAgentV2
         self.reasoningEffort = config.reasoningEffort
+        self.serviceTier = config.serviceTier
         self.reasoningSummary = config.reasoningSummary
         self.doomLoopRecovery = config.doomLoopRecovery
     }

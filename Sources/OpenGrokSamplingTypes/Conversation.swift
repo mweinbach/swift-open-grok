@@ -168,6 +168,17 @@ public enum ConversationItem: Codable, Sendable, Equatable, Hashable {
         .user(UserItem(content: [.text(text: content)], syntheticReason: .schedulerFired))
     }
 
+    /// Mailbox message delivered from a peer agent in the same collaboration
+    /// team. Tagged distinctly from the completion auto-wakes so trace tooling
+    /// and compaction can tell peer traffic apart from lifecycle events.
+    ///
+    /// Mirrors Rust `ConversationItem::agent_message`
+    /// (`xai-grok-sampling-types/src/conversation.rs:2497-2510`, commit
+    /// aa39b8cf).
+    public static func agentMessage(_ content: String) -> Self {
+        .user(UserItem(content: [.text(text: content)], syntheticReason: .agentMessage))
+    }
+
     /// Create an assistant message.
     public static func assistant(_ content: String) -> Self {
         .assistant(AssistantItem(content: content))

@@ -7,6 +7,7 @@
 import Foundation
 import OpenGrokSamplingTypes
 import OpenGrokShared
+import OpenGrokVersion
 
 /// Process-level fallback for the `x-grok-client-identifier` header.
 public let DEFAULT_CLIENT_IDENTIFIER = "grok-shell"
@@ -152,9 +153,14 @@ extension ProviderAdapter {
     public func applyDefaultHeaders(_ headers: inout [String: String], config: SamplerConfig) {
         sanitizeHeaders(&headers)
         guard profile.requestMetadata == .xGrokHeaders else { return }
-        if let v = config.clientVersion, !v.isEmpty {
-            headers["x-grok-client-version"] = v
-        }
+        // xAI's API gates requests on a parseable client version and rejects
+        // absent/unparseable ones with 426 ("version (none)"). The session's
+        // configured clientVersion is legitimately nil on cross-provider paths
+        // (a Codex-parented subagent overriding to a Grok model), so fall back
+        // to this build's own version, normalized to base semver: the fork's
+        // `-open-grok.N` pre-release suffix is not part of the version grammar
+        // the gate parses.
+        headers["x-grok-client-version"] = baseSemVerClientVersion(config.clientVersion)
         if let v = config.deploymentId, !v.isEmpty {
             headers["x-grok-deployment-id"] = v
         }
@@ -179,12 +185,14 @@ extension ProviderAdapter {
             break
         case .some(.codex):
             patchCodexResponsesRequest(&body, policy: policy)
+        case .some(.deepSeek):
+            patchDeepSeekResponsesRequest(&body, policy: policy)
         }
     }
 
     public func promptCacheKey(sessionId: String?) -> String? {
         switch profile.responsesDialect {
-        case .none, .some(.xai):
+        case .none, .some(.xai), .some(.deepSeek):
             return nil
         case .some(.codex):
             guard let sessionId, !sessionId.isEmpty else { return nil }
@@ -225,7 +233,7 @@ extension ProviderAdapter {
         guard isMetadata else { return false }
 
         switch profile.responsesDialect {
-        case .none, .some(.xai):
+        case .none, .some(.xai), .some(.deepSeek):
             break
         case .some(.codex):
             if let headersObj = parsed?["headers"]?.objectValue {
@@ -249,7 +257,8 @@ extension ProviderAdapter {
     public var normalizesResponseEvents: Bool {
         switch profile.responsesDialect {
         case .none: return false
-        case .some(.xai), .some(.codex): return true
+        // Every dialect needs the dependency-boundary compatibility pass.
+        case .some(.xai), .some(.codex), .some(.deepSeek): return true
         }
     }
 
@@ -295,6 +304,40 @@ public struct FireworksProvider: ProviderAdapter {
     }
 }
 
+public struct DeepSeekProvider: ProviderAdapter {
+    public init() {}
+    public var provider: ModelProvider { .deepseek }
+
+    public func sanitizeChatRequest(_ request: inout ChatCompletionWireRequest) {
+        for i in request.messages.indices {
+            request.messages[i].modelId = nil
+        }
+    }
+}
+
+public struct OpenCodeGoProvider: ProviderAdapter {
+    public init() {}
+    public var provider: ModelProvider { .openCodeGo }
+
+    public func sanitizeChatRequest(_ request: inout ChatCompletionWireRequest) {
+        for i in request.messages.indices {
+            request.messages[i].modelId = nil
+        }
+    }
+}
+
+/// Wafer AI is an ordinary OpenAI-compatible Chat Completions provider.
+public struct WaferProvider: ProviderAdapter {
+    public init() {}
+    public var provider: ModelProvider { .wafer }
+
+    public func sanitizeChatRequest(_ request: inout ChatCompletionWireRequest) {
+        for i in request.messages.indices {
+            request.messages[i].modelId = nil
+        }
+    }
+}
+
 // MARK: - Registry
 
 public struct ProviderRegistration: Sendable {
@@ -311,6 +354,9 @@ private let xaiProvider = XaiProvider()
 private let codexProvider = CodexProvider()
 private let kimiProvider = KimiProvider()
 private let fireworksProvider = FireworksProvider()
+private let deepSeekProvider = DeepSeekProvider()
+private let openCodeGoProvider = OpenCodeGoProvider()
+private let waferProvider = WaferProvider()
 
 /// Complete registry for the built-in providers.
 public let PROVIDER_REGISTRY: [ProviderRegistration] = [
@@ -318,6 +364,9 @@ public let PROVIDER_REGISTRY: [ProviderRegistration] = [
     ProviderRegistration(provider: .codex, adapter: codexProvider),
     ProviderRegistration(provider: .kimi, adapter: kimiProvider),
     ProviderRegistration(provider: .fireworks, adapter: fireworksProvider),
+    ProviderRegistration(provider: .deepseek, adapter: deepSeekProvider),
+    ProviderRegistration(provider: .openCodeGo, adapter: openCodeGoProvider),
+    ProviderRegistration(provider: .wafer, adapter: waferProvider),
 ]
 
 /// Look up the stateless transport adapter for a built-in provider.
@@ -327,6 +376,9 @@ public func providerAdapter(_ provider: ModelProvider) -> any ProviderAdapter {
     case .codex: return codexProvider
     case .kimi: return kimiProvider
     case .fireworks: return fireworksProvider
+    case .deepseek: return deepSeekProvider
+    case .openCodeGo: return openCodeGoProvider
+    case .wafer: return waferProvider
     }
 }
 
@@ -380,6 +432,18 @@ public final class CodexTurnState: @unchecked Sendable {
 }
 
 // MARK: - Helpers
+
+/// Resolve the `x-grok-client-version` value: the configured version when it
+/// is non-empty, otherwise this build's own version, truncated at the first
+/// `-` or `+` so only the base semver reaches xAI's version gate.
+func baseSemVerClientVersion(_ configured: String?) -> String {
+    let resolved: String = {
+        if let configured, !configured.isEmpty { return configured }
+        return OpenGrokVersion.installed()
+    }()
+    let base = resolved.prefix { $0 != "-" && $0 != "+" }
+    return base.isEmpty ? resolved : String(base)
+}
 
 func removeXGrokHeaders(_ headers: inout [String: String]) {
     headers = headers.filter { !$0.key.lowercased().hasPrefix("x-grok-") }
@@ -472,6 +536,62 @@ func patchCodexResponsesRequest(_ body: inout JSONValue, policy: ResponsesReques
     input.insert(modeItem, at: insertAt)
 
     obj["input"] = .array(input)
+    body = .object(obj)
+}
+
+/// Fields DeepSeek's stateless Responses endpoint does not support. They are
+/// silently ignored on the wire, so omitting them avoids implying continuity,
+/// storage, or provider-side cache controls that do not exist.
+let DEEPSEEK_UNSUPPORTED_RESPONSES_FIELDS = [
+    "background",
+    "conversation",
+    "context_management",
+    "include",
+    "metadata",
+    "previous_response_id",
+    "prompt",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "safety_identifier",
+    "service_tier",
+    "store",
+    "stream_options",
+    "truncation",
+]
+
+func patchDeepSeekResponsesRequest(_ body: inout JSONValue, policy: ResponsesRequestPolicy) {
+    guard case .object(var obj) = body else { return }
+
+    for field in DEEPSEEK_UNSUPPORTED_RESPONSES_FIELDS {
+        obj.removeValue(forKey: field)
+    }
+
+    // DeepSeek accepts `reasoning.summary` for compatibility but does not
+    // generate one. Its documented Responses effort set is none/low/high/max,
+    // so normalize Open Grok's broader menu explicitly.
+    let effort: String? = policy.localEffort.map { effort in
+        switch effort {
+        case .none: return "none"
+        case .minimal, .low: return "low"
+        case .medium, .high, .xhigh: return "high"
+        case .max, .ultra: return "max"
+        }
+    }
+
+    if case .object(var reasoning) = obj["reasoning"] {
+        reasoning.removeValue(forKey: "summary")
+        if let effort {
+            reasoning["effort"] = .string(effort)
+        }
+        obj["reasoning"] = .object(reasoning)
+    } else if let effort {
+        obj["reasoning"] = .object(["effort": .string(effort)])
+    }
+
+    if case .object(let reasoning) = obj["reasoning"], reasoning.isEmpty {
+        obj.removeValue(forKey: "reasoning")
+    }
+
     body = .object(obj)
 }
 

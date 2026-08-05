@@ -748,7 +748,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
             switch entry.info.provider {
             case .codex:
                 entry.info.apiBackend = .responses
-            case .xai, .kimi, .fireworks:
+            case .xai, .kimi, .fireworks, .deepseek, .openCodeGo, .wafer:
                 entry.info.apiBackend = .chatCompletions
             }
             if baseURL == nil { entry.info.baseURL = "" }

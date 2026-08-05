@@ -588,6 +588,9 @@ public final class SamplingClient: @unchecked Sendable {
         if request.reasoningEffort == nil {
             request.reasoningEffort = defaults.reasoningEffort
         }
+        if request.serviceTier == nil {
+            request.serviceTier = defaults.serviceTier
+        }
     }
 
     private func extractModelMetadata(from headers: [String: String]) -> ResponseModelMetadata? {

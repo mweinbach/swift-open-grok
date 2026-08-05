@@ -50,11 +50,15 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
     case codex
     case kimi
     case fireworks
+    case deepseek
+    case openCodeGo
+    case wafer
 
     public static let defaultValue: ModelProvider = .xai
 
     public enum CodingKeys: String, CodingKey {
-        case xai, codex, kimi, fireworks
+        case xai, codex, kimi, fireworks, deepseek, wafer
+        case openCodeGo = "opencode_go"
     }
 
     public init(from decoder: Decoder) throws {
@@ -65,6 +69,9 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case "codex", "openai", "openai_codex": self = .codex
         case "kimi", "moonshot", "moonshot_ai": self = .kimi
         case "fireworks", "fireworks_ai": self = .fireworks
+        case "deepseek", "deep_seek", "deepseek_api": self = .deepseek
+        case "opencode_go", "opencode-go": self = .openCodeGo
+        case "wafer", "wafer_ai": self = .wafer
         default:
             throw DecodingError.dataCorruptedError(
                 in: container,
@@ -85,6 +92,9 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .codex: return "codex"
         case .kimi: return "kimi"
         case .fireworks: return "fireworks"
+        case .deepseek: return "deepseek"
+        case .openCodeGo: return "opencode_go"
+        case .wafer: return "wafer"
         }
     }
 
@@ -95,6 +105,9 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .codex: return "OpenAI Codex"
         case .kimi: return "Kimi"
         case .fireworks: return "Fireworks AI"
+        case .deepseek: return "DeepSeek"
+        case .openCodeGo: return "OpenCode Go"
+        case .wafer: return "Wafer AI"
         }
     }
 
@@ -102,6 +115,9 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
     public var isCodex: Bool { self == .codex }
     public var isKimi: Bool { self == .kimi }
     public var isFireworks: Bool { self == .fireworks }
+    public var isDeepSeek: Bool { self == .deepseek }
+    public var isOpenCodeGo: Bool { self == .openCodeGo }
+    public var isWafer: Bool { self == .wafer }
 
     /// Return the built-in provider's complete behavior policy.
     public var profile: ProviderProfile {
@@ -110,6 +126,9 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .codex: return .codex
         case .kimi: return .kimi
         case .fireworks: return .fireworks
+        case .deepseek: return .deepseek
+        case .openCodeGo: return .openCodeGo
+        case .wafer: return .wafer
         }
     }
 }
@@ -123,16 +142,21 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
 public enum ResponsesDialect: String, Codable, Sendable, Equatable, Hashable {
     case xai
     case codex
+    /// DeepSeek's native OpenAI-compatible Responses API (V4 Flash and later).
+    /// Stateless (`store: false`), with DeepSeek-owned reasoning-effort mapping.
+    case deepSeek = "deepseek"
 
     public var asString: String {
         switch self {
         case .xai: return "xai"
         case .codex: return "codex"
+        case .deepSeek: return "deepseek"
         }
     }
 
     public var isXai: Bool { self == .xai }
     public var isCodex: Bool { self == .codex }
+    public var isDeepSeek: Bool { self == .deepSeek }
 }
 
 // MARK: - HostedToolDialect
@@ -300,6 +324,9 @@ public struct ProviderProfile: Codable, Sendable, Equatable, Hashable {
     public var isCodex: Bool { provider.isCodex }
     public var isKimi: Bool { provider.isKimi }
     public var isFireworks: Bool { provider.isFireworks }
+    public var isDeepSeek: Bool { provider.isDeepSeek }
+    public var isOpenCodeGo: Bool { provider.isOpenCodeGo }
+    public var isWafer: Bool { provider.isWafer }
     public var allowsXaiServices: Bool { xaiServices.allows }
     public var hasNativeWebSearch: Bool { nativeWebSearch }
     public var responsesDialect: ResponsesDialect? { backends.responses }
@@ -345,6 +372,48 @@ public struct ProviderProfile: Codable, Sendable, Equatable, Hashable {
 
     public static let fireworks = ProviderProfile(
         provider: .fireworks,
+        backends: ProviderBackends(chatCompletions: true, responses: nil, messages: false),
+        codeModeTransport: .unsupported,
+        hostedToolDialect: nil,
+        nativeWebSearch: false,
+        requestMetadata: .standardHeadersOnly,
+        sessionAuth: .apiKeyOnly,
+        xaiServices: .denied
+    )
+
+    /// DeepSeek's direct OpenAI-compatible inference API. V4 Flash supports
+    /// both Chat Completions and the stateless Responses API, including
+    /// OpenAI-shaped hosted web search. Authentication remains isolated to a
+    /// provider-owned API key.
+    public static let deepseek = ProviderProfile(
+        provider: .deepseek,
+        backends: ProviderBackends(chatCompletions: true, responses: .deepSeek, messages: false),
+        codeModeTransport: .functionEnvelope,
+        hostedToolDialect: .openAi,
+        nativeWebSearch: true,
+        requestMetadata: .standardHeadersOnly,
+        sessionAuth: .apiKeyOnly,
+        xaiServices: .denied
+    )
+
+    /// OpenCode Go routes individual models over either OpenAI-compatible Chat
+    /// Completions or Anthropic Messages while sharing one provider API key.
+    public static let openCodeGo = ProviderProfile(
+        provider: .openCodeGo,
+        backends: ProviderBackends(chatCompletions: true, responses: nil, messages: true),
+        codeModeTransport: .unsupported,
+        hostedToolDialect: nil,
+        nativeWebSearch: false,
+        requestMetadata: .standardHeadersOnly,
+        sessionAuth: .apiKeyOnly,
+        xaiServices: .denied
+    )
+
+    /// Wafer AI's OpenAI-compatible Chat Completions API. Wafer supports
+    /// ordinary client-side function tools but does not provide hosted tools,
+    /// web search, Responses, or provider-managed OAuth authentication.
+    public static let wafer = ProviderProfile(
+        provider: .wafer,
         backends: ProviderBackends(chatCompletions: true, responses: nil, messages: false),
         codeModeTransport: .unsupported,
         hostedToolDialect: nil,

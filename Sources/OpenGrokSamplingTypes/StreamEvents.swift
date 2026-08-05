@@ -174,10 +174,14 @@ public struct ChatCompletionChunk: Codable, Sendable, Equatable, Hashable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.id = try c.decode(String.self, forKey: .id)
-        self.object = try c.decode(String.self, forKey: .object)
-        self.created = try c.decode(UInt64.self, forKey: .created)
-        self.model = try c.decode(String.self, forKey: .model)
+        // `id`, `object`, `created`, and `model` are unused envelope metadata.
+        // OpenCode Go omits them on ordinary and terminal chunks alike, so
+        // requiring them would abort stream assembly on an otherwise complete
+        // response. `choices` stays required: it carries the payload.
+        self.id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
+        self.object = try c.decodeIfPresent(String.self, forKey: .object) ?? ""
+        self.created = try c.decodeIfPresent(UInt64.self, forKey: .created) ?? 0
+        self.model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
         self.choices = try c.decode([ChatChunkChoice].self, forKey: .choices)
         self.usage = try c.decodeIfPresent(Usage.self, forKey: .usage)
         // empty-string-as-none normalization for `system_fingerprint`.

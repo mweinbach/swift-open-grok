@@ -617,6 +617,16 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             if LiveSessionsComposition.handles(command) {
                 return try await LiveSessionsComposition.session(for: command, context: context)
             }
+            // Before the ACP hook: LiveACPComposition.handles still claims
+            // .serve/.leader with the historical refusals, so ordering routes
+            // serve to the working implementation.
+            if LiveServeComposition.handles(command) {
+                return try await LiveServeComposition.session(
+                    for: command,
+                    context: context,
+                    services: Self.liveACPServices(dependencies: dependencies)
+                )
+            }
             if LiveACPComposition.handles(command) {
                 return try await LiveACPComposition.session(
                     for: command,
@@ -1032,6 +1042,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             options: options,
             profileModel: agentProfile?.model,
             environment: context.environment,
+            workingDirectory: cwd,
             openGrokHome: openGrokHome,
             sessionID: sessionID
         )
@@ -1269,6 +1280,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         options: CLIExecutionOptions,
         profileModel: String?,
         environment: [String: String],
+        workingDirectory: URL,
         openGrokHome: URL,
         sessionID: String
     ) async throws -> (OpenGrokLiveSamplingConfiguration, LiveResolvedCredential) {
@@ -1307,7 +1319,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let baseURL = resolveProviderBaseURL(
             provider: provider,
             model: selectedProfile,
-            environment: environment
+            environment: environment,
+            configuredXaiBaseURL: provider == .xai
+                ? configuredXaiAPIBaseURL(
+                    workingDirectory: workingDirectory,
+                    openGrokHome: openGrokHome,
+                    environment: environment
+                )
+                : nil
         )
         if provider == .kimi,
            let modelBaseURL = selectedProfile?.baseURL,
@@ -1394,6 +1413,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             return .kimi
         case "fireworks", "fireworks_ai":
             return .fireworks
+        case "deepseek", "deep_seek", "deepseek_api":
+            return .deepseek
+        case "opencode_go", "opencode-go":
+            return .openCodeGo
+        case "wafer", "wafer_ai":
+            return .wafer
         default:
             throw CLIApplicationError.unsupported(route: "provider \(value)")
         }
@@ -1435,20 +1460,63 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             return .chatCompletions
         case .codex:
             return .responses
-        case .kimi, .fireworks:
+        case .kimi, .fireworks, .deepseek, .openCodeGo, .wafer:
             return .chatCompletions
         }
+    }
+
+    /// `[endpoints] xai_api_base_url` — the only endpoint override upstream
+    /// defines for the public xAI API (`agent/config.rs:233`).
+    ///
+    /// Upstream's precedence falls out of how it builds the table:
+    /// `EndpointsConfig::from_config_value` (`agent/config.rs:365`) serializes
+    /// `Default::default()` — whose `xai_api_base_url` reads
+    /// `GROK_XAI_API_BASE_URL`, else the compiled default
+    /// (`agent/config.rs:622`) — and then deep-merges the effective config's
+    /// `[endpoints]` table over it. So the config file beats the environment,
+    /// which beats the compiled default.
+    ///
+    /// Layering matches `LiveCodeModeSettings.resolveToolMode`: the project
+    /// config chain first, then `$OPENGROK_HOME/config.toml`.
+    static func configuredXaiAPIBaseURL(
+        workingDirectory: URL,
+        openGrokHome: URL,
+        environment: [String: String]
+    ) -> String? {
+        let project = loadMergedProjectConfig(
+            cwd: workingDirectory,
+            environment: environment
+        )
+        if let value = endpointsXaiAPIBaseURL(in: project) { return value }
+        let userConfig = try? loadConfigFile(
+            at: openGrokHome.appendingPathComponent("config.toml")
+        )
+        if let userConfig, let value = endpointsXaiAPIBaseURL(in: userConfig) {
+            return value
+        }
+        return nil
+    }
+
+    private static func endpointsXaiAPIBaseURL(in table: TOMLValue) -> String? {
+        guard case .string(let raw)? = table[path: ["endpoints", "xai_api_base_url"]] else {
+            return nil
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     static func resolveProviderBaseURL(
         provider: ModelProvider,
         model: DefaultModelJSON?,
-        environment: [String: String]
+        environment: [String: String],
+        configuredXaiBaseURL: String? = nil
     ) -> String {
         let overrideKey: String
         let fallback: String
         switch provider {
         case .xai:
+            // Config beats env for xAI, per `from_config_value`'s deep merge.
+            if let configuredXaiBaseURL { return configuredXaiBaseURL }
             overrideKey = "GROK_XAI_API_BASE_URL"
             fallback = model?.apiBaseURL ?? model?.baseURL ?? XAI_API_BASE_URL_DEFAULT
         case .codex:
@@ -1460,6 +1528,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         case .fireworks:
             overrideKey = FireworksModels.apiBaseURLEnv
             fallback = model?.apiBaseURL ?? model?.baseURL ?? FireworksModels.apiBaseURLDefault
+        case .deepseek:
+            overrideKey = DeepSeekModels.apiBaseURLEnv
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? DeepSeekModels.apiBaseURLDefault
+        case .openCodeGo:
+            overrideKey = OpenCodeGoModels.apiBaseURLEnv
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? OpenCodeGoModels.apiBaseURLDefault
+        case .wafer:
+            overrideKey = WaferModels.apiBaseURLEnv
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? WaferModels.apiBaseURLDefault
         }
         return nonEmptyEnvironmentValue(overrideKey, environment: environment)
             ?? fallback
@@ -1494,6 +1571,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             keys = []
         case .fireworks:
             keys = [FireworksModels.apiKeyEnv]
+        case .deepseek:
+            keys = [DeepSeekModels.apiKeyEnv]
+        case .openCodeGo:
+            keys = [OpenCodeGoModels.apiKeyEnv]
+        case .wafer:
+            keys = [WaferModels.apiKeyEnv]
         }
         return keys.lazy.compactMap { key in
             nonEmptyEnvironmentValue(key, environment: environment)
@@ -1519,6 +1602,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             return "MOONSHOT_API_KEY or KIMI_CODE_API_KEY"
         case .fireworks:
             return "FIREWORKS_API_KEY"
+        case .deepseek:
+            return DeepSeekModels.apiKeyEnv
+        case .openCodeGo:
+            return OpenCodeGoModels.apiKeyEnv
+        case .wafer:
+            return WaferModels.apiKeyEnv
         }
     }
 

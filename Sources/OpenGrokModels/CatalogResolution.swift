@@ -442,6 +442,15 @@ public func trustedBuiltInSessionEndpoint(provider: ModelProvider, baseURL: Stri
         if provider == .fireworks {
             return FireworksModels.isTrustedAPIBaseURL(baseURL)
         }
+        if provider == .deepseek {
+            return DeepSeekModels.isTrustedAPIBaseURL(baseURL)
+        }
+        if provider == .openCodeGo {
+            return OpenCodeGoModels.isTrustedAPIBaseURL(baseURL)
+        }
+        if provider == .wafer {
+            return WaferModels.isTrustedAPIBaseURL(baseURL)
+        }
         return false
     case .xaiSession:
         return isXaiApiBearerURL(baseURL)

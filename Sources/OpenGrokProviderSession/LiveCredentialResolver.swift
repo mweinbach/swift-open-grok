@@ -174,7 +174,7 @@ public struct LiveCredentialResolver: Sendable {
                 || store[apiKeyScope] != nil
         case .codex:
             return isCodexLoggedIn(at: codexAuthFile)
-        case .kimi, .fireworks:
+        case .kimi, .fireworks, .deepseek, .openCodeGo, .wafer:
             return readProviderAPIKey(grokHome: openGrokHome, provider: provider.asString) != nil
         }
     }
@@ -316,6 +316,12 @@ public struct LiveCredentialResolver: Sendable {
             return "MOONSHOT_API_KEY or KIMI_CODE_API_KEY"
         case .fireworks:
             return "FIREWORKS_API_KEY"
+        case .deepseek:
+            return "DEEPSEEK_API_KEY or `open-grok login --deepseek`"
+        case .openCodeGo:
+            return "OPENCODE_API_KEY"
+        case .wafer:
+            return "WAFER_API_KEY"
         }
     }
 

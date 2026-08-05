@@ -419,6 +419,9 @@ public struct ConversationRequest: Sendable, Equatable {
     public var trace: TraceContextBox?
     /// Reasoning effort level for reasoning models.
     public var reasoningEffort: ReasoningEffort?
+    /// Responses `service_tier` routing id (`"priority"` for Codex Fast mode).
+    /// `nil` means standard routing and omits the field from the wire body.
+    public var serviceTier: String?
     /// JSON Schema for structured output (strict mode).
     public var jsonSchema: JSONValue?
 
@@ -440,6 +443,7 @@ public struct ConversationRequest: Sendable, Equatable {
         xGrokUserId: String? = nil,
         trace: TraceContextBox? = nil,
         reasoningEffort: ReasoningEffort? = nil,
+        serviceTier: String? = nil,
         jsonSchema: JSONValue? = nil
     ) {
         self.items = items
@@ -459,6 +463,7 @@ public struct ConversationRequest: Sendable, Equatable {
         self.xGrokUserId = xGrokUserId
         self.trace = trace
         self.reasoningEffort = reasoningEffort
+        self.serviceTier = serviceTier
         self.jsonSchema = jsonSchema
     }
 

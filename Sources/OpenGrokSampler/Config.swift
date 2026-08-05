@@ -121,6 +121,8 @@ public struct SamplerConfig: Sendable {
     public var streamToolCalls: Bool
     public var idleTimeoutSecs: UInt64?
     public var reasoningEffort: ReasoningEffort?
+    /// Responses `service_tier` routing id (`"priority"` for Codex Fast mode).
+    public var serviceTier: String?
     public var reasoningSummary: ReasoningSummary?
     public var originClient: OriginClientInfo?
     public var clientIdentifier: String?
@@ -157,6 +159,7 @@ public struct SamplerConfig: Sendable {
         streamToolCalls: Bool = false,
         idleTimeoutSecs: UInt64? = nil,
         reasoningEffort: ReasoningEffort? = nil,
+        serviceTier: String? = nil,
         reasoningSummary: ReasoningSummary? = nil,
         originClient: OriginClientInfo? = nil,
         clientIdentifier: String? = nil,
@@ -188,6 +191,7 @@ public struct SamplerConfig: Sendable {
         self.streamToolCalls = streamToolCalls
         self.idleTimeoutSecs = idleTimeoutSecs
         self.reasoningEffort = reasoningEffort
+        self.serviceTier = serviceTier
         self.reasoningSummary = reasoningSummary
         self.originClient = originClient
         self.clientIdentifier = clientIdentifier
@@ -225,6 +229,7 @@ extension SamplerConfig: Codable {
         case streamToolCalls = "stream_tool_calls"
         case idleTimeoutSecs = "idle_timeout_secs"
         case reasoningEffort = "reasoning_effort"
+        case serviceTier = "service_tier"
         case reasoningSummary = "reasoning_summary"
         case originClient = "origin_client"
         case clientIdentifier = "client_identifier"
@@ -257,6 +262,7 @@ extension SamplerConfig: Codable {
             streamToolCalls: try c.decodeIfPresent(Bool.self, forKey: .streamToolCalls) ?? false,
             idleTimeoutSecs: try c.decodeIfPresent(UInt64.self, forKey: .idleTimeoutSecs),
             reasoningEffort: try c.decodeIfPresent(ReasoningEffort.self, forKey: .reasoningEffort),
+            serviceTier: try c.decodeIfPresent(String.self, forKey: .serviceTier),
             reasoningSummary: try c.decodeIfPresent(ReasoningSummary.self, forKey: .reasoningSummary),
             originClient: try c.decodeIfPresent(OriginClientInfo.self, forKey: .originClient),
             clientIdentifier: try c.decodeIfPresent(String.self, forKey: .clientIdentifier),
@@ -289,6 +295,7 @@ extension SamplerConfig: Codable {
         try c.encode(streamToolCalls, forKey: .streamToolCalls)
         try c.encodeIfPresent(idleTimeoutSecs, forKey: .idleTimeoutSecs)
         try c.encodeIfPresent(reasoningEffort, forKey: .reasoningEffort)
+        try c.encodeIfPresent(serviceTier, forKey: .serviceTier)
         try c.encodeIfPresent(reasoningSummary, forKey: .reasoningSummary)
         try c.encodeIfPresent(originClient, forKey: .originClient)
         try c.encodeIfPresent(clientIdentifier, forKey: .clientIdentifier)
