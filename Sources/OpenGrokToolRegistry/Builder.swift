@@ -64,7 +64,7 @@ public struct ToolRegistryBuilder: Sendable {
 
     public init(registerBuiltins: Bool = true) {
         if registerBuiltins {
-            for spec in BuiltinToolCatalog.fileTools {
+            for spec in BuiltinToolCatalog.builtinTools {
                 tools[spec.qualifiedId] = ToolEntry(spec: spec, handler: nil)
             }
             for pack in ToolPackStore.shared.snapshot() {

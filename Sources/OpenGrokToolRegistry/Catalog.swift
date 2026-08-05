@@ -75,6 +75,14 @@ private func intProp(_ description: String) -> JSONValue {
     .object(["type": .string("integer"), "description": .string(description)])
 }
 
+private func stringArrayProp(_ description: String) -> JSONValue {
+    .object([
+        "type": .string("array"),
+        "items": .object(["type": .string("string")]),
+        "description": .string(description),
+    ])
+}
+
 // MARK: - File tool catalog
 
 public enum BuiltinToolCatalog {
@@ -270,8 +278,77 @@ public enum BuiltinToolCatalog {
         Dictionary(uniqueKeysWithValues: fileTools.map { ($0.qualifiedId, $0.kind) })
     }
 
+    // MARK: Media tools
+
+    /// Model-facing text for `image_gen`. Kept byte-identical to
+    /// `OpenGrokWebMediaTools.IMAGE_GEN_DESCRIPTION`, which is the same
+    /// upstream `description_template`; the registry cannot import the tools
+    /// target, so `ImageToolRegistrationTests` pins the two together.
+    public static let imageGenDescription = "Generate a new image from a text description using the configured image provider; returns the saved image's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (for example `images/1.png`) rather than the absolute path, so it renders as a clickable link that opens the image. To produce multiple images, emit multiple tool calls with distinct prompts."
+
+    public static let imageEditDescription = "Edit or transform existing image(s) via the configured image provider; use instead of image_gen for image-to-image work (preserve likeness, transfer style, remix). Returns the saved image's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (for example `images/1.png`) rather than the absolute path, so it renders as a clickable link that opens the image. Each required `image` is one reference — a user-attachment token (for example \"[Image #1]\"), an absolute filesystem path, or a `data:image/...;base64,...` URL (see the `image` parameter for the resolution order and details)."
+
+    public static let imageGenSchema = objectSchema(
+        properties: [
+            "prompt": stringProp("Text description of the image to generate."),
+            "aspect_ratio": stringProp(
+                "Aspect ratio of the generated image, decide it based on the user's request. Defaults to 'auto'. 1:1 for square (icons, profiles), 16:9 for wide (landscapes, cinematic), 9:16 for tall (phone wallpapers, stories), 3:2 for horizontal photos, 2:3 for vertical (portraits, posters)."
+            ),
+        ],
+        required: ["prompt"]
+    )
+
+    public static let imageEditSchema = objectSchema(
+        properties: [
+            "prompt": stringProp(
+                "A text description of the desired edit or transformation. Describe what the output image should look like, referencing the input image(s)."
+            ),
+            "image": stringArrayProp(
+                "Reference image(s) to condition the edit on. Each is one reference, in priority order: (1) a user attachment — its placeholder token, e.g. \"[Image #1]\" (attachments have no path you can see, so never invent one); (2) an absolute filesystem path the user gave you; (3) a `data:image/...;base64,...` URL."
+            ),
+            "aspect_ratio": stringProp(
+                "The aspect ratio of the output image. For single-image edits this is ignored — the output matches the input image's aspect ratio. For multi-image edits, defaults to 'auto'. Supported values: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 2:1, 1:2, 19.5:9, 9:19.5, 20:9, 9:20, auto."
+            ),
+        ],
+        required: ["prompt", "image"]
+    )
+
+    /// Image generation / editing tools.
+    ///
+    /// Registered unconditionally, exactly as upstream's registry does
+    /// (`b.register::<ImageGenTool>()` / `ImageEditTool`,
+    /// `xai-grok-tools/src/registry/types.rs:713`). Whether a *session*
+    /// advertises them is a separate decision made when the session's
+    /// `ToolServerConfig` is assembled, from resolved image credentials —
+    /// see `xai-grok-agent/src/builder.rs:771`.
+    ///
+    /// Both carry `ToolKind::ImageGen`, so `ToolCapabilityMode` already drops
+    /// them from a `.readOnly` or `.execute` session.
+    public static let mediaTools: [RegisteredToolSpec] = [
+        RegisteredToolSpec(
+            namespace: .grokBuild, id: "image_gen", kind: .imageGen,
+            description: imageGenDescription,
+            inputSchema: imageGenSchema
+        ),
+        RegisteredToolSpec(
+            namespace: .grokBuild, id: "image_edit", kind: .imageGen,
+            description: imageEditDescription,
+            inputSchema: imageEditSchema
+        ),
+    ]
+
+    public static var mediaToolKinds: [String: ProductToolKind] {
+        Dictionary(uniqueKeysWithValues: mediaTools.map { ($0.qualifiedId, $0.kind) })
+    }
+
+    public static let imageGenQualifiedId = "GrokBuild:image_gen"
+    public static let imageEditQualifiedId = "GrokBuild:image_edit"
+
+    /// Every spec `ToolRegistryBuilder(registerBuiltins: true)` installs.
+    public static var builtinTools: [RegisteredToolSpec] { fileTools + mediaTools }
+
     public static var allQualifiedIds: Set<String> {
-        Set(fileTools.map(\.qualifiedId))
+        Set(builtinTools.map(\.qualifiedId))
     }
 }
 

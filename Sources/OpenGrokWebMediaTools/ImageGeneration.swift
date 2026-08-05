@@ -447,6 +447,8 @@ public struct ImageGenInput: Codable, Sendable, Equatable, Hashable {
 
 public let IMAGE_GEN_TOOL_NAME = "image_gen"
 public let IMAGE_GEN_DESCRIPTION = "Generate a new image from a text description using the configured image provider; returns the saved image's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (for example `images/1.png`) rather than the absolute path, so it renders as a clickable link that opens the image. To produce multiple images, emit multiple tool calls with distinct prompts."
+public let IMAGE_EDIT_TOOL_NAME = "image_edit"
+public let IMAGE_EDIT_DESCRIPTION = "Edit or transform existing image(s) via the configured image provider; use instead of image_gen for image-to-image work (preserve likeness, transfer style, remix). Returns the saved image's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (for example `images/1.png`) rather than the absolute path, so it renders as a clickable link that opens the image. Each required `image` is one reference — a user-attachment token (for example \"[Image #1]\"), an absolute filesystem path, or a `data:image/...;base64,...` URL (see the `image` parameter for the resolution order and details)."
 public let IMAGE_GEN_PROMPT_DESCRIPTION = "Text description of the image to generate."
 public let IMAGE_GEN_ASPECT_RATIO_DESCRIPTION = "Aspect ratio of the generated image, decide it based on the user's request. Defaults to 'auto'. 1:1 for square (icons, profiles), 16:9 for wide (landscapes, cinematic), 9:16 for tall (phone wallpapers, stories), 3:2 for horizontal photos, 2:3 for vertical (portraits, posters)."
 

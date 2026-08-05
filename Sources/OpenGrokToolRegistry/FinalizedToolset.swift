@@ -250,6 +250,18 @@ private func accessKind(for tool: FinalizedTool, args: JSONValue) -> AccessKind 
         return .webFetch(stringArg(args, keys: ["url"]) ?? "")
     case .webSearch:
         return .webSearch(stringArg(args, keys: ["query"]) ?? "")
+    case .imageGen, .videoGen, .imageToVideo, .referenceToVideo:
+        // Media generation is deliberately *not* an edit or a web category.
+        // `From<&ToolInput> for AccessKind`
+        // (`xai-grok-workspace/src/permission/types.rs:272`) matches neither
+        // `ToolInput::ImageGen` nor `ImageEdit`, so both fall to its
+        // `_ => AccessKind::Read(None)` arm. Routing them to `.edit` would
+        // make a default `denyMutations` session refuse a tool upstream
+        // allows; routing them to `.webFetch` would let a URL-pattern rule
+        // match a prompt. The endpoint reachability gate is credential-side
+        // (the tool is never advertised when the session cannot call it),
+        // not rule-side.
+        return .read(nil)
     default:
         return .read(nil)
     }
