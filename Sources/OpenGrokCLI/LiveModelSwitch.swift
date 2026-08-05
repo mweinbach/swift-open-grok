@@ -62,6 +62,10 @@ struct LiveModelCatalogResolver: Sendable {
     let environment: [String: String]
     let openGrokHome: URL
     let sessionID: String
+    /// Project root for the `[endpoints]` config lookup. A mid-session switch
+    /// has to read the same config chain the cold start did, or the two
+    /// disagree about the endpoint for the same model.
+    let workingDirectory: URL
     /// Injection seam for tests; production passes the real resolver.
     let makeCredentialResolver: @Sendable (
         [String: String],
@@ -72,6 +76,10 @@ struct LiveModelCatalogResolver: Sendable {
         environment: [String: String],
         openGrokHome: URL,
         sessionID: String,
+        workingDirectory: URL = URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath,
+            isDirectory: true
+        ),
         makeCredentialResolver: @escaping @Sendable (
             [String: String],
             URL
@@ -82,16 +90,27 @@ struct LiveModelCatalogResolver: Sendable {
         self.environment = environment
         self.openGrokHome = openGrokHome
         self.sessionID = sessionID
+        self.workingDirectory = workingDirectory
         self.makeCredentialResolver = makeCredentialResolver
     }
 
-    /// Every model the `/model` picker should offer, as `(id, provider)` pairs
-    /// sorted by id. Hidden entries stay hidden.
-    static func catalog() -> [(id: String, provider: String)] {
+    /// Every model the `/model` picker should offer. Hidden entries stay hidden.
+    ///
+    /// Ordering is left to `LiveModelPicker.rows`, which sorts by provider then
+    /// name — sorting by raw id here would interleave providers.
+    static func catalog() -> [LiveModelPickerEntry] {
         embeddedDefaultModels().models
             .filter { !$0.hidden }
-            .map { (id: $0.id ?? $0.model, provider: $0.provider.asString) }
-            .sorted { $0.id < $1.id }
+            .map { model in
+                LiveModelPickerEntry(
+                    id: model.id ?? model.model,
+                    providerID: model.provider.asString,
+                    name: model.name ?? model.id ?? model.model,
+                    description: model.description,
+                    contextWindow: model.contextWindow,
+                    supportsReasoningEffort: model.supportsReasoningEffort
+                )
+            }
     }
 
     func resolve(modelID: String) async throws -> LiveModelResolution {
@@ -105,10 +124,24 @@ struct LiveModelCatalogResolver: Sendable {
         guard provider.profile.supportsBackend(backend) else {
             throw LiveModelSwitchError.unsupportedBackend(provider: provider, backend: backend)
         }
+        // Upstream ranks the config file above the environment for the one
+        // endpoint override it defines (`from_config_value` deep-merges
+        // `[endpoints]` over the env-derived default, agent/config.rs:365).
+        // The cold start applies that leg, so a `/model` switch has to as well
+        // — otherwise the same model reaches a different endpoint depending on
+        // whether you started on it or switched to it. The key is xAI-only
+        // upstream; every other provider keeps its own `*_API_BASE_URL` env var.
         let baseURL = OpenGrokLiveApplicationLauncher.resolveProviderBaseURL(
             provider: provider,
             model: profile,
-            environment: environment
+            environment: environment,
+            configuredXaiBaseURL: provider == .xai
+                ? OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
+                    workingDirectory: workingDirectory,
+                    openGrokHome: openGrokHome,
+                    environment: environment
+                )
+                : nil
         )
         if provider == .kimi,
            let modelBaseURL = profile.baseURL,

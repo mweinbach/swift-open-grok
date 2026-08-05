@@ -1127,7 +1127,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             resolver: LiveModelCatalogResolver(
                 environment: context.environment,
                 openGrokHome: foundation.openGrokHome,
-                sessionID: foundation.sessionID
+                sessionID: foundation.sessionID,
+                workingDirectory: foundation.cwd
             ),
             makeSampler: dependencies.makeSampler,
             history: conversationHistory
@@ -1413,11 +1414,16 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             return .kimi
         case "fireworks", "fireworks_ai":
             return .fireworks
-        case "deepseek", "deep_seek", "deepseek_api":
+        // Union of two upstream alias sets, so a provider name that works in
+        // config also works on the flag: `ModelProvider.init(from:)` decodes the
+        // underscore spellings, and upstream's CLI `provider_action`
+        // (slash/commands/login.rs:78) additionally accepts the hyphen forms
+        // plus the short `opencode` / `go` selectors.
+        case "deepseek", "deep_seek", "deep-seek", "deepseek_api", "deepseek-api":
             return .deepseek
-        case "opencode_go", "opencode-go":
+        case "opencode_go", "opencode-go", "opencode", "go":
             return .openCodeGo
-        case "wafer", "wafer_ai":
+        case "wafer", "wafer_ai", "wafer-ai":
             return .wafer
         default:
             throw CLIApplicationError.unsupported(route: "provider \(value)")
@@ -2990,7 +2996,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     private let workingDirectory: String
     private var modelName: String
     /// `(id, provider)` pairs the `/model` picker lists.
-    private let modelCatalog: [(id: String, provider: String)]
+    private let modelCatalog: [LiveModelPickerEntry]
     /// Rebuilds the sampling stack when a picker row is chosen. `nil` in
     /// compositions with no provider session (tests, headless renders), where
     /// the picker degrades to a relabel.
@@ -3036,7 +3042,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         sink: any PagerTerminalSink,
         workingDirectory: String = FileManager.default.currentDirectoryPath,
         modelName: String = "unknown",
-        modelCatalog: [(id: String, provider: String)] = [],
+        modelCatalog: [LiveModelPickerEntry] = [],
         modelSwitch: LiveModelSwitchCoordinator? = nil,
         permissionCoordinator: PagerPermissionCoordinator? = nil,
         workflowRegistry: RhaiWorkflowRunRegistry? = nil,
@@ -3049,7 +3055,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         self.workingDirectory = workingDirectory
         self.modelName = modelName
         self.modelCatalog = modelCatalog.isEmpty
-            ? [(id: modelName, provider: "current")]
+            ? [LiveModelPickerEntry(id: modelName, providerID: "", name: modelName)]
             : modelCatalog
         self.modelSwitch = modelSwitch
         self.permissionCoordinator = permissionCoordinator
@@ -3276,7 +3282,10 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 .split(separator: "\n", omittingEmptySubsequences: false)
                 .map { PagerStyledLine(text: String($0)) }))
         case .modelPicker:
-            overlays.push(.modelPicker(models: modelCatalog, currentModelID: modelName))
+            overlays.push(LiveModelPicker.overlay(
+                entries: modelCatalog,
+                currentModelID: modelName
+            ))
         case .toggleMouseReporting:
             mouseReportingEnabled.toggle()
             try renderer.setMouseReporting(mouseReportingEnabled)

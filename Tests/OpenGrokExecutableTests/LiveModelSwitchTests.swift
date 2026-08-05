@@ -220,8 +220,12 @@ struct LiveModelSwitchTests {
     func catalogListsEveryVisibleModel() {
         let catalog = LiveModelCatalogResolver.catalog()
         #expect(catalog.count > 1)
-        #expect(catalog.contains { $0.id == "glm-5.2" && $0.provider == "fireworks" })
-        #expect(catalog.map(\.id) == catalog.map(\.id).sorted())
+        let fireworks = catalog.first { $0.id == "glm-5.2" }
+        #expect(fireworks?.providerID == "fireworks")
+        // Ordering is no longer by raw id: `LiveModelPicker.rows` sorts by
+        // provider then name, so sorting here would interleave providers.
+        let ordered = LiveModelPicker.rows(entries: catalog).map(\.label)
+        #expect(ordered.count == catalog.count)
     }
 }
 

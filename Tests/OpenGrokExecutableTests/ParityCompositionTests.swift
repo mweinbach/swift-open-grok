@@ -1506,10 +1506,11 @@ struct ParityCompositionTests {
 
             continuation.yield(.paste("/model"))
             continuation.yield(.key(KeyEvent(key: .enter)))
-            // Only `XAI_API_KEY` is set and grok is the sole xAI model, so
-            // whichever row sits below the active one belongs to a provider
-            // this session cannot authenticate.
-            continuation.yield(.key(KeyEvent(key: .down)))
+            // Only `XAI_API_KEY` is set and grok is the sole xAI model. Rows
+            // sort by provider then name, which puts xAI last, so the active
+            // row is the final one and moving *up* is what reaches another
+            // provider — one this session cannot authenticate.
+            continuation.yield(.key(KeyEvent(key: .up)))
             continuation.yield(.key(KeyEvent(key: .enter)))
             await Self.waitForPaintedText("Could not switch to", terminal: terminal)
         }
