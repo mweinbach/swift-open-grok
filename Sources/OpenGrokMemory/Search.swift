@@ -166,11 +166,36 @@ private func isEvergreenSource(_ source: String) -> Bool {
     source == "global" || source == "workspace"
 }
 
+/// Scaffold lines `MemoryStorage.ensureInitialized()` writes into a fresh
+/// `MEMORY.md`. They are boilerplate, not knowledge, so a chunk that holds
+/// nothing else is not worth returning as a search hit.
+private let memoryScaffoldMarkers = [
+    "This file is automatically managed by Grok's memory system",
+    "Auto-populated by dream consolidation",
+]
+
+/// Whether a chunk carries no real information and should be dropped.
+///
+/// The scaffold test deliberately removes only the scaffold *lines* before
+/// asking whether anything substantive is left. It used to be a bare
+/// `text.contains(marker)` over the whole chunk, which was wrong in a way that
+/// silently broke `/remember`: `ensureInitialized()` writes the scaffold into
+/// `MEMORY.md`, `appendToMemory` appends the user's note to that same file, and
+/// with the default 1600-character chunk size the scaffold and the note land in
+/// one chunk. A whole-chunk `contains` therefore classified the user's own
+/// saved memory as content-free and dropped it from every search — so
+/// `/remember` appeared to work, reported "Saved to workspace memory.", and the
+/// content was then unfindable.
 private func isContentFree(_ text: String, source: String) -> Bool {
     guard !isStructurallyEmpty(text) else { return true }
     guard isEvergreenSource(source) else { return false }
-    return text.contains("This file is automatically managed by Grok's memory system") ||
-        text.contains("Auto-populated by dream consolidation")
+    let withoutScaffold = text
+        .split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        .filter { line in
+            !memoryScaffoldMarkers.contains { line.contains($0) }
+        }
+        .joined(separator: "\n")
+    return isStructurallyEmpty(withoutScaffold)
 }
 
 private func isStructurallyEmpty(_ text: String) -> Bool {

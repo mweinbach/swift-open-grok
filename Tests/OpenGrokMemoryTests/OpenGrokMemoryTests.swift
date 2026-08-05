@@ -241,6 +241,65 @@ struct OpenGrokMemoryRankingTests {
         #expect(first.allSatisfy { $0.score >= 0 && $0.score <= 1 })
     }
 
+    @Test("a scaffold line does not suppress real content sharing its chunk")
+    func scaffoldDoesNotSuppressRealContent() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let storage = MemoryStorage.newFlat(cwd: root, root: root.appendingPathComponent("memory"))
+        let index = try MemoryIndex(indexURL: root.appendingPathComponent("index.json"), storage: storage)
+
+        // This is the exact shape `/remember` produces: `ensureInitialized()`
+        // writes the scaffold into MEMORY.md, then `appendToMemory` appends the
+        // user's note to the same file. At the default 1600-character chunk
+        // size both land in one chunk.
+        let memory = root.appendingPathComponent("MEMORY.md")
+        try """
+        # Project Memory — /repo
+
+        > Auto-populated by dream consolidation. Edit freely.
+
+        This project pins the Rust reference at 9ed09e2a.
+        """.write(to: memory, atomically: true, encoding: .utf8)
+        _ = try index.reindexFile(path: memory, source: "workspace")
+
+        var config = MemorySearchConfig()
+        config.maxResults = 10
+        config.minScore = 0
+        config.temporalDecay.enabled = false
+
+        // Previously the scaffold marker was matched against the whole chunk,
+        // so the user's own saved memory was classified content-free and
+        // dropped — `/remember` reported success and the note was unfindable.
+        let results = try hybridSearch(index: index, query: "Rust reference", config: config)
+        #expect(results.count == 1)
+        #expect(results.first?.snippet.contains("9ed09e2a") == true)
+    }
+
+    @Test("a chunk holding only scaffold is still dropped")
+    func scaffoldOnlyChunkIsDropped() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let storage = MemoryStorage.newFlat(cwd: root, root: root.appendingPathComponent("memory"))
+        let index = try MemoryIndex(indexURL: root.appendingPathComponent("index.json"), storage: storage)
+
+        // The other half of the rule: an untouched scaffold carries no
+        // knowledge and must not surface as a hit.
+        let memory = root.appendingPathComponent("MEMORY.md")
+        try """
+        # Project Memory — /repo
+
+        > Auto-populated by dream consolidation. Edit freely.
+        """.write(to: memory, atomically: true, encoding: .utf8)
+        _ = try index.reindexFile(path: memory, source: "workspace")
+
+        var config = MemorySearchConfig()
+        config.maxResults = 10
+        config.minScore = 0
+        config.temporalDecay.enabled = false
+
+        #expect(try hybridSearch(index: index, query: "project memory", config: config).isEmpty)
+    }
+
     @Test("MMR promotes diverse snippets without changing result count")
     func mmrDiversity() throws {
         let root = try makeTemporaryDirectory()
