@@ -728,6 +728,49 @@ shared build scratch can be poisoned by interleaved agent builds (symptom:
 inexplicable SIGSEGV that passes under a private scratch) — wipe
 `.build/workflow-safe` before final gates.
 
+#### Build-out wave 7 — 2026-08-05 (leader, live catalogs, typed /model, image tools)
+
+Four slices plus CI, committed individually (`47be4f7` CI, `0572728`, `51d1dc9`,
+`e90932e`, `2d4c913`):
+
+- CI landed: a macOS job running the serial gate + smokes, and a deliberately
+  non-blocking Linux job surfacing the compile-gap list on every push.
+- Live model catalogs fetch per provider partition with identity/TTL/ETag
+  caching, embedded < live < user-override merge order, and enforced partition
+  isolation (a Codex refresh cannot touch xAI models or credentials;
+  credential fingerprints are computed caller-side so the module never holds
+  derivation material).
+- Typed `/model <selector>` with upstream's suggest_args completion dropdown;
+  unique match switches without the overlay, ambiguity refused. The
+  compatibility shim was deleted after its migration window. Two latent
+  defects fixed en route: the /model switch path resolving a different
+  endpoint than cold start (config leg missing), and eight tests resolving
+  `[endpoints]` from the repo checkout via a process-cwd default (parameter
+  now required).
+- image_gen/image_edit registered with upstream's registration/advertisement
+  split: exposure decided from resolved credentials at advertisement time.
+- `open-grok leader` connects a local session to a serve endpoint over the
+  production WebSocket client (+ Unix-socket IPC leg), reverse requests routed
+  locally.
+
+Final gates (Swift 6.3.3):
+
+| Command | Exit |
+|---|---|
+| `swift-safe-verify.zsh test` (default parallel) | **0** — 3287 tests / 502 suites, 24.7s |
+| `swift-safe-verify.zsh test --no-parallel` | **0** — 3287 tests / 502 suites, 198.4s |
+| `--filter OpenGrokFileToolsTests` / `OpenGrokToolRegistryTests` | **0** — 32/2 and 70/10 (explicit execution record for the wave-1 pack) |
+| `swift-safe-verify.zsh build --product open-grok` | **0** |
+
+Test count 3147 → **3287** (+140). Carried forward: `/model <name> <effort>`
+(needs an effort parameter through the switch coordinator);
+`opencode_go_enabled_models` config field (four-line filter once ConfigTypes
+gains it); tier-restriction capability check (`tierRestricted` wired but
+always false); leader relay's remote-infrastructure leg; Linux gap closure
+from the CI surface job. Process note: a green `build-tests` is now a handoff
+precondition for agents — four shared-tree breaks in one verification window
+this wave came from source landing without it.
+
 
 ## Per-crate port status (all 84 Rust crates accounted for)
 
