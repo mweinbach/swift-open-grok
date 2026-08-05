@@ -83,9 +83,10 @@ enum LiveCodeModeSettings {
     ///   3. `$OPENGROK_HOME/config.toml`'s `[ui] code_mode`,
     ///   4. `.direct`.
     ///
-    /// `[features] code_mode` is read as a fallback at each config layer
-    /// because `RESTART_REQUIRED_PATHS` (OpenGrokConfig/Loader.swift:251)
-    /// names that path, while the Rust setting lives under `[ui]`.
+    /// `[ui] code_mode` is the only config path upstream defines
+    /// (settings/defs.rs:129 `CODE_MODE_CHOICES`, documented at
+    /// docs/user-guide/05-configuration.md:100). There is no
+    /// `[features] code_mode` anywhere upstream, so none is read here.
     static func resolveToolMode(
         environment: [String: String],
         workingDirectory: URL,
@@ -122,15 +123,12 @@ enum LiveCodeModeSettings {
     }
 
     private static func toolMode(in table: TOMLValue) -> ToolModePreference? {
-        for path in [["ui", "code_mode"], ["features", "code_mode"]] {
-            guard let value = table[path: path] else { continue }
-            switch value {
-            case .string(let raw): if let mode = parse(raw) { return mode }
-            case .boolean(let flag): return flag ? .codeMode : .direct
-            default: continue
-            }
+        guard let value = table[path: ["ui", "code_mode"]] else { return nil }
+        switch value {
+        case .string(let raw): return parse(raw)
+        case .boolean(let flag): return flag ? .codeMode : .direct
+        default: return nil
         }
-        return nil
     }
 }
 

@@ -14,12 +14,15 @@
 // under a PTY at a chosen size, an isolated `OPENGROK_HOME`, scripted input,
 // and a virtual screen to assert against.
 //
-// The inference-backed scenarios are NOT implemented, and the blocker is
-// specific: nothing in the CLI or provider layer reads a provider base URL
-// from the environment, so there is no seam to aim at a mock HTTP/SSE server
-// without changing the provider session. Adding that override is the
-// prerequisite for the rest of W11-S3. `ScenarioResult` and `VirtualScreen`
-// are shaped so those scenarios drop in unchanged once it exists.
+// The base-URL seam that inference-backed scenarios need now exists:
+// `LiveComposition.resolveProviderBaseURL` reads `GROK_XAI_API_BASE_URL`
+// (and the per-provider equivalents), and `[endpoints] xai_api_base_url`
+// overrides it — so a scenario can aim the spawned binary at a mock
+// HTTP/SSE server through `PagerPTYHarness.environment`.
+//
+// Driving one of those exchanges needs `PagerPTYSession`, not `run`: `run`
+// writes all of its input before waiting for exit, so a trailing `/quit`
+// would race the reply it is supposed to let finish.
 //
 // `OpenGrokTerminalCore` is deliberately not imported: it declares its own
 // `TerminalSize` alongside `OpenGrokTTY`'s, and importing both would make the
@@ -389,6 +392,34 @@ public struct PagerPTYHarness: Sendable {
         binary: String? = nil,
         workingDirectory: URL? = nil
     ) async throws -> ScenarioResult {
+        let session = try await start(
+            arguments: arguments,
+            binary: binary,
+            workingDirectory: workingDirectory
+        )
+        do {
+            for line in input {
+                try await session.write(line)
+            }
+            return try await session.finish(timeoutSeconds: timeoutSeconds)
+        } catch {
+            await session.terminate()
+            try? FileManager.default.removeItem(at: session.sandbox)
+            throw error
+        }
+    }
+
+    /// Spawn `open-grok` and hand back a live session instead of waiting for it
+    /// to exit, so a scenario can interleave writing and observing.
+    ///
+    /// The caller owns the child from here: finish it with
+    /// ``PagerPTYSession/finish(timeoutSeconds:)`` or kill it with
+    /// ``PagerPTYSession/terminate()``, and delete `sandbox` either way.
+    public func start(
+        arguments: [String],
+        binary: String? = nil,
+        workingDirectory: URL? = nil
+    ) async throws -> PagerPTYSession {
         let binaryPath = binary ?? Self.defaultBinaryPath()
         guard FileManager.default.isExecutableFile(atPath: binaryPath) else {
             throw PTYHarnessError.binaryNotFound(binaryPath)
@@ -412,56 +443,16 @@ public struct PagerPTYHarness: Sendable {
                 newProcessGroup: true
             )
         )
-
-        // Drain concurrently with the wait: a child that fills the PTY buffer
-        // while nobody reads would block forever on write.
-        let collector = OutputCollector()
-        let draining = Task {
-            for try await chunk in process.output() {
-                await collector.append(chunk)
-            }
-        }
-
-        for line in input {
-            try await process.write(Data(line.utf8))
-        }
-
-        let exit: ProcessExit
-        do {
-            exit = try await withThrowingTaskGroup(of: ProcessExit.self) { group in
-                group.addTask { try await process.waitForExit() }
-                group.addTask {
-                    try await Task.sleep(
-                        nanoseconds: UInt64(timeoutSeconds * 1_000_000_000)
-                    )
-                    throw PTYHarnessError.timedOut(afterSeconds: timeoutSeconds)
-                }
-                let first = try await group.next()!
-                group.cancelAll()
-                return first
-            }
-        } catch {
-            try? await process.signal(.kill)
-            draining.cancel()
-            await process.cancel()
-            try? FileManager.default.removeItem(at: sandbox)
-            throw error
-        }
-
-        // The child has exited; let the drain flush its buffered tail.
-        _ = try? await draining.value
-        await process.cancel()
-
-        let raw = await collector.data
-        var screen = VirtualScreen(size: size)
-        screen.feed(raw)
-        return ScenarioResult(
-            screen: screen,
-            rawOutput: raw,
-            exit: exit,
-            openGrokHome: home,
-            sandbox: sandbox
+        let session = PagerPTYSession(
+            process: process,
+            size: size,
+            sandbox: sandbox,
+            openGrokHome: home
         )
+        // Drain concurrently with everything else: a child that fills the PTY
+        // buffer while nobody reads would block forever on write.
+        await session.beginDraining()
+        return session
     }
 
     /// `PATH`/`HOME` plus a terminal identity, with the developer's
@@ -484,8 +475,126 @@ public struct PagerPTYHarness: Sendable {
     }
 }
 
-/// Accumulates PTY output off the spawning task.
-private actor OutputCollector {
-    private(set) var data = Data()
-    func append(_ chunk: Data) { data.append(chunk) }
+// MARK: - Session
+
+/// A spawned `open-grok` that is still running, so a scenario can write, watch
+/// the screen react, and only then write again.
+///
+/// ``PagerPTYHarness/run(arguments:input:binary:workingDirectory:)`` writes all
+/// of its input up front, which cannot express "send a prompt, let the reply
+/// stream, then quit" — the quit would race the reply. An inference-backed
+/// exchange needs this type.
+public actor PagerPTYSession {
+    private let process: any PTYProcess
+    private let size: TerminalSize
+    /// The run's scratch directory. The caller deletes it.
+    public nonisolated let sandbox: URL
+    public nonisolated let openGrokHome: URL
+
+    private var raw = Data()
+    private var drain: Task<Void, Never>?
+    private var finished = false
+
+    init(process: any PTYProcess, size: TerminalSize, sandbox: URL, openGrokHome: URL) {
+        self.process = process
+        self.size = size
+        self.sandbox = sandbox
+        self.openGrokHome = openGrokHome
+    }
+
+    func beginDraining() {
+        guard drain == nil else { return }
+        drain = Task { [process] in
+            // A closed PTY surfaces as a throw; that is the child exiting, not
+            // a scenario failure, so the accumulated bytes stand.
+            do {
+                for try await chunk in process.output() {
+                    await self.append(chunk)
+                }
+            } catch {}
+        }
+    }
+
+    private func append(_ chunk: Data) { raw.append(chunk) }
+
+    /// Write raw bytes to the terminal. Include `\r` to press Return — a PTY in
+    /// canonical mode takes CR, not LF, as the line terminator.
+    public func write(_ text: String) async throws {
+        try await process.write(Data(text.utf8))
+    }
+
+    /// What a terminal would be showing right now.
+    public func screen() -> VirtualScreen {
+        var screen = VirtualScreen(size: size)
+        screen.feed(raw)
+        return screen
+    }
+
+    public func text() -> String { screen().text }
+
+    /// Poll the rendered screen until some row contains `needle`.
+    ///
+    /// Returns whether it appeared, so a caller can assert on the result rather
+    /// than on a bare timeout. Polling the *screen* (not the raw bytes) is what
+    /// makes this CRLF- and redraw-aware: a TUI that repaints a line still ends
+    /// up with the text on a row, even though the bytes never contain it
+    /// contiguously.
+    public func waitForScreen(
+        containing needle: String,
+        timeoutSeconds: TimeInterval
+    ) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if screen().containsInAnyRow(needle) { return true }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return screen().containsInAnyRow(needle)
+    }
+
+    /// Wait for the child to exit within `timeoutSeconds`, then snapshot it.
+    ///
+    /// A child that overruns is killed and the call throws
+    /// ``PTYHarnessError/timedOut(afterSeconds:)``. Never uses
+    /// `Process.waitUntilExit`, which is banned in this codebase.
+    public func finish(timeoutSeconds: TimeInterval) async throws -> ScenarioResult {
+        let exit: ProcessExit
+        do {
+            exit = try await withThrowingTaskGroup(of: ProcessExit.self) { group in
+                group.addTask { [process] in try await process.waitForExit() }
+                group.addTask {
+                    try await Task.sleep(
+                        nanoseconds: UInt64(timeoutSeconds * 1_000_000_000)
+                    )
+                    throw PTYHarnessError.timedOut(afterSeconds: timeoutSeconds)
+                }
+                let first = try await group.next()!
+                group.cancelAll()
+                return first
+            }
+        } catch {
+            await terminate()
+            throw error
+        }
+
+        // The child has exited; let the drain flush its buffered tail.
+        _ = await drain?.value
+        await process.cancel()
+        finished = true
+        return ScenarioResult(
+            screen: screen(),
+            rawOutput: raw,
+            exit: exit,
+            openGrokHome: openGrokHome,
+            sandbox: sandbox
+        )
+    }
+
+    /// Kill the child and stop draining. Safe to call twice.
+    public func terminate() async {
+        guard !finished else { return }
+        finished = true
+        try? await process.signal(.kill)
+        drain?.cancel()
+        await process.cancel()
+    }
 }

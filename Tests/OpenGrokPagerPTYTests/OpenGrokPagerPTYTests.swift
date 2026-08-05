@@ -3,9 +3,10 @@
 // End-to-end scenarios driven through `PagerPTYHarness`: a real `open-grok`
 // process, a real PTY, and assertions against the reconstructed screen.
 //
-// Only the scenarios that need no model are here. See the SCOPE note at the
-// top of `Sources/OpenGrokPagerPTYHarness/OpenGrokPagerPTYHarness.swift` for
-// why the inference-backed half of PORT_PLAN W11-S3 is not yet implemented.
+// Only the scenarios that need no model are here. The inference-backed half of
+// PORT_PLAN W11-S3 lives in `InferencePTYScenarioTests.swift`, and the
+// incremental drive/observe mechanics those depend on are pinned in
+// `PagerPTYSessionTests.swift`.
 //
 // Every scenario skips when the product binary is absent, so a bare
 // `swift test` without `swift build --product open-grok` reports honestly
