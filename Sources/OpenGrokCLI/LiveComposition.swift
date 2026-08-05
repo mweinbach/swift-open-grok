@@ -18,6 +18,7 @@ import OpenGrokShellBase
 import OpenGrokTerminalCore
 import OpenGrokToolRegistry
 import OpenGrokTTY
+import OpenGrokWebMediaTools
 import OpenGrokWorkspace
 
 public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
@@ -300,6 +301,10 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
     public let terminal: OpenGrokLiveTerminal
     public let makeInteractiveInput: @Sendable () async throws -> OpenGrokLiveInteractiveInput?
     public let makeTerminalSink: @Sendable () -> (any PagerTerminalSink)?
+    /// Transport the image tools issue their requests over. Injectable so a
+    /// composition test can drive the full pipeline against a mock endpoint
+    /// without reaching the network.
+    public let makeImageTransport: @Sendable () -> any HTTPTransport
 
     public init(
         makeSampler: @escaping @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler,
@@ -308,13 +313,17 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
         },
         terminal: OpenGrokLiveTerminal = .production,
         makeInteractiveInput: @escaping @Sendable () async throws -> OpenGrokLiveInteractiveInput? = { nil },
-        makeTerminalSink: @escaping @Sendable () -> (any PagerTerminalSink)? = { nil }
+        makeTerminalSink: @escaping @Sendable () -> (any PagerTerminalSink)? = { nil },
+        makeImageTransport: @escaping @Sendable () -> any HTTPTransport = {
+            URLSessionHTTPTransport()
+        }
     ) {
         self.makeSampler = makeSampler
         self.makeProcessBackend = makeProcessBackend
         self.terminal = terminal
         self.makeInteractiveInput = makeInteractiveInput
         self.makeTerminalSink = makeTerminalSink
+        self.makeImageTransport = makeImageTransport
     }
 
     public static let production = OpenGrokLiveCompositionDependencies(
@@ -322,7 +331,8 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
         makeProcessBackend: { LocalShellProcessBackend() },
         terminal: .production,
         makeInteractiveInput: OpenGrokLiveInteractiveInput.production,
-        makeTerminalSink: { FileHandlePagerTerminalSink() }
+        makeTerminalSink: { FileHandlePagerTerminalSink() },
+        makeImageTransport: { URLSessionHTTPTransport() }
     )
 }
 
@@ -617,9 +627,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             if LiveSessionsComposition.handles(command) {
                 return try await LiveSessionsComposition.session(for: command, context: context)
             }
-            // Before the ACP hook: LiveACPComposition.handles still claims
-            // .serve/.leader with the historical refusals, so ordering routes
-            // serve to the working implementation.
+            // Ordering is load-bearing for the three ACP-family routes.
+            // `LiveACPComposition.handles` still claims .serve/.leader with the
+            // historical refusals, and `LiveServeComposition.handles` still
+            // claims .leader with its own, so each working implementation has
+            // to be consulted before the refusal that predates it: leader
+            // first, then serve, then acp.
+            if LiveLeaderComposition.handles(command) {
+                return try await LiveLeaderComposition.session(
+                    for: command,
+                    context: context,
+                    services: Self.liveACPServices(dependencies: dependencies)
+                )
+            }
             if LiveServeComposition.handles(command) {
                 return try await LiveServeComposition.session(
                     for: command,
@@ -750,6 +770,20 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         renderer: renderer,
                         output: SilentLiveInteractiveOutput()
                     )
+                    // Typing `/model ` drops the dropdown into the catalog, as
+                    // upstream's `ModelCommand::suggest_args` does. Rows insert
+                    // the provider-qualified selector, so accepting one
+                    // produces a command the resolver cannot find ambiguous.
+                    let completionCatalog = LiveModelCatalogResolver.catalog()
+                    let activeModelID = providerConfiguration.initialModelID
+                    await controller.setArgumentSuggestions { command, query in
+                        guard command == "model" else { return [] }
+                        return LiveModelPicker.suggestions(
+                            query: query,
+                            entries: completionCatalog,
+                            currentModelID: activeModelID
+                        )
+                    }
                     let request = OpenGrokPagerRequest(
                         prompt: prompt,
                         mode: pagerMode,
@@ -1070,7 +1104,18 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 environment: context.environment,
                 coordinator: permissionCoordinator
             ),
-            environment: context.environment
+            environment: context.environment,
+            imageToolContext: LiveImageToolContext(
+                availability: LiveImageToolComposition.resolveAvailability(
+                    workingDirectory: cwd,
+                    openGrokHome: openGrokHome,
+                    environment: context.environment,
+                    samplingProvider: samplingConfiguration.provider,
+                    samplingAPIKey: samplingConfiguration.apiKey,
+                    samplingBaseURL: samplingConfiguration.baseURL
+                ),
+                transport: dependencies.makeImageTransport()
+            )
         )
         return LiveSessionFoundation(
             options: options,
@@ -1760,7 +1805,7 @@ struct LiveToolExecutor: Sendable {
     let workingDirectory: URL
     private let composition: OpenGrokShellToolRuntimeComposition
     private let fileToolBridge: ToolBridge
-    private let fileToolNames: Set<String>
+    private let registryToolNames: Set<String>
     private let mcpConnections: MCPSessionConnections
 
     init(
@@ -1774,7 +1819,12 @@ struct LiveToolExecutor: Sendable {
         // keeps that discovery bound to the caller's session rather than to
         // whatever `ProcessInfo` happens to hold, so a test can build an
         // executor without picking up the developer's real hooks and servers.
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        // Image-tool availability is a *credential* decision, so it needs the
+        // session's resolved sampling identity. Defaulted so the many
+        // construction sites that predate the image tools keep compiling; a
+        // session that passes nothing simply never advertises them.
+        imageToolContext: LiveImageToolContext? = nil
     ) async throws {
         let composition = OpenGrokShellToolRuntimeComposition(
             processBackend: processBackend,
@@ -1797,10 +1847,53 @@ struct LiveToolExecutor: Sendable {
             policy: fileAccessPolicy,
             hooks: hooks.gate.map { $0 as any PreToolUseHookRunner } ?? FailOpenPreToolUseHookRunner()
         )
-        let fileToolBridge = ToolBridge(toolset: try FileToolPack.finalizeBuildPack(
+        // The build pack plus, when the session's credentials allow it, the
+        // image tools. Both go through one `finalize`, so image tools inherit
+        // the same capability filter, permission pipeline and dispatch path.
+        var builder = FileToolPack.makeBuilder()
+        var toolConfig = toolServerConfig(
+            for: .build,
+            catalogKinds: builder.knownToolKinds()
+        )
+        if let imageToolContext {
+            let availability = imageToolContext.availability
+            if availability.advertisesAnything,
+               let imageClient = try? ImageGenClient(
+                   config: availability.config,
+                   transport: imageToolContext.transport
+               ) {
+                let handler = LiveImageToolHandler(client: imageClient)
+                let kinds = BuiltinToolCatalog.mediaToolKinds
+                if availability.imageGenEnabled {
+                    builder.setHandler(
+                        qualifiedId: BuiltinToolCatalog.imageGenQualifiedId,
+                        handler: handler
+                    )
+                    toolConfig.tools.append(ToolConfig.fromId(
+                        BuiltinToolCatalog.imageGenQualifiedId,
+                        kind: kinds[BuiltinToolCatalog.imageGenQualifiedId]
+                    ))
+                }
+                if availability.imageEditEnabled {
+                    builder.setHandler(
+                        qualifiedId: BuiltinToolCatalog.imageEditQualifiedId,
+                        handler: handler
+                    )
+                    toolConfig.tools.append(ToolConfig.fromId(
+                        BuiltinToolCatalog.imageEditQualifiedId,
+                        kind: kinds[BuiltinToolCatalog.imageEditQualifiedId]
+                    ))
+                }
+            }
+        }
+        let fileToolBridge = try ToolBridge.finalize(
+            builder: builder,
+            config: toolConfig,
             resources: fileToolResources,
-            capabilityMode: Self.capabilityMode(for: toolPolicy)
-        ))
+            options: FinalizeOptions(
+                capabilityMode: Self.capabilityMode(for: toolPolicy)
+            )
+        )
         let mcpConnections = MCPSessionConnections()
         await LiveMCPComposition.connectConfiguredServers(
             document: try? loadEffectiveConfigDiskOnly(environment: environment),
@@ -1818,7 +1911,7 @@ struct LiveToolExecutor: Sendable {
         self.composition = composition
         self.fileToolBridge = fileToolBridge
         self.mcpConnections = mcpConnections
-        self.fileToolNames = Set(allowedFileToolDefinitions.map(\.name))
+        self.registryToolNames = Set(allowedFileToolDefinitions.map(\.name))
         self.workingDirectory = standardizedWorkingDirectory
         self.tools = terminalTools + allowedFileToolDefinitions.map { definition in
             ToolSpec(
@@ -1862,7 +1955,7 @@ struct LiveToolExecutor: Sendable {
             ))
         }
 
-        if fileToolNames.contains(call.name) {
+        if registryToolNames.contains(call.name) {
             if Task.isCancelled {
                 return .failure(.cancelled)
             }
@@ -3281,7 +3374,26 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             overlays.push(.help(lines: OpenGrokPagerInteractiveController.helpText
                 .split(separator: "\n", omittingEmptySubsequences: false)
                 .map { PagerStyledLine(text: String($0)) }))
-        case .modelPicker:
+        case .modelPicker(let query):
+            // A typed selector that names exactly one model switches directly:
+            // showing a picker the user already answered would be a pointless
+            // second step. Ambiguity and misses fall back to an error rather
+            // than to the overlay, so `/model <typo>` never silently becomes
+            // "pick something else" (upstream returns `Unknown model: …`).
+            if let query, !query.isEmpty {
+                guard let modelID = LiveModelPicker.resolve(
+                    query: query,
+                    entries: modelCatalog
+                ) else {
+                    conversation.appendMessage(PagerMessage(
+                        role: .error,
+                        text: LiveModelPicker.unknownModelMessage(query)
+                    ))
+                    return
+                }
+                await switchModel(to: modelID)
+                return
+            }
             overlays.push(LiveModelPicker.overlay(
                 entries: modelCatalog,
                 currentModelID: modelName

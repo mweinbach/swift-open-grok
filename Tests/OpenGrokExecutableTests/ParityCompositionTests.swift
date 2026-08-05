@@ -1149,7 +1149,7 @@ struct ParityCompositionTests {
         }
     }
 
-    @Test("live headless composition executes sandboxed file tools from the build pack")
+    @Test("live headless composition advertises the full live tool surface and executes a file tool")
     func liveHeadlessFileToolComposition() async {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1191,9 +1191,24 @@ struct ParityCompositionTests {
         // A session with no agent profile lists the full read-write build pack.
         // The mutating tools are only *offered* here; the permission gate still
         // decides at dispatch, which `liveFileToolsDenyMutationsByDefault` pins.
-        #expect(Set(requests.first?.tools.map(\.name) ?? []) == Set([
+        //
+        // `image_gen` / `image_edit` join the list because this session carries
+        // an `XAI_API_KEY`, which is exactly the advertisement rule upstream
+        // uses (`xai-grok-agent/src/builder.rs:771`): the image tools appear
+        // when the session's resolved credentials can actually reach an image
+        // endpoint. `ImageToolCompositionTests` pins both directions.
+        let advertised = Set(requests.first?.tools.map(\.name) ?? [])
+        #expect(advertised == Set([
             "run_terminal_cmd", "read_file", "list_dir", "grep",
-            "glob", "view_image", "search_replace", "write", "apply_patch"
+            "glob", "view_image", "search_replace", "write", "apply_patch",
+            "image_gen", "image_edit"
+        ]))
+        // The `.build` file-tool pack proper is exactly these eight; the rest
+        // of the surface enters at the composition site (terminal tool
+        // unconditionally, image tools by credential advertisement).
+        #expect(advertised.isSuperset(of: [
+            "read_file", "list_dir", "grep", "glob",
+            "view_image", "search_replace", "write", "apply_patch"
         ]))
         #expect(toolResult?.toolCallId == "file-call-1")
         #expect(toolResult?.content.contains("file tool contents") == true)
@@ -1506,11 +1521,15 @@ struct ParityCompositionTests {
 
             continuation.yield(.paste("/model"))
             continuation.yield(.key(KeyEvent(key: .enter)))
-            // Only `XAI_API_KEY` is set and grok is the sole xAI model. Rows
-            // sort by provider then name, which puts xAI last, so the active
-            // row is the final one and moving *up* is what reaches another
-            // provider — one this session cannot authenticate.
-            continuation.yield(.key(KeyEvent(key: .up)))
+            // Only `XAI_API_KEY` is set, so any Codex row is a provider this
+            // session cannot authenticate. Filter to the Codex partition by its
+            // `provider:slug` selector rather than counting arrow presses: rows
+            // sort by provider then name, so a positional assertion would break
+            // every time a provider is added or the ordering is tweaked, and it
+            // would fail looking like broken picker navigation. Typing into the
+            // filter resets the selection to the first visible row, so whichever
+            // Codex model leads the partition is the one selected.
+            for event in Self.typed("codex:") { continuation.yield(event) }
             continuation.yield(.key(KeyEvent(key: .enter)))
             await Self.waitForPaintedText("Could not switch to", terminal: terminal)
         }
@@ -1519,6 +1538,46 @@ struct ParityCompositionTests {
         // A refused switch says why and names the model it stayed on.
         #expect(outcome.output.contains("Could not switch to"))
         #expect(outcome.output.contains("Staying on"))
+    }
+
+    /// A typed selector that names exactly one model switches without ever
+    /// showing the picker; an unresolvable one is refused rather than falling
+    /// back to the overlay, so a typo never silently becomes "pick something
+    /// else". Mirrors upstream's `Unknown model: …` result.
+    @Test("/model <selector> switches directly and refuses an unknown name")
+    func liveInteractiveTypedModelSelector() async {
+        let outcome = await runInteractiveOverlaySession { terminal, continuation in
+            await Self.waitForPaintedText("Build anything", terminal: terminal)
+
+            continuation.yield(.paste("/model codex:gpt-5.6-sol"))
+            continuation.yield(.key(KeyEvent(key: .enter)))
+            // Codex cannot authenticate here, so the switch is refused — but it
+            // was attempted, which is what proves the selector resolved.
+            await Self.waitForPaintedText("Could not switch to", terminal: terminal)
+
+            continuation.yield(.paste("/model definitely-not-a-model"))
+            continuation.yield(.key(KeyEvent(key: .enter)))
+            await Self.waitForPaintedText("Unknown model", terminal: terminal)
+        }
+        #expect(outcome.output.contains("Could not switch to"))
+        #expect(outcome.output.contains("Unknown model"))
+        // The typed path resolves in place; the picker never opens.
+        #expect(!outcome.painted.contains("Select model"))
+    }
+
+    /// The bare display name is shared by two providers in the embedded
+    /// catalog, so it must be refused rather than resolving to whichever entry
+    /// happens to sort first.
+    @Test("/model refuses an ambiguous bare name")
+    func liveInteractiveAmbiguousModelSelector() async {
+        let outcome = await runInteractiveOverlaySession { terminal, continuation in
+            await Self.waitForPaintedText("Build anything", terminal: terminal)
+            continuation.yield(.paste("/model Kimi K3"))
+            continuation.yield(.key(KeyEvent(key: .enter)))
+            await Self.waitForPaintedText("Unknown model", terminal: terminal)
+        }
+        #expect(outcome.output.contains("Unknown model: Kimi K3"))
+        #expect(!outcome.painted.contains("Select model"))
     }
 
     @Test("mouse reporting is bracketed with the alternate screen and toggleable")

@@ -287,6 +287,45 @@ private final class ListenerOutcome: @unchecked Sendable {
     var failure: String?
 }
 
+/// One-shot handoff between a `Network.framework` state callback and an
+/// awaiting continuation.
+///
+/// Both sides race: the callback can fire before `attach`, and `attach` can
+/// land before any state arrives. Whichever is second delivers. `finish` is
+/// idempotent because `stateUpdateHandler` fires repeatedly and resuming a
+/// continuation twice traps.
+final class ContinuationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var outcome: Result<Void, Error>?
+    private var finished = false
+
+    func attach(_ continuation: CheckedContinuation<Void, Error>) {
+        lock.lock()
+        if let outcome {
+            lock.unlock()
+            continuation.resume(with: outcome)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func finish(_ result: Result<Void, Error>) {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        outcome = result
+        let waiting = continuation
+        continuation = nil
+        lock.unlock()
+        waiting?.resume(with: result)
+    }
+}
+
 /// `NWConnection` predates `Sendable` annotation in some SDKs; the box keeps
 /// the actor boundary honest without weakening anything else.
 private struct NWConnectionBox: @unchecked Sendable {
@@ -311,6 +350,61 @@ final class NWConnectionByteChannel: WebSocketByteChannel, @unchecked Sendable {
 
     func start() async {
         connection.start(queue: queue)
+    }
+
+    /// Start and block until the connection is usable, or fail.
+    ///
+    /// `start()` alone only hands the connection to the queue, so a refused or
+    /// unroutable endpoint shows up later as an end-of-stream in the middle of
+    /// the handshake. Production dialling needs the failure at dial time, with
+    /// the endpoint named — hence the readiness wait and the bounded timeout.
+    func startAndWaitReady(timeoutSeconds: Double) async throws {
+        let endpointDescription = String(describing: connection.endpoint)
+        let gate = ContinuationGate()
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                gate.finish(.success(()))
+            case .failed(let error):
+                gate.finish(.failure(WebSocketDialError.connectionFailed(
+                    url: endpointDescription,
+                    reason: String(describing: error)
+                )))
+            case .cancelled:
+                gate.finish(.failure(WebSocketDialError.connectionFailed(
+                    url: endpointDescription,
+                    reason: "connection cancelled before it became ready"
+                )))
+            case .setup, .preparing, .waiting:
+                // `.waiting` is retryable by design (DNS still resolving, path
+                // not yet satisfied); the timeout is what bounds it.
+                break
+            @unknown default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+
+        // The timeout resolves the same gate rather than throwing from a
+        // sibling task: a task group would have to await both children, so a
+        // throwing timeout task would park forever on the continuation task it
+        // was meant to pre-empt.
+        let deadline = UInt64(max(0, timeoutSeconds) * 1_000_000_000)
+        let timeout = Task {
+            try? await Task.sleep(nanoseconds: deadline)
+            guard !Task.isCancelled else { return }
+            gate.finish(.failure(WebSocketDialError.connectTimeout(
+                seconds: timeoutSeconds,
+                url: endpointDescription
+            )))
+        }
+        defer {
+            timeout.cancel()
+            connection.stateUpdateHandler = nil
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            gate.attach(continuation)
+        }
     }
 
     func read() async throws -> [UInt8]? {
