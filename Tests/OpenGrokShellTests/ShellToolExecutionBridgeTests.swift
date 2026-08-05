@@ -119,6 +119,102 @@ private func bridgeRequest(
     )
 }
 
+/// A backend whose foreground `run` outruns its budget and gets backgrounded,
+/// which is what `autoBackgroundOnTimeout` produces in a live session.
+private actor AutoBackgroundingBackend: ShellProcessBackend {
+    static let taskID = "auto-task-1"
+    private(set) var killedTaskIDs: [String] = []
+
+    func run(_ request: ShellCommandRequest) async throws -> ShellCommandResult {
+        ShellCommandResult(
+            combinedOutput: "partial",
+            backgrounded: true,
+            taskID: Self.taskID
+        )
+    }
+
+    func runBackground(_ request: ShellCommandRequest) async throws -> ShellBackgroundHandle {
+        ShellBackgroundHandle(taskID: Self.taskID)
+    }
+
+    func getTask(_ taskID: String) async -> ShellTaskSnapshot? {
+        guard taskID == Self.taskID else { return nil }
+        return ShellTaskSnapshot(
+            taskID: taskID,
+            command: "sleep 60",
+            cwd: URL(fileURLWithPath: "/tmp"),
+            ownerSessionID: "session-auto",
+            isBackgrounded: true
+        )
+    }
+
+    func killTask(_ taskID: String) async -> ShellKillOutcome {
+        killedTaskIDs.append(taskID)
+        return taskID == Self.taskID ? .killed : .notFound
+    }
+
+    func killForegroundCommands() async {}
+    func killForegroundCommands(ownerSessionID: String) async {}
+    func killAllBackgroundTasks() async {}
+    func killAllBackgroundTasks(ownerSessionID: String) async {}
+    func warmShell(at cwd: URL) async {}
+    func backgroundForegroundCommand(toolCallID: String) async -> Bool { false }
+
+    func waitForCompletion(_ taskID: String, timeout: ShellDuration?) async -> ShellTaskSnapshot? {
+        await getTask(taskID)
+    }
+
+    func listTasks() async -> [ShellTaskSnapshot] {
+        if let task = await getTask(Self.taskID) { return [task] }
+        return []
+    }
+
+    func shellCWD() async -> URL? { nil }
+
+    func kills() -> [String] { killedTaskIDs }
+}
+
+@Test("an auto-backgrounded foreground command stays reachable by task id")
+func autoBackgroundedTaskIsOwned() async throws {
+    // A command the model did not ask to background — it just outran the
+    // foreground budget — still hands back a task id. If that id is not
+    // recorded as owned, every consumer (`get_task_output`, `wait_tasks`,
+    // `kill_task`) rejects it as belonging to no one, and the model is left
+    // holding an id it can never use.
+    let cwd = URL(fileURLWithPath: "/tmp/bridge-auto")
+    let backend = AutoBackgroundingBackend()
+    let process = try OpenGrokShellOwnedProcessExecution(
+        sessionID: "session-auto",
+        workingDirectory: cwd,
+        backend: backend
+    )
+
+    let result = try await process.run(bridgeRequest(cwd: cwd))
+    #expect(result.backgrounded)
+    #expect(result.taskID == AutoBackgroundingBackend.taskID)
+
+    let snapshot = await process.taskSnapshot(AutoBackgroundingBackend.taskID)
+    #expect(snapshot?.taskID == AutoBackgroundingBackend.taskID)
+    #expect(await process.waitForCompletion(AutoBackgroundingBackend.taskID, timeout: .seconds(1)) != nil)
+    #expect(await process.listTasks().map(\.taskID) == [AutoBackgroundingBackend.taskID])
+    #expect(await process.killTask(AutoBackgroundingBackend.taskID) == .killed)
+}
+
+@Test("ownership scoping still refuses a task this session never started")
+func unownedTaskIsRefused() async throws {
+    let cwd = URL(fileURLWithPath: "/tmp/bridge-auto-scope")
+    let process = try OpenGrokShellOwnedProcessExecution(
+        sessionID: "session-auto",
+        workingDirectory: cwd,
+        backend: AutoBackgroundingBackend()
+    )
+    // Recording auto-backgrounded ids must not weaken the scope check: an id
+    // this session never produced stays unreachable.
+    #expect(await process.taskSnapshot(AutoBackgroundingBackend.taskID) == nil)
+    #expect(await process.killTask(AutoBackgroundingBackend.taskID) == .notFound)
+    #expect(await process.listTasks().isEmpty)
+}
+
 @Test("owned process execution stamps and preserves the session owner")
 func ownedProcessExecutionStampsOwner() async throws {
     let cwd = URL(fileURLWithPath: "/tmp/bridge-owner")

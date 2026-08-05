@@ -301,8 +301,98 @@ public struct FireworksProvider: ProviderAdapter {
         for i in request.messages.indices {
             request.messages[i].modelId = nil
         }
+        // Fireworks validates tool schemas strictly and 400s the whole request
+        // on a subschema it considers unconstrained — `true`, or an object
+        // carrying nothing but annotations. Loose schemas are legal JSON Schema
+        // and several of our tools emit them, so rewrite rather than reject.
+        if var tools = request.tools {
+            for i in tools.indices {
+                normalizeFireworksSchema(&tools[i].function.parameters)
+            }
+            request.tools = tools
+        }
     }
 }
+
+/// Rewrite every unconstrained subschema into an explicit any-type union.
+///
+/// Port of `normalize_fireworks_schema` (`xai-grok-sampler/src/provider.rs:409`).
+/// Recursion follows the JSON Schema keywords that hold subschemas, so a loose
+/// schema nested inside `properties`, `$defs` or a `oneOf` branch is reached
+/// too — Fireworks rejects those just as readily as a top-level one.
+func normalizeFireworksSchema(_ schema: inout JSONValue) {
+    switch schema {
+    case .bool(true):
+        schema = fireworksUnconstrainedSchema
+    case .array(var items):
+        for i in items.indices {
+            normalizeFireworksSchema(&items[i])
+        }
+        schema = .array(items)
+    case .object(var object):
+        // Keywords whose value is a single subschema.
+        for keyword in [
+            "additionalProperties", "contains", "else", "if", "items", "not",
+            "propertyNames", "then", "unevaluatedItems", "unevaluatedProperties",
+        ] {
+            guard var child = object[keyword] else { continue }
+            normalizeFireworksSchema(&child)
+            object[keyword] = child
+        }
+        // Keywords whose value is an array of subschemas.
+        for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+            guard case .array(var children)? = object[keyword] else { continue }
+            for i in children.indices {
+                normalizeFireworksSchema(&children[i])
+            }
+            object[keyword] = .array(children)
+        }
+        // Keywords whose value is a map of name to subschema.
+        for keyword in [
+            "$defs", "definitions", "dependentSchemas", "patternProperties", "properties",
+        ] {
+            guard case .object(var children)? = object[keyword] else { continue }
+            for key in children.keys {
+                guard var child = children[key] else { continue }
+                normalizeFireworksSchema(&child)
+                children[key] = child
+            }
+            object[keyword] = .object(children)
+        }
+        // An object of pure annotations constrains nothing, so it is as
+        // unconstrained as `true` and gets the same explicit union. The
+        // annotations are kept: they are what the description carries.
+        if object.keys.allSatisfy(isFireworksSchemaAnnotation),
+           case .object(let unconstrained) = fireworksUnconstrainedSchema {
+            object["anyOf"] = unconstrained["anyOf"]
+        }
+        schema = .object(object)
+    default:
+        break
+    }
+}
+
+private func isFireworksSchemaAnnotation(_ keyword: String) -> Bool {
+    switch keyword {
+    case "$anchor", "$comment", "$id", "$schema", "default", "deprecated",
+         "description", "examples", "readOnly", "title", "writeOnly":
+        return true
+    default:
+        return false
+    }
+}
+
+private let fireworksUnconstrainedSchema: JSONValue = .object([
+    "anyOf": .array([
+        .object(["type": .string("null")]),
+        .object(["type": .string("boolean")]),
+        .object(["type": .string("integer")]),
+        .object(["type": .string("number")]),
+        .object(["type": .string("string")]),
+        .object(["type": .string("array")]),
+        .object(["type": .string("object")]),
+    ]),
+])
 
 public struct DeepSeekProvider: ProviderAdapter {
     public init() {}

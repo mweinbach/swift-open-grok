@@ -344,8 +344,135 @@ public enum BuiltinToolCatalog {
     public static let imageGenQualifiedId = "GrokBuild:image_gen"
     public static let imageEditQualifiedId = "GrokBuild:image_edit"
 
+    // MARK: Web tools
+
+    public static let webSearchDescription = "Search the web and return a synthesized answer with source citations. Use for current events, documentation, and anything outside the workspace."
+
+    public static let webFetchDescription = "Fetch the content of a specific public URL and return it as markdown. Use when you already have a URL; use web_search when you need to find one."
+
+    public static let xSearchDescription = "Search public posts on X and return a synthesized answer with source citations."
+
+    public static let webSearchSchema = objectSchema(
+        properties: [
+            "query": stringProp("The search query."),
+            "allowed_domains": stringArrayProp(
+                "Optional domains to restrict the search to."
+            ),
+        ],
+        required: ["query"]
+    )
+
+    public static let webFetchSchema = objectSchema(
+        properties: [
+            "url": stringProp("The URL to fetch content from."),
+        ],
+        required: ["url"]
+    )
+
+    public static let xSearchSchema = objectSchema(
+        properties: [
+            "query": stringProp("The X search query."),
+        ],
+        required: ["query"]
+    )
+
+    /// Web search / fetch tools.
+    ///
+    /// Registered unconditionally, the way upstream's registry does
+    /// (`xai-grok-tools/src/registry/types.rs:708-711`). Whether a session
+    /// advertises them is decided when its `ToolServerConfig` is assembled,
+    /// from the resolved search backend and the `--disable-web-search` switch
+    /// — the same split the image tools use.
+    public static let webTools: [RegisteredToolSpec] = [
+        RegisteredToolSpec(
+            namespace: .grokBuild, id: "web_search", kind: .webSearch,
+            description: webSearchDescription,
+            inputSchema: webSearchSchema
+        ),
+        RegisteredToolSpec(
+            namespace: .grokBuild, id: "web_fetch", kind: .webFetch,
+            description: webFetchDescription,
+            inputSchema: webFetchSchema
+        ),
+        RegisteredToolSpec(
+            namespace: .grokBuild, id: "x_search", kind: .webSearch,
+            description: xSearchDescription,
+            inputSchema: xSearchSchema
+        ),
+    ]
+
+    public static var webToolKinds: [String: ProductToolKind] {
+        Dictionary(uniqueKeysWithValues: webTools.map { ($0.qualifiedId, $0.kind) })
+    }
+
+    public static let webSearchQualifiedId = "GrokBuild:web_search"
+    public static let webFetchQualifiedId = "GrokBuild:web_fetch"
+    public static let xSearchQualifiedId = "GrokBuild:x_search"
+
+    // MARK: Session-state tools
+
+    public static let todoWriteDescription = """
+        Create and manage a structured task list. The user sees this list live — it is your primary way to show progress.
+
+        Use for any task with 3+ steps. Skip for trivial single-step work.
+        """
+
+    public static let todoWriteSchema = objectSchema(
+        properties: [
+            "merge": boolProp(
+                "Optional. When true (default), merges the provided todos into the existing list by id — send only the items you are changing, and to flip status without changing content send just id + status. When false, the provided todos replace the existing list."
+            ),
+            "todos": .object([
+                "type": .string("array"),
+                "description": .string("Array of todo items to write to the workspace"),
+                "items": .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "id": stringProp("Unique identifier for the todo item"),
+                        "content": stringProp("The description/content of the todo item"),
+                        "status": .object([
+                            "type": .string("string"),
+                            "enum": .array([
+                                .string("pending"), .string("in_progress"),
+                                .string("completed"), .string("cancelled"),
+                            ]),
+                            "description": .string(
+                                "The status of the todo item: pending, in_progress, completed, or cancelled"
+                            ),
+                        ]),
+                    ]),
+                    "required": .array([.string("id")]),
+                ]),
+            ]),
+        ],
+        required: ["todos"]
+    )
+
+    /// `todo_write`.
+    ///
+    /// Carries `.read` rather than `.edit`: it touches no file and runs no
+    /// process, so upstream gives it `ToolScope::Read`
+    /// (`grok_build/todo/mod.rs:300-305`). That is load-bearing — a planning
+    /// agent under a read-only capability mode must still be able to record its
+    /// plan, and `plan` is exactly the preset where this is the only state tool.
+    public static let sessionStateTools: [RegisteredToolSpec] = [
+        RegisteredToolSpec(
+            namespace: .grokBuild, id: "todo_write", kind: .read,
+            description: todoWriteDescription,
+            inputSchema: todoWriteSchema
+        ),
+    ]
+
+    public static var sessionStateToolKinds: [String: ProductToolKind] {
+        Dictionary(uniqueKeysWithValues: sessionStateTools.map { ($0.qualifiedId, $0.kind) })
+    }
+
+    public static let todoWriteQualifiedId = "GrokBuild:todo_write"
+
     /// Every spec `ToolRegistryBuilder(registerBuiltins: true)` installs.
-    public static var builtinTools: [RegisteredToolSpec] { fileTools + mediaTools }
+    public static var builtinTools: [RegisteredToolSpec] {
+        fileTools + mediaTools + webTools + sessionStateTools
+    }
 
     public static var allQualifiedIds: Set<String> {
         Set(builtinTools.map(\.qualifiedId))

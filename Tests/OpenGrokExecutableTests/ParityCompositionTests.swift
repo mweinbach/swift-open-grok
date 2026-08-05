@@ -958,7 +958,12 @@ struct ParityCompositionTests {
         let (streams, out, err) = CLIStreams.buffered()
 
         let code = await CLIRunner.run(
-            ["headless", "--prompt", "use the terminal", "--cwd", root.path],
+            [
+                "headless", "--prompt", "use the terminal", "--cwd", root.path,
+                // Headless has no prompter, so shell needs explicit authorization.
+                // This is the supported path a scripted user uses.
+                "--allowedTools", "Bash",
+            ],
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
@@ -1005,7 +1010,10 @@ struct ParityCompositionTests {
         let (streams, out, err) = CLIStreams.buffered()
 
         let code = await CLIRunner.run(
-            ["headless", "--prompt", "run both", "--cwd", root.path],
+            [
+                "headless", "--prompt", "run both", "--cwd", root.path,
+                "--allowedTools", "Bash",
+            ],
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
@@ -1051,7 +1059,8 @@ struct ParityCompositionTests {
                 [
                     "headless", "--prompt", "use the terminal",
                     "--cwd", root.path,
-                    "--output-format", outputFormat
+                    "--output-format", outputFormat,
+                    "--allowedTools", "Bash"
                 ],
                 environment: [
                     "HOME": root.path,
@@ -1124,7 +1133,12 @@ struct ParityCompositionTests {
         let (streams, out, err) = CLIStreams.buffered()
 
         let code = await CLIRunner.run(
-            ["interactive", "--cwd", root.path],
+            [
+                "interactive", "--cwd", root.path,
+                // No presenter attaches in this fixture, so the sheet cannot be
+                // answered; the flag is how a caller authorizes shell instead.
+                "--allowedTools", "Bash",
+            ],
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
@@ -1197,11 +1211,24 @@ struct ParityCompositionTests {
         // uses (`xai-grok-agent/src/builder.rs:771`): the image tools appear
         // when the session's resolved credentials can actually reach an image
         // endpoint. `ImageToolCompositionTests` pins both directions.
+        //
+        // `get_task_output` / `wait_tasks` / `kill_task` ride along with
+        // `run_terminal_cmd`: it can background a command — on request, or on
+        // its own once the foreground budget runs out — and these are the only
+        // way to read, wait on, or stop the task it hands back.
+        //
+        // `web_search` / `web_fetch` / `x_search` follow the image-tool rule:
+        // this session's `XAI_API_KEY` resolves an xAI search backend, so all
+        // three are offered. `LiveWebToolsTests` pins the credential cases.
+        // `todo_write` needs no credentials at all and is unconditional.
         let advertised = Set(requests.first?.tools.map(\.name) ?? [])
         #expect(advertised == Set([
             "run_terminal_cmd", "read_file", "list_dir", "grep",
             "glob", "view_image", "search_replace", "write", "apply_patch",
-            "image_gen", "image_edit"
+            "image_gen", "image_edit",
+            "get_task_output", "wait_tasks", "kill_task",
+            "web_search", "web_fetch", "x_search",
+            "todo_write"
         ]))
         // The `.build` file-tool pack proper is exactly these eight; the rest
         // of the surface enters at the composition site (terminal tool
@@ -2117,7 +2144,10 @@ struct ParityCompositionTests {
         let (streams, out, err) = CLIStreams.buffered()
 
         let code = await CLIRunner.run(
-            ["interactive", "--prompt", "use the terminal", "--cwd", root.path],
+            [
+                "interactive", "--prompt", "use the terminal", "--cwd", root.path,
+                "--allowedTools", "Bash",
+            ],
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,

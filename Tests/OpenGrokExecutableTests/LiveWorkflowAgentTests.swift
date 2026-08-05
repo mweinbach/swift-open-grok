@@ -687,7 +687,7 @@ struct LiveWorkflowRouteTests {
     @Test("the route claims the workflow command and rejects an unknown action")
     func routing() async throws {
         #expect(LiveWorkflowComposition.handles(.workflow(CLIResourceOptions(action: "list"))))
-        #expect(!LiveWorkflowComposition.handles(.doctor))
+        #expect(!LiveWorkflowComposition.handles(.doctor(CLIDoctorOptions())))
         await #expect(throws: CLIApplicationError.self) {
             try await LiveWorkflowComposition.run(
                 options: CLIResourceOptions(action: "frobnicate"),

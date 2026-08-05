@@ -251,13 +251,25 @@ struct OpenGrokCLITests {
         #expect(code == CLIRunner.ExitCode.success.rawValue)
         #expect(out.contents.contains("No MCP servers configured."))
 
-        // A bad subcommand on the same path is still a failure, not a silent zero.
+        // An `mcp` action that is not in the grammar at all is now a usage
+        // error at parse time (clap's exit 2), rather than being accepted and
+        // refused later by the composition.
         let (badStreams, _, badErr) = CLIStreams.buffered()
         let badCode = CLIRunner.main(
             ["mcp", "nonsense"], environment: environment, streams: badStreams
         )
-        #expect(badCode == CLIRunner.ExitCode.failure.rawValue)
+        #expect(badCode == CLIRunner.ExitCode.usage.rawValue)
         #expect(badErr.contents.contains("nonsense"))
+
+        // An action that upstream defines but this composition has not
+        // implemented still parses, and fails on the route rather than at the
+        // grammar — which is what keeps the two failure modes distinguishable.
+        let (missingStreams, _, missingErr) = CLIStreams.buffered()
+        let missingCode = CLIRunner.main(
+            ["mcp", "enable", "demo"], environment: environment, streams: missingStreams
+        )
+        #expect(missingCode == CLIRunner.ExitCode.failure.rawValue)
+        #expect(missingErr.contents.contains("enable"))
     }
 
     /// `sessions list|show|delete` runs on the synchronous path, following the

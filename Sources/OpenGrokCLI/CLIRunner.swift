@@ -16,13 +16,15 @@ public enum CLIRunner {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         streams: CLIStreams
     ) -> Int32 {
-        let command = CLICommandParser.parse(args)
+        let command = CLICommandParser.parse(args, environment: environment)
         switch command {
         case .version(let json):
             writeVersion(json: json, environment: environment, streams: streams)
             return ExitCode.success.rawValue
-        case .help:
-            streams.out(OpenGrokHelp.text)
+        case .help(let topic):
+            return writeHelp(topic: topic, streams: streams)
+        case .completions(let shell):
+            streams.out(OpenGrokCompletions.script(shell: shell))
             return ExitCode.success.rawValue
         case .paths(let json):
             writePaths(json: json, environment: environment, streams: streams)
@@ -85,13 +87,15 @@ public enum CLIRunner {
         streams: CLIStreams,
         application: OpenGrokApplication = .unavailable
     ) async -> Int32 {
-        let command = CLICommandParser.parse(args)
+        let command = CLICommandParser.parse(args, environment: environment)
         switch command {
         case .version(let json):
             writeVersion(json: json, environment: environment, streams: streams)
             return ExitCode.success.rawValue
-        case .help:
-            streams.out(OpenGrokHelp.text)
+        case .help(let topic):
+            return writeHelp(topic: topic, streams: streams)
+        case .completions(let shell):
+            streams.out(OpenGrokCompletions.script(shell: shell))
             return ExitCode.success.rawValue
         case .paths(let json):
             writePaths(json: json, environment: environment, streams: streams)
@@ -167,9 +171,80 @@ public enum CLIRunner {
         }
     }
 
+    private static func writeHelp(topic: String?, streams: CLIStreams) -> Int32 {
+        guard let topic else {
+            streams.out(OpenGrokHelp.text)
+            return ExitCode.success.rawValue
+        }
+        if let text = OpenGrokHelp.topic(topic) {
+            streams.out(text)
+            return ExitCode.success.rawValue
+        }
+        // Silently printing the top-level blob for an unrecognized topic is
+        // what the old behavior did, and it hides typos. Upstream errors here.
+        streams.err("open-grok: no help topic named '\(topic)'.\n")
+        streams.err("Topics: \(OpenGrokHelp.topics.joined(separator: ", ")).\n")
+        return ExitCode.usage.rawValue
+    }
+
+    /// Why a recognized route has no implementation, and what to do instead.
+    ///
+    /// A route that parses and then refuses is only defensible if the refusal
+    /// says which capability is missing; otherwise it reads as a bug. Keyed by
+    /// route name so the parser stays the single source of truth for spelling.
+    private static func unavailableDetail(for command: CLICommand) -> String {
+        switch command {
+        case .inspect:
+            return "Configuration discovery is not wired up yet. "
+                + "'open-grok paths' reports the resolved state directories today."
+        case .doctor(let options):
+            return options.fix
+                ? "Terminal and clipboard remediation is not implemented yet; "
+                    + "there are no fixes to apply."
+                : "Terminal, clipboard, and color probing is not implemented yet."
+        case .plugin(let options):
+            return "The plugin subsystem is parsed but not installed in this build, "
+                + "so 'plugin \(options.action)' has nothing to run."
+        case .utility(let options):
+            switch options.name {
+            case "wrap":
+                return "PTY wrapping with OSC 52 clipboard forwarding is not "
+                    + "implemented; run the command directly instead."
+            case "export":
+                return "Transcript export is not implemented; "
+                    + "'open-grok sessions show <ID>' prints the transcript."
+            case "trace":
+                return "Trace export and upload are not implemented."
+            case "update":
+                return "Self-update is not implemented; reinstall from the "
+                    + "release you obtained this binary from."
+            case "setup":
+                return "Managed configuration fetch and install are not implemented."
+            case "share":
+                return "Session sharing is not implemented."
+            case "memory":
+                return "Cross-session memory management is not implemented."
+            case "dashboard":
+                return "The agent dashboard is not implemented."
+            case "workspace":
+                return "Computer Hub workspace exposure is not implemented."
+            case "worktree":
+                return "Worktree management is not implemented; "
+                    + "use git worktree directly."
+            default:
+                return "No success path is installed for this capability."
+            }
+        case .sessions(let options):
+            return "'sessions \(options.action.rawValue)' is not installed; "
+                + "'list', 'show' and 'delete' are."
+        default:
+            return "No success path is installed for this capability."
+        }
+    }
+
     private static func writeUnsupported(_ command: CLICommand, streams: CLIStreams) {
         streams.err("open-grok: route '\(command.routeName)' is recognized but unavailable in this Swift composition.\n")
-        streams.err("No success path is installed for this capability.\n")
+        streams.err("\(unavailableDetail(for: command))\n")
     }
 
     private static func writeUsageError(_ error: CLIParseError, streams: CLIStreams) {

@@ -320,9 +320,16 @@ struct CodeModeCompositionTests {
 
         let names = sampler.recordedRequests.first?.tools.map(\.name) ?? []
         #expect(code == CLIRunner.ExitCode.success.rawValue)
-        // None of the live tools is on the direct-only list, so only the
-        // transport pair survives.
-        #expect(names == ["exec", "wait"])
+        // Only the direct-only tools survive alongside the transport pair. The
+        // three background-task consumers are on that list on purpose: they
+        // hold the turn until a task finishes, which a cell's yield timer
+        // cannot survive — the timer would hand control back to the model while
+        // the wait is still outstanding.
+        #expect(
+            Set(names) == ["get_task_output", "wait_tasks", "kill_task", "exec", "wait"]
+        )
+        // The transport pair is always last, after any direct-only tool.
+        #expect(names.suffix(2) == ["exec", "wait"])
         // Only-mode is what makes the exec description carry the typed
         // declarations for the nested namespace.
         let exec = sampler.recordedRequests.first?.tools.first { $0.name == "exec" }

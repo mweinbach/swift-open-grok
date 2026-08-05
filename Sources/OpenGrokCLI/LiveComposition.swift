@@ -762,7 +762,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         modelSwitch: modelSwitch,
                         permissionCoordinator: permissionCoordinator,
                         workflowRegistry: workflowRegistry,
-                        terminalProgram: context.environment["TERM_PROGRAM"]
+                        terminalProgram: context.environment["TERM_PROGRAM"],
+                        compaction: stack.compaction
                     )
                     let controller = OpenGrokPagerInteractiveController(
                         input: interactiveInput.events,
@@ -897,6 +898,43 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         }
     }
 
+    /// Root flags that the parser now accepts but that nothing downstream
+    /// honors yet.
+    ///
+    /// Each of these narrows or redirects what the agent may do. Accepting one
+    /// and ignoring it produces a run that is not merely incomplete but wrong
+    /// in the user's favour-of-caution direction — a `--tools Read` run that
+    /// quietly kept Bash, a `--worktree` run that edited the real checkout, a
+    /// `--json-schema` run whose output does not match the schema. Refusing is
+    /// the only honest option until the corresponding subsystem lands.
+    ///
+    /// Flags deliberately absent from this list are the ones whose absence is
+    /// merely a missing refinement rather than a wrong answer (`--verbatim`,
+    /// `--reasoning-effort`, `--no-plan`, `--include-partial-messages`, the
+    /// hidden operational flags), plus everything under
+    /// `common.permissions`, which the permission and sandbox layer consumes.
+    private static func unhonoredLaunchFlag(_ options: CLIExecutionOptions) -> String? {
+        if options.agentOptions.tools != nil { return "--tools" }
+        if options.agentOptions.disallowedTools != nil { return "--disallowed-tools" }
+        if options.agentOptions.agent != nil { return "--agent" }
+        if options.agentOptions.agentsJSON != nil { return "--agents" }
+        if options.agentOptions.maxTurns != nil { return "--max-turns" }
+        if options.agentOptions.disableWebSearch { return "--disable-web-search" }
+        if options.agentOptions.noSubagents { return "--no-subagents" }
+        if options.agentOptions.rules != nil { return "--rules" }
+        if options.agentOptions.systemPromptOverride != nil { return "--system-prompt-override" }
+        if options.jsonSchema != nil { return "--json-schema" }
+        if options.worktree != nil { return "--worktree" }
+        if options.restoreCode { return "--restore-code" }
+        if options.advanced.reauthenticate { return "--reauth" }
+        // Silently keeping the default host when the caller named another one
+        // sends the request somewhere they did not ask for, which is worse than
+        // refusing to start.
+        if options.advanced.cliChatProxyBaseURL != nil { return "--cli-chat-proxy-base-url" }
+        if options.advanced.xaiAPIBaseURL != nil { return "--xai-api-base-url" }
+        return nil
+    }
+
     private static func validateUnsupportedOptions(_ options: CLIExecutionOptions) throws {
         if !options.common.pluginDirectories.isEmpty {
             throw CLIApplicationError.unsupported(route: "plugins")
@@ -906,6 +944,27 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         }
         if options.common.leader || options.common.noLeader {
             throw CLIApplicationError.unsupported(route: "interactive composition options")
+        }
+        // `--restore-code` gets its own message because the generic one is
+        // actively misleading now that rewind exists: a user who has seen
+        // `/rewind` work will reasonably read "not honored yet" as "code
+        // restoration is missing", when in fact it is present and this flag
+        // means something else. Rust's `--restore-code` checks out the git
+        // commit the session was pinned to; the rewind store restores file
+        // snapshots. Same intent, different mechanism, and silently serving one
+        // when the user asked for the other would be the wrong answer rather
+        // than a missing one.
+        if options.restoreCode {
+            throw CLIApplicationError.unsupported(
+                route: """
+                --restore-code, which checks out the session's git commit — \
+                not ported. To undo edits made in a session, resume it and use \
+                /rewind, which restores files from per-prompt snapshots
+                """
+            )
+        }
+        if let flag = unhonoredLaunchFlag(options) {
+            throw CLIApplicationError.unsupported(route: "\(flag), which nothing in this composition honors yet")
         }
         if options.mode == .interactive && options.outputFormat != .plain {
             throw CLIApplicationError.unsupported(route: "interactive structured output")
@@ -927,6 +986,17 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 throw CLIApplicationError.failed("--fullscreen requires an attached terminal")
             }
             return .fullScreen
+        }
+        // Root `--minimal` picks the scrollback-native renderer for an
+        // interactive session. It is session-scoped and writes no config, so it
+        // only reaches here; `--fullscreen` above already overrides it, and
+        // `--no-alt-screen` wins because inline is the stricter request.
+        if options.minimalRendering {
+            // Scrollback-native rendering pins a live region above the prompt,
+            // which needs a terminal to pin it to. Piped output falls back to
+            // inline rather than failing, since unlike `--fullscreen` this flag
+            // is a preference about presentation, not a hard requirement.
+            return terminal.isTTY() ? .minimal : .inline
         }
         return terminal.isTTY() ? .fullScreen : .inline
     }
@@ -1049,6 +1119,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let codeMode: LiveCodeModeCoordinator?
         let conversationHistory: LiveConversationHistory
         let modelSwitch: LiveModelSwitchCoordinator
+        /// Exposed so the interactive controller can offer `/compact` and a
+        /// `/usage` readout without rebuilding the model contract itself. The
+        /// turn loop holds the same instance, so a manual compaction and the
+        /// automatic one share a compaction counter.
+        let compaction: LiveCompactionCoordinator
         let turnDriver: ProviderSessionTurnDriver
         let shell: OpenGrokShell
     }
@@ -1095,6 +1170,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // session never attaches a presenter, so it inherits that same
         // fail-closed behavior for free.
         let permissionCoordinator = PagerPermissionCoordinator()
+        let sessionServices = await makeSessionServices(
+            sessionID: sessionID,
+            workingDirectory: cwd,
+            openGrokHome: openGrokHome,
+            conversationRecord: conversationRecord,
+            environment: context.environment,
+            experimentalMemory: options.agentOptions.experimentalMemory
+        )
         let toolExecutor = try await LiveToolExecutor(
             processBackend: processBackend,
             sessionID: sessionID,
@@ -1115,7 +1198,23 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     samplingBaseURL: samplingConfiguration.baseURL
                 ),
                 transport: dependencies.makeImageTransport()
-            )
+            ),
+            webToolContext: LiveWebToolContext(
+                availability: LiveWebToolComposition.resolveAvailability(
+                    workingDirectory: cwd,
+                    openGrokHome: openGrokHome,
+                    environment: context.environment,
+                    samplingProvider: samplingConfiguration.provider,
+                    samplingAPIKey: samplingConfiguration.apiKey,
+                    samplingBaseURL: samplingConfiguration.baseURL,
+                    disableWebSearch: options.agentOptions.disableWebSearch
+                ),
+                // Web requests reuse the image transport: same HTTP stack, same
+                // test seam. Nothing about it is image-specific.
+                transport: dependencies.makeImageTransport()
+            ),
+            sessionServices: sessionServices,
+            permissionOptions: options.common.permissions
         )
         return LiveSessionFoundation(
             options: options,
@@ -1181,6 +1280,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // A provider change invalidates the cells and stored values the
         // old runtime holds (model_switch.rs:249).
         await modelSwitch.attachCodeMode(codeMode)
+        let compaction = LiveCompactionCoordinator(
+            history: conversationHistory,
+            modelSwitch: modelSwitch,
+            sessionID: foundation.sessionID,
+            openGrokHome: foundation.openGrokHome
+        )
         let turnDriver = ProviderSessionTurnDriver(
             sampler: LiveShellSamplingDriver(
                 modelSwitch: modelSwitch,
@@ -1188,7 +1293,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 conversationHistory: conversationHistory,
                 systemPrompt: foundation.agentProfile?.systemPrompt,
                 toolSurface: toolSurface,
-                codeMode: codeMode
+                codeMode: codeMode,
+                compaction: compaction
             )
         )
         let shell = OpenGrokShell(configuration: OpenGrokShellConfiguration(
@@ -1202,6 +1308,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             codeMode: codeMode,
             conversationHistory: conversationHistory,
             modelSwitch: modelSwitch,
+            compaction: compaction,
             turnDriver: turnDriver,
             shell: shell
         )
@@ -1261,11 +1368,16 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             throw CLIApplicationError.failed("--resume and --continue cannot be used together")
         }
 
-        let requestedResumeID = options.resume?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // `--load` is the hidden `--resume` alias, so both spellings have to
+        // reach the same lookup; `sessionToResume` folds them and drops the
+        // "resume most recent" sentinel.
+        let requestedResumeID = options.sessionToResume?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let sourceRecord: LiveConversationRecord?
         if let requestedResumeID, !requestedResumeID.isEmpty {
             sourceRecord = try await store.load(sessionID: requestedResumeID)
-        } else if options.resume != nil || options.continueSession || options.forkSession {
+        } else if options.resume != nil || options.loadSession != nil
+                    || options.continueSession || options.forkSession {
             sourceRecord = try await store.latest(workingDirectory: workingDirectory)
         } else {
             sourceRecord = nil
@@ -1717,33 +1829,88 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     }
 }
 
-/// Rejects every mutation with an actionable message instead of hanging on a
-/// prompt no terminal is listening for.
+/// Rejects every prompt-requiring access with an actionable message instead of
+/// hanging on a prompt no terminal is listening for.
 struct LiveWriteDenialPrompter: PermissionPrompter {
     func prompt(
         access: AccessKind,
         toolName: String,
         toolCallId: String
     ) async -> PermissionDecision {
-        _ = (access, toolCallId)
-        return .reject(LiveWriteDenialPrompter.denialMessage(toolName: toolName))
+        _ = toolCallId
+        return .reject(LiveWriteDenialPrompter.denialMessage(
+            toolName: toolName,
+            access: access
+        ))
     }
 
-    static func denialMessage(toolName: String) -> String {
-        "'\(toolName)' would modify files, and file mutations are disabled for this session. "
-            + "Set OPENGROK_ALLOW_WRITES=1 to allow them."
+    /// Shell commands reach this prompter too now that `run_terminal_cmd` is
+    /// gated, and "would modify files" is the wrong sentence for one — so the
+    /// message names the actual access.
+    static func denialMessage(toolName: String, access: AccessKind? = nil) -> String {
+        let suffix = " Set OPENGROK_ALLOW_WRITES=1 to allow them."
+        switch access {
+        case .bash:
+            return "'\(toolName)' needs approval to run a shell command, and no "
+                + "approval prompt is available in this session." + suffix
+        case .edit, .none:
+            return "'\(toolName)' would modify files, and file mutations are "
+                + "disabled for this session." + suffix
+        default:
+            return "'\(toolName)' needs approval, and no approval prompt is "
+                + "available in this session." + suffix
+        }
     }
 }
 
 /// "Allow for the rest of the session", held outside the coordinator so a
-/// second mutation never re-prompts once the user has said yes.
+/// second access never re-prompts once the user has said yes.
+///
+/// Scoped per access kind. A single `allowsAll` flag meant that approving one
+/// file edit also pre-approved every later edit *and*, now that shell is gated,
+/// every later shell command — which is not what "allow for this session" on a
+/// write prompt says. Bash grants are held per command prefix, matching the
+/// `bashPrefixGrants` the permission engine already models.
 actor LiveSessionWritePolicy {
-    private var allowsAll = false
+    private var allowsEdits = false
+    private var bashPrefixGrants: [String] = []
+    private var otherGrants: Set<String> = []
 
     init() {}
 
-    func isAllowingAll() -> Bool { allowsAll }
-    func allowAll() { allowsAll = true }
+    func isAllowed(_ access: AccessKind) -> Bool {
+        switch access {
+        case .edit:
+            return allowsEdits
+        case .bash(let command):
+            let trimmed = command.trimmingCharacters(in: .whitespaces)
+            return bashPrefixGrants.contains { !$0.isEmpty && trimmed.hasPrefix($0) }
+        case .read, .grep, .webSearch:
+            return true
+        case .webFetch(let url):
+            return otherGrants.contains(url)
+        case .mcpTool(let name, _):
+            return otherGrants.contains(name)
+        }
+    }
+
+    func allowForSession(_ access: AccessKind) {
+        switch access {
+        case .edit:
+            allowsEdits = true
+        case .bash(let command):
+            // Grant the whole command as its own prefix: a session grant for
+            // `npm test` must not also cover `npm publish`.
+            let trimmed = command.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty { bashPrefixGrants.append(trimmed) }
+        case .webFetch(let url):
+            otherGrants.insert(url)
+        case .mcpTool(let name, _):
+            otherGrants.insert(name)
+        case .read, .grep, .webSearch:
+            break
+        }
+    }
 }
 
 /// Routes a mutation through the pager's permission sheet.
@@ -1760,24 +1927,41 @@ struct LivePermissionModalPrompter: PermissionPrompter {
         toolName: String,
         toolCallId: String
     ) async -> PermissionDecision {
-        if await sessionPolicy.isAllowingAll() { return .allow }
+        if await sessionPolicy.isAllowed(access) { return .allow }
         guard await coordinator.hasPresenter else {
-            return .reject(LiveWriteDenialPrompter.denialMessage(toolName: toolName))
+            return .reject(LiveWriteDenialPrompter.denialMessage(
+                toolName: toolName,
+                access: access
+            ))
         }
         let request = PagerPermissionRequest(
             id: toolCallId.isEmpty ? UUID().uuidString : toolCallId,
             toolName: toolName,
-            targetPath: Self.targetPath(for: access)
+            targetPath: Self.targetPath(for: access),
+            detail: Self.detail(for: access)
         )
         switch await coordinator.decision(for: request) {
         case .allowOnce:
             return .allow
         case .allowSession:
-            await sessionPolicy.allowAll()
+            await sessionPolicy.allowForSession(access)
             return .allow
         case .deny:
             return .reject("'\(toolName)' was denied.")
         }
+    }
+
+    /// Second line of the sheet.
+    ///
+    /// For a protected edit target this is the reason that edit is dangerous —
+    /// `.opengrok/hooks/**`, `.claude/settings.json`, a shell startup file and
+    /// the rest all install something that runs later without a separate
+    /// execution approval, and the user cannot weigh the prompt without being
+    /// told that. The classifier existed but returned a bare `Bool`, so the
+    /// explanation never reached anyone.
+    private static func detail(for access: AccessKind) -> String? {
+        guard case .edit(let path) = access else { return nil }
+        return protectedEditReason(path, userGrokHome: userGrokHome()?.path)?.explanation
     }
 
     private static func targetPath(for access: AccessKind) -> String? {
@@ -1800,13 +1984,193 @@ struct LivePermissionModalPrompter: PermissionPrompter {
     }
 }
 
+/// Config, folder trust, and the permission policy for one session, resolved
+/// together because each depends on the one before it.
+///
+/// Before this existed the live path called `loadEffectiveConfigDiskOnly`,
+/// which merges only systemManaged → managed → user → requirements: a repo's
+/// `.opengrok/config.toml` was silently dropped, and nothing read `[permission]`
+/// at all, so the rule engine ran over an empty policy.
+struct LiveSecurityContext: Sendable {
+    /// Full authority chain: built-ins < user < project < env < CLI + managed.
+    var document: TOMLValue
+    /// Whether this workspace may load repo-local code-exec config.
+    var projectTrusted: Bool
+    var permissions: ResolvedPermissions
+    /// Requirements layers, kept so the sandbox can apply the same admin
+    /// precedence the permission resolver did.
+    var requirements: [TOMLValue]
+
+    /// Resolve for `workspaceRoot`.
+    ///
+    /// Folder trust is decided **first** and gates the project tier: an
+    /// untrusted repo's `.opengrok/config.toml` never enters the merge, so it
+    /// can neither declare MCP servers nor widen its own permission rules.
+    static func resolve(
+        workspaceRoot: URL,
+        environment: [String: String],
+        isInteractive: Bool,
+        // `--allow` / `--deny` / `--permission-mode` / `--always-approve` /
+        // `--trust`, parsed by the root CLI parser. This is the tier that lets
+        // a scripted user authorize a command through the supported path
+        // instead of an environment-variable bypass.
+        cli: CLIPermissionOptions = CLIPermissionOptions()
+    ) -> LiveSecurityContext {
+        // One disk load, reused for the trust flag, the merge and the sandbox.
+        let layers = try? ConfigLayers.load(environment: environment)
+        // The base chain without the project tier, used to read the folder
+        // trust feature flag itself — a repo must not be able to switch off
+        // the gate that is deciding whether to read it.
+        let base = layers?.effectiveConfigBase() ?? .table(TOMLTable())
+
+        let featureEnabled = folderTrustEnabled(document: base, environment: environment)
+        let store = PersistentFolderTrustStore(environment: environment)
+        let outcome = decideFolderTrust(
+            featureEnabled: featureEnabled,
+            inputs: FolderTrustDecideInputs(
+                storeTrusted: store.isTrusted(workspaceRoot),
+                repoConfigsPresent: repoConfigsPresent(at: workspaceRoot),
+                isInteractive: isInteractive,
+                keyRecordable: !isUnsafeTrustRoot(
+                    workspaceRoot.path,
+                    home: environment["HOME"]
+                )
+            )
+        )
+        // `.prompt` is "not yet decided". Until the pager can raise a trust
+        // sheet, an undecided folder is treated as untrusted — the failure mode
+        // is a repo whose servers do not start, not one whose servers run.
+        // `--trust` is the explicit answer to that undecided case.
+        let projectTrusted = outcome == .trusted || cli.trustFolder
+
+        // Passing `cwd: nil` for an untrusted folder is the whole gate: the
+        // project chain is never discovered, so its MCP servers, hooks and
+        // permission rules cannot enter the merged document.
+        let project: TOMLValue = projectTrusted
+            ? loadMergedProjectConfig(
+                cwd: workspaceRoot,
+                userHome: userGrokHome(environment: environment),
+                environment: environment
+            )
+            : .table(TOMLTable())
+        let document = layers.map {
+            AuthorityComposition.from(layers: $0, project: project).effective()
+        } ?? base
+
+        let requirements = [
+            layers?.userRequirements,
+            layers?.systemRequirements,
+            layers?.mdmRequirements,
+        ].compactMap { $0 }
+
+        let home = URL(
+            fileURLWithPath: environment["HOME"] ?? NSHomeDirectory()
+        )
+        // Each `[permission]` layer is passed separately with its own trust
+        // tier, never as the merged document: `deepMergeTOML` replaces arrays,
+        // so a user `config.toml` deny list would otherwise overwrite the
+        // managed one instead of adding to it. Tiering matters too — only
+        // system requirements and managed settings are admin tier, so a
+        // *user's* requirements.toml cannot smuggle a catch-all allow past the
+        // YOLO pin.
+        var permissionLayers: [(document: TOMLValue, source: PermissionRuleSource)] = []
+        if let systemRequirements = layers?.systemRequirements {
+            permissionLayers.append((systemRequirements, .systemRequirements))
+        }
+        if let mdmRequirements = layers?.mdmRequirements {
+            permissionLayers.append((mdmRequirements, .systemRequirements))
+        }
+        if let userRequirements = layers?.userRequirements {
+            permissionLayers.append((userRequirements, .requirements))
+        }
+        if let systemManaged = layers?.systemManaged {
+            permissionLayers.append((systemManaged, .managedConfig))
+        }
+        if let managed = layers?.managed {
+            permissionLayers.append((managed, .managedConfig))
+        }
+        if let user = layers?.user {
+            permissionLayers.append((user, .config))
+        }
+        // Absent entirely when the folder is untrusted.
+        if projectTrusted {
+            permissionLayers.append((project, .config))
+        }
+
+        let permissions = resolvePermissions(PermissionResolutionInputs(
+            permissionLayers: permissionLayers,
+            requirementsLayers: requirements,
+            managedSettings: loadManagedSettingsPermissions(environment: environment),
+            cwd: workspaceRoot,
+            home: home,
+            projectTrusted: projectTrusted,
+            cliAllowRules: cli.allowRules,
+            cliDenyRules: cli.denyRules,
+            cliMode: cli.mode.map { DefaultPermissionMode(parsing: $0.rawValue) },
+            cliAlwaysApprove: cli.alwaysApprove
+        ))
+
+        return LiveSecurityContext(
+            document: document,
+            projectTrusted: projectTrusted,
+            permissions: permissions,
+            requirements: requirements
+        )
+    }
+
+    /// Apply the configured OS sandbox, if any.
+    ///
+    /// Returns the profile name to persist with the session so a resume cannot
+    /// silently come back weaker. Throws `SandboxError` when a profile was
+    /// requested and could not be enforced — never degrades silently.
+    func applySandbox(
+        workspaceRoot: URL,
+        persistedProfile: String?,
+        environment: [String: String]
+    ) throws -> LiveSandboxDecision {
+        try LiveSandboxComposition.bootstrap(
+            workspaceRoot: workspaceRoot,
+            document: document,
+            requirements: requirements,
+            persistedProfile: persistedProfile,
+            environment: environment
+        )
+    }
+
+    /// Vendor `managed-settings.json` — admin tier, so it is read regardless of
+    /// folder trust.
+    private static func loadManagedSettingsPermissions(
+        environment: [String: String]
+    ) -> ClaudeSettingsPermissions? {
+        _ = environment
+        guard let path = claudeManagedSettingsPath(),
+              let data = try? Data(contentsOf: path) else { return nil }
+        return parseClaudeSettingsJSON(data)
+    }
+}
+
 struct LiveToolExecutor: Sendable {
     let tools: [ToolSpec]
     let workingDirectory: URL
     private let composition: OpenGrokShellToolRuntimeComposition
     private let fileToolBridge: ToolBridge
     private let registryToolNames: Set<String>
+    /// The same gate the file tools run through. `run_terminal_cmd` used to
+    /// dispatch straight to `composition.invoke`, so shell execution never saw
+    /// a deny rule, a PreToolUse hook, or the permission modal.
+    private let permissionPipeline: PermissionPipeline?
+    /// The OS sandbox this session runs under. `profileName` is what a session
+    /// writer persists so a resume is pinned to the same profile.
+    let sandbox: LiveSandboxDecision
+    /// Which of `get_task_output` / `wait_tasks` / `kill_task` this session
+    /// actually advertised. Only an advertised name is dispatched, so a profile
+    /// that filtered one out cannot reach it by calling it anyway.
+    private let backgroundTaskToolNames: Set<String>
     private let mcpConnections: MCPSessionConnections
+    /// Rewind snapshots, memory and goals. Optional so every construction site
+    /// that predates them keeps compiling and simply advertises none of their
+    /// tools; see `LiveSessionServices.swift`.
+    let sessionServices: LiveSessionServices?
 
     init(
         processBackend: any ShellProcessBackend,
@@ -1824,7 +2188,21 @@ struct LiveToolExecutor: Sendable {
         // session's resolved sampling identity. Defaulted so the many
         // construction sites that predate the image tools keep compiling; a
         // session that passes nothing simply never advertises them.
-        imageToolContext: LiveImageToolContext? = nil
+        imageToolContext: LiveImageToolContext? = nil,
+        // Web-tool availability is likewise a credential decision — plus the
+        // `--disable-web-search` switch. Defaulted so construction sites that
+        // predate the web tools keep compiling and simply advertise nothing.
+        webToolContext: LiveWebToolContext? = nil,
+        // The `sandbox_profile` a resumed session was created under. A resume
+        // that would weaken it is refused rather than silently downgraded.
+        persistedSandboxProfile: String? = nil,
+        // Rewind / memory / goals. Defaulted to nil so a session that opts into
+        // none of them advertises no extra tools and writes nothing to disk.
+        sessionServices: LiveSessionServices? = nil,
+        // `common.permissions` from the root parser. Defaulted so the many
+        // construction sites that predate the flags keep compiling; a session
+        // that passes nothing simply has no CLI permission tier.
+        permissionOptions: CLIPermissionOptions = CLIPermissionOptions()
     ) async throws {
         let composition = OpenGrokShellToolRuntimeComposition(
             processBackend: processBackend,
@@ -1840,12 +2218,29 @@ struct LiveToolExecutor: Sendable {
             workspaceRoot: standardizedWorkingDirectory,
             environment: environment
         )
+        // Config precedence, folder trust and the permission policy, resolved
+        // once and shared by the file tools, `run_terminal_cmd` and MCP.
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: standardizedWorkingDirectory,
+            environment: environment,
+            isInteractive: fileAccessPolicy.isInteractive,
+            cli: permissionOptions
+        )
+        // Applied before any tool can run. A configured-but-unenforceable
+        // profile throws out of `init`, so the session refuses to start rather
+        // than running unsandboxed after the user asked for one.
+        self.sandbox = try security.applySandbox(
+            workspaceRoot: standardizedWorkingDirectory,
+            persistedProfile: persistedSandboxProfile,
+            environment: environment
+        )
         let fileToolResources = FileToolSession.makeResources(
             workspaceRoot: standardizedWorkingDirectory.path,
             sessionId: sessionID,
             agentId: "main",
             policy: fileAccessPolicy,
-            hooks: hooks.gate.map { $0 as any PreToolUseHookRunner } ?? FailOpenPreToolUseHookRunner()
+            hooks: hooks.gate.map { $0 as any PreToolUseHookRunner } ?? FailOpenPreToolUseHookRunner(),
+            resolved: security.permissions
         )
         // The build pack plus, when the session's credentials allow it, the
         // image tools. Both go through one `finalize`, so image tools inherit
@@ -1886,6 +2281,55 @@ struct LiveToolExecutor: Sendable {
                 }
             }
         }
+        // `todo_write` needs no credentials and no configuration — its whole
+        // backing state is this session's in-memory list — so unlike the image
+        // and web tools it is registered unconditionally and gated only by the
+        // agent profile.
+        builder.setHandler(
+            qualifiedId: BuiltinToolCatalog.todoWriteQualifiedId,
+            handler: LiveTodoToolHandler(store: LiveTodoStore())
+        )
+        toolConfig.tools.append(ToolConfig.fromId(
+            BuiltinToolCatalog.todoWriteQualifiedId,
+            kind: BuiltinToolCatalog.sessionStateToolKinds[BuiltinToolCatalog.todoWriteQualifiedId]
+        ))
+        if let webToolContext {
+            let availability = webToolContext.availability
+            if availability.advertisesAnything {
+                // A session with `web_fetch` but no search backend still gets a
+                // handler; `searchClient` stays nil and only the search arms
+                // refuse. Fetching a URL needs no API key.
+                let searchClient = availability.searchConfig.isEnabled
+                    ? try? WebSearchClient(
+                        configuration: availability.searchConfig,
+                        transport: webToolContext.transport
+                    )
+                    : nil
+                let handler = LiveWebToolHandler(
+                    searchClient: searchClient,
+                    fetchClient: WebFetchClient(
+                        transport: webToolContext.transport,
+                        environment: environment
+                    )
+                )
+                let kinds = BuiltinToolCatalog.webToolKinds
+                let advertised: [(Bool, String)] = [
+                    (availability.webSearchEnabled && searchClient != nil,
+                     BuiltinToolCatalog.webSearchQualifiedId),
+                    (availability.webFetchEnabled,
+                     BuiltinToolCatalog.webFetchQualifiedId),
+                    (availability.xSearchEnabled && searchClient != nil,
+                     BuiltinToolCatalog.xSearchQualifiedId),
+                ]
+                for (enabled, qualifiedId) in advertised where enabled {
+                    builder.setHandler(qualifiedId: qualifiedId, handler: handler)
+                    toolConfig.tools.append(ToolConfig.fromId(
+                        qualifiedId,
+                        kind: kinds[qualifiedId]
+                    ))
+                }
+            }
+        }
         let fileToolBridge = try ToolBridge.finalize(
             builder: builder,
             config: toolConfig,
@@ -1895,8 +2339,12 @@ struct LiveToolExecutor: Sendable {
             )
         )
         let mcpConnections = MCPSessionConnections()
+        // `security.document` already excludes the project tier when the folder
+        // is untrusted, so a hostile repo's `.opengrok/config.toml` servers are
+        // simply not present here — they never reach `makeTransport`, which is
+        // what spawns the process.
         await LiveMCPComposition.connectConfiguredServers(
-            document: try? loadEffectiveConfigDiskOnly(environment: environment),
+            document: security.document,
             toolset: fileToolBridge.toolset,
             connections: mcpConnections,
             environment: environment
@@ -1905,15 +2353,66 @@ struct LiveToolExecutor: Sendable {
         let allowedFileToolDefinitions = fileToolDefinitions.filter {
             toolPolicy?.allows(liveToolName: $0.name) ?? true
         }
-        let terminalTools = toolPolicy?.allows(liveToolName: Self.runTerminalTool.name) == false
-            ? []
-            : [Self.runTerminalTool]
+        // The background-task consumers only make sense alongside the producer:
+        // without `run_terminal_cmd` there is no task for them to read, wait on
+        // or kill. Upstream registers all three in every preset that has bash
+        // (`xai-grok-tools/src/registry/types.rs:694-701`) for the same reason.
+        let backgroundTaskTools: [ToolSpec]
+        let terminalTools: [ToolSpec]
+        if toolPolicy?.allows(liveToolName: Self.runTerminalTool.name) == false {
+            backgroundTaskTools = []
+            terminalTools = []
+        } else {
+            backgroundTaskTools = LiveBackgroundTaskTools
+                .toolSpecs(environment: environment)
+                .filter { toolPolicy?.allows(liveToolName: $0.name) ?? true }
+            terminalTools = [Self.runTerminalTool] + backgroundTaskTools
+        }
+        self.backgroundTaskToolNames = Set(backgroundTaskTools.map(\.name))
+        self.permissionPipeline = fileToolResources.permissionPipeline
         self.composition = composition
         self.fileToolBridge = fileToolBridge
         self.mcpConnections = mcpConnections
         self.registryToolNames = Set(allowedFileToolDefinitions.map(\.name))
         self.workingDirectory = standardizedWorkingDirectory
-        self.tools = terminalTools + allowedFileToolDefinitions.map { definition in
+        self.sessionServices = sessionServices
+        // Session-service tools run through the same agent-profile gate as
+        // every other tool, so a read-only profile that denies `memory_search`
+        // does not get it back through this door.
+        let sessionTools = (sessionServices?.toolSpecs ?? [])
+            .filter { toolPolicy?.allows(liveToolName: $0.name) ?? true }
+        // `invoke` checks the session-service branch BEFORE everything else, so
+        // a session tool sharing a name with any other dispatched tool would
+        // silently win — and win the wrong way. It matters differently for the
+        // two branches it can shadow:
+        //
+        //   * a registry tool loses the capability filter, PreToolUse hooks and
+        //     the permission pipeline that `ToolBridge` applies;
+        //   * `run_terminal_cmd` or a background-task tool loses `gateTerminalCommand`
+        //     / the `kill_task` gate — security checks someone deliberately
+        //     wrote, which is strictly worse than being merely unfiltered.
+        //
+        // Precedence-first is the right trade only for session-state RPCs with
+        // no filesystem or process surface (`memory_search`, `update_goal`),
+        // where being shadowed by a same-named MCP tool is the real hazard.
+        // Anything touching files or processes belongs in the registry so its
+        // gating is structural. Assert rather than comment, so the day someone
+        // adds a colliding name it fails loudly in debug instead of quietly
+        // downgrading that tool's gating.
+        let dispatchedToolNames = registryToolNames
+            .union(backgroundTaskToolNames)
+            .union([Self.runTerminalTool.name])
+        assert(
+            Set(sessionTools.map(\.name)).isDisjoint(with: dispatchedToolNames),
+            """
+            session-service tool name collides with a dispatched tool: \
+            \(Set(sessionTools.map(\.name)).intersection(dispatchedToolNames)). \
+            The session branch runs first and skips the capability filter and \
+            hooks that registry tools get, and the permission gate that shell \
+            and background-task tools get.
+            """
+        )
+        self.tools = terminalTools + sessionTools + allowedFileToolDefinitions.map { definition in
             ToolSpec(
                 name: definition.name,
                 description: definition.description,
@@ -1955,6 +2454,22 @@ struct LiveToolExecutor: Sendable {
             ))
         }
 
+        // Session tools are checked first so a same-named MCP tool cannot
+        // shadow `memory_search` or `update_goal`.
+        if let sessionServices, sessionServices.handles(call.name) {
+            let output = await sessionServices.invoke(name: call.name, arguments: args)
+            return .success(OpenGrokShellToolCallResult(
+                value: .string(output),
+                promptText: output
+            ))
+        }
+
+        // Snapshot whatever this call is about to touch, before it touches it.
+        // This is the only point in the live path that sees every file tool
+        // invocation with its arguments resolved, which is what makes a rewind
+        // point per prompt possible without a hook in each tool.
+        await sessionServices?.noteToolCall(name: call.name, arguments: args)
+
         if registryToolNames.contains(call.name) {
             if Task.isCancelled {
                 return .failure(.cancelled)
@@ -1974,8 +2489,41 @@ struct LiveToolExecutor: Sendable {
             }
         }
 
-        guard call.name == Self.runTerminalTool.name else {
+        guard call.name == Self.runTerminalTool.name
+            || backgroundTaskToolNames.contains(call.name)
+        else {
             return .failure(.unsupported("unknown tool '\(call.name)'"))
+        }
+
+        // Shell execution goes through the same pipeline the file tools use:
+        // PreToolUse hooks, `[permission]` deny/ask/allow with Rust's
+        // bash-segment evaluation, the shell file-access escalation that stops
+        // a `sed -i` from editing a denied path, and the interactive modal.
+        // `kill_task` is gated too. Tearing a process down only de-escalates
+        // the *process*; the workspace is what is at risk. A killed `git rebase`
+        // leaves a detached HEAD and a half-applied stack, a killed install a
+        // partially written store. Ownership-scoping bounds the blast radius to
+        // this session's tasks — which are exactly the ones `run_terminal_cmd`
+        // started, i.e. the destructive set.
+        //
+        // Matched on the canonical name, not the literal: dispatch also accepts
+        // upstream's `kill_command_or_subagent` spelling — which is what the
+        // agent profiles actually spell — so a string match would leave that
+        // door open. `get_task_output` / `wait_tasks` stay ungated: they read
+        // output from a task whose permission decision was already made.
+        //
+        // Chained rather than two independent `if`s. The two are disjoint today,
+        // so it makes no behavioural difference — but the next gated tool will
+        // be copied from the shape that is here.
+        if call.name == Self.runTerminalTool.name {
+            if let denial = await gateTerminalCommand(args: args, call: call) {
+                return .failure(denial)
+            }
+        } else if LiveBackgroundTaskTools.canonicalName(for: call.name)
+            == LiveBackgroundTaskTools.killTaskName {
+            if let denial = await gateKillTask(args: args, call: call) {
+                return .failure(denial)
+            }
         }
 
         do {
@@ -1990,6 +2538,102 @@ struct LiveToolExecutor: Sendable {
             return .failure(.cancelled)
         } catch {
             return .failure(.failed(String(describing: error)))
+        }
+    }
+
+    /// Run `kill_task` through the permission pipeline.
+    ///
+    /// Modelled as `.bash("kill_task <id>")` so a user can express
+    /// `deny = ["Bash(kill_task:*)"]`. With no matching rule the bash path
+    /// falls through to the built-in safe classification, so the common case
+    /// costs no prompt.
+    ///
+    /// Two `nil`-shaped situations that are NOT the same thing, and the
+    /// distinction is the whole point of a gate:
+    ///
+    ///   * **No pipeline** — the gate *cannot* authorize, so it denies. Anything
+    ///     else means a session with no permission machinery kills freely.
+    ///   * **No `task_id`** — there is *nothing* to authorize, so it proceeds.
+    ///     `LiveBackgroundTaskTools.killTask` rejects the call with
+    ///     `.invalidCall` before it ever reaches `process.killTask`, so nothing
+    ///     is killed; duplicating that check here would only produce two
+    ///     different error messages for one malformed call.
+    private func gateKillTask(
+        args: JSONValue,
+        call: ToolCall
+    ) async -> OpenGrokShellToolRuntimeError? {
+        guard let permissionPipeline else {
+            return .failed(
+                "'\(call.name)' has no permission gate configured for this session"
+            )
+        }
+        guard case .object(let object) = args,
+              case .string(let rawTaskID)? = object["task_id"]
+        else { return nil }
+        let taskID = rawTaskID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if taskID.isEmpty { return nil }
+
+        let prepared = await permissionPipeline.prepare(PrepareToolAccessRequest(
+            access: .bash("kill_task \(taskID)"),
+            toolName: call.name,
+            toolCallId: call.callId
+        ))
+        if prepared.mayDispatch { return nil }
+        switch prepared.decision {
+        case .policyDeny(let reason), .reject(let reason):
+            return .failed(reason)
+        case .cancelled:
+            return .cancelled
+        case .followupMessage(let message):
+            return .failed(message)
+        case .ask:
+            return .failed("'\(call.name)' requires approval, and no prompter is available.")
+        case .allow:
+            return nil
+        }
+    }
+
+    /// Run `run_terminal_cmd` through the permission pipeline.
+    ///
+    /// Returns the error to fail the call with, or nil to proceed. Fails closed
+    /// on every path that is not an explicit allow: a session with no pipeline,
+    /// a malformed command, a policy deny, a hook deny, and a bare `.ask` that
+    /// no prompter resolved all stop the command.
+    private func gateTerminalCommand(
+        args: JSONValue,
+        call: ToolCall
+    ) async -> OpenGrokShellToolRuntimeError? {
+        guard let permissionPipeline else {
+            return .failed(
+                "'\(call.name)' has no permission gate configured for this session"
+            )
+        }
+        guard case .object(let object) = args,
+              case .string(let command)? = object["command"],
+              !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return .invalidCall("run_terminal_cmd requires a non-empty command")
+        }
+
+        let prepared = await permissionPipeline.prepare(PrepareToolAccessRequest(
+            access: .bash(command),
+            toolName: call.name,
+            toolCallId: call.callId
+        ))
+        if prepared.mayDispatch { return nil }
+
+        switch prepared.decision {
+        case .policyDeny(let reason), .reject(let reason):
+            return .failed(reason)
+        case .cancelled:
+            return .cancelled
+        case .followupMessage(let message):
+            return .failed(message)
+        case .ask:
+            // The engine asked and nothing answered — deny rather than run.
+            return .failed("'\(call.name)' requires approval, and no prompter is available.")
+        case .allow:
+            return nil
         }
     }
 
@@ -2043,6 +2687,13 @@ private struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
         _ call: OpenGrokShellToolCall,
         using process: any OpenGrokShellProcessExecution
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
+        if LiveBackgroundTaskTools.canonicalName(for: call.name) != nil {
+            return await LiveBackgroundTaskTools.invoke(
+                name: call.name,
+                args: call.args,
+                process: process
+            )
+        }
         guard call.name == "run_terminal_cmd" else {
             return .failure(.unsupported("unknown tool '\(call.name)'"))
         }
@@ -2420,8 +3071,23 @@ struct LiveAgentToolPolicy: Sendable, Equatable {
         if liveToolName == "run_terminal_cmd" {
             return [liveToolName, "run_terminal_command"]
         }
+        // Every profile in `AgentDefinitionSchema` names the background-task
+        // tools the way upstream's grok-build preset renames them, while the
+        // live surface advertises the canonical registry names — the same split
+        // `run_terminal_cmd` already has. Without both spellings here, a
+        // profile that grants `get_command_or_subagent_output` would silently
+        // fail to match the `get_task_output` the session advertises.
+        if let renamed = Self.backgroundTaskRenames[liveToolName] {
+            return [liveToolName, renamed]
+        }
         return [liveToolName]
     }
+
+    private static let backgroundTaskRenames: [String: String] = [
+        "get_task_output": "get_command_or_subagent_output",
+        "wait_tasks": "wait_commands_or_subagents",
+        "kill_task": "kill_command_or_subagent",
+    ]
 
     private static func matches(_ entries: [String], aliases: Set<String>) -> Bool {
         entries.contains { entry in
@@ -2489,8 +3155,36 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     /// `nil` in `direct` mode, which leaves the turn loop byte-identical to a
     /// session that has never heard of Code Mode.
     let codeMode: LiveCodeModeCoordinator?
+    /// Keeps the conversation under the model's context window. Optional only
+    /// so a test can build a driver without a model catalog; a live session
+    /// always has one, and without it a long session dies at the wall.
+    let compaction: LiveCompactionCoordinator?
 
     func sample(
+        context: OpenGrokShellProviderTurnContext,
+        request: OpenGrokShellTurnRequest,
+        emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
+    ) async throws -> OpenGrokShellSamplingResult {
+        // Open the rewind point around the whole turn, and close it on every
+        // exit path — including a thrown error or a cancelled turn, because a
+        // turn that died half-way through an edit is precisely the one worth
+        // being able to undo. Awaited rather than deferred into a detached
+        // task: a `Task { }` in a `defer` is unordered against the *next*
+        // turn's `beginPrompt`, which would let a late close swallow the
+        // following prompt's point.
+        let services = toolExecutor.sessionServices
+        await services?.beginPrompt(text: request.text)
+        do {
+            let result = try await sampleTurn(context: context, request: request, emit: emit)
+            await services?.endPrompt()
+            return result
+        } catch {
+            await services?.endPrompt()
+            throw error
+        }
+    }
+
+    private func sampleTurn(
         context: OpenGrokShellProviderTurnContext,
         request: OpenGrokShellTurnRequest,
         emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
@@ -2536,10 +3230,23 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
            }) {
             items.insert(.system(systemPrompt), at: 0)
         }
+        // Memory is injected after the system prompt exists so it has an item
+        // to splice into, and before compaction runs so the injected block
+        // counts toward the budget like everything else. No-ops on every turn
+        // after the first, and on a resumed session whose transcript already
+        // carries a `<memory-context>` block.
+        let services = toolExecutor.sessionServices
+        items = await services?.injectMemoryContext(into: items, prompt: request.text) ?? items
+
         var toolRoundCount = 0
 
         while true {
             try Task.checkCancellation()
+            // Before every sample, not only the first: a tool round can add
+            // more to the prompt than the whole preceding turn did, and the
+            // request that dies at the context wall is usually the one after a
+            // large tool result, not the one that opened the turn.
+            items = await compactIfNeeded(items: items, emit: emit)
             let response = try await sampler.sample(OpenGrokLiveSamplingRequest(
                 sessionID: context.sessionID,
                 turnID: context.turnID,
@@ -2579,6 +3286,32 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 sessionID: context.sessionID,
                 emit: emit
             ))
+        }
+    }
+
+    /// Keep the prompt under the model's context window, reporting what it did.
+    ///
+    /// Never throws. A session that cannot compact still gets to take its turn
+    /// and see the provider's own error — dying here would replace a
+    /// recoverable "too long" with an unrecoverable one, which is the failure
+    /// this whole path exists to remove.
+    private func compactIfNeeded(
+        items: [ConversationItem],
+        emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
+    ) async -> [ConversationItem] {
+        guard let compaction else { return items }
+        // No status for the check itself: it runs before every sample, so
+        // announcing it would put a line on the status bar for a token count
+        // that almost always comes back under the threshold.
+        switch await compaction.compactIfNeeded(items: items) {
+        case .notNeeded:
+            return items
+        case .unableToCompact(let reason):
+            await emit(.status("could not compact the conversation: \(reason)"))
+            return items
+        case .compacted(let replacement, let report):
+            await emit(.status(report.notice))
+            return replacement
         }
     }
 
@@ -2913,9 +3646,47 @@ enum LivePagerChrome {
             hints.append(PagerShortcutHint(key: "/", label: "commands"))
         }
         hints.append(PagerShortcutHint(keys: ["PgUp", "PgDn"], label: "scroll"))
+        hints.append(PagerShortcutHint(key: "Tab", label: "scrollback"))
         hints.append(PagerShortcutHint(key: "Ctrl+c", label: "quit", isPinned: true))
         return hints
     }
+
+    /// Hints for the scrollback's own focus, mirroring upstream's per-context
+    /// bar. The vim-only keys are listed only when vim mode is on, because
+    /// with it off they genuinely do nothing.
+    static func scrollbackHints(isVimMode: Bool) -> [PagerShortcutHint] {
+        var hints: [PagerShortcutHint] = [
+            PagerShortcutHint(keys: ["\u{2191}", "\u{2193}"], label: "select", isPinned: true),
+            PagerShortcutHint(keys: ["\u{2190}", "\u{2192}"], label: "fold"),
+            PagerShortcutHint(key: "Enter", label: "view")
+        ]
+        if isVimMode {
+            hints.append(PagerShortcutHint(keys: ["y", "Y"], label: "copy"))
+            hints.append(PagerShortcutHint(key: "r", label: "raw"))
+            hints.append(PagerShortcutHint(keys: ["o", "O"], label: "link"))
+        }
+        hints.append(PagerShortcutHint(key: "Tab", label: "prompt", isPinned: true))
+        return hints
+    }
+
+    /// Title for the block viewer.
+    static func blockTitle(for item: PagerConversationItem) -> String {
+        switch item {
+        case .message(let message):
+            switch message.role {
+            case .user: return "Your prompt"
+            case .assistant: return "Response"
+            case .reasoning: return "Thinking"
+            case .system: return "System"
+            case .error: return "Error"
+            }
+        case .tool(let tool):
+            return tool.name
+        case .separator:
+            return "Separator"
+        }
+    }
+
 }
 
 private struct LivePagerConversationState {
@@ -2954,6 +3725,16 @@ private struct LivePagerConversationState {
 
     mutating func appendMessage(_ message: PagerMessage) {
         items.append(.message(message))
+    }
+
+    /// In-place edit of the blocks, for the fold/raw effects the scrollback's
+    /// selection applies. Deliberately narrow: nothing outside may append or
+    /// remove through this, which would desynchronize the streaming indices.
+    mutating func withItems<T>(_ body: (inout [PagerConversationItem]) -> T) -> T {
+        let countBefore = items.count
+        let result = body(&items)
+        assert(items.count == countBefore, "scrollback edits must not change the block count")
+        return result
     }
 
     mutating func appendAssistant(_ text: String) {
@@ -3120,14 +3901,39 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     /// reflects runs started after the session began — including ones another
     /// process on the same `OPENGROK_HOME` started.
     private let workflowRegistry: RhaiWorkflowRunRegistry?
+    /// The turn loop's own coordinator, so a manual `/compact` and the
+    /// automatic one share a compaction counter — which is the whole reason
+    /// that instance is shared rather than rebuilt here.
+    private let compaction: LiveCompactionCoordinator?
     private var currentPermissionRequestID: String?
     private var hasStartedFirstTurn = false
+    /// The scrollback's focus and selected block. `selection.isFocused` is what
+    /// unfocuses the composer, so the two halves of the focus model cannot
+    /// disagree.
+    private var selection = LiveScrollbackSelection()
+    /// Composer mode flags, carried as a whole snapshot so a missed event
+    /// cannot leave the renderer disagreeing with the controller.
+    private var inputModes = OpenGrokPagerInputModes()
 
     /// Mouse. `linesPerEvent` folds the terminal's reports-per-notch into a
     /// per-report line count, which is the whole of the port's wheel handling —
     /// the reference's acceleration bands are not ported.
     private let wheelTuning: MouseWheelTuning
     private var mouseReportingEnabled: Bool
+
+    /// The palette every frame paints with, and the preference it came from.
+    ///
+    /// Resolved once at construction from `[ui] theme` plus what the terminal
+    /// can actually render, then swapped live by `/theme`. Before this the port
+    /// pinned `PagerRenderState.theme` to `.default`, which made the whole
+    /// theme catalog unreachable at runtime.
+    private var themePreference: PagerThemePreference
+    private var renderTheme: PagerRenderTheme
+    private let colorLevel: PagerColorLevel
+
+    /// Reasoning effort for the active model, shown after the model name on the
+    /// composer's bottom border. `nil` on models with no selectable effort.
+    private var reasoningEffort: String?
 
     init(
         mode: OpenGrokPagerMode,
@@ -3140,7 +3946,10 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         permissionCoordinator: PagerPermissionCoordinator? = nil,
         workflowRegistry: RhaiWorkflowRunRegistry? = nil,
         terminalProgram: String? = nil,
-        enableMouseReporting: Bool = true
+        enableMouseReporting: Bool = true,
+        themePreference: PagerThemePreference = .fixed(.grokNight),
+        reasoningEffort: String? = nil,
+        compaction: LiveCompactionCoordinator? = nil
     ) {
         self.mode = mode
         self.terminal = terminal
@@ -3153,10 +3962,29 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         self.modelSwitch = modelSwitch
         self.permissionCoordinator = permissionCoordinator
         self.workflowRegistry = workflowRegistry
+        self.compaction = compaction
         self.wheelTuning = MouseWheelTuning(
             eventsPerTick: MouseWheelTuning.eventsPerTick(forTerminalProgram: terminalProgram)
         )
         self.mouseReportingEnabled = enableMouseReporting
+        self.reasoningEffort = reasoningEffort
+
+        // Minimal mode locks the terminal's own palette, matching the
+        // reference's terminal-native lock. Everything else resolves the stored
+        // preference against what this terminal can render, so a truecolor-only
+        // theme degrades to GrokNight instead of to mush.
+        let environment = ProcessInfo.processInfo.environment
+        let level = pagerDetectColorLevel(environment: environment, isTTY: terminal.size() != nil)
+        let resolution = pagerResolveTheme(
+            preference: themePreference,
+            colorLevel: level,
+            appearance: themePreference == .auto ? PagerSystemAppearance.detect() : nil,
+            terminalNativeLock: mode != .fullScreen
+        )
+        self.themePreference = themePreference
+        self.renderTheme = resolution.theme
+        self.colorLevel = level
+
         let size = terminal.size() ?? OpenGrokLiveTerminalSize(width: 80, height: 24)
         self.terminalSize = OpenGrokTerminalCore.TerminalSize(
             width: size.width,
@@ -3225,6 +4053,22 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             endTurn()
         case .notice(let message):
             conversation.appendMessage(PagerMessage(role: .system, text: message))
+        case .focusChanged(let region):
+            switch region {
+            case .scrollback:
+                selection.focus(itemCount: conversation.items.count)
+                // Following the tail while a selection cursor exists would
+                // yank the viewport away from the block the user just picked.
+                followsBottom = false
+            case .prompt:
+                selection.unfocus()
+            }
+        case .modeChanged(let modes):
+            inputModes = modes
+        case .scrollback(let command):
+            try await applyScrollback(command)
+        case .global(let command):
+            try await applyGlobal(command)
         case .queueChanged(let count):
             queuedPromptCount = count
         case .viewport(let command):
@@ -3366,6 +4210,80 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         }
     }
 
+    // MARK: - Scrollback selection
+
+    private func applyScrollback(_ command: OpenGrokPagerScrollbackCommand) async throws {
+        selection.clamp(itemCount: conversation.items.count)
+        // `Enter` on the selected block opens it in the viewer, which is the
+        // text modal the overlay layer already builds. Handled here rather than
+        // in the selection value because only the renderer owns the stack.
+        if command == .openBlockViewer {
+            guard let index = selection.index,
+                  conversation.items.indices.contains(index) else { return }
+            let item = conversation.items[index]
+            let body = LiveScrollbackSelection.content(of: item)
+            overlays.push(.sessionInfo(
+                id: "block-viewer",
+                title: LivePagerChrome.blockTitle(for: item),
+                lines: body
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .map { PagerStyledLine(text: String($0)) }
+            ))
+            return
+        }
+
+        let outcome = conversation.withItems { items in
+            selection.apply(command, items: &items)
+        }
+        if let clipboard = outcome.clipboard {
+            do {
+                try LivePagerClipboard.copy(clipboard) { data in
+                    try sink.write(String(decoding: data, as: UTF8.self))
+                }
+                try sink.flush()
+            } catch {
+                conversation.appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Could not reach the clipboard: \(error)"
+                ))
+                return
+            }
+        }
+        if let url = outcome.url {
+            conversation.appendMessage(PagerMessage(role: .system, text: url))
+        }
+        if let notice = outcome.notice {
+            conversation.appendMessage(PagerMessage(role: .system, text: notice))
+        }
+    }
+
+    // MARK: - Global chords
+
+    /// Route an application-level chord.
+    ///
+    /// The three that open overlays are the ones this renderer can service; the
+    /// pane toggles and session chords have no backing state here yet and are
+    /// explicit no-ops rather than silent misbehaviour.
+    private func applyGlobal(_ command: OpenGrokPagerGlobalCommand) async throws {
+        switch command {
+        case .commandPalette:
+            try await present(.commandPalette(rows: []))
+        case .shortcutsHelp:
+            try await present(.shortcutsHelp)
+        case .modelPicker:
+            try await present(.modelPicker(query: nil))
+        case .toggleQueue:
+            try await present(.promptQueue(entries: []))
+        case .toggleTodos, .toggleTasks, .sendToBackground, .newSession,
+             .cyclePermissionMode, .toggleAlwaysApprove, .openDashboard,
+             .openSettings, .openSessions, .openExtensions:
+            // Unbound in the controller's key table until the backing surface
+            // exists, so these arrive only from a caller that built them by
+            // hand. Nothing to do beats a misleading approximation.
+            break
+        }
+    }
+
     // MARK: - Overlays
 
     private func present(_ request: OpenGrokPagerOverlayRequest) async throws {
@@ -3417,11 +4335,240 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             }
             let views = (try? await workflowRegistry.views()) ?? []
             overlays.push(.workflows(rows: LiveWorkflowOverlayBuilder.rows(from: views)))
+        case .commandPalette(let rows):
+            overlays.push(.list(
+                id: "command-palette",
+                title: "Commands",
+                rows: rows.isEmpty
+                    ? LivePagerOverlayText.commandRows()
+                    : rows.map {
+                        PagerListRow(
+                            id: $0.insertText,
+                            label: $0.name,
+                            summary: $0.summary,
+                            isSelectable: $0.isAvailable
+                        )
+                    }
+            ))
+        case .promptHistory(let entries):
+            guard !entries.isEmpty else {
+                note("No prompt history in this session yet.")
+                return
+            }
+            // Newest first: the entry you most likely want to re-run is the one
+            // you just ran.
+            overlays.push(.list(
+                id: "prompt-history",
+                title: "Prompt history",
+                rows: entries.reversed().enumerated().map { index, entry in
+                    PagerListRow(
+                        id: "history-\(index)",
+                        label: LivePagerOverlayText.singleLine(entry),
+                        detail: entry.contains("\n") ? "multiline" : nil
+                    )
+                }
+            ))
+        case .promptQueue(let entries):
+            guard !entries.isEmpty else {
+                note("Nothing queued.")
+                return
+            }
+            overlays.push(.list(
+                id: "prompt-queue",
+                title: "Queued prompts",
+                rows: entries.enumerated().map { index, entry in
+                    PagerListRow(
+                        id: "queue-\(index)",
+                        label: LivePagerOverlayText.singleLine(entry),
+                        detail: "#\(index + 1)"
+                    )
+                }
+            ))
+        case .sessionInfo:
+            overlays.push(.sessionInfo(lines: LivePagerOverlayText.sessionInfoLines(
+                workingDirectory: LivePagerChrome.collapseHome(workingDirectory),
+                modelName: modelName,
+                itemCount: conversation.items.count,
+                queuedPromptCount: queuedPromptCount,
+                modes: inputModes
+            )))
+        case .contextUsage:
+            // Real accounting now that the renderer shares the turn loop's
+            // coordinator — the same numbers auto-compaction decides on, not a
+            // character-count estimate. The estimate remains the fallback for
+            // compositions with no coordinator (headless, tests), and says so
+            // rather than presenting a guess as a measurement.
+            guard let compaction else {
+                overlays.push(.sessionInfo(
+                    id: "context-usage",
+                    title: "Context",
+                    lines: LivePagerOverlayText.contextLines(
+                        modelName: modelName,
+                        itemCount: conversation.items.count,
+                        transcriptCharacters: transcript.count
+                    )
+                ))
+                return
+            }
+            let usage = await compaction.usage()
+            overlays.push(.sessionInfo(
+                id: "context-usage",
+                title: "Context",
+                lines: LivePagerContextReport.lines(
+                    usage: usage,
+                    itemCount: conversation.items.count
+                )
+            ))
+        case .copyResponse(let index, let filePath):
+            guard let response = LivePagerOverlayText.assistantResponse(
+                fromLast: index,
+                in: conversation.items
+            ) else {
+                note("No assistant response \(index) back to copy.")
+                return
+            }
+            try deliver(response, to: filePath, label: "Response")
+        case .exportConversation(let filePath):
+            try deliver(transcript, to: filePath, label: "Conversation")
+        case .scrollbackSearch(let query):
+            guard let query, !query.isEmpty else {
+                note("Usage: /find <text>")
+                return
+            }
+            let matches = LivePagerOverlayText.search(query, in: conversation.items)
+            guard !matches.isEmpty else {
+                note("No matches for \(query).")
+                return
+            }
+            overlays.push(.list(
+                id: "scrollback-search",
+                title: "Find: \(query)",
+                rows: matches
+            ))
+        case .welcomeScreen:
+            overlays.push(.welcome(
+                PagerWelcomeOverlay(
+                    subtitle: LivePagerChrome.collapseHome(workingDirectory)
+                ),
+                capturesInput: false
+            ))
+        case .shortcutsHelp:
+            overlays.push(.help(
+                id: "shortcuts-help",
+                lines: LivePagerOverlayText.shortcutsLines()
+            ))
+        case .tutorial:
+            overlays.push(.sessionInfo(
+                id: "tutorial",
+                title: "Getting started",
+                lines: LivePagerOverlayText.tutorialLines()
+            ))
+        case .easterEgg:
+            conversation.appendMessage(PagerMessage(
+                role: .system,
+                text: LivePagerOverlayText.easterEgg
+            ))
+        case .compact(let instructions):
+            // Safe to run here only because the controller guarantees no turn
+            // is in flight: `/compact` is `mutatesConversationHistory`, so a
+            // mid-turn invocation is queued rather than dispatched. Without
+            // that gate this would rewrite the item list a streaming sampler is
+            // reading from.
+            guard let compaction else {
+                note("This session has no compaction coordinator, so /compact has nothing to act on.")
+                return
+            }
+            note("Compacting\u{2026}")
+            try renderState()
+            switch await compaction.compactNow(userContext: instructions) {
+            case .compacted(_, let report):
+                // `compactNow` has already written the replacement back to the
+                // persisted conversation, so there is nothing to apply here —
+                // only to report.
+                note(report.notice)
+            case .notNeeded:
+                note("Nothing to compact — the context is not close to full.")
+            case .unableToCompact(let reason):
+                conversation.appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Could not compact: \(reason)"
+                ))
+            }
+        case .settings(let deepLinkKey):
+            overlays.push(.settings(settingsOverlay(deepLinkKey: deepLinkKey)))
+        case .themePicker(let query):
+            // A typed name that resolves applies straight away; only a miss or
+            // a bare `/theme` opens the picker. Same rule as `/model`, and for
+            // the same reason — showing a chooser the user already answered is
+            // a pointless second step.
+            if let query, !query.isEmpty {
+                guard let message = applyTheme(named: query) else {
+                    conversation.appendMessage(PagerMessage(
+                        role: .error,
+                        text: "Unknown theme: \(query). Try "
+                            + availableThemeNames.joined(separator: ", ") + "."
+                    ))
+                    return
+                }
+                conversation.appendMessage(PagerMessage(role: .system, text: message))
+                return
+            }
+            overlays.push(.list(
+                id: "theme",
+                title: "Select theme",
+                rows: availableThemeNames.map { name in
+                    PagerListRow(
+                        id: name,
+                        label: PagerThemePreference.named(name)?.displayName ?? name,
+                        detail: themePreference == PagerThemePreference.named(name) ? "✓" : nil
+                    )
+                }
+            ))
         case .dismissAll:
             overlays.removeAll()
             currentPermissionRequestID = nil
         }
     }
+
+    private func note(_ text: String) {
+        conversation.appendMessage(PagerMessage(role: .system, text: text))
+    }
+
+    /// Write to a file when one is named, otherwise to the clipboard.
+    private func deliver(_ text: String, to filePath: String?, label: String) throws {
+        guard let filePath, !filePath.isEmpty else {
+            do {
+                try LivePagerClipboard.copy(text) { data in
+                    try sink.write(String(decoding: data, as: UTF8.self))
+                }
+                try sink.flush()
+                conversation.appendMessage(PagerMessage(
+                    role: .system,
+                    text: "\(label) copied — \(text.count) characters."
+                ))
+            } catch {
+                conversation.appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Could not reach the clipboard: \(error)"
+                ))
+            }
+            return
+        }
+        let url = LivePagerClipboard.resolve(filePath, relativeTo: workingDirectory)
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            conversation.appendMessage(PagerMessage(
+                role: .system,
+                text: "\(label) written to \(url.path)."
+            ))
+        } catch {
+            conversation.appendMessage(PagerMessage(
+                role: .error,
+                text: "Could not write \(url.path): \(error)"
+            ))
+        }
+    }
+
 
     /// A control key from the dashboard (`p`/`r`/`x`). Reported as a row
     /// selection by the overlay because the render layer cannot reach a run.
@@ -3482,8 +4629,25 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             return
         }
         overlays.dismiss(id: overlayID)
-        guard overlayID == "model" else { return }
-        await switchModel(to: rowID)
+        switch overlayID {
+        case "model":
+            await switchModel(to: rowID)
+        case "theme":
+            // The row id is the theme name, so a click takes the identical path
+            // a typed `/theme <name>` does — including the downgrade notice on
+            // a terminal that cannot render it.
+            if let message = applyTheme(named: rowID) {
+                conversation.appendMessage(PagerMessage(role: .system, text: message))
+            }
+        case "command-palette":
+            // Display-only for now. Running the picked command would mean the
+            // renderer injecting text back into the controller's composer, and
+            // no such path exists — the event flow is one-way. Rather than
+            // fake it, the palette says what to type.
+            note("Type \(rowID) to run it.")
+        default:
+            break
+        }
     }
 
     /// Rebuild the live sampling stack for `modelID` and record what happened.
@@ -3551,6 +4715,13 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 return .consumed
             case .permission(let id, let requestID, let decision):
                 await resolve(overlayID: id, requestID: requestID, decision: decision)
+                try renderState()
+                return .consumed
+            case .setting(_, let event):
+                // The modal has already folded the change into its own state,
+                // so the repaint is correct either way; this carries the change
+                // out to the session and to config.toml.
+                await applySetting(event)
                 try renderState()
                 return .consumed
             }
@@ -3628,11 +4799,30 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 await select(overlayID: id, rowID: rowID)
             case .permission(let id, let requestID, let decision):
                 await resolve(overlayID: id, requestID: requestID, decision: decision)
+            case .setting(_, let event):
+                await applySetting(event)
             case .ignored, .redraw, .consumed, .dismissed:
                 break
             }
             try renderState()
         }
+    }
+
+    /// Session-side effects of a settings change.
+    ///
+    /// The modal owns its own state and has already applied the change to
+    /// itself, so this carries only the effects that reach past the overlay:
+    /// the two input modes this renderer reads directly, and then the write to
+    /// disk and the live theme swap.
+    private func applySetting(_ event: PagerSettingsEvent) async {
+        if case .commit(let key, .bool(let flag)) = event {
+            switch key {
+            case "multiline_mode": inputModes.isMultiline = flag
+            case "vim_mode": inputModes.isVimMode = flag
+            default: break
+            }
+        }
+        await applySettingsEvent(event)
     }
 
     /// Footer hints label the key they stand for, so a click on one replays it.
@@ -3643,6 +4833,150 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         case "enter": return KeyEvent(key: .enter)
         default: return nil
         }
+    }
+
+    // MARK: - Theme and settings
+
+    /// Switch the live palette. Returns the message to echo, or `nil` when the
+    /// name did not resolve.
+    ///
+    /// The resolution runs through the same clamp-then-quantize path startup
+    /// uses, so `/theme oscura` on a 16-color terminal lands on GrokNight and
+    /// says so rather than painting an unreadable frame.
+    func applyTheme(named name: String) -> String? {
+        guard let preference = PagerThemePreference.named(name) else { return nil }
+        let resolution = pagerResolveTheme(
+            preference: preference,
+            colorLevel: colorLevel,
+            appearance: preference == .auto ? PagerSystemAppearance.detect() : nil,
+            terminalNativeLock: mode != .fullScreen
+        )
+        themePreference = preference
+        renderTheme = resolution.theme
+        try? renderState()
+
+        // Minimal mode locks the terminal's own palette, so the preference is
+        // stored but nothing on screen changes. Saying "Theme: Tokyo Night"
+        // while painting terminal-default would just look broken.
+        if resolution.kind == .terminalDefault, preference != .fixed(.terminalDefault) {
+            return "Saved \(preference.displayName). Minimal mode uses your "
+                + "terminal's own colors; run fullscreen to see it."
+        }
+        if case .fixed(let requested) = preference, requested != resolution.kind {
+            return "Theme \(requested.displayName) needs a truecolor terminal; "
+                + "using \(resolution.kind.displayName)."
+        }
+        return "Theme: \(preference.displayName)"
+    }
+
+    /// Every theme `/theme` can offer on this terminal.
+    var availableThemeNames: [String] {
+        (["auto"] + PagerThemeKind.available(colorLevel: colorLevel).map(\.rawValue))
+    }
+
+    /// Build the settings modal from what is on disk right now.
+    ///
+    /// Read at open time rather than cached at startup: another process may
+    /// have edited `config.toml` since, and a modal showing stale values would
+    /// write them back on the next unrelated toggle.
+    func settingsOverlay(deepLinkKey: String? = nil) -> PagerSettingsOverlay {
+        let store = PagerSettingsStore(configPath: LiveInteractiveControllerRenderer.configPath())
+        var overlay = PagerSettingsOverlay(
+            values: (try? store.load()) ?? [:],
+            dynamicChoices: [
+                .activeModelCatalog: LiveModelPicker.sorted(modelCatalog).map { entry in
+                    PagerSettingChoice(
+                        canonical: entry.id,
+                        display: LiveModelPicker.providerLabel(forProviderID: entry.providerID)
+                            .map { "\($0) · \(entry.name)" } ?? entry.name,
+                        summary: LiveModelPicker.description(for: entry)
+                    )
+                }
+            ],
+            multiSelectEnabled: [
+                "opencode_go_models": (try? store.loadMultiSelect(key: "opencode_go_models")) ?? []
+            ],
+            // Minimal mode hides the rows the reference marks `hidden_in_minimal`,
+            // because none of them have a surface there to affect.
+            minimalMode: mode != .fullScreen
+        )
+        if let deepLinkKey {
+            let rows = overlay.visibleRows
+            if let index = rows.firstIndex(where: { $0.settingKey == deepLinkKey }) {
+                overlay.selectedIndex = index
+                overlay.expandedKeys.insert(deepLinkKey)
+            }
+        }
+        return overlay
+    }
+
+    /// Apply a decision the settings modal made.
+    ///
+    /// A failed write is reported into the transcript rather than swallowed: the
+    /// modal has already redrawn the row as changed, so silence would leave the
+    /// screen disagreeing with the disk.
+    func applySettingsEvent(_ event: PagerSettingsEvent) async {
+        let store = PagerSettingsStore(configPath: LiveInteractiveControllerRenderer.configPath())
+        switch event {
+        case .preview(let key, let value):
+            // Only the theme rows preview, and a preview is display-only.
+            guard key == "theme" || key == "auto_dark_theme" || key == "auto_light_theme",
+                  case .string(let name) = value
+            else { return }
+            _ = applyTheme(named: name)
+
+        case .commit(let key, let value):
+            if key == "theme", case .string(let name) = value {
+                _ = applyTheme(named: name)
+            }
+            do {
+                try store.write(key: key, value: value)
+            } catch PagerSettingsStoreError.notPersistable {
+                // Session-local rows have no disk home by design; the modal's
+                // own copy is the whole of their state.
+                return
+            } catch {
+                conversation.appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Could not save \(key): \(error)"
+                ))
+            }
+
+        case .toggleMultiSelect(let key, let choice, let enabled):
+            var current = (try? store.loadMultiSelect(key: key)) ?? []
+            if enabled { current.insert(choice) } else { current.remove(choice) }
+            try? store.writeMultiSelect(key: key, enabled: current)
+
+        case .resetRequested(let key):
+            do {
+                try store.reset(key: key)
+                if key == "theme" { _ = applyTheme(named: "groknight") }
+            } catch PagerSettingsStoreError.notPersistable {
+                return
+            } catch {
+                conversation.appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Could not reset \(key): \(error)"
+                ))
+            }
+
+        case .secret:
+            // Credentials belong in the owner-protected auth store, not in
+            // config.toml. Until that path is wired, say so rather than
+            // pretending the key was saved.
+            conversation.appendMessage(PagerMessage(
+                role: .system,
+                text: "Saving API keys from the settings modal is not wired yet; "
+                    + "use `open-grok login` instead."
+            ))
+        }
+    }
+
+    /// `$OPENGROK_HOME/config.toml`, the user-level config the reference writes.
+    private static func configPath() -> URL {
+        OpenGrokHomeResolver
+            .resolve(environment: ProcessInfo.processInfo.environment)
+            .appendingPathComponent("config.toml")
     }
 
     private func renderState() throws {
@@ -3682,17 +5016,28 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             input: PagerComposerState(
                 text: prompt.text,
                 cursorCharacterOffset: prompt.cursorOffset,
-                isFocused: true,
-                cursorVisible: true,
+                // The composer is unfocused exactly while the scrollback holds
+                // a selection — the two halves of one focus model.
+                isFocused: !selection.isFocused,
+                cursorVisible: !selection.isFocused,
                 modelName: modelName,
+                reasoningEffort: reasoningEffort,
+                isMultiline: inputModes.isMultiline,
                 maximumHeight: max(3, terminalSize.height / 2)
             ),
             shortcuts: PagerShortcutsBar(
-                hints: LivePagerChrome.shortcutHints(isTurnRunning: isTurnRunning),
+                // The bar follows the focus, the way upstream's does: it lists
+                // the bindings of the region that will actually receive the
+                // next key.
+                hints: selection.isFocused
+                    ? LivePagerChrome.scrollbackHints(isVimMode: inputModes.isVimMode)
+                    : LivePagerChrome.shortcutHints(isTurnRunning: isTurnRunning),
                 pendingKey: prompt.pendingConfirmationKey,
                 pendingLabel: prompt.pendingConfirmationLabel
             ),
             scrollPosition: followsBottom ? .followTail : .offset(scrollOffset),
+            theme: renderTheme,
+            selectedBlockIndex: selection.index,
             overlays: overlays
         )
         // Render through the frame function rather than the renderer's own
@@ -3729,11 +5074,26 @@ private struct LiveInteractiveFrontendFactory: OpenGrokPagerFrontendFactory, Sen
     let prompt: String
 
     func makeFrontend(for mode: OpenGrokPagerMode) async throws -> any OpenGrokPagerFrontend {
-        guard mode == .fullScreen || mode == .inline else {
+        // `--minimal` degrades here rather than refusing. This factory serves
+        // the path with no interactive input, which `resolveInteractivePagerMode`
+        // cannot see — it only knows whether a TTY exists, so a TTY with no
+        // input sink still arrives as `.minimal`. Refusing produced
+        // "unsupported: interactive pager mode minimal" where the flag used to
+        // work. Inline is a faithful downgrade: minimal is scrollback-native,
+        // and `LiveInteractivePagerRenderer` already renders every
+        // non-fullscreen mode as inline. `.plain` has no interactive rendering
+        // at all, so it keeps refusing.
+        let resolved: OpenGrokPagerMode
+        switch mode {
+        case .fullScreen, .inline:
+            resolved = mode
+        case .minimal:
+            resolved = .inline
+        case .plain:
             throw CLIApplicationError.unsupported(route: "interactive pager mode \(mode.rawValue)")
         }
         return OpenGrokPagerForwardingFrontend(
-            renderer: LiveInteractivePagerRenderer(mode: mode, terminal: terminal, prompt: prompt),
+            renderer: LiveInteractivePagerRenderer(mode: resolved, terminal: terminal, prompt: prompt),
             output: SilentLivePagerOutput()
         )
     }

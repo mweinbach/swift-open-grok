@@ -356,6 +356,6 @@ struct LiveAuthCompositionTests {
         #expect(LiveAuthComposition.handles(.utility(authOptions("login"))))
         #expect(LiveAuthComposition.handles(.utility(authOptions("logout"))))
         #expect(!LiveAuthComposition.handles(.utility(authOptions("update"))))
-        #expect(!LiveAuthComposition.handles(.doctor))
+        #expect(!LiveAuthComposition.handles(.doctor(CLIDoctorOptions())))
     }
 }

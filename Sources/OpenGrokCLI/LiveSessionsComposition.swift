@@ -125,6 +125,38 @@ struct LiveSessionCatalog {
             }
     }
 
+    /// Every decodable session record, for the routes that need the whole
+    /// transcript rather than the derived listing — today that is content
+    /// search and the `/resume` picker's preview column.
+    ///
+    /// Kept separate from `list()` because it is materially more expensive: it
+    /// keeps every item of every session alive at once, where `list()` reduces
+    /// each record to a handful of fields as it goes.
+    func records() throws -> [LiveConversationRecord] {
+        guard fileManager.fileExists(atPath: sessionsDirectory.path) else { return [] }
+        let urls: [URL]
+        do {
+            urls = try fileManager.contentsOfDirectory(
+                at: sessionsDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            throw CLIApplicationError.failed("failed to list sessions: \(error)")
+        }
+        return urls
+            .filter { $0.pathExtension == "json" }
+            .compactMap { url -> LiveConversationRecord? in
+                guard let data = try? Data(contentsOf: url) else { return nil }
+                return try? JSONDecoder().decode(LiveConversationRecord.self, from: data)
+            }
+    }
+
+    /// Flattened search documents for every session.
+    func documents() throws -> [LiveSessionDocument] {
+        try records().map(LiveSessionDocument.build(from:))
+    }
+
     func load(sessionID: String) throws -> LiveSessionListing? {
         try LiveConversationStore.validateSessionID(sessionID)
         let url = fileURL(sessionID: sessionID)
@@ -153,6 +185,14 @@ struct LiveSessionCatalog {
         } catch {
             throw CLIApplicationError.failed("failed to delete session \(sessionID): \(error)")
         }
+        // Rewind snapshots live beside the session as `<id>.rewind.jsonl` and
+        // hold verbatim copies of the user's source files. Leaving them behind
+        // after a delete would keep that content on disk with nothing left
+        // pointing at it, which is the opposite of what deleting a session
+        // means. Absent file is not an error: most sessions never record one.
+        try? fileManager.removeItem(
+            at: sessionsDirectory.appendingPathComponent("\(sessionID).rewind.jsonl")
+        )
         return true
     }
 
@@ -215,7 +255,7 @@ public enum LiveSessionsComposition {
 
     /// Subcommands this route serves. `new`/`resume`/`restore`/`export` are
     /// parsed by `CLICommand` but belong to the launch path, not here.
-    public static let actions: Set<CLISessionAction> = [.list, .show, .delete]
+    public static let actions: Set<CLISessionAction> = [.list, .search, .show, .delete]
 
     public static func handles(_ command: CLICommand) -> Bool {
         guard case .sessions(let options) = command else { return false }
@@ -244,7 +284,14 @@ public enum LiveSessionsComposition {
         let catalog = LiveSessionCatalog(openGrokHome: home)
         switch options.action {
         case .list:
-            try runList(catalog: catalog, json: options.json, streams: streams)
+            try runList(
+                catalog: catalog,
+                json: options.json,
+                limit: options.limit,
+                streams: streams
+            )
+        case .search:
+            try runSearch(options: options, catalog: catalog, streams: streams)
         case .show:
             try runShow(options: options, catalog: catalog, streams: streams)
         case .delete:
@@ -256,12 +303,21 @@ public enum LiveSessionsComposition {
 
     // MARK: list
 
+    /// `-n`/`--limit` applies to **both** output branches.
+    ///
+    /// It previously applied to neither: the flag parsed, defaulted to 20, and
+    /// was then dropped on the floor, so `sessions list -n 5` printed every
+    /// session. A limit flag that silently does nothing is worse than an
+    /// unimplemented one — the user reads the short output they asked for and
+    /// gets the whole list. `catalog.list()` is already sorted newest-first, so
+    /// the prefix is the most recent N, which is what Rust's `--limit` means.
     private static func runList(
         catalog: LiveSessionCatalog,
         json: Bool,
+        limit: Int,
         streams: CLIStreams
     ) throws {
-        let sessions = try catalog.list()
+        let sessions = Array(try catalog.list().prefix(max(0, limit)))
         if json {
             streams.out(try encodeJSON(sessions.map(payload(for:))) + "\n")
             return
@@ -312,6 +368,68 @@ public enum LiveSessionsComposition {
             pad(truncate(model, 20), 20),
             truncate(title, 50)
         ].joined(separator: "  ")
+    }
+
+    // MARK: search
+
+    /// `open-grok sessions search <query> [-n LIMIT] [--json]`.
+    ///
+    /// Rust runs a local FTS query and a remote-registry query concurrently and
+    /// merges them (`sessions_cmd.rs:71-166`). This port has no remote registry
+    /// — the file header already records that as deliberately not ported — so
+    /// the output carries local hits only and omits Rust's `(remote)` rows
+    /// rather than printing an empty section that implies a lookup happened.
+    private static func runSearch(
+        options: CLISessionOptions,
+        catalog: LiveSessionCatalog,
+        streams: CLIStreams
+    ) throws {
+        guard let query = options.query?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !query.isEmpty
+        else {
+            throw CLIApplicationError.failed(
+                "sessions search requires a query: open-grok sessions search <query>"
+            )
+        }
+        let hits = LiveSessionSearch.rank(
+            documents: try catalog.documents(),
+            query: query,
+            limit: options.limit
+        )
+        if options.json {
+            streams.out(try encodeJSON(hits.map(payload(for:))) + "\n")
+            return
+        }
+        guard !hits.isEmpty else {
+            streams.out("No sessions matched \(query).\n")
+            return
+        }
+        var lines: [String] = []
+        for hit in hits {
+            // Rust's three-line-per-hit shape (`sessions_cmd.rs`): the id and
+            // score with a human timestamp, then the title, then the snippet.
+            lines.append(
+                "\(hit.sessionID) (score: \(String(format: "%.2f", hit.score)))  "
+                    + timestamp(hit.updatedAt)
+            )
+            lines.append("  \(hit.title ?? "(untitled)")")
+            lines.append("  \(hit.snippet)")
+        }
+        lines.append("")
+        lines.append("Total: \(hits.count)")
+        streams.out(lines.joined(separator: "\n") + "\n")
+    }
+
+    private static func payload(for hit: LiveSessionSearchHit) -> [String: Any] {
+        var payload: [String: Any] = [
+            "id": hit.sessionID,
+            "cwd": hit.workingDirectory,
+            "last_activity_at": timestamp(hit.updatedAt),
+            "score": hit.score,
+            "snippet": hit.snippet
+        ]
+        if let title = hit.title { payload["title"] = title }
+        return payload
     }
 
     // MARK: show

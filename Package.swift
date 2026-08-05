@@ -285,11 +285,18 @@ private func targets() -> [Target] {
     // ---- Wave 10 ----
     // W10-S1 imports markdown, pager render, and terminal core directly (pager
     // markdown rendering); those were only reachable transitively before.
-    t.append(contentsOf: libs(w10s1, dep(w2s5, w8s1, w8s3, w8s5, w9s1, w9s2, w9s3, w9s4, w9s5)))
+    // `w1s2` brings in OpenGrokInterjection, which the interactive controller
+    // uses to buffer mid-turn steers ("send now") until the next prompt.
+    t.append(contentsOf: libs(w10s1, dep(w1s2, w2s5, w8s1, w8s3, w8s5, w9s1, w9s2, w9s3, w9s4, w9s5)))
     // W10-S2 (OpenGrokCLI) also needs branding/paths/env/version, shared
     // identifiers, and configuration — declared here so the frozen manifest
     // already has every edge the real CLI parser will require.
-    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s4, w2s5, w3s1, w3s2, w3s3, w4s3, w5s4, w5s5, w5s6, w6s4, w7s3, w8s1, w8s3, w8s4, w8s5, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokCodeMode"])))
+    // `w6s3` (OpenGrokMemory, OpenGrokGoalState) was predeclared as a target
+    // pair but never given an edge to anything, so both libraries were
+    // unreachable from the executable. The CLI is where they become live: the
+    // memory index backs first-turn injection and the `memory_search` /
+    // `memory_get` tools, and the goal tracker backs `update_goal`.
+    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s4, w2s5, w3s1, w3s2, w3s3, w4s3, w5s4, w5s5, w5s6, w6s3, w6s4, w7s3, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokCodeMode"])))
 
     // ---- Wave 11 (libraries + executable) ----
     t.append(contentsOf: libs(w11s1Lib, dep(w0s1, w0s3, w2s2, w5s6, w10s1, w10s2)))

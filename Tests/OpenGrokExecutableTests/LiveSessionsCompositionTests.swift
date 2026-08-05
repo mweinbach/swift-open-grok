@@ -103,7 +103,7 @@ struct LiveSessionsCompositionTests {
         #expect(LiveSessionsComposition.handles(.sessions(sessionOptions(.delete, identifier: "a"))))
         // `resume` belongs to the launch path, not this route.
         #expect(!LiveSessionsComposition.handles(.sessions(sessionOptions(.resume))))
-        #expect(!LiveSessionsComposition.handles(.doctor))
+        #expect(!LiveSessionsComposition.handles(.doctor(CLIDoctorOptions())))
     }
 
     // MARK: list
@@ -157,6 +157,48 @@ struct LiveSessionsCompositionTests {
         #expect(lines[2].contains("grok-4"))
         #expect(lines[2].contains("Fix the parser"))
         #expect(err.contents.isEmpty)
+    }
+
+    @Test("list honors -n in both the table and JSON branches")
+    func listAppliesTheLimit() throws {
+        let fixture = try SessionsFixture()
+        defer { fixture.dispose() }
+        // Three sessions, distinct activity times so "newest first" is total.
+        for (offset, id) in ["oldest", "middle", "newest"].enumerated() {
+            try fixture.write(
+                id: id,
+                updated: Date(timeIntervalSince1970: 1_700_000_000 + Double(offset) * 1_000),
+                items: [userTurn("prompt \(id)"), assistantTurn("ok", model: "grok-4")]
+            )
+        }
+
+        // The flag previously parsed and was then dropped, so `-n 2` printed
+        // all three. Silently ignoring a limit is worse than rejecting it: the
+        // user reads the short output they asked for and gets everything.
+        let (tableStreams, tableOut, _) = CLIStreams.buffered()
+        try LiveSessionsComposition.run(
+            options: CLISessionOptions(action: .list, limit: 2),
+            environment: fixture.environment,
+            streams: tableStreams
+        )
+        let rows = tableOut.contents.split(separator: "\n").map(String.init)
+        // One header plus exactly two rows, and they are the two most recent.
+        #expect(rows.count == 3)
+        #expect(rows[1].hasPrefix("newest"))
+        #expect(rows[2].hasPrefix("middle"))
+        #expect(!tableOut.contents.contains("oldest"))
+
+        let (jsonStreams, jsonOut, _) = CLIStreams.buffered()
+        try LiveSessionsComposition.run(
+            options: CLISessionOptions(action: .list, json: true, limit: 2),
+            environment: fixture.environment,
+            streams: jsonStreams
+        )
+        let payload = try #require(
+            JSONSerialization.jsonObject(with: Data(jsonOut.contents.utf8)) as? [[String: Any]]
+        )
+        #expect(payload.count == 2)
+        #expect(payload.compactMap { $0["id"] as? String } == ["newest", "middle"])
     }
 
     @Test("list titles skip synthetic user turns")

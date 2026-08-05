@@ -237,6 +237,11 @@ actor LiveModelSwitchCoordinator {
         let sampler: OpenGrokLiveSampler
         let modelID: String
         let provider: ModelProvider
+        /// The full provider configuration this turn runs against. Compaction
+        /// needs the base URL and credential headers to reach Codex's
+        /// server-side compaction endpoint, which is not a sampling call and so
+        /// cannot borrow the sampler's already-built client.
+        let configuration: OpenGrokLiveSamplingConfiguration
     }
 
     private var sampling: OpenGrokLiveSamplingConfiguration
@@ -267,7 +272,12 @@ actor LiveModelSwitchCoordinator {
     }
 
     func snapshot() -> Snapshot {
-        Snapshot(sampler: sampler, modelID: sampling.model, provider: sampling.provider)
+        Snapshot(
+            sampler: sampler,
+            modelID: sampling.model,
+            provider: sampling.provider,
+            configuration: sampling
+        )
     }
 
     var activeModelID: String { sampling.model }

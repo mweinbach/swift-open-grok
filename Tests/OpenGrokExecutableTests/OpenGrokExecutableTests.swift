@@ -123,6 +123,65 @@ struct OpenGrokExecutableTests {
         #expect(terminalRecorder.string == "You: show inline\nGrok: inline answer\n")
     }
 
+    /// Root `--minimal` must degrade, never refuse.
+    ///
+    /// The sibling case above cannot catch this: it does not pass `--minimal`,
+    /// so it never produces `OpenGrokPagerMode.minimal`. When `--minimal` was
+    /// first wired, the only path that produced `.minimal` without a usable
+    /// terminal was also the one that rejected it, and the flag failed with
+    /// "unsupported: interactive pager mode minimal" where it had previously
+    /// worked. Upstream treats `--minimal` as a scrollback-native *preference*,
+    /// so inline is a faithful downgrade — unlike `--fullscreen`, which has no
+    /// sane non-TTY equivalent and is right to throw.
+    ///
+    /// Asserting on the exit code and the absence of a refusal rather than on
+    /// exact terminal bytes: the regression is "this errors instead of
+    /// running", and pinning the byte stream here would just duplicate the
+    /// sibling's assertion while making this case brittle to render changes.
+    @Test("root --minimal degrades instead of refusing without a TTY")
+    func liveMinimalRenderingFallsBackInline() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let terminalRecorder = TerminalRecorder()
+        let terminal = OpenGrokLiveTerminal(
+            isTTY: { false },
+            size: { nil },
+            write: { terminalRecorder.append($0) }
+        )
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in
+                OpenGrokLiveSampler { _, emit in
+                    await emit(.output("minimal answer"))
+                    return OpenGrokLiveSamplingResponse(output: "minimal answer")
+                }
+            },
+            terminal: terminal
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, err) = CLIStreams.buffered()
+
+        // The root form: `--minimal` with a positional prompt. The `minimal`
+        // mode word is a different feature (a one-shot run) and would not
+        // exercise `minimalRendering`.
+        let code = await CLIRunner.run(
+            ["--minimal", "show minimal"],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(out.contents.isEmpty)
+        #expect(!err.contents.contains("unsupported"))
+        #expect(!err.contents.contains("interactive pager mode"))
+        #expect(terminalRecorder.string.contains("minimal answer"))
+    }
+
     @Test("live headless composition runs prompt through shell and pager")
     func liveHeadlessComposition() async {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
