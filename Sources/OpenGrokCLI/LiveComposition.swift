@@ -1,6 +1,7 @@
 import Foundation
 import OpenGrokAgentDefinitions
 import OpenGrokAuth
+import OpenGrokConfig
 import OpenGrokFileTools
 import OpenGrokHTTP
 import OpenGrokModels
@@ -594,6 +595,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             if LiveAuthComposition.handles(command) {
                 return try await LiveAuthComposition.session(for: command, context: context)
             }
+            if LiveMCPComposition.handles(command) {
+                return try await LiveMCPComposition.session(for: command, context: context)
+            }
             guard case .launch(let options) = command else {
                 throw CLIApplicationError.unsupported(route: command.routeName)
             }
@@ -649,7 +653,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 fileAccessPolicy: Self.resolveFileAccessPolicy(
                     environment: context.environment,
                     coordinator: permissionCoordinator
-                )
+                ),
+                environment: context.environment
             )
             // Code Mode is a session-wide decision: the tool surface it
             // projects is fixed for the life of the timeline, which is what
@@ -1439,13 +1444,20 @@ struct LiveToolExecutor: Sendable {
     private let composition: OpenGrokShellToolRuntimeComposition
     private let fileToolBridge: ToolBridge
     private let fileToolNames: Set<String>
+    private let mcpConnections: MCPSessionConnections
 
     init(
         processBackend: any ShellProcessBackend,
         sessionID: String,
         workingDirectory: URL,
         toolPolicy: LiveAgentToolPolicy?,
-        fileAccessPolicy: FileToolAccessPolicy = .denyByDefault
+        fileAccessPolicy: FileToolAccessPolicy = .denyByDefault,
+        // Hooks and MCP servers are discovered from config and environment, and
+        // both of them *spawn processes*. Taking the environment as an argument
+        // keeps that discovery bound to the caller's session rather than to
+        // whatever `ProcessInfo` happens to hold, so a test can build an
+        // executor without picking up the developer's real hooks and servers.
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) async throws {
         let composition = OpenGrokShellToolRuntimeComposition(
             processBackend: processBackend,
@@ -1456,16 +1468,29 @@ struct LiveToolExecutor: Sendable {
             workingDirectory: workingDirectory
         )
         let standardizedWorkingDirectory = workingDirectory.standardizedFileURL
+        let hooks = LiveHooksComposition.load(
+            sessionId: sessionID,
+            workspaceRoot: standardizedWorkingDirectory,
+            environment: environment
+        )
         let fileToolResources = FileToolSession.makeResources(
             workspaceRoot: standardizedWorkingDirectory.path,
             sessionId: sessionID,
             agentId: "main",
-            policy: fileAccessPolicy
+            policy: fileAccessPolicy,
+            hooks: hooks.gate.map { $0 as any PreToolUseHookRunner } ?? FailOpenPreToolUseHookRunner()
         )
         let fileToolBridge = ToolBridge(toolset: try FileToolPack.finalizeBuildPack(
             resources: fileToolResources,
             capabilityMode: Self.capabilityMode(for: toolPolicy)
         ))
+        let mcpConnections = MCPSessionConnections()
+        await LiveMCPComposition.connectConfiguredServers(
+            document: try? loadEffectiveConfigDiskOnly(environment: environment),
+            toolset: fileToolBridge.toolset,
+            connections: mcpConnections,
+            environment: environment
+        )
         let fileToolDefinitions = fileToolBridge.toolDefinitions()
         let allowedFileToolDefinitions = fileToolDefinitions.filter {
             toolPolicy?.allows(liveToolName: $0.name) ?? true
@@ -1475,6 +1500,7 @@ struct LiveToolExecutor: Sendable {
             : [Self.runTerminalTool]
         self.composition = composition
         self.fileToolBridge = fileToolBridge
+        self.mcpConnections = mcpConnections
         self.fileToolNames = Set(allowedFileToolDefinitions.map(\.name))
         self.workingDirectory = standardizedWorkingDirectory
         self.tools = terminalTools + allowedFileToolDefinitions.map { definition in
@@ -1558,6 +1584,7 @@ struct LiveToolExecutor: Sendable {
     }
 
     func shutdown() async {
+        await mcpConnections.shutdown()
         await composition.shutdown()
     }
 

@@ -226,6 +226,12 @@ private func reverseRemap(_ args: JSONValue, map: [String: String]) -> JSONValue
 }
 
 private func accessKind(for tool: FinalizedTool, args: JSONValue) -> AccessKind {
+    // MCP tools are mutations-unknown: they are classified by namespace rather
+    // than kind so `ToolFilter.mcp` rules match on the qualified name and the
+    // call can never be mistaken for a plain read.
+    if tool.namespace == .mcp {
+        return .mcpTool(name: tool.clientName, input: args)
+    }
     switch tool.kind {
     case .read, .listDir, .list:
         let path = stringArg(args, keys: ["target_file", "path", "file_path", "target_directory", "filePath"])
