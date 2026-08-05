@@ -653,6 +653,42 @@ private struct OpenGrokShellTurnKey: Hashable, Sendable {
     }
 }
 
+/// Wraps the provider session handed to a turn driver so the shell learns exactly when the
+/// provider-side turn becomes active. Out-of-band cancellation must not be delivered before that
+/// point, otherwise the provider has no turn to cancel and the request is silently dropped.
+private struct OpenGrokShellTurnStartObserver: OpenGrokShellProviderSession {
+    let base: any OpenGrokShellProviderSession
+    let shell: OpenGrokShell
+    let handle: OpenGrokShellTurnHandle
+
+    func snapshot() async -> OpenGrokShellProviderSessionSnapshot {
+        await base.snapshot()
+    }
+
+    func beginTurn(turnID: String) async throws -> OpenGrokShellProviderTurnContext {
+        do {
+            let context = try await base.beginTurn(turnID: turnID)
+            await shell.markTurnCancellable(handle)
+            return context
+        } catch {
+            await shell.markTurnCancellable(handle)
+            throw error
+        }
+    }
+
+    func finishTurn(turnID: String) async throws {
+        try await base.finishTurn(turnID: turnID)
+    }
+
+    func failTurn(turnID: String) async {
+        await base.failTurn(turnID: turnID)
+    }
+
+    func cancelTurn(turnID: String) async throws {
+        try await base.cancelTurn(turnID: turnID)
+    }
+}
+
 public actor OpenGrokShell: OpenGrokShellFacade {
     private struct ManagedSession: Sendable {
         let request: OpenGrokShellSessionRequest
@@ -674,6 +710,7 @@ public actor OpenGrokShell: OpenGrokShellFacade {
     private var turnTasks: [OpenGrokShellTurnKey: Task<Void, Never>] = [:]
     private var turnCommands: [OpenGrokShellTurnKey: String] = [:]
     private var requestedCancellations: Set<OpenGrokShellTurnKey> = []
+    private var cancellableTurns: Set<OpenGrokShellTurnKey> = []
     private var turnOutcomes: [OpenGrokShellTurnKey: OpenGrokShellTurnOutcome] = [:]
     private var turnUpdateSequences: [OpenGrokShellTurnKey: UInt64] = [:]
 
@@ -829,9 +866,10 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         let provider = session.providerSession
         let driver = configuration.turnDriver
         let shell = self
+        let observed = OpenGrokShellTurnStartObserver(base: provider, shell: shell, handle: handle)
         let task = Task { [shell] in
             do {
-                let result = try await driver.submit(providerSession: provider, request: request) { update in
+                let result = try await driver.submit(providerSession: observed, request: request) { update in
                     await shell.receive(update: update, for: handle)
                 }
                 await shell.finishTurn(handle: handle, commandID: command.commandID, outcome: .completed(result))
@@ -881,6 +919,7 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         }
         requestedCancellations.insert(key)
         task.cancel()
+        await awaitTurnCancellable(key)
         try? await configuration.turnDriver.cancel(
             providerSession: session.providerSession,
             turnID: handle.turnID
@@ -916,6 +955,7 @@ public actor OpenGrokShell: OpenGrokShellFacade {
             let key = OpenGrokShellTurnKey(handle)
             requestedCancellations.insert(key)
             turnTasks[key]?.cancel()
+            await awaitTurnCancellable(key)
             if let session = sessions[handle.sessionID] {
                 try? await configuration.turnDriver.cancel(providerSession: session.providerSession, turnID: handle.turnID)
             }
@@ -948,6 +988,7 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         turnTasks.removeAll()
         turnCommands.removeAll()
         requestedCancellations.removeAll()
+        cancellableTurns.removeAll()
         turnUpdateSequences.removeAll()
         state = .closed
         let report = OpenGrokShellShutdownReport(
@@ -959,6 +1000,23 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         await eventHub.emit(.shutdownCompleted(report))
         await eventHub.finish()
         return report
+    }
+
+    fileprivate func markTurnCancellable(_ handle: OpenGrokShellTurnHandle) {
+        cancellableTurns.insert(OpenGrokShellTurnKey(handle))
+    }
+
+    /// Blocks until the turn's provider session has an active turn (or the turn is already over),
+    /// so an out-of-band `turnDriver.cancel` cannot overtake the driver's `beginTurn`.
+    private func awaitTurnCancellable(
+        _ key: OpenGrokShellTurnKey,
+        timeout: ShellDuration = ShellDuration(timeInterval: 1)
+    ) async {
+        let deadline = Date().addingTimeInterval(max(0, timeout.timeInterval))
+        while !cancellableTurns.contains(key), turnOutcomes[key] == nil, turnTasks[key] != nil {
+            if Date() >= deadline { return }
+            try? await Task.sleep(nanoseconds: 200_000)
+        }
     }
 
     private func receive(update: OpenGrokShellTurnUpdateKind, for handle: OpenGrokShellTurnHandle) async {
@@ -973,8 +1031,10 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         commandID: String,
         outcome: OpenGrokShellTurnOutcome
     ) async {
-        guard var session = sessions[handle.sessionID], session.activeTurnID == handle.turnID else { return }
         let key = OpenGrokShellTurnKey(handle)
+        // A driver may return without ever beginning a provider turn; release cancellation waiters.
+        cancellableTurns.insert(key)
+        guard var session = sessions[handle.sessionID], session.activeTurnID == handle.turnID else { return }
         let wasCancelled = requestedCancellations.remove(key) != nil
         turnTasks.removeValue(forKey: key)
         turnCommands.removeValue(forKey: key)

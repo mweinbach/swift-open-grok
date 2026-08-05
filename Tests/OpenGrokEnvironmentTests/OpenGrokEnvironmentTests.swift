@@ -352,7 +352,9 @@ struct OpenGrokEnvironmentTests {
                 taskCompleted.signal()
             }
             // Wait for the task to start (it should be blocked on the lock).
-            #expect(taskStarted.wait(timeout: .now() + 1.0) == .success,
+            // Generous: this only waits for the global queue to schedule the block, which
+            // can take a while under a loaded machine. The lock behaviour is asserted below.
+            #expect(taskStarted.wait(timeout: .now() + 10.0) == .success,
                     "Concurrent task must start")
             // The task should NOT have completed yet because it's blocked on
             // the lock held by `mainGuard`.

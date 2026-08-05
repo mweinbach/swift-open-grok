@@ -216,6 +216,7 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
     private let childPID: pid_t
     private let processGroup: ProcessGroup
     private let state = PortableMutex()
+    private let readLock = PortableMutex()
     private var exitStatus: ProcessExit = .stillRunning
     private var cancelled = false
     private var masterClosed = false
@@ -456,6 +457,40 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
         }
     }
 
+    /// Reads once and delivers the bytes while holding `readLock`, so the reader task and the
+    /// exit-time drain stay ordered. Returns the read result together with its `errno`.
+    private func readOnce(from fd: Int32, into buf: inout [UInt8]) -> (bytes: Int, code: Int32) {
+        readLock.lock()
+        defer { readLock.unlock() }
+        let n = buf.withUnsafeMutableBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return -1 }
+            return sysRead(fd, base, raw.count)
+        }
+        let code = errno
+        if n > 0 { deliverOutput(Data(buf[0..<n])) }
+        return (n, code)
+    }
+
+    /// Collects whatever the child left buffered before the master is closed.
+    ///
+    /// macOS discards a terminal's output queue once the last slave descriptor closes, so a
+    /// short-lived child's output is lost unless it is read at reap time. The reader task cannot
+    /// be relied on for that: it polls from the cooperative pool and may not have been scheduled
+    /// even once before the child exited.
+    private func drainBeforeClose() {
+        guard let masterFD else { return }
+        if state.withLock({ masterClosed }) { return }
+        var buf = [UInt8](repeating: 0, count: 65_536)
+        // Bounded: a surviving grandchild can keep writing to the slave after the child is reaped.
+        let deadline = Date().addingTimeInterval(0.1)
+        while Date() < deadline {
+            let (n, code) = readOnce(from: masterFD, into: &buf)
+            if n > 0 { continue }
+            if n < 0 && code == EINTR { continue }
+            return
+        }
+    }
+
     private func closeMasterIfNeeded() {
         let fd: Int32? = state.withLock {
             guard !masterClosed else { return nil }
@@ -475,27 +510,26 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
             guard let self else { return }
             var buf = [UInt8](repeating: 0, count: 65_536)
             while !Task.isCancelled {
-                let n = buf.withUnsafeMutableBytes { raw -> Int in
-                    guard let base = raw.baseAddress else { return -1 }
-                    return sysRead(masterFD, base, raw.count)
-                }
+                // Bytes are delivered inside readOnce, under the read lock, so this task and the
+                // exit-time drain cannot interleave chunks out of order.
+                let (n, code) = self.readOnce(from: masterFD, into: &buf)
                 if n > 0 {
-                    self.deliverOutput(Data(buf[0..<n]))
+                    continue
                 } else if n == 0 {
                     self.finishOutput()
                     break
                 } else {
-                    if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR {
+                    if code == EAGAIN || code == EWOULDBLOCK || code == EINTR {
                         try? await Task.sleep(nanoseconds: 5_000_000)
                         continue
                     }
-                    if errno == EBADF {
+                    if code == EBADF {
                         self.finishOutput()
                         break
                     }
                     self.finishOutput(
                         error: PTYError.ioFailed(
-                            "PTY read failed: \(String(cString: strerror(errno)))"
+                            "PTY read failed: \(String(cString: strerror(code)))"
                         )
                     )
                     break
@@ -539,6 +573,7 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
             waitContinuations.removeAll()
             return w
         }
+        drainBeforeClose()
         closeMasterIfNeeded()
         finishOutput()
         for w in waiters {

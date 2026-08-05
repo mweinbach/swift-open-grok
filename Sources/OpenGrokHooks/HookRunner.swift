@@ -122,6 +122,8 @@ private final class HookProcessController: @unchecked Sendable {
         }
     }
 
+    var isRunning: Bool { process.isRunning }
+
     func wait() -> Int32 {
         process.waitUntilExit()
         return process.terminationStatus
@@ -131,7 +133,15 @@ private final class HookProcessController: @unchecked Sendable {
     func readStderr() -> Data { stderrPipe.fileHandleForReading.readDataToEndOfFile() }
 
     func terminate() {
-        if process.isRunning { process.terminate() }
+        guard process.isRunning else { return }
+        process.terminate()
+        // SIGTERM can be ignored by the hook (or inherited as ignored), which would pin the
+        // caller on `waitUntilExit` long past the timeout it just reported. Escalate so a hook
+        // can never hold the runner open.
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(200)) { [self] in
+            guard process.isRunning else { return }
+            kill(process.processIdentifier, SIGKILL)
+        }
     }
 }
 
@@ -208,7 +218,15 @@ private func runCommand(
     do {
         waitOutcome = try await withTaskCancellationHandler(operation: {
             try await withThrowingTaskGroup(of: ProcessWaitOutcome.self) { group in
-                group.addTask { .completed(await waitTask.value) }
+                group.addTask {
+                    // Poll for liveness instead of awaiting the blocking `waitUntilExit` task:
+                    // an unawaitable child would keep this group alive on scope exit, so a
+                    // timed-out hook would still pin the caller for the child's full lifetime.
+                    while controller.isRunning {
+                        try await Task.sleep(nanoseconds: 2_000_000)
+                    }
+                    return .completed(await waitTask.value)
+                }
                 group.addTask {
                     try await Task.sleep(nanoseconds: min(spec.timeoutMs, UInt64.max / 1_000_000) * 1_000_000)
                     return .timedOut
@@ -222,31 +240,19 @@ private func runCommand(
         })
     } catch is CancellationError {
         controller.terminate()
-        _ = await waitTask.value
-        _ = await stdoutTask.value
-        _ = await stderrTask.value
         return HookInvocation(result: .failed("hook cancelled"), elapsedMs: elapsedMilliseconds(since: started))
     } catch {
         controller.terminate()
-        _ = await waitTask.value
-        _ = await stdoutTask.value
-        _ = await stderrTask.value
         return HookInvocation(result: .failed("hook execution failed: \(error)"), elapsedMs: elapsedMilliseconds(since: started))
     }
 
     if case .timedOut = waitOutcome {
         controller.terminate()
-        _ = await waitTask.value
-        _ = await stdoutTask.value
-        _ = await stderrTask.value
         return HookInvocation(result: .failed("timed out after \(spec.timeoutMs)ms"), elapsedMs: elapsedMilliseconds(since: started))
     }
 
     if Task.isCancelled {
         controller.terminate()
-        _ = await waitTask.value
-        _ = await stdoutTask.value
-        _ = await stderrTask.value
         return HookInvocation(result: .failed("hook cancelled"), elapsedMs: elapsedMilliseconds(since: started))
     }
 

@@ -297,9 +297,9 @@ struct MockTransportTests {
             } else {
                 Issue.record("expected metadata first")
             }
-            // Stall longer than the producer's per-chunk delay so several body
-            // frames enqueue and trip maxStreamBufferBytes.
-            try await Task.sleep(nanoseconds: 80_000_000)
+            // Stall far longer than the producer needs to emit its 20 chunks, so a
+            // saturated cooperative pool only delays the overflow instead of hiding it.
+            try await Task.sleep(nanoseconds: 2_000_000_000)
             while let event = try await iterator.next() {
                 _ = event
             }

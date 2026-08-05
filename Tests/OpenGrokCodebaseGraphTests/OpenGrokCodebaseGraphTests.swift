@@ -7,6 +7,21 @@ import Foundation
 import Testing
 @testable import OpenGrokCodebaseGraph
 
+/// Polls until the debounced index apply has landed, so a busy machine only makes the test
+/// slower rather than failing it.
+private func waitForDefinition(
+    _ name: String,
+    on handle: IndexManagerHandle,
+    timeout: TimeInterval = 10
+) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if await handle.hasDefinition(name) { return true }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    return await handle.hasDefinition(name)
+}
+
 @Suite("OpenGrokCodebaseGraph")
 struct OpenGrokCodebaseGraphTests {
 
@@ -134,12 +149,9 @@ struct OpenGrokCodebaseGraphTests {
             encoding: .utf8
         )
         await handle.sendEvent(.modified(path: "t.rs"))
-        // Allow coalesce timer + apply.
-        try await Task.sleep(nanoseconds: 100_000_000)
-        // Force a second event flush in case the first coalesce raced.
-        await handle.sendEvent(.modified(path: "t.rs"))
-        try await Task.sleep(nanoseconds: 100_000_000)
-        #expect(await handle.hasDefinition("version_2"))
+        // Wait for the coalesce timer + apply rather than assuming a fixed delay: the
+        // debounce task competes for the cooperative pool with the rest of the suite.
+        #expect(await waitForDefinition("version_2", on: handle))
         #expect(!(await handle.hasDefinition("original")))
     }
 
@@ -165,8 +177,7 @@ struct OpenGrokCodebaseGraphTests {
             )
             await handle.sendEvent(.modified(path: "t.rs"))
         }
-        try await Task.sleep(nanoseconds: 80_000_000)
-        #expect(await handle.hasDefinition("version_19"))
+        #expect(await waitForDefinition("version_19", on: handle))
     }
 
     @Test("cache save/load round trip")
@@ -345,8 +356,7 @@ struct OpenGrokCodebaseGraphTests {
             )
             await handle.sendEvent(.modified(path: "t.rs"))
         }
-        try await Task.sleep(nanoseconds: 120_000_000)
-        #expect(await handle.hasDefinition("burst_29"))
+        #expect(await waitForDefinition("burst_29", on: handle))
         for i in 0..<29 {
             #expect(!(await handle.hasDefinition("burst_\(i)")))
         }

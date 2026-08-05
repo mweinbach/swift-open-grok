@@ -124,7 +124,7 @@ struct OpenGrokHooksTests {
 
     @Test("command timeout and cancellation return without blocking")
     func commandTimeoutAndCancellation() async {
-        let timeoutSpec = HookSpec(name: "timeout", event: .sessionStart, handlerType: .command, command: "sleep 1", commandRaw: "sleep 1", timeoutMs: 20, sourceDirectory: URL(fileURLWithPath: "/tmp"))
+        let timeoutSpec = HookSpec(name: "timeout", event: .sessionStart, handlerType: .command, command: "sleep 30", commandRaw: "sleep 30", timeoutMs: 20, sourceDirectory: URL(fileURLWithPath: "/tmp"))
         let envelope = HookEventEnvelope(hookEventName: .sessionStart, sessionId: "s", cwd: "/tmp", workspaceRoot: "/tmp")
         let timedOut = await HookRunner.run(spec: timeoutSpec, envelope: envelope, context: HookRunContext(sessionId: "s", workspaceRoot: URL(fileURLWithPath: "/tmp")), mode: .observe)
         #expect(timedOut.result == .failed("timed out after 20ms"))
