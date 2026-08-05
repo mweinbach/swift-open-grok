@@ -205,6 +205,9 @@ actor LiveModelSwitchCoordinator {
     private let resolver: LiveModelCatalogResolver
     private let makeSampler: @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler
     private let history: LiveConversationHistory?
+    /// Notified after a successful switch so the Code Mode runtime can drop
+    /// cells that belong to the provider being left behind.
+    private var codeMode: LiveCodeModeCoordinator?
 
     init(
         sampling: OpenGrokLiveSamplingConfiguration,
@@ -218,6 +221,10 @@ actor LiveModelSwitchCoordinator {
         self.resolver = resolver
         self.makeSampler = makeSampler
         self.history = history
+    }
+
+    func attachCodeMode(_ coordinator: LiveCodeModeCoordinator?) {
+        codeMode = coordinator
     }
 
     func snapshot() -> Snapshot {
@@ -260,6 +267,10 @@ actor LiveModelSwitchCoordinator {
         }
         sampling = resolution.sampling
         sampler = rebuilt
+        await codeMode?.noteModelSwitch(
+            from: previous.provider,
+            to: resolution.sampling.provider
+        )
         return .switched(LiveModelSwitchSummary(
             modelID: resolution.sampling.model,
             requestedID: modelID,

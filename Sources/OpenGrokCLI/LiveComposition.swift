@@ -651,6 +651,26 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     coordinator: permissionCoordinator
                 )
             )
+            // Code Mode is a session-wide decision: the tool surface it
+            // projects is fixed for the life of the timeline, which is what
+            // makes a `wait` after a yield resolvable.
+            let toolMode = LiveCodeModeSettings.resolveToolMode(
+                environment: context.environment,
+                workingDirectory: cwd,
+                openGrokHome: openGrokHome
+            )
+            let toolSurface = LiveCodeModeToolSurface(
+                mode: toolMode,
+                baseTools: toolExecutor.tools
+            )
+            let codeMode = toolSurface.isCodeMode
+                ? LiveCodeModeCoordinator(
+                    surface: toolSurface,
+                    toolExecutor: toolExecutor,
+                    sessionID: sessionID,
+                    workingDirectory: cwd
+                )
+                : nil
             let conversationHistory = LiveConversationHistory(
                 record: conversationRecord,
                 store: conversationStore
@@ -669,6 +689,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 makeSampler: dependencies.makeSampler,
                 history: conversationHistory
             )
+            // A provider change invalidates the cells and stored values the
+            // old runtime holds (model_switch.rs:249).
+            await modelSwitch.attachCodeMode(codeMode)
             let shell = OpenGrokShell(configuration: OpenGrokShellConfiguration(
                 openGrokHome: openGrokHome,
                 processBackend: processBackend,
@@ -678,7 +701,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         modelSwitch: modelSwitch,
                         toolExecutor: toolExecutor,
                         conversationHistory: conversationHistory,
-                        systemPrompt: agentProfile?.systemPrompt
+                        systemPrompt: agentProfile?.systemPrompt,
+                        toolSurface: toolSurface,
+                        codeMode: codeMode
                     )
                 )
             ))
@@ -754,6 +779,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             await controller.shutdown()
                             await interactiveInput.close()
                             _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                            await codeMode?.shutdown()
                             await toolExecutor.shutdown()
                         }
                     )
@@ -791,6 +817,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         task.cancel()
                         await pager.shutdown()
                         _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                        await codeMode?.shutdown()
                         await toolExecutor.shutdown()
                     }
                 )
@@ -819,6 +846,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         task.cancel()
                         await pager.shutdown()
                         _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                        await codeMode?.shutdown()
                         await toolExecutor.shutdown()
                     }
                 )
@@ -1405,7 +1433,7 @@ struct LivePermissionModalPrompter: PermissionPrompter {
     }
 }
 
-private struct LiveToolExecutor: Sendable {
+struct LiveToolExecutor: Sendable {
     let tools: [ToolSpec]
     let workingDirectory: URL
     private let composition: OpenGrokShellToolRuntimeComposition
@@ -1862,13 +1890,13 @@ actor LiveConversationStore {
     }
 }
 
-private struct LiveAgentProfile: Sendable, Equatable {
+struct LiveAgentProfile: Sendable, Equatable {
     let model: String?
     let systemPrompt: String?
     let toolPolicy: LiveAgentToolPolicy
 }
 
-private struct LiveAgentToolPolicy: Sendable, Equatable {
+struct LiveAgentToolPolicy: Sendable, Equatable {
     let configuredTools: [String]
     let allowlist: [String]
     let denylist: [String]
@@ -1966,8 +1994,41 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     let toolExecutor: LiveToolExecutor
     let conversationHistory: LiveConversationHistory
     let systemPrompt: String?
+    /// The tool list this session advertises. In Code Mode it carries `exec`
+    /// and `wait` and, in `code_mode_only`, hides everything the cell can
+    /// reach through `tools.*`.
+    let toolSurface: LiveCodeModeToolSurface
+    /// `nil` in `direct` mode, which leaves the turn loop byte-identical to a
+    /// session that has never heard of Code Mode.
+    let codeMode: LiveCodeModeCoordinator?
 
     func sample(
+        context: OpenGrokShellProviderTurnContext,
+        request: OpenGrokShellTurnRequest,
+        emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
+    ) async throws -> OpenGrokShellSamplingResult {
+        guard let codeMode else {
+            return try await runTurn(context: context, request: request, emit: emit)
+        }
+        // Nested calls raise their tool cards through this turn's sink, and a
+        // cancelled turn (Esc) terminates whatever cells are still running.
+        await codeMode.beginTurn(emit: emit)
+        do {
+            let result = try await withTaskCancellationHandler {
+                try await runTurn(context: context, request: request, emit: emit)
+            } onCancel: {
+                Task { await codeMode.cancelActiveCells() }
+            }
+            await codeMode.endTurn()
+            return result
+        } catch {
+            await codeMode.cancelActiveCells()
+            await codeMode.endTurn()
+            throw error
+        }
+    }
+
+    private func runTurn(
         context: OpenGrokShellProviderTurnContext,
         request: OpenGrokShellTurnRequest,
         emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
@@ -1997,7 +2058,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 model: active.modelID,
                 prompt: request.text,
                 items: items,
-                tools: toolExecutor.tools
+                tools: toolSurface.modelTools
             )) { event in
                 switch event {
                 case .output(let text):
@@ -2038,7 +2099,20 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         sessionID: String,
         emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
     ) async throws -> [ConversationItem] {
-        for call in calls {
+        // `exec` and `wait` are transport, not tools: they raise no card and
+        // never announce themselves, so the transcript shows only the nested
+        // calls the cell made (turn.rs:1998). They also mutate one runtime, so
+        // they run in order rather than joining the parallel group.
+        var transportResults: [Int: ToolResultItem] = [:]
+        if let codeMode {
+            for (index, call) in calls.enumerated() where codeMode.isTransportCall(call) {
+                try Task.checkCancellation()
+                transportResults[index] = await codeMode.handleTransportCall(call)
+            }
+        }
+        let dispatched = calls.enumerated().filter { transportResults[$0.offset] == nil }
+
+        for (_, call) in dispatched {
             try Task.checkCancellation()
             await emit(.tool(OpenGrokShellToolUpdate(
                 callID: call.callId,
@@ -2053,7 +2127,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             of: (Int, ToolResultItem).self,
             returning: [ConversationItem].self
         ) { group in
-            for (index, call) in calls.enumerated() {
+            for (index, call) in dispatched {
                 group.addTask {
                     let result = await toolExecutor.invoke(
                         sessionID: sessionID,
@@ -2100,6 +2174,9 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             }
 
             var orderedResults = Array<ToolResultItem?>(repeating: nil, count: calls.count)
+            for (index, result) in transportResults {
+                orderedResults[index] = result
+            }
             for try await (index, result) in group {
                 orderedResults[index] = result
             }
