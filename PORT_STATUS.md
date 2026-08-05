@@ -214,6 +214,54 @@ Both are mapped with proposed Swift targets in `CRATE_MAP.md`.
 - The Swift port targets the **old** pin's behavior throughout. Nothing in this section is implemented on the Swift side; it is a catch-up backlog, not a status claim.
 - `ProtocolFixtures/` still encodes old-pin wire formats (see the fixture pin caveat in the header). Recapture is a prerequisite for treating any of the above as fixture-verified.
 
+## Wave 8 — 2026-08-05 (the audit findings, closed)
+
+Wave 8 answered the audit below. Gates: `build-tests` **0**, `test --no-parallel`
+**0** — **3,751 tests / 554 suites, zero failures**, 173s. Commits `add82ce`
+(security), `c6bde5c` (compaction), `e2fceee` (memory/sessions), `cc31378` (TUI),
+`9f0a59c` (CLI/tools/services), plus tri-platform CI in `fdf8b3f`.
+
+**Closed:** shell execution gated (refusal proven *before spawn* by a spy backend
+asserting `spawnCount() == 0`); `[permission]` config, `.claude/settings.json`,
+and CLI permission flags feeding the rule engine; project-config precedence;
+folder trust persisted and gating repo MCP; sandbox with its first non-test
+importer; compaction live in the turn loop with Codex Remote V2; background-task
+consumer tools; root CLI invocations; the settings modal, six themes, motion, and
+scrollback focus; memory, goals, rewind, session search; self-update, crash
+handler, skills, SHA-pinned plugins.
+
+**Deliberately not done, with reasons:** telemetry stays dark
+(`productTelemetryEnabled` defaults `true` here vs upstream's `Disabled`, and
+there is no `DISABLE_TELEMETRY` opt-out — wiring emission first would ship it on
+by default; port mode resolution and the opt-out, then call sites). Computer Hub
+`workspace` route, share/feedback (must gate upload on the xAI export boundary so
+a Codex transcript never reaches xAI), `/resume` `/rewind` `/jump` `/delete`
+`/rename` registrations, and 44 slash commands whose backing runtime does not
+exist.
+
+**Nine product bugs the wave found, none in the audit.** Five would have shipped
+silently: `/remember` wrote correctly to disk, said "Saved", and was permanently
+unfindable — twice over, from two independent suppressors in series; SSE block
+boundaries matched only `"\n\n"`, so a CRLF stream never found a boundary and the
+whole response decoded to nothing; the Codex compaction body encoded
+`ConversationItem`'s on-disk form, which no live server speaks; `kill_task`'s gate
+returned `nil` (dispatch) where its sibling returned a failure, while being
+*reported* as fail-closed; slash commands typed mid-turn were queued as prompts
+and sent to the provider verbatim. Also: `/queue` silently stole `/q` from
+`/quit` via alphabetical sort; `--minimal` hard-failed without a TTY; `mcp remove`
+exited 2 and silently did nothing; a permission-layer merge let a user config
+delete an admin's deny rule.
+
+**The port's characteristic failure mode has a name now: "succeeds, does nothing,
+says nothing."** A port is where behavior gets dropped while structure survives —
+it compiles, types line up, the call returns, the thing quietly doesn't happen. In
+none of these was the fix the code that broke; each mechanism did exactly what it
+was written to do. What was missing was any path for the silent case to announce
+itself. Two practices caught all of them and are now standing guidance: assert
+reachability **through the live seam** (what the model is offered, what runs, what
+lands on disk — never against composition types, which pass just as happily when
+nothing constructs them), and **never `_ =` a status-returning call**.
+
 ## Feature-parity audit — 2026-08-05 (six read-only audits, enumerated from the Rust side)
 
 Every prior "gap" list in this document was written from the *port's* perspective
