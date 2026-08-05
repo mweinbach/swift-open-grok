@@ -264,6 +264,86 @@ struct OpenGrokPagerInteractiveControllerTests {
         #expect(states.last?.completions.isEmpty == true)
     }
 
+    /// Once the command name is settled the dropdown belongs to the arguments.
+    /// The controller cannot name a model, so it only decides *when* that phase
+    /// has opened and hands the typed query to the host verbatim.
+    @Test("a typed /model argument opens the argument dropdown and Tab accepts a row")
+    func argumentCompletion() async throws {
+        let renderer = RecordingInteractiveRenderer()
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeInputStream([
+                .paste("/model cod"),
+                .key(KeyEvent(key: .tab)),
+            ]),
+            runtime: TestInteractiveRuntime(sessions: []),
+            renderer: renderer,
+            output: RecordingInteractiveOutput()
+        )
+        await controller.setArgumentSuggestions { command, query in
+            [
+                OpenGrokPagerCommandSuggestion(
+                    // Echoed back so the assertions can see exactly what the
+                    // controller decided the command and query were.
+                    name: "\(command)|\(query)",
+                    summary: "GPT-5.6 Sol",
+                    insertText: "/model codex:gpt-5.6-sol"
+                )
+            ]
+        }
+
+        _ = try await controller.run(.init(prompt: "", mode: .inline))
+
+        let states = await renderer.promptStates
+        #expect(states.contains { $0.completions.contains { $0.name == "model|cod" } })
+        // Accepting an argument row leaves a whole command behind. A bare
+        // selector would submit as a prompt on the next Enter.
+        #expect(states.last?.text == "/model codex:gpt-5.6-sol")
+        #expect(states.last?.completions.isEmpty == true)
+    }
+
+    /// The argument phase opens at the first whitespace after the command name,
+    /// which is upstream's rule too — a trailing space is what moves `/model`
+    /// from the model list into the effort sub-menu. So `/model ` is a real
+    /// query (empty), not an absent one.
+    @Test("a trailing space alone opens the argument phase with an empty query")
+    func argumentCompletionWithEmptyQuery() async throws {
+        let renderer = RecordingInteractiveRenderer()
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeInputStream([.paste("/model ")]),
+            runtime: TestInteractiveRuntime(sessions: []),
+            renderer: renderer,
+            output: RecordingInteractiveOutput()
+        )
+        await controller.setArgumentSuggestions { command, query in
+            [OpenGrokPagerCommandSuggestion(name: "\(command)|\(query)", summary: "")]
+        }
+
+        _ = try await controller.run(.init(prompt: "", mode: .inline))
+
+        let states = await renderer.promptStates
+        #expect(states.contains { $0.completions.contains { $0.name == "model|" } })
+        // The command-name dropdown must not also fire — the name is settled.
+        #expect(states.allSatisfy { !$0.completions.contains { $0.name == "/model" } })
+    }
+
+    /// With no host-supplied source, the argument phase offers nothing rather
+    /// than falling back to command names, which would put `/model` in a
+    /// dropdown the user has already left.
+    @Test("the argument phase offers nothing when no source is installed")
+    func argumentCompletionWithoutSource() async throws {
+        let renderer = RecordingInteractiveRenderer()
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeInputStream([.paste("/model cod")]),
+            runtime: TestInteractiveRuntime(sessions: []),
+            renderer: renderer,
+            output: RecordingInteractiveOutput()
+        )
+
+        _ = try await controller.run(.init(prompt: "", mode: .inline))
+
+        #expect(await renderer.promptStates.allSatisfy { $0.completions.isEmpty })
+    }
+
     @Test("/help opens the shortcuts modal and /quit ends the run without a session")
     func slashCommandsRunLocally() async throws {
         let runtime = TestInteractiveRuntime(sessions: [])
@@ -294,6 +374,59 @@ struct OpenGrokPagerInteractiveControllerTests {
         }
         #expect(overlays == [.help])
         #expect(OpenGrokPagerInteractiveController.helpText.contains("/clear"))
+    }
+
+    /// The controller does not own the model catalog, so it cannot tell a
+    /// unique selector from an ambiguous one. Its whole job is to hand the
+    /// typed argument to the renderer intact; resolution happens there.
+    @Test("/model carries its typed selector through to the overlay request")
+    func modelSelectorReachesTheOverlayRequest() async throws {
+        let overlays = try await modelOverlayRequests(for: [
+            // Bare: no selector, the picker opens.
+            "/model",
+            // Whitespace-only arguments are the bare form too.
+            "/model   ",
+            "/model codex:gpt-5.6-sol",
+            // A display name with a space survives the parser's tokenise and
+            // this side's rejoin — otherwise `Grok 4.5` would arrive as `Grok`.
+            "/model Grok 4.5",
+            // Quoting is the parser's business; the selector comes out unquoted.
+            #"/model "grok 4""#,
+        ])
+
+        #expect(overlays == [
+            .modelPicker(query: nil),
+            .modelPicker(query: nil),
+            .modelPicker(query: "codex:gpt-5.6-sol"),
+            .modelPicker(query: "Grok 4.5"),
+            .modelPicker(query: "grok 4"),
+        ])
+    }
+
+    /// Drive `commands` through the real input path and collect the overlay
+    /// requests, one per command, in order.
+    private func modelOverlayRequests(
+        for commands: [String]
+    ) async throws -> [OpenGrokPagerOverlayRequest] {
+        let output = RecordingInteractiveOutput()
+        var events: [InputEvent] = []
+        for command in commands {
+            events.append(.paste(command))
+            events.append(.key(KeyEvent(key: .enter)))
+        }
+        events.append(.paste("/quit"))
+        events.append(.key(KeyEvent(key: .enter)))
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeInputStream(events),
+            runtime: TestInteractiveRuntime(sessions: []),
+            renderer: RecordingInteractiveRenderer(),
+            output: output
+        )
+        _ = try await controller.run(.init(prompt: "", mode: .inline))
+        return await output.events.compactMap { event in
+            if case .overlay(let request) = event { return request }
+            return nil
+        }
     }
 
     @Test("input EOF restores the frontend without creating a session")

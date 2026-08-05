@@ -60,7 +60,10 @@ struct LiveModelSwitchTests {
         let resolver = LiveModelCatalogResolver(
             environment: environment,
             openGrokHome: home,
-            sessionID: "session-same"
+            sessionID: "session-same",
+            // Hermetic: without this the resolver would read the
+            // `[endpoints]` chain from the process cwd (the repo checkout).
+            workingDirectory: home
         )
         let initial = try await resolver.resolve(modelID: "glm-5.2")
         #expect(initial.sampling.provider == .fireworks)
@@ -102,7 +105,10 @@ struct LiveModelSwitchTests {
         let resolver = LiveModelCatalogResolver(
             environment: environment,
             openGrokHome: home,
-            sessionID: "session-cross"
+            sessionID: "session-cross",
+            // Hermetic: without this the resolver would read the
+            // `[endpoints]` chain from the process cwd (the repo checkout).
+            workingDirectory: home
         )
         let initial = try await resolver.resolve(modelID: "glm-5.2")
         let factory = SamplerFactorySpy()
@@ -137,7 +143,10 @@ struct LiveModelSwitchTests {
         let resolver = LiveModelCatalogResolver(
             environment: environment,
             openGrokHome: home,
-            sessionID: "session-closed"
+            sessionID: "session-closed",
+            // Hermetic: without this the resolver would read the
+            // `[endpoints]` chain from the process cwd (the repo checkout).
+            workingDirectory: home
         )
         let initial = try await resolver.resolve(modelID: "glm-5.2")
         let factory = SamplerFactorySpy()
@@ -170,7 +179,10 @@ struct LiveModelSwitchTests {
         let resolver = LiveModelCatalogResolver(
             environment: environment,
             openGrokHome: home,
-            sessionID: "session-unknown"
+            sessionID: "session-unknown",
+            // Hermetic: without this the resolver would read the
+            // `[endpoints]` chain from the process cwd (the repo checkout).
+            workingDirectory: home
         )
         let initial = try await resolver.resolve(modelID: "glm-5.2")
         let coordinator = LiveModelSwitchCoordinator(
@@ -198,7 +210,10 @@ struct LiveModelSwitchTests {
         let resolver = LiveModelCatalogResolver(
             environment: environment,
             openGrokHome: home,
-            sessionID: "session-noop"
+            sessionID: "session-noop",
+            // Hermetic: without this the resolver would read the
+            // `[endpoints]` chain from the process cwd (the repo checkout).
+            workingDirectory: home
         )
         let initial = try await resolver.resolve(modelID: "glm-5.2")
         let factory = SamplerFactorySpy()
@@ -279,7 +294,10 @@ struct LiveProviderIsolationTests {
         let resolver = LiveModelCatalogResolver(
             environment: environment,
             openGrokHome: home,
-            sessionID: "keep"
+            sessionID: "keep",
+            // Hermetic: without this the resolver would read the
+            // `[endpoints]` chain from the process cwd (the repo checkout).
+            workingDirectory: home
         )
         let initial = try await resolver.resolve(modelID: "glm-5.2")
         let coordinator = LiveModelSwitchCoordinator(
@@ -317,7 +335,10 @@ struct LiveProviderIsolationTests {
         let resolver = LiveModelCatalogResolver(
             environment: environment,
             openGrokHome: home,
-            sessionID: "cross"
+            sessionID: "cross",
+            // Hermetic: without this the resolver would read the
+            // `[endpoints]` chain from the process cwd (the repo checkout).
+            workingDirectory: home
         )
         let initial = try await resolver.resolve(modelID: "glm-5.2")
         let coordinator = LiveModelSwitchCoordinator(
@@ -364,7 +385,10 @@ struct LiveProviderIsolationTests {
         let resolver = LiveModelCatalogResolver(
             environment: environment,
             openGrokHome: home,
-            sessionID: "refused"
+            sessionID: "refused",
+            // Hermetic: without this the resolver would read the
+            // `[endpoints]` chain from the process cwd (the repo checkout).
+            workingDirectory: home
         )
         let initial = try await resolver.resolve(modelID: "glm-5.2")
         let coordinator = LiveModelSwitchCoordinator(

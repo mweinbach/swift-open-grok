@@ -65,6 +65,15 @@ struct LiveModelCatalogResolver: Sendable {
     /// Project root for the `[endpoints]` config lookup. A mid-session switch
     /// has to read the same config chain the cold start did, or the two
     /// disagree about the endpoint for the same model.
+    ///
+    /// Deliberately has no default. The process cwd is *not* the session's
+    /// working directory — `--cwd` is a supported flag, which is why
+    /// `makeSessionFoundation` resolves it through
+    /// `resolveWorkingDirectory(options.common.cwd)`. A defaulted parameter
+    /// would let a future call site silently read the config chain from the
+    /// wrong directory, reintroducing exactly the cold-start/switch divergence
+    /// this field exists to prevent, with no compiler error and no test
+    /// failure. Requiring it turns that into a build error instead.
     let workingDirectory: URL
     /// Injection seam for tests; production passes the real resolver.
     let makeCredentialResolver: @Sendable (
@@ -76,10 +85,7 @@ struct LiveModelCatalogResolver: Sendable {
         environment: [String: String],
         openGrokHome: URL,
         sessionID: String,
-        workingDirectory: URL = URL(
-            fileURLWithPath: FileManager.default.currentDirectoryPath,
-            isDirectory: true
-        ),
+        workingDirectory: URL,
         makeCredentialResolver: @escaping @Sendable (
             [String: String],
             URL

@@ -17,6 +17,7 @@
 
 import Foundation
 import OpenGrokModels
+import OpenGrokPager
 import OpenGrokPagerRender
 import OpenGrokSamplingTypes
 
@@ -222,6 +223,53 @@ enum LiveModelPicker {
             overlay.content = .list(list)
         }
         return overlay
+    }
+
+    // MARK: Completions
+
+    /// Dropdown rows for a partially typed `/model` argument, mirroring
+    /// upstream's `ModelCommand::suggest_args` → `build_model_items`.
+    ///
+    /// Upstream's prompt widget fuzzy-matches `ArgItem.match_text`. This port
+    /// has no fuzzy matcher, so it filters on a case-insensitive substring of
+    /// the same text plus the selector. That is narrower, never wider: every
+    /// row offered is one the query could have meant, and an empty query still
+    /// lists the whole catalog the way upstream's does.
+    static func completions(
+        query: String,
+        entries: [LiveModelPickerEntry],
+        currentModelID: String? = nil
+    ) -> [LiveModelPickerRow] {
+        let all = rows(entries: entries, currentModelID: currentModelID)
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else { return all }
+        return all.filter {
+            $0.matchText.lowercased().contains(needle)
+                || $0.selector.lowercased().contains(needle)
+        }
+    }
+
+    /// The same rows as dropdown suggestions.
+    ///
+    /// `insertText` carries the command back with the selector because the
+    /// composer replaces its whole text on accept — a bare `codex:gpt-5.6-sol`
+    /// left behind would submit as a prompt, not as a model switch.
+    static func suggestions(
+        query: String,
+        entries: [LiveModelPickerEntry],
+        currentModelID: String? = nil,
+        command: String = "model"
+    ) -> [OpenGrokPagerCommandSuggestion] {
+        completions(query: query, entries: entries, currentModelID: currentModelID)
+            .map { row in
+                OpenGrokPagerCommandSuggestion(
+                    name: row.label,
+                    summary: row.summary,
+                    // `insertText` already carries the trailing space that says
+                    // "an effort level may follow" for reasoning models.
+                    insertText: "/\(command) \(row.insertText)"
+                )
+            }
     }
 
     /// `slug · context · description`, omitting parts the catalog does not

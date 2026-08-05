@@ -484,6 +484,19 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         commands: OpenGrokPagerInteractiveController.builtinCommands
     )
 
+    /// Completions for the *arguments* of a command whose name is already
+    /// typed, as `(command, argumentQuery) -> rows`.
+    ///
+    /// The controller owns the command vocabulary but none of the vocabularies
+    /// the arguments come from — it cannot name a model any more than the
+    /// render layer can. So the host supplies this and does its own matching;
+    /// the controller only decides *when* the prompt is in the argument phase.
+    /// Upstream's equivalent is `SlashCommand::suggest_args`
+    /// (`slash/command.rs`), which `/model` implements by listing the catalog.
+    private var argumentSuggestions: (
+        @Sendable (String, String) -> [OpenGrokPagerCommandSuggestion]
+    )?
+
     public init(
         input: AsyncThrowingStream<InputEvent, Error>,
         runtime: any OpenGrokPagerRuntimeAdapter,
@@ -508,6 +521,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             renderer: renderer,
             output: output
         )
+    }
+
+    /// Install the argument-completion source. Call before `run`.
+    public func setArgumentSuggestions(
+        _ provider: (@Sendable (String, String) -> [OpenGrokPagerCommandSuggestion])?
+    ) {
+        argumentSuggestions = provider
     }
 
     public func state() -> OpenGrokPagerInteractiveState {
@@ -1161,7 +1181,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case .completionAccept:
             if let index = editor.selectedCompletion,
                editor.completions.indices.contains(index) {
-                editor.replace(with: editor.completions[index].name)
+                editor.replace(with: editor.completions[index].insertText)
             }
             editor.completions = []
             editor.selectedCompletion = nil
@@ -1238,18 +1258,48 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     }
 
     private func refreshCompletions() {
-        let suggestions = commands
-            .completions(for: editor.text)
-            .prefix(6)
-            .map {
-                OpenGrokPagerCommandSuggestion(
-                    name: $0.displayName,
-                    summary: $0.summary,
-                    isAvailable: $0.availability.isAvailable
-                )
-            }
-        editor.completions = Array(suggestions)
+        let suggestions: [OpenGrokPagerCommandSuggestion]
+        if let argumentPhase = Self.argumentPhase(for: editor.text) {
+            // Once the command name is settled the dropdown belongs to the
+            // arguments — `commands.completions` would return nothing here
+            // anyway, since it refuses any input containing whitespace.
+            suggestions = Array(
+                (argumentSuggestions?(argumentPhase.command, argumentPhase.query) ?? [])
+                    .prefix(6)
+            )
+        } else {
+            suggestions = commands
+                .completions(for: editor.text)
+                .prefix(6)
+                .map {
+                    OpenGrokPagerCommandSuggestion(
+                        name: $0.displayName,
+                        summary: $0.summary,
+                        isAvailable: $0.availability.isAvailable
+                    )
+                }
+        }
+        editor.completions = suggestions
         editor.selectedCompletion = editor.completions.isEmpty ? nil : 0
+    }
+
+    /// `/model codex:` → `(command: "model", query: "codex:")`.
+    ///
+    /// The phase opens at the first whitespace after the command name, which is
+    /// upstream's rule too: a trailing space is what moves the `/model`
+    /// dropdown from the model list into the effort sub-menu. So `/model ` is a
+    /// real query that happens to be empty, not an absent one — the whitespace
+    /// decides the phase before it is trimmed out of the query.
+    static func argumentPhase(for input: String) -> (command: String, query: String)? {
+        let leading = input.drop { $0.isWhitespace }
+        guard leading.first == "/" else { return nil }
+        let body = leading.dropFirst()
+        guard let split = body.firstIndex(where: { $0.isWhitespace }) else { return nil }
+        let command = PagerCommandDefinition.normalize(String(body[..<split]))
+        guard !command.isEmpty else { return nil }
+        let query = body[body.index(after: split)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (command, query)
     }
 
     /// Step to an older (`offset < 0`) or newer prompt. Paging past the newest
@@ -1361,7 +1411,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 try await emit(.overlay(.workflows))
                 return .handled
             case "model":
-                try await emit(.overlay(.modelPicker))
+                // The parser has already split and unquoted the arguments;
+                // rejoining on a single space is what upstream resolves against
+                // (`model.rs` trims `args` and matches the whole string first,
+                // so a multi-word display name like `Grok 4.5` survives).
+                let selector = invocation.arguments
+                    .joined(separator: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                try await emit(.overlay(.modelPicker(query: selector.isEmpty ? nil : selector)))
                 return .handled
             case "toggle-mouse-reporting":
                 try await emit(.overlay(.toggleMouseReporting))
@@ -1378,7 +1435,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     public static let helpText = """
     Commands
       /help                     Browse commands and keyboard shortcuts
-      /model                    Pick the model for this session
+      /model [name]             Pick the model, or switch to a named one
       /clear  /new              Start a new session
       /toggle-mouse-reporting   Toggle mouse reporting (native copy/paste)
       /quit   /exit             Quit the application

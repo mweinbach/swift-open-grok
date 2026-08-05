@@ -299,6 +299,81 @@ struct LiveModelPickerResolutionTests {
     }
 }
 
+/// Provenance: Rust `ModelCommand::suggest_args` → `build_model_items`, and
+/// `empty_query_returns_one_row_per_logical_model`.
+@Suite("Model picker completions")
+struct LiveModelPickerCompletionTests {
+    private let entries = [
+        entry(id: "gpt-5.6-sol", provider: "codex", name: "GPT-5.6 Sol"),
+        entry(id: "grok-build", provider: "xai", name: "Grok Build"),
+        entry(id: "r", provider: "xai", name: "Reasoner", supportsReasoningEffort: true),
+    ]
+
+    /// An empty query lists the whole catalog, one row per logical model.
+    @Test("an empty query offers every model in picker order")
+    func emptyQueryListsEverything() {
+        let rows = LiveModelPicker.completions(query: "", entries: entries)
+        #expect(rows.map(\.selector) == ["codex:gpt-5.6-sol", "xai:grok-build", "xai:r"])
+        #expect(LiveModelPicker.completions(query: "   ", entries: entries).count == 3)
+    }
+
+    /// The query narrows on the same text upstream fuzzy-matches — provider
+    /// label, display name and slug — plus the selector.
+    @Test("a query narrows on provider, name, slug or selector")
+    func queryNarrows() {
+        func selectors(_ query: String) -> [String] {
+            LiveModelPicker.completions(query: query, entries: entries).map(\.selector)
+        }
+        #expect(selectors("codex:") == ["codex:gpt-5.6-sol"])
+        // Provider label, not wire id.
+        #expect(selectors("OpenAI") == ["codex:gpt-5.6-sol"])
+        #expect(selectors("grok") == ["xai:grok-build"])
+        #expect(selectors("reason") == ["xai:r"])
+        #expect(selectors("xai") == ["xai:grok-build", "xai:r"])
+        #expect(selectors("nothing-matches").isEmpty)
+    }
+
+    /// Accepting a row replaces the whole composer, so the row has to carry the
+    /// command back with it — a bare selector would submit as a prompt.
+    @Test("suggestions insert a complete command, not a bare selector")
+    func suggestionsCarryTheCommand() throws {
+        let suggestions = LiveModelPicker.suggestions(
+            query: "codex:",
+            entries: entries,
+            currentModelID: "gpt-5.6-sol"
+        )
+        let codex = try #require(suggestions.first)
+        #expect(codex.name == "OpenAI Codex · GPT-5.6 Sol (current)")
+        #expect(codex.summary == "gpt-5.6-sol · Model description")
+        #expect(codex.insertText == "/model codex:gpt-5.6-sol")
+    }
+
+    /// The trailing space that says "an effort level may follow" survives into
+    /// the inserted command.
+    @Test("a reasoning model's row keeps its trailing space")
+    func reasoningRowKeepsTrailingSpace() throws {
+        let suggestion = try #require(
+            LiveModelPicker.suggestions(query: "reason", entries: entries).first
+        )
+        #expect(suggestion.insertText == "/model xai:r ")
+    }
+
+    /// Every offered row must round-trip: what it inserts has to be exactly
+    /// what the resolver accepts, or the dropdown would hand the user a
+    /// command that then fails as `Unknown model`.
+    @Test("every offered row inserts a command the resolver resolves")
+    func offeredRowsRoundTripThroughTheResolver() {
+        let catalog = LiveModelCatalogResolver.catalog()
+        for suggestion in LiveModelPicker.suggestions(query: "", entries: catalog) {
+            let selector = suggestion.insertText.dropFirst("/model ".count)
+            #expect(
+                LiveModelPicker.resolve(query: String(selector), entries: catalog) != nil,
+                "\(suggestion.insertText) must resolve"
+            )
+        }
+    }
+}
+
 @Suite("Embedded catalog picker entries")
 struct LiveModelCatalogEntryTests {
     /// The picker must see real names and context windows, not bare ids —

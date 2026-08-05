@@ -37,11 +37,22 @@ public struct OpenGrokPagerCommandSuggestion: Sendable, Equatable, Hashable {
     public let name: String
     public let summary: String
     public let isAvailable: Bool
+    /// The whole composer text this row commits to. For a command row that is
+    /// just the command name, but an argument row has to carry the command
+    /// along with it — accepting `codex:gpt-5.6-sol` must leave `/model
+    /// codex:gpt-5.6-sol` behind, not the bare selector.
+    public let insertText: String
 
-    public init(name: String, summary: String, isAvailable: Bool = true) {
+    public init(
+        name: String,
+        summary: String,
+        isAvailable: Bool = true,
+        insertText: String? = nil
+    ) {
         self.name = name
         self.summary = summary
         self.isAvailable = isAvailable
+        self.insertText = insertText ?? name
     }
 }
 
@@ -130,8 +141,12 @@ public struct OpenGrokPagerInteractiveResult: Sendable, Equatable {
 public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// `/help` — the shortcuts modal (spec §16.5), not a transcript dump.
     case help
-    /// `/model` — the model picker.
-    case modelPicker
+    /// `/model` — the model picker, or, when `query` is non-nil, the typed
+    /// selector the user supplied after the command name. A typed selector that
+    /// names exactly one model switches without ever showing the overlay, which
+    /// is why the query rides on the overlay request rather than being resolved
+    /// here: the controller does not own the model catalog.
+    case modelPicker(query: String?)
     /// `/toggle-mouse-reporting` — hand click-drag back to the terminal for
     /// native copy/paste, or take it back.
     case toggleMouseReporting
