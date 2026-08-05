@@ -6,9 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+# One in-flight run per ref; a newer push supersedes an older one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   macos:
-    name: macOS build and test
+    name: macOS (build + test)
     runs-on: macos-15
     timeout-minutes: 90
     steps:
@@ -21,31 +26,61 @@ jobs:
         run: zsh workflows/swift-safe-verify.zsh build
       - name: Build tests
         run: zsh workflows/swift-safe-verify.zsh build-tests
-      # --no-parallel is the documented green gate (PORT_STATUS.md); default
-      # parallel is also green locally but shared-runner load variance makes
+      # --no-parallel is the documented green gate (PORT_STATUS.md). Default
+      # parallel is also green locally, but shared-runner load variance makes
       # serial the honest CI configuration.
       - name: Test (serial gate)
         run: zsh workflows/swift-safe-verify.zsh test --no-parallel
       - name: Product
         run: zsh workflows/swift-safe-verify.zsh build --product open-grok
-      - name: Smoke
+      - name: Smoke (isolated home)
         run: |
           BIN=$(find .build/workflow-safe -name open-grok -type f -perm +111 | head -1)
           OPENGROK_HOME=$(mktemp -d) "$BIN" --version
           OPENGROK_HOME=$(mktemp -d) "$BIN" paths --json
 
-  linux-surface:
-    # Deliberately non-blocking: Linux is a declared support target the port
-    # has not yet earned (PORT_STATUS "Known remaining gaps"). This job exists
-    # to surface the current compile-gap list on every push, not to gate.
-    name: Linux build (gap surfacing, non-blocking)
+  linux:
+    name: Linux (build + test)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Non-blocking until the platform adapters land: Linux is a declared
+    # support target the port has not yet earned (PORT_STATUS "Known remaining
+    # gaps" — Secret Service, inotify, sandbox, ConPTY-equivalents). The job
+    # runs the real gates so the remaining gap list is visible on every push
+    # rather than asserted from memory. Flip continue-on-error off once green.
     continue-on-error: true
-    timeout-minutes: 60
-    container: swift:6.1
+    container: swift:6.1-jammy
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
         run: swift --version
-      - name: Build (allowed to fail)
-        run: swift build 2>&1 | tail -100
+      - name: Build
+        run: swift build 2>&1 | tail -200
+      - name: Build tests
+        run: swift build --build-tests 2>&1 | tail -200
+      - name: Test
+        run: swift test --no-parallel 2>&1 | tail -200
+
+  windows:
+    name: Windows (build + test)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    # Non-blocking for the same reason as Linux, and more so: Windows needs
+    # ConPTY, Credential Manager, LockFileEx, and ReadDirectoryChangesW
+    # adapters. PORT_PLAN's platform strategy is "continuously compiled",
+    # which is exactly what this job measures.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: compnerd/gha-setup-swift@main
+        with:
+          branch: swift-6.1-release
+          tag: 6.1-RELEASE
+      - name: Toolchain
+        run: swift --version
+      - name: Build
+        run: swift build
+      - name: Build tests
+        run: swift build --build-tests
+      - name: Test
+        run: swift test --no-parallel
