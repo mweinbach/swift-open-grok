@@ -26,7 +26,30 @@ public enum PersistedWorkflowStatus: String, Codable, Sendable, Hashable {
     }
 }
 
+/// Manifest version this build writes.
+///
+/// `WORKFLOW_RUN_MANIFEST_VERSION`
+/// (`crates/codegen/xai-grok-shell/src/session/workflow/store.rs:13`).
+public let workflowRunManifestVersion: UInt8 = 4
+
+/// Manifest versions this build will load at all.
+///
+/// Restore validates a **range**, not equality
+/// (`.../session/storage/jsonl/mod.rs:714-723`): a manifest outside
+/// `1...current` is skipped with a warning rather than loaded, so a file
+/// written by a newer build is never reinterpreted under this build's
+/// assumptions. Version `0` is not a valid manifest.
+public let supportedWorkflowRunManifestVersions: ClosedRange<UInt8> = 1...workflowRunManifestVersion
+
+/// Why a within-range but outdated manifest cannot be resumed.
+/// store.rs:104-106.
+public let workflowManifestPredatesAgentAccountingMessage =
+    "this workflow predates agent-count accounting and cannot be resumed; start a new run"
+
 public struct WorkflowRunRecord: Codable, Sendable, Hashable {
+    /// Manifest version this record was written at. Absent in files written
+    /// before versioning; those decode as `1`, the oldest supported version.
+    public var version: UInt8
     public var runID: String
     public var workflowName: String
     public var scriptHash: String
@@ -40,8 +63,22 @@ public struct WorkflowRunRecord: Codable, Sendable, Hashable {
     public var revision: UInt64
     public var completionDelivered: Bool
     public var createdAtMS: UInt64
+    /// Whether agent-usage accounting for this run is known to be incomplete.
+    /// Set when an outdated manifest is downgraded on restore.
+    /// `agent_usage_incomplete`, store.rs:110.
+    public var agentUsageIncomplete: Bool
+    /// Keys this build does not model, preserved verbatim across a
+    /// load/store round trip.
+    public var extra: [String: JSONValue]
+
+    /// Whether this record's version is loadable by this build.
+    public var versionIsSupported: Bool {
+        supportedWorkflowRunManifestVersions.contains(version)
+    }
 
     private enum CodingKeys: String, CodingKey {
+        case version
+        case agentUsageIncomplete = "agent_usage_incomplete"
         case runID = "run_id"
         case workflowName = "workflow_name"
         case scriptHash = "script_hash"
@@ -58,6 +95,7 @@ public struct WorkflowRunRecord: Codable, Sendable, Hashable {
     }
 
     public init(
+        version: UInt8 = workflowRunManifestVersion,
         runID: String,
         workflowName: String,
         scriptHash: String,
@@ -70,8 +108,11 @@ public struct WorkflowRunRecord: Codable, Sendable, Hashable {
         agentsUsed: UInt64 = 0,
         revision: UInt64 = 0,
         completionDelivered: Bool = false,
-        createdAtMS: UInt64 = UInt64(Date().timeIntervalSince1970 * 1_000)
+        createdAtMS: UInt64 = UInt64(Date().timeIntervalSince1970 * 1_000),
+        agentUsageIncomplete: Bool = false,
+        extra: [String: JSONValue] = [:]
     ) {
+        self.version = version
         self.runID = runID
         self.workflowName = workflowName
         self.scriptHash = scriptHash
@@ -85,6 +126,61 @@ public struct WorkflowRunRecord: Codable, Sendable, Hashable {
         self.revision = revision
         self.completionDelivered = completionDelivered
         self.createdAtMS = createdAtMS
+        self.agentUsageIncomplete = agentUsageIncomplete
+        self.extra = extra
+    }
+
+    private static let knownKeys: Set<String> = Set(
+        [
+            CodingKeys.version, .agentUsageIncomplete, .runID, .workflowName,
+            .scriptHash, .argumentsHash, .status, .result, .message,
+            .journalPath, .agentBudget, .agentsUsed, .revision,
+            .completionDelivered, .createdAtMS,
+        ].map(\.rawValue)
+    )
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decodeIfPresent(UInt8.self, forKey: .version)
+            ?? supportedWorkflowRunManifestVersions.lowerBound
+        runID = try c.decode(String.self, forKey: .runID)
+        workflowName = try c.decode(String.self, forKey: .workflowName)
+        scriptHash = try c.decode(String.self, forKey: .scriptHash)
+        argumentsHash = try c.decode(String.self, forKey: .argumentsHash)
+        status = try c.decodeIfPresent(PersistedWorkflowStatus.self, forKey: .status) ?? .active
+        result = try c.decodeIfPresent(JSONValue.self, forKey: .result)
+        message = try c.decodeIfPresent(String.self, forKey: .message)
+        journalPath = try c.decodeIfPresent(String.self, forKey: .journalPath)
+        agentBudget = try c.decodeIfPresent(UInt64.self, forKey: .agentBudget) ?? 0
+        agentsUsed = try c.decodeIfPresent(UInt64.self, forKey: .agentsUsed) ?? 0
+        revision = try c.decodeIfPresent(UInt64.self, forKey: .revision) ?? 0
+        completionDelivered = try c.decodeIfPresent(Bool.self, forKey: .completionDelivered) ?? false
+        createdAtMS = try c.decodeIfPresent(UInt64.self, forKey: .createdAtMS) ?? 0
+        agentUsageIncomplete = try c.decodeIfPresent(Bool.self, forKey: .agentUsageIncomplete) ?? false
+        extra = try UnknownFields.decode(from: decoder, knownKeyStrings: Self.knownKeys)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(version, forKey: .version)
+        try c.encode(runID, forKey: .runID)
+        try c.encode(workflowName, forKey: .workflowName)
+        try c.encode(scriptHash, forKey: .scriptHash)
+        try c.encode(argumentsHash, forKey: .argumentsHash)
+        try c.encode(status, forKey: .status)
+        try c.encodeIfPresent(result, forKey: .result)
+        try c.encodeIfPresent(message, forKey: .message)
+        try c.encodeIfPresent(journalPath, forKey: .journalPath)
+        try c.encode(agentBudget, forKey: .agentBudget)
+        try c.encode(agentsUsed, forKey: .agentsUsed)
+        try c.encode(revision, forKey: .revision)
+        try c.encode(completionDelivered, forKey: .completionDelivered)
+        try c.encode(createdAtMS, forKey: .createdAtMS)
+        if agentUsageIncomplete { try c.encode(true, forKey: .agentUsageIncomplete) }
+        if !extra.isEmpty {
+            var any = encoder.container(keyedBy: AnyCodingKey.self)
+            try UnknownFields.encode(extra, into: &any)
+        }
     }
 }
 
@@ -125,8 +221,12 @@ public actor WorkflowSessionStore {
         do {
             let data = try Data(contentsOf: manifest)
             let decoded = try JSONDecoder().decode([WorkflowRunRecord].self, from: data)
-            records = Dictionary(uniqueKeysWithValues: decoded.map { ($0.runID, $0) })
-            return decoded.sorted { $0.createdAtMS < $1.createdAtMS }
+            // Range validation, not equality: a manifest outside
+            // `1...WORKFLOW_RUN_MANIFEST_VERSION` is skipped rather than
+            // loaded (jsonl/mod.rs:714-723).
+            let supported = decoded.filter(\.versionIsSupported)
+            records = Dictionary(uniqueKeysWithValues: supported.map { ($0.runID, $0) })
+            return supported.sorted { $0.createdAtMS < $1.createdAtMS }
         } catch {
             throw WorkflowPersistenceError.io(String(describing: error))
         }
@@ -137,6 +237,22 @@ public actor WorkflowSessionStore {
         var restored: [WorkflowRunRecord] = []
         for id in Array(records.keys) {
             guard var record = records[id] else { continue }
+            // A manifest older than this build's version predates agent-count
+            // accounting: it is loadable but not resumable, and its usage
+            // figures are not trustworthy (store.rs:100-112).
+            if record.version < workflowRunManifestVersion {
+                record.status = .interrupted
+                record.message = workflowManifestPredatesAgentAccountingMessage
+                record.agentBudget = 0
+                record.agentsUsed = 0
+                record.agentUsageIncomplete = true
+                record.version = workflowRunManifestVersion
+                record.revision = record.revision.saturatingAdd(1)
+                record.completionDelivered = true
+                records[id] = record
+                restored.append(record)
+                continue
+            }
             if record.status == .active {
                 record.status = .interrupted
                 record.message = "the session ended while this workflow was active; start a new run"

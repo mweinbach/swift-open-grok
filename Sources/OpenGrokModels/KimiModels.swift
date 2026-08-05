@@ -36,6 +36,19 @@ public enum KimiModels {
         endpoint(forBaseURL: baseURL) != nil
     }
 
+    /// Whether `modelID` is a Kimi **Code** membership API slug (not Platform).
+    ///
+    /// `is_code_model_slug`
+    /// (`crates/codegen/xai-grok-shell/src/kimi_models.rs:130`, new at pin
+    /// 80dff0a9). Platform serves `kimi-k3` on Moonshot; Code serves `k3` /
+    /// `k3-256k` plus the K2.7 `kimi-for-coding*` family. Deliberately
+    /// slug-based rather than catalog-based, for rebind paths that see only a
+    /// model id after the service partition has already been chosen — note
+    /// `kimi-k3` is Platform and must not match.
+    public static func isCodeModelSlug(_ modelID: String) -> Bool {
+        modelID == "k3" || modelID == "k3-256k" || modelID.hasPrefix("kimi-for-coding")
+    }
+
     public static func apiBaseURL(
         _ endpoint: KimiApiEndpoint,
         environment: [String: String] = ProcessInfo.processInfo.environment

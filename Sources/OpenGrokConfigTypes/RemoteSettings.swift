@@ -455,6 +455,9 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
     public var maxUploadUntrackedBytes: UInt64?
     public var nonGitWorkspaceCapture: Bool?
     public var loginShellCapture: Bool?
+    /// When `false`, scheduled task fires run as main-conversation turns
+    /// instead of background subagents. lib.rs:461-464.
+    public var schedulerBackgroundLoops: Bool?
     public var releaseChannel: String?
     public var locTracking: Bool?
     public var memoryEnabled: Bool?
@@ -494,6 +497,12 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
     public var maxMcpOutputBytes: UInt64?
     public var sessionRegistryEnabled: Bool?
     public var doomLoopRecovery: DoomLoopRecoverySettings?
+    /// Automatic worktree GC policy. Absent ⇒ every knob falls through to
+    /// TOML/defaults; a partial object falls through per-field; a
+    /// present-but-malformed nested value drops to `nil` without failing the
+    /// whole parse. Platform age-expiry policy is client-hardcoded and not
+    /// remote-overridable. lib.rs:610-616.
+    public var worktreeAutoGc: WorktreeAutoGcSettings?
     public var todoGateEnabled: Bool?
     public var todoGateMaxFiresPerPrompt: UInt32?
     public var autoWakeEnabled: Bool?
@@ -520,16 +529,26 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
     public var goalPlannerModel: GoalRoleModel?
     public var goalStrategistModel: GoalRoleModel?
     public var goalSkepticModels: [GoalRoleModel]
+    /// lib.rs:725-726.
+    public var workflowsEnabled: Bool?
     public var managedMcpsEnabled: Bool?
     public var managedMcpGatewayToolsEnabled: Bool?
     public var externalOtelDisabled: Bool?
     public var externalOtelContentGatesLocked: Bool?
+    /// `false` disarms managed-config signature verification (remote
+    /// kill-switch). lib.rs:747-749.
+    public var managedConfigSignatureVerification: Bool?
     public var telemetryEnabled: Bool?
     public var telemetryMode: String?
     public var traceUploadEnabled: Bool?
     public var feedbackEnabled: Bool?
     public var twoPassCompactionEnabled: Bool?
     public var tips: [String]?
+    /// Free-form per-command tags (e.g. `new`, `beta`) rendered as a
+    /// bracketed label in the slash dropdown, keyed by canonical command
+    /// name. Present-but-malformed → `nil` (does not fail the whole parse);
+    /// local `[slash_command_tags]` overrides per key. lib.rs:777-782.
+    public var slashCommandTags: [String: String]?
     public var nonGitWarning: Bool?
     public var officialMarketplaceAutoRegister: Bool?
     public var pluginCta: Bool?
@@ -547,6 +566,9 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
     public var subagentWorktreeSnapshotEnabled: Bool?
     public var imageGenEnabled: Bool?
     public var imageGenModelOverride: String?
+    /// Optional Imagine model override for `image_edit`. Absent/empty →
+    /// default. lib.rs:858-860.
+    public var imageEditModelOverride: String?
     public var videoGenEnabled: Bool?
     public var imageNormalizeCacheEnabled: Bool?
     public var pathNotFoundHints: Bool?
@@ -563,6 +585,14 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
     public var sharingEnabled: Bool?
     public var voiceModeEnabled: Bool?
     public var zdrAccessEnabled: Bool?
+    /// When `true`, the client may show the coding-data sharing upsell
+    /// banner. Absent means off, so older servers and missing flags keep the
+    /// banner hidden. lib.rs:930-935.
+    public var privacyNoticeRollout: Bool?
+    /// Days after a privacy-banner dismiss before it may re-show for users
+    /// who remain coding-data opted-out. `nil` / `0` = never re-show after
+    /// dismiss. lib.rs:936-940.
+    public var privacyBannerReshowDays: UInt64?
     public var rememberToolApprovals: Bool?
     public var crashHandlerEnabled: Bool?
     public var showThinkingBlocks: Bool?
@@ -583,6 +613,9 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
     public var suggestionsEnabled: Bool?
     public var suggestionsAiEnabled: Bool?
     public var autoCompactThresholdPercent: UInt8?
+    /// Max subagent nesting depth (`grok_build_settings.subagents_max_depth`).
+    /// lib.rs:1038-1040.
+    public var subagentsMaxDepth: UInt32?
     public var systemPromptLabel: String?
     public var compactionWallClockBudgetSecs: UInt64?
     public var compactionMode: String?
@@ -616,6 +649,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         case maxUploadUntrackedBytes = "max_upload_untracked_bytes"
         case nonGitWorkspaceCapture = "non_git_workspace_capture"
         case loginShellCapture = "login_shell_capture"
+        case schedulerBackgroundLoops = "scheduler_background_loops"
         case releaseChannel = "release_channel"
         case locTracking = "loc_tracking"
         case memoryEnabled = "memory_enabled"
@@ -655,6 +689,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         case maxMcpOutputBytes = "max_mcp_output_bytes"
         case sessionRegistryEnabled = "session_registry_enabled"
         case doomLoopRecovery = "doom_loop_recovery"
+        case worktreeAutoGc = "worktree_auto_gc"
         case todoGateEnabled = "todo_gate_enabled"
         case todoGateMaxFiresPerPrompt = "todo_gate_max_fires_per_prompt"
         case autoWakeEnabled = "auto_wake_enabled"
@@ -681,16 +716,19 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         case goalPlannerModel = "goal_planner_model"
         case goalStrategistModel = "goal_strategist_model"
         case goalSkepticModels = "goal_skeptic_models"
+        case workflowsEnabled = "workflows_enabled"
         case managedMcpsEnabled = "managed_mcps_enabled"
         case managedMcpGatewayToolsEnabled = "managed_mcp_gateway_tools_enabled"
         case externalOtelDisabled = "external_otel_disabled"
         case externalOtelContentGatesLocked = "external_otel_content_gates_locked"
+        case managedConfigSignatureVerification = "managed_config_signature_verification"
         case telemetryEnabled = "telemetry_enabled"
         case telemetryMode = "telemetry_mode"
         case traceUploadEnabled = "trace_upload_enabled"
         case feedbackEnabled = "feedback_enabled"
         case twoPassCompactionEnabled = "two_pass_compaction_enabled"
         case tips
+        case slashCommandTags = "slash_command_tags"
         case nonGitWarning = "non_git_warning"
         case officialMarketplaceAutoRegister = "official_marketplace_auto_register"
         case pluginCta = "plugin_cta"
@@ -708,6 +746,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         case subagentWorktreeSnapshotEnabled = "subagent_worktree_snapshot_enabled"
         case imageGenEnabled = "image_gen_enabled"
         case imageGenModelOverride = "image_gen_model_override"
+        case imageEditModelOverride = "image_edit_model_override"
         case videoGenEnabled = "video_gen_enabled"
         case imageNormalizeCacheEnabled = "image_normalize_cache_enabled"
         case pathNotFoundHints = "path_not_found_hints"
@@ -724,6 +763,8 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         case sharingEnabled = "sharing_enabled"
         case voiceModeEnabled = "voice_mode_enabled"
         case zdrAccessEnabled = "zdr_access_enabled"
+        case privacyNoticeRollout = "privacy_notice_rollout"
+        case privacyBannerReshowDays = "privacy_banner_reshow_days"
         case rememberToolApprovals = "remember_tool_approvals"
         case crashHandlerEnabled = "crash_handler_enabled"
         case showThinkingBlocks = "show_thinking_blocks"
@@ -744,6 +785,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         case suggestionsEnabled = "suggestions_enabled"
         case suggestionsAiEnabled = "suggestions_ai_enabled"
         case autoCompactThresholdPercent = "auto_compact_threshold_percent"
+        case subagentsMaxDepth = "subagents_max_depth"
         case systemPromptLabel = "system_prompt_label"
         case compactionWallClockBudgetSecs = "compaction_wall_clock_budget_secs"
         case compactionMode = "compaction_mode"
@@ -764,6 +806,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         maxUploadUntrackedBytes = try c.decodeIfPresent(UInt64.self, forKey: .maxUploadUntrackedBytes)
         nonGitWorkspaceCapture = try c.decodeIfPresent(Bool.self, forKey: .nonGitWorkspaceCapture)
         loginShellCapture = try c.decodeIfPresent(Bool.self, forKey: .loginShellCapture)
+        schedulerBackgroundLoops = try c.decodeIfPresent(Bool.self, forKey: .schedulerBackgroundLoops)
         releaseChannel = try c.decodeIfPresent(String.self, forKey: .releaseChannel)
         locTracking = try c.decodeIfPresent(Bool.self, forKey: .locTracking)
         memoryEnabled = try c.decodeIfPresent(Bool.self, forKey: .memoryEnabled)
@@ -803,6 +846,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         maxMcpOutputBytes = try c.decodeIfPresent(UInt64.self, forKey: .maxMcpOutputBytes)
         sessionRegistryEnabled = try c.decodeIfPresent(Bool.self, forKey: .sessionRegistryEnabled)
         doomLoopRecovery = try c.decodeIfPresent(DoomLoopRecoverySettings.self, forKey: .doomLoopRecovery)
+        worktreeAutoGc = Self.decodeTolerantWorktreeAutoGc(from: c, forKey: .worktreeAutoGc)
         todoGateEnabled = try c.decodeIfPresent(Bool.self, forKey: .todoGateEnabled)
         todoGateMaxFiresPerPrompt = try c.decodeIfPresent(UInt32.self, forKey: .todoGateMaxFiresPerPrompt)
         autoWakeEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoWakeEnabled)
@@ -829,16 +873,19 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         goalPlannerModel = try Self.decodeTolerantGoalRoleModel(from: c, forKey: .goalPlannerModel)
         goalStrategistModel = try Self.decodeTolerantGoalRoleModel(from: c, forKey: .goalStrategistModel)
         goalSkepticModels = try Self.decodeTolerantGoalSkepticModels(from: c, forKey: .goalSkepticModels)
+        workflowsEnabled = try c.decodeIfPresent(Bool.self, forKey: .workflowsEnabled)
         managedMcpsEnabled = try c.decodeIfPresent(Bool.self, forKey: .managedMcpsEnabled)
         managedMcpGatewayToolsEnabled = try c.decodeIfPresent(Bool.self, forKey: .managedMcpGatewayToolsEnabled)
         externalOtelDisabled = try c.decodeIfPresent(Bool.self, forKey: .externalOtelDisabled)
         externalOtelContentGatesLocked = try c.decodeIfPresent(Bool.self, forKey: .externalOtelContentGatesLocked)
+        managedConfigSignatureVerification = try c.decodeIfPresent(Bool.self, forKey: .managedConfigSignatureVerification)
         telemetryEnabled = try c.decodeIfPresent(Bool.self, forKey: .telemetryEnabled)
         telemetryMode = try c.decodeIfPresent(String.self, forKey: .telemetryMode)
         traceUploadEnabled = try c.decodeIfPresent(Bool.self, forKey: .traceUploadEnabled)
         feedbackEnabled = try c.decodeIfPresent(Bool.self, forKey: .feedbackEnabled)
         twoPassCompactionEnabled = try c.decodeIfPresent(Bool.self, forKey: .twoPassCompactionEnabled)
         tips = try c.decodeIfPresent([String].self, forKey: .tips)
+        slashCommandTags = Self.decodeTolerantSlashCommandTags(from: c, forKey: .slashCommandTags)
         nonGitWarning = try c.decodeIfPresent(Bool.self, forKey: .nonGitWarning)
         officialMarketplaceAutoRegister = try c.decodeIfPresent(Bool.self, forKey: .officialMarketplaceAutoRegister)
         pluginCta = try c.decodeIfPresent(Bool.self, forKey: .pluginCta)
@@ -856,6 +903,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         subagentWorktreeSnapshotEnabled = try c.decodeIfPresent(Bool.self, forKey: .subagentWorktreeSnapshotEnabled)
         imageGenEnabled = try c.decodeIfPresent(Bool.self, forKey: .imageGenEnabled)
         imageGenModelOverride = try c.decodeIfPresent(String.self, forKey: .imageGenModelOverride)
+        imageEditModelOverride = try c.decodeIfPresent(String.self, forKey: .imageEditModelOverride)
         videoGenEnabled = try c.decodeIfPresent(Bool.self, forKey: .videoGenEnabled)
         imageNormalizeCacheEnabled = try c.decodeIfPresent(Bool.self, forKey: .imageNormalizeCacheEnabled)
         pathNotFoundHints = try c.decodeIfPresent(Bool.self, forKey: .pathNotFoundHints)
@@ -872,6 +920,8 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         sharingEnabled = try c.decodeIfPresent(Bool.self, forKey: .sharingEnabled)
         voiceModeEnabled = try c.decodeIfPresent(Bool.self, forKey: .voiceModeEnabled)
         zdrAccessEnabled = try c.decodeIfPresent(Bool.self, forKey: .zdrAccessEnabled)
+        privacyNoticeRollout = try c.decodeIfPresent(Bool.self, forKey: .privacyNoticeRollout)
+        privacyBannerReshowDays = try c.decodeIfPresent(UInt64.self, forKey: .privacyBannerReshowDays)
         rememberToolApprovals = try c.decodeIfPresent(Bool.self, forKey: .rememberToolApprovals)
         crashHandlerEnabled = try c.decodeIfPresent(Bool.self, forKey: .crashHandlerEnabled)
         showThinkingBlocks = try c.decodeIfPresent(Bool.self, forKey: .showThinkingBlocks)
@@ -892,6 +942,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         suggestionsEnabled = try c.decodeIfPresent(Bool.self, forKey: .suggestionsEnabled)
         suggestionsAiEnabled = try c.decodeIfPresent(Bool.self, forKey: .suggestionsAiEnabled)
         autoCompactThresholdPercent = try c.decodeIfPresent(UInt8.self, forKey: .autoCompactThresholdPercent)
+        subagentsMaxDepth = try c.decodeIfPresent(UInt32.self, forKey: .subagentsMaxDepth)
         systemPromptLabel = try c.decodeIfPresent(String.self, forKey: .systemPromptLabel)
         compactionWallClockBudgetSecs = try c.decodeIfPresent(UInt64.self, forKey: .compactionWallClockBudgetSecs)
         compactionMode = try c.decodeIfPresent(String.self, forKey: .compactionMode)
@@ -912,6 +963,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         try c.encodeIfPresent(maxUploadUntrackedBytes, forKey: .maxUploadUntrackedBytes)
         try c.encodeIfPresent(nonGitWorkspaceCapture, forKey: .nonGitWorkspaceCapture)
         try c.encodeIfPresent(loginShellCapture, forKey: .loginShellCapture)
+        try c.encodeIfPresent(schedulerBackgroundLoops, forKey: .schedulerBackgroundLoops)
         try c.encodeIfPresent(releaseChannel, forKey: .releaseChannel)
         try c.encodeIfPresent(locTracking, forKey: .locTracking)
         try c.encodeIfPresent(memoryEnabled, forKey: .memoryEnabled)
@@ -951,6 +1003,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         try c.encodeIfPresent(maxMcpOutputBytes, forKey: .maxMcpOutputBytes)
         try c.encodeIfPresent(sessionRegistryEnabled, forKey: .sessionRegistryEnabled)
         try c.encodeIfPresent(doomLoopRecovery, forKey: .doomLoopRecovery)
+        try c.encodeIfPresent(worktreeAutoGc, forKey: .worktreeAutoGc)
         try c.encodeIfPresent(todoGateEnabled, forKey: .todoGateEnabled)
         try c.encodeIfPresent(todoGateMaxFiresPerPrompt, forKey: .todoGateMaxFiresPerPrompt)
         try c.encodeIfPresent(autoWakeEnabled, forKey: .autoWakeEnabled)
@@ -977,16 +1030,19 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         try c.encodeIfPresent(goalPlannerModel, forKey: .goalPlannerModel)
         try c.encodeIfPresent(goalStrategistModel, forKey: .goalStrategistModel)
         if !goalSkepticModels.isEmpty { try c.encode(goalSkepticModels, forKey: .goalSkepticModels) }
+        try c.encodeIfPresent(workflowsEnabled, forKey: .workflowsEnabled)
         try c.encodeIfPresent(managedMcpsEnabled, forKey: .managedMcpsEnabled)
         try c.encodeIfPresent(managedMcpGatewayToolsEnabled, forKey: .managedMcpGatewayToolsEnabled)
         try c.encodeIfPresent(externalOtelDisabled, forKey: .externalOtelDisabled)
         try c.encodeIfPresent(externalOtelContentGatesLocked, forKey: .externalOtelContentGatesLocked)
+        try c.encodeIfPresent(managedConfigSignatureVerification, forKey: .managedConfigSignatureVerification)
         try c.encodeIfPresent(telemetryEnabled, forKey: .telemetryEnabled)
         try c.encodeIfPresent(telemetryMode, forKey: .telemetryMode)
         try c.encodeIfPresent(traceUploadEnabled, forKey: .traceUploadEnabled)
         try c.encodeIfPresent(feedbackEnabled, forKey: .feedbackEnabled)
         try c.encodeIfPresent(twoPassCompactionEnabled, forKey: .twoPassCompactionEnabled)
         try c.encodeIfPresent(tips, forKey: .tips)
+        try c.encodeIfPresent(slashCommandTags, forKey: .slashCommandTags)
         try c.encodeIfPresent(nonGitWarning, forKey: .nonGitWarning)
         try c.encodeIfPresent(officialMarketplaceAutoRegister, forKey: .officialMarketplaceAutoRegister)
         try c.encodeIfPresent(pluginCta, forKey: .pluginCta)
@@ -1004,6 +1060,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         try c.encodeIfPresent(subagentWorktreeSnapshotEnabled, forKey: .subagentWorktreeSnapshotEnabled)
         try c.encodeIfPresent(imageGenEnabled, forKey: .imageGenEnabled)
         try c.encodeIfPresent(imageGenModelOverride, forKey: .imageGenModelOverride)
+        try c.encodeIfPresent(imageEditModelOverride, forKey: .imageEditModelOverride)
         try c.encodeIfPresent(videoGenEnabled, forKey: .videoGenEnabled)
         try c.encodeIfPresent(imageNormalizeCacheEnabled, forKey: .imageNormalizeCacheEnabled)
         try c.encodeIfPresent(pathNotFoundHints, forKey: .pathNotFoundHints)
@@ -1020,6 +1077,8 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         try c.encodeIfPresent(sharingEnabled, forKey: .sharingEnabled)
         try c.encodeIfPresent(voiceModeEnabled, forKey: .voiceModeEnabled)
         try c.encodeIfPresent(zdrAccessEnabled, forKey: .zdrAccessEnabled)
+        try c.encodeIfPresent(privacyNoticeRollout, forKey: .privacyNoticeRollout)
+        try c.encodeIfPresent(privacyBannerReshowDays, forKey: .privacyBannerReshowDays)
         try c.encodeIfPresent(rememberToolApprovals, forKey: .rememberToolApprovals)
         try c.encodeIfPresent(crashHandlerEnabled, forKey: .crashHandlerEnabled)
         try c.encodeIfPresent(showThinkingBlocks, forKey: .showThinkingBlocks)
@@ -1040,6 +1099,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         try c.encodeIfPresent(suggestionsEnabled, forKey: .suggestionsEnabled)
         try c.encodeIfPresent(suggestionsAiEnabled, forKey: .suggestionsAiEnabled)
         try c.encodeIfPresent(autoCompactThresholdPercent, forKey: .autoCompactThresholdPercent)
+        try c.encodeIfPresent(subagentsMaxDepth, forKey: .subagentsMaxDepth)
         try c.encodeIfPresent(systemPromptLabel, forKey: .systemPromptLabel)
         try c.encodeIfPresent(compactionWallClockBudgetSecs, forKey: .compactionWallClockBudgetSecs)
         try c.encodeIfPresent(compactionMode, forKey: .compactionMode)
@@ -1090,6 +1150,35 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         let raw = try? container.decode(JSONValue.self, forKey: key)
         guard let raw = raw, !raw.isNull else { return nil }
         return try? raw.decode(GoalRoleModel.self)
+    }
+
+    /// Tolerant nested `worktree_auto_gc`: present-but-malformed → `nil`
+    /// (Rust warns and falls through to TOML/defaults) so one bad nested
+    /// value cannot fail the whole `RemoteSettings` parse.
+    /// `deserialize_tolerant_worktree_auto_gc`, lib.rs:396.
+    private static func decodeTolerantWorktreeAutoGc(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKey key: CodingKeys
+    ) -> WorktreeAutoGcSettings? {
+        guard container.contains(key),
+              let raw = try? container.decode(JSONValue.self, forKey: key),
+              !raw.isNull
+        else { return nil }
+        return try? raw.decode(WorktreeAutoGcSettings.self)
+    }
+
+    /// Tolerant nested `slash_command_tags`: present-but-malformed → `nil`,
+    /// falling through to local config / none.
+    /// `deserialize_tolerant_slash_command_tags`, lib.rs:419.
+    private static func decodeTolerantSlashCommandTags(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKey key: CodingKeys
+    ) -> [String: String]? {
+        guard container.contains(key),
+              let raw = try? container.decode(JSONValue.self, forKey: key),
+              !raw.isNull
+        else { return nil }
+        return try? raw.decode([String: String].self)
     }
 
     /// Tolerant `[GoalRoleModel]`: a non-array value yields `[]`; within an

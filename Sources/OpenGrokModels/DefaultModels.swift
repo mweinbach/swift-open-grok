@@ -181,7 +181,21 @@ private func parseDefaultModelJSON(_ obj: [String: Any]) throws -> DefaultModelJ
             )
         }
     }
-    let reasoningEffort = WireCodec.reasoningEffort(obj["reasoning_effort"] as? String)
+    var reasoningEffort = WireCodec.reasoningEffort(obj["reasoning_effort"] as? String)
+    var supportsReasoningEffort = obj["supports_reasoning_effort"] as? Bool ?? false
+    // Derive the legacy gate/default from `reasoning_efforts` so a menu-only
+    // model counts as supported and gets a wire default. Port of
+    // `ModelEntryConfig::derive_reasoning_effort_fields`
+    // (`crates/codegen/xai-grok-shell/src/agent/config.rs:4870`) — the single
+    // derive site there, matching this one. Idempotent, and an empty menu
+    // leaves both legacy fields untouched.
+    if !reasoningEfforts.isEmpty {
+        supportsReasoningEffort = true
+        if reasoningEffort == nil {
+            reasoningEffort = (reasoningEfforts.first(where: \.isDefault)
+                ?? reasoningEfforts.first)?.value
+        }
+    }
     let contextWindow: UInt64?
     if let n = obj["context_window"] as? NSNumber {
         contextWindow = n.uint64Value
@@ -260,7 +274,7 @@ private func parseDefaultModelJSON(_ obj: [String: Any]) throws -> DefaultModelJ
         inferenceIdleTimeoutSecs: idleTimeout,
         hidden: obj["hidden"] as? Bool ?? false,
         reasoningEffort: reasoningEffort,
-        supportsReasoningEffort: obj["supports_reasoning_effort"] as? Bool ?? false,
+        supportsReasoningEffort: supportsReasoningEffort,
         reasoningEfforts: reasoningEfforts,
         supportedInApi: obj["supported_in_api"] as? Bool ?? true,
         supportsBackendSearch: obj["supports_backend_search"] as? Bool ?? false,
@@ -285,6 +299,67 @@ public func defaultModelEntries(
         map[key] = ModelEntry.fromConfigEntry(config)
     }
     return map
+}
+
+/// Embedded models for one provider, restricted to the Kimi service partition
+/// that `kimiEndpoint` selects, in catalog order.
+///
+/// Port of the partition filter in `default_models`
+/// (`crates/codegen/xai-grok-shell/src/agent/config.rs:4163-4170`): Kimi
+/// Platform and Kimi Code are separate services with separate catalogs and
+/// separate credential scopes, so an entry whose `base_url` maps to the other
+/// endpoint is dropped rather than rewritten. Non-Kimi providers have no
+/// partition and pass through.
+public func embeddedModels(
+    forProvider provider: ModelProvider,
+    kimiEndpoint: KimiApiEndpoint = .platform,
+    embedded: EmbeddedDefaultModels? = nil,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> [DefaultModelJSON] {
+    let embedded = embedded ?? EmbeddedDefaults.shared
+    let effectiveKimi = KimiModels.effectiveEndpoint(kimiEndpoint, environment: environment)
+    return embedded.models.filter { m in
+        guard m.provider == provider else { return false }
+        guard m.provider == .kimi else { return true }
+        return m.baseURL.flatMap { KimiModels.endpoint(forBaseURL: $0) } == effectiveKimi
+    }
+}
+
+/// The embedded model to start with for `provider`, with no user preference.
+///
+/// Port of the fallback ladder in `resolve_default_model_with_provider_auth`
+/// (`crates/codegen/xai-grok-shell/src/agent/models/resolution.rs:116-142`):
+/// the globally bundled default wins when it is present in the visible
+/// catalog, otherwise the **first entry in catalog order** does. For a
+/// single-provider catalog the bundled default (`grok-4.5`) is only reachable
+/// for xAI, so every other provider falls to its first entry.
+///
+/// Catalog order is therefore load-bearing, and upstream sets it deliberately:
+/// within the Kimi **Code** partition `k3` is listed first and described as
+/// "Kimi Code's flagship coding and agent model"
+/// (`crates/codegen/xai-grok-models/default_models.json:56-72`), ahead of the
+/// older K2.7 `kimi-for-coding` family. Within the **Platform** partition the
+/// only entry is `kimi-k3`. Selecting across the partition boundary would pair
+/// a model with the wrong service's endpoint and credential scope.
+public func defaultEmbeddedModel(
+    forProvider provider: ModelProvider,
+    kimiEndpoint: KimiApiEndpoint = .platform,
+    embedded: EmbeddedDefaultModels? = nil,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> DefaultModelJSON? {
+    let embedded = embedded ?? EmbeddedDefaults.shared
+    let candidates = embeddedModels(
+        forProvider: provider,
+        kimiEndpoint: kimiEndpoint,
+        embedded: embedded,
+        environment: environment
+    )
+    if let bundled = candidates.first(where: {
+        ($0.id ?? $0.model) == embedded.default || $0.model == embedded.default
+    }) {
+        return bundled
+    }
+    return candidates.first
 }
 
 /// Build `ModelEntryConfig` map from the embedded corpus.

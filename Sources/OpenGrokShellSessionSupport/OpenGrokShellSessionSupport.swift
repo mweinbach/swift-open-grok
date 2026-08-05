@@ -1141,6 +1141,43 @@ public enum SessionRecoveryPlanner {
     }
 }
 
+/// Chat-history format version written by this build.
+///
+/// `CHAT_FORMAT_VERSION` — `crates/codegen/xai-grok-shell/src/session/persistence.rs:31`.
+/// Version 0 is the legacy `ChatRequestMessage` shape; version 1 is
+/// `ConversationItem`.
+public let chatFormatVersion: UInt8 = 1
+
+/// Which decode shape to try first for a chat-history line.
+///
+/// This is the whole of the version check on load: it is **not** a hard
+/// reject. `read_chat_history_sync`
+/// (`.../session/storage/jsonl/mod.rs:842`) tries `ConversationItem` first
+/// at or above the current version and `ChatRequestMessage` first below it,
+/// falling back to the other shape either way, so no line is lost to a
+/// version mismatch.
+public enum ChatHistoryDecodeOrder: String, Sendable, Hashable {
+    /// `chat_format_version >= 1`: `ConversationItem`, then `ChatRequestMessage`.
+    case conversationItemFirst
+    /// `chat_format_version < 1`: `ChatRequestMessage`, then `ConversationItem`.
+    case chatRequestMessageFirst
+
+    public static func forVersion(_ version: UInt8) -> ChatHistoryDecodeOrder {
+        version >= chatFormatVersion ? .conversationItemFirst : .chatRequestMessageFirst
+    }
+}
+
+/// Whether an empty/missing chat-history file may be rebuilt from the
+/// session's updates log.
+///
+/// `ensure_chat_history` (`.../session/storage/jsonl/mod.rs:103`) rebuilds
+/// **only** at an exact version match: a summary from a different format
+/// version is left alone rather than rebuilt into the wrong shape. Note this
+/// is `==`, not `>=` — a future version is skipped too.
+public func chatHistoryMayBeRebuilt(chatFormatVersion version: UInt8) -> Bool {
+    version == chatFormatVersion
+}
+
 public struct SessionSummary: Codable, Sendable, Hashable {
     public var sessionID: SessionID
     public var cwd: String
@@ -1155,6 +1192,17 @@ public struct SessionSummary: Codable, Sendable, Hashable {
     public var chatFormatVersion: UInt8
     public var everUsedCodex: Bool
     public var sessionKind: String?
+    /// Every summary key this build does not model, preserved verbatim.
+    ///
+    /// Load-bearing for the working-directory **relocation** subsystem
+    /// (`crates/codegen/xai-grok-shell/src/session/storage/relocation/`, new
+    /// at pin 80dff0a9): a Rust-written summary carries `cwd_generation`,
+    /// `previous_cwd`, `pending_cwd_switch_reminder` and
+    /// `cwd_switch_bookkeeping_generation` (persistence.rs:858-870) that this
+    /// port does not yet interpret. Without this bag a Swift round-trip would
+    /// silently drop a session's in-flight relocation record. Porting the
+    /// subsystem itself is deliberately out of scope here.
+    public var extra: [String: JSONValue]
 
     public init(
         sessionID: SessionID,
@@ -1167,9 +1215,10 @@ public struct SessionSummary: Codable, Sendable, Hashable {
         currentModelID: String = "",
         parentSessionID: String? = nil,
         nextTraceTurn: UInt64 = 0,
-        chatFormatVersion: UInt8 = 0,
+        chatFormatVersion: UInt8 = OpenGrokShellSessionSupport.chatFormatVersion,
         everUsedCodex: Bool = false,
-        sessionKind: String? = nil
+        sessionKind: String? = nil,
+        extra: [String: JSONValue] = [:]
     ) {
         self.sessionID = sessionID
         self.cwd = cwd
@@ -1184,6 +1233,12 @@ public struct SessionSummary: Codable, Sendable, Hashable {
         self.chatFormatVersion = chatFormatVersion
         self.everUsedCodex = everUsedCodex
         self.sessionKind = sessionKind
+        self.extra = extra
+    }
+
+    /// Decode order for this summary's chat history.
+    public var chatHistoryDecodeOrder: ChatHistoryDecodeOrder {
+        .forVersion(chatFormatVersion)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -1200,6 +1255,56 @@ public struct SessionSummary: Codable, Sendable, Hashable {
         case chatFormatVersion = "chat_format_version"
         case everUsedCodex = "ever_used_codex"
         case sessionKind = "session_kind"
+    }
+
+    private static let knownKeys: Set<String> = Set(
+        [
+            CodingKeys.sessionID, .cwd, .sessionSummary, .createdAt, .updatedAt,
+            .messageCount, .chatMessageCount, .currentModelID, .parentSessionID,
+            .nextTraceTurn, .chatFormatVersion, .everUsedCodex, .sessionKind,
+        ].map(\.rawValue)
+    )
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try c.decode(SessionID.self, forKey: .sessionID)
+        cwd = try c.decode(String.self, forKey: .cwd)
+        sessionSummary = try c.decodeIfPresent(String.self, forKey: .sessionSummary) ?? ""
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        messageCount = try c.decodeIfPresent(UInt64.self, forKey: .messageCount) ?? 0
+        chatMessageCount = try c.decodeIfPresent(UInt64.self, forKey: .chatMessageCount) ?? 0
+        currentModelID = try c.decodeIfPresent(String.self, forKey: .currentModelID) ?? ""
+        parentSessionID = try c.decodeIfPresent(String.self, forKey: .parentSessionID)
+        nextTraceTurn = try c.decodeIfPresent(UInt64.self, forKey: .nextTraceTurn) ?? 0
+        // serde `#[serde(default)]` on a `u8` is 0, not CHAT_FORMAT_VERSION:
+        // a summary with no version field is legacy-format by definition
+        // (persistence.rs:905-909). Only the *constructor* defaults to 1.
+        chatFormatVersion = try c.decodeIfPresent(UInt8.self, forKey: .chatFormatVersion) ?? 0
+        everUsedCodex = try c.decodeIfPresent(Bool.self, forKey: .everUsedCodex) ?? false
+        sessionKind = try c.decodeIfPresent(String.self, forKey: .sessionKind)
+        extra = try UnknownFields.decode(from: decoder, knownKeyStrings: Self.knownKeys)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(sessionID, forKey: .sessionID)
+        try c.encode(cwd, forKey: .cwd)
+        try c.encode(sessionSummary, forKey: .sessionSummary)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(updatedAt, forKey: .updatedAt)
+        try c.encode(messageCount, forKey: .messageCount)
+        try c.encode(chatMessageCount, forKey: .chatMessageCount)
+        try c.encode(currentModelID, forKey: .currentModelID)
+        try c.encodeIfPresent(parentSessionID, forKey: .parentSessionID)
+        try c.encode(nextTraceTurn, forKey: .nextTraceTurn)
+        try c.encode(chatFormatVersion, forKey: .chatFormatVersion)
+        try c.encode(everUsedCodex, forKey: .everUsedCodex)
+        try c.encodeIfPresent(sessionKind, forKey: .sessionKind)
+        if !extra.isEmpty {
+            var any = encoder.container(keyedBy: AnyCodingKey.self)
+            try UnknownFields.encode(extra, into: &any)
+        }
     }
 }
 

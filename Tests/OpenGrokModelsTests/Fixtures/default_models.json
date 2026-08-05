@@ -54,6 +54,40 @@
       ]
     },
     {
+      "model": "k3",
+      "name": "Kimi K3",
+      "description": "Kimi Code's flagship coding and agent model (up to 1M context)",
+      "base_url": "https://api.kimi.com/coding/v1",
+      "context_window": 1048576,
+      "api_backend": "chat_completions",
+      "provider": "kimi",
+      "env_key": "KIMI_CODE_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true,
+      "reasoning_efforts": [
+        { "value": "low", "description": "Faster responses with lighter reasoning" },
+        { "value": "high", "description": "Balanced reasoning depth for everyday coding", "default": true },
+        { "value": "max", "description": "Maximum reasoning depth for hard problems" }
+      ]
+    },
+    {
+      "model": "k3-256k",
+      "name": "Kimi K3 256K",
+      "description": "Kimi Code's K3 model with a fixed 256K context window",
+      "base_url": "https://api.kimi.com/coding/v1",
+      "context_window": 262144,
+      "api_backend": "chat_completions",
+      "provider": "kimi",
+      "env_key": "KIMI_CODE_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true,
+      "reasoning_efforts": [
+        { "value": "low", "description": "Faster responses with lighter reasoning" },
+        { "value": "high", "description": "Balanced reasoning depth for everyday coding", "default": true },
+        { "value": "max", "description": "Maximum reasoning depth for hard problems" }
+      ]
+    },
+    {
       "model": "kimi-for-coding",
       "name": "Kimi for Coding",
       "description": "Kimi Code's coding and agent model",
