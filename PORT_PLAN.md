@@ -1,15 +1,15 @@
 # Open Grok Rust-to-Swift Port Plan
 
-**Planning baseline:** 2026-07-20 (inventory refreshed 2026-07-22 / R10)
+**Planning baseline:** 2026-07-20 (inventory and reference pin refreshed 2026-08-04)
 **Destination:** `/Users/mweinbach/Projects/swift-open-grok`
-**Read-only reference:** `/tmp/open-grok-reference`
+**Read-only reference:** `xai-org/grok-build` at `80dff0a9dcb24121b976b9f920fbe442af40ea88` (re-pinned 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4`), local clone `/Users/mweinbach/Projects/grok-build`; `/tmp/open-grok-reference` when present. `ProtocolFixtures/` were captured at the **old** ref and must be recaptured against the new pin before grounding any parity claim — see `PORT_STATUS.md`.
 **SwiftPM baseline:** `swift-tools-version: 6.1`
-**Reference inventory:** 81 root Cargo workspace members + 1 standalone markdown fuzz crate = **82 crates**.
-**Swift source/test inventory (see `PORT_STATUS.md` counting method):** **98** `Sources/` targets · **42** bootstrap placeholders · **100** `Tests/` targets · **46** zero-test. Workers must not invoke SwiftPM; only `zsh workflows/swift-safe-verify.zsh` via the sole integration agent.
+**Reference inventory:** 83 root Cargo workspace members + 1 standalone markdown fuzz crate = **84 crates** (was 82; the re-pin added `xai-workflow` and `xai-grok-extra-ca`).
+**Swift source/test inventory (see `PORT_STATUS.md` counting method, recounted 2026-08-04):** **99** `Sources/` targets · **8** matching the ≤15-LOC placeholder rule, of which **7** are genuine placeholders and one is the thin `OpenGrokExecutable` `main` · **101** `Tests/` targets · **12** zero-test. The former **98 / 42 / 100 / 46** figures are superseded. Workers must not invoke SwiftPM; only `zsh workflows/swift-safe-verify.zsh` via the sole integration agent.
 
 ## Mission
 
-A complete 12-wave Swift source-port architecture for Open Grok covering all 81 Cargo workspace members plus the standalone markdown fuzz crate (82 total), with protocol-first SwiftPM targets, actor-owned sessions, provider isolation, custom terminal/TUI, cross-platform adapters, disjoint slice ownership, persistence compatibility, licensing, and release-grade verification. Durable artifacts are written to PORT_PLAN.md, CRATE_MAP.md, and PORT_STATUS.md.
+A complete 12-wave Swift source-port architecture for Open Grok covering all 83 Cargo workspace members plus the standalone markdown fuzz crate (84 total), with protocol-first SwiftPM targets, actor-owned sessions, provider isolation, custom terminal/TUI, cross-platform adapters, disjoint slice ownership, persistence compatibility, licensing, and release-grade verification. Durable artifacts are written to PORT_PLAN.md, CRATE_MAP.md, and PORT_STATUS.md.
 
 This document defines the implementation-ready target graph, ownership, invariants, tests, and dependency order required to avoid a superficial skeleton. Current implementation progress and blockers are tracked separately in `PORT_STATUS.md`.
 
@@ -22,7 +22,7 @@ This document defines the implementation-ready target graph, ownership, invarian
 
 ## Architectural invariants
 
-- All 82 Rust crates are mapped in CRATE_MAP.md: 81 root Cargo workspace members plus the separately rooted xai-grok-markdown-fuzz crate; no manifest or end-user surface is unassigned.
+- All 84 Rust crates are mapped in CRATE_MAP.md: 83 root Cargo workspace members plus the separately rooted xai-grok-markdown-fuzz crate; no manifest or end-user surface is unassigned. The two crates added at the 2026-08-04 re-pin (xai-workflow, xai-grok-extra-ca) are mapped to proposed targets and are not yet started.
 - The package builds with Swift 6.1 language/tooling constraints, emits one executable product named open-grok, preserves Open Grok branding, and never reads or writes ~/.grok.
 - Interactive full-screen, inline/minimal, headless text/JSON/JSONL/schema, ACP stdio/headless/leader/serve/relay, and every documented CLI command/flag pass automated acceptance tests.
 - Session actor tests prove ordered turns/tool calls/steering, exactly-once continuation completion, cooperative cancellation, local ownership, permission gating, background work, rewind, compaction, and clean shutdown.
@@ -124,7 +124,7 @@ Create the package/product topology and the only integration-owned root surfaces
 - **Acceptance:**
   - Package.swift declares swift-tools-version 6.1, an executable product named open-grok, and only target edges approved by the crate map; swift package describe succeeds after each integration batch.
   - A deterministic generation plugin can produce ACP/protocol fixtures without network access and fails when checked-in generated output is stale.
-  - PORT_PLAN.md, CRATE_MAP.md, and PORT_STATUS.md remain the canonical ownership/dependency trackers and enumerate all 81 workspace crates plus xai-grok-markdown-fuzz.
+  - PORT_PLAN.md, CRATE_MAP.md, and PORT_STATUS.md remain the canonical ownership/dependency trackers and enumerate all 83 workspace crates plus xai-grok-markdown-fuzz.
   - Distributed LICENSE, NOTICE, and THIRD-PARTY-NOTICES inputs retain Codex, Ratatui, Mermaid/layout, Roboto, and transitive-package obligations.
 
 #### W0-S2 — Hermetic test support
@@ -968,7 +968,7 @@ Run the final matrix for macOS/Linux/Windows adapters, sandbox/permission/provid
 
 ## Global completion gate
 
-- All 82 Rust crates are mapped in CRATE_MAP.md: 81 root Cargo workspace members plus the separately rooted xai-grok-markdown-fuzz crate; no manifest or end-user surface is unassigned.
+- All 84 Rust crates are mapped in CRATE_MAP.md: 83 root Cargo workspace members plus the separately rooted xai-grok-markdown-fuzz crate; no manifest or end-user surface is unassigned. The two crates added at the 2026-08-04 re-pin (xai-workflow, xai-grok-extra-ca) are mapped to proposed targets and are not yet started.
 - The package builds with Swift 6.1 language/tooling constraints, emits one executable product named open-grok, preserves Open Grok branding, and never reads or writes ~/.grok.
 - Interactive full-screen, inline/minimal, headless text/JSON/JSONL/schema, ACP stdio/headless/leader/serve/relay, and every documented CLI command/flag pass automated acceptance tests.
 - Session actor tests prove ordered turns/tool calls/steering, exactly-once continuation completion, cooperative cancellation, local ownership, permission gating, background work, rewind, compaction, and clean shutdown.

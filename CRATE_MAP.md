@@ -1,10 +1,11 @@
 # Rust Crate to SwiftPM Target Map
 
-**Baseline:** 2026-07-20 (inventory refreshed 2026-07-22 / R10)
-**Count:** 81 root workspace packages from `cargo metadata` plus `xai-grok-markdown-fuzz` in its own nested workspace = **82 total**.
+**Baseline:** 2026-07-20 (inventory and reference pin refreshed 2026-08-04)
+**Reference pin:** `xai-org/grok-build` at `80dff0a9dcb24121b976b9f920fbe442af40ea88` (re-pinned 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4`). `ProtocolFixtures/` were captured at the **old** ref and must be recaptured; see `PORT_STATUS.md`.
+**Count:** **83** root workspace packages from `cargo metadata` plus `xai-grok-markdown-fuzz` in its own nested workspace = **84 total** (was 82; the re-pin added `xai-workflow` and `xai-grok-extra-ca`).
 
-**SwiftPM source/test inventory (committed tree, same method as `PORT_STATUS.md`):**
-**98** `Sources/` targets · **42** bootstrap placeholders (≤15 non-comment LOC; C helpers excluded) · **100** `Tests/` targets · **46** zero-test · **54** with ≥1 test.
+**SwiftPM source/test inventory (committed tree, same method as `PORT_STATUS.md`, recounted 2026-08-04):**
+**99** `Sources/` targets · **8** matching the ≤15-non-comment-LOC placeholder rule, of which **7** are genuine placeholders and one is the thin `OpenGrokExecutable` `main` (C helpers excluded) · **101** `Tests/` targets · **12** zero-test · **89** with ≥1 test. The previously published **98 / 42 / 100 / 46** figures are superseded.
 
 ## Mapping rules
 
@@ -98,11 +99,15 @@
 | 80 | `xai-tracing` | `crates/common/xai-tracing/Cargo.toml` | `OpenGrokTracing` | `W2-S1` | Structured spans, correlation, and redaction. |
 | 81 | `xai-tracing-macros` | `crates/codegen/xai-tracing-macros/Cargo.toml` | `OpenGrokTracing` | `W2-S1` | Rust tracing macros are absorbed into ordinary Swift tracing wrappers; no macro target needed. |
 | 82 | `xai-tty-utils` | `crates/codegen/xai-tty-utils/Cargo.toml` | `OpenGrokTTY` | `W2-S4` | TTY capabilities, raw mode, and console handling. |
+| 83 | `xai-workflow` | `crates/codegen/xai-workflow/Cargo.toml` | proposed `OpenGrokWorkflowEngine` | `W6-S5` (proposed) | **Added upstream since the old pin.** Native Rhai workflow engine: script engine, host bindings, run journal, run metadata, execution, and validation. Proposed as a **new target** rather than folded into the existing `OpenGrokWorkflow`, because that target was ported against the removed JavaScript workflow model — folding would hide a rewrite behind an unchanged name. If a later slice decides the Rhai engine and the workflow tool surface belong together, merge deliberately and record the decision here. |
+| 84 | `xai-grok-extra-ca` | `crates/codegen/xai-grok-extra-ca/Cargo.toml` | proposed `OpenGrokExtraCA` | `W2-S1` (proposed) | **Added upstream since the old pin.** Opt-in extra TLS roots from a PEM path in `OPENGROK_EXTRA_CA_BUNDLE`; default-off with no I/O when unset, parsed once, additive to the platform trust store, 1 MiB cap, warn-and-continue on a bad bundle. Consumed by the HTTP transport, so it sits with `OpenGrokHTTP` in Wave 2. |
+
+Rows 83–84 are appended in discovery order rather than inserted alphabetically, so existing row numbers stay stable across the re-pin.
 
 ## Coverage checks
 
-- Mapped crate rows: **82**.
-- Unique Swift target owners in the plan: **101**.
+- Mapped crate rows: **84**.
+- Unique Swift target owners in the plan: **101** committed, plus **2** proposed for the new upstream crates.
 - Uncovered crates: **0**.
 - `xai-grok-markdown-fuzz` is intentionally counted even though its manifest declares a nested standalone workspace and is absent from root `cargo metadata`.
 - Re-run the plan validation before changing target splits; any unmapped manifest or duplicate target/path owner is a release-blocking architecture error.
