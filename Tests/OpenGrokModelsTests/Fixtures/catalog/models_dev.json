@@ -1,0 +1,22 @@
+{
+  "opencode-go": {
+    "npm": "@ai-sdk/openai-compatible",
+    "models": {
+      "claude-sonnet-4-5": {
+        "name": "Claude Sonnet 4.5",
+        "description": "Anthropic Sonnet through OpenCode Go",
+        "provider": { "npm": "@ai-sdk/anthropic" },
+        "limit": { "context": 200000, "output": 64000 }
+      },
+      "gpt-5-codex": {
+        "name": "GPT-5 Codex",
+        "limit": { "context": 400000, "output": 128000 }
+      },
+      "unsupported-sdk": {
+        "name": "Unsupported",
+        "provider": { "npm": "@ai-sdk/mystery" },
+        "limit": { "context": 100000 }
+      }
+    }
+  }
+}

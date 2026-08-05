@@ -24,6 +24,20 @@ public protocol ModelCatalogCredentialSnapshot: Sendable {
     var kimiCredentialFingerprint: String? { get }
     /// Non-secret digest for Fireworks credential isolation.
     var fireworksCredentialFingerprint: String? { get }
+    /// Non-secret digest for DeepSeek credential isolation.
+    var deepSeekCredentialFingerprint: String? { get }
+    /// Non-secret digest for OpenCode Go credential isolation.
+    var openCodeGoCredentialFingerprint: String? { get }
+    /// Non-secret digest for Wafer credential isolation.
+    var waferCredentialFingerprint: String? { get }
+}
+
+public extension ModelCatalogCredentialSnapshot {
+    // Defaulted so existing conformers keep compiling; a snapshot that does not
+    // model a provider simply never publishes that provider's live catalog.
+    var deepSeekCredentialFingerprint: String? { nil }
+    var openCodeGoCredentialFingerprint: String? { nil }
+    var waferCredentialFingerprint: String? { nil }
 }
 
 /// Default empty credential snapshot (offline / hermetic tests).
@@ -33,19 +47,28 @@ public struct EmptyCredentialSnapshot: ModelCatalogCredentialSnapshot {
     public var codexAccountFingerprint: String?
     public var kimiCredentialFingerprint: String?
     public var fireworksCredentialFingerprint: String?
+    public var deepSeekCredentialFingerprint: String?
+    public var openCodeGoCredentialFingerprint: String?
+    public var waferCredentialFingerprint: String?
 
     public init(
         hasXaiSession: Bool = false,
         hasCodexSession: Bool = false,
         codexAccountFingerprint: String? = nil,
         kimiCredentialFingerprint: String? = nil,
-        fireworksCredentialFingerprint: String? = nil
+        fireworksCredentialFingerprint: String? = nil,
+        deepSeekCredentialFingerprint: String? = nil,
+        openCodeGoCredentialFingerprint: String? = nil,
+        waferCredentialFingerprint: String? = nil
     ) {
         self.hasXaiSession = hasXaiSession
         self.hasCodexSession = hasCodexSession
         self.codexAccountFingerprint = codexAccountFingerprint
         self.kimiCredentialFingerprint = kimiCredentialFingerprint
         self.fireworksCredentialFingerprint = fireworksCredentialFingerprint
+        self.deepSeekCredentialFingerprint = deepSeekCredentialFingerprint
+        self.openCodeGoCredentialFingerprint = openCodeGoCredentialFingerprint
+        self.waferCredentialFingerprint = waferCredentialFingerprint
     }
 }
 
@@ -117,6 +140,9 @@ public final class ModelsManager: @unchecked Sendable {
     private var codexCatalog: CodexModelsCatalog?
     private var kimiCatalog: KimiModelsCatalog?
     private var fireworksCatalog: FireworksModelsCatalog?
+    private var deepSeekCatalog: DeepSeekModelsCatalog?
+    private var openCodeGoCatalog: OpenCodeGoModelsCatalog?
+    private var waferCatalog: WaferModelsCatalog?
     private var models: OrderedModelMap
     private var currentModelID: String
     private var currentReasoningEffort: ReasoningEffort?
@@ -131,6 +157,7 @@ public final class ModelsManager: @unchecked Sendable {
     private let codexCache: CodexModelsCacheManager
     private let xaiTransport: any XaiModelsTransport
     private let codexTransport: any CodexModelsTransport
+    private let liveCatalogs: LiveCatalogRefreshers
 
     public init(
         input: CatalogResolutionInput = .default,
@@ -141,8 +168,10 @@ public final class ModelsManager: @unchecked Sendable {
         grokHome: URL? = nil,
         xaiTransport: any XaiModelsTransport = OfflineModelsTransport(),
         codexTransport: any CodexModelsTransport = OfflineModelsTransport(),
+        liveCatalogs: LiveCatalogRefreshers = LiveCatalogRefreshers(),
         versionProvider: @escaping @Sendable () -> String = { OpenGrokVersion.installed() }
     ) {
+        self.liveCatalogs = liveCatalogs
         let home = grokHome
             ?? OpenGrokStatePaths.stateDirectory(
                 environment: ProcessInfo.processInfo.environment
@@ -196,6 +225,15 @@ public final class ModelsManager: @unchecked Sendable {
     public func allowlistExcludesAllModels() -> Bool {
         lock.lock(); defer { lock.unlock() }
         return allowlistExcludesAll
+    }
+
+    /// Partition actors, for the refresh entry points in `LiveCatalogRefresh.swift`.
+    var liveCatalogRefreshers: LiveCatalogRefreshers { liveCatalogs }
+
+    /// The Kimi service partition a published live catalog belongs to.
+    /// Platform and Code are non-interchangeable, so the snapshot records which.
+    var kimiEndpointForRefresh: KimiApiEndpoint {
+        lock.withLock { input.models.kimiEndpoint }
     }
 
     public func capabilities(for modelID: String) -> ModelCapabilities? {
@@ -282,6 +320,45 @@ public final class ModelsManager: @unchecked Sendable {
         reassemble()
     }
 
+    public func applyDeepSeekCatalog(_ catalog: DeepSeekModelsCatalog?) {
+        lock.lock()
+        if let catalog,
+           let expected = credentials.deepSeekCredentialFingerprint,
+           catalog.credentialFingerprint != expected {
+            lock.unlock()
+            return
+        }
+        self.deepSeekCatalog = catalog
+        lock.unlock()
+        reassemble()
+    }
+
+    public func applyOpenCodeGoCatalog(_ catalog: OpenCodeGoModelsCatalog?) {
+        lock.lock()
+        if let catalog,
+           let expected = credentials.openCodeGoCredentialFingerprint,
+           catalog.credentialFingerprint != expected {
+            lock.unlock()
+            return
+        }
+        self.openCodeGoCatalog = catalog
+        lock.unlock()
+        reassemble()
+    }
+
+    public func applyWaferCatalog(_ catalog: WaferModelsCatalog?) {
+        lock.lock()
+        if let catalog,
+           let expected = credentials.waferCredentialFingerprint,
+           catalog.credentialFingerprint != expected {
+            lock.unlock()
+            return
+        }
+        self.waferCatalog = catalog
+        lock.unlock()
+        reassemble()
+    }
+
     /// Clear provider-isolated remotes on identity change.
     public func clear(identityChange: Bool = true) {
         lock.lock()
@@ -289,6 +366,9 @@ public final class ModelsManager: @unchecked Sendable {
         codexCatalog = nil
         kimiCatalog = nil
         fireworksCatalog = nil
+        deepSeekCatalog = nil
+        openCodeGoCatalog = nil
+        waferCatalog = nil
         etag = nil
         hasFetchedRealCatalog = false
         lock.unlock()
@@ -385,7 +465,10 @@ public final class ModelsManager: @unchecked Sendable {
             prefetched: prefetched,
             codexCatalog: codexCatalog,
             kimiCatalog: kimiCatalog,
-            fireworksCatalog: fireworksCatalog
+            fireworksCatalog: fireworksCatalog,
+            deepSeekCatalog: deepSeekCatalog,
+            openCodeGoCatalog: openCodeGoCatalog,
+            waferCatalog: waferCatalog
         )
         models = assembled
         allowlistExcludesAll = allowlistMatchesNothing(input: input, catalog: assembled)

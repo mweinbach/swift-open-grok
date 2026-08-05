@@ -45,7 +45,11 @@ public func resolveModelList(
         kimiRemote: nil,
         kimiAuthoritative: false,
         fireworksRemote: nil,
-        fireworksAuthoritative: false
+        fireworksAuthoritative: false,
+        deepSeekRemote: nil,
+        deepSeekAuthoritative: false,
+        openCodeGoRemote: nil,
+        openCodeGoAuthoritative: false
     )
 }
 
@@ -59,7 +63,11 @@ public func resolveModelListWithProviderCatalogs(
     kimiRemote: OrderedModelMap?,
     kimiAuthoritative: Bool,
     fireworksRemote: OrderedModelMap?,
-    fireworksAuthoritative: Bool
+    fireworksAuthoritative: Bool,
+    deepSeekRemote: OrderedModelMap? = nil,
+    deepSeekAuthoritative: Bool = false,
+    openCodeGoRemote: OrderedModelMap? = nil,
+    openCodeGoAuthoritative: Bool = false
 ) -> OrderedModelMap {
     var resolved = OrderedModelMap()
     let defaults = defaultModelEntries(
@@ -133,6 +141,22 @@ public func resolveModelListWithProviderCatalogs(
         authoritative: fireworksAuthoritative
     )
 
+    mergeRemoteProviderPartition(
+        resolved: &resolved,
+        defaults: defaults,
+        remote: deepSeekRemote,
+        provider: .deepseek,
+        authoritative: deepSeekAuthoritative
+    )
+
+    mergeRemoteProviderPartition(
+        resolved: &resolved,
+        defaults: defaults,
+        remote: openCodeGoRemote,
+        provider: .openCodeGo,
+        authoritative: openCodeGoAuthoritative
+    )
+
     // Config `[model.*]` overrides win over remotes and defaults.
     for (key, modelOverride) in input.configModels {
         let base = resolved.shiftRemove(key)
@@ -173,7 +197,10 @@ public func resolveModelCatalog(
     prefetched: OrderedModelMap? = nil,
     codexCatalog: CodexModelsCatalog? = nil,
     kimiCatalog: KimiModelsCatalog? = nil,
-    fireworksCatalog: FireworksModelsCatalog? = nil
+    fireworksCatalog: FireworksModelsCatalog? = nil,
+    deepSeekCatalog: DeepSeekModelsCatalog? = nil,
+    openCodeGoCatalog: OpenCodeGoModelsCatalog? = nil,
+    waferCatalog: WaferModelsCatalog? = nil
 ) -> OrderedModelMap {
     var catalog = resolveModelListWithProviderCatalogs(
         input: input,
@@ -183,8 +210,29 @@ public func resolveModelCatalog(
         kimiRemote: kimiCatalog?.entries,
         kimiAuthoritative: kimiCatalog?.isAuthoritative ?? false,
         fireworksRemote: fireworksCatalog?.entries,
-        fireworksAuthoritative: fireworksCatalog?.isAuthoritative ?? false
+        fireworksAuthoritative: fireworksCatalog?.isAuthoritative ?? false,
+        deepSeekRemote: deepSeekCatalog?.entries,
+        deepSeekAuthoritative: deepSeekCatalog?.isAuthoritative ?? false,
+        openCodeGoRemote: openCodeGoCatalog?.entries,
+        openCodeGoAuthoritative: openCodeGoCatalog?.isAuthoritative ?? false
     )
+
+    // Wafer is applied *after* `[model.*]`, not with the other partitions.
+    //
+    // This is a deliberate upstream asymmetry, not an oversight: Wafer's
+    // `/models` response is unconditionally authoritative
+    // (`wafer_models.rs:106-108` returns a bare `true`), and the wipe-and-extend
+    // runs after `resolve_model_list_with_provider_catalogs` returns
+    // (`agent/models/resolution.rs:364-369`). Every other provider partition is
+    // merged *before* the override loop, so a `[model."wafer:…"]` override is
+    // the one override a live catalog can still overwrite. Moving this earlier
+    // would silently change which side wins.
+    if let waferCatalog {
+        catalog.retain { _, entry in entry.info.provider != .wafer }
+        for (key, entry) in waferCatalog.entries.pairs() {
+            catalog[key] = entry
+        }
+    }
 
     switch ModelGlobSet.compile(input.models.disabledModels) {
     case .success(.some(let disabled)):

@@ -420,6 +420,58 @@ public struct CodexModelsCacheManager: Sendable {
         )
     }
 
+    /// Load the cached catalog ignoring TTL and identity.
+    ///
+    /// Used only to recover a previously stored ETag for conditional
+    /// revalidation; the caller must still verify the account fingerprint
+    /// before trusting anything it returns.
+    public func loadAny() -> CodexModelsCatalog? {
+        guard let data = try? Data(contentsOf: path) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let doc = try? decoder.decode(CodexModelsCacheDocument.self, from: data) else {
+            return nil
+        }
+        let models = doc.models.map { cached in
+            CodexCatalogModel(
+                priority: cached.priority,
+                visibility: CodexModelVisibility(rawValue: cached.visibility) ?? .none,
+                autoCompactTokenLimit: cached.autoCompactTokenLimit,
+                compHash: cached.compHash,
+                resolvedContextWindow: cached.resolvedContextWindow,
+                entry: cached.entry
+            )
+        }
+        return CodexModelsCatalog(
+            models: models,
+            etag: doc.etag,
+            accountFingerprint: doc.accountFingerprint
+        )
+    }
+
+    /// Restamp `fetched_at` after a `304 Not Modified` confirmed the snapshot.
+    /// A cache belonging to another principal is left untouched.
+    public func renewTTL(
+        expectedAccountFingerprint: String,
+        now: Date = Date()
+    ) throws {
+        let data = try Data(contentsOf: path)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var doc: CodexModelsCacheDocument
+        do {
+            doc = try decoder.decode(CodexModelsCacheDocument.self, from: data)
+        } catch {
+            throw ModelsError.cacheCorrupt(String(describing: error))
+        }
+        guard doc.accountFingerprint == expectedAccountFingerprint else { return }
+        doc.fetchedAt = now
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try writeAtomicallyData(path, contents: try encoder.encode(doc))
+    }
+
     public func persist(
         _ catalog: CodexModelsCatalog,
         openGrokVersion: String? = nil,
