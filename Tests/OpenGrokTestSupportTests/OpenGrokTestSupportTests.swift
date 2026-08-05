@@ -787,7 +787,8 @@ struct OpenGrokTestSupportTests {
         try FileManager.default.createDirectory(atPath: tempRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: tempRoot) }
         let upstreamPath = "\(tempRoot)/real.sock"
-        try spawnEchoUpstream(path: upstreamPath)
+        let upstream = try spawnEchoUpstream(path: upstreamPath)
+        defer { upstream.stop() }
         // Give the echo upstream a moment to bind.
         Thread.sleep(forTimeInterval: 0.05)
         let proxy = try UdsProxy(
@@ -822,7 +823,8 @@ struct OpenGrokTestSupportTests {
         try FileManager.default.createDirectory(atPath: tempRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: tempRoot) }
         let upstreamPath = "\(tempRoot)/real.sock"
-        try spawnEchoUpstream(path: upstreamPath)
+        let upstream = try spawnEchoUpstream(path: upstreamPath)
+        defer { upstream.stop() }
         Thread.sleep(forTimeInterval: 0.05)
         let proxy = try UdsProxy(
             proxyPath: "\(tempRoot)/proxy.sock",
@@ -859,7 +861,8 @@ struct OpenGrokTestSupportTests {
         try FileManager.default.createDirectory(atPath: tempRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: tempRoot) }
         let upstreamPath = "\(tempRoot)/real.sock"
-        try spawnEchoUpstream(path: upstreamPath)
+        let upstream = try spawnEchoUpstream(path: upstreamPath)
+        defer { upstream.stop() }
         Thread.sleep(forTimeInterval: 0.05)
         var plan = FaultPlan()
         plan.dropFrame = 2
@@ -887,7 +890,8 @@ struct OpenGrokTestSupportTests {
         try FileManager.default.createDirectory(atPath: tempRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: tempRoot) }
         let upstreamPath = "\(tempRoot)/real.sock"
-        try spawnEchoUpstream(path: upstreamPath)
+        let upstream = try spawnEchoUpstream(path: upstreamPath)
+        defer { upstream.stop() }
         Thread.sleep(forTimeInterval: 0.05)
         var plan = FaultPlan()
         plan.duplicateFrame = 1
@@ -1140,48 +1144,11 @@ struct OpenGrokTestSupportTests {
     /// Spawn a simple unix-domain-socket echo server at `path`: every
     /// length-prefixed frame received is echoed back verbatim. Mirrors the
     /// Rust `spawn_echo_upstream` test helper.
-    private func spawnEchoUpstream(path: String) throws {
-        unlink(path)
-        let fd = socket(AF_UNIX, sockStreamType, 0)
-        if fd < 0 { throw NSError(domain: "UdsProxyTest", code: 1) }
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        path.withCString { cPath in
-            withUnsafeMutableBytes(of: &addr.sun_path) { buf in
-                let count = min(strlen(cPath), buf.count - 1)
-                let bytes = UnsafeBufferPointer(start: cPath, count: count)
-                    .map { UInt8(bitPattern: $0) }
-                buf.copyBytes(from: bytes)
-            }
-        }
-        let bound = withUnsafePointer(to: &addr) { ptr -> Int32 in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                bind(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        if bound < 0 { close(fd); throw NSError(domain: "UdsProxyTest", code: 2) }
-        if listen(fd, 128) < 0 { close(fd); throw NSError(domain: "UdsProxyTest", code: 3) }
-        let thread = Thread {
-            while true {
-                let client = accept(fd, nil, nil)
-                if client < 0 { break }
-                let connThread = Thread {
-                    while true {
-                        var len = [UInt8](repeating: 0, count: 4)
-                        guard readExact(fd: client, buffer: &len, count: 4) else { close(client); return }
-                        let bodyLen = Int(UInt32(len[0]) << 24 | UInt32(len[1]) << 16 | UInt32(len[2]) << 8 | UInt32(len[3]))
-                        var body = [UInt8](repeating: 0, count: bodyLen)
-                        if bodyLen > 0 {
-                            guard readExact(fd: client, buffer: &body, count: bodyLen) else { close(client); return }
-                        }
-                        _ = writeAll(fd: client, bytes: len)
-                        if bodyLen > 0 { _ = writeAll(fd: client, bytes: body) }
-                    }
-                }
-                connThread.start()
-            }
-        }
-        thread.start()
+    ///
+    /// Call `stop()` on the returned handle when the test is done; the accept and
+    /// per-connection threads block indefinitely otherwise.
+    private func spawnEchoUpstream(path: String) throws -> EchoUpstream {
+        try EchoUpstream(path: path)
     }
 
     /// Connect a unix-domain socket to `path`.
@@ -1265,3 +1232,224 @@ struct OpenGrokTestSupportTests {
     }
     #endif
 }
+
+#if os(macOS) || os(Linux)
+
+/// Unix-domain echo server backing the `UdsProxy` fixtures: every length-prefixed frame is
+/// echoed back verbatim.
+///
+/// The accept loop and the per-connection reader loops block, so the fixture owns an explicit
+/// shutdown. Without one the threads survive for the life of the test process — one sampled
+/// hang showed the suite parked in this helper's `accept()`. `stop()` wakes the accept loop
+/// through a self-pipe, shuts the live connections down so their blocking reads return, and
+/// joins both before releasing the listening socket.
+private final class EchoUpstream: @unchecked Sendable {
+    private let path: String
+    private var listenFD: Int32 = -1
+    private var wakeRead: Int32 = -1
+    private var wakeWrite: Int32 = -1
+    private let lock = NSLock()
+    private var stopping = false
+    private var clients: Set<Int32> = []
+    private let threads = DispatchGroup()
+
+    init(path: String) throws {
+        self.path = path
+        unlink(path)
+        let fd = socket(AF_UNIX, sockStreamType, 0)
+        if fd < 0 { throw NSError(domain: "UdsProxyTest", code: 1) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        path.withCString { cPath in
+            withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+                let count = min(strlen(cPath), buf.count - 1)
+                let bytes = UnsafeBufferPointer(start: cPath, count: count)
+                    .map { UInt8(bitPattern: $0) }
+                buf.copyBytes(from: bytes)
+            }
+        }
+        let bound = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                bind(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        if bound < 0 { close(fd); throw NSError(domain: "UdsProxyTest", code: 2) }
+        if listen(fd, 128) < 0 { close(fd); throw NSError(domain: "UdsProxyTest", code: 3) }
+        let flags = fcntl(fd, F_GETFL)
+        if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
+        listenFD = fd
+
+        var wake: [Int32] = [-1, -1]
+        if pipe(&wake) == 0 {
+            wakeRead = wake[0]
+            wakeWrite = wake[1]
+            for end in wake {
+                let f = fcntl(end, F_GETFL)
+                if f >= 0 { _ = fcntl(end, F_SETFL, f | O_NONBLOCK) }
+            }
+        }
+
+        threads.enter()
+        let thread = Thread { [self] in
+            defer { threads.leave() }
+            acceptLoop()
+        }
+        thread.name = "opengrok.test.echo-upstream"
+        thread.start()
+    }
+
+    deinit { stop() }
+
+    func stop() {
+        var live: [Int32] = []
+        lock.lock()
+        if stopping {
+            lock.unlock()
+            return
+        }
+        stopping = true
+        live = Array(clients)
+        if wakeWrite >= 0 {
+            var byte: UInt8 = 1
+            _ = Foundation.write(wakeWrite, &byte, 1)
+        }
+        lock.unlock()
+
+        // Blocking reads on a shut-down socket return 0, which ends the connection loops.
+        // The loops own closing their own descriptor.
+        for client in live { shutdown(client, Int32(SHUT_RDWR)) }
+        _ = threads.wait(timeout: .now() + 2)
+
+        lock.lock()
+        if listenFD >= 0 { close(listenFD); listenFD = -1 }
+        if wakeRead >= 0 { close(wakeRead); wakeRead = -1 }
+        if wakeWrite >= 0 { close(wakeWrite); wakeWrite = -1 }
+        lock.unlock()
+        unlink(path)
+    }
+
+    private var isStopping: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopping
+    }
+
+    private func acceptLoop() {
+        while true {
+            if isStopping { return }
+            var fds = [
+                pollfd(fd: listenFD, events: Int16(POLLIN), revents: 0),
+                pollfd(fd: wakeRead, events: Int16(POLLIN), revents: 0)
+            ]
+            let ready = poll(&fds, 2, 100)
+            if ready < 0 {
+                if errno == EINTR { continue }
+                return
+            }
+            if isStopping { return }
+            guard ready > 0, fds[0].revents != 0 else { continue }
+            let client = accept(listenFD, nil, nil)
+            if client < 0 {
+                if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR
+                    || errno == ECONNABORTED { continue }
+                return
+            }
+            // BSD accept() inherits O_NONBLOCK from the listening socket; the connection
+            // loops want blocking reads.
+            let clientFlags = fcntl(client, F_GETFL)
+            if clientFlags >= 0 {
+                _ = fcntl(client, F_SETFL, clientFlags & ~O_NONBLOCK)
+            }
+            lock.lock()
+            if stopping {
+                lock.unlock()
+                close(client)
+                return
+            }
+            clients.insert(client)
+            lock.unlock()
+            // `stop()` shuts these sockets down under a serving thread; without this a
+            // half-written frame would raise SIGPIPE and take the whole test process with it.
+            #if canImport(Darwin)
+            var on: Int32 = 1
+            _ = setsockopt(
+                client,
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                &on,
+                socklen_t(MemoryLayout<Int32>.size)
+            )
+            #endif
+
+            threads.enter()
+            let connThread = Thread { [self] in
+                defer { threads.leave() }
+                serve(client: client)
+            }
+            connThread.name = "opengrok.test.echo-upstream.conn"
+            connThread.start()
+        }
+    }
+
+    private func serve(client: Int32) {
+        defer {
+            lock.lock()
+            clients.remove(client)
+            lock.unlock()
+            close(client)
+        }
+        while true {
+            var len = [UInt8](repeating: 0, count: 4)
+            guard Self.readExact(fd: client, buffer: &len, count: 4) else { return }
+            let bodyLen = Int(
+                UInt32(len[0]) << 24 | UInt32(len[1]) << 16 | UInt32(len[2]) << 8 | UInt32(len[3])
+            )
+            var body = [UInt8](repeating: 0, count: bodyLen)
+            if bodyLen > 0 {
+                guard Self.readExact(fd: client, buffer: &body, count: bodyLen) else { return }
+            }
+            guard Self.writeAll(fd: client, bytes: len) else { return }
+            if bodyLen > 0 {
+                guard Self.writeAll(fd: client, bytes: body) else { return }
+            }
+        }
+    }
+
+    private static func readExact(fd: Int32, buffer: inout [UInt8], count: Int) -> Bool {
+        var got = 0
+        while got < count {
+            let n = buffer.withUnsafeMutableBufferPointer { ptr in
+                Foundation.read(fd, ptr.baseAddress!.advanced(by: got), count - got)
+            }
+            if n < 0 && errno == EINTR { continue }
+            if n <= 0 { return false }
+            got += n
+        }
+        return true
+    }
+
+    private static func writeAll(fd: Int32, bytes: [UInt8]) -> Bool {
+        var sent = 0
+        while sent < bytes.count {
+            let n = bytes.withUnsafeBufferPointer { ptr -> Int in
+                #if canImport(Darwin)
+                return Foundation.write(fd, ptr.baseAddress!.advanced(by: sent), bytes.count - sent)
+                #else
+                // Linux has no SO_NOSIGPIPE; MSG_NOSIGNAL is the per-call equivalent.
+                return send(
+                    fd,
+                    ptr.baseAddress!.advanced(by: sent),
+                    bytes.count - sent,
+                    Int32(MSG_NOSIGNAL)
+                )
+                #endif
+            }
+            if n < 0 && errno == EINTR { continue }
+            if n <= 0 { return false }
+            sent += n
+        }
+        return true
+    }
+}
+
+#endif

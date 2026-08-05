@@ -10,6 +10,25 @@ import Darwin
 import Glibc
 #endif
 
+private struct PTYTestTimeout: Error {}
+
+/// Fails the awaited work instead of hanging the suite when a stream never terminates.
+private func withDeadline<T: Sendable>(
+    seconds: Double,
+    _ work: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await work() }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            throw PTYTestTimeout()
+        }
+        let first = try await group.next()!
+        group.cancelAll()
+        return first
+    }
+}
+
 private func collectPTYOutput(_ stream: AsyncThrowingStream<Data, Error>) async -> Data {
     var collected = Data()
     do {
@@ -273,6 +292,57 @@ struct OpenGrokPTYTests {
             _ = try await process.waitForExit()
         }
         scope.killAll()
+        #endif
+    }
+
+    @Test("short-lived children never lose their output")
+    func shortLivedChildStress() async throws {
+        #if os(macOS) || os(Linux)
+        let scope = ProcessScope()
+        defer { scope.killAll() }
+        let adapter = PlatformPTYAdapter(scope: scope)
+        for i in 0..<20 {
+            let marker = "stress-\(i)"
+            let process = try await adapter.spawn(
+                ProcessSpec(
+                    command: "/bin/echo",
+                    arguments: [marker],
+                    usePTY: true,
+                    initialSize: TerminalSize(width: 40, height: 10)
+                )
+            )
+            let stream = process.output()
+            let collector = Task { await collectPTYOutput(stream) }
+            let exit = try await process.waitForExit()
+            let collected = try await withDeadline(seconds: 5) { await collector.value }
+            #expect(exit == .code(0))
+            #expect(String(decoding: collected, as: UTF8.self).contains(marker))
+        }
+        #endif
+    }
+
+    @Test("output stream ends at reap when a grandchild still holds the slave")
+    func inheritedSlaveDoesNotDeadlock() async throws {
+        #if os(macOS) || os(Linux)
+        let scope = ProcessScope()
+        defer { scope.killAll() }
+        let adapter = PlatformPTYAdapter(scope: scope)
+        // The backgrounded sleeper inherits the pty slave and outlives its parent, so the
+        // master never reports EOF. Termination has to come from the child being reaped.
+        let process = try await adapter.spawn(
+            ProcessSpec(
+                command: "/bin/sh",
+                arguments: ["-c", "sleep 30 & echo parent-done"],
+                usePTY: true,
+                initialSize: TerminalSize(width: 40, height: 10)
+            )
+        )
+        let stream = process.output()
+        let collector = Task { await collectPTYOutput(stream) }
+        let exit = try await withDeadline(seconds: 10) { try await process.waitForExit() }
+        let collected = try await withDeadline(seconds: 5) { await collector.value }
+        #expect(exit == .code(0))
+        #expect(String(decoding: collected, as: UTF8.self).contains("parent-done"))
         #endif
     }
 

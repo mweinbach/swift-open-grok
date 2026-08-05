@@ -201,6 +201,234 @@ private struct PortableMutex: @unchecked Sendable {
     }
 }
 
+/// Dedicated reader for a PTY master (or pipe read end).
+///
+/// The reader is started *before* the child is spawned and parks in `poll(2)`, so bytes are
+/// consumed as soon as they appear. macOS discards a terminal's output queue once the last
+/// slave descriptor closes, so reading only at reap time loses a short-lived child's output.
+///
+/// The stream ends on whichever of two events arrives first: the descriptor reports the end of
+/// the stream (EOF, or `EIO`, which is how macOS reports "last slave closed"), or the child is
+/// reaped — after which a bounded final drain runs before finishing. Ending on EOF alone
+/// deadlocks whenever an unrelated process has inherited a slave descriptor and holds it open;
+/// ending at reap alone loses the bytes still queued.
+///
+/// The loop owns a real thread, never the cooperative pool, and owns `fd`: it closes the
+/// descriptor when it completes.
+final class PTYOutputReader: @unchecked Sendable {
+    private let fd: Int32
+    private let lock = PortableMutex()
+    private var wakeRead: Int32 = -1
+    private var wakeWrite: Int32 = -1
+    private var sink: ((Data) -> Void)?
+    private var onFinish: ((Error?) -> Void)?
+    private var buffered: [Data] = []
+    private var finished = false
+    private var finishError: Error?
+    private var reapDeadline: Date?
+    private var stopRequested = false
+
+    /// How long the post-reap drain may run before the stream is finished regardless. A
+    /// surviving grandchild can keep the slave open and keep writing indefinitely.
+    private static let drainBudget: TimeInterval = 0.1
+
+    init(fd: Int32) {
+        self.fd = fd
+        let flags = fcntl(fd, F_GETFL)
+        if flags >= 0 {
+            _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        }
+        var wake: [Int32] = [-1, -1]
+        if pipe(&wake) == 0 {
+            wakeRead = wake[0]
+            wakeWrite = wake[1]
+            for end in wake {
+                let f = fcntl(end, F_GETFL)
+                if f >= 0 { _ = fcntl(end, F_SETFL, f | O_NONBLOCK) }
+            }
+        }
+    }
+
+    func start() {
+        let thread = Thread { [self] in run() }
+        thread.name = "opengrok.pty.reader"
+        thread.stackSize = 512 * 1024
+        thread.start()
+    }
+
+    /// Installs the consumer. Anything read before this point is replayed in order; if the
+    /// stream already ended, `onFinish` fires immediately.
+    func attach(sink: @escaping (Data) -> Void, onFinish: @escaping (Error?) -> Void) {
+        var replay: [Data] = []
+        var alreadyFinished = false
+        var completionError: Error?
+        lock.withLock {
+            replay = buffered
+            buffered.removeAll()
+            if finished {
+                alreadyFinished = true
+                completionError = finishError
+            } else {
+                self.sink = sink
+                self.onFinish = onFinish
+            }
+        }
+        for chunk in replay { sink(chunk) }
+        if alreadyFinished { onFinish(completionError) }
+    }
+
+    /// Child reaped: drain what is still queued, bounded, then finish the stream.
+    func finishAfterReap() {
+        lock.withLock {
+            guard !finished, reapDeadline == nil else { return }
+            reapDeadline = Date().addingTimeInterval(Self.drainBudget)
+            wake()
+        }
+    }
+
+    /// Stop now without draining (cancellation / teardown).
+    func stop() {
+        lock.withLock {
+            guard !finished else { return }
+            stopRequested = true
+            wake()
+        }
+    }
+
+    // MARK: Private
+
+    /// Nudges the poll out of its wait. Caller holds `lock`.
+    private func wake() {
+        guard wakeWrite >= 0 else { return }
+        var byte: UInt8 = 1
+        _ = sysWrite(wakeWrite, &byte, 1)
+    }
+
+    private func run() {
+        var buf = [UInt8](repeating: 0, count: 65_536)
+        while true {
+            enum Phase {
+                case running
+                case draining(Date)
+                case stop
+            }
+            let phase: Phase = lock.withLock {
+                if stopRequested || finished { return .stop }
+                if let deadline = reapDeadline { return .draining(deadline) }
+                return .running
+            }
+            var timeoutMS: Int32 = 50
+            switch phase {
+            case .stop:
+                complete(nil)
+                return
+            case .draining(let deadline):
+                let remaining = deadline.timeIntervalSinceNow
+                if remaining <= 0 {
+                    complete(nil)
+                    return
+                }
+                timeoutMS = Int32(max(1, min(20, remaining * 1000)))
+            case .running:
+                break
+            }
+
+            var fds = [
+                pollfd(fd: fd, events: Int16(POLLIN), revents: 0),
+                pollfd(fd: wakeRead, events: Int16(POLLIN), revents: 0)
+            ]
+            let ready = poll(&fds, 2, timeoutMS)
+            if ready < 0 {
+                if errno == EINTR { continue }
+                complete(PTYError.ioFailed("PTY poll failed: \(String(cString: strerror(errno)))"))
+                return
+            }
+            if fds[1].revents != 0 { flushWake() }
+
+            var readAny = false
+            var ended = false
+            var failure: Error?
+            readLoop: while true {
+                let n = buf.withUnsafeMutableBytes { raw -> Int in
+                    guard let base = raw.baseAddress else { return -1 }
+                    return sysRead(fd, base, raw.count)
+                }
+                if n > 0 {
+                    readAny = true
+                    deliver(Data(buf[0..<n]))
+                    continue
+                }
+                if n == 0 {
+                    ended = true
+                    break readLoop
+                }
+                let code = errno
+                if code == EINTR { continue }
+                if code == EAGAIN || code == EWOULDBLOCK { break readLoop }
+                // macOS reports "the last slave descriptor closed" as EIO on the master.
+                if code == EIO || code == EBADF || code == ENXIO {
+                    ended = true
+                    break readLoop
+                }
+                failure = PTYError.ioFailed("PTY read failed: \(String(cString: strerror(code)))")
+                break readLoop
+            }
+
+            if ended || failure != nil {
+                complete(failure)
+                return
+            }
+            // Post-reap, a quiet poll means nothing more is queued: finish without
+            // burning the rest of the drain budget.
+            if case .draining = phase, !readAny, ready == 0 {
+                complete(nil)
+                return
+            }
+        }
+    }
+
+    private func flushWake() {
+        guard wakeRead >= 0 else { return }
+        var scratch = [UInt8](repeating: 0, count: 64)
+        while true {
+            let n = scratch.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return sysRead(wakeRead, base, raw.count)
+            }
+            if n <= 0 { return }
+        }
+    }
+
+    /// Delivers under `lock` so replayed and live chunks cannot interleave out of order.
+    private func deliver(_ data: Data) {
+        lock.withLock {
+            if let sink {
+                sink(data)
+            } else {
+                buffered.append(data)
+            }
+        }
+    }
+
+    private func complete(_ error: Error?) {
+        let completion: ((Error?) -> Void)? = lock.withLock {
+            guard !finished else { return nil }
+            finished = true
+            finishError = error
+            let cb = onFinish
+            onFinish = nil
+            sink = nil
+            if wakeRead >= 0 { _ = sysClose(wakeRead) }
+            if wakeWrite >= 0 { _ = sysClose(wakeWrite) }
+            wakeRead = -1
+            wakeWrite = -1
+            _ = sysClose(fd)
+            return cb
+        }
+        completion?(error)
+    }
+}
+
 #endif
 
 // MARK: - POSIX implementation
@@ -216,39 +444,43 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
     private let childPID: pid_t
     private let processGroup: ProcessGroup
     private let state = PortableMutex()
-    private let readLock = PortableMutex()
     private var exitStatus: ProcessExit = .stillRunning
     private var cancelled = false
-    private var masterClosed = false
     private var pendingOutput: [Data] = []
     private var outputFinished = false
     private var outputError: Error?
     private var outputContinuation: AsyncThrowingStream<Data, Error>.Continuation?
-    private var readerTask: Task<Void, Never>?
+    private let reader: PTYOutputReader?
     private var waiterTask: Task<Void, Never>?
     private var nextWaiterID: UInt64 = 1
     private var waitContinuations: [UInt64: CheckedContinuation<ProcessExit, Error>] = [:]
     private var accumulated = Data()
 
+    /// `reader` must already have been started (before the child was spawned) and owns
+    /// `masterFD`, including closing it.
     init(
         identifier: String,
         childPID: pid_t,
         masterFD: Int32?,
+        reader: PTYOutputReader?,
         processGroup: ProcessGroup
     ) {
         self.identifier = identifier
         self.processID = childPID
         self.childPID = childPID
         self.masterFD = masterFD
+        self.reader = reader
         self.processGroup = processGroup
-        startReader()
+        reader?.attach(
+            sink: { [weak self] data in self?.deliverOutput(data) },
+            onFinish: { [weak self] error in self?.finishOutput(error: error) }
+        )
         startWaiter()
     }
 
     deinit {
-        readerTask?.cancel()
         waiterTask?.cancel()
-        closeMasterIfNeeded()
+        reader?.stop()
         if case .stillRunning = snapshotExit() {
             try? processGroup.kill()
         }
@@ -405,15 +637,15 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
         if snapshotExit() == .stillRunning {
             try? processGroup.kill()
         }
-        state.withLock {
-            if let cont = outputContinuation {
-                cont.finish(throwing: PTYError.cancelled)
-                outputContinuation = nil
-            } else {
-                outputError = PTYError.cancelled
-                outputFinished = true
-            }
+        let cont: AsyncThrowingStream<Data, Error>.Continuation? = state.withLock {
+            outputFinished = true
+            outputError = PTYError.cancelled
+            let c = outputContinuation
+            outputContinuation = nil
+            return c
         }
+        cont?.finish(throwing: PTYError.cancelled)
+        reader?.stop()
     }
 
     // MARK: Private helpers
@@ -442,6 +674,7 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
 
     private func finishOutput(error: Error? = nil) {
         let cont: AsyncThrowingStream<Data, Error>.Continuation? = state.withLock {
+            guard !outputFinished else { return nil }
             outputFinished = true
             outputError = error
             let c = outputContinuation
@@ -453,87 +686,6 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
                 cont.finish(throwing: error)
             } else {
                 cont.finish()
-            }
-        }
-    }
-
-    /// Reads once and delivers the bytes while holding `readLock`, so the reader task and the
-    /// exit-time drain stay ordered. Returns the read result together with its `errno`.
-    private func readOnce(from fd: Int32, into buf: inout [UInt8]) -> (bytes: Int, code: Int32) {
-        readLock.lock()
-        defer { readLock.unlock() }
-        let n = buf.withUnsafeMutableBytes { raw -> Int in
-            guard let base = raw.baseAddress else { return -1 }
-            return sysRead(fd, base, raw.count)
-        }
-        let code = errno
-        if n > 0 { deliverOutput(Data(buf[0..<n])) }
-        return (n, code)
-    }
-
-    /// Collects whatever the child left buffered before the master is closed.
-    ///
-    /// macOS discards a terminal's output queue once the last slave descriptor closes, so a
-    /// short-lived child's output is lost unless it is read at reap time. The reader task cannot
-    /// be relied on for that: it polls from the cooperative pool and may not have been scheduled
-    /// even once before the child exited.
-    private func drainBeforeClose() {
-        guard let masterFD else { return }
-        if state.withLock({ masterClosed }) { return }
-        var buf = [UInt8](repeating: 0, count: 65_536)
-        // Bounded: a surviving grandchild can keep writing to the slave after the child is reaped.
-        let deadline = Date().addingTimeInterval(0.1)
-        while Date() < deadline {
-            let (n, code) = readOnce(from: masterFD, into: &buf)
-            if n > 0 { continue }
-            if n < 0 && code == EINTR { continue }
-            return
-        }
-    }
-
-    private func closeMasterIfNeeded() {
-        let fd: Int32? = state.withLock {
-            guard !masterClosed else { return nil }
-            masterClosed = true
-            return masterFD
-        }
-        if let fd { _ = sysClose(fd) }
-    }
-
-    private func startReader() {
-        guard let masterFD else { return }
-        let flags = fcntl(masterFD, F_GETFL)
-        if flags >= 0 {
-            _ = fcntl(masterFD, F_SETFL, flags | O_NONBLOCK)
-        }
-        readerTask = Task.detached { [weak self] in
-            guard let self else { return }
-            var buf = [UInt8](repeating: 0, count: 65_536)
-            while !Task.isCancelled {
-                // Bytes are delivered inside readOnce, under the read lock, so this task and the
-                // exit-time drain cannot interleave chunks out of order.
-                let (n, code) = self.readOnce(from: masterFD, into: &buf)
-                if n > 0 {
-                    continue
-                } else if n == 0 {
-                    self.finishOutput()
-                    break
-                } else {
-                    if code == EAGAIN || code == EWOULDBLOCK || code == EINTR {
-                        try? await Task.sleep(nanoseconds: 5_000_000)
-                        continue
-                    }
-                    if code == EBADF {
-                        self.finishOutput()
-                        break
-                    }
-                    self.finishOutput(
-                        error: PTYError.ioFailed(
-                            "PTY read failed: \(String(cString: strerror(code)))"
-                        )
-                    )
-                    break
-                }
             }
         }
     }
@@ -573,9 +725,9 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
             waitContinuations.removeAll()
             return w
         }
-        drainBeforeClose()
-        closeMasterIfNeeded()
-        finishOutput()
+        // Bounded final drain on the reader thread, which then closes the master and finishes
+        // the stream. Never block here: this runs on the cooperative pool.
+        reader?.finishAfterReap()
         for w in waiters {
             w.resume(returning: exit)
         }
@@ -633,6 +785,12 @@ public struct PosixPTYAdapter: PTYAdapter, SignalHandling, Sendable {
             )
         }
 
+        // Start reading the master before the child exists: macOS discards the terminal's
+        // output queue when the last slave closes, so a short-lived child's bytes must be
+        // consumed as they arrive, not after it is reaped.
+        let reader = PTYOutputReader(fd: master)
+        reader.start()
+
         do {
             // New session + controlling terminal for correct tty(1)/job control.
             let pid = try spawnChild(
@@ -646,6 +804,7 @@ public struct PosixPTYAdapter: PTYAdapter, SignalHandling, Sendable {
                 newProcessGroup: false
             )
             _ = sysClose(slave)
+            slave = -1
             let group = ProcessGroup()
             try group.attach(pid: UInt32(pid))
             scope?.register(group)
@@ -653,11 +812,13 @@ public struct PosixPTYAdapter: PTYAdapter, SignalHandling, Sendable {
                 identifier: "pid:\(pid)",
                 childPID: pid,
                 masterFD: master,
+                reader: reader,
                 processGroup: group
             )
         } catch {
-            _ = sysClose(master)
-            _ = sysClose(slave)
+            // The reader owns the master descriptor and closes it when it stops.
+            reader.stop()
+            if slave >= 0 { _ = sysClose(slave) }
             throw error
         }
     }
@@ -667,12 +828,17 @@ public struct PosixPTYAdapter: PTYAdapter, SignalHandling, Sendable {
         guard pipe(&outPipe) == 0 else {
             throw PTYError.spawnFailed("pipe failed: \(String(cString: strerror(errno)))")
         }
-        let devnull = open("/dev/null", O_RDONLY)
+        var devnull = open("/dev/null", O_RDONLY)
         guard devnull >= 0 else {
             _ = sysClose(outPipe[0])
             _ = sysClose(outPipe[1])
             throw PTYError.spawnFailed("open /dev/null failed")
         }
+
+        // Symmetric with the PTY path: the reader is parked on the read end before the writer
+        // exists, so nothing depends on when the reader is first scheduled.
+        let reader = PTYOutputReader(fd: outPipe[0])
+        reader.start()
 
         do {
             let pid = try spawnChild(
@@ -686,7 +852,9 @@ public struct PosixPTYAdapter: PTYAdapter, SignalHandling, Sendable {
                 newProcessGroup: spec.newProcessGroup
             )
             _ = sysClose(devnull)
+            devnull = -1
             _ = sysClose(outPipe[1])
+            outPipe[1] = -1
             let group = ProcessGroup()
             try group.attach(pid: UInt32(pid))
             scope?.register(group)
@@ -694,12 +862,13 @@ public struct PosixPTYAdapter: PTYAdapter, SignalHandling, Sendable {
                 identifier: "pid:\(pid)",
                 childPID: pid,
                 masterFD: outPipe[0],
+                reader: reader,
                 processGroup: group
             )
         } catch {
-            _ = sysClose(devnull)
-            _ = sysClose(outPipe[0])
-            _ = sysClose(outPipe[1])
+            reader.stop()
+            if devnull >= 0 { _ = sysClose(devnull) }
+            if outPipe[1] >= 0 { _ = sysClose(outPipe[1]) }
             throw error
         }
     }
