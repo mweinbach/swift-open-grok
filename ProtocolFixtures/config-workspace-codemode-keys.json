@@ -1,47 +1,92 @@
 {
   "$schema": "open-grok/protocol-fixtures/config-workspace-codemode-keys",
-  "codeModeMessageKinds": [
-    "request",
-    "response",
-    "notification",
-    "error"
+  "configSourceOrder": [
+    "requirement",
+    "cli",
+    "env",
+    "system_managed_config",
+    "managed_config",
+    "user_config",
+    "config",
+    "remote",
+    "default"
   ],
-  "configAuthorityOrder": [
-    "explicit",
-    "managed",
-    "project",
-    "user",
-    "defaults"
+  "configSourceWireCase": "snake_case",
+  "boolFlagResolutionPrecedence": "requirement > cli > env > config > managed > feature flag > default",
+  "permissionRuleActions": [
+    "allow",
+    "deny",
+    "ask"
   ],
+  "permissionRuleActionDefault": "deny",
+  "permissionRuleActionWireCase": "lowercase",
   "workspacePermissionOrder": [
     "deny",
     "ask",
     "allow"
   ],
+  "codeModeRuntimeDefaults": {
+    "DEFAULT_EXEC_YIELD_TIME_MS": 30000,
+    "DEFAULT_WAIT_YIELD_TIME_MS": 10000,
+    "DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL": 10000
+  },
   "implementedKeySets": {
-    "configAuthority": [
-      "explicit",
-      "managed",
-      "project",
-      "user",
-      "defaults"
+    "configSource": [
+      "requirement",
+      "cli",
+      "env",
+      "system_managed_config",
+      "managed_config",
+      "user_config",
+      "config",
+      "remote",
+      "default"
+    ],
+    "permissionRuleAction": [
+      "allow",
+      "deny",
+      "ask"
     ],
     "workspacePermission": [
       "deny",
       "ask",
       "allow"
-    ],
-    "codeModeMessageKind": [
-      "request",
-      "response",
-      "notification",
-      "error"
     ]
   },
-  "notes": "Checked-in key-order fixtures for implemented foundation contracts (Rust reference revision pinned).",
-  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "notes": "Checked-in key-order fixtures for implemented foundation contracts, recaptured at the 80dff0a9 pin with per-key Rust file:line provenance.",
+  "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+  "portDrift": {
+    "DEFAULT_EXEC_YIELD_TIME_MS": {
+      "swift": 10000,
+      "reference": 30000,
+      "swiftSources": [
+        "Sources/OpenGrokCodeModeProtocol/Runtime.swift:26"
+      ],
+      "note": "Upstream raised the Code Mode exec yield default from 10s to 30s between the two pins. The Swift port still carries 10s. Owned by W1-S4 (OpenGrokCodeModeProtocol), not by the fixture slice."
+    }
+  },
   "provenance": {
-    "source": "OpenGrokConfigTypes/OpenGrokWorkspaceTypes/OpenGrokCodeModeProtocol enums",
-    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+    "source": "xai-grok-config-types (ConfigSource, RuleAction) + xai-grok-code-mode-protocol (runtime defaults), cross-checked against OpenGrokConfigTypes/OpenGrokWorkspaceTypes/OpenGrokCodeModeProtocol",
+    "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+    "previousReferenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+    "pinVerdict": "recaptured",
+    "keyProvenance": {
+      "configSourceOrder": "crates/codegen/xai-grok-config-types/src/flags.rs:9-19 (declaration order; strum serialize_all = snake_case at :8). Mirrored by Sources/OpenGrokConfigTypes/Flags.swift:14-23.",
+      "boolFlagResolutionPrecedence": "crates/codegen/xai-grok-config-types/src/flags.rs:39 (doc comment on the bool-flag resolver)",
+      "permissionRuleActions": "crates/codegen/xai-grok-config-types/src/permission.rs:40-45; Deny is #[default] per the CWE-1188 note at :35-37; serde rename_all = lowercase at :39",
+      "workspacePermissionOrder": "Evaluation precedence deny > ask > allow, asserted by the PORT_PLAN.md global completion gate and by the allow/deny/ask policy lists in Sources/OpenGrokWorkspaceTypes/WorkspaceTypes.swift:220-232",
+      "codeModeRuntimeDefaults": "crates/codegen/xai-grok-code-mode-protocol/src/runtime.rs:11-13"
+    },
+    "recaptureNotes": [
+      "Removed `configAuthorityOrder` / `implementedKeySets.configAuthority` ([explicit, managed, project, user, defaults]). No Rust or Swift enum with those spellings exists at either pin; the key was an invented abstraction. Replaced with the real `ConfigSource` variant order.",
+      "Removed `codeModeMessageKinds` / `implementedKeySets.codeModeMessageKind` ([request, response, notification, error]). No CodeModeMessageKind enum exists in xai-grok-code-mode-protocol or Sources/OpenGrokCodeModeProtocol at either pin. Replaced with the crate's actual public runtime-default constants, one of which genuinely changed at this pin.",
+      "`workspacePermissionOrder` retained unchanged: verified still correct at 80dff0a9."
+    ],
+    "evidence": [
+      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-grok-config-types/src/flags.rs => empty (ConfigSource unchanged)",
+      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-grok-config-types/src/permission.rs => empty (RuleAction unchanged)",
+      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-grok-workspace-types => touches src/rpc/* only; src/types/permission.rs is byte-identical, so PermissionDecision and the permission policy shape are unchanged",
+      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-grok-code-mode-protocol => DEFAULT_EXEC_YIELD_TIME_MS 10_000 -> 30_000 (src/runtime.rs:11) with the matching exec tool-description text at src/description.rs:20"
+    ]
   }
 }

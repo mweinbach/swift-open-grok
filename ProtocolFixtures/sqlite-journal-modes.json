@@ -15,9 +15,21 @@
   "networkFSUsesTruncate": true,
   "localFSUsesWAL": true,
   "truncateHostSuffixPattern": ".h-<host>",
-  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+  "referenceEnvOverride": "GROK_SQLITE_JOURNAL_MODE",
   "provenance": {
     "source": "OpenGrokSQLiteJournal.JournalMode vs xai-sqlite-journal",
-    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+    "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+    "previousReferenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+    "pinVerdict": "unchanged (verified)",
+    "keyProvenance": {
+      "journalModes/pragmaValues": "crates/codegen/xai-sqlite-journal/src/lib.rs:23-30 (JournalMode::Wal/Truncate) and :83-84 (pragma spellings \"WAL\"/\"TRUNCATE\")",
+      "referenceEnvOverride": "crates/codegen/xai-sqlite-journal/src/lib.rs:40 — the reference reads only GROK_SQLITE_JOURNAL_MODE; the branded OPENGROK_SQLITE_JOURNAL_MODE alias is a Swift-port addition, not a reference key",
+      "networkFSUsesTruncate/localFSUsesWAL": "crates/codegen/xai-sqlite-journal/src/lib.rs:67-69 (network filesystems fall back to TRUNCATE, local stays WAL)",
+      "truncateHostSuffixPattern": "crates/codegen/xai-sqlite-journal/src/lib.rs:90-105 (per-host sibling file, TRUNCATE only)"
+    },
+    "evidence": [
+      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-sqlite-journal => empty (no source or Cargo.toml change)"
+    ]
   }
 }

@@ -1,32 +1,32 @@
 {
   "version": 1,
-  "generatedAt": "2026-07-22",
-  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "generatedAt": "2026-08-05",
+  "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
   "files": [
     {
       "path": "ProtocolFixtures/acp-methods.json",
-      "sizeBytes": 732,
-      "sha256": "c30d1167caca873b1c3192a47a9696003a535bf8cd1d9e3b8f42902272093b39"
+      "sizeBytes": 1233,
+      "sha256": "292dad9d3cb8fcd0d3eb5a7adafe820ccb1faaef3dd8c9af613e1c6e36c71695"
     },
     {
       "path": "ProtocolFixtures/cli-version-and-home.json",
-      "sizeBytes": 647,
-      "sha256": "57e5c8957676c3c4196c3bddbf68e9ff757e7b694563301b487802257443d263"
+      "sizeBytes": 2484,
+      "sha256": "d56ae0a2448fb15b00278f5706c9dbf39f40532c158c9e1b8b5cb975f39dc580"
     },
     {
       "path": "ProtocolFixtures/config-workspace-codemode-keys.json",
-      "sizeBytes": 1045,
-      "sha256": "4b21c8466c793f28119696d8f807d771efabafb971608b8afaf2b99bc0b3db20"
+      "sizeBytes": 4585,
+      "sha256": "8ca16d815dbfca4c6bcac6bb04ae3f71cd5539bd5c70a2967d7798ec3b9a4bd3"
     },
     {
       "path": "ProtocolFixtures/crash-gcrx-format.json",
-      "sizeBytes": 853,
-      "sha256": "f33d1506feb41f5d9e38c66dfa130bcfa22397f8548306ae71276b1954a3a22c"
+      "sizeBytes": 2774,
+      "sha256": "25409f2684575a9724fc908234df6360f81cd7200cc66583f3a31240e575768b"
     },
     {
       "path": "ProtocolFixtures/crash-gcrx-sample.bin",
       "sizeBytes": 64,
-      "sha256": "2fe75302987a1327442ddbf786fc3ce8e0fb3a17e0283eac3723f44ad6ca5ec2"
+      "sha256": "f9250fe6db712292daa6055af98ccd1f0669950cbb3f6a58686b55ec27591bdb"
     },
     {
       "path": "ProtocolFixtures/git-loose-blob-hello.zlib",
@@ -35,13 +35,13 @@
     },
     {
       "path": "ProtocolFixtures/git-object-and-index.json",
-      "sizeBytes": 913,
-      "sha256": "eae1e53cd271d8a02c3bb17c53aa23eeb16e0897151088f31a041612fd454521"
+      "sizeBytes": 1639,
+      "sha256": "4d965136e3b5d40a8ac029aa210de25c35e0fbe458c919a3d829a87a87cc84c6"
     },
     {
       "path": "ProtocolFixtures/hunk-tracker-snapshot.json",
-      "sizeBytes": 913,
-      "sha256": "9d8a19c9d11204be06faeeaca5243ea12bf117f21e7001e4f908d4b66ccd0e41"
+      "sizeBytes": 2094,
+      "sha256": "0d52cf52b76b0ae4516de37ad9222cfadbd2d3c19ab19b6a2e72f251a1744988"
     },
     {
       "path": "ProtocolFixtures/otlp-export-trace-grpc.bin",
@@ -55,28 +55,28 @@
     },
     {
       "path": "ProtocolFixtures/otlp-span-export-shape.json",
-      "sizeBytes": 1483,
-      "sha256": "c1b9ba44b19b7f3a8086b4d2004f06c98e36f9c2e248e36d76fab1925e79de6b"
+      "sizeBytes": 2707,
+      "sha256": "4c4475a907917c2fa8785a57b59ba408a91925678927c83f310ad0b5e41d5c1f"
     },
     {
       "path": "ProtocolFixtures/PROVENANCE.json",
-      "sizeBytes": 926,
-      "sha256": "f9690c273a615c190d273b32053c4204becf27d69e420ab4b3e410d36557f76a"
+      "sizeBytes": 8472,
+      "sha256": "edcc731c77f9f69715af704d0e6b7bb72ac905abb4dbd29932c92b022f6d80bc"
     },
     {
       "path": "ProtocolFixtures/pty-process-signals.json",
-      "sizeBytes": 632,
-      "sha256": "887283a66e560c7781a2b11f2545fa4837255e2543b340f8c8ae50ef6124cbd6"
+      "sizeBytes": 1359,
+      "sha256": "2079ae77930f1cedfef609299074e47c187a26fc0b5a976742d827aaaa0e4575"
     },
     {
       "path": "ProtocolFixtures/sqlite-journal-modes.json",
-      "sizeBytes": 615,
-      "sha256": "fc7bce6e00eb4d81b8b96d6e31b55435597c62771461cb8d9a9b2362fcfdf2c9"
+      "sizeBytes": 1644,
+      "sha256": "9f130449f98232995a45f502b7fc652ebb22ce917a7280dfcf93fa6aca79d1e7"
     },
     {
       "path": "ProtocolFixtures/tracing-w3c-traceparent.json",
-      "sizeBytes": 811,
-      "sha256": "3c5e66e00b89bcd4477d98bdb82297534b5124194f3f2ddf59237ae4d72d4809"
+      "sizeBytes": 1861,
+      "sha256": "5b3060080196137097c58db0e20104af1ef383593d54dbc5fc46efdbd87d5c89"
     }
   ]
 }

@@ -10,9 +10,20 @@
   "version": 1,
   "headerSize": 64,
   "maxFrames": 64,
+  "maxFileSize": 576,
   "versionStringLength": 32,
   "layout": "magic(4)+version(1)+signal(1)+si_code(4)+si_addr(8)+pid(4)+timestamp(8)+n_frames(2)+app_version(32)+frames(n*8)",
   "endianness": "little",
+  "capturedSignals": {
+    "unix": [
+      "SIGBUS",
+      "SIGSEGV",
+      "SIGABRT"
+    ],
+    "windows": [
+      "EXCEPTION_ACCESS_VIOLATION"
+    ]
+  },
   "sampleFixture": "ProtocolFixtures/crash-gcrx-sample.bin",
   "sample": {
     "signal": 11,
@@ -21,11 +32,30 @@
     "pid": 4242,
     "timestamp": 1700000000,
     "nFrames": 0,
-    "appVersion": "0.1.220-open-grok.21"
+    "appVersion": "0.1.220-open-grok.53"
   },
-  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
   "provenance": {
-    "source": "OpenGrokCrashHandler.CrashBlobFormat / CrashBlob.serialize",
-    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+    "source": "OpenGrokCrashHandler.CrashBlobFormat / CrashBlob.serialize vs xai-crash-handler",
+    "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+    "previousReferenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+    "pinVerdict": "recaptured",
+    "recapturedFields": [
+      "capturedSignals",
+      "maxFileSize",
+      "sample.appVersion",
+      "ProtocolFixtures/crash-gcrx-sample.bin"
+    ],
+    "keyProvenance": {
+      "magic/version/maxFrames/versionStringLength/headerSize/maxFileSize": "crates/codegen/xai-crash-handler/src/format.rs:7,10,13,16,30,33 — byte-identical between the two pins",
+      "layout": "crates/codegen/xai-crash-handler/src/format.rs:136-151 (writer) and :53-71 (parser); mirrored by Sources/OpenGrokCrashHandler/OpenGrokCrashHandler.swift:100-197",
+      "capturedSignals.unix": "crates/codegen/xai-crash-handler/src/handler.rs:306-308 (SIGBUS, SIGSEGV, SIGABRT)",
+      "capturedSignals.windows": "crates/codegen/xai-crash-handler/src/handler.rs:1-8 module doc — abort() does not route through SetUnhandledExceptionFilter, so SIGABRT capture is Unix-only"
+    },
+    "evidence": [
+      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-crash-handler/src/format.rs => empty. The GCRX header layout, magic, version byte, frame cap, and version-string field are unchanged; the binary golden is byte-compatible with the old parser.",
+      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-crash-handler/src/handler.rs => adds `libc::sigaction(libc::SIGABRT, &sa, ...)` at src/handler.rs:308 so that `panic = \"abort\"` release builds leave a crash report. Recorded as the new `capturedSignals` key.",
+      "crash-gcrx-sample.bin re-encoded with the app_version field set to the release pinned at 80dff0a9 (OPEN_GROK_VERSION = 0.1.220-open-grok.53); every other header byte is identical to the 9739c4a2 capture."
+    ]
   }
 }

@@ -16,9 +16,16 @@
     "darwinLinux": "OpenGrokPTYC setsid+TIOCSCTTY spawn shim",
     "windows": "ConPTY/Job Objects later; typed unsupported"
   },
-  "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+  "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
   "provenance": {
     "source": "OpenGrokPTY.ProcessSignal portableValue vs ptyctl",
-    "referenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4"
+    "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+    "previousReferenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+    "pinVerdict": "unchanged (verified)",
+    "evidence": [
+      "git diff 9739c4a2..80dff0a9 -- crates/codegen/ptyctl => 3 files, 6 insertions / 4 deletions, none behavioral: src/pty.rs adds an `#[allow(clippy::disallowed_methods)]` over the existing spawn_command call, src/styled.rs and src/term.rs are comment/formatting-only.",
+      "The signal numbers are POSIX-assigned (SIGHUP 1, SIGINT 2, SIGKILL 9, SIGTERM 15, SIGWINCH 28 on Darwin/Linux) and are not defined by the reference.",
+      "crates/codegen/ptyctl/src/pty.rs:42 still documents resize as TIOCSWINSZ with kernel-delivered SIGWINCH, matching `platformSeams.darwinLinux`."
+    ]
   }
 }
