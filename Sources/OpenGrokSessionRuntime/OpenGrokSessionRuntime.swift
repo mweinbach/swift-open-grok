@@ -301,6 +301,9 @@ private func stableDigest(_ value: JSONValue) -> String {
     return stableDigest(String(data: (try? encoder.encode(value)) ?? Data(), encoding: .utf8) ?? "")
 }
 
-private extension UInt64 {
+// Internal rather than fileprivate so the module's other files (the workflow
+// run registry) can bump their own counters with it instead of reaching for a
+// helper in another module.
+extension UInt64 {
     func saturatingAdd(_ value: UInt64) -> UInt64 { addingReportingOverflow(value).overflow ? UInt64.max : self + value }
 }

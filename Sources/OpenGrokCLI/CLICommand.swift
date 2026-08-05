@@ -174,6 +174,8 @@ public struct CLILeaderOptions: Sendable, Equatable {
 
 public enum CLISessionAction: String, Sendable, Equatable {
     case list
+    case show
+    case delete
     case new
     case resume
     case restore

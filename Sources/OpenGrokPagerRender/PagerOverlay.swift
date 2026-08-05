@@ -245,6 +245,150 @@ func pagerFuzzyMatches(needle: String, haystack: String) -> Bool {
     return true
 }
 
+// MARK: - Workflows overlay
+
+/// One agent in a run's roster, as `/workflows` shows it.
+public struct PagerWorkflowAgent: Sendable, Equatable, Hashable {
+    public var name: String
+    /// `running`, `ok`, `failed`, `cancelled`, or a terminal reason such as
+    /// `budget_exceeded`.
+    public var state: String
+    public var phase: String?
+    public var tokensUsed: UInt64
+
+    public init(name: String, state: String, phase: String? = nil, tokensUsed: UInt64 = 0) {
+        self.name = name
+        self.state = state
+        self.phase = phase
+        self.tokensUsed = tokensUsed
+    }
+}
+
+/// One run in the dashboard. Mirrors the columns of the reference's `/workflows`
+/// run dashboard — display name, phase, agent roster, progress, result
+/// (`docs/user-guide/04-slash-commands.md`, `/workflows`).
+public struct PagerWorkflowRow: Sendable, Equatable, Hashable {
+    public var runID: String
+    /// The display name. Upstream numbers duplicate handles (`review-changes-2`)
+    /// and never surfaces internal run ids in commands; this carries whatever
+    /// the caller resolved.
+    public var name: String
+    public var status: String
+    public var phase: String?
+    public var agentsFinished: Int
+    /// The run's agent-call budget — the denominator upstream shows as progress.
+    public var agentBudget: UInt64
+    public var tokensUsed: UInt64
+    public var message: String?
+    public var result: String?
+    public var agents: [PagerWorkflowAgent]
+
+    public init(
+        runID: String,
+        name: String,
+        status: String,
+        phase: String? = nil,
+        agentsFinished: Int = 0,
+        agentBudget: UInt64 = 0,
+        tokensUsed: UInt64 = 0,
+        message: String? = nil,
+        result: String? = nil,
+        agents: [PagerWorkflowAgent] = []
+    ) {
+        self.runID = runID
+        self.name = name
+        self.status = status
+        self.phase = phase
+        self.agentsFinished = agentsFinished
+        self.agentBudget = agentBudget
+        self.tokensUsed = tokensUsed
+        self.message = message
+        self.result = result
+        self.agents = agents
+    }
+}
+
+/// The `/workflows` run dashboard: active and retained runs, with a per-run
+/// detail view reached by `enter` and left by `esc`.
+///
+/// This is a *run* dashboard, not a catalog of saved workflow definitions —
+/// the distinction upstream draws explicitly.
+public struct PagerWorkflowsOverlay: Sendable, Equatable, Hashable {
+    public var rows: [PagerWorkflowRow]
+    public var selectedIndex: Int
+    public var scrollOffset: Int
+    /// `true` while the selected run's detail view is open. `esc` closes the
+    /// detail first and the overlay second, so a user never loses the dashboard
+    /// by pressing escape once.
+    public var isDetailOpen: Bool
+    public var emptyMessage: String
+
+    public init(
+        rows: [PagerWorkflowRow],
+        selectedIndex: Int = 0,
+        scrollOffset: Int = 0,
+        isDetailOpen: Bool = false,
+        emptyMessage: String = "No workflow runs"
+    ) {
+        self.rows = rows
+        self.selectedIndex = selectedIndex
+        self.scrollOffset = scrollOffset
+        self.isDetailOpen = isDetailOpen
+        self.emptyMessage = emptyMessage
+        clampSelection()
+    }
+
+    public var selectedRow: PagerWorkflowRow? {
+        rows.indices.contains(selectedIndex) ? rows[selectedIndex] : nil
+    }
+
+    mutating func clampSelection() {
+        guard !rows.isEmpty else {
+            selectedIndex = 0
+            scrollOffset = 0
+            isDetailOpen = false
+            return
+        }
+        selectedIndex = min(max(selectedIndex, 0), rows.count - 1)
+        scrollOffset = max(0, scrollOffset)
+    }
+
+    mutating func moveSelection(by delta: Int) {
+        guard !rows.isEmpty else { return }
+        selectedIndex = min(max(selectedIndex + delta, 0), rows.count - 1)
+    }
+
+    /// The lines the detail view renders for the selected run.
+    public var detailLines: [String] {
+        guard let row = selectedRow else { return [] }
+        var lines = [
+            "run:      \(row.runID)",
+            "workflow: \(row.name)",
+            "status:   \(row.status)",
+        ]
+        if let phase = row.phase { lines.append("phase:    \(phase)") }
+        lines.append("agents:   \(row.agentsFinished) done of \(row.agentBudget) budget")
+        if row.tokensUsed > 0 { lines.append("tokens:   ~\(row.tokensUsed)") }
+        if let message = row.message { lines.append("message:  \(message)") }
+        if !row.agents.isEmpty {
+            lines.append("")
+            lines.append("agents")
+            for agent in row.agents {
+                var line = "  \(agent.name) — \(agent.state)"
+                if let phase = agent.phase { line += " [\(phase)]" }
+                if agent.tokensUsed > 0 { line += " ~\(agent.tokensUsed)t" }
+                lines.append(line)
+            }
+        }
+        if let result = row.result {
+            lines.append("")
+            lines.append("result")
+            lines.append("  \(result)")
+        }
+        return lines
+    }
+}
+
 // MARK: - Text overlay
 
 /// A scrollable body of pre-styled lines — `/help` output, session info.
@@ -439,6 +583,7 @@ public enum PagerOverlayContent: Sendable, Equatable, Hashable {
     case text(PagerTextOverlay)
     case welcome(PagerWelcomeOverlay)
     case permission(PagerPermissionPrompt)
+    case workflows(PagerWorkflowsOverlay)
 }
 
 public struct PagerOverlay: Sendable, Equatable, Hashable {
@@ -531,6 +676,30 @@ extension PagerOverlay {
             overlay.content = .list(list)
         }
         return overlay
+    }
+
+    /// `/workflows` — the live run dashboard.
+    ///
+    /// A modal rather than a bottom sheet: it is a workspace the user navigates
+    /// (rows, then a detail view), not a prompt to answer, and upstream makes it
+    /// fullscreen-only for the same reason.
+    public static func workflows(
+        id: String = "workflows",
+        title: String = "Workflow Runs",
+        rows: [PagerWorkflowRow]
+    ) -> PagerOverlay {
+        PagerOverlay(
+            id: id,
+            title: title,
+            presentation: .centeredModal(.medium),
+            hints: [
+                PagerOverlayHint(key: "↑/↓", label: "select"),
+                PagerOverlayHint(key: "Enter", label: "detail"),
+                PagerOverlayHint(key: "p/r/x", label: "pause/resume/stop"),
+                PagerOverlayHint(key: "Esc", label: "close")
+            ],
+            content: .workflows(PagerWorkflowsOverlay(rows: rows))
+        )
     }
 
     /// `/help` — a modal, not a transcript dump (spec §16.5).
@@ -679,6 +848,16 @@ public struct PagerOverlayStack: Sendable, Equatable {
         var overlay = overlays[index]
 
         if event.key == .escape, event.modifiers.isEmpty {
+            // A run's detail view is a layer inside the overlay, not a second
+            // overlay, so escape has to unwind it first — otherwise one keypress
+            // from the detail view throws away the dashboard too.
+            if case .workflows(var runs) = overlay.content, runs.isDetailOpen {
+                runs.isDetailOpen = false
+                runs.scrollOffset = 0
+                overlay.content = .workflows(runs)
+                overlays[index] = overlay
+                return .redraw
+            }
             guard overlay.dismissOnEscape else { return .consumed }
             overlays.remove(at: index)
             return .dismissed(id: overlay.id)
@@ -698,6 +877,9 @@ public struct PagerOverlayStack: Sendable, Equatable {
         case .permission(var prompt):
             outcome = handlePermission(&prompt, overlay: overlay, event: event)
             overlay.content = .permission(prompt)
+        case .workflows(var runs):
+            outcome = handleWorkflows(&runs, overlay: overlay, event: event, viewportHeight: viewportHeight)
+            overlay.content = .workflows(runs)
         }
 
         overlays[index] = overlay
@@ -758,6 +940,87 @@ public struct PagerOverlayStack: Sendable, Equatable {
             list.scrollOffset = 0
             list.clampSelection()
             return .redraw
+        default:
+            return .consumed
+        }
+    }
+
+    private func handleWorkflows(
+        _ runs: inout PagerWorkflowsOverlay,
+        overlay: PagerOverlay,
+        event: KeyEvent,
+        viewportHeight: Int
+    ) -> PagerOverlayOutcome {
+        let page = max(1, viewportHeight)
+        if runs.isDetailOpen {
+            // In the detail view the arrows scroll the run's own body rather
+            // than moving between runs.
+            let maximum = max(0, runs.detailLines.count - page)
+            func scroll(by delta: Int) -> PagerOverlayOutcome {
+                let target = min(max(0, runs.scrollOffset + delta), maximum)
+                guard target != runs.scrollOffset else { return .consumed }
+                runs.scrollOffset = target
+                return .redraw
+            }
+            switch event.key {
+            case .up: return scroll(by: -1)
+            case .down: return scroll(by: 1)
+            case .pageUp: return scroll(by: -page)
+            case .pageDown: return scroll(by: page)
+            case .home: return scroll(by: -maximum)
+            case .end: return scroll(by: maximum)
+            case .char(let character) where event.modifiers.isEmpty:
+                switch character {
+                case "j": return scroll(by: 1)
+                case "k": return scroll(by: -1)
+                // `p` pauses, `r` resumes, `x` stops. The overlay reports the
+                // intent as a row selection and the session performs it: the
+                // render layer has no way to reach a run, and giving it one
+                // would put session control in the frame model.
+                case "p", "r", "x":
+                    guard let row = runs.selectedRow else { return .consumed }
+                    return .selected(id: overlay.id, rowID: "\(character):\(row.runID)")
+                default: return .consumed
+                }
+            default:
+                return .consumed
+            }
+        }
+        switch event.key {
+        case .up:
+            runs.moveSelection(by: -1)
+            return .redraw
+        case .down:
+            runs.moveSelection(by: 1)
+            return .redraw
+        case .pageUp:
+            runs.moveSelection(by: -page)
+            return .redraw
+        case .pageDown:
+            runs.moveSelection(by: page)
+            return .redraw
+        case .home:
+            runs.selectedIndex = 0
+            runs.clampSelection()
+            return .redraw
+        case .end:
+            runs.selectedIndex = max(0, runs.rows.count - 1)
+            runs.clampSelection()
+            return .redraw
+        case .enter:
+            guard runs.selectedRow != nil else { return .consumed }
+            runs.isDetailOpen = true
+            runs.scrollOffset = 0
+            return .redraw
+        case .char(let character) where event.modifiers.isEmpty:
+            switch character {
+            case "j": runs.moveSelection(by: 1); return .redraw
+            case "k": runs.moveSelection(by: -1); return .redraw
+            case "p", "r", "x":
+                guard let row = runs.selectedRow else { return .consumed }
+                return .selected(id: overlay.id, rowID: "\(character):\(row.runID)")
+            default: return .consumed
+            }
         default:
             return .consumed
         }

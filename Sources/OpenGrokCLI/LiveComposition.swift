@@ -11,6 +11,7 @@ import OpenGrokPagerRender
 import OpenGrokProviderSession
 import OpenGrokSampler
 import OpenGrokSamplingTypes
+import OpenGrokSessionRuntime
 import OpenGrokShared
 import OpenGrokShell
 import OpenGrokShellBase
@@ -53,6 +54,15 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
     public let prompt: String
     public let items: [ConversationItem]
     public let tools: [ToolSpec]
+    /// Force the model to answer in this JSON Schema (strict mode).
+    ///
+    /// A workflow's `agent(prompt, #{output_schema: ...})` is the only caller
+    /// today: the script indexes into the result (`r.output.gaps`), so a prose
+    /// answer would make the workflow take a wrong branch rather than fail
+    /// loudly. Only the chat-completions backend projects this
+    /// (`ConversationExtensions.swift:224`); on the other backends it is
+    /// carried but ignored, and the runner falls back to parsing the text.
+    public let jsonSchema: JSONValue?
 
     public init(
         sessionID: String,
@@ -60,7 +70,8 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         model: String,
         prompt: String,
         items: [ConversationItem]? = nil,
-        tools: [ToolSpec] = []
+        tools: [ToolSpec] = [],
+        jsonSchema: JSONValue? = nil
     ) {
         self.sessionID = sessionID
         self.turnID = turnID
@@ -68,6 +79,7 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         self.prompt = prompt
         self.items = items ?? [.user(prompt)]
         self.tools = tools
+        self.jsonSchema = jsonSchema
     }
 }
 
@@ -154,7 +166,8 @@ public struct OpenGrokLiveSampler: Sendable {
                 toolChoice: request.tools.isEmpty ? nil : .auto,
                 model: request.model,
                 xGrokReqId: request.turnID,
-                xGrokSessionId: request.sessionID
+                xGrokSessionId: request.sessionID,
+                jsonSchema: request.jsonSchema
             )) { delta in
                 await emit(.output(delta))
             }
@@ -598,6 +611,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             if LiveMCPComposition.handles(command) {
                 return try await LiveMCPComposition.session(for: command, context: context)
             }
+            if LiveWorkflowComposition.handles(command) {
+                return try await LiveWorkflowComposition.session(for: command, context: context)
+            }
             guard case .launch(let options) = command else {
                 throw CLIApplicationError.unsupported(route: command.routeName)
             }
@@ -656,6 +672,52 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 ),
                 environment: context.environment
             )
+            // A `--workflow` launch is a background run, exactly as upstream:
+            // it is registered and started here and the session continues
+            // unblocked. A non-interactive launch has no session to continue
+            // into, so it waits for the run and reports it — otherwise the
+            // process would exit while its agents were still working.
+            // One registry per session, shared by the `--workflow` launch and
+            // the `/workflows` dashboard, so both see the same runs.
+            let workflowRegistry = LiveWorkflowLaunch.makeRegistry(openGrokHome: openGrokHome)
+            // Runs left active by a previous process are marked interrupted
+            // before this one starts, so the dashboard never shows a run as
+            // progressing with no task behind it.
+            _ = try? await workflowRegistry.restore()
+            if let workflowPath = options.common.workflow {
+                let registry = workflowRegistry
+                let record = try await LiveWorkflowLaunch.start(
+                    script: try LiveWorkflowComposition.readScript(at: workflowPath),
+                    registry: registry,
+                    session: LiveWorkflowLaunch.Session(
+                        sampler: sampler,
+                        model: samplingConfiguration.model,
+                        workspaceRoot: cwd,
+                        sessionID: sessionID,
+                        openGrokHome: openGrokHome,
+                        systemPrompt: agentProfile?.systemPrompt,
+                        toolPolicy: agentProfile?.toolPolicy,
+                        fileAccessPolicy: Self.resolveFileAccessPolicy(
+                            environment: context.environment,
+                            coordinator: permissionCoordinator
+                        ),
+                        makeProcessBackend: dependencies.makeProcessBackend,
+                        environment: context.environment
+                    )
+                )
+                if options.mode != .interactive {
+                    context.streams.out("workflow run \(record.runID) started\n")
+                    _ = try await registry.awaitCompletion(runID: record.runID)
+                    context.streams.out(LiveWorkflowComposition.renderDetail(
+                        try await registry.view(runID: record.runID)
+                    ))
+                    await toolExecutor.shutdown()
+                    return CLIApplicationSession(waitForExit: {}, shutdown: {})
+                }
+                context.streams.out(
+                    "workflow run \(record.runID) started in the background; watch it with /workflows\n"
+                )
+            }
             // Code Mode is a session-wide decision: the tool surface it
             // projects is fixed for the life of the timeline, which is what
             // makes a `wait` after a yield resolvable.
@@ -738,6 +800,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         modelCatalog: LiveModelCatalogResolver.catalog(),
                         modelSwitch: modelSwitch,
                         permissionCoordinator: permissionCoordinator,
+                        workflowRegistry: workflowRegistry,
                         terminalProgram: context.environment["TERM_PROGRAM"]
                     )
                     let controller = OpenGrokPagerInteractiveController(
@@ -863,8 +926,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         if !options.common.pluginDirectories.isEmpty {
             throw CLIApplicationError.unsupported(route: "plugins")
         }
-        if options.common.mcpConfig != nil || options.common.workflow != nil {
-            throw CLIApplicationError.unsupported(route: "MCP and workflows")
+        if options.common.mcpConfig != nil {
+            throw CLIApplicationError.unsupported(route: "MCP config")
         }
         if options.common.leader || options.common.noLeader {
             throw CLIApplicationError.unsupported(route: "interactive composition options")
@@ -1940,6 +2003,56 @@ struct LiveAgentToolPolicy: Sendable, Equatable {
         capabilityMode = definition.capabilityMode
     }
 
+    private init(
+        configuredTools: [String],
+        allowlist: [String],
+        denylist: [String],
+        sessionAllowlist: [String]?,
+        sessionDenylist: [String],
+        capabilityMode: AgentCapabilityMode?
+    ) {
+        self.configuredTools = configuredTools
+        self.allowlist = allowlist
+        self.denylist = denylist
+        self.sessionAllowlist = sessionAllowlist
+        self.sessionDenylist = sessionDenylist
+        self.capabilityMode = capabilityMode
+    }
+
+    /// A policy that constrains nothing except the capability mode.
+    ///
+    /// `allows(liveToolName:)` requires membership in `configuredTools`, so an
+    /// "unrestricted" policy cannot express itself as an empty list — the
+    /// sentinel below makes every name match instead. Used for a workflow child
+    /// in a session that has no agent profile: the only thing to enforce is the
+    /// clamped capability.
+    init(unrestrictedWith capabilityMode: AgentCapabilityMode) {
+        self.init(
+            configuredTools: [Self.wildcard],
+            allowlist: [],
+            denylist: [],
+            sessionAllowlist: nil,
+            sessionDenylist: [],
+            capabilityMode: capabilityMode
+        )
+    }
+
+    /// The same policy with a different capability mode. Narrowing only: the
+    /// caller (`LiveWorkflowLaunch.clampedPolicy`) has already clamped against
+    /// the parent's mode.
+    func withCapabilityMode(_ mode: AgentCapabilityMode) -> LiveAgentToolPolicy {
+        LiveAgentToolPolicy(
+            configuredTools: configuredTools,
+            allowlist: allowlist,
+            denylist: denylist,
+            sessionAllowlist: sessionAllowlist,
+            sessionDenylist: sessionDenylist,
+            capabilityMode: mode
+        )
+    }
+
+    static let wildcard = "*"
+
     func allows(liveToolName: String) -> Bool {
         let aliases = Self.aliases(for: liveToolName)
         guard Self.matches(configuredTools, aliases: aliases) else { return false }
@@ -1965,6 +2078,7 @@ struct LiveAgentToolPolicy: Sendable, Equatable {
 
     private static func matches(_ entries: [String], aliases: Set<String>) -> Bool {
         entries.contains { entry in
+            if entry == wildcard { return true }
             let shortName = entry.split(separator: ":").last.map(String.init) ?? entry
             return aliases.contains(entry) || aliases.contains(shortName)
         }
@@ -2654,6 +2768,11 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     private var overlays = PagerOverlayStack()
     private var lastOverlayBounds: [PagerOverlayBounds] = []
     private let permissionCoordinator: PagerPermissionCoordinator?
+    /// The background workflow registry, when this session has one. `/workflows`
+    /// reads it live at present time rather than caching rows, so the dashboard
+    /// reflects runs started after the session began — including ones another
+    /// process on the same `OPENGROK_HOME` started.
+    private let workflowRegistry: RhaiWorkflowRunRegistry?
     private var currentPermissionRequestID: String?
     private var hasStartedFirstTurn = false
 
@@ -2672,6 +2791,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         modelCatalog: [(id: String, provider: String)] = [],
         modelSwitch: LiveModelSwitchCoordinator? = nil,
         permissionCoordinator: PagerPermissionCoordinator? = nil,
+        workflowRegistry: RhaiWorkflowRunRegistry? = nil,
         terminalProgram: String? = nil,
         enableMouseReporting: Bool = true
     ) {
@@ -2685,6 +2805,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             : modelCatalog
         self.modelSwitch = modelSwitch
         self.permissionCoordinator = permissionCoordinator
+        self.workflowRegistry = workflowRegistry
         self.wheelTuning = MouseWheelTuning(
             eventsPerTick: MouseWheelTuning.eventsPerTick(forTerminalProgram: terminalProgram)
         )
@@ -2917,10 +3038,34 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                     ? "Mouse reporting on. Wheel scrolls the transcript; click selects overlay rows."
                     : "Mouse reporting off. Click and drag now selects text for your terminal's copy/paste."
             ))
+        case .workflows:
+            guard let workflowRegistry else {
+                conversation.appendMessage(PagerMessage(
+                    role: .system,
+                    text: "No workflow runs in this session. Launch one with --workflow <file>."
+                ))
+                return
+            }
+            let views = (try? await workflowRegistry.views()) ?? []
+            overlays.push(.workflows(rows: LiveWorkflowOverlayBuilder.rows(from: views)))
         case .dismissAll:
             overlays.removeAll()
             currentPermissionRequestID = nil
         }
+    }
+
+    /// A control key from the dashboard (`p`/`r`/`x`). Reported as a row
+    /// selection by the overlay because the render layer cannot reach a run.
+    private func handleWorkflowSelection(rowID: String) async -> Bool {
+        guard let workflowRegistry,
+              let command = LiveWorkflowOverlayBuilder.command(forRowID: rowID)
+        else { return false }
+        let message = await LiveWorkflowOverlayBuilder.apply(command, registry: workflowRegistry)
+        conversation.appendMessage(PagerMessage(role: .system, text: message))
+        let views = (try? await workflowRegistry.views()) ?? []
+        overlays.dismiss(id: "workflows")
+        overlays.push(.workflows(rows: LiveWorkflowOverlayBuilder.rows(from: views)))
+        return true
     }
 
     /// Push or replace the permission sheet. Driven by the coordinator's
@@ -2958,6 +3103,13 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 requestID: String(overlayID.dropFirst("permission:".count)),
                 decision: decision
             )
+            return
+        }
+        if overlayID == "workflows" {
+            // The dashboard stays open: a control key acts on a run and
+            // refreshes the rows, it does not close the surface the user is
+            // working in.
+            if await handleWorkflowSelection(rowID: rowID) { return }
             return
         }
         overlays.dismiss(id: overlayID)

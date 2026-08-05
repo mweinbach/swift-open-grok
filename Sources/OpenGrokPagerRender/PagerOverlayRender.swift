@@ -188,6 +188,14 @@ private func renderCenteredModal(
         )
     case .welcome(let welcome):
         rows = drawWelcomeBody(welcome, in: content, buffer: &buffer, theme: theme)
+    case .workflows(let runs):
+        rows = drawWorkflowsBody(
+            runs,
+            in: content,
+            background: theme.bgBase,
+            buffer: &buffer,
+            theme: theme
+        )
     }
 
     let hints = drawModalFooter(overlay.hints, in: footer, buffer: &buffer, theme: theme)
@@ -562,6 +570,8 @@ func pagerBottomSheetHeight(
         contentRows = 2 + text.lines.count
     case .welcome:
         contentRows = screenHeight
+    case .workflows(let runs):
+        contentRows = 2 + (runs.isDetailOpen ? runs.detailLines.count : max(1, runs.rows.count))
     }
     let ceiling = max(1, screenHeight * 80 / 100)
     let preferred = max(screenHeight / 2, 10)
@@ -640,6 +650,14 @@ private func renderBottomSheet(
         drawTextBody(text, in: content, buffer: &buffer, theme: theme)
     case .welcome(let welcome):
         rows = drawWelcomeBody(welcome, in: content, buffer: &buffer, theme: theme)
+    case .workflows(let runs):
+        rows = drawWorkflowsBody(
+            runs,
+            in: content,
+            background: theme.bgLight,
+            buffer: &buffer,
+            theme: theme
+        )
     }
 
     return PagerOverlayBounds(
@@ -857,8 +875,19 @@ private func renderFullScreenOverlay(
     paintBlank(&buffer, area: frame, foreground: theme.textPrimary, background: theme.bgBase)
 
     var rows: [PagerOverlayBounds.Row] = []
-    if case .welcome(let welcome) = overlay.content {
+    switch overlay.content {
+    case .welcome(let welcome):
         rows = drawWelcomeBody(welcome, in: frame, buffer: &buffer, theme: theme)
+    case .workflows(let runs):
+        rows = drawWorkflowsBody(
+            runs,
+            in: frame,
+            background: theme.bgBase,
+            buffer: &buffer,
+            theme: theme
+        )
+    default:
+        break
     }
     return PagerOverlayBounds(
         id: overlay.id,
@@ -1120,4 +1149,88 @@ private func drawWelcomeCell(
         x: x,
         y: y
     )
+}
+
+
+// MARK: - Workflows dashboard
+
+/// One row per run, or the selected run's detail when it is open.
+///
+/// Rows are emitted as hit-test bounds so a click selects a run, matching the
+/// list overlay; the detail view publishes none, because nothing in it is a
+/// target.
+private func drawWorkflowsBody(
+    _ runs: PagerWorkflowsOverlay,
+    in area: TerminalRect,
+    background: TerminalColor,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme
+) -> [PagerOverlayBounds.Row] {
+    guard area.width > 0, area.height > 0 else { return [] }
+
+    if runs.isDetailOpen {
+        let lines = runs.detailLines
+        let start = min(max(0, runs.scrollOffset), max(0, lines.count))
+        for row in 0..<area.height {
+            let index = start + row
+            guard lines.indices.contains(index) else { break }
+            _ = buffer.setString(
+                x: area.x,
+                y: area.y + row,
+                text: truncateToWidth(lines[index], width: area.width),
+                style: [],
+                foreground: theme.textPrimary,
+                background: background
+            )
+        }
+        return []
+    }
+
+    guard !runs.rows.isEmpty else {
+        _ = buffer.setString(
+            x: area.x,
+            y: area.y,
+            text: truncateToWidth(runs.emptyMessage, width: area.width),
+            style: [],
+            foreground: theme.gray,
+            background: background
+        )
+        return []
+    }
+
+    var bounds: [PagerOverlayBounds.Row] = []
+    let start = min(max(0, runs.scrollOffset), max(0, runs.rows.count - 1))
+    for offset in 0..<area.height {
+        let index = start + offset
+        guard runs.rows.indices.contains(index) else { break }
+        let run = runs.rows[index]
+        let selected = index == runs.selectedIndex
+        let y = area.y + offset
+        let rowBackground = selected ? theme.bgVisual : background
+        paintBlank(
+            &buffer,
+            area: TerminalRect(x: area.x, y: y, width: area.width, height: 1),
+            foreground: theme.textPrimary,
+            background: rowBackground
+        )
+        var text = selected ? "\u{276F} " : "  "
+        text += run.name
+        text += "  [\(run.status)]"
+        if let phase = run.phase { text += "  \(phase)" }
+        text += "  \(run.agentsFinished)/\(run.agentBudget) agents"
+        if run.tokensUsed > 0 { text += "  ~\(run.tokensUsed)t" }
+        _ = buffer.setString(
+            x: area.x,
+            y: y,
+            text: truncateToWidth(text, width: area.width),
+            style: selected ? [.bold] : [],
+            foreground: selected ? theme.accentUser : theme.textPrimary,
+            background: rowBackground
+        )
+        bounds.append(PagerOverlayBounds.Row(
+            id: run.runID,
+            frame: TerminalRect(x: area.x, y: y, width: area.width, height: 1)
+        ))
+    }
+    return bounds
 }

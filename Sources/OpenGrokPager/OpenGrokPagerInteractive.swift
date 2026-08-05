@@ -135,6 +135,8 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// `/toggle-mouse-reporting` — hand click-drag back to the terminal for
     /// native copy/paste, or take it back.
     case toggleMouseReporting
+    /// `/workflows` — the background workflow-run overlay.
+    case workflows
     case dismissAll
 }
 

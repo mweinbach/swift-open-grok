@@ -1184,6 +1184,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Pick the model for this session"
         ),
         PagerCommandDefinition(
+            name: "workflows",
+            summary: "Watch background workflow runs"
+        ),
+        PagerCommandDefinition(
             name: "clear",
             aliases: ["new"],
             summary: "Start a new session"
@@ -1352,6 +1356,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 return .handled
             case "help":
                 try await emit(.overlay(.help))
+                return .handled
+            case "workflows":
+                try await emit(.overlay(.workflows))
                 return .handled
             case "model":
                 try await emit(.overlay(.modelPicker))
