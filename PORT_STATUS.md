@@ -603,6 +603,48 @@ Remaining placeholder targets: `OpenGrokMermaid`, `OpenGrokMermaidLayout`,
 `OpenGrokDistributionSupport`, `OpenGrokReleaseValidation`,
 `OpenGrokPagerPTYHarness`.
 
+#### Build-out wave 4 — 2026-08-05 (Code Mode live, Rhai workflows, MCP/hooks, fixtures)
+
+Five slices committed individually (`5ea18fb`, `1c143bf`, `64242c9`, `993efc4`,
+`931667e`):
+
+- Fixtures re-grounded at `80dff0a9` (per-family verified-unchanged or
+  recaptured); `OpenGrokDistributionSupport` and `OpenGrokReleaseValidation`
+  implemented (a CRLF fix matters: Swift models `\r\n` as one `Character`).
+- The Rhai workflow engine ported with a working interpreter — both upstream
+  built-ins (`ultracode`, `deep-research`) parse and execute end-to-end against
+  a stub host; journal hashes pinned by independently-derived goldens. Agent
+  execution remains an injected seam (not yet wired to live subagents).
+- Code Mode wired into live sessions (direct/code_mode/code_mode_only; nested
+  tools.* calls re-enter the full permission pipeline; transport projection;
+  cells terminate on turn cancel — a documented divergence from Rust's
+  cross-turn callback parking).
+- MCP servers and hooks live: stdio transport and TOML config decoding were
+  missing outright, not just unwired; `{server}__{tool}` naming per the Rust
+  delimiter; an `AccessKind.mcpTool` misclassification meant `mcp` deny rules
+  silently never matched (fixed); PreToolUse hooks gate dispatch through the
+  locked order. `mcp add/remove` await a TOML serializer (parse-only today);
+  Stop hooks await a turn-end seam.
+- **`Process.waitUntilExit` is banned in this codebase.** It parks the calling
+  thread's run loop on a death notification; a child exiting before the run
+  loop is entered spends the notification and the wait never returns. This
+  wedged two full `--no-parallel` runs (~3.5h each) while parallel stayed green
+  by winning the race per-process; a standalone repro wedged within ~200 spawn
+  iterations (preserved in `.port-workflow/preserved/repro*.swift`). Hook exit
+  now arrives via `terminationHandler` bridged to a cancellable continuation.
+  Grep for `waitUntilExit` before landing any process-spawning code.
+
+Final gates over the committed tree (Swift 6.3.3): `test` parallel **0** —
+2677 tests / 399 suites, 26s; `test --no-parallel` **0** ×2 — 152s / 153s;
+`build --product open-grok` **0**. Test count 2395 → **2677** (+282).
+
+Known traps left for a cleanup pass: `OpenGrokShared` and
+`OpenGrokCodeModeProtocol` both extend `JSONValue` with `uint64Value` — a CLI
+file importing both hits an ambiguous-member error; the `[ui] code_mode`
+config path vs `RESTART_REQUIRED_PATHS` naming `["features","code_mode"]`
+needs reconciling; `LocalShellProcessBackendTests.swift:194` remains a
+load-sensitive budget flake (one pre-fix serial occurrence, green since).
+
 
 ## Per-crate port status (all 84 Rust crates accounted for)
 
