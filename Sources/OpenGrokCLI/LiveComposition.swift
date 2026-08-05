@@ -614,6 +614,16 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             if LiveWorkflowComposition.handles(command) {
                 return try await LiveWorkflowComposition.session(for: command, context: context)
             }
+            if LiveSessionsComposition.handles(command) {
+                return try await LiveSessionsComposition.session(for: command, context: context)
+            }
+            if LiveACPComposition.handles(command) {
+                return try await LiveACPComposition.session(
+                    for: command,
+                    context: context,
+                    services: Self.liveACPServices(dependencies: dependencies)
+                )
+            }
             guard case .launch(let options) = command else {
                 throw CLIApplicationError.unsupported(route: command.routeName)
             }
@@ -627,51 +637,20 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 environment: context.environment,
                 required: options.mode != .interactive
             )
-            let cwd = try Self.resolveWorkingDirectory(options.common.cwd)
-            let agentProfile = try Self.resolveAgentProfile(
-                named: options.common.profile,
-                workingDirectory: cwd,
-                environment: context.environment
-            )
-            let openGrokHome = Self.resolveOpenGrokHome(environment: context.environment)
-            let conversationStore = LiveConversationStore(openGrokHome: openGrokHome)
-            let conversationRecord = try await Self.resolveConversationRecord(
+            let foundation = try await Self.makeSessionFoundation(
                 options: options,
-                workingDirectory: cwd,
-                store: conversationStore
+                context: context,
+                dependencies: dependencies
             )
-            let sessionID = conversationRecord.sessionID
-            let (samplingConfiguration, credential) = try await Self.resolveSamplingConfiguration(
-                options: options,
-                profileModel: agentProfile?.model,
-                environment: context.environment,
-                openGrokHome: openGrokHome,
-                sessionID: sessionID
-            )
-            let sampler = try dependencies.makeSampler(samplingConfiguration)
-            let providerConfiguration = Self.makeProviderConfiguration(
-                sessionID: sessionID,
-                sampling: samplingConfiguration,
-                credential: credential,
-                openGrokHome: openGrokHome,
-                environment: context.environment
-            )
-            let processBackend = dependencies.makeProcessBackend()
-            // The coordinator is created unconditionally and gates on whether a
-            // presenter ever attaches, so headless and non-TTY runs keep the
-            // fail-closed denial without a second construction path.
-            let permissionCoordinator = PagerPermissionCoordinator()
-            let toolExecutor = try await LiveToolExecutor(
-                processBackend: processBackend,
-                sessionID: sessionID,
-                workingDirectory: cwd,
-                toolPolicy: agentProfile?.toolPolicy,
-                fileAccessPolicy: Self.resolveFileAccessPolicy(
-                    environment: context.environment,
-                    coordinator: permissionCoordinator
-                ),
-                environment: context.environment
-            )
+            let cwd = foundation.cwd
+            let agentProfile = foundation.agentProfile
+            let openGrokHome = foundation.openGrokHome
+            let sessionID = foundation.sessionID
+            let samplingConfiguration = foundation.samplingConfiguration
+            let sampler = foundation.sampler
+            let providerConfiguration = foundation.providerConfiguration
+            let permissionCoordinator = foundation.permissionCoordinator
+            let toolExecutor = foundation.toolExecutor
             // A `--workflow` launch is a background run, exactly as upstream:
             // it is registered and started here and the session continues
             // unblocked. A non-interactive launch has no session to continue
@@ -718,62 +697,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     "workflow run \(record.runID) started in the background; watch it with /workflows\n"
                 )
             }
-            // Code Mode is a session-wide decision: the tool surface it
-            // projects is fixed for the life of the timeline, which is what
-            // makes a `wait` after a yield resolvable.
-            let toolMode = LiveCodeModeSettings.resolveToolMode(
-                environment: context.environment,
-                workingDirectory: cwd,
-                openGrokHome: openGrokHome
+            let stack = await Self.makeAgentStack(
+                foundation: foundation,
+                context: context,
+                dependencies: dependencies
             )
-            let toolSurface = LiveCodeModeToolSurface(
-                mode: toolMode,
-                baseTools: toolExecutor.tools
-            )
-            let codeMode = toolSurface.isCodeMode
-                ? LiveCodeModeCoordinator(
-                    surface: toolSurface,
-                    toolExecutor: toolExecutor,
-                    sessionID: sessionID,
-                    workingDirectory: cwd
-                )
-                : nil
-            let conversationHistory = LiveConversationHistory(
-                record: conversationRecord,
-                store: conversationStore
-            )
-            // `/model` rebuilds the provider stack through this coordinator; the
-            // shell, session and tool runtime below are provider-independent and
-            // survive a switch untouched.
-            let modelSwitch = LiveModelSwitchCoordinator(
-                sampling: samplingConfiguration,
-                sampler: sampler,
-                resolver: LiveModelCatalogResolver(
-                    environment: context.environment,
-                    openGrokHome: openGrokHome,
-                    sessionID: sessionID
-                ),
-                makeSampler: dependencies.makeSampler,
-                history: conversationHistory
-            )
-            // A provider change invalidates the cells and stored values the
-            // old runtime holds (model_switch.rs:249).
-            await modelSwitch.attachCodeMode(codeMode)
-            let shell = OpenGrokShell(configuration: OpenGrokShellConfiguration(
-                openGrokHome: openGrokHome,
-                processBackend: processBackend,
-                providerFactory: ProviderSessionFactoryAdapter(),
-                turnDriver: ProviderSessionTurnDriver(
-                    sampler: LiveShellSamplingDriver(
-                        modelSwitch: modelSwitch,
-                        toolExecutor: toolExecutor,
-                        conversationHistory: conversationHistory,
-                        systemPrompt: agentProfile?.systemPrompt,
-                        toolSurface: toolSurface,
-                        codeMode: codeMode
-                    )
-                )
-            ))
+            let codeMode = stack.codeMode
+            let modelSwitch = stack.modelSwitch
+            let shell = stack.shell
             let runtime = LivePagerRuntimeAdapter(
                 shell: shell,
                 cwd: cwd,
@@ -1034,6 +965,234 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         return URL(fileURLWithPath: home, isDirectory: true)
             .appendingPathComponent(".opengrok", isDirectory: true)
             .standardizedFileURL
+    }
+
+    // MARK: - Shared session construction
+
+    /// Everything a live session needs before anything provider-facing exists.
+    ///
+    /// Split out of the launch closure so the `acp` route builds a session the
+    /// same way an interactive or headless launch does. The split point is
+    /// deliberate: a `--workflow` launch can finish and return between the two
+    /// phases, so nothing here may depend on the agent stack, and the launch
+    /// path keeps its original construction order exactly.
+    struct LiveSessionFoundation: Sendable {
+        let options: CLIExecutionOptions
+        let cwd: URL
+        let openGrokHome: URL
+        let agentProfile: LiveAgentProfile?
+        let sessionID: String
+        let conversationRecord: LiveConversationRecord
+        let conversationStore: LiveConversationStore
+        let samplingConfiguration: OpenGrokLiveSamplingConfiguration
+        let sampler: OpenGrokLiveSampler
+        let providerConfiguration: ProviderSessionConfiguration
+        let processBackend: any ShellProcessBackend
+        let permissionCoordinator: PagerPermissionCoordinator
+        let toolExecutor: LiveToolExecutor
+    }
+
+    /// The provider-facing half: tool surface, Code Mode, history, `/model`
+    /// switching and the turn driver those feed.
+    ///
+    /// `turnDriver` is exposed alongside `shell` because the ACP route drives
+    /// turns through `ProviderBackedACPPromptDriver` rather than through the
+    /// pager runtime, and both must be the *same* driver instance so an ACP
+    /// prompt gets the identical tool gating, permission behavior, hooks and
+    /// MCP tools a headless launch gets.
+    struct LiveAgentStack: Sendable {
+        let toolSurface: LiveCodeModeToolSurface
+        let codeMode: LiveCodeModeCoordinator?
+        let conversationHistory: LiveConversationHistory
+        let modelSwitch: LiveModelSwitchCoordinator
+        let turnDriver: ProviderSessionTurnDriver
+        let shell: OpenGrokShell
+    }
+
+    static func makeSessionFoundation(
+        options: CLIExecutionOptions,
+        context: CLIApplicationContext,
+        dependencies: OpenGrokLiveCompositionDependencies
+    ) async throws -> LiveSessionFoundation {
+        let cwd = try resolveWorkingDirectory(options.common.cwd)
+        let agentProfile = try resolveAgentProfile(
+            named: options.common.profile,
+            workingDirectory: cwd,
+            environment: context.environment
+        )
+        let openGrokHome = resolveOpenGrokHome(environment: context.environment)
+        let conversationStore = LiveConversationStore(openGrokHome: openGrokHome)
+        let conversationRecord = try await resolveConversationRecord(
+            options: options,
+            workingDirectory: cwd,
+            store: conversationStore
+        )
+        let sessionID = conversationRecord.sessionID
+        let (samplingConfiguration, credential) = try await resolveSamplingConfiguration(
+            options: options,
+            profileModel: agentProfile?.model,
+            environment: context.environment,
+            openGrokHome: openGrokHome,
+            sessionID: sessionID
+        )
+        let sampler = try dependencies.makeSampler(samplingConfiguration)
+        let providerConfiguration = makeProviderConfiguration(
+            sessionID: sessionID,
+            sampling: samplingConfiguration,
+            credential: credential,
+            openGrokHome: openGrokHome,
+            environment: context.environment
+        )
+        let processBackend = dependencies.makeProcessBackend()
+        // The coordinator is created unconditionally and gates on whether a
+        // presenter ever attaches, so headless and non-TTY runs keep the
+        // fail-closed denial without a second construction path. An ACP
+        // session never attaches a presenter, so it inherits that same
+        // fail-closed behavior for free.
+        let permissionCoordinator = PagerPermissionCoordinator()
+        let toolExecutor = try await LiveToolExecutor(
+            processBackend: processBackend,
+            sessionID: sessionID,
+            workingDirectory: cwd,
+            toolPolicy: agentProfile?.toolPolicy,
+            fileAccessPolicy: resolveFileAccessPolicy(
+                environment: context.environment,
+                coordinator: permissionCoordinator
+            ),
+            environment: context.environment
+        )
+        return LiveSessionFoundation(
+            options: options,
+            cwd: cwd,
+            openGrokHome: openGrokHome,
+            agentProfile: agentProfile,
+            sessionID: sessionID,
+            conversationRecord: conversationRecord,
+            conversationStore: conversationStore,
+            samplingConfiguration: samplingConfiguration,
+            sampler: sampler,
+            providerConfiguration: providerConfiguration,
+            processBackend: processBackend,
+            permissionCoordinator: permissionCoordinator,
+            toolExecutor: toolExecutor
+        )
+    }
+
+    static func makeAgentStack(
+        foundation: LiveSessionFoundation,
+        context: CLIApplicationContext,
+        dependencies: OpenGrokLiveCompositionDependencies
+    ) async -> LiveAgentStack {
+        // Code Mode is a session-wide decision: the tool surface it
+        // projects is fixed for the life of the timeline, which is what
+        // makes a `wait` after a yield resolvable.
+        let toolMode = LiveCodeModeSettings.resolveToolMode(
+            environment: context.environment,
+            workingDirectory: foundation.cwd,
+            openGrokHome: foundation.openGrokHome
+        )
+        let toolSurface = LiveCodeModeToolSurface(
+            mode: toolMode,
+            baseTools: foundation.toolExecutor.tools
+        )
+        let codeMode = toolSurface.isCodeMode
+            ? LiveCodeModeCoordinator(
+                surface: toolSurface,
+                toolExecutor: foundation.toolExecutor,
+                sessionID: foundation.sessionID,
+                workingDirectory: foundation.cwd
+            )
+            : nil
+        let conversationHistory = LiveConversationHistory(
+            record: foundation.conversationRecord,
+            store: foundation.conversationStore
+        )
+        // `/model` rebuilds the provider stack through this coordinator; the
+        // shell, session and tool runtime below are provider-independent and
+        // survive a switch untouched.
+        let modelSwitch = LiveModelSwitchCoordinator(
+            sampling: foundation.samplingConfiguration,
+            sampler: foundation.sampler,
+            resolver: LiveModelCatalogResolver(
+                environment: context.environment,
+                openGrokHome: foundation.openGrokHome,
+                sessionID: foundation.sessionID
+            ),
+            makeSampler: dependencies.makeSampler,
+            history: conversationHistory
+        )
+        // A provider change invalidates the cells and stored values the
+        // old runtime holds (model_switch.rs:249).
+        await modelSwitch.attachCodeMode(codeMode)
+        let turnDriver = ProviderSessionTurnDriver(
+            sampler: LiveShellSamplingDriver(
+                modelSwitch: modelSwitch,
+                toolExecutor: foundation.toolExecutor,
+                conversationHistory: conversationHistory,
+                systemPrompt: foundation.agentProfile?.systemPrompt,
+                toolSurface: toolSurface,
+                codeMode: codeMode
+            )
+        )
+        let shell = OpenGrokShell(configuration: OpenGrokShellConfiguration(
+            openGrokHome: foundation.openGrokHome,
+            processBackend: foundation.processBackend,
+            providerFactory: ProviderSessionFactoryAdapter(),
+            turnDriver: turnDriver
+        ))
+        return LiveAgentStack(
+            toolSurface: toolSurface,
+            codeMode: codeMode,
+            conversationHistory: conversationHistory,
+            modelSwitch: modelSwitch,
+            turnDriver: turnDriver,
+            shell: shell
+        )
+    }
+
+    /// The prompt driver the `acp` route uses.
+    ///
+    /// Builds the identical stack a headless launch builds, then drives turns
+    /// through it — so an ACP `session/prompt` gets the same tool gating,
+    /// fail-closed write permissions, hooks and MCP tools. Nothing about the
+    /// stack is ACP-specific; only the thing consuming it differs.
+    static func liveACPServices(
+        dependencies: OpenGrokLiveCompositionDependencies
+    ) -> LiveACPServices {
+        LiveACPServices { launch in
+            let context = CLIApplicationContext(
+                environment: launch.environment,
+                streams: launch.streams,
+                control: .never
+            )
+            let foundation = try await makeSessionFoundation(
+                options: launch.options,
+                context: context,
+                dependencies: dependencies
+            )
+            let stack = await makeAgentStack(
+                foundation: foundation,
+                context: context,
+                dependencies: dependencies
+            )
+            let providerSession = try ProviderSessionFactoryAdapter().makeSession(
+                for: OpenGrokShellSessionRequest(
+                    sessionID: SessionID(foundation.sessionID),
+                    cwd: foundation.cwd,
+                    providerConfiguration: foundation.providerConfiguration
+                )
+            )
+            return LiveACPPromptDriver(
+                driver: ProviderBackedACPPromptDriver(
+                    providerSession: providerSession,
+                    turnDriver: stack.turnDriver
+                ),
+                shutdown: {
+                    await stack.codeMode?.shutdown()
+                    await foundation.toolExecutor.shutdown()
+                }
+            )
+        }
     }
 
     private static func resolveConversationRecord(

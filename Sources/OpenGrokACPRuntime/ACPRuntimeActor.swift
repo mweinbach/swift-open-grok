@@ -135,16 +135,35 @@ public actor ACPAgentRuntime {
         setReverseSender { message in
             try await writer.send(message)
         }
-        do {
-            while state != .closed {
-                let incoming = try await transport.receive()
-                let outgoing = await handle(incoming)
-                for message in outgoing {
-                    try await writer.send(message)
+        // Each inbound message is dispatched on its own child task rather than
+        // inline. `session/prompt` does not return until the driver finishes,
+        // so a sequential loop could not read the `session/cancel` that is
+        // supposed to interrupt it — the cancel would sit in the transport
+        // until the prompt it was meant to stop had already completed. The
+        // actor still serializes the state each handler touches; only the
+        // reading of the next frame is decoupled. This matches upstream, where
+        // `AgentSideConnection` dispatches concurrently
+        // (`crates/codegen/xai-grok-shell/src/agent/server.rs:375`).
+        let runtime = self
+        await withTaskGroup(of: Void.self) { group in
+            do {
+                while state != .closed {
+                    let incoming = try await transport.receive()
+                    group.addTask {
+                        let outgoing = await runtime.handle(incoming)
+                        for message in outgoing {
+                            do {
+                                try await writer.send(message)
+                            } catch {
+                                await runtime.close()
+                                return
+                            }
+                        }
+                    }
                 }
+            } catch {
+                await close()
             }
-        } catch {
-            await close()
         }
         await transport.close()
     }
