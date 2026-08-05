@@ -4,6 +4,24 @@ import Foundation
 import FoundationNetworking
 #endif
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+/// Make writes to `handle` fail with `EPIPE` instead of raising `SIGPIPE`, so a
+/// child that closed its stdin cannot kill the host process.
+func suppressSIGPIPE(on handle: FileHandle) {
+    #if canImport(Darwin)
+    _ = fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1)
+    #else
+    // Linux has no per-descriptor equivalent; the process-wide disposition is
+    // set once so a broken pipe surfaces as a write error.
+    _ = signal(SIGPIPE, SIG_IGN)
+    #endif
+}
+
 public struct HookRunContext: Sendable, Equatable {
     public var sessionId: String
     public var workspaceRoot: URL
@@ -103,11 +121,65 @@ private struct ProcessOutput: Sendable {
     var stderr: Data
 }
 
+/// Threads for the blocking process I/O this file cannot avoid. Kept off the
+/// Swift concurrency cooperative pool: a hook that leaves a grandchild holding
+/// a pipe open blocks its reader forever, and burning cooperative threads that
+/// way deadlocks every unrelated task in the process.
+private let hookIOQueue = DispatchQueue(label: "opengrok.hooks.io", attributes: .concurrent)
+
+/// Reads one pipe to EOF on `hookIOQueue`, accumulating into a buffer the
+/// runner can snapshot at any time.
+///
+/// Snapshotting rather than joining is the point: the runner must be able to
+/// give up on a reader — a grandchild that outlives the hook keeps the write
+/// end open and EOF never arrives — without waiting on it.
+private final class PipeDrain: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buffer = Data()
+    private var finished = false
+
+    init(handle: FileHandle) {
+        hookIOQueue.async { [self] in
+            while true {
+                let chunk = handle.availableData
+                if chunk.isEmpty { break }
+                lock.lock()
+                buffer.append(chunk)
+                let overflowed = buffer.count > hookOutputLimitBytes
+                lock.unlock()
+                if overflowed { break }
+            }
+            lock.lock()
+            finished = true
+            lock.unlock()
+            try? handle.close()
+        }
+    }
+
+    var isFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return finished
+    }
+
+    var snapshot: Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return buffer
+    }
+}
+
 private final class HookProcessController: @unchecked Sendable {
     let process: Process
     let stdinPipe = Pipe()
     let stdoutPipe = Pipe()
     let stderrPipe = Pipe()
+
+    private let lock = NSLock()
+    private var exitStatus: Int32?
+    private var exitWaiters: [CheckedContinuation<Int32, Never>] = []
+    private var stdoutDrain: PipeDrain?
+    private var stderrDrain: PipeDrain?
 
     init(process: Process) { self.process = process }
 
@@ -115,32 +187,95 @@ private final class HookProcessController: @unchecked Sendable {
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        // Exit arrives through the termination handler, never `waitUntilExit`.
+        // `waitUntilExit` parks the calling thread's run loop on a death
+        // notification that is already spent when the child exits inside the
+        // window before that run loop is entered, and then never returns — a
+        // permanently wedged thread per lost race. The handler is delivered on
+        // Foundation's own queue and has no such window.
+        process.terminationHandler = { [weak self] process in
+            self?.finish(status: process.terminationStatus)
+        }
         try process.run()
-        Task.detached(priority: .userInitiated) { [self] in
-            do { try stdinPipe.fileHandleForWriting.write(contentsOf: input) } catch { }
-            try? stdinPipe.fileHandleForWriting.close()
+        // A hook that never reads its stdin and exits early — `exit 2` to deny
+        // is the canonical shape — closes the read end before the envelope is
+        // written. Without this the write raises SIGPIPE and takes the whole
+        // host process down instead of returning an error.
+        suppressSIGPIPE(on: stdinPipe.fileHandleForWriting)
+        stdoutDrain = PipeDrain(handle: stdoutPipe.fileHandleForReading)
+        stderrDrain = PipeDrain(handle: stderrPipe.fileHandleForReading)
+        let stdinHandle = stdinPipe.fileHandleForWriting
+        hookIOQueue.async {
+            try? stdinHandle.write(contentsOf: input)
+            try? stdinHandle.close()
         }
     }
 
-    var isRunning: Bool { process.isRunning }
-
-    func wait() -> Int32 {
-        process.waitUntilExit()
-        return process.terminationStatus
+    private func finish(status: Int32) {
+        lock.lock()
+        guard exitStatus == nil else {
+            lock.unlock()
+            return
+        }
+        exitStatus = status
+        let waiters = exitWaiters
+        exitWaiters.removeAll()
+        lock.unlock()
+        for waiter in waiters { waiter.resume(returning: status) }
     }
 
-    func readStdout() -> Data { stdoutPipe.fileHandleForReading.readDataToEndOfFile() }
-    func readStderr() -> Data { stderrPipe.fileHandleForReading.readDataToEndOfFile() }
+    var hasExited: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return exitStatus != nil
+    }
+
+    /// Resolve when the child exits. Cancellation terminates it, so this can
+    /// always be unstuck by the caller.
+    func waitForExit() async -> Int32 {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if let status = exitStatus {
+                    lock.unlock()
+                    continuation.resume(returning: status)
+                    return
+                }
+                exitWaiters.append(continuation)
+                lock.unlock()
+            }
+        } onCancel: {
+            terminate()
+        }
+    }
+
+    /// Both output buffers, giving the readers up to `graceMs` to see EOF.
+    ///
+    /// The child has already exited by the time this is called, so EOF is
+    /// normally immediate; the ceiling only bounds the case where something the
+    /// hook spawned still holds the write end.
+    func output(graceMs: UInt64 = 2_000) async -> (stdout: Data, stderr: Data) {
+        var waited: UInt64 = 0
+        while waited < graceMs {
+            if stdoutDrain?.isFinished != false && stderrDrain?.isFinished != false { break }
+            try? await Task.sleep(nanoseconds: 2_000_000)
+            waited += 2
+        }
+        return (stdoutDrain?.snapshot ?? Data(), stderrDrain?.snapshot ?? Data())
+    }
 
     func terminate() {
-        guard process.isRunning else { return }
-        process.terminate()
+        guard !hasExited else { return }
+        if process.isRunning { process.terminate() }
         // SIGTERM can be ignored by the hook (or inherited as ignored), which would pin the
-        // caller on `waitUntilExit` long past the timeout it just reported. Escalate so a hook
-        // can never hold the runner open.
-        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(200)) { [self] in
-            guard process.isRunning else { return }
-            kill(process.processIdentifier, SIGKILL)
+        // caller long past the timeout it just reported. Escalate so a hook can never hold
+        // the runner open. The guard is our own exit record rather than `isRunning`, which
+        // reads false during the window before Foundation has reaped and so let the
+        // escalation be skipped for a child that was still alive.
+        let pid = process.processIdentifier
+        hookIOQueue.asyncAfter(deadline: .now() + .milliseconds(200)) { [weak self] in
+            guard let self, !self.hasExited else { return }
+            kill(pid, SIGKILL)
         }
     }
 }
@@ -211,40 +346,39 @@ private func runCommand(
         return HookInvocation(result: .failed("failed to spawn command: \(error)"), elapsedMs: elapsedMilliseconds(since: started))
     }
 
-    let waitTask = Task.detached(priority: .userInitiated) { controller.wait() }
-    let stdoutTask = Task.detached(priority: .userInitiated) { controller.readStdout() }
-    let stderrTask = Task.detached(priority: .userInitiated) { controller.readStderr() }
-    let waitOutcome: ProcessWaitOutcome
-    do {
-        waitOutcome = try await withTaskCancellationHandler(operation: {
-            try await withThrowingTaskGroup(of: ProcessWaitOutcome.self) { group in
-                group.addTask {
-                    // Poll for liveness instead of awaiting the blocking `waitUntilExit` task:
-                    // an unawaitable child would keep this group alive on scope exit, so a
-                    // timed-out hook would still pin the caller for the child's full lifetime.
-                    while controller.isRunning {
-                        try await Task.sleep(nanoseconds: 2_000_000)
-                    }
-                    return .completed(await waitTask.value)
-                }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: min(spec.timeoutMs, UInt64.max / 1_000_000) * 1_000_000)
-                    return .timedOut
-                }
-                let first = try await group.next()!
-                group.cancelAll()
-                return first
+    // Every branch below is bounded: the exit task is unstuck by cancellation
+    // (which terminates the child) and the timeout task by its own sleep, so
+    // neither can outlive the group and pin the caller.
+    let waitOutcome: ProcessWaitOutcome = await withTaskCancellationHandler(operation: {
+        await withTaskGroup(of: ProcessWaitOutcome?.self) { group in
+            group.addTask {
+                .completed(await controller.waitForExit())
             }
-        }, onCancel: {
-            controller.terminate()
-        })
-    } catch is CancellationError {
+            group.addTask {
+                do {
+                    try await Task.sleep(nanoseconds: min(spec.timeoutMs, UInt64.max / 1_000_000) * 1_000_000)
+                } catch {
+                    // Cancelled because the child already exited; the other
+                    // task carries the real outcome.
+                    return nil
+                }
+                return .timedOut
+            }
+            var outcome: ProcessWaitOutcome = .timedOut
+            while let next = await group.next() {
+                guard let next else { continue }
+                outcome = next
+                break
+            }
+            group.cancelAll()
+            // Drain the loser so the group cannot leave a task running past
+            // this scope. Its result is already superseded.
+            while await group.next() != nil {}
+            return outcome
+        }
+    }, onCancel: {
         controller.terminate()
-        return HookInvocation(result: .failed("hook cancelled"), elapsedMs: elapsedMilliseconds(since: started))
-    } catch {
-        controller.terminate()
-        return HookInvocation(result: .failed("hook execution failed: \(error)"), elapsedMs: elapsedMilliseconds(since: started))
-    }
+    })
 
     if case .timedOut = waitOutcome {
         controller.terminate()
@@ -258,9 +392,12 @@ private func runCommand(
 
     let statusCode: Int32
     if case .completed(let status) = waitOutcome { statusCode = status } else { statusCode = -1 }
-    let stdout = truncateHookOutput(await stdoutTask.value)
-    let stderr = truncateHookOutput(await stderrTask.value)
-    let output = ProcessOutput(statusCode: statusCode, stdout: stdout, stderr: stderr)
+    let collected = await controller.output()
+    let output = ProcessOutput(
+        statusCode: statusCode,
+        stdout: truncateHookOutput(collected.stdout),
+        stderr: truncateHookOutput(collected.stderr)
+    )
 
     switch mode {
     case .observe:
