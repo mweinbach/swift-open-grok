@@ -76,7 +76,10 @@ struct OpenGrokExecutableTests {
         #expect(out.contents.isEmpty)
         #expect(err.contents.isEmpty)
         #expect(terminalRecorder.string.contains("\u{1B}[?1049h"))
-        #expect(terminalRecorder.string.contains("Open Grok"))
+        // The session screen has no title banner — its chrome is the composer
+        // box and the shortcuts bar.
+        #expect(terminalRecorder.string.contains("\u{256D}"))
+        #expect(terminalRecorder.string.contains("Ctrl+c:cancel"))
         #expect(terminalRecorder.string.contains("\u{1B}[?1049l"))
         #expect(terminalRecorder.string.hasSuffix("You: show the pager\nGrok: interactive answer\n"))
     }
@@ -192,20 +195,30 @@ struct OpenGrokExecutableTests {
         #expect(object["session_id"] as? String != nil)
     }
 
-    @Test("live composition rejects Codex until OAuth is wired")
-    func liveUnsupportedProvider() async {
+    @Test("live composition routes Codex to its own store and fails closed when unauthenticated")
+    func liveCodexRequiresItsOwnCredentials() async throws {
+        // The Codex route is wired now, so the provider is no longer refused
+        // outright. It must still fail closed when the isolated Codex store
+        // holds nothing — and it must not fall back to the xAI key that is set
+        // here, which is the credential-isolation contract.
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opengrok-codex-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
         let application = OpenGrokApplication.live(control: .never)
         let (streams, out, err) = CLIStreams.buffered()
         let code = await CLIRunner.run(
             ["headless", "--prompt", "hello", "--provider", "codex"],
-            environment: ["XAI_API_KEY": "test-key"],
+            environment: ["XAI_API_KEY": "test-key", "OPENGROK_HOME": home.path],
             streams: streams,
             application: application
         )
 
-        #expect(code == CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(code == CLIRunner.ExitCode.failure.rawValue)
         #expect(out.contents.isEmpty)
-        #expect(err.contents.contains("Codex OAuth provider"))
+        #expect(err.contents.contains("login --codex"))
+        #expect(!err.contents.contains("Codex OAuth provider"))
     }
 
     @Test("async dispatch owns startup, wait, and shutdown")

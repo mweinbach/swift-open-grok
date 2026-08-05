@@ -9,9 +9,9 @@ struct PagerTerminalRendererTests {
         let sink = RecordingPagerTerminalSink()
         let renderer = PagerTerminalRenderer(sink: sink)
         let state = PagerRenderState(
-            size: TerminalSize(width: 12, height: 3),
+            size: TerminalSize(width: 12, height: 8),
             conversation: [.message(PagerMessage(role: .assistant, text: "hello"))],
-            input: PagerInputState(text: "x")
+            input: PagerComposerState(text: "x")
         )
 
         let first = try renderer.render(state)
@@ -24,7 +24,7 @@ struct PagerTerminalRendererTests {
         #expect(firstOutput.contains("\u{1B}[?1049h"))
         #expect(firstOutput.contains("\u{1B}[?25l"))
         #expect(firstOutput.contains("\u{1B}[?25h"))
-        #expect(sink.visibleText.contains("Grok"))
+        #expect(sink.visibleText.contains("hello"))
         #expect(sink.flushCount == 3)
 
         try renderer.restore()
@@ -40,17 +40,17 @@ struct PagerTerminalRendererTests {
         let renderer = PagerTerminalRenderer(
             sink: sink,
             configuration: PagerTerminalRendererConfiguration(
-                mode: .inline(height: 3),
+                mode: .inline(height: 9),
                 useAlternateScreen: true
             )
         )
         let result = try renderer.render(PagerRenderState(
-            size: TerminalSize(width: 16, height: 4),
+            size: TerminalSize(width: 16, height: 9),
             conversation: [
                 .message(PagerMessage(role: .assistant, text: "top")),
                 .message(PagerMessage(role: .assistant, text: "bottom"))
             ],
-            input: PagerInputState(isFocused: false)
+            input: PagerComposerState(isFocused: false)
         ))
 
         #expect(result.didUseFullRedraw)
@@ -66,7 +66,7 @@ struct PagerTerminalRendererTests {
         let state = PagerRenderState(
             size: TerminalSize(width: 10, height: 3),
             conversation: [.message(PagerMessage(role: .assistant, text: "frame"))],
-            input: PagerInputState(isFocused: false)
+            input: PagerComposerState(isFocused: false)
         )
 
         _ = try renderer.render(state)
@@ -92,7 +92,7 @@ struct PagerTerminalRendererTests {
         _ = try renderer.render(PagerRenderState(
             size: TerminalSize(width: 8, height: 2),
             conversation: [.message(PagerMessage(role: .assistant, text: "ok"))],
-            input: PagerInputState(isFocused: false)
+            input: PagerComposerState(isFocused: false)
         ))
 
         #expect(!sink.output.contains("?1049"))

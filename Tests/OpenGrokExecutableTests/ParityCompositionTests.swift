@@ -109,6 +109,62 @@ private final class ParitySamplerFixture: @unchecked Sendable {
     }
 }
 
+/// Sampler that forwards an answer as a sequence of incremental deltas, the way
+/// the production sampler forwards streamed assistant text.
+private final class ParityStreamingSamplerFixture: @unchecked Sendable {
+    private let lock = NSLock()
+    private let deltas: [String]
+    private let holdOpenAfterDeltas: Bool
+    private var emitted: [String] = []
+    private let started = ParitySignal()
+
+    init(deltas: [String], holdOpenAfterDeltas: Bool = false) {
+        self.deltas = deltas
+        self.holdOpenAfterDeltas = holdOpenAfterDeltas
+    }
+
+    var answer: String { deltas.joined() }
+
+    var emittedDeltas: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return emitted
+    }
+
+    /// Resolves once every delta has been delivered but before the turn
+    /// completes, so a test can cancel with the stream genuinely mid-flight and
+    /// without racing the deltas it wants to assert on.
+    func waitForDeltas() async {
+        await started.wait()
+    }
+
+    func makeSampler() -> OpenGrokLiveSampler {
+        let fixture = self
+        return OpenGrokLiveSampler { _, emit in
+            await emit(.status("sampling"))
+            for delta in fixture.deltas {
+                try Task.checkCancellation()
+                await emit(.output(delta))
+                fixture.record(delta)
+            }
+            await fixture.started.signal()
+            if fixture.holdOpenAfterDeltas {
+                try await Task.sleep(nanoseconds: 60_000_000_000)
+            }
+            return OpenGrokLiveSamplingResponse(
+                output: fixture.answer,
+                stopReason: "stop"
+            )
+        }
+    }
+
+    private func record(_ delta: String) {
+        lock.lock()
+        emitted.append(delta)
+        lock.unlock()
+    }
+}
+
 private final class ParitySamplingConfigurationFixture: @unchecked Sendable {
     private let lock = NSLock()
     private var configurations: [OpenGrokLiveSamplingConfiguration] = []
@@ -248,9 +304,11 @@ private final class ParityFileToolSamplerFixture: @unchecked Sendable {
     private let lock = NSLock()
     private var requests: [OpenGrokLiveSamplingRequest] = []
     private let arguments: String
+    private let toolName: String
 
-    init(arguments: String) {
+    init(arguments: String, toolName: String = "read_file") {
         self.arguments = arguments
+        self.toolName = toolName
     }
 
     var recordedRequests: [OpenGrokLiveSamplingRequest] {
@@ -266,7 +324,7 @@ private final class ParityFileToolSamplerFixture: @unchecked Sendable {
             if requestIndex == 0 {
                 let call = ToolCall(
                     id: "file-call-1",
-                    name: "read_file",
+                    name: fixture.toolName,
                     arguments: fixture.arguments
                 )
                 return OpenGrokLiveSamplingResponse(
@@ -1049,7 +1107,7 @@ struct ParityCompositionTests {
         }
     }
 
-    @Test("live headless composition executes sandboxed read-only file tools")
+    @Test("live headless composition executes sandboxed file tools from the build pack")
     func liveHeadlessFileToolComposition() async {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1088,11 +1146,69 @@ struct ParityCompositionTests {
         #expect(err.contents.contains("running tool read_file"))
         #expect(out.contents.contains("file tool contents"))
         #expect(requests.count == 2)
+        // A session with no agent profile lists the full read-write build pack.
+        // The mutating tools are only *offered* here; the permission gate still
+        // decides at dispatch, which `liveFileToolsDenyMutationsByDefault` pins.
         #expect(Set(requests.first?.tools.map(\.name) ?? []) == Set([
-            "run_terminal_cmd", "read_file", "list_dir", "grep"
+            "run_terminal_cmd", "read_file", "list_dir", "grep",
+            "glob", "view_image", "search_replace", "write", "apply_patch"
         ]))
         #expect(toolResult?.toolCallId == "file-call-1")
         #expect(toolResult?.content.contains("file tool contents") == true)
+    }
+
+    /// The dispatch gate, as distinct from the listing gate above: `write` is
+    /// offered to the model but refused at call time unless the session opts in.
+    private func runWriteToolSession(
+        allowWrites: Bool
+    ) async -> (code: Int32, toolResult: String?, wroteFile: Bool) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let target = root.appendingPathComponent("written.txt")
+
+        let sampler = ParityFileToolSamplerFixture(
+            arguments: #"{"file_path":"written.txt","content":"written by the model\n"}"#,
+            toolName: "write"
+        )
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, _, _) = CLIStreams.buffered()
+        var environment = [
+            "HOME": root.path,
+            "OPENGROK_HOME": root.appendingPathComponent("state").path,
+            "XAI_API_KEY": "test-key"
+        ]
+        if allowWrites {
+            environment["OPENGROK_ALLOW_WRITES"] = "1"
+        }
+        let code = await CLIRunner.run(
+            ["headless", "--prompt", "write the file", "--cwd", root.path],
+            environment: environment,
+            streams: streams,
+            application: application
+        )
+        let toolResult = sampler.recordedRequests.last?.items.compactMap { item -> ToolResultItem? in
+            guard case .toolResult(let result) = item else { return nil }
+            return result
+        }.last?.content
+        return (code, toolResult, FileManager.default.fileExists(atPath: target.path))
+    }
+
+    @Test("live file tools deny mutations by default and say how to enable them")
+    func liveFileToolsDenyMutationsByDefault() async {
+        let outcome = await runWriteToolSession(allowWrites: false)
+        #expect(outcome.wroteFile == false)
+        #expect(outcome.toolResult?.contains("OPENGROK_ALLOW_WRITES") == true)
+    }
+
+    @Test("OPENGROK_ALLOW_WRITES lets the write tool through the permission gate")
+    func liveFileToolsAllowWritesOptIn() async {
+        let outcome = await runWriteToolSession(allowWrites: true)
+        #expect(outcome.wroteFile == true)
+        #expect(outcome.toolResult?.contains("OPENGROK_ALLOW_WRITES") != true)
     }
 
     @Test("live file tools reject paths outside the working directory")
@@ -1725,6 +1841,148 @@ struct ParityCompositionTests {
         #expect(requests.first?.command == "printf tool")
         #expect(requests.first?.toolCallID == "tool-1")
         #expect(requests.first?.ownerSessionID == "shell-session")
+    }
+
+    @Test("delta coalescing preserves the exact token sequence")
+    func textDeltaCoalescingPreservesText() {
+        // A long interval forces every delta after the first to accumulate.
+        var batching = LiveTextDeltaCoalescer(interval: .seconds(3_600))
+        let tokens = ["The ", "answer ", "arrives ", "in pieces."]
+        var released: [String] = []
+        for token in tokens {
+            if let batch = batching.push(token) {
+                released.append(batch)
+            }
+        }
+        if let batch = batching.flush() {
+            released.append(batch)
+        }
+
+        #expect(released.joined() == tokens.joined())
+        #expect(released.first == "The ")
+        #expect(released.count == 2)
+
+        // Whatever the interval, the released batches must still concatenate to
+        // the pushed tokens and nothing may be released twice.
+        var immediate = LiveTextDeltaCoalescer(interval: .milliseconds(0))
+        var eager = tokens.compactMap { immediate.push($0) }
+        if let batch = immediate.flush() {
+            eager.append(batch)
+        }
+        #expect(eager.joined() == tokens.joined())
+        #expect(immediate.flush() == nil)
+
+        // Empty deltas never produce a batch.
+        var idle = LiveTextDeltaCoalescer()
+        #expect(idle.push("") == nil)
+        #expect(idle.flush() == nil)
+    }
+
+    @Test("streaming JSON forwards assistant deltas in order without coalescing them")
+    func liveStreamingJSONAssistantDeltaOrdering() async {
+        for outputFormat in ["streaming-json", "streaming-messages-json"] {
+            let deltas = ["The ", "answer ", "arrives ", "in pieces."]
+            let sampler = ParityStreamingSamplerFixture(deltas: deltas)
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let dependencies = OpenGrokLiveCompositionDependencies(
+                makeSampler: { _ in sampler.makeSampler() }
+            )
+            let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+            let (streams, out, _) = CLIStreams.buffered()
+
+            let code = await CLIRunner.run(
+                [
+                    "headless", "--prompt", "stream it",
+                    "--cwd", root.path,
+                    "--output-format", outputFormat
+                ],
+                environment: [
+                    "HOME": root.path,
+                    "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                    "XAI_API_KEY": "test-key"
+                ],
+                streams: streams,
+                application: application
+            )
+
+            let records = out.contents.split(separator: "\n").compactMap { line in
+                try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            }
+            let textType = outputFormat == "streaming-messages-json" ? "assistant" : "output"
+            let textRecords = records.filter { $0["type"] as? String == textType }
+            let contents = textRecords.compactMap { $0["content"] as? String }
+
+            #expect(code == CLIRunner.ExitCode.success.rawValue)
+            #expect(contents == deltas)
+            #expect(contents.joined() == sampler.answer)
+            // The terminal event must not overtake the deltas that precede it.
+            let completedIndex = records.firstIndex { $0["type"] as? String == "completed" }
+            let lastTextIndex = records.lastIndex { $0["type"] as? String == textType }
+            #expect(completedIndex != nil)
+            if let completedIndex, let lastTextIndex {
+                #expect(lastTextIndex < completedIndex)
+            }
+        }
+    }
+
+    @Test("Ctrl-C mid-stream cancels the turn and keeps the delivered deltas")
+    func ctrlCCancellationMidStream() async {
+        let terminal = ParityTerminalFixture(
+            tty: true,
+            size: OpenGrokLiveTerminalSize(width: 60, height: 12)
+        )
+        let deltas = ["partial ", "answer "]
+        let sampler = ParityStreamingSamplerFixture(
+            deltas: deltas,
+            holdOpenAfterDeltas: true
+        )
+        let cancellation = ParityCancellationBox()
+        let control = CLIExecutionControl(
+            isCancelled: { cancellation.isCancelled },
+            waitForCancellation: {
+                while !cancellation.isCancelled {
+                    try? await Task.sleep(nanoseconds: 1_000_000)
+                }
+            }
+        )
+        let input = ParityInputFixture([.ctrlC])
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() },
+            terminal: terminal.terminal
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: control)
+        let (streams, _, _) = CLIStreams.buffered()
+        let task = Task {
+            await CLIRunner.run(
+                ["interactive", "--prompt", "cancel mid stream"],
+                environment: [
+                    "HOME": root.path,
+                    "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                    "XAI_API_KEY": "test-key"
+                ],
+                streams: streams,
+                application: application
+            )
+        }
+
+        await sampler.waitForDeltas()
+        // Wait for the deltas to reach the frame as well, so the assertion
+        // below is about cancellation rather than about render timing.
+        await Self.waitForTerminalOutput("partial", terminal: terminal)
+        if await input.next() == .ctrlC {
+            cancellation.cancel()
+        }
+        let code = await task.value
+
+        #expect(code == CLIRunner.ExitCode.cancelled.rawValue)
+        #expect(sampler.emittedDeltas == deltas)
+        // Text delivered before the cancellation survives into the transcript.
+        #expect(terminal.output.contains("partial"))
+        #expect(terminal.output.contains("\u{1B}[?1049l"))
     }
 
     private static func typed(_ text: String) -> [InputEvent] {

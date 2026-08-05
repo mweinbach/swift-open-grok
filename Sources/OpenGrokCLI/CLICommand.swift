@@ -633,7 +633,7 @@ public enum CLICommandParser {
             case "--json": json = true
             case "--force", "--check":
                 if option.name == "--force" { force = true } else { options[option.name] = "true" }
-            case "--oauth", "--oidc", "--codex", "--device-auth", "--device-code", "--legacy":
+            case "--oauth", "--oidc", "--codex", "--all", "--device-auth", "--device-code", "--legacy":
                 options[option.name] = "true"
             case "--version", "--output", "--shell", "--channel", "--session-id", "--id":
                 options[option.name] = try cursor.value(for: option)

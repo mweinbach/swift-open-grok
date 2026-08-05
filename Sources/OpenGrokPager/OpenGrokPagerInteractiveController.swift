@@ -1,26 +1,52 @@
 import Foundation
+import OpenGrokPagerCommandUI
 import OpenGrokPagerMinimal
 import OpenGrokTerminalCore
 
 public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFrontend {
     private enum Control: Sendable {
+        /// A user Esc or Ctrl+C, fast-pathed ahead of queued input so it lands
+        /// promptly during a busy turn.
+        case interrupt(isEscape: Bool)
+        /// An external `cancel()` — unlike an interrupt this always ends the run.
         case cancel
         case eof
         case shutdown
     }
 
+    /// What an Esc or Ctrl+C resolved to.
+    private enum InterruptOutcome: Sendable {
+        /// Handled inside the prompt; redraw and keep going.
+        case consumed
+        case cancelTurn
+        case quit
+    }
+
     private enum PromptAction: Sendable {
         case changed
         case submit
-        case cancel
+        /// A bare `Esc`. What it means depends on whether a turn is running and
+        /// whether the composer holds a draft — see `resolveEscape`.
+        case escape
+        /// `Ctrl+C`.
+        case interrupt
+        /// `Ctrl+D`.
         case eof
         case resize(TerminalSize)
+        case historyPrevious
+        case historyNext
+        case completionMove(Int)
+        case completionAccept
+        case viewport(OpenGrokPagerViewportCommand)
         case ignored
     }
 
     private enum TurnOutcome: Sendable {
         case finished(OpenGrokPagerRuntimeResult)
         case eof
+        /// The user cancelled the turn; the run continues at the prompt.
+        case turnCancelled
+        /// An external cancel or a fatal condition; the run ends.
         case cancelled
         case shutdown
     }
@@ -41,6 +67,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private struct PromptEditor: Sendable {
         private var characters: [Character]
         private(set) var cursor: Int
+        /// Open slash-command dropdown. When non-empty, `↑`/`↓` move the
+        /// selection instead of recalling history, matching the reference's
+        /// dropdown intercept ahead of the history step.
+        var completions: [OpenGrokPagerCommandSuggestion] = []
+        var selectedCompletion: Int?
+        /// Set while history browsing is open. Without it, `Down` would stop
+        /// browsing the moment `Up` filled the composer with a recalled prompt.
+        var isBrowsingHistory = false
 
         init(text: String) {
             characters = Array(text)
@@ -48,9 +82,20 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         }
 
         var text: String { String(characters) }
+        var isEmpty: Bool { characters.isEmpty }
 
-        var state: OpenGrokPagerInteractivePromptState {
-            OpenGrokPagerInteractivePromptState(text: text, cursorOffset: cursor)
+        func state(
+            pendingKey: String? = nil,
+            pendingLabel: String? = nil
+        ) -> OpenGrokPagerInteractivePromptState {
+            OpenGrokPagerInteractivePromptState(
+                text: text,
+                cursorOffset: cursor,
+                completions: completions,
+                selectedCompletion: selectedCompletion,
+                pendingConfirmationKey: pendingKey,
+                pendingConfirmationLabel: pendingLabel
+            )
         }
 
         mutating func apply(_ event: InputEvent) -> PromptAction {
@@ -70,6 +115,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         mutating func reset() {
             characters.removeAll(keepingCapacity: true)
             cursor = 0
+            completions = []
+            selectedCompletion = nil
+        }
+
+        mutating func replace(with value: String) {
+            characters = Array(value)
+            cursor = characters.count
         }
 
         private mutating func apply(_ event: KeyEvent) -> PromptAction {
@@ -79,9 +131,27 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
 
             switch event.key {
             case .enter:
+                // Enter always submits; Tab accepts the highlighted completion.
+                // Letting Enter accept would make a fully typed command name
+                // need two presses, since its own row stays in the menu.
                 return .submit
             case .escape:
-                return .cancel
+                return .escape
+            case .tab:
+                return completions.isEmpty ? .ignored : .completionAccept
+            case .up:
+                if !completions.isEmpty { return .completionMove(-1) }
+                // `Up` recalls history only on an empty composer
+                // (`app/agent_view/prompt.rs:465-486`); with a draft it is a
+                // scrollback movement instead.
+                return isEmpty || isBrowsingHistory ? .historyPrevious : .viewport(.lineUp)
+            case .down:
+                if !completions.isEmpty { return .completionMove(1) }
+                return isEmpty || isBrowsingHistory ? .historyNext : .viewport(.lineDown)
+            case .pageUp:
+                return .viewport(.pageUp)
+            case .pageDown:
+                return .viewport(.pageDown)
             case .backspace:
                 guard cursor > 0 else { return .ignored }
                 characters.remove(at: cursor - 1)
@@ -100,10 +170,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 cursor += 1
                 return .changed
             case .home:
+                // With a draft, Home is a line-editing key; on an empty
+                // composer it jumps the transcript to the top.
+                guard !isEmpty else { return .viewport(.top) }
                 guard cursor != 0 else { return .ignored }
                 cursor = 0
                 return .changed
             case .end:
+                guard !isEmpty else { return .viewport(.bottom) }
                 guard cursor != characters.count else { return .ignored }
                 cursor = characters.count
                 return .changed
@@ -112,7 +186,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     return .submit
                 }
                 if character == "\u{3}" {
-                    return .cancel
+                    return .interrupt
                 }
                 if character == "\u{4}" {
                     return .eof
@@ -123,7 +197,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 else { return .ignored }
                 insert([event.character ?? character])
                 return .changed
-            case .tab, .backTab, .up, .down, .pageUp, .pageDown, .insert, .f, .null:
+            case .backTab, .insert, .f, .null:
                 return .ignored
             }
         }
@@ -138,8 +212,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 character = event.character
             }
             switch character?.lowercased() {
-            case "c": return .cancel
+            case "c": return .interrupt
             case "d": return .eof
+            case "u": return .viewport(.halfPageUp)
+            case "j": return .viewport(.lineDown)
+            case "k": return .viewport(.lineUp)
+            case "p": return completions.isEmpty ? nil : .completionMove(-1)
+            case "n": return completions.isEmpty ? nil : .completionMove(1)
             default: return nil
             }
         }
@@ -371,6 +450,20 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private var inputPump: Task<Void, Never>?
     private var pendingInput: [InputEvent] = []
 
+    /// Prompt history, oldest first. `historyIndex` is the browse cursor;
+    /// `historySavedDraft` is the composer text stashed when browsing opened,
+    /// restored when the user pages back past the newest entry.
+    private var history: [String] = []
+    private var historyIndex: Int?
+    private var historySavedDraft: String?
+
+    /// An armed double-press confirmation and the instant it expires.
+    private var pendingConfirmation: (key: String, label: String, deadline: Date)?
+
+    private let commands = PagerCommandRegistry(
+        commands: OpenGrokPagerInteractiveController.builtinCommands
+    )
+
     public init(
         input: AsyncThrowingStream<InputEvent, Error>,
         runtime: any OpenGrokPagerRuntimeAdapter,
@@ -400,7 +493,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     public func state() -> OpenGrokPagerInteractiveState {
         OpenGrokPagerInteractiveState(
             lifecycle: lifecycle,
-            prompt: editor.state,
+            prompt: promptState(),
             submittedPrompts: submittedPrompts,
             completedTurnCount: completedTurnCount,
             activeSessionID: activeSessionID,
@@ -462,11 +555,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 switch read {
                 case .element(let event):
                     switch Self.controlAction(for: event) {
-                    case .cancel:
-                        await mailbox.send(.control(.cancel), priority: true)
-                    case .eof:
+                    case .some(.escape):
+                        await mailbox.send(.control(.interrupt(isEscape: true)), priority: true)
+                    case .some(.interrupt):
+                        await mailbox.send(.control(.interrupt(isEscape: false)), priority: true)
+                    case .some(.eof):
                         await mailbox.send(.control(.eof), priority: true)
-                    case .none, .some(.changed), .some(.submit), .some(.resize), .some(.ignored):
+                    default:
                         await mailbox.send(.input(read))
                     }
                 case .end, .failure, .cancelled:
@@ -483,7 +578,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             rendererBegan = true
             try await transition(to: .starting)
             editor = PromptEditor(text: request.prompt)
-            try await emit(.promptChanged(editor.state))
+            try await emit(.promptChanged(promptState()))
 
             if let initialSession {
                 let initialRequest = request
@@ -506,11 +601,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         completedTurnCount += 1
                         editor.reset()
                         try await transition(to: .editing)
-                        try await emit(.promptChanged(editor.state))
+                        try await emit(.promptChanged(promptState()))
                     }
                 case .eof:
                     try await emit(.eof)
                     outcome = .eof
+                case .turnCancelled:
+                    // Cancelling the opening turn drops through to the prompt.
+                    try await emit(.turnCancelled)
+                    editor.reset()
+                    try await transition(to: .editing)
+                    try await emit(.promptChanged(promptState()))
                 case .cancelled:
                     try await emit(.cancelled)
                     outcome = .cancelled
@@ -540,6 +641,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     continue
                 case .control(let control):
                     switch control {
+                    case .interrupt(let isEscape):
+                        switch handleInterrupt(isEscape: isEscape, isTurnRunning: false) {
+                        case .quit:
+                            try await emit(.cancelled)
+                            outcome = .cancelled
+                        case .consumed, .cancelTurn:
+                            try await emit(.promptChanged(promptState()))
+                            await inputPumpGate.resume()
+                        }
                     case .cancel:
                         try await emit(.cancelled)
                         outcome = .cancelled
@@ -553,10 +663,61 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 case .input(let read):
                     switch read {
                     case .element(let event):
-                        switch editor.apply(event) {
+                        let action = editor.apply(event)
+                        // Any key other than the armed one clears a pending
+                        // confirmation, matching `app_view.rs`'s arm lifetime.
+                        switch action {
+                        case .escape, .interrupt, .ignored, .resize:
+                            break
+                        default:
+                            pendingConfirmation = nil
+                        }
+                        switch action {
                         case .changed:
-                            try await emit(.promptChanged(editor.state))
+                            detachHistory()
+                            refreshCompletions()
+                            try await emit(.promptChanged(promptState()))
                             await inputPumpGate.resume()
+                        case .historyPrevious:
+                            browseHistory(offset: -1)
+                            try await emit(.promptChanged(promptState()))
+                            await inputPumpGate.resume()
+                        case .historyNext:
+                            browseHistory(offset: 1)
+                            try await emit(.promptChanged(promptState()))
+                            await inputPumpGate.resume()
+                        case .completionMove(let offset):
+                            if !editor.completions.isEmpty {
+                                let count = editor.completions.count
+                                let current = editor.selectedCompletion ?? 0
+                                editor.selectedCompletion = ((current + offset) % count + count) % count
+                            }
+                            try await emit(.promptChanged(promptState()))
+                            await inputPumpGate.resume()
+                        case .completionAccept:
+                            if let index = editor.selectedCompletion,
+                               editor.completions.indices.contains(index) {
+                                editor.replace(with: editor.completions[index].name)
+                            }
+                            editor.completions = []
+                            editor.selectedCompletion = nil
+                            try await emit(.promptChanged(promptState()))
+                            await inputPumpGate.resume()
+                        case .viewport(let command):
+                            try await emit(.viewport(command))
+                            await inputPumpGate.resume()
+                        case .escape, .interrupt:
+                            let isEscape: Bool
+                            if case .escape = action { isEscape = true } else { isEscape = false }
+                            switch handleInterrupt(isEscape: isEscape, isTurnRunning: false) {
+                            case .quit:
+                                try await emit(.cancelled)
+                                outcome = .cancelled
+                                continue
+                            case .consumed, .cancelTurn:
+                                try await emit(.promptChanged(promptState()))
+                                await inputPumpGate.resume()
+                            }
                         case .submit:
                             let prompt = editor.text
                             guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -564,6 +725,23 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 await inputPumpGate.resume()
                                 continue
                             }
+                            switch try await runSlashCommand(prompt) {
+                            case .quit:
+                                try await emit(.shutdown)
+                                outcome = .shutdown
+                                continue
+                            case .handled:
+                                recordHistory(prompt)
+                                editor.reset()
+                                try await emit(.promptChanged(promptState()))
+                                await inputPumpGate.resume()
+                                continue
+                            case .notACommand:
+                                break
+                            }
+                            recordHistory(prompt)
+                            editor.reset()
+                            try await emit(.promptChanged(promptState()))
 
                             let turnRequest = OpenGrokPagerRequest(
                                 prompt: prompt,
@@ -589,11 +767,19 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                     completedTurnCount += 1
                                     editor.reset()
                                     try await transition(to: .editing)
-                                    try await emit(.promptChanged(editor.state))
+                                    try await emit(.promptChanged(promptState()))
                                 }
                             case .eof:
                                 try await emit(.eof)
                                 outcome = .eof
+                            case .turnCancelled:
+                                // Cancelling a turn returns to the prompt; only
+                                // an external cancel ends the run.
+                                try await emit(.turnCancelled)
+                                editor.reset()
+                                try await transition(to: .editing)
+                                try await emit(.promptChanged(promptState()))
+                                await inputPumpGate.resume()
                             case .cancelled:
                                 try await emit(.cancelled)
                                 outcome = .cancelled
@@ -601,9 +787,6 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 try await emit(.shutdown)
                                 outcome = .shutdown
                             }
-                        case .cancel:
-                            try await emit(.cancelled)
-                            outcome = .cancelled
                         case .eof:
                             try await emit(.eof)
                             outcome = .eof
@@ -767,13 +950,21 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             continue
                         }
                         switch Self.controlAction(for: event) {
-                        case .cancel:
-                            await cancelActiveSession()
-                            turnOutcome = .cancelled
-                        case .eof:
+                        case .some(.escape), .some(.interrupt):
+                            var isEscape = false
+                            if case .some(.escape) = Self.controlAction(for: event) { isEscape = true }
+                            switch handleInterrupt(isEscape: isEscape, isTurnRunning: true) {
+                            case .cancelTurn:
+                                await cancelActiveSession()
+                                turnOutcome = .turnCancelled
+                            case .consumed, .quit:
+                                try await emit(.promptChanged(promptState()))
+                                await inputPumpGate.resume()
+                            }
+                        case .some(.eof):
                             await cancelActiveSession()
                             turnOutcome = .eof
-                        case .none, .some(.changed), .some(.submit), .some(.resize), .some(.ignored):
+                        default:
                             pendingInput.append(event)
                             await inputPumpGate.resume()
                         }
@@ -787,6 +978,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     }
                 case .control(let control):
                     switch control {
+                    case .interrupt(let isEscape):
+                        switch handleInterrupt(isEscape: isEscape, isTurnRunning: true) {
+                        case .cancelTurn:
+                            await cancelActiveSession()
+                            turnOutcome = .turnCancelled
+                        case .consumed, .quit:
+                            try await emit(.promptChanged(promptState()))
+                            await inputPumpGate.resume()
+                        }
                     case .cancel:
                         await cancelActiveSession()
                         turnOutcome = .cancelled
@@ -810,6 +1010,206 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         await closeActiveSession()
         return turnOutcome ?? .eof
     }
+
+    // MARK: - Prompt behavior
+
+    /// Slash commands the TUI honors locally. The reference registers ~70 and
+    /// routes most of them to a pager `Action`; this port lists only the ones
+    /// backed by working Swift wiring, so the dropdown never offers a no-op.
+    private static let builtinCommands: [PagerCommandDefinition] = [
+        PagerCommandDefinition(
+            name: "help",
+            summary: "Browse commands and keyboard shortcuts"
+        ),
+        PagerCommandDefinition(
+            name: "clear",
+            aliases: ["new"],
+            summary: "Start a new session"
+        ),
+        PagerCommandDefinition(
+            name: "quit",
+            aliases: ["exit"],
+            summary: "Quit the application"
+        )
+    ]
+
+    /// `PendingAction::TTL` (`app_view.rs:591`) — a confirmation stays armed
+    /// for one second and any other key clears it.
+    private static let confirmationTimeToLive: TimeInterval = 1.0
+
+    private func promptState() -> OpenGrokPagerInteractivePromptState {
+        expirePendingConfirmation()
+        return editor.state(
+            pendingKey: pendingConfirmation?.key,
+            pendingLabel: pendingConfirmation?.label
+        )
+    }
+
+    private func expirePendingConfirmation() {
+        if let pending = pendingConfirmation, pending.deadline <= Date() {
+            pendingConfirmation = nil
+        }
+    }
+
+    /// Returns true when `key` was already armed, i.e. this is the confirming
+    /// second press.
+    private func confirm(key: String, label: String) -> Bool {
+        expirePendingConfirmation()
+        if let pending = pendingConfirmation, pending.key == key {
+            pendingConfirmation = nil
+            return true
+        }
+        pendingConfirmation = (
+            key: key,
+            label: label,
+            deadline: Date().addingTimeInterval(Self.confirmationTimeToLive)
+        )
+        return false
+    }
+
+    private func refreshCompletions() {
+        let suggestions = commands
+            .completions(for: editor.text)
+            .prefix(6)
+            .map {
+                OpenGrokPagerCommandSuggestion(
+                    name: $0.displayName,
+                    summary: $0.summary,
+                    isAvailable: $0.availability.isAvailable
+                )
+            }
+        editor.completions = Array(suggestions)
+        editor.selectedCompletion = editor.completions.isEmpty ? nil : 0
+    }
+
+    /// Step to an older (`offset < 0`) or newer prompt. Paging past the newest
+    /// entry closes browsing and restores the stashed draft, mirroring
+    /// `close_history_restoring_saved` (`prompt.rs:997`).
+    private func browseHistory(offset: Int) {
+        guard !history.isEmpty else { return }
+        guard let current = historyIndex else {
+            // Down never opens browsing — only Up does.
+            guard offset < 0 else { return }
+            historySavedDraft = editor.text
+            historyIndex = history.count - 1
+            editor.isBrowsingHistory = true
+            editor.replace(with: history[history.count - 1])
+            refreshCompletions()
+            return
+        }
+        let candidate = current + (offset < 0 ? -1 : 1)
+        guard candidate < history.count else {
+            editor.replace(with: historySavedDraft ?? "")
+            detachHistory()
+            refreshCompletions()
+            return
+        }
+        let index = max(0, candidate)
+        historyIndex = index
+        editor.replace(with: history[index])
+        refreshCompletions()
+    }
+
+    private func detachHistory() {
+        historyIndex = nil
+        historySavedDraft = nil
+        editor.isBrowsingHistory = false
+    }
+
+    private func recordHistory(_ prompt: String) {
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if history.last != prompt { history.append(prompt) }
+        detachHistory()
+    }
+
+    /// Esc / Ctrl+C policy, mirroring `try_handle_esc_policy`
+    /// (`app/agent_view/prompt.rs:841`) and the Ctrl+C handler
+    /// (`app/agent_view/input.rs:1359`).
+    ///
+    /// The load-bearing asymmetries: Esc cancels a running turn even with a
+    /// draft in the composer, while Ctrl+C clears the draft first and only
+    /// cancels on the second press. When idle, Esc arms a clear and is
+    /// otherwise swallowed — it never exits — whereas Ctrl+C on an empty
+    /// composer arms a quit.
+    private func handleInterrupt(isEscape: Bool, isTurnRunning: Bool) -> InterruptOutcome {
+        if isTurnRunning {
+            if !isEscape, !editor.text.isEmpty {
+                editor.reset()
+                detachHistory()
+                pendingConfirmation = nil
+                return .consumed
+            }
+            return .cancelTurn
+        }
+        if !editor.text.isEmpty {
+            if isEscape {
+                if confirm(key: "Esc", label: "clear") {
+                    editor.reset()
+                    detachHistory()
+                }
+            } else {
+                editor.reset()
+                detachHistory()
+                pendingConfirmation = nil
+            }
+            return .consumed
+        }
+        guard !isEscape else { return .consumed }
+        return confirm(key: "Ctrl+c", label: "quit") ? .quit : .consumed
+    }
+
+    /// The outcome of a locally handled slash command.
+    private enum SlashOutcome {
+        case notACommand
+        case handled
+        case quit
+    }
+
+    private func runSlashCommand(_ text: String) async throws -> SlashOutcome {
+        guard case .command(let invocation) = PagerCommandParser.parse(text) else {
+            return .notACommand
+        }
+        switch commands.resolve(invocation) {
+        case .unknown(let name):
+            try await emit(.notice("unknown command: /\(name)"))
+            return .handled
+        case .unavailable(_, let reason):
+            try await emit(.notice(reason))
+            return .handled
+        case .available(let command):
+            switch command.name {
+            case "quit":
+                return .quit
+            case "clear":
+                lastSessionID = nil
+                try await emit(.notice("started a new session"))
+                return .handled
+            case "help":
+                try await emit(.notice(Self.helpText))
+                return .handled
+            default:
+                try await emit(.notice("unknown command: /\(command.name)"))
+                return .handled
+            }
+        }
+    }
+
+    private static let helpText = """
+    Commands
+      /help            Browse commands and keyboard shortcuts
+      /clear  /new     Start a new session
+      /quit   /exit    Quit the application
+
+    Keys
+      Enter            send (queue while a turn is running)
+      Esc              cancel the running turn; press twice to clear a draft
+      Ctrl+c           cancel the running turn, or press twice to quit
+      Ctrl+d           end input
+      Up / Down        prompt history on an empty composer
+      PgUp / PgDn      scroll the transcript
+      Home / End       jump to the top or bottom of the transcript
+      Ctrl+u           scroll up half a page
+    """
 
     private func transition(to newLifecycle: OpenGrokPagerInteractiveLifecycle) async throws {
         lifecycle = newLifecycle
@@ -846,15 +1246,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
 
     private static func controlAction(for event: InputEvent) -> PromptAction? {
         guard case .key(let key) = event else { return nil }
-        if key.key == .escape { return .cancel }
+        if key.key == .escape { return .escape }
         guard key.modifiers.contains(.control) else {
-            if key.key == .char("\u{3}") { return .cancel }
+            if key.key == .char("\u{3}") { return .interrupt }
             if key.key == .char("\u{4}") { return .eof }
             return nil
         }
         switch key.key {
         case .char("c"), .char("C"):
-            return .cancel
+            return .interrupt
         case .char("d"), .char("D"):
             return .eof
         default:

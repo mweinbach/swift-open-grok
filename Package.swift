@@ -20,6 +20,11 @@ import PackageDescription
 
 let package = Package(
     name: "swift-open-grok",
+    // Declared explicitly so the Apple deployment target does not float with
+    // the host toolchain's default: `OpenGrokTestSupport` uses Network.framework
+    // (10.14+), which fails to compile under the 10.13 default. macOS 12 matches
+    // the compatibility floor the sources already document. Linux is unaffected.
+    platforms: [.macOS(.v12)],
     products: [
         .executable(name: "open-grok", targets: ["OpenGrokExecutable"]),
     ],
@@ -278,11 +283,13 @@ private func targets() -> [Target] {
     t.append(contentsOf: libs(w9s5, dep(w2s5, w7s1, w7s2, w7s5, w8s3, w8s4, w8s5)))
 
     // ---- Wave 10 ----
-    t.append(contentsOf: libs(w10s1, dep(w8s5, w9s1, w9s2, w9s3, w9s4, w9s5)))
+    // W10-S1 imports markdown, pager render, and terminal core directly (pager
+    // markdown rendering); those were only reachable transitively before.
+    t.append(contentsOf: libs(w10s1, dep(w2s5, w8s1, w8s3, w8s5, w9s1, w9s2, w9s3, w9s4, w9s5)))
     // W10-S2 (OpenGrokCLI) also needs branding/paths/env/version, shared
     // identifiers, and configuration — declared here so the frozen manifest
     // already has every edge the real CLI parser will require.
-    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s4, w2s5, w3s1, w3s2, w3s3, w5s4, w5s5, w5s6, w6s4, w7s3, w8s3, w8s4, w8s5, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry"])))
+    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s4, w2s5, w3s1, w3s2, w3s3, w4s3, w5s4, w5s5, w5s6, w6s4, w7s3, w8s1, w8s3, w8s4, w8s5, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry"])))
 
     // ---- Wave 11 (libraries + executable) ----
     t.append(contentsOf: libs(w11s1Lib, dep(w0s1, w0s3, w2s2, w5s6, w10s1, w10s2)))

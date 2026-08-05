@@ -1,6 +1,8 @@
 import Foundation
 import OpenGrokAgentDefinitions
+import OpenGrokAuth
 import OpenGrokFileTools
+import OpenGrokHTTP
 import OpenGrokModels
 import OpenGrokPager
 import OpenGrokPagerMinimal
@@ -14,6 +16,7 @@ import OpenGrokShellBase
 import OpenGrokTerminalCore
 import OpenGrokToolRegistry
 import OpenGrokTTY
+import OpenGrokWorkspace
 
 public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     public let model: String
@@ -21,19 +24,24 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     public let apiKey: String
     public let provider: ModelProvider
     public let apiBackend: ApiBackend
+    /// Provider headers that travel with every sampling request — Codex OAuth
+    /// account pinning (`ChatGPT-Account-ID`, `X-OpenAI-Fedramp`) arrives here.
+    public let extraHeaders: [String: String]
 
     public init(
         model: String,
         baseURL: String,
         apiKey: String,
         provider: ModelProvider = .xai,
-        apiBackend: ApiBackend = .chatCompletions
+        apiBackend: ApiBackend = .chatCompletions,
+        extraHeaders: [String: String] = [:]
     ) {
         self.model = model
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.provider = provider
         self.apiBackend = apiBackend
+        self.extraHeaders = extraHeaders
     }
 }
 
@@ -87,7 +95,7 @@ public struct OpenGrokLiveSamplingResponse: Sendable, Equatable {
         ))]
         self.items = resolvedItems
         if toolCalls.isEmpty {
-            self.toolCalls = resolvedItems.reversed().compactMap { item in
+            self.toolCalls = resolvedItems.reversed().compactMap { item -> [ToolCall]? in
                 guard case .assistant(let assistant) = item else { return nil }
                 return assistant.toolCalls
             }.first ?? []
@@ -129,22 +137,27 @@ public struct OpenGrokLiveSampler: Sendable {
             baseURL: configuration.baseURL,
             model: configuration.model,
             apiBackend: configuration.apiBackend,
-            provider: configuration.provider
+            provider: configuration.provider,
+            extraHeaders: configuration.extraHeaders
+                .sorted { $0.key < $1.key }
+                .map { (name: $0.key, value: $0.value) }
         ))
         return OpenGrokLiveSampler { request, emit in
             await emit(.status("sampling"))
-            let response = try await client.conversationCollect(ConversationRequest(
+            // Assistant text is forwarded incrementally as it arrives; the
+            // collected response carries the same bytes, so nothing is emitted
+            // again once the turn completes.
+            let response = try await client.streamConversation(ConversationRequest(
                 items: request.items,
                 tools: request.tools,
                 toolChoice: request.tools.isEmpty ? nil : .auto,
                 model: request.model,
                 xGrokReqId: request.turnID,
                 xGrokSessionId: request.sessionID
-            ))
-            let output = response.assistantText()
-            if !output.isEmpty {
-                await emit(.output(output))
+            )) { delta in
+                await emit(.output(delta))
             }
+            let output = response.assistantText()
             return OpenGrokLiveSamplingResponse(
                 output: output,
                 stopReason: response.stopReason?.asString,
@@ -152,6 +165,118 @@ public struct OpenGrokLiveSampler: Sendable {
                 toolCalls: response.assistant()?.toolCalls ?? []
             )
         }
+    }
+}
+
+extension SamplingClient {
+    /// Run one turn over the backend's streaming API, forwarding assistant text
+    /// deltas as they arrive.
+    ///
+    /// The returned response is the same value ``conversationCollect`` would
+    /// have produced — both drain the identical layer-2 event stream and read
+    /// the terminal `completed` event — so persisted history is unaffected by
+    /// streaming. Cancellation propagates through the underlying `AsyncStream`,
+    /// which tears down the in-flight HTTP request on termination.
+    fileprivate func streamConversation(
+        _ request: ConversationRequest,
+        requestId: RequestId = .random(),
+        idleTimeout: MonotonicDuration = .seconds(300),
+        onTextDelta: @escaping @Sendable (String) async -> Void
+    ) async throws -> ConversationResponse {
+        let events: AsyncStream<SamplingEvent>
+        switch apiBackend {
+        case .chatCompletions:
+            let (raw, metadata) = try await conversationStream(request)
+            events = streamChatCompletions(
+                rawStream: raw,
+                modelMetadata: metadata,
+                requestId: requestId,
+                idleTimeout: idleTimeout
+            )
+        case .responses:
+            let (raw, metadata, doomLoop, customToolNames) =
+                try await conversationStreamResponses(request)
+            events = streamResponsesWithClientCustomTools(
+                rawStream: raw,
+                modelMetadata: metadata,
+                requestId: requestId,
+                idleTimeout: idleTimeout,
+                doomLoop: doomLoop,
+                clientCustomToolNames: customToolNames
+            )
+        case .messages:
+            let (raw, metadata) = try await conversationStreamMessages(request)
+            events = streamMessages(
+                rawStream: raw,
+                modelMetadata: metadata,
+                requestId: requestId,
+                idleTimeout: idleTimeout
+            )
+        }
+
+        var coalescer = LiveTextDeltaCoalescer()
+        for await event in events {
+            try Task.checkCancellation()
+            switch event {
+            case .channelToken(_, .text, let text, _):
+                if let batch = coalescer.push(text) {
+                    await onTextDelta(batch)
+                }
+            case .completed(_, let response, _):
+                if let batch = coalescer.flush() {
+                    await onTextDelta(batch)
+                }
+                return response
+            case .failed(_, let error):
+                throw CLIApplicationError.failed(error.message)
+            default:
+                continue
+            }
+        }
+        try Task.checkCancellation()
+        throw CLIApplicationError.failed("sampling stream ended without a response")
+    }
+}
+
+/// Batches assistant text deltas so a fast token stream does not force one
+/// repaint per token.
+///
+/// The first delta is released immediately — the pane should show the answer
+/// starting, not a blank pause — and later deltas accumulate until the interval
+/// elapses. Released batches concatenate to exactly the tokens pushed, so
+/// coalescing never changes the text the pane or a headless stream observes.
+struct LiveTextDeltaCoalescer {
+    private let interval: MonotonicDuration
+
+    private var pending = ""
+    // Module-qualified: `OpenGrokHTTP` declares its own `MonotonicInstant`.
+    private var lastRelease: OpenGrokSampler.MonotonicInstant?
+
+    init(interval: MonotonicDuration = .milliseconds(50)) {
+        self.interval = interval
+    }
+
+    mutating func push(_ text: String) -> String? {
+        guard !text.isEmpty else { return nil }
+        pending += text
+        let now = OpenGrokSampler.MonotonicInstant.now
+        guard let lastRelease else {
+            self.lastRelease = now
+            return take()
+        }
+        guard interval < now - lastRelease else { return nil }
+        self.lastRelease = now
+        return take()
+    }
+
+    mutating func flush() -> String? {
+        take()
+    }
+
+    private mutating func take() -> String? {
+        guard !pending.isEmpty else { return nil }
+        defer { pending = "" }
+        return pending
     }
 }
 
@@ -453,6 +578,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
 
     public var launcher: CLIApplicationLauncher {
         CLIApplicationLauncher { command, context in
+            if LiveAuthComposition.handles(command) {
+                return try await LiveAuthComposition.session(for: command, context: context)
+            }
             guard case .launch(let options) = command else {
                 throw CLIApplicationError.unsupported(route: command.routeName)
             }
@@ -480,15 +608,18 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 store: conversationStore
             )
             let sessionID = conversationRecord.sessionID
-            let samplingConfiguration = try Self.resolveSamplingConfiguration(
+            let (samplingConfiguration, credential) = try await Self.resolveSamplingConfiguration(
                 options: options,
                 profileModel: agentProfile?.model,
-                environment: context.environment
+                environment: context.environment,
+                openGrokHome: openGrokHome,
+                sessionID: sessionID
             )
             let sampler = try dependencies.makeSampler(samplingConfiguration)
             let providerConfiguration = Self.makeProviderConfiguration(
                 sessionID: sessionID,
                 sampling: samplingConfiguration,
+                credential: credential,
                 openGrokHome: openGrokHome,
                 environment: context.environment
             )
@@ -497,7 +628,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 processBackend: processBackend,
                 sessionID: sessionID,
                 workingDirectory: cwd,
-                toolPolicy: agentProfile?.toolPolicy
+                toolPolicy: agentProfile?.toolPolicy,
+                fileAccessPolicy: Self.resolveFileAccessPolicy(environment: context.environment)
             )
             let conversationHistory = LiveConversationHistory(
                 record: conversationRecord,
@@ -533,7 +665,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     let renderer = LiveInteractiveControllerRenderer(
                         mode: pagerMode,
                         terminal: dependencies.terminal,
-                        sink: terminalSink
+                        sink: terminalSink,
+                        workingDirectory: cwd.path,
+                        modelName: providerConfiguration.initialModelID
                     )
                     let controller = OpenGrokPagerInteractiveController(
                         input: interactiveInput.events,
@@ -838,13 +972,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     private static func resolveSamplingConfiguration(
         options: CLIExecutionOptions,
         profileModel: String?,
-        environment: [String: String]
-    ) throws -> OpenGrokLiveSamplingConfiguration {
+        environment: [String: String],
+        openGrokHome: URL,
+        sessionID: String
+    ) async throws -> (OpenGrokLiveSamplingConfiguration, LiveResolvedCredential) {
         let requestedProvider = try options.common.provider.map(resolveProvider)
-        if requestedProvider == .codex {
-            throw CLIApplicationError.unsupported(route: "Codex OAuth provider")
-        }
-
         let embedded = embeddedDefaultModels()
         let requestedModel = options.common.model ?? profileModel
         let knownModel = requestedModel.flatMap { requested in
@@ -859,9 +991,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         }
 
         let provider = requestedProvider ?? knownModel?.provider ?? .xai
-        guard provider != .codex else {
-            throw CLIApplicationError.unsupported(route: "Codex OAuth provider")
-        }
         let selectedModel = try knownModel ?? defaultModelProfile(
             provider: provider,
             embedded: embedded,
@@ -893,24 +1022,41 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 "Kimi model '\(model)' cannot use endpoint \(baseURL)"
             )
         }
-        let apiKey = try resolveProviderAPIKey(
+        // Explicit model/provider environment keys still resolve exactly as
+        // before; they are the resolver's highest-precedence input.
+        let explicitAPIKey = try resolveProviderAPIKey(
             provider: provider,
             model: selectedProfile,
             baseURL: baseURL,
             environment: environment
         )
-        guard let apiKey else {
-            throw CLIApplicationError.failed(
-                "\(providerCredentialDescription(provider)) is required for provider \(provider.asString)"
+        let resolver = LiveCredentialResolver(
+            environment: environment,
+            openGrokHome: openGrokHome,
+            codexRefreshService: .live(
+                endpoints: CodexEndpoints.fromEnvironment(environment),
+                transport: URLSessionHTTPTransport()
             )
+        )
+        let credential: LiveResolvedCredential
+        do {
+            credential = try await resolver.resolve(
+                provider: provider,
+                explicitAPIKey: explicitAPIKey,
+                scope: "cli:\(sessionID)"
+            )
+        } catch let error as LiveCredentialError {
+            throw CLIApplicationError.failed(error.description)
         }
-        return OpenGrokLiveSamplingConfiguration(
+        let sampling = OpenGrokLiveSamplingConfiguration(
             model: model,
             baseURL: baseURL,
-            apiKey: apiKey,
+            apiKey: credential.bearer,
             provider: provider,
-            apiBackend: apiBackend
+            apiBackend: apiBackend,
+            extraHeaders: credential.extraHeaders
         )
+        return (sampling, credential)
     }
 
     private static func resolveAgentProfile(
@@ -1083,9 +1229,31 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         }
     }
 
+    /// Dispatch gate for the file tool pack.
+    ///
+    /// There is no interactive permission prompt yet — the input stream is owned
+    /// end-to-end by `OpenGrokPagerInteractiveController`, with no seam for a
+    /// tool call to ask a question mid-turn — so interactive and headless alike
+    /// fail closed on mutations. `OPENGROK_ALLOW_WRITES` is the explicit opt-in
+    /// until a real prompter lands; reads and searches are unaffected either way.
+    static func resolveFileAccessPolicy(
+        environment: [String: String]
+    ) -> FileToolAccessPolicy {
+        let raw = environment["OPENGROK_ALLOW_WRITES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch raw {
+        case "1", "true", "yes", "on":
+            return .allowAll
+        default:
+            return .prompt(LiveWriteDenialPrompter())
+        }
+    }
+
     private static func makeProviderConfiguration(
         sessionID: String,
         sampling: OpenGrokLiveSamplingConfiguration,
+        credential: LiveResolvedCredential,
         openGrokHome: URL,
         environment: [String: String]
     ) -> ProviderSessionConfiguration {
@@ -1103,11 +1271,25 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             sessionID: sessionID,
             modelCatalog: [sampling.model: entry],
             initialModelID: sampling.model,
-            credentialBindings: [
-                sampling.provider: .apiKey(scope: "cli:\(sessionID)", key: sampling.apiKey)
-            ],
+            credentialBindings: [sampling.provider: credential.binding],
             openGrokHome: openGrokHome,
             environment: environment
+        )
+    }
+}
+
+/// Rejects every mutation with an actionable message instead of hanging on a
+/// prompt no terminal is listening for.
+struct LiveWriteDenialPrompter: PermissionPrompter {
+    func prompt(
+        access: AccessKind,
+        toolName: String,
+        toolCallId: String
+    ) async -> PermissionDecision {
+        _ = (access, toolCallId)
+        return .reject(
+            "'\(toolName)' would modify files, and file mutations are disabled for this session. "
+                + "Set OPENGROK_ALLOW_WRITES=1 to allow them."
         )
     }
 }
@@ -1123,7 +1305,8 @@ private struct LiveToolExecutor: Sendable {
         processBackend: any ShellProcessBackend,
         sessionID: String,
         workingDirectory: URL,
-        toolPolicy: LiveAgentToolPolicy?
+        toolPolicy: LiveAgentToolPolicy?,
+        fileAccessPolicy: FileToolAccessPolicy = .denyByDefault
     ) async throws {
         let composition = OpenGrokShellToolRuntimeComposition(
             processBackend: processBackend,
@@ -1134,15 +1317,15 @@ private struct LiveToolExecutor: Sendable {
             workingDirectory: workingDirectory
         )
         let standardizedWorkingDirectory = workingDirectory.standardizedFileURL
-        let fileToolBridge = ToolBridge(toolset: try FileToolPack.finalizePreset(
-            .explore,
-            resources: ToolResources(
-                cwd: standardizedWorkingDirectory.path,
-                sessionFolder: standardizedWorkingDirectory.path,
-                sessionId: sessionID,
-                agentId: "main",
-                allowedRoots: [standardizedWorkingDirectory.path]
-            )
+        let fileToolResources = FileToolSession.makeResources(
+            workspaceRoot: standardizedWorkingDirectory.path,
+            sessionId: sessionID,
+            agentId: "main",
+            policy: fileAccessPolicy
+        )
+        let fileToolBridge = ToolBridge(toolset: try FileToolPack.finalizeBuildPack(
+            resources: fileToolResources,
+            capabilityMode: Self.capabilityMode(for: toolPolicy)
         ))
         let fileToolDefinitions = fileToolBridge.toolDefinitions()
         let allowedFileToolDefinitions = fileToolDefinitions.filter {
@@ -1163,6 +1346,20 @@ private struct LiveToolExecutor: Sendable {
                     "type": .string("object")
                 ])
             )
+        }
+    }
+
+    /// Listing gate: a read-only agent profile never sees a mutating tool.
+    /// A profile that declares no capability mode gets the pack's default.
+    private static func capabilityMode(
+        for policy: LiveAgentToolPolicy?
+    ) -> ToolCapabilityMode {
+        switch policy?.capabilityMode {
+        case .readOnly: return .readOnly
+        case .readWrite: return .readWrite
+        case .execute: return .execute
+        case .all: return .all
+        case nil: return .readWrite
         }
     }
 
@@ -1990,10 +2187,59 @@ private final class FileHandlePagerTerminalSink: PagerTerminalSink, @unchecked S
     }
 }
 
+/// Chrome the live TUI composes for every frame.
+///
+/// The reference builds its shortcut hints from an action registry
+/// (`src/actions/defaults.rs`); this port lists only the bindings the Swift
+/// controller actually honors, so the bar never advertises a key that does
+/// nothing.
+enum LivePagerChrome {
+    static func collapseHome(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        guard !home.isEmpty, path == home || path.hasPrefix(home + "/") else { return path }
+        return "~" + path.dropFirst(home.count)
+    }
+
+    static func shortcutHints(isTurnRunning: Bool) -> [PagerShortcutHint] {
+        var hints: [PagerShortcutHint] = [
+            // The submit label flips to "queue" while a turn is in flight,
+            // matching `views/agent.rs:992`.
+            PagerShortcutHint(key: "Enter", label: isTurnRunning ? "queue" : "send", isPinned: true)
+        ]
+        if isTurnRunning {
+            hints.append(PagerShortcutHint(key: "Esc", label: "cancel", isPinned: true))
+        } else {
+            hints.append(PagerShortcutHint(key: "\u{2191}", label: "history"))
+            hints.append(PagerShortcutHint(key: "/", label: "commands"))
+        }
+        hints.append(PagerShortcutHint(keys: ["PgUp", "PgDn"], label: "scroll"))
+        hints.append(PagerShortcutHint(key: "Ctrl+c", label: "quit", isPinned: true))
+        return hints
+    }
+}
+
 private struct LivePagerConversationState {
     private(set) var items: [PagerConversationItem] = []
     private var activeAssistantIndex: Int?
     private var toolIndicesByCallID: [String: Int] = [:]
+    /// Renders assistant messages as markdown for frame painting. `nil` leaves
+    /// them as plain text, which is what the inline and transcript paths want.
+    private let markdown: PagerMarkdownRenderer?
+
+    init(markdown: PagerMarkdownRenderer? = nil) {
+        self.markdown = markdown
+    }
+
+    /// Re-render the accumulated message body.
+    ///
+    /// The whole message is re-parsed on each delta rather than patched: a
+    /// streamed answer is bounded by the model's output budget, and markdown
+    /// structure is not stable under append (a fence or table opened by the
+    /// latest delta reinterprets earlier lines).
+    private func styledLines(for text: String) -> [PagerStyledLine] {
+        guard let markdown, !text.isEmpty else { return [] }
+        return markdown.render(text)
+    }
 
     mutating func startTurn(prompt: String) {
         toolIndicesByCallID.removeAll(keepingCapacity: true)
@@ -2018,13 +2264,15 @@ private struct LivePagerConversationState {
             items.append(.message(PagerMessage(
                 role: .assistant,
                 text: text,
-                isStreaming: true
+                isStreaming: true,
+                styledLines: styledLines(for: text)
             )))
             self.activeAssistantIndex = items.indices.last
             return
         }
         message.text += text
         message.isStreaming = true
+        message.styledLines = styledLines(for: message.text)
         items[activeAssistantIndex] = .message(message)
     }
 
@@ -2039,6 +2287,7 @@ private struct LivePagerConversationState {
             return
         }
         message.isStreaming = false
+        message.styledLines = styledLines(for: message.text)
         items[activeAssistantIndex] = .message(message)
         self.activeAssistantIndex = nil
     }
@@ -2082,6 +2331,10 @@ private struct LivePagerConversationState {
         }
     }
 
+    /// The plain transcript replayed to the real terminal after the alt-screen
+    /// is torn down. This is deliberately *not* the on-screen presentation: it
+    /// is a labeled plain-text log that other composition paths and their
+    /// tests share.
     private static func transcriptLines(for item: PagerConversationItem) -> [String] {
         switch item {
         case .message(let message):
@@ -2125,20 +2378,40 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     private let sink: any PagerTerminalSink
     private let renderer: PagerTerminalRenderer
 
-    private var conversation = LivePagerConversationState()
+    private var conversation = LivePagerConversationState(markdown: PagerMarkdownRenderer())
     private var prompt = OpenGrokPagerInteractivePromptState()
-    private var status = PagerStatusLine(text: "Starting")
     private var terminalSize: OpenGrokTerminalCore.TerminalSize
     private var restored = false
+
+    /// Frame chrome. `turnActivity` is `nil` whenever no turn is in flight,
+    /// which is what hides the turn-status row — the reference gives that row
+    /// zero height when idle.
+    private let workingDirectory: String
+    private let modelName: String
+    private var turnActivity: String?
+    private var turnStartedAt: Date?
+    private var animationTick = 0
+    private var isCancelling = false
+
+    /// Viewport state. The last frame's geometry is cached so a page-sized
+    /// scroll can be expressed in rows without re-laying out the transcript.
+    private var followsBottom = true
+    private var scrollOffset = 0
+    private var lastConversationHeight = 1
+    private var lastMaximumScrollOffset = 0
 
     init(
         mode: OpenGrokPagerMode,
         terminal: OpenGrokLiveTerminal,
-        sink: any PagerTerminalSink
+        sink: any PagerTerminalSink,
+        workingDirectory: String = FileManager.default.currentDirectoryPath,
+        modelName: String = "unknown"
     ) {
         self.mode = mode
         self.terminal = terminal
         self.sink = sink
+        self.workingDirectory = workingDirectory
+        self.modelName = modelName
         let size = terminal.size() ?? OpenGrokLiveTerminalSize(width: 80, height: 24)
         self.terminalSize = OpenGrokTerminalCore.TerminalSize(
             width: size.width,
@@ -2168,37 +2441,95 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     }
 
     func render(_ event: OpenGrokPagerInteractiveEvent) async throws {
+        animationTick += 1
         switch event {
         case .lifecycle(let lifecycle):
-            status = PagerStatusLine(
-                text: lifecycle.rawValue.capitalized,
-                isStreaming: lifecycle == .running
-            )
+            if lifecycle == .cancelling { isCancelling = true }
         case .promptChanged(let prompt):
             self.prompt = prompt
         case .turnStarted(let request):
             conversation.startTurn(prompt: request.prompt)
-            status = PagerStatusLine(text: "Thinking", isStreaming: true)
+            turnActivity = "Thinking\u{2026}"
+            turnStartedAt = Date()
+            isCancelling = false
         case .session(let event):
             apply(event)
-        case .turnFinished(let result):
+        case .turnFinished:
             finishAssistant()
-            status = PagerStatusLine(text: result.lifecycle.rawValue.capitalized)
+            endTurn()
         case .notice(let message):
-            status = PagerStatusLine(text: message)
-        case .eof:
-            status = PagerStatusLine(text: "End of input")
+            conversation.appendMessage(PagerMessage(role: .system, text: message))
+        case .viewport(let command):
+            applyViewport(command)
+        case .turnCancelled:
+            finishAssistant()
+            conversation.appendMessage(PagerMessage(role: .system, text: "Cancelled."))
+            endTurn()
+        case .eof, .shutdown:
+            endTurn()
         case .cancelled:
             finishAssistant()
-            status = PagerStatusLine(text: "Cancelled")
+            endTurn()
         case .failed(let message):
             finishAssistant()
             conversation.appendMessage(PagerMessage(role: .error, text: message))
-            status = PagerStatusLine(text: "Failed")
-        case .shutdown:
-            status = PagerStatusLine(text: "Shutdown")
+            endTurn()
         }
         try renderState()
+    }
+
+    private func endTurn() {
+        turnActivity = nil
+        turnStartedAt = nil
+        isCancelling = false
+    }
+
+    /// Move the transcript viewport.
+    ///
+    /// Follow-bottom mirrors `scrollback/state/nav.rs`: scrolling up always
+    /// breaks follow, and a downward scroll re-engages it only once it arrives
+    /// already clamped at the bottom — the reference's overscroll gesture. A
+    /// scroll that merely *lands* at the bottom moved real rows and does not
+    /// re-engage.
+    private func applyViewport(_ command: OpenGrokPagerViewportCommand) {
+        let page = max(1, lastConversationHeight)
+        let half = max(1, page / 2)
+        switch command {
+        case .top:
+            followsBottom = false
+            scrollOffset = 0
+        case .bottom:
+            followsBottom = true
+            scrollOffset = lastMaximumScrollOffset
+        case .lineUp:
+            scrollUp(by: 1)
+        case .lineDown:
+            scrollDown(by: 1)
+        case .halfPageUp:
+            scrollUp(by: half)
+        case .halfPageDown:
+            scrollDown(by: half)
+        case .pageUp:
+            scrollUp(by: page)
+        case .pageDown:
+            scrollDown(by: page)
+        }
+    }
+
+    private func scrollUp(by rows: Int) {
+        let current = followsBottom ? lastMaximumScrollOffset : scrollOffset
+        followsBottom = false
+        scrollOffset = max(0, current - rows)
+    }
+
+    private func scrollDown(by rows: Int) {
+        guard !followsBottom else { return }
+        let target = min(lastMaximumScrollOffset, scrollOffset + rows)
+        if target == scrollOffset {
+            // The gesture arrived already clamped at the bottom: re-engage.
+            followsBottom = true
+        }
+        scrollOffset = target
     }
 
     func restoreTerminal() async throws {
@@ -2214,28 +2545,25 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     private func apply(_ event: OpenGrokPagerEvent) {
         switch event {
         case .lifecycle(let lifecycle):
-            status = PagerStatusLine(
-                text: lifecycle.rawValue.capitalized,
-                isStreaming: lifecycle == .running
-            )
+            if lifecycle == .running, turnActivity == nil {
+                turnActivity = "Thinking\u{2026}"
+                turnStartedAt = turnStartedAt ?? Date()
+            }
         case .output(let text):
             appendAssistant(text)
-            status = PagerStatusLine(text: "Responding", isStreaming: true)
+            turnActivity = "Responding\u{2026}"
         case .status(let text):
-            status = PagerStatusLine(text: text, isStreaming: true)
+            turnActivity = text
         case .tool(let tool):
             apply(tool)
         case .permissionRequested(let request):
-            status = PagerStatusLine(
-                text: "Permission required",
-                detail: request.prompt
-            )
+            turnActivity = "Permission required: \(request.prompt)"
         case .completed:
             finishAssistant()
-            status = PagerStatusLine(text: "Completed")
+            endTurn()
         case .cancelled:
             finishAssistant()
-            status = PagerStatusLine(text: "Cancelled")
+            endTurn()
         }
     }
 
@@ -2249,39 +2577,67 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
 
     private func apply(_ tool: OpenGrokPagerToolUpdate) {
         conversation.apply(tool)
-        status = PagerStatusLine(
-            text: "Tool \(tool.name) \(toolStatusText(tool.state))",
-            isStreaming: tool.state == .running
-        )
-    }
-
-    private func toolStatusText(_ state: OpenGrokPagerToolState) -> String {
-        switch state {
-        case .running: return "running"
-        case .succeeded: return "completed"
-        case .failed: return "failed"
-        case .cancelled: return "cancelled"
+        // While a tool runs, the turn-status row shows the tool's own title —
+        // the reference has no separate "tool running" phrasing.
+        if tool.state == .running {
+            turnActivity = tool.name
         }
     }
 
     private func renderState() throws {
-        try renderer.render(PagerRenderState(
+        let isTurnRunning = turnActivity != nil
+        let completions = prompt.completions.isEmpty
+            ? nil
+            : PagerCompletionMenu(
+                rows: prompt.completions.map {
+                    PagerCompletionRow(
+                        label: $0.name,
+                        summary: $0.summary,
+                        isAvailable: $0.isAvailable
+                    )
+                },
+                selectedIndex: prompt.selectedCompletion
+            )
+        let state = PagerRenderState(
             size: terminalSize,
-            header: PagerHeader(title: "Open Grok", subtitle: "Interactive"),
+            statusBar: PagerStatusBar(
+                workingDirectory: LivePagerChrome.collapseHome(workingDirectory)
+            ),
             conversation: conversation.items,
-            status: status,
-            input: PagerInputState(
+            turnStatus: turnActivity.map { label in
+                PagerTurnStatus(
+                    label: isCancelling ? "Cancelling\u{2026}" : label,
+                    isCancelling: isCancelling,
+                    tick: animationTick,
+                    elapsed: turnStartedAt.map { Date().timeIntervalSince($0) }
+                )
+            },
+            completions: completions,
+            input: PagerComposerState(
                 text: prompt.text,
                 cursorCharacterOffset: prompt.cursorOffset,
                 isFocused: true,
                 cursorVisible: true,
-                maximumHeight: 4
+                modelName: modelName,
+                maximumHeight: max(3, terminalSize.height / 2)
             ),
-            footer: PagerFooter(
-                leading: "Enter send · Ctrl-C cancel · Ctrl-D exit",
-                trailing: "Swift port"
-            )
-        ))
+            shortcuts: PagerShortcutsBar(
+                hints: LivePagerChrome.shortcutHints(isTurnRunning: isTurnRunning),
+                pendingKey: prompt.pendingConfirmationKey,
+                pendingLabel: prompt.pendingConfirmationLabel
+            ),
+            scrollPosition: followsBottom ? .followTail : .offset(scrollOffset)
+        )
+        // Render through the frame function rather than the renderer's own
+        // engine so the resulting layout can seed the next scroll gesture.
+        let result = renderPagerFrame(state)
+        lastConversationHeight = max(1, result.layout.conversation.height)
+        lastMaximumScrollOffset = max(
+            0,
+            result.layout.totalContentLines - result.layout.conversation.height
+        )
+        if followsBottom { scrollOffset = lastMaximumScrollOffset }
+        try renderer.render(result)
     }
 
     private var transcript: String { conversation.transcript }
@@ -2320,18 +2676,25 @@ private actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
     private let prompt: String
     private let renderEngine = PagerRenderEngine()
 
-    private var conversation = LivePagerConversationState()
+    private var conversation: LivePagerConversationState
     private var output = ""
     private var status = "Starting"
     private var inlineBegan = false
     private var inlineEnded = false
     private var inlineNeedsAssistantPrefix = false
     private var restored = false
+    private var renderTick = 0
 
     init(mode: OpenGrokPagerMode, terminal: OpenGrokLiveTerminal, prompt: String) {
         self.mode = mode
         self.terminal = terminal
         self.prompt = prompt
+        // Inline mode streams raw text straight to the terminal and only uses
+        // the conversation state for its plain transcript, so markdown is
+        // rendered for the full-screen frame path only.
+        conversation = LivePagerConversationState(
+            markdown: mode == .fullScreen ? PagerMarkdownRenderer() : nil
+        )
         conversation.startTurn(prompt: prompt)
     }
 
@@ -2412,23 +2775,30 @@ private actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
     }
 
     private func renderFullScreen() async throws {
+        renderTick += 1
         let terminalSize = terminal.size() ?? OpenGrokLiveTerminalSize(width: 80, height: 24)
         let result = renderEngine.render(PagerRenderState(
             size: OpenGrokTerminalCore.TerminalSize(
                 width: terminalSize.width,
                 height: terminalSize.height
             ),
-            header: PagerHeader(title: "Open Grok", subtitle: "Interactive"),
+            statusBar: PagerStatusBar(
+                workingDirectory: LivePagerChrome.collapseHome(
+                    FileManager.default.currentDirectoryPath
+                )
+            ),
             conversation: conversation.items,
-            status: PagerStatusLine(text: status, isStreaming: status == "Thinking" || status == "Responding"),
-            input: PagerInputState(
-                prompt: "",
+            turnStatus: PagerTurnStatus(label: status, tick: renderTick),
+            input: PagerComposerState(
                 text: "",
                 isFocused: false,
                 cursorVisible: false,
-                maximumHeight: 1
+                placeholder: "",
+                maximumHeight: 3
             ),
-            footer: PagerFooter(leading: "Ctrl-C cancel", trailing: "Swift port")
+            shortcuts: PagerShortcutsBar(
+                hints: [PagerShortcutHint(key: "Ctrl+c", label: "cancel", isPinned: true)]
+            )
         ))
         let frame = ANSIOutput.beginSynchronizedUpdate
             + ANSIOutput.moveTo(column: 0, row: 0)

@@ -428,7 +428,7 @@ public struct PagerState: Hashable, Sendable, Codable {
     }
 
     public func permission(with requestID: String) -> PagerPermissionCard? {
-        conversation.compactMap { item in
+        conversation.compactMap { item -> PagerPermissionCard? in
             guard case .permission(let card) = item, card.requestID == requestID else { return nil }
             return card
         }.first

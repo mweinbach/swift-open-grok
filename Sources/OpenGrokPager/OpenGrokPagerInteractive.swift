@@ -16,13 +16,61 @@ public enum OpenGrokPagerInteractiveLifecycle: String, Sendable, Equatable {
     case shutdown
 }
 
+/// A scrollback movement the transcript viewport should apply.
+///
+/// The reference binds these under `When::ScrollbackFocused`
+/// (`src/actions/defaults.rs:175-239`); this port routes them from the prompt
+/// because the Swift TUI has a single focus region.
+public enum OpenGrokPagerViewportCommand: Sendable, Equatable, Hashable {
+    case lineUp
+    case lineDown
+    case halfPageUp
+    case halfPageDown
+    case pageUp
+    case pageDown
+    case top
+    case bottom
+}
+
+/// One row of the slash-command dropdown.
+public struct OpenGrokPagerCommandSuggestion: Sendable, Equatable, Hashable {
+    public let name: String
+    public let summary: String
+    public let isAvailable: Bool
+
+    public init(name: String, summary: String, isAvailable: Bool = true) {
+        self.name = name
+        self.summary = summary
+        self.isAvailable = isAvailable
+    }
+}
+
 public struct OpenGrokPagerInteractivePromptState: Sendable, Equatable {
     public let text: String
     public let cursorOffset: Int
+    /// Slash-command completions for the current text. Empty when the dropdown
+    /// is closed.
+    public let completions: [OpenGrokPagerCommandSuggestion]
+    public let selectedCompletion: Int?
+    /// An armed double-press confirmation, as `(key, label)`. The renderer
+    /// replaces the whole shortcuts bar with `press again to {label}`.
+    public let pendingConfirmationKey: String?
+    public let pendingConfirmationLabel: String?
 
-    public init(text: String = "", cursorOffset: Int = 0) {
+    public init(
+        text: String = "",
+        cursorOffset: Int = 0,
+        completions: [OpenGrokPagerCommandSuggestion] = [],
+        selectedCompletion: Int? = nil,
+        pendingConfirmationKey: String? = nil,
+        pendingConfirmationLabel: String? = nil
+    ) {
         self.text = text
         self.cursorOffset = max(0, min(cursorOffset, text.count))
+        self.completions = completions
+        self.selectedCompletion = selectedCompletion
+        self.pendingConfirmationKey = pendingConfirmationKey
+        self.pendingConfirmationLabel = pendingConfirmationLabel
     }
 }
 
@@ -83,6 +131,11 @@ public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {
     case session(OpenGrokPagerEvent)
     case turnFinished(OpenGrokPagerRuntimeResult)
     case notice(String)
+    /// The user moved the transcript viewport.
+    case viewport(OpenGrokPagerViewportCommand)
+    /// A turn was cancelled but the session stays open for the next prompt —
+    /// distinct from `.cancelled`, which ends the run.
+    case turnCancelled
     case eof
     case cancelled
     case failed(String)
