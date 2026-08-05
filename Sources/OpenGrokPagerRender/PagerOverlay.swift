@@ -578,15 +578,16 @@ public struct PagerPermissionPrompt: Sendable, Equatable, Hashable {
 
 // MARK: - Overlay
 
-public enum PagerOverlayContent: Sendable, Equatable, Hashable {
+public enum PagerOverlayContent: Sendable, Equatable {
     case list(PagerListOverlay)
     case text(PagerTextOverlay)
     case welcome(PagerWelcomeOverlay)
     case permission(PagerPermissionPrompt)
     case workflows(PagerWorkflowsOverlay)
+    case settings(PagerSettingsOverlay)
 }
 
-public struct PagerOverlay: Sendable, Equatable, Hashable {
+public struct PagerOverlay: Sendable, Equatable {
     public var id: String
     public var title: String
     public var presentation: PagerOverlayPresentation
@@ -720,6 +721,27 @@ extension PagerOverlay {
         )
     }
 
+    /// `/settings`, `/privacy`, and `F2` — the settings modal.
+    ///
+    /// Title and footer hints are recomputed from the modal's own mode at paint
+    /// time, so the stored ones here are only what a caller sees before the
+    /// first frame; nothing downstream reads them.
+    public static func settings(
+        _ settings: PagerSettingsOverlay,
+        id: String = "settings"
+    ) -> PagerOverlay {
+        PagerOverlay(
+            id: id,
+            title: pagerSettingsTitle(settings),
+            presentation: .centeredModal(PagerSettingsMetrics.sizing),
+            hints: pagerSettingsHints(settings),
+            content: .settings(settings),
+            // Escape is routed into the modal, which decides whether it means
+            // "back out" or "close" — see `PagerOverlayStack.handle`.
+            dismissOnEscape: false
+        )
+    }
+
     /// Session info — the same text modal under a different title.
     public static func sessionInfo(
         id: String = "session-info",
@@ -790,6 +812,9 @@ public enum PagerOverlayOutcome: Sendable, Equatable {
     case dismissed(id: String)
     case selected(id: String, rowID: String)
     case permission(id: String, requestID: String, decision: PagerPermissionDecision)
+    /// The settings modal decided something the session has to act on — commit
+    /// a value, preview a theme, store a secret, apply a default.
+    case setting(id: String, event: PagerSettingsEvent)
 }
 
 /// The overlay stack, layered above the transcript.
@@ -847,7 +872,13 @@ public struct PagerOverlayStack: Sendable, Equatable {
         guard let index = overlays.lastIndex(where: \.capturesInput) else { return .ignored }
         var overlay = overlays[index]
 
-        if event.key == .escape, event.modifiers.isEmpty {
+        // The settings modal owns Escape outright: inside a chooser or an editor
+        // it means "back out one level", and only browse-Escape closes. Handling
+        // it here would collapse every sub-pane into a dismissal.
+        let ownsEscape: Bool
+        if case .settings = overlay.content { ownsEscape = true } else { ownsEscape = false }
+
+        if event.key == .escape, event.modifiers.isEmpty, !ownsEscape {
             // A run's detail view is a layer inside the overlay, not a second
             // overlay, so escape has to unwind it first — otherwise one keypress
             // from the detail view throws away the dashboard too.
@@ -880,6 +911,24 @@ public struct PagerOverlayStack: Sendable, Equatable {
         case .workflows(var runs):
             outcome = handleWorkflows(&runs, overlay: overlay, event: event, viewportHeight: viewportHeight)
             overlay.content = .workflows(runs)
+        case .settings(var settings):
+            let result = settings.handle(event)
+            overlay.content = .settings(settings)
+            switch result {
+            case .redraw:
+                outcome = .redraw
+            case .consumed:
+                outcome = .consumed
+            case .close:
+                overlays.remove(at: index)
+                return .dismissed(id: overlay.id)
+            case .event(let settingsEvent):
+                outcome = .setting(id: overlay.id, event: settingsEvent)
+            case .eventAndClose(let settingsEvent):
+                overlays[index] = overlay
+                overlays.remove(at: index)
+                return .setting(id: overlay.id, event: settingsEvent)
+            }
         }
 
         overlays[index] = overlay

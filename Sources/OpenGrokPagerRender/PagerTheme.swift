@@ -3,15 +3,18 @@ import OpenGrokTerminalCore
 /// The palette roles the Rust pager's `Theme` struct exposes, ported so frame
 /// code can name colors the same way the reference does.
 ///
-/// The reference ships five concrete themes; this port carries the two that do
-/// not require truecolor — GrokNight (the default) and GrokDay — since those
-/// are the pair the reference itself falls back to on a non-truecolor terminal.
+/// The reference's `Theme` carries 60 fields; the markdown heading and code
+/// slots are owned by the markdown renderer and stay out of this struct. Every
+/// other role the frame chrome paints with is here, under the reference's own
+/// name, so a theme table ports across as a field-for-field transcription.
 public struct PagerRenderTheme: Sendable, Equatable, Hashable {
     public var bgBase: TerminalColor
     public var bgLight: TerminalColor
     public var bgDark: TerminalColor
     public var bgHighlight: TerminalColor
+    public var bgHover: TerminalColor
     public var bgVisual: TerminalColor
+    public var bgTerminal: TerminalColor
 
     public var textPrimary: TerminalColor
     public var textSecondary: TerminalColor
@@ -29,23 +32,46 @@ public struct PagerRenderTheme: Sendable, Equatable, Hashable {
     public var accentRunning: TerminalColor
     public var accentSkill: TerminalColor
     public var accentPlan: TerminalColor
+    public var accentVerify: TerminalColor
+    public var accentFeedback: TerminalColor
+    public var accentRemember: TerminalColor
+    /// The role the reference paints the active model's chrome with
+    /// (`accent_model`).
+    public var accentModel: TerminalColor
+    public var fuzzyAccent: TerminalColor
 
     public var command: TerminalColor
     public var path: TerminalColor
+    public var running: TerminalColor
     public var warning: TerminalColor
 
     public var promptBorder: TerminalColor
     public var promptBorderActive: TerminalColor
     public var selectionBorder: TerminalColor
+    public var hoverBorder: TerminalColor
+    public var scrollbarBackground: TerminalColor
     public var scrollbarForeground: TerminalColor
     public var linkForeground: TerminalColor
+
+    public var diffDeleteBackground: TerminalColor
+    public var diffDeleteForeground: TerminalColor
+    public var diffInsertBackground: TerminalColor
+    public var diffInsertForeground: TerminalColor
+    public var diffEqualForeground: TerminalColor
+    public var diffGutterForeground: TerminalColor
+
+    public var pasteBackground: TerminalColor
+    public var pasteForeground: TerminalColor
+    public var pasteDim: TerminalColor
 
     public init(
         bgBase: TerminalColor = .rgb(20, 20, 20),
         bgLight: TerminalColor = .rgb(36, 36, 36),
         bgDark: TerminalColor = .rgb(28, 28, 28),
         bgHighlight: TerminalColor = .rgb(36, 36, 36),
+        bgHover: TerminalColor = .rgb(44, 44, 44),
         bgVisual: TerminalColor = .rgb(54, 54, 54),
+        bgTerminal: TerminalColor = .rgb(10, 10, 10),
         textPrimary: TerminalColor = .rgb(225, 225, 225),
         textSecondary: TerminalColor = .rgb(200, 200, 200),
         grayDim: TerminalColor = .rgb(88, 88, 88),
@@ -61,20 +87,39 @@ public struct PagerRenderTheme: Sendable, Equatable, Hashable {
         accentRunning: TerminalColor = .rgb(187, 154, 247),
         accentSkill: TerminalColor = .rgb(122, 162, 247),
         accentPlan: TerminalColor = .rgb(255, 219, 141),
+        accentVerify: TerminalColor = .rgb(187, 154, 247),
+        accentFeedback: TerminalColor = .rgb(115, 218, 202),
+        accentRemember: TerminalColor = .rgb(139, 195, 74),
+        accentModel: TerminalColor = .rgb(26, 188, 156),
+        fuzzyAccent: TerminalColor = .rgb(122, 162, 247),
         command: TerminalColor = .rgb(224, 175, 104),
         path: TerminalColor = .rgb(255, 158, 100),
+        running: TerminalColor = .rgb(125, 207, 255),
         warning: TerminalColor = .rgb(224, 175, 104),
         promptBorder: TerminalColor = .rgb(50, 50, 55),
         promptBorderActive: TerminalColor = .rgb(80, 80, 88),
         selectionBorder: TerminalColor = .rgb(60, 60, 65),
+        hoverBorder: TerminalColor = .rgb(30, 30, 34),
+        scrollbarBackground: TerminalColor = .rgb(17, 17, 17),
         scrollbarForeground: TerminalColor = .rgb(36, 36, 36),
-        linkForeground: TerminalColor = .rgb(122, 166, 218)
+        linkForeground: TerminalColor = .rgb(122, 166, 218),
+        diffDeleteBackground: TerminalColor = .rgb(66, 14, 20),
+        diffDeleteForeground: TerminalColor = .rgb(247, 118, 142),
+        diffInsertBackground: TerminalColor = .rgb(6, 56, 6),
+        diffInsertForeground: TerminalColor = .rgb(158, 206, 106),
+        diffEqualForeground: TerminalColor = .rgb(108, 108, 108),
+        diffGutterForeground: TerminalColor = .rgb(108, 108, 108),
+        pasteBackground: TerminalColor = .rgb(17, 17, 17),
+        pasteForeground: TerminalColor = .rgb(200, 200, 200),
+        pasteDim: TerminalColor = .rgb(65, 65, 65)
     ) {
         self.bgBase = bgBase
         self.bgLight = bgLight
         self.bgDark = bgDark
         self.bgHighlight = bgHighlight
+        self.bgHover = bgHover
         self.bgVisual = bgVisual
+        self.bgTerminal = bgTerminal
         self.textPrimary = textPrimary
         self.textSecondary = textSecondary
         self.grayDim = grayDim
@@ -90,84 +135,32 @@ public struct PagerRenderTheme: Sendable, Equatable, Hashable {
         self.accentRunning = accentRunning
         self.accentSkill = accentSkill
         self.accentPlan = accentPlan
+        self.accentVerify = accentVerify
+        self.accentFeedback = accentFeedback
+        self.accentRemember = accentRemember
+        self.accentModel = accentModel
+        self.fuzzyAccent = fuzzyAccent
         self.command = command
         self.path = path
+        self.running = running
         self.warning = warning
         self.promptBorder = promptBorder
         self.promptBorderActive = promptBorderActive
         self.selectionBorder = selectionBorder
+        self.hoverBorder = hoverBorder
+        self.scrollbarBackground = scrollbarBackground
         self.scrollbarForeground = scrollbarForeground
         self.linkForeground = linkForeground
+        self.diffDeleteBackground = diffDeleteBackground
+        self.diffDeleteForeground = diffDeleteForeground
+        self.diffInsertBackground = diffInsertBackground
+        self.diffInsertForeground = diffInsertForeground
+        self.diffEqualForeground = diffEqualForeground
+        self.diffGutterForeground = diffGutterForeground
+        self.pasteBackground = pasteBackground
+        self.pasteForeground = pasteForeground
+        self.pasteDim = pasteDim
     }
-
-    /// GrokNight — the reference default.
-    public static let grokNight = PagerRenderTheme()
-
-    /// GrokDay, the reference's light counterpart.
-    public static let grokDay = PagerRenderTheme(
-        bgBase: .rgb(250, 250, 250),
-        bgLight: .rgb(238, 238, 238),
-        bgDark: .rgb(240, 240, 240),
-        bgHighlight: .rgb(230, 230, 230),
-        bgVisual: .rgb(214, 214, 214),
-        textPrimary: .rgb(30, 30, 30),
-        textSecondary: .rgb(60, 60, 60),
-        grayDim: .rgb(150, 150, 150),
-        gray: .rgb(120, 120, 120),
-        grayBright: .rgb(100, 100, 100),
-        accentUser: .rgb(60, 60, 60),
-        accentAssistant: .rgb(126, 87, 194),
-        accentThinking: .rgb(126, 87, 194),
-        accentTool: .rgb(100, 100, 100),
-        accentSystem: .rgb(45, 106, 200),
-        accentError: .rgb(197, 40, 70),
-        accentSuccess: .rgb(70, 140, 40),
-        accentRunning: .rgb(126, 87, 194),
-        accentSkill: .rgb(45, 106, 200),
-        accentPlan: .rgb(168, 120, 10),
-        command: .rgb(160, 110, 20),
-        path: .rgb(190, 95, 30),
-        warning: .rgb(160, 110, 20),
-        promptBorder: .rgb(205, 205, 205),
-        promptBorderActive: .rgb(170, 170, 172),
-        selectionBorder: .rgb(190, 190, 195),
-        scrollbarForeground: .rgb(214, 214, 214),
-        linkForeground: .rgb(40, 100, 170)
-    )
-
-    /// A `Reset`-everything palette for `NO_COLOR` and minimal mode, matching
-    /// the reference's `Theme::terminal_default()`. Roles that carry meaning
-    /// through color alone fall back to the terminal's own 16 colors.
-    public static let terminalDefault = PagerRenderTheme(
-        bgBase: .reset,
-        bgLight: .reset,
-        bgDark: .reset,
-        bgHighlight: .reset,
-        bgVisual: .reset,
-        textPrimary: .reset,
-        textSecondary: .reset,
-        grayDim: .brightBlack,
-        gray: .brightBlack,
-        grayBright: .brightBlack,
-        accentUser: .cyan,
-        accentAssistant: .magenta,
-        accentThinking: .magenta,
-        accentTool: .brightBlack,
-        accentSystem: .blue,
-        accentError: .red,
-        accentSuccess: .green,
-        accentRunning: .magenta,
-        accentSkill: .blue,
-        accentPlan: .yellow,
-        command: .yellow,
-        path: .yellow,
-        warning: .yellow,
-        promptBorder: .brightBlack,
-        promptBorderActive: .white,
-        selectionBorder: .brightBlack,
-        scrollbarForeground: .brightBlack,
-        linkForeground: .blue
-    )
 
     public static let `default` = PagerRenderTheme.grokNight
 }
@@ -261,6 +254,16 @@ public func pagerFormatTokens(_ value: Int) -> String {
     default:
         return "\(tokens / 1_000_000)M"
     }
+}
+
+/// `context_bar.rs::fmt_pct5` — always exactly five columns, so the context
+/// readout does not shift the status bar as the percentage grows.
+public func pagerFormatPercent(_ percent: Double) -> String {
+    guard percent < 100 else { return "MAX %" }
+    let clamped = max(0, percent)
+    return clamped < 10
+        ? String(format: "%.2f%%", clamped)
+        : String(format: "%.1f%%", clamped)
 }
 
 /// `thinking.rs::format_time`.

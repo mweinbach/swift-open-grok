@@ -15,7 +15,8 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     var contentLines = makeConversationLines(
         state.conversation,
         width: max(1, baseContentWidth),
-        theme: state.theme
+        theme: state.theme,
+        selectedIndex: state.selectedBlockIndex
     )
     let hasScrollbar = state.showScrollbar && baseContentWidth > 1
         && contentLines.count > chrome.conversation.height
@@ -23,7 +24,8 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         contentLines = makeConversationLines(
             state.conversation,
             width: max(1, baseContentWidth - 1),
-            theme: state.theme
+            theme: state.theme,
+            selectedIndex: state.selectedBlockIndex
         )
     }
 
@@ -255,11 +257,13 @@ struct PaintLine {
 func makeConversationLines(
     _ items: [PagerConversationItem],
     width: Int,
-    theme: PagerRenderTheme
+    theme: PagerRenderTheme,
+    selectedIndex: Int? = nil
 ) -> [PaintLine] {
     guard width > 0 else { return [] }
     var lines: [PaintLine] = []
     for (index, item) in items.enumerated() {
+        let blockStart = lines.count
         switch item {
         case .message(let message):
             appendMessage(message, width: width, theme: theme, into: &lines)
@@ -268,6 +272,19 @@ func makeConversationLines(
         case .separator(let text):
             let separator = text.isEmpty ? String(repeating: "─", count: width) : text
             lines.append(PaintLine(separator, foreground: theme.grayDim))
+        }
+        // The selected block wears the accent rail and the visual band, which
+        // is how the reference marks it under `When::ScrollbackFocused`. Rows
+        // that already carry a band — a user prompt's `bg_light` — keep theirs,
+        // so the marker reads as a selection rather than a repaint.
+        if index == selectedIndex {
+            for line in blockStart..<lines.count {
+                lines[line].accentGlyph = PagerGlyphs.accentBar
+                lines[line].accentColor = theme.selectionBorder
+                if lines[line].background == nil {
+                    lines[line].background = theme.bgVisual
+                }
+            }
         }
         // Gap rule (`scrollback/state/layout.rs:1375-1428`): consecutive
         // groupable-and-collapsed blocks pack tight; everything else gets one
@@ -977,7 +994,7 @@ private func renderComposerInfoLine(
     let rightWidth = right.reduce(0) { $0 + UnicodeDisplayWidth.width(of: $1.text) }
 
     var left: [PagerStyledSpan] = []
-    if let model = input.modelName, !model.isEmpty {
+    if let model = input.modelDisplay {
         left.append(PagerStyledSpan(text: " ", foreground: separatorColor))
         left.append(PagerStyledSpan(text: model, foreground: captionColor))
     }

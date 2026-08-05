@@ -135,6 +135,16 @@ private func renderCenteredModal(
 ) -> PagerOverlayBounds? {
     guard let frame = sizing.frame(in: area) else { return nil }
 
+    // The settings modal's title and footer follow its mode, so they are
+    // derived here rather than read off the stored overlay — a chooser opened
+    // three keystrokes ago must not still be titled "Settings".
+    var title = overlay.title
+    var hints = overlay.hints
+    if case .settings(let settings) = overlay.content {
+        title = pagerSettingsTitle(settings)
+        hints = pagerSettingsHints(settings)
+    }
+
     // Clear under the popup so the transcript does not bleed through. The
     // reference applies no backdrop dimming (`modal_window.rs:328`).
     paintBlank(
@@ -143,7 +153,7 @@ private func renderCenteredModal(
         foreground: theme.textPrimary,
         background: theme.bgBase
     )
-    drawModalBorder(&buffer, frame: frame, title: overlay.title, theme: theme)
+    drawModalBorder(&buffer, frame: frame, title: title, theme: theme)
     let closeButton = drawCloseButton(&buffer, frame: frame, theme: theme)
 
     let inner = TerminalRect(
@@ -155,7 +165,7 @@ private func renderCenteredModal(
     let footerWidth = max(0, inner.width - sizing.horizontalPadding * 2)
     let footerLines = max(
         sizing.footerLines,
-        modalFooterRowCount(overlay.hints, width: footerWidth)
+        modalFooterRowCount(hints, width: footerWidth)
     )
     let reserved = sizing.verticalPadding + footerLines
     let content = TerminalRect(
@@ -196,9 +206,11 @@ private func renderCenteredModal(
             buffer: &buffer,
             theme: theme
         )
+    case .settings(let settings):
+        rows = drawSettingsBody(settings, in: content, buffer: &buffer, theme: theme)
     }
 
-    let hints = drawModalFooter(overlay.hints, in: footer, buffer: &buffer, theme: theme)
+    let hintBounds = drawModalFooter(hints, in: footer, buffer: &buffer, theme: theme)
 
     return PagerOverlayBounds(
         id: overlay.id,
@@ -207,7 +219,7 @@ private func renderCenteredModal(
         footer: footer,
         closeButton: closeButton,
         rows: rows,
-        hints: hints
+        hints: hintBounds
     )
 }
 
@@ -572,6 +584,10 @@ func pagerBottomSheetHeight(
         contentRows = screenHeight
     case .workflows(let runs):
         contentRows = 2 + (runs.isDetailOpen ? runs.detailLines.count : max(1, runs.rows.count))
+    case .settings:
+        // The settings modal is only ever presented as a centered modal; if a
+        // caller sheets it anyway, give it the full 80% rather than a stub.
+        contentRows = screenHeight
     }
     let ceiling = max(1, screenHeight * 80 / 100)
     let preferred = max(screenHeight / 2, 10)
@@ -658,6 +674,8 @@ private func renderBottomSheet(
             buffer: &buffer,
             theme: theme
         )
+    case .settings(let settings):
+        rows = drawSettingsBody(settings, in: content, buffer: &buffer, theme: theme)
     }
 
     return PagerOverlayBounds(

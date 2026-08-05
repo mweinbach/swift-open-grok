@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokInterjection
 import OpenGrokPagerCommandUI
 import OpenGrokPagerMinimal
 import OpenGrokPromptQueue
@@ -39,6 +40,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case completionMove(Int)
         case completionAccept
         case viewport(OpenGrokPagerViewportCommand)
+        /// `Tab` on a closed dropdown — hand the keyboard to the scrollback.
+        case focusScrollback
+        /// `Ctrl+M` in the composer (`defaults.rs:702`).
+        case toggleMultiline
+        /// An application chord that is not the composer's to service.
+        case global(OpenGrokPagerGlobalCommand)
         case ignored
     }
 
@@ -89,6 +96,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         /// Set while history browsing is open. Without it, `Down` would stop
         /// browsing the moment `Up` filled the composer with a recalled prompt.
         var isBrowsingHistory = false
+        /// Mirrors `OpenGrokPagerInputModes.isMultiline`. Held here because it
+        /// changes what `Enter` means, which only the editor can decide.
+        var isMultiline = false
 
         init(text: String) {
             characters = Array(text)
@@ -142,17 +152,27 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             if let control = controlAction(for: event) {
                 return control
             }
+            if let global = Self.globalAction(for: event) {
+                return .global(global)
+            }
 
             switch event.key {
             case .enter:
-                // Enter always submits; Tab accepts the highlighted completion.
-                // Letting Enter accept would make a fully typed command name
-                // need two presses, since its own row stays in the menu.
-                return .submit
+                // Enter submits and Shift+Enter (or Alt+Enter, which is what
+                // terminals without the Kitty protocol can actually report)
+                // inserts a newline — multiline mode swaps the two, which is
+                // the whole of `/multiline` upstream.
+                return resolveEnter(modifiers: event.modifiers)
             case .escape:
                 return .escape
             case .tab:
-                return completions.isEmpty ? .ignored : .completionAccept
+                // Tab accepts the highlighted completion; with the dropdown
+                // closed it is the focus switch (`defaults.rs:488`). Letting
+                // Enter accept instead would make a fully typed command name
+                // need two presses, since its own row stays in the menu.
+                return completions.isEmpty ? .focusScrollback : .completionAccept
+            case .backTab:
+                return .global(.cyclePermissionMode)
             case .up:
                 if !completions.isEmpty { return .completionMove(-1) }
                 // `Up` recalls history only on an empty composer
@@ -197,7 +217,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 return .changed
             case .char(let character):
                 if character == "\r" || character == "\n" {
-                    return .submit
+                    return resolveEnter(modifiers: event.modifiers)
                 }
                 if character == "\u{3}" {
                     return .interrupt
@@ -211,8 +231,64 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 else { return .ignored }
                 insert([event.character ?? character])
                 return .changed
-            case .backTab, .insert, .f, .null:
+            case .insert, .f, .null:
                 return .ignored
+            }
+        }
+
+        /// What `Enter` means right now.
+        ///
+        /// Three inputs decide it: the multiline mode, whether the report
+        /// carried Shift or Alt, and whether the draft ends in a backslash.
+        /// The backslash is upstream's rescue for terminals that cannot
+        /// distinguish `Shift+Enter` from `Enter` at all
+        /// (`views/prompt_widget/mod.rs:2137-2142`) — it eats the backslash and
+        /// continues the line, so multiline stays reachable everywhere.
+        private mutating func resolveEnter(modifiers: KeyModifiers) -> PromptAction {
+            let wantsNewline = modifiers.contains(.shift) || modifiers.contains(.alt)
+            if isMultiline != wantsNewline {
+                insert(["\n"])
+                return .changed
+            }
+            // This press would have sent. A line ending in a backslash says
+            // "not yet" — the rescue only applies here, on the send path, and
+            // only with the cursor at the end, which is where it is when
+            // someone types a line and reaches for Enter.
+            guard characters.last == "\\", cursor == characters.count else { return .submit }
+            characters.removeLast()
+            cursor = characters.count
+            insert(["\n"])
+            return .changed
+        }
+
+        /// Application chords that mean the same thing wherever they land.
+        ///
+        /// Only the ones this port routes to a real surface are bound. The
+        /// unbound half of upstream's `AgentScreen` table — `Ctrl+T` todos,
+        /// `Ctrl+G` tasks, `Ctrl+B` background, `Ctrl+S` sessions, `Ctrl+L`
+        /// extensions, `Ctrl+\` dashboard — stays inert on purpose, for the
+        /// same reason the dropdown lists no no-op command.
+        static func globalAction(for event: KeyEvent) -> OpenGrokPagerGlobalCommand? {
+            // `F2` carries no modifier, so it is resolved ahead of the Ctrl
+            // gate (`defaults.rs:839`). The bare form only: a modified `F2` is
+            // a different chord and must not silently open settings. The
+            // `Ctrl+,` / `Cmd+,` alternates are left unbound because most
+            // terminals cannot report either.
+            if case .f(2) = event.key, event.modifiers.isEmpty { return .openSettings }
+            guard event.modifiers.contains(.control) else { return nil }
+            let character: Character?
+            switch event.key {
+            case .char(let value): character = value
+            default: character = event.character
+            }
+            switch character?.lowercased() {
+            // `Ctrl+.` primary with `Ctrl+X` as the alternate, both bound
+            // because `ctrl_dot_unreliable()` terminals swap them
+            // (`defaults.rs:801-823`).
+            case ".", "x": return .shortcutsHelp
+            // `Ctrl+;` primary, `Ctrl+'` alternate (`defaults.rs:551-578`).
+            case ";", "'": return .toggleQueue
+            default: return nil
             }
         }
 
@@ -231,8 +307,19 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case "u": return .viewport(.halfPageUp)
             case "j": return .viewport(.lineDown)
             case "k": return .viewport(.lineUp)
-            case "p": return completions.isEmpty ? nil : .completionMove(-1)
-            case "n": return completions.isEmpty ? nil : .completionMove(1)
+            // Not a mis-assignment against the reference, as it first looks:
+            // upstream hard-codes the same dropdown intercept ahead of the
+            // action registry (`app/agent_view/prompt.rs:212-221`), so
+            // `Ctrl+P`/`Ctrl+N` move the menu while one is open and otherwise
+            // fall through to `CommandPalette` (`defaults.rs:786`) and
+            // `NewSession` (`:748`). That fall-through is what was missing.
+            case "p": return completions.isEmpty ? .global(.commandPalette) : .completionMove(-1)
+            case "n": return completions.isEmpty ? .global(.newSession) : .completionMove(1)
+            // `Ctrl+M` toggles multiline in the prompt and opens the model
+            // picker outside it. Upstream registers both in different `When`
+            // contexts and resolves by focus (`defaults.rs:702` and `:824`);
+            // this branch is the prompt half.
+            case "m": return .toggleMultiline
             default: return nil
             }
         }
@@ -480,6 +567,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// An armed double-press confirmation and the instant it expires.
     private var pendingConfirmation: (key: String, label: String, deadline: Date)?
 
+    /// Which region owns the keyboard. `Tab` moves it; nothing else does.
+    private var focus: OpenGrokPagerFocusRegion = .prompt
+    private var modes = OpenGrokPagerInputModes()
+
+    /// Interjections the user sent mid-turn with `Ctrl+Enter` or, under
+    /// `enter_steers`, a bare `Enter`. Drained into the next prompt so a
+    /// steer that arrives after the sampler has already committed to the turn
+    /// is never silently dropped.
+    private let interjections = EventQueue<KindedInterjection<String>>()
+
     private let commands = PagerCommandRegistry(
         commands: OpenGrokPagerInteractiveController.builtinCommands
     )
@@ -538,8 +635,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             completedTurnCount: completedTurnCount,
             activeSessionID: activeSessionID,
             lastSessionID: lastSessionID,
-            terminalRestored: terminalRestored
+            terminalRestored: terminalRestored,
+            focus: focus,
+            modes: modes
         )
+    }
+
+    /// Seed the runtime-toggleable modes. Call before `run`; after that they
+    /// belong to `/multiline`, `/vim-mode` and `Ctrl+M`.
+    public func setInputModes(_ newModes: OpenGrokPagerInputModes) {
+        modes = newModes
+        editor.isMultiline = newModes.isMultiline
     }
 
     public func run(_ request: OpenGrokPagerRequest) async throws -> OpenGrokPagerInteractiveResult {
@@ -634,6 +740,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             rendererBegan = true
             try await transition(to: .starting)
             editor = PromptEditor(text: request.prompt)
+            // A fresh editor starts in single-line mode; anything seeded by
+            // `setInputModes` has to survive the rebuild or `/multiline` would
+            // silently reset itself at the top of every run.
+            editor.isMultiline = modes.isMultiline
             try await emit(.promptChanged(promptState()))
 
             if let initialSession {
@@ -711,11 +821,26 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 case .input(let read):
                     switch read {
                     case .element(let event):
+                        // The scrollback gets the key first when it has focus,
+                        // and never hands one back to the composer.
+                        if try await handleScrollbackEvent(event) {
+                            await inputPumpGate.resume()
+                            continue
+                        }
                         let action = applyEditorEvent(event)
                         switch action {
                         case .changed, .historyPrevious, .historyNext,
                              .completionMove, .completionAccept:
                             try await emit(.promptChanged(promptState()))
+                            await inputPumpGate.resume()
+                        case .focusScrollback:
+                            try await setFocus(.scrollback)
+                            await inputPumpGate.resume()
+                        case .toggleMultiline:
+                            try await setMultiline(!modes.isMultiline)
+                            await inputPumpGate.resume()
+                        case .global(let command):
+                            try await handleGlobal(command)
                             await inputPumpGate.resume()
                         case .viewport(let command):
                             try await emit(.viewport(command))
@@ -945,6 +1070,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             await cancelActiveSession()
                             turnOutcome = .eof
                         default:
+                            if try await handleScrollbackEvent(event) {
+                                await inputPumpGate.resume()
+                                continue
+                            }
                             // The composer stays live while a turn runs — that
                             // is the whole point of the send→queue flip in the
                             // shortcuts bar.
@@ -965,11 +1094,51 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                         turnOutcome = .turnPreempted
                                     }
                                 } else {
-                                    try await enqueue(prompt)
-                                    await inputPumpGate.resume()
+                                    // A UI-only slash command runs now rather
+                                    // than queueing behind the turn — `/queue`
+                                    // is only ever useful *here*, and queueing
+                                    // it would make it unreachable at the one
+                                    // moment it answers a real question.
+                                    //
+                                    // A history-mutating one must NOT: it would
+                                    // rewrite the item list underneath a
+                                    // streaming sampler. Those go to the queue,
+                                    // which is what upstream does for the whole
+                                    // category via `CommandResult::QueueCommand`.
+                                    switch try await runSlashCommand(
+                                        prompt,
+                                        isTurnRunning: true
+                                    ) {
+                                    case .quit:
+                                        await cancelActiveSession()
+                                        turnOutcome = .shutdown
+                                    case .handled:
+                                        recordHistory(prompt)
+                                        editor.reset()
+                                        try await emit(.promptChanged(promptState()))
+                                        await inputPumpGate.resume()
+                                    case .notACommand where modes.enterSteers:
+                                        // `enter_steers` (`defs.rs:724`): the
+                                        // draft joins the running turn rather
+                                        // than the queue behind it.
+                                        try await interject(prompt, kind: .steer)
+                                        await inputPumpGate.resume()
+                                    case .notACommand:
+                                        try await enqueue(prompt)
+                                        await inputPumpGate.resume()
+                                    }
                                 }
                             case .viewport(let command):
                                 try await emit(.viewport(command))
+                                await inputPumpGate.resume()
+                            case .focusScrollback:
+                                try await setFocus(.scrollback)
+                                await inputPumpGate.resume()
+                            case .toggleMultiline:
+                                try await setMultiline(!modes.isMultiline)
+                                await inputPumpGate.resume()
+                            case .global(let command):
+                                try await handleGlobal(command)
                                 await inputPumpGate.resume()
                             case .ignored:
                                 await inputPumpGate.resume()
@@ -1042,6 +1211,32 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
     }
 
+    /// Buffer a mid-turn message instead of queueing it behind the turn.
+    ///
+    /// The Swift runtime has no mid-turn injection — a sampler that has already
+    /// committed to a turn cannot be handed another user message — so the
+    /// honest port of upstream's `InterjectPrompt` and `enter_steers` is to
+    /// hold the text in `OpenGrokInterjection`'s buffer and fold it into the
+    /// very next prompt, framed by `formatInterjection` exactly as the shell
+    /// frames one. Nothing is dropped and nothing pretends to have steered a
+    /// turn it could not reach.
+    private func interject(_ text: String, kind: InterjectionKind) async throws {
+        interjections.push(KindedInterjection(kind: kind, text: text))
+        recordHistory(text)
+        editor.reset()
+        try await emit(.promptChanged(promptState()))
+        try await emit(.notice(
+            "Held for the running turn — it will lead the next prompt."
+        ))
+    }
+
+    /// Fold any buffered interjections into the front of `prompt`.
+    private func withInterjections(_ prompt: String) -> String {
+        let drained = drainKindedFormatted(interjections)
+        guard !drained.isEmpty else { return prompt }
+        return (drained.map(\.formatted.text) + [prompt]).joined(separator: "\n\n")
+    }
+
     /// Throw away everything still queued. Reserved for the ways a run *ends* —
     /// quit, EOF, external cancel. Cancelling a turn deliberately does not come
     /// here: the reference keeps follow-ups across an interrupt.
@@ -1069,16 +1264,39 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 // because every path below clears the running marker.
                 return nil
             }
+            // A queued slash command is a command, not a prompt. This is the
+            // other half of the mid-turn deferral: `/compact` was put here
+            // precisely so it would run against a settled conversation, and
+            // sending its text to the model instead would be worse than having
+            // run it early.
+            if case .command = PagerCommandParser.parse(entry.text) {
+                await promptQueue.completeRunning()
+                _ = try await runSlashCommand(entry.text)
+                try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
+                continue
+            }
+
+            // `combine_queued_prompts` (`defs.rs:708`): take the whole backlog
+            // as one turn rather than one turn each. Only the entries already
+            // waiting are folded in — anything enqueued during the turn stays
+            // for the next drain, so a fast typist cannot starve the model.
+            var promptText = entry.text
+            if modes.combineQueuedPrompts {
+                let rest = await promptQueue.removeAll().map(\.text)
+                if !rest.isEmpty {
+                    promptText = ([entry.text] + rest).joined(separator: "\n\n")
+                }
+            }
             try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
 
             let turnRequest = OpenGrokPagerRequest(
-                prompt: entry.text,
+                prompt: withInterjections(promptText),
                 mode: request.mode,
                 sessionID: lastSessionID ?? request.sessionID,
                 metadata: request.metadata
             )
             let session = try await runtime.makeSession(for: turnRequest)
-            submittedPrompts.append(entry.text)
+            submittedPrompts.append(promptText)
             let turnOutcome = try await runTurn(
                 session: session,
                 request: turnRequest,
@@ -1149,6 +1367,149 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         }
     }
 
+    // MARK: - Scrollback focus
+
+    /// What the scrollback does with a key while it holds focus.
+    private enum ScrollbackRouting: Sendable {
+        case focusPrompt
+        case command(OpenGrokPagerScrollbackCommand)
+        case viewport(OpenGrokPagerViewportCommand)
+        /// The scrollback has focus and declines to act, but a focused region
+        /// never leaks a keystroke to the composer — upstream's rule for
+        /// modals, applied to the focus split for the same reason.
+        case swallowed
+    }
+
+    /// Map a key under `When::ScrollbackFocused` (`defaults.rs:84-460,475`).
+    ///
+    /// Bare-letter and Shift-letter bindings are suppressed unless vim mode is
+    /// on, mirroring `lookup_with_mode` (`actions/mod.rs:397-430`). With vim
+    /// off the region is still fully usable through the arrows, `Enter`, `Tab`,
+    /// the paging keys and the `Ctrl` chords — which is the point of the gate:
+    /// typing `y` at a transcript should not silently copy something.
+    private func scrollbackRouting(for event: InputEvent) -> ScrollbackRouting {
+        guard case .key(let key) = event else { return .swallowed }
+
+        if key.modifiers.contains(.control) {
+            let character: Character?
+            switch key.key {
+            case .char(let value): character = value
+            default: character = key.character
+            }
+            switch character?.lowercased() {
+            case "k": return .viewport(.lineUp)
+            case "j": return .viewport(.lineDown)
+            case "u": return .viewport(.halfPageUp)
+            case "e": return .command(.expandAllThinking)
+            default: return .swallowed
+            }
+        }
+
+        let isShifted = key.modifiers.contains(.shift)
+        switch key.key {
+        case .tab:
+            return .focusPrompt
+        case .enter:
+            return .command(.openBlockViewer)
+        case .up:
+            return .command(.selectPrevious)
+        case .down:
+            return .command(.selectNext)
+        case .left:
+            return isShifted ? .command(.previousTurn) : .command(.collapse)
+        case .right:
+            return isShifted ? .command(.nextTurn) : .command(.expand)
+        case .pageUp:
+            return .viewport(.pageUp)
+        case .pageDown:
+            return .viewport(.pageDown)
+        case .home:
+            return .command(.selectFirst)
+        case .end:
+            return .command(.selectLast)
+        case .char(let character):
+            guard modes.isVimMode else { return .swallowed }
+            return Self.vimRouting(for: character)
+        default:
+            return .swallowed
+        }
+    }
+
+    private static func vimRouting(for character: Character) -> ScrollbackRouting {
+        switch character {
+        case "j": return .command(.selectNext)
+        case "k": return .command(.selectPrevious)
+        case "L": return .command(.nextTurn)
+        case "H": return .command(.previousTurn)
+        case "J": return .command(.nextResponse)
+        case "K": return .command(.previousResponse)
+        case "g": return .command(.selectFirst)
+        case "G": return .command(.selectLast)
+        case "h": return .command(.collapse)
+        case "l": return .command(.expand)
+        case "e": return .command(.toggleFold)
+        case "E": return .command(.toggleExpandAll)
+        case "r": return .command(.toggleRaw)
+        case "y": return .command(.copyBlockContent)
+        case "Y": return .command(.copyBlockMetadata)
+        case "o": return .command(.openNextLink)
+        case "O": return .command(.openPreviousLink)
+        case "x": return .command(.killBackgroundTask)
+        // `d`/`u` are the VS Code family's half-page bindings upstream
+        // (`defaults.rs:231-235`); this port keeps `Ctrl+D` on EOF
+        // unconditionally so a focus region can never trap the session, and
+        // takes the bare-letter form instead.
+        case "d": return .viewport(.halfPageDown)
+        case "u": return .viewport(.halfPageUp)
+        // `i` and `Space` enter the prompt but, unlike `Tab`, do not leave it
+        // (`defaults.rs:475-487`).
+        case "i", " ": return .focusPrompt
+        default: return .swallowed
+        }
+    }
+
+    /// Apply one key while the scrollback holds focus. Returns false when the
+    /// caller should fall through to the composer — which only happens when
+    /// focus was not on the scrollback to begin with.
+    private func handleScrollbackEvent(_ event: InputEvent) async throws -> Bool {
+        guard focus == .scrollback else { return false }
+        if case .resize(let size) = event {
+            try await renderer.resize(to: size)
+            return true
+        }
+        switch scrollbackRouting(for: event) {
+        case .focusPrompt:
+            try await setFocus(.prompt)
+        case .command(let command):
+            try await emit(.scrollback(command))
+        case .viewport(let command):
+            try await emit(.viewport(command))
+        case .swallowed:
+            break
+        }
+        return true
+    }
+
+    private func setFocus(_ region: OpenGrokPagerFocusRegion) async throws {
+        guard focus != region else { return }
+        focus = region
+        // A focus change disarms anything the composer had pending: the arming
+        // key is no longer the one the next press would hit.
+        pendingConfirmation = nil
+        try await emit(.focusChanged(region))
+        try await emit(.promptChanged(promptState()))
+    }
+
+    private func setMultiline(_ isOn: Bool) async throws {
+        guard modes.isMultiline != isOn else { return }
+        modes.isMultiline = isOn
+        editor.isMultiline = isOn
+        try await emit(.modeChanged(modes))
+        try await emit(.notice(isOn
+            ? "Multiline on. Enter inserts a newline; Shift+Enter sends."
+            : "Multiline off. Enter sends; Shift+Enter inserts a newline."))
+    }
+
     // MARK: - Prompt behavior
 
     /// Feed one input event to the composer and apply the bookkeeping every
@@ -1157,9 +1518,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private func applyEditorEvent(_ event: InputEvent) -> PromptAction {
         let action = editor.apply(event)
         // Any key other than the armed one clears a pending confirmation,
-        // matching `app_view.rs`'s arm lifetime.
+        // matching `app_view.rs`'s arm lifetime. `.global` is exempt because a
+        // confirming chord's second press *is* the armed key — disarming here
+        // would make `Ctrl+N` unconfirmable — so `handleGlobal` owns the
+        // lifetime for those.
         switch action {
-        case .escape, .interrupt, .ignored, .resize:
+        case .escape, .interrupt, .ignored, .resize, .global:
             break
         default:
             pendingConfirmation = nil
@@ -1191,37 +1555,130 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         return action
     }
 
-    /// Slash commands the TUI honors locally. The reference registers ~70 and
+    /// Slash commands the TUI honors locally. The reference registers ~71 and
     /// routes most of them to a pager `Action`; this port lists only the ones
     /// backed by working Swift wiring, so the dropdown never offers a no-op.
-    private static let builtinCommands: [PagerCommandDefinition] = [
-        PagerCommandDefinition(
-            name: "help",
-            summary: "Browse commands and keyboard shortcuts"
-        ),
-        PagerCommandDefinition(
-            name: "model",
-            summary: "Pick the model for this session"
-        ),
-        PagerCommandDefinition(
-            name: "workflows",
-            summary: "Watch background workflow runs"
-        ),
-        PagerCommandDefinition(
-            name: "clear",
-            aliases: ["new"],
-            summary: "Start a new session"
-        ),
-        PagerCommandDefinition(
-            name: "toggle-mouse-reporting",
-            summary: "Toggle mouse reporting (native copy/paste)"
-        ),
+    ///
+    /// Summaries are upstream's verbatim (`src/slash/commands/*.rs`) so the
+    /// dropdown reads identically for every command both sides have.
+    static let builtinCommands: [PagerCommandDefinition] = [
         PagerCommandDefinition(
             name: "quit",
             aliases: ["exit"],
-            summary: "Quit the application"
+            summary: "Quit the application",
+            // `/q` also prefixes `/queue`; upstream registers `quit` first
+            // (`slash/commands/mod.rs:78`) so the short form stays `quit`.
+            priority: 1
+        ),
+        PagerCommandDefinition(
+            name: "help",
+            summary: "Browse commands and keyboard shortcuts",
+            // `/h` also prefixes `/history`.
+            priority: 1
+        ),
+        PagerCommandDefinition(
+            name: "home",
+            aliases: ["welcome"],
+            summary: "Return to the welcome screen"
+        ),
+        PagerCommandDefinition(
+            name: "new",
+            aliases: ["clear"],
+            summary: "Start a new session"
+        ),
+        PagerCommandDefinition(
+            name: "copy",
+            summary: "Copy last response to clipboard or file (/copy [N] [file])",
+            usage: "/copy [N] [file]"
+        ),
+        PagerCommandDefinition(
+            name: "find",
+            summary: "Search the conversation scrollback",
+            usage: "/find [text]"
+        ),
+        PagerCommandDefinition(
+            name: "history",
+            summary: "Search prompt history"
+        ),
+        PagerCommandDefinition(
+            name: "export",
+            summary: "Export the current conversation to a file or clipboard",
+            usage: "/export [filename]"
+        ),
+        PagerCommandDefinition(
+            name: "context",
+            summary: "View context usage"
+        ),
+        PagerCommandDefinition(
+            name: "model",
+            aliases: ["m"],
+            summary: "Switch the active model",
+            usage: "/model [name]"
+        ),
+        PagerCommandDefinition(
+            name: "multiline",
+            aliases: ["ml"],
+            summary: "Toggle multiline input mode (swap Enter and Shift+Enter)"
+        ),
+        PagerCommandDefinition(
+            name: "vim-mode",
+            summary: "Toggle vim-style scrollback keybindings (j/k, h/l, g/G, y/Y, …)"
+        ),
+        PagerCommandDefinition(
+            name: "session-info",
+            summary: "Show session info"
+        ),
+        PagerCommandDefinition(
+            name: "workflows",
+            summary: "Show workflow runs (phases, agents, progress)"
+        ),
+        PagerCommandDefinition(
+            name: "toggle-mouse-reporting",
+            summary: "Toggle terminal mouse reporting (native click-drag copy/paste)"
+        ),
+        PagerCommandDefinition(
+            name: "queue",
+            summary: "List the prompts queued behind the running turn"
+        ),
+        PagerCommandDefinition(
+            name: "compact",
+            summary: "Compact conversation history",
+            usage: "/compact [instructions]",
+            // The one command that must never run inline: it rewrites the
+            // items a streaming turn is sampling from.
+            mutatesConversationHistory: true
+        ),
+        PagerCommandDefinition(
+            name: "settings",
+            aliases: ["config", "preferences", "prefs"],
+            summary: "Open the settings modal"
+        ),
+        PagerCommandDefinition(
+            name: "privacy",
+            summary: "Open coding data, retention, and training settings"
+        ),
+        PagerCommandDefinition(
+            name: "theme",
+            aliases: ["t"],
+            summary: "Switch the color theme",
+            usage: "/theme [name]"
+        ),
+        PagerCommandDefinition(
+            name: "tutorial",
+            aliases: ["tour", "onboarding"],
+            summary: "Quick tips to get the most out of Open Grok"
+        ),
+        PagerCommandDefinition(
+            name: "gboom",
+            summary: "Hidden easter egg",
+            isHidden: true
         )
     ]
+
+    /// The settings row `/privacy` deep-links to
+    /// (`PagerSettingsRegistry.swift:856`), matching upstream's
+    /// `CODING_DATA_SHARING_KEY`.
+    static let codingDataSharingKey = "coding_data_sharing"
 
     /// `PendingAction::TTL` (`app_view.rs:591`) — a confirmation stays armed
     /// for one second and any other key clears it.
@@ -1385,7 +1842,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case quit
     }
 
-    private func runSlashCommand(_ text: String) async throws -> SlashOutcome {
+    /// Run a slash command.
+    ///
+    /// `isTurnRunning` is what keeps a history-mutating command from firing
+    /// while the sampler is streaming. It is deliberately a parameter rather
+    /// than read from state: the two callers are the idle-loop submit and the
+    /// mid-turn submit, and making each say which it is means the guarantee
+    /// cannot be lost again by someone adding a third caller.
+    private func runSlashCommand(
+        _ text: String,
+        isTurnRunning: Bool = false
+    ) async throws -> SlashOutcome {
         guard case .command(let invocation) = PagerCommandParser.parse(text) else {
             return .notACommand
         }
@@ -1396,19 +1863,96 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case .unavailable(_, let reason):
             try await emit(.notice(reason))
             return .handled
+        case .available(let command) where isTurnRunning
+            && command.mutatesConversationHistory:
+            // Queue it as written, so it runs against a settled conversation
+            // once the turn ends — upstream's `CommandResult::QueueCommand`.
+            try await enqueue(text)
+            try await emit(.notice(
+                "/\(command.name) edits the conversation, so it will run when this turn finishes."
+            ))
+            return .handled
         case .available(let command):
             switch command.name {
             case "quit":
                 return .quit
-            case "clear":
-                lastSessionID = nil
-                try await emit(.notice("started a new session"))
+            case "new":
+                try await startNewSession()
                 return .handled
             case "help":
                 try await emit(.overlay(.help))
                 return .handled
+            case "home":
+                try await emit(.overlay(.welcomeScreen))
+                return .handled
             case "workflows":
                 try await emit(.overlay(.workflows))
+                return .handled
+            case "history":
+                try await emit(.overlay(.promptHistory(entries: history)))
+                return .handled
+            case "queue":
+                try await emit(.overlay(.promptQueue(
+                    entries: await promptQueue.orderedTexts
+                )))
+                return .handled
+            case "context":
+                try await emit(.overlay(.contextUsage))
+                return .handled
+            case "session-info":
+                try await emit(.overlay(.sessionInfo))
+                return .handled
+            case "copy":
+                let (index, path) = Self.parseCopyArguments(invocation.arguments)
+                try await emit(.overlay(.copyResponse(index: index, filePath: path)))
+                return .handled
+            case "export":
+                let path = invocation.arguments.first
+                try await emit(.overlay(.exportConversation(filePath: path)))
+                return .handled
+            case "find":
+                let query = invocation.arguments
+                    .joined(separator: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                try await emit(.overlay(.scrollbackSearch(query: query.isEmpty ? nil : query)))
+                return .handled
+            case "multiline":
+                try await setMultiline(!modes.isMultiline)
+                return .handled
+            case "vim-mode":
+                modes.isVimMode.toggle()
+                try await emit(.modeChanged(modes))
+                try await emit(.notice(modes.isVimMode
+                    ? "Vim scrollback keys on — Tab to focus the scrollback, then j/k/h/l/e/y."
+                    : "Vim scrollback keys off — the scrollback still takes arrows, Enter and the Ctrl chords."))
+                return .handled
+            case "compact":
+                let instructions = invocation.arguments
+                    .joined(separator: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                try await emit(.overlay(.compact(
+                    instructions: instructions.isEmpty ? nil : instructions
+                )))
+                return .handled
+            case "settings":
+                try await emit(.overlay(.settings(deepLinkKey: nil)))
+                return .handled
+            case "privacy":
+                // The same modal aimed at one row — upstream's
+                // `OpenSettingsFocus{key: CODING_DATA_SHARING_KEY}`.
+                try await emit(.overlay(.settings(deepLinkKey: Self.codingDataSharingKey)))
+                return .handled
+            case "theme":
+                let name = invocation.arguments
+                    .joined(separator: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                try await emit(.overlay(.themePicker(query: name.isEmpty ? nil : name)))
+                return .handled
+            case "tutorial":
+                try await emit(.overlay(.tutorial))
+                return .handled
+            case "gboom":
+                try await emit(.overlay(.easterEgg))
                 return .handled
             case "model":
                 // The parser has already split and unquoted the arguments;
@@ -1430,25 +1974,118 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         }
     }
 
+    private func startNewSession() async throws {
+        lastSessionID = nil
+        try await emit(.notice("started a new session"))
+    }
+
+    /// `/copy [N] [file]` — `N` is 1-based and counts back from the newest
+    /// response, so a bare `/copy` is `/copy 1`. A single non-numeric argument
+    /// is the file, which is what upstream's parse does too.
+    static func parseCopyArguments(_ arguments: [String]) -> (index: Int, filePath: String?) {
+        var index = 1
+        var remaining = arguments[...]
+        if let first = remaining.first, let parsed = Int(first), parsed > 0 {
+            index = parsed
+            remaining = remaining.dropFirst()
+        }
+        let path = remaining.first.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        return (index, path?.isEmpty == false ? path : nil)
+    }
+
+    /// Service an application chord. Only the commands the port routes
+    /// somewhere real are ever bound, so the remaining cases are unreachable
+    /// rather than silently ignored.
+    private func handleGlobal(_ command: OpenGrokPagerGlobalCommand) async throws {
+        switch command {
+        case .commandPalette:
+            try await emit(.overlay(.commandPalette(rows: Self.paletteRows)))
+        case .shortcutsHelp:
+            try await emit(.overlay(.shortcutsHelp))
+        case .toggleQueue:
+            try await emit(.overlay(.promptQueue(entries: await promptQueue.orderedTexts)))
+        case .modelPicker:
+            try await emit(.overlay(.modelPicker(query: nil)))
+        case .openSettings:
+            try await emit(.overlay(.settings(deepLinkKey: nil)))
+        case .newSession:
+            // `requires_confirmation` upstream (`defaults.rs:758`) — throwing
+            // away a session on one keystroke is not recoverable.
+            guard confirm(key: "Ctrl+n", label: "start a new session") else {
+                try await emit(.promptChanged(promptState()))
+                return
+            }
+            try await startNewSession()
+        case .cyclePermissionMode, .toggleTodos, .toggleTasks, .sendToBackground,
+             .toggleAlwaysApprove, .openDashboard, .openSessions, .openExtensions:
+            // Unbound in `globalAction(for:)` until the backing surface exists.
+            break
+        }
+    }
+
+    /// Every listable command as a palette row.
+    static var paletteRows: [OpenGrokPagerCommandSuggestion] {
+        builtinCommands
+            .filter { !$0.isHidden }
+            .map { command in
+                OpenGrokPagerCommandSuggestion(
+                    name: "/\(command.name)",
+                    summary: command.summary,
+                    insertText: "/\(command.name)"
+                )
+            }
+    }
+
     /// Body of the `/help` modal. Public so the render layer can lay it out as
     /// a text overlay without duplicating the vocabulary.
     public static let helpText = """
     Commands
       /help                     Browse commands and keyboard shortcuts
-      /model [name]             Pick the model, or switch to a named one
-      /clear  /new              Start a new session
+      /model [name]  /m         Switch the active model
+      /new    /clear            Start a new session
+      /home   /welcome          Return to the welcome screen
+      /history                  Search prompt history
+      /queue                    Prompts queued behind the running turn
+      /context                  View context usage
+      /session-info             Show session info
+      /copy [N] [file]          Copy a response to the clipboard or a file
+      /export [file]            Export the conversation
+      /find [text]              Search the conversation scrollback
+      /multiline  /ml           Swap what Enter and Shift+Enter do
+      /vim-mode                 Vim keys for the focused scrollback
+      /tutorial                 Quick tips
+      /workflows                Show workflow runs
       /toggle-mouse-reporting   Toggle mouse reporting (native copy/paste)
       /quit   /exit             Quit the application
 
-    Keys
+    Composer
       Enter            send (queue while a turn is running)
+      Shift+Enter      insert a newline — or a trailing \\ before Enter
+      Ctrl+m           toggle multiline (swaps the two above)
+      Tab              accept a completion, else focus the scrollback
       Esc              cancel the running turn; press twice to clear a draft
       Ctrl+c           cancel the running turn, or press twice to quit
       Ctrl+d           end input
+      Ctrl+p           command palette (moves the dropdown while it is open)
+      Ctrl+n           new session (moves the dropdown while it is open)
+      Ctrl+.  Ctrl+x   this shortcuts sheet
+      Ctrl+;  Ctrl+'   show the prompt queue
       Up / Down        prompt history on an empty composer
       PgUp / PgDn      scroll the transcript
       Home / End       jump to the top or bottom of the transcript
       Ctrl+u           scroll up half a page
+
+    Scrollback (Tab to focus it)
+      ↑ / ↓            select the previous or next block
+      ← / →            collapse or expand the selected block
+      Shift+← / →      previous or next turn
+      Enter            open the selected block in the viewer
+      Ctrl+e           expand or collapse all thinking
+      Ctrl+j / Ctrl+k  scroll a line
+      Tab              back to the composer
+      With /vim-mode:  j k h l g G e E r y Y o O x d u, i or Space to exit
+
+    Mouse
       Wheel            scroll the transcript, or the open overlay
       Click            choose a row in an overlay
     """

@@ -24,13 +24,42 @@ public struct PagerCommandDefinition: Codable, Equatable, Hashable, Sendable, Id
     public let summary: String
     public let usage: String?
     public let availability: PagerCommandAvailability
+    /// Resolvable by name but never listed in the dropdown or the palette —
+    /// upstream's `SlashCommand::visible() == false`, which `/gboom` and the
+    /// debug diagnostics use.
+    public let isHidden: Bool
+    /// Whether running this command rewrites the conversation the model is
+    /// working from.
+    ///
+    /// Load-bearing safety flag, not bookkeeping. Most slash commands only
+    /// touch the UI, so they can run the instant they are typed — including
+    /// mid-turn, which is the only time `/queue` answers anything. A command
+    /// that edits history cannot: firing `/compact` while a turn is streaming
+    /// would rewrite the item list underneath the sampler. Upstream avoids
+    /// this structurally — `/compact` alone returns `CommandResult::QueueCommand`
+    /// (`slash/commands/compact.rs:49`) instead of resolving locally — and this
+    /// flag is how the port keeps that guarantee while still dispatching the
+    /// harmless majority inline.
+    public let mutatesConversationHistory: Bool
+    /// Tie-break for an ambiguous prefix, highest first. Zero — the default —
+    /// leaves suggestions in plain name order.
+    ///
+    /// A prefix like `/q` matches both `quit` and `queue`, and which one the
+    /// dropdown offers should be a decision, not an artifact of the alphabet.
+    /// Upstream settles it with registration order (`slash/commands/mod.rs:78`
+    /// registers `quit` first); this is the same decision made explicit, so a
+    /// command added later cannot quietly take a prefix away from an older one.
+    public let priority: Int
 
     public init(
         name: String,
         aliases: [String] = [],
         summary: String = "",
         usage: String? = nil,
-        availability: PagerCommandAvailability = .available
+        availability: PagerCommandAvailability = .available,
+        isHidden: Bool = false,
+        mutatesConversationHistory: Bool = false,
+        priority: Int = 0
     ) {
         let normalizedName = Self.normalize(name)
         self.id = normalizedName
@@ -39,6 +68,9 @@ public struct PagerCommandDefinition: Codable, Equatable, Hashable, Sendable, Id
         self.summary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
         self.usage = usage?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.availability = availability
+        self.isHidden = isHidden
+        self.mutatesConversationHistory = mutatesConversationHistory
+        self.priority = priority
     }
 
     public var isValid: Bool {
@@ -171,19 +203,23 @@ public struct PagerCommandCompletion: Codable, Equatable, Hashable, Sendable, Id
     public let summary: String
     public let availability: PagerCommandAvailability
     public let matchedAlias: String?
+    /// Copied from the definition so the sort can tie-break without a lookup.
+    public let priority: Int
 
     public init(
         commandName: String,
         displayName: String,
         summary: String,
         availability: PagerCommandAvailability,
-        matchedAlias: String? = nil
+        matchedAlias: String? = nil,
+        priority: Int = 0
     ) {
         self.commandName = commandName
         self.displayName = displayName
         self.summary = summary
         self.availability = availability
         self.matchedAlias = matchedAlias
+        self.priority = priority
         self.id = commandName
     }
 
@@ -192,7 +228,6 @@ public struct PagerCommandCompletion: Codable, Equatable, Hashable, Sendable, Id
 
 public struct PagerCommandRegistry: Equatable, Hashable, Sendable {
     public let commands: [PagerCommandDefinition]
-
     public init(commands: [PagerCommandDefinition] = []) {
         var seen = Set<String>()
         self.commands = commands
@@ -223,6 +258,7 @@ public struct PagerCommandRegistry: Equatable, Hashable, Sendable {
         guard trimmed.first == "/", !trimmed.contains(where: { $0.isWhitespace }) else { return [] }
         let query = String(trimmed.dropFirst()).lowercased()
         return commands.compactMap { command in
+            guard !command.isHidden else { return nil }
             let canonicalMatch = command.name.hasPrefix(query)
             let alias = command.aliases.first(where: { $0.hasPrefix(query) })
             guard canonicalMatch || alias != nil else { return nil }
@@ -231,13 +267,15 @@ public struct PagerCommandRegistry: Equatable, Hashable, Sendable {
                 displayName: "/\(command.name)",
                 summary: command.summary.isEmpty ? command.availability.label : command.summary,
                 availability: command.availability,
-                matchedAlias: canonicalMatch ? nil : alias
+                matchedAlias: canonicalMatch ? nil : alias,
+                priority: command.priority
             )
         }
         .sorted { lhs, rhs in
             let lhsExact = lhs.commandName == query
             let rhsExact = rhs.commandName == query
             if lhsExact != rhsExact { return lhsExact }
+            if lhs.priority != rhs.priority { return lhs.priority > rhs.priority }
             return lhs.commandName < rhs.commandName
         }
     }

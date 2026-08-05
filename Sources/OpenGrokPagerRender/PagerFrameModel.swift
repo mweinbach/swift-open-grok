@@ -269,6 +269,10 @@ public struct PagerComposerState: Sendable, Equatable, Hashable {
     public var title: String?
     /// Left group of the bottom border.
     public var modelName: String?
+    /// Reasoning effort for the active model, rendered as a parenthetical after
+    /// the model name — `Grok Build (xhigh)` (`agent_view/render.rs:2344-2347`).
+    /// `nil` on models that have no selectable effort.
+    public var reasoningEffort: String?
     public var flags: [PagerComposerFlag]
     /// Right group of the bottom border.
     public var isMultiline: Bool
@@ -286,6 +290,7 @@ public struct PagerComposerState: Sendable, Equatable, Hashable {
         placeholder: String = "Build anything",
         title: String? = nil,
         modelName: String? = nil,
+        reasoningEffort: String? = nil,
         flags: [PagerComposerFlag] = [],
         isMultiline: Bool = false,
         showBorders: Bool = true,
@@ -299,10 +304,21 @@ public struct PagerComposerState: Sendable, Equatable, Hashable {
         self.placeholder = placeholder
         self.title = title
         self.modelName = modelName
+        self.reasoningEffort = reasoningEffort
         self.flags = flags
         self.isMultiline = isMultiline
         self.showBorders = showBorders
         self.maximumHeight = max(1, maximumHeight)
+    }
+
+    /// What the bottom border actually prints for the model: the name, plus the
+    /// effort in parentheses when the model has one.
+    public var modelDisplay: String? {
+        guard let modelName, !modelName.isEmpty else { return nil }
+        guard let effort = reasoningEffort?.trimmingCharacters(in: .whitespaces),
+              !effort.isEmpty
+        else { return modelName }
+        return "\(modelName) (\(effort))"
     }
 }
 
@@ -423,6 +439,13 @@ public struct PagerRenderState: Sendable, Equatable {
     public var scrollPosition: PagerScrollPosition
     public var theme: PagerRenderTheme
     public var showScrollbar: Bool
+    /// Index into `conversation` of the block the scrollback has selected.
+    ///
+    /// Non-nil is exactly "the scrollback holds the keyboard": the reference
+    /// splits its binding table on `When::ScrollbackFocused` and marks the
+    /// selected entry, and this one field carries both halves. The composer's
+    /// own `input.isFocused` is what the caller clears alongside it.
+    public var selectedBlockIndex: Int?
     /// Overlays layered above the transcript. A non-empty stack also holds
     /// input focus — see `PagerOverlayStack.handle`.
     public var overlays: PagerOverlayStack
@@ -438,9 +461,11 @@ public struct PagerRenderState: Sendable, Equatable {
         scrollPosition: PagerScrollPosition = .followTail,
         theme: PagerRenderTheme = .default,
         showScrollbar: Bool = true,
+        selectedBlockIndex: Int? = nil,
         overlays: PagerOverlayStack = PagerOverlayStack()
     ) {
         self.overlays = overlays
+        self.selectedBlockIndex = selectedBlockIndex
         self.size = size
         self.statusBar = statusBar
         self.conversation = conversation
