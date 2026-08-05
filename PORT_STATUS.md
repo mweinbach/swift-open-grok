@@ -214,6 +214,74 @@ Both are mapped with proposed Swift targets in `CRATE_MAP.md`.
 - The Swift port targets the **old** pin's behavior throughout. Nothing in this section is implemented on the Swift side; it is a catch-up backlog, not a status claim.
 - `ProtocolFixtures/` still encodes old-pin wire formats (see the fixture pin caveat in the header). Recapture is a prerequisite for treating any of the above as fixture-verified.
 
+## Feature-parity audit — 2026-08-05 (six read-only audits, enumerated from the Rust side)
+
+Every prior "gap" list in this document was written from the *port's* perspective
+— what a wave set out to build. This audit enumerated the **Rust** surface first,
+so features no wave ever claimed could not hide. Full reports:
+`AUDIT-{cli,tui,tools,sessions,providers,config}.md` (session scratchpad).
+**Headline: subsystem depth is real; breadth and enforcement are not.**
+
+**SECURITY — fix before any other parity work.**
+
+1. **`run_terminal_cmd` bypasses the permission system entirely**
+   (`LiveComposition.swift:1977-1988` dispatches straight to `composition.invoke`):
+   no permission request, no deny rules, no PreToolUse hooks. The interactive
+   permission modal built in wave 2 gates *file writes only*. Arbitrary shell runs
+   unprompted — including commands that rewrite the protected config files.
+2. **Nothing reads `[permission]` config** (`grep '"permission"' Sources/` → 0
+   hits). A user's `deny = ["Bash(rm:*)"]` is silently ignored; the rule engine is
+   correct, tested, and has no input.
+3. **No sandbox enforcement**: `OpenGrokSandbox` (2,208 lines, real `sandbox_init`)
+   has zero importers. Rust applies Seatbelt at startup and at every local exec.
+4. **Folder trust is inert** — a hostile repo's `.mcp.json` spawns servers on first
+   open (`LiveMCPComposition.connectConfiguredServers` performs no trust check).
+5. **Project config is dropped from the live precedence chain**: live loads
+   `effectiveConfigBase()`, so any repo `.opengrok/config.toml` (MCP servers, hooks,
+   tool config) has no effect. The faithful `AuthorityComposition` has zero callers.
+
+**HARD WALLS — the session cannot proceed past them.**
+
+6. **No compaction path is live.** A session exceeding the context window dies with
+   a provider error: no auto-compact, no `/compact`, no truncation fallback. The
+   full Codex Remote Compaction V2 protocol exists in `Sources/OpenGrokCompaction`
+   (~1,600 lines, unit-tested) with **zero call sites** outside its own module —
+   the README's flagship feature, library-only.
+7. **Background execution is a dead end.** `run_terminal_cmd` backgrounds (and
+   *auto*-backgrounds on a 10s budget) but `get_task_output` / `wait_tasks` /
+   `kill_task` do not exist, so the model can never reach the output. Producer
+   shipped without consumers.
+8. **No `/rewind` or restore-code**, and no file snapshots — a bad agent edit
+   outside git is permanent.
+
+**BREADTH — daily-driver surfaces never waved.**
+
+9. **Root CLI invocation forms don't parse**: `open-grok "prompt"`, `-p`, `-c`,
+   `-r`, `-m` all fail as `unknown command`; only subcommands were implemented.
+   No permission/sandbox flags at all, blocking scripted and CI use.
+10. **62 of 71 slash commands missing** (`/compact`, `/resume`, `/usage`, `/copy`,
+    `/export`, `/find`, `/theme`, `/context`, …); no settings modal (90 rows, all
+    Advanced feature flags); no scrollback focus model (21 dead bindings); themes
+    ported but unselectable; plan mode absent.
+11. **Session recovery is command-line-only** — no picker, no search, no titles;
+    memory and goals are complete libraries reachable by nothing (`update_goal`'s
+    prompt text is registered while the tool is not — the model may be told to call
+    a tool that does not exist).
+12. **Auxiliary services dark**: self-update (users can never upgrade), crash
+    handler never installed, skills entirely absent, plugin marketplace parses but
+    has no dispatcher case, Computer Hub fully built and unreachable, telemetry/
+    voice/announcements/share unwired. `web_search`/`web_fetch` have no registered
+    handler, so non-hosted-search providers (Kimi, Fireworks, OpenCode Go, Wafer)
+    have no search at all.
+13. **One provider-level defect**: Fireworks JSON-Schema normalization is missing
+    (`normalize_fireworks_schema`), so loose tool schemas 400 on Fireworks.
+
+Statuses used above distinguish **live** (reachable from the running executable)
+from **implemented-unwired** (tested library, no importer) from **absent**. Most
+items in 6-12 are unwired rather than absent, which is why the test suite is green
+and the feature is missing at the same time — coverage of a library proves nothing
+about its reachability.
+
 ## Known remaining gaps
 
 1. **No current macOS verifier blocker** as of the last verifier run (2026-07-23): the serialized package, tests, product build, and executable smokes were green. Not re-run since.
