@@ -559,6 +559,50 @@ target this wave touched, and it passed **5/5** re-run in isolation. Three
 subsequent serial runs — including the last two over the exact final tree — were
 clean. Recorded as a new member of the known flake set, not as a regression.
 
+#### Build-out wave 3 — 2026-08-05 (final combined gates)
+
+Four parallel slices, committed individually as each verified:
+
+- `ad098d4` — complete PTY fix (pre-fork poll(2) reader + reap-or-EOF
+  termination; 300/300 capture in the standalone probe vs 0/300 reading at
+  reap) and the `spawnEchoUpstream` fixture lifecycle.
+- `e2ea8f3` — upstream data-layer catch-up at the `80dff0a9` pin: scoped auth
+  keys, new config schema with remote-flag removal, `chat_format_version`
+  hard-check, workflow manifest version range, Kimi Code k3/k3-256k with
+  endpoint-aware default selection.
+- `e9935ea` — live `/model` switching (in-place rebuild, history preserved,
+  fail-closed without credentials) and queued prompts via `OpenGrokPromptQueue`.
+- `0097d9d` — Code Mode engine + persistent JavaScriptCore cell runtime,
+  replacing the two largest placeholder targets. JSC cannot interrupt a running
+  script on demand; termination closes the cell stream immediately and a
+  per-entry execution ceiling reclaims the thread (hard interrupt would need a
+  child process).
+
+Final gates over the committed tree (Swift 6.3.3, Darwin 27.0.0 arm64):
+
+| Command | Exit |
+|---|---|
+| `swift-safe-verify.zsh test` (default parallel) | **0** — 2395 tests / 363 suites, 23.4s |
+| `swift-safe-verify.zsh test --no-parallel` | **0** — 2395 tests / 363 suites, 132.8s |
+| `swift-safe-verify.zsh build --product open-grok` | **0** |
+
+**Default parallel is green for the first time on merit** — the PTY capture
+flake that dominated every prior parallel red is fixed at the mechanism level,
+not suppressed. Test count 2257 → **2395** (+138). Remaining known flake
+class: load-sensitive subprocess-completion budgets (see the serial-run caveat
+above); members pass repeatedly in isolation.
+
+Operational lessons recorded this wave: the two-lock problem (the verify
+wrapper's lock dir plus SwiftPM's own `.build/workflow-safe` lock — a queued
+run is indistinguishable from a hung one by CPU alone; check for SwiftPM's
+"another instance" message), kill process groups rather than wrappers, and
+`swift test --filter` with a zero-match regex exits 0 — verify reported test
+counts, never exit codes alone.
+
+Remaining placeholder targets: `OpenGrokMermaid`, `OpenGrokMermaidLayout`,
+`OpenGrokDistributionSupport`, `OpenGrokReleaseValidation`,
+`OpenGrokPagerPTYHarness`.
+
 
 ## Per-crate port status (all 84 Rust crates accounted for)
 
