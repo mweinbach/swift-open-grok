@@ -79,7 +79,7 @@ public actor OpenGrokShellOwnedProcessExecution: OpenGrokShellProcessExecution {
         foregroundCallIDs.insert(callID)
         defer { foregroundCallIDs.remove(callID) }
 
-        return try await withTaskCancellationHandler(
+        let result = try await withTaskCancellationHandler(
             operation: {
                 try await backend.run(ownedRequest)
             },
@@ -87,6 +87,16 @@ public actor OpenGrokShellOwnedProcessExecution: OpenGrokShellProcessExecution {
                 Task { await backend.killForegroundCommands(ownerSessionID: sessionID) }
             }
         )
+        // A foreground command that outruns `foregroundBlockBudget` is moved to
+        // the background by the backend, not by an explicit `runBackground`
+        // call, so its task id never passes through the branch below. Without
+        // recording it here every ownership check — `taskSnapshot`, `killTask`,
+        // `waitForCompletion` — rejects the very id `run` just handed back, and
+        // the model has no way to reach a task it did not choose to background.
+        if result.backgrounded, let taskID = result.taskID, !taskID.isEmpty {
+            backgroundTaskOwners[taskID] = callID
+        }
+        return result
     }
 
     public func runBackground(_ request: ShellCommandRequest) async throws -> ShellBackgroundHandle {
