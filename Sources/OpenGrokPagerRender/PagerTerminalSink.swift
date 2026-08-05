@@ -57,15 +57,21 @@ public struct PagerTerminalRendererConfiguration: Sendable, Equatable {
     public var mode: PagerTerminalMode
     public var useAlternateScreen: Bool
     public var useSynchronizedOutput: Bool
+    /// Emit SGR mouse-reporting enable/disable bracketed with the alternate
+    /// screen. DEC private modes are scoped per screen buffer on some
+    /// terminals, so the disable has to land on the buffer that saw the enable.
+    public var useMouseReporting: Bool
 
     public init(
         mode: PagerTerminalMode = .fullscreen,
         useAlternateScreen: Bool = true,
-        useSynchronizedOutput: Bool = true
+        useSynchronizedOutput: Bool = true,
+        useMouseReporting: Bool = false
     ) {
         self.mode = mode
         self.useAlternateScreen = useAlternateScreen
         self.useSynchronizedOutput = useSynchronizedOutput
+        self.useMouseReporting = useMouseReporting
     }
 }
 

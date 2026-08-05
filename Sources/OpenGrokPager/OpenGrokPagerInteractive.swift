@@ -124,6 +124,31 @@ public struct OpenGrokPagerInteractiveResult: Sendable, Equatable {
     }
 }
 
+/// A UI surface the controller asks the renderer to present. The controller
+/// owns the slash-command vocabulary but not the overlay stack, which lives in
+/// the render layer, so the command handler emits an intent instead of a modal.
+public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
+    /// `/help` — the shortcuts modal (spec §16.5), not a transcript dump.
+    case help
+    /// `/model` — the model picker.
+    case modelPicker
+    /// `/toggle-mouse-reporting` — hand click-drag back to the terminal for
+    /// native copy/paste, or take it back.
+    case toggleMouseReporting
+    case dismissAll
+}
+
+/// Whether the renderer already consumed an input event.
+///
+/// An active overlay swallows every key, including keys it does not act on —
+/// the reference's rule that a modal never leaks a keystroke to the composer.
+public enum OpenGrokPagerInputRouting: Sendable, Equatable, Hashable {
+    /// Nothing claimed the event; run the normal prompt pipeline.
+    case notHandled
+    /// Fully handled and already repainted.
+    case consumed
+}
+
 public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {
     case lifecycle(OpenGrokPagerInteractiveLifecycle)
     case promptChanged(OpenGrokPagerInteractivePromptState)
@@ -133,6 +158,9 @@ public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {
     case notice(String)
     /// The user moved the transcript viewport.
     case viewport(OpenGrokPagerViewportCommand)
+    /// Present (or dismiss) an overlay. Renderers with no overlay stack — the
+    /// headless and test adapters — ignore it.
+    case overlay(OpenGrokPagerOverlayRequest)
     /// A turn was cancelled but the session stays open for the next prompt —
     /// distinct from `.cancelled`, which ends the run.
     case turnCancelled
@@ -147,11 +175,23 @@ public protocol OpenGrokPagerInteractiveRenderAdapter: Sendable {
     func render(_ event: OpenGrokPagerInteractiveEvent) async throws
     func resize(to size: TerminalSize) async throws
     func restoreTerminal() async throws
+
+    /// First refusal on raw input, ahead of the prompt state machine.
+    ///
+    /// Overlays and the mouse router live in the render layer, so the
+    /// controller offers every event here before interpreting it. Renderers
+    /// with neither default to `.notHandled` and behave exactly as before.
+    func handleInput(_ event: InputEvent) async throws -> OpenGrokPagerInputRouting
 }
 
 extension OpenGrokPagerInteractiveRenderAdapter {
     public func resize(to size: TerminalSize) async throws {
         _ = size
+    }
+
+    public func handleInput(_ event: InputEvent) async throws -> OpenGrokPagerInputRouting {
+        _ = event
+        return .notHandled
     }
 }
 

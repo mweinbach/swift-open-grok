@@ -264,7 +264,7 @@ struct OpenGrokPagerInteractiveControllerTests {
         #expect(states.last?.completions.isEmpty == true)
     }
 
-    @Test("/help prints locally and /quit ends the run without a session")
+    @Test("/help opens the shortcuts modal and /quit ends the run without a session")
     func slashCommandsRunLocally() async throws {
         let runtime = TestInteractiveRuntime(sessions: [])
         let output = RecordingInteractiveOutput()
@@ -286,11 +286,14 @@ struct OpenGrokPagerInteractiveControllerTests {
         // Neither command reaches the model.
         #expect(await runtime.requests.isEmpty)
         #expect(result.submittedPrompts.isEmpty)
-        let notices = await output.events.compactMap { event -> String? in
-            if case .notice(let text) = event { return text }
+        // `/help` is a modal now, not a transcript dump, so it reaches the
+        // renderer as an overlay request rather than a notice.
+        let overlays = await output.events.compactMap { event -> OpenGrokPagerOverlayRequest? in
+            if case .overlay(let request) = event { return request }
             return nil
         }
-        #expect(notices.contains { $0.contains("/clear") })
+        #expect(overlays == [.help])
+        #expect(OpenGrokPagerInteractiveController.helpText.contains("/clear"))
     }
 
     @Test("input EOF restores the frontend without creating a session")

@@ -192,6 +192,16 @@ public enum PagerGlyphs {
     public static let ellipsis = "\u{2026}"         // …
     public static let statusSeparator = "\u{2502}"  // │
 
+    public static let emptyDot = "\u{25CB}"         // ○
+    public static let ballotX = "\u{2717}"          // ✗
+
+    /// Modal windows use a square border (`Borders::ALL` with the default
+    /// border type), unlike the composer's rounded box.
+    public static let modalTopLeft: Character = "\u{250C}"      // ┌
+    public static let modalTopRight: Character = "\u{2510}"     // ┐
+    public static let modalBottomLeft: Character = "\u{2514}"   // └
+    public static let modalBottomRight: Character = "\u{2518}"  // ┘
+
     public static let borderTopLeft: Character = "\u{256D}"      // ╭
     public static let borderTopRight: Character = "\u{256E}"     // ╮
     public static let borderBottomLeft: Character = "\u{2570}"   // ╰

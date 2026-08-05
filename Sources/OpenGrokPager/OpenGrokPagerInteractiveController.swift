@@ -547,6 +547,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         let inputReader = ThrowingStreamReader(input)
         let inputPumpGate = InputPumpGate()
         self.inputPumpGate = inputPumpGate
+        let renderer = self.renderer
         inputPump = Task {
             while !Task.isCancelled {
                 guard await inputPumpGate.waitUntilAllowed() else { return }
@@ -554,6 +555,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 await inputPumpGate.pause()
                 switch read {
                 case .element(let event):
+                    // Overlays and the mouse router get first refusal, ahead of
+                    // both the interrupt classifier and the prompt state
+                    // machine. Ctrl+C / Ctrl+D are deliberately exempt so a
+                    // modal can never trap the session.
+                    let isEscapeHatch: Bool
+                    switch Self.controlAction(for: event) {
+                    case .some(.interrupt), .some(.eof): isEscapeHatch = true
+                    default: isEscapeHatch = false
+                    }
+                    if !isEscapeHatch,
+                       let routing = try? await renderer.handleInput(event),
+                       routing == .consumed
+                    {
+                        await inputPumpGate.resume()
+                        continue
+                    }
                     switch Self.controlAction(for: event) {
                     case .some(.escape):
                         await mailbox.send(.control(.interrupt(isEscape: true)), priority: true)
@@ -1022,9 +1039,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Browse commands and keyboard shortcuts"
         ),
         PagerCommandDefinition(
+            name: "model",
+            summary: "Pick the model for this session"
+        ),
+        PagerCommandDefinition(
             name: "clear",
             aliases: ["new"],
             summary: "Start a new session"
+        ),
+        PagerCommandDefinition(
+            name: "toggle-mouse-reporting",
+            summary: "Toggle mouse reporting (native copy/paste)"
         ),
         PagerCommandDefinition(
             name: "quit",
@@ -1185,7 +1210,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 try await emit(.notice("started a new session"))
                 return .handled
             case "help":
-                try await emit(.notice(Self.helpText))
+                try await emit(.overlay(.help))
+                return .handled
+            case "model":
+                try await emit(.overlay(.modelPicker))
+                return .handled
+            case "toggle-mouse-reporting":
+                try await emit(.overlay(.toggleMouseReporting))
                 return .handled
             default:
                 try await emit(.notice("unknown command: /\(command.name)"))
@@ -1194,11 +1225,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         }
     }
 
-    private static let helpText = """
+    /// Body of the `/help` modal. Public so the render layer can lay it out as
+    /// a text overlay without duplicating the vocabulary.
+    public static let helpText = """
     Commands
-      /help            Browse commands and keyboard shortcuts
-      /clear  /new     Start a new session
-      /quit   /exit    Quit the application
+      /help                     Browse commands and keyboard shortcuts
+      /model                    Pick the model for this session
+      /clear  /new              Start a new session
+      /toggle-mouse-reporting   Toggle mouse reporting (native copy/paste)
+      /quit   /exit             Quit the application
 
     Keys
       Enter            send (queue while a turn is running)
@@ -1209,6 +1244,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       PgUp / PgDn      scroll the transcript
       Home / End       jump to the top or bottom of the transcript
       Ctrl+u           scroll up half a page
+      Wheel            scroll the transcript, or the open overlay
+      Click            choose a row in an overlay
     """
 
     private func transition(to newLifecycle: OpenGrokPagerInteractiveLifecycle) async throws {

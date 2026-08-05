@@ -34,6 +34,38 @@ private final class ParityTerminalFixture: @unchecked Sendable {
         return String(decoding: storage, as: UTF8.self)
     }
 
+    /// Painted text with the escape sequences removed.
+    ///
+    /// The renderer emits a cursor move and an SGR run before every glyph, so
+    /// `output` never contains a readable word. Stripping the sequences leaves
+    /// the cells in paint order, which for a full frame is reading order.
+    var paintedText: String {
+        var result = ""
+        var iterator = output[...]
+        while let escape = iterator.firstIndex(of: "\u{1B}") {
+            result += iterator[iterator.startIndex..<escape]
+            var cursor = iterator.index(after: escape)
+            guard cursor < iterator.endIndex else { break }
+            if iterator[cursor] == "[" || iterator[cursor] == "]" {
+                let isOSC = iterator[cursor] == "]"
+                cursor = iterator.index(after: cursor)
+                while cursor < iterator.endIndex {
+                    let scalar = iterator[cursor].unicodeScalars.first!.value
+                    let isFinal = isOSC
+                        ? (scalar == 0x07 || iterator[cursor] == "\\")
+                        : (scalar >= 0x40 && scalar <= 0x7E)
+                    cursor = iterator.index(after: cursor)
+                    if isFinal { break }
+                }
+            } else {
+                cursor = iterator.index(after: cursor)
+            }
+            iterator = iterator[cursor...]
+        }
+        result += iterator
+        return result
+    }
+
     func append(_ data: Data) {
         lock.lock()
         storage.append(data)
@@ -1211,6 +1243,291 @@ struct ParityCompositionTests {
         #expect(outcome.toolResult?.contains("OPENGROK_ALLOW_WRITES") != true)
     }
 
+    /// Drives a real interactive session whose turn calls the write tool, and
+    /// answers the permission sheet with a scripted key once it is painted.
+    private func runInteractivePermissionSession(
+        answer: [InputEvent]
+    ) async -> (code: Int32, painted: String, toolResult: String?, wroteFile: Bool) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let target = root.appendingPathComponent("written.txt")
+
+        let sampler = ParityFileToolSamplerFixture(
+            arguments: #"{"file_path":"written.txt","content":"written by the model\n"}"#,
+            toolName: "write"
+        )
+        let terminal = ParityTerminalFixture(
+            tty: true,
+            size: OpenGrokLiveTerminalSize(width: 80, height: 24)
+        )
+        let input = AsyncThrowingStream<InputEvent, Error> { continuation in
+            Task {
+                for event in Self.typed("write the file") + [.key(KeyEvent(key: .enter))] {
+                    continuation.yield(event)
+                }
+                await Self.waitForPaintedText("Allow write", terminal: terminal)
+                for event in answer {
+                    continuation.yield(event)
+                }
+                await Self.waitForTerminalOutput("file tool result", terminal: terminal)
+                continuation.yield(.key(KeyEvent(
+                    key: .char("d"),
+                    modifiers: .control,
+                    character: "d"
+                )))
+                continuation.finish()
+            }
+        }
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() },
+            terminal: terminal.terminal,
+            makeInteractiveInput: {
+                OpenGrokLiveInteractiveInput(events: input, close: {})
+            },
+            makeTerminalSink: {
+                ParityTerminalSink(terminal: terminal)
+            }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, _, _) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            ["interactive", "--cwd", root.path],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+        let toolResult = sampler.recordedRequests.last?.items.compactMap { item -> ToolResultItem? in
+            guard case .toolResult(let result) = item else { return nil }
+            return result
+        }.last?.content
+        return (
+            code,
+            terminal.paintedText,
+            toolResult,
+            FileManager.default.fileExists(atPath: target.path)
+        )
+    }
+
+    @Test("the interactive permission sheet allows a write when the user picks Yes")
+    func liveInteractivePermissionAllowsWrite() async {
+        // Option 2 is "Yes" — a one-shot allow.
+        let outcome = await runInteractivePermissionSession(
+            answer: [.key(KeyEvent(key: .char("2"), character: "2"))]
+        )
+        #expect(outcome.code == CLIRunner.ExitCode.success.rawValue)
+        #expect(outcome.painted.contains("Allow write"))
+        #expect(outcome.wroteFile == true)
+        // The sheet replaces the env gate in interactive mode, so the denial
+        // message that names the variable must not appear.
+        #expect(outcome.toolResult?.contains("OPENGROK_ALLOW_WRITES") != true)
+    }
+
+    @Test("the interactive permission sheet denies a write when the user picks No")
+    func liveInteractivePermissionDeniesWrite() async {
+        // Option 3 is "No, and tell Grok what to do differently".
+        let outcome = await runInteractivePermissionSession(
+            answer: [.key(KeyEvent(key: .char("3"), character: "3"))]
+        )
+        #expect(outcome.code == CLIRunner.ExitCode.success.rawValue)
+        #expect(outcome.wroteFile == false)
+        #expect(outcome.toolResult?.contains("denied") == true)
+    }
+
+    @Test("arrowing down to Yes and pressing Enter answers the permission sheet")
+    func liveInteractivePermissionKeyboardNavigation() async {
+        // The sheet opens on option 1 ("allow all edits this session"); one
+        // Down lands on "Yes", and Enter confirms the highlighted row.
+        let outcome = await runInteractivePermissionSession(
+            answer: [
+                .key(KeyEvent(key: .down)),
+                .key(KeyEvent(key: .enter))
+            ]
+        )
+        #expect(outcome.wroteFile == true)
+    }
+
+    @Test("OPENGROK_ALLOW_WRITES still bypasses the sheet in interactive mode")
+    func liveInteractivePermissionEnvBypass() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let target = root.appendingPathComponent("written.txt")
+
+        let sampler = ParityFileToolSamplerFixture(
+            arguments: #"{"file_path":"written.txt","content":"written by the model\n"}"#,
+            toolName: "write"
+        )
+        let terminal = ParityTerminalFixture(
+            tty: true,
+            size: OpenGrokLiveTerminalSize(width: 80, height: 24)
+        )
+        let input = AsyncThrowingStream<InputEvent, Error> { continuation in
+            Task {
+                for event in Self.typed("write the file") + [.key(KeyEvent(key: .enter))] {
+                    continuation.yield(event)
+                }
+                await Self.waitForTerminalOutput("file tool result", terminal: terminal)
+                continuation.yield(.key(KeyEvent(
+                    key: .char("d"),
+                    modifiers: .control,
+                    character: "d"
+                )))
+                continuation.finish()
+            }
+        }
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() },
+            terminal: terminal.terminal,
+            makeInteractiveInput: {
+                OpenGrokLiveInteractiveInput(events: input, close: {})
+            },
+            makeTerminalSink: { ParityTerminalSink(terminal: terminal) }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, _, _) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            ["interactive", "--cwd", root.path],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key",
+                "OPENGROK_ALLOW_WRITES": "1"
+            ],
+            streams: streams,
+            application: application
+        )
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(FileManager.default.fileExists(atPath: target.path))
+        #expect(terminal.paintedText.contains("Allow write") == false)
+    }
+
+    /// Runs an interactive session with a scripted key sequence and no turn,
+    /// returning everything written to the terminal.
+    private func runInteractiveOverlaySession(
+        script: @escaping @Sendable (
+            ParityTerminalFixture,
+            AsyncThrowingStream<InputEvent, Error>.Continuation
+        ) async -> Void
+    ) async -> (code: Int32, output: String, painted: String) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let sampler = ParitySamplerFixture(responses: [:])
+        let terminal = ParityTerminalFixture(
+            tty: true,
+            size: OpenGrokLiveTerminalSize(width: 100, height: 30)
+        )
+        let input = AsyncThrowingStream<InputEvent, Error> { continuation in
+            Task {
+                await script(terminal, continuation)
+                continuation.yield(.key(KeyEvent(
+                    key: .char("d"),
+                    modifiers: .control,
+                    character: "d"
+                )))
+                continuation.finish()
+            }
+        }
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() },
+            terminal: terminal.terminal,
+            makeInteractiveInput: {
+                OpenGrokLiveInteractiveInput(events: input, close: {})
+            },
+            makeTerminalSink: { ParityTerminalSink(terminal: terminal) }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, _, _) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            ["interactive", "--cwd", root.path],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+        return (code, terminal.output, terminal.paintedText)
+    }
+
+    @Test("a fresh session opens on the welcome screen with the composer still live")
+    func liveInteractiveWelcomeScreen() async {
+        let outcome = await runInteractiveOverlaySession { terminal, continuation in
+            await Self.waitForPaintedText("Open Grok", terminal: terminal)
+            // The welcome overlay does not capture input, so a prompt typed
+            // underneath it still submits — which is also what pops it.
+            for event in Self.typed("hello") { continuation.yield(event) }
+            continuation.yield(.key(KeyEvent(key: .enter)))
+            await Self.waitForTerminalOutput("missing response", terminal: terminal)
+        }
+        #expect(outcome.code == CLIRunner.ExitCode.success.rawValue)
+        #expect(outcome.painted.contains("Open Grok"))
+        #expect(outcome.output.contains("You: hello"))
+    }
+
+    @Test("/help opens the shortcuts modal and Esc closes it")
+    func liveInteractiveHelpOverlay() async {
+        let outcome = await runInteractiveOverlaySession { terminal, continuation in
+            continuation.yield(.paste("/help"))
+            continuation.yield(.key(KeyEvent(key: .enter)))
+            await Self.waitForPaintedText("Keyboard Shortcuts", terminal: terminal)
+            continuation.yield(.key(KeyEvent(key: .escape)))
+        }
+        #expect(outcome.painted.contains("Keyboard Shortcuts"))
+        #expect(outcome.painted.contains("toggle-mouse-reporting"))
+    }
+
+    @Test("/model reports the picked model instead of switching silently")
+    func liveInteractiveModelPicker() async {
+        let outcome = await runInteractiveOverlaySession { terminal, continuation in
+            continuation.yield(.paste("/model"))
+            continuation.yield(.key(KeyEvent(key: .enter)))
+            await Self.waitForPaintedText("Select model", terminal: terminal)
+            continuation.yield(.key(KeyEvent(key: .enter)))
+            await Self.waitForPaintedText("Model set to", terminal: terminal)
+        }
+        #expect(outcome.painted.contains("Select model"))
+        #expect(outcome.output.contains("Model set to"))
+    }
+
+    @Test("mouse reporting is bracketed with the alternate screen and toggleable")
+    func liveInteractiveMouseReporting() async {
+        let outcome = await runInteractiveOverlaySession { terminal, continuation in
+            // A wheel report over the transcript scrolls it rather than
+            // reaching the composer.
+            continuation.yield(.mouse(MouseEvent(kind: .scrollUp, x: 10, y: 5)))
+            continuation.yield(.paste("/toggle-mouse-reporting"))
+            continuation.yield(.key(KeyEvent(key: .enter)))
+            await Self.waitForPaintedText("Mouse reporting off", terminal: terminal)
+        }
+        let output = outcome.output
+        let enable = output.range(of: "\u{1B}[?1006h")
+        let alternateEnter = output.range(of: "\u{1B}[?1049h")
+        let disable = output.range(of: "\u{1B}[?1006l")
+        let alternateExit = output.range(of: "\u{1B}[?1049l")
+        #expect(enable != nil)
+        #expect(disable != nil)
+        // Enable lands inside the alternate screen; the final disable lands
+        // before leaving it, so reporting can never outlive the session.
+        if let enable, let alternateEnter {
+            #expect(alternateEnter.lowerBound < enable.lowerBound)
+        }
+        if let alternateExit, let disable = output.range(
+            of: "\u{1B}[?1006l",
+            options: .backwards
+        ) {
+            #expect(disable.lowerBound < alternateExit.lowerBound)
+        }
+        _ = disable
+        #expect(output.contains("Mouse reporting off"))
+    }
+
     @Test("live file tools reject paths outside the working directory")
     func liveFileToolSandbox() async {
         let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -1997,6 +2314,19 @@ struct ParityCompositionTests {
     ) async {
         for _ in 0..<1_000 {
             if terminal.output.contains(text) {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+
+    /// Wait for text that only ever appears on screen, never in the transcript.
+    private static func waitForPaintedText(
+        _ text: String,
+        terminal: ParityTerminalFixture
+    ) async {
+        for _ in 0..<1_000 {
+            if terminal.paintedText.contains(text) {
                 return
             }
             try? await Task.sleep(nanoseconds: 5_000_000)

@@ -72,19 +72,34 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     )
     renderCompletions(state.completions, in: chrome.completions, buffer: &buffer, theme: state.theme)
     renderTurnStatus(state.turnStatus, in: chrome.turnStatus, buffer: &buffer, theme: state.theme)
-    let cursorPosition = renderComposer(
-        state.input,
+    // An active overlay owns input focus, so the composer paints unfocused and
+    // surrenders the terminal cursor for as long as the stack is non-empty.
+    var composer = state.input
+    if state.overlays.isActive {
+        composer.isFocused = false
+        composer.cursorVisible = false
+    }
+    let composerCursor = renderComposer(
+        composer,
         in: chrome.input,
         buffer: &buffer,
         theme: state.theme
     )
     renderShortcutsBar(state.shortcuts, in: chrome.shortcuts, buffer: &buffer, theme: state.theme)
 
+    let overlayBounds = renderOverlays(
+        state.overlays,
+        layout: layout,
+        buffer: &buffer,
+        theme: state.theme
+    )
+
     return PagerRenderResult(
         buffer: buffer,
         layout: layout,
-        cursorPosition: cursorPosition,
-        links: links
+        cursorPosition: state.overlays.isActive ? nil : composerCursor,
+        links: links,
+        overlays: overlayBounds
     )
 }
 
@@ -1207,7 +1222,7 @@ private func fill(
     }
 }
 
-private func paintBlank(
+func paintBlank(
     _ buffer: inout CellBuffer,
     area: TerminalRect,
     foreground: TerminalColor,
@@ -1230,7 +1245,7 @@ private func paintBlank(
 }
 
 @discardableResult
-private func paintSpans(
+func paintSpans(
     _ buffer: inout CellBuffer,
     spans: [PagerStyledSpan],
     x: Int,
@@ -1265,7 +1280,7 @@ private func paintSpans(
 
 /// Clip a span run to `width` display columns, dropping whole spans past the
 /// budget and trimming the one that straddles it.
-private func truncateSpans(_ spans: [PagerStyledSpan], to width: Int) -> [PagerStyledSpan] {
+func truncateSpans(_ spans: [PagerStyledSpan], to width: Int) -> [PagerStyledSpan] {
     guard width > 0 else { return [] }
     var result: [PagerStyledSpan] = []
     var used = 0

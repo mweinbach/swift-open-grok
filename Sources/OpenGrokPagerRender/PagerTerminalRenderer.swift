@@ -18,6 +18,7 @@ public final class PagerTerminalRenderer {
     private var cursorVisible: Bool?
     private var synchronizedOutputActive = false
     private var pendingResize = false
+    private var mouseReportingActive = false
 
     public init(
         sink: any PagerTerminalSink,
@@ -53,8 +54,30 @@ public final class PagerTerminalRenderer {
             try sink.write("\u{1B}[?25l")
             cursorVisible = false
         }
+
+        // Enable strictly after `?1049h` so the matching disable in `restore()`
+        // — which runs strictly before `?1049l` — lands on the same buffer.
+        if configuration.useMouseReporting {
+            mouseReportingActive = true
+            try sink.write(ANSIMouse.enableReporting)
+        }
         try sink.flush()
     }
+
+    /// Turn SGR mouse reporting on or off mid-session. Disabling hands click
+    /// and drag back to the terminal for native copy/paste, which is what
+    /// `/toggle-mouse-reporting` is for. Idempotent; returns whether it wrote.
+    @discardableResult
+    public func setMouseReporting(_ enabled: Bool) throws -> Bool {
+        guard started, !restorationAttempted else { return false }
+        guard enabled != mouseReportingActive else { return false }
+        mouseReportingActive = enabled
+        try sink.write(enabled ? ANSIMouse.enableReporting : ANSIMouse.disableReporting)
+        try sink.flush()
+        return true
+    }
+
+    public var isMouseReportingEnabled: Bool { mouseReportingActive }
 
     @discardableResult
     public func render(_ state: PagerRenderState) throws -> PagerTerminalRenderReport {
@@ -157,6 +180,13 @@ public final class PagerTerminalRenderer {
         if sink.capabilities.supportsCursorVisibility {
             output += "\u{1B}[?25h"
             cursorVisible = true
+        }
+        // Unconditional when the session ever asked for reporting: a terminal
+        // that silently kept a mode we think we turned off must not be left
+        // emitting escape bursts into the user's shell.
+        if mouseReportingActive || configuration.useMouseReporting {
+            output += ANSIMouse.trackingReset
+            mouseReportingActive = false
         }
         if enteredAlternateScreen {
             output += "\u{1B}[?1049l"

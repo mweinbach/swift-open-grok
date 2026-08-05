@@ -476,7 +476,20 @@ extension OpenGrokLiveInteractiveInput {
                 width: size.width,
                 height: size.height
             ))]
-        case .text, .pasteStart, .pasteEnd, .unknown:
+        case .unknown(let data):
+            // `TerminalInputDecoder` has no mouse handling: an SGR report
+            // (`ESC [ < b ; x ; y M|m`) terminates on its final byte, falls
+            // through the CSI switch and arrives here intact, so decoding it
+            // recovers the event without a new module dependency. Legacy X10
+            // is *not* recoverable this way — that parser treats `ESC [ M` as a
+            // complete CSI and the three coordinate bytes leak as text — which
+            // is why the driver enables `?1006h` last, making SGR the mode any
+            // terminal that understands it will use.
+            guard case .event(let mouse) = MouseReportDecoder.decode(Array(data)) else {
+                return []
+            }
+            return [.mouse(mouse)]
+        case .text, .pasteStart, .pasteEnd:
             return []
         }
     }
@@ -624,12 +637,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 environment: context.environment
             )
             let processBackend = dependencies.makeProcessBackend()
+            // The coordinator is created unconditionally and gates on whether a
+            // presenter ever attaches, so headless and non-TTY runs keep the
+            // fail-closed denial without a second construction path.
+            let permissionCoordinator = PagerPermissionCoordinator()
             let toolExecutor = try await LiveToolExecutor(
                 processBackend: processBackend,
                 sessionID: sessionID,
                 workingDirectory: cwd,
                 toolPolicy: agentProfile?.toolPolicy,
-                fileAccessPolicy: Self.resolveFileAccessPolicy(environment: context.environment)
+                fileAccessPolicy: Self.resolveFileAccessPolicy(
+                    environment: context.environment,
+                    coordinator: permissionCoordinator
+                )
             )
             let conversationHistory = LiveConversationHistory(
                 record: conversationRecord,
@@ -667,7 +687,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         terminal: dependencies.terminal,
                         sink: terminalSink,
                         workingDirectory: cwd.path,
-                        modelName: providerConfiguration.initialModelID
+                        modelName: providerConfiguration.initialModelID,
+                        modelCatalog: providerConfiguration.modelCatalog
+                            .map { (id: $0.key, provider: $0.value.info.provider.rawValue) }
+                            .sorted { $0.id < $1.id },
+                        permissionCoordinator: permissionCoordinator,
+                        terminalProgram: context.environment["TERM_PROGRAM"]
                     )
                     let controller = OpenGrokPagerInteractiveController(
                         input: interactiveInput.events,
@@ -1231,13 +1256,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
 
     /// Dispatch gate for the file tool pack.
     ///
-    /// There is no interactive permission prompt yet — the input stream is owned
-    /// end-to-end by `OpenGrokPagerInteractiveController`, with no seam for a
-    /// tool call to ask a question mid-turn — so interactive and headless alike
-    /// fail closed on mutations. `OPENGROK_ALLOW_WRITES` is the explicit opt-in
-    /// until a real prompter lands; reads and searches are unaffected either way.
+    /// `OPENGROK_ALLOW_WRITES=1` is an explicit bypass that skips prompting
+    /// entirely. Otherwise mutations route to `coordinator`: in an interactive
+    /// TTY the pager renderer installs itself as its presenter and the tool
+    /// suspends on the permission sheet, and everywhere else nothing is
+    /// listening, so the prompter fails closed with an actionable message
+    /// rather than hanging on a modal no terminal will paint.
     static func resolveFileAccessPolicy(
-        environment: [String: String]
+        environment: [String: String],
+        coordinator: PagerPermissionCoordinator? = nil
     ) -> FileToolAccessPolicy {
         let raw = environment["OPENGROK_ALLOW_WRITES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1246,7 +1273,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         case "1", "true", "yes", "on":
             return .allowAll
         default:
-            return .prompt(LiveWriteDenialPrompter())
+            guard let coordinator else { return .prompt(LiveWriteDenialPrompter()) }
+            return .prompt(LivePermissionModalPrompter(
+                coordinator: coordinator,
+                sessionPolicy: LiveSessionWritePolicy()
+            ))
         }
     }
 
@@ -1287,10 +1318,77 @@ struct LiveWriteDenialPrompter: PermissionPrompter {
         toolCallId: String
     ) async -> PermissionDecision {
         _ = (access, toolCallId)
-        return .reject(
-            "'\(toolName)' would modify files, and file mutations are disabled for this session. "
-                + "Set OPENGROK_ALLOW_WRITES=1 to allow them."
+        return .reject(LiveWriteDenialPrompter.denialMessage(toolName: toolName))
+    }
+
+    static func denialMessage(toolName: String) -> String {
+        "'\(toolName)' would modify files, and file mutations are disabled for this session. "
+            + "Set OPENGROK_ALLOW_WRITES=1 to allow them."
+    }
+}
+
+/// "Allow for the rest of the session", held outside the coordinator so a
+/// second mutation never re-prompts once the user has said yes.
+actor LiveSessionWritePolicy {
+    private var allowsAll = false
+
+    init() {}
+
+    func isAllowingAll() -> Bool { allowsAll }
+    func allowAll() { allowsAll = true }
+}
+
+/// Routes a mutation through the pager's permission sheet.
+///
+/// Fails closed when no presenter is installed — headless runs, non-TTY pipes,
+/// and the window after teardown — so a tool can never suspend on a modal that
+/// will not be drawn.
+struct LivePermissionModalPrompter: PermissionPrompter {
+    let coordinator: PagerPermissionCoordinator
+    let sessionPolicy: LiveSessionWritePolicy
+
+    func prompt(
+        access: AccessKind,
+        toolName: String,
+        toolCallId: String
+    ) async -> PermissionDecision {
+        if await sessionPolicy.isAllowingAll() { return .allow }
+        guard await coordinator.hasPresenter else {
+            return .reject(LiveWriteDenialPrompter.denialMessage(toolName: toolName))
+        }
+        let request = PagerPermissionRequest(
+            id: toolCallId.isEmpty ? UUID().uuidString : toolCallId,
+            toolName: toolName,
+            targetPath: Self.targetPath(for: access)
         )
+        switch await coordinator.decision(for: request) {
+        case .allowOnce:
+            return .allow
+        case .allowSession:
+            await sessionPolicy.allowAll()
+            return .allow
+        case .deny:
+            return .reject("'\(toolName)' was denied.")
+        }
+    }
+
+    private static func targetPath(for access: AccessKind) -> String? {
+        switch access {
+        case .edit(let path):
+            return path
+        case .read(let path):
+            return path
+        case .grep(let path, _):
+            return path
+        case .bash(let command):
+            return command
+        case .webFetch(let url):
+            return url
+        case .webSearch(let query):
+            return query
+        case .mcpTool(let name, _):
+            return name
+        }
     }
 }
 
@@ -2387,7 +2485,11 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     /// which is what hides the turn-status row — the reference gives that row
     /// zero height when idle.
     private let workingDirectory: String
-    private let modelName: String
+    private var modelName: String
+    /// `(id, provider)` pairs the `/model` picker lists. There is no live
+    /// model-switch path in this composition, so selecting one only relabels
+    /// the composer and posts a system message — see `INTEGRATION-overlays.md`.
+    private let modelCatalog: [(id: String, provider: String)]
     private var turnActivity: String?
     private var turnStartedAt: Date?
     private var animationTick = 0
@@ -2400,18 +2502,46 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     private var lastConversationHeight = 1
     private var lastMaximumScrollOffset = 0
 
+    /// Overlay stack and the geometry the last frame published for it. Bounds
+    /// are replaced wholesale every frame and never cached across one: a modal
+    /// that no longer fits (below 20×6) publishes nothing, so a stale rect
+    /// would hit-test against an overlay that is not on screen.
+    private var overlays = PagerOverlayStack()
+    private var lastOverlayBounds: [PagerOverlayBounds] = []
+    private let permissionCoordinator: PagerPermissionCoordinator?
+    private var currentPermissionRequestID: String?
+    private var hasStartedFirstTurn = false
+
+    /// Mouse. `linesPerEvent` folds the terminal's reports-per-notch into a
+    /// per-report line count, which is the whole of the port's wheel handling —
+    /// the reference's acceleration bands are not ported.
+    private let wheelTuning: MouseWheelTuning
+    private var mouseReportingEnabled: Bool
+
     init(
         mode: OpenGrokPagerMode,
         terminal: OpenGrokLiveTerminal,
         sink: any PagerTerminalSink,
         workingDirectory: String = FileManager.default.currentDirectoryPath,
-        modelName: String = "unknown"
+        modelName: String = "unknown",
+        modelCatalog: [(id: String, provider: String)] = [],
+        permissionCoordinator: PagerPermissionCoordinator? = nil,
+        terminalProgram: String? = nil,
+        enableMouseReporting: Bool = true
     ) {
         self.mode = mode
         self.terminal = terminal
         self.sink = sink
         self.workingDirectory = workingDirectory
         self.modelName = modelName
+        self.modelCatalog = modelCatalog.isEmpty
+            ? [(id: modelName, provider: "current")]
+            : modelCatalog
+        self.permissionCoordinator = permissionCoordinator
+        self.wheelTuning = MouseWheelTuning(
+            eventsPerTick: MouseWheelTuning.eventsPerTick(forTerminalProgram: terminalProgram)
+        )
+        self.mouseReportingEnabled = enableMouseReporting
         let size = terminal.size() ?? OpenGrokLiveTerminalSize(width: 80, height: 24)
         self.terminalSize = OpenGrokTerminalCore.TerminalSize(
             width: size.width,
@@ -2424,13 +2554,29 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                     ? .fullscreen
                     : .inline(height: max(1, min(12, size.height))),
                 useAlternateScreen: mode == .fullScreen,
-                useSynchronizedOutput: true
+                useSynchronizedOutput: true,
+                useMouseReporting: enableMouseReporting
             )
         )
     }
 
     func begin() async throws {
         try renderer.start()
+        if let permissionCoordinator {
+            await permissionCoordinator.setPresenter { [weak self] request in
+                await self?.showPermission(request)
+            }
+        }
+        // The welcome screen only makes sense on an empty session, and it must
+        // not capture input: the reference paints a live composer beneath it.
+        if conversation.items.isEmpty {
+            overlays.push(.welcome(
+                PagerWelcomeOverlay(
+                    subtitle: LivePagerChrome.collapseHome(workingDirectory)
+                ),
+                capturesInput: false
+            ))
+        }
         try renderState()
     }
 
@@ -2448,6 +2594,11 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         case .promptChanged(let prompt):
             self.prompt = prompt
         case .turnStarted(let request):
+            // The welcome screen's lifetime is exactly "before the first turn".
+            if !hasStartedFirstTurn {
+                hasStartedFirstTurn = true
+                overlays.dismiss(id: "welcome")
+            }
             conversation.startTurn(prompt: request.prompt)
             turnActivity = "Thinking\u{2026}"
             turnStartedAt = Date()
@@ -2461,18 +2612,26 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             conversation.appendMessage(PagerMessage(role: .system, text: message))
         case .viewport(let command):
             applyViewport(command)
+        case .overlay(let request):
+            try await present(request)
         case .turnCancelled:
             finishAssistant()
             conversation.appendMessage(PagerMessage(role: .system, text: "Cancelled."))
+            // A cancelled turn must not leave a tool parked on a sheet the user
+            // just walked away from.
+            await resolveOutstandingPermissions()
             endTurn()
         case .eof, .shutdown:
+            await resolveOutstandingPermissions()
             endTurn()
         case .cancelled:
             finishAssistant()
+            await resolveOutstandingPermissions()
             endTurn()
         case .failed(let message):
             finishAssistant()
             conversation.appendMessage(PagerMessage(role: .error, text: message))
+            await resolveOutstandingPermissions()
             endTurn()
         }
         try renderState()
@@ -2535,6 +2694,12 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     func restoreTerminal() async throws {
         guard !restored else { return }
         restored = true
+        // Detach the presenter first, so a tool that asks after this point
+        // fails closed instead of suspending on a sheet nobody will paint.
+        await permissionCoordinator?.setPresenter(nil)
+        await permissionCoordinator?.resolveAll(with: .deny)
+        overlays.removeAll()
+        currentPermissionRequestID = nil
         try renderer.restore()
         if mode == .fullScreen {
             try sink.write(transcript)
@@ -2584,6 +2749,203 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         }
     }
 
+    // MARK: - Overlays
+
+    private func present(_ request: OpenGrokPagerOverlayRequest) async throws {
+        switch request {
+        case .help:
+            overlays.push(.help(lines: OpenGrokPagerInteractiveController.helpText
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map { PagerStyledLine(text: String($0)) }))
+        case .modelPicker:
+            overlays.push(.modelPicker(models: modelCatalog, currentModelID: modelName))
+        case .toggleMouseReporting:
+            mouseReportingEnabled.toggle()
+            try renderer.setMouseReporting(mouseReportingEnabled)
+            conversation.appendMessage(PagerMessage(
+                role: .system,
+                text: mouseReportingEnabled
+                    ? "Mouse reporting on. Wheel scrolls the transcript; click selects overlay rows."
+                    : "Mouse reporting off. Click and drag now selects text for your terminal's copy/paste."
+            ))
+        case .dismissAll:
+            overlays.removeAll()
+            currentPermissionRequestID = nil
+        }
+    }
+
+    /// Push or replace the permission sheet. Driven by the coordinator's
+    /// presenter callback, so `nil` means "the queue drained".
+    private func showPermission(_ request: PagerPermissionRequest?) async {
+        if let current = currentPermissionRequestID {
+            overlays.dismiss(id: "permission:\(current)")
+            currentPermissionRequestID = nil
+        }
+        if let request {
+            overlays.push(.permission(request))
+            currentPermissionRequestID = request.id
+        }
+        try? renderState()
+    }
+
+    private func resolveOutstandingPermissions() async {
+        guard let permissionCoordinator else { return }
+        await permissionCoordinator.resolveAll(with: .deny)
+        if let current = currentPermissionRequestID {
+            overlays.dismiss(id: "permission:\(current)")
+            currentPermissionRequestID = nil
+        }
+    }
+
+    /// Apply the outcome of a row choice, whether it came from `Enter` or a
+    /// click. Overlay row ids are domain ids, so both paths land here.
+    private func select(overlayID: String, rowID: String) async {
+        if overlayID.hasPrefix("permission:") {
+            // The sheet's row ids are `PagerPermissionDecision` raw values, so a
+            // click resolves the request exactly as the keyboard would.
+            guard let decision = PagerPermissionDecision(rawValue: rowID) else { return }
+            await resolve(
+                overlayID: overlayID,
+                requestID: String(overlayID.dropFirst("permission:".count)),
+                decision: decision
+            )
+            return
+        }
+        overlays.dismiss(id: overlayID)
+        guard overlayID == "model" else { return }
+        // No live model-switch path exists: the sampler's model is fixed at
+        // session construction. Relabel and say so rather than silently doing
+        // nothing.
+        modelName = rowID
+        conversation.appendMessage(PagerMessage(
+            role: .system,
+            text: "Model set to \(rowID). It applies to new sessions — "
+                + "this session keeps its current model."
+        ))
+    }
+
+    private func resolve(
+        overlayID: String,
+        requestID: String,
+        decision: PagerPermissionDecision
+    ) async {
+        overlays.dismiss(id: overlayID)
+        if currentPermissionRequestID == requestID { currentPermissionRequestID = nil }
+        await permissionCoordinator?.resolve(requestID: requestID, decision: decision)
+    }
+
+    // MARK: - Input routing
+
+    func handleInput(_ event: InputEvent) async throws -> OpenGrokPagerInputRouting {
+        switch event {
+        case .key(let key):
+            guard overlays.isActive else { return .notHandled }
+            switch overlays.handle(key, viewportHeight: overlayViewportHeight) {
+            case .ignored:
+                return .notHandled
+            case .redraw, .consumed, .dismissed:
+                try renderState()
+                return .consumed
+            case .selected(let id, let rowID):
+                await select(overlayID: id, rowID: rowID)
+                try renderState()
+                return .consumed
+            case .permission(let id, let requestID, let decision):
+                await resolve(overlayID: id, requestID: requestID, decision: decision)
+                try renderState()
+                return .consumed
+            }
+        case .mouse(let mouse):
+            guard mouseReportingEnabled else { return .notHandled }
+            try await handleMouse(mouse)
+            return .consumed
+        case .paste:
+            // A modal swallows pasted text for the same reason it swallows
+            // keys: nothing typed while it is up belongs to the composer.
+            return overlays.isActive ? .consumed : .notHandled
+        default:
+            return .notHandled
+        }
+    }
+
+    /// Row budget for the focused overlay's page keys, read off the last painted
+    /// frame. Falls back to the transcript height when that overlay published no
+    /// bounds, which is what a viewport too small to hold a modal looks like.
+    private var overlayViewportHeight: Int {
+        guard let focused = overlays.focused?.id,
+              let bounds = lastOverlayBounds.last(where: { $0.id == focused })
+        else { return max(1, lastConversationHeight) }
+        return max(1, bounds.content.height)
+    }
+
+    private func handleMouse(_ event: MouseEvent) async throws {
+        let hit = lastOverlayBounds.last { $0.hitTest(x: event.x, y: event.y) }
+        if event.isScroll {
+            // One notch moves an overlay's selection by exactly one row, but
+            // moves the transcript by the terminal's lines-per-report — the
+            // reference's split between dropdown navigation and scrollback.
+            if let hit, overlays.isActive, hit.id == overlays.focused?.id {
+                let key = KeyEvent(key: event.kind == .scrollUp ? .up : .down)
+                switch overlays.handle(key, viewportHeight: max(1, hit.content.height)) {
+                case .ignored: break
+                default:
+                    try renderState()
+                    return
+                }
+            }
+            switch event.kind {
+            case .scrollUp:
+                scrollUp(by: wheelTuning.linesPerEvent)
+            case .scrollDown:
+                scrollDown(by: wheelTuning.linesPerEvent)
+            case .scrollLeft, .scrollRight:
+                return
+            default:
+                return
+            }
+            try renderState()
+            return
+        }
+
+        guard event.kind == .down, event.resolvedButton == .left, let hit else { return }
+        if let close = hit.closeButton, close.contains(x: event.x, y: event.y) {
+            overlays.dismiss(id: hit.id)
+            if currentPermissionRequestID.map({ "permission:\($0)" }) == hit.id {
+                currentPermissionRequestID = nil
+            }
+            try renderState()
+            return
+        }
+        if let row = hit.row(atX: event.x, y: event.y) {
+            await select(overlayID: hit.id, rowID: row.id)
+            try renderState()
+            return
+        }
+        if let hint = hit.hints.first(where: { $0.frame.contains(x: event.x, y: event.y) }),
+           let key = Self.keyEvent(forHint: hint.key)
+        {
+            switch overlays.handle(key, viewportHeight: max(1, hit.content.height)) {
+            case .selected(let id, let rowID):
+                await select(overlayID: id, rowID: rowID)
+            case .permission(let id, let requestID, let decision):
+                await resolve(overlayID: id, requestID: requestID, decision: decision)
+            case .ignored, .redraw, .consumed, .dismissed:
+                break
+            }
+            try renderState()
+        }
+    }
+
+    /// Footer hints label the key they stand for, so a click on one replays it.
+    /// Range and arrow hints (`1-9`, `↑/↓`) name no single key and do nothing.
+    private static func keyEvent(forHint key: String) -> KeyEvent? {
+        switch key.lowercased() {
+        case "esc": return KeyEvent(key: .escape)
+        case "enter": return KeyEvent(key: .enter)
+        default: return nil
+        }
+    }
+
     private func renderState() throws {
         let isTurnRunning = turnActivity != nil
         let completions = prompt.completions.isEmpty
@@ -2626,11 +2988,14 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 pendingKey: prompt.pendingConfirmationKey,
                 pendingLabel: prompt.pendingConfirmationLabel
             ),
-            scrollPosition: followsBottom ? .followTail : .offset(scrollOffset)
+            scrollPosition: followsBottom ? .followTail : .offset(scrollOffset),
+            overlays: overlays
         )
         // Render through the frame function rather than the renderer's own
         // engine so the resulting layout can seed the next scroll gesture.
         let result = renderPagerFrame(state)
+        // Fresh every frame: a modal that no longer fits publishes no bounds.
+        lastOverlayBounds = result.overlays
         lastConversationHeight = max(1, result.layout.conversation.height)
         lastMaximumScrollOffset = max(
             0,

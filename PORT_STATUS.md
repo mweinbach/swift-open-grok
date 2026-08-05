@@ -432,6 +432,133 @@ intermittently. The one-off serial issue is recorded as an unidentified
 intermittent, not attributed to any slice — three surrounding serial runs on the
 identical tree were clean.
 
+#### Build-out wave 2 integration — 2026-08-05
+
+Integration of two parallel slices — the overlay/modal framework in
+`OpenGrokPagerRender` and SGR mouse decoding in `OpenGrokTerminalCore` — into the
+live interactive path, plus the interactive permission modal those two enable.
+**All changes are uncommitted in the working tree**; the commit base below is the
+tree the changes sit on, not a commit containing them.
+
+- Commit base: `9318be73d5110ba1bbc3203a2e6d3f7187d8313f`
+- `swift --version`: Apple Swift 6.3.3 (`swift-6.3.3-RELEASE`), target `arm64-apple-macosx28.0`
+- Platform: Darwin 27.0.0 arm64 (macOS)
+
+| Command | Exit |
+|---|---|
+| `swift-safe-verify.zsh build` | **0** |
+| `swift-safe-verify.zsh build-tests` | **0** |
+| `swift-safe-verify.zsh test` (default parallel) | **1** ×2 — 2257 tests / 331 suites, 1 then 6 issues, all drawn from the documented flake set (`OpenGrokPTYTests`/`OpenGrokPTYCLITests` subprocess capture, `OpenGrokExecutionToolsTests` capture, `OpenGrokFastWorktreeTests` branch collision) |
+| `swift-safe-verify.zsh test --no-parallel` | **0** ×3 — 2257 tests / 331 suites, 0 issues, 111.0 / 122.1 / 123.8s (a fourth, earlier serial run was red; see the caveat below) |
+| `swift-safe-verify.zsh build --product open-grok` | **0** |
+
+Test count grew 2174 → **2257** (+83; **8** of them the end-to-end integration
+tests added in this pass — permission allow/deny/keyboard-nav/env-bypass, the
+welcome screen, `/help`, `/model`, and mouse-reporting bracketing — the rest the
+two slices' own suites). Scoped filters all green:
+`OpenGrokPagerRenderTests` 61, `OpenGrokTerminalCoreTests` 79,
+`OpenGrokPagerTests` 23, `OpenGrokCLITests` 11, and the wave-2
+overlay/permission/mouse subset 8/8.
+
+**What was wired.**
+
+- **Overlay routing.** `LiveInteractiveControllerRenderer` owns a
+  `PagerOverlayStack` and passes it into `PagerRenderState`. Input reaches it
+  through a new `OpenGrokPagerInteractiveRenderAdapter.handleInput(_:)` that
+  `OpenGrokPagerInteractiveController`'s input pump calls **before** the
+  interrupt classifier and the prompt state machine; the default implementation
+  returns `.notHandled`, so headless and test renderers are unchanged. `.selected`
+  and `.permission` outcomes are handled inside the renderer, where the stack
+  lives, rather than round-tripping through the controller.
+- **Welcome screen.** Auto-pushed in `begin()` when the session starts with no
+  history, with `capturesInput: false` so the composer beneath it stays live, and
+  popped when the first turn starts.
+- **`/help`** is now the "Keyboard Shortcuts" modal instead of a transcript dump.
+  `/model` and `/toggle-mouse-reporting` were added to the command registry.
+- **Permission modal replaces the env gate in interactive mode.** A shared
+  `PagerPermissionCoordinator` is created per run; the interactive renderer
+  installs itself as its presenter, and `LivePermissionModalPrompter` suspends
+  the mutating tool on `decision(for:)`. "Allow for session" flips an actor-held
+  session policy so a second mutation does not re-prompt.
+- **Mouse.** `ANSIMouse.enableReporting` is written immediately inside `?1049h`
+  and `ANSIMouse.trackingReset` immediately before `?1049l`, both in
+  `PagerTerminalRenderer` (config flag `useMouseReporting`), so the disable
+  always lands on the buffer that saw the enable. Signal and crash restore paths
+  already emitted `?1000l…?1006l` before `?1049l` and needed no change. SGR
+  reports are recovered from the TTY decoder's `.unknown(Data)` fallthrough and
+  emitted as `InputEvent.mouse`. Wheel scrolls the transcript by
+  `MouseWheelTuning.linesPerEvent` (per-terminal, from `TERM_PROGRAM`) through
+  the existing scroll functions, so the overscroll-to-follow rule is inherited
+  rather than re-implemented; wheel inside the focused overlay moves its
+  selection one row per report. Clicks hit-test `PagerRenderResult.overlays`,
+  read fresh every frame: a row click takes the same path as `Enter`, the close
+  button dismisses, and a footer-hint click replays the key it names.
+
+**Permission UX decisions.**
+
+- `OPENGROK_ALLOW_WRITES=1` remains an explicit bypass that skips prompting
+  entirely, ahead of the coordinator.
+- Headless and non-TTY stay fail-closed with the same actionable denial message.
+  The gate is `PagerPermissionCoordinator.hasPresenter` (added in integration)
+  rather than a second construction path, so a tool can never suspend on a sheet
+  nobody will paint.
+- Ctrl+C and Ctrl+D are **exempt** from overlay routing. Every other key is
+  swallowed by an active modal, but a permission sheet that trapped the session
+  would be worse than the parity loss.
+- Teardown resolves outstanding requests with `.deny` on turn cancel, EOF,
+  shutdown, failure, and in `restoreTerminal()` — which detaches the presenter
+  first, so anything arriving after teardown fails closed instead of suspending.
+
+**Divergences.**
+
+- The permission sheet renders a diff preview (`+`/`-` rows, 5 then `… +N`); the
+  reference shows only `Allow {tool} to {path}?` and puts the diff in the
+  transcript. Inherited from the overlay slice's brief; pass an empty
+  `diffPreview` to match the reference. The live prompter currently passes none,
+  because `PermissionPrompter` receives an `AccessKind`, not the hunks.
+- `Enter` submits and `Tab` accepts a completion; the reference lets `Enter`
+  accept the highlighted row.
+- **No `Ctrl+R` mouse-reporting binding.** The reference registers it under
+  `When::ScrollbackFocused` only. This port has a single focus region, so there
+  is no way to distinguish it from the prompt's `Ctrl+R` history search;
+  `/toggle-mouse-reporting` is the only entry point.
+- `/toggle-mouse-reporting` is **always available**. The reference hides both it
+  and its keybinding behind an opt-in feature flag
+  (`[ui] mouse_reporting_toggle` / `GROK_MOUSE_REPORTING_TOGGLE`, default off,
+  cached at startup); that flag is not ported. Reporting itself starts on in
+  both.
+- Wheel acceleration is not ported — one report is worth `linesPerEvent` lines
+  with no rolling-window multiplier. The constants are recorded in
+  `INTEGRATION-mouse.md`.
+- **Legacy X10 mouse reports still leak.** SGR is recovered from
+  `.unknown(Data)`, but `TerminalInputDecoder` treats `ESC [ M` as a complete CSI
+  and its three coordinate bytes reach the text stream as ghost input. The fix is
+  the prefilter described in `INTEGRATION-mouse.md` §2 — run `MouseStreamParser`
+  ahead of `TerminalInputDecoder` on the raw byte stream — which needs a change
+  inside `OpenGrokTTY`. Mitigated, not fixed, by enabling `?1006h` last.
+
+**Deferred.**
+
+- **Link clicks.** `PagerRenderResult.links` is published and the click path
+  hit-tests overlays only; a click outside an overlay is dropped rather than
+  opening a link. The reference also requires mouse-up on the same cell as
+  mouse-down, which needs down-cell tracking that does not exist yet. No
+  selection, drag, double/triple-click, or hover either.
+- **Live model switch.** `/model` posts `Model set to X` and relabels the
+  composer. The sampler's model is fixed at session construction and nothing
+  downstream can change it mid-session, so the picker is honest about being
+  advisory rather than silently inert.
+- **Queued prompts / steering** (spec §14) — still unimplemented.
+
+**Serial-run caveat.** The first `--no-parallel` run over this tree was **exit 1
+with 1 issue**, at `LocalShellProcessBackendTests.swift:194`
+("foreground block budget moves work into the background", a `sleep 1`
+subprocess whose completion is awaited with a 5s budget). It is the same
+load-sensitive subprocess class as the documented PTY flakes, it is outside every
+target this wave touched, and it passed **5/5** re-run in isolation. Three
+subsequent serial runs — including the last two over the exact final tree — were
+clean. Recorded as a new member of the known flake set, not as a regression.
+
 
 ## Per-crate port status (all 84 Rust crates accounted for)
 

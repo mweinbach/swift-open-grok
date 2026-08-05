@@ -423,6 +423,9 @@ public struct PagerRenderState: Sendable, Equatable {
     public var scrollPosition: PagerScrollPosition
     public var theme: PagerRenderTheme
     public var showScrollbar: Bool
+    /// Overlays layered above the transcript. A non-empty stack also holds
+    /// input focus — see `PagerOverlayStack.handle`.
+    public var overlays: PagerOverlayStack
 
     public init(
         size: TerminalSize,
@@ -434,8 +437,10 @@ public struct PagerRenderState: Sendable, Equatable {
         shortcuts: PagerShortcutsBar? = nil,
         scrollPosition: PagerScrollPosition = .followTail,
         theme: PagerRenderTheme = .default,
-        showScrollbar: Bool = true
+        showScrollbar: Bool = true,
+        overlays: PagerOverlayStack = PagerOverlayStack()
     ) {
+        self.overlays = overlays
         self.size = size
         self.statusBar = statusBar
         self.conversation = conversation
@@ -497,17 +502,28 @@ public struct PagerRenderResult: Sendable, Equatable {
     public var layout: PagerFrameLayout
     public var cursorPosition: TerminalPoint?
     public var links: [LinkSpan]
+    /// Screen geometry of every painted overlay, exposed for mouse hit-testing
+    /// the same way `links` is. An overlay too small to draw publishes nothing,
+    /// so a router never acts on a previous frame's bounds.
+    public var overlays: [PagerOverlayBounds]
 
     public init(
         buffer: CellBuffer,
         layout: PagerFrameLayout,
         cursorPosition: TerminalPoint?,
-        links: [LinkSpan] = []
+        links: [LinkSpan] = [],
+        overlays: [PagerOverlayBounds] = []
     ) {
         self.buffer = buffer
         self.layout = layout
         self.cursorPosition = cursorPosition
         self.links = links
+        self.overlays = overlays
+    }
+
+    /// The topmost overlay containing a screen position, if any.
+    public func overlay(atX x: Int, y: Int) -> PagerOverlayBounds? {
+        overlays.last { $0.hitTest(x: x, y: y) }
     }
 
     public func snapshot(includeTrailingSpaces: Bool = false) -> String {
