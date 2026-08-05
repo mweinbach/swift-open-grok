@@ -164,6 +164,10 @@ public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {
     /// A turn was cancelled but the session stays open for the next prompt —
     /// distinct from `.cancelled`, which ends the run.
     case turnCancelled
+    /// The number of prompts waiting behind the running turn changed. Carried
+    /// as a count rather than the queue itself: the renderer paints `+{n}` and
+    /// the `"Enter to send now"` suffix, and needs nothing else.
+    case queueChanged(queuedPromptCount: Int)
     case eof
     case cancelled
     case failed(String)

@@ -1,6 +1,7 @@
 import Foundation
 import OpenGrokPagerCommandUI
 import OpenGrokPagerMinimal
+import OpenGrokPromptQueue
 import OpenGrokTerminalCore
 
 public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFrontend {
@@ -46,9 +47,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case eof
         /// The user cancelled the turn; the run continues at the prompt.
         case turnCancelled
+        /// A bare `Enter` on an empty composer force-sent the head of the
+        /// queue. The turn ends the same way a cancel does, but the queue keeps
+        /// draining instead of parking at the composer.
+        case turnPreempted
         /// An external cancel or a fatal condition; the run ends.
         case cancelled
         case shutdown
+    }
+
+    /// What the run loop should do once a turn has been accounted for.
+    private enum TurnDisposition: Sendable {
+        /// Back to the composer, leaving anything queued queued.
+        case keepEditing
+        /// Start the next queued prompt immediately.
+        case drainNext
+        case end(OpenGrokPagerInteractiveLifecycle)
     }
 
     private enum StreamRead<Element: Sendable>: Sendable {
@@ -448,7 +462,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private var signalMailbox: SignalMailbox?
     private var inputPumpGate: InputPumpGate?
     private var inputPump: Task<Void, Never>?
-    private var pendingInput: [InputEvent] = []
+
+    /// Every prompt the user submits goes through the queue, whether the shell
+    /// was idle or busy when they pressed Enter. An idle submit enqueues and
+    /// drains in the same breath, so there is a single ordering authority and
+    /// the drain path is not a second, subtly different code path.
+    private let promptQueue = PromptQueue(sessionId: "interactive")
+    private var nextPromptSequence = 0
 
     /// Prompt history, oldest first. `historyIndex` is the browse cursor;
     /// `historySavedDraft` is the composer text stashed when browsing opened,
@@ -541,7 +561,6 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         running = true
         rendererBegan = false
         terminalRestored = false
-        pendingInput.removeAll(keepingCapacity: false)
         let mailbox = SignalMailbox()
         signalMailbox = mailbox
         let inputReader = ThrowingStreamReader(input)
@@ -602,39 +621,32 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 if !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     submittedPrompts.append(request.prompt)
                 }
+                // The opening turn owns a session the caller already built, so
+                // it cannot go through the drain loop; only what it leaves
+                // behind in the queue can.
+                editor.reset()
                 let turnOutcome = try await runTurn(
                     session: initialSession,
                     request: initialRequest,
                     mailbox: mailbox,
                     inputPumpGate: inputPumpGate
                 )
-                switch turnOutcome {
-                case .finished(let result):
-                    lastSessionID = result.sessionID ?? lastSessionID
-                    if result.lifecycle == .cancelled {
-                        try await emit(.cancelled)
-                        outcome = .cancelled
-                    } else {
-                        completedTurnCount += 1
-                        editor.reset()
-                        try await transition(to: .editing)
-                        try await emit(.promptChanged(promptState()))
+                switch try await apply(
+                    turnOutcome: turnOutcome,
+                    inputPumpGate: inputPumpGate
+                ) {
+                case .end(let lifecycle):
+                    outcome = lifecycle
+                case .keepEditing:
+                    break
+                case .drainNext:
+                    if let lifecycle = try await drainQueue(
+                        request: request,
+                        mailbox: mailbox,
+                        inputPumpGate: inputPumpGate
+                    ) {
+                        outcome = lifecycle
                     }
-                case .eof:
-                    try await emit(.eof)
-                    outcome = .eof
-                case .turnCancelled:
-                    // Cancelling the opening turn drops through to the prompt.
-                    try await emit(.turnCancelled)
-                    editor.reset()
-                    try await transition(to: .editing)
-                    try await emit(.promptChanged(promptState()))
-                case .cancelled:
-                    try await emit(.cancelled)
-                    outcome = .cancelled
-                case .shutdown:
-                    try await emit(.shutdown)
-                    outcome = .shutdown
                 }
             } else {
                 try await transition(to: .editing)
@@ -642,16 +654,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
 
             while outcome == .completed {
                 try Task.checkCancellation()
-                let signal: Signal
-                if !pendingInput.isEmpty {
-                    signal = .input(.element(pendingInput.removeFirst()))
-                } else {
-                    guard let nextSignal = await mailbox.next() else {
-                        try await emit(.eof)
-                        outcome = .eof
-                        continue
-                    }
-                    signal = nextSignal
+                guard let signal = await mailbox.next() else {
+                    try await discardQueue(reason: "input ended")
+                    try await emit(.eof)
+                    outcome = .eof
+                    continue
                 }
                 switch signal {
                 case .session:
@@ -661,6 +668,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     case .interrupt(let isEscape):
                         switch handleInterrupt(isEscape: isEscape, isTurnRunning: false) {
                         case .quit:
+                            try await discardQueue(reason: "quitting")
                             try await emit(.cancelled)
                             outcome = .cancelled
                         case .consumed, .cancelTurn:
@@ -668,56 +676,25 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             await inputPumpGate.resume()
                         }
                     case .cancel:
+                        try await discardQueue(reason: "run cancelled")
                         try await emit(.cancelled)
                         outcome = .cancelled
                     case .eof:
+                        try await discardQueue(reason: "input ended")
                         try await emit(.eof)
                         outcome = .eof
                     case .shutdown:
+                        try await discardQueue(reason: "shutting down")
                         try await emit(.shutdown)
                         outcome = .shutdown
                     }
                 case .input(let read):
                     switch read {
                     case .element(let event):
-                        let action = editor.apply(event)
-                        // Any key other than the armed one clears a pending
-                        // confirmation, matching `app_view.rs`'s arm lifetime.
+                        let action = applyEditorEvent(event)
                         switch action {
-                        case .escape, .interrupt, .ignored, .resize:
-                            break
-                        default:
-                            pendingConfirmation = nil
-                        }
-                        switch action {
-                        case .changed:
-                            detachHistory()
-                            refreshCompletions()
-                            try await emit(.promptChanged(promptState()))
-                            await inputPumpGate.resume()
-                        case .historyPrevious:
-                            browseHistory(offset: -1)
-                            try await emit(.promptChanged(promptState()))
-                            await inputPumpGate.resume()
-                        case .historyNext:
-                            browseHistory(offset: 1)
-                            try await emit(.promptChanged(promptState()))
-                            await inputPumpGate.resume()
-                        case .completionMove(let offset):
-                            if !editor.completions.isEmpty {
-                                let count = editor.completions.count
-                                let current = editor.selectedCompletion ?? 0
-                                editor.selectedCompletion = ((current + offset) % count + count) % count
-                            }
-                            try await emit(.promptChanged(promptState()))
-                            await inputPumpGate.resume()
-                        case .completionAccept:
-                            if let index = editor.selectedCompletion,
-                               editor.completions.indices.contains(index) {
-                                editor.replace(with: editor.completions[index].name)
-                            }
-                            editor.completions = []
-                            editor.selectedCompletion = nil
+                        case .changed, .historyPrevious, .historyNext,
+                             .completionMove, .completionAccept:
                             try await emit(.promptChanged(promptState()))
                             await inputPumpGate.resume()
                         case .viewport(let command):
@@ -728,6 +705,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             if case .escape = action { isEscape = true } else { isEscape = false }
                             switch handleInterrupt(isEscape: isEscape, isTurnRunning: false) {
                             case .quit:
+                                try await discardQueue(reason: "quitting")
                                 try await emit(.cancelled)
                                 outcome = .cancelled
                                 continue
@@ -738,12 +716,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         case .submit:
                             let prompt = editor.text
                             guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                                // Nothing to send and nothing queued — the
+                                // send-now path only exists during a turn.
                                 try await emit(.notice("prompt cannot be empty"))
                                 await inputPumpGate.resume()
                                 continue
                             }
                             switch try await runSlashCommand(prompt) {
                             case .quit:
+                                try await discardQueue(reason: "quitting")
                                 try await emit(.shutdown)
                                 outcome = .shutdown
                                 continue
@@ -756,55 +737,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             case .notACommand:
                                 break
                             }
-                            recordHistory(prompt)
-                            editor.reset()
-                            try await emit(.promptChanged(promptState()))
-
-                            let turnRequest = OpenGrokPagerRequest(
-                                prompt: prompt,
-                                mode: request.mode,
-                                sessionID: lastSessionID ?? request.sessionID,
-                                metadata: request.metadata
-                            )
-                            let session = try await runtime.makeSession(for: turnRequest)
-                            submittedPrompts.append(prompt)
-                            let turnOutcome = try await runTurn(
-                                session: session,
-                                request: turnRequest,
+                            try await enqueue(prompt)
+                            if let lifecycle = try await drainQueue(
+                                request: request,
                                 mailbox: mailbox,
                                 inputPumpGate: inputPumpGate
-                            )
-                            switch turnOutcome {
-                            case .finished(let result):
-                                lastSessionID = result.sessionID ?? lastSessionID
-                                if result.lifecycle == .cancelled {
-                                    try await emit(.cancelled)
-                                    outcome = .cancelled
-                                } else {
-                                    completedTurnCount += 1
-                                    editor.reset()
-                                    try await transition(to: .editing)
-                                    try await emit(.promptChanged(promptState()))
-                                }
-                            case .eof:
-                                try await emit(.eof)
-                                outcome = .eof
-                            case .turnCancelled:
-                                // Cancelling a turn returns to the prompt; only
-                                // an external cancel ends the run.
-                                try await emit(.turnCancelled)
-                                editor.reset()
-                                try await transition(to: .editing)
-                                try await emit(.promptChanged(promptState()))
-                                await inputPumpGate.resume()
-                            case .cancelled:
-                                try await emit(.cancelled)
-                                outcome = .cancelled
-                            case .shutdown:
-                                try await emit(.shutdown)
-                                outcome = .shutdown
+                            ) {
+                                outcome = lifecycle
                             }
                         case .eof:
+                            try await discardQueue(reason: "input ended")
                             try await emit(.eof)
                             outcome = .eof
                         case .resize(let size):
@@ -815,6 +757,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             continue
                         }
                     case .end:
+                        try await discardQueue(reason: "input ended")
                         try await emit(.eof)
                         outcome = .eof
                     case .failure(let message):
@@ -982,8 +925,40 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             await cancelActiveSession()
                             turnOutcome = .eof
                         default:
-                            pendingInput.append(event)
-                            await inputPumpGate.resume()
+                            // The composer stays live while a turn runs — that
+                            // is the whole point of the send→queue flip in the
+                            // shortcuts bar.
+                            switch applyEditorEvent(event) {
+                            case .submit:
+                                let prompt = editor.text
+                                if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    // Bare Enter on an empty composer with a
+                                    // follow-up waiting force-sends the head of
+                                    // the queue. The Swift runtime has no
+                                    // mid-turn injection, so "send now" ends the
+                                    // running turn and starts the queued prompt.
+                                    if await promptQueue.isEmpty {
+                                        try await emit(.notice("prompt cannot be empty"))
+                                        await inputPumpGate.resume()
+                                    } else {
+                                        await cancelActiveSession()
+                                        turnOutcome = .turnPreempted
+                                    }
+                                } else {
+                                    try await enqueue(prompt)
+                                    await inputPumpGate.resume()
+                                }
+                            case .viewport(let command):
+                                try await emit(.viewport(command))
+                                await inputPumpGate.resume()
+                            case .ignored:
+                                await inputPumpGate.resume()
+                            case .changed, .historyPrevious, .historyNext,
+                                 .completionMove, .completionAccept,
+                                 .escape, .interrupt, .eof, .resize:
+                                try await emit(.promptChanged(promptState()))
+                                await inputPumpGate.resume()
+                            }
                         }
                     case .end:
                         await cancelActiveSession()
@@ -1028,7 +1003,173 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         return turnOutcome ?? .eof
     }
 
+    // MARK: - Queue
+
+    /// Put a prompt at the tail of the queue and clear the composer.
+    ///
+    /// Enqueuing is what `Enter` does in both states; the only difference is
+    /// whether a drain follows immediately.
+    private func enqueue(_ prompt: String) async throws {
+        nextPromptSequence += 1
+        await promptQueue.enqueue(QueueEntryMeta(
+            id: "prompt-\(nextPromptSequence)",
+            kind: "prompt",
+            text: prompt
+        ))
+        recordHistory(prompt)
+        editor.reset()
+        try await emit(.promptChanged(promptState()))
+        try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
+    }
+
+    /// Throw away everything still queued. Reserved for the ways a run *ends* —
+    /// quit, EOF, external cancel. Cancelling a turn deliberately does not come
+    /// here: the reference keeps follow-ups across an interrupt.
+    private func discardQueue(reason: String) async throws {
+        let discarded = await promptQueue.removeAll()
+        guard !discarded.isEmpty else { return }
+        let plural = discarded.count == 1 ? "prompt" : "prompts"
+        try await emit(.notice("discarded \(discarded.count) queued \(plural) — \(reason)"))
+        try await emit(.queueChanged(queuedPromptCount: 0))
+    }
+
+    /// Run queued prompts in order until the queue empties or something ends
+    /// the run. Returns the terminal lifecycle, or `nil` to continue editing.
+    private func drainQueue(
+        request: OpenGrokPagerRequest,
+        mailbox: SignalMailbox,
+        inputPumpGate: InputPumpGate
+    ) async throws -> OpenGrokPagerInteractiveLifecycle? {
+        while true {
+            let entry: QueueEntryMeta
+            do {
+                entry = try await promptQueue.beginNext()
+            } catch {
+                // `.empty` is the normal exit; `.alreadyRunning` cannot happen
+                // because every path below clears the running marker.
+                return nil
+            }
+            try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
+
+            let turnRequest = OpenGrokPagerRequest(
+                prompt: entry.text,
+                mode: request.mode,
+                sessionID: lastSessionID ?? request.sessionID,
+                metadata: request.metadata
+            )
+            let session = try await runtime.makeSession(for: turnRequest)
+            submittedPrompts.append(entry.text)
+            let turnOutcome = try await runTurn(
+                session: session,
+                request: turnRequest,
+                mailbox: mailbox,
+                inputPumpGate: inputPumpGate
+            )
+            switch try await apply(turnOutcome: turnOutcome, inputPumpGate: inputPumpGate) {
+            case .drainNext:
+                continue
+            case .keepEditing:
+                return nil
+            case .end(let lifecycle):
+                return lifecycle
+            }
+        }
+    }
+
+    /// Account for a finished turn: clear the queue's running marker, emit the
+    /// matching event, and say whether the queue should keep draining.
+    private func apply(
+        turnOutcome: TurnOutcome,
+        inputPumpGate: InputPumpGate
+    ) async throws -> TurnDisposition {
+        switch turnOutcome {
+        case .finished(let result):
+            await promptQueue.completeRunning()
+            lastSessionID = result.sessionID ?? lastSessionID
+            if result.lifecycle == .cancelled {
+                try await discardQueue(reason: "run cancelled")
+                try await emit(.cancelled)
+                return .end(.cancelled)
+            }
+            completedTurnCount += 1
+            try await transition(to: .editing)
+            try await emit(.promptChanged(promptState()))
+            return .drainNext
+        case .eof:
+            await promptQueue.cancelRunning()
+            try await discardQueue(reason: "input ended")
+            try await emit(.eof)
+            return .end(.eof)
+        case .turnCancelled:
+            // Cancelling a turn returns to the prompt and keeps the queue; only
+            // an external cancel ends the run.
+            await promptQueue.cancelRunning()
+            try await emit(.turnCancelled)
+            try await transition(to: .editing)
+            try await emit(.promptChanged(promptState()))
+            await inputPumpGate.resume()
+            return .keepEditing
+        case .turnPreempted:
+            await promptQueue.cancelRunning()
+            try await emit(.notice("sending the queued prompt now"))
+            try await transition(to: .editing)
+            try await emit(.promptChanged(promptState()))
+            await inputPumpGate.resume()
+            return .drainNext
+        case .cancelled:
+            await promptQueue.cancelRunning()
+            try await discardQueue(reason: "run cancelled")
+            try await emit(.cancelled)
+            return .end(.cancelled)
+        case .shutdown:
+            await promptQueue.cancelRunning()
+            try await discardQueue(reason: "shutting down")
+            try await emit(.shutdown)
+            return .end(.shutdown)
+        }
+    }
+
     // MARK: - Prompt behavior
+
+    /// Feed one input event to the composer and apply the bookkeeping every
+    /// caller shares — confirmation disarming, history detach, completion
+    /// movement. Returns the action for the caller to act on.
+    private func applyEditorEvent(_ event: InputEvent) -> PromptAction {
+        let action = editor.apply(event)
+        // Any key other than the armed one clears a pending confirmation,
+        // matching `app_view.rs`'s arm lifetime.
+        switch action {
+        case .escape, .interrupt, .ignored, .resize:
+            break
+        default:
+            pendingConfirmation = nil
+        }
+        switch action {
+        case .changed:
+            detachHistory()
+            refreshCompletions()
+        case .historyPrevious:
+            browseHistory(offset: -1)
+        case .historyNext:
+            browseHistory(offset: 1)
+        case .completionMove(let offset):
+            if !editor.completions.isEmpty {
+                let count = editor.completions.count
+                let current = editor.selectedCompletion ?? 0
+                editor.selectedCompletion = ((current + offset) % count + count) % count
+            }
+        case .completionAccept:
+            if let index = editor.selectedCompletion,
+               editor.completions.indices.contains(index) {
+                editor.replace(with: editor.completions[index].name)
+            }
+            editor.completions = []
+            editor.selectedCompletion = nil
+        default:
+            break
+        }
+        return action
+    }
 
     /// Slash commands the TUI honors locally. The reference registers ~70 and
     /// routes most of them to a pager `Action`; this port lists only the ones

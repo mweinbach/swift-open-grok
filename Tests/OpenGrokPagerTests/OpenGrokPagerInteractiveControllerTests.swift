@@ -353,6 +353,202 @@ struct OpenGrokPagerInteractiveControllerTests {
     }
 }
 
+/// Poll `condition` until it holds or the deadline passes.
+///
+/// Every wait in the queue suite goes through here rather than through a
+/// continuation the controller is expected to resume. A missed event then fails
+/// one assertion instead of parking the whole test binary forever — these tests
+/// drive a controller over input streams that deliberately never end, so an
+/// unbounded await is a suite-wide hang waiting to happen.
+private func waitUntil(
+    seconds: Double = 10,
+    _ condition: @Sendable () async -> Bool
+) async -> Bool {
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline {
+        if await condition() { return true }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    return await condition()
+}
+
+/// Await a controller run with a deadline, cancelling it if it overruns.
+private func runResult(
+    of task: Task<OpenGrokPagerInteractiveResult, Error>,
+    seconds: Double = 10
+) async -> OpenGrokPagerInteractiveResult? {
+    let watchdog = Task {
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        task.cancel()
+    }
+    defer { watchdog.cancel() }
+    return try? await task.value
+}
+
+@Suite("Queued prompts")
+struct OpenGrokPagerPromptQueueTests {
+    @Test("Enter during a turn queues follow-ups that drain in order")
+    func queuesAndDrainsInOrder() async throws {
+        let first = TestInteractiveSession(sessionID: "q1")
+        let second = TestInteractiveSession(sessionID: "q2")
+        await second.emit(.completed(.init(sessionID: "q2")))
+        let third = TestInteractiveSession(sessionID: "q3")
+        await third.emit(.completed(.init(sessionID: "q3")))
+
+        let runtime = TestInteractiveRuntime(sessions: [first, second, third])
+        let renderer = RecordingInteractiveRenderer()
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeOpenInputStream([
+                .paste("alpha"),
+                .key(KeyEvent(key: .enter)),
+                .paste("beta"),
+                .key(KeyEvent(key: .enter)),
+                .paste("gamma"),
+                .key(KeyEvent(key: .enter)),
+            ]),
+            runtime: runtime,
+            renderer: renderer,
+            output: RecordingInteractiveOutput()
+        )
+
+        let task = Task { try await controller.run(.init(prompt: "", mode: .inline)) }
+        // Both follow-ups are queued behind the still-running first turn.
+        #expect(await waitUntil { await renderer.queueCounts.contains(2) })
+        #expect(await runtime.requests.map(\.prompt) == ["alpha"])
+        await first.finish(sessionID: "q1")
+
+        // Once the queue has drained, nothing is left to run.
+        #expect(await waitUntil { await runtime.requests.count == 3 })
+        await controller.shutdown()
+        let result = await runResult(of: task)
+
+        #expect(result?.submittedPrompts == ["alpha", "beta", "gamma"])
+        #expect(await runtime.requests.map(\.prompt) == ["alpha", "beta", "gamma"])
+    }
+
+    @Test("cancelling a turn keeps the queue, quitting discards it")
+    func cancelKeepsQueueAndQuitClearsIt() async throws {
+        let running = TestInteractiveSession(sessionID: "keep")
+        let runtime = TestInteractiveRuntime(sessions: [running])
+        let renderer = RecordingInteractiveRenderer()
+        let output = RecordingInteractiveOutput()
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeOpenInputStream([
+                .paste("alpha"),
+                .key(KeyEvent(key: .enter)),
+                .paste("beta"),
+                .key(KeyEvent(key: .enter)),
+                .key(KeyEvent(key: .char("c"), modifiers: [.control], character: "c")),
+                .paste("/quit"),
+                .key(KeyEvent(key: .enter)),
+            ]),
+            runtime: runtime,
+            renderer: renderer,
+            output: output
+        )
+
+        let task = Task { try await controller.run(.init(prompt: "", mode: .inline)) }
+        let result = await runResult(of: task)
+
+        #expect(result?.lifecycle == .shutdown)
+        // The cancel returned to the composer without running the follow-up,
+        // and never handed it to the runtime.
+        #expect(await runtime.requests.map(\.prompt) == ["alpha"])
+        #expect(await renderer.events.contains(.turnCancelled))
+        // Quitting is what finally discards it, and says so.
+        let notices = await output.notices
+        #expect(notices.contains { $0.contains("discarded 1 queued prompt") })
+    }
+
+    @Test("Enter on an empty composer force-sends the head of the queue")
+    func bareEnterForceSendsQueuedPrompt() async throws {
+        let running = TestInteractiveSession(sessionID: "slow")
+        let queued = TestInteractiveSession(sessionID: "next")
+        await queued.emit(.completed(.init(sessionID: "next")))
+        let runtime = TestInteractiveRuntime(sessions: [running, queued])
+        let renderer = RecordingInteractiveRenderer()
+        let output = RecordingInteractiveOutput()
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeOpenInputStream([
+                .paste("alpha"),
+                .key(KeyEvent(key: .enter)),
+                .paste("beta"),
+                .key(KeyEvent(key: .enter)),
+                // Composer is empty again — this Enter sends the follow-up now.
+                .key(KeyEvent(key: .enter)),
+            ]),
+            runtime: runtime,
+            renderer: renderer,
+            output: output
+        )
+
+        let task = Task { try await controller.run(.init(prompt: "", mode: .inline)) }
+        #expect(await waitUntil { await runtime.requests.count == 2 })
+        await controller.shutdown()
+        let result = await runResult(of: task)
+
+        #expect(result?.submittedPrompts == ["alpha", "beta"])
+        #expect(await running.cancelCount >= 1)
+        #expect(await output.notices.contains { $0.contains("sending the queued prompt now") })
+    }
+
+    @Test("input EOF during a turn discards the queue")
+    func eofDiscardsQueue() async throws {
+        let running = TestInteractiveSession(sessionID: "eof")
+        let runtime = TestInteractiveRuntime(sessions: [running])
+        let output = RecordingInteractiveOutput()
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeInputStream([
+                .paste("alpha"),
+                .key(KeyEvent(key: .enter)),
+                .paste("beta"),
+                .key(KeyEvent(key: .enter)),
+                .key(KeyEvent(key: .char("d"), modifiers: [.control], character: "d")),
+            ]),
+            runtime: runtime,
+            renderer: RecordingInteractiveRenderer(),
+            output: output
+        )
+
+        let task = Task { try await controller.run(.init(prompt: "", mode: .inline)) }
+        let result = await runResult(of: task)
+
+        #expect(result?.lifecycle == .eof)
+        #expect(await runtime.requests.map(\.prompt) == ["alpha"])
+        #expect(await output.notices.contains { $0.contains("discarded 1 queued prompt") })
+    }
+
+    @Test("the queued count reaches the renderer as prompts arrive and drain")
+    func publishesQueueCount() async throws {
+        let running = TestInteractiveSession(sessionID: "count")
+        let runtime = TestInteractiveRuntime(sessions: [running])
+        let renderer = RecordingInteractiveRenderer()
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeOpenInputStream([
+                .paste("alpha"),
+                .key(KeyEvent(key: .enter)),
+                .paste("beta"),
+                .key(KeyEvent(key: .enter)),
+                .paste("gamma"),
+                .key(KeyEvent(key: .enter)),
+            ]),
+            runtime: runtime,
+            renderer: renderer,
+            output: RecordingInteractiveOutput()
+        )
+
+        let task = Task { try await controller.run(.init(prompt: "", mode: .inline)) }
+        #expect(await waitUntil { await renderer.queueCounts.contains(2) })
+        await controller.shutdown()
+        _ = await runResult(of: task)
+
+        let counts = await renderer.queueCounts
+        // 1 on the idle submit, 0 as it is dequeued, then 1 and 2 as the
+        // follow-ups land behind the running turn.
+        #expect(counts.prefix(4) == [1, 0, 1, 2])
+    }
+}
+
 private actor TestInteractiveSession: OpenGrokPagerSessionAdapter {
     nonisolated let sessionID: String?
     nonisolated let events: AsyncThrowingStream<OpenGrokPagerEvent, Error>
@@ -370,6 +566,13 @@ private actor TestInteractiveSession: OpenGrokPagerSessionAdapter {
 
     func emit(_ event: OpenGrokPagerEvent) {
         continuation.yield(event)
+    }
+
+    /// Complete the turn on demand, so a test can hold a turn open while it
+    /// types follow-ups into the queue.
+    func finish(sessionID: String) {
+        continuation.yield(.completed(.init(sessionID: sessionID)))
+        continuation.finish()
     }
 
     func cancel() {
@@ -433,6 +636,13 @@ private actor RecordingInteractiveRenderer: OpenGrokPagerInteractiveRenderAdapte
         }
     }
 
+    var queueCounts: [Int] {
+        events.compactMap { event in
+            if case .queueChanged(let count) = event { return count }
+            return nil
+        }
+    }
+
     private(set) var sizes: [TerminalSize] = []
     private(set) var beginCount = 0
     private(set) var restoreCount = 0
@@ -456,6 +666,13 @@ private actor RecordingInteractiveRenderer: OpenGrokPagerInteractiveRenderAdapte
 
 private actor RecordingInteractiveOutput: OpenGrokPagerInteractiveOutputAdapter {
     private(set) var events: [OpenGrokPagerInteractiveEvent] = []
+
+    var notices: [String] {
+        events.compactMap { event in
+            if case .notice(let message) = event { return message }
+            return nil
+        }
+    }
 
     func forward(_ event: OpenGrokPagerInteractiveEvent) {
         events.append(event)

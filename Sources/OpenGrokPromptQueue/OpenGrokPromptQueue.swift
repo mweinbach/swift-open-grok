@@ -321,6 +321,30 @@ public actor PromptQueue {
         entries.map(\.id)
     }
 
+    /// Number of queued, not-yet-running entries. This is the count the TUI
+    /// renders as `+{n}`; a running prompt is no longer queued.
+    public var count: Int {
+        entries.count
+    }
+
+    public var isEmpty: Bool {
+        entries.isEmpty
+    }
+
+    /// Ordered texts currently queued (not including running).
+    public var orderedTexts: [String] {
+        entries.map(\.text)
+    }
+
+    /// Drop every queued entry, leaving any running prompt alone. The explicit
+    /// discard a quit performs — cancelling a turn must not reach for this.
+    @discardableResult
+    public func removeAll() -> [QueueEntryMeta] {
+        let dropped = entries
+        entries.removeAll()
+        return dropped
+    }
+
     /// Wire snapshot for `x.ai/queue/changed`.
     public func wireSnapshot() -> QueueChanged {
         let wires = entries.enumerated().map { index, entry in

@@ -655,13 +655,27 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 record: conversationRecord,
                 store: conversationStore
             )
+            // `/model` rebuilds the provider stack through this coordinator; the
+            // shell, session and tool runtime below are provider-independent and
+            // survive a switch untouched.
+            let modelSwitch = LiveModelSwitchCoordinator(
+                sampling: samplingConfiguration,
+                sampler: sampler,
+                resolver: LiveModelCatalogResolver(
+                    environment: context.environment,
+                    openGrokHome: openGrokHome,
+                    sessionID: sessionID
+                ),
+                makeSampler: dependencies.makeSampler,
+                history: conversationHistory
+            )
             let shell = OpenGrokShell(configuration: OpenGrokShellConfiguration(
                 openGrokHome: openGrokHome,
                 processBackend: processBackend,
                 providerFactory: ProviderSessionFactoryAdapter(),
                 turnDriver: ProviderSessionTurnDriver(
                     sampler: LiveShellSamplingDriver(
-                        sampler: sampler,
+                        modelSwitch: modelSwitch,
                         toolExecutor: toolExecutor,
                         conversationHistory: conversationHistory,
                         systemPrompt: agentProfile?.systemPrompt
@@ -688,9 +702,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         sink: terminalSink,
                         workingDirectory: cwd.path,
                         modelName: providerConfiguration.initialModelID,
-                        modelCatalog: providerConfiguration.modelCatalog
-                            .map { (id: $0.key, provider: $0.value.info.provider.rawValue) }
-                            .sorted { $0.id < $1.id },
+                        // The picker lists the whole embedded catalog, not just
+                        // the model this session started on — otherwise `/model`
+                        // offers exactly one row, the current one.
+                        modelCatalog: LiveModelCatalogResolver.catalog(),
+                        modelSwitch: modelSwitch,
                         permissionCoordinator: permissionCoordinator,
                         terminalProgram: context.environment["TERM_PROGRAM"]
                     )
@@ -1133,27 +1149,24 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         embedded: EmbeddedDefaultModels,
         environment: [String: String]
     ) throws -> DefaultModelJSON {
-        if provider == .xai,
-           let model = embedded.models.first(where: {
-               ($0.id ?? $0.model) == embedded.default || $0.model == embedded.default
-           }) {
-            return model
-        }
+        // Reject an unroutable override before it can silently fall back to
+        // the other Kimi service's catalog.
         if provider == .kimi,
-           let override = nonEmptyEnvironmentValue(KimiModels.apiBaseURLEnv, environment: environment) {
-            guard let endpoint = KimiModels.endpoint(forBaseURL: override) else {
-                throw CLIApplicationError.failed(
-                    "unsupported Kimi API base URL: \(override)"
-                )
-            }
-            if let model = embedded.models.first(where: {
-                $0.provider == .kimi
-                    && $0.baseURL.flatMap(KimiModels.endpoint(forBaseURL:)) == endpoint
-            }) {
-                return model
-            }
+           let override = nonEmptyEnvironmentValue(KimiModels.apiBaseURLEnv, environment: environment),
+           KimiModels.endpoint(forBaseURL: override) == nil {
+            throw CLIApplicationError.failed(
+                "unsupported Kimi API base URL: \(override)"
+            )
         }
-        guard let model = embedded.models.first(where: { $0.provider == provider }) else {
+        // Service-aware: Kimi Platform and Kimi Code are separate services with
+        // separate catalogs and credential scopes, so selection runs over the
+        // endpoint's partition rather than raw file order. Ordering within the
+        // partition is upstream's own defaulting.
+        guard let model = defaultEmbeddedModel(
+            forProvider: provider,
+            embedded: embedded,
+            environment: environment
+        ) else {
             throw CLIApplicationError.failed(
                 "no embedded default model for provider \(provider.asString)"
             )
@@ -1172,7 +1185,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         }
     }
 
-    private static func resolveProviderBaseURL(
+    static func resolveProviderBaseURL(
         provider: ModelProvider,
         model: DefaultModelJSON?,
         environment: [String: String]
@@ -1197,7 +1210,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             ?? fallback
     }
 
-    private static func resolveProviderAPIKey(
+    static func resolveProviderAPIKey(
         provider: ModelProvider,
         model: DefaultModelJSON?,
         baseURL: String,
@@ -1728,7 +1741,7 @@ private struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
     }
 }
 
-private struct LiveConversationRecord: Codable, Sendable, Equatable {
+struct LiveConversationRecord: Codable, Sendable, Equatable {
     var sessionID: String
     var workingDirectory: String
     var parentSessionID: String?
@@ -1749,7 +1762,7 @@ private struct LiveConversationRecord: Codable, Sendable, Equatable {
     }
 }
 
-private actor LiveConversationStore {
+actor LiveConversationStore {
     private let sessionsDirectory: URL
     private let fileManager: FileManager
 
@@ -1903,13 +1916,31 @@ private struct LiveAgentToolPolicy: Sendable, Equatable {
     }
 }
 
-private actor LiveConversationHistory {
+actor LiveConversationHistory {
     private var record: LiveConversationRecord
     private let store: LiveConversationStore
 
     init(record: LiveConversationRecord, store: LiveConversationStore) {
         self.record = record
         self.store = store
+    }
+
+    var items: [ConversationItem] { record.items }
+
+    /// Rewrite history to its provider-neutral spine ahead of a provider
+    /// change, and persist the result. Returns how many items were dropped.
+    ///
+    /// This is destructive on purpose: the persisted session must not keep
+    /// carriers the next provider would be handed on resume.
+    @discardableResult
+    func isolateForProviderSwitch() async throws -> Int {
+        let before = record.items
+        let sanitized = liveProviderNeutralHistory(before)
+        guard sanitized != before else { return 0 }
+        record.items = sanitized
+        record.updatedAt = Date()
+        try await store.save(record)
+        return before.count - sanitized.count
     }
 
     func itemsForTurn(sessionID: String, prompt: String) -> [ConversationItem] {
@@ -1929,7 +1960,9 @@ private actor LiveConversationHistory {
 }
 
 private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
-    let sampler: OpenGrokLiveSampler
+    /// Owns the sampler rather than holding one, so `/model` can rebuild the
+    /// provider stack between turns without replacing the shell.
+    let modelSwitch: LiveModelSwitchCoordinator
     let toolExecutor: LiveToolExecutor
     let conversationHistory: LiveConversationHistory
     let systemPrompt: String?
@@ -1939,6 +1972,10 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         request: OpenGrokShellTurnRequest,
         emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
     ) async throws -> OpenGrokShellSamplingResult {
+        // One snapshot per turn: a switch that lands mid tool loop applies to
+        // the next turn, never to half of this one.
+        let active = await modelSwitch.snapshot()
+        let sampler = active.sampler
         var items = await conversationHistory.itemsForTurn(
             sessionID: context.sessionID,
             prompt: request.text
@@ -1957,7 +1994,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             let response = try await sampler.sample(OpenGrokLiveSamplingRequest(
                 sessionID: context.sessionID,
                 turnID: context.turnID,
-                model: context.modelID,
+                model: active.modelID,
                 prompt: request.text,
                 items: items,
                 tools: toolExecutor.tools
@@ -2486,10 +2523,14 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     /// zero height when idle.
     private let workingDirectory: String
     private var modelName: String
-    /// `(id, provider)` pairs the `/model` picker lists. There is no live
-    /// model-switch path in this composition, so selecting one only relabels
-    /// the composer and posts a system message — see `INTEGRATION-overlays.md`.
+    /// `(id, provider)` pairs the `/model` picker lists.
     private let modelCatalog: [(id: String, provider: String)]
+    /// Rebuilds the sampling stack when a picker row is chosen. `nil` in
+    /// compositions with no provider session (tests, headless renders), where
+    /// the picker degrades to a relabel.
+    private let modelSwitch: LiveModelSwitchCoordinator?
+    /// Prompts waiting behind the running turn, as published by the controller.
+    private var queuedPromptCount = 0
     private var turnActivity: String?
     private var turnStartedAt: Date?
     private var animationTick = 0
@@ -2525,6 +2566,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         workingDirectory: String = FileManager.default.currentDirectoryPath,
         modelName: String = "unknown",
         modelCatalog: [(id: String, provider: String)] = [],
+        modelSwitch: LiveModelSwitchCoordinator? = nil,
         permissionCoordinator: PagerPermissionCoordinator? = nil,
         terminalProgram: String? = nil,
         enableMouseReporting: Bool = true
@@ -2537,6 +2579,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         self.modelCatalog = modelCatalog.isEmpty
             ? [(id: modelName, provider: "current")]
             : modelCatalog
+        self.modelSwitch = modelSwitch
         self.permissionCoordinator = permissionCoordinator
         self.wheelTuning = MouseWheelTuning(
             eventsPerTick: MouseWheelTuning.eventsPerTick(forTerminalProgram: terminalProgram)
@@ -2610,6 +2653,8 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             endTurn()
         case .notice(let message):
             conversation.appendMessage(PagerMessage(role: .system, text: message))
+        case .queueChanged(let count):
+            queuedPromptCount = count
         case .viewport(let command):
             applyViewport(command)
         case .overlay(let request):
@@ -2813,15 +2858,44 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         }
         overlays.dismiss(id: overlayID)
         guard overlayID == "model" else { return }
-        // No live model-switch path exists: the sampler's model is fixed at
-        // session construction. Relabel and say so rather than silently doing
-        // nothing.
-        modelName = rowID
-        conversation.appendMessage(PagerMessage(
-            role: .system,
-            text: "Model set to \(rowID). It applies to new sessions — "
-                + "this session keeps its current model."
-        ))
+        await switchModel(to: rowID)
+    }
+
+    /// Rebuild the live sampling stack for `modelID` and record what happened.
+    ///
+    /// A refused switch is reported as an error row and leaves `modelName` — and
+    /// therefore the composer's border and the next turn's provider — alone.
+    private func switchModel(to modelID: String) async {
+        guard let modelSwitch else {
+            // No provider session behind this renderer; the picker can still
+            // relabel, but it must not claim the session changed.
+            modelName = modelID
+            conversation.appendMessage(PagerMessage(
+                role: .system,
+                text: "Model set to \(modelID). It applies to new sessions — "
+                    + "this session keeps its current model."
+            ))
+            return
+        }
+        switch await modelSwitch.apply(modelID: modelID) {
+        case .unchanged:
+            conversation.appendMessage(PagerMessage(
+                role: .system,
+                text: "Already using \(modelID)."
+            ))
+        case .switched(let summary):
+            modelName = summary.modelID
+            conversation.appendMessage(PagerMessage(
+                role: .system,
+                text: summary.transcriptMessage
+            ))
+        case .failed(let modelID, let message):
+            conversation.appendMessage(PagerMessage(
+                role: .error,
+                text: "Could not switch to \(modelID): \(message). "
+                    + "Staying on \(modelName)."
+            ))
+        }
     }
 
     private func resolve(
@@ -2963,7 +3037,8 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         let state = PagerRenderState(
             size: terminalSize,
             statusBar: PagerStatusBar(
-                workingDirectory: LivePagerChrome.collapseHome(workingDirectory)
+                workingDirectory: LivePagerChrome.collapseHome(workingDirectory),
+                queuedPromptCount: queuedPromptCount
             ),
             conversation: conversation.items,
             turnStatus: turnActivity.map { label in
@@ -2971,7 +3046,11 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                     label: isCancelling ? "Cancelling\u{2026}" : label,
                     isCancelling: isCancelling,
                     tick: animationTick,
-                    elapsed: turnStartedAt.map { Date().timeIntervalSince($0) }
+                    elapsed: turnStartedAt.map { Date().timeIntervalSince($0) },
+                    queuedPromptCount: queuedPromptCount,
+                    // Bare Enter force-sends the head only when the composer is
+                    // empty; with a draft, Enter queues it behind the others.
+                    queueIsSendable: queuedPromptCount > 0 && prompt.text.isEmpty
                 )
             },
             completions: completions,

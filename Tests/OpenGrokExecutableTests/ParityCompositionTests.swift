@@ -706,7 +706,17 @@ struct ParityCompositionTests {
                     "KIMI_CODE_API_KEY": "kimi-code-key"
                 ],
                 provider: .kimi,
-                model: "kimi-for-coding",
+                // The Kimi **Code** service's own default, not `kimi-for-coding`.
+                // With no user preference, upstream falls back to the first
+                // entry in catalog order within the selected partition
+                // (`resolve_default_model_with_provider_auth`,
+                // `xai-grok-shell/src/agent/models/resolution.rs:116-142`), and
+                // upstream lists `k3` first — "Kimi Code's flagship coding and
+                // agent model" (`xai-grok-models/default_models.json:56-72`) —
+                // ahead of the older K2.7 `kimi-for-coding` family. This
+                // expectation was `kimi-for-coding` only because the port's
+                // embedded catalog predated `k3`.
+                model: "k3",
                 baseURL: "https://api.kimi.com/coding/v1",
                 apiBackend: .chatCompletions,
                 apiKey: "kimi-code-key"
@@ -1483,17 +1493,31 @@ struct ParityCompositionTests {
         #expect(outcome.painted.contains("toggle-mouse-reporting"))
     }
 
-    @Test("/model reports the picked model instead of switching silently")
+    @Test("/model switches the live session and refuses what it cannot authenticate")
     func liveInteractiveModelPicker() async {
         let outcome = await runInteractiveOverlaySession { terminal, continuation in
             continuation.yield(.paste("/model"))
             continuation.yield(.key(KeyEvent(key: .enter)))
             await Self.waitForPaintedText("Select model", terminal: terminal)
+            // The picker opens on the active model, so a bare Enter is a no-op
+            // rather than a pointless rebuild.
             continuation.yield(.key(KeyEvent(key: .enter)))
-            await Self.waitForPaintedText("Model set to", terminal: terminal)
+            await Self.waitForPaintedText("Already using", terminal: terminal)
+
+            continuation.yield(.paste("/model"))
+            continuation.yield(.key(KeyEvent(key: .enter)))
+            // Only `XAI_API_KEY` is set and grok is the sole xAI model, so
+            // whichever row sits below the active one belongs to a provider
+            // this session cannot authenticate.
+            continuation.yield(.key(KeyEvent(key: .down)))
+            continuation.yield(.key(KeyEvent(key: .enter)))
+            await Self.waitForPaintedText("Could not switch to", terminal: terminal)
         }
         #expect(outcome.painted.contains("Select model"))
-        #expect(outcome.output.contains("Model set to"))
+        #expect(outcome.output.contains("Already using"))
+        // A refused switch says why and names the model it stayed on.
+        #expect(outcome.output.contains("Could not switch to"))
+        #expect(outcome.output.contains("Staying on"))
     }
 
     @Test("mouse reporting is bracketed with the alternate screen and toggleable")
