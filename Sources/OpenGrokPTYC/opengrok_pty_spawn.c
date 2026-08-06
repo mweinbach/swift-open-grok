@@ -1,5 +1,14 @@
 // Portable PTY open + fork/exec with session / controlling-terminal / CWD setup.
 
+/* glibc hides posix_openpt/grantpt/unlockpt/ptsname behind __USE_XOPEN2K,
+   which SwiftPM's default C dialect does not request; without this they
+   compile as implicit int-returning functions and ptsname's char* result is
+   truncated to an int. Must precede every other include. Apple's headers
+   declare them unconditionally. */
+#if !defined(__APPLE__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
+
 #include "opengrok_pty_spawn.h"
 
 #include <errno.h>

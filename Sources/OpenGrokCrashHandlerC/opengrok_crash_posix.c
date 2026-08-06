@@ -67,11 +67,14 @@ static size_t write_u64_le(unsigned char *buf, size_t off, uint64_t v) {
     return off + 8;
 }
 
+/* `fault_addr` carries siginfo_t's si_addr but cannot be named that: glibc
+   defines si_addr as an object-like macro expanding to a _sifields member
+   access, so any identifier with that spelling is rewritten mid-declaration. */
 static size_t write_header(
     unsigned char *buf,
     uint8_t sig,
     int32_t si_code,
-    uint64_t si_addr,
+    uint64_t fault_addr,
     uint32_t pid,
     uint64_t timestamp,
     uint16_t n_frames
@@ -84,7 +87,7 @@ static size_t write_header(
     buf[off++] = OG_VERSION;
     buf[off++] = sig;
     off = write_i32_le(buf, off, si_code);
-    off = write_u64_le(buf, off, si_addr);
+    off = write_u64_le(buf, off, fault_addr);
     off = write_u32_le(buf, off, pid);
     off = write_u64_le(buf, off, timestamp);
     off = write_u16_le(buf, off, n_frames);
@@ -212,11 +215,11 @@ static void write_crash_blob(int sig, siginfo_t *info, void *ctx) {
     }
 
     int32_t si_code = 0;
-    uint64_t si_addr = 0;
+    uint64_t fault_addr = 0;
     if (info != NULL) {
         si_code = info->si_code;
 #if defined(__APPLE__) || defined(__linux__)
-        si_addr = (uint64_t)(uintptr_t)info->si_addr;
+        fault_addr = (uint64_t)(uintptr_t)info->si_addr;
 #endif
     }
 
@@ -239,7 +242,7 @@ static void write_crash_blob(int sig, siginfo_t *info, void *ctx) {
         g_crash_buf,
         (uint8_t)sig,
         si_code,
-        si_addr,
+        fault_addr,
         pid,
         timestamp,
         n_frames
@@ -262,7 +265,7 @@ static void write_crash_blob(int sig, siginfo_t *info, void *ctx) {
                 g_crash_buf,
                 (uint8_t)sig,
                 si_code,
-                si_addr,
+                fault_addr,
                 pid,
                 timestamp,
                 n_frames
