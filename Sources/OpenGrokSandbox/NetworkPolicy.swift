@@ -284,7 +284,30 @@ private struct SockFprog {
     var filter: UnsafeMutablePointer<SockFilter>?
 }
 
+/// Install the seccomp filter built by `buildLinuxSeccompNetworkProgram`.
+///
+/// Unimplemented, and it fails rather than returning `false`: this is the gate
+/// that keeps a `.blocked` child off the network, so "could not install" must
+/// never read as "nothing to install". Installing needs `prctl(2)`, which glibc
+/// declares variadic (`int prctl(int, ...)`); ClangImporter drops variadic C
+/// functions, so it is not callable from Swift, and neither is the `syscall(2)`
+/// or `unshare(2)` fallback (same reason / not exported by the Glibc overlay).
+/// Closing this needs a C shim target in Package.swift, which this change does
+/// not own — see the note in the wave report.
 private func installLinuxSeccompNetworkFilter() throws -> Bool {
+    _ = buildLinuxSeccompNetworkProgram()
+    throw SandboxError.unsupported(
+        "Linux child network blocking requires a seccomp C shim: prctl(2) is "
+        + "variadic and therefore unavailable to Swift"
+    )
+}
+
+/// The BPF program that blocks connect/bind/sendto/sendmsg/listen/accept.
+///
+/// Split out from installation and kept live so the filter stays reviewable and
+/// testable while the installation seam is unsupported. It is *built* on Linux
+/// today, never *installed*.
+private func buildLinuxSeccompNetworkProgram() -> [SockFilter] {
     let BPF_LD: UInt16 = 0x00
     let BPF_W: UInt16 = 0x00
     let BPF_ABS: UInt16 = 0x20
@@ -296,10 +319,6 @@ private func installLinuxSeccompNetworkFilter() throws -> Bool {
     let SECCOMP_RET_ALLOW: UInt32 = 0x7fff_0000
     let SECCOMP_RET_ERRNO: UInt32 = 0x0005_0000
     let EPERM_VAL: UInt32 = 1
-
-    let PR_SET_NO_NEW_PRIVS: Int32 = 38
-    let PR_SET_SECCOMP: Int32 = 22
-    let SECCOMP_MODE_FILTER: UInt = 2
 
     #if arch(x86_64)
     let blockedSyscalls: [UInt32] = [42 /* connect */, 49 /* bind */, 44 /* sendto */, 46 /* sendmsg */, 50 /* listen */, 43 /* accept */, 288 /* accept4 */]
@@ -332,18 +351,7 @@ private func installLinuxSeccompNetworkFilter() throws -> Bool {
     // 4. Blocked: ERRNO(EPERM)
     instructions.append(SockFilter(code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO | EPERM_VAL))
 
-    let res = instructions.withUnsafeMutableBufferPointer { buf -> Int32 in
-        var prog = SockFprog(len: UInt16(buf.count), filter: buf.baseAddress)
-        if prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-            return -1
-        }
-        return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0)
-    }
-
-    if res != 0 {
-        throw SandboxError.enforcementFailed("Failed to install Linux seccomp network filter (errno: \(errno))")
-    }
-    return true
+    return instructions
 }
 #endif
 

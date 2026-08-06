@@ -270,12 +270,19 @@ struct OpenGrokSandboxTests {
     func childNetworkPolicyPreExec() throws {
         let policy = ChildNetworkPolicy.blocked
         #if os(Linux)
-        // On Linux, installing child network filter in test runner might succeed or fail depending on process privileges.
-        // We verify the entry point executes or throws typed error.
+        // Linux in-process network blocking is not installable from Swift
+        // (prctl(2) is variadic, so ClangImporter drops it). The seam must say
+        // so out loud: a silent success here would report a child as network-
+        // blocked when nothing was installed.
+        #expect(throws: SandboxError.self) { try policy.enforceInChildProcess() }
         do {
             try policy.enforceInChildProcess()
-        } catch SandboxError.enforcementFailed {
-            // expected if prctl permissions missing in test env
+            Issue.record("blocked policy must not report success without a filter")
+        } catch let error as SandboxError {
+            guard case .unsupported = error else {
+                Issue.record("expected .unsupported, got \(error)")
+                return
+            }
         }
         #else
         // Non-Linux platforms report explicit no-op / unsupported behavior cleanly

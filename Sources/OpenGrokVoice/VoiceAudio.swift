@@ -1,5 +1,9 @@
 import Foundation
 
+#if canImport(Glibc)
+import Glibc
+#endif
+
 public struct InputDeviceInfo: Codable, Equatable, Sendable {
     public let name: String
     public let detail: String
@@ -207,7 +211,9 @@ private final class LinuxVoiceCaptureSession: VoiceCaptureSession, @unchecked Se
         }
 
         guard process.isRunning else {
-            process.waitUntilExit()
+            // No `waitUntilExit()` here: `isRunning == false` means Foundation
+            // already reaped the child, so `terminationStatus` is final and the
+            // wait would park on a spent notification (AGENTS.md §2).
             throw VoiceError.configuration(
                 "\(name) exited immediately with status \(process.terminationStatus)"
             )
@@ -215,26 +221,30 @@ private final class LinuxVoiceCaptureSession: VoiceCaptureSession, @unchecked Se
         return LinuxVoiceCaptureSession(process: process, output: output.fileHandleForReading)
     }
 
-    func stop() async {
-        let process: Process?
-        let reader: Task<Void, Never>?
+    /// Claim the stop transition and hand back what needs tearing down, all in
+    /// one synchronous critical section. Separate from `stop()` because
+    /// `NSLock.lock()` is `noasync` on swift-corelibs-foundation — and the
+    /// section must not span an await regardless.
+    private func claimStop() -> (process: Process?, reader: Task<Void, Never>?)? {
         lock.lock()
-        if stopped {
-            lock.unlock()
-            return
-        }
+        defer { lock.unlock() }
+        if stopped { return nil }
         stopped = true
-        process = self.process
-        self.process = nil
-        reader = self.reader
-        self.reader = nil
-        lock.unlock()
+        let claimedProcess = process
+        process = nil
+        let claimedReader = reader
+        reader = nil
+        return (claimedProcess, claimedReader)
+    }
+
+    func stop() async {
+        guard let claimed = claimStop() else { return }
 
         continuation.finish()
-        if let process {
+        if let process = claimed.process {
             terminate(process)
         }
-        if let reader {
+        if let reader = claimed.reader {
             await reader.value
         }
     }
@@ -266,12 +276,17 @@ private final class LinuxVoiceCaptureSession: VoiceCaptureSession, @unchecked Se
         return stopped
     }
 
+    /// Drop the reference to a recorder that has already exited.
+    ///
+    /// Deliberately does not call `waitUntilExit()`: `isRunning == false` means
+    /// Foundation already observed and reaped the child, and waiting on a
+    /// process whose death notification is already spent parks the calling
+    /// thread's run loop forever (AGENTS.md §2).
     private func reapIfExited() {
         lock.lock()
-        let process = self.process
-        lock.unlock()
+        defer { lock.unlock() }
         if let process, !process.isRunning {
-            process.waitUntilExit()
+            self.process = nil
         }
     }
 }
@@ -287,10 +302,25 @@ private func executableURL(named name: String) -> URL? {
     return nil
 }
 
+/// Signal the recorder and wait, bounded, for it to go away.
+///
+/// Polls `isRunning` rather than calling `waitUntilExit()`: the recorder
+/// usually dies before we get here, and waiting on an already-spent death
+/// notification never returns (AGENTS.md §2). A recorder that ignores SIGTERM
+/// gets SIGKILL; either way this returns.
 private func terminate(_ process: Process) {
-    if process.isRunning {
-        process.terminate()
+    guard process.isRunning else { return }
+    process.terminate()
+    let deadline = Date().addingTimeInterval(2.0)
+    while process.isRunning, Date() < deadline {
+        usleep(5_000)
     }
-    process.waitUntilExit()
+    if process.isRunning {
+        kill(process.processIdentifier, SIGKILL)
+        let killDeadline = Date().addingTimeInterval(1.0)
+        while process.isRunning, Date() < killDeadline {
+            usleep(5_000)
+        }
+    }
 }
 #endif
