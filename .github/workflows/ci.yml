@@ -49,7 +49,7 @@ jobs:
     # runs the real gates so the remaining gap list is visible on every push
     # rather than asserted from memory. Flip continue-on-error off once green.
     continue-on-error: true
-    container: swift:6.1-jammy
+    container: swift:6.3.3-jammy
     defaults:
       run:
         # The `bash` keyword runs steps as `bash --noprofile --norc -eo
@@ -87,8 +87,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: compnerd/gha-setup-swift@main
         with:
-          branch: swift-6.1-release
-          tag: 6.1-RELEASE
+          swift-version: swift-6.3.3-release
+          swift-build: 6.3.3-RELEASE
       - name: Toolchain
         run: swift --version
       - name: Build
