@@ -30,6 +30,16 @@ import Darwin
 
 #if os(macOS) || os(Linux)
 
+/// Cross-platform `SOCK_STREAM`: Darwin spells it as a bare `Int32`, glibc as
+/// a `__socket_type` enum whose `rawValue` is the `Int32` `socket(2)` wants.
+private var sockStreamType: Int32 {
+    #if canImport(Darwin)
+    return SOCK_STREAM
+    #else
+    return Int32(SOCK_STREAM.rawValue)
+    #endif
+}
+
 /// Which pump direction a `FaultPlan` applies to.
 public enum FaultDirection: Sendable, Equatable {
     case clientToLeader
@@ -237,7 +247,7 @@ public final class UdsProxy: @unchecked Sendable {
         self.handle = FaultHandle(state: state)
         // Remove any stale socket file.
         unlink(proxyPath)
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        let fd = socket(AF_UNIX, sockStreamType, 0)
         if fd < 0 { throw UdsProxyError.bindFailed(proxyPath) }
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -479,7 +489,7 @@ private func writeFrame(writer: Int32, lenPrefix: [UInt8], body: [UInt8]) -> Boo
 
 /// Connect a unix-domain socket to `path`. Returns the fd or -1 on error.
 private func connectUnixSocket(path: String) -> Int32 {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    let fd = socket(AF_UNIX, sockStreamType, 0)
     if fd < 0 { return -1 }
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)

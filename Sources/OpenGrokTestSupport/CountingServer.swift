@@ -332,12 +332,17 @@ private final class CountingServerImpl: @unchecked Sendable {
         if listen(listenFD, 128) < 0 { throw HttpServerError.bindFailed }
         var resolved = sockaddr_in()
         var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let port = withUnsafeMutablePointer(to: &resolved) { ptr -> UInt16 in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+        // Read the port back through `ptr`, not through `resolved`: naming the
+        // variable inside the closure is a second access overlapping the
+        // exclusive one `withUnsafeMutablePointer` already holds.
+        let port = withUnsafeMutablePointer(to: &resolved) { ptr -> UInt16? in
+            let rc = ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                 getsockname(listenFD, sa, &len)
-                return UInt16(bigEndian: resolved.sin_port)
             }
+            guard rc == 0 else { return nil }
+            return UInt16(bigEndian: ptr.pointee.sin_port)
         }
+        guard let port, port != 0 else { throw HttpServerError.bindFailed }
         baseURL = "http://127.0.0.1:\(port)\(basePath)"
         let thread = Thread { [weak self] in self?.acceptLoop() }
         thread.start()
@@ -411,10 +416,13 @@ private final class CountingServerImpl: @unchecked Sendable {
             // exactly once using a write-all loop that handles partial
             // writes.
             let response = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: \(connectionHeader)\r\nserver: opengrok-test-mock/1.0\r\n\r\n{}"
-            _ = response.withCString { ptr -> Int in
+            let wrote = response.withCString { ptr -> Bool in
                 writeAll(fd: fd, bytes: ptr, count: strlen(ptr))
             }
-            if connectionClose { close(fd); return }
+            // A short write leaves a truncated response framed on a keep-alive
+            // connection, which corrupts the *next* response the client parses.
+            // Drop the connection instead so the failure is local.
+            if !wrote || connectionClose { close(fd); return }
         }
         close(fd)
     }

@@ -470,12 +470,17 @@ public final class HttpServer: @unchecked Sendable {
         // Get the bound port.
         var resolved = sockaddr_in()
         var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let port = withUnsafeMutablePointer(to: &resolved) { ptr -> UInt16 in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+        // Read the port back through `ptr`, not through `resolved`: naming the
+        // variable inside the closure is a second access overlapping the
+        // exclusive one `withUnsafeMutablePointer` already holds.
+        let port = withUnsafeMutablePointer(to: &resolved) { ptr -> UInt16? in
+            let rc = ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                 getsockname(listenFD, sa, &len)
-                return UInt16(bigEndian: resolved.sin_port)
             }
+            guard rc == 0 else { return nil }
+            return UInt16(bigEndian: ptr.pointee.sin_port)
         }
+        guard let port, port != 0 else { throw HttpServerError.bindFailed }
         baseURL = "http://127.0.0.1:\(port)\(basePath)"
         // Accept loop on a background thread.
         let thread = Thread { [weak self] in self?.acceptLoop() }
