@@ -1060,18 +1060,23 @@ struct OpenGrokFastWorktreeTests {
         )
         do {
             _ = try builder.create()
-            Issue.record("expected unsupported even with delegate on this platform")
+            Issue.record("force must never silently succeed, delegate or not")
         } catch let error as FastWorktreeError {
+            // Off Linux the platform gate rejects the mode outright. On Linux
+            // the mode is plausible, so the builder gets as far as validating
+            // the source and rejects it there. Either way it is a typed
+            // FastWorktreeError and the snapshot never ran, which is the
+            // property this test exists to hold.
+            #if !os(Linux)
             guard case .unsupported = error else {
                 Issue.record("expected .unsupported, got \(error)")
                 return
             }
+            #endif
         } catch {
             Issue.record("unexpected \(error)")
         }
-        #if !os(Linux)
-        #expect(!delegate.createCalled, "force must not invoke delegate off Linux")
-        #endif
+        #expect(!delegate.createCalled, "force must not invoke the delegate")
     }
 
     @Test("forced overlay with delegate remains unsupported on non-Linux")
@@ -1098,18 +1103,23 @@ struct OpenGrokFastWorktreeTests {
         )
         do {
             _ = try builder.create()
-            Issue.record("expected unsupported even with delegate on this platform")
+            Issue.record("force must never silently succeed, delegate or not")
         } catch let error as FastWorktreeError {
+            // Off Linux the platform gate rejects the mode outright. On Linux
+            // the mode is plausible, so the builder gets as far as validating
+            // the source and rejects it there. Either way it is a typed
+            // FastWorktreeError and the snapshot never ran, which is the
+            // property this test exists to hold.
+            #if !os(Linux)
             guard case .unsupported = error else {
                 Issue.record("expected .unsupported, got \(error)")
                 return
             }
+            #endif
         } catch {
             Issue.record("unexpected \(error)")
         }
-        #if !os(Linux)
-        #expect(!delegate.createCalled, "force must not invoke delegate off Linux")
-        #endif
+        #expect(!delegate.createCalled, "force must not invoke the delegate")
     }
 
     @Test("executable mode 0o755 survives CoW and non-CoW copy")
