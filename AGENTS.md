@@ -169,6 +169,13 @@ Two practices catch this class. Both are cheap and reviewable:
   capability values and typed unsupported errors, never conditional code.
 - Comments explain *why* — a constraint the code cannot show. Not what the next line
   does, not where it came from.
+- **When a deliberate tradeoff is load-bearing, write down what it costs, not only
+  why it's right.** A comment that argues only the upside reads as the author
+  defending a choice and gets deleted along with the constraint it was protecting.
+  One that names the downside — "this will fail two suites together if you reword
+  the message; that is expected, here is why, don't loosen it" — reads as a decision
+  already weighed, and it is the only thing that survives contact with someone
+  staring at a red suite looking for the fastest green.
 - Match the surrounding file's naming, comment density, and idiom.
 
 ---
