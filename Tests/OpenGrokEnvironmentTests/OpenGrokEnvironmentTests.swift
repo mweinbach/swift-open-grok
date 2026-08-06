@@ -340,14 +340,17 @@ struct OpenGrokEnvironmentTests {
             // lock is not held correctly.
             let taskStarted = DispatchSemaphore(value: 0)
             let taskCompleted = DispatchSemaphore(value: 0)
-            var taskSawValue: String? = nil
+            // A box rather than a captured `var`: swift-corelibs types
+            // `DispatchQueue.async`'s work item `@Sendable`, so mutating a
+            // captured local from it does not compile on Linux.
+            let taskSaw = ObservedValueBox()
             DispatchQueue.global().async {
                 taskStarted.signal()
                 // This guard creation blocks on `envVarLock` until the main
                 // guard restores. After acquiring the lock, it snapshots the
                 // restored (pre-guard) value, NOT "main-task-value".
                 let concurrentGuard = EnvVarGuard.set(key, "concurrent-value")
-                taskSawValue = ProcessInfo.processInfo.environment[key]
+                taskSaw.store(ProcessInfo.processInfo.environment[key])
                 concurrentGuard.restore()
                 taskCompleted.signal()
             }
@@ -368,11 +371,34 @@ struct OpenGrokEnvironmentTests {
             // The concurrent task must have seen its own value (after acquiring
             // the lock), NOT the main task's temporary value. This proves the
             // guard did not interleave.
-            #expect(taskSawValue == "concurrent-value",
-                    "Concurrent task must see its own value, not the main task's temporary value (got \(taskSawValue ?? "nil"))")
+            let observed = taskSaw.take()
+
+            #expect(observed == "concurrent-value",
+                    "Concurrent task must see its own value, not the main task's temporary value (got \(observed ?? "nil"))")
         }
         let after = ProcessInfo.processInfo.environment[key]
         #expect(after == before,
                 "After concurrent guards, the env var must match the pre-guard state")
+    }
+}
+
+/// Lock-protected slot for a value produced on another thread.
+///
+/// swift-corelibs types `DispatchQueue.async`'s work item `@Sendable`, so a
+/// concurrency test cannot write its observation into a captured `var`.
+private final class ObservedValueBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+
+    func store(_ newValue: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        value = newValue
+    }
+
+    func take() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }

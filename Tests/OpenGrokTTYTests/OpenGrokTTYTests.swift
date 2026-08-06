@@ -290,11 +290,17 @@ struct OpenGrokTTYTests {
     #if os(macOS) || os(Linux)
     /// posix_spawn-based sleeper in its own process group (no fork — unavailable in Swift on Apple).
     private func spawnSleeper() throws -> pid_t {
+        // Darwin types these as opaque pointers; glibc types them as structs,
+        // so only the no-argument initializer spells both.
+        #if canImport(Darwin)
         var actions = posix_spawn_file_actions_t(bitPattern: 0)
+        var attrs = posix_spawnattr_t(bitPattern: 0)
+        #else
+        var actions = posix_spawn_file_actions_t()
+        var attrs = posix_spawnattr_t()
+        #endif
         posix_spawn_file_actions_init(&actions)
         defer { posix_spawn_file_actions_destroy(&actions) }
-
-        var attrs = posix_spawnattr_t(bitPattern: 0)
         posix_spawnattr_init(&attrs)
         defer { posix_spawnattr_destroy(&attrs) }
 
@@ -347,28 +353,14 @@ struct OpenGrokTTYTests {
     private func withPTYPair(_ body: (Int32, Int32) async throws -> Void) async throws {
         var master: Int32 = -1
         var slave: Int32 = -1
-        // Prefer openpty when present (macOS / libutil).
-        #if os(macOS)
+        // `openpty` on both platforms. The alternative Linux spelling
+        // (posix_openpt/grantpt/unlockpt/ptsname) is unusable from Swift:
+        // glibc hides those behind __USE_XOPEN2K, which the Glibc overlay does
+        // not request, so they do not exist in scope. glibc 2.34+ folds libutil
+        // into libc, so `openpty` needs no extra link flag.
         guard openpty(&master, &slave, nil, nil, nil) == 0 else {
             throw TTYError.ioFailed("openpty failed: \(String(cString: strerror(errno)))")
         }
-        #else
-        // Linux: posix_openpt path
-        master = posix_openpt(O_RDWR | O_NOCTTY)
-        guard master >= 0, grantpt(master) == 0, unlockpt(master) == 0 else {
-            if master >= 0 { close(master) }
-            throw TTYError.ioFailed("posix_openpt failed")
-        }
-        guard let name = ptsname(master) else {
-            close(master)
-            throw TTYError.ioFailed("ptsname failed")
-        }
-        slave = open(name, O_RDWR | O_NOCTTY)
-        guard slave >= 0 else {
-            close(master)
-            throw TTYError.ioFailed("open slave failed")
-        }
-        #endif
         defer {
             close(master)
             close(slave)

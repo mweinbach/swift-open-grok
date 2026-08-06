@@ -5,6 +5,9 @@
 // transport.
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokHTTP

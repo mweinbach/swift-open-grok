@@ -5,6 +5,9 @@
 // mock transport, and user-agent tests.
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import Testing
 @testable import OpenGrokCircuitBreaker
 @testable import OpenGrokHTTP

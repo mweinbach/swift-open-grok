@@ -10,6 +10,9 @@
 // `~/.opengrok`).
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import Testing
 @testable import OpenGrokTestSupport
 import OpenGrokTestUtilities
@@ -1010,21 +1013,41 @@ struct OpenGrokTestSupportTests {
         return (UInt16(status), data)
     }
 
-    /// Synchronous wrapper around `URLSession.data(for:)` using a semaphore.
+    /// Result slot for `synchronousData`. A box rather than captured `var`s
+    /// because corelibs types the completion handler `@Sendable`, so mutating
+    /// captured locals from it does not compile on Linux.
+    private final class DataTaskResult: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: (data: Data?, response: URLResponse?, error: Error?) = (nil, nil, nil)
+
+        func store(_ data: Data?, _ response: URLResponse?, _ error: Error?) {
+            lock.lock()
+            defer { lock.unlock() }
+            value = (data, response, error)
+        }
+
+        func take() -> (data: Data?, response: URLResponse?, error: Error?) {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
+    private struct MissingResponse: Error {}
+
+    /// Synchronous wrapper around `URLSession.dataTask` using a semaphore.
     private func synchronousData(for request: URLRequest) throws -> (Data, URLResponse) {
         let semaphore = DispatchSemaphore(value: 0)
-        var resultData: Data?
-        var resultResponse: URLResponse?
-        var resultError: Error?
+        let result = DataTaskResult()
         URLSession.shared.dataTask(with: request) { data, response, error in
-            resultData = data
-            resultResponse = response
-            resultError = error
+            result.store(data, response, error)
             semaphore.signal()
         }.resume()
         semaphore.wait()
-        if let error = resultError { throw error }
-        return (resultData ?? Data(), resultResponse!)
+        let outcome = result.take()
+        if let error = outcome.error { throw error }
+        guard let response = outcome.response else { throw MissingResponse() }
+        return (outcome.data ?? Data(), response)
     }
 
     /// Concatenation of all chat-completion content deltas in an SSE body.

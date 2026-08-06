@@ -7,6 +7,9 @@
 // wall.
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import OpenGrokHTTP
 // `@testable` reaches the SSE reassembler and the transport's frame decoding,
 // which are internal on purpose: they are implementation detail of the HTTP

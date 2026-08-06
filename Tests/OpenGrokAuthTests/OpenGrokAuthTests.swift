@@ -4,6 +4,9 @@
 // cancellation, Codex isolation, OIDC/device/external seams, secret redaction.
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import Testing
 @testable import OpenGrokAuth
 import OpenGrokHTTP
