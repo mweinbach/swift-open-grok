@@ -305,6 +305,19 @@ public enum TraceRedaction {
         return result
     }
 
+    /// Redaction result, or `nil` when the input was already clean.
+    ///
+    /// Mirrors Rust `redact_owned` (`redact_common.rs:14-23`), whose `Option`
+    /// is load-bearing: the external stream's export-time validator uses
+    /// "would redaction change this?" as its detector for a string the emit
+    /// path failed to scrub, and drops the record when the answer is yes.
+    /// `redactString` is idempotent, so a correctly scrubbed value returns
+    /// `nil` on the second pass.
+    public static func redactedIfChanged(_ input: String) -> String? {
+        let redacted = redactString(input)
+        return redacted == input ? nil : redacted
+    }
+
     /// Redact HTTP headers for tracing export. Private headers become `"<redacted>"`.
     public static func redactHeaders(
         _ headers: [String: String]

@@ -70,6 +70,14 @@ public enum TelemetryMode: Sendable, Equatable, Hashable, CustomStringConvertibl
 
 // MARK: - Config
 
+/// Sink-level configuration for an already-resolved telemetry mode.
+///
+/// Every flag here defaults **off**. Upstream has no `productTelemetryEnabled`
+/// equivalent — product emission is governed purely by `TelemetryMode::Enabled`
+/// (`session_ctx.rs:134-144`) — so this port's extra flag is an additive
+/// restriction, and defaulting it on would have made this struct a second,
+/// silent way to turn telemetry on. Construct it from
+/// ``TelemetryModeResolver/resolve(_:)``, never from the bare default.
 public struct TelemetryConfig: Sendable, Equatable {
     public var eventsURL: String?
     public var eventsAPIKey: String?
@@ -86,7 +94,7 @@ public struct TelemetryConfig: Sendable, Equatable {
         mixpanelToken: String? = nil,
         openTelemetryEnabled: Bool = false,
         openTelemetryEndpoint: String? = nil,
-        productTelemetryEnabled: Bool = true
+        productTelemetryEnabled: Bool = false
     ) {
         self.eventsURL = eventsURL
         self.eventsAPIKey = eventsAPIKey
@@ -103,6 +111,13 @@ public struct TelemetryConfig: Sendable, Equatable {
 public enum TelemetryRedaction {
     public static func redactString(_ input: String) -> String {
         TraceRedaction.redactString(input)
+    }
+
+    /// Redaction result, or `nil` when the input was already clean. Used by
+    /// the external stream's export-time validator as its unscrubbed-string
+    /// detector (Rust `redact_owned`, `redact_common.rs:14-23`).
+    public static func redactedIfChanged(_ input: String) -> String? {
+        TraceRedaction.redactedIfChanged(input)
     }
 
     public static func redactJSONValue(_ value: JSONValue) -> JSONValue {
@@ -904,6 +919,92 @@ public struct ExternalOTELPolicy: Sendable, Equatable {
     }
 }
 
+/// External-stream boolean truth table.
+///
+/// Deliberately different from ``telemetryEnvBool``: here an **empty string is
+/// `false`**, not `nil` (upstream `external/config.rs:197-203` versus
+/// `config.rs:203-211`). That difference is load-bearing — `GROK_EXTERNAL_OTEL=""`
+/// must read as "off", not as "unset, consult the config file".
+public func externalEnvBool(_ raw: String?) -> Bool? {
+    guard let raw else { return nil }
+    switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "1", "true", "yes", "on": return true
+    case "0", "false", "no", "off", "": return false
+    default: return nil
+    }
+}
+
+/// The `[telemetry] otel_*` keys as written on disk.
+///
+/// Kept separate from ``ExternalOtelConfig`` because the disk layer is only an
+/// *input* to resolution: headers, notably, are env-only and never read from
+/// here (upstream RQ4, `external/config.rs:118-120`) so a checked-in config
+/// file cannot carry a collector credential.
+public struct ExternalOtelFileConfig: Sendable, Equatable {
+    public var enabled: Bool?
+    public var endpoint: String?
+    public var protocolRaw: String?
+    public var metricsExporter: String?
+    public var logsExporter: String?
+    public var logUserPrompts: Bool?
+    public var logToolDetails: Bool?
+
+    public init(
+        enabled: Bool? = nil,
+        endpoint: String? = nil,
+        protocolRaw: String? = nil,
+        metricsExporter: String? = nil,
+        logsExporter: String? = nil,
+        logUserPrompts: Bool? = nil,
+        logToolDetails: Bool? = nil
+    ) {
+        self.enabled = enabled
+        self.endpoint = endpoint
+        self.protocolRaw = protocolRaw
+        self.metricsExporter = metricsExporter
+        self.logsExporter = logsExporter
+        self.logUserPrompts = logUserPrompts
+        self.logToolDetails = logToolDetails
+    }
+}
+
+/// Admin pins from `requirements.toml` `[telemetry]`.
+/// `agent/config.rs:3470-3486`.
+public struct ExternalOtelRequirementPins: Sendable, Equatable {
+    public var otelEnabled: Bool?
+    public var logUserPrompts: Bool?
+    public var logToolDetails: Bool?
+
+    public init(
+        otelEnabled: Bool? = nil,
+        logUserPrompts: Bool? = nil,
+        logToolDetails: Bool? = nil
+    ) {
+        self.otelEnabled = otelEnabled
+        self.logUserPrompts = logUserPrompts
+        self.logToolDetails = logToolDetails
+    }
+
+    public var isEmpty: Bool {
+        otelEnabled == nil && logUserPrompts == nil && logToolDetails == nil
+    }
+}
+
+/// Remote policy for the external stream. Restrictive only — it can force the
+/// stream off and force the content gates shut, and has no enable direction at
+/// all (`external/mod.rs:371-389`).
+public struct ExternalOtelRemotePolicy: Sendable, Equatable {
+    public var forceDisable: Bool
+    public var lockContentGates: Bool
+
+    public init(forceDisable: Bool = false, lockContentGates: Bool = false) {
+        self.forceDisable = forceDisable
+        self.lockContentGates = lockContentGates
+    }
+
+    public static let permissive = ExternalOtelRemotePolicy()
+}
+
 extension ExternalOtelConfig {
     private static let defaultHTTPBase = "http://localhost:4318"
     private static let defaultGRPCBase = "http://localhost:4317"
@@ -915,22 +1016,79 @@ extension ExternalOtelConfig {
         resolve(getenv: { environment[$0] })
     }
 
+    /// Full resolution across every layer upstream consults.
+    ///
+    /// Precedence is requirement pin > env > config file > default off
+    /// (`agent/config.rs:3416-3421`), with `remote` applied last and able only
+    /// to tighten.
+    public static func resolve(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        file: ExternalOtelFileConfig?,
+        pins: ExternalOtelRequirementPins = ExternalOtelRequirementPins(),
+        remote: ExternalOtelRemotePolicy = .permissive
+    ) -> ExternalOtelConfig? {
+        if remote.forceDisable { return nil }
+        // A requirement pin masquerades as an env value so it outranks the
+        // real environment without duplicating the resolution ladder.
+        // agent/config.rs:3475-3486.
+        let pinned: (String) -> String? = { name in
+            let pin: Bool?
+            switch name {
+            case _ where TelemetryEnv.externalMasterNames.contains(name):
+                pin = pins.otelEnabled
+            case "OTEL_LOG_USER_PROMPTS":
+                pin = pins.logUserPrompts
+            case "OTEL_LOG_TOOL_DETAILS":
+                pin = pins.logToolDetails
+            default:
+                pin = nil
+            }
+            if let pin { return pin ? "1" : "0" }
+            return environment[name]
+        }
+        guard var resolved = resolve(getenv: pinned, file: file) else { return nil }
+        resolved.gates = resolved.gates.tightened(forceOff: remote.lockContentGates)
+        return resolved
+    }
+
     /// Testable resolution core.
     public static func resolve(
         getenv: (String) -> String?
     ) -> ExternalOtelConfig? {
-        let masterRaw = getenv("OPENGROK_EXTERNAL_OTEL") ?? getenv("GROK_EXTERNAL_OTEL")
-        let enabled = masterRaw.map {
-            ["1", "true", "yes", "on"].contains($0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-        } ?? false
+        resolve(getenv: getenv, file: nil)
+    }
+
+    /// Testable resolution core with a disk-config layer.
+    public static func resolve(
+        getenv: (String) -> String?,
+        file: ExternalOtelFileConfig?
+    ) -> ExternalOtelConfig? {
+        // Master switch: env > config file > default off.
+        // external/config.rs:262-277. An *unrecognized* env value falls
+        // through to the file layer rather than counting as "on" — matching
+        // upstream's `env_bool` returning `None`.
+        var masterRaw: String?
+        for name in TelemetryEnv.externalMasterNames where masterRaw == nil {
+            masterRaw = getenv(name)
+        }
+        let enabled: Bool
+        if let parsed = externalEnvBool(masterRaw) {
+            enabled = parsed
+        } else if let fileEnabled = file?.enabled {
+            enabled = fileEnabled
+        } else {
+            enabled = false
+        }
         guard enabled else { return nil }
 
-        func select(_ name: String) -> ExporterSelection {
-            guard let raw = getenv(name) else { return .none }
+        func select(_ name: String, _ fileValue: String?) -> ExporterSelection {
+            guard let raw = getenv(name) ?? fileValue else { return .none }
+            // An unrecognized exporter name resolves to `.none`, not to a
+            // default-on exporter: a typo must not open a stream.
             return ExporterSelection.parse(raw) ?? .none
         }
-        let metricsExporter = select("OTEL_METRICS_EXPORTER")
-        let logsExporter = select("OTEL_LOGS_EXPORTER")
+        let metricsExporter = select("OTEL_METRICS_EXPORTER", file?.metricsExporter)
+        let logsExporter = select("OTEL_LOGS_EXPORTER", file?.logsExporter)
         // Spans: OTEL_TRACES_EXPORTER or fall back to logs exporter for parity.
         let spansExporter: ExporterSelection = {
             if let raw = getenv("OTEL_TRACES_EXPORTER") {
@@ -946,14 +1104,18 @@ extension ExternalOtelConfig {
         }
 
         let transport: OtlpTransport
-        if let raw = getenv("OTEL_EXPORTER_OTLP_PROTOCOL") {
+        if let raw = getenv("OTEL_EXPORTER_OTLP_PROTOCOL") ?? file?.protocolRaw {
+            // An unrecognized protocol disables the whole stream rather than
+            // falling back to a default — upstream external/config.rs:306-318.
             guard let parsed = OtlpTransport.parse(raw) else { return nil }
             transport = parsed
         } else {
             transport = .httpProtobuf
         }
 
-        let base = getenv("OTEL_EXPORTER_OTLP_ENDPOINT")?
+        let base = (getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+            ?? file?.endpoint)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let logsEndpoint = resolveSignalEndpoint(
             specific: getenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"),
@@ -991,9 +1153,14 @@ extension ExternalOtelConfig {
         let timeoutMs = getenv("OTEL_EXPORTER_OTLP_TIMEOUT")
             .flatMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
             ?? 10_000
+        // Content gates: env > config file > false. external/config.rs:375-386.
+        // Both default shut, so prompt text and tool arguments are excluded
+        // unless someone opted in on top of an already opted-in stream.
         let gates = OTELContentGates(
-            logUserPrompts: envBool(getenv("OTEL_LOG_USER_PROMPTS")) ?? false,
-            logToolDetails: envBool(getenv("OTEL_LOG_TOOL_DETAILS")) ?? false
+            logUserPrompts: externalEnvBool(getenv("OTEL_LOG_USER_PROMPTS"))
+                ?? file?.logUserPrompts ?? false,
+            logToolDetails: externalEnvBool(getenv("OTEL_LOG_TOOL_DETAILS"))
+                ?? file?.logToolDetails ?? false
         )
 
         // Optional provider allow/deny lists (OpenGrok extension for isolation).
@@ -1031,14 +1198,6 @@ extension ExternalOtelConfig {
         )
     }
 
-    private static func envBool(_ raw: String?) -> Bool? {
-        guard let raw else { return nil }
-        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "1", "true", "yes", "on": return true
-        case "0", "false", "no", "off", "": return false
-        default: return nil
-        }
-    }
 
     private static func resolveSignalEndpoint(
         specific: String?,

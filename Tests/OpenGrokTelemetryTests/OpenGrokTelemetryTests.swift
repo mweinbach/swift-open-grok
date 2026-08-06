@@ -241,7 +241,8 @@ struct ProductTelemetryPrivacyTests {
             mode: .enabled,
             config: TelemetryConfig(
                 eventsURL: "https://example.test/events",
-                eventsAPIKey: "key"
+                eventsAPIKey: "key",
+                productTelemetryEnabled: true
             ),
             productExport: product
         )
@@ -671,7 +672,8 @@ struct TelemetryRegistryTests {
             mode: .enabled,
             config: TelemetryConfig(
                 eventsURL: "https://example.test/e",
-                eventsAPIKey: "k"
+                eventsAPIKey: "k",
+                productTelemetryEnabled: true
             ),
             productExport: product
         )
