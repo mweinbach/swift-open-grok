@@ -126,7 +126,11 @@ private func sampleServerInfo() -> McpServerInfo {
 }
 
 private func sampleConfig() throws -> McpBridgeConfig {
-    McpBridgeConfig(sessionId: try SessionId("session-1"), namespace: "mcp")
+    McpBridgeConfig(
+        sessionId: try SessionId("session-1"),
+        mediation: .mediated(AllowAllHubMediator()),
+        namespace: "mcp"
+    )
 }
 
 private func terminalResult(

@@ -303,7 +303,7 @@ struct ComputerHubSDKTests {
             description: ToolDescription(name: "ping", description: "ping"),
             transportKind: .local
         )
-        let harness = ToolHarnessBuilder()
+        let harness = ToolHarnessBuilder(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness"))
             .withLocal(tool, registration: reg)
             .withSession(try SessionId("s"))
             .withPrincipal(Principal.new(user).withScope(localInvokeScope))
@@ -325,7 +325,7 @@ struct ComputerHubSDKTests {
 
     @Test("harness missing tool")
     func harnessMissing() async throws {
-        let harness = ToolHarness()
+        let harness = ToolHarness(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness"))
         let toolId = try ToolId("nope:tool")
         let stream = await harness.call(toolId: toolId, args: .null)
         for await item in stream {
@@ -341,7 +341,7 @@ struct ComputerHubSDKTests {
     func harnessRemoteDisconnected() async throws {
         let key = PrincipalKey(url: "wss://hub", userId: try UserId("u"))
         let conn = HubConnection(key: key, connected: false)
-        let harness = ToolHarnessBuilder()
+        let harness = ToolHarnessBuilder(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness"))
             .withConnection(conn)
             .withSession(try SessionId("s"))
             .withPrincipal(Principal.new(try UserId("u")).withScope(localInvokeScope))
@@ -366,7 +366,7 @@ struct ComputerHubSDKTests {
             description: ToolDescription(name: "ping", description: "ping"),
             transportKind: .local
         )
-        let harness = ToolHarnessBuilder()
+        let harness = ToolHarnessBuilder(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness"))
             .withLocal(PingTool(id: toolId), registration: reg)
             .withPrincipal(Principal.new(user)) // no scopes
             .withRequiredScopes([localInvokeScope])

@@ -14,7 +14,7 @@ import OpenGrokWorkspaceTypes
 struct WorkspaceClientTests {
     @Test("not connected fast-fails")
     func notConnected() async throws {
-        let client = WorkspaceClient(harness: ToolHarness(), connected: ConnectedFlag(false))
+        let client = WorkspaceClient(harness: ToolHarness(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness")), connected: ConnectedFlag(false))
         do {
             _ = try await client.rpcRaw(method: "workspace.info", params: .object([:]))
             Issue.record("expected notConnected")
@@ -37,7 +37,7 @@ struct WorkspaceClientTests {
             description: ToolDescription(name: "workspace_rpc", description: "rpc"),
             transportKind: .local
         )
-        let harness = ToolHarnessBuilder()
+        let harness = ToolHarnessBuilder(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness"))
             .withLocal(tool, registration: reg)
             .withSession(try SessionId("s"))
             .withPrincipal(Principal.new(user).withScope(localInvokeScope))
@@ -67,7 +67,7 @@ struct WorkspaceClientTests {
     @Test("non-fatal notFound does not clear latch")
     func nonFatalKeepsConnected() async throws {
         let flag = ConnectedFlag(true)
-        let harness = ToolHarness() // no tools → notFound, not fatal
+        let harness = ToolHarness(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness")) // no tools → notFound, not fatal
         let client = WorkspaceClient(harness: harness, connected: flag)
         do {
             _ = try await client.rpcRaw(method: "workspace.info", params: .object([:]))
@@ -95,7 +95,7 @@ struct WorkspaceClientTests {
             description: ToolDescription(name: "workspace_rpc", description: "rpc"),
             transportKind: .local
         )
-        let harness = ToolHarnessBuilder()
+        let harness = ToolHarnessBuilder(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness"))
             .withLocal(tool, registration: reg)
             .withSession(try SessionId("s"))
             .withPrincipal(Principal.new(user).withScope(localInvokeScope))
@@ -125,7 +125,7 @@ struct WorkspaceClientTests {
             description: ToolDescription(name: "workspace_rpc", description: "rpc"),
             transportKind: .local
         )
-        let harness = ToolHarnessBuilder()
+        let harness = ToolHarnessBuilder(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness"))
             .withLocal(tool, registration: reg)
             .withSession(try SessionId("s"))
             .withPrincipal(Principal.new(user).withScope(localInvokeScope))
@@ -139,7 +139,7 @@ struct WorkspaceClientTests {
 
         // Force decode failure by asking for a typed method whose envelope is garbage.
         let badTool = WorkspaceRpcGarbageTool(id: toolId)
-        let badHarness = ToolHarnessBuilder()
+        let badHarness = ToolHarnessBuilder(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness"))
             .withLocal(badTool, registration: reg)
             .withSession(try SessionId("s"))
             .withPrincipal(Principal.new(user).withScope(localInvokeScope))
@@ -188,7 +188,7 @@ struct WorkspaceClientTests {
 
     @Test("mark connected resets latch")
     func markConnected() {
-        let client = WorkspaceClient(harness: ToolHarness(), connected: ConnectedFlag(false))
+        let client = WorkspaceClient(harness: ToolHarness(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness")), connected: ConnectedFlag(false))
         #expect(!client.isConnected)
         client.markConnected()
         #expect(client.isConnected)
@@ -199,7 +199,7 @@ struct WorkspaceClientTests {
     @Test("attachReconnect restores latch after hub reconnect sequence")
     func attachReconnect() throws {
         let flag = ConnectedFlag(true)
-        let client = WorkspaceClient(harness: ToolHarness(), connected: flag)
+        let client = WorkspaceClient(harness: ToolHarness(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness")), connected: flag)
         let key = PrincipalKey(url: "wss://hub", userId: try UserId("u"))
         let conn = HubConnection(key: key, connected: true)
         client.attachReconnect(to: conn)
@@ -228,7 +228,7 @@ struct WorkspaceClientTests {
             description: ToolDescription(name: "workspace_rpc", description: "rpc"),
             transportKind: .local
         )
-        let harness = ToolHarnessBuilder()
+        let harness = ToolHarnessBuilder(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness"))
             .withLocal(tool, registration: reg)
             .withSession(try SessionId("s"))
             .withPrincipal(Principal.new(user).withScope(localInvokeScope))

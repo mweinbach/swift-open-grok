@@ -167,12 +167,25 @@ public protocol McpTransport: Sendable {
     func close() async throws
 }
 
-public struct McpBridgeConfig: Sendable, Hashable {
+public struct McpBridgeConfig: Sendable {
     public var sessionId: SessionId
     public var namespace: String?
+    /// Host permission/sandbox gate applied to every bridged tool call.
+    ///
+    /// Required, and consumed inside `McpToolHandler.execute` rather than
+    /// left to whoever registers the handlers: an MCP tool is code from
+    /// another vendor's server reaching the agent's machine, so the gate
+    /// has to be a property of the bridge itself. A registry that forgot
+    /// to wrap it would otherwise be a silent bypass.
+    public var mediation: HubMediation
 
-    public init(sessionId: SessionId, namespace: String? = nil) {
+    public init(
+        sessionId: SessionId,
+        mediation: HubMediation,
+        namespace: String? = nil
+    ) {
         self.sessionId = sessionId
+        self.mediation = mediation
         self.namespace = namespace
     }
 }
@@ -230,7 +243,10 @@ public final class McpBridge: Sendable {
                 toolId: toolId,
                 definition: definition,
                 transport: transport,
-                namespace: config.namespace
+                namespace: config.namespace,
+                sessionId: config.sessionId,
+                serverName: serverInfo.name,
+                mediation: config.mediation
             )
         }
 
@@ -284,17 +300,26 @@ public final class McpToolHandler: ToolHandle, Sendable {
 
     private let transport: any McpTransport
     private let namespace: String?
+    private let sessionId: SessionId
+    private let serverName: String
+    private let mediation: HubMediation
 
     fileprivate init(
         toolId: ToolId,
         definition: McpToolDefinition,
         transport: any McpTransport,
-        namespace: String?
+        namespace: String?,
+        sessionId: SessionId,
+        serverName: String,
+        mediation: HubMediation
     ) {
         self.toolId = toolId
         self.definition = definition
         self.transport = transport
         self.namespace = namespace
+        self.sessionId = sessionId
+        self.serverName = serverName
+        self.mediation = mediation
     }
 
     public func id() -> ToolId {
@@ -328,7 +353,22 @@ public final class McpToolHandler: ToolHandle, Sendable {
         ctx: ToolCallContext,
         args: JSONValue
     ) async -> ToolStream<TypedToolOutput> {
-        _ = ctx
+        // Gate before the call leaves the process. A denial here must
+        // reach the model as `permission_denied` and the MCP server must
+        // never observe the request at all.
+        if let denied = await mediation.admit(
+            HubCallRequest(
+                toolId: toolId,
+                toolCallId: ctx.callId,
+                sessionId: sessionId,
+                origin: .mcpBridge(server: serverName),
+                arguments: args,
+                isReadOnly: capabilities().isReadOnly
+            )
+        ) {
+            return terminalOnly(.failure(denied))
+        }
+
         let result: McpCallResult
         do {
             result = try await transport.callTool(name: definition.name, arguments: args)

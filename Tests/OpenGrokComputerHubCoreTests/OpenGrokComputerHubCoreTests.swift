@@ -52,7 +52,7 @@ struct ComputerHubCoreTests {
             )
         )
 
-        let resolver = CompoundResolver(local: localReg, remote: remoteReg)
+        let resolver = CompoundResolver(local: localReg, mediation: .unmediated(reason: "resolver unit test; no agent reaches this resolver"), remote: remoteReg)
         let resolved = resolver.resolve(sessionId: session, toolId: toolId)
         #expect(resolved?.isLocal == true)
 
@@ -76,7 +76,7 @@ struct ComputerHubCoreTests {
         let user = try UserId("u")
         let session = try SessionId("s")
         let transport = LocalTransport(
-            resolver: CompoundResolver(local: InMemoryToolRegistry()),
+            resolver: CompoundResolver(local: InMemoryToolRegistry(), mediation: .unmediated(reason: "resolver unit test; no agent reaches this resolver")),
             userId: user,
             sessionId: session
         )
@@ -103,7 +103,7 @@ struct ComputerHubCoreTests {
             )
         )
         let transport = LocalTransport(
-            resolver: CompoundResolver(local: reg),
+            resolver: CompoundResolver(local: reg, mediation: .unmediated(reason: "resolver unit test; no agent reaches this resolver")),
             userId: user,
             sessionId: session,
             requiredScopes: [localInvokeScope, "admin"]
@@ -143,7 +143,7 @@ struct ComputerHubCoreTests {
     func notFound() async throws {
         let session = try SessionId("s")
         let toolId = try ToolId("missing:tool")
-        let resolver = CompoundResolver(local: InMemoryToolRegistry())
+        let resolver = CompoundResolver(local: InMemoryToolRegistry(), mediation: .unmediated(reason: "resolver unit test; no agent reaches this resolver"))
         let stream = await resolver.resolveAndDispatch(
             sessionId: session,
             toolId: toolId,
@@ -350,7 +350,7 @@ struct ComputerHubCoreTests {
     @Test("inner dispatch fails after detach")
     func innerDispatchDropped() async throws {
         let session = try SessionId("s")
-        let resolver = CompoundResolver(local: InMemoryToolRegistry())
+        let resolver = CompoundResolver(local: InMemoryToolRegistry(), mediation: .unmediated(reason: "resolver unit test; no agent reaches this resolver"))
         let inner = InnerDispatchForResolver(resolver: resolver, sessionId: session)
         inner.detach()
         let stream = await inner.call(

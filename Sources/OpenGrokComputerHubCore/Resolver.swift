@@ -129,13 +129,36 @@ public final class InMemoryToolRegistry: ToolRegistry, @unchecked Sendable {
     }
 }
 
+/// Placeholder principal for the resolver's payload-bound check.
+///
+/// Grants nothing: the only call site passes an empty `requiredScopes`,
+/// so this value never participates in a scope decision. Hoisted out of
+/// the dispatch path so that path carries no `try!`.
+let resolverPrincipal: Principal = {
+    // `UserId` rejects only the empty string, so this cannot fail.
+    guard let id = try? UserId("resolver") else {
+        preconditionFailure(#"UserId("resolver") is non-empty"#)
+    }
+    return Principal.new(id)
+}()
+
 /// Local shadows remote when both planes register the same tool id.
 public final class CompoundResolver: @unchecked Sendable {
     public let local: any ToolRegistry
     public let remote: (any ToolRegistry)?
+    /// Host permission/sandbox gate for everything dispatched through
+    /// this resolver — including tool-calls-tool traffic arriving via
+    /// `InnerDispatchForResolver`, which is otherwise the easiest way for
+    /// a gated tool to launder a call through an ungated one.
+    public let mediation: HubMediation
 
-    public init(local: any ToolRegistry, remote: (any ToolRegistry)? = nil) {
+    public init(
+        local: any ToolRegistry,
+        mediation: HubMediation,
+        remote: (any ToolRegistry)? = nil
+    ) {
         self.local = local
+        self.mediation = mediation
         self.remote = remote
     }
 
@@ -162,12 +185,32 @@ public final class CompoundResolver: @unchecked Sendable {
                 )
             )
         }
-        // Payload bound from declared capabilities.
+        // Payload bound from declared capabilities. `requiredScopes` is
+        // empty because this path has no handshake behind it — the scope
+        // check belongs to the transport that called us, and duplicating
+        // it here with an invented principal would only look like a gate.
+        //
+        // Divergence from `resolver.rs:265` (`resolve_and_dispatch`),
+        // which dispatches with no bound at all: this port keeps the
+        // payload ceiling because `InnerDispatchForResolver` makes the
+        // path reachable from tool code.
         if let denied = admitCall(
-            principal: Principal.new(try! UserId("resolver")),
+            principal: resolverPrincipal,
             requiredScopes: [],
             capabilities: resolved.handle.capabilities(),
             args: args
+        ) {
+            return terminalOnly(Result<TypedToolOutput, ToolError>.failure(denied))
+        }
+        if let denied = await mediation.admit(
+            HubCallRequest(
+                toolId: toolId,
+                toolCallId: ctx.callId,
+                sessionId: sessionId,
+                origin: resolved.isLocal ? .local : .remote,
+                arguments: args,
+                isReadOnly: resolved.handle.capabilities().isReadOnly
+            )
         ) {
             return terminalOnly(Result<TypedToolOutput, ToolError>.failure(denied))
         }

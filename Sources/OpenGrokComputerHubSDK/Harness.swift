@@ -59,14 +59,19 @@ public final class ToolHarness: @unchecked Sendable {
     public private(set) var principal: Principal?
     public var requiredScopes: [String]
     public let cancelRegistry: CancelRegistry
+    /// Host permission/sandbox gate. Required at construction — see
+    /// `HubMediation`; there is no default posture.
+    public let mediation: HubMediation
     private let cancelTokens = NSLock()
     private var activeCancels: [ToolCallId: CancellationToken] = [:]
 
     public init(
+        mediation: HubMediation,
         local: LocalRegistry = LocalRegistry(),
         requiredScopes: [String] = [localInvokeScope],
         cancelRegistry: CancelRegistry = CancelRegistry()
     ) {
+        self.mediation = mediation
         self.local = local
         self.requiredScopes = requiredScopes
         self.cancelRegistry = cancelRegistry
@@ -113,7 +118,8 @@ public final class ToolHarness: @unchecked Sendable {
         // Capability-scope + bound check against principal when present.
         let principal = self.principal
             ?? Principal.new(try! UserId("harness")).withScope(localInvokeScope)
-        let caps = local.get(toolId)?.capabilities()
+        let localHandle = local.get(toolId)
+        let caps = localHandle?.capabilities()
         if let denied = admitCall(
             principal: principal,
             requiredScopes: requiredScopes,
@@ -123,8 +129,26 @@ public final class ToolHarness: @unchecked Sendable {
             return terminalOnly(Result<TypedToolOutput, ToolError>.failure(denied))
         }
 
+        // Host permission/sandbox gate, between transport admission and
+        // dispatch (PORT_PLAN.md gate order). Runs for remote and MCP-
+        // bridged tools too: a tool the agent did not register locally is
+        // the case that most needs a gate, not the one that needs an
+        // exemption.
+        if let denied = await mediation.admit(
+            HubCallRequest(
+                toolId: toolId,
+                toolCallId: ctx.callId,
+                sessionId: sessionId,
+                origin: localHandle == nil ? .remote : .local,
+                arguments: args,
+                isReadOnly: caps?.isReadOnly ?? false
+            )
+        ) {
+            return terminalOnly(Result<TypedToolOutput, ToolError>.failure(denied))
+        }
+
         // Local first (local-shadows-remote).
-        if let handle = local.get(toolId) {
+        if let handle = localHandle {
             return await handle.execute(ctx: ctx, args: args)
         }
 
@@ -185,8 +209,13 @@ public struct ToolHarnessBuilder {
     private var sessionId: SessionId?
     private var principal: Principal?
     private var requiredScopes: [String] = [localInvokeScope]
+    private var mediation: HubMediation
 
-    public init() {}
+    /// The posture is a constructor argument, not a `with…` step, so a
+    /// builder chain cannot be written that simply forgets the gate.
+    public init(mediation: HubMediation) {
+        self.mediation = mediation
+    }
 
     public func withLocal(_ tool: any ToolDyn, registration: ToolRegistration) -> ToolHarnessBuilder {
         let c = self
@@ -219,7 +248,11 @@ public struct ToolHarnessBuilder {
     }
 
     public func build() -> ToolHarness {
-        let h = ToolHarness(local: local, requiredScopes: requiredScopes)
+        let h = ToolHarness(
+            mediation: mediation,
+            local: local,
+            requiredScopes: requiredScopes
+        )
         if let connection { h.attach(connection: connection) }
         if let sessionId { h.bindSession(sessionId) }
         if let principal { h.setPrincipal(principal) }
