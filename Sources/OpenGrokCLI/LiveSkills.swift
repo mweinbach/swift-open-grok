@@ -16,6 +16,7 @@
 import Foundation
 import OpenGrokACP
 import OpenGrokAgentDefinitions
+import OpenGrokPager
 import OpenGrokShared
 
 public enum LiveSkills {
@@ -104,6 +105,23 @@ public enum LiveSkills {
         }
     }
 
+    /// Combine the pager's builtin command rows with the same skill catalog
+    /// used by slash dispatch. Keeping this conversion here prevents ACP and
+    /// the TUI from inventing separate skill names or metadata.
+    public static func availableCommands(
+        builtins: [OpenGrokPagerCommandRegistration],
+        skills: [SkillCommand]
+    ) -> [AvailableCommand] {
+        let builtinRows = builtins.map { command in
+            AvailableCommand(
+                name: command.name,
+                description: command.summary,
+                input: command.usage.map { AvailableCommandInput.unstructured(hint: $0) }
+            )
+        }
+        return builtinRows + availableCommands(skills)
+    }
+
     /// Skills the *model* may invoke. Note this is a different filter from the
     /// slash catalog: `disable-model-invocation` gates here,
     /// `user-invocable` gates there.
@@ -169,7 +187,24 @@ public enum LiveSkills {
             </skills_referenced>
             \(blocks.joined(separator: "\n"))
             </skill_information>
-            """
+        """
+    }
+
+    /// Build the model-facing prompt for one resolved slash skill.
+    public static func invocationPrompt(
+        commandName: String,
+        args: String,
+        catalog: [SkillCommand],
+        sessionID: String? = nil
+    ) -> String? {
+        guard let entry = catalog.first(where: { $0.commandName == commandName }),
+              let information = skillInformation(
+                  invocations: [(skill: entry.skill, args: args)],
+                  sessionID: sessionID
+              )
+        else { return nil }
+        let invocation = args.isEmpty ? "/\(commandName)" : "/\(commandName) \(args)"
+        return "\(invocation)\n\(information)"
     }
 
     /// Substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and the `${…_DIR}` tokens.

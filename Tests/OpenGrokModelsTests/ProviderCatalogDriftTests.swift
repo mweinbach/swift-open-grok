@@ -10,6 +10,90 @@ import Testing
 @testable import OpenGrokModels
 import OpenGrokSamplingTypes
 
+private func makeOpenCodeGoTestEntry(key: String, rawModel: String) -> ModelEntry {
+    var info = ModelInfo.fallback(slug: key)
+    info.id = key
+    info.model = rawModel
+    info.name = rawModel
+    info.baseURL = OpenCodeGoModels.apiBaseURLDefault
+    info.provider = .openCodeGo
+    info.apiBackend = .chatCompletions
+    info.supportedInApi = true
+    return ModelEntry(info: info, envKey: .single(OpenCodeGoModels.apiKeyEnv))
+}
+
+private func makeOpenCodeGoTestCatalog() -> OpenCodeGoModelsCatalog {
+    OpenCodeGoModelsCatalog(
+        entries: OrderedModelMap([
+            ("opencode-go:gpt-ish", makeOpenCodeGoTestEntry(
+                key: "opencode-go:gpt-ish",
+                rawModel: "gpt-ish"
+            )),
+            ("opencode-go:claude-ish", makeOpenCodeGoTestEntry(
+                key: "opencode-go:claude-ish",
+                rawModel: "claude-ish"
+            )),
+        ]),
+        descriptors: [],
+        warnings: [],
+        credentialFingerprint: "fixture"
+    )
+}
+
+@Suite("OpenCode Go enablement")
+struct OpenCodeGoEnablementTests {
+    @Test("an empty enable list keeps discovered OpenCode Go models out")
+    func emptyDefaultFailsClosed() throws {
+        let catalog = resolveModelCatalog(
+            input: CatalogResolutionInput(),
+            openCodeGoCatalog: makeOpenCodeGoTestCatalog()
+        )
+
+        #expect(catalog["opencode-go:gpt-ish"] == nil)
+        #expect(catalog["opencode-go:claude-ish"] == nil)
+        #expect(catalog["grok-4.5"] != nil)
+    }
+
+    @Test("key and raw model identifiers independently enable entries")
+    func keyAndRawIdentifiers() throws {
+        var keyInput = CatalogResolutionInput(
+            models: ModelsSectionConfig(opencodeGoEnabledModels: ["opencode-go:gpt-ish"])
+        )
+        var catalog = resolveModelCatalog(input: keyInput, openCodeGoCatalog: makeOpenCodeGoTestCatalog())
+        #expect(catalog["opencode-go:gpt-ish"] != nil)
+        #expect(catalog["opencode-go:claude-ish"] == nil)
+
+        keyInput.models.opencodeGoEnabledModels = ["claude-ish"]
+        catalog = resolveModelCatalog(input: keyInput, openCodeGoCatalog: makeOpenCodeGoTestCatalog())
+        #expect(catalog["opencode-go:gpt-ish"] == nil)
+        #expect(catalog["opencode-go:claude-ish"] != nil)
+    }
+
+    @Test("disabled models still win after OpenCode Go enablement")
+    func disabledModelsStillRemoveEnabledEntry() throws {
+        let input = CatalogResolutionInput(
+            models: ModelsSectionConfig(
+                disabledModels: ["opencode-go:gpt-ish"],
+                opencodeGoEnabledModels: ["opencode-go:gpt-ish"]
+            )
+        )
+        let catalog = resolveModelCatalog(input: input, openCodeGoCatalog: makeOpenCodeGoTestCatalog())
+        #expect(catalog["opencode-go:gpt-ish"] == nil)
+    }
+
+    @Test("ModelsManager reassembles the published partition when enablement changes")
+    func managerReassemblesOnInputUpdate() {
+        let manager = ModelsManager()
+        manager.applyOpenCodeGoCatalog(makeOpenCodeGoTestCatalog())
+        #expect(manager.catalogSnapshot()["opencode-go:gpt-ish"] == nil)
+
+        manager.updateInput(CatalogResolutionInput(
+            models: ModelsSectionConfig(opencodeGoEnabledModels: ["gpt-ish"])
+        ))
+        #expect(manager.catalogSnapshot()["opencode-go:gpt-ish"] != nil)
+    }
+}
+
 @Suite("DeepSeek catalog")
 struct DeepSeekCatalogTests {
     /// Provenance: Rust `trusted_hosts_are_provider_scoped`.

@@ -14,6 +14,8 @@ import OpenGrokCodeModeProtocol
 import OpenGrokJavaScriptRuntime
 import OpenGrokShared
 
+public typealias CodeModeRuntimeCapability = JavaScriptRuntimeCapability
+
 /// Grace added to an observation window of at least ten seconds so a nested
 /// tool that lands just after the advertised deadline still returns without
 /// another model turn. Mirrors `YIELD_GRACE_PERIOD` / `MIN_YIELD_TIME_FOR_GRACE`
@@ -70,6 +72,12 @@ public struct InProcessCodeModeSessionProvider: CodeModeSessionProvider {
 /// calls re-enter the host through the delegate, and `shutdown` disposes
 /// every runtime. Mirrors `InProcessCodeModeSession` (service.rs:88).
 public final class InProcessCodeModeSession: CodeModeSession {
+    /// The engine capability used by live composition before it advertises
+    /// `exec` and `wait`.
+    public static var runtimeCapability: CodeModeRuntimeCapability {
+        .current
+    }
+
     private let runtime: CodeModeSessionRuntime
 
     /// - Parameter executionCeilingMs: how long one uninterrupted

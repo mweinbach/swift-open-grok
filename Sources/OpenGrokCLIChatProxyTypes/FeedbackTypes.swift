@@ -112,6 +112,8 @@ public enum FeedbackContent: Sendable, Equatable {
 public struct FeedbackSubmission: Hashable, Sendable, Codable, Equatable {
     public var sessionId: String
     public var userId: String?
+    public var authorName: String?
+    public var authorEmail: String?
     public var clientType: ClientType
     public var feedbackType: FeedbackType
     public var turnNumber: Int64?
@@ -228,6 +230,8 @@ public struct FeedbackSubmission: Hashable, Sendable, Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case sessionId
         case userId
+        case authorName
+        case authorEmail
         case clientType
         case feedbackType
         case turnNumber
@@ -272,6 +276,8 @@ public struct FeedbackSubmission: Hashable, Sendable, Codable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         sessionId = try container.decode(String.self, forKey: .sessionId)
         userId = try container.decodeIfPresent(String.self, forKey: .userId)
+        authorName = try container.decodeIfPresent(String.self, forKey: .authorName)
+        authorEmail = try container.decodeIfPresent(String.self, forKey: .authorEmail)
         clientType = try container.decodeIfPresent(ClientType.self, forKey: .clientType) ?? .agent
         feedbackType = try container.decodeIfPresent(FeedbackType.self, forKey: .feedbackType) ?? .rating
         turnNumber = try container.decodeIfPresent(Int64.self, forKey: .turnNumber)
@@ -325,6 +331,8 @@ public struct FeedbackSubmission: Hashable, Sendable, Codable, Equatable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(sessionId, forKey: .sessionId)
         try container.encodeIfPresent(userId, forKey: .userId)
+        try container.encodeIfPresent(authorName, forKey: .authorName)
+        try container.encodeIfPresent(authorEmail, forKey: .authorEmail)
         try container.encode(clientType, forKey: .clientType)
         try container.encode(feedbackType, forKey: .feedbackType)
         try container.encodeIfPresent(turnNumber, forKey: .turnNumber)

@@ -27,6 +27,7 @@ enum LiveWorkflowLaunch {
         let workspaceRoot: URL
         let sessionID: String
         let openGrokHome: URL
+        let telemetryBootstrapContext: LiveTelemetryBootstrapContext
         let systemPrompt: String?
         let toolPolicy: LiveAgentToolPolicy?
         let fileAccessPolicy: FileToolAccessPolicy
@@ -116,6 +117,7 @@ enum LiveWorkflowLaunch {
                             sessionID: "\(session.sessionID)-wf-\(context.runID)-\(mode.rawValue)",
                             workingDirectory: session.workspaceRoot,
                             toolPolicy: clampedPolicy(session.toolPolicy, to: mode),
+                            telemetryBootstrapContext: session.telemetryBootstrapContext,
                             fileAccessPolicy: session.fileAccessPolicy,
                             environment: session.environment
                         )

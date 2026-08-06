@@ -155,14 +155,38 @@ struct OpenGrokSandboxTests {
         #expect(SandboxMode.from(profile: .workspace) == .restricted)
     }
 
-    @Test("bwrap reexec returns nil when already inside")
-    func bwrapInside() {
+    @Test("bwrap marker alone does not suppress reexec")
+    func bwrapMarkerAloneDoesNotSuppressReexec() {
         let argv = bwrapReexecCommand(
             denyWrite: ["/tmp"],
             denyRead: [],
             environment: [bwrapEnvVar: "1"]
         )
-        #expect(argv == nil)
+        #expect(argv != nil)
+    }
+
+    @Test("verified bwrap receipt suppresses reexec")
+    func verifiedBwrapReceiptSuppressesReexec() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenGrokBwrapReceipt-\(UUID().uuidString)", isDirectory: true)
+        let environment = ["OPENGROK_HOME": home.path]
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let receipt = try createBwrapReceipt(environment: environment)
+        var inside = environment
+        inside[bwrapEnvVar] = "1"
+        inside[bwrapReceiptPathEnvVar] = receipt.path
+        inside[bwrapReceiptTokenEnvVar] = receipt.token
+        #expect(isVerifiedInsideBwrap(environment: inside))
+        #if os(Linux)
+        #expect(PlatformSandboxSupport.supportInfo(environment: inside).isSupported)
+        #expect(PlatformSandboxEnforcer().detectSupportedMode(environment: inside) == .restricted)
+        #endif
+        #expect(bwrapReexecCommand(
+            denyWrite: ["/tmp"],
+            denyRead: [],
+            environment: inside
+        ) == nil)
     }
 
     @Test("bwrap reexec builds argv outside")
@@ -172,11 +196,40 @@ struct OpenGrokSandboxTests {
             denyRead: [],
             environment: [:],
             arguments: ["--help"],
-            executable: URL(fileURLWithPath: "/bin/open-grok")
+            executable: URL(fileURLWithPath: "/bin/open-grok"),
+            bwrapPath: "/usr/bin/bwrap"
         )
         #expect(argv != nil)
-        #expect(argv?.first == "bwrap")
+        #expect(argv?.first == "/usr/bin/bwrap")
+        #expect(argv?.prefix(3).elementsEqual(["/usr/bin/bwrap", "--cap-drop", "ALL"]) == true)
         #expect(argv?.contains("--ro-bind") == true)
+        #expect(argv?.suffix(2).elementsEqual(["/bin/open-grok", "--help"]) == true)
+    }
+
+    @Test("bwrap materializes profile roots before deny overlays")
+    func bwrapMaterializesProfileRoots() {
+        let argv = bwrapReexecCommand(
+            denyWrite: ["/tmp"],
+            denyRead: [],
+            environment: [:],
+            arguments: ["--help"],
+            executable: URL(fileURLWithPath: "/bin/open-grok"),
+            bwrapPath: "/usr/bin/bwrap",
+            readOnly: ["/etc"],
+            readWrite: ["/tmp"],
+            defaultRead: true
+        )
+        #expect(argv != nil)
+        #expect(argv?.contains("--cap-drop") == true)
+        #expect(argv?.contains("ALL") == true)
+        #expect(argv?.contains("--bind") == true)
+        #expect(argv?.contains("--unshare-net") == false)
+        if let argv {
+            let denyIndex = argv.lastIndex(of: "/tmp") ?? -1
+            let writableIndex = argv.firstIndex(of: "--bind") ?? -1
+            #expect(writableIndex >= 0)
+            #expect(denyIndex > writableIndex)
+        }
     }
 
     @Test("requires read deny only for custom with deny list")
@@ -250,23 +303,30 @@ struct OpenGrokSandboxTests {
     }
 
     #if os(macOS)
-    @Test("seatbelt profile includes firmlink aliases and write sub-actions")
-    func seatbeltWriteSubactionsAndAliases() {
-        let resolved = ResolvedSandboxProfile(
-            name: "custom",
-            readOnly: [],
-            readWrite: [URL(fileURLWithPath: "/tmp/ws")],
-            deny: [URL(fileURLWithPath: "/tmp/ws/.env")],
-            denyEntries: ["**/*.pem"],
-            defaultRead: true,
-            restrictNetwork: true
-        )
-        let sbpl = buildSeatbeltProfile(resolved, workspace: URL(fileURLWithPath: "/tmp/ws"))
-        #expect(sbpl.contains("deny file-write-data"))
-        #expect(sbpl.contains("deny file-write-unlink"))
-        #expect(sbpl.contains("deny file-write-create"))
-        #expect(sbpl.contains("/private/tmp/ws/.env") || sbpl.contains("/tmp/ws/.env"))
-        #expect(sbpl.contains("(deny network*)"))
+    @Test("seatbelt profile keeps process network open for provider traffic")
+    func seatbeltProcessNetworkAlwaysAllowed() {
+        func build(restrictNetwork: Bool) -> String {
+            let resolved = ResolvedSandboxProfile(
+                name: "custom",
+                readOnly: [],
+                readWrite: [URL(fileURLWithPath: "/tmp/ws")],
+                deny: [URL(fileURLWithPath: "/tmp/ws/.env")],
+                denyEntries: ["**/*.pem"],
+                defaultRead: true,
+                restrictNetwork: restrictNetwork
+            )
+            return buildSeatbeltProfile(resolved, workspace: URL(fileURLWithPath: "/tmp/ws"))
+        }
+
+        for restrictNetwork in [true, false] {
+            let sbpl = build(restrictNetwork: restrictNetwork)
+            #expect(sbpl.contains("(allow network*)"))
+            #expect(!sbpl.contains("(deny network*)"))
+            #expect(sbpl.contains("deny file-write-data"))
+            #expect(sbpl.contains("deny file-write-unlink"))
+            #expect(sbpl.contains("deny file-write-create"))
+            #expect(sbpl.contains("/private/tmp/ws/.env") || sbpl.contains("/tmp/ws/.env"))
+        }
     }
     #else
     @Test("seatbelt profile builder reports unsupported on non-macOS")
@@ -330,8 +390,8 @@ struct OpenGrokSandboxTests {
         }
         #else
         // Off Linux the per-child filter is a deliberate no-op, matching
-        // upstream's non-Linux `Ok(())` (child_net.rs:226-229); macOS
-        // restricts network in the process-level Seatbelt profile instead.
+        // upstream's non-Linux `Ok(())` (child_net.rs:226-229); macOS keeps
+        // process-level network access available for provider sampling.
         let (bExe, bArgs) = try blocked.restrictedLaunch(
             executable: "/bin/echo",
             arguments: ["hi"]
@@ -341,15 +401,42 @@ struct OpenGrokSandboxTests {
         #endif
     }
 
-    @Test("bwrap reexec includes network unsharing flag when requested")
-    func bwrapReexecNetworkIsolation() {
+    @Test("bwrap reexec never isolates provider network")
+    func bwrapReexecKeepsProviderNetwork() {
         let argv = bwrapReexecCommand(
             denyWrite: [],
             denyRead: [],
             restrictNetwork: true,
             environment: [:]
         )
-        #expect(argv?.contains("--unshare-net") == true)
+        #expect(argv?.contains("--unshare-net") == false)
+        #expect(argv?.contains(bwrapEnvVar) == true)
+    }
+
+    @Test("bwrap marker without a receipt cannot claim enforcement")
+    func bwrapMarkerRequiresReceipt() {
+        #expect(throws: SandboxError.self) {
+            try validateBwrapReceipt(environment: [bwrapEnvVar: "1"])
+        }
+    }
+
+    @Test("bwrap receipt is one-use and scoped to the sandbox home")
+    func bwrapReceiptValidation() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenGrokBwrapReceipt-\(UUID().uuidString)", isDirectory: true)
+        let environment = ["OPENGROK_HOME": home.path]
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let receipt = try createBwrapReceipt(environment: environment)
+        var inside = environment
+        inside[bwrapEnvVar] = "1"
+        inside[bwrapReceiptPathEnvVar] = receipt.path
+        inside[bwrapReceiptTokenEnvVar] = receipt.token
+        try validateBwrapReceipt(environment: inside)
+        #expect(!FileManager.default.fileExists(atPath: receipt.path))
+        #expect(throws: SandboxError.self) {
+            try validateBwrapReceipt(environment: inside)
+        }
     }
 
     @Test("glob validation accepts supported subset and rejects hostile/ambiguous globs")
@@ -378,6 +465,8 @@ struct OpenGrokSandboxTests {
         let plan = bwrapDenyPlan(profile: .devbox, workspace: ws)
         #expect(plan != nil)
         #expect(plan?.denyWrite.contains("/data") == true)
+        #expect(plan?.defaultRead == true)
+        #expect(plan?.readWrite.contains(ws.path) == true)
     }
 
     @Test("bwrap blocked placeholder creates zero-permission path")
@@ -434,4 +523,112 @@ struct OpenGrokSandboxTests {
         #expect(!info.details.isEmpty)
         #expect(PlatformSandboxSupport.platformLabel.contains("/"))
     }
+
+    #if os(Linux)
+    @Test("ordinary Linux capability remains unsupported until reexec verifies confinement")
+    func ordinaryLinuxCapabilityIsUnsupported() {
+        let environment = ["PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""]
+        let info = PlatformSandboxSupport.supportInfo(environment: environment)
+        #expect(!info.isSupported)
+        #expect(info.backend == .none)
+        #expect(info.details.contains("activation") || info.details.contains("re-exec"))
+        #expect(PlatformSandboxEnforcer().detectSupportedMode() == .none)
+    }
+
+    @Test("caller supplied bwrap marker cannot authorize support or apply")
+    func callerSuppliedBwrapMarkerCannotAuthorize() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenGrokBwrapSpoof-\(UUID().uuidString)", isDirectory: true)
+        let environment = [
+            "OPENGROK_HOME": home.path,
+            bwrapEnvVar: "1",
+        ]
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        #expect(!isVerifiedInsideBwrap(environment: environment))
+        #expect(!isInsideBwrap(environment: environment))
+        #expect(!PlatformSandboxSupport.supportInfo(environment: environment).isSupported)
+        #expect(PlatformSandboxEnforcer().detectSupportedMode() == .none)
+
+        let workspace = home.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        let resolved = try ProfileName.workspace.resolve(
+            workspace: workspace,
+            config: SandboxConfig()
+        )
+        let hooks = LinuxBwrapReexecHooks(
+            environment: { environment },
+            arguments: { [] },
+            executable: { "/bin/open-grok" },
+            supportInfo: { PlatformSandboxSupport.supportInfo(environment: environment) },
+            discoverBubblewrap: { _ in nil },
+            probe: { _ in false },
+            exec: { _, _, _ in
+                throw SandboxError.enforcementFailed("spoofed marker reached exec")
+            }
+        )
+        #expect(throws: SandboxError.self) {
+            try PlatformEnforcer.apply(
+                resolved: resolved,
+                workspace: workspace,
+                profile: .workspace,
+                linuxReexecHooks: hooks
+            )
+        }
+    }
+    #endif
+
+    #if os(Linux)
+    @Test("Linux reexec uses an injected absolute bwrap handoff")
+    func linuxReexecHandoffIsInjectable() throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenGrokBwrap-\(UUID().uuidString)", isDirectory: true)
+        let home = workspace.appendingPathComponent("home", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        let lock = NSLock()
+        var capturedPath = ""
+        var capturedArguments: [String] = []
+        let hooks = LinuxBwrapReexecHooks(
+            environment: { ["OPENGROK_HOME": home.path] },
+            arguments: { ["--child-arg"] },
+            executable: { "/bin/open-grok" },
+            supportInfo: {
+                SandboxSupportInfo(
+                    isSupported: true,
+                    backend: .linuxBubblewrap,
+                    details: "injected"
+                )
+            },
+            discoverBubblewrap: { _ in "/usr/bin/bwrap" },
+            probe: { _ in true },
+            exec: { path, arguments, _ in
+                lock.lock()
+                capturedPath = path
+                capturedArguments = arguments
+                lock.unlock()
+                throw SandboxError.enforcementFailed("captured for test")
+            }
+        )
+
+        let manager = SandboxManager(
+            profile: .strict,
+            workspace: workspace,
+            linuxReexecHooks: hooks
+        )
+        #expect(throws: SandboxError.self) {
+            try manager.apply(workspace: workspace)
+        }
+        lock.lock()
+        let path = capturedPath
+        let arguments = capturedArguments
+        lock.unlock()
+        #expect(path == "/usr/bin/bwrap")
+        #expect(arguments.contains("--"))
+        #expect(arguments.suffix(2).elementsEqual(["/bin/open-grok", "--child-arg"]))
+        #expect(!arguments.contains("--unshare-net"))
+        #expect(!manager.applied)
+    }
+    #endif
 }

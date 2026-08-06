@@ -1,6 +1,25 @@
 import Foundation
 import OpenGrokPagerMinimal
 
+public struct OpenGrokPagerCommandRegistration: Sendable, Equatable, Hashable {
+    public let name: String
+    public let aliases: [String]
+    public let summary: String
+    public let usage: String?
+
+    public init(
+        name: String,
+        aliases: [String] = [],
+        summary: String = "",
+        usage: String? = nil
+    ) {
+        self.name = name
+        self.aliases = aliases
+        self.summary = summary
+        self.usage = usage
+    }
+}
+
 public enum OpenGrokPagerMode: String, Sendable, Equatable, CaseIterable {
     case fullScreen
     case inline
@@ -45,6 +64,15 @@ public protocol OpenGrokPagerRuntimeAdapter: Sendable {
     func makeSession(
         for request: OpenGrokPagerRequest
     ) async throws -> any OpenGrokPagerSessionAdapter
+
+    func replaceSession(from request: OpenGrokPagerRequest) async throws -> String
+}
+
+public extension OpenGrokPagerRuntimeAdapter {
+    func replaceSession(from request: OpenGrokPagerRequest) async throws -> String {
+        _ = request
+        throw OpenGrokPagerError.sessionReplacementUnsupported
+    }
 }
 
 public protocol OpenGrokPagerFrontend: Sendable {
@@ -64,6 +92,7 @@ public protocol OpenGrokPagerFrontendFactory: Sendable {
 public enum OpenGrokPagerError: Error, Sendable, Equatable, CustomStringConvertible {
     case alreadyRunning
     case shutdown
+    case sessionReplacementUnsupported
 
     public var description: String {
         switch self {
@@ -71,6 +100,8 @@ public enum OpenGrokPagerError: Error, Sendable, Equatable, CustomStringConverti
             return "pager is already running"
         case .shutdown:
             return "pager has been shut down"
+        case .sessionReplacementUnsupported:
+            return "pager runtime does not support session replacement"
         }
     }
 }

@@ -1,7 +1,7 @@
 // OpenGrokDistributionSupportTests.swift
 //
 // Every expectation here is anchored to a concrete line in the Rust reference
-// at 80dff0a9dcb24121b976b9f920fbe442af40ea88 (see the target's source
+// at 9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05 (see the target's source
 // comments for the file:line citations).
 
 import Foundation
@@ -9,6 +9,41 @@ import Testing
 
 @testable import OpenGrokDistributionSupport
 import OpenGrokUpdate
+
+private struct PortStatusBaseline {
+    let referenceRevision: String
+    let release: String
+
+    static func load(filePath: String = #filePath) throws -> Self {
+        var root = URL(fileURLWithPath: filePath).deletingLastPathComponent()
+        while root.path != "/" && !FileManager.default.fileExists(atPath: root.appendingPathComponent("PORT_STATUS.md").path) {
+            root = root.deletingLastPathComponent()
+        }
+        let statusURL = root.appendingPathComponent("PORT_STATUS.md")
+        guard let text = try? String(contentsOf: statusURL, encoding: .utf8),
+              let line = text.split(whereSeparator: \.isNewline).first(where: { $0.hasPrefix("**Reference:**") }) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let referenceLine = String(line)
+        guard let revisionStart = referenceLine.range(of: " at `"),
+              let revisionEnd = referenceLine[revisionStart.upperBound...].firstIndex(of: "`") else {
+            throw CocoaError(.propertyListReadCorrupt)
+        }
+        let revision = String(referenceLine[revisionStart.upperBound..<revisionEnd])
+        guard revision.range(of: "^[0-9a-fA-F]{40}$", options: .regularExpression) != nil,
+              let releaseStart = referenceLine.range(of: "release `v"),
+              let releaseEnd = referenceLine[releaseStart.upperBound...].firstIndex(of: "`") else {
+            throw CocoaError(.propertyListReadCorrupt)
+        }
+        let release = String(referenceLine[releaseStart.upperBound..<releaseEnd])
+        guard !release.isEmpty else { throw CocoaError(.propertyListReadCorrupt) }
+        return Self(referenceRevision: revision, release: release)
+    }
+}
+
+private func pinnedVersion() throws -> ReleaseVersion {
+    try #require(ReleaseVersion(OpenGrokDistributionSupport.referencePinnedRelease))
+}
 
 @Suite("Release version and tag rules")
 struct ReleaseVersionTests {
@@ -65,24 +100,25 @@ struct ReleaseVersionTests {
 
     @Test("tag must agree with OPEN_GROK_VERSION, as the release workflow requires")
     func tagAnchoring() {
+        let release = OpenGrokDistributionSupport.referencePinnedRelease
         #expect(ReleaseVersion.tagMatchesVersionFile(
-            tag: "v0.1.220-open-grok.53",
-            versionFileContents: "0.1.220-open-grok.53\n"
+            tag: "v\(release)",
+            versionFileContents: "\(release)\n"
         ))
         // The workflow reads only the first line and trims it.
         #expect(ReleaseVersion.tagMatchesVersionFile(
-            tag: "v0.1.220-open-grok.53",
-            versionFileContents: "0.1.220-open-grok.53\r\ntrailing junk\n"
+            tag: "v\(release)",
+            versionFileContents: "\(release)\r\ntrailing junk\n"
         ))
         // A tag naming a different release must not pass.
         #expect(!ReleaseVersion.tagMatchesVersionFile(
             tag: "v0.1.220-open-grok.21",
-            versionFileContents: "0.1.220-open-grok.53\n"
+            versionFileContents: "\(release)\n"
         ))
         // A tag without the `v` prefix is not the tag form the workflow creates.
         #expect(!ReleaseVersion.tagMatchesVersionFile(
-            tag: "0.1.220-open-grok.53",
-            versionFileContents: "0.1.220-open-grok.53\n"
+            tag: release,
+            versionFileContents: "\(release)\n"
         ))
     }
 }
@@ -253,7 +289,7 @@ struct ReleaseChecksumTests {
 struct ReleaseArtifactLayoutTests {
     @Test("the macOS asset set matches what the reference builder stages")
     func macOSReferenceAssets() throws {
-        let version = try #require(ReleaseVersion("0.1.220-open-grok.53"))
+        let version = try pinnedVersion()
         let layout = ReleaseArtifactLayout(platform: .macOSAppleSilicon, version: version)
         #expect(layout.referenceAssetNames == [
             "open-grok-macos-aarch64",
@@ -266,7 +302,7 @@ struct ReleaseArtifactLayoutTests {
 
     @Test("the Windows asset set matches what the reference builder stages")
     func windowsReferenceAssets() throws {
-        let version = try #require(ReleaseVersion("0.1.220-open-grok.53"))
+        let version = try pinnedVersion()
         let layout = ReleaseArtifactLayout(platform: .windowsX86_64, version: version)
         #expect(layout.referenceAssetNames == [
             "open-grok-windows-x86_64.exe",
@@ -279,7 +315,7 @@ struct ReleaseArtifactLayoutTests {
 
     @Test("NOTICE is port-added, not part of the reference asset set")
     func noticeIsPortAdded() throws {
-        let version = try #require(ReleaseVersion("0.1.220-open-grok.53"))
+        let version = try pinnedVersion()
         let layout = ReleaseArtifactLayout(platform: .macOSAppleSilicon, version: version)
         #expect(!layout.referenceAssetNames.contains("NOTICE"))
         #expect(layout.assetNames.contains("NOTICE"))
@@ -295,11 +331,11 @@ struct ReleaseArtifactLayoutTests {
 
     @Test("base URL resolution follows install.sh's three-way branch")
     func baseURLResolution() throws {
-        let version = try #require(ReleaseVersion("0.1.220-open-grok.53"))
+        let version = try pinnedVersion()
 
         #expect(
             ReleaseArtifactLayout.releaseBaseURL(overrideBaseURL: nil, version: version)
-                == "https://github.com/mweinbach/open-grok/releases/download/v0.1.220-open-grok.53"
+                == "https://github.com/mweinbach/open-grok/releases/download/v\(version.value)"
         )
         #expect(
             ReleaseArtifactLayout.releaseBaseURL(overrideBaseURL: nil, version: nil)
@@ -418,15 +454,15 @@ struct InstallLayoutTests {
 
     @Test("versioned download name splices the version into the artifact name")
     func versionedDownloadName() throws {
-        let version = try #require(ReleaseVersion("0.1.220-open-grok.53"))
+        let version = try pinnedVersion()
         #expect(
             InstallLayout.versionedDownloadName(version: version, platform: .macOSAppleSilicon)
-                == "open-grok-0.1.220-open-grok.53-macos-aarch64"
+                == "open-grok-\(version.value)-macos-aarch64"
         )
         // Windows keeps `.exe` last so the staged file stays executable.
         #expect(
             InstallLayout.versionedDownloadName(version: version, platform: .windowsX86_64)
-                == "open-grok-0.1.220-open-grok.53-windows-x86_64.exe"
+                == "open-grok-\(version.value)-windows-x86_64.exe"
         )
 
         let layout = try InstallLayout.resolve(
@@ -435,7 +471,7 @@ struct InstallLayoutTests {
         ).get()
         #expect(
             layout.versionedDownloadPath(version: version, platform: .macOSAppleSilicon)
-                == "/tmp/home/downloads/open-grok-0.1.220-open-grok.53-macos-aarch64"
+                == "/tmp/home/downloads/open-grok-\(version.value)-macos-aarch64"
         )
     }
 }
@@ -579,9 +615,9 @@ struct CompletionsPackageTests {
 
     @Test("completions are not claimed as reference release assets")
     func completionsAreNotUpstream() throws {
-        // The Rust reference ships no completions at 80dff0a9; a parity check
+        // The Rust reference ships no completions at 9ed09e2a; a parity check
         // against upstream must not expect them in the published asset set.
-        let version = try #require(ReleaseVersion("0.1.220-open-grok.53"))
+        let version = try pinnedVersion()
         let layout = ReleaseArtifactLayout(platform: .macOSAppleSilicon, version: version)
         #expect(!layout.referenceAssetNames.contains { $0.contains("completion") })
         #expect(!layout.assetNames.contains { $0.contains("completion") })
@@ -591,14 +627,10 @@ struct CompletionsPackageTests {
 @Suite("Reference pin")
 struct ReferencePinTests {
     @Test("the target names the current pin and its release")
-    func pin() {
-        #expect(
-            OpenGrokDistributionSupport.referenceRevision
-                == "80dff0a9dcb24121b976b9f920fbe442af40ea88"
-        )
-        #expect(
-            ReleaseVersion(OpenGrokDistributionSupport.referencePinnedRelease)?.value
-                == "0.1.220-open-grok.53"
-        )
+    func pin() throws {
+        let baseline = try PortStatusBaseline.load()
+        #expect(OpenGrokDistributionSupport.referenceRevision == baseline.referenceRevision)
+        #expect(OpenGrokDistributionSupport.referencePinnedRelease == baseline.release)
+        #expect(ReleaseVersion(OpenGrokDistributionSupport.referencePinnedRelease) != nil)
     }
 }

@@ -26,6 +26,30 @@ public enum LiveCredentialSource: String, Sendable, Equatable, Hashable {
     case storedAPIKey
     case storedSession
     case codexOAuth
+    case namedAuthProvider
+}
+
+/// Non-secret auth facts that the live composition needs for telemetry gates.
+///
+/// API-key and deployment-key credentials intentionally carry the empty
+/// context: a ZDR team is an OAuth/account fact, not a property inferred from
+/// an arbitrary bearer string.
+public struct ProviderTelemetryContext: Sendable, Equatable {
+    public let zeroDataRetention: Bool
+    public let userID: String?
+    public let teamID: String?
+
+    public init(
+        zeroDataRetention: Bool = false,
+        userID: String? = nil,
+        teamID: String? = nil
+    ) {
+        self.zeroDataRetention = zeroDataRetention
+        self.userID = userID
+        self.teamID = teamID
+    }
+
+    public static let empty = ProviderTelemetryContext()
 }
 
 /// A resolved outbound credential plus the binding the provider session needs.
@@ -38,6 +62,7 @@ public struct LiveResolvedCredential: Sendable {
     public let bearer: String
     /// Identity headers that must accompany the bearer (Codex account pinning).
     public let extraHeaders: [String: String]
+    public let telemetryContext: ProviderTelemetryContext
     public let binding: ProviderCredentialBinding
 
     public init(
@@ -47,6 +72,7 @@ public struct LiveResolvedCredential: Sendable {
         authKind: BuiltInSessionAuthKind,
         bearer: String,
         extraHeaders: [String: String] = [:],
+        telemetryContext: ProviderTelemetryContext = .empty,
         binding: ProviderCredentialBinding
     ) {
         self.provider = provider
@@ -55,6 +81,7 @@ public struct LiveResolvedCredential: Sendable {
         self.authKind = authKind
         self.bearer = bearer
         self.extraHeaders = extraHeaders
+        self.telemetryContext = telemetryContext
         self.binding = binding
     }
 }
@@ -191,10 +218,13 @@ public struct LiveCredentialResolver: Sendable {
             config: config,
             environment: environment
         )
+        let resolvedExplicitAPIKey = config.apiKeyAuthDisabled(environment: environment)
+            ? nil
+            : explicitAPIKey
         let precedence = await resolveCredentialPrecedence(
             manager: manager,
             environment: environment,
-            explicitAPIKey: explicitAPIKey
+            explicitAPIKey: resolvedExplicitAPIKey
         )
         let credentials = precedence.resolved
 
@@ -216,7 +246,7 @@ public struct LiveCredentialResolver: Sendable {
             )
         }
 
-        if let explicitAPIKey, bearer == explicitAPIKey {
+        if let resolvedExplicitAPIKey, bearer == resolvedExplicitAPIKey {
             return Self.apiKeyCredential(
                 provider: .xai,
                 scope: scope,
@@ -242,6 +272,11 @@ public struct LiveCredentialResolver: Sendable {
             source: .storedSession,
             authKind: .xaiSession,
             bearer: bearer,
+            telemetryContext: ProviderTelemetryContext(
+                zeroDataRetention: session?.isZDRTeam == true,
+                userID: session?.userID.isEmpty == false ? session?.userID : nil,
+                teamID: session?.teamID
+            ),
             binding: ProviderCredentialBinding(
                 scope: scope,
                 kind: .xaiSession,

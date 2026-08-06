@@ -51,6 +51,29 @@ private actor InertShellBackend: ShellProcessBackend {
     func shellCWD() async -> URL? { nil }
 }
 
+private final class SamplingRequestRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [OpenGrokLiveSamplingRequest] = []
+
+    func append(_ request: OpenGrokLiveSamplingRequest) {
+        lock.lock()
+        requests.append(request)
+        lock.unlock()
+    }
+
+    var firstToolNames: Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return Set(requests.first?.tools.map(\.name) ?? [])
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests.count
+    }
+}
+
 /// A workspace with a fully isolated `$OPENGROK_HOME` / `$HOME`, so nothing
 /// reads or writes the developer's real memory tree or session store.
 private struct LiveWorkspace {
@@ -110,6 +133,12 @@ private struct LiveWorkspace {
         try? Data(contents.utf8).write(to: url)
     }
 
+    func writeUserConfig(_ contents: String) {
+        try? Data(contents.utf8).write(
+            to: grokHome.appendingPathComponent("config.toml")
+        )
+    }
+
     func read(_ relative: String) -> String? {
         try? String(contentsOf: root.appendingPathComponent(relative), encoding: .utf8)
     }
@@ -134,20 +163,23 @@ private func makeLiveExecutor(
     record: LiveConversationRecord = LiveConversationRecord.new(
         sessionID: "live-session",
         workingDirectory: URL(fileURLWithPath: "/tmp")
-    )
+    ),
+    noMemory: Bool = false
 ) async throws -> (LiveToolExecutor, LiveSessionServices) {
     let services = await OpenGrokLiveApplicationLauncher.makeSessionServices(
         sessionID: "live-session",
         workingDirectory: workspace.root,
         openGrokHome: workspace.grokHome,
         conversationRecord: record,
-        environment: workspace.environment
+        environment: workspace.environment,
+        noMemory: noMemory
     )
     let executor = try await LiveToolExecutor(
         processBackend: InertShellBackend(),
         sessionID: "live-session",
         workingDirectory: workspace.root,
         toolPolicy: nil,
+        telemetryBootstrapContext: .empty,
         fileAccessPolicy: .allowAll,
         environment: workspace.environment,
         sessionServices: services
@@ -206,6 +238,64 @@ struct LiveSessionServicesReachabilityTests {
         )
         #expect(services.memory != nil)
         #expect(services.toolSpecs.contains { $0.name == "memory_search" })
+    }
+
+    @Test("--no-memory disables config-enabled memory before tool advertisement")
+    func noMemoryFlagDisablesConfiguredMemory() async throws {
+        let workspace = LiveWorkspace(memoryEnabled: false)
+        workspace.writeUserConfig("[memory]\nenabled = true\n")
+        defer { workspace.cleanup() }
+
+        let (executor, services) = try await makeLiveExecutor(workspace, noMemory: true)
+        #expect(services.memory == nil)
+        let advertised = Set(executor.tools.map(\.name))
+        #expect(!advertised.contains("memory_search"))
+        #expect(!advertised.contains("memory_get"))
+    }
+
+    @Test("--no-memory reaches the launcher and removes configured memory tools")
+    func noMemoryFlagReachesLiveLauncher() async throws {
+        let workspace = LiveWorkspace(memoryEnabled: false)
+        workspace.writeUserConfig("[memory]\nenabled = true\n")
+        defer { workspace.cleanup() }
+
+        let recorder = SamplingRequestRecorder()
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in
+                OpenGrokLiveSampler { request, emit in
+                    recorder.append(request)
+                    await emit(.output("memory disabled"))
+                    return OpenGrokLiveSamplingResponse(
+                        output: "memory disabled",
+                        stopReason: "stop"
+                    )
+                }
+            }
+        )
+        let application = OpenGrokApplication.live(
+            dependencies: dependencies,
+            control: .never
+        )
+        let (streams, _, _) = CLIStreams.buffered()
+        var environment = workspace.environment
+        environment["XAI_API_KEY"] = "test-key"
+
+        let code = await CLIRunner.run(
+            [
+                "headless",
+                "--no-memory",
+                "--prompt", "verify memory opt-out",
+                "--cwd", workspace.root.path
+            ],
+            environment: environment,
+            streams: streams,
+            application: application
+        )
+
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(recorder.count > 0)
+        #expect(!recorder.firstToolNames.contains("memory_search"))
+        #expect(!recorder.firstToolNames.contains("memory_get"))
     }
 
     @Test("memory tools are absent when memory is off, rather than present and refusing")
@@ -367,6 +457,7 @@ struct LiveSessionServicesReachabilityTests {
             sessionID: "live-session",
             workingDirectory: workspace.root,
             toolPolicy: nil,
+            telemetryBootstrapContext: .empty,
             fileAccessPolicy: .allowAll,
             environment: workspace.environment,
             sessionServices: services

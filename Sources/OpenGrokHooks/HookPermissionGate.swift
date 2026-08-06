@@ -123,7 +123,11 @@ public final class HookPermissionGate: PreToolUseHookRunner, @unchecked Sendable
 
     /// Turn-end `Stop` dispatch. Returns the blocks and additional context the
     /// session should feed back before ending the turn.
-    public func runStop(event: HookEvent = .stop, promptId: String? = nil) async -> StopDispatchResult {
+    public func runStop(
+        event: HookEvent = .stop,
+        promptId: String? = nil,
+        payload: [String: HookJSONValue] = [:]
+    ) async -> StopDispatchResult {
         guard dispatcher.registry.hasEnabledHooks(
             for: event,
             disabledNames: dispatcher.disabledNames
@@ -137,7 +141,8 @@ public final class HookPermissionGate: PreToolUseHookRunner, @unchecked Sendable
             workspaceRoot: context.workspaceRoot.path,
             transcriptPath: context.transcriptPath,
             clientIdentifier: context.clientIdentifier,
-            promptId: promptId
+            promptId: promptId,
+            payload: payload
         )
         let result = await dispatcher.dispatchStop(
             event: event,

@@ -5,7 +5,7 @@
 // Applied once at process startup. Covers in-process filesystem access and
 // child processes via platform backends:
 //   * macOS Seatbelt (`sandbox_init` + SBPL)
-//   * Linux Landlock probe + bubblewrap re-exec plan
+//   * Linux bubblewrap capability probe + process-replacing re-exec
 //   * Windows restricted-token / Job Object seams (typed unsupported)
 //
 // YOLO (`--dangerously-skip-permissions`) affects permission prompts only and

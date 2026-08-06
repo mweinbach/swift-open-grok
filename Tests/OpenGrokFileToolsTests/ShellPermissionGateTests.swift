@@ -41,6 +41,13 @@ private struct DenyingHook: PreToolUseHookRunner {
     }
 }
 
+private struct ForcedAskClassifier: PermissionClassifier {
+    func classify(access: AccessKind, toolName: String) async -> PermissionDecision {
+        _ = (access, toolName)
+        return .ask
+    }
+}
+
 private func bashRequest(_ command: String) -> PrepareToolAccessRequest {
     PrepareToolAccessRequest(
         access: .bash(command),
@@ -211,6 +218,63 @@ struct ShellPermissionGateTests {
             toolCallId: "c"
         ))
         #expect(edit.mayDispatch == false)
+    }
+
+    @Test("an active sandbox auto-allows a parseable command without prompting")
+    func sandboxAutoAllowsEligibleBash() async {
+        let prompter = RecordingPrompter(answer: .reject("should not be asked"))
+        let pipeline = FileToolSession.makePipeline(
+            policy: .prompt(prompter),
+            workspaceRoot: "/work",
+            sandboxAutoAllowBash: { true }
+        )
+
+        let prepared = await pipeline.prepare(bashRequest("printf hi"))
+        #expect(prepared.mayDispatch)
+        #expect(await prompter.recorded().isEmpty)
+        let events = await pipeline.permissions.events
+        #expect(events.last?.decisionReason == "sandbox_auto")
+    }
+
+    @Test("sandbox auto-allow preserves policy asks and Bash request floors")
+    func sandboxAutoPreservesPolicyAndFloors() async {
+        let prompter = RecordingPrompter(answer: .reject("prompted"))
+        let pipeline = FileToolSession.makePipeline(
+            policy: .prompt(prompter),
+            workspaceRoot: "/work",
+            resolved: resolved([
+                PermissionRule(action: .ask, tool: .bash, pattern: "printf", source: .config)
+            ]),
+            sandboxAutoAllowBash: { true }
+        )
+
+        let policyAsk = await pipeline.prepare(bashRequest("printf hi"))
+        #expect(policyAsk.mayDispatch == false)
+
+        #expect(bashSandboxAutoAllow("echo hi > /work/output.txt") == false)
+        let writeFloor = await pipeline.prepare(bashRequest("echo hi > /work/output.txt"))
+        #expect(writeFloor.mayDispatch == false)
+
+        let opaqueFloor = await pipeline.prepare(bashRequest("echo $(pwd)"))
+        #expect(opaqueFloor.mayDispatch == false)
+
+        #expect(await prompter.recorded().count == 3)
+    }
+
+    @Test("auto classifier forced prompt outranks sandbox auto-allow")
+    func classifierForcedPromptWins() async {
+        let prompter = RecordingPrompter(answer: .reject("classifier forced prompt"))
+        let pipeline = FileToolSession.makePipeline(
+            policy: .prompt(prompter),
+            workspaceRoot: "/work",
+            sandboxAutoAllowBash: { true }
+        )
+        await pipeline.permissions.setAutoMode(true)
+        await pipeline.permissions.setClassifier(ForcedAskClassifier())
+
+        let prepared = await pipeline.prepare(bashRequest("printf hi"))
+        #expect(prepared.mayDispatch == false)
+        #expect(await prompter.recorded() == ["printf hi"])
     }
 
     @Test("additionalDirectories widen the session's allowed roots")

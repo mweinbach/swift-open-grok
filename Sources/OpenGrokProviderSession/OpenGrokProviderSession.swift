@@ -155,6 +155,10 @@ public struct ProviderCredentialBinding: Sendable {
         return snapshot.deploymentID ?? snapshot.apiKeyID ?? snapshot.userID ?? snapshot.teamID
     }
 
+    /// Narrow live-composition seam for transport middleware. The provider
+    /// remains owned by the binding; callers receive only the auth protocol.
+    public var authCredentialProvider: any AuthCredentialProvider { source }
+
     fileprivate var credentialProvider: any AuthCredentialProvider { source }
 }
 
@@ -169,6 +173,7 @@ public struct ProviderSessionConfiguration: Sendable {
     public let retryPolicy: RetryPolicy
     public let openGrokHome: URL
     public let environment: [String: String]
+    public let everUsedNonXAI: Bool?
 
     public init(
         sessionID: String,
@@ -180,7 +185,8 @@ public struct ProviderSessionConfiguration: Sendable {
         toolRequest: ProviderToolRequest = ProviderToolRequest(),
         retryPolicy: RetryPolicy = .default,
         openGrokHome: URL? = nil,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        everUsedNonXAI: Bool? = false
     ) {
         self.sessionID = sessionID
         self.modelCatalog = modelCatalog
@@ -193,6 +199,7 @@ public struct ProviderSessionConfiguration: Sendable {
         self.environment = environment
         self.openGrokHome = openGrokHome
             ?? ProviderSession.defaultOpenGrokHome(environment: environment)
+        self.everUsedNonXAI = everUsedNonXAI
     }
 
     public init(
@@ -205,7 +212,8 @@ public struct ProviderSessionConfiguration: Sendable {
         toolRequest: ProviderToolRequest = ProviderToolRequest(),
         retryPolicy: RetryPolicy = .default,
         openGrokHome: URL? = nil,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        everUsedNonXAI: Bool? = false
     ) {
         self.init(
             sessionID: sessionID,
@@ -217,7 +225,8 @@ public struct ProviderSessionConfiguration: Sendable {
             toolRequest: toolRequest,
             retryPolicy: retryPolicy,
             openGrokHome: openGrokHome,
-            environment: environment
+            environment: environment,
+            everUsedNonXAI: everUsedNonXAI
         )
     }
 }
@@ -535,6 +544,7 @@ public actor ProviderSession {
         self.toolRequest = configuration.toolRequest
         self.retryPolicy = configuration.retryPolicy
         self.environment = configuration.environment
+        let persistedBoundary = configuration.everUsedNonXAI ?? true
         let initial = try ProviderSession.resolveRoute(
             candidates: [configuration.initialModelID] + configuration.fallbackModelIDs,
             catalog: configuration.modelCatalog,
@@ -542,11 +552,11 @@ public actor ProviderSession {
             toolRequest: configuration.toolRequest,
             retryPolicy: configuration.retryPolicy,
             environment: configuration.environment,
-            everUsedNonXAI: false
+            everUsedNonXAI: persistedBoundary
         )
         self.route = initial.route
         self.state = .ready(modelID: initial.route.modelID, provider: initial.route.provider, generation: 0)
-        self.everUsedNonXAI = !initial.route.profile.isXai
+        self.everUsedNonXAI = persistedBoundary || !initial.route.profile.isXai
     }
 
     public init(

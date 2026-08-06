@@ -73,6 +73,114 @@ private final class ParityTerminalFixture: @unchecked Sendable {
     }
 }
 
+@Suite("Wave 11 new-session reachability")
+struct Wave11NewSessionCompositionTests {
+    @Test("interactive /new rotates the live session and provider history")
+    func interactiveNewSessionResetsProviderHistory() async throws {
+        let terminal = ParityTerminalFixture(
+            tty: true,
+            size: OpenGrokLiveTerminalSize(width: 80, height: 20)
+        )
+        let sampler = ParitySamplerFixture(responses: [
+            "first session prompt": OpenGrokLiveSamplingResponse(output: "first session answer"),
+            "second session prompt": OpenGrokLiveSamplingResponse(output: "second session answer")
+        ])
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let input = AsyncThrowingStream<InputEvent, Error> { continuation in
+            Task {
+                for event in Self.typed("first session prompt") {
+                    continuation.yield(event)
+                }
+                continuation.yield(.key(KeyEvent(key: .enter)))
+                await Self.waitForTerminalOutput("first session answer", terminal: terminal)
+                continuation.yield(.paste("/new"))
+                continuation.yield(.key(KeyEvent(key: .enter)))
+                for event in Self.typed("second session prompt") {
+                    continuation.yield(event)
+                }
+                continuation.yield(.key(KeyEvent(key: .enter)))
+                await Self.waitForTerminalOutput("second session answer", terminal: terminal)
+                continuation.yield(.key(KeyEvent(
+                    key: .char("d"),
+                    modifiers: .control,
+                    character: "d"
+                )))
+                continuation.finish()
+            }
+        }
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() },
+            terminal: terminal.terminal,
+            makeInteractiveInput: {
+                OpenGrokLiveInteractiveInput(events: input, close: {})
+            },
+            makeTerminalSink: {
+                ParityTerminalSink(terminal: terminal)
+            }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, err) = CLIStreams.buffered()
+
+        let code = await CLIRunner.run(
+            ["interactive", "--cwd", root.path],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let requests = sampler.recordedRequests
+        let sessionFiles = (try? FileManager.default.contentsOfDirectory(
+            at: root.appendingPathComponent("state/sessions"),
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "json" }) ?? []
+        let firstItems = requests.first?.items ?? []
+        let secondItems = requests.dropFirst().first?.items ?? []
+        func userTexts(_ items: [ConversationItem]) -> [String] {
+            items.compactMap { item in
+                guard case .user(let user) = item else { return nil }
+                return user.content.compactMap { part in
+                    guard case .text(let text) = part else { return nil }
+                    return text
+                }.joined()
+            }
+        }
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(out.contents.isEmpty)
+        #expect(err.contents.isEmpty)
+        #expect(requests.count == 2)
+        guard requests.count == 2 else { return }
+        #expect(requests[0].sessionID != requests[1].sessionID)
+        #expect(userTexts(firstItems).contains("first session prompt"))
+        #expect(userTexts(secondItems).contains("second session prompt"))
+        #expect(userTexts(secondItems).contains("first session prompt") == false)
+        #expect(sessionFiles.count == 2)
+    }
+
+    private static func typed(_ text: String) -> [InputEvent] {
+        text.map { character in
+            .key(KeyEvent(key: .char(character), character: character))
+        }
+    }
+
+    private static func waitForTerminalOutput(
+        _ text: String,
+        terminal: ParityTerminalFixture
+    ) async {
+        for _ in 0..<1_000 {
+            if terminal.output.contains(text) {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+}
+
 private final class ParityTerminalSink: PagerTerminalSink {
     let capabilities = PagerTerminalCapabilities.standard
     private let terminal: ParityTerminalFixture
@@ -265,6 +373,35 @@ private final class ParityToolLoopSamplerFixture: @unchecked Sendable {
                 return result
             }.last
             let answer = "final answer after \(toolResult?.content ?? "missing tool result")"
+            await emit(.output(answer))
+            return OpenGrokLiveSamplingResponse(output: answer, stopReason: "stop")
+        }
+    }
+
+    private func record(_ request: OpenGrokLiveSamplingRequest) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let index = requests.count
+        requests.append(request)
+        return index
+    }
+}
+
+private final class ParityStopHookSamplerFixture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [OpenGrokLiveSamplingRequest] = []
+
+    var recordedRequests: [OpenGrokLiveSamplingRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+
+    func makeSampler() -> OpenGrokLiveSampler {
+        let fixture = self
+        return OpenGrokLiveSampler { request, emit in
+            let index = fixture.record(request)
+            let answer = index == 0 ? "first answer" : "final answer"
             await emit(.output(answer))
             return OpenGrokLiveSamplingResponse(output: answer, stopReason: "stop")
         }
@@ -995,6 +1132,127 @@ struct ParityCompositionTests {
         #expect(processRequests.first?.ownerSessionID != nil)
     }
 
+    @Test("live headless composition re-enters after a Stop hook block")
+    func liveStopHookContinuationComposition() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let state = root.appendingPathComponent("stop-count")
+        let envelopeDirectory = root.appendingPathComponent("stop-envelopes")
+        try FileManager.default.createDirectory(at: envelopeDirectory, withIntermediateDirectories: true)
+        let hookScript = root.appendingPathComponent("stop-hook.sh")
+        try """
+        #!/bin/sh
+        count=0
+        if [ -f '\(state.path)' ]; then count=$(cat '\(state.path)'); fi
+        count=$((count + 1))
+        printf '%s' "$count" > '\(state.path)'
+        cat > "\(envelopeDirectory.path)/$count.json"
+        if [ "$count" -eq 1 ]; then
+          printf '%s' '{"decision":"block","reason":"please verify","hookSpecificOutput":{"additionalContext":"include test evidence"}}'
+        else
+          printf '%s' '{"decision":"allow"}'
+        fi
+        """.write(to: hookScript, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: hookScript.path
+        )
+        let hooksDirectory = root.appendingPathComponent("state/hooks")
+        try FileManager.default.createDirectory(at: hooksDirectory, withIntermediateDirectories: true)
+        try """
+        {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"\(hookScript.path)"}]}]}}
+        """.write(
+            to: hooksDirectory.appendingPathComponent("stop.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let sampler = ParityStopHookSamplerFixture()
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, _) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            ["headless", "--prompt", "stop-hook prompt", "--cwd", root.path],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let requests = sampler.recordedRequests
+        let envelopes = (1...2).compactMap { index -> [String: Any]? in
+            let data = try? Data(contentsOf: envelopeDirectory.appendingPathComponent("\(index).json"))
+            return data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        }
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(out.contents.contains("final answer"))
+        #expect(requests.count == 2)
+        #expect(envelopes.count == 2)
+        guard requests.count == 2, envelopes.count == 2 else { return }
+        #expect(envelopes[0]["hookEventName"] as? String == "stop")
+        #expect(envelopes[0]["reason"] as? String == "end_turn")
+        #expect(envelopes[0]["stopHookActive"] as? Bool == false)
+        #expect(envelopes[0]["promptId"] as? String != nil)
+        #expect(envelopes[0]["lastAssistantMessage"] as? String == "first answer")
+        #expect(envelopes[1]["stopHookActive"] as? Bool == true)
+        #expect(requests[1].items.contains { item in
+            let text = item.textContent()
+            return text.contains("please verify") && text.contains("include test evidence")
+        })
+    }
+
+    @Test("live headless Stop force-stop ends without a continuation request")
+    func liveStopHookForceStopComposition() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let hooksDirectory = root.appendingPathComponent("state/hooks")
+        try FileManager.default.createDirectory(at: hooksDirectory, withIntermediateDirectories: true)
+        let hookScript = root.appendingPathComponent("force-stop-hook.sh")
+        try """
+        #!/bin/sh
+        printf '%s' '{"decision":"block","reason":"do not continue","continue":false,"stopReason":"forced stop"}'
+        """.write(to: hookScript, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: hookScript.path
+        )
+        try """
+        {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"\(hookScript.path)"}]}]}}
+        """.write(
+            to: hooksDirectory.appendingPathComponent("stop.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let sampler = ParityStopHookSamplerFixture()
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, out, _) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            ["headless", "--prompt", "force-stop prompt", "--cwd", root.path],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "XAI_API_KEY": "test-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(out.contents.contains("first answer"))
+        #expect(sampler.recordedRequests.count == 1)
+    }
+
     @Test("live tool rounds execute concurrently and preserve result order")
     func liveParallelToolLoopComposition() async {
         let backend = ParityConcurrentShellCommandBackend()
@@ -1461,6 +1719,8 @@ struct ParityCompositionTests {
     /// Runs an interactive session with a scripted key sequence and no turn,
     /// returning everything written to the terminal.
     private func runInteractiveOverlaySession(
+        configuration: String? = nil,
+        environmentOverrides: [String: String] = [:],
         script: @escaping @Sendable (
             ParityTerminalFixture,
             AsyncThrowingStream<InputEvent, Error>.Continuation
@@ -1469,6 +1729,15 @@ struct ParityCompositionTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let state = root.appendingPathComponent("state")
+        try? FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        if let configuration {
+            try? configuration.write(
+                to: state.appendingPathComponent("config.toml"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
         let sampler = ParitySamplerFixture(responses: [:])
         let terminal = ParityTerminalFixture(
             tty: true,
@@ -1495,13 +1764,15 @@ struct ParityCompositionTests {
         )
         let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
         let (streams, _, _) = CLIStreams.buffered()
+        var environment = [
+            "HOME": root.path,
+            "OPENGROK_HOME": state.path,
+            "XAI_API_KEY": "test-key"
+        ]
+        environment.merge(environmentOverrides) { _, override in override }
         let code = await CLIRunner.run(
             ["interactive", "--cwd", root.path],
-            environment: [
-                "HOME": root.path,
-                "OPENGROK_HOME": root.appendingPathComponent("state").path,
-                "XAI_API_KEY": "test-key"
-            ],
+            environment: environment,
             streams: streams,
             application: application
         )
@@ -1596,18 +1867,31 @@ struct ParityCompositionTests {
         #expect(!outcome.painted.contains("Select model"))
     }
 
-    /// The bare display name is shared by two providers in the embedded
-    /// catalog, so it must be refused rather than resolving to whichever entry
-    /// happens to sort first.
+    /// A bare display name shared by two configured rows must be refused rather
+    /// than resolving to whichever entry happens to sort first.
     @Test("/model refuses an ambiguous bare name")
     func liveInteractiveAmbiguousModelSelector() async {
-        let outcome = await runInteractiveOverlaySession { terminal, continuation in
+        let outcome = await runInteractiveOverlaySession(configuration: """
+        [model.ambiguous_one]
+        model = "ambiguous-one"
+        name = "Ambiguous Fixture Model"
+        provider = "xai"
+        base_url = "https://api.x.ai/v1"
+        api_backend = "chat_completions"
+
+        [model.ambiguous_two]
+        model = "ambiguous-two"
+        name = "Ambiguous Fixture Model"
+        provider = "xai"
+        base_url = "https://api.x.ai/v1"
+        api_backend = "chat_completions"
+        """) { terminal, continuation in
             await Self.waitForPaintedText("Build anything", terminal: terminal)
-            continuation.yield(.paste("/model Kimi K3"))
+            continuation.yield(.paste("/model Ambiguous Fixture Model"))
             continuation.yield(.key(KeyEvent(key: .enter)))
             await Self.waitForPaintedText("Unknown model", terminal: terminal)
         }
-        #expect(outcome.output.contains("Unknown model: Kimi K3"))
+        #expect(outcome.output.contains("Unknown model: Ambiguous Fixture Model"))
         #expect(!outcome.painted.contains("Select model"))
     }
 
@@ -1741,6 +2025,330 @@ struct ParityCompositionTests {
         ))
     }
 
+    @Test("live resume restores the stored non-xAI provider instead of ambient xAI")
+    func liveSessionResumeRestoresStoredProvider() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let workspace = root.appendingPathComponent("workspace")
+        let state = root.appendingPathComponent("state")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+
+        let fixture = ParitySamplingConfigurationFixture()
+        let application = OpenGrokApplication.live(
+            dependencies: OpenGrokLiveCompositionDependencies(
+                makeSampler: fixture.makeSampler(configuration:)
+            ),
+            control: .never
+        )
+        let environment = [
+            "HOME": root.path,
+            "OPENGROK_HOME": state.path,
+            "XAI_API_KEY": "ambient-xai-key",
+            "OPENAI_API_KEY": "codex-key"
+        ]
+
+        let (firstStreams, _, _) = CLIStreams.buffered()
+        let firstCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "codex question",
+                "--provider", "codex",
+                "--cwd", workspace.path,
+                "--session-id", "stored-codex"
+            ],
+            environment: environment,
+            streams: firstStreams,
+            application: application
+        )
+        let storedBeforeResume = try await LiveConversationStore(openGrokHome: state)
+            .load(sessionID: "stored-codex")
+        let (resumeStreams, resumeOut, resumeErr) = CLIStreams.buffered()
+        let resumeCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "resumed question",
+                "--resume", "stored-codex",
+                "--cwd", workspace.path
+            ],
+            environment: environment,
+            streams: resumeStreams,
+            application: application
+        )
+
+        let configurations = fixture.recordedConfigurations
+        #expect(firstCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(storedBeforeResume.currentModelID == "gpt-5.6-sol")
+        #expect(storedBeforeResume.currentProvider == .codex)
+        #expect(resumeCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(resumeErr.contents.isEmpty)
+        #expect(resumeOut.contents == "provider answer\n")
+        #expect(configurations.count == 2)
+        #expect(configurations.allSatisfy { $0.provider == .codex })
+        #expect(configurations.allSatisfy { $0.provider != .xai })
+        #expect(try await LiveConversationStore(openGrokHome: state).load(sessionID: "stored-codex").currentProvider == .codex)
+        #expect(try await LiveConversationStore(openGrokHome: state).load(sessionID: "stored-codex").everUsedNonXAI == true)
+    }
+
+    @Test("explicit xAI resume neutralizes opaque history before sampling and persistence")
+    func liveResumeNeutralizesOpaqueHistoryForXAI() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let workspace = root.appendingPathComponent("workspace")
+        let state = root.appendingPathComponent("state")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+
+        let toolCall = ToolCall(id: "call-1", name: "read", arguments: "{}")
+        let opaqueItems: [ConversationItem] = [
+            .system("system spine"),
+            .user("old question"),
+            .reasoning(ReasoningItem(id: "reasoning-1")),
+            .backendToolCall(BackendToolCallItem(kind: .webSearch(
+                WebSearchToolCall(id: "backend-1", action: .search(query: "secret"))
+            ))),
+            .assistant(AssistantItem(content: "visible answer", toolCalls: [toolCall])),
+            .toolResult(ToolResultItem(toolCallId: "call-1", content: "opaque result"))
+        ]
+        var record = LiveConversationRecord.new(sessionID: "opaque-resume", workingDirectory: workspace)
+        record.items = opaqueItems
+        record.currentModelID = "gpt-5.6-sol"
+        record.currentProvider = .codex
+        record.everUsedNonXAI = true
+        try await LiveConversationStore(openGrokHome: state).save(record)
+
+        let sampler = ParitySamplerFixture(responses: [
+            "xAI question": OpenGrokLiveSamplingResponse(output: "xAI answer")
+        ])
+        let application = OpenGrokApplication.live(
+            dependencies: OpenGrokLiveCompositionDependencies(
+                makeSampler: { _ in sampler.makeSampler() }
+            ),
+            control: .never
+        )
+        let (streams, _, _) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            [
+                "headless", "--prompt", "xAI question",
+                "--model", "grok-4.5",
+                "--resume", "opaque-resume",
+                "--cwd", workspace.path
+            ],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": state.path,
+                "XAI_API_KEY": "xai-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let request = try #require(sampler.recordedRequests.first)
+        let saved = try await LiveConversationStore(openGrokHome: state).load(sessionID: "opaque-resume")
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(request.items == [
+            .system("system spine"),
+            .user("old question"),
+            .assistant(AssistantItem(content: "visible answer")),
+            .user("xAI question")
+        ])
+        #expect(saved.items == [
+            .system("system spine"),
+            .user("old question"),
+            .assistant(AssistantItem(content: "visible answer")),
+            .user("xAI question")
+        ] + [.assistant(AssistantItem(content: "xAI answer"))])
+        #expect(saved.currentProvider == .xai)
+        #expect(saved.everUsedNonXAI == true)
+    }
+
+    @Test("legacy resume strips opaque carriers without inventing a clean export marker")
+    func legacyResumePreservesUnknownExportMarker() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let workspace = root.appendingPathComponent("workspace")
+        let state = root.appendingPathComponent("state")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        var record = LiveConversationRecord.new(sessionID: "legacy-resume", workingDirectory: workspace)
+        record.items = [
+            .user("legacy question"),
+            .reasoning(ReasoningItem(id: "legacy-reasoning")),
+            .backendToolCall(BackendToolCallItem(kind: .webSearch(
+                WebSearchToolCall(id: "legacy-backend", action: .search(query: "legacy secret"))
+            ))),
+            .assistant(AssistantItem(content: "legacy answer", toolCalls: [
+                ToolCall(id: "legacy-call", name: "read", arguments: "{}")
+            ])),
+            .toolResult(ToolResultItem(toolCallId: "legacy-call", content: "legacy result"))
+        ]
+        record.currentModelID = nil
+        record.currentProvider = nil
+        record.everUsedNonXAI = nil
+        try await LiveConversationStore(openGrokHome: state).save(record)
+
+        let sampler = ParitySamplerFixture(responses: [
+            "legacy question": OpenGrokLiveSamplingResponse(output: "legacy response")
+        ])
+        let application = OpenGrokApplication.live(
+            dependencies: OpenGrokLiveCompositionDependencies(makeSampler: { _ in sampler.makeSampler() }),
+            control: .never
+        )
+        let (streams, _, _) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            [
+                "headless", "--prompt", "legacy question",
+                "--resume", "legacy-resume",
+                "--cwd", workspace.path
+            ],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": state.path,
+                "XAI_API_KEY": "xai-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let request = try #require(sampler.recordedRequests.first)
+        let saved = try await LiveConversationStore(openGrokHome: state).load(sessionID: "legacy-resume")
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(request.items.contains(where: { if case .reasoning = $0 { return true }; return false }) == false)
+        #expect(request.items.contains(where: { if case .toolResult = $0 { return true }; return false }) == false)
+        #expect(request.items.contains(where: { if case .backendToolCall = $0 { return true }; return false }) == false)
+        #expect(request.items.contains(where: {
+            if case .assistant(let assistant) = $0 { return !assistant.toolCalls.isEmpty }
+            return false
+        }) == false)
+        #expect(saved.items.contains(where: { if case .reasoning = $0 { return true }; return false }) == false)
+        #expect(saved.items.contains(where: { if case .backendToolCall = $0 { return true }; return false }) == false)
+        #expect(saved.items.contains(where: { if case .toolResult = $0 { return true }; return false }) == false)
+        #expect(saved.everUsedNonXAI == nil)
+    }
+
+    @Test("an explicitly xAI-targeted fork sanitizes only the child")
+    func explicitXAIConversationForkIsSourceSafe() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let workspace = root.appendingPathComponent("workspace")
+        let state = root.appendingPathComponent("state")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+
+        let call = ToolCall(id: "fork-call", name: "read", arguments: "{}")
+        let sourceItems: [ConversationItem] = [
+            .user("source question"),
+            .reasoning(ReasoningItem(id: "source-reasoning")),
+            .assistant(AssistantItem(content: "source answer", toolCalls: [call])),
+            .toolResult(ToolResultItem(toolCallId: "fork-call", content: "source result"))
+        ]
+        var source = LiveConversationRecord.new(sessionID: "fork-source", workingDirectory: workspace)
+        source.items = sourceItems
+        source.currentModelID = "gpt-5.6-sol"
+        source.currentProvider = .codex
+        source.everUsedNonXAI = true
+        let store = LiveConversationStore(openGrokHome: state)
+        try await store.save(source)
+
+        let sampler = ParitySamplerFixture(responses: [
+            "fork question": OpenGrokLiveSamplingResponse(output: "fork answer")
+        ])
+        let application = OpenGrokApplication.live(
+            dependencies: OpenGrokLiveCompositionDependencies(makeSampler: { _ in sampler.makeSampler() }),
+            control: .never
+        )
+        let (streams, _, _) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            [
+                "headless", "--prompt", "fork question",
+                "--model", "grok-4.5",
+                "--resume", "fork-source",
+                "--fork-session", "--session-id", "fork-child",
+                "--cwd", workspace.path
+            ],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": state.path,
+                "XAI_API_KEY": "xai-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let request = try #require(sampler.recordedRequests.first)
+        let savedSource = try await store.load(sessionID: "fork-source")
+        let savedChild = try await store.load(sessionID: "fork-child")
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(request.sessionID == "fork-child")
+        #expect(request.items == [
+            .user("source question"),
+            .assistant(AssistantItem(content: "source answer")),
+            .user("fork question")
+        ])
+        #expect(savedSource.items == sourceItems)
+        #expect(savedSource.currentProvider == .codex)
+        #expect(savedChild.currentProvider == .xai)
+        #expect(savedChild.everUsedNonXAI == true)
+    }
+
+    @Test("live session persistence pins sandbox mode on resume")
+    func liveSessionSandboxResumeDowngradeIsRefused() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let workspace = root.appendingPathComponent("workspace")
+        let state = root.appendingPathComponent("state")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+
+        let sampler = ParitySamplerFixture(responses: [
+            "create pinned session": OpenGrokLiveSamplingResponse(output: "created")
+        ])
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let environment = [
+            "HOME": root.path,
+            "OPENGROK_HOME": state.path,
+            "XAI_API_KEY": "test-key"
+        ]
+
+        let (createStreams, _, _) = CLIStreams.buffered()
+        let createCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "create pinned session",
+                "--cwd", workspace.path,
+                "--session-id", "pinned-session"
+            ],
+            environment: environment,
+            streams: createStreams,
+            application: application
+        )
+        let sessionURL = state.appendingPathComponent("sessions/pinned-session.json")
+        let persisted = try #require(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: sessionURL)) as? [String: Any]
+        )
+        #expect(createCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(persisted["sandbox_profile"] as? String == "off")
+
+        var pinned = persisted
+        pinned["sandbox_profile"] = "strict"
+        try JSONSerialization.data(withJSONObject: pinned, options: [.prettyPrinted, .sortedKeys])
+            .write(to: sessionURL, options: .atomic)
+
+        let (resumeStreams, resumeOut, resumeErr) = CLIStreams.buffered()
+        let resumeCode = await CLIRunner.run(
+            [
+                "headless", "--prompt", "must not sample",
+                "--cwd", workspace.path,
+                "--resume", "pinned-session",
+                "--sandbox", "off"
+            ],
+            environment: environment,
+            streams: resumeStreams,
+            application: application
+        )
+
+        #expect(resumeCode == CLIRunner.ExitCode.failure.rawValue)
+        #expect(resumeOut.contents.isEmpty)
+        #expect(resumeErr.contents.contains("cannot resume this session with sandbox profile 'off'"))
+        #expect(resumeErr.contents.contains("created with 'strict'"))
+        #expect(sampler.recordedRequests.count == 1)
+    }
+
     @Test("live continue selects the latest session for the working directory")
     func liveSessionContinueComposition() async {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -1811,32 +2419,30 @@ struct ParityCompositionTests {
         ])
     }
 
-    @Test("live session forks copy history without mutating the source")
+    @Test("live session forks copy route metadata, history, and rewind state")
     func liveSessionForkComposition() async {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let workspace = root.appendingPathComponent("workspace")
         let state = root.appendingPathComponent("state")
         defer { try? FileManager.default.removeItem(at: root) }
         try? FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
-        let sampler = ParitySamplerFixture(responses: [
-            "source question": OpenGrokLiveSamplingResponse(output: "source answer"),
-            "fork question": OpenGrokLiveSamplingResponse(output: "fork answer"),
-            "source follow-up": OpenGrokLiveSamplingResponse(output: "source follow-up answer")
-        ])
+        let sampler = ParitySamplingConfigurationFixture()
         let dependencies = OpenGrokLiveCompositionDependencies(
-            makeSampler: { _ in sampler.makeSampler() }
+            makeSampler: sampler.makeSampler(configuration:)
         )
         let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
         let environment = [
             "HOME": root.path,
             "OPENGROK_HOME": state.path,
-            "XAI_API_KEY": "test-key"
+            "XAI_API_KEY": "test-key",
+            "FIREWORKS_API_KEY": "fireworks-key"
         ]
 
         let (sourceStreams, _, _) = CLIStreams.buffered()
         let sourceCode = await CLIRunner.run(
             [
                 "headless", "--prompt", "source question",
+                "--model", "glm-5.2",
                 "--cwd", workspace.path,
                 "--session-id", "source-session"
             ],
@@ -1844,6 +2450,17 @@ struct ParityCompositionTests {
             streams: sourceStreams,
             application: application
         )
+        let parentRewind = LiveRewindStore(openGrokHome: state, sessionID: "source-session")
+        await parentRewind.append(LiveRewindPoint(
+            promptIndex: 0,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            promptText: "source question"
+        ))
+        let parentRewindURL = LiveRewindStore.rewindFileURL(
+            openGrokHome: state,
+            sessionID: "source-session"
+        )
+        let parentRewindBytes = try? Data(contentsOf: parentRewindURL)
         let (forkStreams, _, _) = CLIStreams.buffered()
         let forkCode = await CLIRunner.run(
             [
@@ -1870,26 +2487,123 @@ struct ParityCompositionTests {
         )
 
         let requests = sampler.recordedRequests
+        let configurations = sampler.recordedConfigurations
         let forkURL = state.appendingPathComponent("sessions/fork-session.json")
         let forkObject = (try? Data(contentsOf: forkURL)).flatMap {
             try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
         }
+        let store = LiveConversationStore(openGrokHome: state)
+        let childRecord = try? await store.load(sessionID: "fork-session")
+        let childRewindURL = LiveRewindStore.rewindFileURL(
+            openGrokHome: state,
+            sessionID: "fork-session"
+        )
+        let childRewindBytes = try? Data(contentsOf: childRewindURL)
         #expect(sourceCode == CLIRunner.ExitCode.success.rawValue)
         #expect(forkCode == CLIRunner.ExitCode.success.rawValue)
         #expect(resumeCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(configurations.map(\.provider) == [.fireworks, .fireworks, .fireworks])
+        #expect(configurations.map(\.model) == [
+            "accounts/fireworks/models/glm-5p2",
+            "accounts/fireworks/models/glm-5p2",
+            "accounts/fireworks/models/glm-5p2"
+        ])
         #expect(requests[1].sessionID == "fork-session")
         #expect(requests[1].items == [
             .user("source question"),
-            .assistant(AssistantItem(content: "source answer")),
+            .assistant(AssistantItem(content: "provider answer")),
             .user("fork question")
         ])
         #expect(requests[2].sessionID == "source-session")
         #expect(requests[2].items == [
             .user("source question"),
-            .assistant(AssistantItem(content: "source answer")),
+            .assistant(AssistantItem(content: "provider answer")),
             .user("source follow-up")
         ])
         #expect(forkObject?["parentSessionID"] as? String == "source-session")
+        #expect(forkObject?["current_model_id"] as? String == "accounts/fireworks/models/glm-5p2")
+        #expect(forkObject?["current_provider"] as? String == "fireworks")
+        #expect(forkObject?["ever_used_codex"] as? Bool == true)
+        #expect(childRecord?.parentSessionID == "source-session")
+        #expect(childRecord?.currentModelID == "accounts/fireworks/models/glm-5p2")
+        #expect(childRecord?.currentProvider == .fireworks)
+        #expect(childRecord?.everUsedNonXAI == true)
+        #expect(childRewindBytes == parentRewindBytes)
+
+        if let childRecord {
+            let childServices = await OpenGrokLiveApplicationLauncher.makeSessionServices(
+                sessionID: "fork-session",
+                workingDirectory: workspace,
+                openGrokHome: state,
+                conversationRecord: childRecord,
+                environment: environment
+            )
+            guard let childRewind = childServices.rewind else {
+                Issue.record("forked session services did not construct rewind")
+                return
+            }
+            let points = await childRewind.points()
+            #expect(points.map(\.promptIndex) == [0])
+            let dryRun = try? await childRewind.restore(
+                toPromptIndex: 0,
+                mode: .conversationOnly,
+                force: false,
+                currentItems: childRecord.items
+            )
+            #expect(dryRun?.applied == false)
+            #expect(dryRun?.targetPromptIndex == 0)
+        }
+    }
+
+    @Test("forking a legacy record refuses before creating child artifacts")
+    func legacyForkRefusesWithoutChildArtifacts() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let workspace = root.appendingPathComponent("workspace")
+        let state = root.appendingPathComponent("state")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+
+        var legacy = LiveConversationRecord.new(
+            sessionID: "legacy-source",
+            workingDirectory: workspace
+        )
+        legacy.everUsedNonXAI = nil
+        try await LiveConversationStore(openGrokHome: state).save(legacy)
+
+        let application = OpenGrokApplication.live(
+            dependencies: OpenGrokLiveCompositionDependencies(
+                makeSampler: { _ in
+                    OpenGrokLiveSampler { _, _ in
+                        OpenGrokLiveSamplingResponse(output: "should not sample")
+                    }
+                }
+            ),
+            control: .never
+        )
+        let (streams, _, errorOutput) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            [
+                "headless", "--prompt", "fork question",
+                "--resume", "legacy-source",
+                "--fork-session", "--session-id", "legacy-child",
+                "--cwd", workspace.path
+            ],
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": state.path,
+                "XAI_API_KEY": "xai-key"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        #expect(code == CLIRunner.ExitCode.failure.rawValue)
+        #expect(errorOutput.contents.contains("ever_used_codex"))
+        #expect((try? await LiveConversationStore(openGrokHome: state).load(sessionID: "legacy-child")) == nil)
+        #expect(!FileManager.default.fileExists(atPath: LiveRewindStore.rewindFileURL(
+            openGrokHome: state,
+            sessionID: "legacy-child"
+        ).path))
     }
 
     @Test("live interactive composition reuses one session across typed turns")

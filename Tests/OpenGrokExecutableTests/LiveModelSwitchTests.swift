@@ -288,6 +288,9 @@ struct LiveProviderIsolationTests {
         let store = LiveConversationStore(openGrokHome: home)
         var record = LiveConversationRecord.new(sessionID: "keep", workingDirectory: home)
         record.items = Self.conversation()
+        record.currentModelID = "accounts/fireworks/models/glm-5p2"
+        record.currentProvider = .fireworks
+        record.everUsedNonXAI = true
         try await store.save(record)
         let history = LiveConversationHistory(record: record, store: store)
 
@@ -367,8 +370,63 @@ struct LiveProviderIsolationTests {
         // The neutralisation is persisted, so a resume cannot replay the
         // dropped carriers to the new provider.
         #expect(try await store.load(sessionID: "cross").items == kept)
+        #expect(try await store.load(sessionID: "cross").everUsedNonXAI == true)
+        let boundary = await history.sharedExportBoundary
+        #expect(!boundary.allowsXaiExport)
         #expect(summary.transcriptMessage.contains("fireworks"))
         #expect(summary.transcriptMessage.contains("kimi"))
+    }
+
+    @Test("a provider-switch persistence failure leaves the old route active")
+    func crossProviderPersistenceFailureKeepsActiveRoute() async throws {
+        let home = try makeTemporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let environment = isolatedEnvironment(home: home, extra: [
+            "FIREWORKS_API_KEY": "fw-key",
+            "MOONSHOT_API_KEY": "kimi-key",
+        ])
+        let sessionsPath = home.appendingPathComponent("sessions")
+        try Data("not a directory".utf8).write(to: sessionsPath)
+
+        let resolver = LiveModelCatalogResolver(
+            environment: environment,
+            openGrokHome: home,
+            sessionID: "persistence-failure",
+            workingDirectory: home
+        )
+        let initial = try await resolver.resolve(modelID: "glm-5.2")
+        var record = LiveConversationRecord.new(sessionID: "persistence-failure", workingDirectory: home)
+        record.items = Self.conversation()
+        record.currentModelID = initial.sampling.model
+        record.currentProvider = initial.sampling.provider
+        record.everUsedNonXAI = false
+        let history = LiveConversationHistory(
+            record: record,
+            store: LiveConversationStore(openGrokHome: home)
+        )
+        let coordinator = LiveModelSwitchCoordinator(
+            sampling: initial.sampling,
+            sampler: SamplerFactorySpy.stubSampler,
+            resolver: resolver,
+            makeSampler: { _ in SamplerFactorySpy.stubSampler },
+            history: history
+        )
+
+        let originalRecord = record
+        let outcome = await coordinator.apply(modelID: "kimi-k3")
+        guard case .failed(let failedModelID, let message) = outcome else {
+            Issue.record("expected persistence failure, got \(outcome)")
+            return
+        }
+        #expect(failedModelID == "kimi-k3")
+        #expect(message.hasPrefix("provider isolation failed:"))
+        let snapshot = await coordinator.snapshot()
+        #expect(snapshot.modelID == initial.sampling.model)
+        #expect(snapshot.provider == initial.sampling.provider)
+        #expect(snapshot.configuration == initial.sampling)
+        #expect(await history.snapshot() == originalRecord)
+        #expect(await history.items == originalRecord.items)
+        #expect((await history.sharedExportBoundary).allowsXaiExport)
     }
 
     @Test("a refused cross-provider switch leaves history alone")

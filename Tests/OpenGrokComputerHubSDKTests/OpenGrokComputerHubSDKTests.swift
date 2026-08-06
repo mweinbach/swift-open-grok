@@ -36,6 +36,20 @@ private final class NotificationRecorder: @unchecked Sendable {
     }
 }
 
+private final class TestConnectionClient: ConnectionClient, @unchecked Sendable {
+    func request(
+        _ request: JsonRpcRequest<JSONValue>
+    ) async throws -> JsonRpcResponse<JSONValue> {
+        _ = request
+        throw ClientError.notConnected
+    }
+
+    func notify(_ notification: JsonRpcNotification<JSONValue>) async throws {
+        _ = notification
+        throw ClientError.notConnected
+    }
+}
+
 private final class LockedValue<Value>: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Value
@@ -73,8 +87,10 @@ struct ComputerHubSDKTests {
         let b = pool.acquire(key: key)
         #expect(a === b)
         #expect(pool.refCount(for: key) == 2)
+        #expect(!a.isConnected)
+        #expect(a.connectionClient() == nil)
         pool.release(key: key)
-        #expect(a.isConnected) // still held
+        #expect(!a.isConnected)
         #expect(pool.refCount(for: key) == 1)
         pool.release(key: key)
         #expect(!a.isConnected)
@@ -85,7 +101,11 @@ struct ComputerHubSDKTests {
     @Test("reconnect ordering disconnected→reconnecting→reconnected")
     func reconnectOrdering() throws {
         let key = PrincipalKey(url: "wss://hub", userId: try UserId("u"))
-        let conn = HubConnection(key: key, connected: true)
+        let conn = HubConnection(
+            key: key,
+            client: TestConnectionClient(),
+            connected: true
+        )
         let recorder = ReconnectEventRecorder()
         conn.onReconnect { recorder.append($0) }
         conn.runReconnectSequence(attempts: 3, succeedOn: 2, reason: "drop")
@@ -101,7 +121,11 @@ struct ComputerHubSDKTests {
     @Test("reconnect giveUp ordering")
     func reconnectGiveUp() throws {
         let key = PrincipalKey(url: "wss://hub", userId: try UserId("u"))
-        let conn = HubConnection(key: key, connected: true)
+        let conn = HubConnection(
+            key: key,
+            client: TestConnectionClient(),
+            connected: true
+        )
         let recorder = ReconnectEventRecorder()
         conn.onReconnect { recorder.append($0) }
         conn.runReconnectSequence(attempts: 2, succeedOn: 99, reason: "net")
@@ -341,6 +365,25 @@ struct ComputerHubSDKTests {
     func harnessRemoteDisconnected() async throws {
         let key = PrincipalKey(url: "wss://hub", userId: try UserId("u"))
         let conn = HubConnection(key: key, connected: false)
+        let harness = ToolHarnessBuilder(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness"))
+            .withConnection(conn)
+            .withSession(try SessionId("s"))
+            .withPrincipal(Principal.new(try UserId("u")).withScope(localInvokeScope))
+            .build()
+        let stream = await harness.call(toolId: try ToolId("remote:x"), args: .null)
+        for await item in stream {
+            if case .terminal(.failure(let err)) = item {
+                #expect(err.kind == .networkError)
+                return
+            }
+        }
+        Issue.record("expected networkError")
+    }
+
+    @Test("harness connected without a client fails closed")
+    func harnessConnectedWithoutClient() async throws {
+        let key = PrincipalKey(url: "wss://hub", userId: try UserId("u"))
+        let conn = HubConnection(key: key, connected: true)
         let harness = ToolHarnessBuilder(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness"))
             .withConnection(conn)
             .withSession(try SessionId("s"))

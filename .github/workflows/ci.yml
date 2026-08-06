@@ -16,6 +16,9 @@ jobs:
     name: macOS (build + test)
     runs-on: macos-15
     timeout-minutes: 90
+    env:
+      CI: "1"
+      OPENGROK_PERFORMANCE_PROFILE: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Select latest Xcode
@@ -24,6 +27,10 @@ jobs:
         run: swift --version
       - name: Build
         run: zsh workflows/swift-safe-verify.zsh build
+      - name: Product
+        run: |
+          GROK_COMMIT="$(git rev-parse --short HEAD)" \
+            zsh workflows/swift-safe-verify.zsh build --product open-grok
       - name: Build tests
         run: zsh workflows/swift-safe-verify.zsh build-tests
       # --no-parallel is the documented green gate (PORT_STATUS.md). Default
@@ -31,25 +38,31 @@ jobs:
       # serial the honest CI configuration.
       - name: Test (serial gate)
         run: zsh workflows/swift-safe-verify.zsh test --no-parallel
-      - name: Product
-        run: zsh workflows/swift-safe-verify.zsh build --product open-grok
       - name: Smoke (isolated home)
         run: |
+          set -euo pipefail
           BIN=$(find .build/workflow-safe -name open-grok -type f -perm +111 | head -1)
-          OPENGROK_HOME=$(mktemp -d) "$BIN" --version
-          OPENGROK_HOME=$(mktemp -d) "$BIN" paths --json
+          test -n "$BIN"
+          smoke_root=$(mktemp -d)
+          trap 'rm -rf "$smoke_root"' EXIT
+          expected_version=$(sed -n '1p' OPEN_GROK_VERSION)
+          expected_commit=$(git rev-parse --short HEAD)
+          "$BIN" release-validate \
+            --binary "$BIN" \
+            --expected-version "$expected_version" \
+            --expected-commit "$expected_commit" \
+            --isolated-root "$smoke_root"
 
   linux:
     name: Linux (build + test)
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # Non-blocking until the platform adapters land: Linux is a declared
-    # support target the port has not yet earned (PORT_STATUS "Known remaining
-    # gaps" — Secret Service, inotify, sandbox, ConPTY-equivalents). The job
-    # runs the real gates so the remaining gap list is visible on every push
-    # rather than asserted from memory. Flip continue-on-error off once green.
-    continue-on-error: true
+    # Linux is a blocking platform gate. Unsupported runtime adapters must
+    # report explicitly in the test output; they must not turn a failed build
+    # into a successful workflow conclusion.
     container: swift:6.3.3-jammy
+    env:
+      CI: "1"
     defaults:
       run:
         # The `bash` keyword runs steps as `bash --noprofile --norc -eo
@@ -66,34 +79,79 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
-        run: swift --version
+        run: |
+          apt-get update
+          apt-get install -y bubblewrap zsh
+          swift --version
+      - name: Verify bubblewrap namespace
+        run: |
+          BWRAP=$(command -v bwrap)
+          test -x "$BWRAP"
+          "$BWRAP" --cap-drop ALL --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/sh -c ':'
       - name: Build
-        run: swift build 2>&1 | tail -200
+        run: zsh workflows/swift-safe-verify.zsh build
+      - name: Product
+        run: zsh workflows/swift-safe-verify.zsh build --product open-grok
       - name: Build tests
-        run: swift build --build-tests 2>&1 | tail -200
-      - name: Test
-        run: swift test --no-parallel 2>&1 | tail -200
+        run: zsh workflows/swift-safe-verify.zsh build-tests
+      - name: Test (serial gate)
+        run: zsh workflows/swift-safe-verify.zsh test --no-parallel
 
-  windows:
-    name: Windows (build + test)
+  windows-compile:
+    name: Windows (compile)
     runs-on: windows-latest
     timeout-minutes: 120
-    # Non-blocking for the same reason as Linux, and more so: Windows needs
-    # ConPTY, Credential Manager, LockFileEx, and ReadDirectoryChangesW
-    # adapters. PORT_PLAN's platform strategy is "continuously compiled",
-    # which is exactly what this job measures.
-    continue-on-error: true
+    env:
+      CI: "1"
+      GROK_VERSION: 0.1.220-open-grok.windows-ci
+      GROK_TEST_EXPECTED_COMPILED_VERSION: 0.1.220-open-grok.windows-ci
     steps:
       - uses: actions/checkout@v4
       - uses: compnerd/gha-setup-swift@main
         with:
           swift-version: swift-6.3.3-release
           swift-build: 6.3.3-RELEASE
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          path-type: inherit
+          update: true
+          install: zsh
       - name: Toolchain
+        shell: msys2 {0}
         run: swift --version
       - name: Build
-        run: swift build
+        shell: msys2 {0}
+        run: zsh workflows/swift-safe-verify.zsh build
       - name: Build tests
-        run: swift build --build-tests
-      - name: Test
-        run: swift test --no-parallel
+        shell: msys2 {0}
+        run: zsh workflows/swift-safe-verify.zsh build-tests
+
+  windows-diagnostic-tests:
+    name: Windows (diagnostic tests)
+    needs: windows-compile
+    runs-on: windows-latest
+    timeout-minutes: 120
+    continue-on-error: true
+    env:
+      CI: "1"
+      GROK_VERSION: 0.1.220-open-grok.windows-ci
+      GROK_TEST_EXPECTED_COMPILED_VERSION: 0.1.220-open-grok.windows-ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: compnerd/gha-setup-swift@main
+        with:
+          swift-version: swift-6.3.3-release
+          swift-build: 6.3.3-RELEASE
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          path-type: inherit
+          update: true
+          install: zsh
+      - name: Toolchain
+        shell: msys2 {0}
+        run: swift --version
+      - name: Test (diagnostic only)
+        shell: msys2 {0}
+        run: zsh workflows/swift-safe-verify.zsh test --no-parallel

@@ -112,13 +112,20 @@ public final class Demux: @unchecked Sendable {
     }
 
     public func registerProgressWaiter(toolCallId: ToolCallId) {
-        lock.lock()
-        defer { lock.unlock() }
-        progressBuffers[toolCallId] = []
-        progress[toolCallId] = { [weak self] frame in
+        registerProgressWaiter(toolCallId: toolCallId) { [weak self] frame in
             guard let self else { return false }
             return self.enqueueProgress(toolCallId, frame)
         }
+    }
+
+    public func registerProgressWaiter(
+        toolCallId: ToolCallId,
+        sink: @escaping ProgressSink
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        progressBuffers[toolCallId] = []
+        progress[toolCallId] = sink
     }
 
     public func unregisterProgressWaiter(toolCallId: ToolCallId) {

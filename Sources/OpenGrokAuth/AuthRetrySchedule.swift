@@ -12,40 +12,14 @@
 // state at pin 80dff0a9. These are in-memory turn-scoped policy.
 
 import Foundation
+import OpenGrokSamplingTypes
 
 /// Wire-credential provenance of a request that failed authentication.
 ///
 /// A 401 for a request that went out with **no** credential header is not
 /// evidence against the credential itself, so retry policy must not charge
 /// a credential-rejection slot for it. error.rs:88.
-public enum SentCredential: String, Sendable, Hashable, Codable {
-    /// The request carried a credential; the server rejected it.
-    case sent
-    /// The request went out with no credential header at all.
-    case missing
-    /// Provenance unknown (synthesized or legacy errors). Retry policy
-    /// treats this like ``sent`` — fail closed toward terminating rather
-    /// than retrying forever. error.rs:96.
-    case unknown
-
-    public static let `default`: SentCredential = .unknown
-
-    /// Unrecognized values from a newer peer degrade to ``unknown`` instead
-    /// of failing the whole containing payload. error.rs:103.
-    public init(from decoder: Decoder) throws {
-        let raw = try decoder.singleValueContainer().decode(String.self)
-        self = SentCredential(rawValue: raw) ?? .unknown
-    }
-
-    /// `SentCredential::from_sent_fragment` (error.rs:118): a captured
-    /// credential fragment means a credential was stamped on the wire.
-    public static func fromSentFragment(_ fragment: String?) -> SentCredential {
-        fragment == nil ? .missing : .sent
-    }
-
-    public var isMissing: Bool { self == .missing }
-    public var isUnknown: Bool { self == .unknown }
-}
+public typealias SentCredential = OpenGrokSamplingTypes.SentCredential
 
 /// One instant captured on two clocks, so elapsed time stays honest across
 /// a system suspend without trusting the wall clock alone.

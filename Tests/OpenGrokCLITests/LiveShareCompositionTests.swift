@@ -86,13 +86,15 @@ struct LiveShareCompositionTests {
     private func saveRecord(
         sessionID: String,
         items: [ConversationItem],
-        home: URL
+        home: URL,
+        everUsedNonXAI: Bool? = false
     ) async throws {
         var record = LiveConversationRecord.new(
             sessionID: sessionID,
             workingDirectory: URL(fileURLWithPath: "/tmp/project")
         )
         record.items = items
+        record.everUsedNonXAI = everUsedNonXAI
         try await LiveConversationStore(openGrokHome: home).save(record)
     }
 
@@ -112,6 +114,33 @@ struct LiveShareCompositionTests {
 
     private var nullStreams: CLIStreams {
         CLIStreams(out: { _ in }, err: { _ in })
+    }
+
+    @Test("conversation record marker distinguishes false, true, and legacy nil")
+    func recordMarkerCodec() throws {
+        let fresh = LiveConversationRecord.new(
+            sessionID: "codec",
+            workingDirectory: URL(fileURLWithPath: "/tmp/project")
+        )
+        let freshData = try JSONEncoder().encode(fresh)
+        let freshObject = try #require(
+            JSONSerialization.jsonObject(with: freshData) as? [String: Any]
+        )
+        #expect((freshObject["ever_used_codex"] as? Bool) == false)
+
+        var marked = fresh
+        marked.everUsedNonXAI = true
+        let markedRoundTrip = try JSONDecoder().decode(
+            LiveConversationRecord.self,
+            from: JSONEncoder().encode(marked)
+        )
+        #expect(markedRoundTrip.everUsedNonXAI == true)
+
+        var legacyObject = freshObject
+        legacyObject.removeValue(forKey: "ever_used_codex")
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        let legacy = try JSONDecoder().decode(LiveConversationRecord.self, from: legacyData)
+        #expect(legacy.everUsedNonXAI == nil)
     }
 
     // MARK: Reachability
@@ -146,7 +175,12 @@ struct LiveShareCompositionTests {
         defer { cleanup() }
         // The session exists on disk; upstream still refuses on auth first
         // (share.rs:35 precedes the lookup at :60-67).
-        try await saveRecord(sessionID: "sess-1", items: [.user("hello")], home: home)
+        try await saveRecord(
+            sessionID: "sess-1",
+            items: [.user("hello")],
+            home: home,
+            everUsedNonXAI: nil
+        )
         await expectFailure("Authentication required to share session") {
             try await LiveShareComposition.run(
                 options: shareOptions(["share", "sess-1"]),
@@ -225,7 +259,12 @@ struct LiveShareCompositionTests {
     func unverifiableBoundary() async throws {
         let (home, cleanup) = try makeHome()
         defer { cleanup() }
-        try await saveRecord(sessionID: "sess-1", items: [.user("hello")], home: home)
+        try await saveRecord(
+            sessionID: "sess-1",
+            items: [.user("hello")],
+            home: home,
+            everUsedNonXAI: nil
+        )
         // Blocker 1: the live record persists no provider observation, so
         // the production route ALWAYS refuses here today — fail-closed.
         await expectFailure("cannot share session sess-1") {
@@ -242,7 +281,12 @@ struct LiveShareCompositionTests {
     func codexMarkedSessionNeverUploads() async throws {
         let (home, cleanup) = try makeHome()
         defer { cleanup() }
-        try await saveRecord(sessionID: "sess-1", items: [.user("hello")], home: home)
+        try await saveRecord(
+            sessionID: "sess-1",
+            items: [.user("hello")],
+            home: home,
+            everUsedNonXAI: true
+        )
         let (streams, out, _) = CLIStreams.buffered()
         await expectFailure("Codex-backed sessions cannot be shared through xAI services.") {
             try await LiveShareComposition.run(
@@ -250,7 +294,6 @@ struct LiveShareCompositionTests {
                 environment: environment(home: home, auth: xaiAuth()),
                 streams: streams,
                 remoteSettings: sharingSettings(true),
-                persistedBoundaryMarkers: { _ in true }
             )
         }
         #expect(!out.contents.contains("http"))
@@ -260,7 +303,12 @@ struct LiveShareCompositionTests {
     func liveClosedBoundaryRefuses() async throws {
         let (home, cleanup) = try makeHome()
         defer { cleanup() }
-        try await saveRecord(sessionID: "sess-1", items: [.user("hello")], home: home)
+        try await saveRecord(
+            sessionID: "sess-1",
+            items: [.user("hello")],
+            home: home,
+            everUsedNonXAI: false
+        )
         let boundary = ExportBoundary()
         boundary.observe(.codex)
         await expectFailure("Codex-backed sessions cannot be shared through xAI services.") {
@@ -280,14 +328,13 @@ struct LiveShareCompositionTests {
     func emptySession() async throws {
         let (home, cleanup) = try makeHome()
         defer { cleanup() }
-        try await saveRecord(sessionID: "sess-1", items: [], home: home)
+        try await saveRecord(sessionID: "sess-1", items: [], home: home, everUsedNonXAI: false)
         await expectFailure("No messages to share yet") {
             try await LiveShareComposition.run(
                 options: shareOptions(["share", "sess-1"]),
                 environment: environment(home: home, auth: xaiAuth()),
                 streams: nullStreams,
                 remoteSettings: sharingSettings(true),
-                persistedBoundaryMarkers: { _ in false }
             )
         }
     }
@@ -298,15 +345,19 @@ struct LiveShareCompositionTests {
     func uploadBlocker() async throws {
         let (home, cleanup) = try makeHome()
         defer { cleanup() }
-        try await saveRecord(sessionID: "sess-1", items: [.user("hello")], home: home)
+        try await saveRecord(
+            sessionID: "sess-1",
+            items: [.user("hello")],
+            home: home,
+            everUsedNonXAI: false
+        )
         let (streams, out, _) = CLIStreams.buffered()
         do {
             try await LiveShareComposition.run(
                 options: shareOptions(["share", "sess-1"]),
                 environment: environment(home: home, auth: xaiAuth()),
                 streams: streams,
-                remoteSettings: sharingSettings(true),
-                persistedBoundaryMarkers: { _ in false }
+                remoteSettings: sharingSettings(true)
             )
             Issue.record("the route succeeded, which means something claims to have uploaded")
         } catch let error as CLIApplicationError {
@@ -317,12 +368,17 @@ struct LiveShareCompositionTests {
         #expect(!out.contents.contains("http"))
     }
 
-    @Test("an open live boundary without a persisted marker also reaches the upload blocker")
-    func openLiveBoundaryReachesUploadBlocker() async throws {
+    @Test("an open live boundary cannot rescue a legacy record")
+    func openLiveBoundaryCannotRescueLegacyRecord() async throws {
         let (home, cleanup) = try makeHome()
         defer { cleanup() }
-        try await saveRecord(sessionID: "sess-1", items: [.user("hello")], home: home)
-        await expectFailure("upload path is not ported") {
+        try await saveRecord(
+            sessionID: "sess-1",
+            items: [.user("hello")],
+            home: home,
+            everUsedNonXAI: nil
+        )
+        await expectFailure("cannot share session sess-1") {
             try await LiveShareComposition.run(
                 options: shareOptions(["share", "sess-1"]),
                 environment: environment(home: home, auth: xaiAuth()),

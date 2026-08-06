@@ -1317,6 +1317,11 @@ struct ClientHermeticTests {
             Issue.record("expected throw")
         } catch let err as SamplingError {
             #expect(err.isAuthError)
+            if case .auth(_, let credential) = err {
+                #expect(credential == .sent)
+            } else {
+                Issue.record("expected credentialed auth error")
+            }
             #expect(attr.seen == scrubbedBearerPrefix("super-secret-token-value"))
             #expect(attr.seen?.count == SENT_BEARER_PREFIX_LEN)
         }

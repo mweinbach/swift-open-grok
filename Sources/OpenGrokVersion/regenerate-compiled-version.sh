@@ -16,7 +16,7 @@
 # Resolution order (matches the Rust reference + the Open Grok release script):
 #   1. `GROK_VERSION` environment variable, if set and non-empty.
 #   2. The first line of `OPEN_GROK_VERSION` at the package root, if present.
-#   3. The canonical Open Grok release string `0.1.220-open-grok.21`
+#   3. The canonical Open Grok release string `0.1.220-open-grok.54`
 #      (the Rust `CARGO_PKG_VERSION` fallback equivalent for Open Grok).
 #
 # Usage:
@@ -31,7 +31,8 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 package_root="$(cd "${script_dir}/../.." && pwd)"
 generated_file="${script_dir}/CompiledVersion.generated.swift"
 version_file="${package_root}/OPEN_GROK_VERSION"
-default_version="0.1.220-open-grok.21"
+default_version="0.1.220-open-grok.54"
+short_commit="${GROK_COMMIT:-}"
 
 if [[ -n "${GROK_VERSION:-}" ]]; then
     version="${GROK_VERSION}"
@@ -54,6 +55,7 @@ fi
 # literal. The version string is semver-shaped (digits, dots, dashes, plus,
 # alphanumerics) so escaping is defensive rather than expected.
 escaped_version="$(printf '%s' "${version}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+escaped_commit="$(printf '%s' "${short_commit}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
 
 cat > "${generated_file}" <<EOF
 // CompiledVersion.generated.swift
@@ -71,7 +73,7 @@ cat > "${generated_file}" <<EOF
 //
 // The regeneration script falls back to the \`OPEN_GROK_VERSION\` file at the
 // package root (matching the Rust release script's \`version_file\`), then to
-// the canonical Open Grok release string \`0.1.220-open-grok.21\`. Two clean
+// the canonical Open Grok release string \`0.1.220-open-grok.54\`. Two clean
 // builds with distinct \`GROK_VERSION\` values produce distinct
 // \`OpenGrokVersion.compiledVersion\` values after regeneration.
 
@@ -83,6 +85,8 @@ internal enum OpenGrokCompiledVersion {
     /// generation time. Mirrors the Rust \`VERSION\` constant.
     @usableFromInline
     internal static let version: String = "${escaped_version}"
+    @usableFromInline
+    internal static let shortCommit: String? = $([[ -n "${short_commit}" ]] && printf '"%s"' "${escaped_commit}" || printf 'nil')
 }
 EOF
 

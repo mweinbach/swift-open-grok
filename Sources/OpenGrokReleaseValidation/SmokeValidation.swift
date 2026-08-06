@@ -27,6 +27,24 @@
 import Foundation
 import OpenGrokDistributionSupport
 
+public struct SmokeResolvedPaths: Sendable, Equatable, Decodable {
+    public let opengrokHome: String
+    public let managedBinary: String
+    public let projectState: String
+
+    public init(opengrokHome: String, managedBinary: String, projectState: String) {
+        self.opengrokHome = opengrokHome
+        self.managedBinary = managedBinary
+        self.projectState = projectState
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case opengrokHome = "opengrok_home"
+        case managedBinary = "managed_binary"
+        case projectState = "project_state"
+    }
+}
+
 /// Smoke assertions over a release binary's `--version` output and the paths an
 /// isolated install touched.
 public enum SmokeValidation {
@@ -118,6 +136,103 @@ public enum SmokeValidation {
         return report
     }
 
+    // MARK: - Resolved paths
+
+    /// Validate the resolved paths emitted by `paths --json` during ordinary
+    /// product smoke. This is deliberately separate from
+    /// ``validateIsolatedHome``: a configuration report cannot prove that an
+    /// installer actually wrote anything.
+    public static func validateResolvedPaths(
+        _ paths: SmokeResolvedPaths,
+        isolatedRoot: String
+    ) -> ReleaseValidationReport {
+        var report = ReleaseValidationReport()
+        guard isolatedRoot.hasPrefix("/") else {
+            report.record(ReleaseValidationFinding(
+                id: "smoke.pathsRootNotAbsolute",
+                severity: .failure,
+                subject: isolatedRoot,
+                message: "the isolated root must be an absolute path"
+            ))
+            return report
+        }
+
+        if paths.opengrokHome.hasPrefix("/") {
+            if isContained(paths.opengrokHome, in: isolatedRoot) {
+                report.record(ReleaseValidationFinding(
+                    id: "smoke.pathsHomeContained",
+                    severity: .info,
+                    subject: paths.opengrokHome,
+                    message: "resolved OPENGROK_HOME is inside the isolated root"
+                ))
+            } else {
+                report.record(ReleaseValidationFinding(
+                    id: "smoke.pathsHomeEscaped",
+                    severity: .failure,
+                    subject: paths.opengrokHome,
+                    message: "resolved OPENGROK_HOME is outside the isolated root \(isolatedRoot)"
+                ))
+            }
+        } else {
+            report.record(ReleaseValidationFinding(
+                id: "smoke.pathsHomeNotAbsolute",
+                severity: .failure,
+                subject: paths.opengrokHome,
+                message: "resolved OPENGROK_HOME is not absolute"
+            ))
+        }
+
+        if paths.managedBinary.hasPrefix("/") {
+            if isContained(paths.managedBinary, in: isolatedRoot) {
+                report.record(ReleaseValidationFinding(
+                    id: "smoke.pathsBinaryContained",
+                    severity: .info,
+                    subject: paths.managedBinary,
+                    message: "resolved managed binary is inside the isolated root"
+                ))
+            } else {
+                report.record(ReleaseValidationFinding(
+                    id: "smoke.pathsBinaryEscaped",
+                    severity: .failure,
+                    subject: paths.managedBinary,
+                    message: "resolved managed binary is outside the isolated root \(isolatedRoot)"
+                ))
+            }
+        } else {
+            report.record(ReleaseValidationFinding(
+                id: "smoke.pathsBinaryNotAbsolute",
+                severity: .failure,
+                subject: paths.managedBinary,
+                message: "resolved managed binary is not absolute"
+            ))
+        }
+
+        if paths.projectState.isEmpty || paths.projectState.contains("..") {
+            report.record(ReleaseValidationFinding(
+                id: "smoke.pathsProjectStateMalformed",
+                severity: .failure,
+                subject: paths.projectState,
+                message: "project state path is empty or escapes its configured directory"
+            ))
+        } else if isLegacyHomePath(paths.projectState) {
+            report.record(ReleaseValidationFinding(
+                id: "smoke.pathsLegacyHome",
+                severity: .failure,
+                subject: paths.projectState,
+                message: "resolved paths must not name the legacy ~/.grok tree"
+            ))
+        } else {
+            report.record(ReleaseValidationFinding(
+                id: "smoke.pathsProjectStateValid",
+                severity: .info,
+                subject: paths.projectState,
+                message: "project state path is well formed"
+            ))
+        }
+
+        return report
+    }
+
     // MARK: - Isolated home
 
     /// The environment variables the release workflow isolates before smoking
@@ -199,5 +314,11 @@ public enum SmokeValidation {
     /// component rather than a substring.
     public static func isLegacyHomePath(_ path: String) -> Bool {
         path.split(separator: "/").contains(".grok")
+    }
+
+    private static func isContained(_ path: String, in root: String) -> Bool {
+        let normalizedRoot = URL(fileURLWithPath: root).standardizedFileURL.path
+        let normalizedPath = URL(fileURLWithPath: path).standardizedFileURL.path
+        return normalizedPath == normalizedRoot || normalizedPath.hasPrefix(normalizedRoot + "/")
     }
 }

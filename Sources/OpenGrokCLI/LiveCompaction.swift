@@ -192,7 +192,7 @@ enum LiveCompactionResult: Sendable, Equatable {
 actor LiveCompactionCoordinator {
     private let history: LiveConversationHistory
     private let modelSwitch: LiveModelSwitchCoordinator
-    private let sessionID: String
+    private var sessionID: String
     private let openGrokHome: URL
     /// Injection seam: production builds an HTTP transport from the live
     /// credential; tests supply a scripted one.
@@ -239,6 +239,14 @@ actor LiveCompactionCoordinator {
         self.openGrokHome = openGrokHome
         self.codexRemoteV2Enabled = codexRemoteV2Enabled
         self.makeCodexTransport = makeCodexTransport
+    }
+
+    func replaceSessionID(_ sessionID: String) {
+        self.sessionID = sessionID
+        compactionCount = 0
+        step = 0
+        lastReport = nil
+        autoCompactSuppressed = false
     }
 
     /// The data a `/usage` or `/context` readout renders.

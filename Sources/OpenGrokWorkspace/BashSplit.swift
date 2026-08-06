@@ -380,6 +380,82 @@ public struct BashSegmentEvaluation: Sendable, Equatable {
     public var reason: String?
 }
 
+private let sandboxWriteCommands: Set<String> = [
+    "rm", "rmdir", "touch", "mkdir", "chmod", "chown", "chgrp", "cp", "mv",
+    "ln", "install", "rsync", "dd", "tee", "truncate",
+]
+
+private let sandboxExecRiskCommands: Set<String> = [
+    "xargs", "eval", "exec", "source", ".", "command", "builtin",
+]
+
+private func hasShellRedirectWrite(_ command: String) -> Bool {
+    var inSingle = false
+    var inDouble = false
+    var escaped = false
+    var index = command.startIndex
+    while index < command.endIndex {
+        let character = command[index]
+        if escaped {
+            escaped = false
+        } else if character == "\\" && !inSingle {
+            escaped = true
+        } else if character == "'" && !inDouble {
+            inSingle.toggle()
+        } else if character == "\"" && !inSingle {
+            inDouble.toggle()
+        } else if character == ">" && !inSingle && !inDouble {
+            let next = command.index(after: index)
+            if next >= command.endIndex || command[next] != "&" {
+                return true
+            }
+        }
+        index = command.index(after: index)
+    }
+    return false
+}
+
+private func hasEnvironmentAssignment(_ command: String) -> Bool {
+    command
+        .split(whereSeparator: { $0.isWhitespace || $0 == ";" || $0 == "|" })
+        .contains { isEnvAssignment(String($0)) }
+}
+
+/// Whether Bash can use the active OS sandbox as its authorization boundary.
+///
+/// This is deliberately stricter than the ordinary safe-command list: an
+/// unknown but parseable command may run in the sandbox, while floors that can
+/// write real files, alter execution environment, or invoke opaque/indirect
+/// programs remain prompt-required.
+public func bashSandboxAutoAllow(
+    _ command: String,
+    exactGrants: [String] = []
+) -> Bool {
+    guard let segments = allCommandsFromScript(command) else { return false }
+    let normalized = command.trimmingCharacters(in: .whitespacesAndNewlines)
+    let exactGrant = exactGrants.contains {
+        $0.trimmingCharacters(in: .whitespacesAndNewlines) == normalized
+    }
+    if hasEnvironmentAssignment(command) && !exactGrant { return false }
+    if hasShellRedirectWrite(command) && !exactGrant { return false }
+
+    for words in segments {
+        let unwrapped = unwrapWrappers(words)
+        guard let first = unwrapped.first else { continue }
+        let base = (first as NSString).lastPathComponent.lowercased()
+        if isDangerousCommandWords(unwrapped) { return false }
+        if sandboxExecRiskCommands.contains(base) { return false }
+        if base == "rg" && rgHasPreFlag(unwrapped) { return false }
+        if sandboxWriteCommands.contains(base) && !exactGrant { return false }
+        if base == "sed",
+           unwrapped.contains(where: { $0 == "-i" || $0.hasPrefix("-i") }),
+           !exactGrant {
+            return false
+        }
+    }
+    return true
+}
+
 public func evaluateBashSegments(
     _ cmd: String,
     grants: [String],

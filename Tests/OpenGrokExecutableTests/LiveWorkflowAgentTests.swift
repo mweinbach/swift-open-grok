@@ -7,6 +7,8 @@
 // process.
 
 import Foundation
+import OpenGrokHooks
+import OpenGrokHooksPluginTypes
 import OpenGrokPagerRender
 import OpenGrokSamplingTypes
 import OpenGrokTerminalCore
@@ -67,10 +69,16 @@ private final class ScriptedInvoker: LiveWorkflowToolInvoker, @unchecked Sendabl
     let tools: [ToolSpec]
     let workingDirectory: URL
     private let recorder = CallRecorder()
+    private let stopScript: StopScript
 
-    init(tools: [ToolSpec], workingDirectory: URL = URL(fileURLWithPath: "/tmp")) {
+    init(
+        tools: [ToolSpec],
+        workingDirectory: URL = URL(fileURLWithPath: "/tmp"),
+        stopResults: [StopDispatchResult] = []
+    ) {
         self.tools = tools
         self.workingDirectory = workingDirectory
+        self.stopScript = StopScript(results: stopResults)
     }
 
     func invoke(
@@ -85,12 +93,40 @@ private final class ScriptedInvoker: LiveWorkflowToolInvoker, @unchecked Sendabl
         ))
     }
 
+    func runStop(
+        event: HookEvent,
+        promptID: String?,
+        payload: [String: HookJSONValue]
+    ) async -> StopDispatchResult {
+        await stopScript.next(event: event, promptID: promptID, payload: payload)
+    }
+
     func recordedCalls() async -> [String] { await recorder.calls }
+    func recordedStopPayloads() async -> [[String: HookJSONValue]] { await stopScript.payloads }
 }
 
 private actor CallRecorder {
     private(set) var calls: [String] = []
     func record(_ name: String) { calls.append(name) }
+}
+
+private actor StopScript {
+    private var results: [StopDispatchResult]
+    private(set) var payloads: [[String: HookJSONValue]] = []
+
+    init(results: [StopDispatchResult]) {
+        self.results = results
+    }
+
+    func next(
+        event: HookEvent,
+        promptID: String?,
+        payload: [String: HookJSONValue]
+    ) -> StopDispatchResult {
+        payloads.append(payload)
+        guard !results.isEmpty else { return StopDispatchResult() }
+        return results.removeFirst()
+    }
 }
 
 private func spec(_ name: String) -> ToolSpec {
@@ -163,6 +199,72 @@ struct LiveWorkflowChildAgentTests {
             if case .toolResult(let result) = item { return result.content.contains("read_file") }
             return false
         })
+    }
+
+    @Test("a SubagentStop block feeds back and re-enters the child turn")
+    func subagentStopContinuesOnce() async throws {
+        let sampler = ScriptedSampler([
+            .init(match: "review", responses: [
+                textResponse("first answer"),
+                textResponse("final answer"),
+            ])
+        ])
+        let invoker = ScriptedInvoker(
+            tools: [],
+            stopResults: [
+                StopDispatchResult(blocks: [StopBlock(hookName: "review", reason: "keep checking")]),
+                StopDispatchResult(),
+            ]
+        )
+        let child = LiveWorkflowChildAgent(
+            runID: "run",
+            environment: environment(sampler: sampler.sampler, invoker: invoker),
+            cancellation: RhaiCancellationToken()
+        )
+
+        let result = try await child.run(
+            agentID: "a1",
+            options: RhaiAgentOptions(prompt: "review the change", label: "reviewer")
+        ) { _ in }
+
+        #expect(result.output == .string("final answer"))
+        let requests = await sampler.recordedRequests()
+        #expect(requests.count == 2)
+        #expect(requests[1].items.contains { $0.textContent().contains("keep checking") })
+        let payloads = await invoker.recordedStopPayloads()
+        #expect(payloads.count == 2)
+        #expect(payloads[0]["stopHookActive"] == .boolean(false))
+        #expect(payloads[1]["stopHookActive"] == .boolean(true))
+    }
+
+    @Test("a SubagentStop force-stop ends the child without feedback")
+    func subagentStopForceStops() async throws {
+        let sampler = ScriptedSampler([
+            .init(match: "stop", responses: [textResponse("done")])
+        ])
+        let invoker = ScriptedInvoker(
+            tools: [],
+            stopResults: [
+                StopDispatchResult(
+                    blocks: [StopBlock(hookName: "stopper", reason: "halt")],
+                    preventContinuation: StopBlock(hookName: "stopper", reason: "halt")
+                )
+            ]
+        )
+        let child = LiveWorkflowChildAgent(
+            runID: "run",
+            environment: environment(sampler: sampler.sampler, invoker: invoker),
+            cancellation: RhaiCancellationToken()
+        )
+
+        let result = try await child.run(
+            agentID: "a1",
+            options: RhaiAgentOptions(prompt: "stop now")
+        ) { _ in }
+
+        #expect(result.output == .string("done"))
+        #expect((await sampler.recordedRequests()).count == 1)
+        #expect((await invoker.recordedStopPayloads()).count == 1)
     }
 
     @Test("an output_schema is forced on the request and decoded into a real object")

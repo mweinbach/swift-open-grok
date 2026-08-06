@@ -209,7 +209,7 @@ struct PagerFocusAndCommandTests {
         #expect(rows?.contains { $0.name == "/gboom" } == false)
     }
 
-    @Test("Ctrl+N needs a second press before it throws a session away")
+    @Test("Ctrl+N needs a second press before it replaces the session")
     func ctrlNConfirms() async throws {
         let single = try await Harness.run([
             .key(KeyEvent(key: .char("n"), modifiers: [.control], character: "n")),
@@ -220,7 +220,8 @@ struct PagerFocusAndCommandTests {
             .key(KeyEvent(key: .char("n"), modifiers: [.control], character: "n")),
             .key(KeyEvent(key: .char("n"), modifiers: [.control], character: "n")),
         ])
-        #expect(await confirmed.notices.contains("started a new session"))
+        #expect(await confirmed.notices.contains("started a new session") == false)
+        #expect(await confirmed.sessionReplacements.count == 1)
     }
 
     @Test("Ctrl+. and Ctrl+X both open the shortcuts sheet")
@@ -440,7 +441,7 @@ struct PagerFocusAndCommandTests {
             .filter(\.mutatesConversationHistory)
             .map(\.name)
             .sorted()
-        #expect(mutating == ["compact", "rewind"])
+        #expect(mutating == ["compact", "new", "rewind"])
     }
 
     @Test("/rewind cannot execute while a turn is in flight")
@@ -714,6 +715,7 @@ private actor Harness {
     }
     var modeSnapshots: [OpenGrokPagerInputModes] { get async { await renderer.modeSnapshots } }
     var notices: [String] { get async { await renderer.notices } }
+    var sessionReplacements: [String] { get async { await renderer.sessionReplacements } }
     var lastPromptText: String { get async { await renderer.lastPromptText } }
     var turnPrompts: [String] { get async { await runtime.requests.map(\.prompt) } }
 
@@ -838,6 +840,13 @@ private actor FocusRecordingRenderer: OpenGrokPagerInteractiveRenderAdapter {
         events.compactMap { if case .notice(let message) = $0 { return message } else { return nil } }
     }
 
+    var sessionReplacements: [String] {
+        events.compactMap {
+            if case .sessionReplaced(let sessionID) = $0 { return sessionID }
+            return nil
+        }
+    }
+
     var lastPromptText: String {
         events.reversed().compactMap {
             if case .promptChanged(let state) = $0 { return state.text } else { return nil }
@@ -909,6 +918,11 @@ private actor FocusTestRuntime: OpenGrokPagerRuntimeAdapter {
         let session = HoldingSession(sessionID: request.sessionID ?? "auto")
         session.finish()
         return session
+    }
+
+    func replaceSession(from request: OpenGrokPagerRequest) async throws -> String {
+        _ = request
+        return "replacement-\(UUID().uuidString)"
     }
 }
 

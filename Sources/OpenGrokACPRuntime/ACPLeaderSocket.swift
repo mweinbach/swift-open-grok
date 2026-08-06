@@ -50,7 +50,26 @@ public enum ACPLeaderSocketPaths {
         relayURL: String?,
         environment: [String: String]
     ) -> (socket: URL, lock: URL) {
-        if let override = environment[socketEnvironmentVariable], !override.isEmpty {
+        resolve(
+            openGrokHome: openGrokHome,
+            relayURL: relayURL,
+            environment: environment,
+            socketOverride: environment[socketEnvironmentVariable]
+        )
+    }
+
+    /// Resolve an endpoint while honoring an explicit CLI socket override.
+    ///
+    /// The command-line value must win over the environment so a client can
+    /// attach to a deliberately selected leader without mutating its process
+    /// environment. The daemon keeps using the environment-only overload.
+    public static func resolve(
+        openGrokHome: URL,
+        relayURL: String?,
+        environment: [String: String],
+        socketOverride: String?
+    ) -> (socket: URL, lock: URL) {
+        if let override = socketOverride, !override.isEmpty {
             let socket = URL(fileURLWithPath: override)
             return (socket, socket.appendingPathExtension("lock"))
         }
@@ -72,6 +91,7 @@ public enum ACPLeaderSocketPaths {
 public enum ACPLeaderLockError: Error, Sendable, CustomStringConvertible {
     case held(byProcess: Int32?, path: String)
     case cannotOpen(path: String, reason: String)
+    case unsupportedPlatform(path: String)
 
     public var description: String {
         switch self {
@@ -80,15 +100,20 @@ public enum ACPLeaderLockError: Error, Sendable, CustomStringConvertible {
             return "another leader is already running (\(owner)); lock held at \(path)"
         case .cannotOpen(let path, let reason):
             return "could not open the leader lock at \(path): \(reason)"
+        case .unsupportedPlatform(let path):
+            return "leader mode is unavailable on Windows: the leader lock at \(path) has no supported locking backend"
         }
     }
 }
 
-/// An advisory `flock` on the leader's lock file, holding this process's PID.
+/// An advisory lock on the leader's lock file, holding this process's PID.
 ///
 /// Advisory rather than a PID-file check because a PID file alone races: two
 /// clients can both read "no leader" and both spawn one. `flock` makes the
-/// decision atomic.
+/// decision atomic on supported platforms. Windows refuses before touching the
+/// filesystem because the Swift leader transport is Unix-only; adding a
+/// `LockFileEx` helper without a named-pipe transport would still advertise a
+/// leader that cannot accept clients.
 public final class ACPLeaderLock: @unchecked Sendable {
     public let lockPath: URL
     public let socketPath: URL
@@ -103,6 +128,9 @@ public final class ACPLeaderLock: @unchecked Sendable {
 
     /// Take the lock, or report who holds it.
     public func acquire() throws {
+#if os(Windows)
+        throw ACPLeaderLockError.unsupportedPlatform(path: lockPath.path)
+#else
         try FileManager.default.createDirectory(
             at: lockPath.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -128,6 +156,7 @@ public final class ACPLeaderLock: @unchecked Sendable {
         descriptor = fd
         owned = true
         stateLock.unlock()
+#endif
     }
 
     /// The PID recorded in a lock file, if it is readable and parseable.
@@ -149,11 +178,13 @@ public final class ACPLeaderLock: @unchecked Sendable {
         owned = false
         stateLock.unlock()
 
+#if !os(Windows)
         guard wasOwner, fd >= 0 else { return }
         flock(fd, LOCK_UN)
         close(fd)
         try? FileManager.default.removeItem(at: socketPath)
         try? FileManager.default.removeItem(at: lockPath)
+#endif
     }
 
     deinit { release() }

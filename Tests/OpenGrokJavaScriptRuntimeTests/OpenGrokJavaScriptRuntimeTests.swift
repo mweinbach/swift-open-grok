@@ -504,16 +504,33 @@ struct JavaScriptJSONBridgeTests {
     }
 }
 
+@Suite("JavaScript runtime capability")
+struct JavaScriptRuntimeCapabilityTests {
+    @Test("JavaScriptCore hosts report an available runtime")
+    func available() {
+        #expect(JavaScriptRuntimeCapability.current == .available)
+        #expect(JavaScriptRuntimeCapability.current.unavailableError == nil)
+    }
+}
+
 #else
 
 @Suite("JavaScript runtime platform support")
 struct JavaScriptRuntimeUnsupportedPlatformTests {
     @Test("starting a cell reports the unsupported platform")
     func unsupported() {
-        #expect(throws: JavaScriptRuntimeError.self) {
+        #expect(JavaScriptRuntimeCapability.current == .unavailable)
+        #expect(JavaScriptRuntimeCapability.current.unavailableError == .unsupportedPlatform)
+        do {
             _ = try JavaScriptCellRuntime.start(
                 configuration: JavaScriptCellConfiguration(toolCallId: "call_1", source: "text('x')")
             )
+            Issue.record("expected JavaScriptCellRuntime.start to fail")
+        } catch let error as JavaScriptRuntimeError {
+            #expect(error == .unsupportedPlatform)
+            #expect(error.kind == .unsupportedPlatform)
+        } catch {
+            Issue.record("expected JavaScriptRuntimeError, got \(error)")
         }
     }
 }

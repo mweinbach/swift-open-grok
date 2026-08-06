@@ -64,6 +64,7 @@ public actor PermissionHandle {
     public var shellCwd: String
     public var prompter: any PermissionPrompter
     public var classifier: (any PermissionClassifier)?
+    public let sandboxAutoAllowBash: @Sendable () -> Bool
     public private(set) var events: [PermissionEvent]
     /// Last matched rule source for auditing (deny/ask/allow).
     public private(set) var lastMatchedRuleSource: PermissionRuleSource?
@@ -75,7 +76,8 @@ public actor PermissionHandle {
         yoloPinReason: String? = nil,
         allowAll: Bool = false,
         shellCwd: String = FileManager.default.currentDirectoryPath,
-        prompter: any PermissionPrompter = HeadlessPermissionPrompter()
+        prompter: any PermissionPrompter = HeadlessPermissionPrompter(),
+        sandboxAutoAllowBash: @Sendable @escaping () -> Bool = { false }
     ) {
         var cfg = config
         if yoloPinReason != nil {
@@ -100,6 +102,7 @@ public actor PermissionHandle {
         self.shellCwd = shellCwd
         self.prompter = prompter
         self.classifier = nil
+        self.sandboxAutoAllowBash = sandboxAutoAllowBash
         self.events = []
         self.lastMatchedRuleSource = nil
     }
@@ -117,6 +120,10 @@ public actor PermissionHandle {
     public func setAutoMode(_ enabled: Bool) {
         autoMode = enabled
         if enabled { yoloMode = false }
+    }
+
+    public func setClassifier(_ classifier: (any PermissionClassifier)?) {
+        self.classifier = classifier
     }
 
     public func setAllowEditsForSession(_ enabled: Bool) {
@@ -182,6 +189,7 @@ public actor PermissionHandle {
 
         var policyForcedPrompt = false
         var shellFileForcedPrompt = false
+        var autoForcedPrompt = false
 
         // 1. Compiled policy direct evaluate (deny > ask > allow).
         if let matched = policy.evaluateWithSource(access) {
@@ -332,7 +340,8 @@ public actor PermissionHandle {
                     )
                     return d
                 }
-                if seg.autoAllow && !seg.needsPrompt {
+                if seg.autoAllow && !seg.needsPrompt,
+                   bashSandboxAutoAllow(cmd, exactGrants: bashPrefixGrants) {
                     record(
                         access: access, toolName: toolName, toolCallId: toolCallId,
                         decision: .allow, autoApproved: true, userPrompted: false,
@@ -380,6 +389,27 @@ public actor PermissionHandle {
                 )
                 return classified
             }
+            if case .ask = classified {
+                autoForcedPrompt = true
+            }
+        }
+
+        // Sandbox auto-approval is intentionally later than policy, hooks,
+        // shell-file escalation, and auto classification. The Bash floor helper
+        // keeps opaque shell, dangerous segments, executable indirection,
+        // unsafe environment assignments, and real-file writes on the prompt
+        // path even when the OS sandbox is active.
+        if case .bash(let cmd) = access,
+           !policyForcedPrompt,
+           !autoForcedPrompt,
+           sandboxAutoAllowBash(),
+           bashSandboxAutoAllow(cmd, exactGrants: bashPrefixGrants) {
+            record(
+                access: access, toolName: toolName, toolCallId: toolCallId,
+                decision: .allow, autoApproved: true, userPrompted: false,
+                reason: "sandbox_auto"
+            )
+            return .allow
         }
 
         // 7. Prompt policy.

@@ -8,6 +8,7 @@
 // process, and the `/workflows` overlay in a live session shows the same rows.
 
 import Foundation
+import OpenGrokConfig
 import OpenGrokSessionPersistence
 import OpenGrokSessionRuntime
 import OpenGrokShared
@@ -45,6 +46,11 @@ public enum LiveWorkflowComposition {
         environment: [String: String],
         streams: CLIStreams
     ) async throws {
+        let cwd = try resolveWorkingDirectory(options.common.cwd)
+        let workflows = try loadResolvedWorkflows(cwd: cwd, environment: environment)
+        guard workflows.value else {
+            throw CLIApplicationError.failed("workflows are disabled by GROK_WORKFLOWS or [workflows].enabled")
+        }
         let home = workflowStateDirectory(environment: environment)
         let registry = RhaiWorkflowRunRegistry(store: WorkflowSessionStore(directory: home))
 
@@ -114,6 +120,23 @@ public enum LiveWorkflowComposition {
         return URL(fileURLWithPath: home, isDirectory: true)
             .appendingPathComponent(".opengrok", isDirectory: true)
             .standardizedFileURL
+    }
+
+    private static func resolveWorkingDirectory(_ path: String?) throws -> URL {
+        let base = FileManager.default.currentDirectoryPath
+        let url: URL
+        if let path, path.hasPrefix("/") {
+            url = URL(fileURLWithPath: path).standardizedFileURL
+        } else {
+            url = URL(fileURLWithPath: base, isDirectory: true)
+                .appendingPathComponent(path ?? ".")
+                .standardizedFileURL
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw CLIApplicationError.failed("working directory does not exist: \(url.path)")
+        }
+        return url
     }
 
     static func readScript(at path: String) throws -> String {

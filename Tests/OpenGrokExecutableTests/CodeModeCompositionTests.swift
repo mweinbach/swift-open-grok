@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokCodeMode
 import OpenGrokPager
 import OpenGrokPagerRender
 import OpenGrokSamplingTypes
@@ -252,10 +253,67 @@ private enum CodeModeFixtures {
     }
 }
 
+private func codeModeToolNames(
+    capability: CodeModeRuntimeCapability?
+) async -> [String] {
+    let root = CodeModeFixtures.workspace()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let sampler = CodeModeSamplerFixture(script: [])
+    let dependencies: OpenGrokLiveCompositionDependencies
+    if let capability {
+        dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() },
+            makeCodeModeCapability: { capability }
+        )
+    } else {
+        dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in sampler.makeSampler() }
+        )
+    }
+    let application = OpenGrokApplication.live(
+        dependencies: dependencies,
+        control: .never
+    )
+    let (streams, _, _) = CLIStreams.buffered()
+    let code = await CLIRunner.run(
+        ["headless", "--prompt", "hello", "--cwd", root.path],
+        environment: CodeModeFixtures.environment(
+            root: root,
+            extra: ["OPENGROK_TOOL_MODE": "code_mode"]
+        ),
+        streams: streams,
+        application: application
+    )
+    #expect(code == CLIRunner.ExitCode.success.rawValue)
+    return sampler.recordedRequests.first?.tools.map(\.name) ?? []
+}
+
 // MARK: - Tests
 
 @Suite("Code Mode live composition")
 struct CodeModeCompositionTests {
+
+    @Test("an unavailable runtime suppresses the Code Mode transport")
+    func unavailableRuntimeDoesNotAdvertiseTransport() async {
+        let names = await codeModeToolNames(capability: .unavailable)
+        #expect(names.contains("exec") == false)
+        #expect(names.contains("wait") == false)
+        #expect(names.contains("read_file"))
+        #expect(names.contains("run_terminal_cmd"))
+    }
+
+#if !canImport(JavaScriptCore)
+    @Test("the default non-JavaScriptCore capability suppresses the transport")
+    func defaultRuntimeDoesNotAdvertiseTransport() async {
+        let names = await codeModeToolNames(capability: nil)
+        #expect(names.contains("exec") == false)
+        #expect(names.contains("wait") == false)
+        #expect(names.contains("read_file"))
+        #expect(names.contains("run_terminal_cmd"))
+    }
+#endif
+
+#if canImport(JavaScriptCore)
 
     // MARK: Tool surface
 
@@ -684,6 +742,7 @@ struct CodeModeCompositionTests {
         #expect(elapsed != nil)
         #expect((elapsed ?? .infinity) < 30, "cancel took \(elapsed ?? -1)s")
     }
+#endif
 }
 
 /// Records when Esc was sent so the test can bound how long teardown took.

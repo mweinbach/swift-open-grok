@@ -3,9 +3,8 @@
 // Tool-server and harness SDK (Swift port of `xai-computer-hub-sdk`).
 //
 // Shared substrate: connection pool, cancel-on-drop, cancel registry,
-// demux, auth credentials, and ToolHarness for local + remote dispatch.
-// WebSocket wire transport remains a later integration concern; tests
-// use channel-backed mocks and the hermetic Demux.
+// demux, auth credentials, ToolHarness for local + remote dispatch, and the
+// production WebSocket transport used by live workspace exposure.
 
 import Foundation
 import OpenGrokComputerHubCore

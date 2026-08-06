@@ -23,6 +23,47 @@
 import Foundation
 import Testing
 @testable import OpenGrokCLI
+import OpenGrokACPRuntime
+import OpenGrokConfigTypes
+
+private final class LauncherWorkspaceChannel: WorkspaceControlChannel, @unchecked Sendable {
+    let advertisedCapabilities: OpenGrokACPRuntime.ACPLeaderCapabilities? =
+        OpenGrokACPRuntime.ACPLeaderCapabilities(workspaceExposure: true)
+    private let lock = NSLock()
+    private var received: [WorkspaceControlCommand] = []
+
+    var commands: [WorkspaceControlCommand] {
+        lock.lock(); defer { lock.unlock() }
+        return received
+    }
+
+    private func record(_ command: WorkspaceControlCommand) {
+        lock.lock()
+        received.append(command)
+        lock.unlock()
+    }
+
+    func send(_ command: WorkspaceControlCommand) async throws -> WorkspaceStatusPayload {
+        record(command)
+        return WorkspaceStatusPayload(state: "none", pid: 7331)
+    }
+
+    func close() async {}
+}
+
+private final class WorkspaceLoaderProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var calls: Int {
+        lock.lock(); defer { lock.unlock() }
+        return count
+    }
+
+    func record() {
+        lock.lock(); count += 1; lock.unlock()
+    }
+}
 
 private func launcherContext(
     environment: [String: String]
@@ -43,6 +84,98 @@ private func launcherContext(
 struct LiveWorkspaceLauncherReachabilityTests {
     /// Gate explicitly off: refuses inside `preflight`, before any dial.
     private static let gateOff = ["GROK_WORKSPACE_COMMAND": "0"]
+
+    private func launcher(
+        loader: @escaping @Sendable ([String: String]) async -> RemoteSettings?,
+        connect: @escaping @Sendable ([String: String]) async throws -> any WorkspaceControlChannel
+    ) -> OpenGrokLiveApplicationLauncher {
+        let route = LiveWorkspaceRouteDependencies(
+            loadRemoteSettings: loader,
+            connect: connect
+        )
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in
+                OpenGrokLiveSampler { _, _ in
+                    throw CLIApplicationError.failed("workspace test did not need a sampler")
+                }
+            },
+            workspaceRoute: route
+        )
+        return OpenGrokLiveApplicationLauncher(dependencies: dependencies)
+    }
+
+    @Test("no override fetches enabled settings and reaches the injected leader")
+    func enabledRemoteSettingsReachLeader() async throws {
+        let probe = WorkspaceLoaderProbe()
+        let channel = LauncherWorkspaceChannel()
+        var settings = RemoteSettings()
+        settings.workspaceCommandEnabled = true
+        let enabledSettings = settings
+        let launcher = launcher(
+            loader: { _ in
+                probe.record()
+                return enabledSettings
+            },
+            connect: { _ in channel }
+        ).launcher
+        let (context, out, _) = launcherContext(environment: [:])
+
+        _ = try await launcher.start(
+            try CLICommandParser.parseOrThrow(["workspace", "status"]),
+            context
+        )
+
+        #expect(probe.calls == 1)
+        #expect(channel.commands == [.status])
+        #expect(out.contents.contains("Workspace exposure: not running"))
+    }
+
+    @Test("an explicit false override bypasses settings and preserves the disabled refusal")
+    func overrideBypassesLoader() async throws {
+        let probe = WorkspaceLoaderProbe()
+        let channel = LauncherWorkspaceChannel()
+        let launcher = launcher(
+            loader: { _ in
+                probe.record()
+                return nil
+            },
+            connect: { _ in channel }
+        ).launcher
+        let (context, _, _) = launcherContext(environment: Self.gateOff)
+
+        await #expect(throws: WorkspaceRouteError.self) {
+            try await launcher.start(
+                try CLICommandParser.parseOrThrow(["workspace", "status"]),
+                context
+            )
+        }
+
+        #expect(probe.calls == 0)
+        #expect(channel.commands.isEmpty)
+    }
+
+    @Test("unavailable or disabled fetched settings refuse before leader IPC")
+    func fetchedSettingsRefuseBeforeDialing() async throws {
+        var disabled = RemoteSettings()
+        disabled.workspaceCommandEnabled = false
+        let fetchedSettings: [RemoteSettings?] = [nil, disabled]
+        for fetched in fetchedSettings {
+            let channel = LauncherWorkspaceChannel()
+            let launcher = launcher(
+                loader: { _ in fetched },
+                connect: { _ in channel }
+            ).launcher
+            let (context, _, _) = launcherContext(environment: [:])
+
+            await #expect(throws: WorkspaceRouteError.self) {
+                try await launcher.start(
+                    try CLICommandParser.parseOrThrow(["workspace", "status"]),
+                    context
+                )
+            }
+            #expect(channel.commands.isEmpty)
+        }
+    }
 
     @Test("`workspace status` reaches LiveWorkspaceComposition, not a refusal")
     func workspaceStatusReachesTheRoute() async throws {
@@ -108,9 +241,9 @@ struct LiveWorkspaceLauncherReachabilityTests {
         // The negative control. Without it, the assertions above would pass
         // just as happily against a launcher that answered *every* command
         // with a WorkspaceRouteError — the test would be measuring nothing.
-        // `worktree` parses to `.utility` exactly like `workspace` does and
-        // has no composition behind it.
-        let command = try CLICommandParser.parseOrThrow(["worktree", "list"])
+        // `trace` remains a genuinely unhooked utility. `worktree` is now a
+        // live route and must not be used as a negative control here.
+        let command = try CLICommandParser.parseOrThrow(["trace", "--local"])
         let (context, _, _) = launcherContext(environment: Self.gateOff)
         let launcher = OpenGrokLiveApplicationLauncher().launcher
 
@@ -118,7 +251,7 @@ struct LiveWorkspaceLauncherReachabilityTests {
             _ = try await launcher.start(command, context)
             Issue.record("expected an unhooked utility route to refuse")
         } catch let error as WorkspaceRouteError {
-            let detail = "the workspace route claimed `worktree` — `handles` is "
+            let detail = "the workspace route claimed `trace` — `handles` is "
                 + "matching too broadly. Got: \(error)"
             Issue.record(Comment(rawValue: detail))
         } catch {

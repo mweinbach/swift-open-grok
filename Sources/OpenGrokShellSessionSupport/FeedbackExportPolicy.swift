@@ -49,10 +49,9 @@ public enum FeedbackSubmissionPlan: Sendable, Equatable {
     /// Persist the full submission locally; upload only the redacted copy
     /// (`strip_metadata()` + `feedback_text = None`,
     /// feedback_manager.rs:136-140). Upstream preserves the author identity
-    /// across the strip (feedback_types.rs:470-472); this port's
-    /// `FeedbackSubmission` predates the `author_name`/`author_email`
-    /// fields, so there is nothing to preserve — recorded in
-    /// INTEGRATION-w10-share.md as a wire-type gap, not a policy choice.
+    /// across the strip (feedback_types.rs:470-472); the Swift wire type
+    /// carries those optional author fields and `stripMetadata()` preserves
+    /// them alongside the rating/text fields.
     case persistAndUpload(persist: FeedbackSubmission, outbound: FeedbackSubmission)
 
     /// The full, unredacted submission for local persistence. Present in

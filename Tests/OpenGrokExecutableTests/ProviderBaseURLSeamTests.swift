@@ -134,6 +134,41 @@ struct ProviderBaseURLSeamTests {
         )
         #expect(resolved == "https://codex.example/v1")
     }
+
+    @Test("trusted named gateway tables reach the live catalog input")
+    func namedGatewayReachesLiveCatalog() throws {
+        let root = workspace()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let project = root.appendingPathComponent("project", isDirectory: true)
+        writeConfig("""
+        [auth_provider.corp]
+        command = "corp-token"
+
+        [model_providers.gateway]
+        base_url = "https://gateway.example/v1"
+        auth_provider = "corp"
+        api_backend = "chat_completions"
+        extra_headers = { X-Corp = "yes" }
+
+        [model.enterprise]
+        model = "enterprise-v1"
+        model_provider = "gateway"
+        """, at: home)
+
+        let input = liveCatalogResolutionInput(
+            workingDirectory: project,
+            environment: [
+                "HOME": root.path,
+                "OPENGROK_HOME": home.path,
+            ]
+        )
+        let catalog = resolveModelCatalog(input: input)
+        let entry = try #require(catalog["enterprise"])
+        #expect(entry.info.baseURL == "https://gateway.example/v1")
+        #expect(entry.authProvider == "corp")
+        #expect(entry.info.extraHeaders.contains { $0.0 == "X-Corp" && $0.1 == "yes" })
+    }
 }
 
 /// PORT_STATUS wave 5 flagged `[features] code_mode` as a config surface with
@@ -157,7 +192,8 @@ struct CodeModeConfigSurfaceTests {
         return LiveCodeModeSettings.resolveToolMode(
             environment: ["HOME": root.path],
             workingDirectory: root.appendingPathComponent("project", isDirectory: true),
-            openGrokHome: home
+            openGrokHome: home,
+            runtimeCapability: .available
         )
     }
 

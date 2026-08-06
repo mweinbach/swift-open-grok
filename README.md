@@ -7,12 +7,11 @@ the Open Grok branding while keeping all runtime/configuration state isolated
 to `$OPENGROK_HOME` or `~/.opengrok` (the legacy `~/.grok` path is never read
 or written).
 
-> **Status (2026-08-02):** The committed port is clean at checkpoint
+> **Status (2026-08-06):** The committed port is clean at checkpoint
 > `1c4ed0c55e0c39722925d026af46b8ed0936be65`, including R16–R19 work that
-> postdates the older status snapshot. The last recorded full verifier results
-> remain historical until rerun at this checkpoint. Continuation work must also
-> reconcile Rust baseline `9739c4a2ad23cfea14312a481169757f3da494f4` with
-> exact upstream revision `c1bca4020bad3b8058984d49388ac150e3ce7fd7`.
+> postdates the older status snapshot. The current Rust baseline is
+> `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (`0.1.220-open-grok.54`); see
+> `PORT_STATUS.md` for the pinned fixture provenance and remaining port drift.
 > Workers must still **not** invoke
 > SwiftPM directly; the sole integration path is the serialized verifier below.
 > See `PORT_STATUS.md`, `PORT_PLAN.md`, and `CRATE_MAP.md` for exact scope and
@@ -52,7 +51,7 @@ explicitly **not yet implemented** and must not be presented as working.
 ## Protocol fixture validation
 
 Checked-in fixtures under `ProtocolFixtures/` are provenance-labelled against
-Rust ref `9739c4a2ad23cfea14312a481169757f3da494f4` and cover:
+Rust ref `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` and cover:
 
 - ACP method names
 - Binary OTLP `ExportTraceServiceRequest` (HTTP protobuf + gRPC-framed) goldens
@@ -73,7 +72,7 @@ Prefer tests that re-encode/decode goldens (telemetry + BuildSupport) over
 digest-only checks. Regeneration (deterministic, network-free):
 
 ```sh
-scripts/regenerate-protocol-manifest.sh --reference-revision 9739c4a2ad23cfea14312a481169757f3da494f4
+scripts/regenerate-protocol-manifest.sh --reference-revision 9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05
 ```
 
 ## Package layout

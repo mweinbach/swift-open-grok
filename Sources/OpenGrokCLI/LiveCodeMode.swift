@@ -90,24 +90,34 @@ enum LiveCodeModeSettings {
     static func resolveToolMode(
         environment: [String: String],
         workingDirectory: URL,
-        openGrokHome: URL
+        openGrokHome: URL,
+        runtimeCapability: CodeModeRuntimeCapability = .current
     ) -> ToolModePreference {
+        let requestedMode: ToolModePreference
         if let raw = environment["OPENGROK_TOOL_MODE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !raw.isEmpty,
            let mode = parse(raw) {
-            return mode
+            requestedMode = mode
+        } else {
+            let project = loadMergedProjectConfig(
+                cwd: workingDirectory,
+                environment: environment
+            )
+            if let mode = toolMode(in: project) {
+                requestedMode = mode
+            } else {
+                let userConfig = try? loadConfigFile(
+                    at: openGrokHome.appendingPathComponent("config.toml")
+                )
+                requestedMode = userConfig.flatMap { toolMode(in: $0) } ?? .direct
+            }
         }
-        let project = loadMergedProjectConfig(
-            cwd: workingDirectory,
-            environment: environment
-        )
-        if let mode = toolMode(in: project) { return mode }
-        let userConfig = try? loadConfigFile(
-            at: openGrokHome.appendingPathComponent("config.toml")
-        )
-        if let userConfig, let mode = toolMode(in: userConfig) { return mode }
-        return .direct
+
+        guard runtimeCapability.isAvailable || requestedMode == .direct else {
+            return .direct
+        }
+        return requestedMode
     }
 
     /// Accepts the canonical strings and the legacy boolean form that the

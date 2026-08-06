@@ -407,12 +407,16 @@ public func runGit(_ args: [String], cwd: URL) throws -> GitCommandResult {
         "GIT_OPTIONAL_LOCKS": "0",
     ]) { _, new in new }
 
+    let finished = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in
+        finished.signal()
+    }
     do {
         try process.run()
     } catch {
         throw FastWorktreeError.gitFailed("failed to spawn git: \(error)")
     }
-    process.waitUntilExit()
+    finished.wait()
     let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     return GitCommandResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr)

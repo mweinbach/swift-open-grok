@@ -7,9 +7,42 @@ import Foundation
 import Testing
 
 @testable import OpenGrokReleaseValidation
+import OpenGrokDistributionSupport
 
 private let emptyDigest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 private let otherDigest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+private let pinnedRelease = OpenGrokReleaseValidation.referencePinnedRelease
+
+private struct PortStatusBaseline {
+    let referenceRevision: String
+    let release: String
+
+    static func load(filePath: String = #filePath) throws -> Self {
+        var root = URL(fileURLWithPath: filePath).deletingLastPathComponent()
+        while root.path != "/" && !FileManager.default.fileExists(atPath: root.appendingPathComponent("PORT_STATUS.md").path) {
+            root = root.deletingLastPathComponent()
+        }
+        let statusURL = root.appendingPathComponent("PORT_STATUS.md")
+        guard let text = try? String(contentsOf: statusURL, encoding: .utf8),
+              let line = text.split(whereSeparator: \.isNewline).first(where: { $0.hasPrefix("**Reference:**") }) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let referenceLine = String(line)
+        guard let revisionStart = referenceLine.range(of: " at `"),
+              let revisionEnd = referenceLine[revisionStart.upperBound...].firstIndex(of: "`") else {
+            throw CocoaError(.propertyListReadCorrupt)
+        }
+        let revision = String(referenceLine[revisionStart.upperBound..<revisionEnd])
+        guard revision.range(of: "^[0-9a-fA-F]{40}$", options: .regularExpression) != nil,
+              let releaseStart = referenceLine.range(of: "release `v"),
+              let releaseEnd = referenceLine[releaseStart.upperBound...].firstIndex(of: "`") else {
+            throw CocoaError(.propertyListReadCorrupt)
+        }
+        let release = String(referenceLine[releaseStart.upperBound..<releaseEnd])
+        guard !release.isEmpty else { throw CocoaError(.propertyListReadCorrupt) }
+        return Self(referenceRevision: revision, release: release)
+    }
+}
 
 @Suite("Validation report")
 struct ReleaseValidationReportTests {
@@ -246,8 +279,8 @@ struct SmokeValidationTests {
     @Test("the reported version is the first version-shaped token in the output")
     func reportedVersionExtraction() {
         #expect(
-            SmokeValidation.reportedVersion(in: "open-grok 0.1.220-open-grok.53 (abc1234)")
-                == "0.1.220-open-grok.53"
+            SmokeValidation.reportedVersion(in: "open-grok \(pinnedRelease) (abc1234)")
+                == pinnedRelease
         )
         #expect(SmokeValidation.reportedVersion(in: "open-grok\n0.2.5\n") == "0.2.5")
         #expect(SmokeValidation.reportedVersion(in: "no version here") == nil)
@@ -256,8 +289,8 @@ struct SmokeValidationTests {
     @Test("output carrying both the version and the short commit passes")
     func versionAndCommitPass() {
         let report = SmokeValidation.validateVersionOutput(
-            "open-grok 0.1.220-open-grok.53 (abc1234)",
-            expectedVersion: "0.1.220-open-grok.53",
+            "open-grok \(pinnedRelease) (abc1234)",
+            expectedVersion: pinnedRelease,
             expectedShortCommit: "abc1234"
         )
         #expect(report.passed)
@@ -268,7 +301,7 @@ struct SmokeValidationTests {
     func versionMismatchBlocks() {
         let report = SmokeValidation.validateVersionOutput(
             "open-grok 0.1.220-open-grok.21 (abc1234)",
-            expectedVersion: "0.1.220-open-grok.53",
+            expectedVersion: pinnedRelease,
             expectedShortCommit: "abc1234"
         )
         #expect(!report.passed)
@@ -278,8 +311,8 @@ struct SmokeValidationTests {
     @Test("a missing build commit blocks")
     func missingCommitBlocks() {
         let report = SmokeValidation.validateVersionOutput(
-            "open-grok 0.1.220-open-grok.53",
-            expectedVersion: "0.1.220-open-grok.53",
+            "open-grok \(pinnedRelease)",
+            expectedVersion: pinnedRelease,
             expectedShortCommit: "abc1234"
         )
         #expect(!report.passed)
@@ -290,7 +323,7 @@ struct SmokeValidationTests {
     func unparseableOutputBlocks() {
         let report = SmokeValidation.validateVersionOutput(
             "Segmentation fault",
-            expectedVersion: "0.1.220-open-grok.53",
+            expectedVersion: pinnedRelease,
             expectedShortCommit: nil
         )
         #expect(!report.passed)
@@ -300,12 +333,47 @@ struct SmokeValidationTests {
     @Test("the commit assertion is skipped when no commit is supplied")
     func commitOptional() {
         let report = SmokeValidation.validateVersionOutput(
-            "open-grok 0.1.220-open-grok.53",
-            expectedVersion: "0.1.220-open-grok.53",
+            "open-grok \(pinnedRelease)",
+            expectedVersion: pinnedRelease,
             expectedShortCommit: nil
         )
         #expect(report.passed)
         #expect(report.findings.map(\.id) == ["smoke.versionMatches"])
+    }
+
+    @Test("resolved product paths must remain inside the isolated root")
+    func resolvedPathsContainment() {
+        let report = SmokeValidation.validateResolvedPaths(
+            SmokeResolvedPaths(
+                opengrokHome: "/tmp/smoke.XXXX",
+                managedBinary: "/tmp/smoke.XXXX/bin/open-grok",
+                projectState: ".opengrok"
+            ),
+            isolatedRoot: "/tmp/smoke.XXXX"
+        )
+        #expect(report.passed)
+        #expect(report.findings.map(\.id) == [
+            "smoke.pathsHomeContained",
+            "smoke.pathsBinaryContained",
+            "smoke.pathsProjectStateValid",
+        ])
+    }
+
+    @Test("resolved paths that escape the root block")
+    func resolvedPathsEscape() {
+        let report = SmokeValidation.validateResolvedPaths(
+            SmokeResolvedPaths(
+                opengrokHome: "/tmp/other",
+                managedBinary: "/tmp/other/bin/open-grok",
+                projectState: ".opengrok"
+            ),
+            isolatedRoot: "/tmp/smoke.XXXX"
+        )
+        #expect(!report.passed)
+        #expect(report.findings(atLeast: .failure).map(\.id) == [
+            "smoke.pathsHomeEscaped",
+            "smoke.pathsBinaryEscaped",
+        ])
     }
 }
 
@@ -322,7 +390,7 @@ struct IsolatedHomeValidationTests {
             isolatedRoot: "/tmp/smoke.XXXX",
             touchedPaths: [
                 "/tmp/smoke.XXXX/home/.opengrok",
-                "/tmp/smoke.XXXX/home/downloads/open-grok-0.1.220-open-grok.53-macos-aarch64",
+                "/tmp/smoke.XXXX/home/downloads/open-grok-\(pinnedRelease)-macos-aarch64",
                 "/tmp/smoke.XXXX/bin/open-grok",
             ]
         )
@@ -394,10 +462,11 @@ struct IsolatedHomeValidationTests {
 @Suite("Reference pin")
 struct ReleaseValidationPinTests {
     @Test("the target names the current pin")
-    func pin() {
-        #expect(
-            OpenGrokReleaseValidation.referenceRevision
-                == "80dff0a9dcb24121b976b9f920fbe442af40ea88"
-        )
+    func pin() throws {
+        let baseline = try PortStatusBaseline.load()
+        #expect(OpenGrokReleaseValidation.referenceRevision == baseline.referenceRevision)
+        #expect(OpenGrokReleaseValidation.referencePinnedRelease == baseline.release)
+        #expect(OpenGrokReleaseValidation.referenceRevision == OpenGrokDistributionSupport.referenceRevision)
+        #expect(OpenGrokReleaseValidation.referencePinnedRelease == OpenGrokDistributionSupport.referencePinnedRelease)
     }
 }

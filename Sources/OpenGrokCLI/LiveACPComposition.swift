@@ -40,17 +40,36 @@ import OpenGrokShellSessionSupport
 /// refuses loudly instead of quietly answering nothing.
 public struct LiveACPServices: Sendable {
     public var makePromptDriver: @Sendable (LiveACPLaunch) async throws -> LiveACPPromptDriver
+    private let makeComponentsOperation: @Sendable (LiveACPLaunch) async throws -> LiveACPLaunchComponents
 
     public init(
         makePromptDriver: @escaping @Sendable (LiveACPLaunch) async throws -> LiveACPPromptDriver
     ) {
         self.makePromptDriver = makePromptDriver
+        self.makeComponentsOperation = { launch in
+            LiveACPLaunchComponents(promptDriver: try await makePromptDriver(launch))
+        }
+    }
+
+    public init(
+        makeComponents: @escaping @Sendable (LiveACPLaunch) async throws -> LiveACPLaunchComponents
+    ) {
+        self.makeComponentsOperation = makeComponents
+        self.makePromptDriver = { launch in
+            try await makeComponents(launch).promptDriver
+        }
+    }
+
+    fileprivate func makeComponents(
+        _ launch: LiveACPLaunch
+    ) async throws -> LiveACPLaunchComponents {
+        try await makeComponentsOperation(launch)
     }
 
     /// The default. A no-op driver would make `session/prompt` return an empty
     /// turn and look like a working agent, so this refuses with a message that
     /// names the missing piece.
-    public static let unavailable = LiveACPServices { _ in
+    public static let unavailable = LiveACPServices(makePromptDriver: { _ in
         throw CLIApplicationError.failed(
             """
             the ACP stdio agent has no prompt driver wired in this build.
@@ -59,6 +78,19 @@ public struct LiveACPServices: Sendable {
             LiveACPServices(makePromptDriver:) — see LiveACPComposition.
             """
         )
+    })
+}
+
+public struct LiveACPLaunchComponents: Sendable {
+    public let promptDriver: LiveACPPromptDriver
+    public let extensionHandler: (any ACPAgentExtensionHandler)?
+
+    public init(
+        promptDriver: LiveACPPromptDriver,
+        extensionHandler: (any ACPAgentExtensionHandler)? = nil
+    ) {
+        self.promptDriver = promptDriver
+        self.extensionHandler = extensionHandler
     }
 }
 
@@ -70,13 +102,19 @@ public struct LiveACPServices: Sendable {
 /// teardown travels with the driver instead of being reconstructed here.
 public struct LiveACPPromptDriver: ACPPromptDriver {
     private let driver: any ACPPromptDriver
+    private let availableCommands: [AvailableCommand]
+    private let skillCatalog: [LiveSkills.SkillCommand]
     public let shutdown: @Sendable () async -> Void
 
     public init(
         driver: any ACPPromptDriver,
+        availableCommands: [AvailableCommand] = [],
+        skillCatalog: [LiveSkills.SkillCommand] = [],
         shutdown: @escaping @Sendable () async -> Void = {}
     ) {
         self.driver = driver
+        self.availableCommands = availableCommands
+        self.skillCatalog = skillCatalog
         self.shutdown = shutdown
     }
 
@@ -84,7 +122,41 @@ public struct LiveACPPromptDriver: ACPPromptDriver {
         context: ACPPromptContext,
         emit: @escaping @Sendable (SessionNotification, ACPNotificationDisposition) async -> Void
     ) async throws -> PromptResponse {
-        try await driver.run(context: context, emit: emit)
+        if !availableCommands.isEmpty {
+            await emit(
+                SessionNotification(
+                    sessionId: context.request.sessionId,
+                    update: .availableCommandsUpdate(
+                        AvailableCommandsUpdate(availableCommands: availableCommands)
+                    )
+                ),
+                .durable
+            )
+        }
+
+        var adaptedContext = context
+        let text = context.request.prompt.compactMap { block -> String? in
+            guard case let .text(value) = block else { return nil }
+            return value.text
+        }.joined()
+        let tokens = text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        if let first = tokens.first,
+           first.hasPrefix("/"),
+           !skillCatalog.isEmpty {
+            let commandName = String(first.dropFirst()).lowercased()
+            let args = tokens.dropFirst().joined(separator: " ")
+            if let expanded = LiveSkills.invocationPrompt(
+                commandName: commandName,
+                args: args,
+                catalog: skillCatalog,
+                sessionID: context.session.sessionId.rawValue
+            ) {
+                var request = context.request
+                request.prompt = [.text(expanded)]
+                adaptedContext = ACPPromptContext(session: context.session, request: request)
+            }
+        }
+        return try await driver.run(context: adaptedContext, emit: emit)
     }
 
     public func cancel(sessionId: AcpSessionId) async {
@@ -168,14 +240,17 @@ public enum LiveACPComposition {
     ) async throws -> CLIApplicationSession {
         let cwd = try resolveWorkingDirectory(options.common.cwd)
         let home = OpenGrokHomeResolver.resolve(environment: context.environment)
+        let runtimeSessionID = options.sessionID ?? UUID().uuidString
+        var launchOptions = options
+        launchOptions.sessionID = runtimeSessionID
         let launch = LiveACPLaunch(
             workingDirectory: cwd,
             openGrokHome: home,
             environment: context.environment,
             streams: context.streams,
-            options: options
+            options: launchOptions
         )
-        let promptDriver = try await services.makePromptDriver(launch)
+        let launchComponents = try await services.makeComponents(launch)
 
         // The same shapes Shell uses for its own sessions
         // (`OpenGrokShell.swift:483-500`): an in-memory ACP snapshot store and
@@ -183,14 +258,15 @@ public enum LiveACPComposition {
         // `DefaultOpenGrokShellACPRuntimeFactory` keeps the two paths from
         // drifting apart.
         let workspace = LocalOpenGrokShellWorkspace(root: cwd, openGrokHome: home)
-        let components = DefaultOpenGrokShellACPRuntimeFactory().makeRuntime(
-            sessionID: SessionID(options.sessionID ?? UUID().uuidString),
+        let runtimeComponents = DefaultOpenGrokShellACPRuntimeFactory().makeRuntime(
+            sessionID: SessionID(runtimeSessionID),
             cwd: cwd,
             workspace: workspace,
-            promptDriver: promptDriver
+            promptDriver: launchComponents.promptDriver,
+            extensionHandler: launchComponents.extensionHandler
         )
         let host = ACPStdioHost(
-            runtime: components.runtime,
+            runtime: runtimeComponents.runtime,
             transport: transport ?? ACPStdioTransport(io: ACPStandardIO())
         )
         return CLIApplicationSession(
@@ -200,7 +276,7 @@ public enum LiveACPComposition {
                 // transport, then the tool executor and Code Mode processes
                 // the driver owns.
                 await host.shutdown()
-                await promptDriver.shutdown()
+                await launchComponents.promptDriver.shutdown()
             }
         )
     }

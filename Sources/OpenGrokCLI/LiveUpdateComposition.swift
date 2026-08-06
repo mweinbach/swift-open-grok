@@ -345,14 +345,15 @@ public enum LiveVersionPolicyGate {
 
     public static func isExempt(_ command: CLICommand) -> Bool {
         switch command {
-        case .version, .help, .paths, .completions, .models, .invalid:
-            return true
-        case .utility(let options):
-            return exemptUtilityRoutes.contains(options.name)
-        case .doctor:
-            return true
-        default:
+        case .launch, .serve, .leader:
             return false
+        default:
+            // Rust returns from every direct management/inspection command
+            // before the later default startup check. Swift routes those
+            // commands through the async application seam, so exempting all
+            // non-session commands preserves that boundary instead of
+            // accidentally blocking recovery or management operations.
+            return true
         }
     }
 

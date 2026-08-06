@@ -374,17 +374,26 @@ public struct ModelEntry: Sendable, Equatable, Codable {
     public var envKey: EnvKeys?
     /// When set, `baseURL` is used for session auth, `apiBaseURL` for API-key auth.
     public var apiBaseURL: String?
+    public var authProvider: String?
+    public var queryParams: [String: String]
+    public var envHTTPHeaders: [String: String]
 
     public init(
         info: ModelInfo,
         apiKey: String? = nil,
         envKey: EnvKeys? = nil,
-        apiBaseURL: String? = nil
+        apiBaseURL: String? = nil,
+        authProvider: String? = nil,
+        queryParams: [String: String] = [:],
+        envHTTPHeaders: [String: String] = [:]
     ) {
         self.info = info
         self.apiKey = apiKey
         self.envKey = envKey
         self.apiBaseURL = apiBaseURL
+        self.authProvider = authProvider
+        self.queryParams = queryParams
+        self.envHTTPHeaders = envHTTPHeaders
     }
 
     /// Convenience: routing slug.
@@ -402,7 +411,10 @@ public struct ModelEntry: Sendable, Equatable, Codable {
             info: ModelInfo.fromConfig(entry),
             apiKey: entry.apiKey,
             envKey: entry.envKey,
-            apiBaseURL: entry.apiBaseURL
+            apiBaseURL: entry.apiBaseURL,
+            authProvider: nil,
+            queryParams: [:],
+            envHTTPHeaders: [:]
         )
     }
 
@@ -424,6 +436,9 @@ public struct ModelEntry: Sendable, Equatable, Codable {
         case apiKey = "api_key"
         case envKey = "env_key"
         case apiBaseURL = "api_base_url"
+        case authProvider = "auth_provider"
+        case queryParams = "query_params"
+        case envHTTPHeaders = "env_http_headers"
         // Flattened encode path for disk cache: the Rust cache stores ModelEntry
         // as a flat struct via serde flatten-like layout of info + credential
         // fields. Our cache uses nested `info` for clarity and round-trips it.
@@ -619,6 +634,10 @@ public struct ConfigModelOverride: Sendable, Equatable {
     public var apiKey: String?
     public var envKey: EnvKeys?
     public var apiBaseURL: String?
+    public var modelProvider: String?
+    public var authProvider: String?
+    public var queryParams: [(String, String)]
+    public var envHTTPHeaders: [(String, String)]
     public var maxCompletionTokens: UInt32?
     public var temperature: Float?
     public var topP: Float?
@@ -655,6 +674,10 @@ public struct ConfigModelOverride: Sendable, Equatable {
         apiKey: String? = nil,
         envKey: EnvKeys? = nil,
         apiBaseURL: String? = nil,
+        modelProvider: String? = nil,
+        authProvider: String? = nil,
+        queryParams: [(String, String)] = [],
+        envHTTPHeaders: [(String, String)] = [],
         maxCompletionTokens: UInt32? = nil,
         temperature: Float? = nil,
         topP: Float? = nil,
@@ -690,6 +713,10 @@ public struct ConfigModelOverride: Sendable, Equatable {
         self.apiKey = apiKey
         self.envKey = envKey
         self.apiBaseURL = apiBaseURL
+        self.modelProvider = modelProvider
+        self.authProvider = authProvider
+        self.queryParams = queryParams
+        self.envHTTPHeaders = envHTTPHeaders
         self.maxCompletionTokens = maxCompletionTokens
         self.temperature = temperature
         self.topP = topP
@@ -818,6 +845,9 @@ public struct ConfigModelOverride: Sendable, Equatable {
         if apiKey != nil { entry.apiKey = apiKey }
         if envKey != nil { entry.envKey = envKey }
         if apiBaseURL != nil { entry.apiBaseURL = apiBaseURL }
+        if authProvider != nil { entry.authProvider = authProvider }
+        if !queryParams.isEmpty { entry.queryParams = Dictionary(uniqueKeysWithValues: queryParams) }
+        if !envHTTPHeaders.isEmpty { entry.envHTTPHeaders = Dictionary(uniqueKeysWithValues: envHTTPHeaders) }
         if supportedInApi == nil, apiKey != nil || envKey != nil {
             entry.info.supportedInApi = true
         }
@@ -865,6 +895,9 @@ extension ConfigModelOverride {
         lhs.model == rhs.model && lhs.baseURL == rhs.baseURL && lhs.name == rhs.name &&
         lhs.description == rhs.description && lhs.apiKey == rhs.apiKey && lhs.envKey == rhs.envKey &&
         lhs.apiBaseURL == rhs.apiBaseURL && lhs.maxCompletionTokens == rhs.maxCompletionTokens &&
+        lhs.modelProvider == rhs.modelProvider && lhs.authProvider == rhs.authProvider &&
+        equalStringPairs(lhs.queryParams, rhs.queryParams) &&
+        equalStringPairs(lhs.envHTTPHeaders, rhs.envHTTPHeaders) &&
         lhs.temperature == rhs.temperature && lhs.topP == rhs.topP && lhs.apiBackend == rhs.apiBackend &&
         lhs.provider == rhs.provider && lhs.authScheme == rhs.authScheme && lhs.toolMode == rhs.toolMode &&
         equalStringPairs(lhs.extraHeaders, rhs.extraHeaders) && lhs.contextWindow == rhs.contextWindow &&

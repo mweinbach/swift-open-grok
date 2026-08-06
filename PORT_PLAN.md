@@ -40,7 +40,7 @@ This document defines the implementation-ready target graph, ownership, invarian
 - Use protocol-first domain targets and Foundation value/network/file APIs; no AppKit, UIKit, or SwiftUI dependency is permitted in session, provider, tool, workspace, persistence, rendering-model, or terminal-core targets.
 - Centralize compile-time seams in adapter targets using #if os(macOS), #if os(Linux), and #if os(Windows); platform-neutral callers consume capability values and typed unsupported errors rather than conditional code.
 - Use one custom terminal/TUI stack: Unicode cell grid, viewport, ANSI/input parser, diff renderer, and Action -> reducer -> Effect runtime. macOS/Linux use POSIX TTY/PTY adapters; Windows uses Console/ConPTY adapters.
-- Use macOS Keychain, Linux Secret Service or an explicit owner-only documented fallback, and Windows Credential Manager behind SecretStore; never silently downgrade secure persistence.
+- Use macOS Keychain behind `SecretStore`. Linux reports unsupported until a Secret Service/libsecret adapter is linked, with an explicitly requested owner-only file store as the documented fallback. Windows reports unsupported until Credential Manager or an equivalent owner-only adapter is linked; never silently downgrade secure persistence.
 - Use macOS Seatbelt, Linux sandbox capability adapters, and Windows restricted-token/job/filesystem seams behind SandboxEnforcer. If parity is impossible, startup/resume reports an explicit unsupported capability and never silently weakens a persisted sandbox mode.
 - Use FSEvents/kqueue, inotify, and ReadDirectoryChangesW; IOPM, Linux inhibitor facilities, and SetThreadExecutionState; POSIX process groups/signals and Windows Job Objects behind dedicated protocols.
 - Treat Swift 6 strict concurrency as a design constraint: Sendable values cross actors, blocking C/OS calls run in bounded adapters, and continuations are guarded for exactly-once resume.
@@ -282,7 +282,7 @@ Port atomic file primitives, schema-versioned SQLite journaling, secure credenti
 - **Acceptance:**
   - SQLite operations are isolated in an actor, use explicit transactions/WAL policy, migrate deterministically, and recover from interrupted writes without partial logical records.
   - Atomic write/rename/fsync and advisory-lock behavior is tested on macOS and Linux, with Windows ReplaceFile/locking seams and explicit error mapping.
-  - SecretStore uses Keychain on macOS, Secret Service or an owner-only documented fallback on Linux, and Credential Manager on Windows; plaintext fallback is never silent.
+  - SecretStore uses Keychain on macOS; Linux defaults to typed unsupported with an explicitly requested owner-only fallback until Secret Service/libsecret is linked; Windows remains typed unsupported until Credential Manager or an equivalent owner-only adapter is linked. Plaintext fallback is never silent.
   - Checksum, permissions, canonicalization, and symlink tests cover hostile paths and concurrent writers.
 
 #### W2-S3 — Filesystem watch, Git status, code graph, and hunk attribution

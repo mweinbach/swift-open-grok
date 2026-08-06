@@ -48,6 +48,17 @@ private actor SpyShellBackend: ShellProcessBackend {
     func shellCWD() async -> URL? { nil }
 }
 
+private struct AllowingPrompter: PermissionPrompter {
+    func prompt(
+        access: AccessKind,
+        toolName: String,
+        toolCallId: String
+    ) async -> PermissionDecision {
+        _ = (access, toolName, toolCallId)
+        return .allow
+    }
+}
+
 /// A workspace plus a fully isolated `$OPENGROK_HOME` / `$HOME`, so no test
 /// ever reads the developer's real config, `~/.claude`, or trust store.
 private struct IsolatedWorkspace {
@@ -119,12 +130,49 @@ struct ShellGateDispatchTests {
             sessionID: "session-1",
             workingDirectory: workspace.root,
             toolPolicy: nil,
+            telemetryBootstrapContext: .empty,
             // Headless: no coordinator, so the prompter fails closed. A rule
             // that resolves to `.ask` therefore denies, which is what a CI or
             // piped run should do.
             fileAccessPolicy: .denyByDefault,
             environment: workspace.environment
         )
+    }
+
+    @Test("an enforced sandbox auto-allows one eligible Bash dispatch")
+    func sandboxAutoAllowsEligibleDispatch() async throws {
+        let workspace = IsolatedWorkspace()
+        defer { workspace.cleanup() }
+
+        let backend = SpyShellBackend()
+        let executor = try await LiveToolExecutor(
+            processBackend: backend,
+            sessionID: "session-1",
+            workingDirectory: workspace.root,
+            toolPolicy: nil,
+            telemetryBootstrapContext: .empty,
+            fileAccessPolicy: .prompt(AllowingPrompter()),
+            environment: workspace.environment,
+            sandboxDecision: LiveSandboxDecision(
+                profileName: "workspace",
+                mode: .restricted,
+                enforced: true,
+                autoAllowBash: true
+            ),
+            sandboxAutoAllowBash: { true }
+        )
+
+        let result = await executor.invoke(
+            sessionID: "session-1",
+            workingDirectory: workspace.root,
+            call: terminalCall("printf hi")
+        )
+        guard case .success = result else {
+            Issue.record("sandbox auto-allow did not dispatch eligible Bash: \(result)")
+            return
+        }
+        #expect(await backend.commands() == ["printf hi"])
+        await executor.shutdown()
     }
 
     @Test("a denied command never reaches the process backend and leaves no file")
@@ -264,6 +312,7 @@ struct ShellGateDispatchTests {
             sessionID: "session-1",
             workingDirectory: workspace.root,
             toolPolicy: nil,
+            telemetryBootstrapContext: .empty,
             fileAccessPolicy: .denyByDefault,
             environment: workspace.environment,
             permissionOptions: CLIPermissionOptions(allowRules: ["Bash"])
@@ -279,6 +328,48 @@ struct ShellGateDispatchTests {
             return
         }
         #expect(await backend.commands() == ["printf hi"])
+
+        await executor.shutdown()
+    }
+
+    @Test("a Bash PreToolUse hook denies the live shell spelling before spawn")
+    func bashHookDeniesLiveTerminalCommand() async throws {
+        let workspace = IsolatedWorkspace()
+        defer { workspace.cleanup() }
+
+        let hooksDirectory = URL(fileURLWithPath: workspace.environment["OPENGROK_HOME"]!)
+            .appendingPathComponent("hooks")
+        try FileManager.default.createDirectory(at: hooksDirectory, withIntermediateDirectories: true)
+        let hook = #"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"printf '%s' '{\"decision\":\"deny\",\"reason\":\"blocked by Bash hook\"}'"}]}]}}"#
+        try hook.write(
+            to: hooksDirectory.appendingPathComponent("deny-live-shell.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let backend = SpyShellBackend()
+        let executor = try await LiveToolExecutor(
+            processBackend: backend,
+            sessionID: "session-1",
+            workingDirectory: workspace.root,
+            toolPolicy: nil,
+            telemetryBootstrapContext: .empty,
+            fileAccessPolicy: .denyByDefault,
+            environment: workspace.environment,
+            permissionOptions: CLIPermissionOptions(allowRules: ["Bash"])
+        )
+
+        let result = await executor.invoke(
+            sessionID: "session-1",
+            workingDirectory: workspace.root,
+            call: terminalCall("printf hi")
+        )
+
+        guard case .failure = result else {
+            Issue.record("a matching Bash hook must deny run_terminal_cmd, got \(result)")
+            return
+        }
+        #expect(await backend.spawnCount() == 0)
 
         await executor.shutdown()
     }
@@ -318,6 +409,7 @@ struct ShellGateDispatchTests {
             sessionID: "session-1",
             workingDirectory: workspace.root,
             toolPolicy: nil,
+            telemetryBootstrapContext: .empty,
             fileAccessPolicy: .denyByDefault,
             environment: workspace.environment,
             permissionOptions: CLIPermissionOptions(

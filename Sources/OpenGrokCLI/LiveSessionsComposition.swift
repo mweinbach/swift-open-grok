@@ -190,9 +190,10 @@ struct LiveSessionCatalog {
         // after a delete would keep that content on disk with nothing left
         // pointing at it, which is the opposite of what deleting a session
         // means. Absent file is not an error: most sessions never record one.
-        try? fileManager.removeItem(
-            at: sessionsDirectory.appendingPathComponent("\(sessionID).rewind.jsonl")
-        )
+        try? fileManager.removeItem(at: LiveRewindStore.rewindFileURL(
+            openGrokHome: sessionsDirectory.deletingLastPathComponent(),
+            sessionID: sessionID
+        ))
         return true
     }
 

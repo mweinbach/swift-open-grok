@@ -208,6 +208,70 @@ struct WorkspaceGateTests {
     }
 }
 
+@Suite("workspace remote settings loader")
+struct WorkspaceRemoteSettingsLoaderTests {
+    @Test("fetches authenticated settings from the configured proxy")
+    func fetchesConfiguredSettings() async throws {
+        var settings = RemoteSettings()
+        settings.workspaceCommandEnabled = true
+        let transport = MockHTTPTransport(responses: [
+            MockHTTPTransport.ScriptedResponse(
+                metadata: HTTPResponseMetadata(statusCode: 200),
+                body: try JSONEncoder().encode(settings)
+            )
+        ])
+
+        let loaded = await loadWorkspaceRemoteSettings(
+            environment: [
+                "XAI_API_KEY": "test-token",
+                "GROK_CLI_CHAT_PROXY_BASE_URL": "https://proxy.example/v1",
+            ],
+            transport: transport
+        )
+
+        #expect(loaded?.workspaceCommandEnabled == true)
+        let request = try #require(transport.recordedRequests.first)
+        #expect(request.method == .get)
+        #expect(request.url.absoluteString == "https://proxy.example/v1/settings")
+        #expect(request.headers["Accept"] == "application/json")
+        #expect(request.headers["Authorization"] == "Bearer test-token")
+    }
+
+    @Test("maps malformed endpoint, non-2xx, and malformed body to unavailable settings")
+    func loaderFailsClosed() async throws {
+        let environment = ["XAI_API_KEY": "test-token"]
+        let malformedEndpoint = await loadWorkspaceRemoteSettings(
+            environment: environment.merging(["GROK_CLI_CHAT_PROXY_BASE_URL": "%%%"], uniquingKeysWith: { _, new in new }),
+            transport: MockHTTPTransport()
+        )
+        #expect(malformedEndpoint == nil)
+
+        let nonSuccessTransport = MockHTTPTransport(responses: [
+            MockHTTPTransport.ScriptedResponse(
+                metadata: HTTPResponseMetadata(statusCode: 503),
+                body: Data("{}".utf8)
+            )
+        ])
+        let nonSuccess = await loadWorkspaceRemoteSettings(
+            environment: environment,
+            transport: nonSuccessTransport
+        )
+        #expect(nonSuccess == nil)
+
+        let malformedBodyTransport = MockHTTPTransport(responses: [
+            MockHTTPTransport.ScriptedResponse(
+                metadata: HTTPResponseMetadata(statusCode: 200),
+                body: Data("not-json".utf8)
+            )
+        ])
+        let malformedBody = await loadWorkspaceRemoteSettings(
+            environment: environment,
+            transport: malformedBodyTransport
+        )
+        #expect(malformedBody == nil)
+    }
+}
+
 // MARK: - Sandbox refusal
 
 @Suite("workspace sandbox refusal")
@@ -336,6 +400,44 @@ struct WorkspaceCapabilityTests {
         #expect(polled.state == "running")
         #expect(polled.activeToolCalls == 1)
         #expect(polled.sessions == ["sess-1"])
+    }
+
+    @Test("production leader configuration constructs a live workspace connector")
+    func productionLeaderConfigurationWiresExposureConnector() async throws {
+        let configuration = LiveLeaderComposition.productionIPCConfiguration(
+            paths: (
+                socket: URL(fileURLWithPath: "/tmp/open-grok-leader.sock"),
+                lock: URL(fileURLWithPath: "/tmp/open-grok-leader.lock")
+            ),
+            relayURL: "wss://relay.example/ws",
+            environment: [:],
+            productionExposureConnector: { _, _ in TripwireExposureConnection() }
+        )
+        guard configuration.controlPlane != nil else {
+            Issue.record("production leader configuration dropped its exposure connector")
+            return
+        }
+        let host = ACPLeaderIPCHost(
+            runtime: ACPAgentRuntime(),
+            configuration: configuration
+        )
+        let replies = try await driveWorkspaceControl(
+            over: host,
+            commands: [
+                (id: "ws-connector", command: [
+                    "type": "workspace_start",
+                    "hub_url": "wss://hub.test/ws",
+                    "cwd": "/tmp/proj"
+                ])
+            ]
+        )
+        guard case .controlResult("ws-connector", .workspaceStatus(let status)) = replies["ws-connector"] else {
+            Issue.record("production workspace connector did not start the exposure: \(replies)")
+            return
+        }
+        #expect(status.state == "running")
+        #expect(status.hubURL == "wss://hub.test/ws")
+        #expect(status.cwd == "/tmp/proj")
     }
 
     @Test("the production workspace channel consumes a control result", .timeLimit(.minutes(1)))

@@ -173,10 +173,16 @@ struct ImageToolRegistrationTests {
     @Test("a registered tool with no handler refuses to dispatch")
     func unboundHandlerRefuses() async throws {
         let builder = ToolRegistryBuilder()
+        let pipeline = PermissionPipeline(
+            permissions: PermissionHandle(allowAll: true, shellCwd: NSTemporaryDirectory())
+        )
         let bridge = try ToolBridge.finalize(
             builder: builder,
             config: imageToolConfig(),
-            resources: ToolResources(cwd: NSTemporaryDirectory()),
+            resources: ToolResources(
+                cwd: NSTemporaryDirectory(),
+                permissionPipeline: pipeline
+            ),
             options: FinalizeOptions(capabilityMode: .readWrite)
         )
         let result = await bridge.call(

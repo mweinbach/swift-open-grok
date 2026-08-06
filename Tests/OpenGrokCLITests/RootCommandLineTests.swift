@@ -304,6 +304,11 @@ struct RootCommandLineTests {
         )
     }
 
+    @Test("--no-memory is retained for the live session launcher")
+    func noMemoryFlag() throws {
+        #expect(try launch(["--no-memory"]).agentOptions.noMemory)
+    }
+
     // MARK: - Interface and globals
 
     /// Upstream's `--minimal` is a scrollback-native *interactive* renderer.
@@ -428,5 +433,18 @@ struct RootCommandLineTests {
             return
         }
         #expect(json)
+    }
+
+    @Test("leader policy flags survive interactive and headless root parsing")
+    func leaderPolicyFlags() throws {
+        let interactive = try launch(["--leader", "fix the bug"])
+        #expect(interactive.common.leader)
+        #expect(!interactive.common.noLeader)
+
+        let headless = try launch(["--no-leader", "-p", "summarize"])
+        #expect(!headless.common.leader)
+        #expect(headless.common.noLeader)
+
+        #expect(parseError(["--leader", "--no-leader"]) == .conflictingOptions("--leader", "--no-leader"))
     }
 }

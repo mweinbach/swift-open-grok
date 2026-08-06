@@ -122,7 +122,7 @@ public actor LocalWorkspaceOps {
     public nonisolated let root: URL
     public nonisolated let boundary: PathBoundary
     public let permissions: PermissionHandle
-    public let pipeline: PermissionPipeline
+    public nonisolated let pipeline: PermissionPipeline
     public let locks: PathResourceLockManager
     public let config: WorkspaceConfig
     /// When set, remote policy is authoritative; local fallback must not bypass.

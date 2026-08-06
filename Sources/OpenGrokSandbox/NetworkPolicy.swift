@@ -265,8 +265,9 @@ extension ChildNetworkPolicy {
     /// `ChildNetworkRestriction.swift`, failing closed with
     /// `SandboxError.unsupported` when the host cannot enforce. Off Linux it
     /// is a deliberate no-op, matching upstream's non-Linux child filter
-    /// (`child_net.rs:226-229` returns `Ok(())`) — macOS network policy is
-    /// applied in the process-level Seatbelt profile, not per child.
+    /// (`child_net.rs:226-229` returns `Ok(())`). macOS keeps process-level
+    /// network access available for provider sampling rather than denying it
+    /// in Seatbelt.
     ///
     /// `.websites` is a typed unsupported on every platform: upstream models
     /// the per-origin list but never enforces it (`network_policy.rs:3`:

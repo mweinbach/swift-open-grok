@@ -55,7 +55,7 @@ private func targets() -> [Target] {
     let w1s5 = ["OpenGrokConfigTypes", "OpenGrokConfig"]
 
     // Wave 2.
-    let w2s1 = ["OpenGrokHTTP", "OpenGrokCircuitBreaker", "OpenGrokTracing", "OpenGrokTelemetry"]
+    let w2s1 = ["OpenGrokExtraCA", "OpenGrokHTTP", "OpenGrokCircuitBreaker", "OpenGrokTracing", "OpenGrokTelemetry"]
     let w2s2 = ["OpenGrokSQLiteJournal", "OpenGrokSecrets", "OpenGrokFileUtils"]
     let w2s3 = ["OpenGrokFSNotify", "OpenGrokGitStatus", "OpenGrokCodebaseGraph", "OpenGrokHunkTracker"]
     let w2s4 = ["OpenGrokPTY", "OpenGrokPTYCLI", "OpenGrokTTY", "OpenGrokSystemPower", "OpenGrokCrashHandler"]
@@ -144,6 +144,7 @@ private func targets() -> [Target] {
         exclude: ["regenerate-compiled-version.sh", "CompiledVersion.generated.swift"],
         plugins: [.plugin(name: "OpenGrokVersionBuildPlugin")]
     ))
+    t.append(.executableTarget(name: "OpenGrokVersionGenerator"))
     // W0-S4: the Rust `xai-grok-shared` crate depends on
     // `prod-mc-cli-chat-proxy-types` and re-exports
     // `FeedbackTerminalInfo`. The Swift port mirrors that edge:
@@ -173,7 +174,14 @@ private func targets() -> [Target] {
     // W2-S1: Tracing/CircuitBreaker base; HTTP -> both; Telemetry -> both.
     t.append(.target(name: "OpenGrokCircuitBreaker", dependencies: dep(w0s3, w0s4, w1s5)))
     t.append(.target(name: "OpenGrokTracing", dependencies: dep(w0s3, w0s4, w1s5)))
-    t.append(.target(name: "OpenGrokHTTP", dependencies: dep(w0s3, w0s4, w1s5, ["OpenGrokCircuitBreaker", "OpenGrokTracing"])))
+    t.append(.target(
+        name: "COpenGrokSockets",
+        path: "Sources/COpenGrokSockets",
+        publicHeadersPath: "include",
+        linkerSettings: [.linkedLibrary("ws2_32", .when(platforms: [.windows]))]
+    ))
+    t.append(.target(name: "OpenGrokExtraCA", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokTracing"])))
+    t.append(.target(name: "OpenGrokHTTP", dependencies: dep(w0s3, w0s4, w1s5, ["OpenGrokCircuitBreaker", "OpenGrokTracing", "COpenGrokSockets", "OpenGrokExtraCA"])))
     t.append(.target(name: "OpenGrokTelemetry", dependencies: dep(w0s3, w0s4, w1s5, ["OpenGrokTracing", "OpenGrokHTTP"])))
     // W2-S2: FileUtils base; SQLiteJournal/Secrets build on it.
     t.append(.target(name: "OpenGrokFileUtils", dependencies: dep(w0s2, w0s3, w0s4, w1s5)))
@@ -218,7 +226,7 @@ private func targets() -> [Target] {
     t.append(.target(name: "OpenGrokTextArea", dependencies: dep(w0s2, w0s4, ["OpenGrokTerminalCore"])))
 
     // ---- Wave 3 ----
-    t.append(contentsOf: libs(w3s1, dep(w0s2, w0s3, w0s4, w1s5, w2s1, w2s2)))
+    t.append(contentsOf: libs(w3s1, dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s1, w2s2)))
     t.append(contentsOf: libs(w3s2, dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s1)))
     t.append(contentsOf: libs(w3s3, dep(w0s2, w0s3, w0s4, w1s1, w1s3, w1s5, w2s1)))
 
@@ -228,20 +236,20 @@ private func targets() -> [Target] {
     t.append(contentsOf: libs(w4s3, dep(w0s2, w0s3, w0s4, w1s1, w1s4, w1s5, w2s2, w2s3, w2s4)))
     // W4-S4: Core base; SDK -> Core; WorkspaceClient -> Core/SDK.
     t.append(.target(name: "OpenGrokComputerHubCore", dependencies: dep(w0s2, w0s4, w1s1, w1s4, w2s1, w2s4)))
-    t.append(.target(name: "OpenGrokComputerHubSDK", dependencies: dep(w0s2, w0s4, w1s1, w1s4, w2s1, w2s4, ["OpenGrokComputerHubCore"])))
+    t.append(.target(name: "OpenGrokComputerHubSDK", dependencies: dep(w0s2, w0s4, w1s1, w1s4, w2s4, ["OpenGrokComputerHubCore", "OpenGrokHTTP"])))
     t.append(.target(name: "OpenGrokWorkspaceClient", dependencies: dep(w0s2, w0s4, w1s1, w1s4, w2s1, w2s4, ["OpenGrokComputerHubCore", "OpenGrokComputerHubSDK"])))
 
     // ---- Wave 5 ----
     // W5-S1: ToolRegistry base; FileTools -> ToolRegistry.
     t.append(.target(name: "OpenGrokToolRegistry", dependencies: dep(w0s2, w1s1, w1s3, w1s4, w2s2, w2s3, w4s3)))
     t.append(.target(name: "OpenGrokFileTools", dependencies: dep(w0s2, w1s1, w1s3, w1s4, w2s2, w2s3, w4s3, ["OpenGrokToolRegistry"])))
-    t.append(contentsOf: libs(w5s2, dep(w0s2, w0s4, w1s1, w1s3, w2s1, w2s4, w3s3, w4s3, w4s4)))
+    t.append(contentsOf: libs(w5s2, dep(w0s2, w0s4, w1s1, w1s3, w2s1, w2s4, w3s3, w4s3, w4s4, w4s1)))
     t.append(contentsOf: libs(w5s3, dep(w0s2, w1s1, w1s2, w1s4, w4s2, w4s3)))
     // W5-S4: MCP base; ComputerHubMCPAdapter -> MCP.
-    t.append(.target(name: "OpenGrokMCP", dependencies: dep(w0s2, w0s3, w1s1, w1s4, w1s5, w2s1, w2s2, w4s4)))
+    t.append(.target(name: "OpenGrokMCP", dependencies: dep(w0s2, w0s3, w1s1, w1s4, w1s5, w2s1, w2s2, w4s4, w4s1)))
     t.append(.target(name: "OpenGrokComputerHubMCPAdapter", dependencies: dep(w0s2, w0s3, w1s1, w1s4, w1s5, w2s1, w2s2, w4s4, ["OpenGrokMCP"])))
     // W5-S5: Hooks base; PluginMarketplace -> Hooks.
-    t.append(.target(name: "OpenGrokHooks", dependencies: dep(w0s2, w0s3, w1s4, w1s5, w2s1, w2s2, w4s3)))
+    t.append(.target(name: "OpenGrokHooks", dependencies: dep(w0s2, w0s3, w1s4, w1s5, w2s1, w2s2, w4s3, w4s1)))
     t.append(.target(name: "OpenGrokPluginMarketplace", dependencies: dep(w0s2, w0s3, w1s4, w1s5, w2s1, w2s2, w4s3, ["OpenGrokHooks"])))
     t.append(contentsOf: libs(w5s6, dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s1, w2s2, w2s4, w3s3)))
 
@@ -296,10 +304,13 @@ private func targets() -> [Target] {
     // unreachable from the executable. The CLI is where they become live: the
     // memory index backs first-turn injection and the `memory_search` /
     // `memory_get` tools, and the goal tracker backs `update_goal`.
-    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s4, w2s5, w3s1, w3s2, w3s3, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w7s3, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokCodeMode"])))
+    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s4, w2s5, w3s1, w3s2, w3s3, w4s2, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w7s3, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokCodeMode", "OpenGrokReleaseValidation"])))
 
     // ---- Wave 11 (libraries + executable) ----
-    t.append(contentsOf: libs(w11s1Lib, dep(w0s1, w0s3, w2s2, w5s6, w10s1, w10s2)))
+    // Distribution support only imports build support, version, and update
+    // metadata. Keeping the edge narrow matters now that the CLI consumes the
+    // release validator; a reverse CLI dependency here would recreate a cycle.
+    t.append(contentsOf: libs(w11s1Lib, dep(w0s1, w0s3, w5s6)))
     t.append(contentsOf: libs(w11s3Lib, dep(w10s1, w10s2, w2s4, w2s5, w0s2)))
     // `OpenGrokDistributionSupport` is on this edge so `OpenGrokReleaseValidation`
     // can reach the package's single SHA-256 (`ReleaseChecksum.generate`, which
@@ -307,7 +318,7 @@ private func targets() -> [Target] {
     // (`ReleaseVersion.isValid`). Without it, `ChecksumValidation` could only
     // take a digest it was handed and `SmokeValidation` had to carry a second
     // copy of the version pattern.
-    t.append(contentsOf: libs(w11s5Lib, dep(w10s1, w10s2, ["OpenGrokSandbox", "OpenGrokAuth", "OpenGrokTelemetry", "OpenGrokUpdate", "OpenGrokMermaid", "OpenGrokTerminalCore", "OpenGrokCodeMode", "OpenGrokDistributionSupport"])))
+    t.append(contentsOf: libs(w11s5Lib, dep(["OpenGrokDistributionSupport"])))
     t.append(.executableTarget(
         name: "OpenGrokExecutable",
         dependencies: dep(["OpenGrokCLI", "OpenGrokPager", "OpenGrokPagerMinimal", "OpenGrokShell", "OpenGrokVersion", "OpenGrokDistributionSupport"])
@@ -339,7 +350,7 @@ private func targets() -> [Target] {
     t.append(contentsOf: tests(["OpenGrokSamplingTypes", "OpenGrokChatState", "OpenGrokTokenEstimation"]))
     t.append(contentsOf: tests(w1s4))
     t.append(contentsOf: tests(["OpenGrokConfigTypes", "OpenGrokConfig"]))
-    t.append(contentsOf: tests(["OpenGrokCircuitBreaker", "OpenGrokTracing", "OpenGrokHTTP", "OpenGrokTelemetry"]))
+    t.append(contentsOf: tests(["OpenGrokExtraCA", "OpenGrokCircuitBreaker", "OpenGrokTracing", "OpenGrokHTTP", "OpenGrokTelemetry"]))
     t.append(contentsOf: tests(["OpenGrokFileUtils", "OpenGrokSQLiteJournal", "OpenGrokSecrets"]))
     t.append(contentsOf: tests(w2s3))
     t.append(contentsOf: tests(["OpenGrokTTY", "OpenGrokPTY", "OpenGrokPTYCLI", "OpenGrokSystemPower", "OpenGrokCrashHandler"]))
@@ -408,13 +419,17 @@ private func targets() -> [Target] {
     t.append(contentsOf: tests(w11s5Lib))
 
     // ---- Standalone Wave 11 test/harness targets ----
-    t.append(.testTarget(name: "OpenGrokCompatibilityTests", dependencies: dep(["OpenGrokPager", "OpenGrokCLI", "OpenGrokTestSupport", "OpenGrokTestUtilities", "OpenGrokACP", "OpenGrokToolProtocol", "OpenGrokSamplingTypes", "OpenGrokSampler", "OpenGrokShell"])))
+    t.append(.testTarget(name: "OpenGrokCompatibilityTests", dependencies: dep(["OpenGrokPager", "OpenGrokCLI", "OpenGrokTestSupport", "OpenGrokTestUtilities", "OpenGrokACP", "OpenGrokToolProtocol", "OpenGrokSamplingTypes", "OpenGrokSampler", "OpenGrokShell", "OpenGrokDistributionSupport"])))
     // `OpenGrokPTY`/`OpenGrokTTY` are direct here because the scenarios name
     // `ProcessExit` and `TerminalSize` in their own assertions.
     t.append(.testTarget(name: "OpenGrokPagerPTYTests", dependencies: dep(["OpenGrokPagerPTYHarness", "OpenGrokPTY", "OpenGrokTTY", "OpenGrokTestSupport", "OpenGrokTestUtilities"])))
     t.append(.testTarget(name: "OpenGrokFuzzingTests", dependencies: dep(["OpenGrokPager", "OpenGrokCLI", "OpenGrokMarkdownCore", "OpenGrokMarkdown", "OpenGrokSampler", "OpenGrokToolRegistry", "OpenGrokFileTools", "OpenGrokShell"])))
-    t.append(.testTarget(name: "OpenGrokPerformanceTests", dependencies: dep(["OpenGrokPager", "OpenGrokCLI", "OpenGrokMarkdown", "OpenGrokSampler", "OpenGrokShell", "OpenGrokMemory"])))
-    t.append(.testTarget(name: "OpenGrokSecurityTests", dependencies: dep(["OpenGrokReleaseValidation", "OpenGrokPager", "OpenGrokCLI", "OpenGrokSandbox", "OpenGrokAuth"])))
+    t.append(.testTarget(name: "OpenGrokPerformanceTests", dependencies: dep(["OpenGrokPager", "OpenGrokCLI", "OpenGrokMarkdown", "OpenGrokSampler", "OpenGrokSamplingTypes", "OpenGrokShared", "OpenGrokShell", "OpenGrokShellBase", "OpenGrokMemory"])))
+    t.append(.testTarget(name: "OpenGrokSecurityTests", dependencies: dep([
+        "OpenGrokReleaseValidation", "OpenGrokPager", "OpenGrokCLI", "OpenGrokSandbox",
+        "OpenGrokAuth", "OpenGrokFileTools", "OpenGrokWorkspace", "OpenGrokProviderSession",
+        "OpenGrokSamplingTypes", "OpenGrokShellBase"
+    ])))
 
     // ---- Build support plugins ----
     // Read-only validation of checked-in protocol fixtures. Regeneration is
@@ -440,7 +455,7 @@ private func targets() -> [Target] {
     t.append(.plugin(
         name: "OpenGrokVersionBuildPlugin",
         capability: .buildTool(),
-        dependencies: []
+        dependencies: [.target(name: "OpenGrokVersionGenerator")]
     ))
 
     return t

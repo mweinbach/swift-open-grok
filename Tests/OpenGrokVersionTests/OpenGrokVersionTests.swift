@@ -4,7 +4,7 @@
 //
 // Tests translate the Rust `xai-grok-version/src/lib.rs` `tests` module and
 // add coverage for the minimal semver parser, the `GROK_TEST_VERSION` runtime
-// override, and the Open Grok prerelease format `0.1.220-open-grok.21`.
+// override, and the Open Grok prerelease format `0.1.220-open-grok.54`.
 
 import Foundation
 import Testing
@@ -13,11 +13,34 @@ import Testing
 @Suite("OpenGrokVersion")
 struct OpenGrokVersionTests {
 
+    private var expectedCompiledVersion: String {
+        ProcessInfo.processInfo.environment["GROK_TEST_EXPECTED_COMPILED_VERSION"]
+            ?? "0.1.220-open-grok.54"
+    }
+
     // MARK: - Compiled version constant
 
     @Test("Compiled version matches the reference OPEN_GROK_VERSION")
     func compiledVersionMatchesReference() {
-        #expect(OpenGrokVersion.compiledVersion == "0.1.220-open-grok.21")
+        #expect(OpenGrokVersion.compiledVersion == expectedCompiledVersion)
+    }
+
+    @Test("package-root OPEN_GROK_VERSION matches the compiled default")
+    func packageRootVersionMarkerMatchesCompiledDefault() throws {
+        var root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        while root.path != "/",
+              !FileManager.default.fileExists(atPath: root.appendingPathComponent("Package.swift").path) {
+            root.deleteLastPathComponent()
+        }
+        let marker = try String(
+            contentsOf: root.appendingPathComponent("OPEN_GROK_VERSION"),
+            encoding: .utf8
+        )
+            .split(whereSeparator: \.isNewline)
+            .first
+            .map(String.init) ?? ""
+        #expect(marker == "0.1.220-open-grok.54")
+        #expect(OpenGrokVersion.compiledVersion == marker)
     }
 
     @Test("compiledVersion is driven by the build-tool plugin (GROK_VERSION injection)")
@@ -28,18 +51,15 @@ struct OpenGrokVersionTests {
         // the Rust crate's `option_env!("GROK_VERSION")`.
         //
         // This test verifies that `compiledVersion` is a non-empty string
-        // that matches the expected default when `GROK_VERSION` is not set
-        // during the build. The checked-in
+        // that matches the build's expected version. The checked-in
         // `Sources/OpenGrokVersion/CompiledVersion.generated.swift` is now
         // excluded from target compilation (the plugin generates the real
         // version into the build output), so this test checks the compiled
         // value directly rather than reading the source tree file.
         #expect(!OpenGrokVersion.compiledVersion.isEmpty,
                 "compiledVersion must be a non-empty string injected at build time")
-        // When GROK_VERSION is not set during the build, the plugin falls
-        // back to the canonical default.
-        #expect(OpenGrokVersion.compiledVersion == "0.1.220-open-grok.21",
-                "compiledVersion must match the canonical default when GROK_VERSION is unset (got \(OpenGrokVersion.compiledVersion))")
+        #expect(OpenGrokVersion.compiledVersion == expectedCompiledVersion,
+                "compiledVersion must match the expected build value (got \(OpenGrokVersion.compiledVersion))")
     }
 
     @Test("testVersionEnvironmentVariable matches Rust TEST_VERSION_ENV")
@@ -101,13 +121,10 @@ struct OpenGrokVersionTests {
     @Test("installedSemVer() parses the compiled Open Grok version")
     func installedSemVerParsesCompiled() throws {
         let version = try OpenGrokVersion.installedSemVer(environment: [:])
-        #expect(version.major == 0)
-        #expect(version.minor == 1)
-        #expect(version.patch == 220)
-        #expect(version.prerelease == ["open-grok", "21"])
-        #expect(version.build == [])
-        #expect(version.hasPrerelease)
-        #expect(!version.hasBuild)
+        let expected = try SemVerVersion.parse(expectedCompiledVersion)
+        #expect(version == expected)
+        #expect(version.hasPrerelease == expected.hasPrerelease)
+        #expect(version.hasBuild == expected.hasBuild)
     }
 
     @Test("installedSemVer() parses a GROK_TEST_VERSION override")
@@ -192,12 +209,12 @@ struct OpenGrokVersionTests {
 
     @Test("SemVerVersion parses the Open Grok release string")
     func semverParsesOpenGrokRelease() throws {
-        let v = try SemVerVersion.parse("0.1.220-open-grok.21")
+        let v = try SemVerVersion.parse("0.1.220-open-grok.54")
         #expect(v.major == 0)
         #expect(v.minor == 1)
         #expect(v.patch == 220)
-        #expect(v.prerelease == ["open-grok", "21"])
-        #expect(v.description == "0.1.220-open-grok.21")
+        #expect(v.prerelease == ["open-grok", "54"])
+        #expect(v.description == "0.1.220-open-grok.54")
     }
 
     @Test("SemVerVersion trims surrounding whitespace")
@@ -395,7 +412,7 @@ struct OpenGrokVersionTests {
     @Test("SemVer open-grok release ordering: prerelease < stable")
     func semverOpenGrokReleaseOrdering() throws {
         let release = try SemVerVersion.parse("0.1.220")
-        let pre = try SemVerVersion.parse("0.1.220-open-grok.21")
+        let pre = try SemVerVersion.parse("0.1.220-open-grok.54")
         #expect(pre < release)
     }
 
@@ -568,7 +585,7 @@ struct OpenGrokVersionTests {
 
         // If the package root has an OPEN_GROK_VERSION file (copied into the
         // temp package root), the script must use its first line. Otherwise it
-        // uses the default `0.1.220-open-grok.21`.
+        // uses the default `0.1.220-open-grok.54`.
         let tempVersionFile = tempDir.appendingPathComponent("OPEN_GROK_VERSION")
         if FileManager.default.fileExists(atPath: tempVersionFile.path),
            let fileContents = try? String(contentsOf: tempVersionFile, encoding: .utf8) {
@@ -584,7 +601,7 @@ struct OpenGrokVersionTests {
         } else {
             // No OPEN_GROK_VERSION file in the package root: the script falls
             // back to the default version.
-            #expect(version == "0.1.220-open-grok.21",
+            #expect(version == "0.1.220-open-grok.54",
                     "Generated version must be the default when no OPEN_GROK_VERSION file exists")
         }
     }

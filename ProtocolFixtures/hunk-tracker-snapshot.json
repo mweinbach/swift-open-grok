@@ -30,11 +30,11 @@
   "jsonOutputFormatting": [
     "sortedKeys"
   ],
-  "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+  "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
   "provenance": {
     "source": "OpenGrokHunkTracker.HunkTrackerSnapshot Codable wire vs xai-hunk-tracker",
-    "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
-    "previousReferenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+    "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
+    "previousReferenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
     "pinVerdict": "unchanged (verified)",
     "keyProvenance": {
       "sampleSnapshot": "crates/codegen/xai-hunk-tracker/src/types.rs:529-536 (HunkTrackerSnapshot: file_states, turn_index, session_stats)",
@@ -42,8 +42,8 @@
       "hunkSourceTypes": "crates/codegen/xai-hunk-tracker/src/types.rs HunkSource variants AgentEdit / ExternalEditOnAgentFile / External"
     },
     "evidence": [
-      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-hunk-tracker => 14 insertions / 296 deletions, all dead-code removal. The wire-bearing declarations are untouched: HunkTrackerSnapshot and SessionStats keep the same fields and camelCase serde renaming; the HunkSource variant set is unchanged.",
-      "The types.rs deletions are only unused helper methods (HunkSource::is_agent_tracked, Hunk::summary, Hunk::display_path); the same pattern holds for the actor/, commands.rs, diff.rs, and handle.rs deletions, none of which are Serialize/Deserialize surfaces."
+      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-hunk-tracker => empty (the wire-bearing declarations remain unchanged at the current pin)",
+      "HunkTrackerSnapshot and SessionStats keep the same fields and camelCase serde renaming, and the HunkSource variant set is unchanged."
     ]
   }
 }

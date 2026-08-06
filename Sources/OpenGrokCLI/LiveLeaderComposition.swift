@@ -35,10 +35,51 @@ import Foundation
 import OpenGrokACP
 import OpenGrokACPRuntime
 import OpenGrokAuth
+import OpenGrokComputerHubCore
 import OpenGrokHTTP
 import OpenGrokShared
 import OpenGrokShell
 import OpenGrokShellSessionSupport
+import OpenGrokWorkspace
+
+public struct LiveLeaderAuthDependencies: Sendable {
+    public var makeRefresher: @Sendable (
+        GrokAuth,
+        GrokComConfig
+    ) -> (any TokenRefresher)?
+
+    public init(
+        makeRefresher: @escaping @Sendable (
+            GrokAuth,
+            GrokComConfig
+        ) -> (any TokenRefresher)?
+    ) {
+        self.makeRefresher = makeRefresher
+    }
+
+    public static func production(
+        transport: any HTTPTransport = URLSessionHTTPTransport()
+    ) -> LiveLeaderAuthDependencies {
+        LiveLeaderAuthDependencies { auth, config in
+            guard auth.authMode == .oidc,
+                  auth.isXAIAuth,
+                  let issuer = auth.oidcIssuer ?? config.effectiveOIDC?.issuer,
+                  let clientID = auth.oidcClientID ?? config.effectiveOIDC?.clientID,
+                  let tokenEndpoint = URL(
+                      string: "\(issuer.trimmingCharacters(in: CharacterSet(charactersIn: "/")))/oauth2/token"
+                  )
+            else {
+                return nil
+            }
+            return OIDCTokenRefresher(
+                tokenEndpoint: tokenEndpoint,
+                clientID: clientID,
+                issuer: issuer,
+                transport: transport
+            )
+        }
+    }
+}
 
 public enum LiveLeaderComposition {
     public static let routeName = "leader"
@@ -54,12 +95,18 @@ public enum LiveLeaderComposition {
     public static func session(
         for command: CLICommand,
         context: CLIApplicationContext,
-        services: LiveACPServices = .unavailable
+        services: LiveACPServices = .unavailable,
+        authDependencies: LiveLeaderAuthDependencies = .production()
     ) async throws -> CLIApplicationSession {
         guard case .leader(let options) = command else {
             throw CLIApplicationError.unsupported(route: command.routeName)
         }
-        return try await leaderSession(options: options, context: context, services: services)
+        return try await leaderSession(
+            options: options,
+            context: context,
+            services: services,
+            authDependencies: authDependencies
+        )
     }
 
     // MARK: - Endpoint resolution
@@ -101,7 +148,11 @@ public enum LiveLeaderComposition {
         tokenType: TokenType,
         tokenHeader: String
     ) -> ACPRelayAuthorization? {
-        guard let auth, tokenType == .oidcSession, !auth.key.isEmpty else { return nil }
+        guard let auth,
+              tokenType == .oidcSession,
+              auth.isXAIAuth,
+              !auth.key.isEmpty
+        else { return nil }
         return ACPRelayAuthorization(
             token: auth.key,
             userID: auth.userID,
@@ -114,7 +165,8 @@ public enum LiveLeaderComposition {
     static func leaderSession(
         options: CLILeaderOptions,
         context: CLIApplicationContext,
-        services: LiveACPServices
+        services: LiveACPServices,
+        authDependencies: LiveLeaderAuthDependencies
     ) async throws -> CLIApplicationSession {
         let environment = context.environment
         let cwd = try resolveWorkingDirectory(options.common.cwd)
@@ -141,7 +193,8 @@ public enum LiveLeaderComposition {
         let paths = ACPLeaderSocketPaths.resolve(
             openGrokHome: home,
             relayURL: relay.url,
-            environment: environment
+            environment: environment,
+            socketOverride: options.common.leaderSocket
         )
 
         // The lock is taken *before* the socket is bound, because binding
@@ -185,13 +238,42 @@ public enum LiveLeaderComposition {
             workspaceBoundary: workspace.acpBoundary
         )
 
+        let authConfig = GrokComConfig.default(environment: environment)
+        let manager = AuthManager(
+            grokHome: home,
+            config: authConfig,
+            environment: environment
+        )
+        if let auth = await manager.currentOrExpired(),
+           let refresher = authDependencies.makeRefresher(auth, authConfig) {
+            await manager.configureRefresher(refresher)
+        }
+        let hubAuth = LeaderComputerHubAuthProvider(manager: manager)
+        let sharedPermissionPipeline = workspace.permissionPipeline
+        let hubConnector: ACPWorkspaceExposureConnector = { [hubAuth, sharedPermissionPipeline] hubURL, workspaceCwd in
+            let mediation = HubMediation.mediated(
+                LivePermissionHubMediator(pipeline: sharedPermissionPipeline)
+            )
+            return try await ComputerHubWorkspaceExposure.connect(
+                hubURL: hubURL,
+                cwd: workspaceCwd,
+                auth: hubAuth,
+                mediation: mediation
+            )
+        }
+
         let log: @Sendable (String) -> Void = { message in
             context.streams.err("open-grok: \(message)\n")
         }
 
         let ipc = ACPLeaderIPCHost(
             runtime: runtime,
-            configuration: ACPLeaderIPCConfiguration(),
+            configuration: productionIPCConfiguration(
+                paths: paths,
+                relayURL: relay.url,
+                environment: environment,
+                productionExposureConnector: hubConnector
+            ),
             log: log
         )
         let listener = ACPLeaderSocketListener(path: paths.socket)
@@ -210,17 +292,39 @@ public enum LiveLeaderComposition {
         // `ConfigUpdate::Auth` handler there never re-arms a relay either
         // (`app.rs:1432-1442` promises it, `app.rs:1557-1582` does not do it),
         // so a leader that starts logged-out stays relay-less until restart.
-        let manager = AuthManager(
-            grokHome: home,
-            config: GrokComConfig.default(environment: environment),
-            environment: environment
-        )
         let auth = await manager.current()
         let authorization = relayAuthorization(
             auth: auth,
             tokenType: await manager.tokenType(),
-            tokenHeader: GrokComConfig.default(environment: environment).tokenHeader
+            tokenHeader: authConfig.tokenHeader
         )
+
+        let authRecovery: ACPRelayClient.AuthRecovery?
+        if authorization == nil {
+            authRecovery = nil
+        } else {
+            authRecovery = { _ in
+                switch await manager.recoverUnauthorized() {
+                case .recovered:
+                    guard let refreshedAuth = await manager.current() else {
+                        return .terminalFailure
+                    }
+                    let refreshedType = await manager.tokenType()
+                    guard let refreshedAuthorization = Self.relayAuthorization(
+                        auth: refreshedAuth,
+                        tokenType: refreshedType,
+                        tokenHeader: authConfig.tokenHeader
+                    ) else {
+                        return .terminalFailure
+                    }
+                    return .recovered(refreshedAuthorization)
+                case .retryableFailure:
+                    return .retryableFailure
+                case .terminalFailure:
+                    return .terminalFailure
+                }
+            }
+        }
 
         var relayClient: ACPRelayClient?
         var relayNote: String
@@ -237,6 +341,7 @@ public enum LiveLeaderComposition {
                     clientMode: "headless"
                 ),
                 makeRuntime: { runtime },
+                authRecovery: authRecovery,
                 log: log
             )
             relayNote = relayIsEager(options) ? "connecting" : "waiting for a headless client"
@@ -289,6 +394,33 @@ public enum LiveLeaderComposition {
         )
     }
 
+    /// Build the production leader configuration from one resolved startup
+    /// snapshot. Keeping this seam together prevents registration metadata and
+    /// `get_leader_info` from silently falling back to library defaults.
+    static func productionIPCConfiguration(
+        paths: (socket: URL, lock: URL),
+        relayURL: String,
+        environment: [String: String],
+        productionExposureConnector: @escaping ACPWorkspaceExposureConnector
+    ) -> ACPLeaderIPCConfiguration {
+        let version = OpenGrokCLIVersion.installed(environment: environment)
+        let metadata = ACPLeaderControlMetadata(
+            socketPath: paths.socket.path,
+            lockPath: paths.lock.path,
+            wsURLSuffix: ACPLeaderSocketPaths.suffix(forRelayURL: relayURL),
+            binaryVersion: version
+        )
+        let controlPlane = ACPLeaderControlPlane(
+            metadata: metadata,
+            defaultHubURL: ACPLeaderControlPlane.productionComputerHubURL,
+            connector: productionExposureConnector
+        )
+        return ACPLeaderIPCConfiguration(
+            binaryVersion: version,
+            controlPlane: controlPlane
+        )
+    }
+
     /// Poll for the first headless registration.
     ///
     /// Polling rather than a signal because `ACPLeaderIPCHost` deliberately has
@@ -334,12 +466,16 @@ public enum LiveLeaderComposition {
             let owner = pid.map { "process \($0)" } ?? "another process"
             return """
                 a leader is already running for this endpoint (\(owner) holds \(path)).
-                Connect to it at \(socket.path) instead of starting a second one, or stop it first.
-                This build does not implement upstream's connect-or-spawn handoff \
-                (`leader/mod.rs:1444-1637`), so the race is resolved by refusing rather than adopting.
+                Normal launches using `--leader` use connect-or-spawn to attach to \(socket.path) instead of starting a second one.
+                Stop the existing leader first only when you intend to replace its shared runtime.
                 """
         case .cannotOpen(let path, let reason):
             return "could not open the leader lock at \(path): \(reason)"
+        case .unsupportedPlatform(let path):
+            return """
+                leader mode is unavailable on Windows: the leader lock at \(path) has no supported locking backend.
+                No leader was started and no endpoint was created; Windows support requires both a native lock and named-pipe transport.
+                """
         }
     }
 

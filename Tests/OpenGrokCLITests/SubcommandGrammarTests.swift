@@ -380,7 +380,7 @@ struct SubcommandGrammarTests {
             (["wrap", "sh"], "clipboard"),
             (["export", "abc"], "sessions show"),
             (["inspect"], "paths"),
-            (["worktree", "list"], "git worktree"),
+            (["trace", "--local"], "trace"),
             (["session", "new"], "list")
         ]
         for (args, needle) in cases {

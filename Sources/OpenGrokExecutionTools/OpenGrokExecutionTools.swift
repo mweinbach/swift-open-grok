@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokSandbox
 import OpenGrokPTY
 import OpenGrokShared
 import OpenGrokToolProtocol
@@ -707,6 +708,7 @@ private enum ProcessRunner {
 
 public actor ExecutionToolRuntime {
     private let adapter: any PTYAdapter
+    private let launchTransform: ChildLaunchTransform
     private let workspace: LocalWorkspaceOps?
     private let taskIdProvider: any ExecutionTaskIDProvider
     private let outputHome: URL?
@@ -719,12 +721,14 @@ public actor ExecutionToolRuntime {
         adapter: any PTYAdapter = PlatformPTYAdapter(),
         workspace: LocalWorkspaceOps? = nil,
         taskIdProvider: any ExecutionTaskIDProvider = UUIDExecutionTaskIDProvider(),
-        outputHome: URL? = nil
+        outputHome: URL? = nil,
+        launchTransform: @escaping ChildLaunchTransform = childNetworkRestrictedLaunch
     ) {
         self.adapter = adapter
         self.workspace = workspace
         self.taskIdProvider = taskIdProvider
         self.outputHome = outputHome
+        self.launchTransform = launchTransform
     }
 
     public func execute(_ request: ExecutionRequest) async -> Result<ExecutionToolOutput, ToolError> {
@@ -741,7 +745,15 @@ public actor ExecutionToolRuntime {
                 )
             }
             let outputURL = try await resolveOutputURL(validated.request.outputFile, taskId: validated.request.toolCallId)
-            let process = try await adapter.spawn(shellProcessSpec(for: validated, workingDirectory: cwd))
+            var processSpec = shellProcessSpec(for: validated, workingDirectory: cwd)
+            do {
+                let launch = try launchTransform(processSpec.command, processSpec.arguments)
+                processSpec.command = launch.executable
+                processSpec.arguments = launch.arguments
+            } catch {
+                return .failure(.execution(toolId: Self.executionToolId, detail: "failed to prepare command launch: \(error)"))
+            }
+            let process = try await adapter.spawn(processSpec)
             if validated.request.isBackground {
                 let taskId = taskIdProvider.nextTaskId()
                 let now = Date()

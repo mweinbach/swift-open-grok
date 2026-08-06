@@ -23,19 +23,20 @@
 //   * a validation report type         — this file
 //
 // Design note: this target deliberately takes digests as inputs rather than
-// hashing bytes itself. `Package.swift` does not give it an edge to
-// `OpenGrokBuildSupport` (which owns the package's single SHA-256
-// implementation) or to `OpenGrokDistributionSupport`, and adding a second
-// SHA-256 here would be a duplicate behaviour path. The caller supplies the
-// digest; see `INTEGRATION-fixtures-dist.md` for the Package.swift edge that
-// would let this target compute it directly.
+// hashing bytes itself. `OpenGrokBuildSupport` owns the package's single
+// SHA-256 implementation, while `OpenGrokDistributionSupport` owns the
+// release baseline forwarded below.
 
 import Foundation
+import OpenGrokDistributionSupport
 
 /// Namespace for the release gate.
 public enum OpenGrokReleaseValidation {
     /// The Rust reference revision these checks were transcribed from.
-    public static let referenceRevision = "80dff0a9dcb24121b976b9f920fbe442af40ea88"
+    public static let referenceRevision = OpenGrokDistributionSupport.referenceRevision
+
+    /// The upstream release pinned at ``referenceRevision``.
+    public static let referencePinnedRelease = OpenGrokDistributionSupport.referencePinnedRelease
 }
 
 /// How badly a finding blocks a release.

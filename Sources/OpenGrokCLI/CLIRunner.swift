@@ -14,7 +14,8 @@ public enum CLIRunner {
     public static func main(
         _ args: [String],
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        streams: CLIStreams
+        streams: CLIStreams,
+        releaseValidationDependencies: LiveReleaseValidationDependencies = .live
     ) -> Int32 {
         let command = CLICommandParser.parse(args, environment: environment)
         switch command {
@@ -29,6 +30,13 @@ public enum CLIRunner {
         case .paths(let json):
             writePaths(json: json, environment: environment, streams: streams)
             return ExitCode.success.rawValue
+        case .releaseValidate(let options):
+            return LiveReleaseValidation.run(
+                options: options,
+                environment: environment,
+                streams: streams,
+                dependencies: releaseValidationDependencies
+            )
         case .models(let options):
             writeModels(options: options, streams: streams)
             return ExitCode.success.rawValue
@@ -71,6 +79,21 @@ public enum CLIRunner {
                 streams.err("open-grok: \(error).\n")
                 return ExitCode.failure.rawValue
             }
+        case .utility(let options) where options.name == "worktree":
+            do {
+                try LiveWorktreeComposition.run(
+                    options: options, environment: environment, streams: streams
+                )
+                return ExitCode.success.rawValue
+            } catch let error as CLIApplicationError {
+                streams.err("open-grok: \(error.description).\n")
+                return error.isUnsupported
+                    ? ExitCode.notImplemented.rawValue
+                    : ExitCode.failure.rawValue
+            } catch {
+                streams.err("open-grok: \(error).\n")
+                return ExitCode.failure.rawValue
+            }
         case .invalid(let error):
             writeUsageError(error, streams: streams)
             return ExitCode.usage.rawValue
@@ -85,9 +108,17 @@ public enum CLIRunner {
         _ args: [String],
         environment: [String: String] = ProcessInfo.processInfo.environment,
         streams: CLIStreams,
-        application: OpenGrokApplication = .unavailable
+        application: OpenGrokApplication = .unavailable,
+        releaseValidationDependencies: LiveReleaseValidationDependencies = .live
     ) async -> Int32 {
         let command = CLICommandParser.parse(args, environment: environment)
+        if let refusal = LiveVersionPolicyGate.refusal(
+            for: command,
+            environment: environment
+        ) {
+            streams.err(refusal + "\n")
+            return ExitCode.failure.rawValue
+        }
         switch command {
         case .version(let json):
             writeVersion(json: json, environment: environment, streams: streams)
@@ -100,6 +131,13 @@ public enum CLIRunner {
         case .paths(let json):
             writePaths(json: json, environment: environment, streams: streams)
             return ExitCode.success.rawValue
+        case .releaseValidate(let options):
+            return LiveReleaseValidation.run(
+                options: options,
+                environment: environment,
+                streams: streams,
+                dependencies: releaseValidationDependencies
+            )
         case .models(let options):
             writeModels(options: options, streams: streams)
             return ExitCode.success.rawValue
@@ -124,7 +162,7 @@ public enum CLIRunner {
     }
 
     private static func writeVersion(json: Bool, environment: [String: String], streams: CLIStreams) {
-        let version = OpenGrokCLIVersion.installed(environment: environment)
+        let version = OpenGrokCLIVersion.installedWithCommit(environment: environment)
         if json {
             writeJSON(VersionOutput(version: version), streams: streams)
         } else {
@@ -203,8 +241,10 @@ public enum CLIRunner {
                     + "there are no fixes to apply."
                 : "Terminal, clipboard, and color probing is not implemented yet."
         case .plugin(let options):
-            return "The plugin subsystem is parsed but not installed in this build, "
-                + "so 'plugin \(options.action)' has nothing to run."
+            if LivePluginComposition.actions.contains(options.action) {
+                return "The live plugin action '\(options.action)' requires the live application composition."
+            }
+            return "Plugin action '\(options.action)' is not implemented in this build."
         case .utility(let options):
             switch options.name {
             case "wrap":
@@ -215,20 +255,14 @@ public enum CLIRunner {
                     + "'open-grok sessions show <ID>' prints the transcript."
             case "trace":
                 return "Trace export and upload are not implemented."
-            case "update":
-                return "Self-update is not implemented; reinstall from the "
-                    + "release you obtained this binary from."
             case "setup":
                 return "Managed configuration fetch and install are not implemented."
             case "share":
-                return "Session sharing is not implemented."
+                return "Session sharing is fail-closed in the synchronous runner; the live route refuses before upload because signed-URL and backend share clients are not ported."
             case "memory":
                 return "Cross-session memory management is not implemented."
             case "dashboard":
                 return "The agent dashboard is not implemented."
-            case "worktree":
-                return "Worktree management is not implemented; "
-                    + "use git worktree directly."
             default:
                 return "No success path is installed for this capability."
             }

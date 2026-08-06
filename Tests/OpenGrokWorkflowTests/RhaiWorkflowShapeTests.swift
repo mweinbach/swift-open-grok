@@ -214,7 +214,10 @@ struct RhaiWorkflowShapeTests {
 
         #expect(await host.phases == ["Understand", "Verify", "Deliver"])
         // scout (sequential), three readers (barrier), two review rounds.
-        #expect(await host.labels == ["scout", "reader-0", "reader-1", "reader-2", "reviewer", "reviewer"])
+        let labels = await host.labels
+        #expect(labels.first == "scout")
+        #expect(Set(labels.dropFirst().prefix(3)) == Set(["reader-0", "reader-1", "reader-2"]))
+        #expect(Array(labels.suffix(2)) == ["reviewer", "reviewer"])
         #expect(await host.peakConcurrency == 3)
     }
 

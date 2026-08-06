@@ -70,6 +70,104 @@ public struct AuthRetryMiddleware: Sendable {
     }
 }
 
+/// HTTPTransport decorator that performs one pre-body 401 refresh/replay.
+/// Streaming POSTs are replayable only until response body bytes are exposed.
+public struct AuthRetryTransport: HTTPTransport, Sendable {
+    public let transport: any HTTPTransport
+    public let credentials: any AuthCredentialProvider
+    public let maxRetries: UInt
+
+    public init(
+        transport: any HTTPTransport,
+        credentials: any AuthCredentialProvider,
+        maxRetries: UInt = 1
+    ) {
+        self.transport = transport
+        self.credentials = credentials
+        self.maxRetries = maxRetries
+    }
+
+    public func send(_ request: HTTPRequest) async throws -> HTTPResponse {
+        try await AuthRetryMiddleware(credentials: credentials, maxRetries: maxRetries)
+            .send(request, using: transport)
+    }
+
+    public func stream(_ request: HTTPRequest) -> AsyncThrowingStream<HTTPStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    var retryCount: UInt = 0
+                    while true {
+                        try Task.checkCancellation()
+                        let stamped = stamp(request)
+                        var pending: [HTTPStreamEvent] = []
+                        var sawBody = false
+                        var sawMetadata = false
+                        var shouldRetry = false
+                        var iterator = transport.stream(stamped).makeAsyncIterator()
+
+                        while let event = try await iterator.next() {
+                            switch event {
+                            case .metadata(let metadata):
+                                sawMetadata = true
+                                if metadata.statusCode == 401,
+                                   retryCount < maxRetries,
+                                   !sawBody,
+                                   await credentials.refreshAfterUnauthorized(),
+                                   credentials.snapshot().token != nil
+                                {
+                                    retryCount += 1
+                                    shouldRetry = true
+                                    break
+                                }
+                                continuation.yield(.metadata(metadata))
+                                for buffered in pending {
+                                    continuation.yield(buffered)
+                                }
+                                pending.removeAll(keepingCapacity: false)
+                            case .body(let data):
+                                if data.isEmpty { continue }
+                                if sawMetadata {
+                                    continuation.yield(.body(data))
+                                } else {
+                                    pending.append(.body(data))
+                                }
+                                sawBody = true
+                            case .end:
+                                continuation.yield(.end)
+                            }
+                            if shouldRetry { break }
+                        }
+
+                        if shouldRetry { continue }
+                        continuation.finish()
+                        return
+                    }
+                } catch is CancellationError {
+                    continuation.finish(throwing: HTTPError.cancelled)
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func stamp(_ request: HTTPRequest) -> HTTPRequest {
+        var stamped = request
+        credentials.apply(to: &stamped.headers, baseURL: request.url.absoluteString)
+        if stamped.headers["Authorization"] == nil,
+           let token = credentials.snapshot().token
+        {
+            stamped.headers["Authorization"] = "Bearer \(token)"
+            if credentials.needsTokenAuthHeader() {
+                stamped.headers[xaiTokenAuthHeader] = xaiTokenAuthValue
+            }
+        }
+        return stamped
+    }
+}
+
 /// Concurrent refresh single-flight: only one refresh runs; waiters share result.
 public actor RefreshSingleFlight {
     private var inFlight: Task<Bool, Never>?

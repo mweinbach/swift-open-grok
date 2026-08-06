@@ -5,42 +5,31 @@
     "help",
     "paths"
   ],
-  "compiledVersionDefault": "0.1.220-open-grok.21",
-  "referencePinnedRelease": "0.1.220-open-grok.53",
+  "compiledVersionDefault": "0.1.220-open-grok.54",
+  "referencePinnedRelease": "0.1.220-open-grok.54",
   "compiledVersionEnv": "GROK_VERSION",
   "emptyTestVersionReturnsEmpty": true,
   "homeEnv": "OPENGROK_HOME",
   "homeFallback": "~/.opengrok",
   "legacyHomeForbidden": "~/.grok",
-  "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+  "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
   "testVersionEnv": "GROK_TEST_VERSION",
   "unimplementedStayUnavailable": true,
-  "portDrift": {
-    "compiledVersionDefault": {
-      "swift": "0.1.220-open-grok.21",
-      "reference": "0.1.220-open-grok.53",
-      "swiftSources": [
-        "Sources/OpenGrokVersion/CompiledVersion.generated.swift:30",
-        "Plugins/OpenGrokVersionBuildPlugin/OpenGrokVersionBuildPlugin.swift:33"
-      ],
-      "note": "The Swift fallback release string still names the old pin's release. Owned by W0-S3 / the version build plugin, not by the fixture slice; recorded here so the drift is visible rather than silently papered over by the fixture."
-    }
-  },
   "provenance": {
     "source": "OpenGrokVersion/OpenGrokCLI semantics vs Rust xai-grok-version + xai-grok-config path resolution",
-    "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
-    "previousReferenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+    "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
+    "previousReferenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
     "pinVerdict": "recaptured",
     "recapturedFields": [
       "referencePinnedRelease",
-      "compiledVersionEnv",
-      "portDrift"
+      "compiledVersionDefault",
+      "compiledVersionEnv"
     ],
     "evidence": [
-      "OPEN_GROK_VERSION: 0.1.220-open-grok.21 at 9739c4a2 -> 0.1.220-open-grok.53 at 80dff0a9 (the only fixture-relevant change in this family)",
-      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-grok-version => empty; TEST_VERSION_ENV=\"GROK_TEST_VERSION\" (src/lib.rs:5), VERSION = option_env!(\"GROK_VERSION\") else CARGO_PKG_VERSION (src/lib.rs:7-10), installed() trims the override so an empty override yields an empty string (src/lib.rs:15-19)",
-      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-grok-config/src/paths.rs => empty; default_grok_home() = <home>/.opengrok (src/paths.rs:28-32) and grok_home() prefers $OPENGROK_HOME (src/paths.rs:35-47) at both refs",
-      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-grok-paths => only removal of unused AbsPathBuf/RelPathBuf helpers (into_string, is_dir, as_path, to_path_buf); no home or path-policy semantics changed"
+      "OPEN_GROK_VERSION moved 0.1.220-open-grok.53 at 80dff0a9 -> 0.1.220-open-grok.54 at 9ed09e2a; the Swift compiled default now follows the current marker.",
+      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-grok-version => empty; TEST_VERSION_ENV=\"GROK_TEST_VERSION\" (src/lib.rs:5), VERSION = option_env!(\"GROK_VERSION\") else CARGO_PKG_VERSION (src/lib.rs:7-10), and installed() trimming semantics are unchanged.",
+      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-grok-config/src/paths.rs => empty; default_grok_home() = <home>/.opengrok and grok_home() still prefers $OPENGROK_HOME.",
+      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-grok-paths => empty for the path-policy surface asserted here."
     ]
   }
 }

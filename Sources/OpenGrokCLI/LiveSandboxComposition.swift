@@ -12,20 +12,36 @@
 // silently come back weaker.
 //
 // KNOWN DIVERGENCES from Rust, deliberate and bounded:
-//   * The profile is applied at first tool-executor construction rather than at
-//     process start. Seatbelt is irreversible and process-wide, so applying it
-//     here still covers every child `run_terminal_cmd` spawns — but any file
-//     access the CLI performed *before* the first executor is built is outside
-//     the sandbox.
-//   * Linux is not enforced: `PlatformEnforcer` requires a bubblewrap re-exec
-//     that is not implemented, so a non-off profile on Linux throws
-//     `SandboxError.enforcementFailed` rather than degrading.
-//   * `auto_allow_bash` is resolved and reported but is not yet allowed to skip
-//     bash permission prompts — the permission gate stays the boundary.
+//   * The process-wide sandbox manager is wrapped by a CLI-owned runtime seam so
+//     lifecycle tests can model activation without installing Seatbelt/bwrap.
 
 import Foundation
 import OpenGrokConfig
 import OpenGrokSandbox
+
+protocol LiveSandboxRuntime: Sendable {
+    func apply(profileName: ProfileName, workspaceRoot: URL) throws
+    func isSandboxActive() -> Bool
+    func activeProfileName() -> String?
+    func setAutoAllowBash(_ enabled: Bool)
+    func shouldAutoAllowBash() -> Bool
+}
+
+struct LiveSandboxRuntimeAdapter: LiveSandboxRuntime {
+    func apply(profileName: ProfileName, workspaceRoot: URL) throws {
+        _ = try bootstrapSandbox(
+            profileName: profileName,
+            workspace: workspaceRoot,
+            apply: true,
+            failClosed: true
+        )
+    }
+
+    func isSandboxActive() -> Bool { OpenGrokSandbox.isSandboxActive() }
+    func activeProfileName() -> String? { OpenGrokSandbox.activeProfileName() }
+    func setAutoAllowBash(_ enabled: Bool) { OpenGrokSandbox.setAutoAllowBash(enabled) }
+    func shouldAutoAllowBash() -> Bool { OpenGrokSandbox.shouldAutoAllowBash() }
+}
 
 /// The sandbox decision for one session.
 public struct LiveSandboxDecision: Sendable, Equatable {
@@ -35,6 +51,8 @@ public struct LiveSandboxDecision: Sendable, Equatable {
     public var mode: SandboxMode
     /// True when enforcement was actually installed in this process.
     public var enforced: Bool
+    /// True only when the resolved setting was activated after enforcement.
+    public var autoAllowBash: Bool
     /// Set when the profile was requested but could not be enforced.
     public var unsupported: String?
 
@@ -42,11 +60,13 @@ public struct LiveSandboxDecision: Sendable, Equatable {
         profileName: String,
         mode: SandboxMode,
         enforced: Bool,
+        autoAllowBash: Bool = false,
         unsupported: String? = nil
     ) {
         self.profileName = profileName
         self.mode = mode
         self.enforced = enforced
+        self.autoAllowBash = autoAllowBash
         self.unsupported = unsupported
     }
 }
@@ -105,23 +125,32 @@ public enum LiveSandboxComposition {
 
     /// Refuse a resume that would weaken the sandbox.
     ///
-    /// Mirrors `resolve_startup_sandbox` (cli.rs:1004) and the `rank` ladder in
-    /// `SandboxMode`: a session created under `strict` may not come back under
-    /// `off`. Aliases (`readonly`/`read-only`, `none`/`off`) compare equal
-    /// because both sides are parsed into `ProfileName` first.
+    /// Mirrors `resolve_startup_sandbox` (cli.rs:1004): a persisted profile is
+    /// pinned exactly, while aliases (`readonly`/`read-only`, `none`/`off`)
+    /// compare equal because both sides are parsed into `ProfileName` first.
     public static func validateResume(
         requested: String,
         persisted: String?
     ) throws {
         guard let persisted, !persisted.isEmpty else { return }
-        let persistedMode = SandboxMode.from(profile: ProfileName(parsing: persisted))
-        let requestedMode = SandboxMode.from(profile: ProfileName(parsing: requested))
+        let persistedProfile = ProfileName(parsing: persisted)
+        let requestedProfile = ProfileName(parsing: requested)
+        let persistedName = persistedProfile.description
+        let requestedName = requestedProfile.description
+        guard requestedName != persistedName else { return }
+
+        let persistedMode = SandboxMode.from(profile: persistedProfile)
+        let requestedMode = SandboxMode.from(profile: requestedProfile)
         if requestedMode.rank < persistedMode.rank {
             throw SandboxError.modePinningViolation(
                 "cannot resume this session under sandbox profile '\(requested)' — "
                     + "it was created with '\(persisted)'"
             )
         }
+        throw SandboxError.configConflict(
+            "cannot resume this session with sandbox profile '\(requested)' — "
+                + "it was created with '\(persisted)'"
+        )
     }
 
     /// Resolve and, when the profile is not `off`, apply the sandbox.
@@ -142,39 +171,98 @@ public enum LiveSandboxComposition {
         persistedProfile: String? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> LiveSandboxDecision {
-        let name = resolveProfileName(
+        try bootstrap(
+            workspaceRoot: workspaceRoot,
             document: document,
             requirements: requirements,
             cliProfile: cliProfile,
+            persistedProfile: persistedProfile,
+            environment: environment,
+            runtime: LiveSandboxRuntimeAdapter()
+        )
+    }
+
+    static func bootstrap(
+        workspaceRoot: URL,
+        document: TOMLValue?,
+        requirements: [TOMLValue] = [],
+        cliProfile: String? = nil,
+        persistedProfile: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        runtime: any LiveSandboxRuntime
+    ) throws -> LiveSandboxDecision {
+        let resolvedAutoAllowBash = resolveAutoAllowBash(
+            document: document,
+            requirements: requirements,
             environment: environment
         )
-        try validateResume(requested: name, persisted: persistedProfile)
+        runtime.setAutoAllowBash(false)
 
-        let profile = ProfileName(parsing: name)
+        let persistedName = persistedProfile.map { ProfileName(parsing: $0).description }
+        let requestedName: String
+        if let cliProfile, !cliProfile.isEmpty {
+            requestedName = ProfileName(parsing: cliProfile).description
+            if let persistedName, requestedName != persistedName {
+                throw SandboxError.configConflict(
+                    "cannot resume this session with sandbox profile '\(requestedName)' — "
+                        + "it was created with '\(persistedName)'"
+                )
+            }
+        } else if let persistedName {
+            requestedName = persistedName
+        } else {
+            requestedName = ProfileName(parsing: resolveProfileName(
+                document: document,
+                requirements: requirements,
+                cliProfile: nil,
+                environment: environment
+            )).description
+        }
+        try validateResume(requested: requestedName, persisted: persistedName)
+
+        let profile = ProfileName(parsing: requestedName)
         let mode = SandboxMode.from(profile: profile)
 
         if profile == .off {
-            return LiveSandboxDecision(profileName: name, mode: mode, enforced: false)
-        }
-        if isSandboxActive() {
             return LiveSandboxDecision(
-                profileName: activeProfileName() ?? name,
+                profileName: profile.description,
                 mode: mode,
-                enforced: true
+                enforced: false,
+                autoAllowBash: false
+            )
+        }
+        if runtime.isSandboxActive() {
+            runtime.setAutoAllowBash(resolvedAutoAllowBash)
+            return LiveSandboxDecision(
+                profileName: runtime.activeProfileName() ?? profile.description,
+                mode: mode,
+                enforced: true,
+                autoAllowBash: runtime.shouldAutoAllowBash()
             )
         }
 
         do {
-            _ = try bootstrapSandbox(
-                profileName: profile,
-                workspace: workspaceRoot,
-                apply: true,
-                failClosed: true
+            try runtime.apply(profileName: profile, workspaceRoot: workspaceRoot)
+            guard runtime.isSandboxActive() else {
+                runtime.setAutoAllowBash(false)
+                throw SandboxError.enforcementFailed(
+                    "sandbox bootstrap returned without active enforcement"
+                )
+            }
+            runtime.setAutoAllowBash(resolvedAutoAllowBash)
+            return LiveSandboxDecision(
+                profileName: profile.description,
+                mode: mode,
+                enforced: true,
+                autoAllowBash: runtime.shouldAutoAllowBash()
             )
-            return LiveSandboxDecision(profileName: name, mode: mode, enforced: true)
         } catch let error as SandboxError {
+            runtime.setAutoAllowBash(false)
             // Surface the typed error. Never downgrade to "ran without a
             // sandbox" — the user asked for one.
+            throw error
+        } catch {
+            runtime.setAutoAllowBash(false)
             throw error
         }
     }

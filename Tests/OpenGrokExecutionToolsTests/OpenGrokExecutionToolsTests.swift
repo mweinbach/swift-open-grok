@@ -105,6 +105,54 @@ private func temporaryDirectory() throws -> URL {
     return url
 }
 
+@Suite("execution launch policy")
+struct ExecutionLaunchPolicyTests {
+    @Test("rewrites the shell launch before the PTY adapter receives it")
+    func rewritesShellLaunch() async throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let adapter = FakePTYAdapter(process: FakePTYProcess(chunks: [], exit: .code(0)))
+        let runtime = ExecutionToolRuntime(
+            adapter: adapter,
+            outputHome: home,
+            launchTransform: { executable, arguments in
+                #expect(executable == "/bin/sh")
+                #expect(arguments == ["-lc", "printf output"])
+                return ("/wrapped/sh", ["--network-denied", executable] + arguments)
+            }
+        )
+
+        let result = await runtime.execute(ExecutionRequest(command: "printf output", toolCallId: "launch-rewrite"))
+        guard case .success = result else {
+            Issue.record("expected transformed execution to reach the adapter")
+            return
+        }
+        #expect(adapter.spec?.command == "/wrapped/sh")
+        #expect(adapter.spec?.arguments == ["--network-denied", "/bin/sh", "-lc", "printf output"])
+    }
+
+    @Test("does not spawn when the launch transform throws")
+    func throwingTransformPreventsSpawn() async throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let adapter = FakePTYAdapter(process: FakePTYProcess(chunks: [], exit: .code(0)))
+        let runtime = ExecutionToolRuntime(
+            adapter: adapter,
+            outputHome: home,
+            launchTransform: { _, _ in throw NSError(domain: "launch", code: 1) }
+        )
+
+        let result = await runtime.execute(ExecutionRequest(command: "printf output", toolCallId: "launch-failure"))
+        guard case .failure(let error) = result else {
+            Issue.record("expected a launch-policy execution failure")
+            return
+        }
+        #expect(error.kind == .execution)
+        #expect(error.detail.contains("failed to prepare command launch"))
+        #expect(adapter.spec == nil)
+    }
+}
+
 @Test("execution validation applies Rust timeout and output defaults")
 func executionValidationDefaultsAndCaps() throws {
     let foreground = try validateExecutionRequest(ExecutionRequest(command: "echo ok"))

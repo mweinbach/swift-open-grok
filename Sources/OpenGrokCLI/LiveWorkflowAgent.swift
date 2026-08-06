@@ -19,6 +19,8 @@
 // parent session does not.
 
 import Foundation
+import OpenGrokHooks
+import OpenGrokHooksPluginTypes
 import OpenGrokSamplingTypes
 import OpenGrokShared
 import OpenGrokShell
@@ -38,9 +40,41 @@ protocol LiveWorkflowToolInvoker: Sendable {
         workingDirectory: URL,
         call: ToolCall
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError>
+
+    func runStop(
+        event: HookEvent,
+        promptID: String?,
+        payload: [String: HookJSONValue]
+    ) async -> StopDispatchResult
 }
 
 extension LiveToolExecutor: LiveWorkflowToolInvoker {}
+
+extension LiveWorkflowToolInvoker {
+    func runStop(
+        event: HookEvent,
+        promptID: String?,
+        payload: [String: HookJSONValue]
+    ) async -> StopDispatchResult {
+        StopDispatchResult()
+    }
+}
+
+func formatLiveStopFeedback(_ result: StopDispatchResult) -> String {
+    var feedback = ""
+    if !result.blocks.isEmpty {
+        feedback = "Stop hook feedback:\n"
+        for block in result.blocks {
+            feedback += "- \(block.reason)\n"
+        }
+        feedback.removeLast()
+    }
+    for context in result.additionalContext {
+        if !feedback.isEmpty { feedback += "\n\n" }
+        feedback += context
+    }
+    return feedback
+}
 
 // MARK: - Capability clamp
 
@@ -198,6 +232,8 @@ struct LiveWorkflowChildAgent: Sendable {
 
         var round = 0
         var characters = options.prompt.count
+        var stopHookContinuations = 0
+        var stopHookActive = false
         while true {
             try checkCancelled()
             await emit(.status(agentID: agentID, "sampling"))
@@ -217,6 +253,27 @@ struct LiveWorkflowChildAgent: Sendable {
             items.append(contentsOf: response.items)
 
             guard !response.toolCalls.isEmpty else {
+                if stopHookContinuations < 8 {
+                    let stopResult = await invoker.runStop(
+                        event: .subagentStop,
+                        promptID: sessionID,
+                        payload: [
+                            "phase": .string("gate"),
+                            "subagentId": .string(agentID),
+                            "subagentType": .string(options.label ?? ""),
+                            "reason": .string("end_turn"),
+                            "stopHookActive": .boolean(stopHookActive),
+                            "lastAssistantMessage": .string(response.output),
+                        ]
+                    )
+                    if stopResult.preventContinuation == nil,
+                       stopResult.wantsContinuation {
+                        stopHookContinuations += 1
+                        stopHookActive = true
+                        items.append(.autoContinue(formatLiveStopFeedback(stopResult)))
+                        continue
+                    }
+                }
                 return Output(
                     value: decodeOutput(response.output, schema: options.outputSchema),
                     tokensUsed: estimateTokens(characters: characters)

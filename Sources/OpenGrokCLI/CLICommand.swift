@@ -575,6 +575,40 @@ public struct CLIUtilityOptions: Sendable, Equatable {
     }
 }
 
+public struct CLIReleaseValidationArtifact: Sendable, Equatable {
+    public var name: String
+    public var artifactPath: String
+    public var sidecarPath: String
+
+    public init(name: String, artifactPath: String, sidecarPath: String) {
+        self.name = name
+        self.artifactPath = artifactPath
+        self.sidecarPath = sidecarPath
+    }
+}
+
+public struct CLIReleaseValidationOptions: Sendable, Equatable {
+    public var binaryPath: String
+    public var expectedVersion: String
+    public var expectedShortCommit: String?
+    public var isolatedRoot: String
+    public var artifacts: [CLIReleaseValidationArtifact]
+
+    public init(
+        binaryPath: String,
+        expectedVersion: String,
+        expectedShortCommit: String? = nil,
+        isolatedRoot: String,
+        artifacts: [CLIReleaseValidationArtifact] = []
+    ) {
+        self.binaryPath = binaryPath
+        self.expectedVersion = expectedVersion
+        self.expectedShortCommit = expectedShortCommit
+        self.isolatedRoot = isolatedRoot
+        self.artifacts = artifacts
+    }
+}
+
 public enum CLICommand: Sendable, Equatable {
     case version(json: Bool)
     case help(topic: String?)
@@ -591,6 +625,7 @@ public enum CLICommand: Sendable, Equatable {
     case mcp(CLIResourceOptions)
     case workflow(CLIResourceOptions)
     case utility(CLIUtilityOptions)
+    case releaseValidate(CLIReleaseValidationOptions)
     case invalid(CLIParseError)
 
     public var routeName: String {
@@ -610,6 +645,7 @@ public enum CLICommand: Sendable, Equatable {
         case .mcp: return "mcp"
         case .workflow: return "workflow"
         case .utility(let options): return options.name
+        case .releaseValidate: return "release-validate"
         case .invalid: return "invalid"
         }
     }
@@ -637,6 +673,7 @@ public enum CLICommandParser {
         "version", "v", "help", "paths", "path", "inspect", "doctor", "completions",
         "interactive", "minimal", "headless", "acp", "serve", "leader", "agent",
         "session", "sessions", "model", "models", "plugin", "mcp", "workflow",
+        "release-validate",
         "login", "logout", "setup", "share", "wrap", "export", "trace", "update",
         "memory", "dashboard", "workspace", "worktree"
     ]
@@ -743,6 +780,8 @@ public enum CLICommandParser {
             return .mcp(try parseResource(args, command: "mcp", common: common))
         case "workflow":
             return .workflow(try parseResource(args, command: "workflow", common: common))
+        case "release-validate":
+            return .releaseValidate(try parseReleaseValidation(args))
         default:
             return .utility(try parseUtility(args, name: name, common: common))
         }
@@ -1197,7 +1236,7 @@ public enum CLICommandParser {
     private static let utilitySubcommands: [String: Set<String>] = [
         "memory": ["clear"],
         "workspace": ["start", "pause", "resume", "stop", "restart", "status", "list"],
-        "worktree": ["list", "ls", "show", "rm", "gc", "db"]
+        "worktree": ["list", "ls", "show", "rm", "gc", "prune", "db"]
     ]
 
     private static func parseUtility(
@@ -1243,10 +1282,69 @@ public enum CLICommandParser {
         if utilitySubcommands[name] != nil, values.isEmpty {
             throw CLIParseError.missingSubcommand(name)
         }
+        if name == "worktree" {
+            try validateWorktreeGrammar(values: values, options: options, flags: flags)
+        }
         return CLIUtilityOptions(
             name: name, values: values, options: options, flags: flags,
             json: json, force: force, common: common
         )
+    }
+
+    private static func validateWorktreeGrammar(
+        values: [String],
+        options: [String: String],
+        flags: Set<String>
+    ) throws {
+        guard let action = values.first else { return }
+        let allowedOptions: Set<String>
+        let allowedFlags: Set<String>
+        switch action {
+        case "list", "ls":
+            guard values.count == 1 else {
+                throw CLIParseError.unexpectedArgument("worktree list accepts no positional targets")
+            }
+            allowedOptions = ["--repo", "--type"]
+            allowedFlags = ["--json", "--all"]
+        case "show":
+            guard values.count == 2 else {
+                throw CLIParseError.unexpectedArgument("worktree show requires one id or path")
+            }
+            allowedOptions = []
+            allowedFlags = ["--json"]
+        case "rm":
+            guard values.count >= 2 else {
+                throw CLIParseError.unexpectedArgument("worktree rm requires at least one id or path")
+            }
+            allowedOptions = []
+            allowedFlags = ["--json", "--dry-run", "--force"]
+        case "gc", "prune":
+            guard values.count == 1 else {
+                throw CLIParseError.unexpectedArgument("worktree gc accepts no positional targets")
+            }
+            allowedOptions = ["--max-age"]
+            allowedFlags = ["--json", "--dry-run", "--force"]
+        case "db":
+            guard values.count == 2, ["rebuild", "stats", "path"].contains(values[1]) else {
+                throw CLIParseError.unexpectedArgument(
+                    "worktree db requires rebuild, stats, or path"
+                )
+            }
+            allowedOptions = []
+            allowedFlags = ["--json"]
+        default:
+            return
+        }
+        for key in options.keys where !allowedOptions.contains(key) && !allowedFlags.contains(key) {
+            throw CLIParseError.unexpectedArgument(
+                "worktree " + action + " does not accept " + key
+            )
+        }
+        for flag in flags where !allowedFlags.contains(flag) {
+            throw CLIParseError.unexpectedArgument(
+                "worktree " + action + " does not accept " + flag
+            )
+        }
     }
 
     private static func parseCompletions(_ args: [String]) throws -> CLICommand {
@@ -1262,6 +1360,90 @@ public enum CLICommandParser {
             )
         }
         return .completions(shell: shell.lowercased())
+    }
+
+    private static func parseReleaseValidation(
+        _ args: [String]
+    ) throws -> CLIReleaseValidationOptions {
+        var cursor = ArgumentCursor(args)
+        var binaryPath: String?
+        var expectedVersion: String?
+        var expectedShortCommit: String?
+        var isolatedRoot: String?
+        var artifacts: [CLIReleaseValidationArtifact] = []
+        var pendingArtifact: (name: String, path: String)?
+
+        while let token = cursor.pop() {
+            guard let option = OptionToken(token) else {
+                throw CLIParseError.unexpectedArgument(token)
+            }
+            switch option.name {
+            case "--binary":
+                binaryPath = try cursor.value(for: option)
+            case "--expected-version":
+                expectedVersion = try cursor.value(for: option)
+            case "--expected-commit":
+                expectedShortCommit = try cursor.value(for: option)
+            case "--isolated-root":
+                isolatedRoot = try cursor.value(for: option)
+            case "--artifact":
+                guard pendingArtifact == nil else {
+                    throw CLIParseError.requiresOption("--artifact", "--sidecar")
+                }
+                let specification = try cursor.value(for: option)
+                guard let separator = specification.firstIndex(of: "=") else {
+                    throw CLIParseError.invalidValue(
+                        option: option.name,
+                        value: specification,
+                        expected: "NAME=ARTIFACT_PATH"
+                    )
+                }
+                let name = String(specification[..<separator])
+                let path = String(specification[specification.index(after: separator)...])
+                guard !name.isEmpty, !path.isEmpty else {
+                    throw CLIParseError.invalidValue(
+                        option: option.name,
+                        value: specification,
+                        expected: "NAME=ARTIFACT_PATH"
+                    )
+                }
+                pendingArtifact = (name, path)
+            case "--sidecar":
+                guard let pair = pendingArtifact else {
+                    throw CLIParseError.requiresOption("--sidecar", "--artifact")
+                }
+                artifacts.append(
+                    CLIReleaseValidationArtifact(
+                        name: pair.name,
+                        artifactPath: pair.path,
+                        sidecarPath: try cursor.value(for: option)
+                    )
+                )
+                pendingArtifact = nil
+            default:
+                throw CLIParseError.unknownOption(option.name)
+            }
+        }
+
+        if pendingArtifact != nil {
+            throw CLIParseError.requiresOption("--artifact", "--sidecar")
+        }
+        guard let binaryPath else {
+            throw CLIParseError.requiresOption("release-validate", "--binary")
+        }
+        guard let expectedVersion else {
+            throw CLIParseError.requiresOption("release-validate", "--expected-version")
+        }
+        guard let isolatedRoot else {
+            throw CLIParseError.requiresOption("release-validate", "--isolated-root")
+        }
+        return CLIReleaseValidationOptions(
+            binaryPath: binaryPath,
+            expectedVersion: expectedVersion,
+            expectedShortCommit: expectedShortCommit,
+            isolatedRoot: isolatedRoot,
+            artifacts: artifacts
+        )
     }
 
     fileprivate static func consumeCommon(
@@ -1577,6 +1759,9 @@ fileprivate struct LaunchState {
         }
         if worktreeRef != nil && worktree == nil {
             throw CLIParseError.requiresOption("--worktree-ref", "--worktree")
+        }
+        if forkSession && worktree != nil {
+            throw CLIParseError.conflictingOptions("--fork-session", "--worktree")
         }
         if agentOptions.experimentalMemory && agentOptions.noMemory {
             throw CLIParseError.conflictingOptions("--experimental-memory", "--no-memory")

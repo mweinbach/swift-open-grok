@@ -101,6 +101,9 @@ public actor WebSocketServer {
     #if canImport(Network)
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "opengrok-websocket-server")
+    #else
+    private var portableListener: PortableSocketListener?
+    private var portableAcceptTask: Task<Void, Never>?
     #endif
 
     public init(configuration: WebSocketServerConfiguration) {
@@ -128,13 +131,33 @@ public actor WebSocketServer {
         #if canImport(Network)
         return try startWithNetwork()
         #else
-        // Deliberately a typed error rather than a partial implementation: an
-        // epoll/`accept(2)` adapter is real work, and a server that silently
-        // fails to listen is worse than one that says it cannot.
-        throw WebSocketServerError.unsupportedPlatform(
-            "Network.framework is unavailable and no epoll accept-loop adapter is implemented; "
-                + "see WebSocketServer.swift"
-        )
+        do {
+            let listener = try PortableSocketListener.tcp(
+                host: configuration.host,
+                port: configuration.port
+            )
+            guard let port = listener.port else {
+                throw WebSocketServerError.bindFailed("listener returned no TCP port")
+            }
+            portableListener = listener
+            portableAcceptTask = Task { [weak self, listener] in
+                while !Task.isCancelled {
+                    do {
+                        let channel = try await listener.accept()
+                        await self?.acceptPortable(channel)
+                    } catch {
+                        break
+                    }
+                }
+            }
+            return port
+        } catch let error as PortableSocketError {
+            started = false
+            throw WebSocketServerError.bindFailed(error.description)
+        } catch {
+            started = false
+            throw error
+        }
         #endif
     }
 
@@ -144,6 +167,11 @@ public actor WebSocketServer {
         #if canImport(Network)
         listener?.cancel()
         listener = nil
+        #else
+        portableAcceptTask?.cancel()
+        portableAcceptTask = nil
+        portableListener?.close()
+        portableListener = nil
         #endif
         continuation?.finish()
         continuation = nil
@@ -213,17 +241,24 @@ public actor WebSocketServer {
     }
 
     private func accept(_ box: NWConnectionBox) async {
-        guard !stopped, let continuation else {
+        guard !stopped else {
             box.value.cancel()
             return
         }
         let channel = NWConnectionByteChannel(box.value, queue: queue)
         await channel.start()
+        let peer = String(describing: box.value.endpoint)
+        acceptChannel(channel, peer: peer)
+    }
+    #endif
+
+    private func acceptChannel(_ channel: any WebSocketByteChannel, peer: String) {
+        guard !stopped, let continuation else {
+            Task { await channel.close() }
+            return
+        }
         let policy = configuration.policy
         let maximumMessageSize = configuration.maximumMessageSize
-        let peer = String(describing: box.value.endpoint)
-        // The upgrade runs off the accept path so one slow or hostile client
-        // cannot stall the listener.
         Task {
             do {
                 let upgraded = try await WebSocketServerUpgrade.perform(channel: channel, policy: policy)
@@ -245,6 +280,11 @@ public actor WebSocketServer {
                 await channel.close()
             }
         }
+    }
+
+    #if !canImport(Network)
+    private func acceptPortable(_ channel: PortableSocketChannel) {
+        acceptChannel(channel, peer: "portable socket")
     }
     #endif
 }
@@ -271,8 +311,10 @@ public enum WebSocketNetworkChannel {
         await channel.start()
         return channel
         #else
-        throw WebSocketServerError.unsupportedPlatform(
-            "Network.framework is unavailable and no BSD-socket dialer is implemented"
+        return try await PortableSocketConnector.tcp(
+            host: host,
+            port: port,
+            timeoutSeconds: 5
         )
         #endif
     }

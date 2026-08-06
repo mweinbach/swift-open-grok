@@ -11,6 +11,7 @@
 
 import Foundation
 import Testing
+import OpenGrokAuth
 import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokHTTP
@@ -25,6 +26,87 @@ private func toml(_ source: String) throws -> TOMLValue {
 /// Records every request and answers none — contact shows up as a recorded
 /// request rather than being swallowed.
 private func forbiddenTransport() -> MockHTTPTransport { MockHTTPTransport() }
+
+private func writeTelemetryAuth(
+    home: URL,
+    teamBlockedReasons: [String]
+) throws {
+    let environment = ["OPENGROK_HOME": home.path]
+    let config = GrokComConfig.default(environment: environment)
+    let auth = GrokAuth(
+        key: "test-access-token",
+        authMode: .oidc,
+        userID: "telemetry-user",
+        teamID: "telemetry-team",
+        teamBlockedReasons: teamBlockedReasons,
+        codingDataRetentionOptOut: false,
+        oidcIssuer: xaiOAuth2Issuer
+    )
+    var store: AuthStore = [:]
+    store[config.authScope] = auth
+    try writeAuthJSON(
+        at: home.appendingPathComponent("auth.json"),
+        store: store
+    )
+}
+
+private func makeTelemetryFoundation(
+    home: URL,
+    workspace: URL,
+    teamBlockedReasons: [String]
+) async throws -> OpenGrokLiveApplicationLauncher.LiveSessionFoundation {
+    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    try writeTelemetryAuth(home: home, teamBlockedReasons: teamBlockedReasons)
+    try """
+        [features]
+        telemetry = true
+
+        [telemetry]
+        otel_enabled = true
+        otel_logs_exporter = "otlp"
+        """
+        .write(
+            to: home.appendingPathComponent("config.toml"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+    let command = try CLICommandParser.parseOrThrow([
+        "headless",
+        "--prompt", "hello",
+        "--cwd", workspace.path
+    ])
+    guard case .launch(let options) = command else {
+        throw CLIApplicationError.failed("telemetry fixture did not parse to a launch")
+    }
+    let context = CLIApplicationContext(
+        environment: [
+            "HOME": home.path,
+            "OPENGROK_HOME": home.path,
+            "XAI_API_KEY": "test-key",
+            "GROK_DISABLE_API_KEY_AUTH": "1",
+            "GROK_EXTERNAL_OTEL": "1",
+            "OTEL_LOGS_EXPORTER": "otlp",
+            "OTEL_LOG_USER_PROMPTS": "1"
+        ],
+        streams: CLIStreams(out: { _ in }, err: { _ in }),
+        control: .never
+    )
+    let dependencies = OpenGrokLiveCompositionDependencies(
+        makeSampler: { _ in
+            OpenGrokLiveSampler { _, emit in
+                await emit(.output("ok"))
+                return OpenGrokLiveSamplingResponse(output: "ok", stopReason: "stop")
+            }
+        }
+    )
+    return try await OpenGrokLiveApplicationLauncher.makeSessionFoundation(
+        options: options,
+        context: context,
+        dependencies: dependencies
+    )
+}
 
 @Suite(.serialized)
 struct LiveTelemetryDefaultOffTests {
@@ -184,6 +266,44 @@ struct LiveTelemetryDefaultOffTests {
         #expect(!status.clientInstalled)
         #expect(!status.externalStreamActive)
         #expect(Telemetry.current() == nil)
+    }
+
+    @Test func liveFoundationZDRSuppressesOptedInTelemetry() async throws {
+        LiveTelemetry.shutdown()
+        defer { LiveTelemetry.shutdown() }
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opengrok-telemetry-live-zdr-\(UUID().uuidString)")
+        let foundation = try await makeTelemetryFoundation(
+            home: root.appendingPathComponent("home", isDirectory: true),
+            workspace: root.appendingPathComponent("workspace", isDirectory: true),
+            teamBlockedReasons: ["BLOCKED_REASON_NO_LOGS"]
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        #expect(foundation.telemetryBootstrapContext.zeroDataRetention)
+        #expect(foundation.toolExecutor.telemetryStatus.isDark)
+        #expect(Telemetry.current() == nil)
+        await foundation.toolExecutor.shutdown()
+    }
+
+    @Test func liveFoundationNonZDRControlKeepsOptedInTelemetryReachable() async throws {
+        LiveTelemetry.shutdown()
+        defer { LiveTelemetry.shutdown() }
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opengrok-telemetry-live-control-\(UUID().uuidString)")
+        let foundation = try await makeTelemetryFoundation(
+            home: root.appendingPathComponent("home", isDirectory: true),
+            workspace: root.appendingPathComponent("workspace", isDirectory: true),
+            teamBlockedReasons: []
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        #expect(!foundation.telemetryBootstrapContext.zeroDataRetention)
+        #expect(!foundation.toolExecutor.telemetryStatus.isDark)
+        #expect(Telemetry.current() != nil)
+        await foundation.toolExecutor.shutdown()
     }
 }
 

@@ -95,6 +95,12 @@ public struct ACPRelayConfiguration: Sendable {
     /// Header *names* are what a relay authenticates on, so they are spelled
     /// exactly as upstream sends them.
     public var handshakeHeaders: [(String, String)] {
+        handshakeHeaders(authorization: authorization)
+    }
+
+    public func handshakeHeaders(
+        authorization: ACPRelayAuthorization?
+    ) -> [(String, String)] {
         var headers: [(String, String)] = [("Origin", origin)]
         if let authorization {
             headers.append(("Authorization", "Bearer \(authorization.token)"))
@@ -108,6 +114,17 @@ public struct ACPRelayConfiguration: Sendable {
 }
 
 // MARK: - Session outcome
+
+public enum ACPRelayAuthRecoveryReason: Sendable, Hashable {
+    case authError
+    case handshakeUnauthorized
+}
+
+public enum ACPRelayAuthRecoveryResult: Sendable, Hashable {
+    case recovered(ACPRelayAuthorization)
+    case retryableFailure
+    case terminalFailure
+}
 
 public enum ACPRelayEndReason: Sendable, Hashable, CustomStringConvertible {
     /// The far side closed cleanly or the stream ended.
@@ -171,7 +188,7 @@ public struct ACPRelayTransport: ACPTransport {
             if case .response(let id, _, let error) = message, let error {
                 if error.code.code == ACPRelayTransport.authErrorCode {
                     await outcome.record(.authError)
-                    log("relay: authentication rejected (\(error.message)); ending session")
+                    log("relay: authentication rejected; ending session")
                     throw ACPTransportError.closed
                 }
                 // Upstream drops these rather than forwarding
@@ -252,12 +269,17 @@ actor ACPRelayOutcomeBox {
 
 public actor ACPRelayClient {
     public typealias RuntimeProvider = @Sendable () async throws -> ACPAgentRuntime
+    public typealias AuthRecovery = @Sendable (
+        ACPRelayAuthRecoveryReason
+    ) async -> ACPRelayAuthRecoveryResult
 
     public let configuration: ACPRelayConfiguration
     private let makeRuntime: RuntimeProvider
+    private let authRecovery: AuthRecovery?
     private let log: @Sendable (String) -> Void
 
     private var stopped = false
+    private var authorization: ACPRelayAuthorization?
     private var activeConnection: WebSocketConnection?
     private var connectionCount = 0
     private var lastEndReason: ACPRelayEndReason?
@@ -265,11 +287,14 @@ public actor ACPRelayClient {
     public init(
         configuration: ACPRelayConfiguration,
         makeRuntime: @escaping RuntimeProvider,
+        authRecovery: AuthRecovery? = nil,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) {
         self.configuration = configuration
         self.makeRuntime = makeRuntime
+        self.authRecovery = authRecovery
         self.log = log
+        self.authorization = configuration.authorization
     }
 
     /// Number of successful relay connections so far. Observable so a
@@ -295,6 +320,7 @@ public actor ACPRelayClient {
         var attempt = 0
         while !stopped {
             let outcome = ACPRelayOutcomeBox()
+            var handshakeUnauthorized = false
             do {
                 let connection = try await dial()
                 if stopped {
@@ -317,8 +343,13 @@ public actor ACPRelayClient {
                 keepAlive?.cancel()
                 activeConnection = nil
             } catch {
+                handshakeUnauthorized = Self.isHandshakeUnauthorized(error)
                 await outcome.record(.transportFailure(String(describing: error)))
-                log("relay: connection to \(configuration.url.absoluteString) failed: \(error)")
+                if handshakeUnauthorized {
+                    log("relay: handshake rejected with HTTP 401")
+                } else {
+                    log("relay: connection to \(configuration.url.absoluteString) failed: \(error)")
+                }
             }
 
             let reason = stopped ? ACPRelayEndReason.cancelled : await outcome.take()
@@ -326,13 +357,33 @@ public actor ACPRelayClient {
             if stopped { return }
             log("relay: disconnected (\(reason))")
 
-            if reason == .authError, configuration.authorization == nil {
-                // Nothing to refresh, so retrying would spin against a wall.
-                log(
-                    "relay: no credentials to refresh; not reconnecting. "
-                        + "Run `open-grok login` and restart the leader."
-                )
-                return
+            if reason == .authError || handshakeUnauthorized {
+                let recoveryReason: ACPRelayAuthRecoveryReason = reason == .authError
+                    ? .authError
+                    : .handshakeUnauthorized
+                if let authRecovery {
+                    switch await authRecovery(recoveryReason) {
+                    case .recovered(let authorization):
+                        self.authorization = authorization
+                        attempt = 0
+                        log("relay: auth recovery succeeded; reconnecting immediately")
+                        continue
+                    case .terminalFailure:
+                        stopped = true
+                        log("relay: auth recovery is terminal; stopping")
+                        return
+                    case .retryableFailure:
+                        log("relay: auth recovery did not change credentials; backing off")
+                    }
+                } else if authorization == nil {
+                    // Nothing to refresh, so retrying would spin against a wall.
+                    stopped = true
+                    log(
+                        "relay: no credentials to refresh; not reconnecting. "
+                            + "Run `open-grok login` and restart the leader."
+                    )
+                    return
+                }
             }
 
             attempt += 1
@@ -414,11 +465,17 @@ public actor ACPRelayClient {
         try await WebSocketDialer.connect(
             to: configuration.url,
             options: WebSocketDialOptions(
-                headers: configuration.handshakeHeaders,
+                headers: configuration.handshakeHeaders(authorization: authorization),
                 connectTimeoutSeconds: configuration.connectTimeoutSeconds,
                 maximumMessageSize: configuration.maximumMessageSize
             )
         )
+    }
+
+    private static func isHandshakeUnauthorized(_ error: Error) -> Bool {
+        guard let error = error as? WebSocketChannelError else { return false }
+        guard case .handshakeRejected(let status, _) = error else { return false }
+        return status == 401
     }
 
     /// Client-sent ping every 15s with an empty payload (`relay.rs:597, 644-650`).

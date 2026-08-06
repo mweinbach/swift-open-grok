@@ -114,6 +114,14 @@ private func relayCancel(sessionId: String) -> ACPMessage {
     )
 }
 
+private func relayAuthError(id: Int64 = 99) -> ACPMessage {
+    .response(
+        id: .number(id),
+        result: nil,
+        error: AcpError(code: -32000, message: "expired")
+    )
+}
+
 private func relayDrain(
     _ transport: any ACPTransport,
     limit: Int = 40,
@@ -213,29 +221,89 @@ struct ACPRelayHeaderTests {
 
 #if canImport(Network)
 
+private final class RelayAuthRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String] = []
+
+    func record(_ value: String?) {
+        guard let value else { return }
+        lock.lock()
+        values.append(value)
+        lock.unlock()
+    }
+
+    var tokens: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+}
+
+private final class RelayRecoveryRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedReasons: [ACPRelayAuthRecoveryReason] = []
+
+    func record(_ reason: ACPRelayAuthRecoveryReason) {
+        lock.lock()
+        recordedReasons.append(reason)
+        lock.unlock()
+    }
+
+    var reasons: [ACPRelayAuthRecoveryReason] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedReasons
+    }
+}
+
 /// A stand-in relay: a plain WebSocket listener that hands back the ACP
 /// transport for whichever connection arrived, so a test can drive the leader.
 private actor StandInRelay {
     private let server: WebSocketServer
-    private let secret: String
+    private let secrets: Set<String>
+    private let authRecorder: RelayAuthRecorder
     private var accepted: [ACPWebSocketConnectionTransport] = []
     private var connections: [WebSocketConnection] = []
     private var pump: Task<Void, Never>?
 
     init(secret: String) {
-        self.secret = secret
+        let allowed: Set<String> = [secret]
+        let recorder = RelayAuthRecorder()
+        self.secrets = allowed
+        self.authRecorder = recorder
         self.server = WebSocketServer(
             configuration: WebSocketServerConfiguration(
                 host: "127.0.0.1",
                 port: 0,
                 policy: WebSocketUpgradePolicy(
                     path: "/ws",
-                    authorize: { request in
+                    authorize: { [allowed, recorder] request in
+                        recorder.record(request.bearerToken)
+                        if let bearer = request.bearerToken { return allowed.contains(bearer) }
+                        return request.queryItems["server-key"].map(allowed.contains) ?? false
+                    }
+                )
+            )
+        )
+    }
+
+    init(secrets: Set<String>) {
+        let recorder = RelayAuthRecorder()
+        self.secrets = secrets
+        self.authRecorder = recorder
+        self.server = WebSocketServer(
+            configuration: WebSocketServerConfiguration(
+                host: "127.0.0.1",
+                port: 0,
+                policy: WebSocketUpgradePolicy(
+                    path: "/ws",
+                    authorize: { [secrets, recorder] request in
+                        recorder.record(request.bearerToken)
                         // Same posture as `serve`: a bearer token decides
                         // alone, and only its absence falls through to the
                         // query parameter.
-                        if let bearer = request.bearerToken { return bearer == secret }
-                        return request.queryItems["server-key"] == secret
+                        if let bearer = request.bearerToken { return secrets.contains(bearer) }
+                        return request.queryItems["server-key"].map(secrets.contains) ?? false
                     }
                 )
             )
@@ -269,6 +337,8 @@ private actor StandInRelay {
     }
 
     func connectionCount() -> Int { accepted.count }
+
+    func bearerTokens() -> [String] { authRecorder.tokens }
 
     /// Drop connection `index` without a close handshake, the way a lost
     /// network leg does.
@@ -417,6 +487,148 @@ struct ACPRelayClientLiveTests {
 
         #expect(await client.successfulConnectionCount() >= 2)
         await client.stop()
+    }
+
+    @Test("an in-band auth error refreshes the bearer before reconnecting", .timeLimit(.minutes(1)))
+    func inBandAuthRecoveryUsesNewBearer() async throws {
+        let relay = StandInRelay(secrets: ["old-token", "new-token"])
+        let url = try await relay.start()
+        defer { Task { await relay.stop() } }
+
+        let recovery = RelayRecoveryRecorder()
+        let runtime = ACPAgentRuntime(promptDriver: RelayEchoPromptDriver())
+        let client = ACPRelayClient(
+            configuration: makeConfiguration(
+                url: url,
+                secret: "old-token",
+                reconnect: WebSocketReconnectPolicy(baseDelaySeconds: 0.01, maximumDelaySeconds: 0.05)
+            ),
+            makeRuntime: { runtime },
+            authRecovery: { reason in
+                recovery.record(reason)
+                return .recovered(
+                    ACPRelayAuthorization(token: "new-token", userID: "user-1")
+                )
+            }
+        )
+        let running = Task { await client.run() }
+        defer { Task { await client.stop() } }
+
+        let first = try await relay.transport(0)
+        try await first.send(relayAuthError())
+        let second = try await relay.transport(1)
+        try await second.send(relayInitialize(id: 1))
+        let initialized = try await relayDrain(second) { message in
+            if case .response(.number(1), _, _) = message { return true }
+            return false
+        }
+        if case .response(_, _, let error) = initialized {
+            #expect(error == nil)
+        }
+
+        #expect(recovery.reasons == [.authError])
+        #expect(await relay.bearerTokens() == ["old-token", "new-token"])
+        await client.stop()
+        await running.value
+    }
+
+    @Test("a handshake 401 refreshes the bearer before retrying", .timeLimit(.minutes(1)))
+    func handshakeUnauthorizedRecoveryUsesNewBearer() async throws {
+        let relay = StandInRelay(secrets: ["new-token"])
+        let url = try await relay.start()
+        defer { Task { await relay.stop() } }
+
+        let recovery = RelayRecoveryRecorder()
+        let runtime = ACPAgentRuntime(promptDriver: RelayEchoPromptDriver())
+        let client = ACPRelayClient(
+            configuration: makeConfiguration(
+                url: url,
+                secret: "old-token",
+                reconnect: WebSocketReconnectPolicy(baseDelaySeconds: 0.01, maximumDelaySeconds: 0.05)
+            ),
+            makeRuntime: { runtime },
+            authRecovery: { reason in
+                recovery.record(reason)
+                return .recovered(
+                    ACPRelayAuthorization(token: "new-token", userID: "user-1")
+                )
+            }
+        )
+        let running = Task { await client.run() }
+        defer { Task { await client.stop() } }
+
+        let second = try await relay.transport(0)
+        try await second.send(relayInitialize(id: 1))
+        let initialized = try await relayDrain(second) { message in
+            if case .response(.number(1), _, _) = message { return true }
+            return false
+        }
+        if case .response(_, _, let error) = initialized {
+            #expect(error == nil)
+        }
+
+        #expect(recovery.reasons == [.handshakeUnauthorized])
+        #expect(await relay.bearerTokens() == ["old-token", "new-token"])
+        await client.stop()
+        await running.value
+    }
+
+    @Test("terminal auth recovery stops without another connection", .timeLimit(.minutes(1)))
+    func terminalAuthRecoveryStopsRelay() async throws {
+        let relay = StandInRelay(secret: "old-token")
+        let url = try await relay.start()
+        defer { Task { await relay.stop() } }
+
+        let runtime = ACPAgentRuntime(promptDriver: RelayEchoPromptDriver())
+        let client = ACPRelayClient(
+            configuration: makeConfiguration(
+                url: url,
+                secret: "old-token",
+                reconnect: WebSocketReconnectPolicy(baseDelaySeconds: 0.01, maximumDelaySeconds: 0.05)
+            ),
+            makeRuntime: { runtime },
+            authRecovery: { _ in .terminalFailure }
+        )
+        let running = Task { await client.run() }
+        let first = try await relay.transport(0)
+        try await first.send(relayAuthError())
+        await running.value
+
+        #expect(await relay.connectionCount() == 1)
+        #expect(await client.mostRecentEndReason() == .authError)
+    }
+
+    @Test("retryable auth recovery keeps bounded reconnect active", .timeLimit(.minutes(1)))
+    func retryableAuthRecoveryBacksOffAndRetries() async throws {
+        let relay = StandInRelay(secret: "old-token")
+        let url = try await relay.start()
+        defer { Task { await relay.stop() } }
+
+        let recovery = RelayRecoveryRecorder()
+        let runtime = ACPAgentRuntime(promptDriver: RelayEchoPromptDriver())
+        let client = ACPRelayClient(
+            configuration: makeConfiguration(
+                url: url,
+                secret: "old-token",
+                reconnect: WebSocketReconnectPolicy(baseDelaySeconds: 0.01, maximumDelaySeconds: 0.05)
+            ),
+            makeRuntime: { runtime },
+            authRecovery: { reason in
+                recovery.record(reason)
+                return .retryableFailure
+            }
+        )
+        let running = Task { await client.run() }
+        defer { Task { await client.stop() } }
+
+        let first = try await relay.transport(0)
+        try await first.send(relayAuthError())
+        _ = try await relay.transport(1)
+
+        #expect(recovery.reasons == [.authError])
+        #expect(await relay.connectionCount() >= 2)
+        await client.stop()
+        await running.value
     }
 
     /// A wrong secret is a 401 at the handshake. With a bounded policy the

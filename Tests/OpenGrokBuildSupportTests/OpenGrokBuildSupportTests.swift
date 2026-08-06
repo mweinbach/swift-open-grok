@@ -90,6 +90,78 @@ struct OpenGrokBuildSupportTests {
         return url
     }
 
+    private func temporaryCorpus(provenanceContents: String?) throws -> (URL, GeneratedManifest) {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("opengrok-fixture-validator-\(UUID().uuidString)", isDirectory: true)
+        let fixtures = root.appendingPathComponent("ProtocolFixtures", isDirectory: true)
+        try FileManager.default.createDirectory(at: fixtures, withIntermediateDirectories: true)
+        let sampleURL = fixtures.appendingPathComponent("sample.txt")
+        try Data("sample\n".utf8).write(to: sampleURL)
+        if let provenanceContents {
+            try Data(provenanceContents.utf8).write(to: fixtures.appendingPathComponent("PROVENANCE.json"))
+        }
+        guard let entry = FixtureValidator.entry(for: sampleURL, relativeTo: root) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        return (root, GeneratedManifest(
+            generatedAt: "2026-08-06",
+            referenceRevision: "revision-a",
+            files: [entry]
+        ))
+    }
+
+    private func removeTemporaryCorpus(_ root: URL) {
+        do {
+            try FileManager.default.removeItem(at: root)
+        } catch {
+            Issue.record("failed to remove temporary corpus: \(error)")
+        }
+    }
+
+    @Test("FixtureValidator accepts matching manifest and provenance revisions")
+    func fixtureValidatorMatchingReferenceMetadata() throws {
+        let (root, manifest) = try temporaryCorpus(provenanceContents: "{\"referenceRevision\":\"revision-a\"}")
+        defer { removeTemporaryCorpus(root) }
+        let result = FixtureValidator.validate(manifest: manifest, packageRoot: root, allowUnexpectedFiles: true)
+        #expect(result == .fresh)
+    }
+
+    @Test("FixtureValidator reports a manifest and provenance revision mismatch")
+    func fixtureValidatorReferenceMismatch() throws {
+        let (root, manifest) = try temporaryCorpus(provenanceContents: "{\"referenceRevision\":\"revision-b\"}")
+        defer { removeTemporaryCorpus(root) }
+        let result = FixtureValidator.validate(manifest: manifest, packageRoot: root, allowUnexpectedFiles: true)
+        guard case .stale(let issues) = result else {
+            Issue.record("expected stale result")
+            return
+        }
+        #expect(issues.contains(.referenceRevisionMismatch(expected: "revision-a", actual: "revision-b")))
+    }
+
+    @Test("FixtureValidator reports missing provenance metadata")
+    func fixtureValidatorMissingProvenance() throws {
+        let (root, manifest) = try temporaryCorpus(provenanceContents: nil)
+        defer { removeTemporaryCorpus(root) }
+        let result = FixtureValidator.validate(manifest: manifest, packageRoot: root, allowUnexpectedFiles: true)
+        guard case .stale(let issues) = result else {
+            Issue.record("expected stale result")
+            return
+        }
+        #expect(issues.contains(.provenanceMissing(path: "ProtocolFixtures/PROVENANCE.json")))
+    }
+
+    @Test("FixtureValidator reports malformed provenance metadata")
+    func fixtureValidatorMalformedProvenance() throws {
+        let (root, manifest) = try temporaryCorpus(provenanceContents: "not-json")
+        defer { removeTemporaryCorpus(root) }
+        let result = FixtureValidator.validate(manifest: manifest, packageRoot: root, allowUnexpectedFiles: true)
+        guard case .stale(let issues) = result else {
+            Issue.record("expected stale result")
+            return
+        }
+        #expect(issues.contains(.provenanceMalformed(path: "ProtocolFixtures/PROVENANCE.json")))
+    }
+
     @Test("Checked-in protocol fixture manifest is fresh")
     func fixtureManifestFresh() throws {
         let manifestURL = packageRoot

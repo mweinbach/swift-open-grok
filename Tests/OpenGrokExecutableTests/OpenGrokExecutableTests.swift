@@ -313,6 +313,129 @@ struct OpenGrokExecutableTests {
         ])
     }
 
+    @Test("managed minimum version blocks session startup before launcher dispatch")
+    func managedMinimumVersionBlocksSessionStartup() async {
+        let recorder = InvocationRecorder()
+        let application = OpenGrokApplication(
+            launcher: CLIApplicationLauncher { _, _ in
+                recorder.append("start")
+                return CLIApplicationSession(waitForExit: {}, shutdown: {})
+            },
+            control: .never
+        )
+        let (streams, out, err) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            ["headless", "--prompt", "blocked"],
+            environment: [
+                "GROK_TEST_VERSION": "0.1.0",
+                "GROK_REQUIRED_MINIMUM_VERSION": "0.2.0"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        #expect(code == CLIRunner.ExitCode.failure.rawValue)
+        #expect(out.contents.isEmpty)
+        #expect(err.contents == "This version of Grok (0.1.0) is older than the minimum required by your organization (0.2.0).\n\nUpdate to an approved version through your organization's approved method (for example, run `open-grok update`).\n")
+        #expect(recorder.snapshot.isEmpty)
+    }
+
+    @Test("managed maximum version blocks session startup before launcher dispatch")
+    func managedMaximumVersionBlocksSessionStartup() async {
+        let recorder = InvocationRecorder()
+        let application = OpenGrokApplication(
+            launcher: CLIApplicationLauncher { _, _ in
+                recorder.append("start")
+                return CLIApplicationSession(waitForExit: {}, shutdown: {})
+            },
+            control: .never
+        )
+        let (streams, out, err) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            ["interactive"],
+            environment: [
+                "GROK_TEST_VERSION": "0.3.0",
+                "GROK_REQUIRED_MAXIMUM_VERSION": "0.2.0"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        #expect(code == CLIRunner.ExitCode.failure.rawValue)
+        #expect(out.contents.isEmpty)
+        #expect(err.contents == "This version of Grok (0.3.0) is newer than the maximum allowed by your organization (0.2.0).\n\nInstall an approved version through your organization's approved method (for example, run `open-grok update --version 0.2.0`).\n")
+        #expect(recorder.snapshot.isEmpty)
+    }
+
+    @Test("in-range managed version reaches the application launcher")
+    func inRangeManagedVersionReachesLauncher() async {
+        let recorder = InvocationRecorder()
+        let application = OpenGrokApplication(
+            launcher: CLIApplicationLauncher { command, _ in
+                recorder.append("start:\(command.routeName)")
+                return CLIApplicationSession(
+                    waitForExit: { recorder.append("wait") },
+                    shutdown: { recorder.append("shutdown") }
+                )
+            },
+            control: .never
+        )
+        let (streams, out, err) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            ["headless", "--prompt", "allowed"],
+            environment: [
+                "GROK_TEST_VERSION": "0.2.0",
+                "GROK_REQUIRED_MINIMUM_VERSION": "0.1.0",
+                "GROK_REQUIRED_MAXIMUM_VERSION": "0.3.0"
+            ],
+            streams: streams,
+            application: application
+        )
+
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(out.contents.isEmpty)
+        #expect(err.contents.isEmpty)
+        #expect(recorder.snapshot == ["start:headless", "wait", "shutdown"])
+    }
+
+    @Test("management and recovery routes remain reachable outside managed range")
+    func managedVersionExemptsManagementAndRecoveryRoutes() async {
+        let routes: [[String]] = [
+            ["doctor"],
+            ["login"],
+            ["update"],
+            ["mcp", "list"],
+            ["sessions", "list"],
+            ["workspace", "status"]
+        ]
+
+        for args in routes {
+            let recorder = InvocationRecorder()
+            let application = OpenGrokApplication(
+                launcher: CLIApplicationLauncher { command, _ in
+                    recorder.append(command.routeName)
+                    return CLIApplicationSession(waitForExit: {}, shutdown: {})
+                },
+                control: .never
+            )
+            let (streams, out, err) = CLIStreams.buffered()
+            let code = await CLIRunner.run(
+                args,
+                environment: [
+                    "GROK_TEST_VERSION": "0.1.0",
+                    "GROK_REQUIRED_MINIMUM_VERSION": "0.2.0"
+                ],
+                streams: streams,
+                application: application
+            )
+
+            #expect(code == CLIRunner.ExitCode.success.rawValue)
+            #expect(out.contents.isEmpty)
+            #expect(err.contents.isEmpty)
+            #expect(recorder.snapshot == [CLICommandParser.parse(args).routeName])
+        }
+    }
+
     @Test("launcher errors are reported as process failures")
     func launcherFailure() async {
         let launcher = CLIApplicationLauncher { _, _ in

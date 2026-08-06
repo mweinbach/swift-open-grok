@@ -34,8 +34,9 @@ public enum PathBoundaryError: Error, Equatable, Sendable, CustomStringConvertib
 /// Enforces that filesystem operations stay within a workspace root.
 public struct PathBoundary: Sendable {
     public let root: URL
-    /// When true, resolve symlinks before containment checks (TOCTOU-safer
-    /// for existing paths; missing paths use lexical checks only).
+    /// When true, resolve symlinks before containment checks. Missing leaves
+    /// are checked through their deepest existing ancestor so a symlink cannot
+    /// hide an outbound parent before a writer creates the leaf.
     public var resolveSymlinks: Bool
 
     public init(root: URL, resolveSymlinks: Bool = true) {
@@ -83,14 +84,19 @@ public struct PathBoundary: Sendable {
             throw PathBoundaryError.outsideWorkspace(raw)
         }
 
-        if resolveSymlinks, FileManager.default.fileExists(atPath: lexical) {
-            // realpath-style resolution via FileUtils when available.
-            if let resolved = try? resolveCanonicalPath(URL(fileURLWithPath: lexical)) {
+        if resolveSymlinks {
+            // realpath-style resolution via FileUtils when available. For a
+            // missing leaf, canonicalize the deepest existing ancestor instead
+            // of accepting a lexical path whose parent may be an outbound link.
+            let probe = deepestExistingAncestor(URL(fileURLWithPath: lexical))
+            if let probe, let resolved = try? resolveCanonicalPath(probe) {
                 let resolvedLex = normalizeForContainment(resolved.path)
                 if !containsPath(root: containmentRoot, candidate: resolvedLex) {
                     throw PathBoundaryError.symlinkEscape(raw)
                 }
-                return resolved
+                if probe.path == lexical {
+                    return resolved
+                }
             }
         }
         return URL(fileURLWithPath: lexical)
@@ -142,6 +148,19 @@ func resolveCanonicalPath(_ url: URL) throws -> URL {
         return URL(fileURLWithPath: String(cString: buf))
     }
     #endif
+}
+
+private func deepestExistingAncestor(_ url: URL) -> URL? {
+    var probe = url
+    while !probe.path.isEmpty {
+        if FileManager.default.fileExists(atPath: probe.path) {
+            return probe
+        }
+        let parent = probe.deletingLastPathComponent()
+        if parent.path == probe.path { break }
+        probe = parent
+    }
+    return nil
 }
 
 /// Folder trust decision for a workspace root.

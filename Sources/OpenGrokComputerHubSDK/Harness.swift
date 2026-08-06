@@ -154,10 +154,17 @@ public final class ToolHarness: @unchecked Sendable {
 
         // Remote fallback — never invent local execution when the tool is
         // only reachable remotely (or not at all).
-        if let connection, connection.isConnected,
-           let client = connection.connectionClient(),
-           let sessionId
-        {
+        if let connection {
+            guard connection.isConnected,
+                  let client = connection.connectionClient(),
+                  let sessionId
+            else {
+                return terminalOnly(
+                    Result<TypedToolOutput, ToolError>.failure(
+                        .networkError("remote hub is not ready for \(toolId.rawValue)")
+                    )
+                )
+            }
             let transport = RemoteTransport(
                 connection: client,
                 principal: principal.withSession(sessionId),
@@ -165,16 +172,6 @@ public final class ToolHarness: @unchecked Sendable {
                 requiredScopes: requiredScopes
             )
             return await transport.call(toolId: toolId, args: args, ctx: ctx)
-        }
-
-        // Remote plane intended but unavailable: fail closed, do not
-        // fabricate a local path.
-        if connection != nil, !connection!.isConnected {
-            return terminalOnly(
-                Result<TypedToolOutput, ToolError>.failure(
-                    .networkError("remote hub not connected for \(toolId.rawValue)")
-                )
-            )
         }
 
         return terminalOnly(

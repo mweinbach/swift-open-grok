@@ -314,6 +314,21 @@ struct ProviderSessionLifecycleTests {
         #expect(snapshot.route.canExportToXAI == false)
     }
 
+    @Test("a rehydrated non-xAI marker keeps xAI export closed")
+    func rehydratedBoundaryRemainsClosed() async throws {
+        let session = try ProviderSession(configuration: ProviderSessionConfiguration(
+            sessionID: "rehydrated-boundary",
+            modelCatalog: ["xai": modelEntry(model: "xai", provider: .xai, backend: .responses)],
+            initialModelID: "xai",
+            credentialBindings: [.xai: xaiBinding()],
+            openGrokHome: URL(fileURLWithPath: "/tmp/provider-session-tests", isDirectory: true),
+            everUsedNonXAI: true
+        ))
+        let snapshot = await session.snapshot()
+        #expect(snapshot.everUsedNonXAI)
+        #expect(snapshot.route.canExportToXAI == false)
+    }
+
     @Test("usage remains attributed to the provider and model used by the turn")
     func usageAttribution() async throws {
         let session = try ProviderSession(configuration: ProviderSessionConfiguration(

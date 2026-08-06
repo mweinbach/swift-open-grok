@@ -220,7 +220,10 @@ struct ToolRegistryTests {
     func noHandler() async throws {
         let builder = ToolRegistryBuilder()
         let config = toolServerConfig(for: .explore, catalogKinds: builder.knownToolKinds())
-        let resources = ToolResources(cwd: "/tmp")
+        let pipeline = PermissionPipeline(
+            permissions: PermissionHandle(allowAll: true, shellCwd: NSTemporaryDirectory())
+        )
+        let resources = ToolResources(cwd: "/tmp", permissionPipeline: pipeline)
         let set = try unwrap(builder.finalize(config: config, resources: resources))
         let result = await set.prepareAndCall(
             clientName: "read_file",

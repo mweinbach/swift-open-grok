@@ -291,10 +291,23 @@ public enum WebSocketDialer {
         }
         return channel
         #else
-        throw WebSocketDialError.unsupportedPlatform(
-            "Network.framework is unavailable and no BSD-socket dialer is implemented; "
-                + "cannot reach \(url.absoluteString)"
-        )
+        guard !url.isSecure else {
+            throw WebSocketDialError.unsupportedPlatform(
+                "portable sockets provide plaintext ws:// only; cannot reach \(url.absoluteString)"
+            )
+        }
+        do {
+            return try await PortableSocketConnector.tcp(
+                host: url.host,
+                port: url.port,
+                timeoutSeconds: connectTimeoutSeconds
+            )
+        } catch let error as PortableSocketError {
+            throw WebSocketDialError.connectionFailed(
+                url: url.absoluteString,
+                reason: error.description
+            )
+        }
         #endif
     }
 

@@ -8,6 +8,8 @@
 import Foundation
 import Testing
 @testable import OpenGrokCLI
+import OpenGrokModels
+import OpenGrokSamplingTypes
 
 private func entry(
     id: String,
@@ -396,5 +398,50 @@ struct LiveModelCatalogEntryTests {
                 "\(selector) must resolve to \(entry.id)"
             )
         }
+    }
+}
+
+@Suite("Live OpenCode Go catalog")
+struct LiveOpenCodeGoCatalogTests {
+    @Test("picker entries come from the filtered shared catalog snapshot")
+    func filteredSnapshotFeedsPicker() throws {
+        var info = ModelInfo.fallback(slug: "opencode-go:gpt-ish")
+        info.id = "opencode-go:gpt-ish"
+        info.model = "gpt-ish"
+        info.name = "GPT-ish"
+        info.provider = .openCodeGo
+        info.baseURL = OpenCodeGoModels.apiBaseURLDefault
+        info.apiBackend = .chatCompletions
+
+        let remote = OpenCodeGoModelsCatalog(
+            entries: OrderedModelMap([
+                ("opencode-go:gpt-ish", ModelEntry(
+                    info: info,
+                    envKey: .single(OpenCodeGoModels.apiKeyEnv)
+                ))
+            ]),
+            descriptors: [],
+            warnings: [],
+            credentialFingerprint: "fixture"
+        )
+        let store = LiveModelCatalogStore(input: CatalogResolutionInput())
+        store.applyOpenCodeGoCatalog(remote)
+
+        let resolver = LiveModelCatalogResolver(
+            environment: [:],
+            openGrokHome: URL(fileURLWithPath: "/tmp/opengrok-tests", isDirectory: true),
+            sessionID: "fixture",
+            workingDirectory: URL(fileURLWithPath: "/tmp", isDirectory: true),
+            catalogSource: { store.snapshot() }
+        )
+        #expect(!resolver.catalogEntries().contains { $0.id == "opencode-go:gpt-ish" })
+
+        store.updateInput(CatalogResolutionInput(
+            models: ModelsSectionConfig(opencodeGoEnabledModels: ["gpt-ish"])
+        ))
+        #expect(
+            resolver.catalogEntries().filter { $0.id == "opencode-go:gpt-ish" }.map(\.id)
+                == ["opencode-go:gpt-ish"]
+        )
     }
 }

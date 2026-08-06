@@ -44,8 +44,8 @@ struct LinuxChildNetworkRestrictionTests {
         #expect(!restrictNetworkAtKnownLinuxLaunches(applied: false, configured: true))
         #expect(!restrictNetworkAtKnownLinuxLaunches(applied: true, configured: false))
         #else
-        // macOS/Windows apply network policy in the process-level profile;
-        // the per-child launch restriction must never arm there even when the
+        // macOS/Windows keep process-level provider network access; the
+        // per-child launch restriction must never arm there even when the
         // sandbox applied and the resolved profile restricts network.
         #expect(!restrictNetworkAtKnownLinuxLaunches(applied: true, configured: true))
         #expect(!restrictNetworkAtKnownLinuxLaunches(applied: false, configured: false))

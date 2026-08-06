@@ -55,6 +55,7 @@ public struct SamplingErrorInfo: Codable, Sendable, Equatable, Error {
     public var isRetryable: Bool
     public var retryAfterSecs: UInt64?
     public var modelMetadata: ResponseModelMetadata?
+    public var credential: SentCredential?
     public var emptyResponseContext: EmptyResponseContext?
     public var doomLoopTriggers: [String]?
     public var doomLoopAbortedAtChunk: UInt64?
@@ -66,6 +67,7 @@ public struct SamplingErrorInfo: Codable, Sendable, Equatable, Error {
         isRetryable: Bool,
         retryAfterSecs: UInt64? = nil,
         modelMetadata: ResponseModelMetadata? = nil,
+        credential: SentCredential? = nil,
         emptyResponseContext: EmptyResponseContext? = nil,
         doomLoopTriggers: [String]? = nil,
         doomLoopAbortedAtChunk: UInt64? = nil
@@ -76,6 +78,7 @@ public struct SamplingErrorInfo: Codable, Sendable, Equatable, Error {
         self.isRetryable = isRetryable
         self.retryAfterSecs = retryAfterSecs
         self.modelMetadata = modelMetadata
+        self.credential = credential
         self.emptyResponseContext = emptyResponseContext
         self.doomLoopTriggers = doomLoopTriggers
         self.doomLoopAbortedAtChunk = doomLoopAbortedAtChunk
@@ -88,6 +91,7 @@ public struct SamplingErrorInfo: Codable, Sendable, Equatable, Error {
         case isRetryable = "is_retryable"
         case retryAfterSecs = "retry_after_secs"
         case modelMetadata = "model_metadata"
+        case credential
         case emptyResponseContext = "empty_response_context"
         case doomLoopTriggers = "doom_loop_triggers"
         case doomLoopAbortedAtChunk = "doom_loop_aborted_at_chunk"
@@ -98,8 +102,13 @@ public struct SamplingErrorInfo: Codable, Sendable, Equatable, Error {
         let isRetryable = error.isRetryable
         let message = error.displayMessage
         switch error {
-        case .auth:
-            self.init(kind: .auth, message: message, isRetryable: isRetryable)
+        case .auth(_, let credential):
+            self.init(
+                kind: .auth,
+                message: message,
+                isRetryable: isRetryable,
+                credential: credential
+            )
         case .invalidConfiguration:
             self.init(kind: .api, message: message, isRetryable: isRetryable)
         case .http:
@@ -207,7 +216,7 @@ extension SamplingError {
     /// Human-readable display string matching the Rust Display impl surface.
     public var displayMessage: String {
         switch self {
-        case .auth(let msg):
+        case .auth(let msg, _):
             return "authentication error: \(msg)"
         case .invalidConfiguration(let msg):
             return "invalid configuration: \(msg)"

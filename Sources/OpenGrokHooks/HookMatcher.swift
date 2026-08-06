@@ -52,7 +52,8 @@ public struct HookMatcher: Sendable, Equatable, Hashable {
 
     private static func aliases(for value: String) -> [String] {
         switch value {
-        case "Bash": return ["run_terminal_command"]
+        case "Bash", "run_terminal_command", "run_terminal_cmd":
+            return terminalAliases(for: value)
         case "Read": return ["read_file"]
         case "Write": return ["search_replace", "hashline_edit"]
         case "Edit": return ["search_replace", "hashline_edit"]
@@ -64,7 +65,8 @@ public struct HookMatcher: Sendable, Equatable, Hashable {
 
     private static func externalAliases(for value: String) -> [String] {
         switch value {
-        case "run_terminal_command": return ["Bash"]
+        case "Bash", "run_terminal_command", "run_terminal_cmd":
+            return terminalAliases(for: value)
         case "read_file": return ["Read"]
         case "search_replace": return ["Write", "Edit"]
         case "hashline_edit": return ["Write", "Edit"]
@@ -72,6 +74,10 @@ public struct HookMatcher: Sendable, Equatable, Hashable {
         case "search_files": return ["Grep"]
         default: return []
         }
+    }
+
+    private static func terminalAliases(for value: String) -> [String] {
+        ["Bash", "run_terminal_command", "run_terminal_cmd"].filter { $0 != value }
     }
 }
 

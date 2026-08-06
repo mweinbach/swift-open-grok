@@ -6,17 +6,82 @@ import Testing
 
 @Suite("OpenGrok hooks")
 struct OpenGrokHooksTests {
+    @Test("command hooks use the injected launch transform")
+    func commandLaunchTransformRewritesArguments() async {
+        let spec = HookSpec(
+            name: "rewritten",
+            event: .preToolUse,
+            handlerType: .command,
+            command: "exit 7",
+            commandRaw: "exit 7",
+            timeoutMs: 1_000,
+            sourceDirectory: URL(fileURLWithPath: "/tmp")
+        )
+        let envelope = HookEventEnvelope(
+            hookEventName: .preToolUse,
+            sessionId: "s",
+            cwd: "/tmp",
+            workspaceRoot: "/tmp"
+        )
+        let result = await HookRunner.run(
+            spec: spec,
+            envelope: envelope,
+            context: HookRunContext(sessionId: "s", workspaceRoot: URL(fileURLWithPath: "/tmp")),
+            mode: .tool,
+            launchTransform: { executable, arguments in
+                #expect(executable == "/bin/sh")
+                #expect(arguments == ["-c", "exit 7"])
+                return (executable, ["-c", #"printf '{"decision":"deny","reason":"transformed"}'"#])
+            }
+        )
+        #expect(result.result == .decision(.deny(reason: "transformed", hookName: "rewritten")))
+    }
+
+    @Test("a throwing command launch transform records failure without running the hook")
+    func commandLaunchTransformFailureDoesNotSpawn() async {
+        let marker = FileManager.default.temporaryDirectory.appendingPathComponent("opengrok-hook-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: marker) }
+        let spec = HookSpec(
+            name: "blocked",
+            event: .sessionStart,
+            handlerType: .command,
+            command: "printf started > \"\(marker.path)\"",
+            commandRaw: "printf started",
+            timeoutMs: 1_000,
+            sourceDirectory: URL(fileURLWithPath: "/tmp")
+        )
+        let envelope = HookEventEnvelope(hookEventName: .sessionStart, sessionId: "s", cwd: "/tmp", workspaceRoot: "/tmp")
+        let result = await HookRunner.run(
+            spec: spec,
+            envelope: envelope,
+            context: HookRunContext(sessionId: "s", workspaceRoot: URL(fileURLWithPath: "/tmp")),
+            mode: .observe,
+            launchTransform: { _, _ in throw NSError(domain: "launch", code: 1) }
+        )
+        guard case .failed(let detail) = result.result else {
+            Issue.record("expected a failed hook invocation")
+            return
+        }
+        #expect(detail.contains("failed to spawn command"))
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
+
     @Test("matcher preserves exact and regex semantics")
     func matcherSemantics() throws {
         let exact = try HookMatcher(pattern: "Bash|Read")
         #expect(exact.isMatch("Bash"))
         #expect(exact.isMatch("run_terminal_command"))
+        #expect(exact.isMatch("run_terminal_cmd"))
         #expect(exact.isMatch("read_file"))
         #expect(!exact.isMatch("my_read_file"))
+
+        let upstream = try HookMatcher(pattern: "run_terminal_command")
+        #expect(upstream.isMatch("run_terminal_cmd"))
 
         let regex = try HookMatcher(pattern: "^Bash$")
         #expect(regex.isMatch("Bash"))
         #expect(regex.isMatch("run_terminal_command"))
+        #expect(regex.isMatch("run_terminal_cmd"))
         #expect(!regex.isMatch("read_file"))
         #expect(throws: HookMatcherError.self) {
             _ = try HookMatcher(pattern: "[invalid")

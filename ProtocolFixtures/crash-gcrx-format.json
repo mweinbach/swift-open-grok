@@ -32,13 +32,13 @@
     "pid": 4242,
     "timestamp": 1700000000,
     "nFrames": 0,
-    "appVersion": "0.1.220-open-grok.53"
+    "appVersion": "0.1.220-open-grok.54"
   },
-  "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+  "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
   "provenance": {
     "source": "OpenGrokCrashHandler.CrashBlobFormat / CrashBlob.serialize vs xai-crash-handler",
-    "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
-    "previousReferenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+    "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
+    "previousReferenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
     "pinVerdict": "recaptured",
     "recapturedFields": [
       "capturedSignals",
@@ -53,9 +53,9 @@
       "capturedSignals.windows": "crates/codegen/xai-crash-handler/src/handler.rs:1-8 module doc — abort() does not route through SetUnhandledExceptionFilter, so SIGABRT capture is Unix-only"
     },
     "evidence": [
-      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-crash-handler/src/format.rs => empty. The GCRX header layout, magic, version byte, frame cap, and version-string field are unchanged; the binary golden is byte-compatible with the old parser.",
-      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-crash-handler/src/handler.rs => adds `libc::sigaction(libc::SIGABRT, &sa, ...)` at src/handler.rs:308 so that `panic = \"abort\"` release builds leave a crash report. Recorded as the new `capturedSignals` key.",
-      "crash-gcrx-sample.bin re-encoded with the app_version field set to the release pinned at 80dff0a9 (OPEN_GROK_VERSION = 0.1.220-open-grok.53); every other header byte is identical to the 9739c4a2 capture."
+      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-crash-handler/src/format.rs => empty. The GCRX header layout, magic, version byte, frame cap, and version-string field remain unchanged.",
+      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-crash-handler/src/handler.rs => empty; the captured signal set remains the one already verified at the prior pin.",
+      "crash-gcrx-sample.bin re-encoded with app_version = 0.1.220-open-grok.54 from the 9ed09e2a release marker; every other header byte is identical to the prior golden."
     ]
   }
 }

@@ -55,8 +55,8 @@ public enum SessionFS {
     ///
     /// Containment is delegated to `PathBoundary`, so traversal, NUL bytes,
     /// case folding, Unicode normalization, and symlink targets that point
-    /// outside the root are all rejected. Paths that do not exist yet are
-    /// checked lexically (the parent directory is created on write).
+    /// outside the root are all rejected. Missing leaves are checked through
+    /// their deepest existing ancestor before any parent is created.
     public static func enforceRoots(_ absolute: String, roots: [String]) throws {
         guard !roots.isEmpty else { return }
         let path = (absolute as NSString).standardizingPath
@@ -116,18 +116,39 @@ public enum SessionFS {
         absolute: String,
         content: String,
         resources: ToolResources,
-        previousContent: String?
+        previousContent: String?,
+        beforeWrite: (@Sendable () async throws -> Void)? = nil
     ) async throws {
         try enforceRoots(absolute, roots: resources.allowedRoots)
         let lock = await resources.locks.acquirePath(absolute)
         defer { Task { await lock.release() } }
+
+        // Revalidate after the path lock. A caller may have replaced a parent
+        // between the initial policy check and the mutation; no-follow atomic
+        // replacement below is the final race-resistant guard.
+        try enforceRoots(absolute, roots: resources.allowedRoots)
+        try await beforeWrite?()
+        // The synchronization seam used by adversarial callers can model a
+        // parent replacement exactly at this boundary. Surface it as the same
+        // typed escape as the initial validation instead of a generic mkdir
+        // failure.
+        try enforceRoots(absolute, roots: resources.allowedRoots)
 
         let url = URL(fileURLWithPath: absolute)
         let parent = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
 
         do {
-            try AtomicFile.write(url, contents: content, options: AtomicWriteOptions(syncFile: true))
+            try AtomicFile.write(
+                url,
+                contents: content,
+                options: AtomicWriteOptions(syncFile: true, noFollowFinal: true)
+            )
+        } catch let error as FileUtilsError {
+            if case .symlinkEncountered = error {
+                throw SessionFSError.symlinkEscape(absolute)
+            }
+            throw SessionFSError.io("write failed: \(error.description)")
         } catch {
             // Never attribute failed writes.
             throw SessionFSError.io("write failed: \(error.localizedDescription)")

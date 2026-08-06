@@ -39,10 +39,12 @@
 
 import Foundation
 import OpenGrokACPRuntime
+import OpenGrokAuth
 import OpenGrokComputerHubCore
 import OpenGrokComputerHubSDK
 import OpenGrokConfigTypes
 import OpenGrokHTTP
+import OpenGrokModels
 import OpenGrokSandbox
 import OpenGrokShared
 import OpenGrokWorkspaceClient
@@ -185,6 +187,79 @@ public protocol WorkspaceControlChannel: Sendable {
     func close() async
 }
 
+/// Injectable edges owned by the executable workspace route.
+///
+/// The loader is deliberately environment-driven so production uses the same
+/// home, auth, and endpoint resolution as the rest of the CLI while tests can
+/// replace both network and leader IPC with in-process seams.
+public struct LiveWorkspaceRouteDependencies: Sendable {
+    public let loadRemoteSettings: @Sendable ([String: String]) async -> RemoteSettings?
+    public let connect: @Sendable ([String: String]) async throws -> any WorkspaceControlChannel
+
+    public init(
+        loadRemoteSettings: @escaping @Sendable ([String: String]) async -> RemoteSettings?,
+        connect: @escaping @Sendable ([String: String]) async throws -> any WorkspaceControlChannel
+    ) {
+        self.loadRemoteSettings = loadRemoteSettings
+        self.connect = connect
+    }
+
+    public static func production(
+        transport: any HTTPTransport = URLSessionHTTPTransport()
+    ) -> LiveWorkspaceRouteDependencies {
+        LiveWorkspaceRouteDependencies(
+            loadRemoteSettings: { environment in
+                await loadWorkspaceRemoteSettings(environment: environment, transport: transport)
+            },
+            connect: { environment in
+                try await LiveWorkspaceComposition.dialLeader(environment: environment)
+            }
+        )
+    }
+}
+
+/// Fetch authenticated `/v1/settings`, failing closed on every unavailable
+/// auth, endpoint, transport, status, or decoding outcome.
+public func loadWorkspaceRemoteSettings(
+    environment: [String: String],
+    transport: any HTTPTransport
+) async -> RemoteSettings? {
+    let home = OpenGrokHomeResolver.resolve(environment: environment)
+    let authManager = AuthManager(
+        grokHome: home,
+        config: GrokComConfig.default(environment: environment),
+        environment: environment
+    )
+    guard let auth = try? await authManager.auth() else { return nil }
+
+    let baseURLString = EndpointsConfig(
+        cliChatProxyBaseURL: environment["GROK_CLI_CHAT_PROXY_BASE_URL"]
+    ).proxyURL()
+    guard let baseURL = URL(string: baseURLString),
+          baseURL.scheme != nil,
+          baseURL.host != nil
+    else { return nil }
+
+    var headers = [
+        "Accept": "application/json",
+        "Authorization": "Bearer \(auth.key)",
+        "X-XAI-Token-Auth": GrokComConfig.default(environment: environment).tokenHeader,
+    ]
+    if !auth.userID.isEmpty { headers["x-userid"] = auth.userID }
+    if let email = auth.email { headers["x-email"] = email }
+
+    let request = HTTPRequest(
+        method: .get,
+        url: baseURL.appendingPathComponent("settings"),
+        headers: headers,
+        timeout: 10
+    )
+    guard let response = try? await transport.send(request),
+          (200..<300).contains(response.metadata.statusCode)
+    else { return nil }
+    return try? JSONDecoder().decode(RemoteSettings.self, from: response.body)
+}
+
 /// `main.rs:353-362` (`ensure_workspace_caps`).
 public func ensureWorkspaceCapabilities(
     _ capabilities: ACPLeaderCapabilities?
@@ -221,12 +296,31 @@ public enum LiveWorkspaceComposition {
     /// Launcher entry point, matching `LiveMCPComposition.session`.
     public static func session(
         for command: CLICommand,
-        context: CLIApplicationContext
+        context: CLIApplicationContext,
+        routeDependencies: LiveWorkspaceRouteDependencies = .production()
     ) async throws -> CLIApplicationSession {
         guard case .utility(let options) = command, options.name == routeName else {
             throw CLIApplicationError.unsupported(route: command.routeName)
         }
-        try await run(options: options, environment: context.environment, streams: context.streams)
+        let sandboxProfile = OpenGrokSandbox.configuredProfile()
+        if let rawAction = options.values.first {
+            let action = rawAction == "list" ? "status" : rawAction
+            try enforceSandboxProfile(action: action, profile: sandboxProfile)
+        }
+        let remoteSettings: RemoteSettings?
+        if workspaceCommandEnvironmentOverride(context.environment) == nil {
+            remoteSettings = await routeDependencies.loadRemoteSettings(context.environment)
+        } else {
+            remoteSettings = nil
+        }
+        try await run(
+            options: options,
+            environment: context.environment,
+            streams: context.streams,
+            sandboxProfile: sandboxProfile,
+            remoteSettings: remoteSettings,
+            connect: routeDependencies.connect
+        )
         return CLIApplicationSession(waitForExit: {}, shutdown: {})
     }
 
@@ -244,16 +338,7 @@ public enum LiveWorkspaceComposition {
         sandboxProfile: String?,
         remoteSettings: RemoteSettings?
     ) throws {
-        if activatingActions.contains(action), let profile = sandboxProfile {
-            throw WorkspaceRouteError(
-                "`open-grok workspace` start/restart/resume is unavailable under "
-                    + "sandbox profile '\(profile)': those commands (re)activate "
-                    + "shared-leader workspace exposure that this session cannot "
-                    + "prove is confined by that profile. Disable the profile at "
-                    + "the source that selected it (CLI, env, config, or a managed "
-                    + "requirement)."
-            )
-        }
+        try enforceSandboxProfile(action: action, profile: sandboxProfile)
 
         let override = workspaceCommandEnvironmentOverride(environment)
         // `main.rs:311-315`: the remote fetch is skipped entirely when the
@@ -274,6 +359,19 @@ public enum LiveWorkspaceComposition {
                 "Could not load your settings for `open-grok workspace`. Check your "
                     + "network connection (run `open-grok login` if you are signed "
                     + "out), then try again."
+            )
+        }
+    }
+
+    private static func enforceSandboxProfile(action: String, profile: String?) throws {
+        if activatingActions.contains(action), let profile {
+            throw WorkspaceRouteError(
+                "`open-grok workspace` start/restart/resume is unavailable under "
+                    + "sandbox profile '\(profile)': those commands (re)activate "
+                    + "shared-leader workspace exposure that this session cannot "
+                    + "prove is confined by that profile. Disable the profile at "
+                    + "the source that selected it (CLI, env, config, or a managed "
+                    + "requirement)."
             )
         }
     }
@@ -336,7 +434,11 @@ public enum LiveWorkspaceComposition {
             try requireLeaderMode(options: options)
         }
 
-        let channel = try await (connect ?? Self.dialLeader)(environment)
+        var leaderEnvironment = environment
+        if let socketOverride = options.common.leaderSocket, !socketOverride.isEmpty {
+            leaderEnvironment[ACPLeaderSocketPaths.socketEnvironmentVariable] = socketOverride
+        }
+        let channel = try await (connect ?? Self.dialLeader)(leaderEnvironment)
         defer { Task { await channel.close() } }
 
         try ensureWorkspaceCapabilities(channel.advertisedCapabilities)
@@ -416,7 +518,7 @@ public enum LiveWorkspaceComposition {
 
     /// `main.rs:363-386` (`connect_workspace_control`).
     @Sendable
-    private static func dialLeader(
+    static func dialLeader(
         environment: [String: String]
     ) async throws -> any WorkspaceControlChannel {
         let home = OpenGrokHomeResolver.resolve(environment: environment)
@@ -441,21 +543,19 @@ public enum LiveWorkspaceComposition {
 
 // MARK: - Leader-backed channel
 
-/// Speaks the leader IPC framing directly: this port has no `LeaderClient`
-/// (the Rust type at `leader/client.rs`), only the socket dialer and the
-/// frame codec, so the register/control exchange is assembled here.
+/// Workspace control uses the same production leader client as pager launches.
+/// Keeping one reader loop prevents ACP notifications from racing control
+/// replies on this mixed-purpose socket.
 public final class LeaderWorkspaceControlChannel: WorkspaceControlChannel, @unchecked Sendable {
     public let advertisedCapabilities: ACPLeaderCapabilities?
 
-    private let channel: any WebSocketByteChannel
-    private let lock = NSLock()
-    private var decoder = ACPLeaderFrameDecoder()
+    private let client: ACPLeaderClient
 
     private init(
-        channel: any WebSocketByteChannel,
+        client: ACPLeaderClient,
         capabilities: ACPLeaderCapabilities?
     ) {
-        self.channel = channel
+        self.client = client
         self.advertisedCapabilities = capabilities
     }
 
@@ -465,100 +565,51 @@ public final class LeaderWorkspaceControlChannel: WorkspaceControlChannel, @unch
         channel: any WebSocketByteChannel,
         clientType: String = "grok-workspace-cli"
     ) async throws -> LeaderWorkspaceControlChannel {
-        let pending = LeaderWorkspaceControlChannel(channel: channel, capabilities: nil)
-        try await pending.write(
-            .register(
-                clientType: clientType,
-                mode: .stdio,
-                capabilities: ACPLeaderClientCapabilities()
-            )
+        let client = ACPLeaderClient(
+            channel: channel,
+            clientType: clientType,
+            mode: .stdio,
+            capabilities: ACPLeaderClientCapabilities()
         )
-        guard let reply = try await pending.readMessage() else {
-            throw WorkspaceRouteError(
-                "the leader closed the connection during registration"
+        do {
+            let registration = try await client.start()
+            return LeaderWorkspaceControlChannel(
+                client: client,
+                capabilities: registration.capabilities
             )
+        } catch {
+            await client.close()
+            throw WorkspaceRouteError(String(describing: error))
         }
-        guard case .registered(_, _, _, _, let capabilities) = reply else {
-            throw WorkspaceRouteError(
-                "unexpected leader reply to register: \(reply)"
-            )
-        }
-        return LeaderWorkspaceControlChannel(channel: channel, capabilities: capabilities)
     }
 
     public func send(
         _ command: WorkspaceControlCommand
     ) async throws -> WorkspaceStatusPayload {
-        let requestID = UUID().uuidString
-        try await write(.control(requestID: requestID, command: command.wire))
-
-        // Skip frames that are not the answer to this request: the leader
-        // multiplexes ACP traffic onto the same socket, so an unrelated
-        // frame arriving first must not be mistaken for our reply.
-        while let message = try await readMessage() {
-            switch message {
-            case .controlResult(let id, let payload) where id == requestID:
-                guard case .workspaceStatus(let status) = payload else {
-                    throw WorkspaceRouteError(
-                        "the leader answered `workspace \(command.wire["command"] ?? "?")` "
-                            + "with an unexpected payload: \(payload)"
-                    )
-                }
-                return WorkspaceStatusPayload(
-                    state: status.state,
-                    hubURL: status.hubURL,
-                    cwd: status.cwd,
-                    uptimeMs: status.uptimeMs,
-                    activeToolCalls: Int(status.activeToolCalls),
-                    sessions: status.sessions,
-                    pid: Int(status.pid)
-                )
-            case .controlError(let id, let code, let text) where id == requestID:
-                throw WorkspaceRouteError(
-                    "the leader refused `workspace \(command.wire["command"] ?? "?")` "
-                        + "(code \(code)): \(text)"
-                )
-            case .shuttingDown, .shutdown:
-                throw WorkspaceRouteError("the leader shut down before answering")
-            case .error(let code, let text):
-                throw WorkspaceRouteError("leader error \(code): \(text)")
-            default:
-                continue
-            }
+        let payload: ACPLeaderControlPayload
+        do {
+            payload = try await client.control(command.wire)
+        } catch {
+            throw WorkspaceRouteError(String(describing: error))
         }
-        throw WorkspaceRouteError(
-            "the leader closed the connection without answering `workspace "
-                + "\(command.wire["command"] ?? "?")`"
+        guard case .workspaceStatus(let status) = payload else {
+            throw WorkspaceRouteError(
+                "the leader answered `workspace \(command.wire["command"] ?? "?")` "
+                    + "with an unexpected payload: \(payload)"
+            )
+        }
+        return WorkspaceStatusPayload(
+            state: status.state,
+            hubURL: status.hubURL,
+            cwd: status.cwd,
+            uptimeMs: status.uptimeMs,
+            activeToolCalls: Int(status.activeToolCalls),
+            sessions: status.sessions,
+            pid: Int(status.pid)
         )
     }
 
     public func close() async {
-        await channel.close()
-    }
-
-    private func write(_ message: ACPLeaderClientMessage) async throws {
-        try await channel.write(try ACPLeaderCodec.encode(message))
-    }
-
-    private func readMessage() async throws -> ACPLeaderServerMessage? {
-        while true {
-            if let body = try nextBufferedFrame() {
-                return try ACPLeaderCodec.decode(ACPLeaderServerMessage.self, from: body)
-            }
-            guard let bytes = try await channel.read(), !bytes.isEmpty else { return nil }
-            buffer(bytes)
-        }
-    }
-
-    private func buffer(_ bytes: [UInt8]) {
-        lock.lock()
-        decoder.append(bytes)
-        lock.unlock()
-    }
-
-    private func nextBufferedFrame() throws -> [UInt8]? {
-        lock.lock()
-        defer { lock.unlock() }
-        return try decoder.nextFrame()
+        await client.close()
     }
 }

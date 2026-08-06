@@ -55,6 +55,44 @@ public struct DefaultModelJSON: Sendable, Equatable {
     public var showModelFingerprint: Bool
     public var autoCompactThresholdPercent: UInt8?
     public var systemPromptLabel: String?
+
+    /// Project a resolved catalog entry onto the CLI's routing profile shape.
+    /// Remote partitions use the same provider/baseURL/env-key fields as the
+    /// embedded catalog, so the live switch can resolve either source through
+    /// one path.
+    public static func fromCatalogEntry(_ entry: ModelEntry) -> DefaultModelJSON {
+        let info = entry.info
+        return DefaultModelJSON(
+            id: info.id,
+            model: info.model,
+            baseURL: info.baseURL,
+            apiBaseURL: entry.apiBaseURL,
+            name: info.name,
+            description: info.description,
+            contextWindow: info.contextWindow,
+            temperature: info.temperature,
+            topP: info.topP,
+            maxCompletionTokens: info.maxCompletionTokens,
+            apiBackend: info.apiBackend,
+            provider: info.provider,
+            envKey: entry.envKey,
+            toolMode: info.toolMode,
+            multiAgentVersion: nil,
+            agentType: info.agentType,
+            inferenceIdleTimeoutSecs: info.inferenceIdleTimeoutSecs,
+            hidden: info.hidden,
+            reasoningEffort: info.reasoningEffort,
+            supportsReasoningEffort: info.supportsReasoningEffort,
+            reasoningEfforts: info.reasoningEfforts,
+            supportedInApi: info.supportedInApi,
+            supportsBackendSearch: info.supportsBackendSearch,
+            compactionsRemaining: info.compactionsRemaining,
+            compactionAtTokens: info.compactionAtTokens,
+            showModelFingerprint: info.showModelFingerprint,
+            autoCompactThresholdPercent: info.autoCompactThresholdPercent,
+            systemPromptLabel: info.systemPromptLabel
+        )
+    }
 }
 
 // MARK: - Public accessors (mirror `xai_grok_models`)

@@ -9,8 +9,8 @@
 // whatever the peer sends. The leader IPC envelope is layered on top by
 // `OpenGrokACPRuntime`.
 //
-// Same platform convention as `WebSocketServer`: `Network.framework` where it
-// exists, a typed error naming the missing adapter where it does not.
+// Network.framework remains the Apple implementation; the C adapter below
+// supplies POSIX sockets on non-Network Unix platforms.
 
 import Foundation
 
@@ -52,6 +52,10 @@ public actor UnixSocketListener {
     private var listener: NWListener?
     private var continuation: AsyncStream<any WebSocketByteChannel>.Continuation?
     private let queue = DispatchQueue(label: "opengrok-unix-socket")
+    #else
+    private var listener: PortableSocketListener?
+    private var continuation: AsyncStream<any WebSocketByteChannel>.Continuation?
+    private var acceptTask: Task<Void, Never>?
     #endif
 
     public init(path: String) {
@@ -161,10 +165,28 @@ public actor UnixSocketListener {
         started = true
         return stream
         #else
-        throw UnixSocketListenerError.unsupportedPlatform(
-            "Network.framework is unavailable and no BSD socket/accept(2) adapter is implemented; "
-                + "cannot listen at \(path)"
-        )
+        let listener: PortableSocketListener
+        do {
+            listener = try PortableSocketListener.unix(path: path)
+        } catch let error as PortableSocketError {
+            throw UnixSocketListenerError.bindFailed(path: path, reason: error.description)
+        }
+        let (stream, continuation) = AsyncStream<any WebSocketByteChannel>.makeStream()
+        self.listener = listener
+        self.continuation = continuation
+        self.stream = stream
+        started = true
+        acceptTask = Task { [weak self, listener] in
+            while !Task.isCancelled {
+                do {
+                    let channel = try await listener.accept()
+                    await self?.yield(channel)
+                } catch {
+                    break
+                }
+            }
+        }
+        return stream
         #endif
     }
 
@@ -174,10 +196,27 @@ public actor UnixSocketListener {
         listener = nil
         continuation?.finish()
         continuation = nil
+        #else
+        acceptTask?.cancel()
+        acceptTask = nil
+        listener?.close()
+        listener = nil
+        continuation?.finish()
+        continuation = nil
         #endif
         stream = nil
         started = false
     }
+
+    #if !canImport(Network)
+    private func yield(_ channel: any WebSocketByteChannel) {
+        guard started, let continuation else {
+            Task { await channel.close() }
+            return
+        }
+        continuation.yield(channel)
+    }
+    #endif
 }
 
 /// Dialling the other side of a `UnixSocketListener`.
@@ -211,10 +250,14 @@ public enum UnixSocketDialer {
         }
         return channel
         #else
-        throw UnixSocketListenerError.unsupportedPlatform(
-            "Network.framework is unavailable and no BSD socket dialer is implemented; "
-                + "cannot connect to \(path)"
-        )
+        do {
+            return try await PortableSocketConnector.unix(
+                path: path,
+                timeoutSeconds: connectTimeoutSeconds
+            )
+        } catch let error as PortableSocketError {
+            throw UnixSocketListenerError.bindFailed(path: path, reason: error.description)
+        }
         #endif
     }
 }

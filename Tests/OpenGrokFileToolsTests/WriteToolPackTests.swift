@@ -318,6 +318,29 @@ struct WriteToolPackTests {
         _ = try success(read)
     }
 
+    @Test("a missing permission pipeline blocks the real write handler")
+    func missingPipelineBlocksWriteDispatch() async throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let resources = ToolResources(cwd: dir.path, allowedRoots: [dir.path])
+        let set = try FileToolPack.finalizeBuildPack(resources: resources)
+        let file = dir.appendingPathComponent("blocked.txt")
+
+        let result = await set.prepareAndCall(
+            clientName: "write",
+            args: .object([
+                "file_path": .string("blocked.txt"),
+                "content": .string("must not dispatch"),
+            ])
+        )
+        guard case .failure(let error) = result else {
+            Issue.record("expected the missing pipeline to deny dispatch")
+            return
+        }
+        #expect(error.kind == .permissionDenied)
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+    }
+
     @Test("headless prompt policy denies edits without dispatching")
     func headlessPromptDeniesEdits() async throws {
         let dir = try tempDir()

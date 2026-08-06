@@ -10,6 +10,20 @@ import OpenGrokToolRuntime
 import OpenGrokToolTypes
 import OpenGrokWorkspaceTypes
 
+private final class ReadinessConnectionClient: ConnectionClient, @unchecked Sendable {
+    func request(
+        _ request: JsonRpcRequest<JSONValue>
+    ) async throws -> JsonRpcResponse<JSONValue> {
+        _ = request
+        throw ClientError.notConnected
+    }
+
+    func notify(_ notification: JsonRpcNotification<JSONValue>) async throws {
+        _ = notification
+        throw ClientError.notConnected
+    }
+}
+
 @Suite("OpenGrokWorkspaceClient")
 struct WorkspaceClientTests {
     @Test("not connected fast-fails")
@@ -201,7 +215,11 @@ struct WorkspaceClientTests {
         let flag = ConnectedFlag(true)
         let client = WorkspaceClient(harness: ToolHarness(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness")), connected: flag)
         let key = PrincipalKey(url: "wss://hub", userId: try UserId("u"))
-        let conn = HubConnection(key: key, connected: true)
+        let conn = HubConnection(
+            key: key,
+            client: ReadinessConnectionClient(),
+            connected: true
+        )
         client.attachReconnect(to: conn)
 
         conn.markDisconnected(reason: "drop")
@@ -213,8 +231,29 @@ struct WorkspaceClientTests {
         }
         conn.markReconnecting(attempt: 1)
         #expect(!client.isConnected)
-        conn.markConnected()
+        conn.activate(client: ReadinessConnectionClient())
         #expect(client.isConnected)
+    }
+
+    @Test("hub-backed client stays disconnected until activation")
+    func hubBackedReadiness() throws {
+        let key = PrincipalKey(url: "wss://hub", userId: try UserId("u"))
+        let connection = HubConnection(key: key)
+        let harness = ToolHarnessBuilder(mediation: .unmediated(reason: "wire/dispatch unit test; no agent reaches this harness"))
+            .withConnection(connection)
+            .withSession(try SessionId("s"))
+            .withPrincipal(Principal.new(try UserId("u")).withScope(localInvokeScope))
+            .build()
+        let client = WorkspaceClient.withHubConnection(
+            harness: harness,
+            connection: connection
+        )
+        #expect(!client.isConnected)
+
+        connection.activate(client: ReadinessConnectionClient())
+        #expect(client.isConnected)
+        connection.markDisconnected(reason: "drop")
+        #expect(!client.isConnected)
     }
 
     @Test("workspace unavailable surfaces typed error")

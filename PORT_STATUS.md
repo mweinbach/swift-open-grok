@@ -1,10 +1,10 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-06 (Wave 10 integration and macOS green gate)
-**Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. This remains an incomplete source port rather than a full Rust-parity release: Linux sandbox activation, the real Computer Hub connector, share upload/persisted export markers, and blocking cross-platform CI remain open.
+**As of:** 2026-08-06 (Wave 11 integration and macOS green gate)
+**Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (re-pinned **2026-08-05** from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`. The prior 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` (`/tmp/open-grok-reference` when present).
-**Fixture pin caveat:** every artifact under `ProtocolFixtures/` was captured at the **old** ref `9739c4a2…` and its provenance/manifest still name that ref. Fixtures are **not** re-captured against `80dff0a9…`, and the 2026-08-05 move to `9ed09e2a…` did not recapture them either; they must be re-captured before any fixture-grounded parity claim against the current baseline.
+**Fixture pin:** `ProtocolFixtures/` was re-evaluated against `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` on 2026-08-06, with `80dff0a9dcb24121b976b9f920fbe442af40ea88` recorded as the immediate previous revision. CLI and crash release-stamped artifacts were recaptured for `0.1.220-open-grok.54`; unchanged families carry explicit `80dff0a9..9ed09e2a` diff evidence.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
@@ -15,14 +15,191 @@
 | `git diff --check` | **Exit 0**. |
 | `zsh workflows/swift-safe-verify.zsh build-tests` | **Exit 0**. |
 | `zsh workflows/swift-safe-verify.zsh build` | **Exit 0**. |
-| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | **Exit 0** — 73 Swift Testing runs, **3,325 tests / 554 suites**, zero failures. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | **Exit 0** — 102 Swift Testing runs, **4,079 tests / 610 suites**, zero failures. |
 | `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Exit 0**. |
 
-Focused Wave 10 filters also passed: shell launch transformation (16/3), live
-sandbox CLI propagation (1/1), workspace capability and production control
-channel (4/1), leader control plane (13/1), leader payload goldens (8/1),
-sandbox policies (35/2 on macOS), export boundary (7/1), share gate (12/1),
-feedback export policy (7/1), and live share refusal composition (13/1).
+The root verifier also fixed and reran the final integration regressions in the
+performance profile, live model/provider resume path, persisted sandbox resume
+path, and concurrent workflow-shape assertion before the authoritative serial
+gate. The remaining Wave 11 limitations require non-macOS runtime or repository
+administration evidence; none is represented as locally verified parity.
+
+### Wave 11 audit closure — G002 (2026-08-06)
+
+The managed required-version startup gate is now live on the shipped async
+runner path. `CLIRunner.run` evaluates `LiveVersionPolicyGate.refusal` after
+parsing and before `application.run`, writes the exact refusal to stderr, and
+returns exit code 1 without constructing the application launcher session.
+Only `.launch`, `.serve`, and `.leader` session-start families are gated;
+management, inspection, and recovery routes remain reachable, matching the
+Rust early-return boundary while accounting for Swift's broader async
+application routing.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter OpenGrokExecutableTests` | **Exit 0** — reported **203 tests / 31 suites**, including the new below-floor, above-ceiling, in-range, and management/recovery exemption cases. |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Exit 0** — shipped product path compiles. |
+
+### Wave 11 audit closure — G005 (2026-08-06)
+
+Skills are now reachable from the live launch composition. Session foundation
+discovery uses the resolved `cwd` and environment, reserves every active pager
+builtin before building one effective catalog, registers that catalog in the
+interactive controller, injects the model-facing `<agent_skills>` listing, and
+expands `/skill args` into `<skill_information>` before the sampler turn. ACP
+prompt sessions advertise the same builtin-plus-skill rows, including argument
+hints and `_meta.scope`/`_meta.path`, and use the same resolved names for slash
+dispatch. The existing `workspace.discover_skills` serializer remains a separate
+deferred RPC surface because no live workspace request router currently consumes
+it; it is not advertised as reachable.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter LiveSkillsReachabilityTests` | **Exit 0** — reported **3 tests / 1 suite**, zero failures. |
+
+### Wave 11 audit closure — G009 (2026-08-06)
+
+macOS Seatbelt profiles now always allow process-level network access so the
+agent can reach its provider/LLM API while sandboxed. `restrictNetwork` remains
+the policy input for Linux child-launch isolation; it is no longer translated
+into a process-wide macOS `(deny network*)` rule. The regression covers both
+resolved flag values and preserves file-write and firmlink-deny assertions.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter OpenGrokSandboxTests` | **Exit 0** — reported **35 tests / 2 suites**, zero failures. |
+
+### Wave 11 audit closure — G013 (2026-08-06)
+
+Linux sandbox capability reporting is now backend-honest: Landlock detection no
+longer advertises an unimplemented backend, and bubblewrap must pass the exact
+runtime probe before support is reported. A non-off Linux apply now resolves a
+fail-closed deny plan, creates a one-use receipt, and process-replaces the agent
+with an absolute bubblewrap path; the inside invocation validates and consumes
+that receipt, so a caller-supplied marker cannot claim enforcement. The outer
+agent keeps provider network access; the existing child-only `unshare` wrapper
+arms only after successful apply. Live foundation bootstrap now runs after cwd
+and persisted-session resolution but before sampler, process backend, hooks,
+MCP, or tool construction, and passes the resolved security context/decision
+into `LiveToolExecutor`. A capable Linux runner still needs the final
+filesystem/provider-network/child-network behavioral proof.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter OpenGrokSandboxTests` | **Exit 0** — reported **37 tests / 2 suites**, zero failures. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter LiveSandboxCompositionTests` | **Exit 0** — reported **3 tests / 1 suite**, zero failures. |
+
+### Wave 11 audit closure — G035 (2026-08-06)
+
+Linux capability reporting no longer treats a discoverable or probeable
+bubblewrap executable as current-process support. Ordinary Linux processes
+report `SandboxSupportInfo.isSupported == false` and
+`PlatformSandboxEnforcer.detectSupportedMode() == .none` until the bwrap
+re-exec returns with the process-owned receipt. The live manager still attempts
+that re-exec when bwrap is launchable, then marks the process applied only after
+receipt validation; a caller-supplied `__GROK_INSIDE_BWRAP` marker cannot claim
+support, mode, or enforcement. Child-network restriction remains gated by the
+post-apply state. Linux-host behavioral proof remains open because this macOS
+runner cannot execute the bwrap confinement check.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter OpenGrokSandboxTests` | **Exit 0** — reported **39 tests / 2 suites**, zero failures on macOS; Linux-only capability assertions are compile-guarded for a Linux-capable runner. |
+
+### Wave 11 audit closure — G037 (2026-08-06)
+
+Live Code Mode now resolves an effective tool mode through the
+`InProcessCodeModeSession.runtimeCapability` facade before constructing the
+model-facing surface. Hosts without JavaScriptCore fall back to direct tools,
+so `exec` and `wait` are not advertised before the runtime can start; the
+startup seam remains typed and fail-closed with
+`JavaScriptRuntimeError.unsupportedPlatform`. The live dependency seam accepts
+an explicit capability provider for regression coverage, and ACP shares the
+same effective-mode decision through `makeAgentStack`.
+
+The Rust reference embeds V8 (`xai-grok-code-mode`), while the Swift port still
+uses JavaScriptCore where available and falls back to direct tools elsewhere.
+A portable embedded or out-of-process JavaScript engine remains future parity
+work; suppressing the transport is the deliberate current divergence.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter CodeModeCompositionTests` | **Exit 0** — reported **10 tests / 1 suite**, zero failures on the JavaScriptCore host; includes the injected unavailable-capability control. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter JavaScriptRuntimeCapabilityTests` | **Exit 0** — reported **1 test / 1 suite**, zero failures on the JavaScriptCore host. |
+
+### Wave 11 audit finding — G043 (2026-08-06) — partial
+
+`OpenGrokExtraCA` now mirrors the upstream opt-in contract: an unset or empty
+`OPENGROK_EXTRA_CA_BUNDLE` performs no read, a process-cached loader reads at
+most 1 MiB, parses PEM certificate blocks into validated DER, drops malformed
+blocks individually, and warns without failing HTTP startup. `HTTPTLSConfiguration`
+captures the resolved roots, and every default-created production URLSession
+uses them through the shared transport delegate, including the separate Darwin
+streaming session and WebSocket/MCP-adjacent construction. Existing default
+factories for sampling, auth, MCP, updates, and web/media therefore inherit the
+same policy without per-feature helpers.
+
+Darwin installs the accepted DER certificates as additive `SecTrust` anchors
+while retaining system roots and requiring successful trust evaluation. Linux
+FoundationNetworking has no `URLProtectionSpace.serverTrust` challenge API;
+the Linux streaming delegate therefore retains the resolved policy for honest
+capability reporting but cannot install custom anchors. G043 is intentionally
+not marked closed until a portable Linux TLS backend can apply the same roots
+to both buffered and streaming traffic.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh build-tests` | **Exit 0**. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter OpenGrokExtraCATests` | **Exit 0** — reported **7 tests / 1 suite**, zero failures. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter OpenGrokHTTPTests` | **Exit 0** — reported **119 tests / 18 suites**, zero failures. |
+
+### Wave 11 audit closure — G047 (2026-08-06)
+
+The shipped version path now resolves the current reference release
+`0.1.220-open-grok.54`: the package-root `OPEN_GROK_VERSION` marker is read by
+the build plugin after the `GROK_VERSION` override, the manual generator and
+checked-in reference fallback use the same `.54` default, and the executable's
+`CLIRunner --version` route is asserted for both plain and JSON output. The
+`GROK_TEST_VERSION` override behavior remains unchanged.
+
+Every ProtocolFixtures JSON family now names the full `9ed09e2a` revision and
+the immediate prior `80dff0a9` revision. The provenance index records the
+per-family 80dff0a9..9ed09e2a diff result, the CLI fixture no longer reports the
+resolved version drift, the GCRX sample carries `.54`, and the manifest was
+regenerated after all bytes and metadata changed. The independent Code Mode
+yield-time drift remains recorded.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter OpenGrokVersionTests` | **Exit 0** — reported **44 tests / 1 suite**, zero failures. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter OpenGrokCLITests` | **Exit 0** — reported **316 tests / 34 suites**, zero failures. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter OpenGrokCompatibilityTests` | **Exit 0** — reported **19 tests / 4 suites**, zero failures. |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Exit 0** — shipped product path compiles. |
+
+### Wave 11 audit closure — G053 (2026-08-06)
+
+The shipped CLI now exposes `release-validate`, and the macOS product smoke
+invokes it instead of running raw `--version` and `paths --json` commands. The
+route executes the supplied product in a controlled `OPENGROK_HOME`, `HOME`, and
+`OPEN_GROK_BIN_DIR`, validates version plus optional short-commit metadata through
+`SmokeValidation`, checks resolved-path containment separately from observed-write
+isolation, merges checksum findings only when artifact/sidecar pairs are supplied,
+renders every finding to stderr, and returns success only after evaluating
+`ReleaseValidationReport.passed`. The manifest dependency direction is now
+acyclic: `OpenGrokCLI` imports `OpenGrokReleaseValidation`, while the validator
+depends only on distribution support.
+
+The Swift workspace still has no installer or artifact-producing release workflow;
+`validateIsolatedHome` therefore remains reserved for a future installer smoke
+that can collect actual touched paths. The validator pin follows the current
+workspace baseline `9ed09e2a…` through `OpenGrokDistributionSupport`.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter ReleaseValidationCommandTests` | **Exit 0** — reported **4 tests / 1 suite**, zero failures. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter OpenGrokReleaseValidationTests` | **Exit 0** — reported **37 tests / 6 suites**, zero failures. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter OpenGrokVersionTests` | **Exit 0** — reported **44 tests / 1 suite**, zero failures. |
+| `GROK_COMMIT="$(git rev-parse --short HEAD)" zsh workflows/swift-safe-verify.zsh build --product open-grok` plus the product release-validate smoke | **Exit 0** — stamped version and commit matched; resolved paths stayed inside the temporary root. |
 
 ## Historical Luna integration verification snapshot (2026-07-23; superseded)
 
@@ -41,30 +218,23 @@ test totals are recorded in the 2026-08-06 snapshot above.
 
 ## Inventory counting method (reproducible)
 
-Counts are mechanical over the committed tree (no Package.swift parsing), recomputed **2026-08-04**:
+Counts are mechanical over the current tree (no Package.swift parsing), recomputed **2026-08-06**:
 
-1. **Production source targets** = directories under `Sources/` → **99**.
-2. **Test targets** = directories under `Tests/` → **101**.
-3. **Bootstrap placeholder production targets** = source directories whose Swift sources total **≤15 non-comment, non-blank lines** (classic empty-module stubs), **excluding** pure C helper targets `COpenGrokZlib`, `OpenGrokPTYC`, and `OpenGrokCrashHandlerC` (real C implementations, not placeholders) → **8**.
-4. **Zero-test targets** = test directories with **no** `@Test` and **no** `func test[A-Z_]` in any `.swift` file → **12**.
-5. **Non-placeholder production targets** = 99 − 8 = **91**. **Test targets with ≥1 test** = 101 − 12 = **89**.
+1. **Production source targets** = directories under `Sources/` → **102**.
+2. **Test targets** = directories under `Tests/` → **102**.
+3. **Bootstrap placeholder production targets** = source directories whose Swift sources total **≤15 non-comment, non-blank lines** (classic empty-module stubs), **excluding** pure C helper targets `COpenGrokZlib`, `COpenGrokSockets`, `OpenGrokPTYC`, and `OpenGrokCrashHandlerC` (real C implementations, not placeholders) → **1**.
+4. **Zero-test targets** = test directories with **no** `@Test` and **no** `func test[A-Z_]` in any `.swift` file → **0**.
+5. **Non-placeholder production targets** = **102** (the sole ≤15-line target is the executable entry point, not a placeholder). **Test targets with ≥1 test** = **102**.
 
-The eight targets meeting the ≤15-line rule are exactly:
+The only target meeting the ≤15-line rule after excluding C helpers is:
 
 | Target | Non-comment LOC | Character |
 |---|---:|---|
-| `OpenGrokCodeMode` | 1 | true placeholder |
-| `OpenGrokJavaScriptRuntime` | 1 | true placeholder |
-| `OpenGrokMermaid` | 1 | true placeholder |
-| `OpenGrokMermaidLayout` | 1 | true placeholder |
-| `OpenGrokDistributionSupport` | 1 | true placeholder |
-| `OpenGrokReleaseValidation` | 1 | true placeholder |
-| `OpenGrokPagerPTYHarness` | 1 | true placeholder |
 | `OpenGrokExecutable` | 15 | **not** a placeholder — thin `main` that hands off to `OpenGrokCLI` |
 
-So the honest figure is **7 real placeholders out of 99** production targets, plus one legitimately small entry point. The previously published **42 / 98** figure is superseded and was stale by roughly 35 targets.
+So the honest figure is **0 real placeholders out of 102** production targets, plus one legitimately small entry point. The previously published **42 / 98** figure is superseded.
 
-The twelve zero-test targets are `OpenGrokCodeModeTests`, `OpenGrokCompatibilityTests`, `OpenGrokDistributionSupportTests`, `OpenGrokFuzzingTests`, `OpenGrokJavaScriptRuntimeTests`, `OpenGrokMermaidLayoutTests`, `OpenGrokMermaidTests`, `OpenGrokPagerPTYHarnessTests`, `OpenGrokPagerPTYTests`, `OpenGrokPerformanceTests`, `OpenGrokReleaseValidationTests`, and `OpenGrokSecurityTests`. Note the pattern: the remaining empty test targets are the placeholder modules plus the four cross-cutting gate suites (compatibility, fuzzing, performance, security), which are the release gates the port has not yet earned.
+No retained test target is empty under the mechanical `@Test`/`func test[A-Z_]` criterion. The Wave 11 compatibility, release-validation, PagerPTY harness, PagerPTY, fuzzing, performance, and security targets all contain executable declarations; the inventory canary below prevents that fact from silently regressing.
 
 Verifier commands used for this recount (read-only; no SwiftPM invoked):
 
@@ -73,7 +243,7 @@ ls Sources | wc -l
 ls Tests | wc -l
 for d in Sources/*/; do
   t=$(basename "$d")
-  case "$t" in COpenGrokZlib|OpenGrokPTYC|OpenGrokCrashHandlerC) continue;; esac
+  case "$t" in COpenGrokZlib|COpenGrokSockets|OpenGrokPTYC|OpenGrokCrashHandlerC) continue;; esac
   n=$(find "$d" -name '*.swift' -exec cat {} + | grep -v '^[[:space:]]*$' | grep -v '^[[:space:]]*//' | wc -l)
   [ "$n" -le 15 ] && echo "$t $n"
 done
@@ -104,7 +274,7 @@ capability list.
 
 **Streaming is implemented but unused on the live path.** `OpenGrokSampler` provides `StreamChatCompletions`, `StreamResponses`, and `StreamMessages`, but the live loop calls `conversationCollect` and renders the whole reply at once. Token-by-token output is a composition change, not new provider work.
 
-**All non-launch CLI routes refuse.** `login`, `logout`, `sessions`, `mcp`, `plugin`, `workflow`, `doctor`, `serve`, `acp`, `update`, `memory`, `dashboard`, `workspace`, `worktree`, `inspect`, `completions`, `setup`, `share`, `wrap`, `export`, and `trace` all parse their arguments correctly and then throw `CLIApplicationError.unsupported`, surfaced as `route '<name>' is not available in the current Swift composition` (`Sources/OpenGrokCLI/OpenGrokApplication.swift:10`). Argument parsing is real; only the handlers are missing.
+**Most non-launch CLI routes refuse.** `login`, `logout`, `sessions`, `mcp`, `plugin`, `workflow`, `doctor`, `serve`, `acp`, `update`, `memory`, `dashboard`, `workspace`, `worktree`, `inspect`, `completions`, `setup`, `wrap`, `export`, and `trace` all parse their arguments correctly and then throw `CLIApplicationError.unsupported`, surfaced as `route '<name>' is not available in the current Swift composition` (`Sources/OpenGrokCLI/OpenGrokApplication.swift:10`). `share` is the deliberate exception: the shipped async runner reaches its live authorization composition, which fails closed before upload because the network clients are not ported. Argument parsing is real; only the handlers listed above remain missing.
 
 ### Real-but-orphaned libraries
 
@@ -133,7 +303,7 @@ This is the port's largest honesty gap and the reason "91 non-placeholder target
 - `OpenGrokGitStatus`: removed CryptoKit; pure-Swift `PortableSHA1`; C target `COpenGrokZlib` (links libz) declared in `Package.swift`; pack-only objects throw `packedObjectUnsupported` (not silent empty HEAD).
 - `OpenGrokCLI` version delegates to `OpenGrokVersion.installed` (empty `GROK_TEST_VERSION` parity).
 - Tests: ToolRuntime assertion fixed; executable composition suites; telemetry MockHTTPTransport gRPC collector-compat + golden fixture re-encode; BuildSupport semantic fixture decode.
-- `ProtocolFixtures/`: binary OTLP HTTP/gRPC goldens, git loose-object zlib, GCRX crash sample, tracing/storage/hunk/PTY/crash format fixtures + provenance + manifest at ref `9739c4a2…` — **still pinned to the old ref after the 2026-08-04 re-pin to `80dff0a9…` and the 2026-08-05 re-pin to `9ed09e2a…`; recapture required**.
+- `ProtocolFixtures/`: binary OTLP HTTP/gRPC goldens, git loose-object zlib, GCRX crash sample, tracing/storage/hunk/PTY/crash format fixtures + provenance + manifest recaptured at ref `9ed09e2a…`; release-stamped artifacts use `0.1.220-open-grok.54`, and unchanged families carry explicit `80dff0a9..9ed09e2a` evidence.
 - Docs/workflows: exact inventory; worker/reviewer/remediation prompts forbid bare SwiftPM; only integration may run `workflows/swift-safe-verify.zsh`.
 
 ### Integration fixes already in tree (prior cycle)
@@ -215,7 +385,9 @@ The Swift `OpenGrokWorkflow` target was written against the pre-rewrite JS model
 - `crates/codegen/xai-workflow` — the Rhai workflow engine above.
 - `crates/codegen/xai-grok-extra-ca` — opt-in extra TLS roots from `OPENGROK_EXTRA_CA_BUNDLE` (PEM path), default-off with no I/O when unset, parsed once into a `OnceLock`, additive to webpki roots, 1 MiB cap, and warn-and-continue on a bad bundle. Small and self-contained; a good early catch-up slice.
 
-Both are mapped with proposed Swift targets in `CRATE_MAP.md`.
+`xai-workflow` remains mapped to a proposed target; `xai-grok-extra-ca` now has a
+real `OpenGrokExtraCA` target and is tracked as an implemented partial because
+FoundationNetworking cannot yet install custom roots on Linux.
 
 ### 4. New providers, models, and sampling surface
 
@@ -241,32 +413,130 @@ Gates: `build-tests` **0**, `build` **0**, `test --no-parallel` **0** —
 the count reported by this worktree's current SwiftPM discovery; it supersedes
 older wave totals rather than being inferred from them.
 
-**ACP leader control is now live through the production workspace client.**
+**ACP leader control is live through the production workspace client.**
 The leader advertises `control_v1` and `workspace_exposure`, answers typed
 leader/profile/workspace payloads, and owns a start/pause/resume/stop/status
 state machine. The CLI's real `LeaderWorkspaceControlChannel` consumes
 `control_result`; integration testing found and removed a duplicate length
-prefix that previously made registration close immediately. A leader without
-an injected Computer Hub connector still answers status truthfully as `none`
-and refuses start with a typed error. The actual hub connector remains the
-product gap; capability advertising no longer lies about the control protocol.
+prefix that previously made registration close immediately. `leaderSession`
+now injects resolved socket/lock paths, relay suffix, installed version, the
+leader-owned auth provider, permission mediation, and the production Computer
+Hub WebSocket exposure connector. Backend-less library callers still answer
+status truthfully as `none` and refuse start with a typed error.
+
+### Wave 11 audit closure — G018 (2026-08-06)
+
+The shipped leader composition no longer constructs `ACPLeaderIPCHost` with
+default metadata. A single production configuration factory supplies the real
+socket and lock paths, `ACPLeaderSocketPaths.suffix(forRelayURL:)`, and
+`OpenGrokCLIVersion.installed(environment:)` to both registration and
+`get_leader_info`. The connector uses the leader-owned `AuthManager`,
+`LivePermissionHubMediator`, and `HubWebSocketConnectionClient`; the latter
+performs authenticated hello/identity validation, serialized writes, demuxed
+reads, disconnect/reconnect handling, and rejects plaintext `ws://` except for
+loopback hosts.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter LiveLeaderCompositionLiveTests` | **Exit 0** — reported **2 tests / 1 suite**, zero failures; real Unix-socket registration and `get_leader_info` assert paths, suffix, version, and capability advertisement. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter HubWebSocketConnectionClientTests` | **Exit 0** — reported **3 tests / 1 suite**, zero failures; authenticated loopback handshake, progress/response demux, malformed-frame failure, and remote plaintext rejection. |
+
+### Wave 11 audit closure — G019 (2026-08-06)
+
+The production `workspace` launcher now resolves the feature gate through an
+authenticated `GET /v1/settings` when `GROK_WORKSPACE_COMMAND` is absent. The
+route uses the configured `EndpointsConfig` proxy URL, existing `AuthManager`
+credential/refresh behavior, and an injectable `HTTPTransport`; malformed URLs
+or bodies, transport failures, and non-2xx responses remain fail-closed as the
+existing unknown-settings refusal. Explicit truthy or falsy environment
+overrides bypass the loader entirely. The launcher passes the fetched setting
+into the existing leader capability/control path, proving an enabled account
+reaches `workspace status` without a real network or socket in tests.
+
+This closes the workspace feature-gate reachability gap only. The separate
+Computer Hub backend remains an injected production connector boundary: this
+change does not claim that `workspace start` itself establishes a real Hub
+session when the leader has no configured exposure backend.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter WorkspaceGateTests` | **Exit 0** — reported **6 tests / 1 suite**, zero failures. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter WorkspaceRemoteSettingsLoaderTests` | **Exit 0** — reported **2 tests / 1 suite**, zero failures; configured `/v1/settings` URL, bearer/Accept headers, decoding, and fail-closed malformed/non-2xx cases. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter LiveWorkspaceLauncherReachabilityTests` | **Exit 0** — reported **8 tests / 1 suite**, zero failures; no-override fetch-to-leader path, override bypass, and unavailable/disabled refusal controls. |
+
+### Wave 11 audit closure — G022 (2026-08-06)
+
+Computer Hub workspace exposure is now constructed on the shipped leader path.
+`LiveLeaderComposition.leaderSession` passes a connector-bearing
+`ACPLeaderIPCConfiguration` into the real `ACPLeaderIPCHost`; the connector
+uses the concrete authenticated `HubWebSocketConnectionClient` and wraps the
+hub harness in `LivePermissionHubMediator`. The mediator now receives the
+leader workspace's existing `PermissionPipeline` through
+`LocalOpenGrokShellWorkspace`, so hub calls cannot silently acquire a second
+default gate. The transport rejects non-loopback plaintext `ws://`, performs
+hello/identity validation, serializes writes, drains demux waiters on failure,
+and owns disconnect/reconnect state. The separately packaged
+`OpenGrokComputerHubMCPAdapter` remains intentionally unclaimed as live: no
+configured MCP transport is part of the leader exposure path.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter WorkspaceCapabilityTests` | **Exit 0** — reported **5 tests / 1 suite**, zero failures; production leader configuration retains a connector and `workspace_start` reaches `running`. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter HubWebSocketConnectionClientTests` | **Exit 0** — reported **3 tests / 1 suite**, zero failures; authenticated loopback handshake, progress/response demux, malformed-frame failure, and remote plaintext rejection. |
+
+### Wave 11 audit closure — G023 (2026-08-06)
+
+The real `LiveLeaderComposition.session` socket test now exercises the
+workspace control seam instead of stopping after ACP `initialize`. Over the
+production Unix socket it asserts `control_v1` and `workspace_exposure`,
+checks `workspace_status` for the live leader PID, sends a valid
+`workspace_start` request with a test cwd, and requires the typed
+auth-backed connection refusal in the credential-free test environment. A
+follow-up status remains `none`, proving the failed start did not fabricate an
+exposure. The same test continues to assert `get_leader_info` paths, relay
+suffix, and installed version. This closes the live false-green risk without
+claiming a successful Hub session in a no-credential test; the production Hub
+connector and its separate transport coverage remain tracked under G022.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter LiveLeaderCompositionLiveTests` | **Exit 0** — reported **2 tests / 1 suite**, zero failures; real-socket registration, metadata, capabilities, status, typed start refusal, and ACP initialize. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter WorkspaceCapabilityTests` | **Exit 0** — reported **5 tests / 1 suite**, zero failures; in-memory control-plane and production connector tripwires remain green. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter ACPLeaderIPC` | **Exit 0** — reported **24 tests / 3 suites**, zero failures; registration, routing, control dispatch, workspace lifecycle, and metadata codec coverage. |
+
+### Wave 11 audit closure — G028 (2026-08-06)
+
+Live telemetry bootstrap now resolves the xAI `AuthManager` from the session's
+isolated `OPENGROK_HOME` before constructing `LiveToolExecutor`. The policy
+decision uses `currentOrExpired().isZDRTeam`, so an expired ZDR credential still
+darkens telemetry; user/team identity is taken only from a current xAI auth and
+is passed explicitly to `bootstrapFromDisk`. The resulting `LiveTelemetryStatus`
+is retained on the executor for a live-seam assertion. Workflow child executors
+inherit the same immutable context, so they cannot silently fall back to
+`zeroDataRetention == false`; standalone fixtures must pass an explicit empty
+context.
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter LiveTelemetryDefaultOffTests` | **Exit 0** — reported **6 tests / 1 suite**, zero failures; stored xAI OIDC ZDR auth darkens product + external OTEL, and the non-ZDR opt-in control remains active through the real session foundation. |
 
 **The xAI export boundary exists and is fail-closed.** One shared monotonic
 boundary closes when any provider profile denies xAI services. Share and
 feedback policies consult it before export and again at send time; share wire
 payloads use a serde-compatible JSON codec. The `share` composition is tested
 but deliberately not connected to a successful upload path: persisted session
-records still lack the `ever_used_codex` marker and no signed-URL/backend upload
-client exists. The route therefore refuses unverifiable sessions and proves no
-transcript bytes leave the process.
+ new live records now persist and rehydrate the `ever_used_codex` marker; legacy
+ records without it remain unverifiable and are refused. No signed-URL/backend
+ upload client exists, so the route still proves no transcript bytes leave the
+ process.
 
 **Sandbox selection and child spawn now meet.** The parsed CLI `--sandbox`
 profile reaches live bootstrap, and the local shell process backend applies the
 sandbox launch transform before every spawn. Linux child network denial has a
 fail-closed `unshare` user+network-namespace wrapper with a cached host probe.
-This is not yet a claim that normal Linux sandboxed CLI launches work:
-non-off Linux profiles still fail before arming because process-wide bubblewrap
-re-exec is absent. macOS Seatbelt remains the only process-wide live enforcer.
+Linux process-wide sandbox activation is now a receipt-backed bubblewrap
+re-exec; capable-Linux behavioral proof remains open. macOS Seatbelt remains
+the process-wide live enforcer on Apple hosts.
 
 **CI stopped hiding Linux compiler failures.** Linux workflow commands now run
 under Bash with `pipefail`, and the crash C shim defines `_GNU_SOURCE` before
@@ -450,7 +720,7 @@ about its reachability.
 3. **The live agent streams and can write, but writes are gated off by default.** `run_terminal_cmd` plus the write-capable `.build` file pack (`read_file`, `list_dir`, `grep`, `glob`, `view_image`, `search_replace`, `write`, `apply_patch`) are wired through `PermissionPipeline`, and assistant text is forwarded as deltas. Mutations are refused unless `OPENGROK_ALLOW_WRITES=1` is set, because no interactive permission prompter exists yet — that prompter is the remaining work, not the tools.
 4. **Codex is wired.** `resolveSamplingConfiguration` routes through `LiveCredentialResolver`, and account-pinning headers reach both the sampler and `ProviderSession`. Untested against a live Codex account: no end-to-end OAuth run has been performed, only isolated-store unit tests.
 5. **`login`/`logout` now run** (including `--all`, `--codex`); the remaining non-launch routes still refuse after parsing.
-6. **Few placeholders remain:** **7** true production stubs out of **99** (`OpenGrokCodeMode`, `OpenGrokJavaScriptRuntime`, `OpenGrokMermaid`, `OpenGrokMermaidLayout`, `OpenGrokDistributionSupport`, `OpenGrokReleaseValidation`, `OpenGrokPagerPTYHarness`), plus the four empty cross-cutting gate suites.
+6. **Few placeholders remain:** **6** true production stubs out of **99** (`OpenGrokCodeMode`, `OpenGrokJavaScriptRuntime`, `OpenGrokMermaid`, `OpenGrokMermaidLayout`, `OpenGrokDistributionSupport`, `OpenGrokPagerPTYHarness`), plus the four empty cross-cutting gate suites.
 7. **The port is 202 commits behind upstream** with known data-layer breakage; see "Upstream drift since re-pin baseline".
 8. **`ProtocolFixtures/` are stale** relative to the new pin and cannot ground parity claims until recaptured.
 9. **Portability gaps remaining:** Windows ConPTY/Credential Manager/LockFileEx; full Linux Secret Service; pack object reading; full tree-sitter not in Package.swift; OTLP gRPC uses collector-shaped TraceService Export requests (path + framing + `grpc-status`) over `HTTPTransport` rather than a dedicated HTTP/2 tonic client—trailers depend on the transport surfacing them.
@@ -1067,7 +1337,7 @@ Status legend:
 | 45 | `xai-grok-plugin-marketplace` | `OpenGrokPluginMarketplace` | orphaned | 1,058 LOC + tests; no importer, and the `plugin` CLI route refuses. Was mislabeled "pending". |
 | 46 | `xai-grok-sampler` | `OpenGrokSampler` | live (partial) | 5,106 LOC + tests; drives the live agent for xAI/Kimi/Fireworks. `StreamChatCompletions`/`StreamResponses`/`StreamMessages` exist but the live path calls `conversationCollect`, so streaming ships unused. |
 | 47 | `xai-grok-sampling-types` | `OpenGrokSamplingTypes` | target-green | R03. |
-| 48 | `xai-grok-sandbox` | `OpenGrokSandbox` | orphaned | 1,805 LOC + tests, well past "scaffold", but no importer — the live agent runs `run_terminal_cmd` outside any sandbox enforcement. |
+| 48 | `xai-grok-sandbox` | `OpenGrokSandbox` | live (partial) | Process-wide macOS Seatbelt and Linux bubblewrap re-exec are reachable from the live session foundation; Linux capability probing and receipt-backed handoff are covered by focused tests, while capable-Linux behavioral proof remains pending. |
 | 49 | `xai-grok-secrets` | `OpenGrokSecrets` | target-green | R07 + remediation. |
 | 50 | `xai-grok-shared` | `OpenGrokShared` | ported | W0-S4. |
 | 51 | `xai-grok-shell` | `OpenGrokShell`, `OpenGrokACPRuntime`, `OpenGrokSessionPersistence`, `OpenGrokProviderSession` (live) · `OpenGrokSessionRuntime`, `OpenGrokAgentCoordinator`, `OpenGrokGoalState` (orphaned) | split | `OpenGrokShell` (1,364 LOC) is imported by the CLI and pulls in ACP runtime, session persistence, and provider session. `OpenGrokSessionRuntime` (282) and its dependents `OpenGrokAgentCoordinator` (328) and `OpenGrokWorkflow` have no importer. `OpenGrokGoalState` (1,271 LOC + tests) is unreferenced. Was mislabeled "pending". |
@@ -1103,7 +1373,7 @@ Status legend:
 | 81 | `xai-tracing-macros` | `OpenGrokTracing` | deferred-with-reason | Absorbed into tracing APIs. |
 | 82 | `xai-tty-utils` | `OpenGrokTTY` | live | 1,385 LOC + tests; imported by the CLI for raw mode and terminal capability detection. |
 | 83 | `xai-workflow` | *(proposed)* `OpenGrokWorkflowEngine` | not started | **New upstream crate at the `80dff0a9…` re-pin.** Native Rhai workflow engine (`engine`/`host`/`journal`/`meta`/`run`/`validate`). The existing `OpenGrokWorkflow` target (1,296 LOC) was ported against the removed JS workflow model and needs re-porting, not extension. See "Upstream drift". |
-| 84 | `xai-grok-extra-ca` | *(proposed)* `OpenGrokExtraCA` | not started | **New upstream crate at the `80dff0a9…` re-pin.** Opt-in extra TLS roots from `OPENGROK_EXTRA_CA_BUNDLE`; default-off, 1 MiB cap, warn-and-continue. Small, self-contained, no dependents — a good first catch-up slice. |
+| 84 | `xai-grok-extra-ca` | `OpenGrokExtraCA` | live-partial | **Wave 11 G043.** Default-off, process-cached PEM loader with a 1 MiB cap, per-block DER validation, warn-and-continue handling, and central HTTP/WebSocket wiring. Darwin installs additive Security anchors; Linux FoundationNetworking has no `serverTrust` challenge API, so Linux buffered/streaming custom-root support remains blocked. |
 
 Rows 83–84 are appended in discovery order rather than inserted alphabetically, so existing row numbers stay stable across the re-pin.
 
@@ -1113,28 +1383,227 @@ Separate **source-target** inventory: **8 / 99** targets match the ≤15-LOC pla
 
 Read the tally with care in both directions. The placeholder count fell from 42 to 7 because real implementations landed, but "orphaned ≈ 18" is the offsetting truth: roughly a fifth of the crate map is code that compiles and passes its own tests while contributing nothing to `open-grok` behavior. Neither target-green nor a low placeholder count is executable product parity.
 
+### Wave 11 audit closure — G029 (2026-08-06)
+
+The live session foundation now constructs one shared `ExportBoundary`-backed
+`LiveFeedbackComposition`. It persists the complete `FeedbackSubmission` to
+session-owned local state before making any upload decision, sends only the
+redacted outbound copy, and rechecks the same monotonic boundary immediately
+before each HTTP dispatch. The production client uses the configured proxy,
+bearer credentials, `/v1/feedback`, and request completion endpoints; missing
+feature configuration or credentials remains truthful local-only persistence.
+
+Interactive `/feedback <text>` is registered only when the feature gate and
+boundary allow it. The same composition is installed as the production ACP
+`x.ai/feedback` extension handler, with ACP session identity aligned to the
+session record. `LiveConversationRecord` already persists `ever_used_codex`;
+legacy records with a missing marker rehydrate closed and therefore cannot
+upload. `FeedbackSubmission` now carries the upstream `authorName` and
+`authorEmail` fields, preserving them in the redacted wire copy.
+
+Focused verification (2026-08-06):
+
+| Command | Result |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh build --target OpenGrokCLI` | exit 0 |
+| `zsh workflows/swift-safe-verify.zsh build --target OpenGrokCLITests` | exit 0 |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter LiveFeedbackCompositionTests` | exit 0; 6 tests, 0 failures |
+
+This closes the feedback live-wiring gap. Signed share upload remains a
+separate export client and is still intentionally fail-closed.
+
+### Wave 11 audit closure — G030 (2026-08-06)
+
+The shipped async executable now dispatches parsed `share <SESSION_ID>` through
+`LiveShareComposition` before the generic unsupported-command guard. The route
+uses the persisted tri-state `ever_used_codex` marker and the resident shared
+`ExportBoundary`, so legacy records and provider-boundary crossings remain
+unverifiable or denied rather than being treated as clean. A launcher-level
+regression drives the real parsed command and asserts the share-specific
+authentication refusal; an unrelated utility remains the negative control.
+
+The success path is deliberately not claimed: signed-URL upload, exported-session
+serialization, and backend share-link creation are still absent. After all
+authorization checks, the live route returns an explicit fail-closed refusal and
+the synchronous compatibility runner names the same missing network clients
+instead of reporting the stale generic “not implemented” capability.
+
+### Wave 11 audit closure — G031 (2026-08-06)
+
+Forking is now a store-owned coupled artifact operation. The child inherits the
+parent transcript, `parentSessionID`, persisted model/provider route, and the
+tri-state `ever_used_codex` boundary marker before launch. When the parent has a
+rewind sidecar, the flat Swift `<session>.rewind.jsonl` bytes are copied exactly;
+the child `LiveSessionServices` coordinator therefore lists and restores the
+same points. A sidecar-copy or child-record write failure removes partial child
+artifacts, and legacy records with no boundary marker are refused before any
+child file is created.
+
+Copying the rewind sidecar is an intentional Swift recovery-safety divergence:
+the inspected Rust storage-copy routine preserves summary/model and compaction
+artifacts but does not copy its rewind-points file. Swift keeps the extra copy so
+forked recovery state cannot silently disappear.
+
+Focused verification (2026-08-06):
+
+| Command | Result |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter liveSessionSandboxResumeDowngradeIsRefused` | exit 0; **1 test / 1 suite**, zero failures after the root integration fix persisted the selected sandbox profile before history construction. |
+
+The G031 fork tests and the formerly failing sandbox-persistence regression are
+both covered by the final full serial green gate recorded at the top of this
+ledger.
+
+### Wave 11 audit partial — G036 (2026-08-06)
+
+The production transport seam now has a package-local `COpenGrokSockets`
+adapter. Outside `Network.framework`, `WebSocketServer` binds the configured
+TCP host/port (including ephemeral port 0), accepts raw channels, runs the
+existing HTTP upgrade, and `WebSocketNetworkChannel`/`WebSocketDialer` use the
+same adapter with bounded connect errors. On Unix, `UnixSocketListener` and
+`UnixSocketDialer` now bind/connect `AF_UNIX` through that seam; stale endpoint
+removal remains exclusively in `ACPLeaderSocketListener` after lock
+acquisition. Apple builds continue to select the existing Network.framework
+implementation.
+
+The live WebSocket and leader suites no longer require `Network.framework` on
+Unix, so Linux can exercise the shipped serve and leader compositions instead
+of silently skipping them. The Rust reference still requires Windows leader
+IPC to use path-derived named pipes (not AF_UNIX); that adapter, plus the
+Windows-safe leader lock/cleanup strategy, is not claimed in this slice.
+
+Focused verification (2026-08-06, macOS Network.framework path):
+
+| Command | Result |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh build --target OpenGrokHTTP` | exit 0 |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter WebSocketDialerLiveTests` | exit 0; 3 tests in 1 suite, 0 failures |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter LiveLeaderCompositionLiveTests` | exit 0; 2 tests in 1 suite, 0 failures |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter ACPServeHostLiveTests` | exit 0; 7 tests in 1 suite, 0 failures |
+
+### Wave 11 audit closure — G038 (2026-08-06)
+
+`PlatformSecretStore.preferredBackend` now reports `.keychain` only on macOS;
+Linux and Windows report `.unsupported` until native Secret Service/libsecret
+and Credential Manager adapters are actually linked. Linux `makeDefault` remains
+unsupported without an explicit root, selects the owner-only file backend only
+when `ownerOnlyRoot` is supplied, and throws `ownerOnlyFallbackActive` when the
+caller requests fail-closed fallback handling. Windows remains unsupported, and
+the public all-throwing `WindowsCredentialManagerStore` placeholder is removed.
+The enum values for the future native backends remain reserved but are no longer
+advertised as current capabilities.
+
+The live CLI deliberately remains file-backed for Rust parity: xAI credentials
+use owner-protected `auth.json`, while Codex credentials use isolated
+`codex-auth.json`; this change does not route either path through
+`PlatformSecretStore`.
+
+Focused verification (2026-08-06, macOS):
+
+| Command | Result |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter OpenGrokSecretsTests` | exit 0; 27 tests in 1 suite, 0 failures |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter LiveAuthCompositionTests` | exit 0; 13 tests in 1 suite, 0 failures |
+
+Linux and Windows conditional branches still require their respective CI legs
+for host-level execution proof; no native vault dependency was added in this
+remediation.
+
+### Wave 11 audit closure — G040 (2026-08-06)
+
+Leader locking is now platform-explicit and fail-closed. `ACPLeaderLock.acquire`
+keeps the existing nonblocking POSIX `flock`/PID/sync/owner-cleanup behavior on
+supported Unix platforms, while the Windows branch throws the typed
+`ACPLeaderLockError.unsupportedPlatform` before creating the lock directory,
+lock file, PID contents, or socket endpoint. `LiveLeaderComposition` converts
+that case into a distinct Windows-unavailable CLI failure, and
+`LiveLeaderClient` rethrows it instead of falling through to spawn. This is a
+deliberate divergence from upstream: Swift has no Windows named-pipe leader
+transport yet, so a `LockFileEx` helper alone would advertise a leader that
+cannot accept clients. Full parity still requires a native Windows lock plus
+the path-derived named-pipe transport described by the Rust reference.
+
+Focused verification (2026-08-06, macOS):
+
+| Command | Result |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter ACPLeaderLockTests` | exit 0; **3 tests / 1 suite**, 0 failures |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter LiveLeaderCompositionLiveTests` | exit 0; **2 tests / 1 suite**, 0 failures |
+
+The Windows-only lock and live-composition refusal tests are compile-gated and
+were not executable on this macOS runner. The portable Swift version generator
+removes the prior `/bin/sh` blocker, but a post-change Windows CI run is still
+required to report those tests' non-zero count and confirm the injected
+`$OPENGROK_HOME` remains artifact-free there.
+
+### Wave 11 audit closure — G048 (2026-08-06)
+
+Local workflow availability now resolves from the effective local authority
+document with the pinned Open Grok precedence: `GROK_WORKFLOWS` environment,
+`[workflows].enabled`, then default enabled. The remote
+`workflows_enabled` field remains wire-compatible but is intentionally ignored;
+it is not an authority source for this local kill-switch. The resolver runs with
+an explicit session/route working directory and its decision gates the
+`workflow` route, `--workflow` launch before sampler construction or script
+reading, and interactive workflow registry injection. Disabled sessions receive
+no workflow registry, so the `/workflows` dashboard is not exposed.
+
+Focused verification (2026-08-06, macOS):
+
+| Command | Result |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter WorkflowConfigurationTests` | exit 0; **5 tests / 1 suite**, 0 failures |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter LiveWorkflowKillSwitchTests` | exit 0; **2 tests / 1 suite**, 0 failures |
+
+The negative-control launch test confirms `GROK_WORKFLOWS=0` refuses through the
+real `CLIRunner.run` → `OpenGrokApplication.live` path, leaves the workflow
+manifest absent, and does not invoke the injected sampler factory.
+
+### Wave 11 audit closure — G049 (2026-08-06)
+
+The dedicated `OpenGrokSecurityTests` release target now exercises the shipped
+security seams instead of declaring zero tests. The live file-tool executor
+rejects a missing leaf beneath an outbound symlink, `SessionFS.writeText`
+revalidates after its synchronization boundary and uses no-follow atomic
+replacement, and the sandbox resume gate rejects persisted-profile weakening.
+Provider selection fails closed when only another provider's store exists, and
+credential-owned authorization/account headers cannot be replaced by model
+metadata. The isolated-home report remains fail-closed for escaped and legacy
+paths. Malicious MCP/hooks/plugins, corruption, updater safety, redaction, and
+platform matrix coverage remain separate W11-S5 work.
+
+Focused verification (2026-08-06, macOS):
+
+| Command | Result |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter SecurityReleaseGateTests` | exit 0; **5 tests / 1 suite**, 0 failures |
+
+The full repository suite was intentionally not run; integrated verification
+remains owned by the coordinating agent.
+
 ## Next action
 
 The work remains executable-integration and platform-proof work, not placeholder
-filling. Wave 10 leaves the following ordered priorities.
+filling. Wave 11 leaves the following ordered priorities.
 
-### Current priorities after Wave 10
+### Current priorities after Wave 11
 
-1. **Finish Linux sandbox activation.** Add the reviewed process-wide
-   bubblewrap/re-exec seam so non-off profiles can arm before the already-wired
-   child `unshare` launch transform; then prove outbound child networking is
-   denied on a real Linux runner.
-2. **Connect workspace exposure to Computer Hub.** Supply the production
-   `ACPWorkspaceExposureConnection` backend to leader composition; keep the
-   current typed `workspace_start` refusal until that connector is real.
-3. **Persist and enforce the export marker.** Stamp and rehydrate the
-   `ever_used_codex`/non-xAI boundary in session records before wiring any
-   share, feedback, trace, or cloud upload path. Then add the signed-URL and
-   backend share clients with both pre-send boundary checks intact.
-4. **Make platform CI blocking only after it is truthful.** Remove the Windows
-   build plugin's `/bin/sh` dependency, reproduce the macOS BuildSupport CI
-   termination, and close Linux compile/runtime gaps before removing
-   `continue-on-error`.
+1. **Finish capable-Linux sandbox proof.** Run the behavioral filesystem,
+   provider-network, and child-network checks on a runner with working
+   bubblewrap and unshare namespaces; the process-wide re-exec seam is live.
+2. **Expand production workspace exposure proof.** Add a loopback Hub lifecycle
+   fixture covering workspace start/pause/resume/stop and permission mediation;
+   the shipped connector and leader wiring are now live.
+3. **Finish export clients.** The live launcher now stamps and rehydrates the
+   `ever_used_codex`/non-xAI boundary and sanitizes provider-opaque history on
+   resume, continue, fork, and `/model` changes. Add the signed-URL and backend
+   share clients with both pre-send boundary checks intact; legacy records remain
+   intentionally unverifiable and fail closed.
+4. **Collect honest platform CI evidence.** The Windows `/bin/sh` plugin
+   dependency is removed and Linux plus Windows compilation are now blocking
+   workflow jobs. Run a disposable PR, repair any newly surfaced platform
+   failures, and configure the macOS, Linux, and Windows compile checks as
+   required before making a platform-green or release claim.
 5. **Continue upstream catch-up and remaining live-route work** without
    weakening explicit refusals or the serialized verifier discipline.
 
@@ -1157,3 +1626,77 @@ filling. Wave 10 leaves the following ordered priorities.
 - `Sources/OpenGrokChatState/CompactionTranscript.swift` JSONValue pattern correction — **do not revert**.
 - Registered workflow `.opengrok/workflows/swift-open-grok-safe-resume.rhai`, legacy harness `workflows/run-grok45-port.zsh`, safe verifier `workflows/swift-safe-verify.zsh`, and `.gitignore` entries for `.port-workflow` / scratch builds — retained.
 - C helper targets `OpenGrokPTYC` and `OpenGrokCrashHandlerC` are required Package.swift edges for R09 shims.
+
+### Wave 11 audit closure — G050 (2026-08-06)
+
+The formerly empty `OpenGrokFuzzingTests` and `OpenGrokPerformanceTests`
+targets now execute real Swift Testing suites through the shipped Markdown,
+pager, sampler, shell, and memory seams. The fuzz target checks all nine
+checked-in `render_all` seeds plus bounded CRLF, truncation, delimiter, and
+Unicode-safe chunk mutations in pretty and raw modes. It compares full and
+streaming output, validates source/link/code ranges, and maps every render
+through `PagerMarkdownRenderer` without empty spans or lost visible content.
+
+The performance target uses a fixed `OPENGROK_PERFORMANCE_PROFILE=macos-15`
+profile and reviewed budgets for 1,024 Chat chunks, a 32-document transcript,
+128 ordered shell turns, and 48 persisted memory files. It deliberately does
+not self-baseline during a run. Swift exposes four applicable renderer modes
+(pretty/raw × full/streaming); the Rust fuzz binary also toggles Syntect on/off,
+which has no Swift equivalent and is not fabricated here.
+
+Focused verification (2026-08-06, macOS 15 / Apple Swift 6.4):
+
+| Command | Result |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh build-tests` | exit 0; all test products compiled |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter MarkdownRenderFuzzingTests` | exit 0; **1 test / 1 suite**, 0 failures |
+| `OPENGROK_PERFORMANCE_PROFILE=macos-15 zsh workflows/swift-safe-verify.zsh test --no-parallel --filter PerformanceGateTests` | exit 0; **4 tests / 1 suite**, 0 failures |
+
+The fixed-profile performance run reported medians of **6.59 ms** for 1,024
+Chat chunks (8 s budget), **3.30 s** for the large transcript renderer
+(8 s), **390.56 ms** for 128 shell turns (20 s), and **43.15 ms** for 48-file
+memory reindex/search/reload (8 s). These are measured medians from the clean
+macOS-15 run, not self-derived limits. The full repository suite remains owned
+by the coordinating agent and was intentionally not run here.
+
+### Wave 11 audit closure — G055 (2026-08-06)
+
+The release-confidence inventory now runs through the already-executed
+`OpenGrokCompatibilityTests` target. `ReleaseGateTestInventoryTests` uses a
+curated registry of the compatibility, release-validation, PagerPTY harness,
+and PagerPTY targets, recursively inspects their Swift sources from a
+`#filePath`-anchored package root, and reports the target plus inspected files
+when no `@Test` or XCTest-style declaration is found. A synthetic empty-target
+negative control proves the scanner detects the silent condition instead of
+merely passing against the current tree. The pure `VirtualScreen` coverage now
+belongs to `OpenGrokPagerPTYHarnessTests`, while process-backed scenarios remain
+in `OpenGrokPagerPTYTests`. The fuzzing, performance, and security targets were
+already test-bearing in the current tree and therefore remain declared; no
+vacuous targets were removed.
+
+Focused verification (2026-08-06, macOS):
+
+| Command | Result |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --filter ReleaseGateTestInventoryTests --no-parallel` | exit 0; **2 tests / 1 suite**, 0 failures |
+| `zsh workflows/swift-safe-verify.zsh test --filter VirtualScreenTests --no-parallel` | exit 0; **9 tests / 1 suite**, 0 failures |
+
+The mechanical inventory now reports **102 test targets**, **0 zero-test
+targets**, and **102 test targets with at least one executable declaration**.
+
+### Wave 11 audit closure — G056 (2026-08-06) — configuration landed, platform evidence pending
+
+The Windows version build plugin no longer invokes `/bin/sh`: SwiftPM now
+executes the declared `OpenGrokVersionGenerator` target, which writes
+`CompiledVersion.generated.swift` through the portable build-command seam.
+Linux is a blocking job and runs the serialized verifier for build, build-tests,
+and the serial test gate. Windows is split into a required `Windows (compile)`
+job and a separately named `Windows (diagnostic tests)` job; only the latter is
+allowed to continue on error. Both Windows jobs provision MSYS2 `zsh` before
+invoking the repository verifier, so the required compile check does not rely
+on raw SwiftPM commands or a Unix `/bin/sh` path.
+
+No post-change Linux or Windows GitHub Actions run, and no repository branch
+protection/ruleset update, is recorded here. The workflow is therefore fail-
+closed at the job-conclusion level but is not a release/platform-green claim;
+the required-check policy and real PR evidence remain integration-owner work.

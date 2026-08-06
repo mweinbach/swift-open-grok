@@ -787,6 +787,8 @@ private final class LocalShellProcessController: @unchecked Sendable {
     private let lock = NSLock()
     private var groupIsolated = false
     private var started = false
+    private var termination: LocalShellProcessExit?
+    private var waiters: [CheckedContinuation<LocalShellProcessExit, Never>] = []
 
     init(process: Process, stdout: LocalShellPipeReader, stderr: LocalShellPipeReader) {
         self.process = process
@@ -804,7 +806,23 @@ private final class LocalShellProcessController: @unchecked Sendable {
     }
 
     func start() throws {
-        try process.run()
+        process.terminationHandler = { [weak self] process in
+            guard let self else { return }
+            let exit: LocalShellProcessExit
+            if process.terminationReason == .uncaughtSignal {
+                exit = LocalShellProcessExit(code: nil, signal: process.terminationStatus)
+            } else {
+                exit = LocalShellProcessExit(code: process.terminationStatus, signal: nil)
+            }
+            self.recordTermination(exit)
+            process.terminationHandler = nil
+        }
+        do {
+            try process.run()
+        } catch {
+            process.terminationHandler = nil
+            throw error
+        }
         lock.lock()
         started = true
         lock.unlock()
@@ -812,13 +830,33 @@ private final class LocalShellProcessController: @unchecked Sendable {
     }
 
     func waitForExit() async -> LocalShellProcessExit {
-        await Task.detached(priority: .utility) { [self] in
-            process.waitUntilExit()
-            if process.terminationReason == .uncaughtSignal {
-                return LocalShellProcessExit(code: nil, signal: process.terminationStatus)
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let termination {
+                lock.unlock()
+                continuation.resume(returning: termination)
+            } else {
+                waiters.append(continuation)
+                lock.unlock()
             }
-            return LocalShellProcessExit(code: process.terminationStatus, signal: nil)
-        }.value
+        }
+    }
+
+    private func recordTermination(_ exit: LocalShellProcessExit) {
+        let pending: [CheckedContinuation<LocalShellProcessExit, Never>]
+        lock.lock()
+        guard termination == nil else {
+            lock.unlock()
+            return
+        }
+        termination = exit
+        pending = waiters
+        waiters.removeAll()
+        lock.unlock()
+
+        for waiter in pending {
+            waiter.resume(returning: exit)
+        }
     }
 
     func send(_ signal: ShellSignal) throws {

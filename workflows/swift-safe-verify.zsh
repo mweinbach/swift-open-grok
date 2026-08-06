@@ -71,6 +71,9 @@ case "$action" in
     swift build --build-tests --scratch-path "$scratch_path" --jobs "$jobs" "$@"
     ;;
   test)
+    if [[ -z "${OPENGROK_PERFORMANCE_PROFILE:-}" ]]; then
+      export OPENGROK_PERFORMANCE_PROFILE=macos-15
+    fi
     swift test --scratch-path "$scratch_path" --jobs "$jobs" "$@"
     ;;
   *)

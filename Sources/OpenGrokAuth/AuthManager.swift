@@ -8,6 +8,12 @@ import OpenGrokFileUtils
 import OpenGrokPaths
 import OpenGrokSecrets
 
+public enum AuthUnauthorizedRecoveryResult: Sendable, Equatable {
+    case recovered(GrokAuth)
+    case retryableFailure
+    case terminalFailure(RefreshTokenFailedReason)
+}
+
 /// Single source of truth for xAI credentials.
 public actor AuthManager {
     private var cached: GrokAuth?
@@ -267,17 +273,34 @@ public actor AuthManager {
         try await auth().key
     }
 
-    /// 401 recovery: refresh and return true if token changed.
-    public func tryRecoverUnauthorized() async -> Bool {
+    /// Preserve whether an unauthorized refresh changed the credential or
+    /// reached a terminal refresh-token failure so relay callers can choose
+    /// between immediate reconnect, backoff, and cancellation.
+    public func recoverUnauthorized() async -> AuthUnauthorizedRecoveryResult {
         let before = cached?.key
         let type = TokenType.from(auth: cached)
-        guard type.isRefreshable else { return false }
+        guard type.isRefreshable else { return .retryableFailure }
         do {
             let auth = try await refreshChain(reason: .serverRejected)
-            return auth.key != before
+            guard auth.key != before else { return .retryableFailure }
+            return .recovered(auth)
+        } catch let error as AuthError {
+            if case .refresh(.permanent(let failure)) = error {
+                return .terminalFailure(failure.reason)
+            }
+            return .retryableFailure
         } catch {
-            return false
+            return .retryableFailure
         }
+    }
+
+    /// Compatibility wrapper for HTTP callers that only need a changed-token
+    /// boolean.
+    public func tryRecoverUnauthorized() async -> Bool {
+        if case .recovered = await recoverUnauthorized() {
+            return true
+        }
+        return false
     }
 
     private func refreshChain(reason: RefreshReason) async throws -> GrokAuth {

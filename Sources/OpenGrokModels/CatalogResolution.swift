@@ -234,6 +234,13 @@ public func resolveModelCatalog(
         }
     }
 
+    let enabledOpenCodeGo = Set(input.models.opencodeGoEnabledModels)
+    catalog.retain { key, entry in
+        entry.info.provider != .openCodeGo
+            || enabledOpenCodeGo.contains(key)
+            || enabledOpenCodeGo.contains(entry.model)
+    }
+
     switch ModelGlobSet.compile(input.models.disabledModels) {
     case .success(.some(let disabled)):
         catalog.retain { key, entry in !disabled.matches(key: key, model: entry.model) }

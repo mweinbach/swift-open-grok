@@ -273,12 +273,20 @@ public struct OpenGrokShellProviderSessionSnapshot: Sendable, Equatable {
     public let modelID: String
     public let provider: String
     public let generation: UInt64
+    public let everUsedNonXAI: Bool
 
-    public init(sessionID: String, modelID: String, provider: String, generation: UInt64) {
+    public init(
+        sessionID: String,
+        modelID: String,
+        provider: String,
+        generation: UInt64,
+        everUsedNonXAI: Bool = false
+    ) {
         self.sessionID = sessionID
         self.modelID = modelID
         self.provider = provider
         self.generation = generation
+        self.everUsedNonXAI = everUsedNonXAI
     }
 }
 
@@ -340,7 +348,8 @@ public struct ProviderSessionAdapter: OpenGrokShellProviderSession, Sendable {
             sessionID: sessionID,
             modelID: snapshot.route.modelID,
             provider: snapshot.route.provider.asString,
-            generation: snapshot.generation
+            generation: snapshot.generation,
+            everUsedNonXAI: snapshot.everUsedNonXAI
         )
     }
 
@@ -435,17 +444,20 @@ public struct ProviderSessionTurnDriver: OpenGrokShellTurnDriver, Sendable {
 public protocol OpenGrokShellWorkspace: Sendable {
     var handle: WorkspaceHandle { get }
     var acpBoundary: any ACPWorkspaceBoundary { get }
+    var permissionPipeline: PermissionPipeline { get }
 }
 
 public struct LocalOpenGrokShellWorkspace: OpenGrokShellWorkspace, Sendable {
     public let handle: WorkspaceHandle
     public let acpBoundary: any ACPWorkspaceBoundary
+    public let permissionPipeline: PermissionPipeline
 
     public init(root: URL, openGrokHome: URL, capability: CapabilityMode = .full) {
         let config = WorkspaceConfig(root: root, openGrokHome: openGrokHome)
         let operations = LocalWorkspaceOps(config: config)
         self.handle = WorkspaceHandle(config: config, capability: capability)
         self.acpBoundary = LocalACPWorkspaceBoundary(operations: operations)
+        self.permissionPipeline = operations.pipeline
     }
 }
 
@@ -476,7 +488,8 @@ public protocol OpenGrokShellACPRuntimeFactory: Sendable {
         sessionID: SessionID,
         cwd: URL,
         workspace: any OpenGrokShellWorkspace,
-        promptDriver: any ACPPromptDriver
+        promptDriver: any ACPPromptDriver,
+        extensionHandler: (any ACPAgentExtensionHandler)?
     ) -> OpenGrokShellACPComponents
 }
 
@@ -487,13 +500,15 @@ public struct DefaultOpenGrokShellACPRuntimeFactory: OpenGrokShellACPRuntimeFact
         sessionID: SessionID,
         cwd: URL,
         workspace: any OpenGrokShellWorkspace,
-        promptDriver: any ACPPromptDriver
+        promptDriver: any ACPPromptDriver,
+        extensionHandler: (any ACPAgentExtensionHandler)? = nil
     ) -> OpenGrokShellACPComponents {
         let store = InMemoryACPSessionStore()
         let runtime = ACPAgentRuntime(
             store: store,
             promptDriver: promptDriver,
-            workspaceBoundary: workspace.acpBoundary
+            workspaceBoundary: workspace.acpBoundary,
+            extensionHandler: extensionHandler
         )
         return OpenGrokShellACPComponents(runtime: runtime, store: store)
     }
@@ -776,7 +791,8 @@ public actor OpenGrokShell: OpenGrokShellFacade {
             sessionID: request.sessionID,
             cwd: request.cwd,
             workspace: workspace,
-            promptDriver: promptDriver
+            promptDriver: promptDriver,
+            extensionHandler: nil
         )
         let now = configuration.now()
         let summary = SessionSummary(
@@ -785,6 +801,7 @@ public actor OpenGrokShell: OpenGrokShellFacade {
             createdAt: now,
             updatedAt: now,
             currentModelID: providerSnapshot.modelID,
+            everUsedCodex: providerSnapshot.everUsedNonXAI,
             sessionKind: "shell"
         )
         let managed = ManagedSession(
@@ -824,6 +841,20 @@ public actor OpenGrokShell: OpenGrokShellFacade {
     public func lookupSession(_ sessionID: SessionID) async -> OpenGrokShellSessionDescriptor? {
         guard let session = sessions[sessionID] else { return nil }
         return await descriptor(for: session)
+    }
+
+    public func synchronizeProviderBoundary(
+        sessionID: SessionID,
+        everUsedNonXAI: Bool
+    ) async throws {
+        guard var session = sessions[sessionID] else {
+            throw OpenGrokShellError.sessionNotFound(sessionID.rawValue)
+        }
+        guard everUsedNonXAI, !session.summary.everUsedCodex else { return }
+        session.summary.everUsedCodex = true
+        session.summary.updatedAt = configuration.now()
+        sessions[sessionID] = session
+        try await persistSession(sessionID)
     }
 
     public func submitTurn(sessionID: SessionID, request: OpenGrokShellTurnRequest) async throws -> OpenGrokShellTurnHandle {

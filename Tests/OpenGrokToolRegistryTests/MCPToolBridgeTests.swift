@@ -545,6 +545,27 @@ struct MCPPermissionRoutingTests {
         #expect(provider.calls.all.isEmpty)
     }
 
+    @Test("a missing permission pipeline denies an MCP call before reaching the server")
+    func missingPipelineDeniesTheCall() async {
+        let toolset = makeToolset()
+        let provider = StubProvider(serverName: "linear", tools: [
+            MCPBridgedTool(name: "save_issue", description: "")
+        ])
+        let registration = await MCPToolBridge.register(provider: provider, into: toolset)
+        #expect(registration.failure == nil)
+
+        let outcome = await toolset.prepareAndCall(
+            clientName: "linear__save_issue",
+            args: .object(["title": .string("blocked")])
+        )
+        guard case .failure(let error) = outcome else {
+            Issue.record("expected the missing pipeline to deny dispatch")
+            return
+        }
+        #expect(error.kind == .permissionDenied)
+        #expect(provider.calls.all.isEmpty)
+    }
+
     @Test("a deny rule on tool 'mcp' blocks the call")
     func mcpDenyRuleBlocks() async {
         var config = PermissionConfig()

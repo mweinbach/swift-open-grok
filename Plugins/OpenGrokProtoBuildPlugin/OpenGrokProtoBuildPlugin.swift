@@ -60,6 +60,22 @@ struct OpenGrokProtoBuildPlugin: CommandPlugin {
         let data = try Data(contentsOf: URL(fileURLWithPath: manifestPath))
         let manifest = try JSONDecoder().decode(Manifest.self, from: data)
         var failures: [String] = []
+        let provenancePath = "\(fixturesDir)/PROVENANCE.json"
+        guard fm.fileExists(atPath: provenancePath) else {
+            failures.append("missing provenance: ProtocolFixtures/PROVENANCE.json")
+            throw CLIError.stale(failures)
+        }
+        do {
+            let provenanceData = try Data(contentsOf: URL(fileURLWithPath: provenancePath))
+            let provenance = try JSONDecoder().decode(Provenance.self, from: provenanceData)
+            if provenance.referenceRevision != manifest.referenceRevision {
+                failures.append(
+                    "reference revision mismatch: manifest \(manifest.referenceRevision) provenance \(provenance.referenceRevision)"
+                )
+            }
+        } catch {
+            failures.append("malformed provenance: ProtocolFixtures/PROVENANCE.json")
+        }
         var seen: Set<String> = []
         for entry in manifest.files {
             seen.insert(entry.path)
@@ -182,6 +198,10 @@ private struct ManifestEntry: Codable {
     let path: String
     let sizeBytes: Int
     let sha256: String
+}
+
+private struct Provenance: Codable {
+    let referenceRevision: String
 }
 
 private enum CLIError: Error {

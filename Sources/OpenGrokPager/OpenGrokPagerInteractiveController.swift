@@ -6,6 +6,13 @@ import OpenGrokPromptQueue
 import OpenGrokTerminalCore
 
 public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFrontend {
+    public typealias CustomCommandHandler = @Sendable (
+        PagerCommandInvocation
+    ) async throws -> String?
+    public typealias LocalCommandHandler = @Sendable (
+        PagerCommandInvocation
+    ) async throws -> String?
+
     private enum Control: Sendable {
         /// A user Esc or Ctrl+C, fast-pathed ahead of queued input so it lands
         /// promptly during a busy turn.
@@ -543,6 +550,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private var editor = PromptEditor(text: "")
     private var submittedPrompts: [String] = []
     private var completedTurnCount = 0
+    private var currentRequest: OpenGrokPagerRequest?
     private var activeSessionID: String?
     private var lastSessionID: String?
     private var terminalRestored = false
@@ -583,9 +591,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// is never silently dropped.
     private let interjections = EventQueue<KindedInterjection<String>>()
 
-    private let commands = PagerCommandRegistry(
-        commands: OpenGrokPagerInteractiveController.builtinCommands
-    )
+    private let commands: PagerCommandRegistry
+    private let paletteRows: [OpenGrokPagerCommandSuggestion]
+    private let customCommandNames: Set<String>
+    private let customCommandHandler: CustomCommandHandler?
+    private let localCommandNames: Set<String>
+    private let localCommandHandler: LocalCommandHandler?
 
     /// Completions for the *arguments* of a command whose name is already
     /// typed, as `(command, argumentQuery) -> rows`.
@@ -604,25 +615,72 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         input: AsyncThrowingStream<InputEvent, Error>,
         runtime: any OpenGrokPagerRuntimeAdapter,
         renderer: any OpenGrokPagerInteractiveRenderAdapter,
-        output: any OpenGrokPagerInteractiveOutputAdapter
+        output: any OpenGrokPagerInteractiveOutputAdapter,
+        customCommands: [OpenGrokPagerCommandRegistration] = [],
+        customCommandHandler: CustomCommandHandler? = nil,
+        localCommands: [OpenGrokPagerCommandRegistration] = [],
+        localCommandHandler: LocalCommandHandler? = nil,
+        workflowsEnabled: Bool = true
     ) {
         self.input = input
         self.runtime = runtime
         self.renderer = renderer
         self.output = output
+        let definitions = customCommands.map { registration in
+            PagerCommandDefinition(
+                name: registration.name,
+                aliases: registration.aliases,
+                summary: registration.summary,
+                usage: registration.usage
+            )
+        }
+        let builtinCommands = Self.builtinCommands.filter { workflowsEnabled || $0.name != "workflows" }
+        self.commands = PagerCommandRegistry(
+            commands: builtinCommands + definitions + localCommands.map { registration in
+                PagerCommandDefinition(
+                    name: registration.name,
+                    aliases: registration.aliases,
+                    summary: registration.summary,
+                    usage: registration.usage
+                )
+            }
+        )
+        self.paletteRows = builtinCommands
+            .filter { !$0.isHidden }
+            .map { command in
+                OpenGrokPagerCommandSuggestion(
+                    name: "/\(command.name)",
+                    summary: command.summary,
+                    insertText: "/\(command.name)"
+                )
+            }
+        self.customCommandNames = Set(definitions.map(\.name))
+        self.customCommandHandler = customCommandHandler
+        self.localCommandNames = Set(localCommands.map { PagerCommandDefinition.normalize($0.name) })
+        self.localCommandHandler = localCommandHandler
     }
 
     public init(
         input: AsyncStream<InputEvent>,
         runtime: any OpenGrokPagerRuntimeAdapter,
         renderer: any OpenGrokPagerInteractiveRenderAdapter,
-        output: any OpenGrokPagerInteractiveOutputAdapter
+        output: any OpenGrokPagerInteractiveOutputAdapter,
+        customCommands: [OpenGrokPagerCommandRegistration] = [],
+        customCommandHandler: CustomCommandHandler? = nil,
+        localCommands: [OpenGrokPagerCommandRegistration] = [],
+        localCommandHandler: LocalCommandHandler? = nil,
+        workflowsEnabled: Bool = true
     ) {
         self.init(
             input: Self.makeThrowingStream(from: input),
             runtime: runtime,
             renderer: renderer,
-            output: output
+            output: output,
+            customCommands: customCommands,
+            customCommandHandler: customCommandHandler,
+            localCommands: localCommands,
+            localCommandHandler: localCommandHandler,
+            workflowsEnabled: workflowsEnabled
         )
     }
 
@@ -691,6 +749,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         guard !shutdownRequested else { throw OpenGrokPagerInteractiveError.shutdown }
 
         running = true
+        currentRequest = request
         rendererBegan = false
         terminalRestored = false
         let mailbox = SignalMailbox()
@@ -837,6 +896,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             try await discardQueue(reason: "quitting")
                             try await emit(.shutdown)
                             outcome = .shutdown
+                        case .submit(let generatedPrompt):
+                            try await enqueue(generatedPrompt, historyText: text)
+                            if let lifecycle = try await drainQueue(
+                                request: request,
+                                mailbox: mailbox,
+                                inputPumpGate: inputPumpGate
+                            ) {
+                                outcome = lifecycle
+                            }
                         case .handled, .notACommand:
                             // The draft is deliberately untouched — upstream's
                             // `SendSlashCommandPreservingDraft`.
@@ -866,7 +934,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             try await setMultiline(!modes.isMultiline)
                             await inputPumpGate.resume()
                         case .global(let command):
-                            try await handleGlobal(command)
+                            try await handleGlobal(command, isTurnRunning: false)
                             await inputPumpGate.resume()
                         case .viewport(let command):
                             try await emit(.viewport(command))
@@ -898,6 +966,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 try await discardQueue(reason: "quitting")
                                 try await emit(.shutdown)
                                 outcome = .shutdown
+                                continue
+                            case .submit(let generatedPrompt):
+                                try await enqueue(generatedPrompt, historyText: prompt)
+                                if let lifecycle = try await drainQueue(
+                                    request: request,
+                                    mailbox: mailbox,
+                                    inputPumpGate: inputPumpGate
+                                ) {
+                                    outcome = lifecycle
+                                }
                                 continue
                             case .handled:
                                 recordHistory(prompt)
@@ -1138,6 +1216,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                     case .quit:
                                         await cancelActiveSession()
                                         turnOutcome = .shutdown
+                                    case .submit(let generatedPrompt):
+                                        try await enqueue(generatedPrompt, historyText: prompt)
+                                        await inputPumpGate.resume()
                                     case .handled:
                                         recordHistory(prompt)
                                         editor.reset()
@@ -1164,7 +1245,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 try await setMultiline(!modes.isMultiline)
                                 await inputPumpGate.resume()
                             case .global(let command):
-                                try await handleGlobal(command)
+                                try await handleGlobal(command, isTurnRunning: true)
                                 await inputPumpGate.resume()
                             case .ignored:
                                 await inputPumpGate.resume()
@@ -1208,6 +1289,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         case .quit:
                             await cancelActiveSession()
                             turnOutcome = .shutdown
+                        case .submit(let generatedPrompt):
+                            try await enqueue(generatedPrompt, historyText: text)
+                            await inputPumpGate.resume()
                         case .handled, .notACommand:
                             try await emit(.promptChanged(promptState()))
                             await inputPumpGate.resume()
@@ -1233,14 +1317,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     ///
     /// Enqueuing is what `Enter` does in both states; the only difference is
     /// whether a drain follows immediately.
-    private func enqueue(_ prompt: String) async throws {
+    private func enqueue(_ prompt: String, historyText: String? = nil) async throws {
         nextPromptSequence += 1
         await promptQueue.enqueue(QueueEntryMeta(
             id: "prompt-\(nextPromptSequence)",
             kind: "prompt",
             text: prompt
         ))
-        recordHistory(prompt)
+        recordHistory(historyText ?? prompt)
         editor.reset()
         try await emit(.promptChanged(promptState()))
         try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
@@ -1306,7 +1390,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // run it early.
             if case .command = PagerCommandParser.parse(entry.text) {
                 await promptQueue.completeRunning()
-                _ = try await runSlashCommand(entry.text)
+                switch try await runSlashCommand(entry.text) {
+                case .submit(let generatedPrompt):
+                    try await enqueue(generatedPrompt, historyText: entry.text)
+                case .quit, .handled, .notACommand:
+                    break
+                }
                 try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
                 continue
             }
@@ -1619,7 +1708,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         PagerCommandDefinition(
             name: "new",
             aliases: ["clear"],
-            summary: "Start a new session"
+            summary: "Start a new session",
+            mutatesConversationHistory: true
         ),
         PagerCommandDefinition(
             name: "copy",
@@ -1747,6 +1837,21 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             isHidden: true
         )
     ]
+
+    public static var builtinCommandCatalog: [OpenGrokPagerCommandRegistration] {
+        builtinCommands.map { command in
+            OpenGrokPagerCommandRegistration(
+                name: command.name,
+                aliases: command.aliases,
+                summary: command.summary,
+                usage: command.usage
+            )
+        }
+    }
+
+    public static var builtinCommandNames: Set<String> {
+        Set(builtinCommands.flatMap(\.allNames))
+    }
 
     /// The settings row `/privacy` deep-links to
     /// (`PagerSettingsRegistry.swift:856`), matching upstream's
@@ -1913,6 +2018,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case notACommand
         case handled
         case quit
+        case submit(String)
     }
 
     /// Run a slash command.
@@ -1946,6 +2052,27 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             ))
             return .handled
         case .available(let command):
+            if localCommandNames.contains(command.name) {
+                guard let localCommandHandler else {
+                    try await emit(.notice("/\(command.name) is unavailable in this session"))
+                    return .handled
+                }
+                if let notice = try await localCommandHandler(invocation), !notice.isEmpty {
+                    try await emit(.notice(notice))
+                }
+                return .handled
+            }
+            if customCommandNames.contains(command.name) {
+                guard let customCommandHandler else {
+                    try await emit(.notice("/\(command.name) is unavailable in this session"))
+                    return .handled
+                }
+                guard let generatedPrompt = try await customCommandHandler(invocation) else {
+                    try await emit(.notice("/\(command.name) could not load its skill definition"))
+                    return .handled
+                }
+                return .submit(generatedPrompt)
+            }
             switch command.name {
             case "quit":
                 return .quit
@@ -2082,8 +2209,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     }
 
     private func startNewSession() async throws {
-        lastSessionID = nil
-        try await emit(.notice("started a new session"))
+        guard let currentRequest else {
+            throw OpenGrokPagerInteractiveError.sessionFailed("no active request for new session")
+        }
+        let sessionID = try await runtime.replaceSession(from: currentRequest)
+        lastSessionID = sessionID
+        activeSessionID = nil
+        editor.reset()
+        await promptQueue.removeAll()
+        interjections.clear()
+        try await emit(.sessionReplaced(sessionID: sessionID))
     }
 
     /// `/copy [N] [file]` — `N` is 1-based and counts back from the newest
@@ -2103,10 +2238,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// Service an application chord. Only the commands the port routes
     /// somewhere real are ever bound, so the remaining cases are unreachable
     /// rather than silently ignored.
-    private func handleGlobal(_ command: OpenGrokPagerGlobalCommand) async throws {
+    private func handleGlobal(
+        _ command: OpenGrokPagerGlobalCommand,
+        isTurnRunning: Bool = false
+    ) async throws {
         switch command {
         case .commandPalette:
-            try await emit(.overlay(.commandPalette(rows: Self.paletteRows)))
+            try await emit(.overlay(.commandPalette(rows: paletteRows)))
         case .shortcutsHelp:
             try await emit(.overlay(.shortcutsHelp))
         case .toggleQueue:
@@ -2122,25 +2260,19 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 try await emit(.promptChanged(promptState()))
                 return
             }
+            if isTurnRunning {
+                try await enqueue("/new")
+                try await emit(.notice(
+                    "/new edits the conversation, so it will run when this turn finishes."
+                ))
+                return
+            }
             try await startNewSession()
         case .cyclePermissionMode, .toggleTodos, .toggleTasks, .sendToBackground,
              .toggleAlwaysApprove, .openDashboard, .openSessions, .openExtensions:
             // Unbound in `globalAction(for:)` until the backing surface exists.
             break
         }
-    }
-
-    /// Every listable command as a palette row.
-    static var paletteRows: [OpenGrokPagerCommandSuggestion] {
-        builtinCommands
-            .filter { !$0.isHidden }
-            .map { command in
-                OpenGrokPagerCommandSuggestion(
-                    name: "/\(command.name)",
-                    summary: command.summary,
-                    insertText: "/\(command.name)"
-                )
-            }
     }
 
     /// Body of the `/help` modal. Public so the render layer can lay it out as
@@ -2207,6 +2339,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       Wheel            scroll the transcript, or the open overlay
       Click            choose a row in an overlay
     """
+
+    public static func helpText(workflowsEnabled: Bool) -> String {
+        guard !workflowsEnabled else { return helpText }
+        return helpText
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("/workflows") }
+            .joined(separator: "\n")
+    }
 
     private func transition(to newLifecycle: OpenGrokPagerInteractiveLifecycle) async throws {
         lifecycle = newLifecycle

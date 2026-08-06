@@ -53,8 +53,8 @@
       "allow"
     ]
   },
-  "notes": "Checked-in key-order fixtures for implemented foundation contracts, recaptured at the 80dff0a9 pin with per-key Rust file:line provenance.",
-  "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+  "notes": "Checked-in key-order fixtures for implemented foundation contracts, re-evaluated at the 9ed09e2a pin with per-key Rust file:line provenance.",
+  "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
   "portDrift": {
     "DEFAULT_EXEC_YIELD_TIME_MS": {
       "swift": 10000,
@@ -67,8 +67,8 @@
   },
   "provenance": {
     "source": "xai-grok-config-types (ConfigSource, RuleAction) + xai-grok-code-mode-protocol (runtime defaults), cross-checked against OpenGrokConfigTypes/OpenGrokWorkspaceTypes/OpenGrokCodeModeProtocol",
-    "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
-    "previousReferenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+    "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
+    "previousReferenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
     "pinVerdict": "recaptured",
     "keyProvenance": {
       "configSourceOrder": "crates/codegen/xai-grok-config-types/src/flags.rs:9-19 (declaration order; strum serialize_all = snake_case at :8). Mirrored by Sources/OpenGrokConfigTypes/Flags.swift:14-23.",
@@ -83,10 +83,10 @@
       "`workspacePermissionOrder` retained unchanged: verified still correct at 80dff0a9."
     ],
     "evidence": [
-      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-grok-config-types/src/flags.rs => empty (ConfigSource unchanged)",
-      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-grok-config-types/src/permission.rs => empty (RuleAction unchanged)",
-      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-grok-workspace-types => touches src/rpc/* only; src/types/permission.rs is byte-identical, so PermissionDecision and the permission policy shape are unchanged",
-      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-grok-code-mode-protocol => DEFAULT_EXEC_YIELD_TIME_MS 10_000 -> 30_000 (src/runtime.rs:11) with the matching exec tool-description text at src/description.rs:20"
+      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-grok-config-types/src/flags.rs => empty (ConfigSource unchanged at the current pin)",
+      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-grok-config-types/src/permission.rs => empty (RuleAction unchanged at the current pin)",
+      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-grok-workspace-types/src/types/permission.rs => empty (PermissionDecision and policy shape unchanged)",
+      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-grok-code-mode-protocol => empty (the 30_000ms exec default is unchanged at the current pin)"
     ]
   }
 }

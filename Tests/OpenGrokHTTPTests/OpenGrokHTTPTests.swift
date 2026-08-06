@@ -342,7 +342,8 @@ struct TransportConfigurationTests {
             ),
             tls: HTTPTLSConfiguration(
                 validateCertificates: false,
-                minimumTLSVersion: "tls1.2"
+                minimumTLSVersion: "tls1.2",
+                extraRootCertificates: [Data([0x30, 0x00])]
             ),
             additionalHeaders: ["X-Test": "1"]
         )
@@ -353,6 +354,7 @@ struct TransportConfigurationTests {
         #expect(snap.proxyPassword == "s3cret")
         #expect(snap.tlsValidateCertificates == false)
         #expect(snap.tlsMinimumVersion == "tls1.2")
+        #expect(snap.tlsExtraRootCertificateCount == 1)
         #expect(snap.userAgent == "cfg-test/1.0")
         #expect(snap.additionalHeaders["X-Test"] == "1")
         #expect(snap.maxStreamBufferBytes == 1024)
@@ -367,6 +369,7 @@ struct TransportConfigurationTests {
         let urlTransport = URLSessionHTTPTransport(configuration: transport)
         #expect(urlTransport.appliedConfigurationSnapshot.proxyUsername == "alice")
         #expect(urlTransport.appliedConfigurationSnapshot.tlsMinimumVersion == "tls1.2")
+        #expect(urlTransport.appliedConfigurationSnapshot.tlsExtraRootCertificateCount == 1)
     }
 
     @Test func webSocketUsesTransportConfiguration() throws {
@@ -382,7 +385,8 @@ struct TransportConfigurationTests {
             ),
             tls: HTTPTLSConfiguration(
                 validateCertificates: false,
-                minimumTLSVersion: "1.2"
+                minimumTLSVersion: "1.2",
+                extraRootCertificates: [Data([0x30, 0x00])]
             ),
             additionalHeaders: ["X-WS": "yes"]
         )
@@ -395,8 +399,10 @@ struct TransportConfigurationTests {
         #expect(prepared.snapshot.proxyHost == "ws-proxy.example")
         #expect(prepared.snapshot.proxyUsername == "u")
         #expect(prepared.snapshot.tlsValidateCertificates == false)
+        #expect(prepared.snapshot.tlsExtraRootCertificateCount == 1)
         #expect(prepared.snapshot.userAgent == "ws-test/2.0")
         #expect(prepared.delegate.validateCertificates == false)
+        #expect(prepared.delegate.extraRootCertificates.count == 1)
         #expect(prepared.request.value(forHTTPHeaderField: "User-Agent") == "ws-test/2.0")
         #expect(prepared.request.value(forHTTPHeaderField: "X-WS") == "yes")
         #expect(prepared.request.value(forHTTPHeaderField: "Sec-WebSocket-Protocol") == "chat")

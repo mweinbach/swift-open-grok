@@ -639,6 +639,7 @@ struct ACPLeaderLockTests {
         return url
     }
 
+#if !os(Windows)
     @Test("acquiring records this process's pid")
     func recordsPID() throws {
         let directory = try makeDirectory()
@@ -701,4 +702,29 @@ struct ACPLeaderLockTests {
         #expect(!FileManager.default.fileExists(atPath: socketPath.path))
         #expect(!FileManager.default.fileExists(atPath: lockPath.path))
     }
+#else
+    @Test("Windows refuses leader locking before creating endpoint artifacts")
+    func windowsRefusesWithoutArtifacts() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("leader-lock-\(UUID().uuidString)")
+        let lockPath = directory.appendingPathComponent("leader.lock")
+        let socketPath = directory.appendingPathComponent("leader.sock")
+        let lock = ACPLeaderLock(lockPath: lockPath, socketPath: socketPath)
+
+        do {
+            try lock.acquire()
+            Issue.record("Windows leader locking unexpectedly succeeded")
+        } catch let error as ACPLeaderLockError {
+            guard case .unsupportedPlatform(let path) = error else {
+                Issue.record("expected unsupportedPlatform, got \(error)")
+                return
+            }
+            #expect(path == lockPath.path)
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+        #expect(!FileManager.default.fileExists(atPath: lockPath.path))
+        #expect(!FileManager.default.fileExists(atPath: socketPath.path))
+    }
+#endif
 }

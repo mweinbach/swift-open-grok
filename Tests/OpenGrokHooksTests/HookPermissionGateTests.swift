@@ -60,10 +60,15 @@ private struct HookFixture {
         return contents.split(whereSeparator: \.isNewline).map(String.init)
     }
 
-    func spec(name: String, command: String, matcher: String? = nil) -> HookSpec {
+    func spec(
+        name: String,
+        command: String,
+        matcher: String? = nil,
+        event: HookEvent = .preToolUse
+    ) -> HookSpec {
         HookSpec(
             name: name,
-            event: .preToolUse,
+            event: event,
             handlerType: .command,
             configuredMatcher: matcher,
             matcher: matcher.flatMap { try? HookMatcher(pattern: $0) },
@@ -83,6 +88,111 @@ private struct HookFixture {
                 environment: ProcessInfo.processInfo.environment
             )
         )
+    }
+}
+
+@Suite("Stop hook gate")
+struct StopHookGateTests {
+    @Test("stop hooks accumulate block feedback and additional context")
+    func accumulatesFeedback() async throws {
+        let fixture = try HookFixture()
+        defer { fixture.cleanup() }
+
+        let blocker = try fixture.script(
+            named: "blocker",
+            body: #"printf '{"decision":"block","reason":"finish the review"}\n'"#
+        )
+        let context = try fixture.script(
+            named: "context",
+            body: #"printf '{"decision":"allow","hookSpecificOutput":{"additionalContext":"check the failing test"}}\n'"#
+        )
+        let gate = fixture.gate([
+            fixture.spec(name: "blocker", command: blocker, event: .stop),
+            fixture.spec(name: "context", command: context, event: .stop),
+        ])
+
+        let result = await gate.runStop(
+            promptId: "prompt-1",
+            payload: [
+                "reason": .string("end_turn"),
+                "stopHookActive": .boolean(false),
+                "lastAssistantMessage": .string("answer"),
+            ]
+        )
+
+        #expect(result.blocks.map(\.reason) == ["finish the review"])
+        #expect(result.additionalContext == ["check the failing test"])
+        #expect(result.wantsContinuation)
+        #expect(gate.recordedRuns().map(\.state) == [.blocked, .success])
+    }
+
+    @Test("the first force-stop wins and overrides continuation feedback")
+    func forceStopWins() async throws {
+        let fixture = try HookFixture()
+        defer { fixture.cleanup() }
+
+        let first = try fixture.script(
+            named: "first",
+            body: #"printf '{"decision":"block","reason":"first block","continue":false,"stopReason":"budget exhausted"}\n'"#
+        )
+        let second = try fixture.script(
+            named: "second",
+            body: #"printf '{"decision":"block","reason":"second block","continue":false,"stopReason":"later reason"}\n'"#
+        )
+        let gate = fixture.gate([
+            fixture.spec(name: "first", command: first, event: .stop),
+            fixture.spec(name: "second", command: second, event: .stop),
+        ])
+
+        let result = await gate.runStop()
+
+        #expect(result.preventContinuation?.hookName == "first")
+        #expect(result.preventContinuation?.reason == "budget exhausted")
+        #expect(!result.wantsContinuation)
+        #expect(fixture.executionOrder() == ["first", "second"])
+    }
+
+    @Test("stop hook failures fail open and remain recorded")
+    func failureFailsOpen() async throws {
+        let fixture = try HookFixture()
+        defer { fixture.cleanup() }
+
+        let broken = try fixture.script(named: "broken", body: "exit 7")
+        let gate = fixture.gate([fixture.spec(name: "broken", command: broken, event: .stop)])
+
+        let result = await gate.runStop()
+
+        #expect(result.blocks.isEmpty)
+        #expect(result.additionalContext.isEmpty)
+        #expect(result.preventContinuation == nil)
+        #expect(gate.recordedRuns().map(\.state) == [.failed])
+    }
+
+    @Test("stop envelopes carry the turn-end fields")
+    func envelopeCarriesTurnFields() async throws {
+        let fixture = try HookFixture()
+        defer { fixture.cleanup() }
+
+        let capture = fixture.root.appendingPathComponent("stop-envelope.json").path
+        let command = try fixture.script(named: "capture", body: "cat > '\(capture)'")
+        let gate = fixture.gate([fixture.spec(name: "capture", command: command, event: .stop)])
+
+        _ = await gate.runStop(
+            promptId: "prompt-42",
+            payload: [
+                "reason": .string("end_turn"),
+                "stopHookActive": .boolean(true),
+                "lastAssistantMessage": .string("last answer"),
+            ]
+        )
+
+        let data = try Data(contentsOf: URL(fileURLWithPath: capture))
+        let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(object["hookEventName"] as? String == "stop")
+        #expect(object["promptId"] as? String == "prompt-42")
+        #expect(object["reason"] as? String == "end_turn")
+        #expect(object["stopHookActive"] as? Bool == true)
+        #expect(object["lastAssistantMessage"] as? String == "last answer")
     }
 }
 

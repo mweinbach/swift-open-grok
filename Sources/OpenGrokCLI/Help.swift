@@ -75,11 +75,13 @@ public enum OpenGrokHelp {
       plugin list|install|uninstall|update|enable|disable|details|validate|tag
       plugin marketplace list|add|remove|update
       memory clear                          Clear cross-session memory.
-      worktree list|show|rm|gc|db           Manage git worktrees.
+      worktree list|show|rm|gc|prune|db     Manage git worktrees.
       workspace start|pause|resume|stop|restart|status
       login, logout                         Manage credentials.
       inspect, doctor [fix]                 Diagnose config and terminal.
       setup, update, export, trace, share, wrap, dashboard
+      release-validate --binary PATH --expected-version VERSION
+                     [--expected-commit COMMIT] --isolated-root ROOT
       completions SHELL                     bash, zsh, fish, powershell, elvish.
       paths                                 Print resolved state paths.
       version, help
@@ -99,6 +101,18 @@ public enum OpenGrokHelp {
     /// topic has to be an error rather than a silent fallback.
     public static func topic(_ name: String) -> String? {
         switch name {
+        case "release-validate":
+            return """
+            open-grok release-validate --binary PATH --expected-version VERSION
+                                      [--expected-commit COMMIT] --isolated-root ROOT
+                                      [--artifact NAME=PATH --sidecar PATH]…
+
+            Runs the shipped binary's --version and paths --json checks in an
+            isolated environment. Artifact pairs add SHA-256 sidecar checks.
+            Every finding is rendered to stderr; exit 1 means the merged report
+            is not passing.
+
+            """
         case "agent":
             return """
             open-grok agent [stdio|headless|serve|leader] [OPTIONS]
@@ -162,7 +176,7 @@ public enum OpenGrokHelp {
               list, ls [--repo R] [--type T] [--json] [--all]
               show <ID_OR_PATH>
               rm <IDS…> [-f, --force] [--dry-run]
-              gc [--dry-run] [--max-age AGE] [-f, --force]
+              gc|prune [--dry-run] [--max-age AGE] [-f, --force]
               db rebuild|stats|path
 
             """

@@ -345,15 +345,17 @@ struct OpenGrokSecretsTests {
         #if os(macOS)
         #expect(PlatformSecretStore.preferredBackend == .keychain)
         #elseif os(Linux)
-        #expect(PlatformSecretStore.preferredBackend == .secretService)
+        #expect(PlatformSecretStore.preferredBackend == .unsupported)
         #elseif os(Windows)
-        #expect(PlatformSecretStore.preferredBackend == .credentialManager)
+        #expect(PlatformSecretStore.preferredBackend == .unsupported)
+        #else
+        #expect(PlatformSecretStore.preferredBackend == .unsupported)
         #endif
     }
 
+#if os(macOS)
     @Test("macOS Keychain store round trip preserves metadata")
     func keychainRoundTrip() async throws {
-        #if os(macOS)
         let service = "ai.xai.open-grok.secrets.test.\(UUID().uuidString)"
         let store = KeychainSecretStore(service: service)
         let account = "test-account-\(UUID().uuidString.prefix(8))"
@@ -381,14 +383,63 @@ struct OpenGrokSecretsTests {
         } catch SecretStoreError.notFound {
             // expected
         }
+    }
+#endif
+
+    @Test("default factory refuses missing native secret backend")
+    func defaultFactoryWithoutNativeBackend() async throws {
+        #if os(macOS)
+        let store = try await PlatformSecretStore.makeDefault()
+        #expect(store.backend == .keychain)
+        #elseif os(Linux) || os(Windows)
+        do {
+            let store = try await PlatformSecretStore.makeDefault()
+            Issue.record("expected unsupported default factory, got \(store.backend)")
+        } catch SecretStoreError.unsupported {
+            // expected until a native adapter is linked
+        } catch {
+            Issue.record("unexpected default factory error: \(error)")
+        }
         #else
         do {
-            _ = try await PlatformSecretStore.makeDefault()
+            let store = try await PlatformSecretStore.makeDefault()
+            Issue.record("expected unsupported default factory, got \(store.backend)")
         } catch SecretStoreError.unsupported {
-            // expected without ownerOnlyRoot
-        } catch SecretStoreError.ownerOnlyFallbackActive {
-            // also acceptable
+            // expected on platforms without a native adapter
+        } catch {
+            Issue.record("unexpected default factory error: \(error)")
         }
+        #endif
+    }
+
+    @Test("Linux owner-only fallback is explicit")
+    func explicitOwnerOnlyFallback() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ogrok-explicit-fallback-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        #if os(macOS)
+        let store = try await PlatformSecretStore.makeDefault(
+            options: SecretStoreOptions(ownerOnlyRoot: root)
+        )
+        #expect(store.backend == .keychain)
+        #elseif os(Linux)
+        let store = try await PlatformSecretStore.makeDefault(
+            options: SecretStoreOptions(ownerOnlyRoot: root)
+        )
+        #expect(store.backend == .ownerOnlyFallback)
+        #elseif os(Windows)
+        do {
+            let store = try await PlatformSecretStore.makeDefault(
+                options: SecretStoreOptions(ownerOnlyRoot: root)
+            )
+            Issue.record("expected unsupported Windows factory, got \(store.backend)")
+        } catch SecretStoreError.unsupported {
+            // expected — neither native nor owner-only Windows storage is wired
+        } catch {
+            Issue.record("unexpected Windows factory error: \(error)")
+        }
+        #else
+        #expect(PlatformSecretStore.preferredBackend == .unsupported)
         #endif
     }
 
@@ -404,21 +455,25 @@ struct OpenGrokSecretsTests {
         #expect(store.backend == .keychain)
         #elseif os(Windows)
         do {
-            _ = try await PlatformSecretStore.makeDefault(
+            let store = try await PlatformSecretStore.makeDefault(
                 options: SecretStoreOptions(failClosedOnFallback: true, ownerOnlyRoot: root)
             )
-            Issue.record("expected unsupported on Windows")
+            Issue.record("expected unsupported on Windows, got \(store.backend)")
         } catch SecretStoreError.unsupported {
             // expected — no silent plaintext
+        } catch {
+            Issue.record("unexpected Windows factory error: \(error)")
         }
         #else
         do {
-            _ = try await PlatformSecretStore.makeDefault(
+            let store = try await PlatformSecretStore.makeDefault(
                 options: SecretStoreOptions(failClosedOnFallback: true, ownerOnlyRoot: root)
             )
-            Issue.record("expected ownerOnlyFallbackActive")
+            Issue.record("expected ownerOnlyFallbackActive, got \(store.backend)")
         } catch SecretStoreError.ownerOnlyFallbackActive {
             // expected
+        } catch {
+            Issue.record("unexpected fallback error: \(error)")
         }
         #endif
     }

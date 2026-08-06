@@ -1,9 +1,13 @@
 import Foundation
 import OpenGrokAgentDefinitions
+import OpenGrokACPRuntime
 import OpenGrokAuth
+import OpenGrokCodeMode
 import OpenGrokConfig
 import OpenGrokFileTools
 import OpenGrokHTTP
+import OpenGrokHooks
+import OpenGrokHooksPluginTypes
 import OpenGrokModels
 import OpenGrokPager
 import OpenGrokPagerMinimal
@@ -11,10 +15,12 @@ import OpenGrokPagerRender
 import OpenGrokProviderSession
 import OpenGrokSampler
 import OpenGrokSamplingTypes
+import OpenGrokSandbox
 import OpenGrokSessionRuntime
 import OpenGrokShared
 import OpenGrokShell
 import OpenGrokShellBase
+import OpenGrokShellSessionSupport
 import OpenGrokTerminalCore
 import OpenGrokToolRegistry
 import OpenGrokTTY
@@ -30,6 +36,10 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     /// Provider headers that travel with every sampling request — Codex OAuth
     /// account pinning (`ChatGPT-Account-ID`, `X-OpenAI-Fedramp`) arrives here.
     public let extraHeaders: [String: String]
+    public let queryParams: [String: String]
+    public let bearerResolver: (any BearerResolver)?
+    public let credentialProvider: (any AuthCredentialProvider)?
+    public let transport: (any HTTPTransport)?
 
     public init(
         model: String,
@@ -37,7 +47,11 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         apiKey: String,
         provider: ModelProvider = .xai,
         apiBackend: ApiBackend = .chatCompletions,
-        extraHeaders: [String: String] = [:]
+        extraHeaders: [String: String] = [:],
+        queryParams: [String: String] = [:],
+        bearerResolver: (any BearerResolver)? = nil,
+        credentialProvider: (any AuthCredentialProvider)? = nil,
+        transport: (any HTTPTransport)? = nil
     ) {
         self.model = model
         self.baseURL = baseURL
@@ -45,6 +59,55 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         self.provider = provider
         self.apiBackend = apiBackend
         self.extraHeaders = extraHeaders
+        self.queryParams = queryParams
+        self.bearerResolver = bearerResolver
+        self.credentialProvider = credentialProvider
+        self.transport = transport
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.model == rhs.model && lhs.baseURL == rhs.baseURL && lhs.apiKey == rhs.apiKey &&
+        lhs.provider == rhs.provider && lhs.apiBackend == rhs.apiBackend &&
+        lhs.extraHeaders == rhs.extraHeaders && lhs.queryParams == rhs.queryParams
+    }
+}
+
+final class NamedAuthBearerResolver: BearerResolver, @unchecked Sendable {
+    private let provider: NamedAuthProviderResolver
+
+    init(provider: NamedAuthProviderResolver) {
+        self.provider = provider
+    }
+
+    func currentBearer() -> String? {
+        provider.currentToken()
+    }
+
+    var reservedHeaders: [String] { ["Authorization", "x-api-key"] }
+}
+
+final class CredentialBearerResolver: BearerResolver, @unchecked Sendable {
+    private let provider: any AuthCredentialProvider
+
+    init(provider: any AuthCredentialProvider) {
+        self.provider = provider
+    }
+
+    func currentBearer() -> String? {
+        provider.snapshot().token
+    }
+
+    func currentAuth() -> ResolvedBearerAuth? {
+        let snapshot = provider.snapshot()
+        guard let token = snapshot.token else { return nil }
+        let extraHeaders: [(name: String, value: String)] = provider.needsTokenAuthHeader()
+            ? [(name: xaiTokenAuthHeader, value: xaiTokenAuthValue)]
+            : []
+        return ResolvedBearerAuth(bearer: token, extraHeaders: extraHeaders)
+    }
+
+    var reservedHeaders: [String] {
+        ["Authorization", "x-api-key", xaiTokenAuthHeader]
     }
 }
 
@@ -146,6 +209,21 @@ public struct OpenGrokLiveSampler: Sendable {
     public static func production(
         configuration: OpenGrokLiveSamplingConfiguration
     ) throws -> OpenGrokLiveSampler {
+        let baseTransport = configuration.transport ?? URLSessionHTTPTransport()
+        let transport: any HTTPTransport
+        let bearerResolver: (any BearerResolver)?
+        if let credentialProvider = configuration.credentialProvider {
+            transport = AuthRetryTransport(
+                transport: baseTransport,
+                credentials: credentialProvider,
+                maxRetries: 1
+            )
+            bearerResolver = configuration.bearerResolver
+                ?? CredentialBearerResolver(provider: credentialProvider)
+        } else {
+            transport = baseTransport
+            bearerResolver = configuration.bearerResolver
+        }
         let client = try SamplingClient(config: SamplerConfig(
             apiKey: configuration.apiKey,
             baseURL: configuration.baseURL,
@@ -154,8 +232,10 @@ public struct OpenGrokLiveSampler: Sendable {
             provider: configuration.provider,
             extraHeaders: configuration.extraHeaders
                 .sorted { $0.key < $1.key }
-                .map { (name: $0.key, value: $0.value) }
-        ))
+                .map { (name: $0.key, value: $0.value) },
+            queryParams: configuration.queryParams,
+            bearerResolver: bearerResolver
+        ), transport: transport)
         return OpenGrokLiveSampler { request, emit in
             await emit(.status("sampling"))
             // Assistant text is forwarded incrementally as it arrives; the
@@ -297,6 +377,7 @@ struct LiveTextDeltaCoalescer {
 
 public struct OpenGrokLiveCompositionDependencies: Sendable {
     public let makeSampler: @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler
+    public let makeCodeModeCapability: @Sendable () -> CodeModeRuntimeCapability
     public let makeProcessBackend: @Sendable () -> any ShellProcessBackend
     public let terminal: OpenGrokLiveTerminal
     public let makeInteractiveInput: @Sendable () async throws -> OpenGrokLiveInteractiveInput?
@@ -305,9 +386,16 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
     /// composition test can drive the full pipeline against a mock endpoint
     /// without reaching the network.
     public let makeImageTransport: @Sendable () -> any HTTPTransport
+    public let workspaceRoute: LiveWorkspaceRouteDependencies
+    public let makeLeaderClient: @Sendable (
+        LiveLeaderClientLaunchConfiguration
+    ) async throws -> LiveLeaderClientLease
 
     public init(
         makeSampler: @escaping @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler,
+        makeCodeModeCapability: @escaping @Sendable () -> CodeModeRuntimeCapability = {
+            InProcessCodeModeSession.runtimeCapability
+        },
         makeProcessBackend: @escaping @Sendable () -> any ShellProcessBackend = {
             LocalShellProcessBackend()
         },
@@ -316,23 +404,37 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
         makeTerminalSink: @escaping @Sendable () -> (any PagerTerminalSink)? = { nil },
         makeImageTransport: @escaping @Sendable () -> any HTTPTransport = {
             URLSessionHTTPTransport()
+        },
+        workspaceRoute: LiveWorkspaceRouteDependencies = .production(),
+        makeLeaderClient: @escaping @Sendable (
+            LiveLeaderClientLaunchConfiguration
+        ) async throws -> LiveLeaderClientLease = { configuration in
+            try await LiveLeaderClientAcquisition.production.connectOrSpawn(configuration)
         }
     ) {
         self.makeSampler = makeSampler
+        self.makeCodeModeCapability = makeCodeModeCapability
         self.makeProcessBackend = makeProcessBackend
         self.terminal = terminal
         self.makeInteractiveInput = makeInteractiveInput
         self.makeTerminalSink = makeTerminalSink
         self.makeImageTransport = makeImageTransport
+        self.workspaceRoute = workspaceRoute
+        self.makeLeaderClient = makeLeaderClient
     }
 
     public static let production = OpenGrokLiveCompositionDependencies(
         makeSampler: OpenGrokLiveSampler.production(configuration:),
+        makeCodeModeCapability: { InProcessCodeModeSession.runtimeCapability },
         makeProcessBackend: { LocalShellProcessBackend() },
         terminal: .production,
-        makeInteractiveInput: OpenGrokLiveInteractiveInput.production,
-        makeTerminalSink: { FileHandlePagerTerminalSink() },
-        makeImageTransport: { URLSessionHTTPTransport() }
+            makeInteractiveInput: OpenGrokLiveInteractiveInput.production,
+            makeTerminalSink: { FileHandlePagerTerminalSink() },
+        makeImageTransport: { URLSessionHTTPTransport() },
+        workspaceRoute: .production(),
+        makeLeaderClient: { configuration in
+            try await LiveLeaderClientAcquisition.production.connectOrSpawn(configuration)
+        }
     )
 }
 
@@ -606,17 +708,53 @@ extension OpenGrokApplication {
     }
 }
 
+private final class LiveSessionExportBoundaryRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var boundaries: [String: ExportBoundary] = [:]
+
+    func register(sessionID: String, boundary: ExportBoundary) {
+        lock.lock()
+        boundaries[sessionID] = boundary
+        lock.unlock()
+    }
+
+    func remove(sessionID: String) {
+        lock.lock()
+        boundaries.removeValue(forKey: sessionID)
+        lock.unlock()
+    }
+
+    func boundary(for sessionID: String) -> ExportBoundary? {
+        lock.lock()
+        defer { lock.unlock() }
+        return boundaries[sessionID]
+    }
+}
+
 public struct OpenGrokLiveApplicationLauncher: Sendable {
     private let dependencies: OpenGrokLiveCompositionDependencies
+    private let updateServices: LiveUpdateServices
+    private let exportBoundaries = LiveSessionExportBoundaryRegistry()
 
-    public init(dependencies: OpenGrokLiveCompositionDependencies = .production) {
+    public init(
+        dependencies: OpenGrokLiveCompositionDependencies = .production,
+        updateServices: LiveUpdateServices = .production
+    ) {
         self.dependencies = dependencies
+        self.updateServices = updateServices
     }
 
     public var launcher: CLIApplicationLauncher {
         CLIApplicationLauncher { command, context in
             if LiveAuthComposition.handles(command) {
                 return try await LiveAuthComposition.session(for: command, context: context)
+            }
+            if LiveUpdateComposition.handles(command) {
+                return try await LiveUpdateComposition.session(
+                    for: command,
+                    context: context,
+                    services: updateServices
+                )
             }
             if LiveMCPComposition.handles(command) {
                 return try await LiveMCPComposition.session(for: command, context: context)
@@ -627,8 +765,24 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             if LiveSessionsComposition.handles(command) {
                 return try await LiveSessionsComposition.session(for: command, context: context)
             }
+            if LiveShareComposition.handles(command) {
+                return try await LiveShareComposition.session(
+                    for: command,
+                    context: context,
+                    liveBoundaries: { sessionID in
+                        exportBoundaries.boundary(for: sessionID)
+                    }
+                )
+            }
             if LiveWorkspaceComposition.handles(command) {
-                return try await LiveWorkspaceComposition.session(for: command, context: context)
+                return try await LiveWorkspaceComposition.session(
+                    for: command,
+                    context: context,
+                    routeDependencies: dependencies.workspaceRoute
+                )
+            }
+            if LiveWorktreeComposition.handles(command) {
+                return try await LiveWorktreeComposition.session(for: command, context: context)
             }
             // Ordering is load-bearing for the three ACP-family routes.
             // `LiveACPComposition.handles` still claims .serve/.leader with the
@@ -657,6 +811,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     services: Self.liveACPServices(dependencies: dependencies)
                 )
             }
+            if LivePluginComposition.handles(command) {
+                return try await LivePluginComposition.session(for: command, context: context)
+            }
             guard case .launch(let options) = command else {
                 throw CLIApplicationError.unsupported(route: command.routeName)
             }
@@ -670,6 +827,47 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 environment: context.environment,
                 required: options.mode != .interactive
             )
+            let workflowSourceCWD = try Self.resolveWorkingDirectory(options.common.cwd)
+            let workflowsEnabled = try loadResolvedWorkflows(
+                cwd: workflowSourceCWD,
+                environment: context.environment
+            ).value
+            if options.common.workflow != nil && !workflowsEnabled {
+                throw CLIApplicationError.failed(
+                    "workflows are disabled by GROK_WORKFLOWS or [workflows].enabled"
+                )
+            }
+            if options.common.leader {
+                let cwd = try Self.resolveWorkingDirectory(options.common.cwd)
+                let openGrokHome = Self.resolveOpenGrokHome(environment: context.environment)
+                let relay = GrokComConfig.default(environment: context.environment)
+                let lease = try await dependencies.makeLeaderClient(
+                    LiveLeaderClientLaunchConfiguration(
+                        workingDirectory: cwd,
+                        openGrokHome: openGrokHome,
+                        relayURL: relay.grokWSURL,
+                        relayOrigin: relay.grokWSOrigin,
+                        socketOverride: options.common.leaderSocket,
+                        environment: context.environment,
+                        clientType: options.mode == .headless ? "grok-p" : "grok-tui",
+                        mode: options.mode == .headless ? .headless : .stdio,
+                        capabilities: ACPLeaderClientCapabilities(
+                            clientVersion: OpenGrokCLIVersion.installed(environment: context.environment),
+                            terminal: options.mode == .interactive,
+                            fsRead: true,
+                            fsWrite: true
+                        )
+                    )
+                )
+                return try await Self.makeLeaderLaunchSession(
+                    options: options,
+                    prompt: prompt,
+                    workingDirectory: cwd,
+                    lease: lease,
+                    context: context,
+                    terminal: dependencies.terminal
+                )
+            }
             let foundation = try await Self.makeSessionFoundation(
                 options: options,
                 context: context,
@@ -684,6 +882,20 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             let providerConfiguration = foundation.providerConfiguration
             let permissionCoordinator = foundation.permissionCoordinator
             let toolExecutor = foundation.toolExecutor
+        let skillCommands = foundation.skillCatalog.map { entry in
+                OpenGrokPagerCommandRegistration(
+                    name: entry.commandName,
+                    summary: entry.skill.shortDescription ?? entry.skill.description,
+                    usage: entry.skill.argumentHint
+                )
+            }
+            let feedbackCommands = foundation.feedback.slashCommandAvailable
+                ? [OpenGrokPagerCommandRegistration(
+                    name: "feedback",
+                    summary: "Send private feedback about this session",
+                    usage: "/feedback <text>"
+                )]
+                : []
             // A `--workflow` launch is a background run, exactly as upstream:
             // it is registered and started here and the session continues
             // unblocked. A non-interactive launch has no session to continue
@@ -691,13 +903,18 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             // process would exit while its agents were still working.
             // One registry per session, shared by the `--workflow` launch and
             // the `/workflows` dashboard, so both see the same runs.
-            let workflowRegistry = LiveWorkflowLaunch.makeRegistry(openGrokHome: openGrokHome)
-            // Runs left active by a previous process are marked interrupted
-            // before this one starts, so the dashboard never shows a run as
-            // progressing with no task behind it.
-            _ = try? await workflowRegistry.restore()
-            if let workflowPath = options.common.workflow {
-                let registry = workflowRegistry
+            let workflowRegistry: RhaiWorkflowRunRegistry?
+            if workflowsEnabled {
+                let registry = LiveWorkflowLaunch.makeRegistry(openGrokHome: openGrokHome)
+                // Runs left active by a previous process are marked interrupted
+                // before this one starts, so the dashboard never shows a run as
+                // progressing with no task behind it.
+                _ = try? await registry.restore()
+                workflowRegistry = registry
+            } else {
+                workflowRegistry = nil
+            }
+            if let workflowPath = options.common.workflow, let registry = workflowRegistry {
                 let record = try await LiveWorkflowLaunch.start(
                     script: try LiveWorkflowComposition.readScript(at: workflowPath),
                     registry: registry,
@@ -707,7 +924,16 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         workspaceRoot: cwd,
                         sessionID: sessionID,
                         openGrokHome: openGrokHome,
-                        systemPrompt: agentProfile?.systemPrompt,
+                        telemetryBootstrapContext: foundation.telemetryBootstrapContext,
+                        systemPrompt: [
+                            agentProfile?.systemPrompt,
+                            LiveSkills.listing(foundation.discoveredSkills)
+                        ]
+                        .compactMap { value in
+                            guard let value, !value.isEmpty else { return nil }
+                            return value
+                        }
+                        .joined(separator: "\n\n"),
                         toolPolicy: agentProfile?.toolPolicy,
                         fileAccessPolicy: Self.resolveFileAccessPolicy(
                             environment: context.environment,
@@ -735,13 +961,22 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 context: context,
                 dependencies: dependencies
             )
+            let sharedExportBoundary = await stack.conversationHistory.sharedExportBoundary
+            exportBoundaries.register(
+                sessionID: sessionID,
+                boundary: sharedExportBoundary
+            )
             let codeMode = stack.codeMode
             let modelSwitch = stack.modelSwitch
             let shell = stack.shell
             let runtime = LivePagerRuntimeAdapter(
                 shell: shell,
                 cwd: cwd,
-                providerConfiguration: providerConfiguration
+                providerConfiguration: providerConfiguration,
+                conversationHistory: stack.conversationHistory,
+                conversationStore: foundation.conversationStore,
+                toolExecutor: foundation.toolExecutor,
+                compaction: stack.compaction
             )
             if options.mode == .interactive {
                 let pagerMode = try Self.resolveInteractivePagerMode(
@@ -761,10 +996,18 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         // The picker lists the whole embedded catalog, not just
                         // the model this session started on — otherwise `/model`
                         // offers exactly one row, the current one.
-                        modelCatalog: LiveModelCatalogResolver.catalog(),
+                        modelCatalog: stack.catalogStore.pickerEntries(),
+                        catalogStore: stack.catalogStore,
                         modelSwitch: modelSwitch,
+                        providerBoundarySync: { everUsedNonXAI in
+                            try await shell.synchronizeProviderBoundary(
+                                sessionID: SessionID(sessionID),
+                                everUsedNonXAI: everUsedNonXAI
+                            )
+                        },
                         permissionCoordinator: permissionCoordinator,
                         workflowRegistry: workflowRegistry,
+                        workflowsEnabled: workflowsEnabled,
                         terminalProgram: context.environment["TERM_PROGRAM"],
                         compaction: stack.compaction,
                         sessionID: sessionID,
@@ -780,13 +1023,41 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         input: interactiveInput.events,
                         runtime: runtime,
                         renderer: renderer,
-                        output: SilentLiveInteractiveOutput()
+                        output: SilentLiveInteractiveOutput(),
+                        customCommands: skillCommands,
+                        customCommandHandler: { invocation in
+                            LiveSkills.invocationPrompt(
+                                commandName: invocation.name,
+                                args: invocation.arguments.joined(separator: " "),
+                                catalog: foundation.skillCatalog,
+                                sessionID: sessionID
+                            )
+                        },
+                        localCommands: feedbackCommands,
+                        localCommandHandler: { invocation in
+                            guard invocation.name == "feedback" else { return nil }
+                            let text = invocation.arguments.joined(separator: " ")
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !text.isEmpty else {
+                                return "usage: /feedback <text>"
+                            }
+                            let outcome = try await foundation.feedback.submitText(text)
+                            switch outcome {
+                            case .persistedLocally:
+                                return "feedback saved locally; this session is not eligible for upload"
+                            case .persistedAndUploaded:
+                                return "feedback uploaded"
+                            case .persistedButUploadFailed:
+                                return "feedback saved locally; upload failed"
+                            }
+                        },
+                        workflowsEnabled: workflowsEnabled
                     )
                     // Typing `/model ` drops the dropdown into the catalog, as
                     // upstream's `ModelCommand::suggest_args` does. Rows insert
                     // the provider-qualified selector, so accepting one
                     // produces a command the resolver cannot find ambiguous.
-                    let completionCatalog = LiveModelCatalogResolver.catalog()
+                    let completionCatalog = stack.catalogStore.pickerEntries()
                     let activeModelID = providerConfiguration.initialModelID
                     await controller.setArgumentSuggestions { command, query in
                         guard command == "model" else { return [] }
@@ -836,6 +1107,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
                             await codeMode?.shutdown()
                             await toolExecutor.shutdown()
+                            exportBoundaries.remove(sessionID: sessionID)
                         }
                     )
                 }
@@ -874,6 +1146,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
                         await codeMode?.shutdown()
                         await toolExecutor.shutdown()
+                        exportBoundaries.remove(sessionID: sessionID)
                     }
                 )
             } else {
@@ -903,10 +1176,91 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
                         await codeMode?.shutdown()
                         await toolExecutor.shutdown()
+                        exportBoundaries.remove(sessionID: sessionID)
                     }
                 )
             }
         }
+    }
+
+    private static func makeLeaderLaunchSession(
+        options: CLIExecutionOptions,
+        prompt: String,
+        workingDirectory: URL,
+        lease: LiveLeaderClientLease,
+        context: CLIApplicationContext,
+        terminal: OpenGrokLiveTerminal
+    ) async throws -> CLIApplicationSession {
+        let runtime = LiveLeaderPagerRuntimeAdapter(
+            client: lease.client,
+            workingDirectory: workingDirectory
+        )
+
+        if options.mode == .interactive {
+            guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                await lease.close()
+                throw CLIApplicationError.failed(
+                    "interactive leader mode requires a prompt when no local input controller is attached"
+                )
+            }
+            let pagerMode = try Self.resolveInteractivePagerMode(
+                options: options,
+                terminal: terminal
+            )
+            let pager = OpenGrokPager(
+                runtime: runtime,
+                frontendFactory: LiveInteractiveFrontendFactory(
+                    terminal: terminal,
+                    prompt: prompt
+                )
+            )
+            let request = OpenGrokPagerRequest(
+                prompt: prompt,
+                mode: pagerMode,
+                metadata: ["mode": options.mode.rawValue]
+            )
+            let task = Task { try await pager.run(request) }
+            return CLIApplicationSession(
+                waitForExit: {
+                    _ = try await withTaskCancellationHandler {
+                        try await task.value
+                    } onCancel: {
+                        task.cancel()
+                    }
+                },
+                shutdown: {
+                    task.cancel()
+                    await pager.shutdown()
+                    await lease.close()
+                }
+            )
+        }
+
+        let pager = OpenGrokPagerMinimal(
+            runtime: runtime,
+            renderer: PlainLivePagerRenderer(),
+            output: LivePagerOutput(streams: context.streams, format: options.outputFormat)
+        )
+        let task = Task {
+            try await pager.run(OpenGrokPagerMinimalRequest(
+                prompt: prompt,
+                metadata: ["mode": options.mode.rawValue]
+            ))
+        }
+        return CLIApplicationSession(
+            waitForExit: {
+                _ = try await withTaskCancellationHandler {
+                    try await task.value
+                } onCancel: {
+                    task.cancel()
+                }
+            },
+            shutdown: {
+                task.cancel()
+                await pager.shutdown()
+                await lease.close()
+            }
+        )
     }
 
     /// Root flags that the parser now accepts but that nothing downstream
@@ -930,12 +1284,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         if options.agentOptions.agent != nil { return "--agent" }
         if options.agentOptions.agentsJSON != nil { return "--agents" }
         if options.agentOptions.maxTurns != nil { return "--max-turns" }
-        if options.agentOptions.disableWebSearch { return "--disable-web-search" }
         if options.agentOptions.noSubagents { return "--no-subagents" }
         if options.agentOptions.rules != nil { return "--rules" }
         if options.agentOptions.systemPromptOverride != nil { return "--system-prompt-override" }
         if options.jsonSchema != nil { return "--json-schema" }
-        if options.worktree != nil { return "--worktree" }
         if options.restoreCode { return "--restore-code" }
         if options.advanced.reauthenticate { return "--reauth" }
         // Silently keeping the default host when the caller named another one
@@ -952,9 +1304,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         }
         if options.common.mcpConfig != nil {
             throw CLIApplicationError.unsupported(route: "MCP config")
-        }
-        if options.common.leader || options.common.noLeader {
-            throw CLIApplicationError.unsupported(route: "interactive composition options")
         }
         // `--restore-code` gets its own message because the generic one is
         // actively misleading now that rewind exists: a user who has seen
@@ -1109,12 +1458,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let sessionID: String
         let conversationRecord: LiveConversationRecord
         let conversationStore: LiveConversationStore
+        let conversationHistory: LiveConversationHistory
+        let securityContext: LiveSecurityContext
+        let sandboxDecision: LiveSandboxDecision
         let samplingConfiguration: OpenGrokLiveSamplingConfiguration
         let sampler: OpenGrokLiveSampler
         let providerConfiguration: ProviderSessionConfiguration
         let processBackend: any ShellProcessBackend
         let permissionCoordinator: PagerPermissionCoordinator
+        let telemetryBootstrapContext: LiveTelemetryBootstrapContext
         let toolExecutor: LiveToolExecutor
+        let discoveredSkills: [SkillInfo]
+        let skillCatalog: [LiveSkills.SkillCommand]
+        let feedback: LiveFeedbackComposition
     }
 
     /// The provider-facing half: tool surface, Code Mode, history, `/model`
@@ -1129,6 +1485,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let toolSurface: LiveCodeModeToolSurface
         let codeMode: LiveCodeModeCoordinator?
         let conversationHistory: LiveConversationHistory
+        let catalogStore: LiveModelCatalogStore
         let modelSwitch: LiveModelSwitchCoordinator
         /// Exposed so the interactive controller can offer `/compact` and a
         /// `/usage` readout without rebuilding the model contract itself. The
@@ -1144,27 +1501,91 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         context: CLIApplicationContext,
         dependencies: OpenGrokLiveCompositionDependencies
     ) async throws -> LiveSessionFoundation {
-        let cwd = try resolveWorkingDirectory(options.common.cwd)
+        let sourceCwd = try resolveWorkingDirectory(options.common.cwd)
+        let openGrokHome = resolveOpenGrokHome(environment: context.environment)
+        let worktreePreparation = try LiveWorktreeLaunch.prepare(
+            options: options,
+            sourceDirectory: sourceCwd,
+            openGrokHome: openGrokHome,
+            isCancelled: context.control.isCancelled
+        )
+        let cwd = worktreePreparation?.effectiveDirectory ?? sourceCwd
         let agentProfile = try resolveAgentProfile(
             named: options.common.profile,
             workingDirectory: cwd,
             environment: context.environment
         )
-        let openGrokHome = resolveOpenGrokHome(environment: context.environment)
+        let discoveredSkills: [SkillInfo]
+        if agentProfile?.discoverSkills ?? true {
+            discoveredSkills = LiveSkills.discover(cwd: cwd, environment: context.environment)
+        } else {
+            discoveredSkills = []
+        }
+        let skillCatalog = LiveSkills.commandCatalog(
+            skills: discoveredSkills,
+            reservedNames: OpenGrokPagerInteractiveController.builtinCommandNames
+                .union(["feedback"])
+        )
         let conversationStore = LiveConversationStore(openGrokHome: openGrokHome)
-        let conversationRecord = try await resolveConversationRecord(
+        var conversationRecord = try await resolveConversationRecord(
             options: options,
+            lookupWorkingDirectory: sourceCwd,
             workingDirectory: cwd,
             store: conversationStore
         )
         let sessionID = conversationRecord.sessionID
+        try LiveWorktreeLaunch.attachSession(worktreePreparation, sessionID: sessionID)
+        let permissionCoordinator = PagerPermissionCoordinator()
+        let fileAccessPolicy = resolveFileAccessPolicy(
+            environment: context.environment,
+            coordinator: permissionCoordinator
+        )
+        let securityContext = LiveSecurityContext.resolve(
+            workspaceRoot: cwd.standardizedFileURL,
+            environment: context.environment,
+            isInteractive: fileAccessPolicy.isInteractive,
+            cli: options.common.permissions
+        )
+        // Bootstrap owns the first irreversible process-wide operation. It
+        // happens after the persisted record and effective cwd are known, but
+        // before sampler, process backend, hooks, MCP transports, or tools are
+        // constructed. Linux may replace this process with bubblewrap here.
+        let sandboxDecision = try securityContext.applySandbox(
+            workspaceRoot: cwd.standardizedFileURL,
+            cliProfile: options.common.permissions.sandboxProfile,
+            persistedProfile: conversationRecord.sandboxProfile,
+            environment: context.environment
+        )
+        conversationRecord.sandboxProfile = sandboxDecision.profileName
         let (samplingConfiguration, credential) = try await resolveSamplingConfiguration(
             options: options,
             profileModel: agentProfile?.model,
+            conversationRecord: conversationRecord,
             environment: context.environment,
             workingDirectory: cwd,
             openGrokHome: openGrokHome,
             sessionID: sessionID
+        )
+        let telemetryBootstrapContext = LiveTelemetryBootstrapContext(
+            zeroDataRetention: credential.telemetryContext.zeroDataRetention,
+            userID: credential.telemetryContext.userID,
+            teamID: credential.telemetryContext.teamID
+        )
+        let launchHistory = LiveConversationHistory(
+            record: conversationRecord,
+            store: conversationStore
+        )
+        try await launchHistory.reconcileRoute(
+            modelID: samplingConfiguration.model,
+            provider: samplingConfiguration.provider
+        )
+        conversationRecord = await launchHistory.snapshot()
+        let feedback = try await LiveFeedbackComposition.production(
+            sessionID: sessionID,
+            openGrokHome: openGrokHome,
+            environment: context.environment,
+            boundary: await launchHistory.sharedExportBoundary,
+            transport: dependencies.makeImageTransport()
         )
         let sampler = try dependencies.makeSampler(samplingConfiguration)
         let providerConfiguration = makeProviderConfiguration(
@@ -1172,7 +1593,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             sampling: samplingConfiguration,
             credential: credential,
             openGrokHome: openGrokHome,
-            environment: context.environment
+            environment: context.environment,
+            everUsedNonXAI: conversationRecord.everUsedNonXAI
         )
         let processBackend = dependencies.makeProcessBackend()
         // The coordinator is created unconditionally and gates on whether a
@@ -1180,24 +1602,22 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // fail-closed denial without a second construction path. An ACP
         // session never attaches a presenter, so it inherits that same
         // fail-closed behavior for free.
-        let permissionCoordinator = PagerPermissionCoordinator()
         let sessionServices = await makeSessionServices(
             sessionID: sessionID,
             workingDirectory: cwd,
             openGrokHome: openGrokHome,
             conversationRecord: conversationRecord,
             environment: context.environment,
-            experimentalMemory: options.agentOptions.experimentalMemory
+            experimentalMemory: options.agentOptions.experimentalMemory,
+            noMemory: options.agentOptions.noMemory
         )
         let toolExecutor = try await LiveToolExecutor(
             processBackend: processBackend,
             sessionID: sessionID,
             workingDirectory: cwd,
             toolPolicy: agentProfile?.toolPolicy,
-            fileAccessPolicy: resolveFileAccessPolicy(
-                environment: context.environment,
-                coordinator: permissionCoordinator
-            ),
+            telemetryBootstrapContext: telemetryBootstrapContext,
+            fileAccessPolicy: fileAccessPolicy,
             environment: context.environment,
             imageToolContext: LiveImageToolContext(
                 availability: LiveImageToolComposition.resolveAvailability(
@@ -1224,9 +1644,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 // test seam. Nothing about it is image-specific.
                 transport: dependencies.makeImageTransport()
             ),
+            sandboxDecision: sandboxDecision,
+            securityContext: securityContext,
             sessionServices: sessionServices,
             permissionOptions: options.common.permissions
         )
+        conversationRecord.sandboxProfile = sandboxDecision.profileName
+        try await conversationStore.save(conversationRecord)
         return LiveSessionFoundation(
             options: options,
             cwd: cwd,
@@ -1235,12 +1659,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             sessionID: sessionID,
             conversationRecord: conversationRecord,
             conversationStore: conversationStore,
+            conversationHistory: launchHistory,
+            securityContext: securityContext,
+            sandboxDecision: sandboxDecision,
             samplingConfiguration: samplingConfiguration,
             sampler: sampler,
             providerConfiguration: providerConfiguration,
             processBackend: processBackend,
             permissionCoordinator: permissionCoordinator,
-            toolExecutor: toolExecutor
+            telemetryBootstrapContext: telemetryBootstrapContext,
+            toolExecutor: toolExecutor,
+            discoveredSkills: discoveredSkills,
+            skillCatalog: skillCatalog,
+            feedback: feedback
         )
     }
 
@@ -1255,7 +1686,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let toolMode = LiveCodeModeSettings.resolveToolMode(
             environment: context.environment,
             workingDirectory: foundation.cwd,
-            openGrokHome: foundation.openGrokHome
+            openGrokHome: foundation.openGrokHome,
+            runtimeCapability: dependencies.makeCodeModeCapability()
         )
         let toolSurface = LiveCodeModeToolSurface(
             mode: toolMode,
@@ -1269,10 +1701,20 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 workingDirectory: foundation.cwd
             )
             : nil
-        let conversationHistory = LiveConversationHistory(
-            record: foundation.conversationRecord,
-            store: foundation.conversationStore
+        let conversationHistory = foundation.conversationHistory
+        let catalogStore = LiveModelCatalogStore(
+            input: liveCatalogResolutionInput(
+                workingDirectory: foundation.cwd,
+                environment: context.environment
+            )
         )
+        let configuredProviderDefinitions = parseConfiguredModelCatalog(
+            from: ((try? loadAuthorityComposition(
+                cwd: foundation.cwd,
+                environment: context.environment
+            ).effective()) ?? .table(TOMLTable())),
+            environment: context.environment
+        ).authProviders
         // `/model` rebuilds the provider stack through this coordinator; the
         // shell, session and tool runtime below are provider-independent and
         // survive a switch untouched.
@@ -1283,7 +1725,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 environment: context.environment,
                 openGrokHome: foundation.openGrokHome,
                 sessionID: foundation.sessionID,
-                workingDirectory: foundation.cwd
+                workingDirectory: foundation.cwd,
+                catalogSource: { catalogStore.snapshot() },
+                authProviderDefinitions: { configuredProviderDefinitions }
             ),
             makeSampler: dependencies.makeSampler,
             history: conversationHistory
@@ -1303,6 +1747,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 toolExecutor: foundation.toolExecutor,
                 conversationHistory: conversationHistory,
                 systemPrompt: foundation.agentProfile?.systemPrompt,
+                skillsListing: LiveSkills.listing(foundation.discoveredSkills),
                 toolSurface: toolSurface,
                 codeMode: codeMode,
                 compaction: compaction
@@ -1318,6 +1763,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             toolSurface: toolSurface,
             codeMode: codeMode,
             conversationHistory: conversationHistory,
+            catalogStore: catalogStore,
             modelSwitch: modelSwitch,
             compaction: compaction,
             turnDriver: turnDriver,
@@ -1334,7 +1780,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     static func liveACPServices(
         dependencies: OpenGrokLiveCompositionDependencies
     ) -> LiveACPServices {
-        LiveACPServices { launch in
+        LiveACPServices(makeComponents: { launch in
             let context = CLIApplicationContext(
                 environment: launch.environment,
                 streams: launch.streams,
@@ -1357,21 +1803,31 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     providerConfiguration: foundation.providerConfiguration
                 )
             )
-            return LiveACPPromptDriver(
+            let promptDriver = LiveACPPromptDriver(
                 driver: ProviderBackedACPPromptDriver(
                     providerSession: providerSession,
                     turnDriver: stack.turnDriver
                 ),
+                availableCommands: LiveSkills.availableCommands(
+                    builtins: OpenGrokPagerInteractiveController.builtinCommandCatalog,
+                    skills: foundation.skillCatalog
+                ),
+                skillCatalog: foundation.skillCatalog,
                 shutdown: {
                     await stack.codeMode?.shutdown()
                     await foundation.toolExecutor.shutdown()
                 }
             )
-        }
+            return LiveACPLaunchComponents(
+                promptDriver: promptDriver,
+                extensionHandler: LiveFeedbackACPHandler(composition: foundation.feedback)
+            )
+        })
     }
 
     private static func resolveConversationRecord(
         options: CLIExecutionOptions,
+        lookupWorkingDirectory: URL,
         workingDirectory: URL,
         store: LiveConversationStore
     ) async throws -> LiveConversationRecord {
@@ -1389,7 +1845,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             sourceRecord = try await store.load(sessionID: requestedResumeID)
         } else if options.resume != nil || options.loadSession != nil
                     || options.continueSession || options.forkSession {
-            sourceRecord = try await store.latest(workingDirectory: workingDirectory)
+            sourceRecord = try await store.latest(workingDirectory: lookupWorkingDirectory)
         } else {
             sourceRecord = nil
         }
@@ -1399,20 +1855,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 throw CLIApplicationError.failed("no session is available to fork")
             }
             let destinationID = options.sessionID ?? UUID().uuidString
-            try LiveConversationStore.validateSessionID(destinationID)
-            guard destinationID != sourceRecord.sessionID else {
-                throw CLIApplicationError.failed("forked session ID must differ from the source session")
-            }
-            if try await store.loadIfPresent(sessionID: destinationID) != nil {
-                throw CLIApplicationError.failed("session already exists: \(destinationID)")
-            }
-            return LiveConversationRecord(
-                sessionID: destinationID,
-                workingDirectory: workingDirectory.standardizedFileURL.path,
-                parentSessionID: sourceRecord.sessionID,
-                createdAt: Date(),
-                updatedAt: Date(),
-                items: sourceRecord.items
+            return try await store.fork(
+                sourceSessionID: sourceRecord.sessionID,
+                destinationSessionID: destinationID,
+                workingDirectory: workingDirectory
             )
         }
 
@@ -1448,6 +1894,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     private static func resolveSamplingConfiguration(
         options: CLIExecutionOptions,
         profileModel: String?,
+        conversationRecord: LiveConversationRecord,
         environment: [String: String],
         workingDirectory: URL,
         openGrokHome: URL,
@@ -1455,19 +1902,62 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     ) async throws -> (OpenGrokLiveSamplingConfiguration, LiveResolvedCredential) {
         let requestedProvider = try options.common.provider.map(resolveProvider)
         let embedded = embeddedDefaultModels()
-        let requestedModel = options.common.model ?? profileModel
-        let knownModel = requestedModel.flatMap { requested in
-            embedded.models.first { model in
+        let explicitModel = options.common.model ?? profileModel
+        let restoresStoredRoute = explicitModel == nil && requestedProvider == nil
+        if restoresStoredRoute,
+           conversationRecord.currentModelID != nil,
+           conversationRecord.currentProvider == nil {
+            throw CLIApplicationError.failed(
+                "session \(conversationRecord.sessionID) has a stored model without a stored provider; refusing to guess a provider"
+            )
+        }
+        if restoresStoredRoute,
+           conversationRecord.currentModelID == nil,
+           conversationRecord.currentProvider != nil {
+            throw CLIApplicationError.failed(
+                "session \(conversationRecord.sessionID) has a stored provider without a stored model; refusing to guess a model"
+            )
+        }
+        let requestedModel = explicitModel ?? (restoresStoredRoute ? conversationRecord.currentModelID : nil)
+        let restoredProvider = restoresStoredRoute ? conversationRecord.currentProvider : nil
+        let configuredCatalog = liveConfiguredModelCatalog(
+            workingDirectory: workingDirectory,
+            environment: environment
+        )
+        let configuredCatalogMap = resolveModelCatalog(input: liveCatalogResolutionInput(
+            workingDirectory: workingDirectory,
+            environment: environment
+        ))
+        let routeProvider = requestedProvider ?? restoredProvider
+        let configuredEntry = requestedModel.flatMap { requested in
+            if let routeProvider {
+                return configuredCatalogMap.pairs().first { pair in
+                    let entry = pair.1
+                    return entry.info.provider == routeProvider
+                        && (pair.0 == requested || entry.model == requested)
+                }?.1
+            }
+            return findModelByID(configuredCatalogMap, modelID: requested)
+        }
+        let embeddedModel = requestedModel.flatMap { requested in
+            let matches = embedded.models.filter { model in
                 (model.id ?? model.model) == requested || model.model == requested
             }
+            if let routeProvider {
+                return matches.first { $0.provider == routeProvider }
+            }
+            return matches.first
         }
-        if let requestedProvider, let knownModel, knownModel.provider != requestedProvider {
+        let knownModel = configuredEntry.map(DefaultModelJSON.fromCatalogEntry) ?? embeddedModel
+        if let effectiveProvider = routeProvider,
+           let knownModel,
+           knownModel.provider != effectiveProvider {
             throw CLIApplicationError.failed(
-                "model '\(requestedModel ?? knownModel.model)' belongs to provider \(knownModel.provider.asString), not \(requestedProvider.asString)"
+                "model '\(requestedModel ?? knownModel.model)' belongs to provider \(knownModel.provider.asString), not \(effectiveProvider.asString)"
             )
         }
 
-        let provider = requestedProvider ?? knownModel?.provider ?? .xai
+        let provider = routeProvider ?? knownModel?.provider ?? .xai
         let selectedModel = try knownModel ?? defaultModelProfile(
             provider: provider,
             embedded: embedded,
@@ -1485,18 +1975,24 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 "provider \(provider.asString) does not support \(apiBackend.rawValue)"
             )
         }
-        let baseURL = resolveProviderBaseURL(
-            provider: provider,
-            model: selectedProfile,
-            environment: environment,
-            configuredXaiBaseURL: provider == .xai
-                ? configuredXaiAPIBaseURL(
-                    workingDirectory: workingDirectory,
-                    openGrokHome: openGrokHome,
-                    environment: environment
-                )
-                : nil
-        )
+        let baseURL: String
+        if let configuredEntry {
+            baseURL = configuredEntry.apiBaseURL
+                ?? configuredEntry.info.baseURL
+        } else {
+            baseURL = resolveProviderBaseURL(
+                provider: provider,
+                model: selectedProfile,
+                environment: environment,
+                configuredXaiBaseURL: provider == .xai
+                    ? configuredXaiAPIBaseURL(
+                        workingDirectory: workingDirectory,
+                        openGrokHome: openGrokHome,
+                        environment: environment
+                    )
+                    : nil
+            )
+        }
         if provider == .kimi,
            let modelBaseURL = selectedProfile?.baseURL,
            let modelEndpoint = KimiModels.endpoint(forBaseURL: modelBaseURL),
@@ -1508,12 +2004,38 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         }
         // Explicit model/provider environment keys still resolve exactly as
         // before; they are the resolver's highest-precedence input.
-        let explicitAPIKey = try resolveProviderAPIKey(
-            provider: provider,
-            model: selectedProfile,
-            baseURL: baseURL,
-            environment: environment
-        )
+        let namedAuthResolver: NamedAuthProviderResolver?
+        if let authProvider = configuredEntry?.authProvider {
+            guard let definition = configuredCatalog.authProviders.first(where: { $0.0 == authProvider })?.1 else {
+                throw CLIApplicationError.failed("named auth provider '\(authProvider)' is unavailable")
+            }
+            namedAuthResolver = NamedAuthProviderResolver(configuration: definition)
+        } else {
+            namedAuthResolver = nil
+        }
+        let explicitAPIKey: String?
+        if let configuredEntry, namedAuthResolver == nil {
+            if let configuredCredential = configuredEntry.ownCredential(environment: environment)
+                ?? configuredEntry.envKey?.resolveValue(environment: environment) {
+                explicitAPIKey = configuredCredential
+            } else {
+                explicitAPIKey = try resolveProviderAPIKey(
+                    provider: provider,
+                    model: selectedProfile,
+                    baseURL: baseURL,
+                    environment: environment
+                )
+            }
+        } else if namedAuthResolver != nil {
+            explicitAPIKey = nil
+        } else {
+            explicitAPIKey = try resolveProviderAPIKey(
+                provider: provider,
+                model: selectedProfile,
+                baseURL: baseURL,
+                environment: environment
+            )
+        }
         let resolver = LiveCredentialResolver(
             environment: environment,
             openGrokHome: openGrokHome,
@@ -1523,24 +2045,79 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             )
         )
         let credential: LiveResolvedCredential
-        do {
-            credential = try await resolver.resolve(
+        if let namedAuthResolver {
+            guard let token = namedAuthResolver.currentToken(), !token.isEmpty else {
+                throw CLIApplicationError.failed("named auth provider did not return a usable credential")
+            }
+            credential = LiveResolvedCredential(
                 provider: provider,
-                explicitAPIKey: explicitAPIKey,
-                scope: "cli:\(sessionID)"
+                scope: "cli:\(sessionID)",
+                source: .namedAuthProvider,
+                authKind: .apiKeyOnly,
+                bearer: token,
+                binding: .apiKey(scope: "cli:\(sessionID)", key: token)
             )
-        } catch let error as LiveCredentialError {
-            throw CLIApplicationError.failed(error.description)
+        } else {
+            do {
+                credential = try await resolver.resolve(
+                    provider: provider,
+                    explicitAPIKey: explicitAPIKey,
+                    scope: "cli:\(sessionID)"
+                )
+            } catch let error as LiveCredentialError {
+                throw CLIApplicationError.failed(error.description)
+            }
         }
+        let headers = mergeCredentialHeaders(
+            provider: provider,
+            credentialHeaders: credential.extraHeaders,
+            configuredHeaders: configuredEntry?.info.extraHeaders ?? []
+        )
         let sampling = OpenGrokLiveSamplingConfiguration(
             model: model,
             baseURL: baseURL,
             apiKey: credential.bearer,
             provider: provider,
             apiBackend: apiBackend,
-            extraHeaders: credential.extraHeaders
+            extraHeaders: headers,
+            queryParams: configuredEntry?.queryParams ?? [:],
+            bearerResolver: namedAuthResolver.map(NamedAuthBearerResolver.init),
+            credentialProvider: credential.binding.authCredentialProvider
         )
         return (sampling, credential)
+    }
+
+    /// Credential-owned headers must never be replaced by model metadata.
+    /// This is especially important for Codex account pinning: a configured
+    /// model may carry stale `ChatGPT-Account-ID` or authorization fields, but
+    /// the selected provider's credential snapshot is the sole authority.
+    static func mergeCredentialHeaders(
+        provider: ModelProvider,
+        credentialHeaders: [String: String],
+        configuredHeaders: [(String, String)]
+    ) -> [String: String] {
+        let reserved = Set([
+            "authorization",
+            "x-api-key",
+            "chatgpt-account-id",
+            "x-openai-fedramp",
+            codexAuthAnchorHeader,
+            codexAccountAnchorHeader,
+            codexUserAnchorHeader,
+            codexWorkspaceAnchorHeader,
+        ].map { $0.lowercased() })
+        var merged = credentialHeaders
+        for (name, value) in configuredHeaders {
+            guard !reserved.contains(name.lowercased()) else { continue }
+            merged[name] = value
+        }
+        if provider != .codex {
+            for name in codexReservedAuthHeaders {
+                merged.removeValue(forKey: name)
+                merged = merged.filter { $0.key.lowercased() != name.lowercased() }
+            }
+        }
+        return merged
     }
 
     private static func resolveAgentProfile(
@@ -1568,7 +2145,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         return LiveAgentProfile(
             model: definition.model.modelID,
             systemPrompt: composedPrompt.isEmpty ? nil : composedPrompt,
-            toolPolicy: LiveAgentToolPolicy(definition: definition)
+            toolPolicy: LiveAgentToolPolicy(definition: definition),
+            discoverSkills: definition.discoverSkills
         )
     }
 
@@ -1817,7 +2395,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         sampling: OpenGrokLiveSamplingConfiguration,
         credential: LiveResolvedCredential,
         openGrokHome: URL,
-        environment: [String: String]
+        environment: [String: String],
+        everUsedNonXAI: Bool?
     ) -> ProviderSessionConfiguration {
         let entry = ModelEntry(
             info: ModelInfo(
@@ -1835,7 +2414,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             initialModelID: sampling.model,
             credentialBindings: [sampling.provider: credential.binding],
             openGrokHome: openGrokHome,
-            environment: environment
+            environment: environment,
+            everUsedNonXAI: everUsedNonXAI
         )
     }
 }
@@ -2138,9 +2718,21 @@ struct LiveSecurityContext: Sendable {
         workspaceRoot: URL,
         cliProfile: String?,
         persistedProfile: String?,
-        environment: [String: String]
+        environment: [String: String],
+        runtime: (any LiveSandboxRuntime)? = nil
     ) throws -> LiveSandboxDecision {
-        try LiveSandboxComposition.bootstrap(
+        if let runtime {
+            return try LiveSandboxComposition.bootstrap(
+                workspaceRoot: workspaceRoot,
+                document: document,
+                requirements: requirements,
+                cliProfile: cliProfile,
+                persistedProfile: persistedProfile,
+                environment: environment,
+                runtime: runtime
+            )
+        }
+        return try LiveSandboxComposition.bootstrap(
             workspaceRoot: workspaceRoot,
             document: document,
             requirements: requirements,
@@ -2172,6 +2764,7 @@ struct LiveToolExecutor: Sendable {
     /// dispatch straight to `composition.invoke`, so shell execution never saw
     /// a deny rule, a PreToolUse hook, or the permission modal.
     private let permissionPipeline: PermissionPipeline?
+    private let hookPermissionGate: HookPermissionGate?
     /// The OS sandbox this session runs under. `profileName` is what a session
     /// writer persists so a resume is pinned to the same profile.
     let sandbox: LiveSandboxDecision
@@ -2184,12 +2777,14 @@ struct LiveToolExecutor: Sendable {
     /// that predates them keeps compiling and simply advertises none of their
     /// tools; see `LiveSessionServices.swift`.
     let sessionServices: LiveSessionServices?
+    let telemetryStatus: LiveTelemetryStatus
 
     init(
         processBackend: any ShellProcessBackend,
         sessionID: String,
         workingDirectory: URL,
         toolPolicy: LiveAgentToolPolicy?,
+        telemetryBootstrapContext: LiveTelemetryBootstrapContext,
         fileAccessPolicy: FileToolAccessPolicy = .denyByDefault,
         // Hooks and MCP servers are discovered from config and environment, and
         // both of them *spawn processes*. Taking the environment as an argument
@@ -2206,6 +2801,11 @@ struct LiveToolExecutor: Sendable {
         // `--disable-web-search` switch. Defaulted so construction sites that
         // predate the web tools keep compiling and simply advertise nothing.
         webToolContext: LiveWebToolContext? = nil,
+        // Foundation and workflow children pass the auth-derived policy from
+        // the parent session; standalone fixtures must choose an explicit
+        // context rather than silently defaulting to telemetry-enabled.
+        sandboxDecision: LiveSandboxDecision? = nil,
+        securityContext: LiveSecurityContext? = nil,
         // The `sandbox_profile` a resumed session was created under. A resume
         // that would weaken it is refused rather than silently downgraded.
         persistedSandboxProfile: String? = nil,
@@ -2215,7 +2815,8 @@ struct LiveToolExecutor: Sendable {
         // `common.permissions` from the root parser. Defaulted so the many
         // construction sites that predate the flags keep compiling; a session
         // that passes nothing simply has no CLI permission tier.
-        permissionOptions: CLIPermissionOptions = CLIPermissionOptions()
+        permissionOptions: CLIPermissionOptions = CLIPermissionOptions(),
+        sandboxAutoAllowBash: (@Sendable () -> Bool)? = nil
     ) async throws {
         let composition = OpenGrokShellToolRuntimeComposition(
             processBackend: processBackend,
@@ -2233,7 +2834,7 @@ struct LiveToolExecutor: Sendable {
         )
         // Config precedence, folder trust and the permission policy, resolved
         // once and shared by the file tools, `run_terminal_cmd` and MCP.
-        let security = LiveSecurityContext.resolve(
+        let security = securityContext ?? LiveSecurityContext.resolve(
             workspaceRoot: standardizedWorkingDirectory,
             environment: environment,
             isInteractive: fileAccessPolicy.isInteractive,
@@ -2244,23 +2845,37 @@ struct LiveToolExecutor: Sendable {
         // upstream has no project layer for telemetry. Passing it would let a
         // repo's checked-in `.opengrok/config.toml` enable telemetry for
         // everyone who clones it. Pinned by `projectConfigCannotEnableTelemetry`.
-        _ = LiveTelemetry.bootstrapFromDisk(environment: environment)
+        self.telemetryStatus = LiveTelemetry.bootstrapFromDisk(
+            environment: environment,
+            zeroDataRetention: telemetryBootstrapContext.zeroDataRetention,
+            userID: telemetryBootstrapContext.userID,
+            teamID: telemetryBootstrapContext.teamID
+        )
         // Applied before any tool can run. A configured-but-unenforceable
         // profile throws out of `init`, so the session refuses to start rather
         // than running unsandboxed after the user asked for one.
-        self.sandbox = try security.applySandbox(
-            workspaceRoot: standardizedWorkingDirectory,
-            cliProfile: permissionOptions.sandboxProfile,
-            persistedProfile: persistedSandboxProfile,
-            environment: environment
-        )
+        if let sandboxDecision {
+            self.sandbox = sandboxDecision
+        } else {
+            self.sandbox = try security.applySandbox(
+                workspaceRoot: standardizedWorkingDirectory,
+                cliProfile: permissionOptions.sandboxProfile,
+                persistedProfile: persistedSandboxProfile,
+                environment: environment
+            )
+        }
+        let sandboxIsEnforced = self.sandbox.enforced
+        let sandboxPredicate: @Sendable () -> Bool = sandboxAutoAllowBash ?? {
+            sandboxIsEnforced && shouldAutoAllowBash()
+        }
         let fileToolResources = FileToolSession.makeResources(
             workspaceRoot: standardizedWorkingDirectory.path,
             sessionId: sessionID,
             agentId: "main",
             policy: fileAccessPolicy,
             hooks: hooks.gate.map { $0 as any PreToolUseHookRunner } ?? FailOpenPreToolUseHookRunner(),
-            resolved: security.permissions
+            resolved: security.permissions,
+            sandboxAutoAllowBash: sandboxPredicate
         )
         // The build pack plus, when the session's credentials allow it, the
         // image tools. Both go through one `finalize`, so image tools inherit
@@ -2390,6 +3005,7 @@ struct LiveToolExecutor: Sendable {
         }
         self.backgroundTaskToolNames = Set(backgroundTaskTools.map(\.name))
         self.permissionPipeline = fileToolResources.permissionPipeline
+        self.hookPermissionGate = hooks.gate
         self.composition = composition
         self.fileToolBridge = fileToolBridge
         self.mcpConnections = mcpConnections
@@ -2441,6 +3057,19 @@ struct LiveToolExecutor: Sendable {
                 ])
             )
         }
+    }
+
+    func runStop(
+        event: HookEvent = .stop,
+        promptID: String?,
+        payload: [String: HookJSONValue]
+    ) async -> StopDispatchResult {
+        guard let hookPermissionGate else { return StopDispatchResult() }
+        return await hookPermissionGate.runStop(
+            event: event,
+            promptId: promptID,
+            payload: payload
+        )
     }
 
     /// Listing gate: a read-only agent profile never sees a mutating tool.
@@ -2660,6 +3289,13 @@ struct LiveToolExecutor: Sendable {
     func shutdown() async {
         await mcpConnections.shutdown()
         await composition.shutdown()
+    }
+
+    func registerSession(sessionID: String, workingDirectory: URL) async throws {
+        try await composition.registerSession(
+            sessionID: sessionID,
+            workingDirectory: workingDirectory
+        )
     }
 
     private static let runTerminalTool = ToolSpec(
@@ -2884,8 +3520,53 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
     var createdAt: Date
     var updatedAt: Date
     var items: [ConversationItem]
+    var sandboxProfile: String?
+    var currentModelID: String?
+    var currentProvider: ModelProvider?
+    var everUsedNonXAI: Bool?
 
-    static func new(sessionID: String, workingDirectory: URL) -> LiveConversationRecord {
+    init(
+        sessionID: String,
+        workingDirectory: String,
+        parentSessionID: String?,
+        createdAt: Date,
+        updatedAt: Date,
+        items: [ConversationItem],
+        sandboxProfile: String? = nil,
+        currentModelID: String? = nil,
+        currentProvider: ModelProvider? = nil,
+        everUsedNonXAI: Bool? = nil
+    ) {
+        self.sessionID = sessionID
+        self.workingDirectory = workingDirectory
+        self.parentSessionID = parentSessionID
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.items = items
+        self.sandboxProfile = sandboxProfile
+        self.currentModelID = currentModelID
+        self.currentProvider = currentProvider
+        self.everUsedNonXAI = everUsedNonXAI
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID
+        case workingDirectory
+        case parentSessionID
+        case createdAt
+        case updatedAt
+        case items
+        case sandboxProfile = "sandbox_profile"
+        case currentModelID = "current_model_id"
+        case currentProvider = "current_provider"
+        case everUsedNonXAI = "ever_used_codex"
+    }
+
+    static func new(
+        sessionID: String,
+        workingDirectory: URL,
+        sandboxProfile: String? = nil
+    ) -> LiveConversationRecord {
         let now = Date()
         return LiveConversationRecord(
             sessionID: sessionID,
@@ -2893,7 +3574,11 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
             parentSessionID: nil,
             createdAt: now,
             updatedAt: now,
-            items: []
+            items: [],
+            sandboxProfile: sandboxProfile,
+            currentModelID: nil,
+            currentProvider: nil,
+            everUsedNonXAI: false
         )
     }
 }
@@ -2993,6 +3678,87 @@ actor LiveConversationStore {
         }
     }
 
+    /// Copy one session as a coupled transcript/rewind artifact transaction.
+    ///
+    /// The export marker and provider route are copied before the child can be
+    /// launched, and a rewind sidecar is copied byte-for-byte when present so
+    /// the child coordinator resumes the parent's prompt numbering and points.
+    /// A legacy source is refused because its export boundary cannot be safely
+    /// inherited. Any partial child artifacts are removed before the error is
+    /// returned, so a failed fork never leaves a misleading session behind.
+    func fork(
+        sourceSessionID: String,
+        destinationSessionID: String,
+        workingDirectory: URL
+    ) throws -> LiveConversationRecord {
+        try Self.validateSessionID(sourceSessionID)
+        try Self.validateSessionID(destinationSessionID)
+        guard sourceSessionID != destinationSessionID else {
+            throw CLIApplicationError.failed("forked session ID must differ from the source session")
+        }
+        guard let source = try loadIfPresent(sessionID: sourceSessionID) else {
+            throw CLIApplicationError.failed("session not found: \(sourceSessionID)")
+        }
+        guard source.everUsedNonXAI != nil else {
+            throw CLIApplicationError.failed(
+                "cannot fork legacy session \(sourceSessionID): its session record has no "
+                    + "ever_used_codex export-boundary marker. Resume it once with this build "
+                    + "to persist the boundary before forking."
+            )
+        }
+        guard try loadIfPresent(sessionID: destinationSessionID) == nil else {
+            throw CLIApplicationError.failed("session already exists: \(destinationSessionID)")
+        }
+
+        let destinationRecordURL = fileURL(sessionID: destinationSessionID)
+        let sourceRewindURL = LiveRewindStore.rewindFileURL(
+            openGrokHome: sessionsDirectory.deletingLastPathComponent(),
+            sessionID: sourceSessionID
+        )
+        let destinationRewindURL = LiveRewindStore.rewindFileURL(
+            openGrokHome: sessionsDirectory.deletingLastPathComponent(),
+            sessionID: destinationSessionID
+        )
+        guard !fileManager.fileExists(atPath: destinationRewindURL.path) else {
+            throw CLIApplicationError.failed("rewind state already exists: \(destinationSessionID)")
+        }
+
+        let now = Date()
+        let child = LiveConversationRecord(
+            sessionID: destinationSessionID,
+            workingDirectory: workingDirectory.standardizedFileURL.path,
+            parentSessionID: source.sessionID,
+            createdAt: now,
+            updatedAt: now,
+            items: source.items,
+            sandboxProfile: source.sandboxProfile,
+            currentModelID: source.currentModelID,
+            currentProvider: source.currentProvider,
+            everUsedNonXAI: source.everUsedNonXAI
+        )
+
+        do {
+            try fileManager.createDirectory(
+                at: sessionsDirectory,
+                withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            try encoder.encode(child).write(to: destinationRecordURL, options: .atomic)
+            if fileManager.fileExists(atPath: sourceRewindURL.path) {
+                let rewindBytes = try Data(contentsOf: sourceRewindURL)
+                try rewindBytes.write(to: destinationRewindURL, options: .atomic)
+            }
+        } catch {
+            try? fileManager.removeItem(at: destinationRecordURL)
+            try? fileManager.removeItem(at: destinationRewindURL)
+            throw CLIApplicationError.failed(
+                "failed to fork session \(sourceSessionID) as \(destinationSessionID): \(error)"
+            )
+        }
+        return child
+    }
+
     private func fileURL(sessionID: String) -> URL {
         sessionsDirectory.appendingPathComponent(sessionID).appendingPathExtension("json")
     }
@@ -3002,6 +3768,7 @@ struct LiveAgentProfile: Sendable, Equatable {
     let model: String?
     let systemPrompt: String?
     let toolPolicy: LiveAgentToolPolicy
+    let discoverSkills: Bool
 }
 
 struct LiveAgentToolPolicy: Sendable, Equatable {
@@ -3121,13 +3888,37 @@ struct LiveAgentToolPolicy: Sendable, Equatable {
 actor LiveConversationHistory {
     private var record: LiveConversationRecord
     private let store: LiveConversationStore
+    private var exportBoundary: ExportBoundary
 
-    init(record: LiveConversationRecord, store: LiveConversationStore) {
+    init(
+        record: LiveConversationRecord,
+        store: LiveConversationStore,
+        exportBoundary: ExportBoundary? = nil
+    ) {
         self.record = record
         self.store = store
+        self.exportBoundary = exportBoundary ?? ExportBoundary(
+            everUsedNonXAI: record.everUsedNonXAI != false
+        )
     }
 
     var items: [ConversationItem] { record.items }
+
+    var sessionID: String { record.sessionID }
+
+    var sharedExportBoundary: ExportBoundary { exportBoundary }
+
+    func snapshot() -> LiveConversationRecord { record }
+
+    /// Switch the in-memory spine only after the replacement record is
+    /// durably written. The old record remains available through the store.
+    func replace(with record: LiveConversationRecord) throws {
+        try LiveConversationStore.validateSessionID(record.sessionID)
+        self.record = record
+        self.exportBoundary = ExportBoundary(
+            everUsedNonXAI: record.everUsedNonXAI != false
+        )
+    }
 
     /// Rewrite history to its provider-neutral spine ahead of a provider
     /// change, and persist the result. Returns how many items were dropped.
@@ -3139,10 +3930,44 @@ actor LiveConversationHistory {
         let before = record.items
         let sanitized = liveProviderNeutralHistory(before)
         guard sanitized != before else { return 0 }
-        record.items = sanitized
-        record.updatedAt = Date()
-        try await store.save(record)
+        var next = record
+        next.items = sanitized
+        next.updatedAt = Date()
+        try await store.save(next)
+        record = next
         return before.count - sanitized.count
+    }
+
+    /// Persist the route before the next provider can observe replayed history.
+    /// A legacy record with no route metadata is treated as unsafe when it has
+    /// opaque carriers; its unknown export marker remains nil rather than being
+    /// rewritten to a falsely clean value.
+    @discardableResult
+    func reconcileRoute(modelID: String, provider: ModelProvider) async throws -> Int {
+        let before = record
+        let sanitized = liveProviderNeutralHistory(before.items)
+        let hasOpaqueItems = sanitized != before.items
+        let routeChanged = before.currentProvider != provider
+        let legacyRoute = before.currentModelID == nil || before.currentProvider == nil
+        let xAIExportClosed = provider.profile.allowsXaiServices && before.everUsedNonXAI == true
+        let shouldSanitize = hasOpaqueItems && (routeChanged || legacyRoute || xAIExportClosed)
+
+        var next = before
+        if shouldSanitize {
+            next.items = sanitized
+        }
+        next.currentModelID = modelID
+        next.currentProvider = provider
+        if !provider.profile.allowsXaiServices {
+            next.everUsedNonXAI = true
+        }
+        if next != before {
+            next.updatedAt = Date()
+        }
+        try await store.save(next)
+        record = next
+        exportBoundary.observe(provider)
+        return shouldSanitize ? before.items.count - sanitized.count : 0
     }
 
     func itemsForTurn(sessionID: String, prompt: String) -> [ConversationItem] {
@@ -3168,6 +3993,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     let toolExecutor: LiveToolExecutor
     let conversationHistory: LiveConversationHistory
     let systemPrompt: String?
+    let skillsListing: String?
     /// The tool list this session advertises. In Code Mode it carries `exec`
     /// and `wait` and, in `code_mode_only`, hides everything the cell can
     /// reach through `tools.*`.
@@ -3243,12 +4069,18 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             sessionID: context.sessionID,
             prompt: request.text
         )
-        if let systemPrompt,
+        let combinedSystemPrompt = [systemPrompt, skillsListing]
+            .compactMap { value in
+                guard let value, !value.isEmpty else { return nil }
+                return value
+            }
+            .joined(separator: "\n\n")
+        if !combinedSystemPrompt.isEmpty,
            !items.contains(where: {
                if case .system = $0 { return true }
                return false
            }) {
-            items.insert(.system(systemPrompt), at: 0)
+            items.insert(.system(combinedSystemPrompt), at: 0)
         }
         // Memory is injected after the system prompt exists so it has an item
         // to splice into, and before compaction runs so the injected block
@@ -3259,6 +4091,9 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         items = await services?.injectMemoryContext(into: items, prompt: request.text) ?? items
 
         var toolRoundCount = 0
+        var stopHookContinuations = 0
+        var stopHookActive = false
+        var authRetrySchedule = AuthRetrySchedule()
 
         while true {
             try Task.checkCancellation()
@@ -3267,25 +4102,61 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             // request that dies at the context wall is usually the one after a
             // large tool result, not the one that opened the turn.
             items = await compactIfNeeded(items: items, emit: emit)
-            let response = try await sampler.sample(OpenGrokLiveSamplingRequest(
-                sessionID: context.sessionID,
-                turnID: context.turnID,
-                model: active.modelID,
-                prompt: request.text,
-                items: items,
-                tools: toolSurface.modelTools
-            )) { event in
-                switch event {
-                case .output(let text):
-                    await emit(.assistantText(text))
-                case .status(let status):
-                    await emit(.status(status))
+            var response: OpenGrokLiveSamplingResponse?
+            while response == nil {
+                do {
+                    response = try await sampler.sample(OpenGrokLiveSamplingRequest(
+                        sessionID: context.sessionID,
+                        turnID: context.turnID,
+                        model: active.modelID,
+                        prompt: request.text,
+                        items: items,
+                        tools: toolSurface.modelTools
+                    )) { event in
+                        switch event {
+                        case .output(let text):
+                            await emit(.assistantText(text))
+                        case .status(let status):
+                            await emit(.status(status))
+                        }
+                    }
+                    authRetrySchedule.resetOnSuccess()
+                } catch let error as SamplingError {
+                    guard case .auth(_, let credential) = error else { throw error }
+                    switch authRetrySchedule.onRecovered401(credential) {
+                    case .unchargedResubmit:
+                        await Task.yield()
+                    case .backoff(_, let delaySeconds):
+                        try await Task.sleep(
+                            nanoseconds: UInt64(max(0, delaySeconds) * 1_000_000_000)
+                        )
+                    case .exhausted, .runawayGuard:
+                        throw error
+                    }
                 }
             }
+            guard let response else { throw CLIApplicationError.failed("sampling produced no response") }
             items.append(contentsOf: response.items)
 
             guard !response.toolCalls.isEmpty else {
                 try Task.checkCancellation()
+                if stopHookContinuations < 8 {
+                    let stopResult = await toolExecutor.runStop(
+                        promptID: request.promptID,
+                        payload: [
+                            "reason": .string("end_turn"),
+                            "stopHookActive": .boolean(stopHookActive),
+                            "lastAssistantMessage": .string(response.output),
+                        ]
+                    )
+                    if stopResult.preventContinuation == nil,
+                       stopResult.wantsContinuation {
+                        stopHookContinuations += 1
+                        stopHookActive = true
+                        items.append(.autoContinue(formatLiveStopFeedback(stopResult)))
+                        continue
+                    }
+                }
                 try await conversationHistory.commit(
                     sessionID: context.sessionID,
                     items: items
@@ -3443,17 +4314,29 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
 private actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPagerRuntimeAdapter {
     let shell: OpenGrokShell
     let cwd: URL
-    let providerConfiguration: ProviderSessionConfiguration
+    private var providerConfiguration: ProviderSessionConfiguration
+    private let conversationHistory: LiveConversationHistory
+    private let conversationStore: LiveConversationStore
+    private let toolExecutor: LiveToolExecutor?
+    private let compaction: LiveCompactionCoordinator?
     private var createdSessionID: SessionID?
 
     init(
         shell: OpenGrokShell,
         cwd: URL,
-        providerConfiguration: ProviderSessionConfiguration
+        providerConfiguration: ProviderSessionConfiguration,
+        conversationHistory: LiveConversationHistory,
+        conversationStore: LiveConversationStore,
+        toolExecutor: LiveToolExecutor? = nil,
+        compaction: LiveCompactionCoordinator? = nil
     ) {
         self.shell = shell
         self.cwd = cwd
         self.providerConfiguration = providerConfiguration
+        self.conversationHistory = conversationHistory
+        self.conversationStore = conversationStore
+        self.toolExecutor = toolExecutor
+        self.compaction = compaction
     }
 
     func makeSession(
@@ -3486,6 +4369,48 @@ private actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenG
         for request: OpenGrokPagerRequest
     ) async throws -> any OpenGrokPagerSessionAdapter {
         try await makeSession(for: request.sessionRequest)
+    }
+
+    func replaceSession(from request: OpenGrokPagerRequest) async throws -> String {
+        _ = request
+        let newSessionID = UUID().uuidString
+        try LiveConversationStore.validateSessionID(newSessionID)
+        let record = LiveConversationRecord.new(
+            sessionID: newSessionID,
+            workingDirectory: cwd,
+            sandboxProfile: toolExecutor?.sandbox.profileName
+        )
+        let configuration = ProviderSessionConfiguration(
+            sessionID: newSessionID,
+            modelCatalog: providerConfiguration.modelCatalog,
+            initialModelID: providerConfiguration.initialModelID,
+            credentialBindings: providerConfiguration.credentialBindings,
+            fallbackModelIDs: providerConfiguration.fallbackModelIDs,
+            auxiliaryModelIDs: providerConfiguration.auxiliaryModelIDs,
+            toolRequest: providerConfiguration.toolRequest,
+            retryPolicy: providerConfiguration.retryPolicy,
+            openGrokHome: providerConfiguration.openGrokHome,
+            environment: providerConfiguration.environment,
+            everUsedNonXAI: record.everUsedNonXAI
+        )
+
+        _ = try await shell.start()
+        _ = try await shell.createSession(OpenGrokShellSessionRequest(
+            sessionID: SessionID(newSessionID),
+            cwd: cwd,
+            providerConfiguration: configuration,
+            restorePersistedState: false
+        ))
+        try await conversationStore.save(record)
+        try await toolExecutor?.registerSession(
+            sessionID: newSessionID,
+            workingDirectory: cwd
+        )
+        try await conversationHistory.replace(with: record)
+        await compaction?.replaceSessionID(newSessionID)
+        providerConfiguration = configuration
+        createdSessionID = SessionID(newSessionID)
+        return newSessionID
     }
 }
 
@@ -3919,10 +4844,12 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     private var modelName: String
     /// `(id, provider)` pairs the `/model` picker lists.
     private let modelCatalog: [LiveModelPickerEntry]
+    private let catalogStore: LiveModelCatalogStore?
     /// Rebuilds the sampling stack when a picker row is chosen. `nil` in
     /// compositions with no provider session (tests, headless renders), where
     /// the picker degrades to a relabel.
     private let modelSwitch: LiveModelSwitchCoordinator?
+    private let providerBoundarySync: (@Sendable (Bool) async throws -> Void)?
     /// Prompts waiting behind the running turn, as published by the controller.
     private var queuedPromptCount = 0
     private var turnActivity: String?
@@ -3949,6 +4876,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     /// reflects runs started after the session began — including ones another
     /// process on the same `OPENGROK_HOME` started.
     private let workflowRegistry: RhaiWorkflowRunRegistry?
+    private let workflowsEnabled: Bool
     /// The turn loop's own coordinator, so a manual `/compact` and the
     /// automatic one share a compaction counter — which is the whole reason
     /// that instance is shared rather than rebuilt here.
@@ -3961,7 +4889,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     /// loop actually captured and `/remember` writes to the backend the
     /// `memory_search` tool reads. Rebuilding them here would produce a second
     /// store pointed at the same files, which is how two writers appear.
-    private let sessionID: String
+    private var sessionID: String
     private let sessionServices: LiveSessionServices?
     private let conversationHistory: LiveConversationHistory?
     private let sessionCatalog: LiveSessionCatalog?
@@ -4002,9 +4930,12 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         workingDirectory: String = FileManager.default.currentDirectoryPath,
         modelName: String = "unknown",
         modelCatalog: [LiveModelPickerEntry] = [],
+        catalogStore: LiveModelCatalogStore? = nil,
         modelSwitch: LiveModelSwitchCoordinator? = nil,
+        providerBoundarySync: (@Sendable (Bool) async throws -> Void)? = nil,
         permissionCoordinator: PagerPermissionCoordinator? = nil,
         workflowRegistry: RhaiWorkflowRunRegistry? = nil,
+        workflowsEnabled: Bool = true,
         terminalProgram: String? = nil,
         enableMouseReporting: Bool = true,
         themePreference: PagerThemePreference = .fixed(.grokNight),
@@ -4027,9 +4958,12 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         self.modelCatalog = modelCatalog.isEmpty
             ? [LiveModelPickerEntry(id: modelName, providerID: "", name: modelName)]
             : modelCatalog
+        self.catalogStore = catalogStore
         self.modelSwitch = modelSwitch
+        self.providerBoundarySync = providerBoundarySync
         self.permissionCoordinator = permissionCoordinator
         self.workflowRegistry = workflowRegistry
+        self.workflowsEnabled = workflowsEnabled
         self.compaction = compaction
         self.wheelTuning = MouseWheelTuning(
             eventsPerTick: MouseWheelTuning.eventsPerTick(forTerminalProgram: terminalProgram)
@@ -4119,6 +5053,8 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         case .turnFinished:
             finishAssistant()
             endTurn()
+        case .sessionReplaced(let sessionID):
+            resetForNewSession(sessionID: sessionID)
         case .notice(let message):
             conversation.appendMessage(PagerMessage(role: .system, text: message))
         case .focusChanged(let region):
@@ -4170,6 +5106,25 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         turnActivity = nil
         turnStartedAt = nil
         isCancelling = false
+    }
+
+    private func resetForNewSession(sessionID: String) {
+        self.sessionID = sessionID
+        conversation.removeAll()
+        selection.unfocus()
+        followsBottom = true
+        scrollOffset = 0
+        lastMaximumScrollOffset = 0
+        queuedPromptCount = 0
+        prompt = OpenGrokPagerInteractivePromptState()
+        hasStartedFirstTurn = false
+        currentPermissionRequestID = nil
+        endTurn()
+        overlays.removeAll()
+        overlays.push(.welcome(
+            PagerWelcomeOverlay(subtitle: LivePagerChrome.collapseHome(workingDirectory)),
+            capturesInput: false
+        ))
     }
 
     /// Move the transcript viewport.
@@ -4357,10 +5312,11 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     private func present(_ request: OpenGrokPagerOverlayRequest) async throws {
         switch request {
         case .help:
-            overlays.push(.help(lines: OpenGrokPagerInteractiveController.helpText
+            overlays.push(.help(lines: OpenGrokPagerInteractiveController.helpText(workflowsEnabled: workflowsEnabled)
                 .split(separator: "\n", omittingEmptySubsequences: false)
                 .map { PagerStyledLine(text: String($0)) }))
         case .modelPicker(let query):
+            let entries = catalogStore?.pickerEntries() ?? modelCatalog
             // A typed selector that names exactly one model switches directly:
             // showing a picker the user already answered would be a pointless
             // second step. Ambiguity and misses fall back to an error rather
@@ -4369,7 +5325,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             if let query, !query.isEmpty {
                 guard let modelID = LiveModelPicker.resolve(
                     query: query,
-                    entries: modelCatalog
+                    entries: entries
                 ) else {
                     conversation.appendMessage(PagerMessage(
                         role: .error,
@@ -4381,7 +5337,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 return
             }
             overlays.push(LiveModelPicker.overlay(
-                entries: modelCatalog,
+                entries: entries,
                 currentModelID: modelName
             ))
         case .toggleMouseReporting:
@@ -4408,7 +5364,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 id: "command-palette",
                 title: "Commands",
                 rows: rows.isEmpty
-                    ? LivePagerOverlayText.commandRows()
+                    ? LivePagerOverlayText.commandRows(workflowsEnabled: workflowsEnabled)
                     : rows.map {
                         PagerListRow(
                             id: $0.insertText,
@@ -4968,6 +5924,14 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             ))
         case .switched(let summary):
             modelName = summary.modelID
+            if let providerBoundarySync {
+                do {
+                    let boundary = await conversationHistory?.sharedExportBoundary
+                    try await providerBoundarySync(boundary?.everUsedNonXAI ?? false)
+                } catch {
+                    note("Provider boundary summary could not be persisted: \(error)")
+                }
+            }
             conversation.appendMessage(PagerMessage(
                 role: .system,
                 text: summary.transcriptMessage
@@ -5180,10 +6144,11 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     /// write them back on the next unrelated toggle.
     func settingsOverlay(deepLinkKey: String? = nil) -> PagerSettingsOverlay {
         let store = PagerSettingsStore(configPath: LiveInteractiveControllerRenderer.configPath())
+        let activeCatalog = catalogStore?.pickerEntries() ?? modelCatalog
         var overlay = PagerSettingsOverlay(
             values: (try? store.load()) ?? [:],
             dynamicChoices: [
-                .activeModelCatalog: LiveModelPicker.sorted(modelCatalog).map { entry in
+                .activeModelCatalog: LiveModelPicker.sorted(activeCatalog).map { entry in
                     PagerSettingChoice(
                         canonical: entry.id,
                         display: LiveModelPicker.providerLabel(forProviderID: entry.providerID)
@@ -5230,6 +6195,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             }
             do {
                 try store.write(key: key, value: value)
+                reloadCatalogInput()
             } catch PagerSettingsStoreError.notPersistable {
                 // Session-local rows have no disk home by design; the modal's
                 // own copy is the whole of their state.
@@ -5244,12 +6210,21 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         case .toggleMultiSelect(let key, let choice, let enabled):
             var current = (try? store.loadMultiSelect(key: key)) ?? []
             if enabled { current.insert(choice) } else { current.remove(choice) }
-            try? store.writeMultiSelect(key: key, enabled: current)
+            do {
+                try store.writeMultiSelect(key: key, enabled: current)
+                reloadCatalogInput()
+            } catch {
+                conversation.appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Could not save \(key): \(error)"
+                ))
+            }
 
         case .resetRequested(let key):
             do {
                 try store.reset(key: key)
                 if key == "theme" { _ = applyTheme(named: "groknight") }
+                reloadCatalogInput()
             } catch PagerSettingsStoreError.notPersistable {
                 return
             } catch {
@@ -5276,6 +6251,14 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         OpenGrokHomeResolver
             .resolve(environment: ProcessInfo.processInfo.environment)
             .appendingPathComponent("config.toml")
+    }
+
+    private func reloadCatalogInput() {
+        guard let catalogStore else { return }
+        catalogStore.updateInput(liveCatalogResolutionInput(
+            workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
+            environment: ProcessInfo.processInfo.environment
+        ))
     }
 
     private func renderState() throws {

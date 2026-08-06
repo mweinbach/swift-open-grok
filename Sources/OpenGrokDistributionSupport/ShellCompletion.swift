@@ -2,7 +2,7 @@
 //
 // Completions packaging.
 //
-// IMPORTANT — scope. The Rust reference at `80dff0a9` does NOT generate or
+// IMPORTANT — scope. The Rust reference at `9ed09e2a` does NOT generate or
 // publish shell completions: neither `scripts/build-macos-release.sh` nor
 // `scripts/build-windows-release.ps1` stages a completion file, `dist/` holds
 // none, and no crate contains a clap completion generator. Completions are a

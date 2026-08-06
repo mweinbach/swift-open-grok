@@ -142,8 +142,6 @@ struct WebSocketDialOptionsTests {
     }
 }
 
-#if canImport(Network)
-
 @Suite("Dialling a live socket", .serialized)
 struct WebSocketDialerLiveTests {
     /// A refused connection must fail at dial time with the endpoint named,
@@ -236,5 +234,3 @@ struct WebSocketDialerLiveTests {
         await connection.close()
     }
 }
-
-#endif

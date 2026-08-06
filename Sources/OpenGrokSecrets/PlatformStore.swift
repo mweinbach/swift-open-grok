@@ -39,9 +39,9 @@ public enum PlatformSecretStore: Sendable {
         #if os(macOS)
         return .keychain
         #elseif os(Windows)
-        return .credentialManager
+        return .unsupported
         #elseif os(Linux)
-        return .secretService
+        return .unsupported
         #else
         return .unsupported
         #endif
@@ -50,12 +50,11 @@ public enum PlatformSecretStore: Sendable {
     /// Create the platform store.
     ///
     /// - macOS: Keychain
-    /// - Linux: Secret Service when available; otherwise explicit owner-only
-    ///   file store under `ownerOnlyRoot` (required)
-    /// - Windows: Credential Manager adapter is not yet wired. Operations
-    ///   that cannot uphold the security contract throw `unsupported` —
-    ///   never a silent plaintext store. Owner-only file fallback is also
-    ///   refused on Windows until DACL enforcement lands.
+    /// - Linux: unsupported by default; an explicit `ownerOnlyRoot` selects
+    ///   the documented owner-only file fallback until a Secret Service
+    ///   adapter is linked.
+    /// - Windows: unsupported until Credential Manager or an equivalent
+    ///   owner-only adapter is linked.
     public static func makeDefault(options: SecretStoreOptions = SecretStoreOptions()) async throws -> any SecretStore {
         #if os(macOS)
         return KeychainSecretStore(service: options.service)
@@ -92,34 +91,3 @@ public enum PlatformSecretStore: Sendable {
         try OwnerOnlyFileSecretStore(rootDirectory: root)
     }
 }
-
-#if os(Windows)
-/// Placeholder Credential Manager store. Every operation throws
-/// `unsupported` until Win32 CredWrite/CredRead is linked — never silent.
-public actor WindowsCredentialManagerStore: SecretStore {
-    public nonisolated let backend: SecretStoreBackend = .credentialManager
-    private let service: String
-
-    public init(service: String = OpenGrokKeychain.defaultService) {
-        self.service = service
-    }
-
-    public func read(account: String) async throws -> Credential {
-        throw SecretStoreError.unsupported(
-            "Windows Credential Manager read not wired for service '\(service)' account lookup"
-        )
-    }
-
-    public func write(_ credential: Credential) async throws {
-        throw SecretStoreError.unsupported(
-            "Windows Credential Manager write not wired for account '\(credential.account)'"
-        )
-    }
-
-    public func delete(account: String) async throws {
-        throw SecretStoreError.unsupported(
-            "Windows Credential Manager delete not wired for account '\(account)'"
-        )
-    }
-}
-#endif

@@ -99,11 +99,17 @@ public func patchTouchesAny(_ patch: TOMLTable, paths: [PatchPath]) -> Bool {
 }
 
 /// Keys stripped from every applied patch so an override can't re-introduce a
-/// nested `version_overrides`/`campaigns` array (recursive re-injection).
-/// This const owns the recursive-injection keys for every override kind;
+/// nested `version_overrides`/`campaigns` array or define the
+/// `auth_provider`/`model_providers` command tables.
+/// This const owns the protected top-level keys for every override kind;
 /// `applyPatches` takes the strip list as a parameter so the strip step
 /// itself stays key-agnostic.
-public let PATCH_STRIP_KEYS: [String] = ["version_overrides", "campaigns"]
+public let PATCH_STRIP_KEYS: [String] = [
+    "version_overrides",
+    "campaigns",
+    "auth_provider",
+    "model_providers",
+]
 
 /// Deep-merge each patch in iteration order (later wins on a leaf), stripping
 /// `stripKeys` from every patch first. Mirrors Rust `apply_patches`.

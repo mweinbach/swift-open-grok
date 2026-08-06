@@ -59,12 +59,18 @@ public enum LiveShareComposition {
     /// session, matching `LiveSessionsComposition.session(for:context:)`.
     public static func session(
         for command: CLICommand,
-        context: CLIApplicationContext
+        context: CLIApplicationContext,
+        liveBoundaries: (@Sendable (String) -> ExportBoundary?)? = nil
     ) async throws -> CLIApplicationSession {
         guard case .utility(let options) = command, options.name == routeName else {
             throw CLIApplicationError.unsupported(route: command.routeName)
         }
-        try await run(options: options, environment: context.environment, streams: context.streams)
+        try await run(
+            options: options,
+            environment: context.environment,
+            streams: context.streams,
+            liveBoundaries: liveBoundaries
+        )
         return CLIApplicationSession(waitForExit: {}, shutdown: {})
     }
 
@@ -129,10 +135,17 @@ public enum LiveShareComposition {
         }
 
         let liveBoundary = liveBoundaries?(sessionID) ?? nil
-        let persistedMarker = persistedBoundaryMarkers?(sessionID) ?? nil
-        if persistedMarker == nil && liveBoundary == nil {
-            // Blocker 1 (file header): fail closed on unverifiable, never
-            // treat "no marker" as "clean".
+        let persistedMarker: Bool?
+        if let persistedBoundaryMarkers {
+            persistedMarker = persistedBoundaryMarkers(sessionID)
+        } else {
+            persistedMarker = record.everUsedNonXAI
+        }
+        if persistedMarker == nil {
+            // A legacy record is unverifiable even when a resident process
+            // offers a live boundary: the persisted transcript may outlive
+            // that process, so an absent durable marker can never authorize
+            // an xAI export.
             throw CLIApplicationError.failed(
                 "cannot share session \(sessionID): this build's session record does not "
                     + "persist which providers the session used (no ever_used_codex marker), "

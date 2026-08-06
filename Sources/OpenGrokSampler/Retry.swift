@@ -160,7 +160,7 @@ public func formatSamplingError(_ err: SamplingError, retryCount: UInt32?) -> St
     }
 
     switch err {
-    case .auth(let msg):
+    case .auth(let msg, _):
         return "\(retryPrefix)Authentication failed: \(msg). Please check your API key configuration."
     case .invalidConfiguration(let msg):
         return "\(retryPrefix)Invalid configuration: \(msg). Please check your model settings."

@@ -220,11 +220,15 @@ actor LiveRewindStore {
         sessionID: String,
         limits: LiveRewindLimits = .default
     ) {
-        self.fileURL = openGrokHome
+        self.fileURL = Self.rewindFileURL(openGrokHome: openGrokHome, sessionID: sessionID)
+        self.limits = limits
+    }
+
+    static func rewindFileURL(openGrokHome: URL, sessionID: String) -> URL {
+        openGrokHome
             .appendingPathComponent("sessions", isDirectory: true)
             .appendingPathComponent("\(sessionID).rewind.jsonl")
             .standardizedFileURL
-        self.limits = limits
     }
 
     private static func encoder() -> JSONEncoder {

@@ -16,7 +16,7 @@
 // `if-no-files-found: error`, so a missing file is a release failure upstream
 // too.
 //
-// `NOTICE` does NOT exist in the Rust reference tree at `80dff0a9`. It exists
+// `NOTICE` does NOT exist in the Rust reference tree at `9ed09e2a`. It exists
 // in the Swift port and PORT_PLAN.md's release gate requires it, so it is
 // checked separately and labelled as port-added rather than being presented as
 // upstream behaviour.

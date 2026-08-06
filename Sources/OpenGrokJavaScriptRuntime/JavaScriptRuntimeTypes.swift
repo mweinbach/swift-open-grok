@@ -128,3 +128,37 @@ public struct JavaScriptRuntimeError: Error, Hashable, Sendable, CustomStringCon
         JavaScriptRuntimeError(kind: .initializationFailed, message: message)
     }
 }
+
+/// Platform capability for the in-process JavaScript runtime.
+///
+/// The conditional implementation lives here so callers can gate Code Mode
+/// before advertising a transport that cannot start. The startup seam still
+/// throws `unsupportedPlatform` defensively if a caller bypasses the gate.
+public struct JavaScriptRuntimeCapability: Sendable, Equatable {
+    public let isAvailable: Bool
+    public let unavailableError: JavaScriptRuntimeError?
+
+    public init(
+        isAvailable: Bool,
+        unavailableError: JavaScriptRuntimeError? = nil
+    ) {
+        self.isAvailable = isAvailable
+        self.unavailableError = isAvailable
+            ? nil
+            : (unavailableError ?? .unsupportedPlatform)
+    }
+
+    public static let available = JavaScriptRuntimeCapability(isAvailable: true)
+    public static let unavailable = JavaScriptRuntimeCapability(
+        isAvailable: false,
+        unavailableError: .unsupportedPlatform
+    )
+
+    public static var current: JavaScriptRuntimeCapability {
+        #if canImport(JavaScriptCore)
+        return .available
+        #else
+        return .unavailable
+        #endif
+    }
+}

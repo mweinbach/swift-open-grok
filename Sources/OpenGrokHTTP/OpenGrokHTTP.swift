@@ -12,12 +12,16 @@
 import Foundation
 import Dispatch
 import OpenGrokCircuitBreaker
+import OpenGrokExtraCA
 import OpenGrokShared
 import OpenGrokTracing
 import OpenGrokVersion
 
 #if canImport(FoundationNetworking)
 import FoundationNetworking
+#endif
+#if canImport(Security)
+import Security
 #endif
 
 
@@ -380,10 +384,17 @@ public struct HTTPTLSConfiguration: Sendable, Equatable {
     /// When `false`, certificate validation is relaxed (tests only).
     public var validateCertificates: Bool
     public var minimumTLSVersion: String?
+    /// Validated DER roots applied additively to the platform trust store.
+    public var extraRootCertificates: [Data]
 
-    public init(validateCertificates: Bool = true, minimumTLSVersion: String? = nil) {
+    public init(
+        validateCertificates: Bool = true,
+        minimumTLSVersion: String? = nil,
+        extraRootCertificates: [Data] = OpenGrokExtraCA.processRootCertificates
+    ) {
         self.validateCertificates = validateCertificates
         self.minimumTLSVersion = minimumTLSVersion
+        self.extraRootCertificates = extraRootCertificates
     }
 }
 
@@ -745,6 +756,7 @@ public enum HTTPSessionConfigurationBuilder {
         public var proxyPassword: String?
         public var tlsValidateCertificates: Bool
         public var tlsMinimumVersion: String?
+        public var tlsExtraRootCertificateCount: Int
         public var connectTimeout: TimeInterval
         public var requestTimeout: TimeInterval?
         public var maxStreamBufferBytes: Int
@@ -762,6 +774,7 @@ public enum HTTPSessionConfigurationBuilder {
             proxyPassword: transport.proxy?.password,
             tlsValidateCertificates: transport.tls.validateCertificates,
             tlsMinimumVersion: transport.tls.minimumTLSVersion,
+            tlsExtraRootCertificateCount: transport.tls.extraRootCertificates.count,
             connectTimeout: transport.connectTimeout,
             requestTimeout: transport.requestTimeout,
             maxStreamBufferBytes: transport.maxStreamBufferBytes
@@ -775,6 +788,25 @@ public enum HTTPSessionConfigurationBuilder {
 /// are accepted without chain evaluation. Default is strict system validation.
 public final class HTTPTransportSessionDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
     public let validateCertificates: Bool
+    public let extraRootCertificates: [Data]
+
+    /// Whether this platform can install additive trust anchors in a server
+    /// trust challenge. FoundationNetworking currently exposes no equivalent
+    /// `serverTrust` challenge API on Linux.
+    public static var supportsAdditionalTrustRoots: Bool {
+        #if canImport(Darwin) && canImport(Security)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    /// `true` when configured roots cannot be applied by this platform's
+    /// URLSession implementation. The transport remains strict rather than
+    /// weakening validation or replacing system roots.
+    public var additionalTrustRootsUnavailable: Bool {
+        !extraRootCertificates.isEmpty && !Self.supportsAdditionalTrustRoots
+    }
 
     /// Whether this platform can honor `validateCertificates == false`.
     ///
@@ -799,8 +831,12 @@ public final class HTTPTransportSessionDelegate: NSObject, URLSessionDelegate, @
         !validateCertificates && !Self.supportsRelaxedCertificateValidation
     }
 
-    public init(validateCertificates: Bool = true) {
+    public init(
+        validateCertificates: Bool = true,
+        extraRootCertificates: [Data] = OpenGrokExtraCA.processRootCertificates
+    ) {
         self.validateCertificates = validateCertificates
+        self.extraRootCertificates = extraRootCertificates
         super.init()
     }
 
@@ -817,6 +853,21 @@ public final class HTTPTransportSessionDelegate: NSObject, URLSessionDelegate, @
             {
                 completionHandler(.useCredential, URLCredential(trust: trust))
                 return
+            }
+            if !extraRootCertificates.isEmpty,
+               let trust = challenge.protectionSpace.serverTrust
+            {
+                let anchors = extraRootCertificates.compactMap {
+                    SecCertificateCreateWithData(nil, $0 as CFData)
+                }
+                if !anchors.isEmpty,
+                   SecTrustSetAnchorCertificates(trust, anchors as CFArray) == errSecSuccess,
+                   SecTrustSetAnchorCertificatesOnly(trust, false) == errSecSuccess,
+                   SecTrustEvaluateWithError(trust, nil)
+                {
+                    completionHandler(.useCredential, URLCredential(trust: trust))
+                    return
+                }
             }
             completionHandler(.performDefaultHandling, nil)
             return
@@ -840,13 +891,16 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
         configuration: HTTPTransportConfiguration = HTTPTransportConfiguration(),
         session: URLSession? = nil
     ) {
+        // A caller-supplied session owns its TLS policy; only default-created
+        // sessions attach the resolved extra-root delegate below.
         self.configuration = configuration
         if let session {
             self.session = session
             self.sessionDelegate = nil
         } else {
             let delegate = HTTPTransportSessionDelegate(
-                validateCertificates: configuration.tls.validateCertificates
+                validateCertificates: configuration.tls.validateCertificates,
+                extraRootCertificates: configuration.tls.extraRootCertificates
             )
             let config = HTTPSessionConfigurationBuilder.makeEphemeral(configuration)
             self.sessionDelegate = delegate
@@ -977,7 +1031,10 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
             mailbox.finish(throwing: error)
             return mailbox.makeStream {}
         }
-        let delegate = StreamingDataDelegate(mailbox: mailbox)
+        let delegate = StreamingDataDelegate(
+            mailbox: mailbox,
+            extraRootCertificates: configuration.tls.extraRootCertificates
+        )
         let streamSession = URLSession(
             configuration: HTTPSessionConfigurationBuilder.makeEphemeral(configuration),
             delegate: delegate,
@@ -1029,11 +1086,15 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
 /// that stops reading stops the transfer instead of growing the buffer.
 private final class StreamingDataDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let mailbox: BoundedStreamMailbox
+    /// Retained for capability reporting; corelibs Foundation has no trust
+    /// challenge hook to install these roots for streaming sessions.
+    private let extraRootCertificates: [Data]
     private let lock = NSLock()
     private var failure: Error?
 
-    init(mailbox: BoundedStreamMailbox) {
+    init(mailbox: BoundedStreamMailbox, extraRootCertificates: [Data]) {
         self.mailbox = mailbox
+        self.extraRootCertificates = extraRootCertificates
         super.init()
     }
 
@@ -1610,7 +1671,8 @@ public final class URLSessionWebSocketClient: WebSocketClient, @unchecked Sendab
             request.setValue(v, forHTTPHeaderField: k)
         }
         let delegate = HTTPTransportSessionDelegate(
-            validateCertificates: configuration.tls.validateCertificates
+            validateCertificates: configuration.tls.validateCertificates,
+            extraRootCertificates: configuration.tls.extraRootCertificates
         )
         let config = HTTPSessionConfigurationBuilder.makeEphemeral(configuration)
         let session = URLSession(

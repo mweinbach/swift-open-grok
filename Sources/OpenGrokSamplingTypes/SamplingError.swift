@@ -12,6 +12,29 @@
 import Foundation
 import OpenGrokShared
 
+/// Provenance of the credential presented on an authentication failure.
+/// Kept in the dependency-neutral sampling-types target so retry policy and
+/// transport layers can share it without creating a target cycle.
+public enum SentCredential: String, Sendable, Hashable, Codable {
+    case sent
+    case missing
+    case unknown
+
+    public static let `default`: SentCredential = .unknown
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = SentCredential(rawValue: raw) ?? .unknown
+    }
+
+    public static func fromSentFragment(_ fragment: String?) -> SentCredential {
+        fragment == nil ? .missing : .sent
+    }
+
+    public var isMissing: Bool { self == .missing }
+    public var isUnknown: Bool { self == .unknown }
+}
+
 /// Why the model's response was classified as "empty".
 public enum EmptyReason: String, Codable, Sendable, Equatable, Hashable {
     /// The model emitted reasoning tokens but produced no visible content
@@ -120,7 +143,7 @@ public struct HTTPStatus: Sendable, Equatable, Hashable {
 
 /// Sampling error variants.
 public enum SamplingError: Error, Sendable, Equatable {
-    case auth(String)
+    case auth(String, credential: SentCredential)
     case invalidConfiguration(String)
     case http(String)
     case serialization(String)
@@ -142,6 +165,11 @@ public enum SamplingError: Error, Sendable, Equatable {
     /// template so `serializationFromRendered` can never drift.
     public static let serializationDisplayPrefix = "serialization error: "
 
+    /// Compatibility constructor for callers that do not have wire provenance.
+    public static func auth(_ message: String) -> Self {
+        .auth(message, credential: .unknown)
+    }
+
     /// Rebuild a `.serialization` error from a rendered message.
     public static func serializationMessage(_ msg: String) -> Self {
         .serialization(msg)
@@ -158,7 +186,7 @@ public enum SamplingError: Error, Sendable, Equatable {
 
     public var isAuthError: Bool {
         switch self {
-        case .auth: return true
+        case .auth(_, _): return true
         case .api(let status, _, _, _, _): return status.isUnauthorized
         default: return false
         }
@@ -199,7 +227,7 @@ public enum SamplingError: Error, Sendable, Equatable {
 
     public var isRetryable: Bool {
         switch self {
-        case .auth: return false
+        case .auth(_, _): return false
         case .invalidConfiguration: return false
         case .http: return true  // mirrors is_retryable_reqwest for request/body errors
         case .serialization: return false

@@ -69,8 +69,8 @@ public struct ChildNetworkRestriction: Sendable, Equatable {
 ///
 /// Off Linux every probe returns `nil` and `wrappedCommand` throws
 /// `SandboxError.unsupported`; per-child network denial is a Linux seam
-/// (upstream's filter is likewise `cfg(target_os = "linux")` — macOS network
-/// policy lives in the process-level Seatbelt profile).
+/// (upstream's filter is likewise `cfg(target_os = "linux")`). macOS keeps
+/// process-level network access available for provider sampling.
 public enum LinuxChildNetworkRestriction {
     /// Candidate namespace invocations, least surprising first:
     ///   1. uid-preserving user namespace (util-linux >= 2.33) — the child

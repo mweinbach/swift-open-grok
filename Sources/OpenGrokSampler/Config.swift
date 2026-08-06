@@ -115,6 +115,7 @@ public struct SamplerConfig: Sendable {
     public var authScheme: AuthScheme
     /// Extra request headers applied verbatim.
     public var extraHeaders: [(name: String, value: String)]
+    public var queryParams: [String: String]
     public var contextWindow: UInt64
     public var forceHTTP1: Bool
     public var maxRetries: UInt32?
@@ -153,6 +154,7 @@ public struct SamplerConfig: Sendable {
         provider: ModelProvider = .xai,
         authScheme: AuthScheme = .bearer,
         extraHeaders: [(name: String, value: String)] = [],
+        queryParams: [String: String] = [:],
         contextWindow: UInt64 = 0,
         forceHTTP1: Bool = false,
         maxRetries: UInt32? = nil,
@@ -185,6 +187,7 @@ public struct SamplerConfig: Sendable {
         self.provider = provider
         self.authScheme = authScheme
         self.extraHeaders = extraHeaders
+        self.queryParams = queryParams
         self.contextWindow = contextWindow
         self.forceHTTP1 = forceHTTP1
         self.maxRetries = maxRetries
@@ -223,6 +226,7 @@ extension SamplerConfig: Codable {
         case provider
         case authScheme = "auth_scheme"
         case extraHeaders = "extra_headers"
+        case queryParams = "query_params"
         case contextWindow = "context_window"
         case forceHTTP1 = "force_http1"
         case maxRetries = "max_retries"
@@ -256,6 +260,7 @@ extension SamplerConfig: Codable {
             provider: try c.decodeIfPresent(ModelProvider.self, forKey: .provider) ?? .xai,
             authScheme: try c.decodeIfPresent(AuthScheme.self, forKey: .authScheme) ?? .bearer,
             extraHeaders: Self.decodeHeaders(try c.decodeIfPresent([String: String].self, forKey: .extraHeaders)),
+            queryParams: try c.decodeIfPresent([String: String].self, forKey: .queryParams) ?? [:],
             contextWindow: try c.decodeIfPresent(UInt64.self, forKey: .contextWindow) ?? 0,
             forceHTTP1: try c.decodeIfPresent(Bool.self, forKey: .forceHTTP1) ?? false,
             maxRetries: try c.decodeIfPresent(UInt32.self, forKey: .maxRetries),
@@ -289,6 +294,7 @@ extension SamplerConfig: Codable {
         try c.encode(provider, forKey: .provider)
         try c.encode(authScheme, forKey: .authScheme)
         try c.encode(Self.encodeHeaders(extraHeaders), forKey: .extraHeaders)
+        try c.encode(queryParams, forKey: .queryParams)
         try c.encode(contextWindow, forKey: .contextWindow)
         try c.encode(forceHTTP1, forKey: .forceHTTP1)
         try c.encodeIfPresent(maxRetries, forKey: .maxRetries)
@@ -320,4 +326,3 @@ extension SamplerConfig: Codable {
         return out
     }
 }
-

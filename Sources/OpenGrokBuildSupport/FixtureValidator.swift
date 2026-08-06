@@ -34,6 +34,12 @@ public enum FixtureValidationIssue: Sendable, Equatable {
     /// traversal, or symlink escape). The validator refuses to read such
     /// paths, preserving package/path isolation.
     case pathEscape(path: String, reason: String)
+    /// The manifest and provenance index name different reference revisions.
+    case referenceRevisionMismatch(expected: String, actual: String)
+    /// The provenance index is missing from the fixture corpus.
+    case provenanceMissing(path: String)
+    /// The provenance index cannot be decoded or has no reference revision.
+    case provenanceMalformed(path: String)
 }
 
 /// Errors raised by manifest path containment validation.
@@ -71,6 +77,20 @@ public enum FixtureValidator {
     ) -> FixtureValidationResult {
         var issues: [FixtureValidationIssue] = []
         var seen: Set<String> = []
+        let provenanceURL = packageRoot.appendingPathComponent("ProtocolFixtures/PROVENANCE.json")
+        if !FileManager.default.fileExists(atPath: provenanceURL.path) {
+            issues.append(.provenanceMissing(path: "ProtocolFixtures/PROVENANCE.json"))
+        } else if let provenanceData = try? Data(contentsOf: provenanceURL),
+                  let provenance = try? JSONDecoder().decode(FixtureProvenance.self, from: provenanceData) {
+            if provenance.referenceRevision != manifest.referenceRevision {
+                issues.append(.referenceRevisionMismatch(
+                    expected: manifest.referenceRevision,
+                    actual: provenance.referenceRevision
+                ))
+            }
+        } else {
+            issues.append(.provenanceMalformed(path: "ProtocolFixtures/PROVENANCE.json"))
+        }
         // Resolve the fixtures root once and reuse it for every entry, so a
         // hostile or corrupt manifest cannot make us hash or read outside
         // `ProtocolFixtures`.
@@ -225,4 +245,8 @@ public enum FixtureValidator {
         if c == r { return true }
         return c.hasPrefix(r + "/")
     }
+}
+
+private struct FixtureProvenance: Decodable {
+    let referenceRevision: String
 }

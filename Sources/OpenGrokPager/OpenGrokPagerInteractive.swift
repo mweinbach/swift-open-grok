@@ -392,6 +392,9 @@ public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {
     case turnStarted(OpenGrokPagerRequest)
     case session(OpenGrokPagerEvent)
     case turnFinished(OpenGrokPagerRuntimeResult)
+    /// The live runtime committed a fresh session and the renderer must clear
+    /// its transcript without deleting the previous session's record.
+    case sessionReplaced(sessionID: String)
     case notice(String)
     /// The user moved the transcript viewport.
     case viewport(OpenGrokPagerViewportCommand)

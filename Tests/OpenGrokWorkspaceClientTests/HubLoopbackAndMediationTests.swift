@@ -184,7 +184,8 @@ private func rpcRegistration(
 /// assertion here proves the remote path ran.
 private func makeRemoteBackedClient(
     mediation: HubMediation,
-    remoteLabel: String = "remote"
+    remoteLabel: String = "remote",
+    connection: HubConnection? = nil
 ) throws -> (client: WorkspaceClient, server: InProcessHubServer) {
     let toolId = try ToolId(WORKSPACE_RPC_TOOL_ID)
     let user = try UserId("u")
@@ -206,7 +207,7 @@ private func makeRemoteBackedClient(
         sessionId: session
     )
 
-    let connection = HubConnection(
+    let connection = connection ?? HubConnection(
         key: PrincipalKey(url: "loopback", userId: user),
         client: server,
         connected: true
@@ -216,7 +217,7 @@ private func makeRemoteBackedClient(
     harness.bindSession(session)
     harness.setPrincipal(Principal.new(user).withScope(localInvokeScope).withSession(session))
 
-    return (WorkspaceClient(harness: harness), server)
+    return (WorkspaceClient.withHubConnection(harness: harness, connection: connection), server)
 }
 
 // MARK: - Loopback
@@ -239,6 +240,36 @@ struct HubLoopbackTests {
             return
         }
         #expect(ok["served_by"] == .string("remote"))
+        #expect(server.executedToolIds.count == 1)
+    }
+
+    @Test("pool acquisition stays disconnected until the handshake activates it")
+    func pooledRemoteActivation() async throws {
+        let user = try UserId("u")
+        let pool = HubConnectionPool()
+        let connection = pool.acquire(
+            key: PrincipalKey(url: "loopback", userId: user)
+        )
+        let (client, server) = try makeRemoteBackedClient(
+            mediation: .mediated(AllowAllHubMediator()),
+            connection: connection
+        )
+        #expect(!connection.isConnected)
+        #expect(!client.isConnected)
+
+        do {
+            _ = try await client.rpcRaw(method: "workspace.info", params: .object([:]))
+            Issue.record("pre-activation RPC unexpectedly succeeded")
+        } catch WorkspaceClientError.notConnected {
+            #expect(server.executedToolIds.isEmpty)
+        } catch {
+            Issue.record("expected notConnected, got \(error)")
+        }
+
+        connection.activate(client: server)
+        #expect(connection.isConnected)
+        #expect(client.isConnected)
+        _ = try await client.rpcRaw(method: "workspace.info", params: .object([:]))
         #expect(server.executedToolIds.count == 1)
     }
 

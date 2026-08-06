@@ -166,7 +166,10 @@ struct LiveLeaderRelayEligibilityTests {
             key: key,
             authMode: .oidc,
             createTime: Date(),
-            userID: "user-1"
+            userID: "user-1",
+            refreshToken: "refresh-token",
+            oidcIssuer: xaiOAuth2Issuer,
+            oidcClientID: defaultOAuth2ClientID
         )
     }
 
@@ -218,6 +221,16 @@ struct LiveLeaderRelayEligibilityTests {
             ) == nil
         )
     }
+
+    @Test("production auth dependencies install an xAI OIDC refresher")
+    func productionAuthDependencies() {
+        let auth = auth(key: "tok")
+        let config = GrokComConfig.default(environment: [:])
+        let dependencies = LiveLeaderAuthDependencies.production(
+            transport: MockHTTPTransport()
+        )
+        #expect(dependencies.makeRefresher(auth, config) is OIDCTokenRefresher)
+    }
 }
 
 @Suite("Leader messages")
@@ -251,7 +264,7 @@ struct LiveLeaderMessageTests {
 
 // MARK: - Live
 
-#if canImport(Network)
+#if !os(Windows)
 
 @Suite("Live leader route", .serialized)
 struct LiveLeaderCompositionLiveTests {
@@ -267,6 +280,7 @@ struct LiveLeaderCompositionLiveTests {
         let context = makeLeaderContext(
             environment: [
                 "OPENGROK_HOME": home.path,
+                "GROK_TEST_VERSION": "11.2.3-test",
                 // No credentials, so the relay parks and the test exercises the
                 // IPC half without reaching the network.
                 "GROK_WS_URL": "wss://staging.invalid/ws",
@@ -310,13 +324,121 @@ struct LiveLeaderCompositionLiveTests {
             )
         )
         let registered = try #require(try await reader.next(ACPLeaderServerMessage.self))
-        guard case .registered(let clientID, let ready, let version, _, _) = registered else {
+        guard case .registered(
+            let clientID,
+            let ready,
+            let version,
+            let binaryVersion,
+            let capabilities
+        ) = registered else {
             Issue.record("expected registered, got \(registered)")
             return
         }
         #expect(clientID == 1)
         #expect(ready)
         #expect(version == ACPLeaderProtocolLimits.protocolVersion)
+        #expect(binaryVersion == "11.2.3-test")
+        #expect(capabilities?.controlV1 == true)
+        #expect(capabilities?.workspaceExposure == true)
+
+        try await channel.write(
+            try ACPLeaderCodec.encode(
+                ACPLeaderClientMessage.control(
+                    requestID: "leader-info",
+                    command: ["type": "get_leader_info"]
+                )
+            )
+        )
+        var receivedLeaderInfo: ACPLeaderInfo?
+        for _ in 0..<20 {
+            guard let message = try await reader.next(ACPLeaderServerMessage.self) else { break }
+            guard case .controlResult("leader-info", .leaderInfo(let info)) = message else { continue }
+            receivedLeaderInfo = info
+            break
+        }
+        let leaderInfo = try #require(receivedLeaderInfo)
+        let expectedPaths = ACPLeaderSocketPaths.resolve(
+            openGrokHome: home,
+            relayURL: "wss://staging.invalid/ws",
+            environment: context.environment
+        )
+        #expect(leaderInfo.socketPath == expectedPaths.socket.path)
+        #expect(leaderInfo.lockPath == expectedPaths.lock.path)
+        #expect(leaderInfo.wsURLSuffix == ACPLeaderSocketPaths.suffix(forRelayURL: "wss://staging.invalid/ws"))
+        #expect(leaderInfo.leaderBinaryVersion == "11.2.3-test")
+
+        // Workspace control must survive the production composition too. The
+        // test home has no credentials, so the real connector reaches its
+        // typed auth-backed refusal instead of fabricating a running exposure.
+        try await channel.write(
+            try ACPLeaderCodec.encode(
+                ACPLeaderClientMessage.control(
+                    requestID: "workspace-status-before",
+                    command: ["type": "workspace_status"]
+                )
+            )
+        )
+        let beforeStart = try await readControlReply(
+            reader: reader,
+            channel: channel,
+            requestID: "workspace-status-before"
+        )
+        guard case .controlResult(
+            "workspace-status-before",
+            .workspaceStatus(let initialStatus)
+        ) = beforeStart else {
+            Issue.record("expected workspace_status result, got \(beforeStart)")
+            return
+        }
+        #expect(initialStatus.state == "none")
+        #expect(initialStatus.pid == leaderInfo.pid)
+
+        try await channel.write(
+            try ACPLeaderCodec.encode(
+                ACPLeaderClientMessage.control(
+                    requestID: "workspace-start",
+                    command: [
+                        "type": "workspace_start",
+                        "hub_url": "wss://hub.test/ws",
+                        "cwd": home.path,
+                    ]
+                )
+            )
+        )
+        let startReply = try await readControlReply(
+            reader: reader,
+            channel: channel,
+            requestID: "workspace-start"
+        )
+        guard case .controlError("workspace-start", let code, let message) = startReply else {
+            Issue.record("expected typed workspace_start refusal, got \(startReply)")
+            return
+        }
+        #expect(code == ACPLeaderControlErrorCode.workspaceError)
+        #expect(message.contains("failed to connect workspace to hub"))
+
+        try await channel.write(
+            try ACPLeaderCodec.encode(
+                ACPLeaderClientMessage.control(
+                    requestID: "workspace-status-after",
+                    command: ["type": "workspace_status"]
+                )
+            )
+        )
+        let afterStart = try await readControlReply(
+            reader: reader,
+            channel: channel,
+            requestID: "workspace-status-after"
+        )
+        guard case .controlResult(
+            "workspace-status-after",
+            .workspaceStatus(let finalStatus)
+        ) = afterStart else {
+            Issue.record("expected post-refusal workspace_status result, got \(afterStart)")
+            return
+        }
+        #expect(finalStatus.state == "none")
+        #expect(finalStatus.pid == leaderInfo.pid)
 
         // And the socket carries real ACP, not just the envelope.
         let initialize = ACPMessage.request(
@@ -408,6 +530,82 @@ struct LiveLeaderCompositionLiveTests {
 
     private func dialUnixSocket(path: String) async throws -> any WebSocketByteChannel {
         try await UnixSocketDialer.connect(path: path)
+    }
+
+    private func readControlReply(
+        reader: ACPLeaderChannelReader,
+        channel: any WebSocketByteChannel,
+        requestID: String
+    ) async throws -> ACPLeaderServerMessage {
+        let deadline = Task {
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            guard !Task.isCancelled else { return }
+            await channel.close()
+        }
+        defer { deadline.cancel() }
+
+        while true {
+            guard let message = try await reader.next(ACPLeaderServerMessage.self) else {
+                throw ACPLeaderProtocolError.connectionClosed
+            }
+            switch message {
+            case .controlResult(let replyID, _) where replyID == requestID:
+                return message
+            case .controlError(let replyID, _, _) where replyID == requestID:
+                return message
+            default:
+                continue
+            }
+        }
+    }
+}
+
+#endif
+
+#if os(Windows)
+
+@Suite("Windows leader refusal")
+struct LiveLeaderCompositionWindowsTests {
+    @Test("leader refuses before prompt startup or endpoint creation")
+    func leaderRefusesWithoutArtifacts() async throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("og-ldr-\(UUID().uuidString)")
+        let environment = [
+            "OPENGROK_HOME": home.path,
+            "GROK_WS_URL": "wss://staging.invalid/ws",
+        ]
+        let paths = ACPLeaderSocketPaths.resolve(
+            openGrokHome: home,
+            relayURL: environment["GROK_WS_URL"],
+            environment: environment
+        )
+        let services = LiveACPServices { _ in
+            throw CLIApplicationError.failed("prompt driver should not be requested before Windows refusal")
+        }
+
+        do {
+            _ = try await LiveLeaderComposition.session(
+                for: .leader(CLILeaderOptions()),
+                context: makeLeaderContext(
+                    environment: environment,
+                    recorder: LeaderStreamRecorder()
+                ),
+                services: services
+            )
+            Issue.record("expected Windows leader mode to refuse")
+        } catch let error as CLIApplicationError {
+            guard case .failed(let message) = error else {
+                Issue.record("expected .failed, got \(error)")
+                return
+            }
+            #expect(message.contains("unavailable on Windows"))
+            #expect(message.contains(paths.lock.path))
+            #expect(message.contains("named-pipe transport"))
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: home.path))
+        #expect(!FileManager.default.fileExists(atPath: paths.lock.path))
+        #expect(!FileManager.default.fileExists(atPath: paths.socket.path))
     }
 }
 

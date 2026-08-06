@@ -2,7 +2,7 @@
 //
 // Platform sandbox support probes and enforcement backends:
 //   * macOS — Seatbelt (sandbox_init + SBPL)
-//   * Linux — Landlock probe + bubblewrap re-exec plan
+//   * Linux — backend-honest bubblewrap capability probe + process re-exec
 //   * Windows — restricted-token / Job Object (compile-checked unsupported)
 //
 // R15 acceptance: fail closed when a non-off mode cannot be enforced.
@@ -11,6 +11,10 @@ import Foundation
 
 #if canImport(Darwin)
 import Darwin
+#endif
+
+#if os(Linux)
+import Glibc
 #endif
 
 // MARK: - Support probe
@@ -52,7 +56,9 @@ public enum PlatformSandboxSupport {
     }
 
     /// Probe whether the current process can apply a real OS sandbox.
-    public static func supportInfo() -> SandboxSupportInfo {
+    public static func supportInfo(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> SandboxSupportInfo {
         #if os(macOS)
         // sandbox_init is present on all supported macOS versions.
         return SandboxSupportInfo(
@@ -61,27 +67,27 @@ public enum PlatformSandboxSupport {
             details: "macOS Seatbelt (sandbox_init) available"
         )
         #elseif os(Linux)
-        let landlock = landlockSupported()
-        let bwrap = FileManager.default.isExecutableFile(atPath: "/usr/bin/bwrap")
-            || FileManager.default.isExecutableFile(atPath: "/bin/bwrap")
-        if landlock {
-            return SandboxSupportInfo(
-                isSupported: true,
-                backend: .linuxLandlock,
-                details: "Linux Landlock ABI available"
-            )
-        }
-        if bwrap {
+        // A bwrap executable is launch availability, not current-process
+        // enforcement. Only a process that re-entered with a process-owned
+        // receipt may advertise restricted support to capability consumers.
+        if isVerifiedInsideBwrap(environment: environment) {
+            let bwrap = findBubblewrap(environment: environment)?.description ?? "bubblewrap"
             return SandboxSupportInfo(
                 isSupported: true,
                 backend: .linuxBubblewrap,
-                details: "bubblewrap available (Landlock not present)"
+                details: "bubblewrap confinement verified in the current process (\(bwrap))"
             )
         }
+        let bwrapAvailable = findBubblewrap(environment: environment) != nil
+        let landlock = landlockSupported()
         return SandboxSupportInfo(
             isSupported: false,
             backend: .none,
-            details: "neither Landlock nor bubblewrap available"
+            details: bwrapAvailable
+                ? "Linux bubblewrap is available, but this process is not verified inside the re-exec; activation/re-exec is required"
+                : landlock
+                    ? "Linux Landlock is detectable but no implemented filesystem backend is available; activation/re-exec is required"
+                    : "Linux process-wide sandbox activation is unavailable; bubblewrap re-exec is required"
         )
         #elseif os(Windows)
         // Restricted tokens / Job Objects exist but are not yet wired.
@@ -194,11 +200,9 @@ public func buildSeatbeltProfile(_ resolved: ResolvedSandboxProfile, workspace: 
         }
     }
 
-    if resolved.restrictNetwork {
-        lines.append("(deny network*)")
-    } else {
-        lines.append("(allow network*)")
-    }
+    // Keep provider/LLM traffic available in the agent process. Network
+    // restriction is enforced at known Linux child launches instead.
+    lines.append("(allow network*)")
 
     return lines.joined(separator: "\n")
 }
@@ -259,25 +263,204 @@ public func applySeatbeltProfile(_ sbpl: String) throws {
 
 // MARK: - Bubblewrap plan (Linux)
 
-/// A plan for re-exec under bubblewrap with deny mounts.
+/// A complete mount plan for re-exec under bubblewrap.
 public struct BwrapDenyPlan: Sendable, Equatable {
     public var denyWrite: [String]
     public var denyRead: [String]
     public var hasGlobs: Bool
     public var restrictNetwork: Bool
+    public var readOnly: [String]
+    public var readWrite: [String]
+    public var defaultRead: Bool
 
-    public init(denyWrite: [String], denyRead: [String], hasGlobs: Bool, restrictNetwork: Bool = false) {
+    public init(
+        denyWrite: [String],
+        denyRead: [String],
+        hasGlobs: Bool,
+        restrictNetwork: Bool = false,
+        readOnly: [String] = [],
+        readWrite: [String] = [],
+        defaultRead: Bool = true
+    ) {
         self.denyWrite = denyWrite
         self.denyRead = denyRead
         self.hasGlobs = hasGlobs
         self.restrictNetwork = restrictNetwork
+        self.readOnly = readOnly
+        self.readWrite = readWrite
+        self.defaultRead = defaultRead
     }
 }
 
 public let bwrapEnvVar = "__GROK_INSIDE_BWRAP"
+public let bwrapReceiptPathEnvVar = "__GROK_BWRAP_RECEIPT_PATH"
+public let bwrapReceiptTokenEnvVar = "__GROK_BWRAP_RECEIPT_TOKEN"
 
+/// Return true only for a verified bwrap re-entry. The environment marker is
+/// deliberately not exposed as a standalone capability signal.
 public func isInsideBwrap(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
-    environment[bwrapEnvVar] != nil
+    isVerifiedInsideBwrap(environment: environment)
+}
+
+/// Return true only after the bwrap handoff marker is paired with the
+/// process-owned, one-use receipt installed before `execve`. Marker presence
+/// by itself is intentionally not security evidence.
+public func isVerifiedInsideBwrap(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> Bool {
+    guard environment[bwrapEnvVar] == "1",
+          let receiptPath = environment[bwrapReceiptPathEnvVar],
+          let receiptToken = environment[bwrapReceiptTokenEnvVar],
+          !receiptPath.isEmpty,
+          !receiptToken.isEmpty else {
+        return false
+    }
+
+    let expectedDirectory = sandboxGrokHome(environment: environment)
+        .appendingPathComponent("sandbox-receipts", isDirectory: true)
+        .resolvingSymlinksInPath()
+        .standardizedFileURL
+        .path
+    let actualURL = URL(fileURLWithPath: receiptPath)
+        .resolvingSymlinksInPath()
+        .standardizedFileURL
+    guard actualURL.path.hasPrefix(expectedDirectory + "/"),
+          actualURL.lastPathComponent == receiptToken,
+          let contents = try? String(contentsOf: actualURL, encoding: .utf8),
+          contents == receiptToken else {
+        return false
+    }
+    return true
+}
+
+/// Discover bubblewrap by absolute path. Executable-file presence is only a
+/// discovery step; callers must still run `probeBubblewrap` before claiming
+/// enforcement capability.
+public func findBubblewrap(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> String? {
+    let fixed = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]
+    for path in fixed where FileManager.default.isExecutableFile(atPath: path) {
+        return path
+    }
+    for directory in (environment["PATH"] ?? "").split(separator: ":") {
+        let candidate = "\(directory)/bwrap"
+        if FileManager.default.isExecutableFile(atPath: candidate) {
+            return candidate
+        }
+    }
+    return nil
+}
+
+/// Run the exact minimal bubblewrap invocation used by the production
+/// re-exec. A successful process exit is the only capability signal accepted.
+public func probeBubblewrap(path: String) -> Bool {
+    guard FileManager.default.isExecutableFile(atPath: path) else { return false }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: path)
+    process.arguments = [
+        "--cap-drop", "ALL",
+        "--ro-bind", "/", "/",
+        "--dev-bind", "/dev", "/dev",
+        "--proc", "/proc",
+        "--", "/bin/sh", "-c", ":",
+    ]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    let finished = DispatchSemaphore(value: 0)
+    let status = LockedProcessStatus()
+    process.terminationHandler = { child in
+        status.set(child.terminationStatus)
+        finished.signal()
+    }
+    do {
+        try process.run()
+    } catch {
+        process.terminationHandler = nil
+        return false
+    }
+    if finished.wait(timeout: .now() + 5) == .timedOut {
+        process.terminate()
+        if finished.wait(timeout: .now() + 1) == .timedOut {
+            #if os(Linux)
+            kill(process.processIdentifier, SIGKILL)
+            #endif
+            _ = finished.wait(timeout: .now() + 2)
+        }
+        return false
+    }
+    return status.get() == 0
+}
+
+/// Injectable seams for the process-replacing Linux handoff. Production uses
+/// the current argv/environment and `execve`; tests can capture the planned
+/// command without replacing the test runner.
+public struct LinuxBwrapReexecHooks: Sendable {
+    public var environment: @Sendable () -> [String: String]
+    public var arguments: @Sendable () -> [String]
+    public var executable: @Sendable () -> String
+    public var supportInfo: @Sendable () -> SandboxSupportInfo
+    public var discoverBubblewrap: @Sendable ([String: String]) -> String?
+    public var probe: @Sendable (String) -> Bool
+    public var exec: @Sendable (String, [String], [String: String]) throws -> Void
+
+    public init(
+        environment: @escaping @Sendable () -> [String: String],
+        arguments: @escaping @Sendable () -> [String],
+        executable: @escaping @Sendable () -> String,
+        supportInfo: @escaping @Sendable () -> SandboxSupportInfo,
+        discoverBubblewrap: @escaping @Sendable ([String: String]) -> String?,
+        probe: @escaping @Sendable (String) -> Bool,
+        exec: @escaping @Sendable (String, [String], [String: String]) throws -> Void
+    ) {
+        self.environment = environment
+        self.arguments = arguments
+        self.executable = executable
+        self.supportInfo = supportInfo
+        self.discoverBubblewrap = discoverBubblewrap
+        self.probe = probe
+        self.exec = exec
+    }
+
+    public static let production = LinuxBwrapReexecHooks(
+        environment: { ProcessInfo.processInfo.environment },
+        arguments: { Array(CommandLine.arguments.dropFirst()) },
+        executable: {
+            guard let first = CommandLine.arguments.first, !first.isEmpty else {
+                return "/proc/self/exe"
+            }
+            if first.hasPrefix("/") { return first }
+            return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(first)
+                .standardizedFileURL
+                .path
+        },
+        supportInfo: {
+            PlatformSandboxSupport.supportInfo(environment: ProcessInfo.processInfo.environment)
+        },
+        discoverBubblewrap: { environment in findBubblewrap(environment: environment) },
+        probe: { probeBubblewrap(path: $0) },
+        exec: { executable, arguments, environment in
+            try replaceProcess(executable: executable, arguments: arguments, environment: environment)
+        }
+    )
+}
+
+private final class LockedProcessStatus: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Int32?
+
+    func set(_ newValue: Int32) {
+        lock.lock()
+        value = newValue
+        lock.unlock()
+    }
+
+    func get() -> Int32? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
 }
 
 /// Create a zero-permission placeholder path for bwrap read-deny bind-overs.
@@ -365,19 +548,51 @@ public func bwrapReexecCommand(
     restrictNetwork: Bool = false,
     environment: [String: String] = ProcessInfo.processInfo.environment,
     arguments: [String] = Array(CommandLine.arguments.dropFirst()),
-    executable: URL? = nil
+    executable: URL? = nil,
+    bwrapPath: String = "bwrap",
+    receiptPath: String? = nil,
+    receiptToken: String? = nil,
+    readOnly: [String] = [],
+    readWrite: [String] = [],
+    defaultRead: Bool = true
 ) -> [String]? {
-    if isInsideBwrap(environment: environment) { return nil }
+    if isVerifiedInsideBwrap(environment: environment) { return nil }
+    _ = restrictNetwork
     let selfExe: String
     if let executable {
         selfExe = executable.path
     } else {
         selfExe = CommandLine.arguments.first ?? "/proc/self/exe"
     }
-    var argv: [String] = ["bwrap", "--bind", "/", "/"]
-    if restrictNetwork {
-        argv.append("--unshare-net")
+    var argv: [String] = [bwrapPath, "--cap-drop", "ALL"]
+    if defaultRead {
+        argv.append(contentsOf: ["--ro-bind", "/", "/"])
+    } else {
+        // A strict profile starts from an empty root and explicitly mounts its
+        // read-only/read-write roots below. This is the only way to preserve
+        // `defaultRead == false` instead of turning it into a writable host.
+        argv.append(contentsOf: ["--tmpfs", "/"])
     }
+    for path in readOnly where path != "/" {
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        argv.append(contentsOf: ["--ro-bind", path, path])
+    }
+    for path in readWrite where path != "/" {
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        argv.append(contentsOf: ["--bind", path, path])
+    }
+    // The agent retains provider network access. Child-only network denial is
+    // armed later through LocalShellProcessBackend after successful apply.
+    argv.append(contentsOf: ["--setenv", bwrapEnvVar, "1"])
+    if let receiptPath, let receiptToken {
+        argv.append(contentsOf: [
+            "--setenv", bwrapReceiptPathEnvVar, receiptPath,
+            "--setenv", bwrapReceiptTokenEnvVar, receiptToken,
+        ])
+    }
+    // Device and proc mounts are established before deny overlays so explicit
+    // denies remain the final authority for every profile root.
+    argv.append(contentsOf: ["--dev-bind", "/dev", "/dev", "--proc", "/proc"])
     for path in denyWrite {
         if FileManager.default.fileExists(atPath: path) {
             argv.append(contentsOf: ["--ro-bind", path, path])
@@ -388,10 +603,9 @@ public func bwrapReexecCommand(
         if let placeholder = bwrapBlockedPlaceholder(name: isDir ? "sandbox-blocked-dir" : "sandbox-blocked", wantDir: isDir, environment: environment) {
             argv.append(contentsOf: ["--ro-bind", placeholder.path, path])
         } else {
-            argv.append(contentsOf: ["--ro-bind", path, path])
+            return nil
         }
     }
-    argv.append(contentsOf: ["--dev-bind", "/dev", "/dev", "--proc", "/proc"])
     argv.append(contentsOf: ["--", selfExe])
     argv.append(contentsOf: arguments)
     return argv
@@ -405,6 +619,9 @@ public func bwrapDenyPlan(
 ) -> BwrapDenyPlan? {
     let cfg = config ?? loadSandboxConfig(workspace: workspace)
     var denyWrite: [String] = []
+    var readOnly: [String] = []
+    var readWrite: [String] = []
+    var defaultRead = true
     if isDevboxBased(profile: profile, config: cfg) {
         denyWrite.append("/data")
     }
@@ -412,31 +629,126 @@ public func bwrapDenyPlan(
     var hasGlobs = false
     var restrictNet = profile.restrictsNetwork
     if profile != .off {
-        if let resolved = try? profile.resolve(workspace: workspace, config: cfg) {
-            restrictNet = resolved.restrictNetwork
-            let (exact, globs) = partitionDenyEntries(resolved.denyEntries)
-            hasGlobs = !globs.isEmpty
-            for entry in exact {
-                let pathStr = entry.hasPrefix("/") ? entry : workspace.appendingPathComponent(entry).path
-                denyRead.append(pathStr)
+        guard let resolved = try? profile.resolve(workspace: workspace, config: cfg) else {
+            return nil
+        }
+        readOnly = resolved.readOnly.map(\.path)
+        readWrite = resolved.readWrite.map(\.path)
+        defaultRead = resolved.defaultRead
+        restrictNet = resolved.restrictNetwork
+        let (exact, globs) = partitionDenyEntries(resolved.denyEntries)
+        hasGlobs = !globs.isEmpty
+        for entry in exact {
+            let pathStr = entry.hasPrefix("/") ? entry : workspace.appendingPathComponent(entry).path
+            denyRead.append(pathStr)
+        }
+        for d in resolved.deny {
+            if !denyRead.contains(d.path) {
+                denyRead.append(d.path)
             }
-            for d in resolved.deny {
-                if !denyRead.contains(d.path) {
-                    denyRead.append(d.path)
-                }
-            }
-            if hasGlobs {
-                if let expanded = expandDenyGlobs(workspace: workspace, globs: globs) {
-                    denyRead.append(contentsOf: expanded)
-                } else {
-                    // Fail closed if glob expansion failed or exceeded limits
-                    return nil
-                }
+        }
+        if hasGlobs {
+            if let expanded = expandDenyGlobs(workspace: workspace, globs: globs) {
+                denyRead.append(contentsOf: expanded)
+            } else {
+                // Fail closed if glob expansion failed or exceeded limits
+                return nil
             }
         }
     }
     let uniqueRead = Array(Set(denyRead)).sorted()
-    return BwrapDenyPlan(denyWrite: denyWrite, denyRead: uniqueRead, hasGlobs: hasGlobs, restrictNetwork: restrictNet)
+    return BwrapDenyPlan(
+        denyWrite: denyWrite,
+        denyRead: uniqueRead,
+        hasGlobs: hasGlobs,
+        restrictNetwork: restrictNet,
+        readOnly: Array(Set(readOnly)).sorted(),
+        readWrite: Array(Set(readWrite)).sorted(),
+        defaultRead: defaultRead
+    )
+}
+
+/// Create the one-use receipt that proves this process initiated the
+/// bubblewrap handoff. A caller-supplied environment marker without this
+/// receipt is never accepted as successful enforcement.
+func createBwrapReceipt(environment: [String: String]) throws -> (path: String, token: String) {
+    let token = UUID().uuidString
+    let directory = sandboxGrokHome(environment: environment)
+        .appendingPathComponent("sandbox-receipts", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let path = directory.appendingPathComponent(token).path
+    try Data(token.utf8).write(to: URL(fileURLWithPath: path), options: .atomic)
+    #if canImport(Darwin) || canImport(Glibc)
+    _ = chmod(path, 0o600)
+    #endif
+    return (path, token)
+}
+
+/// Consume and validate the receipt installed by bubblewrap's `--setenv`.
+func validateBwrapReceipt(environment: [String: String]) throws {
+    guard isVerifiedInsideBwrap(environment: environment) else {
+        throw SandboxError.enforcementFailed("bubblewrap handoff marker is absent")
+    }
+    guard let path = environment[bwrapReceiptPathEnvVar],
+          let token = environment[bwrapReceiptTokenEnvVar],
+          !path.isEmpty,
+          !token.isEmpty else {
+        throw SandboxError.enforcementFailed(
+            "bubblewrap marker was present without a process-owned enforcement receipt"
+        )
+    }
+    let expectedDirectory = sandboxGrokHome(environment: environment)
+        .appendingPathComponent("sandbox-receipts", isDirectory: true)
+        .standardizedFileURL
+        .path
+    let actualPath = URL(fileURLWithPath: path).standardizedFileURL.path
+    guard actualPath.hasPrefix(expectedDirectory + "/") else {
+        throw SandboxError.enforcementFailed("bubblewrap receipt path is outside the sandbox receipt directory")
+    }
+    guard let contents = try? String(contentsOfFile: actualPath, encoding: .utf8),
+          contents == token,
+          URL(fileURLWithPath: actualPath).lastPathComponent == token else {
+        throw SandboxError.enforcementFailed("bubblewrap enforcement receipt is invalid")
+    }
+    try? FileManager.default.removeItem(atPath: actualPath)
+}
+
+private func replaceProcess(
+    executable: String,
+    arguments: [String],
+    environment: [String: String]
+) throws {
+    #if os(Linux) || os(macOS)
+    let argumentPointers = ([executable] + arguments).map { strdup($0) }
+    let environmentPointers = environment
+        .sorted { $0.key < $1.key }
+        .map { strdup("\($0.key)=\($0.value)") }
+    defer {
+        for pointer in argumentPointers { if let pointer { free(pointer) } }
+        for pointer in environmentPointers { if let pointer { free(pointer) } }
+    }
+    var argv = argumentPointers + [nil]
+    var envp = environmentPointers + [nil]
+    let result: Int32 = argv.withUnsafeMutableBufferPointer { argvBuffer in
+        envp.withUnsafeMutableBufferPointer { envBuffer in
+            executable.withCString { path in
+                #if os(Linux)
+                Glibc.execve(path, argvBuffer.baseAddress, envBuffer.baseAddress)
+                #else
+                Darwin.execve(path, argvBuffer.baseAddress, envBuffer.baseAddress)
+                #endif
+            }
+        }
+    }
+    let message = String(cString: strerror(errno))
+    _ = result
+    throw SandboxError.enforcementFailed("execve(\(executable)) failed: \(message)")
+    #else
+    _ = executable
+    _ = arguments
+    _ = environment
+    throw SandboxError.unsupported("bubblewrap re-exec is only available on Linux")
+    #endif
 }
 
 // MARK: - Windows seams (compile-checked)

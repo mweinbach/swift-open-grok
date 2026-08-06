@@ -98,7 +98,8 @@ public enum FileToolSession {
         workspaceRoot: String,
         planMode: PlanModeTracker? = nil,
         hooks: any PreToolUseHookRunner = FailOpenPreToolUseHookRunner(),
-        resolved: ResolvedPermissions? = nil
+        resolved: ResolvedPermissions? = nil,
+        sandboxAutoAllowBash: @Sendable @escaping () -> Bool = { false }
     ) -> PermissionPipeline {
         // The blanket-approval request (`OPENGROK_ALLOW_WRITES=1`) maps to
         // `yoloMode`, not `allowAll`, whenever a real policy was resolved.
@@ -122,7 +123,8 @@ public enum FileToolSession {
             yoloPinReason: resolved?.yoloPinReason,
             allowAll: blanketApproval && !hasPolicy,
             shellCwd: workspaceRoot,
-            prompter: policy.prompter
+            prompter: policy.prompter,
+            sandboxAutoAllowBash: sandboxAutoAllowBash
         )
         return PermissionPipeline(
             permissions: permissions,
@@ -146,7 +148,8 @@ public enum FileToolSession {
         hunkTracker: HunkTrackerActor? = nil,
         promptIndex: Int = 0,
         allowedRoots: [String]? = nil,
-        resolved: ResolvedPermissions? = nil
+        resolved: ResolvedPermissions? = nil,
+        sandboxAutoAllowBash: @Sendable @escaping () -> Bool = { false }
     ) -> ToolResources {
         let root = (workspaceRoot as NSString).standardizingPath
         return ToolResources(
@@ -157,7 +160,8 @@ public enum FileToolSession {
                 workspaceRoot: root,
                 planMode: planMode,
                 hooks: hooks,
-                resolved: resolved
+                resolved: resolved,
+                sandboxAutoAllowBash: sandboxAutoAllowBash
             ),
             hunkTracker: hunkTracker,
             promptIndex: promptIndex,

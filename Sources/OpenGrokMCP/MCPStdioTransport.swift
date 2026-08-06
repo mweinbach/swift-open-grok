@@ -14,6 +14,7 @@
 // break the caller.
 
 import Foundation
+import OpenGrokSandbox
 import OpenGrokToolProtocol
 
 #if canImport(Darwin)
@@ -151,6 +152,7 @@ private final class MCPStdioLineSink: @unchecked Sendable {
 
 public actor MCPStdioTransport: MCPTransport {
     private let configuration: MCPStdioTransportConfiguration
+    private let launchTransform: ChildLaunchTransform
     private let process: Process
     private let stdinPipe = Pipe()
     private let stdoutPipe = Pipe()
@@ -159,8 +161,12 @@ public actor MCPStdioTransport: MCPTransport {
     private var started = false
     private var isClosed = false
 
-    public init(configuration: MCPStdioTransportConfiguration) {
+    public init(
+        configuration: MCPStdioTransportConfiguration,
+        launchTransform: @escaping ChildLaunchTransform = childNetworkRestrictedLaunch
+    ) {
         self.configuration = configuration
+        self.launchTransform = launchTransform
         self.process = Process()
     }
 
@@ -169,11 +175,21 @@ public actor MCPStdioTransport: MCPTransport {
         guard !started else { return }
         guard !isClosed else { throw MCPError.transportClosed }
 
-        process.executableURL = Self.resolveExecutable(
+        let resolvedExecutable = Self.resolveExecutable(
             configuration.command,
             environment: configuration.environment ?? ProcessInfo.processInfo.environment
         )
-        process.arguments = configuration.arguments
+        let launch: (executable: String, arguments: [String])
+        do {
+            launch = try launchTransform(resolvedExecutable.path, configuration.arguments)
+        } catch {
+            isClosed = true
+            throw MCPError.transport(
+                "unable to launch MCP server '\(configuration.command)': (error)"
+            )
+        }
+        process.executableURL = URL(fileURLWithPath: launch.executable)
+        process.arguments = launch.arguments
         if let environment = configuration.environment {
             var merged = ProcessInfo.processInfo.environment
             for (key, value) in environment { merged[key] = value }

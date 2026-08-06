@@ -107,30 +107,34 @@ public final class FinalizedToolset: @unchecked Sendable {
         let access = accessKind(for: tool, args: canonical)
         let applyPatchLabel = tool.id == "apply_patch"
 
-        if let pipeline = resources.permissionPipeline {
-            let prepared = await pipeline.prepare(
-                PrepareToolAccessRequest(
-                    access: access,
-                    toolName: clientName,
-                    toolCallId: callId,
-                    applyPatchLabel: applyPatchLabel
-                )
+        guard let pipeline = resources.permissionPipeline else {
+            return .failure(.permissionDenied(
+                "'\(clientName)' has no permission gate configured for this session"
+            ))
+        }
+
+        let prepared = await pipeline.prepare(
+            PrepareToolAccessRequest(
+                access: access,
+                toolName: clientName,
+                toolCallId: callId,
+                applyPatchLabel: applyPatchLabel
             )
-            if !prepared.mayDispatch {
-                // The decision's own text is what the model and the user read.
-                // `prepared.reason` is an internal audit code ("permission_handle"),
-                // so it is only the fallback when the denial carries no message.
-                let explanation: String?
-                switch prepared.decision {
-                case .reject(let message), .policyDeny(let message), .followupMessage(let message):
-                    explanation = message
-                case .allow, .ask, .cancelled:
-                    explanation = nil
-                }
-                return .failure(.permissionDenied(
-                    explanation ?? prepared.reason ?? prepared.decision.description
-                ))
+        )
+        if !prepared.mayDispatch {
+            // The decision's own text is what the model and the user read.
+            // `prepared.reason` is an internal audit code ("permission_handle"),
+            // so it is only the fallback when the denial carries no message.
+            let explanation: String?
+            switch prepared.decision {
+            case .reject(let message), .policyDeny(let message), .followupMessage(let message):
+                explanation = message
+            case .allow, .ask, .cancelled:
+                explanation = nil
             }
+            return .failure(.permissionDenied(
+                explanation ?? prepared.reason ?? prepared.decision.description
+            ))
         }
 
         guard let handler = tool.handler else {

@@ -155,7 +155,10 @@ extension OpenGrokLiveApplicationLauncher {
         // `--experimental-memory`, upstream's opt-in switch. Passed explicitly
         // rather than read off the environment so the flag, the env var and the
         // config key are all visible in one place below.
-        experimentalMemory: Bool = false
+        experimentalMemory: Bool = false,
+        // Upstream applies this opt-out after every other memory source, so it
+        // must remain effective even when config or the environment enables it.
+        noMemory: Bool = false
     ) async -> LiveSessionServices {
         // Rewind is on by default. It is the only recovery path for a bad
         // agent edit outside git, and its cost when unused is one empty
@@ -182,10 +185,11 @@ extension OpenGrokLiveApplicationLauncher {
             document: document,
             environment: environment
         )
-        // The flag can only ever turn memory ON. Letting its absence turn it
-        // off would mean an interactive session with `memory.enabled = true` in
-        // config silently lost its memory, since nothing passes the flag there.
+        // The positive flag can only turn memory ON. The negative flag is
+        // applied afterward so it wins over config, environment, and the
+        // positive override just as it does upstream.
         if experimentalMemory { memoryConfiguration.enabled = true }
+        if noMemory { memoryConfiguration.enabled = false }
         let memory = LiveMemoryBackend(
             configuration: memoryConfiguration,
             workingDirectory: workingDirectory,

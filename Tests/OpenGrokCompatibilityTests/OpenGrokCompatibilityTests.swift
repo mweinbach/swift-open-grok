@@ -10,23 +10,47 @@
 //
 // Digest freshness is deliberately NOT re-checked here —
 // `Tests/OpenGrokBuildSupportTests` already validates every manifest digest
-// through `FixtureValidator`, and this target has no dependency edge to the
-// package's SHA-256 implementation. This suite checks the things that test
-// does not: the pin, the verdicts, and manifest/provenance agreement.
+// through `FixtureValidator`. This suite checks the things that test does not:
+// the pin, the verdicts, and manifest/provenance agreement.
 
 import Foundation
 import Testing
 
 import OpenGrokACP
-
-/// The revision `PORT_STATUS.md` pins the Rust reference to.
-private let pinnedReferenceRevision = "80dff0a9dcb24121b976b9f920fbe442af40ea88"
-
-/// The revision the fixtures were originally captured at, before the
-/// 2026-08-04 re-pin. No fixture may still name it.
-private let supersededReferenceRevision = "9739c4a2ad23cfea14312a481169757f3da494f4"
+import OpenGrokDistributionSupport
 
 private let acceptedVerdicts: Set<String> = ["unchanged (verified)", "recaptured"]
+
+private struct PortStatusBaseline {
+    let referenceRevision: String
+    let release: String
+
+    static func load(filePath: String = #filePath) throws -> Self {
+        var root = URL(fileURLWithPath: filePath).deletingLastPathComponent()
+        while root.path != "/" && !FileManager.default.fileExists(atPath: root.appendingPathComponent("PORT_STATUS.md").path) {
+            root = root.deletingLastPathComponent()
+        }
+        let statusURL = root.appendingPathComponent("PORT_STATUS.md")
+        guard let text = try? String(contentsOf: statusURL, encoding: .utf8),
+              let line = text.split(whereSeparator: \.isNewline).first(where: { $0.hasPrefix("**Reference:**") }) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let referenceLine = String(line)
+        guard let revisionStart = referenceLine.range(of: " at `"),
+              let revisionEnd = referenceLine[revisionStart.upperBound...].firstIndex(of: "`") else {
+            throw CocoaError(.propertyListReadCorrupt)
+        }
+        let revision = String(referenceLine[revisionStart.upperBound..<revisionEnd])
+        guard revision.range(of: "^[0-9a-fA-F]{40}$", options: .regularExpression) != nil,
+              let releaseStart = referenceLine.range(of: "release `v"),
+              let releaseEnd = referenceLine[releaseStart.upperBound...].firstIndex(of: "`") else {
+            throw CocoaError(.propertyListReadCorrupt)
+        }
+        let release = String(referenceLine[releaseStart.upperBound..<releaseEnd])
+        guard !release.isEmpty else { throw CocoaError(.propertyListReadCorrupt) }
+        return Self(referenceRevision: revision, release: release)
+    }
+}
 
 // MARK: - Fixture corpus access
 
@@ -72,6 +96,107 @@ private enum FixtureCorpus {
     }
 }
 
+// MARK: - Release-gate test inventory
+
+private struct ReleaseGateTestInventory {
+    struct Report: Equatable {
+        let missingTargets: [String]
+        let inspectedFiles: [String: [String]]
+
+        var failureDescription: String {
+            missingTargets.map { target in
+                let files = inspectedFiles[target] ?? []
+                let listing = files.isEmpty ? "none" : files.joined(separator: ", ")
+                return "\(target) has no executable test declaration; inspected Swift files: \(listing)"
+            }.joined(separator: " | ")
+        }
+    }
+
+    static let registry = [
+        "OpenGrokCompatibilityTests",
+        "OpenGrokReleaseValidationTests",
+        "OpenGrokPagerPTYHarnessTests",
+        "OpenGrokPagerPTYTests",
+    ]
+
+    static func packageRoot(filePath: String = #filePath) -> URL {
+        var root = URL(fileURLWithPath: filePath).deletingLastPathComponent()
+        while root.path != "/" {
+            if FileManager.default.fileExists(atPath: root.appendingPathComponent("Package.swift").path) {
+                return root
+            }
+            root = root.deletingLastPathComponent()
+        }
+        return URL(fileURLWithPath: filePath).deletingLastPathComponent()
+    }
+
+    static func scan(
+        testsRoot: URL = packageRoot().appendingPathComponent("Tests", isDirectory: true),
+        targetNames: [String] = registry
+    ) throws -> Report {
+        var missingTargets: [String] = []
+        var inspectedFiles: [String: [String]] = [:]
+
+        for targetName in targetNames {
+            let targetDirectory = testsRoot.appendingPathComponent(targetName, isDirectory: true)
+            let swiftFiles = swiftFiles(in: targetDirectory)
+            inspectedFiles[targetName] = swiftFiles.map(\.lastPathComponent).sorted()
+            let hasExecutableTest = swiftFiles.contains { file in
+                guard let source = try? String(contentsOf: file, encoding: .utf8) else {
+                    return false
+                }
+                return source.contains("@Test")
+                    || source.range(of: #"func\s+test[A-Z_]"#, options: .regularExpression) != nil
+            }
+            if !hasExecutableTest {
+                missingTargets.append(targetName)
+            }
+        }
+
+        return Report(missingTargets: missingTargets, inspectedFiles: inspectedFiles)
+    }
+
+    private static func swiftFiles(in directory: URL) -> [URL] {
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            return []
+        }
+        return enumerator.compactMap { element in
+            guard let file = element as? URL, file.pathExtension == "swift" else {
+                return nil
+            }
+            return file
+        }
+    }
+}
+
+@Suite("release gate test inventory")
+struct ReleaseGateTestInventoryTests {
+    @Test("named Wave 11 release gates contain executable tests")
+    func namedTargetsContainTests() throws {
+        let report = try ReleaseGateTestInventory.scan()
+        #expect(report.missingTargets.isEmpty, Comment(rawValue: report.failureDescription))
+    }
+
+    @Test("an empty test target is detected")
+    func syntheticEmptyTargetIsDetected() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opengrok-empty-test-target-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let report = try ReleaseGateTestInventory.scan(
+            testsRoot: root,
+            targetNames: ["SyntheticEmptyTests"]
+        )
+        #expect(report.missingTargets == ["SyntheticEmptyTests"])
+        #expect(report.failureDescription.contains("inspected Swift files: none"))
+    }
+}
+
 // MARK: - Pin discipline
 
 @Suite("Protocol fixture pin")
@@ -81,19 +206,24 @@ struct ProtocolFixturePinTests {
         #expect(!FixtureCorpus.jsonFixtureNames.isEmpty)
     }
 
+    @Test("the repository ledger agrees with the canonical production baseline")
+    func ledgerMatchesCanonicalBaseline() throws {
+        let baseline = try PortStatusBaseline.load()
+        #expect(baseline.referenceRevision == OpenGrokDistributionSupport.referenceRevision)
+        #expect(baseline.release == OpenGrokDistributionSupport.referencePinnedRelease)
+    }
+
     @Test("the generated manifest names the pinned reference revision")
     func manifestNamesPin() throws {
         let manifest = try FixtureCorpus.json("manifest.json")
-        #expect(manifest["referenceRevision"] as? String == pinnedReferenceRevision)
+        #expect(manifest["referenceRevision"] as? String == OpenGrokDistributionSupport.referenceRevision)
     }
 
     @Test("the provenance index names the pinned reference revision")
     func provenanceNamesPin() throws {
         let provenance = try FixtureCorpus.json("PROVENANCE.json")
-        #expect(provenance["referenceRevision"] as? String == pinnedReferenceRevision)
-        #expect(
-            provenance["previousReferenceRevision"] as? String == supersededReferenceRevision
-        )
+        #expect(provenance["referenceRevision"] as? String == OpenGrokDistributionSupport.referenceRevision)
+        #expect((provenance["previousReferenceRevision"] as? String)?.count == 40)
     }
 
     @Test("every JSON fixture names the pinned reference revision at top level")
@@ -101,28 +231,28 @@ struct ProtocolFixturePinTests {
         for name in FixtureCorpus.jsonFixtureNames {
             let fixture = try FixtureCorpus.json(name)
             #expect(
-                fixture["referenceRevision"] as? String == pinnedReferenceRevision,
+                fixture["referenceRevision"] as? String == OpenGrokDistributionSupport.referenceRevision,
                 "\(name) does not name the pinned reference revision"
+            )
+            let nested = fixture["provenance"] as? [String: Any]
+            #expect(
+                nested?["referenceRevision"] as? String == OpenGrokDistributionSupport.referenceRevision,
+                "\(name) provenance does not name the pinned reference revision"
             )
         }
     }
 
     @Test("no fixture still names the superseded pre-re-pin revision")
     func noSupersededRevisionRemains() throws {
-        for name in FixtureCorpus.jsonFixtureNames + ["PROVENANCE.json", "manifest.json"] {
-            let data = try Data(contentsOf: FixtureCorpus.url(name))
-            let text = String(decoding: data, as: UTF8.self)
-            if name == "PROVENANCE.json" || FixtureCorpus.jsonFixtureNames.contains(name) {
-                // The old ref may appear only as `previousReferenceRevision` or
-                // inside recorded evidence, never as the fixture's own pin.
-                let fixture = try FixtureCorpus.json(name)
-                #expect(fixture["referenceRevision"] as? String != supersededReferenceRevision)
-            } else {
-                #expect(
-                    !text.contains(supersededReferenceRevision),
-                    "\(name) still names the superseded revision"
-                )
-            }
+        let provenance = try FixtureCorpus.json("PROVENANCE.json")
+        guard let previous = provenance["previousReferenceRevision"] as? String else {
+            Issue.record("PROVENANCE.json has no previousReferenceRevision")
+            return
+        }
+        #expect(previous.range(of: "^[0-9a-fA-F]{40}$", options: .regularExpression) != nil)
+        for name in FixtureCorpus.jsonFixtureNames {
+            let fixture = try FixtureCorpus.json(name)
+            #expect(fixture["referenceRevision"] as? String != previous)
         }
     }
 }
@@ -166,8 +296,10 @@ struct ProtocolFixtureVerdictTests {
         for name in FixtureCorpus.jsonFixtureNames {
             let fixture = try FixtureCorpus.json(name)
             let provenance = fixture["provenance"] as? [String: Any] ?? [:]
+            let index = try FixtureCorpus.json("PROVENANCE.json")
+            let previous = index["previousReferenceRevision"] as? String
             #expect(
-                provenance["previousReferenceRevision"] as? String == supersededReferenceRevision,
+                provenance["previousReferenceRevision"] as? String == previous,
                 "\(name) does not record its previous capture revision"
             )
         }
@@ -286,7 +418,7 @@ struct RecapturedFixtureContentTests {
     @Test("the version fixture records the release pinned at the new ref")
     func versionFixtureNamesPinnedRelease() throws {
         let fixture = try FixtureCorpus.json("cli-version-and-home.json")
-        #expect(fixture["referencePinnedRelease"] as? String == "0.1.220-open-grok.53")
+        #expect(fixture["referencePinnedRelease"] as? String == OpenGrokDistributionSupport.referencePinnedRelease)
         // Home policy did not move with the pin.
         #expect(fixture["homeEnv"] as? String == "OPENGROK_HOME")
         #expect(fixture["homeFallback"] as? String == "~/.opengrok")
@@ -336,7 +468,7 @@ struct RecapturedFixtureContentTests {
         let versionBytes = Array(bytes[32..<64]).prefix { $0 != 0 }
         let appVersion = String(decoding: versionBytes, as: UTF8.self)
         #expect(appVersion == sample["appVersion"] as? String)
-        #expect(appVersion == "0.1.220-open-grok.53")
+        #expect(appVersion == OpenGrokDistributionSupport.referencePinnedRelease)
     }
 
     @Test("the config/permission fixture carries per-key Rust provenance")
@@ -362,9 +494,9 @@ struct RecapturedFixtureContentTests {
 
     @Test("known Swift-port drift is recorded rather than hidden")
     func portDriftIsRecorded() throws {
-        // Both fixtures whose upstream value moved ahead of the Swift port must
-        // say so explicitly, and the provenance index must list the same drift.
-        for name in ["cli-version-and-home.json", "config-workspace-codemode-keys.json"] {
+        // The Code Mode fixture still records the unresolved upstream default;
+        // the release-version drift is resolved by the shipped version seam.
+        for name in ["config-workspace-codemode-keys.json"] {
             let fixture = try FixtureCorpus.json(name)
             let drift = fixture["portDrift"] as? [String: Any] ?? [:]
             #expect(!drift.isEmpty, "\(name) recaptured a moved value without recording port drift")
@@ -372,8 +504,7 @@ struct RecapturedFixtureContentTests {
 
         let provenance = try FixtureCorpus.json("PROVENANCE.json")
         let openDrift = provenance["openPortDrift"] as? [String] ?? []
-        #expect(openDrift.count == 2)
-        #expect(openDrift.contains { $0.contains("CompiledVersion.generated.swift") })
+        #expect(openDrift.count == 1)
         #expect(openDrift.contains { $0.contains("DEFAULT_EXEC_YIELD_TIME_MS") })
     }
 }

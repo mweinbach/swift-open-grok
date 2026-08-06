@@ -2,6 +2,7 @@ import Foundation
 import Testing
 import OpenGrokShared
 import OpenGrokShellBase
+import OpenGrokShellSessionSupport
 @testable import OpenGrokShell
 
 private actor RecordingBackend: ShellProcessBackend {
@@ -44,13 +45,15 @@ private actor RecordingBackend: ShellProcessBackend {
 
 private actor RecordingProvider: OpenGrokShellProviderSession {
     let sessionID: String
+    let everUsedNonXAI: Bool
     private var activeTurnID: String?
     private(set) var beginCount = 0
     private(set) var finishCount = 0
     private(set) var cancelCount = 0
 
-    init(sessionID: String) {
+    init(sessionID: String, everUsedNonXAI: Bool = false) {
         self.sessionID = sessionID
+        self.everUsedNonXAI = everUsedNonXAI
     }
 
     func snapshot() async -> OpenGrokShellProviderSessionSnapshot {
@@ -58,7 +61,8 @@ private actor RecordingProvider: OpenGrokShellProviderSession {
             sessionID: sessionID,
             modelID: "test-model",
             provider: "test-provider",
-            generation: 0
+            generation: 0,
+            everUsedNonXAI: everUsedNonXAI
         )
     }
 
@@ -197,6 +201,23 @@ func startupSessionLifecycle() async throws {
     #expect(collected.contains { if case .sessionCreated = $0 { return true }; return false })
     #expect(collected.contains { if case .turnCompleted = $0 { return true }; return false })
     #expect(collected.contains { if case .shutdownCompleted = $0 { return true }; return false })
+}
+
+@Test("createSession persists the provider export boundary marker")
+func createSessionPersistsBoundaryMarker() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let provider = RecordingProvider(sessionID: "session-marker", everUsedNonXAI: true)
+    let driver = RecordingTurnDriver()
+    let backend = RecordingBackend()
+    let shell = makeShell(root: root, provider: provider, driver: driver, backend: backend)
+    _ = try await shell.start()
+    let sessionID = SessionID("session-marker")
+    _ = try await shell.createSession(OpenGrokShellSessionRequest(sessionID: sessionID, cwd: root))
+
+    let store = SessionStateStore(root: root.appendingPathComponent("home", isDirectory: true))
+    let state = try await store.load(sessionID: sessionID)
+    #expect(state?.summary.everUsedCodex == true)
+    _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
 }
 
 @Test("cancellation reaches the provider and bounded shutdown kills owned tools")

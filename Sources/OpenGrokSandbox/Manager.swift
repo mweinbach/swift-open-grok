@@ -105,6 +105,11 @@ public func flushSandboxEvents() {
     try? state?.logger.flushToDisk()
 }
 
+public typealias ChildLaunchTransform = @Sendable (
+    _ executable: String,
+    _ arguments: [String]
+) throws -> (executable: String, arguments: [String])
+
 public func sandboxMetrics() -> SandboxMetrics? {
     globalSandboxStore.withLock { sandbox, _, _ in
         sandbox?.logger.metrics
@@ -126,6 +131,7 @@ public final class SandboxManager: @unchecked Sendable {
     public private(set) var profile: ProfileName
     public let logger: SandboxLogger
     private var netRestricted: Bool
+    private let linuxReexecHooks: LinuxBwrapReexecHooks
     public private(set) var applied: Bool = false
     /// When true, non-off apply failures throw instead of degrading.
     public var failClosed: Bool
@@ -134,12 +140,14 @@ public final class SandboxManager: @unchecked Sendable {
         profile: ProfileName,
         workspace: URL,
         logger: SandboxLogger = SandboxLogger(),
-        failClosed: Bool = true
+        failClosed: Bool = true,
+        linuxReexecHooks: LinuxBwrapReexecHooks = .production
     ) {
         self.profile = profile
         self.logger = logger
         self.netRestricted = profile.restrictsNetwork
         self.failClosed = failClosed
+        self.linuxReexecHooks = linuxReexecHooks
         _ = workspace
     }
 
@@ -159,7 +167,31 @@ public final class SandboxManager: @unchecked Sendable {
         let resolved = try profile.resolve(workspace: workspace, config: config)
         netRestricted = resolved.restrictNetwork
 
-        let support = PlatformSandboxSupport.supportInfo()
+        let support: SandboxSupportInfo
+        #if os(Linux)
+        support = linuxReexecHooks.supportInfo()
+        #else
+        support = PlatformSandboxSupport.supportInfo()
+        #endif
+        #if os(Linux)
+        // Ordinary Linux processes intentionally report unsupported to
+        // capability consumers until re-exec completes. A discovered bwrap
+        // executable keeps the launch path eligible; PlatformEnforcer then
+        // performs the real process replacement or throws fail-closed.
+        if !support.isSupported,
+           linuxReexecHooks.discoverBubblewrap(linuxReexecHooks.environment()) == nil {
+            logger.log(.applyFailed(
+                profile: profile.description,
+                workspace: workspace,
+                error: support.details
+            ))
+            if failClosed || requiresReadDeny(profile: profile, workspace: workspace, config: config) {
+                throw SandboxError.unsupported(support.details)
+            }
+            applied = false
+            return
+        }
+        #else
         if !support.isSupported {
             logger.log(.applyFailed(
                 profile: profile.description,
@@ -172,9 +204,15 @@ public final class SandboxManager: @unchecked Sendable {
             applied = false
             return
         }
+        #endif
 
         do {
-            try PlatformEnforcer.apply(resolved: resolved, workspace: workspace, profile: profile)
+            try PlatformEnforcer.apply(
+                resolved: resolved,
+                workspace: workspace,
+                profile: profile,
+                linuxReexecHooks: linuxReexecHooks
+            )
             applied = true
             logger.log(.profileApplied(
                 profile: profile.description,
@@ -240,19 +278,59 @@ public func childNetworkRestrictedLaunch(
 // MARK: - Platform enforcer dispatch
 
 enum PlatformEnforcer {
-    static func apply(resolved: ResolvedSandboxProfile, workspace: URL, profile: ProfileName) throws {
+    static func apply(
+        resolved: ResolvedSandboxProfile,
+        workspace: URL,
+        profile: ProfileName,
+        linuxReexecHooks: LinuxBwrapReexecHooks = .production
+    ) throws {
         #if os(macOS)
         let sbpl = buildSeatbeltProfile(resolved, workspace: workspace)
         try applySeatbeltProfile(sbpl)
         #elseif os(Linux)
-        if isInsideBwrap() {
+        let environment = linuxReexecHooks.environment()
+        if isVerifiedInsideBwrap(environment: environment) {
+            try validateBwrapReceipt(environment: environment)
             return
         }
-        let plan = bwrapDenyPlan(profile: profile, workspace: workspace)
-        let planDetails = plan != nil ? "deny_write=\(plan!.denyWrite) deny_read=\(plan!.denyRead.count) has_globs=\(plan!.hasGlobs) restrict_network=\(plan!.restrictNetwork)" : "none"
-        throw SandboxError.enforcementFailed(
-            "Linux sandbox requires bubblewrap re-exec before apply; cannot enforce in-process without bwrap (\(planDetails))"
-        )
+        guard let bwrapPath = linuxReexecHooks.discoverBubblewrap(environment) else {
+            throw SandboxError.unsupported("bubblewrap executable was not found on Linux")
+        }
+        guard linuxReexecHooks.probe(bwrapPath) else {
+            throw SandboxError.unsupported("bubblewrap executable failed the runtime capability probe at \(bwrapPath)")
+        }
+        guard let plan = bwrapDenyPlan(profile: profile, workspace: workspace) else {
+            throw SandboxError.enforcementFailed("could not resolve a fail-closed bubblewrap deny plan")
+        }
+        let receipt = try createBwrapReceipt(environment: environment)
+        guard let command = bwrapReexecCommand(
+            denyWrite: plan.denyWrite,
+            denyRead: plan.denyRead,
+            restrictNetwork: false,
+            environment: environment,
+            arguments: linuxReexecHooks.arguments(),
+            executable: URL(fileURLWithPath: linuxReexecHooks.executable()),
+            bwrapPath: bwrapPath,
+            receiptPath: receipt.path,
+            receiptToken: receipt.token,
+            readOnly: plan.readOnly,
+            readWrite: plan.readWrite,
+            defaultRead: plan.defaultRead
+        ) else {
+            throw SandboxError.enforcementFailed("bubblewrap re-exec command could not be prepared")
+        }
+        var execEnvironment = environment
+        execEnvironment.removeValue(forKey: bwrapEnvVar)
+        execEnvironment.removeValue(forKey: bwrapReceiptPathEnvVar)
+        execEnvironment.removeValue(forKey: bwrapReceiptTokenEnvVar)
+        do {
+            try linuxReexecHooks.exec(bwrapPath, Array(command.dropFirst()), execEnvironment)
+        } catch {
+            try? FileManager.default.removeItem(atPath: receipt.path)
+            throw error
+        }
+        try? FileManager.default.removeItem(atPath: receipt.path)
+        throw SandboxError.enforcementFailed("bubblewrap exec returned without replacing the agent process")
         #elseif os(Windows)
         try createRestrictedTokenSandbox(profile: resolved)
         #else
@@ -321,14 +399,22 @@ public struct PlatformSandboxEnforcer: SandboxEnforcer {
     }
 
     public func detectSupportedMode() -> SandboxMode {
-        let info = PlatformSandboxSupport.supportInfo()
+        detectSupportedMode(environment: ProcessInfo.processInfo.environment)
+    }
+
+    /// Detect support using an injected environment for startup/re-entry
+    /// probes. The protocol requirement above keeps the shipped call site on
+    /// the real process environment; this overload makes the same decision
+    /// testable without mutating global process state.
+    public func detectSupportedMode(
+        environment: [String: String]
+    ) -> SandboxMode {
+        let info = PlatformSandboxSupport.supportInfo(environment: environment)
         if !info.isSupported { return .none }
         #if os(macOS)
         return .restricted
         #elseif os(Linux)
-        return info.backend == .linuxLandlock || info.backend == .linuxBubblewrap
-            ? .restricted
-            : .none
+        return .restricted
         #else
         return .none
         #endif
@@ -417,4 +503,3 @@ public struct BootstrapSandboxEnforcer: SandboxEnforcer {
         candidate.rank >= persisted.rank
     }
 }
-

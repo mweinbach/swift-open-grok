@@ -11,6 +11,7 @@ import Testing
 @testable import OpenGrokAuth
 import OpenGrokHTTP
 import OpenGrokSecrets
+import OpenGrokConfig
 
 // MARK: - Helpers
 
@@ -25,6 +26,69 @@ private func makeConfig(preferred: PreferredAuthMethod? = nil) -> GrokComConfig 
     var cfg = GrokComConfig.default(environment: [:])
     cfg.preferredMethod = preferred
     return cfg
+}
+
+private final class StubExternalAuthRunner: ExternalAuthProcessRunner, @unchecked Sendable {
+    private let lock = NSLock()
+    private var outputs: [ExternalAuthExecution]
+    private(set) var calls = 0
+
+    init(_ outputs: [ExternalAuthExecution]) {
+        self.outputs = outputs
+    }
+
+    func run(
+        command: String,
+        args: [String]?,
+        cwd: String?,
+        timeout: TimeInterval,
+        refreshToken: String?
+    ) -> ExternalAuthExecution? {
+        lock.lock()
+        defer { lock.unlock() }
+        calls += 1
+        return outputs.isEmpty ? nil : outputs.removeFirst()
+    }
+}
+
+private final class TestClock: @unchecked Sendable {
+    var date: Date
+    init(_ date: Date) { self.date = date }
+}
+
+@Suite("Named external auth providers")
+struct NamedExternalAuthProviderTests {
+    @Test("tokens cache until the TTL refresh margin")
+    func cachesAndRefreshes() {
+        let clock = TestClock(Date(timeIntervalSince1970: 1000))
+        let runner = StubExternalAuthRunner([
+            ExternalAuthExecution(stdout: #"{"access_token":"first","expires_in":120}"#, exitCode: 0),
+            ExternalAuthExecution(stdout: #"{"access_token":"second","expires_in":120}"#, exitCode: 0),
+        ])
+        let resolver = NamedAuthProviderResolver(
+            configuration: AuthProviderConfig(command: "token", tokenTTLSecs: 120),
+            runner: runner,
+            now: { clock.date }
+        )
+        #expect(resolver.currentToken() == "first")
+        #expect(resolver.currentToken() == "first")
+        #expect(runner.calls == 1)
+        clock.date = Date(timeIntervalSince1970: 1061)
+        #expect(resolver.currentToken() == "second")
+        #expect(runner.calls == 2)
+    }
+
+    @Test("nonzero and empty command output fail closed")
+    func failureIsNil() {
+        let runner = StubExternalAuthRunner([
+            ExternalAuthExecution(stdout: "", exitCode: 1),
+        ])
+        let resolver = NamedAuthProviderResolver(
+            configuration: AuthProviderConfig(command: "token"),
+            runner: runner
+        )
+        #expect(resolver.currentToken() == nil)
+    }
 }
 
 // MARK: - Models / scopes / JWT
@@ -372,6 +436,46 @@ struct AuthManagerTests {
         #expect(ok)
         let cur = await manager.currentOrExpired()
         #expect(cur?.key == "new")
+        let store = try readAuthJSON(at: home.appendingPathComponent("auth.json"))
+        #expect(store[makeConfig().authScope]?.key == "new")
+    }
+
+    @Test func unauthorizedRecoveryPreservesRetryableNoProgress() async throws {
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let manager = AuthManager(grokHome: home, config: makeConfig(), environment: [:])
+        var auth = GrokAuth.testDefault(key: "same", authMode: .oidc)
+        auth.refreshToken = "rt"
+        auth.expiresAt = Date().addingTimeInterval(3600)
+        try await manager.update(auth)
+        await manager.configureRefresher(
+            MockTokenRefresher(outcome: .success(auth))
+        )
+
+        let result = await manager.recoverUnauthorized()
+        #expect(result == .retryableFailure)
+        #expect((await manager.currentOrExpired())?.key == "same")
+    }
+
+    @Test func unauthorizedRecoveryPreservesTerminalRefreshRejection() async throws {
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let manager = AuthManager(grokHome: home, config: makeConfig(), environment: [:])
+        var auth = GrokAuth.testDefault(key: "stale", authMode: .oidc)
+        auth.refreshToken = "rt"
+        auth.expiresAt = Date().addingTimeInterval(3600)
+        try await manager.update(auth)
+        await manager.configureRefresher(
+            MockTokenRefresher(
+                outcome: .permanentFailure(
+                    reason: .refreshTokenRejected,
+                    triedKey: "stale"
+                )
+            )
+        )
+
+        let result = await manager.recoverUnauthorized()
+        #expect(result == .terminalFailure(.refreshTokenRejected))
     }
 
     @Test func cancellationDuringUpdateLeavesPriorIntact() async throws {
@@ -476,6 +580,52 @@ struct AuthRetryTests {
         #expect(transport.recordedRequests.count == 2)
         #expect(transport.recordedRequests[0].headers["Authorization"] == "Bearer stale-token")
         #expect(transport.recordedRequests[1].headers["Authorization"] == "Bearer fresh-token")
+    }
+
+    @Test func streaming401RefreshReplaysBeforeBody() async throws {
+        let transport = MockHTTPTransport(responses: [
+            .init(metadata: HTTPResponseMetadata(statusCode: 401), body: Data()),
+            .init(
+                metadata: HTTPResponseMetadata(
+                    statusCode: 200,
+                    headers: ["Content-Type": "text/event-stream"]
+                ),
+                bodyChunks: [Data("data: ok\n\n".utf8)]
+            ),
+        ])
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let manager = AuthManager(grokHome: home, config: makeConfig(), environment: [:])
+        var auth = GrokAuth.testDefault(key: "stale-token", authMode: .oidc)
+        auth.refreshToken = "rt"
+        auth.expiresAt = Date().addingTimeInterval(3600)
+        try await manager.update(auth)
+        var fresh = auth
+        fresh.key = "fresh-token"
+        await manager.configureRefresher(MockTokenRefresher(outcome: .success(fresh)))
+
+        let provider = LiveAuthCredentialProvider(manager: manager)
+        let retryTransport = AuthRetryTransport(
+            transport: transport,
+            credentials: provider,
+            maxRetries: 1
+        )
+        let request = HTTPRequest(
+            method: .post,
+            url: URL(string: "https://example.test/v1/chat/completions")!,
+            body: Data("{}".utf8),
+            idempotency: .nonIdempotent
+        )
+        var events: [HTTPStreamEvent] = []
+        for try await event in retryTransport.stream(request) {
+            events.append(event)
+        }
+
+        #expect(transport.recordedRequests.count == 2)
+        #expect(transport.recordedRequests[0].headers["Authorization"] == "Bearer stale-token")
+        #expect(transport.recordedRequests[1].headers["Authorization"] == "Bearer fresh-token")
+        #expect(events.contains { if case .metadata(let metadata) = $0 { return metadata.statusCode == 200 }; return false })
+        #expect(events.contains { if case .body(let data) = $0 { return data == Data("data: ok\n\n".utf8) }; return false })
     }
 
     @Test func nonIdempotentIsNotReplayed() async throws {

@@ -101,6 +101,13 @@ public final class WorkspaceClient: @unchecked Sendable {
         self.deadlineMs = nil
     }
 
+    public init(harness: ToolHarness, connection: HubConnection) {
+        self.harness = harness
+        self.connected = ConnectedFlag(connection.isConnected)
+        self.deadlineMs = nil
+        attachReconnect(to: connection)
+    }
+
     /// Share a pre-created connected flag so an SDK reconnect callback
     /// holding the same flag can reset it.
     public static func withConnectedFlag(
@@ -108,6 +115,13 @@ public final class WorkspaceClient: @unchecked Sendable {
         connected: ConnectedFlag
     ) -> WorkspaceClient {
         WorkspaceClient(harness: harness, connected: connected)
+    }
+
+    public static func withHubConnection(
+        harness: ToolHarness,
+        connection: HubConnection
+    ) -> WorkspaceClient {
+        WorkspaceClient(harness: harness, connection: connection)
     }
 
     public func withDeadline(ms: UInt64) -> WorkspaceClient {

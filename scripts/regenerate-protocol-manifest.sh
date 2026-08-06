@@ -10,14 +10,21 @@
 # path/sizeBytes/sha256) matches OpenGrokBuildSupport.GeneratedManifest so the
 # plugin and the Wave 11 compatibility tests consume the same file.
 #
-# Usage: scripts/regenerate-protocol-manifest.sh [--reference-revision REF]
+# Usage: scripts/regenerate-protocol-manifest.sh --reference-revision REF
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 FIX_DIR="ProtocolFixtures"
 MANIFEST="$FIX_DIR/manifest.json"
-REF="${1:-}"
-if [[ "$REF" == "--reference-revision" ]]; then REF="$2"; else REF="open-grok.21"; fi
+if [[ $# -ne 2 || "$1" != "--reference-revision" ]]; then
+  echo "usage: $0 --reference-revision REF" >&2
+  exit 2
+fi
+REF="$2"
+if [[ ! "$REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+  echo "reference revision must be a 40-character hexadecimal Git hash" >&2
+  exit 2
+fi
 
 command -v shasum >/dev/null 2>&1 || { echo "shasum (SHA-256) is required" >&2; exit 1; }
 

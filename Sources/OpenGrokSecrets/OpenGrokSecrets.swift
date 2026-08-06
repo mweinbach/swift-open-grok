@@ -4,8 +4,8 @@
 //
 // Reference crates:
 //   * `xai-grok-secrets` — outbound log/telemetry redaction
-//   * Platform stores — Keychain (macOS), Secret Service / owner-only
-//     fallback (Linux), Credential Manager (Windows)
+//   * Platform stores — Keychain on macOS, explicit owner-only fallback on
+//     Linux, and typed unsupported results where native adapters are absent
 //
 // Invariants:
 //   * Plaintext fallback is NEVER silent (`backend` + optional throw).
@@ -59,7 +59,9 @@ public struct Credential: Sendable, Equatable, CustomStringConvertible, CustomDe
 /// The backend a concrete store uses, for diagnostics and audit.
 public enum SecretStoreBackend: String, Sendable, Equatable, Codable {
     case keychain
+    /// Reserved until a native Secret Service adapter is linked.
     case secretService
+    /// Reserved until a native Credential Manager adapter is linked.
     case credentialManager
     case ownerOnlyFallback
     case unsupported

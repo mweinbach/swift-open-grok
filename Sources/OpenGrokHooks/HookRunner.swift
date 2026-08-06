@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokSandbox
 
 #if canImport(FoundationNetworking)
 import FoundationNetworking
@@ -100,13 +101,14 @@ public enum HookRunner {
         spec: HookSpec,
         envelope: HookEventEnvelope,
         context: HookRunContext,
-        mode: HookGateKind
+        mode: HookGateKind,
+        launchTransform: @escaping ChildLaunchTransform = childNetworkRestrictedLaunch
     ) async -> HookInvocation {
         let start = Date()
         let invocation: HookInvocation
         switch spec.handlerType {
         case .command:
-            invocation = await runCommand(spec: spec, envelope: envelope, context: context, mode: mode)
+            invocation = await runCommand(spec: spec, envelope: envelope, context: context, mode: mode, launchTransform: launchTransform)
         case .http:
             invocation = await runHTTP(spec: spec, envelope: envelope, context: context, mode: mode)
         }
@@ -289,7 +291,8 @@ private func runCommand(
     spec: HookSpec,
     envelope: HookEventEnvelope,
     context: HookRunContext,
-    mode: HookGateKind
+    mode: HookGateKind,
+    launchTransform: @escaping ChildLaunchTransform
 ) async -> HookInvocation {
     let started = Date()
     guard let command = spec.command, !command.isEmpty else {
@@ -309,25 +312,35 @@ private func runCommand(
         }
     }
 
-    let process: Process
+    let executable: String
+    let arguments: [String]
     if shell {
-        process = Process()
         #if os(Windows)
-        process.executableURL = URL(fileURLWithPath: context.environment["COMSPEC"] ?? "cmd.exe")
-        process.arguments = ["/C", command]
+        executable = context.environment["COMSPEC"] ?? "cmd.exe"
+        arguments = ["/C", command]
         #else
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", command]
+        executable = "/bin/sh"
+        arguments = ["-c", command]
         #endif
     } else {
         let path = URL(fileURLWithPath: command, relativeTo: spec.sourceDirectory).standardizedFileURL
         guard FileManager.default.fileExists(atPath: path.path) else {
             return HookInvocation(result: .failed("command not found: \(path.path)"), elapsedMs: elapsedMilliseconds(since: started))
         }
-        process = Process()
-        process.executableURL = path
-        process.arguments = []
+        executable = path.path
+        arguments = []
     }
+
+    let launch: (executable: String, arguments: [String])
+    do {
+        launch = try launchTransform(executable, arguments)
+    } catch {
+        return HookInvocation(result: .failed("failed to spawn command: \(error)"), elapsedMs: elapsedMilliseconds(since: started))
+    }
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: launch.executable)
+    process.arguments = launch.arguments
 
     process.currentDirectoryURL = context.workspaceRoot
     var childEnvironment = context.environment

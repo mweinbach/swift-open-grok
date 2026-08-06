@@ -90,13 +90,14 @@ public final class HubConnection: @unchecked Sendable {
 
     public var isConnected: Bool {
         lock.lock(); defer { lock.unlock() }
-        return _connected
+        return _connected && client != nil
     }
 
     public func markDisconnected(reason: String) {
         lock.lock()
         _connected = false
         reconnectAttempt = 0
+        client = nil
         let handlers = reconnectHandlers
         lock.unlock()
         // Fail in-flight waiters on disconnect.
@@ -116,6 +117,11 @@ public final class HubConnection: @unchecked Sendable {
 
     public func markConnected() {
         lock.lock()
+        guard client != nil else {
+            _connected = false
+            lock.unlock()
+            return
+        }
         _connected = true
         reconnectAttempt = 0
         let handlers = reconnectHandlers
@@ -126,6 +132,7 @@ public final class HubConnection: @unchecked Sendable {
     public func markGiveUp(reason: String) {
         lock.lock()
         _connected = false
+        client = nil
         let handlers = reconnectHandlers
         lock.unlock()
         for h in handlers { h(.giveUp(reason: reason)) }
@@ -137,11 +144,18 @@ public final class HubConnection: @unchecked Sendable {
         succeedOn: Int,
         reason: String = "drop"
     ) {
+        lock.lock()
+        let reconnectClient = client
+        lock.unlock()
         markDisconnected(reason: reason)
         for attempt in 1...max(1, attempts) {
             markReconnecting(attempt: attempt)
             if attempt == succeedOn {
-                markConnected()
+                if let reconnectClient {
+                    activate(client: reconnectClient)
+                } else {
+                    markConnected()
+                }
                 return
             }
         }
@@ -170,8 +184,24 @@ public final class HubConnection: @unchecked Sendable {
     public func bindClient(_ client: any ConnectionClient) {
         lock.lock()
         self.client = client
-        _connected = true
+        _connected = false
+        reconnectAttempt = 0
         lock.unlock()
+    }
+
+    public func activate(
+        client: any ConnectionClient,
+        emitReconnected: Bool = true
+    ) {
+        lock.lock()
+        self.client = client
+        _connected = true
+        reconnectAttempt = 0
+        let handlers = emitReconnected ? reconnectHandlers : []
+        lock.unlock()
+        if emitReconnected {
+            for handler in handlers { handler(.reconnected) }
+        }
     }
 
     public func connectionClient() -> (any ConnectionClient)? {
@@ -216,7 +246,7 @@ public final class HubConnectionPool: @unchecked Sendable {
             connections[key] = (existing.conn, existing.refs + 1)
             return existing.conn
         }
-        let conn = HubConnection(key: key, connected: true)
+        let conn = HubConnection(key: key)
         connections[key] = (conn, 1)
         return conn
     }

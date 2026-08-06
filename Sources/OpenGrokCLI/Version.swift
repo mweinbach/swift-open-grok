@@ -25,4 +25,10 @@ public enum OpenGrokCLIVersion {
     ) -> String {
         OpenGrokVersion.installed(environment: environment)
     }
+
+    public static func installedWithCommit(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String {
+        OpenGrokVersion.installedWithCommit(environment: environment)
+    }
 }

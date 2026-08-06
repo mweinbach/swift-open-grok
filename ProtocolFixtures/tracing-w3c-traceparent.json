@@ -21,20 +21,20 @@
     "set-cookie",
     "path"
   ],
-  "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+  "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
   "provenance": {
     "source": "OpenGrokTracing W3C traceparent + TraceCorrelation",
-    "referenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
-    "previousReferenceRevision": "9739c4a2ad23cfea14312a481169757f3da494f4",
+    "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
+    "previousReferenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
     "pinVerdict": "unchanged (verified)",
     "keyProvenance": {
       "traceparentFormat/sampleTraceparent": "crates/common/xai-tracing/src/fastrace.rs:39,46-47 (encode_w3c_traceparent / decode_w3c_traceparent) and src/grpc_client.rs:94 (W3C traceparent/tracestate injection). The sample value is the W3C Trace Context specification's own example.",
       "redactedByDefault": "The span-attribute redaction denylist in crates/codegen/xai-grok-telemetry/src/otel_layer/redact.rs"
     },
     "evidence": [
-      "git diff 9739c4a2..80dff0a9 -- crates/common/xai-tracing => empty",
-      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-tracing-macros => empty",
-      "git diff 9739c4a2..80dff0a9 -- crates/codegen/xai-grok-telemetry/src/otel_layer/redact.rs => only two additions to ALLOWED_STRING_KEYS (terminal.term_version, terminal.term_version_source) at :140-141 plus the matching test expectation. The redaction denylist this fixture records is untouched."
+      "git diff 80dff0a9..9ed09e2a -- crates/common/xai-tracing => empty",
+      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-tracing-macros => empty",
+      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-grok-telemetry/src/otel_layer/redact.rs => empty; the redaction denylist this fixture records is untouched."
     ]
   }
 }

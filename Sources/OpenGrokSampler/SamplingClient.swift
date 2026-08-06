@@ -29,6 +29,7 @@ public final class SamplingClient: @unchecked Sendable {
     private let transport: any HTTPTransport
     private var defaultHeaders: [String: String]
     private let baseURL: String
+    private let queryParams: [String: String]
     public let defaults: SamplingClientDefaults
     private let providerAdapter: any ProviderAdapter
     private let attributionCallback: (any Auth401AttributionCallback)?
@@ -88,6 +89,7 @@ public final class SamplingClient: @unchecked Sendable {
         self.transport = transport
         self.defaultHeaders = headers
         self.baseURL = config.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        self.queryParams = config.queryParams
         self.defaults = SamplingClientDefaults(from: config)
         self.providerAdapter = adapter
         self.attributionCallback = config.attributionCallback
@@ -530,8 +532,17 @@ public final class SamplingClient: @unchecked Sendable {
         let endpointPath = !basePath.isEmpty && p.hasPrefix("/v1/")
             ? String(p.dropFirst(3))
             : p
-        guard let url = URL(string: base + endpointPath) else {
+        guard var url = URL(string: base + endpointPath) else {
             throw SamplingError.invalidConfiguration("invalid base URL: \(baseURL)")
+        }
+        if !queryParams.isEmpty {
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            var items = components?.queryItems ?? []
+            items.append(contentsOf: queryParams.keys.sorted().compactMap { key in
+                queryParams[key].map { URLQueryItem(name: key, value: $0) }
+            })
+            components?.queryItems = items
+            if let updated = components?.url { url = updated }
         }
         return url
     }
@@ -624,7 +635,7 @@ public final class SamplingClient: @unchecked Sendable {
         if status == 401 {
             let prefix = currentSentBearerPrefix()
             attributionCallback?.record401(consumer: consumer, sentBearerPrefix: prefix)
-            return .auth(message)
+            return .auth(message, credential: SentCredential.fromSentFragment(prefix))
         }
 
         return .api(
@@ -701,7 +712,7 @@ func synthesizeFromInfo(_ info: SamplingErrorInfo) -> SamplingError {
             .first ?? 0
         return .idleTimeout(elapsedSecs: secs)
     case .auth:
-        return .auth(info.message)
+        return .auth(info.message, credential: info.credential ?? .unknown)
     case .serialization:
         return .serializationFromRendered(info.message)
     case .http:

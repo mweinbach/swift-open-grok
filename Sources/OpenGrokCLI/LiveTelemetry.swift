@@ -66,6 +66,18 @@ public struct LiveTelemetryStatus: Sendable, Equatable {
     }
 }
 
+struct LiveTelemetryBootstrapContext: Sendable, Equatable {
+    let zeroDataRetention: Bool
+    let userID: String?
+    let teamID: String?
+
+    static let empty = LiveTelemetryBootstrapContext(
+        zeroDataRetention: false,
+        userID: nil,
+        teamID: nil
+    )
+}
+
 public enum LiveTelemetry {
     // MARK: - Resolution
 

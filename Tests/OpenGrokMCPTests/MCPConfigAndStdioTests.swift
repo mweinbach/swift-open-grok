@@ -246,8 +246,61 @@ private struct StdioServerScript {
     func cleanup() { try? FileManager.default.removeItem(at: root) }
 }
 
+private enum MCPLaunchTransformTestError: Error {
+    case rejected
+}
+
 @Suite("MCP stdio transport")
 struct MCPStdioTransportTests {
+    @Test("a launch transform rewrites the child argv before spawn")
+    func launchTransformRewritesArguments() async throws {
+        let script = try StdioServerScript(body: """
+        if [ "$1" != "--transformed" ]; then exit 7; fi
+        while IFS= read -r line; do
+          id=$(printf '%s' "$line" | sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+          if [ -n "$id" ]; then
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\\n' "$id"
+          fi
+        done
+        """)
+        defer { script.cleanup() }
+
+        let transport = MCPStdioTransport(
+            configuration: MCPStdioTransportConfiguration(command: script.path, requestTimeout: 15),
+            launchTransform: { executable, arguments in
+                #expect(executable == script.path)
+                #expect(arguments.isEmpty)
+                return (executable, ["--transformed"])
+            }
+        )
+        defer { Task { await transport.close() } }
+
+        let response = try await transport.send(.request(MCPRequest(id: .number(1), method: MCPMethod.ping, params: nil)))
+        guard case .response(let payload)? = response else {
+            Issue.record("expected a response after transformed launch")
+            return
+        }
+        #expect(payload.error == nil)
+    }
+
+    @Test("a throwing launch transform prevents the stdio child from running")
+    func launchTransformFailureDoesNotSpawn() async throws {
+        let script = try StdioServerScript(body: "printf started > \"$0.started\"")
+        let marker = URL(fileURLWithPath: script.path + ".started")
+        defer { script.cleanup() }
+
+        let transport = MCPStdioTransport(
+            configuration: MCPStdioTransportConfiguration(command: script.path, requestTimeout: 5),
+            launchTransform: { _, _ in throw MCPLaunchTransformTestError.rejected }
+        )
+        defer { Task { await transport.close() } }
+
+        await #expect(throws: MCPError.self) {
+            _ = try await transport.send(.request(MCPRequest(id: .number(1), method: MCPMethod.ping, params: nil)))
+        }
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
+
     @Test("a request gets the matching response back over stdio")
     func roundTripsARequest() async throws {
         // Reads one request line, replies with a ping result carrying its id.

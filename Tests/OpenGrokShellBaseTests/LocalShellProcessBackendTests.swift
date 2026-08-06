@@ -87,6 +87,35 @@ struct LocalShellProcessBackendTests {
         #endif
     }
 
+    @Test("rapid background exits always complete their lifecycle")
+    func rapidBackgroundExitLifecycle() async throws {
+        #if os(Windows)
+        return
+        #else
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let backend = LocalShellProcessBackend(
+            launchTransform: { executable, arguments in
+                (executable, arguments)
+            }
+        )
+
+        for index in 0..<32 {
+            let handle = try await backend.runBackground(
+                ShellCommandRequest(
+                    command: "exit 0",
+                    workingDirectory: directory,
+                    toolCallID: "call-rapid-exit-\(index)",
+                    shell: .sh
+                )
+            )
+            let snapshot = await backend.waitForCompletion(handle.taskID, timeout: .seconds(2))
+            #expect(snapshot?.completed == true)
+            #expect(snapshot?.exitCode == 0)
+        }
+        #endif
+    }
+
     @Test("owner cleanup kills only matching background tasks")
     func ownerCleanup() async throws {
         #if os(Windows)

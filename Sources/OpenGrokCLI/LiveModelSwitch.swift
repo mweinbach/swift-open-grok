@@ -21,9 +21,29 @@
 //     A provider change rewrites history to its provider-neutral text spine.
 
 import Foundation
+import OpenGrokAuth
+import OpenGrokConfig
+import OpenGrokHTTP
 import OpenGrokModels
 import OpenGrokProviderSession
 import OpenGrokSamplingTypes
+
+func liveConfiguredModelCatalog(
+    workingDirectory: URL,
+    environment: [String: String]
+) -> ConfiguredModelCatalog {
+    let authority = try? loadAuthorityComposition(
+        cwd: workingDirectory,
+        environment: environment
+    )
+    let trusted = (try? ConfigLayers.load(environment: environment))
+        .map { parseProviderDefinitions(from: $0.effectiveConfigBase()) }
+    return parseConfiguredModelCatalog(
+        from: authority?.effective() ?? .table(TOMLTable()),
+        trustedProviderDefinitions: trusted,
+        environment: environment
+    )
+}
 
 /// A model resolved against the embedded catalog together with the credential
 /// its provider requires.
@@ -75,6 +95,8 @@ struct LiveModelCatalogResolver: Sendable {
     /// this field exists to prevent, with no compiler error and no test
     /// failure. Requiring it turns that into a build error instead.
     let workingDirectory: URL
+    let catalogSource: @Sendable () -> OrderedModelMap
+    let authProviderDefinitions: @Sendable () -> [(String, AuthProviderConfig)]
     /// Injection seam for tests; production passes the real resolver.
     let makeCredentialResolver: @Sendable (
         [String: String],
@@ -86,6 +108,10 @@ struct LiveModelCatalogResolver: Sendable {
         openGrokHome: URL,
         sessionID: String,
         workingDirectory: URL,
+        catalogSource: @escaping @Sendable () -> OrderedModelMap = {
+            resolveModelCatalog(input: .default)
+        },
+        authProviderDefinitions: @escaping @Sendable () -> [(String, AuthProviderConfig)] = { [] },
         makeCredentialResolver: @escaping @Sendable (
             [String: String],
             URL
@@ -97,6 +123,8 @@ struct LiveModelCatalogResolver: Sendable {
         self.openGrokHome = openGrokHome
         self.sessionID = sessionID
         self.workingDirectory = workingDirectory
+        self.catalogSource = catalogSource
+        self.authProviderDefinitions = authProviderDefinitions
         self.makeCredentialResolver = makeCredentialResolver
     }
 
@@ -105,26 +133,33 @@ struct LiveModelCatalogResolver: Sendable {
     /// Ordering is left to `LiveModelPicker.rows`, which sorts by provider then
     /// name — sorting by raw id here would interleave providers.
     static func catalog() -> [LiveModelPickerEntry] {
-        embeddedDefaultModels().models
-            .filter { !$0.hidden }
-            .map { model in
-                LiveModelPickerEntry(
-                    id: model.id ?? model.model,
-                    providerID: model.provider.asString,
-                    name: model.name ?? model.id ?? model.model,
-                    description: model.description,
-                    contextWindow: model.contextWindow,
-                    supportsReasoningEffort: model.supportsReasoningEffort
-                )
-            }
+        entries(from: resolveModelCatalog(input: .default))
+    }
+
+    func catalogEntries() -> [LiveModelPickerEntry] {
+        Self.entries(from: catalogSource())
+    }
+
+    static func entries(from catalog: OrderedModelMap) -> [LiveModelPickerEntry] {
+        catalog.pairs().compactMap { key, entry in
+            guard !entry.info.hidden, entry.info.userSelectable else { return nil }
+            return LiveModelPickerEntry(
+                id: key,
+                providerID: entry.info.provider.asString,
+                name: entry.info.name ?? entry.info.model,
+                description: entry.info.description,
+                contextWindow: entry.info.contextWindow,
+                supportsReasoningEffort: entry.info.supportsReasoningEffort
+            )
+        }
     }
 
     func resolve(modelID: String) async throws -> LiveModelResolution {
-        guard let profile = embeddedDefaultModels().models.first(where: {
-            ($0.id ?? $0.model) == modelID || $0.model == modelID
-        }) else {
+        let catalog = catalogSource()
+        guard let entry = findModelByID(catalog, modelID: modelID) else {
             throw LiveModelSwitchError.unknownModel(modelID)
         }
+        let profile = DefaultModelJSON.fromCatalogEntry(entry)
         let provider = profile.provider
         let backend = profile.apiBackend
         guard provider.profile.supportsBackend(backend) else {
@@ -137,18 +172,36 @@ struct LiveModelCatalogResolver: Sendable {
         // — otherwise the same model reaches a different endpoint depending on
         // whether you started on it or switched to it. The key is xAI-only
         // upstream; every other provider keeps its own `*_API_BASE_URL` env var.
-        let baseURL = OpenGrokLiveApplicationLauncher.resolveProviderBaseURL(
-            provider: provider,
-            model: profile,
-            environment: environment,
-            configuredXaiBaseURL: provider == .xai
-                ? OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
+        let baseURL: String
+        if provider == .xai, entry.apiBaseURL == XAI_API_BASE_URL_DEFAULT {
+            baseURL = OpenGrokLiveApplicationLauncher.resolveProviderBaseURL(
+                provider: provider,
+                model: profile,
+                environment: environment,
+                configuredXaiBaseURL: OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
                     workingDirectory: workingDirectory,
                     openGrokHome: openGrokHome,
                     environment: environment
                 )
-                : nil
-        )
+            )
+        } else if let apiBaseURL = entry.apiBaseURL {
+            baseURL = apiBaseURL
+        } else if !entry.info.baseURL.isEmpty {
+            baseURL = entry.info.baseURL
+        } else {
+            baseURL = OpenGrokLiveApplicationLauncher.resolveProviderBaseURL(
+                provider: provider,
+                model: profile,
+                environment: environment,
+                configuredXaiBaseURL: provider == .xai
+                    ? OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
+                        workingDirectory: workingDirectory,
+                        openGrokHome: openGrokHome,
+                        environment: environment
+                    )
+                    : nil
+            )
+        }
         if provider == .kimi,
            let modelBaseURL = profile.baseURL,
            let modelEndpoint = KimiModels.endpoint(forBaseURL: modelBaseURL),
@@ -156,25 +209,63 @@ struct LiveModelCatalogResolver: Sendable {
            modelEndpoint != resolvedEndpoint {
             throw LiveModelSwitchError.unsupportedBaseURL(provider: provider, baseURL: baseURL)
         }
-        let explicitAPIKey = try OpenGrokLiveApplicationLauncher.resolveProviderAPIKey(
-            provider: provider,
-            model: profile,
-            baseURL: baseURL,
-            environment: environment
-        )
-        let credential: LiveResolvedCredential
-        do {
-            credential = try await makeCredentialResolver(environment, openGrokHome).resolve(
+        let namedAuthResolver: NamedAuthProviderResolver?
+        if let authProvider = entry.authProvider {
+            guard let definition = authProviderDefinitions().first(where: { $0.0 == authProvider })?.1 else {
+                throw LiveModelSwitchError.credentialsUnavailable(
+                    provider: provider,
+                    detail: "named auth provider '\(authProvider)' is unavailable"
+                )
+            }
+            namedAuthResolver = NamedAuthProviderResolver(configuration: definition)
+        } else {
+            namedAuthResolver = nil
+        }
+        let explicitAPIKey: String?
+        if namedAuthResolver != nil {
+            explicitAPIKey = nil
+        } else if let own = entry.ownCredential(environment: environment) {
+            explicitAPIKey = own
+        } else {
+            explicitAPIKey = try OpenGrokLiveApplicationLauncher.resolveProviderAPIKey(
                 provider: provider,
-                explicitAPIKey: explicitAPIKey,
-                scope: "cli:\(sessionID)"
-            )
-        } catch let error as LiveCredentialError {
-            throw LiveModelSwitchError.credentialsUnavailable(
-                provider: provider,
-                detail: error.description
+                model: profile,
+                baseURL: baseURL,
+                environment: environment
             )
         }
+        let credential: LiveResolvedCredential
+        if let namedAuthResolver {
+            guard let token = namedAuthResolver.currentToken(), !token.isEmpty else {
+                throw LiveModelSwitchError.credentialsUnavailable(
+                    provider: provider,
+                    detail: "named auth provider did not return a usable credential"
+                )
+            }
+            credential = LiveResolvedCredential(
+                provider: provider,
+                scope: "cli:\(sessionID)",
+                source: .namedAuthProvider,
+                authKind: .apiKeyOnly,
+                bearer: token,
+                binding: .apiKey(scope: "cli:\(sessionID)", key: token)
+            )
+        } else {
+            do {
+                credential = try await makeCredentialResolver(environment, openGrokHome).resolve(
+                    provider: provider,
+                    explicitAPIKey: explicitAPIKey,
+                    scope: "cli:\(sessionID)"
+                )
+            } catch let error as LiveCredentialError {
+                throw LiveModelSwitchError.credentialsUnavailable(
+                    provider: provider,
+                    detail: error.description
+                )
+            }
+        }
+        var headers = credential.extraHeaders
+        for (name, value) in entry.info.extraHeaders { headers[name] = value }
         return LiveModelResolution(
             sampling: OpenGrokLiveSamplingConfiguration(
                 model: profile.model,
@@ -182,7 +273,10 @@ struct LiveModelCatalogResolver: Sendable {
                 apiKey: credential.bearer,
                 provider: provider,
                 apiBackend: backend,
-                extraHeaders: credential.extraHeaders
+                extraHeaders: headers,
+                queryParams: entry.queryParams,
+                bearerResolver: namedAuthResolver.map(NamedAuthBearerResolver.init),
+                credentialProvider: credential.binding.authCredentialProvider
             ),
             credential: credential
         )
@@ -311,8 +405,18 @@ actor LiveModelSwitchCoordinator {
         }
 
         var dropped = 0
-        if resolution.sampling.provider != previous.provider, let history {
-            dropped = (try? await history.isolateForProviderSwitch()) ?? 0
+        if let history {
+            do {
+                dropped = try await history.reconcileRoute(
+                    modelID: resolution.sampling.model,
+                    provider: resolution.sampling.provider
+                )
+            } catch {
+                return .failed(
+                    modelID: modelID,
+                    message: "provider isolation failed: \(String(describing: error))"
+                )
+            }
         }
         sampling = resolution.sampling
         sampler = rebuilt
@@ -334,10 +438,185 @@ actor LiveModelSwitchCoordinator {
     /// (`accounts/fireworks/models/glm-5p2`), so re-picking the active row is
     /// recognised as a no-op whichever name the picker used.
     private func activeCatalogID(for configuration: OpenGrokLiveSamplingConfiguration) -> String? {
-        embeddedDefaultModels().models
-            .first { $0.model == configuration.model }
-            .map { $0.id ?? $0.model }
+        resolver.catalogSource().pairs()
+            .first { $0.1.model == configuration.model }
+            .map { $0.0 }
     }
+}
+
+/// Shared live catalog owner. The manager is the source of truth for both the
+/// picker and switch resolver, so a provider partition can never bypass the
+/// final catalog filters.
+final class LiveModelCatalogStore: @unchecked Sendable {
+    private let manager: ModelsManager
+
+    init(
+        input: CatalogResolutionInput,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        openGrokHome: URL? = nil
+    ) {
+        let home = openGrokHome ?? Self.resolveOpenGrokHome(environment: environment)
+        let credentialResolver = LiveCredentialResolver(
+            environment: environment,
+            openGrokHome: home
+        )
+        let broker = LiveModelCatalogCredentialBroker(
+            resolver: credentialResolver,
+            environment: environment
+        )
+        let refreshers = LiveCatalogRefreshers.live(
+            transport: LiveModelCatalogHTTPTransport(transport: URLSessionHTTPTransport()),
+            broker: broker,
+            grokHome: home,
+            environment: environment
+        )
+        manager = ModelsManager(input: input, liveCatalogs: refreshers)
+    }
+
+    func snapshot() -> OrderedModelMap {
+        manager.catalogSnapshot()
+    }
+
+    func pickerEntries() -> [LiveModelPickerEntry] {
+        LiveModelCatalogResolver.entries(from: snapshot())
+    }
+
+    func updateInput(_ input: CatalogResolutionInput) {
+        manager.updateInput(input)
+    }
+
+    func applyOpenCodeGoCatalog(_ catalog: OpenCodeGoModelsCatalog?) {
+        manager.applyOpenCodeGoCatalog(catalog)
+    }
+
+    func refreshOpenCodeGo() async {
+        let outcome = await manager.refreshPartition(.openCodeGo)
+        if !outcome.published, outcome.failure != nil {
+            return
+        }
+    }
+
+    private static func resolveOpenGrokHome(environment: [String: String]) -> URL {
+        if let path = environment["OPENGROK_HOME"], !path.isEmpty {
+            return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+        }
+        let home = environment["HOME"] ?? environment["USERPROFILE"] ?? NSHomeDirectory()
+        return URL(fileURLWithPath: home, isDirectory: true)
+            .appendingPathComponent(".opengrok", isDirectory: true)
+            .standardizedFileURL
+    }
+}
+
+private struct LiveModelCatalogHTTPTransport: ModelCatalogTransport {
+    let transport: any HTTPTransport
+
+    func send(
+        _ request: ModelCatalogRequest,
+        cancellation: CancellationToken?
+    ) async throws -> ModelCatalogResponse {
+        try cancellation?.throwIfCancelled()
+        guard let url = URL(string: request.url) else {
+            throw ModelsError.remoteMalformed("invalid catalog URL")
+        }
+        let response = try await transport.send(HTTPRequest(
+            method: .get,
+            url: url,
+            headers: Dictionary(uniqueKeysWithValues: request.headers.map { ($0.name, $0.value) }),
+            timeout: request.timeout
+        ))
+        try cancellation?.throwIfCancelled()
+        return ModelCatalogResponse(
+            status: response.metadata.statusCode,
+            headers: response.metadata.headers.map { ModelCatalogHeader($0.key, $0.value) },
+            body: response.body
+        )
+    }
+}
+
+private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
+    let resolver: LiveCredentialResolver
+    let environment: [String: String]
+
+    func credential(for partition: ModelCatalogPartition) async -> ProviderCatalogCredential? {
+        let provider = partition.provider
+        let explicit = environmentKey(for: provider)
+        guard let credential = try? await resolver.resolve(
+            provider: provider,
+            explicitAPIKey: explicit,
+            scope: "catalog:\(partition.rawValue)"
+        ) else {
+            return nil
+        }
+        return ProviderCatalogCredential(
+            apiKey: credential.bearer,
+            fingerprint: liveCatalogCredentialFingerprint(credential.bearer)
+        )
+    }
+
+    func codexCredential(forceRefresh: Bool) async -> CodexCatalogCredential? {
+        nil
+    }
+
+    private func environmentKey(for provider: ModelProvider) -> String? {
+        if provider == .kimi {
+            return environment[KimiModels.platformAPIKeyEnv]
+                ?? environment[KimiModels.codeAPIKeyEnv]
+        }
+        let key: String?
+        switch provider {
+        case .fireworks:
+            key = FireworksModels.apiKeyEnv
+        case .deepseek:
+            key = DeepSeekModels.apiKeyEnv
+        case .openCodeGo:
+            key = OpenCodeGoModels.apiKeyEnv
+        case .wafer:
+            key = WaferModels.apiKeyEnv
+        case .kimi, .xai, .codex:
+            key = nil
+        }
+        return key.flatMap { environment[$0] }
+    }
+}
+
+private func liveCatalogCredentialFingerprint(_ value: String) -> String {
+    var hash: UInt64 = 14_695_981_039_346_656_037
+    for byte in value.utf8 {
+        hash ^= UInt64(byte)
+        hash &*= 1_099_511_628_211
+    }
+    return String(hash, radix: 16)
+}
+
+func liveCatalogResolutionInput(
+    workingDirectory: URL,
+    environment: [String: String]
+) -> CatalogResolutionInput {
+    let document = (try? loadAuthorityComposition(
+        cwd: workingDirectory,
+        environment: environment
+    ).effective()) ?? .table(TOMLTable())
+    let enabled = document[path: ["models", "opencode_go_enabled_models"]]?.arrayValue?
+        .compactMap(\.stringValue) ?? []
+    let configured = liveConfiguredModelCatalog(
+        workingDirectory: workingDirectory,
+        environment: environment
+    )
+    let endpoints = EndpointsConfig(
+        xaiApiBaseURL: document[path: ["endpoints", "xai_api_base_url"]]?.stringValue
+            ?? XAI_API_BASE_URL_DEFAULT,
+        modelsBaseURL: document[path: ["endpoints", "models_base_url"]]?.stringValue,
+        modelsListURL: document[path: ["endpoints", "models_list_url"]]?.stringValue,
+        deploymentKey: document[path: ["endpoints", "deployment_key"]]?.stringValue
+    )
+    return CatalogResolutionInput(
+        endpoints: endpoints,
+        models: ModelsSectionConfig(
+            default: document[path: ["models", "default"]]?.stringValue,
+            opencodeGoEnabledModels: enabled
+        ),
+        configModels: configured.modelOverrides
+    )
 }
 
 /// Strip provider-native carriers from a conversation so it can be replayed to
