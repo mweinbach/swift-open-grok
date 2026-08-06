@@ -214,6 +214,56 @@ Both are mapped with proposed Swift targets in `CRATE_MAP.md`.
 - The Swift port targets the **old** pin's behavior throughout. Nothing in this section is implemented on the Swift side; it is a catch-up backlog, not a status claim.
 - `ProtocolFixtures/` still encodes old-pin wire formats (see the fixture pin caveat in the header). Recapture is a prerequisite for treating any of the above as fixture-verified.
 
+## Wave 9 — 2026-08-06 (telemetry, Computer Hub, Linux, commands)
+
+Gates: `build-tests` **0**, `test --no-parallel` **0** — **3,858 tests / 574
+suites, zero failures**, 193s. Commits `8ce2082` (AGENTS.md + CLAUDE.md),
+`e08c962`, `3097f74`, `bcc2405`, `65d8eda`, `a42f591`, `f97653e`.
+
+**Telemetry is live and default-off, in that order.** Wave 8 left it dark because
+our `productTelemetryEnabled` defaulted `true` against upstream's `Disabled` and
+no `DISABLE_TELEMETRY` opt-out existed. The inversion was fixed and *proven*
+before a call site landed: byte-level assertions over the serialized OTLP body
+show no prompt text, no `sk-` key, no username, no project name with gates off,
+plus an open-gate negative control. The bootstrap deliberately reads from disk
+rather than the security context's document — that document carries the project
+tier, so a repo's checked-in `.opengrok/config.toml` would otherwise enable
+telemetry for everyone who clones it (`projectConfigCannotEnableTelemetry`).
+
+**Computer Hub: the route is live and every dispatch path is gated.** Before this
+wave *every* Hub adapter bypassed the permission gate — `admitCall` was transport
+only, and the MCP handler called straight into the vendor server. `HubMediation`
+now has no default anywhere and is a required constructor argument on four types,
+so an ungated surface must be spelled `.unmediated(reason:)` and is greppable.
+Denials return `permissionDenied`/-32003, not a custom code, so a model cannot
+distinguish a hub denial from a local one and retry around it. Where the port
+genuinely cannot represent a workspace status on the wire, the route runs the real
+sequence and terminates at upstream's own capability refusal, with
+`portDefaultLeaderIsRefused` asserting `workspaceExposure == false` so flipping
+that bit without building the control plane fails a test rather than shipping a
+lie. The ACPRuntime control plane is the recorded gap.
+
+**Linux:** streaming HTTP implemented rather than stubbed; child network blocking
+returns a **typed unsupported error** rather than silently not blocking. The
+in-process seccomp shim is deliberately deferred to its own reviewed slice —
+`unshare --net` at the spawner may be the better seam (no shim, testable without
+root, fails closed at the process boundary). Full seam inventory in
+`INTEGRATION-w9-linux.md`.
+
+**Commands:** the five session commands register now that their backing exists;
+auto-compaction surfaces as a first-class `Compacting…` turn state; `/context`
+carries window occupancy while `/usage` stays reserved for billing as upstream
+has it.
+
+**Reachability got its own test.** The workspace launcher clause now has one that
+drives the real launcher with parsed argv, plus two controls: one proving the
+suite goes **red** if the clause is deleted, and one proving `handles` does not
+match too broadly. Without those a reachability test passes for the wrong reason —
+the failure this project has now hit three times.
+
+**`AGENTS.md` and `CLAUDE.md` were added** so these lessons are enforced by
+documentation rather than by the coordinator noticing.
+
 ## Wave 8 — 2026-08-05 (the audit findings, closed)
 
 Wave 8 answered the audit below. Gates: `build-tests` **0**, `test --no-parallel`
