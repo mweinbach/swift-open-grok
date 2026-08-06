@@ -82,6 +82,48 @@ struct OpenGrokSQLiteJournalTests {
         }
     }
 
+    @Test("linux mount fstypes classify to the same set as the magics")
+    func linuxFSTypeNames() {
+        for name in [
+            "nfs", "nfs4", "cifs", "smb3", "9p", "coda", "afs", "ceph",
+            "lustre", "gfs2", "gpfs", "ocfs2", "wekafs", "glusterfs",
+            "fuse", "fuse.sshfs", "FUSE.s3fs", "NFS",
+        ] {
+            #expect(NetworkFS.isNetworkFSTypeLinux(name), "\(name) should be network")
+        }
+        for name in ["ext4", "btrfs", "xfs", "tmpfs", "overlay", "proc", "devpts", ""] {
+            #expect(!NetworkFS.isNetworkFSTypeLinux(name), "\(name) should be local")
+        }
+    }
+
+    @Test("mount table resolves the longest matching mount point")
+    func mountTableLongestPrefix() {
+        let mounts = """
+        overlay / overlay rw,relatime 0 0
+        proc /proc proc rw,nosuid 0 0
+        server:/export /mnt/share nfs4 rw,relatime 0 0
+        /dev/sdb1 /mnt/share/local ext4 rw,relatime 0 0
+        """
+        #expect(NetworkFS.mountFSType(forPath: "/home/u/x", mounts: mounts) == "overlay")
+        #expect(NetworkFS.mountFSType(forPath: "/mnt/share", mounts: mounts) == "nfs4")
+        #expect(NetworkFS.mountFSType(forPath: "/mnt/share/a/b", mounts: mounts) == "nfs4")
+        // The nested bind mount wins over its NFS parent: longest prefix.
+        #expect(NetworkFS.mountFSType(forPath: "/mnt/share/local/f", mounts: mounts) == "ext4")
+        // A sibling that merely shares a name prefix must not match.
+        #expect(NetworkFS.mountFSType(forPath: "/mnt/shared", mounts: mounts) == "overlay")
+    }
+
+    @Test("mount fields unescape octal sequences")
+    func mountFieldUnescaping() {
+        #expect(NetworkFS.unescapeMountField(#"/mnt/my\040share"#) == "/mnt/my share")
+        #expect(NetworkFS.unescapeMountField(#"/mnt/a\134b"#) == #"/mnt/a\b"#)
+        #expect(NetworkFS.unescapeMountField("/mnt/plain") == "/mnt/plain")
+        // A trailing lone backslash has no 3-digit octal after it; pass through.
+        #expect(NetworkFS.unescapeMountField(#"/mnt/x\"#) == #"/mnt/x\"#)
+        let mounts = #"srv:/e /mnt/my\040share nfs4 rw 0 0"#
+        #expect(NetworkFS.mountFSType(forPath: "/mnt/my share/f", mounts: mounts) == "nfs4")
+    }
+
     @Test("windows UNC classifies")
     func windowsUNC() {
         #expect(NetworkFS.isWindowsUNC(#"\\server\share\grok"#))

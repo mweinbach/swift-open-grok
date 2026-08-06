@@ -78,20 +78,27 @@ extension TOMLValue {
             }
             self = .table(table)
         case let value as NSNumber:
-            // `NSNumber` erases Bool into a number, so check the CoreFoundation
-            // type rather than casting to `Bool` (which would match `1`).
-            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+            // `NSNumber` erases Bool into a number, so identify booleans by
+            // representation rather than casting to `Bool` (which matches `1`).
+            let encoding = String(cString: value.objCType)
+            #if canImport(Darwin)
+            let isBoolean = CFGetTypeID(value) == CFBooleanGetTypeID()
+            #else
+            // swift-corelibs-foundation exposes no CoreFoundation type IDs.
+            // Its JSON booleans are `__NSCFBoolean`, the only NSNumber
+            // `JSONSerialization` yields with the "c" encoding — integers
+            // come back as "i" or "q", floats as "d".
+            let isBoolean = encoding == "c"
+            #endif
+            if isBoolean {
                 self = .boolean(value.boolValue)
+            } else if encoding == "d" || encoding == "f" {
+                self = .float(value.doubleValue)
             } else {
                 // Read the integer straight off the NSNumber. Going via
                 // `doubleValue` would silently round integers above 2^53, and
                 // these are timeouts and ports, not approximations.
-                let encoding = String(cString: value.objCType)
-                if encoding == "d" || encoding == "f" {
-                    self = .float(value.doubleValue)
-                } else {
-                    self = .integer(value.int64Value)
-                }
+                self = .integer(value.int64Value)
             }
         case is NSNull:
             throw TOMLWriteError.unrepresentable("null")

@@ -37,6 +37,11 @@ enum NetworkFS {
     // MARK: - Pure classifiers (testable)
 
     /// Linux `statfs` f_type magic values (low 32 bits).
+    ///
+    /// Retained as the canonical definition of the network set even though the
+    /// live Linux probe classifies by mount-table *name*: Swift's Glibc overlay
+    /// does not export `statfs`, so the magic is unreadable without a C shim.
+    /// `isNetworkFSTypeLinux` mirrors this list entry for entry.
     static func isNetworkFSMagic(_ fType: UInt64) -> Bool {
         let NFS_SUPER_MAGIC: UInt64 = 0x6969
         let SMB_SUPER_MAGIC: UInt64 = 0x517B
@@ -78,6 +83,62 @@ enum NetworkFS {
             || n == "webdav" || n == "macfuse" || n == "osxfuse"
     }
 
+    /// Linux mount-table fstype names, mirroring `isNetworkFSMagic`'s set.
+    static func isNetworkFSTypeLinux(_ fstype: String) -> Bool {
+        let n = fstype.lowercased()
+        // FUSE_SUPER_MAGIC covers every `fuse.*` transport (sshfs, s3fs, ...);
+        // NFS reports nfs/nfs3/nfs4 under one magic.
+        if n.hasPrefix("fuse") || n.hasPrefix("nfs") { return true }
+        switch n {
+        case "smbfs", "smb2", "smb3", "cifs", "9p", "coda", "afs", "ceph",
+             "lustre", "gfs2", "gpfs", "ocfs2", "wekafs", "glusterfs", "beegfs":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Decode `/proc/self/mounts` octal escapes (`\040` space, `\011` tab,
+    /// `\012` newline, `\134` backslash). Unrecognized sequences pass through.
+    static func unescapeMountField(_ field: String) -> String {
+        guard field.contains("\\") else { return field }
+        var out = ""
+        var chars = Array(field)
+        var i = 0
+        while i < chars.count {
+            if chars[i] == "\\", i + 3 < chars.count,
+               let value = UInt8(String(chars[(i + 1)...(i + 3)]), radix: 8) {
+                out.append(Character(UnicodeScalar(value)))
+                i += 4
+            } else {
+                out.append(chars[i])
+                i += 1
+            }
+        }
+        return out
+    }
+
+    /// fstype of the mount containing `path`, from a `/proc/self/mounts`-format
+    /// table. Longest matching mount point wins, so a bind mount nested inside
+    /// another mount is classified by its own entry rather than its parent's.
+    static func mountFSType(forPath path: String, mounts: String) -> String? {
+        var best: (length: Int, fstype: String)?
+        for line in mounts.split(whereSeparator: \.isNewline) {
+            let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard fields.count >= 3 else { continue }
+            let mountPoint = unescapeMountField(String(fields[1]))
+            guard !mountPoint.isEmpty else { continue }
+            let matches = mountPoint == "/"
+                || path == mountPoint
+                || path.hasPrefix(mountPoint + "/")
+            guard matches else { continue }
+            if best == nil || mountPoint.count > best!.length {
+                best = (mountPoint.count, unescapeMountField(String(fields[2])))
+            }
+        }
+        return best?.fstype
+    }
+
     /// Windows UNC path classification.
     static func isWindowsUNC(_ path: String) -> Bool {
         guard path.hasPrefix("\\\\") else { return false }
@@ -115,10 +176,13 @@ enum NetworkFS {
 
     #if os(Linux)
     private static func classifyLinux(_ path: URL) -> Bool {
-        var st = statfs()
-        let rc = path.path.withCString { statfs($0, &st) }
-        guard rc == 0 else { return false }
-        return isNetworkFSMagic(UInt64(bitPattern: Int64(st.f_type)))
+        let resolved = path.resolvingSymlinksInPath().path
+        guard let mounts = try? String(contentsOfFile: "/proc/self/mounts", encoding: .utf8),
+              let fstype = mountFSType(forPath: resolved, mounts: mounts)
+        else {
+            return false
+        }
+        return isNetworkFSTypeLinux(fstype)
     }
     #endif
 

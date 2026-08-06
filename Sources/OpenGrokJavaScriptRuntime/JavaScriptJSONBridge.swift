@@ -80,12 +80,20 @@ public enum JavaScriptJSONBridge {
         case is NSNull:
             return .null
         case let number as NSNumber:
-            // `NSNumber` erases Bool into the same class; the ObjC type
-            // encoding is the only reliable discriminator.
-            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+            // `NSNumber` erases Bool into the same class, so identify booleans
+            // by representation rather than by casting to `Bool`.
+            let text = String(cString: number.objCType)
+            #if canImport(Darwin)
+            let isBoolean = CFGetTypeID(number) == CFBooleanGetTypeID()
+            #else
+            // swift-corelibs-foundation exposes no CoreFoundation type IDs; its
+            // booleans are `__NSCFBoolean`, the only NSNumber carrying the "c"
+            // encoding (integers are "i"/"q", floats "d").
+            let isBoolean = text == "c"
+            #endif
+            if isBoolean {
                 return .bool(number.boolValue)
             }
-            let text = String(cString: number.objCType)
             if text == "d" || text == "f" {
                 return .number(.double(number.doubleValue))
             }
