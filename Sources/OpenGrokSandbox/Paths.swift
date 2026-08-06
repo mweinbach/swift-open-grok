@@ -76,15 +76,23 @@ public func essentialWritablePathsMinimal(
     return paths
 }
 
-/// Reject roots that contain raw `..` components (lexical traversal).
+/// Reject roots that contain raw `..` components (lexical traversal) or NUL.
+///
+/// Both checks read the percent-*decoded* path. `URL.path` renders a NUL as
+/// "%00" on every platform, so testing the raw path against "\0" could never
+/// fire — and on Linux that was not merely dead, it was fail-open: the root
+/// `/workspace/..\0` came back as the single component "..%00", which is not
+/// "..", so a traversable root passed the gate. macOS happened to survive only
+/// because its `URL` drops the NUL and leaves a bare ".." for the first check.
 public func rejectTraversableRoot(_ root: URL) throws {
-    let components = root.path.split(separator: "/", omittingEmptySubsequences: false)
+    let decoded = root.path.removingPercentEncoding ?? root.path
+    // NUL first: it is what hides a traversal from the component scan below.
+    if decoded.contains("\0") {
+        throw SandboxError.profileInvalid("Refusing profile with NUL in root: \(root.path)")
+    }
+    let components = decoded.split(separator: "/", omittingEmptySubsequences: false)
     if components.contains("..") {
         throw SandboxError.profileInvalid("Refusing profile with traversable root: \(root.path)")
-    }
-    // Null bytes and empty path components after normalization are hostile.
-    if root.path.contains("\0") {
-        throw SandboxError.profileInvalid("Refusing profile with NUL in root: \(root.path)")
     }
 }
 
