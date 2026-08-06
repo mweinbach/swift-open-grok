@@ -295,7 +295,6 @@ private struct SockFprog {
 /// Closing this needs a C shim target in Package.swift, which this change does
 /// not own — see the note in the wave report.
 private func installLinuxSeccompNetworkFilter() throws -> Bool {
-    _ = buildLinuxSeccompNetworkProgram()
     throw SandboxError.unsupported(
         "Linux child network blocking requires a seccomp C shim: prctl(2) is "
         + "variadic and therefore unavailable to Swift"
@@ -304,9 +303,12 @@ private func installLinuxSeccompNetworkFilter() throws -> Bool {
 
 /// The BPF program that blocks connect/bind/sendto/sendmsg/listen/accept.
 ///
-/// Split out from installation and kept live so the filter stays reviewable and
-/// testable while the installation seam is unsupported. It is *built* on Linux
-/// today, never *installed*.
+/// Split out from installation and retained deliberately: it is the reviewable
+/// record of what confinement is supposed to do, ready for the day a C shim can
+/// install it. Nothing calls it today — this is *implemented-unwired*, not a
+/// live filter, and `installLinuxSeccompNetworkFilter` throws rather than
+/// pretending otherwise.
+@available(*, unavailable, message: "no installation path exists yet; see installLinuxSeccompNetworkFilter")
 private func buildLinuxSeccompNetworkProgram() -> [SockFilter] {
     let BPF_LD: UInt16 = 0x00
     let BPF_W: UInt16 = 0x00
