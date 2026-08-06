@@ -9,6 +9,7 @@
 // file never exists with looser permissions.
 
 import Foundation
+import OpenGrokShared
 
 #if canImport(Darwin)
 import Darwin
@@ -78,47 +79,10 @@ public func writeAtomically(
     #endif
 
     // Rename temp → final (atomic on the same filesystem).
-    #if canImport(Darwin)
     do {
-        // FileManager.replaceItem attempts an atomic swap; falls back to
-        // remove+rename when the destination doesn't exist. We try
-        // `removeItem` + `moveItem` to guarantee the swap when the dest is
-        // absent (replaceItem requires an existing dest).
-        if FileManager.default.fileExists(atPath: finalPath.path) {
-            _ = try FileManager.default.replaceItemAt(
-                finalPath,
-                withItemAt: tmp,
-                backupItemName: nil,
-                options: []
-            )
-        } else {
-            try FileManager.default.moveItem(at: tmp, to: finalPath)
-        }
+        try atomicallyReplaceItem(at: finalPath, with: tmp)
     } catch {
         try? FileManager.default.removeItem(at: tmp)
         throw error
     }
-    #else
-    // swift-corelibs-foundation's `replaceItemAt` throws NSFileNoSuchFile
-    // rather than replacing, so every config write to an *existing* file
-    // failed on Linux. `rename(2)` is the primitive that call is meant to
-    // wrap: atomic within a filesystem, and it replaces an existing
-    // destination — so this also drops the `fileExists` pre-check and the
-    // TOCTOU window that came with it.
-    let renamed = tmp.path.withCString { source in
-        finalPath.path.withCString { destination in
-            rename(source, destination)
-        }
-    }
-    if renamed != 0 {
-        let code = errno
-        let message = String(cString: strerror(code))
-        try? FileManager.default.removeItem(at: tmp)
-        throw NSError(
-            domain: NSPOSIXErrorDomain,
-            code: Int(code),
-            userInfo: [NSLocalizedDescriptionKey: "rename failed: \(message)"]
-        )
-    }
-    #endif
 }

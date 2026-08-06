@@ -4,6 +4,7 @@
 // temp+rename pattern without requiring string conversion of binary JSON.
 
 import Foundation
+import OpenGrokShared
 
 #if canImport(Darwin)
 import Darwin
@@ -30,9 +31,5 @@ func writeAtomicallyData(_ finalPath: URL, contents: Data, mode: UInt32? = 0o600
     }
     #endif
     // Replace destination atomically when possible.
-    if FileManager.default.fileExists(atPath: finalPath.path) {
-        _ = try FileManager.default.replaceItemAt(finalPath, withItemAt: tmp)
-    } else {
-        try FileManager.default.moveItem(at: tmp, to: finalPath)
-    }
+    try atomicallyReplaceItem(at: finalPath, with: tmp)
 }

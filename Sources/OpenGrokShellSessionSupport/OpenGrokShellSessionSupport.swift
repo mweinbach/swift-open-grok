@@ -1518,11 +1518,10 @@ public actor ActiveSessionRegistry {
             let data = try encoder.encode(sessions)
             let temporary = root.appendingPathComponent("\(Self.dataFileName).tmp")
             try data.write(to: temporary, options: .atomic)
-            if FileManager.default.fileExists(atPath: root.appendingPathComponent(Self.dataFileName).path) {
-                _ = try FileManager.default.replaceItemAt(root.appendingPathComponent(Self.dataFileName), withItemAt: temporary)
-            } else {
-                try FileManager.default.moveItem(at: temporary, to: root.appendingPathComponent(Self.dataFileName))
-            }
+            try atomicallyReplaceItem(
+                at: root.appendingPathComponent(Self.dataFileName),
+                with: temporary
+            )
         } catch {
             throw ShellSessionSupportError.persistence(error.localizedDescription)
         }
@@ -1548,11 +1547,7 @@ public actor SessionStateStore {
             let temporary = sessionRoot.appendingPathComponent("\(Self.fileName).tmp")
             try data.write(to: temporary, options: .atomic)
             let destination = sessionRoot.appendingPathComponent(Self.fileName)
-            if FileManager.default.fileExists(atPath: destination.path) {
-                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
-            } else {
-                try FileManager.default.moveItem(at: temporary, to: destination)
-            }
+            try atomicallyReplaceItem(at: destination, with: temporary)
         } catch {
             throw ShellSessionSupportError.persistence(error.localizedDescription)
         }

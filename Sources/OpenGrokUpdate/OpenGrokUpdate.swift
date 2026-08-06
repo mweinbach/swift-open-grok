@@ -6,6 +6,7 @@
 // distribution integration and must use a verified external installer.
 
 import Foundation
+import OpenGrokShared
 import OpenGrokPaths
 import OpenGrokVersion
 
@@ -803,11 +804,7 @@ public actor VersionCacheStore {
             let temporaryURL = cacheURL.appendingPathExtension("tmp")
             defer { try? fileManager.removeItem(at: temporaryURL) }
             try data.write(to: temporaryURL, options: .atomic)
-            if fileManager.fileExists(atPath: cacheURL.path) {
-                _ = try fileManager.replaceItemAt(cacheURL, withItemAt: temporaryURL)
-            } else {
-                try fileManager.moveItem(at: temporaryURL, to: cacheURL)
-            }
+            try atomicallyReplaceItem(at: cacheURL, with: temporaryURL)
         } catch let error as OpenGrokUpdateError {
             throw error
         } catch {

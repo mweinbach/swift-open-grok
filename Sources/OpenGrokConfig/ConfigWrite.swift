@@ -18,6 +18,7 @@
 // do not.
 
 import Foundation
+import OpenGrokShared
 import OpenGrokConfigTypes
 
 // MARK: - Bridging Codable values into TOMLValue
@@ -124,18 +125,14 @@ public func writeConfigFile(_ root: TOMLValue, to path: URL) throws {
     )
     let temporary = path.deletingPathExtension().appendingPathExtension("toml.tmp")
     try Data(text.utf8).write(to: temporary, options: .atomic)
-    // `replaceItemAt` requires an existing original, so a first write — the
-    // common case for a project config — has to move the temp file into place
-    // instead. Both paths leave no `.toml.tmp` behind.
-    if FileManager.default.fileExists(atPath: path.path) {
-        _ = try FileManager.default.replaceItemAt(path, withItemAt: temporary)
-    } else {
-        do {
-            try FileManager.default.moveItem(at: temporary, to: path)
-        } catch {
-            try? FileManager.default.removeItem(at: temporary)
-            throw error
-        }
+    // Handles both the first write and the replace, and does the right thing
+    // on Linux where `replaceItemAt` refuses to replace. Either way no
+    // `.toml.tmp` is left behind.
+    do {
+        try atomicallyReplaceItem(at: path, with: temporary)
+    } catch {
+        try? FileManager.default.removeItem(at: temporary)
+        throw error
     }
 }
 

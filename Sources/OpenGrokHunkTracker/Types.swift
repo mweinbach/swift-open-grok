@@ -3,6 +3,7 @@
 // Core types for hunk tracking. Port of xai-hunk-tracker `types.rs`.
 
 import Foundation
+import OpenGrokShared
 
 /// Unique identifier for a hunk (UUID string).
 public struct HunkId: Hashable, Sendable, Codable, Equatable, CustomStringConvertible {
@@ -607,14 +608,10 @@ public enum HunkTrackerStore {
         let tmp = path + ".tmp-\(UUID().uuidString)"
         try data.write(to: URL(fileURLWithPath: tmp), options: .atomic)
         // Atomic replace.
-        if fm.fileExists(atPath: path) {
-            _ = try fm.replaceItemAt(
-                URL(fileURLWithPath: path),
-                withItemAt: URL(fileURLWithPath: tmp)
-            )
-        } else {
-            try fm.moveItem(atPath: tmp, toPath: path)
-        }
+        try atomicallyReplaceItem(
+            at: URL(fileURLWithPath: path),
+            with: URL(fileURLWithPath: tmp)
+        )
     }
 
     public static func load(from path: String) throws -> HunkTrackerSnapshot {
