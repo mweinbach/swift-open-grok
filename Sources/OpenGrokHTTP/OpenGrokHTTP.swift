@@ -776,6 +776,29 @@ public enum HTTPSessionConfigurationBuilder {
 public final class HTTPTransportSessionDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
     public let validateCertificates: Bool
 
+    /// Whether this platform can honor `validateCertificates == false`.
+    ///
+    /// swift-corelibs-foundation ships neither `NSURLAuthenticationMethodServerTrust`
+    /// nor `URLProtectionSpace.serverTrust` — both are explicitly `@available(*,
+    /// unavailable)` there — so the relaxation cannot be applied off Darwin.
+    /// Challenges then always take strict system handling, which is the
+    /// fail-closed direction.
+    public static var supportsRelaxedCertificateValidation: Bool {
+        #if canImport(Darwin)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    /// `true` when relaxed validation was asked for but this platform cannot
+    /// deliver it, so the request will still be validated strictly. Exposed so
+    /// a caller pointing at a self-signed endpoint learns that from the
+    /// transport rather than from an unexplained TLS failure.
+    public var relaxedValidationUnavailable: Bool {
+        !validateCertificates && !Self.supportsRelaxedCertificateValidation
+    }
+
     public init(validateCertificates: Bool = true) {
         self.validateCertificates = validateCertificates
         super.init()
@@ -786,6 +809,7 @@ public final class HTTPTransportSessionDelegate: NSObject, URLSessionDelegate, @
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
+        #if canImport(Darwin)
         let method = challenge.protectionSpace.authenticationMethod
         if method == NSURLAuthenticationMethodServerTrust {
             if !validateCertificates,
@@ -797,6 +821,7 @@ public final class HTTPTransportSessionDelegate: NSObject, URLSessionDelegate, @
             completionHandler(.performDefaultHandling, nil)
             return
         }
+        #endif
         // Proxy basic-auth is supplied via connectionProxyDictionary credentials.
         completionHandler(.performDefaultHandling, nil)
     }
@@ -854,7 +879,7 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
                 throw HTTPError.bufferExceeded(limit: configuration.maxResponseBytes)
             }
             return HTTPResponse(
-                metadata: metadata(from: http),
+                metadata: Self.metadata(from: http),
                 body: data
             )
         } catch is CancellationError {
@@ -875,6 +900,9 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
         let mailbox = BoundedStreamMailbox(
             maxPendingBytes: configuration.maxStreamBufferBytes
         )
+        #if !canImport(Darwin)
+        return streamViaDataDelegate(request, mailbox: mailbox)
+        #else
         let producer = Task {
             do {
                 try Task.checkCancellation()
@@ -886,7 +914,7 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
                         TransportFailure(kind: .permanent, detail: "non-HTTP response")
                     )
                 }
-                try mailbox.push(.metadata(metadata(from: http)))
+                try mailbox.push(.metadata(Self.metadata(from: http)))
 
                 var chunk = Data()
                 chunk.reserveCapacity(16 * 1024)
@@ -927,7 +955,42 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
         return mailbox.makeStream {
             producer.cancel()
         }
+        #endif
     }
+
+    #if !canImport(Darwin)
+    /// Streaming for swift-corelibs-foundation, which has no `URLSession.bytes(for:)`.
+    ///
+    /// A `URLSessionDataDelegate` delivers body chunks as they arrive, which is
+    /// what SSE needs; the alternative corelibs API (`data(for:)`) only yields
+    /// the whole body at completion and would turn every stream into a stall.
+    /// The session is per-stream because the delegate is per-stream, and it is
+    /// invalidated on termination so the task and its connection are released.
+    private func streamViaDataDelegate(
+        _ request: HTTPRequest,
+        mailbox: BoundedStreamMailbox
+    ) -> AsyncThrowingStream<HTTPStreamEvent, Error> {
+        let urlRequest: URLRequest
+        do {
+            urlRequest = try makeURLRequest(request)
+        } catch {
+            mailbox.finish(throwing: error)
+            return mailbox.makeStream {}
+        }
+        let delegate = StreamingDataDelegate(mailbox: mailbox)
+        let streamSession = URLSession(
+            configuration: HTTPSessionConfigurationBuilder.makeEphemeral(configuration),
+            delegate: delegate,
+            delegateQueue: nil
+        )
+        let task = streamSession.dataTask(with: urlRequest)
+        task.resume()
+        return mailbox.makeStream {
+            task.cancel()
+            streamSession.finishTasksAndInvalidate()
+        }
+    }
+    #endif
 
     private func makeURLRequest(_ request: HTTPRequest) throws -> URLRequest {
         var urlRequest = URLRequest(url: request.url)
@@ -942,7 +1005,7 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
         return urlRequest
     }
 
-    private func metadata(from response: HTTPURLResponse) -> HTTPResponseMetadata {
+    fileprivate static func metadata(from response: HTTPURLResponse) -> HTTPResponseMetadata {
         var headers: [String: String] = [:]
         for (key, value) in response.allHeaderFields {
             if let k = key as? String, let v = value as? String {
@@ -956,6 +1019,114 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
         )
     }
 }
+
+#if !canImport(Darwin)
+/// Pumps a corelibs `URLSessionDataTask` into a `BoundedStreamMailbox`.
+///
+/// The delegate owns the mailbox's terminal state: exactly one of `finish()`
+/// or `finish(throwing:)` runs, from `didCompleteWithError`. A `push` that
+/// throws (the mailbox's bounded-buffer limit) cancels the task, so a consumer
+/// that stops reading stops the transfer instead of growing the buffer.
+private final class StreamingDataDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let mailbox: BoundedStreamMailbox
+    private let lock = NSLock()
+    private var failure: Error?
+
+    init(mailbox: BoundedStreamMailbox) {
+        self.mailbox = mailbox
+        super.init()
+    }
+
+    /// Record the first failure and stop the transfer. Terminal delivery still
+    /// happens in `didCompleteWithError` so there is one finish path.
+    private func fail(_ error: Error, cancelling task: URLSessionTask?) {
+        lock.lock()
+        if failure == nil { failure = error }
+        lock.unlock()
+        task?.cancel()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let http = response as? HTTPURLResponse else {
+            fail(
+                HTTPError.transport(
+                    TransportFailure(kind: .permanent, detail: "non-HTTP response")
+                ),
+                cancelling: dataTask
+            )
+            completionHandler(.cancel)
+            return
+        }
+        do {
+            try mailbox.push(.metadata(URLSessionHTTPTransport.metadata(from: http)))
+            completionHandler(.allow)
+        } catch {
+            fail(error, cancelling: dataTask)
+            completionHandler(.cancel)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive data: Data
+    ) {
+        guard !data.isEmpty else { return }
+        do {
+            try mailbox.push(.body(data))
+        } catch {
+            fail(error, cancelling: dataTask)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: (any Error)?
+    ) {
+        lock.lock()
+        let recorded = failure
+        lock.unlock()
+
+        if let recorded {
+            mailbox.finish(throwing: recorded)
+        } else if let error {
+            if let urlError = error as? URLError {
+                if urlError.code == .cancelled {
+                    mailbox.finish(throwing: HTTPError.cancelled)
+                } else {
+                    mailbox.finish(
+                        throwing: HTTPError.transport(
+                            TransportFailure.classifyURLError(urlError)
+                        )
+                    )
+                }
+            } else {
+                mailbox.finish(
+                    throwing: HTTPError.transport(
+                        TransportFailure(kind: .interrupted, detail: errorCauseChain(error))
+                    )
+                )
+            }
+        } else {
+            // `.end` may still exceed the buffer bound; report that rather than
+            // closing the stream as if the body had been delivered in full.
+            do {
+                try mailbox.push(.end)
+                mailbox.finish()
+            } catch {
+                mailbox.finish(throwing: error)
+            }
+        }
+        session.finishTasksAndInvalidate()
+    }
+}
+#endif
 
 // MARK: - Mock transport
 
