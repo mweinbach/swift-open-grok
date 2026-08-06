@@ -265,30 +265,6 @@ struct ACPLeaderIPCRegistrationTests {
         #expect(reply == .pong)
     }
 
-    /// This build advertises `control_v1 = false`. A client that ignores the
-    /// bit and sends a control request must get a refusal it can act on, not a
-    /// request that hangs forever.
-    @Test("a control command is refused with an actionable message", .timeLimit(.minutes(1)))
-    func controlIsRefused() async throws {
-        let host = makeHost()
-        let (client, served) = attach(to: host)
-        defer { served.cancel() }
-
-        try await client.send(
-            .register(clientType: "a", mode: .stdio, capabilities: ACPLeaderClientCapabilities())
-        )
-        _ = try await client.next { if case .registered = $0 { return true } else { return false } }
-
-        try await client.send(.control(requestID: "42", command: ["type": "get_leader_info"]))
-        let reply = try await client.next {
-            if case .controlError = $0 { return true } else { return false }
-        }
-        guard case .controlError(let requestID, _, let message) = reply else { return }
-        #expect(requestID == "42")
-        #expect(message.contains("control_v1"))
-        #expect(message.contains("get_leader_info"))
-    }
-
     /// `server.rs:1650-1665` — only a headless registration arms the relay. A
     /// TUI attaching locally must not, or an auto-spawned leader would open a
     /// remote leg nobody asked for.
@@ -492,5 +468,596 @@ struct ACPLeaderIPCRoutingTests {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         #expect(await host.connectedClientCount() == 0)
+    }
+}
+
+// MARK: - Control plane fakes
+
+/// A connected exposure, standing in for the hub backend a composition
+/// injects in production (`ACPWorkspaceExposureConnector`).
+private final class FakeExposureConnection: ACPWorkspaceExposureConnection, @unchecked Sendable {
+    private let lock = NSLock()
+    private var activity: ACPWorkspaceActivitySnapshot
+    private var disconnects = 0
+    private var reconnects = 0
+    private var reconnectError: (any Error)?
+
+    init(activity: ACPWorkspaceActivitySnapshot = ACPWorkspaceActivitySnapshot()) {
+        self.activity = activity
+    }
+
+    var disconnectCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return disconnects
+    }
+
+    var reconnectCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return reconnects
+    }
+
+    func failReconnects(with error: any Error) {
+        lock.lock()
+        reconnectError = error
+        lock.unlock()
+    }
+
+    func snapshot() -> ACPWorkspaceActivitySnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return activity
+    }
+
+    func disconnect() async {
+        lock.withLock {
+            disconnects += 1
+        }
+    }
+
+    func reconnect() async throws {
+        let error = lock.withLock {
+            reconnects += 1
+            return reconnectError
+        }
+        if let error { throw error }
+    }
+}
+
+private struct FakeHubError: Error, CustomStringConvertible {
+    var description: String { "hub offline" }
+}
+
+/// One (hubURL, cwd) a connector was asked to connect. A named struct rather
+/// than a tuple so call lists compare with plain `==` (tuples cannot conform
+/// to `Equatable`, so `[(String, String)]` has no array equality).
+private struct ConnectCall: Equatable {
+    var hubURL: String
+    var cwd: String
+}
+
+/// Records the connects a connector was asked to perform, so a test can tell
+/// a real connect from an idempotent re-read.
+private final class ConnectLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [ConnectCall] = []
+
+    var calls: [ConnectCall] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
+    }
+
+    func record(_ hubURL: String, _ cwd: String) {
+        lock.lock()
+        entries.append(ConnectCall(hubURL: hubURL, cwd: cwd))
+        lock.unlock()
+    }
+}
+
+/// A movable offset for the plane's injected clock, so uptime assertions are
+/// exact rather than timing-tuned.
+private final class MutableUptime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nanoseconds: UInt64 = 0
+
+    var value: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return nanoseconds
+    }
+
+    func advance(milliseconds: UInt64) {
+        lock.lock()
+        nanoseconds += milliseconds * 1_000_000
+        lock.unlock()
+    }
+}
+
+@Suite("Leader IPC control plane")
+struct ACPLeaderControlPlaneTests {
+    private func makeHost(plane: ACPLeaderControlPlane? = nil) -> ACPLeaderIPCHost {
+        ACPLeaderIPCHost(
+            runtime: ACPAgentRuntime(promptDriver: LeaderEchoPromptDriver()),
+            configuration: ACPLeaderIPCConfiguration(binaryVersion: "1.2.3", controlPlane: plane)
+        )
+    }
+
+    @discardableResult
+    private func register(_ client: LeaderTestClient) async throws -> ACPLeaderCapabilities? {
+        try await client.send(
+            .register(clientType: "grok-workspace-cli", mode: .stdio, capabilities: ACPLeaderClientCapabilities())
+        )
+        let reply = try await client.next { if case .registered = $0 { return true } else { return false } }
+        guard case .registered(_, _, _, _, let capabilities) = reply else { return nil }
+        return capabilities
+    }
+
+    private func sendControl(
+        _ client: LeaderTestClient,
+        id: String,
+        command: [String: String]
+    ) async throws {
+        try await client.send(.control(requestID: id, command: command))
+    }
+
+    private func nextResult(
+        _ client: LeaderTestClient
+    ) async throws -> ACPLeaderServerMessage {
+        try await client.next { if case .controlResult = $0 { return true } else { return false } }
+    }
+
+    private func nextError(
+        _ client: LeaderTestClient
+    ) async throws -> ACPLeaderServerMessage {
+        try await client.next { if case .controlError = $0 { return true } else { return false } }
+    }
+
+    private var processPID: UInt32 {
+        UInt32(clamping: ProcessInfo.processInfo.processIdentifier)
+    }
+
+    /// The production default: no hub backend is wired, and status must still
+    /// answer truthfully through the real host rather than the route hanging.
+    /// This is the live-seam proof behind the `workspace_exposure` advert.
+    @Test("workspace status on a backend-less leader answers state none with the real pid", .timeLimit(.minutes(1)))
+    func statusWithoutBackend() async throws {
+        let host = makeHost()
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+
+        let capabilities = try await register(client)
+        #expect(capabilities?.controlV1 == true)
+        #expect(capabilities?.workspaceExposure == true)
+
+        try await sendControl(client, id: "ws-1", command: ["type": "workspace_status"])
+        let reply = try await nextResult(client)
+        guard case .controlResult("ws-1", .workspaceStatus(let status)) = reply else {
+            Issue.record("expected a workspace_status result, got \(reply)")
+            return
+        }
+        #expect(status.state == "none")
+        #expect(status.pid == processPID)
+        #expect(status.uptimeMs == 0)
+        #expect(status.activeToolCalls == 0)
+        #expect(status.sessions.isEmpty)
+        #expect(status.hubURL == nil)
+        #expect(status.cwd == nil)
+    }
+
+    /// The port's workspace CLI spells the discriminator `command`
+    /// (`WorkspaceControlCommand.wire`); upstream spells it `type`. Both must
+    /// parse, or the shipped client breaks against its own leader.
+    @Test("the port's `command` spelling and upstream's `type` spelling both parse", .timeLimit(.minutes(1)))
+    func bothDiscriminatorSpellingsParse() async throws {
+        let host = makeHost()
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+        _ = try await register(client)
+
+        try await sendControl(client, id: "a", command: ["command": "workspace_status"])
+        let portReply = try await nextResult(client)
+        guard case .controlResult("a", .workspaceStatus) = portReply else {
+            Issue.record("the `command` spelling did not parse: \(portReply)")
+            return
+        }
+
+        try await sendControl(client, id: "b", command: ["type": "workspace_status"])
+        let upstreamReply = try await nextResult(client)
+        guard case .controlResult("b", .workspaceStatus) = upstreamReply else {
+            Issue.record("the `type` spelling did not parse: \(upstreamReply)")
+            return
+        }
+    }
+
+    /// A frame with no discriminator at all must produce a typed error — the
+    /// failure mode that matters is a client hanging on a request nobody
+    /// answers, and it must stay impossible.
+    @Test("a control frame without a discriminator is an error, not a hang", .timeLimit(.minutes(1)))
+    func missingDiscriminator() async throws {
+        let host = makeHost()
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+        _ = try await register(client)
+
+        try await sendControl(client, id: "9", command: [:])
+        let reply = try await nextError(client)
+        guard case .controlError("9", let code, let message) = reply else {
+            Issue.record("expected a control error, got \(reply)")
+            return
+        }
+        #expect(code == ACPLeaderControlErrorCode.invalidCommand)
+        #expect(message.contains("discriminator"))
+    }
+
+    /// With no hub backend wired, start refuses with a typed error that names
+    /// the missing piece — and status keeps telling the truth afterwards.
+    @Test("workspace start without a backend is refused and state stays none", .timeLimit(.minutes(1)))
+    func startWithoutBackendRefused() async throws {
+        let host = makeHost()
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+        _ = try await register(client)
+
+        try await sendControl(client, id: "1", command: ["type": "workspace_start", "cwd": "/tmp/proj"])
+        let refusal = try await nextError(client)
+        guard case .controlError("1", let code, let message) = refusal else {
+            Issue.record("expected a control error, got \(refusal)")
+            return
+        }
+        #expect(code == ACPLeaderControlErrorCode.workspaceError)
+        #expect(message.contains("no hub connection backend"))
+
+        try await sendControl(client, id: "2", command: ["type": "workspace_status"])
+        let reply = try await nextResult(client)
+        guard case .controlResult("2", .workspaceStatus(let status)) = reply else {
+            Issue.record("expected a status, got \(reply)")
+            return
+        }
+        #expect(status.state == "none")
+    }
+
+    /// The whole point of the control plane: drive start → pause → resume →
+    /// status → stop through the real host and watch the wire payload track
+    /// each transition (`server.rs:1100-1226`).
+    @Test("the exposure lifecycle moves through real states on the wire", .timeLimit(.minutes(1)))
+    func exposureLifecycle() async throws {
+        let connection = FakeExposureConnection(
+            activity: ACPWorkspaceActivitySnapshot(activeToolCalls: 2, sessionIDs: ["sess-b", "sess-a"])
+        )
+        let connects = ConnectLog()
+        let plane = ACPLeaderControlPlane(
+            metadata: ACPLeaderControlMetadata(binaryVersion: "1.2.3"),
+            connector: { hubURL, cwd in
+                connects.record(hubURL, cwd)
+                return connection
+            }
+        )
+        let host = makeHost(plane: plane)
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+        _ = try await register(client)
+
+        try await sendControl(client, id: "1", command: [
+            "type": "workspace_start",
+            "hub_url": "wss://hub.test/ws",
+            "cwd": "/tmp/proj",
+        ])
+        let started = try await nextResult(client)
+        guard case .controlResult("1", .workspaceStatus(let running)) = started else {
+            Issue.record("expected start to succeed, got \(started)")
+            return
+        }
+        #expect(running.state == "running")
+        #expect(running.hubURL == "wss://hub.test/ws")
+        #expect(running.cwd == "/tmp/proj")
+        #expect(running.activeToolCalls == 2)
+        // `server.rs:1081-1082` — sessions are sorted in the payload.
+        #expect(running.sessions == ["sess-a", "sess-b"])
+        #expect(running.pid == processPID)
+        #expect(connects.calls == [ConnectCall(hubURL: "wss://hub.test/ws", cwd: "/tmp/proj")])
+
+        try await sendControl(client, id: "2", command: ["type": "workspace_pause"])
+        let paused = try await nextResult(client)
+        guard case .controlResult("2", .workspaceStatus(let pausedStatus)) = paused else {
+            Issue.record("expected pause to succeed, got \(paused)")
+            return
+        }
+        #expect(pausedStatus.state == "paused")
+        #expect(connection.disconnectCount == 1)
+
+        try await sendControl(client, id: "3", command: ["type": "workspace_resume"])
+        let resumed = try await nextResult(client)
+        guard case .controlResult("3", .workspaceStatus(let resumedStatus)) = resumed else {
+            Issue.record("expected resume to succeed, got \(resumed)")
+            return
+        }
+        #expect(resumedStatus.state == "running")
+        #expect(connection.reconnectCount == 1)
+
+        try await sendControl(client, id: "4", command: ["type": "workspace_status"])
+        let polled = try await nextResult(client)
+        guard case .controlResult("4", .workspaceStatus(let polledStatus)) = polled else {
+            Issue.record("expected status to succeed, got \(polled)")
+            return
+        }
+        #expect(polledStatus.state == "running")
+
+        try await sendControl(client, id: "5", command: ["type": "workspace_stop"])
+        let stopped = try await nextResult(client)
+        guard case .controlResult("5", .workspaceStatus(let stoppedStatus)) = stopped else {
+            Issue.record("expected stop to succeed, got \(stopped)")
+            return
+        }
+        #expect(stoppedStatus.state == "none")
+        #expect(stoppedStatus.hubURL == nil)
+        #expect(connection.disconnectCount == 2)
+    }
+
+    /// `server.rs:1116-1124` — a start that names the live exposure's own
+    /// parameters is a status read, not a reconnect.
+    @Test("re-starting the same exposure answers without reconnecting", .timeLimit(.minutes(1)))
+    func startIsIdempotent() async throws {
+        let connects = ConnectLog()
+        let plane = ACPLeaderControlPlane(
+            connector: { hubURL, cwd in
+                connects.record(hubURL, cwd)
+                return FakeExposureConnection()
+            }
+        )
+        let host = makeHost(plane: plane)
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+        _ = try await register(client)
+
+        let command: [String: String] = [
+            "type": "workspace_start",
+            "hub_url": "wss://hub.test/ws",
+            "cwd": "/tmp/proj",
+        ]
+        try await sendControl(client, id: "1", command: command)
+        _ = try await nextResult(client)
+        try await sendControl(client, id: "2", command: command)
+        let second = try await nextResult(client)
+        guard case .controlResult("2", .workspaceStatus(let status)) = second else {
+            Issue.record("expected the second start to succeed, got \(second)")
+            return
+        }
+        #expect(status.state == "running")
+        #expect(connects.calls.count == 1)
+    }
+
+    /// `server.rs:1108-1114` — no explicit `hub_url` falls through to the
+    /// production hub constant.
+    @Test("start with no hub url resolves the production hub", .timeLimit(.minutes(1)))
+    func startDefaultsHubURL() async throws {
+        let connects = ConnectLog()
+        let plane = ACPLeaderControlPlane(
+            connector: { hubURL, cwd in
+                connects.record(hubURL, cwd)
+                return FakeExposureConnection()
+            }
+        )
+        let host = makeHost(plane: plane)
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+        _ = try await register(client)
+
+        try await sendControl(client, id: "1", command: ["type": "workspace_start", "cwd": "/tmp/proj"])
+        let reply = try await nextResult(client)
+        guard case .controlResult("1", .workspaceStatus(let status)) = reply else {
+            Issue.record("expected start to succeed, got \(reply)")
+            return
+        }
+        #expect(status.hubURL == ACPLeaderControlPlane.productionComputerHubURL)
+        #expect(connects.calls == [ConnectCall(hubURL: ACPLeaderControlPlane.productionComputerHubURL, cwd: "/tmp/proj")])
+    }
+
+    /// `server.rs:1112-1113` — a hub URL that is not ws/wss is refused before
+    /// any connect is attempted.
+    @Test("start with an invalid hub url is refused before any connect", .timeLimit(.minutes(1)))
+    func startInvalidHubURL() async throws {
+        let connects = ConnectLog()
+        let plane = ACPLeaderControlPlane(
+            connector: { hubURL, cwd in
+                connects.record(hubURL, cwd)
+                return FakeExposureConnection()
+            }
+        )
+        let host = makeHost(plane: plane)
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+        _ = try await register(client)
+
+        try await sendControl(client, id: "1", command: [
+            "type": "workspace_start",
+            "hub_url": "https://not-a-socket.example",
+            "cwd": "/tmp/proj",
+        ])
+        let refusal = try await nextError(client)
+        guard case .controlError("1", let code, let message) = refusal else {
+            Issue.record("expected a control error, got \(refusal)")
+            return
+        }
+        #expect(code == ACPLeaderControlErrorCode.workspaceError)
+        #expect(message.contains("invalid hub url"))
+        #expect(connects.calls.isEmpty)
+    }
+
+    /// `server.rs:1176`, :1192 vs :1207-1217: pause and resume with no
+    /// exposure are errors; stop is a successful not-running status.
+    @Test("pause and resume without an exposure are refused; stop reports none", .timeLimit(.minutes(1)))
+    func noExposureRefusals() async throws {
+        let host = makeHost()
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+        _ = try await register(client)
+
+        for (id, command) in [("1", "workspace_pause"), ("2", "workspace_resume")] {
+            try await sendControl(client, id: id, command: ["type": command])
+            let refusal = try await nextError(client)
+            guard case .controlError(_, let code, let message) = refusal else {
+                Issue.record("expected a control error, got \(refusal)")
+                return
+            }
+            #expect(code == ACPLeaderControlErrorCode.workspaceError)
+            #expect(message == "no workspace exposure is running")
+        }
+
+        try await sendControl(client, id: "3", command: ["type": "workspace_stop"])
+        let stopped = try await nextResult(client)
+        guard case .controlResult("3", .workspaceStatus(let status)) = stopped else {
+            Issue.record("expected stop to succeed, got \(stopped)")
+            return
+        }
+        #expect(status.state == "none")
+    }
+
+    /// `server.rs:1197-1200` — a failed reconnect leaves the exposure paused,
+    /// so status keeps reporting the truth.
+    @Test("a failed reconnect leaves the exposure paused", .timeLimit(.minutes(1)))
+    func resumeFailureKeepsPaused() async throws {
+        let connection = FakeExposureConnection()
+        let plane = ACPLeaderControlPlane(
+            connector: { _, _ in connection }
+        )
+        let host = makeHost(plane: plane)
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+        _ = try await register(client)
+
+        try await sendControl(client, id: "1", command: ["type": "workspace_start", "cwd": "/tmp/proj"])
+        _ = try await nextResult(client)
+        try await sendControl(client, id: "2", command: ["type": "workspace_pause"])
+        _ = try await nextResult(client)
+
+        connection.failReconnects(with: FakeHubError())
+        try await sendControl(client, id: "3", command: ["type": "workspace_resume"])
+        let refusal = try await nextError(client)
+        guard case .controlError("3", let code, let message) = refusal else {
+            Issue.record("expected a control error, got \(refusal)")
+            return
+        }
+        #expect(code == ACPLeaderControlErrorCode.workspaceError)
+        #expect(message.contains("failed to reconnect to hub"))
+
+        try await sendControl(client, id: "4", command: ["type": "workspace_status"])
+        let polled = try await nextResult(client)
+        guard case .controlResult("4", .workspaceStatus(let status)) = polled else {
+            Issue.record("expected a status, got \(polled)")
+            return
+        }
+        #expect(status.state == "paused")
+    }
+
+    /// Uptime comes from the exposure's real start instant
+    /// (`server.rs:1161`, :1092), proven with the plane's injected clock so
+    /// the assertion is exact rather than timing-tuned.
+    @Test("uptime accrues from the start instant, through a pause", .timeLimit(.minutes(1)))
+    func uptimeAccrues() async throws {
+        let startNanoseconds: UInt64 = 1_000_000_000
+        let uptime = MutableUptime()
+        let connection = FakeExposureConnection()
+        let plane = ACPLeaderControlPlane(
+            connector: { _, _ in connection },
+            nowNanoseconds: { startNanoseconds + uptime.value }
+        )
+        let host = makeHost(plane: plane)
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+        _ = try await register(client)
+
+        try await sendControl(client, id: "1", command: ["type": "workspace_start", "cwd": "/tmp/proj"])
+        _ = try await nextResult(client)
+
+        uptime.advance(milliseconds: 4200)
+        try await sendControl(client, id: "2", command: ["type": "workspace_pause"])
+        let paused = try await nextResult(client)
+        guard case .controlResult("2", .workspaceStatus(let status)) = paused else {
+            Issue.record("expected pause to succeed, got \(paused)")
+            return
+        }
+        // Paused time counts: upstream keeps one `Instant` on the exposure.
+        #expect(status.uptimeMs == 4200)
+    }
+
+    /// `server.rs:975-997` — the discovery payload carries the leader's real
+    /// metadata, with this build's profiler facts honestly false.
+    @Test("get_leader_info answers with the leader's real metadata", .timeLimit(.minutes(1)))
+    func leaderInfo() async throws {
+        let plane = ACPLeaderControlPlane(
+            metadata: ACPLeaderControlMetadata(
+                socketPath: "/tmp/leader.sock",
+                lockPath: "/tmp/leader.lock",
+                wsURLSuffix: "-abcd1234",
+                binaryVersion: "1.2.3"
+            )
+        )
+        let host = makeHost(plane: plane)
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+        _ = try await register(client)
+
+        try await sendControl(client, id: "1", command: ["type": "get_leader_info"])
+        let reply = try await nextResult(client)
+        guard case .controlResult("1", .leaderInfo(let info)) = reply else {
+            Issue.record("expected leader_info, got \(reply)")
+            return
+        }
+        #expect(info.socketPath == "/tmp/leader.sock")
+        #expect(info.lockPath == "/tmp/leader.lock")
+        #expect(info.wsURLSuffix == "-abcd1234")
+        #expect(info.leaderProtocolVersion == ACPLeaderProtocolLimits.protocolVersion)
+        #expect(info.leaderBinaryVersion == "1.2.3")
+        #expect(info.pid == processPID)
+        // No profiler exists in this port (`cpu_profile.rs:650-655` compiles
+        // one in upstream on unix); both flags stay false.
+        #expect(!info.profilingSupported)
+        #expect(!info.profilingCompiledIn)
+        #expect(!info.cpuProfileActive)
+        #expect(!info.cpuProfileStopping)
+        #expect(info.profileStartedAt == nil)
+        #expect(info.profileFormats.isEmpty)
+    }
+
+    /// The commands this build does not implement get a typed refusal with
+    /// the request id echoed — while the read-only probes still answer, so
+    /// the refusals are scoped, not a blanket "no control plane".
+    @Test("cpu profiling and relaunch are typed refusals, never a hang", .timeLimit(.minutes(1)))
+    func unsupportedCommandsRefused() async throws {
+        let host = makeHost()
+        let (client, served) = attach(to: host)
+        defer { served.cancel() }
+        _ = try await register(client)
+
+        try await client.send(.control(requestID: "1", command: ["type": "start_cpu_profile", "frequency_hz": "250"]))
+        let profileRefusal = try await nextError(client)
+        guard case .controlError("1", let profileCode, let profileMessage) = profileRefusal else {
+            Issue.record("expected a control error, got \(profileRefusal)")
+            return
+        }
+        #expect(profileCode == ACPLeaderControlErrorCode.unsupportedCommand)
+        // `cpu_profile.rs:707-709`.
+        #expect(profileMessage.contains("not supported in this build"))
+
+        try await sendControl(client, id: "2", command: ["type": "relaunch_for_update", "to_version": "9.9.9"])
+        let relaunchRefusal = try await nextError(client)
+        guard case .controlError("2", let relaunchCode, let relaunchMessage) = relaunchRefusal else {
+            Issue.record("expected a control error, got \(relaunchRefusal)")
+            return
+        }
+        #expect(relaunchCode == ACPLeaderControlErrorCode.unsupportedCommand)
+        #expect(relaunchMessage.contains("restart the leader manually"))
+
+        try await sendControl(client, id: "3", command: ["type": "cpu_profile_status"])
+        let status = try await nextResult(client)
+        guard case .controlResult("3", .cpuProfileStatus(let profile)) = status else {
+            Issue.record("expected cpu_profile_status, got \(status)")
+            return
+        }
+        #expect(!profile.active)
+        #expect(!profile.stopping)
+        #expect(profile.startedAt == nil)
     }
 }

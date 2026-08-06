@@ -28,17 +28,25 @@ public struct ACPLeaderIPCConfiguration: Sendable {
     public var binaryVersion: String
     public var capabilities: ACPLeaderCapabilities
     public var maximumMessageSize: Int
+    /// The control plane that answers `control` frames. `nil` builds one with
+    /// default metadata and no workspace backend: `get_leader_info` and
+    /// `workspace_status` answer truthfully while `workspace_start` refuses
+    /// with a typed error. A composition with a hub connector injects a
+    /// fully-backed plane here.
+    public var controlPlane: ACPLeaderControlPlane?
 
     public init(
         registrationTimeoutSeconds: Double? = 30,
         binaryVersion: String = "0.0.0",
         capabilities: ACPLeaderCapabilities = .supported,
-        maximumMessageSize: Int = ACPLeaderProtocolLimits.maximumMessageSize
+        maximumMessageSize: Int = ACPLeaderProtocolLimits.maximumMessageSize,
+        controlPlane: ACPLeaderControlPlane? = nil
     ) {
         self.registrationTimeoutSeconds = registrationTimeoutSeconds
         self.binaryVersion = binaryVersion
         self.capabilities = capabilities
         self.maximumMessageSize = maximumMessageSize
+        self.controlPlane = controlPlane
     }
 }
 
@@ -234,6 +242,7 @@ public actor ACPLeaderIPCHost {
     private let runtime: ACPAgentRuntime
     private let router: ACPLeaderRouter
     private let log: @Sendable (String) -> Void
+    private let controlPlane: ACPLeaderControlPlane
 
     private var nextClientID: UInt64 = 1
     private var clients: [UInt64: ClientHandle] = [:]
@@ -258,6 +267,9 @@ public actor ACPLeaderIPCHost {
         self.configuration = configuration
         self.router = router
         self.log = log
+        self.controlPlane = configuration.controlPlane ?? ACPLeaderControlPlane(
+            metadata: ACPLeaderControlMetadata(binaryVersion: configuration.binaryVersion)
+        )
     }
 
     public func connectedClientCount() -> Int { clients.count }
@@ -374,6 +386,9 @@ public actor ACPLeaderIPCHost {
     public func stop() async {
         guard !stopped else { return }
         stopped = true
+        // `server.rs:1228-1235` — a live workspace exposure drains with the
+        // leader, before clients are told to leave.
+        await controlPlane.finalize()
         for client in clients.values {
             await client.writer.send(.shuttingDown(reason: .manual, delayMilliseconds: 0))
             await client.writer.send(.shutdown)
@@ -471,17 +486,21 @@ public actor ACPLeaderIPCHost {
             case .disconnect:
                 return
             case .control(let requestID, let command):
-                // `client.rs:187-240` gates control on `control_v1`, which this
-                // build does not advertise. Answering with a precise refusal is
-                // what keeps a client that ignores the capability bit from
-                // hanging on a request nobody will ever answer.
-                await writer.send(
-                    .controlError(
-                        requestID: requestID,
-                        code: ACPLeaderRegistrationError.expectedRegister,
-                        message: unsupportedControlMessage(command: command["type"] ?? "unknown")
-                    )
-                )
+                // `server.rs:1763-1817` spawns control handling per request: a
+                // workspace start can await a hub connect for seconds, and
+                // answering inline would stall this client's ACP traffic and
+                // pings behind it. Detached rather than `Task {}` for the same
+                // executor-inheritance reason as `withTimeout` above.
+                Task.detached { [controlPlane, writer] in
+                    switch await controlPlane.run(command) {
+                    case .success(let payload):
+                        await writer.send(.controlResult(requestID: requestID, payload: payload))
+                    case .failure(let code, let message):
+                        await writer.send(
+                            .controlError(requestID: requestID, code: code, message: message)
+                        )
+                    }
+                }
             case .acp(let payload):
                 await forwardToAgent(payload: payload, clientID: clientID)
             }
@@ -581,16 +600,6 @@ public actor ACPLeaderIPCHost {
             case .string(let value) = object["sessionId"] ?? .null
         else { return nil }
         return AcpSessionId(value)
-    }
-
-    private func unsupportedControlMessage(command: String) -> String {
-        """
-        control command `\(command)` is not available: this leader advertises \
-        leader_capabilities.control_v1 = false. The control plane (CPU profiling, \
-        workspace exposure, auto-update relaunch) is not implemented in this build. \
-        Check `leader_capabilities` in the `registered` message before sending control \
-        requests.
-        """
     }
 }
 

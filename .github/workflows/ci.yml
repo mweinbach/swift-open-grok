@@ -50,6 +50,19 @@ jobs:
     # rather than asserted from memory. Flip continue-on-error off once green.
     continue-on-error: true
     container: swift:6.1-jammy
+    defaults:
+      run:
+        # The `bash` keyword runs steps as `bash --noprofile --norc -eo
+        # pipefail`. pipefail is load-bearing: the `| tail -200` pipes below
+        # only trim log volume, and without pipefail a failed `swift build`
+        # exits 0 through `tail` — observed 2026-08-06 (run 31062760767):
+        # the crash-handler C target failed with "2 errors generated" in all
+        # three steps while every step concluded "success". Cost: if the
+        # container image ever loses /bin/bash the job fails at the first
+        # step instead of silently weakening back to `sh -e`; the
+        # Ubuntu-based swift images ship bash, so that failure is loud and
+        # immediate, which is the point of choosing it.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain

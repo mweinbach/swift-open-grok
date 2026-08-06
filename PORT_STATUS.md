@@ -1,14 +1,30 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-04 (inventory + functional audit refresh; reference re-pinned)
-**Overall state:** The package builds and tests green on macOS, and `open-grok` now launches a working full-screen TUI agent rather than a bootstrap shell. This remains an incomplete source port rather than a full Rust-parity release: a large share of the implemented library surface is not reachable from the executable, and all non-launch CLI routes still refuse.
+**As of:** 2026-08-06 (Wave 10 integration and macOS green gate)
+**Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. This remains an incomplete source port rather than a full Rust-parity release: Linux sandbox activation, the real Computer Hub connector, share upload/persisted export markers, and blocking cross-platform CI remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (re-pinned **2026-08-05** from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`. The prior 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` (`/tmp/open-grok-reference` when present).
 **Fixture pin caveat:** every artifact under `ProtocolFixtures/` was captured at the **old** ref `9739c4a2…` and its provenance/manifest still name that ref. Fixtures are **not** re-captured against `80dff0a9…`, and the 2026-08-05 move to `9ed09e2a…` did not recapture them either; they must be re-captured before any fixture-grounded parity claim against the current baseline.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
-## Luna integration verification snapshot (2026-07-23; resumed serialized remediation)
+## Current integration verification snapshot (2026-08-06)
+
+| Command | Outcome |
+|---|---|
+| `git diff --check` | **Exit 0**. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` | **Exit 0**. |
+| `zsh workflows/swift-safe-verify.zsh build` | **Exit 0**. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | **Exit 0** — 73 Swift Testing runs, **3,325 tests / 554 suites**, zero failures. |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Exit 0**. |
+
+Focused Wave 10 filters also passed: shell launch transformation (16/3), live
+sandbox CLI propagation (1/1), workspace capability and production control
+channel (4/1), leader control plane (13/1), leader payload goldens (8/1),
+sandbox policies (35/2 on macOS), export boundary (7/1), share gate (12/1),
+feedback export policy (7/1), and live share refusal composition (13/1).
+
+## Historical Luna integration verification snapshot (2026-07-23; superseded)
 
 | Command | Outcome |
 |---|---|
@@ -19,7 +35,8 @@
 | `zsh workflows/swift-safe-verify.zsh build --product open-grok` | **Exit 0**. |
 | `open-grok --version`, `help`, and isolated `paths` smokes | **Pass** — version `0.1.220-open-grok.21`; state remained under `/tmp/open-grok-smoke-home`. |
 
-Integration verification is green for the current worktree. `CompactionTranscript.swift` and workflow artifacts remain intact. SwiftPM reports four non-failing warnings for fixture files not declared as resources. The test totals above are from the 2026-07-23 run and have **not** been re-verified since; the 2026-08-04 refresh below is inventory and source inspection only, not a new verifier run.
+This is retained as a historical checkpoint only. The current green gate and
+test totals are recorded in the 2026-08-06 snapshot above.
 
 
 ## Inventory counting method (reproducible)
@@ -65,9 +82,11 @@ for d in Tests/*/; do
 done
 ```
 
-## Live executable capability snapshot (2026-08-04, source-audited)
+## Historical live executable capability snapshot (2026-08-04, superseded)
 
-This section replaces the former "executable is bootstrap-only" claim, which is no longer true. Each item was verified by reading the named file.
+This section records the tree as it existed on 2026-08-04. Later wave sections
+supersede its present-tense reachability claims; do not use it as the current
+capability list.
 
 **Snapshot caveat:** this describes the tree as audited on 2026-08-04. The three active build-out slices in "Next action" were landing uncommitted files at that moment (Codex credential provider and live auth composition, a write tool pack, and pager markdown/styled-text rendering). Where an item below says a capability is missing, it means missing from the audited state — the in-flight slices are the work to close exactly those gaps, and this section should be re-audited when they land.
 
@@ -214,6 +233,48 @@ Both are mapped with proposed Swift targets in `CRATE_MAP.md`.
 - The Swift port targets the **old** pin's behavior throughout. Nothing in this section is implemented on the Swift side; it is a catch-up backlog, not a status claim.
 - `ProtocolFixtures/` still encodes old-pin wire formats (see the fixture pin caveat in the header). Recapture is a prerequisite for treating any of the above as fixture-verified.
 
+## Wave 10 — 2026-08-06 (leader control, export boundary, sandbox spawn, CI honesty)
+
+Gates: `build-tests` **0**, `build` **0**, `test --no-parallel` **0** —
+**3,325 tests / 554 suites, zero failures** across 73 Swift Testing runs — and
+`build --product open-grok` **0**. `git diff --check` **0**. The aggregate is
+the count reported by this worktree's current SwiftPM discovery; it supersedes
+older wave totals rather than being inferred from them.
+
+**ACP leader control is now live through the production workspace client.**
+The leader advertises `control_v1` and `workspace_exposure`, answers typed
+leader/profile/workspace payloads, and owns a start/pause/resume/stop/status
+state machine. The CLI's real `LeaderWorkspaceControlChannel` consumes
+`control_result`; integration testing found and removed a duplicate length
+prefix that previously made registration close immediately. A leader without
+an injected Computer Hub connector still answers status truthfully as `none`
+and refuses start with a typed error. The actual hub connector remains the
+product gap; capability advertising no longer lies about the control protocol.
+
+**The xAI export boundary exists and is fail-closed.** One shared monotonic
+boundary closes when any provider profile denies xAI services. Share and
+feedback policies consult it before export and again at send time; share wire
+payloads use a serde-compatible JSON codec. The `share` composition is tested
+but deliberately not connected to a successful upload path: persisted session
+records still lack the `ever_used_codex` marker and no signed-URL/backend upload
+client exists. The route therefore refuses unverifiable sessions and proves no
+transcript bytes leave the process.
+
+**Sandbox selection and child spawn now meet.** The parsed CLI `--sandbox`
+profile reaches live bootstrap, and the local shell process backend applies the
+sandbox launch transform before every spawn. Linux child network denial has a
+fail-closed `unshare` user+network-namespace wrapper with a cached host probe.
+This is not yet a claim that normal Linux sandboxed CLI launches work:
+non-off Linux profiles still fail before arming because process-wide bubblewrap
+re-exec is absent. macOS Seatbelt remains the only process-wide live enforcer.
+
+**CI stopped hiding Linux compiler failures.** Linux workflow commands now run
+under Bash with `pipefail`, and the crash C shim defines `_GNU_SOURCE` before
+glibc headers so `REG_RIP`/`REG_RBP` are visible. Platform jobs remain
+non-blocking while their real gaps are open: Windows' version build plugin still
+hardcodes `/bin/sh`, and the latest observed macOS CI run terminated during
+BuildSupport rather than producing a trustworthy platform pass.
+
 ## Wave 9 — 2026-08-06 (telemetry, Computer Hub, Linux, commands)
 
 Gates: `build-tests` **0**, `test --no-parallel` **0** — **3,858 tests / 574
@@ -241,7 +302,9 @@ genuinely cannot represent a workspace status on the wire, the route runs the re
 sequence and terminates at upstream's own capability refusal, with
 `portDefaultLeaderIsRefused` asserting `workspaceExposure == false` so flipping
 that bit without building the control plane fails a test rather than shipping a
-lie. The ACPRuntime control plane is the recorded gap.
+lie. The ACPRuntime control plane was the recorded gap; Wave 10 closes the
+protocol/client portion while retaining the missing real Hub connector as an
+explicit typed refusal.
 
 **Linux:** streaming HTTP implemented rather than stubbed; child network blocking
 returns a **typed unsupported error** rather than silently not blocking. The
@@ -392,7 +455,10 @@ about its reachability.
 8. **`ProtocolFixtures/` are stale** relative to the new pin and cannot ground parity claims until recaptured.
 9. **Portability gaps remaining:** Windows ConPTY/Credential Manager/LockFileEx; full Linux Secret Service; pack object reading; full tree-sitter not in Package.swift; OTLP gRPC uses collector-shaped TraceService Export requests (path + framing + `grpc-status`) over `HTTPTransport` rather than a dedicated HTTP/2 tonic client—trailers depend on the transport surfacing them.
 10. **Package-green ≠ Rust parity:** focused and integrated Swift tests do not prove full source-port behavior.
-11. **Native Linux and Windows CI** remain absent; declared platform strategies are not CI-proven here.
+11. **Native Linux and Windows CI jobs exist but are non-blocking.** Linux now
+    reports piped compiler failures honestly; Windows remains blocked by the
+    build plugin's `/bin/sh` invocation. Neither platform has earned a green
+    support claim.
 
 ## Verifier command record (required for green claims)
 
@@ -1049,9 +1115,30 @@ Read the tally with care in both directions. The placeholder count fell from 42 
 
 ## Next action
 
-The work has moved from "fill in placeholders" to "connect implemented code to the executable". Three slices are **in progress in parallel**; they touch disjoint paths and are not sequenced behind one another.
+The work remains executable-integration and platform-proof work, not placeholder
+filling. Wave 10 leaves the following ordered priorities.
 
-### Active build-out wave (in progress, parallel)
+### Current priorities after Wave 10
+
+1. **Finish Linux sandbox activation.** Add the reviewed process-wide
+   bubblewrap/re-exec seam so non-off profiles can arm before the already-wired
+   child `unshare` launch transform; then prove outbound child networking is
+   denied on a real Linux runner.
+2. **Connect workspace exposure to Computer Hub.** Supply the production
+   `ACPWorkspaceExposureConnection` backend to leader composition; keep the
+   current typed `workspace_start` refusal until that connector is real.
+3. **Persist and enforce the export marker.** Stamp and rehydrate the
+   `ever_used_codex`/non-xAI boundary in session records before wiring any
+   share, feedback, trace, or cloud upload path. Then add the signed-URL and
+   backend share clients with both pre-send boundary checks intact.
+4. **Make platform CI blocking only after it is truthful.** Remove the Windows
+   build plugin's `/bin/sh` dependency, reproduce the macOS BuildSupport CI
+   termination, and close Linux compile/runtime gaps before removing
+   `continue-on-error`.
+5. **Continue upstream catch-up and remaining live-route work** without
+   weakening explicit refusals or the serialized verifier discipline.
+
+### Historical active build-out wave (completed or superseded)
 
 1. **TUI streaming + markdown.** Switch the live loop from `conversationCollect` to the existing `StreamChatCompletions`/`StreamResponses`/`StreamMessages` paths, and wire `OpenGrokMarkdown`/`OpenGrokMarkdownCore` into `PagerTerminalRenderer` so replies render incrementally as formatted text instead of arriving as one plain-text block. Both dependencies are already implemented and tested; this is composition work.
 2. **Write/edit tools behind the permission engine.** Expand the live tool set beyond the read-only `.explore` pack to the write/patch/edit tools in `OpenGrokFileTools`, routed through `OpenGrokWorkspace`'s permission engine in the documented gate order, with `OpenGrokHooks` supplying `PreToolUse` and hunk attribution recorded only after success. This is the first slice that exercises the gate order on a mutating operation.

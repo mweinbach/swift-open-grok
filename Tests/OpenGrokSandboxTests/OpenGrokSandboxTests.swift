@@ -288,27 +288,56 @@ struct OpenGrokSandboxTests {
     }
     #endif
 
-    @Test("child network policy pre-exec enforcement")
-    func childNetworkPolicyPreExec() throws {
-        let policy = ChildNetworkPolicy.blocked
+    @Test("child network policy launch transform")
+    func childNetworkPolicyRestrictedLaunch() throws {
+        // .unrestricted passes through everywhere.
+        let (uExe, uArgs) = try ChildNetworkPolicy.unrestricted.restrictedLaunch(
+            executable: "/bin/echo",
+            arguments: ["hi"]
+        )
+        #expect(uExe == "/bin/echo")
+        #expect(uArgs == ["hi"])
+
+        // .websites is modeled upstream but never enforced
+        // (xai-grok-sandbox/src/network_policy.rs:3), so the port must refuse
+        // loudly on every platform rather than degrade to all-or-nothing.
+        #expect(throws: SandboxError.self) {
+            try ChildNetworkPolicy.websites(WebsitePolicy()).restrictedLaunch(
+                executable: "/bin/echo",
+                arguments: []
+            )
+        }
+
+        let blocked = ChildNetworkPolicy.blocked
         #if os(Linux)
-        // Linux in-process network blocking is not installable from Swift
-        // (prctl(2) is variadic, so ClangImporter drops it). The seam must say
-        // so out loud: a silent success here would report a child as network-
-        // blocked when nothing was installed.
-        #expect(throws: SandboxError.self) { try policy.enforceInChildProcess() }
-        do {
-            try policy.enforceInChildProcess()
-            Issue.record("blocked policy must not report success without a filter")
-        } catch let error as SandboxError {
-            guard case .unsupported = error else {
-                Issue.record("expected .unsupported, got \(error)")
-                return
+        // .blocked is real on Linux: wrapped through the network-denying
+        // unshare re-exec when the host can enforce, typed unsupported when
+        // it cannot — never a silent no-op. The probe decides which branch
+        // this host is on; both are asserted, so an incapable host cannot
+        // fake success and a capable host cannot silently stop enforcing.
+        if LinuxChildNetworkRestriction.probeHost() != nil {
+            let (exe, args) = try blocked.restrictedLaunch(
+                executable: "/bin/echo",
+                arguments: ["hi"]
+            )
+            #expect(exe.hasSuffix("unshare"))
+            #expect(args.contains("--net"))
+            #expect(Array(args.suffix(2)) == ["/bin/echo", "hi"])
+        } else {
+            #expect(throws: SandboxError.self) {
+                try blocked.restrictedLaunch(executable: "/bin/echo", arguments: ["hi"])
             }
         }
         #else
-        // Non-Linux platforms report explicit no-op / unsupported behavior cleanly
-        #expect(throws: Never.self) { try policy.enforceInChildProcess() }
+        // Off Linux the per-child filter is a deliberate no-op, matching
+        // upstream's non-Linux `Ok(())` (child_net.rs:226-229); macOS
+        // restricts network in the process-level Seatbelt profile instead.
+        let (bExe, bArgs) = try blocked.restrictedLaunch(
+            executable: "/bin/echo",
+            arguments: ["hi"]
+        )
+        #expect(bExe == "/bin/echo")
+        #expect(bArgs == ["hi"])
         #endif
     }
 

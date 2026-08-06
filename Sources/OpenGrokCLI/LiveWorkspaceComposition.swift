@@ -25,22 +25,14 @@
 //   * `main.rs:468-514` (`render_workspace_payload`) — the human and `--json`
 //     output shapes, reproduced field for field in `renderStatus`.
 //
-// WHAT THIS PORT CANNOT DO, AND WHY IT SAYS SO INSTEAD OF FAKING IT
+// CURRENT CONTROL-PLANE BOUNDARY
 //
-// The leader in this port answers every `control` frame with `controlError`
-// and advertises `leader_capabilities.control_v1 = false` /
-// `workspace_exposure = false` (`ACPLeaderIPC.swift:473-484`,
-// `ACPLeaderProtocol.swift:196-239`). `ACPLeaderServerMessage` has no
-// success case for a control request at all — a workspace status literally
-// cannot be represented on this port's wire yet.
-//
-// So `workspaceControl` performs the *real* sequence — dial, register, read
-// the advertised capabilities, send the control frame — and reports what it
-// actually found. Against today's leader that is upstream's own
-// `ensure_workspace_caps` refusal, reached by upstream's own means, not a
-// hardcoded "not implemented". When the ACPRuntime owner adds a
-// `controlResult` case and flips the capability bits, `renderStatus` and the
-// decode path below are already the consumers. See INTEGRATION-w9-hub.md.
+// The leader now advertises and serves the control protocol, including a
+// truthful `workspace_status` result. The hub connection remains an injected
+// backend seam: a leader without that backend refuses `workspace_start` with
+// a typed error, while status still reports `none`. This client must consume
+// `controlResult` directly; skipping it would make a valid leader response
+// look like a hang.
 //
 // The launcher hook that routes here goes in `LiveComposition.swift`, which
 // this slice does not own; the diff is in INTEGRATION-w9-hub.md.
@@ -505,6 +497,22 @@ public final class LeaderWorkspaceControlChannel: WorkspaceControlChannel, @unch
         // frame arriving first must not be mistaken for our reply.
         while let message = try await readMessage() {
             switch message {
+            case .controlResult(let id, let payload) where id == requestID:
+                guard case .workspaceStatus(let status) = payload else {
+                    throw WorkspaceRouteError(
+                        "the leader answered `workspace \(command.wire["command"] ?? "?")` "
+                            + "with an unexpected payload: \(payload)"
+                    )
+                }
+                return WorkspaceStatusPayload(
+                    state: status.state,
+                    hubURL: status.hubURL,
+                    cwd: status.cwd,
+                    uptimeMs: status.uptimeMs,
+                    activeToolCalls: Int(status.activeToolCalls),
+                    sessions: status.sessions,
+                    pid: Int(status.pid)
+                )
             case .controlError(let id, let code, let text) where id == requestID:
                 throw WorkspaceRouteError(
                     "the leader refused `workspace \(command.wire["command"] ?? "?")` "
@@ -515,9 +523,6 @@ public final class LeaderWorkspaceControlChannel: WorkspaceControlChannel, @unch
             case .error(let code, let text):
                 throw WorkspaceRouteError("leader error \(code): \(text)")
             default:
-                // `ACPLeaderServerMessage` has no success case for a control
-                // request, so there is nothing here that could carry a status
-                // payload. Keep draining rather than guessing.
                 continue
             }
         }
@@ -532,8 +537,7 @@ public final class LeaderWorkspaceControlChannel: WorkspaceControlChannel, @unch
     }
 
     private func write(_ message: ACPLeaderClientMessage) async throws {
-        let body = try ACPLeaderCodec.encode(message)
-        try await channel.write(try ACPLeaderFrameEncoder.encode(body))
+        try await channel.write(try ACPLeaderCodec.encode(message))
     }
 
     private func readMessage() async throws -> ACPLeaderServerMessage? {

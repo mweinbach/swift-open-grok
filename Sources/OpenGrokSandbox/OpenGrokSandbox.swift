@@ -18,7 +18,7 @@ import Foundation
 
 // Module surface is composed of:
 //   Types.swift, Paths.swift, Profiles.swift, NetworkPolicy.swift,
-//   Platform.swift, Manager.swift
+//   ChildNetworkRestriction.swift, Platform.swift, Manager.swift
 //
 // This file re-exports the primary entry points for discoverability.
 

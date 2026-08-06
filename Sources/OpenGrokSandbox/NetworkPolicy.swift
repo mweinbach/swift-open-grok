@@ -256,115 +256,45 @@ private struct IPv4Address {
     }
 }
 
-// MARK: - Child Network Filter Integration
-
-/// Install a Linux seccomp BPF filter blocking network syscalls in pre-exec child launch paths.
-/// Returns true on Linux if installed successfully, or false/no-op on other OS targets.
-@discardableResult
-public func installChildNetworkFilter() throws -> Bool {
-    #if os(Linux)
-    return try installLinuxSeccompNetworkFilter()
-    #else
-    return false
-    #endif
-}
-
-#if os(Linux)
-import Glibc
-
-private struct SockFilter {
-    var code: UInt16
-    var jt: UInt8
-    var jf: UInt8
-    var k: UInt32
-}
-
-private struct SockFprog {
-    var len: UInt16
-    var filter: UnsafeMutablePointer<SockFilter>?
-}
-
-/// Install the seccomp filter built by `buildLinuxSeccompNetworkProgram`.
-///
-/// Unimplemented, and it fails rather than returning `false`: this is the gate
-/// that keeps a `.blocked` child off the network, so "could not install" must
-/// never read as "nothing to install". Installing needs `prctl(2)`, which glibc
-/// declares variadic (`int prctl(int, ...)`); ClangImporter drops variadic C
-/// functions, so it is not callable from Swift, and neither is the `syscall(2)`
-/// or `unshare(2)` fallback (same reason / not exported by the Glibc overlay).
-/// Closing this needs a C shim target in Package.swift, which this change does
-/// not own — see the note in the wave report.
-private func installLinuxSeccompNetworkFilter() throws -> Bool {
-    throw SandboxError.unsupported(
-        "Linux child network blocking requires a seccomp C shim: prctl(2) is "
-        + "variadic and therefore unavailable to Swift"
-    )
-}
-
-/// The BPF program that blocks connect/bind/sendto/sendmsg/listen/accept.
-///
-/// Split out from installation and retained deliberately: it is the reviewable
-/// record of what confinement is supposed to do, ready for the day a C shim can
-/// install it. Nothing calls it today — this is *implemented-unwired*, not a
-/// live filter, and `installLinuxSeccompNetworkFilter` throws rather than
-/// pretending otherwise.
-@available(*, unavailable, message: "no installation path exists yet; see installLinuxSeccompNetworkFilter")
-private func buildLinuxSeccompNetworkProgram() -> [SockFilter] {
-    let BPF_LD: UInt16 = 0x00
-    let BPF_W: UInt16 = 0x00
-    let BPF_ABS: UInt16 = 0x20
-    let BPF_JMP: UInt16 = 0x05
-    let BPF_JEQ: UInt16 = 0x10
-    let BPF_K: UInt16 = 0x00
-    let BPF_RET: UInt16 = 0x06
-
-    let SECCOMP_RET_ALLOW: UInt32 = 0x7fff_0000
-    let SECCOMP_RET_ERRNO: UInt32 = 0x0005_0000
-    let EPERM_VAL: UInt32 = 1
-
-    #if arch(x86_64)
-    let blockedSyscalls: [UInt32] = [42 /* connect */, 49 /* bind */, 44 /* sendto */, 46 /* sendmsg */, 50 /* listen */, 43 /* accept */, 288 /* accept4 */]
-    #elseif arch(arm64)
-    let blockedSyscalls: [UInt32] = [203 /* connect */, 200 /* bind */, 206 /* sendto */, 211 /* sendmsg */, 201 /* listen */, 202 /* accept */, 242 /* accept4 */]
-    #else
-    let blockedSyscalls: [UInt32] = [42, 49, 44, 46, 50, 43, 288]
-    #endif
-
-    var instructions: [SockFilter] = []
-    let totalChecks = blockedSyscalls.count
-
-    // 1. Load syscall number (seccomp_data.nr at offset 0)
-    instructions.append(SockFilter(code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 0))
-
-    // 2. Check each blocked syscall
-    for (i, sysNo) in blockedSyscalls.enumerated() {
-        let remaining = totalChecks - i - 1
-        instructions.append(SockFilter(
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: UInt8(remaining + 1),
-            jf: 0,
-            k: sysNo
-        ))
-    }
-
-    // 3. Default: ALLOW
-    instructions.append(SockFilter(code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW))
-
-    // 4. Blocked: ERRNO(EPERM)
-    instructions.append(SockFilter(code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO | EPERM_VAL))
-
-    return instructions
-}
-#endif
+// MARK: - Child Network Launch Restriction
 
 extension ChildNetworkPolicy {
-    /// Enforce child network policy on current/child process prior to exec.
-    public func enforceInChildProcess() throws {
+    /// Transform a child launch to enforce this policy at spawn time.
+    ///
+    /// `.blocked` maps to the Linux `unshare` namespace re-exec in
+    /// `ChildNetworkRestriction.swift`, failing closed with
+    /// `SandboxError.unsupported` when the host cannot enforce. Off Linux it
+    /// is a deliberate no-op, matching upstream's non-Linux child filter
+    /// (`child_net.rs:226-229` returns `Ok(())`) — macOS network policy is
+    /// applied in the process-level Seatbelt profile, not per child.
+    ///
+    /// `.websites` is a typed unsupported on every platform: upstream models
+    /// the per-origin list but never enforces it (`network_policy.rs:3`:
+    /// "not selected by sandbox profiles or enforced by the current"
+    /// runtime). Degrading an allow-list to all-or-nothing would break the
+    /// origins the user allowed, and degrading to a no-op would claim
+    /// enforcement that does not exist — so it refuses loudly instead.
+    public func restrictedLaunch(
+        executable: String,
+        arguments: [String]
+    ) throws -> (executable: String, arguments: [String]) {
         switch self {
         case .unrestricted:
-            break
-        case .blocked, .websites:
-            try installChildNetworkFilter()
+            return (executable, arguments)
+        case .blocked:
+            #if os(Linux)
+            return try LinuxChildNetworkRestriction.wrappedCommand(
+                executable: executable,
+                arguments: arguments
+            )
+            #else
+            return (executable, arguments)
+            #endif
+        case .websites:
+            throw SandboxError.unsupported(
+                "per-origin child network policies are not enforceable: upstream "
+                    + "models ChildNetworkPolicy::Websites but never enforces it"
+            )
         }
     }
 }

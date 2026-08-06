@@ -1,6 +1,16 @@
 // Async-signal-safe crash capture. Mirrors xai-crash-handler handler.rs.
 // Only async-signal-safe libc calls in signal context.
 
+// glibc hides the `REG_RIP`/`REG_RBP` gregs indices behind __USE_GNU, which is
+// only set when _GNU_SOURCE is defined *before* the first system header. Without
+// it the x86_64 Linux PC/FP extraction below fails to compile — and it fails
+// only on x86_64 Linux, so an arm64 Linux build stays green and hides it.
+// Cost: this must stay above every #include in this file. Moving it below one
+// silently reverts to the broken state on exactly one platform.
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
+
 #include "opengrok_crash_posix.h"
 
 #include <errno.h>

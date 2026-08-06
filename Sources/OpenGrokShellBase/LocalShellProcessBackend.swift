@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokSandbox
 
 #if canImport(Darwin)
 import Darwin
@@ -13,6 +14,10 @@ public actor LocalShellProcessBackend: ShellProcessBackend, ShellCapabilityProvi
     private let cancellationGracePeriod: ShellDuration
     private let maximumOutputFileBytes: Int
     private let taskIDProvider: @Sendable () -> String
+    private let launchTransform: @Sendable (
+        _ executable: String,
+        _ arguments: [String]
+    ) throws -> (executable: String, arguments: [String])
     private let lifecycle = ShellProcessLifecycle()
 
     private var records: [String: LocalShellTaskRecord] = [:]
@@ -25,13 +30,18 @@ public actor LocalShellProcessBackend: ShellProcessBackend, ShellCapabilityProvi
         maximumOutputFileBytes: Int = 64 * 1024 * 1024,
         taskIDProvider: @escaping @Sendable () -> String = {
             "task-\(UUID().uuidString.lowercased())"
-        }
+        },
+        launchTransform: @escaping @Sendable (
+            _ executable: String,
+            _ arguments: [String]
+        ) throws -> (executable: String, arguments: [String]) = childNetworkRestrictedLaunch
     ) {
         self.inheritedEnvironment = inheritedEnvironment
         self.capabilities = capabilities
         self.cancellationGracePeriod = ShellDuration(timeInterval: max(0, cancellationGracePeriod.timeInterval))
         self.maximumOutputFileBytes = max(0, maximumOutputFileBytes)
         self.taskIDProvider = taskIDProvider
+        self.launchTransform = launchTransform
         self.currentCWD = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).standardizedFileURL
     }
 
@@ -228,6 +238,7 @@ public actor LocalShellProcessBackend: ShellProcessBackend, ShellCapabilityProvi
             inheritedEnvironment: inheritedEnvironment,
             validateWorkingDirectory: true
         )
+        let launch = try launchTransform(prepared.executable, prepared.arguments)
         let taskID = taskIDProvider().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !taskID.isEmpty else {
             throw ShellError.invalidRequest("task ID provider returned an empty identifier")
@@ -242,8 +253,8 @@ public actor LocalShellProcessBackend: ShellProcessBackend, ShellCapabilityProvi
             maximumOutputFileBytes: maximumOutputFileBytes
         )
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: prepared.executable)
-        process.arguments = prepared.arguments
+        process.executableURL = URL(fileURLWithPath: launch.executable)
+        process.arguments = launch.arguments
         process.environment = prepared.environment
         process.currentDirectoryURL = prepared.workingDirectory
 

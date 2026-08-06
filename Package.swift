@@ -252,7 +252,7 @@ private func targets() -> [Target] {
     t.append(contentsOf: libs(w6s2, dep(w0s2, w1s3, w2s1, w3s2, w3s3)))
     t.append(contentsOf: libs(w6s3, dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s2, w2s3, w3s3)))
     // W6-S4: ShellBase base; ShellSessionSupport -> ShellBase.
-    t.append(.target(name: "OpenGrokShellBase", dependencies: dep(w0s2, w0s3, w0s4, w1s1, w1s2, w1s3, w1s4, w1s5, w2s1, w2s2, w3s1, w3s2, w3s3, w4s3, w5s1)))
+    t.append(.target(name: "OpenGrokShellBase", dependencies: dep(w0s2, w0s3, w0s4, w1s1, w1s2, w1s3, w1s4, w1s5, w2s1, w2s2, w3s1, w3s2, w3s3, w4s1, w4s3, w5s1)))
     t.append(.target(name: "OpenGrokShellSessionSupport", dependencies: dep(w0s2, w0s3, w0s4, w1s1, w1s2, w1s3, w1s4, w1s5, w2s1, w2s2, w3s1, w3s2, w3s3, w4s3, w5s1, ["OpenGrokShellBase"])))
     t.append(contentsOf: libs(w6s5, dep(w0s2, w0s4, w1s1, w1s4, w1s5, w4s2, w5s6)))
     t.append(.target(name: "OpenGrokWorkflow", dependencies: dep(w0s4, ["OpenGrokToolTypes"])))

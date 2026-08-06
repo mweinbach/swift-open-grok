@@ -214,12 +214,27 @@ public final class SandboxManager: @unchecked Sendable {
     }
 }
 
-/// Execute a child process pre-exec action, installing the Linux seccomp network filter if child network restriction is enabled.
-public func applyChildNetworkRestrictionToLaunch(preExec: (() throws -> Void)? = nil) throws {
-    if shouldRestrictChildNetwork() {
-        try installChildNetworkFilter()
+/// Transform a known Linux child launch for spawn. When the process-wide
+/// sandbox restricts child network (`shouldRestrictChildNetwork`), the
+/// launch is re-execed through a network-denying namespace; otherwise it is
+/// returned unchanged. Fail closed — a host that cannot enforce throws
+/// `SandboxError.unsupported` rather than spawning an unrestricted child.
+///
+/// This replaces upstream's `pre_exec` seccomp hook
+/// (`streaming_local_terminal.rs:917-921`): Foundation.Process has no
+/// pre-exec seam, so enforcement moves into the argv the spawner execs. See
+/// `ChildNetworkRestriction.swift` for the mechanism decision record.
+public func childNetworkRestrictedLaunch(
+    executable: String,
+    arguments: [String]
+) throws -> (executable: String, arguments: [String]) {
+    guard shouldRestrictChildNetwork() else {
+        return (executable, arguments)
     }
-    try preExec?()
+    return try LinuxChildNetworkRestriction.wrappedCommand(
+        executable: executable,
+        arguments: arguments
+    )
 }
 
 // MARK: - Platform enforcer dispatch

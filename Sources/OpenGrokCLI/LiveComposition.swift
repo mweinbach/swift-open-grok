@@ -2136,6 +2136,7 @@ struct LiveSecurityContext: Sendable {
     /// requested and could not be enforced — never degrades silently.
     func applySandbox(
         workspaceRoot: URL,
+        cliProfile: String?,
         persistedProfile: String?,
         environment: [String: String]
     ) throws -> LiveSandboxDecision {
@@ -2143,6 +2144,7 @@ struct LiveSecurityContext: Sendable {
             workspaceRoot: workspaceRoot,
             document: document,
             requirements: requirements,
+            cliProfile: cliProfile,
             persistedProfile: persistedProfile,
             environment: environment
         )
@@ -2248,6 +2250,7 @@ struct LiveToolExecutor: Sendable {
         // than running unsandboxed after the user asked for one.
         self.sandbox = try security.applySandbox(
             workspaceRoot: standardizedWorkingDirectory,
+            cliProfile: permissionOptions.sandboxProfile,
             persistedProfile: persistedSandboxProfile,
             environment: environment
         )

@@ -14,14 +14,17 @@ import Testing
 import OpenGrokACPRuntime
 import OpenGrokComputerHubCore
 import OpenGrokConfigTypes
+import OpenGrokHTTP
 import OpenGrokShared
 import OpenGrokToolProtocol
 import OpenGrokWorkspace
 
 // MARK: - Fakes
 
-/// A leader that answers control commands, standing in for the control plane
-/// this port's `ACPLeaderIPCHost` does not implement yet.
+/// A leader that answers control commands, standing in for the hub backend:
+/// `ACPLeaderIPCHost` implements the control plane, but these tests exercise
+/// the route without a real leader process, so the channel stays fake. The
+/// live-seam proof against the real host is `portDefaultLeaderBacksExposureAdvert`.
 private final class FakeLeaderChannel: WorkspaceControlChannel, @unchecked Sendable {
     let advertisedCapabilities: ACPLeaderCapabilities?
 
@@ -275,13 +278,170 @@ struct WorkspaceCapabilityTests {
         }
     }
 
-    @Test("this port's default leader capabilities do not permit exposure")
-    func portDefaultLeaderIsRefused() {
-        // Guards the honesty claim in the route's header comment: if someone
-        // flips `ACPLeaderCapabilities.supported` without implementing the
-        // control plane, this fails and they have to look at why.
-        #expect(!ACPLeaderCapabilities.supported.workspaceExposure)
+    @Test("this port's leader backs its workspace_exposure advert with a live control plane")
+    func portDefaultLeaderBacksExposureAdvert() async throws {
+        // The inverted tripwire. While the control plane did not exist, this
+        // test asserted `workspaceExposure == false` so the bit could not be
+        // flipped without the implementation. `ACPLeaderControlPlane` now
+        // exists, so the assertion inverts: the bit must stay set AND the real
+        // ACPLeaderIPCHost — driven below over the same frame codec the
+        // production Unix socket serves — must answer workspace control round
+        // trips. Dropping the control plane while keeping the bit fails here,
+        // which is the lie the original guard prevented in the other
+        // direction.
+        #expect(ACPLeaderCapabilities.supported.workspaceExposure)
+        #expect(ACPLeaderCapabilities.supported.controlV1)
+
+        // Half 1: the production-default host (no hub backend wired) still
+        // answers `workspace_status` truthfully — state none, real pid.
+        let production = ACPLeaderIPCHost(runtime: ACPAgentRuntime())
+        let productionReplies = try await driveWorkspaceControl(
+            over: production,
+            commands: [(id: "ws-1", command: ["type": "workspace_status"])]
+        )
+        guard case .controlResult("ws-1", .workspaceStatus(let none)) = productionReplies["ws-1"] else {
+            Issue.record("expected a workspace_status result, got \(productionReplies)")
+            return
+        }
+        #expect(none.state == "none")
+        #expect(none.pid == UInt32(clamping: ProcessInfo.processInfo.processIdentifier))
+
+        // Half 2: with an exposure backend injected, the same seam reports
+        // the exposure itself — reachable, not merely representable.
+        let plane = ACPLeaderControlPlane(
+            connector: { _, _ in TripwireExposureConnection() }
+        )
+        let backed = ACPLeaderIPCHost(
+            runtime: ACPAgentRuntime(),
+            configuration: ACPLeaderIPCConfiguration(controlPlane: plane)
+        )
+        let backedReplies = try await driveWorkspaceControl(
+            over: backed,
+            commands: [
+                (id: "ws-1", command: ["type": "workspace_start", "hub_url": "wss://hub.test/ws", "cwd": "/tmp/proj"]),
+                (id: "ws-2", command: ["type": "workspace_status"]),
+            ]
+        )
+        guard case .controlResult("ws-1", .workspaceStatus(let started)) = backedReplies["ws-1"] else {
+            Issue.record("expected workspace_start to succeed, got \(backedReplies)")
+            return
+        }
+        #expect(started.state == "running")
+        #expect(started.hubURL == "wss://hub.test/ws")
+        #expect(started.cwd == "/tmp/proj")
+        guard case .controlResult("ws-2", .workspaceStatus(let polled)) = backedReplies["ws-2"] else {
+            Issue.record("expected workspace_status to succeed, got \(backedReplies)")
+            return
+        }
+        #expect(polled.state == "running")
+        #expect(polled.activeToolCalls == 1)
+        #expect(polled.sessions == ["sess-1"])
     }
+
+    @Test("the production workspace channel consumes a control result", .timeLimit(.minutes(1)))
+    func productionChannelConsumesControlResult() async throws {
+        let host = ACPLeaderIPCHost(runtime: ACPAgentRuntime())
+        let pair = InMemoryWebSocketChannel.makePair()
+        let served = Task { await host.serve(channel: pair.a) }
+        defer { served.cancel() }
+
+        let deadline = Task {
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            guard !Task.isCancelled else { return }
+            await pair.b.close()
+        }
+        defer { deadline.cancel() }
+
+        let channel = try await LeaderWorkspaceControlChannel.register(channel: pair.b)
+        let payload = try await channel.send(.status)
+        #expect(payload.state == "none")
+        #expect(payload.pid == ProcessInfo.processInfo.processIdentifier)
+        await channel.close()
+    }
+}
+
+// MARK: - Control plane tripwire driver
+
+/// An exposure backend for the tripwire: proves the control plane reports an
+/// exposure it is given, not only the empty state.
+private final class TripwireExposureConnection: ACPWorkspaceExposureConnection, @unchecked Sendable {
+    func snapshot() -> ACPWorkspaceActivitySnapshot {
+        ACPWorkspaceActivitySnapshot(activeToolCalls: 1, sessionIDs: ["sess-1"])
+    }
+
+    func disconnect() async {}
+    func reconnect() async throws {}
+}
+
+/// Drive the real leader IPC host over an in-memory channel and collect one
+/// control reply per command. This is the same frame codec and host the
+/// production Unix socket serves (`ACPLeaderSocketListener`).
+private func driveWorkspaceControl(
+    over host: ACPLeaderIPCHost,
+    commands: [(id: String, command: [String: String])]
+) async throws -> [String: ACPLeaderServerMessage] {
+    let pair = InMemoryWebSocketChannel.makePair()
+    let served = Task { await host.serve(channel: pair.a) }
+    defer { served.cancel() }
+
+    let reader = ACPLeaderChannelReader(
+        channel: pair.b,
+        maximumMessageSize: ACPLeaderProtocolLimits.maximumMessageSize
+    )
+    // Bounded reads: a leader that stops answering would park the suite
+    // forever (`ByteMailbox.take()` ignores cancellation), so a deadline
+    // closes the channel and fails the test instead.
+    let deadline = Task {
+        try? await Task.sleep(nanoseconds: 10_000_000_000)
+        guard !Task.isCancelled else { return }
+        await pair.b.close()
+    }
+    defer { deadline.cancel() }
+
+    try await pair.b.write(
+        try ACPLeaderCodec.encode(
+            ACPLeaderClientMessage.register(
+                clientType: "grok-workspace-cli",
+                mode: .stdio,
+                capabilities: ACPLeaderClientCapabilities()
+            )
+        )
+    )
+
+    // Await the registration before any control traffic, and require the
+    // advert this whole test exists to police.
+    var capabilities: ACPLeaderCapabilities?
+    while capabilities == nil {
+        guard let message = try await reader.next(ACPLeaderServerMessage.self) else { break }
+        if case .registered(_, _, _, _, let advertised) = message {
+            capabilities = advertised
+        }
+    }
+    #expect(capabilities?.workspaceExposure == true)
+    #expect(capabilities?.controlV1 == true)
+
+    var replies: [String: ACPLeaderServerMessage] = [:]
+    for (id, command) in commands {
+        try await pair.b.write(
+            try ACPLeaderCodec.encode(ACPLeaderClientMessage.control(requestID: id, command: command))
+        )
+        // Control commands are answered on detached tasks
+        // (`server.rs:1763-1817`), so each reply is awaited before the next
+        // command is sent — a pipelined status could legitimately read the
+        // pre-start state and make the test flaky.
+        while replies[id] == nil {
+            guard let message = try await reader.next(ACPLeaderServerMessage.self) else { break }
+            switch message {
+            case .controlResult(let replyID, _) where replyID == id:
+                replies[id] = message
+            case .controlError(let replyID, _, _) where replyID == id:
+                replies[id] = message
+            default:
+                continue
+            }
+        }
+    }
+    return replies
 }
 
 // MARK: - Lifecycle

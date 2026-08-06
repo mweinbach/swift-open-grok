@@ -226,6 +226,23 @@ struct LocalShellProcessBackendTests {
         }
     }
 
+    @Test("the process backend applies the sandbox launch transform")
+    func appliesLaunchTransform() async throws {
+        #if os(Windows)
+        return
+        #else
+        let backend = LocalShellProcessBackend(
+            launchTransform: { _, _ in
+                ("/bin/sh", ["-c", "printf 'wrapped-launch'"])
+            }
+        )
+        let result = try await backend.run(
+            ShellCommandRequest(command: "printf 'unwrapped-launch'", shell: .sh)
+        )
+        #expect(result.combinedOutput == "wrapped-launch")
+        #endif
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("OpenGrokShellProcessBackend-\(UUID().uuidString)", isDirectory: true)

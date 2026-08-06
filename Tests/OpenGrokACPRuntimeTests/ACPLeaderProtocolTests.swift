@@ -163,6 +163,12 @@ struct ACPLeaderMessageTests {
                 capabilities: ACPLeaderCapabilities(controlV1: true, profileFormats: ["svg"])
             ),
             .acp(payload: #"{"jsonrpc":"2.0","id":1,"result":{}}"#),
+            .controlResult(
+                requestID: "6",
+                payload: .workspaceStatus(
+                    ACPLeaderWorkspaceStatus(state: "none", pid: 7)
+                )
+            ),
             .controlError(requestID: "7", code: 1, message: "nope"),
             .pong,
             .error(code: 3, message: "Registration timeout"),
@@ -214,18 +220,183 @@ struct ACPLeaderMessageTests {
         }
     }
 
+    /// Upstream's typed client encodes `frequency_hz` as a JSON *number*
+    /// (`protocol.rs:198-202`), which a strict `[String: String]` decode
+    /// would reject whole-frame — wedging the connection over one command.
+    @Test("a control frame with a numeric field still decodes")
+    func controlFrameNumericField() throws {
+        let body = Array(
+            #"{"type":"control","request_id":"1","command":{"type":"start_cpu_profile","frequency_hz":250,"output":"/tmp/p"}}"#.utf8
+        )
+        let decoded = try ACPLeaderCodec.decode(ACPLeaderClientMessage.self, from: body)
+        #expect(
+            decoded == .control(
+                requestID: "1",
+                command: ["type": "start_cpu_profile", "frequency_hz": "250", "output": "/tmp/p"]
+            )
+        )
+    }
+
     @Test("the protocol version is 1")
     func protocolVersion() {
         #expect(ACPLeaderProtocolLimits.protocolVersion == 1)
     }
 
-    /// This build implements no control commands, so it must not claim
-    /// `control_v1`: a client that sees the bit set sends a request nobody will
-    /// ever answer.
-    @Test("advertised capabilities are all false")
+    /// The advertisement is pinned field-by-field: `control_v1` and
+    /// `workspace_exposure` are claimed because `ACPLeaderControlPlane`
+    /// implements them (upstream advertises both unconditionally for the same
+    /// reason — `server.rs:153-160`); the profiler and relaunch stay
+    /// unclaimed because this build has neither.
+    @Test("advertised capabilities claim exactly the implemented control plane")
     func advertisedCapabilities() {
-        #expect(ACPLeaderCapabilities.supported == ACPLeaderCapabilities())
-        #expect(!ACPLeaderCapabilities.supported.controlV1)
+        let supported = ACPLeaderCapabilities.supported
+        #expect(supported.controlV1)
+        #expect(supported.workspaceExposure)
+        #expect(!supported.runtimeCPUProfile)
+        #expect(!supported.relaunchV1)
+        #expect(supported.profileFormats.isEmpty)
+    }
+}
+
+@Suite("Leader control payloads")
+struct ACPLeaderControlPayloadTests {
+    /// The whole success frame, byte-pinned. `protocol.rs:364-367` wraps the
+    /// payload in serde's `{"Ok": ...}`; `protocol.rs:719-731` pins the
+    /// `workspace_status` tag and field spellings.
+    @Test("a workspace_status control result encodes to upstream's exact JSON")
+    func workspaceStatusResultWireShape() throws {
+        let frame = try ACPLeaderCodec.encode(
+            ACPLeaderServerMessage.controlResult(
+                requestID: "ws-1",
+                payload: .workspaceStatus(
+                    ACPLeaderWorkspaceStatus(
+                        state: "running",
+                        hubURL: "wss://hub.example/v1/tools",
+                        cwd: "/home/u/proj",
+                        uptimeMs: 4200,
+                        activeToolCalls: 2,
+                        sessions: ["grok-a", "grok-b"],
+                        pid: 4242
+                    )
+                )
+            )
+        )
+        #expect(
+            String(decoding: frame.dropFirst(4), as: UTF8.self)
+                == #"{"request_id":"ws-1","result":{"Ok":{"active_tool_calls":2,"cwd":"/home/u/proj","hub_url":"wss://hub.example/v1/tools","pid":4242,"sessions":["grok-a","grok-b"],"state":"running","type":"workspace_status","uptime_ms":4200}},"type":"control_result"}"#
+        )
+    }
+
+    /// serde has no `skip_serializing_if` on the optional fields, so a
+    /// not-running status carries explicit nulls (`protocol.rs:266-274`).
+    @Test("a not-running status encodes explicit nulls, not omitted keys")
+    func notRunningStatusEncodesNulls() throws {
+        let frame = try ACPLeaderCodec.encode(
+            ACPLeaderWorkspaceStatus(state: "none", pid: 4242)
+        )
+        #expect(
+            String(decoding: frame.dropFirst(4), as: UTF8.self)
+                == #"{"active_tool_calls":0,"cwd":null,"hub_url":null,"pid":4242,"sessions":[],"state":"none","type":"workspace_status","uptime_ms":0}"#
+        )
+    }
+
+    /// `protocol.rs:735-747` — the optional fields may be absent entirely;
+    /// both spellings must decode to the same payload.
+    @Test("a status with absent optional fields still decodes")
+    func statusDecodeDefaults() throws {
+        let body = Array(
+            #"{"type":"workspace_status","state":"none","uptime_ms":0,"active_tool_calls":0,"pid":1}"#.utf8
+        )
+        let decoded = try ACPLeaderCodec.decode(ACPLeaderControlPayload.self, from: body)
+        guard case .workspaceStatus(let status) = decoded else {
+            Issue.record("expected workspace_status, got \(decoded)")
+            return
+        }
+        #expect(status == ACPLeaderWorkspaceStatus(state: "none", pid: 1))
+    }
+
+    /// `protocol.rs:647-679` — an upstream `leader_info` payload decodes, with
+    /// `cpu_profile_stopping` defaulting to false for older leaders.
+    @Test("upstream's leader_info golden decodes")
+    func leaderInfoDecode() throws {
+        let body = Array(
+            #"{"type":"leader_info","pid":123,"socket_path":"/tmp/leader.sock","lock_path":"/tmp/leader.lock","ws_url_suffix":"suffix","leader_protocol_version":1,"leader_binary_version":"1.2.3","profiling_supported":true,"profiling_compiled_in":true,"cpu_profile_active":false,"profile_started_at":null,"profile_formats":["svg"]}"#.utf8
+        )
+        let decoded = try ACPLeaderCodec.decode(ACPLeaderControlPayload.self, from: body)
+        #expect(
+            decoded == .leaderInfo(
+                ACPLeaderInfo(
+                    pid: 123,
+                    socketPath: "/tmp/leader.sock",
+                    lockPath: "/tmp/leader.lock",
+                    wsURLSuffix: "suffix",
+                    leaderProtocolVersion: 1,
+                    leaderBinaryVersion: "1.2.3",
+                    profilingSupported: true,
+                    profilingCompiledIn: true,
+                    profileFormats: ["svg"]
+                )
+            )
+        )
+    }
+
+    /// `protocol.rs:663-666` — upstream's inactive `cpu_profile_status`
+    /// golden, the only payload a profiler-less build ever produces.
+    @Test("upstream's inactive cpu_profile_status golden decodes")
+    func cpuProfileStatusDecode() throws {
+        let body = Array(
+            #"{"type":"cpu_profile_status","active":false,"started_at":null,"svg_path":null,"frequency_hz":null}"#.utf8
+        )
+        let decoded = try ACPLeaderCodec.decode(ACPLeaderControlPayload.self, from: body)
+        #expect(decoded == .cpuProfileStatus(ACPLeaderCpuProfileStatus()))
+    }
+
+    @Test("every payload variant round-trips")
+    func payloadRoundTrips() throws {
+        let payloads: [ACPLeaderControlPayload] = [
+            .leaderInfo(
+                ACPLeaderInfo(
+                    pid: 1,
+                    socketPath: "/s",
+                    lockPath: "/l",
+                    wsURLSuffix: "",
+                    leaderProtocolVersion: 1,
+                    leaderBinaryVersion: "0.0.0"
+                )
+            ),
+            .cpuProfileStatus(ACPLeaderCpuProfileStatus(active: true, stopping: true, startedAt: "t", svgPath: "/p", frequencyHz: 250)),
+            .workspaceStatus(ACPLeaderWorkspaceStatus(state: "paused", hubURL: "wss://h", cwd: "/c", uptimeMs: 1, activeToolCalls: 3, sessions: ["a"], pid: 9)),
+        ]
+        for payload in payloads {
+            let frame = try ACPLeaderCodec.encode(payload)
+            var decoder = ACPLeaderFrameDecoder()
+            decoder.append(frame)
+            let body = try #require(try decoder.nextFrame())
+            #expect(try ACPLeaderCodec.decode(ACPLeaderControlPayload.self, from: body) == payload)
+        }
+    }
+
+    /// A payload variant this port does not model fails to decode rather
+    /// than being approximated into one it does.
+    @Test("an unknown payload type is refused")
+    func unknownPayloadType() {
+        #expect(throws: ACPLeaderProtocolError.self) {
+            try ACPLeaderCodec.decode(
+                ACPLeaderControlPayload.self,
+                from: Array(#"{"type":"relaunching","from_version":"1","to_version":"2","grace_ms":0}"#.utf8)
+            )
+        }
+    }
+
+    /// The Err half shares the `control_result` type with Ok; both must be
+    /// reachable through the same decode entry point.
+    @Test("the Err half of a control result still decodes")
+    func controlErrorStillDecodes() throws {
+        let body = Array(
+            #"{"type":"control_result","request_id":"7","result":{"Err":{"code":102,"message":"no workspace exposure is running"}}}"#.utf8
+        )
+        let decoded = try ACPLeaderCodec.decode(ACPLeaderServerMessage.self, from: body)
+        #expect(decoded == .controlError(requestID: "7", code: 102, message: "no workspace exposure is running"))
     }
 }
 
