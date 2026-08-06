@@ -227,6 +227,28 @@ struct OpenGrokSandboxTests {
         }
     }
 
+    @Test("the NUL guard actually fires, on a root with no traversal to fall back on")
+    func nulGuardIsLiveOnItsOwn() throws {
+        // `/workspace/a\0b` has no ".." component, so only the NUL check can
+        // reject it. Asserting the message pins *which* guard fired: the old
+        // code tested the raw `URL.path`, where a NUL is always rendered
+        // "%00", so this guard never ran on any platform and the sibling test
+        // above passed on macOS purely via the traversal check.
+        let hostile = URL(fileURLWithPath: "/workspace/a\0b")
+        // Precondition for the test to mean anything.
+        #expect(!hostile.path.contains("\0"), "URL.path is expected to encode NUL, not preserve it")
+
+        do {
+            try rejectTraversableRoot(hostile)
+            Issue.record("a root containing NUL must be rejected")
+        } catch let error as SandboxError {
+            guard case .profileInvalid(let detail) = error, detail.contains("NUL") else {
+                Issue.record("expected the NUL guard to fire, got \(error)")
+                return
+            }
+        }
+    }
+
     #if os(macOS)
     @Test("seatbelt profile includes firmlink aliases and write sub-actions")
     func seatbeltWriteSubactionsAndAliases() {
