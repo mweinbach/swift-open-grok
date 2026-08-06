@@ -226,8 +226,6 @@ public enum CLIRunner {
                 return "Cross-session memory management is not implemented."
             case "dashboard":
                 return "The agent dashboard is not implemented."
-            case "workspace":
-                return "Computer Hub workspace exposure is not implemented."
             case "worktree":
                 return "Worktree management is not implemented; "
                     + "use git worktree directly."

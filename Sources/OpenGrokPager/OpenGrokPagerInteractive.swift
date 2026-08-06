@@ -338,6 +338,29 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// and the controller cannot resolve it because it does not own the
     /// catalog.
     case themePicker(query: String?)
+    /// `/rewind [n] [--mode=…] [--force]`, alias `/undo` — the rewind picker on
+    /// a bare invocation, a dry-run preview with a prompt number, and the real
+    /// restore only with `--force`. The whole argument string rides along
+    /// because the rewind grammar is owned by the CLI layer, not here.
+    case rewind(argument: String)
+    /// `/jump` — pick a user turn and scroll the transcript to it. Upstream
+    /// gates this to fullscreen (`jump.rs`, `ModeSupport::FullscreenOnly`);
+    /// minimal mode scrolls with the terminal's own scrollback.
+    case jumpPicker
+    /// `/delete` — delete this session's stored transcript.
+    ///
+    /// `confirmed` is false for the command itself, which only raises the
+    /// confirmation; the picker's own row sends the confirmed form. Deleting a
+    /// transcript is not undoable, so it never happens on one keystroke.
+    case deleteSession(confirmed: Bool)
+    /// `/remember [text]` — write a note to workspace memory.
+    case remember(text: String)
+    /// `/recall <query>` — search workspace memory.
+    case recall(query: String)
+    /// `/flush <notes>` — append to today's session memory log.
+    case flush(text: String)
+    /// `/goal [objective|status|pause|resume|clear]` — the goal tracker.
+    case goal(argument: String)
     case dismissAll
 }
 
@@ -350,6 +373,17 @@ public enum OpenGrokPagerInputRouting: Sendable, Equatable, Hashable {
     case notHandled
     /// Fully handled and already repainted.
     case consumed
+    /// Handled, and the controller should now run this slash command as if the
+    /// user had typed and submitted it.
+    ///
+    /// This exists for the command palette, whose rows *are* commands. Upstream
+    /// resolves a palette row to `Action::SendSlashCommandPreservingDraft`
+    /// (`app/modals.rs:932`) — it runs the command and leaves the composer
+    /// draft alone. The renderer cannot reach the command vocabulary (it lives
+    /// in the controller) and the event flow is otherwise one-way, so the
+    /// routing value carries the command back up. Nothing here touches the
+    /// composer, which is what "preserving draft" means.
+    case runCommand(String)
 }
 
 public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {

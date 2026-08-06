@@ -45,6 +45,9 @@ This port is built out in waves by parallel agent teams. If you are coordinating
 
 ## Commits
 
+- **In a multi-agent wave, only the coordinating lead commits.** Slice agents hand
+  over verified diffs and let the lead land them in reviewed slices; the rules below
+  are addressed to whoever is doing the committing. Working solo, that's you.
 - Commit in logical slices as work lands, not one giant commit at the end.
 - Subject line: imperative, ≤72 chars, no "feat:"/"fix:" prefixes.
 - Body: what changed and **why it mattered** — especially the failure it prevents.

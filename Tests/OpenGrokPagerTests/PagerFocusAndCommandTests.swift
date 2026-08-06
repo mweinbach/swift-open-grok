@@ -429,12 +429,140 @@ struct PagerFocusAndCommandTests {
         #expect(await harness.overlayRequests.contains(.contextUsage))
     }
 
+    /// The flag is a whitelist, not a description: anything that rewrites the
+    /// item list a streaming sampler is reading from has to carry it, and this
+    /// pins the membership so a new command cannot join silently. `/rewind`
+    /// earns it for the same reason `/compact` does — a forced rewind truncates
+    /// history and restores files underneath the running turn.
     @Test("only history-mutating commands carry the deferral flag")
     func onlyCompactMutatesHistory() {
         let mutating = OpenGrokPagerInteractiveController.builtinCommands
             .filter(\.mutatesConversationHistory)
             .map(\.name)
-        #expect(mutating == ["compact"])
+            .sorted()
+        #expect(mutating == ["compact", "rewind"])
+    }
+
+    @Test("/rewind cannot execute while a turn is in flight")
+    func rewindIsDeferredDuringATurn() async throws {
+        let held = HoldingSession(sessionID: "streaming")
+        let harness = try await Harness.run(
+            [
+                .paste("edit some files"),
+                .key(KeyEvent(key: .enter)),
+                .paste("/rewind 2 --force"),
+                .key(KeyEvent(key: .enter)),
+            ],
+            sessions: [held]
+        )
+        let rewinds = await harness.overlayRequests.filter { request in
+            if case .rewind = request { return true }
+            return false
+        }
+        #expect(rewinds.isEmpty, "/rewind executed mid-turn")
+        #expect(await harness.notices.contains { $0.contains("will run when this turn finishes") })
+    }
+
+    // MARK: - Session-scoped commands
+
+    @Test("/rewind carries its whole argument string through untouched")
+    func rewindCarriesItsArgument() async throws {
+        let harness = try await Harness.run([
+            .paste("/rewind 3 --mode=files --force"),
+            .key(KeyEvent(key: .enter)),
+        ])
+        #expect(await harness.overlayRequests
+            .contains(.rewind(argument: "3 --mode=files --force")))
+    }
+
+    @Test("/undo is /rewind")
+    func undoAliasesRewind() async throws {
+        let harness = try await Harness.run([
+            .paste("/undo"),
+            .key(KeyEvent(key: .enter)),
+        ])
+        #expect(await harness.overlayRequests.contains(.rewind(argument: "")))
+    }
+
+    /// Deleting a transcript is not undoable, so the command itself must never
+    /// carry the confirmed form — only the modal's own row does. If this ever
+    /// flipped, `/delete` would erase a session on one keystroke.
+    @Test("/delete asks before it deletes")
+    func deleteAsksFirst() async throws {
+        let harness = try await Harness.run([
+            .paste("/delete"),
+            .key(KeyEvent(key: .enter)),
+        ])
+        #expect(await harness.overlayRequests.contains(.deleteSession(confirmed: false)))
+        #expect(await harness.overlayRequests.contains(.deleteSession(confirmed: true)) == false)
+    }
+
+    @Test("/jump asks for the turn picker")
+    func jumpOpensThePicker() async throws {
+        let harness = try await Harness.run([
+            .paste("/jump"),
+            .key(KeyEvent(key: .enter)),
+        ])
+        #expect(await harness.overlayRequests.contains(.jumpPicker))
+    }
+
+    @Test("the memory and goal commands carry their prose argument whole")
+    func memoryCommandsCarryProse() async throws {
+        let harness = try await Harness.run([
+            .paste("/remember this project pins swift 6.1"),
+            .key(KeyEvent(key: .enter)),
+            .paste("/recall swift version"),
+            .key(KeyEvent(key: .enter)),
+            .paste("/flush wrapped up the parser work"),
+            .key(KeyEvent(key: .enter)),
+            .paste("/goal finish the port"),
+            .key(KeyEvent(key: .enter)),
+        ])
+        let requests = await harness.overlayRequests
+        #expect(requests.contains(.remember(text: "this project pins swift 6.1")))
+        #expect(requests.contains(.recall(query: "swift version")))
+        #expect(requests.contains(.flush(text: "wrapped up the parser work")))
+        #expect(requests.contains(.goal(argument: "finish the port")))
+    }
+
+    // MARK: - Command palette
+
+    /// The palette used to be display-only because the renderer had no way to
+    /// hand a picked command back. `.runCommand` is that way, and this asserts
+    /// the round trip actually *runs* the command rather than describing it —
+    /// which was the whole failure mode.
+    @Test("a command-palette row runs its command and leaves the draft alone")
+    func paletteRowRunsItsCommand() async throws {
+        let harness = try await Harness.run(
+            [
+                .paste("half-written prompt"),
+                .key(KeyEvent(key: .f(1))),
+            ],
+            stagedCommand: "/context"
+        )
+        #expect(await harness.overlayRequests.contains(.contextUsage))
+        // "Preserving draft": nothing the palette did touched the composer.
+        #expect(await harness.lastPromptText == "half-written prompt")
+    }
+
+    @Test("a palette row naming a history-mutating command is deferred too")
+    func paletteRespectsTheMidTurnGate() async throws {
+        let held = HoldingSession(sessionID: "streaming")
+        let harness = try await Harness.run(
+            [
+                .paste("start something"),
+                .key(KeyEvent(key: .enter)),
+                .key(KeyEvent(key: .f(1))),
+            ],
+            sessions: [held],
+            stagedCommand: "/compact"
+        )
+        let compacts = await harness.overlayRequests.filter { request in
+            if case .compact = request { return true }
+            return false
+        }
+        #expect(compacts.isEmpty, "the palette bypassed the mid-turn deferral")
+        #expect(await harness.notices.contains { $0.contains("will run when this turn finishes") })
     }
 
     // MARK: - Settings, privacy and theme
@@ -594,9 +722,11 @@ private actor Harness {
         sessions: [HoldingSession] = [],
         modes: OpenGrokPagerInputModes = OpenGrokPagerInputModes(),
         releaseAfterQueueReaches: Int? = nil,
-        expectedTurns: Int? = nil
+        expectedTurns: Int? = nil,
+        stagedCommand: String? = nil
     ) async throws -> Harness {
         let renderer = FocusRecordingRenderer()
+        if let stagedCommand { await renderer.stageCommand(stagedCommand) }
         let runtime = FocusTestRuntime(held: sessions)
         // A test that waits for a *later* turn cannot let the input stream
         // finish: exhaustion ends the run from inside the turn loop, which
@@ -644,8 +774,27 @@ private actor FocusRecordingRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private var queueWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var highestQueueCount = 0
 
+    /// Stands in for a selected command-palette row: the next input event the
+    /// renderer sees resolves to this command instead of falling through to the
+    /// composer, which is exactly what `select(overlayID:rowID:)` does in the
+    /// live renderer.
+    private var stagedCommand: String?
+
     func begin() {}
     func restoreTerminal() {}
+
+    func stageCommand(_ text: String) { stagedCommand = text }
+
+    /// Only `F1` stands in for the palette selection. Claiming every event
+    /// would swallow the composer input the same tests type, which is the
+    /// behaviour the live renderer has too: it consumes a key only when an
+    /// overlay is actually up.
+    func handleInput(_ event: InputEvent) async throws -> OpenGrokPagerInputRouting {
+        guard case .key(let key) = event, key.key == .f(1) else { return .notHandled }
+        guard let staged = stagedCommand else { return .notHandled }
+        stagedCommand = nil
+        return .runCommand(staged)
+    }
 
     func render(_ event: OpenGrokPagerInteractiveEvent) {
         events.append(event)

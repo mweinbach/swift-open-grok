@@ -627,6 +627,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             if LiveSessionsComposition.handles(command) {
                 return try await LiveSessionsComposition.session(for: command, context: context)
             }
+            if LiveWorkspaceComposition.handles(command) {
+                return try await LiveWorkspaceComposition.session(for: command, context: context)
+            }
             // Ordering is load-bearing for the three ACP-family routes.
             // `LiveACPComposition.handles` still claims .serve/.leader with the
             // historical refusals, and `LiveServeComposition.handles` still
@@ -763,7 +766,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         permissionCoordinator: permissionCoordinator,
                         workflowRegistry: workflowRegistry,
                         terminalProgram: context.environment["TERM_PROGRAM"],
-                        compaction: stack.compaction
+                        compaction: stack.compaction,
+                        sessionID: sessionID,
+                        // The tool executor's own aggregate, not a second one:
+                        // `/rewind` must see the snapshots the turn loop
+                        // captured, and `/remember` must write to the backend
+                        // `memory_search` reads.
+                        sessionServices: toolExecutor.sessionServices,
+                        conversationHistory: stack.conversationHistory,
+                        sessionCatalog: LiveSessionCatalog(openGrokHome: openGrokHome)
                     )
                     let controller = OpenGrokPagerInteractiveController(
                         input: interactiveInput.events,
@@ -2226,6 +2237,12 @@ struct LiveToolExecutor: Sendable {
             isInteractive: fileAccessPolicy.isInteractive,
             cli: permissionOptions
         )
+        // Deliberately `bootstrapFromDisk` rather than the security context's
+        // already-loaded document: that document carries the project tier, and
+        // upstream has no project layer for telemetry. Passing it would let a
+        // repo's checked-in `.opengrok/config.toml` enable telemetry for
+        // everyone who clones it. Pinned by `projectConfigCannotEnableTelemetry`.
+        _ = LiveTelemetry.bootstrapFromDisk(environment: environment)
         // Applied before any tool can run. A configured-but-unenforceable
         // profile throws out of `init`, so the session refuses to start rather
         // than running unsandboxed after the user asked for one.
@@ -3302,8 +3319,16 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         guard let compaction else { return items }
         // No status for the check itself: it runs before every sample, so
         // announcing it would put a line on the status bar for a token count
-        // that almost always comes back under the threshold.
-        switch await compaction.compactIfNeeded(items: items) {
+        // that almost always comes back under the threshold. `willCompact`
+        // fires only once the coordinator has decided, which is what makes
+        // "Compacting…" true whenever it is on screen. It is the third
+        // turn-status label, beside "Thinking…" and "Responding…", matching
+        // upstream's `TurnActivity::AutoCompacting` (`views/turn_status.rs:704`)
+        // — same ellipsis character, and the renderer already gives a
+        // `.status(text)` the spinner and the phase timer.
+        switch await compaction.compactIfNeeded(items: items, willCompact: {
+            await emit(.status("Compacting\u{2026}"))
+        }) {
         case .notNeeded:
             return items
         case .unableToCompact(let reason):
@@ -3727,6 +3752,26 @@ private struct LivePagerConversationState {
         items.append(.message(message))
     }
 
+    /// Drop everything from `index` on — what `/rewind` does to the visible
+    /// transcript once the persisted history has been truncated.
+    ///
+    /// The streaming bookkeeping is reset rather than adjusted: a rewind can
+    /// only run between turns, so there is no active assistant block to keep,
+    /// and a stale `activeAssistantIndex` pointing past the new end is exactly
+    /// how the next turn would append into the wrong block.
+    mutating func truncate(to index: Int) {
+        guard index >= 0, index < items.count else { return }
+        items.removeSubrange(index...)
+        activeAssistantIndex = nil
+        toolIndicesByCallID.removeAll(keepingCapacity: true)
+    }
+
+    mutating func removeAll() {
+        items.removeAll()
+        activeAssistantIndex = nil
+        toolIndicesByCallID.removeAll(keepingCapacity: true)
+    }
+
     /// In-place edit of the blocks, for the fold/raw effects the scrollback's
     /// selection applies. Deliberately narrow: nothing outside may append or
     /// remove through this, which would desynchronize the streaming indices.
@@ -3905,6 +3950,18 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     /// automatic one share a compaction counter — which is the whole reason
     /// that instance is shared rather than rebuilt here.
     private let compaction: LiveCompactionCoordinator?
+    /// The session this renderer belongs to, and the three things the
+    /// session-scoped commands act on.
+    ///
+    /// `sessionServices` is the same aggregate the tool executor holds — the one
+    /// `makeSessionServices` built — so `/rewind` acts on the snapshots the turn
+    /// loop actually captured and `/remember` writes to the backend the
+    /// `memory_search` tool reads. Rebuilding them here would produce a second
+    /// store pointed at the same files, which is how two writers appear.
+    private let sessionID: String
+    private let sessionServices: LiveSessionServices?
+    private let conversationHistory: LiveConversationHistory?
+    private let sessionCatalog: LiveSessionCatalog?
     private var currentPermissionRequestID: String?
     private var hasStartedFirstTurn = false
     /// The scrollback's focus and selected block. `selection.isFocused` is what
@@ -3949,9 +4006,17 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         enableMouseReporting: Bool = true,
         themePreference: PagerThemePreference = .fixed(.grokNight),
         reasoningEffort: String? = nil,
-        compaction: LiveCompactionCoordinator? = nil
+        compaction: LiveCompactionCoordinator? = nil,
+        sessionID: String = "",
+        sessionServices: LiveSessionServices? = nil,
+        conversationHistory: LiveConversationHistory? = nil,
+        sessionCatalog: LiveSessionCatalog? = nil
     ) {
         self.mode = mode
+        self.sessionID = sessionID
+        self.sessionServices = sessionServices
+        self.conversationHistory = conversationHistory
+        self.sessionCatalog = sessionCatalog
         self.terminal = terminal
         self.sink = sink
         self.workingDirectory = workingDirectory
@@ -4524,10 +4589,201 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                     )
                 }
             ))
+        case .rewind(let argument):
+            // Safe to touch history here for the same reason `/compact` is:
+            // `rewind` is `mutatesConversationHistory`, so the controller defers
+            // it out of a running turn rather than dispatching it inline.
+            await applyRewind(argument: argument)
+        case .jumpPicker:
+            guard mode == .fullScreen else {
+                // Upstream's `ModeSupport::FullscreenOnly` remedy, verbatim in
+                // substance: there is no viewport to move in minimal mode.
+                note("/jump needs fullscreen mode — minimal scrolls with your terminal's native scrollback.")
+                return
+            }
+            overlays.push(LiveJumpPicker.overlay(items: conversation.items))
+        case .deleteSession(let confirmed):
+            await deleteSession(confirmed: confirmed)
+        case .remember(let text):
+            note(await LiveMemoryCommands.remember(text, backend: sessionServices?.memory))
+        case .recall(let query):
+            note(await LiveMemoryCommands.recall(query, backend: sessionServices?.memory))
+        case .flush(let text):
+            note(await LiveMemoryCommands.flush(
+                text,
+                sessionID: sessionID,
+                backend: sessionServices?.memory
+            ))
+        case .goal(let argument):
+            guard let coordinator = sessionServices?.goal else {
+                note("Goal tracking is not available in this session.")
+                return
+            }
+            switch await LiveGoalCommands.run(argument: argument, coordinator: coordinator) {
+            case .message(let text):
+                note(text)
+            case .submitPrompt(let text):
+                // Setting a goal seeds the model with the goal instruction,
+                // which is a turn rather than a message. The renderer cannot
+                // start one, so it says what it did and hands the text to the
+                // user rather than silently dropping it.
+                note("Goal set. Send this to brief the model on it, or just keep going:")
+                note(text)
+            }
         case .dismissAll:
             overlays.removeAll()
             currentPermissionRequestID = nil
         }
+    }
+
+    // MARK: - Session-scoped commands
+
+    /// `/rewind` — picker on a bare invocation, dry run with a number, restore
+    /// only with `--force`.
+    ///
+    /// The history the coordinator reasons about is the *persisted* one, not the
+    /// rendered blocks: the rendered transcript drops nothing but also holds no
+    /// tool results, so truncating it positionally is a projection of the real
+    /// truncation, not the source of truth.
+    private func applyRewind(argument: String) async {
+        guard let coordinator = sessionServices?.rewind else {
+            note("Rewind is disabled for this session (OPENGROK_REWIND=0).")
+            return
+        }
+        let currentItems = await conversationHistory?.items ?? []
+        switch await LiveSessionCommands.rewind(
+            argument: argument,
+            rewind: coordinator,
+            currentItems: currentItems
+        ) {
+        case .message(let text):
+            note(text)
+        case .overlay(let overlay):
+            overlays.push(overlay)
+        case .rewound(let targetPromptIndex, _, let summary):
+            await commitRewind(toPromptIndex: targetPromptIndex, summary: summary)
+        }
+    }
+
+    /// Apply a rewind the coordinator has already performed on disk.
+    ///
+    /// `restore(force: true)` puts the *files* back; the conversation is the
+    /// caller's to truncate, which is why this exists rather than living in the
+    /// coordinator. Both halves land or neither is claimed: a failed commit is
+    /// reported as an error rather than swallowed, because the files have
+    /// already moved and a session whose history disagrees with its working tree
+    /// is worse than one that says so.
+    private func commitRewind(toPromptIndex targetPromptIndex: Int, summary: String) async {
+        note(summary)
+        guard let conversationHistory else { return }
+        let truncated = liveTruncateConversation(
+            await conversationHistory.items,
+            toPromptIndex: targetPromptIndex
+        )
+        do {
+            try await conversationHistory.commit(sessionID: sessionID, items: truncated)
+        } catch {
+            conversation.appendMessage(PagerMessage(
+                role: .error,
+                text: "Files were restored, but the conversation could not be truncated: \(error)"
+            ))
+            return
+        }
+        truncateRenderedTranscript(toPromptIndex: targetPromptIndex)
+    }
+
+    /// Drop rendered blocks from the `targetPromptIndex`-th user prompt onward.
+    ///
+    /// Counted positionally over user blocks, the same rule
+    /// `liveTruncateConversation` applies to the persisted items — the two lists
+    /// hold different things (the renderer has no tool results, the record has
+    /// no system notices) but they agree on how many user turns have happened,
+    /// which is the only thing the index means.
+    private func truncateRenderedTranscript(toPromptIndex targetPromptIndex: Int) {
+        var seen = 0
+        var cut: Int?
+        for (index, item) in conversation.items.enumerated() {
+            guard case .message(let message) = item, message.role == .user else { continue }
+            if seen == targetPromptIndex {
+                cut = index
+                break
+            }
+            seen += 1
+        }
+        guard let cut else { return }
+        conversation.truncate(to: cut)
+        selection.clamp(itemCount: conversation.items.count)
+        followsBottom = true
+    }
+
+    /// `/delete` — remove this session's stored transcript.
+    ///
+    /// Two steps, because there is no second copy and no undo. The confirmed
+    /// step clears the in-memory history *before* removing the file: without
+    /// that, the next turn would re-commit the whole conversation and the file
+    /// would reappear, so "deleted" would have been a lie with a delay on it.
+    private func deleteSession(confirmed: Bool) async {
+        guard let sessionCatalog, !sessionID.isEmpty else {
+            note("No active session to delete.")
+            return
+        }
+        guard confirmed else {
+            overlays.push(LiveSessionDeleteConfirmation.overlay(
+                sessionID: sessionID,
+                itemCount: await conversationHistory?.items.count ?? 0
+            ))
+            return
+        }
+        if let conversationHistory {
+            do {
+                try await conversationHistory.commit(sessionID: sessionID, items: [])
+            } catch {
+                conversation.appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Could not clear the in-memory conversation, so nothing was deleted: \(error)"
+                ))
+                return
+            }
+        }
+        do {
+            guard try sessionCatalog.delete(sessionID: sessionID) else {
+                note("This session has not been written to disk yet, so there was nothing to delete.")
+                return
+            }
+        } catch {
+            conversation.appendMessage(PagerMessage(
+                role: .error,
+                text: "Could not delete the session: \(error)"
+            ))
+            return
+        }
+        conversation.removeAll()
+        selection.unfocus()
+        followsBottom = true
+        note("Session deleted. This session keeps its id, so anything you send now starts its history over.")
+        overlays.push(.welcome(
+            PagerWelcomeOverlay(subtitle: LivePagerChrome.collapseHome(workingDirectory)),
+            capturesInput: false
+        ))
+    }
+
+    /// Scroll so the block at `index` sits at the top of the transcript.
+    ///
+    /// The offset is *measured*, not estimated: the frame function is pure, so
+    /// laying out the blocks before `index` at this frame's width returns the
+    /// exact line count they occupy — which is the offset that puts `index`
+    /// first. Any arithmetic on character counts would drift the moment a block
+    /// wrapped differently from the guess.
+    private func revealBlock(at index: Int) throws {
+        guard conversation.items.indices.contains(index) else { return }
+        guard index > 0 else {
+            followsBottom = false
+            scrollOffset = 0
+            return
+        }
+        let probe = renderState(conversation: Array(conversation.items.prefix(index)))
+        followsBottom = false
+        scrollOffset = renderPagerFrame(probe).layout.totalContentLines
     }
 
     private func note(_ text: String) {
@@ -4609,24 +4865,30 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
 
     /// Apply the outcome of a row choice, whether it came from `Enter` or a
     /// click. Overlay row ids are domain ids, so both paths land here.
-    private func select(overlayID: String, rowID: String) async {
+    ///
+    /// Returns a slash command the *controller* should run, when the row is one
+    /// — only the command palette produces that. The renderer cannot run a
+    /// command itself: the vocabulary and the mid-turn deferral both live in the
+    /// controller, and duplicating either here is how the two would drift.
+    @discardableResult
+    private func select(overlayID: String, rowID: String) async -> String? {
         if overlayID.hasPrefix("permission:") {
             // The sheet's row ids are `PagerPermissionDecision` raw values, so a
             // click resolves the request exactly as the keyboard would.
-            guard let decision = PagerPermissionDecision(rawValue: rowID) else { return }
+            guard let decision = PagerPermissionDecision(rawValue: rowID) else { return nil }
             await resolve(
                 overlayID: overlayID,
                 requestID: String(overlayID.dropFirst("permission:".count)),
                 decision: decision
             )
-            return
+            return nil
         }
         if overlayID == "workflows" {
             // The dashboard stays open: a control key acts on a run and
             // refreshes the rows, it does not close the surface the user is
             // working in.
-            if await handleWorkflowSelection(rowID: rowID) { return }
-            return
+            _ = await handleWorkflowSelection(rowID: rowID)
+            return nil
         }
         overlays.dismiss(id: overlayID)
         switch overlayID {
@@ -4640,14 +4902,43 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 conversation.appendMessage(PagerMessage(role: .system, text: message))
             }
         case "command-palette":
-            // Display-only for now. Running the picked command would mean the
-            // renderer injecting text back into the controller's composer, and
-            // no such path exists — the event flow is one-way. Rather than
-            // fake it, the palette says what to type.
-            note("Type \(rowID) to run it.")
+            // The row id is the command's insert text, so handing it back runs
+            // exactly what the row named — upstream's
+            // `SendSlashCommandPreservingDraft` (`app/modals.rs:932`). The
+            // composer is untouched, which is the "preserving draft" half.
+            return rowID
+        case LiveJumpPicker.overlayID:
+            guard let index = Int(rowID) else { return nil }
+            try? revealBlock(at: index)
+        case LiveSessionDeleteConfirmation.overlayID:
+            // Any row but the confirm row cancels, so a row id this renderer
+            // does not recognise can only fail closed.
+            guard rowID == LiveSessionDeleteConfirmation.confirmRowID else { return nil }
+            await deleteSession(confirmed: true)
+        case LiveRewindPicker.overlayID:
+            guard let target = Int(rowID), let coordinator = sessionServices?.rewind else {
+                return nil
+            }
+            // Deliberately a dry run: selecting a row in a list must not restore
+            // files, which is not undoable. The preview says how to apply it.
+            switch await LiveSessionCommands.apply(
+                target: target,
+                mode: .all,
+                force: false,
+                coordinator: coordinator,
+                currentItems: await conversationHistory?.items ?? []
+            ) {
+            case .message(let text):
+                note(text)
+            case .overlay(let overlay):
+                overlays.push(overlay)
+            case .rewound(let index, _, let summary):
+                await commitRewind(toPromptIndex: index, summary: summary)
+            }
         default:
             break
         }
+        return nil
     }
 
     /// Rebuild the live sampling stack for `modelID` and record what happened.
@@ -4710,9 +5001,9 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 try renderState()
                 return .consumed
             case .selected(let id, let rowID):
-                await select(overlayID: id, rowID: rowID)
+                let command = await select(overlayID: id, rowID: rowID)
                 try renderState()
-                return .consumed
+                return command.map { .runCommand($0) } ?? .consumed
             case .permission(let id, let requestID, let decision):
                 await resolve(overlayID: id, requestID: requestID, decision: decision)
                 try renderState()
@@ -4727,8 +5018,8 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             }
         case .mouse(let mouse):
             guard mouseReportingEnabled else { return .notHandled }
-            try await handleMouse(mouse)
-            return .consumed
+            let command = try await handleMouse(mouse)
+            return command.map { .runCommand($0) } ?? .consumed
         case .paste:
             // A modal swallows pasted text for the same reason it swallows
             // keys: nothing typed while it is up belongs to the composer.
@@ -4748,7 +5039,10 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         return max(1, bounds.content.height)
     }
 
-    private func handleMouse(_ event: MouseEvent) async throws {
+    /// Returns a slash command when the click landed on a command-palette row,
+    /// exactly as the keyboard path does — a click and an Enter must resolve the
+    /// same row the same way.
+    private func handleMouse(_ event: MouseEvent) async throws -> String? {
         let hit = lastOverlayBounds.last { $0.hitTest(x: event.x, y: event.y) }
         if event.isScroll {
             // One notch moves an overlay's selection by exactly one row, but
@@ -4760,7 +5054,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 case .ignored: break
                 default:
                     try renderState()
-                    return
+                    return nil
                 }
             }
             switch event.kind {
@@ -4769,34 +5063,35 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             case .scrollDown:
                 scrollDown(by: wheelTuning.linesPerEvent)
             case .scrollLeft, .scrollRight:
-                return
+                return nil
             default:
-                return
+                return nil
             }
             try renderState()
-            return
+            return nil
         }
 
-        guard event.kind == .down, event.resolvedButton == .left, let hit else { return }
+        guard event.kind == .down, event.resolvedButton == .left, let hit else { return nil }
         if let close = hit.closeButton, close.contains(x: event.x, y: event.y) {
             overlays.dismiss(id: hit.id)
             if currentPermissionRequestID.map({ "permission:\($0)" }) == hit.id {
                 currentPermissionRequestID = nil
             }
             try renderState()
-            return
+            return nil
         }
         if let row = hit.row(atX: event.x, y: event.y) {
-            await select(overlayID: hit.id, rowID: row.id)
+            let command = await select(overlayID: hit.id, rowID: row.id)
             try renderState()
-            return
+            return command
         }
+        var command: String?
         if let hint = hit.hints.first(where: { $0.frame.contains(x: event.x, y: event.y) }),
            let key = Self.keyEvent(forHint: hint.key)
         {
             switch overlays.handle(key, viewportHeight: max(1, hit.content.height)) {
             case .selected(let id, let rowID):
-                await select(overlayID: id, rowID: rowID)
+                command = await select(overlayID: id, rowID: rowID)
             case .permission(let id, let requestID, let decision):
                 await resolve(overlayID: id, requestID: requestID, decision: decision)
             case .setting(_, let event):
@@ -4806,6 +5101,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             }
             try renderState()
         }
+        return command
     }
 
     /// Session-side effects of a settings change.
@@ -4980,6 +5276,25 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     }
 
     private func renderState() throws {
+        let result = renderPagerFrame(renderState(conversation: conversation.items))
+        // Fresh every frame: a modal that no longer fits publishes no bounds.
+        lastOverlayBounds = result.overlays
+        lastConversationHeight = max(1, result.layout.conversation.height)
+        lastMaximumScrollOffset = max(
+            0,
+            result.layout.totalContentLines - result.layout.conversation.height
+        )
+        if followsBottom { scrollOffset = lastMaximumScrollOffset }
+        try renderer.render(result)
+    }
+
+    /// The frame model for a given block list.
+    ///
+    /// Parameterised on the conversation so `revealBlock` can lay out a prefix
+    /// through the identical chrome and measure where a block starts. Every
+    /// other field is this frame's real state, which is what makes the
+    /// measurement match the frame the user is looking at.
+    private func renderState(conversation blocks: [PagerConversationItem]) -> PagerRenderState {
         let isTurnRunning = turnActivity != nil
         let completions = prompt.completions.isEmpty
             ? nil
@@ -4993,13 +5308,13 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 },
                 selectedIndex: prompt.selectedCompletion
             )
-        let state = PagerRenderState(
+        return PagerRenderState(
             size: terminalSize,
             statusBar: PagerStatusBar(
                 workingDirectory: LivePagerChrome.collapseHome(workingDirectory),
                 queuedPromptCount: queuedPromptCount
             ),
-            conversation: conversation.items,
+            conversation: blocks,
             turnStatus: turnActivity.map { label in
                 PagerTurnStatus(
                     label: isCancelling ? "Cancelling\u{2026}" : label,
@@ -5040,18 +5355,6 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             selectedBlockIndex: selection.index,
             overlays: overlays
         )
-        // Render through the frame function rather than the renderer's own
-        // engine so the resulting layout can seed the next scroll gesture.
-        let result = renderPagerFrame(state)
-        // Fresh every frame: a modal that no longer fits publishes no bounds.
-        lastOverlayBounds = result.overlays
-        lastConversationHeight = max(1, result.layout.conversation.height)
-        lastMaximumScrollOffset = max(
-            0,
-            result.layout.totalContentLines - result.layout.conversation.height
-        )
-        if followsBottom { scrollOffset = lastMaximumScrollOffset }
-        try renderer.render(result)
     }
 
     private var transcript: String { conversation.transcript }

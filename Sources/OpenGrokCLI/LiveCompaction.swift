@@ -260,18 +260,29 @@ actor LiveCompactionCoordinator {
     func mostRecentReport() -> CompactionReport? { lastReport }
 
     /// The automatic path, called by the turn loop before each sample.
-    func compactIfNeeded(items: [ConversationItem]) async -> LiveCompactionResult {
+    ///
+    /// `willCompact` fires only once the threshold check has already said yes,
+    /// which is why the decision is taken here rather than left inside
+    /// `engine.compactIfNeeded`. The check runs before *every* sample and almost
+    /// always comes back under the threshold, so a callback fired on entry would
+    /// put "Compacting…" on the status bar for work that is not happening — and
+    /// a status line that lies about what the session is doing is worse than no
+    /// status line at all.
+    func compactIfNeeded(
+        items: [ConversationItem],
+        willCompact: (@Sendable () async -> Void)? = nil
+    ) async -> LiveCompactionResult {
         step &+= 1
         if autoCompactSuppressed {
             return .unableToCompact(reason: "compaction is suppressed after an earlier failure")
         }
         let snapshot = await modelSwitch.snapshot()
         let engine = makeEngine(snapshot: snapshot, items: items)
-        switch await engine.compactIfNeeded(
-            items: items,
-            step: step,
-            compactionCount: compactionCount
-        ) {
+        guard engine.trigger(items: items, step: step) != nil else {
+            return .notNeeded(engine.usage(items: items, compactionCount: compactionCount))
+        }
+        await willCompact?()
+        switch await engine.compact(items: items, compactionCount: compactionCount) {
         case .notNeeded(let usage):
             return .notNeeded(usage)
         case .unableToCompact(let reason):

@@ -296,7 +296,7 @@ private func targets() -> [Target] {
     // unreachable from the executable. The CLI is where they become live: the
     // memory index backs first-turn injection and the `memory_search` /
     // `memory_get` tools, and the goal tracker backs `update_goal`.
-    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s4, w2s5, w3s1, w3s2, w3s3, w4s3, w5s4, w5s5, w5s6, w6s3, w6s4, w7s3, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokCodeMode"])))
+    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s4, w2s5, w3s1, w3s2, w3s3, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w7s3, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokCodeMode"])))
 
     // ---- Wave 11 (libraries + executable) ----
     t.append(contentsOf: libs(w11s1Lib, dep(w0s1, w0s3, w2s2, w5s6, w10s1, w10s2)))
@@ -392,7 +392,14 @@ private func targets() -> [Target] {
     t.append(contentsOf: tests(w9s4))
     t.append(contentsOf: tests(w9s5))
     t.append(contentsOf: tests(w10s1))
-    t.append(contentsOf: tests(w10s2))
+    // Declared explicitly rather than through `tests(_:)`: the CLI suite reaches
+    // the Computer Hub targets (w4s4) for the workspace-route tests and
+    // OpenGrokWorkspace (w4s3) for the permission-mediation assertions, and the
+    // helper gives a test target only its own library.
+    t.append(.testTarget(
+        name: "OpenGrokCLITests",
+        dependencies: dep(w10s2, w4s4, w4s3)
+    ))
     // OpenGrokExecutable tests exercise the composition via libraries (test
     // targets do not depend on the executable target directly).
     t.append(.testTarget(name: "OpenGrokExecutableTests", dependencies: dep(["OpenGrokCLI", "OpenGrokDistributionSupport", "OpenGrokShell", "OpenGrokPager"])))

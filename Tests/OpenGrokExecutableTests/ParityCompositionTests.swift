@@ -1532,7 +1532,11 @@ struct ParityCompositionTests {
             continuation.yield(.key(KeyEvent(key: .escape)))
         }
         #expect(outcome.painted.contains("Keyboard Shortcuts"))
-        #expect(outcome.painted.contains("toggle-mouse-reporting"))
+        // Asserts a row near the top of the list rather than a specific command
+        // deep in it: the registry keeps growing, and the modal scrolls, so
+        // pinning a late entry makes this test fail whenever a command is added
+        // ahead of it — which says nothing about whether /help opened.
+        #expect(outcome.painted.contains("/help"))
     }
 
     @Test("/model switches the live session and refuses what it cannot authenticate")

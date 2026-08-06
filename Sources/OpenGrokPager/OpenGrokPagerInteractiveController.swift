@@ -14,6 +14,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case cancel
         case eof
         case shutdown
+        /// A slash command the renderer resolved on the controller's behalf —
+        /// today, a command-palette row. It travels as a control signal rather
+        /// than as input so it lands in the same dispatch the composer's own
+        /// submit uses, including the mid-turn deferral for history-rewriting
+        /// commands.
+        case command(String)
     }
 
     /// What an Esc or Ctrl+C resolved to.
@@ -709,12 +715,20 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     case .some(.interrupt), .some(.eof): isEscapeHatch = true
                     default: isEscapeHatch = false
                     }
-                    if !isEscapeHatch,
-                       let routing = try? await renderer.handleInput(event),
-                       routing == .consumed
-                    {
-                        await inputPumpGate.resume()
-                        continue
+                    if !isEscapeHatch {
+                        switch try? await renderer.handleInput(event) {
+                        case .some(.consumed):
+                            await inputPumpGate.resume()
+                            continue
+                        case .some(.runCommand(let text)):
+                            // The gate stays paused: whichever loop services the
+                            // control signal resumes it, exactly as for an
+                            // interrupt.
+                            await mailbox.send(.control(.command(text)), priority: true)
+                            continue
+                        case .some(.notHandled), .none:
+                            break
+                        }
                     }
                     switch Self.controlAction(for: event) {
                     case .some(.escape):
@@ -817,6 +831,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         try await discardQueue(reason: "shutting down")
                         try await emit(.shutdown)
                         outcome = .shutdown
+                    case .command(let text):
+                        switch try await runSlashCommand(text) {
+                        case .quit:
+                            try await discardQueue(reason: "quitting")
+                            try await emit(.shutdown)
+                            outcome = .shutdown
+                        case .handled, .notACommand:
+                            // The draft is deliberately untouched — upstream's
+                            // `SendSlashCommandPreservingDraft`.
+                            try await emit(.promptChanged(promptState()))
+                            await inputPumpGate.resume()
+                        }
                     }
                 case .input(let read):
                     switch read {
@@ -1177,6 +1203,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     case .shutdown:
                         await cancelActiveSession()
                         turnOutcome = .shutdown
+                    case .command(let text):
+                        switch try await runSlashCommand(text, isTurnRunning: true) {
+                        case .quit:
+                            await cancelActiveSession()
+                            turnOutcome = .shutdown
+                        case .handled, .notACommand:
+                            try await emit(.promptChanged(promptState()))
+                            await inputPumpGate.resume()
+                        }
                     }
                 }
             }
@@ -1669,6 +1704,44 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Quick tips to get the most out of Open Grok"
         ),
         PagerCommandDefinition(
+            name: "rewind",
+            aliases: ["undo"],
+            summary: "Rewind to a previous turn",
+            usage: "/rewind [n] [--mode=all|files|conversation] [--force]",
+            // A forced rewind rewrites history and restores files. Running that
+            // against the item list a turn is sampling from is the same hazard
+            // `/compact` carries, so it takes the same deferral.
+            mutatesConversationHistory: true
+        ),
+        PagerCommandDefinition(
+            name: "jump",
+            summary: "Jump to a turn in the conversation"
+        ),
+        PagerCommandDefinition(
+            name: "delete",
+            summary: "Delete this session and return home"
+        ),
+        PagerCommandDefinition(
+            name: "remember",
+            summary: "Save a memory note",
+            usage: "/remember [text]"
+        ),
+        PagerCommandDefinition(
+            name: "recall",
+            summary: "Search workspace memory",
+            usage: "/recall <query>"
+        ),
+        PagerCommandDefinition(
+            name: "flush",
+            summary: "Write notes to this session's memory log",
+            usage: "/flush <notes>"
+        ),
+        PagerCommandDefinition(
+            name: "goal",
+            summary: "Set or inspect the session goal",
+            usage: "/goal [objective|status|pause|resume|clear]"
+        ),
+        PagerCommandDefinition(
             name: "gboom",
             summary: "Hidden easter egg",
             isHidden: true
@@ -1951,6 +2024,31 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case "tutorial":
                 try await emit(.overlay(.tutorial))
                 return .handled
+            case "rewind":
+                try await emit(.overlay(.rewind(
+                    argument: invocation.arguments.joined(separator: " ")
+                )))
+                return .handled
+            case "jump":
+                try await emit(.overlay(.jumpPicker))
+                return .handled
+            case "delete":
+                // Never confirmed from the command itself — the renderer raises
+                // a confirmation and only its row sends `confirmed: true`.
+                try await emit(.overlay(.deleteSession(confirmed: false)))
+                return .handled
+            case "remember":
+                try await emit(.overlay(.remember(text: Self.rejoined(invocation.arguments))))
+                return .handled
+            case "recall":
+                try await emit(.overlay(.recall(query: Self.rejoined(invocation.arguments))))
+                return .handled
+            case "flush":
+                try await emit(.overlay(.flush(text: Self.rejoined(invocation.arguments))))
+                return .handled
+            case "goal":
+                try await emit(.overlay(.goal(argument: Self.rejoined(invocation.arguments))))
+                return .handled
             case "gboom":
                 try await emit(.overlay(.easterEgg))
                 return .handled
@@ -1972,6 +2070,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 return .handled
             }
         }
+    }
+
+    /// Put a parsed argument list back together as the user typed it.
+    ///
+    /// The parser splits and unquotes; every command whose argument is prose
+    /// rather than a token list wants the whole tail back, and rejoining on a
+    /// single space is what upstream's `args.trim()` receives.
+    private static func rejoined(_ arguments: [String]) -> String {
+        arguments.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func startNewSession() async throws {
@@ -2051,8 +2158,19 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /copy [N] [file]          Copy a response to the clipboard or a file
       /export [file]            Export the conversation
       /find [text]              Search the conversation scrollback
+      /jump                     Jump to a turn in the conversation
+      /rewind [n]  /undo        Rewind to before a previous turn
+      /delete                   Delete this session's stored transcript
+      /compact [instructions]   Compact conversation history
+      /remember [text]          Save a memory note
+      /recall <query>           Search workspace memory
+      /flush <notes>            Write notes to this session's memory log
+      /goal [objective]         Set or inspect the session goal
       /multiline  /ml           Swap what Enter and Shift+Enter do
       /vim-mode                 Vim keys for the focused scrollback
+      /settings   /config       Open the settings modal
+      /privacy                  Coding data, retention and training settings
+      /theme [name]  /t         Switch the color theme
       /tutorial                 Quick tips
       /workflows                Show workflow runs
       /toggle-mouse-reporting   Toggle mouse reporting (native copy/paste)
