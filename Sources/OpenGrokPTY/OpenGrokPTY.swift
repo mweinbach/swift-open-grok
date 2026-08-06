@@ -500,7 +500,7 @@ public final class PosixPTYProcess: PTYProcess, @unchecked Sendable {
         ws.ws_col = UInt16(clamping: size.width)
         ws.ws_xpixel = 0
         ws.ws_ypixel = 0
-        let rc = ioctl(masterFD, TIOCSWINSZ, &ws)
+        let rc = ioctl(masterFD, UInt(TIOCSWINSZ), &ws)
         if rc != 0 {
             throw PTYError.ioFailed("TIOCSWINSZ failed: \(String(cString: strerror(errno)))")
         }

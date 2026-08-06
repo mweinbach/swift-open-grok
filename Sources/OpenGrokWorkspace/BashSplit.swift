@@ -89,10 +89,17 @@ public func isAlwaysSafeCommandWords(_ words: [String]) -> Bool {
 }
 
 /// Legacy name kept for callers.
-public let dangerousCommands: Set<String> = Set(
-    dangerousCommandPrefixes.map { $0.split(separator: " ").first.map(String.init) ?? $0 }
-        + extendedDangerousPrefixes.map { $0.split(separator: " ").first.map(String.init) ?? $0 }
-)
+///
+/// Built with an explicit loop rather than `Set(mapA + mapB)`: that one
+/// expression exceeds the Linux type checker's budget.
+public let dangerousCommands: Set<String> = {
+    var names = Set<String>()
+    for prefix in dangerousCommandPrefixes + extendedDangerousPrefixes {
+        let head = prefix.split(separator: " ").first.map(String.init) ?? prefix
+        names.insert(head)
+    }
+    return names
+}()
 
 /// Split a script on `&&`, `||`, `;`, `|`, newlines into word-only segments.
 /// Returns `nil` when high-risk constructs are detected (fail closed).

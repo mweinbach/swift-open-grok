@@ -854,7 +854,7 @@ public final class PosixTerminalResizeMonitor: TerminalResizeSource, @unchecked 
 
 private func terminalSize(fd: Int32) -> TerminalSize? {
     var window = winsize()
-    guard ioctl(fd, TIOCGWINSZ, &window) == 0 else { return nil }
+    guard ioctl(fd, UInt(TIOCGWINSZ), &window) == 0 else { return nil }
     let width = Int(window.ws_col)
     let height = Int(window.ws_row)
     guard width > 0, height > 0 else { return nil }

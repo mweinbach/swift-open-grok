@@ -71,7 +71,14 @@ public func computeGixStatusThreadLimit(
 public func softNprocLimit() -> Int? {
     #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(Linux)
     var lim = rlimit(rlim_cur: 0, rlim_max: 0)
-    if getrlimit(RLIMIT_NPROC, &lim) != 0 { return nil }
+    // glibc spells the constant `__RLIMIT_NPROC` and makes `RLIMIT_NPROC` a
+    // macro alias, which ClangImporter does not surface to Swift.
+    #if os(Linux)
+    let resource = __rlimit_resource_t(__RLIMIT_NPROC.rawValue)
+    #else
+    let resource = RLIMIT_NPROC
+    #endif
+    if getrlimit(resource, &lim) != 0 { return nil }
     // RLIM_INFINITY is a C macro unavailable as a Swift constant on some SDKs;
     // treat the high-bit pattern (~0 >> 1 style / all-bits-set) as unlimited.
     let cur = lim.rlim_cur

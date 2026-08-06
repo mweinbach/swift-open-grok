@@ -222,7 +222,7 @@ public final class PosixTTYAdapter: TTYAdapter, @unchecked Sendable {
 
     public func size() -> TerminalSize? {
         var ws = winsize()
-        guard ioctl(fd, TIOCGWINSZ, &ws) == 0 else { return nil }
+        guard ioctl(fd, UInt(TIOCGWINSZ), &ws) == 0 else { return nil }
         let w = Int(ws.ws_col)
         let h = Int(ws.ws_row)
         guard w > 0, h > 0 else { return nil }
@@ -743,7 +743,14 @@ public func redirectNativeStderr() {
     let duped = dup(STDERR_FILENO)
     guard duped >= 0 else { return }
     stderrRedirectState.savedFD = duped
+    #if canImport(Darwin)
     fflush(stderr)
+    #else
+    // glibc exports `stderr` as a mutable global, which Swift 6 strict
+    // concurrency rejects. `fflush(nil)` drains every open stream — a superset
+    // of what is needed, and safe here because fd 2 is about to be replaced.
+    fflush(nil)
+    #endif
     let devnull = open("/dev/null", O_WRONLY)
     guard devnull >= 0 else { return }
     _ = dup2(devnull, STDERR_FILENO)

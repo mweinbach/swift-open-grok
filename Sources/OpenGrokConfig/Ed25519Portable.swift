@@ -102,15 +102,13 @@ enum SHA512 {
         while offset < padded.count {
             for i in 0..<16 {
                 let j = offset + i * 8
-                w[i] =
-                    (UInt64(padded[j]) << 56) |
-                    (UInt64(padded[j + 1]) << 48) |
-                    (UInt64(padded[j + 2]) << 40) |
-                    (UInt64(padded[j + 3]) << 32) |
-                    (UInt64(padded[j + 4]) << 24) |
-                    (UInt64(padded[j + 5]) << 16) |
-                    (UInt64(padded[j + 6]) << 8) |
-                    UInt64(padded[j + 7])
+                // Accumulated in a loop rather than one eight-term `|` chain:
+                // the chain exceeds the Linux type checker's expression budget.
+                var word: UInt64 = 0
+                for b in 0..<8 {
+                    word = (word << 8) | UInt64(padded[j + b])
+                }
+                w[i] = word
             }
             for i in 16..<80 {
                 let s0 = rotr(w[i - 15], 1) ^ rotr(w[i - 15], 8) ^ (w[i - 15] >> 7)

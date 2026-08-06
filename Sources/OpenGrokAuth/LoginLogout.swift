@@ -6,6 +6,22 @@ import Foundation
 import OpenGrokHTTP
 import OpenGrokPaths
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+/// Cross-platform `SOCK_STREAM`: Darwin spells it as a bare `Int32`, glibc as
+/// a `__socket_type` enum whose `rawValue` is the `Int32` `socket(2)` wants.
+private var sockStreamType: Int32 {
+    #if canImport(Darwin)
+    return SOCK_STREAM
+    #else
+    return Int32(SOCK_STREAM.rawValue)
+    #endif
+}
+
 /// Which account store a login/logout command targets.
 public enum AuthAccountTarget: String, Sendable, Equatable {
     /// Bare `open-grok login` / `logout` — xAI only.
@@ -49,9 +65,6 @@ public func loginXAIWithSession(
     try await manager.loginWithSession(auth)
 }
 
-#if os(macOS) || os(Linux)
-import Darwin
-#endif
 import Foundation
 import OpenGrokFileUtils
 import OpenGrokHTTP
@@ -337,13 +350,13 @@ internal final class CodexCallbackListener: @unchecked Sendable {
     let port: UInt16
 
     init(preferredPort: UInt16 = 1455, fallbackPort: UInt16 = 1457) throws {
-        if let bound = CodexCallbackListener.bind(port: preferredPort) {
+        if let bound = CodexCallbackListener.bindListener(port: preferredPort) {
             self.serverFd = bound.fd
             self.port = bound.port
-        } else if let bound = CodexCallbackListener.bind(port: fallbackPort) {
+        } else if let bound = CodexCallbackListener.bindListener(port: fallbackPort) {
             self.serverFd = bound.fd
             self.port = bound.port
-        } else if let bound = CodexCallbackListener.bind(port: 0) {
+        } else if let bound = CodexCallbackListener.bindListener(port: 0) {
             self.serverFd = bound.fd
             self.port = bound.port
         } else {
@@ -351,8 +364,11 @@ internal final class CodexCallbackListener: @unchecked Sendable {
         }
     }
 
-    private static func bind(port: UInt16) -> (fd: Int32, port: UInt16)? {
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
+    // Named `bindListener` rather than `bind` so the libc `bind(2)` below
+    // resolves without module-qualifying it — the qualifier would have to name
+    // Darwin on Apple and Glibc on Linux.
+    private static func bindListener(port: UInt16) -> (fd: Int32, port: UInt16)? {
+        let fd = socket(AF_INET, sockStreamType, 0)
         guard fd >= 0 else { return nil }
         var opt: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, socklen_t(MemoryLayout<Int32>.size))
@@ -362,19 +378,14 @@ internal final class CodexCallbackListener: @unchecked Sendable {
         addr.sin_addr.s_addr = inet_addr("127.0.0.1")
         let res = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                #if os(macOS) || os(Linux)
-                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-                #else
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-                #endif
             }
         }
         if res == 0 {
-            #if os(macOS) || os(Linux)
-            Darwin.listen(fd, 1)
-            #else
-            listen(fd, 1)
-            #endif
+            guard listen(fd, 1) == 0 else {
+                close(fd)
+                return nil
+            }
             var boundAddr = sockaddr_in()
             var len = socklen_t(MemoryLayout<sockaddr_in>.size)
             withUnsafeMutablePointer(to: &boundAddr) {

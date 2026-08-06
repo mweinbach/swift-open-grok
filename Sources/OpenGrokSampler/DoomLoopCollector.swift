@@ -4,10 +4,21 @@
 // Mirrors Rust `doom_loop.rs`.
 
 import Foundation
-import os
 import OpenGrokSamplingTypes
 
+#if canImport(os)
+import os
 private let logger = os.Logger(subsystem: "OpenGrokSampler", category: "DoomLoopCollector")
+#else
+/// No unified logging exists off Darwin, and this module has no other
+/// diagnostic sink. Discarding matches the Darwin default (`.debug` is not
+/// surfaced unless someone attaches to the log stream) rather than adding a
+/// stderr channel the macOS build does not have.
+private struct DiscardingDebugLogger {
+    func debug(_ message: @autoclosure () -> String) {}
+}
+private let logger = DiscardingDebugLogger()
+#endif
 
 /// Cheap-to-clone accumulator shared between the SSE decoder and the
 /// stream transform of one request attempt.

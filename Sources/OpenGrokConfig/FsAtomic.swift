@@ -66,10 +66,9 @@ public func writeAtomically(
     if let mode = mode {
         // chmod the temp file BEFORE the rename so the final file never
         // exists with looser permissions.
-        let cstr = tmp.path.withCString { strdup($0) }
-        defer { free(cstr) }
         // `mode_t` is `UInt16` on Darwin, `UInt32` on Linux — cast explicitly.
-        if chmod(cstr, mode_t(mode)) != 0 {
+        let rc = tmp.path.withCString { chmod($0, mode_t(mode)) }
+        if rc != 0 {
             let err = String(cString: strerror(errno))
             try? FileManager.default.removeItem(at: tmp)
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
