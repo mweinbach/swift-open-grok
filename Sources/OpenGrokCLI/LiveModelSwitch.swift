@@ -116,7 +116,21 @@ struct LiveModelCatalogResolver: Sendable {
             [String: String],
             URL
         ) -> LiveCredentialResolver = { environment, openGrokHome in
-            LiveCredentialResolver(environment: environment, openGrokHome: openGrokHome)
+            // The SAME resolver the cold start builds (LiveComposition.swift
+            // `resolveSamplingConfiguration`), live Codex refresh included.
+            // The default `.storeOnly` service hands back whatever token is
+            // on disk — expired included — so a mid-session switch to Codex
+            // would ship a stale bearer the cold start would have refreshed,
+            // violating the resolver's no-stale-fallback contract on exactly
+            // one of the two paths.
+            LiveCredentialResolver(
+                environment: environment,
+                openGrokHome: openGrokHome,
+                codexRefreshService: .live(
+                    endpoints: CodexEndpoints.fromEnvironment(environment),
+                    transport: URLSessionHTTPTransport()
+                )
+            )
         }
     ) {
         self.environment = environment
@@ -190,6 +204,17 @@ struct LiveModelCatalogResolver: Sendable {
                     environment: environment
                 )
             )
+        } else if provider != .xai,
+                  let envOverride = OpenGrokLiveApplicationLauncher.providerBaseURLEnvironmentOverride(
+                      provider: provider,
+                      environment: environment
+                  ) {
+            // The env override outranks the catalog entry's URL for non-xAI
+            // providers, matching the cold start's ladder — without this rung
+            // a switched-to model reached the entry's endpoint while a
+            // started-on model honored the override. (xAI keeps its
+            // config-beats-env branch above.)
+            baseURL = envOverride
         } else if let apiBaseURL = entry.apiBaseURL {
             baseURL = apiBaseURL
         } else if !entry.info.baseURL.isEmpty {
@@ -274,8 +299,15 @@ struct LiveModelCatalogResolver: Sendable {
                 )
             }
         }
-        var headers = credential.extraHeaders
-        for (name, value) in entry.info.extraHeaders { headers[name] = value }
+        // The cold start's guarded merge, not a plain overlay: a configured
+        // entry's `extra_headers` must not override the credential's
+        // Authorization or Codex account-pinning headers mid-switch when the
+        // startup path would have refused the same override.
+        let headers = OpenGrokLiveApplicationLauncher.mergeCredentialHeaders(
+            provider: provider,
+            credentialHeaders: credential.extraHeaders,
+            configuredHeaders: entry.info.extraHeaders
+        )
         return LiveModelResolution(
             sampling: OpenGrokLiveSamplingConfiguration(
                 model: profile.model,

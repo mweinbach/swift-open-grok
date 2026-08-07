@@ -147,7 +147,8 @@ public final class SamplingClient: @unchecked Sendable {
             req,
             model: req.model ?? defaults.model,
             policy: policy,
-            adapter: providerAdapter
+            adapter: providerAdapter,
+            applyResponseDefaults: true
         )
         if case .object(var obj) = body {
             obj["stream"] = .bool(true)

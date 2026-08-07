@@ -1165,9 +1165,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         modelCatalog: stack.catalogStore.pickerEntries(),
                         catalogStore: stack.catalogStore,
                         modelSwitch: modelSwitch,
+                        // Routed through the runtime adapter, not the shell
+                        // directly: the adapter knows whether the (lazily
+                        // created) shell session exists yet and targets the
+                        // session the runtime is actually on after `/new` or
+                        // `/resume` — a direct shell call with the launch
+                        // session id threw "session not found" on every
+                        // pre-first-turn `/model` switch.
                         providerBoundarySync: { everUsedNonXAI in
-                            try await shell.synchronizeProviderBoundary(
-                                sessionID: SessionID(sessionID),
+                            try await runtime.synchronizeProviderBoundary(
                                 everUsedNonXAI: everUsedNonXAI
                             )
                         },
@@ -2911,47 +2917,62 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         )
     }
 
-    static func resolveProviderBaseURL(
+    /// The per-provider base-URL environment override, or nil when unset —
+    /// one source of truth for the ladder's top rung, shared by the cold
+    /// start (`resolveProviderBaseURL`) and the `/model` switch path so the
+    /// same model cannot reach a different endpoint depending on whether the
+    /// session started on it or switched to it.
+    static func providerBaseURLEnvironmentOverride(
         provider: ModelProvider,
-        model: DefaultModelJSON?,
-        environment: [String: String],
-        configuredXaiBaseURL: String? = nil
-    ) -> String {
+        environment: [String: String]
+    ) -> String? {
         let overrideKey: String
-        let fallback: String
         switch provider {
-        case .xai:
-            // Config beats env for xAI, per `from_config_value`'s deep merge.
-            if let configuredXaiBaseURL { return configuredXaiBaseURL }
-            overrideKey = "GROK_XAI_API_BASE_URL"
-            fallback = model?.apiBaseURL ?? model?.baseURL ?? XAI_API_BASE_URL_DEFAULT
-        case .codex:
-            overrideKey = "GROK_CODEX_INFERENCE_BASE_URL"
-            fallback = model?.apiBaseURL ?? model?.baseURL ?? CodexModels.defaultInferenceBaseURL
-        case .kimi:
-            overrideKey = KimiModels.apiBaseURLEnv
-            fallback = model?.apiBaseURL ?? model?.baseURL ?? KimiModels.platformAPIBaseURL
-        case .fireworks:
-            overrideKey = FireworksModels.apiBaseURLEnv
-            fallback = model?.apiBaseURL ?? model?.baseURL ?? FireworksModels.apiBaseURLDefault
-        case .deepseek:
-            overrideKey = DeepSeekModels.apiBaseURLEnv
-            fallback = model?.apiBaseURL ?? model?.baseURL ?? DeepSeekModels.apiBaseURLDefault
-        case .openCodeGo:
-            overrideKey = OpenCodeGoModels.apiBaseURLEnv
-            fallback = model?.apiBaseURL ?? model?.baseURL ?? OpenCodeGoModels.apiBaseURLDefault
-        case .wafer:
-            overrideKey = WaferModels.apiBaseURLEnv
-            fallback = model?.apiBaseURL ?? model?.baseURL ?? WaferModels.apiBaseURLDefault
+        case .xai: overrideKey = "GROK_XAI_API_BASE_URL"
+        case .codex: overrideKey = "GROK_CODEX_INFERENCE_BASE_URL"
+        case .kimi: overrideKey = KimiModels.apiBaseURLEnv
+        case .fireworks: overrideKey = FireworksModels.apiBaseURLEnv
+        case .deepseek: overrideKey = DeepSeekModels.apiBaseURLEnv
+        case .openCodeGo: overrideKey = OpenCodeGoModels.apiBaseURLEnv
+        case .wafer: overrideKey = WaferModels.apiBaseURLEnv
         case .meta:
             // Meta endpoint constants (meta_models.rs:14-16): the
             // OPENGROK_META_API_BASE_URL override, else the model's own URL,
             // else https://api.meta.ai/v1 — the same ladder as the other
             // API-key providers.
             overrideKey = MetaModels.apiBaseURLEnv
-            fallback = model?.apiBaseURL ?? model?.baseURL ?? MetaModels.apiBaseURLDefault
         }
         return nonEmptyEnvironmentValue(overrideKey, environment: environment)
+    }
+
+    static func resolveProviderBaseURL(
+        provider: ModelProvider,
+        model: DefaultModelJSON?,
+        environment: [String: String],
+        configuredXaiBaseURL: String? = nil
+    ) -> String {
+        let fallback: String
+        switch provider {
+        case .xai:
+            // Config beats env for xAI, per `from_config_value`'s deep merge.
+            if let configuredXaiBaseURL { return configuredXaiBaseURL }
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? XAI_API_BASE_URL_DEFAULT
+        case .codex:
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? CodexModels.defaultInferenceBaseURL
+        case .kimi:
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? KimiModels.platformAPIBaseURL
+        case .fireworks:
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? FireworksModels.apiBaseURLDefault
+        case .deepseek:
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? DeepSeekModels.apiBaseURLDefault
+        case .openCodeGo:
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? OpenCodeGoModels.apiBaseURLDefault
+        case .wafer:
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? WaferModels.apiBaseURLDefault
+        case .meta:
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? MetaModels.apiBaseURLDefault
+        }
+        return providerBaseURLEnvironmentOverride(provider: provider, environment: environment)
             ?? fallback
     }
 
@@ -5539,7 +5560,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     }
 }
 
-private actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPagerRuntimeAdapter {
+actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPagerRuntimeAdapter {
     let shell: OpenGrokShell
     let cwd: URL
     private var providerConfiguration: ProviderSessionConfiguration
@@ -5597,6 +5618,19 @@ private actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenG
                 restorePersistedState: false
             ))
             createdSessionIDs.insert(sessionID)
+            // The record is born carrying the boundary's CURRENT truth, not
+            // the launch configuration's snapshot — upstream marks the store
+            // at session open (`initialize_provider_boundary`, persistence.rs
+            // :2745-2758) for the same reason. Without this, a pre-first-turn
+            // `/model` switch to a non-xAI provider (deferred below because
+            // no record existed yet) would create a shell summary claiming
+            // the session never left xAI.
+            if await conversationHistory.sharedExportBoundary.everUsedNonXAI {
+                try await shell.synchronizeProviderBoundary(
+                    sessionID: sessionID,
+                    everUsedNonXAI: true
+                )
+            }
         }
         activeShellSessionID = sessionID
         let handle = try await shell.submitTurn(
@@ -5604,6 +5638,26 @@ private actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenG
             request: OpenGrokShellTurnRequest(text: request.prompt)
         )
         return LivePagerSession(shell: shell, handle: handle, shellEvents: shellEvents)
+    }
+
+    /// Mirror the live export boundary into the shell session's persisted
+    /// summary, the port of the persistence actor's `observe_provider` leg
+    /// on a model switch (`PersistenceMsg::CurrentModel`, persistence.rs:
+    /// 2179-2187 → `mark_ever_used_codex`).
+    ///
+    /// Before the first prompt no shell session exists — the port creates it
+    /// lazily in `makeSession`, where upstream's `init_session` runs at
+    /// session open (persistence.rs:2775) — so there is nothing to mirror
+    /// into yet and the sync defers: `makeSession` seeds the record from the
+    /// same shared `ExportBoundary` at creation, so the deferred value cannot
+    /// be lost. Once a session exists, a failure here is a real persistence
+    /// failure and still propagates to the caller's warning row.
+    func synchronizeProviderBoundary(everUsedNonXAI: Bool) async throws {
+        guard let sessionID = activeShellSessionID else { return }
+        try await shell.synchronizeProviderBoundary(
+            sessionID: sessionID,
+            everUsedNonXAI: everUsedNonXAI
+        )
     }
 
     func makeSession(

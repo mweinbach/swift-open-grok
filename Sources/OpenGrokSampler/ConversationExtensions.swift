@@ -398,11 +398,22 @@ public func projectMessagesRequest(
 // MARK: - Projection: ConversationRequest → Responses wire (JSON body)
 
 /// Project a conversation request onto a Responses API JSON body.
+///
+/// `applyResponseDefaults` is the sampling client's `apply_response_defaults`
+/// leg (client.rs:2453-2462): `store: false` — the OpenAI default of `true`
+/// breaks ZDR compliance, and the Codex backend rejects stored requests
+/// outright — plus `include: ["reasoning.encrypted_content"]`, without which
+/// a stateless Codex conversation gets no reasoning back to replay. It must
+/// run BEFORE the adapter patch so the DeepSeek/Meta patchers can strip both
+/// fields, exactly as upstream orders it (client.rs:2649 → :2703). Default
+/// `false` because the Codex compaction bodies build through this projector
+/// too and own their contract fields themselves (client.rs:2133-2140).
 public func projectResponsesRequestBody(
     _ req: ConversationRequest,
     model: String,
     policy: ResponsesRequestPolicy,
-    adapter: any ProviderAdapter
+    adapter: any ProviderAdapter,
+    applyResponseDefaults: Bool = false
 ) -> JSONValue {
     var input: [JSONValue] = []
     for item in req.items {
@@ -585,6 +596,16 @@ public func projectResponsesRequestBody(
     // "default"`, so only a concrete tier id reaches the wire.
     if let tier = normalizedServiceTier(req.serviceTier) {
         body["service_tier"] = .string(tier)
+    }
+    if applyResponseDefaults {
+        if body["store"] == nil {
+            body["store"] = .bool(false)
+        }
+        var include = body["include"]?.arrayValue ?? []
+        if !include.contains(.string("reasoning.encrypted_content")) {
+            include.append(.string("reasoning.encrypted_content"))
+        }
+        body["include"] = .array(include)
     }
 
     var value = JSONValue.object(body)

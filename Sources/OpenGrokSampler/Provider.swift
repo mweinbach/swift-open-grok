@@ -590,6 +590,23 @@ func isUnknownTopLevelResponseEvent(error: SamplingError, data: String) -> Bool 
 func patchCodexResponsesRequest(_ body: inout JSONValue, policy: ResponsesRequestPolicy) {
     patchCodexInstructionRoles(&body)
 
+    // Codex sandboxes `web_search` unless the request opts into live access;
+    // grant it while leaving an explicit override untouched (provider.rs:
+    // 594-607).
+    if case .object(var obj) = body,
+       case .array(var tools) = obj["tools"] {
+        for i in tools.indices {
+            guard tools[i]["type"]?.stringValue == "web_search",
+                  case .object(var tool) = tools[i],
+                  tool["external_web_access"] == nil
+            else { continue }
+            tool["external_web_access"] = .bool(true)
+            tools[i] = .object(tool)
+        }
+        obj["tools"] = .array(tools)
+        body = .object(obj)
+    }
+
     if let summary = policy.reasoningSummary?.wireValue {
         ensureReasoningObject(&body)
         if case .object(var obj) = body {
