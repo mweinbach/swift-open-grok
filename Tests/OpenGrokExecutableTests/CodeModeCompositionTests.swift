@@ -382,9 +382,11 @@ struct CodeModeCompositionTests {
         // three background-task consumers are on that list on purpose: they
         // hold the turn until a task finishes, which a cell's yield timer
         // cannot survive — the timer would hand control back to the model while
-        // the wait is still outstanding.
+        // the wait is still outstanding. `spawn_subagent` is in the same class:
+        // a foreground spawn parks the turn on the child
+        // (`is_code_mode_direct_only_tool`, session/code_mode.rs:68).
         #expect(
-            Set(names) == ["get_task_output", "wait_tasks", "kill_task", "exec", "wait"]
+            Set(names) == ["get_task_output", "wait_tasks", "kill_task", "spawn_subagent", "exec", "wait"]
         )
         // The transport pair is always last, after any direct-only tool.
         #expect(names.suffix(2) == ["exec", "wait"])

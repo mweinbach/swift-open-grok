@@ -1479,12 +1479,19 @@ struct ParityCompositionTests {
         // this session's `XAI_API_KEY` resolves an xAI search backend, so all
         // three are offered. `LiveWebToolsTests` pins the credential cases.
         // `todo_write` needs no credentials at all and is unconditional.
+        //
+        // `spawn_subagent` is the subagent stack's surface (upstream's
+        // production rename of `task`, config.rs:152-156): present because
+        // subagents are enabled and the built-in roster is non-empty
+        // (builder.rs:848-896). `LiveSubagentToolTests` pins the gates and
+        // the end-to-end spawn.
         let advertised = Set(requests.first?.tools.map(\.name) ?? [])
         #expect(advertised == Set([
             "run_terminal_cmd", "read_file", "list_dir", "grep",
             "glob", "view_image", "search_replace", "write", "apply_patch",
             "image_gen", "image_edit",
             "get_task_output", "wait_tasks", "kill_task",
+            "spawn_subagent",
             "web_search", "web_fetch", "x_search",
             "todo_write"
         ]))
