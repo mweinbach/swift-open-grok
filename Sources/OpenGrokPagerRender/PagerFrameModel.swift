@@ -450,6 +450,73 @@ public struct PagerShortcutsBar: Sendable, Equatable, Hashable {
     }
 }
 
+// MARK: - Announcement banner
+
+/// The single in-session announcement banner slot, plain data the renderer
+/// paints without knowing where announcements come from. The composition
+/// resolves the slot selection (critical wins over promo, first non-hidden),
+/// expiry, hide-key state, and CTA usability through `OpenGrokAnnouncements`,
+/// then hands the renderer this projection. Keeping the render module free of
+/// the announcements dependency is what lets the banner slot live in the same
+/// wave as the rest of the chrome (`OpenGrokPagerRender` cannot depend on
+/// `OpenGrokAnnouncements` — see the wave-8 dep edge in `Package.swift`).
+///
+/// Layout mirrors `crates/codegen/xai-grok-pager/src/views/announcements.rs`:
+/// critical is two rows (`! Title` + message), promo is one row. `dismissible`
+/// (absent/`true` upstream) paints the `[hide]` button and `hide: /announcements
+/// hide` affordance; `dismissible = false` pins the banner and reclaims those
+/// columns. A promo's `message` is not painted on the banner — upstream paints
+/// it on the roomier welcome hero — so only the CTA button (+ optional dim
+/// `ctaCaption` for pinned promos) leads the row.
+public struct PagerAnnouncementBanner: Sendable, Equatable, Hashable {
+    public enum Severity: String, Sendable, Equatable, Hashable {
+        case critical
+        case promo
+    }
+
+    public var severity: Severity
+    /// Trimmed non-empty or `nil`. Critical paints `! <title>` in error red.
+    public var title: String?
+    /// Trimmed non-empty or `nil`. The selection guarantees a visible message;
+    /// `nil` here only when the critical has a title but no message body.
+    public var message: String?
+    /// `false` pins the banner (no hide affordances, columns reclaimed).
+    public var dismissible: Bool
+    /// Usable CTA `(label, url)` for a promo, trimmed non-empty. `nil` on a
+    /// critical (it never paints a button) or a promo with no usable CTA.
+    public var ctaLabel: String?
+    public var ctaURL: String?
+    /// Dim helper caption for a *pinned* promo (`dismissible == false`).
+    /// Dismissible promos keep `Ctrl+O` on YOLO, so they suppress the caption.
+    public var ctaCaption: String?
+
+    public init(
+        severity: PagerAnnouncementBanner.Severity,
+        title: String? = nil,
+        message: String? = nil,
+        dismissible: Bool = true,
+        ctaLabel: String? = nil,
+        ctaURL: String? = nil,
+        ctaCaption: String? = nil
+    ) {
+        self.severity = severity
+        self.title = title
+        self.message = message
+        self.dismissible = dismissible
+        self.ctaLabel = ctaLabel
+        self.ctaURL = ctaURL
+        self.ctaCaption = ctaCaption
+    }
+
+    /// Slot height in rows: 2 for a critical (title + message), 1 for a promo.
+    public var height: Int {
+        switch severity {
+        case .critical: return 2
+        case .promo: return 1
+        }
+    }
+}
+
 // MARK: - Frame state
 
 public enum PagerScrollPosition: Sendable, Equatable, Hashable {
@@ -460,6 +527,7 @@ public enum PagerScrollPosition: Sendable, Equatable, Hashable {
 public struct PagerRenderState: Sendable, Equatable {
     public var size: TerminalSize
     public var statusBar: PagerStatusBar?
+    public var announcementBanner: PagerAnnouncementBanner?
     public var conversation: [PagerConversationItem]
     public var turnStatus: PagerTurnStatus?
     public var completions: PagerCompletionMenu?
@@ -486,6 +554,7 @@ public struct PagerRenderState: Sendable, Equatable {
     public init(
         size: TerminalSize,
         statusBar: PagerStatusBar? = nil,
+        announcementBanner: PagerAnnouncementBanner? = nil,
         conversation: [PagerConversationItem] = [],
         turnStatus: PagerTurnStatus? = nil,
         completions: PagerCompletionMenu? = nil,
@@ -502,6 +571,7 @@ public struct PagerRenderState: Sendable, Equatable {
         self.selectedBlockIndex = selectedBlockIndex
         self.size = size
         self.statusBar = statusBar
+        self.announcementBanner = announcementBanner
         self.conversation = conversation
         self.turnStatus = turnStatus
         self.completions = completions
@@ -517,6 +587,7 @@ public struct PagerRenderState: Sendable, Equatable {
 public struct PagerFrameLayout: Sendable, Equatable {
     public var bounds: TerminalRect
     public var statusBar: TerminalRect
+    public var announcementBanner: TerminalRect
     public var conversation: TerminalRect
     public var completions: TerminalRect
     public var turnStatus: TerminalRect
@@ -531,6 +602,7 @@ public struct PagerFrameLayout: Sendable, Equatable {
     public init(
         bounds: TerminalRect,
         statusBar: TerminalRect,
+        announcementBanner: TerminalRect,
         conversation: TerminalRect,
         completions: TerminalRect,
         turnStatus: TerminalRect,
@@ -544,6 +616,7 @@ public struct PagerFrameLayout: Sendable, Equatable {
     ) {
         self.bounds = bounds
         self.statusBar = statusBar
+        self.announcementBanner = announcementBanner
         self.conversation = conversation
         self.completions = completions
         self.turnStatus = turnStatus

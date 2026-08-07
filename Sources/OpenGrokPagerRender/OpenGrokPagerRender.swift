@@ -47,6 +47,7 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     let layout = PagerFrameLayout(
         bounds: bounds,
         statusBar: chrome.statusBar,
+        announcementBanner: chrome.announcementBanner,
         conversation: chrome.conversation,
         completions: chrome.completions,
         turnStatus: chrome.turnStatus,
@@ -68,6 +69,13 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         buffer: &buffer,
         theme: state.theme,
         motion: state.motion
+    )
+    renderAnnouncementBanner(
+        state.announcementBanner,
+        in: chrome.announcementBanner,
+        buffer: &buffer,
+        theme: state.theme,
+        links: &links
     )
     renderConversation(
         contentLines,
@@ -118,6 +126,7 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
 
 private struct ChromeLayout {
     var statusBar: TerminalRect
+    var announcementBanner: TerminalRect
     var conversation: TerminalRect
     var completions: TerminalRect
     var turnStatus: TerminalRect
@@ -150,6 +159,7 @@ private func makeChromeLayout(bounds: TerminalRect, state: PagerRenderState) -> 
     guard bounds.height > 0, bounds.width > 0 else {
         return ChromeLayout(
             statusBar: empty,
+            announcementBanner: empty,
             conversation: empty,
             completions: empty,
             turnStatus: empty,
@@ -167,8 +177,15 @@ private func makeChromeLayout(bounds: TerminalRect, state: PagerRenderState) -> 
     }
 
     let statusHeight = state.statusBar != nil ? take(1) : 0
-    // One blank row between the status bar and the transcript.
+    // One blank row between the status bar and the banner (or transcript
+    // when no banner is showing).
     let statusGap = statusHeight > 0 ? take(1) : 0
+
+    // Announcement banner: 0, 1, or 2 rows, slotted between the status bar
+    // and the transcript — same precedence as upstream's agent view
+    // (`app_view.rs:5222-5241`): critical (2 rows) wins, then promo (1 row).
+    let announcementHeight = state.announcementBanner.map { take($0.height) } ?? 0
+    let announcementGap = announcementHeight > 0 ? take(1) : 0
 
     let shortcutsHeight = state.shortcuts != nil ? take(1) : 0
     // The reference drops the bottom padding row on short terminals.
@@ -188,7 +205,7 @@ private func makeChromeLayout(bounds: TerminalRect, state: PagerRenderState) -> 
     let completionsGap = completionsHeight > 0 ? take(1) : 0
 
     let conversationHeight = max(0, remaining)
-    _ = (statusGap, bottomGap, promptGap, turnStatusGap, completionsGap)
+    _ = (statusGap, announcementGap, bottomGap, promptGap, turnStatusGap, completionsGap)
 
     var y = bounds.y
     func place(_ height: Int, gapAfter: Int = 0) -> TerminalRect {
@@ -198,6 +215,7 @@ private func makeChromeLayout(bounds: TerminalRect, state: PagerRenderState) -> 
     }
 
     let statusBar = place(statusHeight, gapAfter: statusGap)
+    let announcementBanner = place(announcementHeight, gapAfter: announcementGap)
     let conversation = place(conversationHeight, gapAfter: completionsGap)
     let completions = place(completionsHeight, gapAfter: turnStatusGap)
     let turnStatus = place(turnStatusHeight, gapAfter: promptGap)
@@ -206,6 +224,7 @@ private func makeChromeLayout(bounds: TerminalRect, state: PagerRenderState) -> 
 
     return ChromeLayout(
         statusBar: statusBar,
+        announcementBanner: announcementBanner,
         conversation: conversation,
         completions: completions,
         turnStatus: turnStatus,
@@ -653,6 +672,257 @@ private func renderStatusBar(
             limit: area.right,
             background: theme.bgBase
         )
+    }
+}
+
+// MARK: - Announcement banner
+
+/// The dim `hide: /announcements hide` affordance text, shared by both
+/// painters. Upstream's `HIDE_CTA` (`views/announcements.rs:44`).
+private let announcementHideCTA = "hide: /announcements hide"
+/// The right-aligned clickable hide button. Upstream's `HIDE_BUTTON` (`:46`).
+private let announcementHideButton = "[hide]"
+/// The alert prefix leading a critical title row. Upstream's `TITLE_PREFIX`
+/// (`:48`); the message row indents by its width so its column matches the
+/// title's.
+private let announcementTitlePrefix = "! "
+/// Columns between text and the right-aligned button/CTA. Upstream's `GAP`
+/// (`:50`).
+private let announcementGap = 2
+
+/// Paint the in-session announcement banner slot. Mirrors
+/// `views/announcements.rs::render_banner` (`:441-458`): critical is two rows
+/// (`! Title` + message), promo is one row (CTA button + optional caption).
+/// `dismissible == false` pins the banner — neither hide affordance paints
+/// and the title/message reclaim the reserved columns. The promo `message` is
+/// not painted here (upstream paints it on the welcome hero), so a promo with
+/// no usable CTA renders only its hide affordances.
+///
+/// The renderer is given the already-resolved slot selection; it does not
+/// re-derive critical-wins-over-promo or hidden filtering. A `nil` banner or a
+/// zero-sized slot paints nothing.
+private func renderAnnouncementBanner(
+    _ banner: PagerAnnouncementBanner?,
+    in area: TerminalRect,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme,
+    links: inout [LinkSpan]
+) {
+    guard let banner, area.height > 0, area.width > 0 else { return }
+    paintBlank(&buffer, area: area, foreground: theme.textPrimary, background: theme.bgBase)
+    switch banner.severity {
+    case .critical:
+        renderCriticalAnnouncementRows(banner, in: area, buffer: &buffer, theme: theme)
+    case .promo:
+        renderPromoAnnouncementRow(banner, in: area, buffer: &buffer, theme: theme, links: &links)
+    }
+}
+
+/// Critical layout (2 rows): row 0 `! Title` (error red, bold) with a
+/// right-aligned dim `[hide]` button when dismissible; row 1 the message
+/// (default fg) indented to the title column, then the dim
+/// `hide: /announcements hide` CTA. The CTA width is reserved up front so a
+/// long message truncates with `…` instead of pushing the CTA off-screen.
+/// Non-dismissible paints neither hide affordance and reclaims the reserved
+/// widths (`W−2` for both rows).
+private func renderCriticalAnnouncementRows(
+    _ banner: PagerAnnouncementBanner,
+    in area: TerminalRect,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme
+) {
+    let maxW = area.width
+    let prefixW = UnicodeDisplayWidth.width(of: announcementTitlePrefix)
+    let buttonW = UnicodeDisplayWidth.width(of: announcementHideButton)
+    let row0 = area.y
+    let row1 = area.y + 1
+    let maxY = area.y + area.height
+    let alertStyle: CellStyle = [.bold]
+    let alertFG = theme.accentError
+    let dimFG = theme.gray
+    let dismissible = banner.dismissible
+
+    if row0 < maxY {
+        // `! ` prefix anchors the alert even when the title is missing.
+        buffer.setString(
+            x: area.x,
+            y: row0,
+            text: truncateToWidth(announcementTitlePrefix, width: maxW),
+            style: alertStyle,
+            foreground: alertFG,
+            background: theme.bgBase
+        )
+
+        var hideRectEnd: Int? = nil
+        if dismissible {
+            // Right-aligned [hide] button, painted first so its width is
+            // reserved before the title budget is computed.
+            if maxW >= buttonW {
+                let hideX = area.x + (maxW - buttonW)
+                buffer.setString(
+                    x: hideX,
+                    y: row0,
+                    text: announcementHideButton,
+                    style: [.dim],
+                    foreground: dimFG,
+                    background: theme.bgBase
+                )
+                hideRectEnd = hideX
+            }
+        }
+
+        let titleBudget: Int
+        if dismissible, let hideX = hideRectEnd {
+            titleBudget = max(0, maxW - prefixW - buttonW - announcementGap)
+            _ = hideX
+        } else {
+            titleBudget = max(0, maxW - prefixW)
+        }
+        if let title = banner.title, titleBudget > 0 {
+            buffer.setString(
+                x: area.x + prefixW,
+                y: row0,
+                text: truncateToWidth(title, width: titleBudget),
+                style: alertStyle,
+                foreground: alertFG,
+                background: theme.bgBase
+            )
+        }
+    }
+
+    if row1 < maxY {
+        // Message column == title column: indent past the `! ` prefix.
+        var x = area.x + prefixW
+        var remaining = max(0, maxW - prefixW)
+        let ctaW = UnicodeDisplayWidth.width(of: announcementHideCTA)
+
+        let msgBudget: Int
+        if dismissible {
+            msgBudget = max(0, remaining - ctaW - announcementGap)
+        } else {
+            msgBudget = remaining
+        }
+        if let message = banner.message, msgBudget > 0 {
+            let msgDisp = truncateToWidth(message, width: msgBudget)
+            let msgW = min(UnicodeDisplayWidth.width(of: msgDisp), msgBudget)
+            if msgW > 0 {
+                buffer.setString(
+                    x: x,
+                    y: row1,
+                    text: msgDisp,
+                    style: [],
+                    foreground: theme.textPrimary,
+                    background: theme.bgBase
+                )
+                x += msgW + announcementGap
+                remaining = max(0, remaining - msgW - announcementGap)
+            }
+        }
+        if dismissible, remaining > 0 {
+            buffer.setString(
+                x: x,
+                y: row1,
+                text: truncateToWidth(announcementHideCTA, width: remaining),
+                style: [.dim],
+                foreground: dimFG,
+                background: theme.bgBase
+            )
+        }
+    }
+}
+
+/// Promo layout (1 row): the `[Label]` CTA button (semantic warning yellow)
+/// leads the row and is omitted when the promo has no usable CTA. The dim
+/// `ctaCaption` follows the button only for a *pinned* promo
+/// (`dismissible == false`); a dismissible promo keeps `Ctrl+O` on YOLO so the
+/// caption is suppressed. The right-hand `[hide]` + `hide: /announcements hide`
+/// affordances are reserved first (dismissible only) so the button + caption
+/// never overpaint them. The promo `message` is not painted here.
+private func renderPromoAnnouncementRow(
+    _ banner: PagerAnnouncementBanner,
+    in area: TerminalRect,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme,
+    links: inout [LinkSpan]
+) {
+    let maxW = area.width
+    let row = area.y
+    let buttonW = UnicodeDisplayWidth.width(of: announcementHideButton)
+    let hideCTAW = UnicodeDisplayWidth.width(of: announcementHideCTA)
+    let dimFG = theme.gray
+    let dismissible = banner.dismissible
+
+    // Non-dismissible: neither hide affordance paints and `rightReserved`
+    // stays 0, so the button reclaims the right-hand columns.
+    var rightReserved = 0
+    if dismissible {
+        if maxW >= buttonW {
+            let hideX = area.x + (maxW - buttonW)
+            buffer.setString(
+                x: hideX,
+                y: row,
+                text: announcementHideButton,
+                style: [.dim],
+                foreground: dimFG,
+                background: theme.bgBase
+            )
+        }
+        // Dim hide CTA directly left of the button; skipped whole when it
+        // cannot fit (redundant with [hide], so no partial paint).
+        if maxW >= buttonW + announcementGap + hideCTAW {
+            let hideCTAX = area.x + (maxW - buttonW - announcementGap - hideCTAW)
+            buffer.setString(
+                x: hideCTAX,
+                y: row,
+                text: announcementHideCTA,
+                style: [.dim],
+                foreground: dimFG,
+                background: theme.bgBase
+            )
+            rightReserved = buttonW + announcementGap + hideCTAW
+        } else if maxW >= buttonW {
+            rightReserved = buttonW + announcementGap
+        }
+    }
+
+    let remaining: Int
+    if rightReserved > 0 {
+        remaining = max(0, maxW - rightReserved - announcementGap)
+    } else {
+        remaining = maxW
+    }
+    guard remaining > 0, let label = banner.ctaLabel, !label.isEmpty else { return }
+
+    // Caption only for a pinned promo whose `Ctrl+O` actually opens the CTA.
+    let caption: String? = (!dismissible) ? banner.ctaCaption : nil
+    let button = "[\(label)]"
+    let buttonDisp = truncateToWidth(button, width: remaining)
+    let buttonW2 = min(UnicodeDisplayWidth.width(of: buttonDisp), remaining)
+    guard buttonW2 > 0 else { return }
+    buffer.setString(
+        x: area.x,
+        y: row,
+        text: buttonDisp,
+        style: [],
+        foreground: theme.warning,
+        background: theme.bgBase
+    )
+    if let url = banner.ctaURL, !url.isEmpty {
+        links.append(LinkSpan(row: row, colStart: area.x, colEnd: area.x + buttonW2, url: url))
+    }
+    if let caption, !caption.isEmpty {
+        let cap = " \(caption)"
+        let capW = UnicodeDisplayWidth.width(of: cap)
+        if buttonW2 + capW <= remaining {
+            buffer.setString(
+                x: area.x + buttonW2,
+                y: row,
+                text: cap,
+                style: [.dim],
+                foreground: dimFG,
+                background: theme.bgBase
+            )
+        }
     }
 }
 
