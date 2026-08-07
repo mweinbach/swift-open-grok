@@ -1,7 +1,8 @@
 // LiveBackgroundTaskToolsTests.swift
 //
-// Covers the consumer half of background execution: `get_task_output`,
-// `wait_tasks` and `kill_task`.
+// Covers the consumer half of background execution:
+// `get_command_or_subagent_output`, `wait_commands_or_subagents` and
+// `kill_command_or_subagent` — upstream's production names.
 //
 // The bug these tools close is that `run_terminal_cmd` hands the model a
 // `task_id` — either because it asked for `is_background`, or because the
@@ -199,16 +200,23 @@ private func object(
     // model asks for a wait its own session will silently truncate.
     let environment = ["OPENGROK_MAX_WAIT_BLOCK_MS": "5000"]
     let specs = LiveBackgroundTaskTools.toolSpecs(environment: environment)
-    let getOutput = specs.first { $0.name == "get_task_output" }
+    let getOutput = specs.first { $0.name == "get_command_or_subagent_output" }
     #expect(getOutput?.description?.contains("5000 (~5 s)") == true)
     #expect(getOutput?.description?.contains("600000") == false)
 }
 
 // MARK: - Tool surface
 
-@Test func allThreeToolsAreAdvertisedWithTheirRequiredArguments() {
+@Test func productionToolNamesMatchUpstreamGrokBuildPreset() {
+    // xai-grok-agent/src/config.rs:161-173 — grok-build renames the registry
+    // trio to these production names before advertising them to the model.
+    let productionTrio = Set([
+        "get_command_or_subagent_output",
+        "wait_commands_or_subagents",
+        "kill_command_or_subagent",
+    ])
     let specs = LiveBackgroundTaskTools.toolSpecs(environment: [:])
-    #expect(Set(specs.map(\.name)) == ["get_task_output", "wait_tasks", "kill_task"])
+    #expect(Set(specs.map(\.name)) == productionTrio)
 
     for spec in specs {
         guard case .object(let schema) = spec.parameters,
@@ -218,31 +226,57 @@ private func object(
             continue
         }
         switch spec.name {
-        case "get_task_output": #expect(required == [.string("task_ids")])
-        case "wait_tasks": #expect(required == [.string("task_ids"), .string("mode")])
-        case "kill_task": #expect(required == [.string("task_id")])
-        default: Issue.record("unexpected tool \(spec.name)")
+        case "get_command_or_subagent_output":
+            #expect(required == [.string("task_ids")])
+        case "wait_commands_or_subagents":
+            #expect(required == [.string("task_ids"), .string("mode")])
+        case "kill_command_or_subagent":
+            #expect(required == [.string("task_id")])
+        default:
+            Issue.record("unexpected tool \(spec.name)")
         }
     }
 }
 
-@Test func upstreamsRenamedSpellingsResolveToTheCanonicalTools() {
-    // Every agent profile in `AgentDefinitionSchema` names these tools the way
-    // the grok-build preset renames them, so both spellings have to resolve.
+@Test func registryAliasesResolveToTheProductionTools() {
+    // Older prompts and registry docs still emit the short names; dispatch must
+    // accept them even though the live surface advertises the production trio.
+    #expect(
+        LiveBackgroundTaskTools.canonicalName(for: "get_task_output")
+            == "get_command_or_subagent_output"
+    )
+    #expect(
+        LiveBackgroundTaskTools.canonicalName(for: "wait_tasks")
+            == "wait_commands_or_subagents"
+    )
+    #expect(
+        LiveBackgroundTaskTools.canonicalName(for: "kill_task")
+            == "kill_command_or_subagent"
+    )
     #expect(
         LiveBackgroundTaskTools.canonicalName(for: "get_command_or_subagent_output")
-            == "get_task_output"
+            == "get_command_or_subagent_output"
     )
-    #expect(
-        LiveBackgroundTaskTools.canonicalName(for: "wait_commands_or_subagents")
-            == "wait_tasks"
-    )
-    #expect(
-        LiveBackgroundTaskTools.canonicalName(for: "kill_command_or_subagent")
-            == "kill_task"
-    )
-    #expect(LiveBackgroundTaskTools.canonicalName(for: "get_task_output") == "get_task_output")
     #expect(LiveBackgroundTaskTools.canonicalName(for: "read_file") == nil)
+}
+
+@Test func registryAliasSpellingsDispatchToTheSameImplementation() async {
+    let process = FakeProcessExecution(killOutcomes: ["live": .killed])
+    let viaProduction = object(await LiveBackgroundTaskTools.invoke(
+        name: "kill_command_or_subagent",
+        args: .object(["task_id": .string("live")]),
+        process: process,
+        environment: [:]
+    ))
+    #expect(viaProduction?["outcome"] == .string("killed"))
+
+    let viaRegistry = object(await LiveBackgroundTaskTools.invoke(
+        name: "kill_task",
+        args: .object(["task_id": .string("live")]),
+        process: process,
+        environment: [:]
+    ))
+    #expect(viaRegistry?["outcome"] == .string("killed"))
 }
 
 // MARK: - get_task_output
@@ -460,17 +494,6 @@ private func object(
         Issue.record("expected an invalid-call failure")
         return
     }
-}
-
-@Test func renamedSpellingsDispatchToTheSameImplementation() async {
-    let process = FakeProcessExecution(killOutcomes: ["live": .killed])
-    let result = object(await LiveBackgroundTaskTools.invoke(
-        name: "kill_command_or_subagent",
-        args: .object(["task_id": .string("live")]),
-        process: process,
-        environment: [:]
-    ))
-    #expect(result?["outcome"] == .string("killed"))
 }
 
 @Test func anUnrelatedToolNameIsRefused() async {

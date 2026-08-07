@@ -1,7 +1,9 @@
 // LiveBackgroundTaskTools.swift
 //
-// The consumer half of background execution: `get_task_output`, `wait_tasks`
-// and `kill_task`.
+// The consumer half of background execution:
+// `get_command_or_subagent_output`, `wait_commands_or_subagents` and
+// `kill_command_or_subagent` — upstream's production names for the registry
+// trio `get_task_output` / `wait_tasks` / `kill_task`.
 //
 // `run_terminal_cmd` can put a command in the background two ways — the model
 // asks for it with `is_background: true`, or the command outruns the 10s
@@ -24,24 +26,22 @@ import OpenGrokShellBase
 enum LiveBackgroundTaskTools {
     // MARK: - Names
 
-    static let getTaskOutputName = "get_task_output"
-    static let waitTasksName = "wait_tasks"
-    static let killTaskName = "kill_task"
+    static let getTaskOutputName = "get_command_or_subagent_output"
+    static let waitTasksName = "wait_commands_or_subagents"
+    static let killTaskName = "kill_command_or_subagent"
 
     static let toolNames: Set<String> = [
         getTaskOutputName, waitTasksName, killTaskName,
     ]
 
-    /// The names upstream's grok-build preset renames these to
-    /// (`xai-grok-agent/src/config.rs:163-173`). Swift advertises the canonical
-    /// registry names, matching how it advertises `run_terminal_cmd` rather
-    /// than the renamed `run_terminal_command`, but a model primed on the
-    /// renamed contract — or an agent profile written against it, as every
-    /// profile in `AgentDefinitionSchema` is — must still resolve.
+    /// Registry names upstream's grok-build preset renames away from
+    /// (`xai-grok-agent/src/config.rs:161-173`). Swift advertises the production
+    /// names the way every profile in `AgentDefinitionSchema` spells them; the
+    /// short registry names still resolve at dispatch for older prompts.
     static let aliases: [String: String] = [
-        "get_command_or_subagent_output": getTaskOutputName,
-        "wait_commands_or_subagents": waitTasksName,
-        "kill_command_or_subagent": killTaskName,
+        "get_task_output": getTaskOutputName,
+        "wait_tasks": waitTasksName,
+        "kill_task": killTaskName,
     ]
 
     /// Canonical name for `name`, or nil when it is not one of these tools.
@@ -128,15 +128,16 @@ enum LiveBackgroundTaskTools {
 
     /// Mirrors `xai_tool_types::build_wait_tasks_description`. Upstream keeps
     /// this tool only as a compatibility alias for prompts that still emit it —
-    /// `get_task_output` with a positive `timeout_ms` is the preferred path —
-    /// but `wait_any` exists only here, so it is not purely redundant.
+    /// `get_command_or_subagent_output` with a positive `timeout_ms` is the
+    /// preferred path — but `wait_any` exists only here, so it is not purely
+    /// redundant.
     static func waitTasksSpec(waitCap: String) -> ToolSpec {
         ToolSpec(
             name: waitTasksName,
             description: """
             Wait for multiple background tasks or subagents to complete.
 
-            Prefer get_task_output with task_ids and a positive timeout_ms. This tool is kept for compatibility.
+            Prefer get_command_or_subagent_output with task_ids and a positive timeout_ms. This tool is kept for compatibility.
 
             Usage notes:
             - task_ids: list of task IDs from is_background=true commands
@@ -228,7 +229,7 @@ enum LiveBackgroundTaskTools {
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
         let taskIDs = resolveTaskIDs(object)
         guard !taskIDs.isEmpty else {
-            return .failure(.invalidCall("get_task_output requires a non-empty task_ids list"))
+            return .failure(.invalidCall("\(getTaskOutputName) requires a non-empty task_ids list"))
         }
         // Omitted or zero is a non-blocking snapshot; only a positive value waits.
         let requested = integer(object["timeout_ms"])
@@ -298,11 +299,11 @@ enum LiveBackgroundTaskTools {
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
         let taskIDs = resolveTaskIDs(object)
         guard !taskIDs.isEmpty else {
-            return .failure(.invalidCall("wait_tasks requires a non-empty task_ids list"))
+            return .failure(.invalidCall("\(waitTasksName) requires a non-empty task_ids list"))
         }
         let mode = string(object["mode"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "wait_all"
         guard mode == "wait_all" || mode == "wait_any" else {
-            return .failure(.invalidCall("wait_tasks mode must be 'wait_all' or 'wait_any'"))
+            return .failure(.invalidCall("\(waitTasksName) mode must be 'wait_all' or 'wait_any'"))
         }
         // Unlike get_task_output, this tool is always in wait mode, so an
         // omitted timeout falls back to the default rather than polling.
@@ -349,7 +350,7 @@ enum LiveBackgroundTaskTools {
             .trimmingCharacters(in: .whitespacesAndNewlines),
             !taskID.isEmpty
         else {
-            return .failure(.invalidCall("kill_task requires a task_id"))
+            return .failure(.invalidCall("\(killTaskName) requires a task_id"))
         }
         // `killTask` is ownership-scoped: a task this session did not start
         // reports `.notFound` rather than being signalled.
