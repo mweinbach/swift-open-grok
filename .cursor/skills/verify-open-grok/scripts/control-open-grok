@@ -1,0 +1,247 @@
+#!/usr/bin/env zsh
+# control-open-grok — drive the real open-grok binary for project verification.
+# Invoked by .cursor/skills/verify-open-grok/SKILL.md. Agents: treat flags and
+# subcommands as literal.
+set -euo pipefail
+
+readonly script_path="${0:A}"
+readonly skill_dir="${script_path:h:h}"
+readonly repo_root="${skill_dir:h:h:h}"
+readonly default_scratch="${repo_root}/.build/workflow-safe"
+readonly default_bin="${default_scratch}/out/Products/Debug/open-grok"
+readonly version_file="${repo_root}/OPEN_GROK_VERSION"
+readonly state_dir="${VERIFY_OPENGROK_STATE_DIR:-${TMPDIR:-/tmp}/open-grok-verify-state}"
+readonly artifacts_root="${VERIFY_OPENGROK_ARTIFACTS:-${skill_dir}/artifacts}"
+
+die() {
+  print -u2 "control-open-grok: $*"
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+usage: control-open-grok <command> [args]
+
+  ensure-build          Build open-grok via workflows/swift-safe-verify.zsh if needed
+  launch [--force-build]
+                        Create an isolated OPENGROK_HOME run and print exports
+  doctor                Read-only health check for the active verify run
+  cli -- <args...>      Run open-grok with the active OPENGROK_HOME
+  evidence <feature> <label> -- <args...>
+                        Run a CLI command and write stdout/stderr/exit under artifacts/
+  cleanup               Remove the active run's OPENGROK_HOME (keeps artifacts)
+
+Environment (set by launch; override only when you know why):
+  VERIFY_OPENGROK_RUN_ID   Run id (directory name under /tmp)
+  OPENGROK_HOME            Isolated state root for this run
+  VERIFY_OPENGROK_BIN      Absolute path to the open-grok binary
+  VERIFY_OPENGROK_ARTIFACTS Evidence root (default: skill artifacts/)
+EOF
+}
+
+require_repo() {
+  [[ -f "${repo_root}/Package.swift" ]] || die "not inside swift-open-grok (missing Package.swift at ${repo_root})"
+  [[ -f "${version_file}" ]] || die "missing ${version_file}"
+}
+
+load_active_run() {
+  [[ -f "${state_dir}/active.env" ]] || die "no active run; run: control-open-grok launch"
+  # shellcheck disable=SC1090
+  source "${state_dir}/active.env"
+  [[ -n "${VERIFY_OPENGROK_RUN_ID:-}" ]] || die "active.env missing VERIFY_OPENGROK_RUN_ID"
+  [[ -n "${OPENGROK_HOME:-}" ]] || die "active.env missing OPENGROK_HOME"
+  [[ -n "${VERIFY_OPENGROK_BIN:-}" ]] || die "active.env missing VERIFY_OPENGROK_BIN"
+}
+
+expected_version() {
+  tr -d '[:space:]' <"${version_file}"
+}
+
+cmd_ensure_build() {
+  require_repo
+  local force="${1:-}"
+  local bin="${VERIFY_OPENGROK_BIN:-${default_bin}}"
+  local expected
+  expected="$(expected_version)"
+
+  if [[ "${force}" != "--force" && -x "${bin}" ]]; then
+    local reported
+    reported="$("${bin}" version --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null || true)"
+    if [[ "${reported}" == "${expected}" ]]; then
+      print -u2 -r -- "binary ok: ${bin} (${reported})"
+      return 0
+    fi
+    print -u2 "control-open-grok: binary at ${bin} reports '${reported}', expected '${expected}'; rebuilding"
+  fi
+
+  (
+    cd "${repo_root}"
+    zsh workflows/swift-safe-verify.zsh build --product open-grok
+  )
+  [[ -x "${bin}" ]] || die "build finished but binary missing: ${bin}"
+  local after
+  after="$("${bin}" version --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+  [[ "${after}" == "${expected}" ]] || die "built binary version ${after} != ${expected}"
+  print -u2 -r -- "built: ${bin} (${after})"
+}
+
+cmd_launch() {
+  require_repo
+  local force_build=0
+  if [[ "${1:-}" == "--force-build" ]]; then
+    force_build=1
+    shift
+  fi
+  (( $# == 0 )) || die "launch takes at most --force-build"
+
+  if (( force_build )); then
+    cmd_ensure_build --force
+  else
+    cmd_ensure_build
+  fi
+
+  local run_id
+  run_id="${VERIFY_OPENGROK_RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
+  local home="/tmp/open-grok-verify-${run_id}"
+  # Refuse to reuse a non-empty home that we did not just create empty.
+  if [[ -e "${home}" ]]; then
+    die "OPENGROK_HOME already exists: ${home} (pick a new VERIFY_OPENGROK_RUN_ID or cleanup)"
+  fi
+  mkdir -p "${home}" "${state_dir}" "${artifacts_root}"
+
+  local bin="${VERIFY_OPENGROK_BIN:-${default_bin}}"
+  [[ -x "${bin}" ]] || die "binary not executable: ${bin}"
+
+  cat >"${state_dir}/active.env" <<EOF
+export VERIFY_OPENGROK_RUN_ID='${run_id}'
+export OPENGROK_HOME='${home}'
+export VERIFY_OPENGROK_BIN='${bin}'
+export VERIFY_OPENGROK_ARTIFACTS='${artifacts_root}'
+export VERIFY_OPENGROK_REPO='${repo_root}'
+EOF
+
+  # Human status on stderr; stdout is eval-safe exports only.
+  print -u2 -r -- "launched verify run ${run_id}"
+  print -u2 -r -- "OPENGROK_HOME=${home}"
+  print -u2 -r -- "binary=${bin}"
+  print -r -- "export VERIFY_OPENGROK_RUN_ID='${run_id}'"
+  print -r -- "export OPENGROK_HOME='${home}'"
+  print -r -- "export VERIFY_OPENGROK_BIN='${bin}'"
+  print -r -- "export VERIFY_OPENGROK_ARTIFACTS='${artifacts_root}'"
+}
+
+cmd_doctor() {
+  require_repo
+  load_active_run
+
+  local expected reported paths_json home_from_paths
+  expected="$(expected_version)"
+  [[ -x "${VERIFY_OPENGROK_BIN}" ]] || die "binary missing: ${VERIFY_OPENGROK_BIN}"
+  [[ -d "${OPENGROK_HOME}" ]] || die "OPENGROK_HOME missing: ${OPENGROK_HOME}"
+  [[ "${OPENGROK_HOME}" == /tmp/open-grok-verify-* ]] || die "refusing non-isolated OPENGROK_HOME: ${OPENGROK_HOME}"
+
+  reported="$(
+    OPENGROK_HOME="${OPENGROK_HOME}" "${VERIFY_OPENGROK_BIN}" version --json \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])'
+  )"
+  [[ "${reported}" == "${expected}" ]] || die "version mismatch: binary=${reported} OPEN_GROK_VERSION=${expected}"
+
+  paths_json="$(OPENGROK_HOME="${OPENGROK_HOME}" "${VERIFY_OPENGROK_BIN}" paths --json)"
+  home_from_paths="$(print -r -- "${paths_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["opengrok_home"])')"
+  [[ "${home_from_paths}" == "${OPENGROK_HOME}" ]] || die "paths --json home ${home_from_paths} != ${OPENGROK_HOME}"
+
+  # Never drive the user's real ~/.opengrok under a verify run.
+  local real_home
+  real_home="${HOME}/.opengrok"
+  [[ "${OPENGROK_HOME}" != "${real_home}" ]] || die "OPENGROK_HOME points at the real user home"
+
+  print -r -- "doctor ok"
+  print -r -- "  binary: ${VERIFY_OPENGROK_BIN}"
+  print -r -- "  version: ${reported}"
+  print -r -- "  OPENGROK_HOME: ${OPENGROK_HOME}"
+  print -r -- "  artifacts: ${VERIFY_OPENGROK_ARTIFACTS}"
+  print -r -- "  note: product 'doctor' route is unwired; this helper is the verify health check"
+}
+
+run_cli() {
+  load_active_run
+  OPENGROK_HOME="${OPENGROK_HOME}" "${VERIFY_OPENGROK_BIN}" "$@"
+}
+
+cmd_cli() {
+  if [[ "${1:-}" != "--" ]]; then
+    die "usage: control-open-grok cli -- <open-grok args...>"
+  fi
+  shift
+  run_cli "$@"
+}
+
+cmd_evidence() {
+  (( $# >= 3 )) || die "usage: control-open-grok evidence <feature> <label> -- <args...>"
+  local feature="$1"
+  local label="$2"
+  shift 2
+  [[ "${1:-}" == "--" ]] || die "usage: control-open-grok evidence <feature> <label> -- <args...>"
+  shift
+
+  load_active_run
+  local dir="${VERIFY_OPENGROK_ARTIFACTS}/${feature}"
+  mkdir -p "${dir}"
+  local base="${dir}/${label}"
+  local out="${base}.stdout.txt"
+  local err="${base}.stderr.txt"
+  local meta="${base}.meta.txt"
+  local code=0
+
+  set +e
+  OPENGROK_HOME="${OPENGROK_HOME}" "${VERIFY_OPENGROK_BIN}" "$@" >"${out}" 2>"${err}"
+  code=$?
+  set -e
+
+  {
+    print -r -- "feature=${feature}"
+    print -r -- "label=${label}"
+    print -r -- "command=${VERIFY_OPENGROK_BIN} $*"
+    print -r -- "OPENGROK_HOME=${OPENGROK_HOME}"
+    print -r -- "exit=${code}"
+    print -r -- "stdout=${out}"
+    print -r -- "stderr=${err}"
+  } >"${meta}"
+
+  print -r -- "evidence written: ${meta} (exit ${code})"
+  return "${code}"
+}
+
+cmd_cleanup() {
+  if [[ ! -f "${state_dir}/active.env" ]]; then
+    print -r -- "cleanup: no active run"
+    return 0
+  fi
+  load_active_run
+  if [[ "${OPENGROK_HOME}" == /tmp/open-grok-verify-* && -d "${OPENGROK_HOME}" ]]; then
+    rm -rf "${OPENGROK_HOME}"
+    print -r -- "removed ${OPENGROK_HOME}"
+  else
+    die "refusing to remove unexpected OPENGROK_HOME: ${OPENGROK_HOME}"
+  fi
+  rm -f "${state_dir}/active.env"
+  print -r -- "cleanup done (artifacts kept under ${VERIFY_OPENGROK_ARTIFACTS})"
+}
+
+main() {
+  (( $# >= 1 )) || { usage; exit 64; }
+  local cmd="$1"
+  shift
+  case "${cmd}" in
+    ensure-build) cmd_ensure_build "${1:-}" ;;
+    launch) cmd_launch "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    cli) cmd_cli "$@" ;;
+    evidence) cmd_evidence "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command: ${cmd} (try --help)" ;;
+  esac
+}
+
+main "$@"
