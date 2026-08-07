@@ -456,8 +456,13 @@ enum LiveMemoryTools {
 
     static var toolNames: Set<String> { [searchToolName, getToolName] }
 
+    /// Only advertised when a memory backend exists. Rust injects these into the
+    /// default toolset only when `memory_backend.is_some()`
+    /// (`xai-grok-agent/builder.rs:745-752`) and strips them afterward when it
+    /// is none (`builder.rs:805-817`).
     static func toolSpecs(configuration: LiveMemoryConfiguration) -> [ToolSpec] {
-        [
+        guard configuration.enabled else { return [] }
+        return [
             ToolSpec(
                 name: searchToolName,
                 description: """
@@ -512,6 +517,11 @@ enum LiveMemoryTools {
                 ])
             ),
         ]
+    }
+
+    /// Names the model may call. Matches `toolSpecs` — empty when memory is off.
+    static func advertisedToolNames(configuration: LiveMemoryConfiguration) -> Set<String> {
+        Set(toolSpecs(configuration: configuration).map(\.name))
     }
 
     /// Run one memory tool call. Returns the prompt text the model sees.

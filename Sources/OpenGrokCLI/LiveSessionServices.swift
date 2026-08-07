@@ -41,10 +41,8 @@ struct LiveSessionServices: Sendable {
         self.memory = memory
         self.goal = goal
         var specs: [ToolSpec] = []
-        if memory != nil {
-            specs += LiveMemoryTools.toolSpecs(
-                configuration: memory?.configuration ?? .disabled
-            )
+        if let memory {
+            specs += LiveMemoryTools.toolSpecs(configuration: memory.configuration)
         }
         if goal != nil {
             specs += LiveGoalTools.toolSpecs(goalIsActive: goalIsActive)
@@ -82,7 +80,7 @@ struct LiveSessionServices: Sendable {
 
     /// Dispatch one session-service tool call.
     func invoke(name: String, arguments: JSONValue) async -> String {
-        if LiveMemoryTools.toolNames.contains(name) {
+        if let memory, LiveMemoryTools.advertisedToolNames(configuration: memory.configuration).contains(name) {
             return await LiveMemoryTools.invoke(
                 name: name,
                 arguments: arguments,
