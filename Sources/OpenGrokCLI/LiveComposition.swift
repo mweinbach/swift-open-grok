@@ -1445,13 +1445,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     /// `--json-schema` run whose output does not match the schema. Refusing is
     /// the only honest option until the corresponding subsystem lands.
     ///
-    /// Flags deliberately absent from this list are the ones whose absence is
-    /// merely a missing refinement rather than a wrong answer (`--verbatim`,
-    /// `--no-plan`, `--include-partial-messages`, the hidden operational
-    /// flags), plus everything under `common.permissions`, which the
-    /// permission and sandbox layer consumes. `--reasoning-effort` left this
-    /// list when `resolveSamplingConfiguration` started validating and
-    /// applying it to the initial session.
+    /// Flags deliberately absent from this list:
+    /// - `--verbatim` and `--include-partial-messages`: output-shaping
+    ///   preferences whose wrong answer is incomplete streaming, not a silently
+    ///   widened tool surface — tolerated until structured output honors them.
+    /// - `--no-auto-update`: excluded while the update composition wires it.
+    /// - Everything under `common.permissions`, which the permission and
+    ///   sandbox layer consumes.
+    /// `--reasoning-effort` left this list when `resolveSamplingConfiguration`
+    /// started validating and applying it to the initial session.
     private static func unhonoredLaunchFlag(_ options: CLIExecutionOptions) -> String? {
         if options.agentOptions.tools != nil { return "--tools" }
         if options.agentOptions.disallowedTools != nil { return "--disallowed-tools" }
@@ -1459,11 +1461,29 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         if options.agentOptions.agentsJSON != nil { return "--agents" }
         if options.agentOptions.maxTurns != nil { return "--max-turns" }
         if options.agentOptions.noSubagents { return "--no-subagents" }
+        if options.agentOptions.noPlan { return "--no-plan" }
+        if options.agentOptions.noAskUser { return "--no-ask-user" }
         if options.agentOptions.rules != nil { return "--rules" }
         if options.agentOptions.systemPromptOverride != nil { return "--system-prompt-override" }
         if options.jsonSchema != nil { return "--json-schema" }
         if options.restoreCode { return "--restore-code" }
         if options.advanced.reauthenticate { return "--reauth" }
+        if options.advanced.storageMode != nil { return "--storage-mode" }
+        if options.advanced.clientIdentifier != nil { return "--client-identifier" }
+        if options.advanced.hunkTrackerMode != nil { return "--hunk-tracker-mode" }
+        if options.advanced.installer != nil { return "--installer" }
+        if options.advanced.compactionMode != nil { return "--compaction-mode" }
+        if options.advanced.compactionDetail != nil { return "--compaction-detail" }
+        if options.advanced.terminal { return "--terminal" }
+        if options.advanced.fsRead { return "--fs-read" }
+        if options.advanced.fsWrite { return "--fs-write" }
+        if options.advanced.todoGate { return "--todo-gate" }
+        if options.advanced.logSampling { return "--log-sampling" }
+        if options.advanced.noWaitForBackground { return "--no-wait-for-background" }
+        // Default is 600 (`cli.rs:677-734`); any other value means the caller
+        // set `--background-wait-timeout` explicitly.
+        if options.advanced.backgroundWaitTimeoutSeconds != 600 { return "--background-wait-timeout" }
+        if options.advanced.forceLogin { return "--force-login" }
         // Silently keeping the default host when the caller named another one
         // sends the request somewhere they did not ask for, which is worse than
         // refusing to start.
