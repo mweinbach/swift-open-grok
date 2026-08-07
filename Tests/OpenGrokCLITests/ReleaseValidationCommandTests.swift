@@ -5,7 +5,7 @@ import OpenGrokReleaseValidation
 
 @Suite("Release validation command")
 struct ReleaseValidationCommandTests {
-    private let version = "0.1.220-open-grok.54"
+    private let version = "0.1.220-open-grok.57"
     private let commit = "abc1234"
     private let root = "/tmp/open-grok-release-smoke"
 
@@ -98,7 +98,7 @@ struct ReleaseValidationCommandTests {
                     if arguments == ["--version"] {
                         return ReleaseValidationProcessOutput(
                             exitStatus: 0,
-                            stdout: "Open Grok 0.1.220-open-grok.54 (abc1234)\n",
+                            stdout: "Open Grok 0.1.220-open-grok.57 (abc1234)\n",
                             stderr: ""
                         )
                     }
@@ -112,7 +112,7 @@ struct ReleaseValidationCommandTests {
                     if arguments == ["--version"] {
                         return ReleaseValidationProcessOutput(
                             exitStatus: 0,
-                            stdout: "Open Grok 0.1.220-open-grok.54 (abc1234)\n",
+                            stdout: "Open Grok 0.1.220-open-grok.57 (abc1234)\n",
                             stderr: ""
                         )
                     }

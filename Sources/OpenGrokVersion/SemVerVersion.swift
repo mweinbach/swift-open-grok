@@ -1,7 +1,7 @@
 // SemVerVersion.swift
 //
 // A minimal Semantic Versioning parser that preserves the Open Grok
-// prerelease/channel strings (e.g. `0.1.220-open-grok.54`). The Rust reference
+// prerelease/channel strings (e.g. `0.1.220-open-grok.57`). The Rust reference
 // uses the `semver` crate; this Swift port implements the subset of semver
 // required by `xai-grok-version::installed_semver` and the Open Grok release
 // channel format.
@@ -224,13 +224,13 @@ extension SemVerVersion: Comparable {
 // MARK: - Identifier helpers
 
 extension SemVerVersion {
-    /// `true` when the version has a prerelease tag (e.g. `-open-grok.54`).
+    /// `true` when the version has a prerelease tag (e.g. `-open-grok.57`).
     public var hasPrerelease: Bool { !prerelease.isEmpty }
 
     /// `true` when the version has build metadata (e.g. `+abc1234`).
     public var hasBuild: Bool { !build.isEmpty }
 
-    /// The prerelease tag as a dot-joined string (e.g. `open-grok.54`), or
+    /// The prerelease tag as a dot-joined string (e.g. `open-grok.57`), or
     /// empty when absent.
     public var prereleaseString: String {
         prerelease.joined(separator: ".")

@@ -1,11 +1,11 @@
 {
   "$schema": "open-grok/protocol-fixtures/provenance",
   "generatedAt": "2026-08-06",
-  "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
-  "previousReferenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+  "referenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
+  "previousReferenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
   "note": "Fixtures are provenance-labelled compatibility artifacts for implemented foundation formats. Binary goldens are re-encoded or structurally decoded in tests (OTLP, GCRX, git zlib metadata, hunk/PTY/tracing/storage keys) rather than digest-only validation.",
-  "recaptureNote": "Every entry below was re-evaluated against the 2026-08-05 re-pin from 80dff0a9 to 9ed09e2a. For each family the upstream Rust source paths were diffed across the two refs; a family is 'unchanged (verified)' only when that diff is empty or provably non-semantic for the asserted content, and 'recaptured' when the fixture had to be re-derived from the new-pin source. Per-file evidence lives in each fixture's own `provenance` block.",
-  "method": "Hand-derivation from the Rust reference at /Users/mweinbach/Projects/xai-grok-build-reference with file:line provenance, cross-checked against the corresponding Swift port target. No network access; the reference checkout is read-only and was left clean.",
+  "recaptureNote": "Every entry below was re-evaluated against the 2026-08-06 re-pin from 9ed09e2a to 70002584 (the 3-commit Meta-provider delta). For each family the upstream Rust source paths were diffed across the two refs; a family is 'unchanged (verified)' only when that diff is empty or provably non-semantic for the asserted content, and 'recaptured' when the fixture had to be re-derived from the new-pin source. The Meta delta touched only xai-grok-models, xai-grok-pager(-minimal), xai-grok-sampler, xai-grok-sampling-types, xai-grok-shell, OPEN_GROK_VERSION, and docs — no fixture family's source moved, so the only recaptures are the two release-stamped artifacts. Per-file evidence lives in each fixture's own `provenance` block.",
+  "method": "Hand-derivation from the Rust reference at /Users/mweinbach/Projects/grok-build with file:line provenance, cross-checked against the corresponding Swift port target. No network access; the reference checkout is read-only and was left clean.",
   "entries": [
     {
       "file": "PROVENANCE.json",
@@ -18,7 +18,7 @@
       "verdict": "unchanged (verified)",
       "family": "acp",
       "referenceSources": ["crates/codegen/xai-acp-lib"],
-      "evidence": "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-acp-lib => empty (source and Cargo.toml both untouched)."
+      "evidence": "git diff 9ed09e2a..70002584 -- crates/codegen/xai-acp-lib => empty (source and Cargo.toml both untouched)."
     },
     {
       "file": "cli-version-and-home.json",
@@ -30,11 +30,11 @@
         "crates/codegen/xai-grok-config/src/paths.rs",
         "crates/codegen/xai-grok-paths"
       ],
-      "evidence": "OPEN_GROK_VERSION moved 0.1.220-open-grok.53 -> .54. The xai-grok-version, xai-grok-config/src/paths.rs, and xai-grok-paths surfaces asserted by this fixture are unchanged across 80dff0a9..9ed09e2a."
+      "evidence": "OPEN_GROK_VERSION moved 0.1.220-open-grok.54 -> .57. The xai-grok-version, xai-grok-config/src/paths.rs, and xai-grok-paths surfaces asserted by this fixture are unchanged across 9ed09e2a..70002584."
     },
     {
       "file": "config-workspace-codemode-keys.json",
-      "verdict": "recaptured",
+      "verdict": "unchanged (verified)",
       "family": "config/workspace/code-mode keys",
       "referenceSources": [
         "crates/codegen/xai-grok-config-types/src/flags.rs",
@@ -42,7 +42,7 @@
         "crates/codegen/xai-grok-workspace-types/src/types/permission.rs",
         "crates/codegen/xai-grok-code-mode-protocol/src/runtime.rs"
       ],
-      "evidence": "git diff 80dff0a9..9ed09e2a is empty for the asserted ConfigSource, RuleAction, workspace permission, and Code Mode runtime-default surfaces. The 30_000ms exec default remains the one unresolved port drift recorded by this fixture."
+      "evidence": "git diff 9ed09e2a..70002584 is empty for the asserted ConfigSource, RuleAction, workspace permission, and Code Mode runtime-default surfaces. The 30_000ms exec default remains the one unresolved port drift recorded by this fixture."
     },
     {
       "file": "crash-gcrx-format.json",
@@ -52,42 +52,42 @@
         "crates/codegen/xai-crash-handler/src/format.rs",
         "crates/codegen/xai-crash-handler/src/handler.rs"
       ],
-      "evidence": "git diff 80dff0a9..9ed09e2a is empty for format.rs and handler.rs, so the GCRX layout and signal capture remain unchanged; only the sample app_version was re-encoded to the .54 release marker."
+      "evidence": "git diff 9ed09e2a..70002584 -- crates/codegen/xai-crash-handler => empty, so the GCRX layout and signal capture remain unchanged; only the sample app_version was re-encoded to the .57 release marker."
     },
     {
       "file": "crash-gcrx-sample.bin",
       "verdict": "recaptured",
       "family": "crash-gcrx",
       "referenceSources": ["crates/codegen/xai-crash-handler/src/format.rs"],
-      "evidence": "Re-encoded 64-byte header with app_version = 0.1.220-open-grok.54. All other bytes are identical to the prior golden."
+      "evidence": "Re-encoded 64-byte header with app_version = 0.1.220-open-grok.57 (in-place same-length substitution at offset 32). All other bytes are identical to the prior golden."
     },
     {
       "file": "git-loose-blob-hello.zlib",
       "verdict": "unchanged (verified)",
       "family": "git-object",
       "referenceSources": ["crates/codegen/xai-gix-status"],
-      "evidence": "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-gix-status => empty. The artifact encodes git's own loose-object framing, which the reference does not define."
+      "evidence": "git diff 9ed09e2a..70002584 -- crates/codegen/xai-gix-status => empty. The artifact encodes git's own loose-object framing, which the reference does not define."
     },
     {
       "file": "git-object-and-index.json",
       "verdict": "unchanged (verified)",
       "family": "git-object",
       "referenceSources": ["crates/codegen/xai-gix-status"],
-      "evidence": "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-gix-status => empty."
+      "evidence": "git diff 9ed09e2a..70002584 -- crates/codegen/xai-gix-status => empty."
     },
     {
       "file": "hunk-tracker-snapshot.json",
       "verdict": "unchanged (verified)",
       "family": "hunk-tracker",
       "referenceSources": ["crates/codegen/xai-hunk-tracker/src/types.rs"],
-      "evidence": "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-hunk-tracker => empty for the persisted wire declarations. HunkTrackerSnapshot, SessionStats, and the HunkSource variant set are untouched, so the wire shape is identical."
+      "evidence": "git diff 9ed09e2a..70002584 -- crates/codegen/xai-hunk-tracker => empty for the persisted wire declarations. HunkTrackerSnapshot, SessionStats, and the HunkSource variant set are untouched, so the wire shape is identical."
     },
     {
       "file": "otlp-export-trace-grpc.bin",
       "verdict": "unchanged (verified)",
       "family": "otlp",
       "referenceSources": ["Cargo.lock (opentelemetry-proto)", "crates/codegen/xai-grok-telemetry/src/otlp_http.rs"],
-      "evidence": "git diff 80dff0a9..9ed09e2a is empty for the OTLP exporter surface; the protobuf schema and framing remain unchanged."
+      "evidence": "git diff 9ed09e2a..70002584 is empty for Cargo.lock and the OTLP exporter surface; the protobuf schema and framing remain unchanged."
     },
     {
       "file": "otlp-export-trace-http.pb",
@@ -108,14 +108,14 @@
       "verdict": "unchanged (verified)",
       "family": "pty",
       "referenceSources": ["crates/codegen/ptyctl"],
-      "evidence": "git diff 80dff0a9..9ed09e2a -- crates/codegen/ptyctl => empty. No behavioral change."
+      "evidence": "git diff 9ed09e2a..70002584 -- crates/codegen/ptyctl => empty. No behavioral change."
     },
     {
       "file": "sqlite-journal-modes.json",
       "verdict": "unchanged (verified)",
       "family": "sqlite-journal",
       "referenceSources": ["crates/codegen/xai-sqlite-journal"],
-      "evidence": "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-sqlite-journal => empty. The fixture's referenceEnvOverride key remains documentation of the existing port extension, not a pin change."
+      "evidence": "git diff 9ed09e2a..70002584 -- crates/codegen/xai-sqlite-journal => empty. The fixture's referenceEnvOverride key remains documentation of the existing port extension, not a pin change."
     },
     {
       "file": "tracing-w3c-traceparent.json",
@@ -126,7 +126,7 @@
         "crates/codegen/xai-tracing-macros",
         "crates/codegen/xai-grok-telemetry/src/otel_layer/redact.rs"
       ],
-      "evidence": "git diff 80dff0a9..9ed09e2a is empty for the tracing and redaction surfaces asserted here; the denylist remains untouched."
+      "evidence": "git diff 9ed09e2a..70002584 is empty for the tracing and redaction surfaces asserted here; the denylist remains untouched."
     }
   ],
   "openPortDrift": [

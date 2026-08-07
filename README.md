@@ -10,7 +10,7 @@ or written).
 > **Status (2026-08-06):** The committed port is clean at checkpoint
 > `1c4ed0c55e0c39722925d026af46b8ed0936be65`, including R16–R19 work that
 > postdates the older status snapshot. The current Rust baseline is
-> `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (`0.1.220-open-grok.54`); see
+> `70002584da34e4c37ea14a3bce35341b7d04f9a7` (`0.1.220-open-grok.57`); see
 > `PORT_STATUS.md` for the pinned fixture provenance and remaining port drift.
 > Workers must still **not** invoke
 > SwiftPM directly; the sole integration path is the serialized verifier below.

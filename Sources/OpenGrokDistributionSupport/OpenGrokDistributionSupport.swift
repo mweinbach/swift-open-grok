@@ -39,8 +39,8 @@ import Foundation
 public enum OpenGrokDistributionSupport {
     /// The Rust reference revision every rule in this target was transcribed
     /// from. Kept in lockstep with `ProtocolFixtures/PROVENANCE.json`.
-    public static let referenceRevision = "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05"
+    public static let referenceRevision = "70002584da34e4c37ea14a3bce35341b7d04f9a7"
 
     /// The upstream release pinned at ``referenceRevision`` (`OPEN_GROK_VERSION`).
-    public static let referencePinnedRelease = "0.1.220-open-grok.54"
+    public static let referencePinnedRelease = "0.1.220-open-grok.57"
 }

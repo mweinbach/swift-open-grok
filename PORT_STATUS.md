@@ -1,12 +1,81 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-06 (Wave 11 integration and macOS green gate)
+**As of:** 2026-08-06 (Wave 12 Meta re-pin, fundamentals closures, and macOS green gate)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
-**Reference:** `xai-org/grok-build` at `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (re-pinned **2026-08-05** from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`. The prior 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` (`/tmp/open-grok-reference` when present).
-**Fixture pin:** `ProtocolFixtures/` was re-evaluated against `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` on 2026-08-06, with `80dff0a9dcb24121b976b9f920fbe442af40ea88` recorded as the immediate previous revision. CLI and crash release-stamped artifacts were recaptured for `0.1.220-open-grok.54`; unchanged families carry explicit `80dff0a9..9ed09e2a` diff evidence.
+**Reference:** `xai-org/grok-build` at `70002584da34e4c37ea14a3bce35341b7d04f9a7` (re-pinned **2026-08-06** from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05`; +3 commits, release `v0.1.220-open-grok.57` — the Meta API provider delta: `0f8dc87b` provider, `666b2ceb` login/settings, `70002584` stored-key unlock fix. The prior 2026-08-05 re-pin moved from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`; before that the 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` (`/tmp/open-grok-reference` when present).
+**Fixture pin:** `ProtocolFixtures/` was re-evaluated against `70002584da34e4c37ea14a3bce35341b7d04f9a7` on 2026-08-06, with `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` recorded as the immediate previous revision. The Meta delta touched no fixture family's upstream source (all fourteen family diffs across `9ed09e2a..70002584`, including `Cargo.lock`, are empty), so the only recaptures are the two release-stamped artifacts (CLI version fixture and the GCRX sample, both restamped `0.1.220-open-grok.57` — the GCRX golden by same-length in-place substitution at offset 32); unchanged families carry explicit `9ed09e2a..70002584` diff evidence.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
+
+## Wave 12 — Meta provider catch-up, re-pin to 70002584, and fundamentals closures (2026-08-06)
+
+**Scope.** Re-pinned the reference from `9ed09e2a` (v0.1.220-open-grok.54) to `70002584` (v0.1.220-open-grok.57): a 3-commit upstream delta adding the Meta API provider (`0f8dc87b` provider, `666b2ceb` login/settings, `70002584` Meta/Wafer stored-key unlock fix). Alongside the delta port, three fundamentals audits (TUI/animations, slash commands + completions, reasoning effort + backends) drove closures of pre-existing implemented-unwired gaps. Six implementation slices ran as a coordinated wave with disjoint ownership; the lead landed the re-pin, version bump, and fixture recapture.
+
+### Verification snapshot (2026-08-06, authoritative serial gate)
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh build` | Exit 0. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` | Exit 0. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | **Exit 0** — 102 Swift Testing runs, **4,195 tests / 602 suites**, zero failures (2026-08-06, after the wave's regression fixes and the re-pin landed). |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | Exit 0 (verified by slice B3-CLI-2). |
+
+### Meta provider — live end-to-end for new sessions
+
+- **Types** (`OpenGrokSamplingTypes`): `ModelProvider.meta` (+ serde aliases `meta_ai`/`meta_api`), `ResponsesDialect.meta`, `ProviderProfile.meta` (responses-only, FunctionEnvelope, native web search, API-key-only, xAI services denied; types.rs:1349-1362). Decoder previously failed closed on `"meta"`; all switch sites were compiler-forced.
+- **Models** (`OpenGrokModels`): `MetaModels.swift` ports `meta_models.rs` (curated Muse Spark catalog, `https://api.meta.ai/v1` + `OPENGROK_META_API_BASE_URL`, `META_API_KEY`, trusted-host rule, env-first/stored-on-trusted key selection, `/models` slug intersection, error redaction); `ModelCatalogPartition.meta` threaded through merge chain, `LiveCatalogRefresh`, and `ModelsManager` (fingerprint publish gate).
+- **Sampler** (`OpenGrokSampler`): real `MetaProvider` (registry 7→8, between DeepSeek and OpenCodeGo), `patchMetaResponsesRequest` (drops include/prompt_cache_key/prompt_cache_retention/store, reasoning-typed input items, reasoning.summary; effort passes through unchanged, unlike DeepSeek's remap), cache-key nil, metadata no-op, normalizes-events true. Drift tests re-pinned to 8 providers.
+- **CLI** (`OpenGrokCLI`/`OpenGrokProviderSession`): env + stored credential resolution for meta, endpoint constants, `--provider meta` (+ aliases), `--model meta:…` cold start proven against the mock server, meta credential fingerprint on the production snapshot.
+- **Settings UI**: `meta_api_key` secret row (catalog 89→90) and a real secret-save write path (see below).
+
+### Security-shaped closures (quoted lines live in the slice reports; landed code cited here)
+
+- **Stored-key trusted-host restriction now enforced on the LIVE path.** Upstream's fix commit gates stored Meta/Wafer keys behind `trusted_built_in_session_endpoint` (config.rs:5430-5437). The Swift gate existed but its only live consumer was the auxiliary-model path; `LiveCredentialResolver.resolve` now takes the model's `baseURL` and withholds stored provider keys from untrusted hosts (env keys resolve unconditionally, matching `select_api_key`). Ported the resolver half of `stored_meta_and_wafer_keys_resolve_only_on_trusted_hosts` (config.rs:7409-7458). Note: the Wafer *unlock* half of upstream's fix was already correct here — the port never had that bug.
+- **Raw-input replay gating** (`ConversationExtensions.swift` ~454-469): the `.codexRawInput` splice is now dialect-gated fail-closed per upstream `raw_responses_input_replacements` (conversation.rs:1614-1650) — Codex raw items replay only into the Codex dialect; DeepSeek/Meta explicitly replay nothing.
+- **Secret-save write path**: the settings modal's secret rows now write/clear through the same provider-scoped store the credential resolver reads (`storeScopedAPIKey`/`clearScopedAPIKey`; upstream `store_provider_api_key`, effects/mod.rs:832-843), then refresh the credential snapshot and spawn a catalog refresh. Reset on a secret row routes to clear (the generic reset path classifies secrets `notPersistable` and would have silently swallowed it).
+- **Silent provider fallback killed**: the embedded-corpus provider decode no longer coerces unknown providers to `.xai` via `try?`; unknown providers fail loud, matching upstream serde strictness.
+
+### Fundamentals closures (from the three audits)
+
+- **Reasoning effort now reaches the wire.** Before this wave no effort of any kind reached an outbound live request: the single live `SamplingClient` construction dropped `reasoningEffort`/`reasoningSummary`/`codexMultiAgentV2`/temperature/topP/maxCompletionTokens/contextWindow, and `--reasoning-effort` was parsed, advertised, and consumed by nothing. All are now threaded from the catalog entry through `OpenGrokLiveSamplingConfiguration` into `SamplerConfig`, with live-seam tests asserting the outbound JSON against the mock server. `/model <name> <effort>` grammar, `/effort`, and the composer effort label landed; effort presence in `SamplerConfig` doubles as the Fireworks effort-support gate (client.rs:1806-1813).
+- **Request shaping upstream-exact**: base Responses `reasoning` object (always present; `max|ultra → xhigh` clamp; summary "concise"; conversation.rs:3892-3895), Codex keeps the emptied `reasoning` object, Messages projection gains `output_config`/`thinking: adaptive-summarized`/`tool_choice` (conversation.rs:5313-5352), Fireworks/Wafer `reasoning_effort` strips restored, Codex unknown-event swallow tightened to literal `unknown variant` (provider.rs:834-847).
+- **Animation clock exists.** `PagerMotion.swift` was a complete, tested port of every upstream animation constant with no clock driving it. A demand-driven wall-clock ticker now runs at the controller seam (30fps/83ms-slow, event_loop.rs:3172-3189 semantics), `PagerFrameClock` coalesces paints at the 16ms min-draw interval, and the accent wave, finish flash, pending-user diamond, welcome shimmer, and background-task spinner are live at their render sites. Turn elapsed time derives from the motion clock; `tokenCount` (estimate) and context-ramp tokens feed the status renderers. The `ui.display_refresh.auto_cadence_enabled` settings row gained its reader (cadence policy); the `show_tips` row was hidden (no tips banner exists — a registered no-op row violates §4).
+- **Slash suggestion engine at upstream parity**: nucleo-exact fuzzy scoring with smart case (verified against the rev grok-build pins), MRU recording/boost persisted to `slash-mru.json`, the 6-row cap removed with scrolling, curated bare-`/` order, `/theme` + `/effort` + `/export` argument completion, Esc-close and PageUp/Down paging. The invented `priority` tiebreak was removed (divergence-removal; `/q` cold now offers `queue` first like upstream).
+- **New commands with verified backing**: `/resume` (session picker + runtime swap + transcript repaint; `mutatesConversationHistory`), `/usage` (alias `cost`; renders the previously-unreferenced `LiveUsageComposition.report`), `/btw`, `/mcps` (connection results previously computed then discarded are now retained), `/effort`, `/rename` (alias `title`; new stored-title write). Reachability tests dispatch each through the real controller and the live adapter.
+
+### Regressions caught by the serial gate and fixed in-wave
+
+- **Intermittent OpenGrokPagerTests hang** (wedged one full-suite run 18+ minutes): a cancel arriving while `OpenGrokPager.run` was between `.starting` and publishing `activeSession` was silently swallowed, leaving the run awaiting a session stream never told to stop (same hole one layer down in the forwarding frontend). Pre-existing bug exposed by the wave's new tests; both sites now latch and honor the early cancel. Verified with 900 serial contention runs, 0 hangs.
+- **/effort usage error painted under the welcome overlay** (real user-facing bug found by a live-seam test): the welcome overlay blanks the whole transcript and was only dismissed at `turnStarted`, so command errors on the welcome screen never reached the terminal. All transcript appends now dismiss welcome through one helper. Cost: a notice on the welcome screen replaces the logo instead of toasting over it like upstream.
+- Esc dropdown-close, shimmer rest-color, and the `/resume` deferral-flag pin were fixed by their owning slices.
+
+### Corpus and corpus-consumer fixes
+
+- `DefaultModelsJSON.swift` regenerated **byte-for-byte** against upstream `default_models.json` at `70002584` (13 → 20 models). The old corpus had drifted below even the previous pin (missing `fireworks:kimi-k3`, `fireworks:kimi-k3-fast`, two `deepseek:` entries) and its `web_search` default named a model absent from its own array (`grok-4.20-multi-agent`), so auxiliary web-search routing only worked via the bare-xAI fallback; it now resolves `grok-4.5` through the catalog, which the live session consumes.
+
+### Re-pin mechanics
+
+- `OPEN_GROK_VERSION`, the regeneration script/plugin defaults, `CompiledVersion.generated.swift`, `referencePinnedRelease`, and `referenceRevision` all moved to `.57`/`70002584`. Version-pinned tests updated.
+- `ProtocolFixtures/`: all fourteen family diffs across `9ed09e2a..70002584` (including `Cargo.lock`) are empty; the only recaptures are the two release-stamped artifacts (`cli-version-and-home.json`, `crash-gcrx-format.json` + `crash-gcrx-sample.bin` restamped by same-length in-place substitution at offset 32). Every fixture's revision chain advanced; `manifest.json` sizes/hashes regenerated.
+
+### Deliberately not done (recorded, with reasons)
+
+- **Live-session credential rebind** after a settings-modal key save (upstream task_result.rs:1087-1300, effects/mod.rs:3602-3647, the ACP `open-grok/meta/models/apply` extension): new keys apply to new sessions and `/model` switches only; the saved-key notice says so. The whole per-provider rebind pipeline (~220 lines + effects + ACP method family) is absent for *every* provider, not just Meta.
+- **`/login`/`/logout` in-pager**: not registered — xAI login blocks on a plaintext stdin read while the TUI owns fd 0 in raw mode, and Codex OAuth prints to stdout mid-flow with no TUI suspend/resume. API-key entry is covered in-TUI by the (now functional) settings secret rows. Registering OAuth rows with no working backing would violate §4.
+- **Pager-minimal auth rendering**: upstream's one-line Meta delta to `pager-minimal/src/auth.rs` lands inside a pre-existing gap — the Swift target ports only the run-loop shell, not `auth.rs`/`welcome.rs`. Deferred as a whole.
+- **`.idleMonitor` turn indicator**: render side exists; deliberately unproduced — this composition has no idle-watcher feed, and a guessed glyph would claim watchers that don't exist.
+- **xAI/Codex halves of `spawn_background_refresh`**: not fired — the CLI catalog store has no live xAI/Codex list transport, so the call would be a refresh-shaped no-op. Meta/DeepSeek/Kimi/Fireworks/OpenCodeGo/Wafer partitions refresh post-readiness (reachability-tested).
+- **`/usage` billing arms** (`show`/`manage`): absent with upstream's non-consumer error copy — no billing surface exists in the port.
+- **Display-refresh probe**: `probedRefreshHz` is nil (no probe FFI); auto-cadence resolves to upstream's `probe_skip` default, matching the settings row's restart-required caption.
+- **Matcher scope**: fzf atom operators (`^ $ ! '`), diacritic folding, and highlight indices not ported (no consumer); ranked sort skips the builtin-over-plugin tiebreak (definitions carry no source tag).
+
+### Pre-existing gaps found by this wave's audits, recorded but NOT fixed here
+
+- **xAI `x_search` replay**: upstream replays `XSearch` history into xAI-dialect Responses requests as `x_search_call` items (conversation.rs:1627-1629, 1978-1997); the Swift builder has never done this — `.xSearch` backend items are captured from streams but never re-sent. Needs its own slice and tests.
+- **Stale ledger corrections**: the wave-8 deferral line listing `/rewind` `/jump` `/delete` as unregistered (formerly at line ~621) predates their registration and is superseded by this section. `/recall`, `/flush`, and `/goal` are Swift-only rows with no upstream command-file counterpart (they map onto ported memory/goal features); recorded here as a deliberate divergence pending an upstream-parity decision.
+- **Orphaned pager targets**: `OpenGrokPagerModel`/`PagerConversationUI`/`PagerOperationsUI`/`PagerRuntime` remain importer-less from `Sources/` (first recorded 2026-08-04); the animation work consumed `PagerRuntime`'s design but landed the ticker at the controller seam, so the orphan status is unchanged.
+- Inline (`--no-alt-screen`) remains a 12-row bottom viewport without native scrollback; interactive `--minimal` still renders as inline; the scrollbar widget, tips banner, `/context` bar renderer consumers, and FPS HUD remain absent (all L/M-sized, listed in the TUI audit).
 
 ## Current integration verification snapshot (2026-08-06)
 

@@ -4,7 +4,7 @@
 //
 // Tests translate the Rust `xai-grok-version/src/lib.rs` `tests` module and
 // add coverage for the minimal semver parser, the `GROK_TEST_VERSION` runtime
-// override, and the Open Grok prerelease format `0.1.220-open-grok.54`.
+// override, and the Open Grok prerelease format `0.1.220-open-grok.57`.
 
 import Foundation
 import Testing
@@ -15,7 +15,7 @@ struct OpenGrokVersionTests {
 
     private var expectedCompiledVersion: String {
         ProcessInfo.processInfo.environment["GROK_TEST_EXPECTED_COMPILED_VERSION"]
-            ?? "0.1.220-open-grok.54"
+            ?? "0.1.220-open-grok.57"
     }
 
     // MARK: - Compiled version constant
@@ -39,7 +39,7 @@ struct OpenGrokVersionTests {
             .split(whereSeparator: \.isNewline)
             .first
             .map(String.init) ?? ""
-        #expect(marker == "0.1.220-open-grok.54")
+        #expect(marker == "0.1.220-open-grok.57")
         #expect(OpenGrokVersion.compiledVersion == marker)
     }
 
@@ -209,12 +209,12 @@ struct OpenGrokVersionTests {
 
     @Test("SemVerVersion parses the Open Grok release string")
     func semverParsesOpenGrokRelease() throws {
-        let v = try SemVerVersion.parse("0.1.220-open-grok.54")
+        let v = try SemVerVersion.parse("0.1.220-open-grok.57")
         #expect(v.major == 0)
         #expect(v.minor == 1)
         #expect(v.patch == 220)
-        #expect(v.prerelease == ["open-grok", "54"])
-        #expect(v.description == "0.1.220-open-grok.54")
+        #expect(v.prerelease == ["open-grok", "57"])
+        #expect(v.description == "0.1.220-open-grok.57")
     }
 
     @Test("SemVerVersion trims surrounding whitespace")
@@ -412,7 +412,7 @@ struct OpenGrokVersionTests {
     @Test("SemVer open-grok release ordering: prerelease < stable")
     func semverOpenGrokReleaseOrdering() throws {
         let release = try SemVerVersion.parse("0.1.220")
-        let pre = try SemVerVersion.parse("0.1.220-open-grok.54")
+        let pre = try SemVerVersion.parse("0.1.220-open-grok.57")
         #expect(pre < release)
     }
 
@@ -585,7 +585,7 @@ struct OpenGrokVersionTests {
 
         // If the package root has an OPEN_GROK_VERSION file (copied into the
         // temp package root), the script must use its first line. Otherwise it
-        // uses the default `0.1.220-open-grok.54`.
+        // uses the default `0.1.220-open-grok.57`.
         let tempVersionFile = tempDir.appendingPathComponent("OPEN_GROK_VERSION")
         if FileManager.default.fileExists(atPath: tempVersionFile.path),
            let fileContents = try? String(contentsOf: tempVersionFile, encoding: .utf8) {
@@ -601,7 +601,7 @@ struct OpenGrokVersionTests {
         } else {
             // No OPEN_GROK_VERSION file in the package root: the script falls
             // back to the default version.
-            #expect(version == "0.1.220-open-grok.54",
+            #expect(version == "0.1.220-open-grok.57",
                     "Generated version must be the default when no OPEN_GROK_VERSION file exists")
         }
     }

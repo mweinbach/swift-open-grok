@@ -5,20 +5,20 @@
     "help",
     "paths"
   ],
-  "compiledVersionDefault": "0.1.220-open-grok.54",
-  "referencePinnedRelease": "0.1.220-open-grok.54",
+  "compiledVersionDefault": "0.1.220-open-grok.57",
+  "referencePinnedRelease": "0.1.220-open-grok.57",
   "compiledVersionEnv": "GROK_VERSION",
   "emptyTestVersionReturnsEmpty": true,
   "homeEnv": "OPENGROK_HOME",
   "homeFallback": "~/.opengrok",
   "legacyHomeForbidden": "~/.grok",
-  "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
+  "referenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
   "testVersionEnv": "GROK_TEST_VERSION",
   "unimplementedStayUnavailable": true,
   "provenance": {
     "source": "OpenGrokVersion/OpenGrokCLI semantics vs Rust xai-grok-version + xai-grok-config path resolution",
-    "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
-    "previousReferenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+    "referenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
+    "previousReferenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
     "pinVerdict": "recaptured",
     "recapturedFields": [
       "referencePinnedRelease",
@@ -26,10 +26,10 @@
       "compiledVersionEnv"
     ],
     "evidence": [
-      "OPEN_GROK_VERSION moved 0.1.220-open-grok.53 at 80dff0a9 -> 0.1.220-open-grok.54 at 9ed09e2a; the Swift compiled default now follows the current marker.",
-      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-grok-version => empty; TEST_VERSION_ENV=\"GROK_TEST_VERSION\" (src/lib.rs:5), VERSION = option_env!(\"GROK_VERSION\") else CARGO_PKG_VERSION (src/lib.rs:7-10), and installed() trimming semantics are unchanged.",
-      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-grok-config/src/paths.rs => empty; default_grok_home() = <home>/.opengrok and grok_home() still prefers $OPENGROK_HOME.",
-      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-grok-paths => empty for the path-policy surface asserted here."
+      "OPEN_GROK_VERSION moved 0.1.220-open-grok.54 at 9ed09e2a -> 0.1.220-open-grok.57 at 70002584; the Swift compiled default now follows the current marker.",
+      "git diff 9ed09e2a..70002584 -- crates/codegen/xai-grok-version => empty; TEST_VERSION_ENV=\"GROK_TEST_VERSION\" (src/lib.rs:5), VERSION = option_env!(\"GROK_VERSION\") else CARGO_PKG_VERSION (src/lib.rs:7-10), and installed() trimming semantics are unchanged.",
+      "git diff 9ed09e2a..70002584 -- crates/codegen/xai-grok-config/src/paths.rs => empty; default_grok_home() = <home>/.opengrok and grok_home() still prefers $OPENGROK_HOME.",
+      "git diff 9ed09e2a..70002584 -- crates/codegen/xai-grok-paths => empty for the path-policy surface asserted here."
     ]
   }
 }

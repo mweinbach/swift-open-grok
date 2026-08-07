@@ -20,14 +20,14 @@
     "notes": "Explicit non-parity when object is pack-only; no silent empty HEAD tree",
     "supported": false
   },
-  "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
+  "referenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
   "provenance": {
     "source": "generated-from-git-sha1-and-zlib-semantics, provenance-labelled against xai-gix-status",
-    "referenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
-    "previousReferenceRevision": "80dff0a9dcb24121b976b9f920fbe442af40ea88",
+    "referenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
+    "previousReferenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
     "pinVerdict": "unchanged (verified)",
     "evidence": [
-      "git diff 80dff0a9..9ed09e2a -- crates/codegen/xai-gix-status => empty (no source or Cargo.toml change)",
+      "git diff 9ed09e2a..70002584 -- crates/codegen/xai-gix-status => empty (no source or Cargo.toml change)",
       "The asserted content is git's own on-disk object/index format (loose-object zlib framing, DIRC index signature, index versions 2/3/4), which is defined by git rather than by the reference and did not move with the pin.",
       "ProtocolFixtures/git-loose-blob-hello.zlib is byte-identical across the two pins and still inflates to `blob 6\\0hello\\n` (13 raw bytes, sha1 ce013625030ba8dba906f756967f9e9ca394464a)."
     ]
