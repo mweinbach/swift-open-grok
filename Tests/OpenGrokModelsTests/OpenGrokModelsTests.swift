@@ -16,21 +16,25 @@ import OpenGrokSamplingTypes
 struct EmbeddedDefaultModelsTests {
     @Test func defaultIDsMatchRustCorpus() {
         #expect(defaultModel() == "grok-4.5")
-        #expect(defaultWebSearchModel() == "grok-4.20-multi-agent")
+        #expect(defaultWebSearchModel() == "grok-4.5")
         #expect(defaultImageDescriptionModel() == "grok-4.5")
         #expect(defaultSessionSummaryModel() == "grok-4.5")
-        #expect(defaultModel(for: .webSearch) == "grok-4.20-multi-agent")
+        #expect(defaultModel(for: .webSearch) == "grok-4.5")
     }
 
     @Test func embeddedJSONParsesAndContainsDefault() throws {
         let embedded = try parseEmbeddedDefaultModels(DEFAULT_MODELS_JSON)
         #expect(embedded.default == "grok-4.5")
         #expect(embedded.models.map(\.model).contains("grok-4.5"))
+        // The corpus at the pinned reference carries exactly 20 models.
+        #expect(embedded.models.count == 20)
         // Multi-provider corpus.
         let providers = Set(embedded.models.map(\.provider))
         #expect(providers.contains(.xai))
         #expect(providers.contains(.kimi))
         #expect(providers.contains(.fireworks))
+        #expect(providers.contains(.deepseek))
+        #expect(providers.contains(.meta))
         #expect(providers.contains(.codex))
     }
 
@@ -43,6 +47,10 @@ struct EmbeddedDefaultModelsTests {
         ]
         if let url = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }),
            let fixture = try? String(contentsOf: url, encoding: .utf8) {
+            // The fixture is a byte copy of upstream `default_models.json`;
+            // pinning byte equality makes any hand-edit of the embedded
+            // constant a loud test failure instead of silent corpus drift.
+            #expect(fixture == DEFAULT_MODELS_JSON)
             let a = try parseEmbeddedDefaultModels(fixture)
             let b = try parseEmbeddedDefaultModels(DEFAULT_MODELS_JSON)
             #expect(a.default == b.default)
@@ -52,6 +60,33 @@ struct EmbeddedDefaultModelsTests {
             // Fixture optional if resource packaging is absent; constant is authority.
             #expect(!DEFAULT_MODELS_JSON.isEmpty)
         }
+    }
+
+    /// Upstream serde fails hard on an unknown provider; the port must not
+    /// silently misattribute the entry to xAI (`agent/config.rs:4115-4116`,
+    /// `#[serde(default)]` covers only the *missing* field).
+    @Test func unknownProviderFailsLoud() {
+        let body = #"""
+        {
+          "default": "known",
+          "models": [
+            { "model": "known", "api_backend": "responses" },
+            { "model": "mystery", "api_backend": "responses",
+              "provider": "totally-unknown-future-provider" }
+          ]
+        }
+        """#
+        #expect(throws: ModelsError.self) {
+            _ = try parseEmbeddedDefaultModels(body)
+        }
+        // A missing provider still defaults to xAI.
+        let missing = #"""
+        {
+          "default": "known",
+          "models": [ { "model": "known", "api_backend": "responses" } ]
+        }
+        """#
+        #expect((try? parseEmbeddedDefaultModels(missing))?.models.first?.provider == .xai)
     }
 
     @Test func defaultEntriesPreserveStableKeysAndCapabilities() {
@@ -1194,7 +1229,7 @@ struct AuxiliaryModelRoutingTests {
             sessionKey: "session-bearer"
         )
         #expect(webAux != nil)
-        #expect(webAux?.routingModel == "grok-4.20-multi-agent")
+        #expect(webAux?.routingModel == "grok-4.5")
 
         let summaryAux = resolveAuxiliaryModelSamplingConfig(
             modelID: defaultSessionSummaryModel(),
@@ -1242,6 +1277,9 @@ struct TrustedEndpointValidationTests {
 
         #expect(trustedBuiltInSessionEndpoint(provider: .fireworks, baseURL: "https://api.fireworks.ai/inference/v1"))
         #expect(!trustedBuiltInSessionEndpoint(provider: .fireworks, baseURL: "https://custom-fireworks.org"))
+
+        #expect(trustedBuiltInSessionEndpoint(provider: .meta, baseURL: "https://api.meta.ai/v1"))
+        #expect(!trustedBuiltInSessionEndpoint(provider: .meta, baseURL: "https://custom-meta.org"))
     }
 }
 

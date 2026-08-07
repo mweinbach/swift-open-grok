@@ -187,12 +187,14 @@ extension ProviderAdapter {
             patchCodexResponsesRequest(&body, policy: policy)
         case .some(.deepSeek):
             patchDeepSeekResponsesRequest(&body, policy: policy)
+        case .some(.meta):
+            patchMetaResponsesRequest(&body)
         }
     }
 
     public func promptCacheKey(sessionId: String?) -> String? {
         switch profile.responsesDialect {
-        case .none, .some(.xai), .some(.deepSeek):
+        case .none, .some(.xai), .some(.deepSeek), .some(.meta):
             return nil
         case .some(.codex):
             guard let sessionId, !sessionId.isEmpty else { return nil }
@@ -233,7 +235,7 @@ extension ProviderAdapter {
         guard isMetadata else { return false }
 
         switch profile.responsesDialect {
-        case .none, .some(.xai), .some(.deepSeek):
+        case .none, .some(.xai), .some(.deepSeek), .some(.meta):
             break
         case .some(.codex):
             if let headersObj = parsed?["headers"]?.objectValue {
@@ -258,7 +260,7 @@ extension ProviderAdapter {
         switch profile.responsesDialect {
         case .none: return false
         // Every dialect needs the dependency-boundary compatibility pass.
-        case .some(.xai), .some(.codex), .some(.deepSeek): return true
+        case .some(.xai), .some(.codex), .some(.deepSeek), .some(.meta): return true
         }
     }
 
@@ -297,6 +299,12 @@ public struct FireworksProvider: ProviderAdapter {
     public var provider: ModelProvider { .fireworks }
 
     public func sanitizeChatRequest(_ request: inout ChatCompletionWireRequest) {
+        // Most Fireworks models 400 on `reasoning_effort`, so strip it
+        // unconditionally here (provider.rs:353). The client's chat-defaults
+        // gate restores the effort after this sanitize when the model's
+        // config declares effort support — see
+        // `SamplingClient.sanitizeChatWireRequest`.
+        request.reasoningEffort = nil
         // Fireworks rejects internal per-message model_id attribution.
         for i in request.messages.indices {
             request.messages[i].modelId = nil
@@ -405,6 +413,15 @@ public struct DeepSeekProvider: ProviderAdapter {
     }
 }
 
+/// Meta's Model API is a stateless, OpenAI-compatible Responses provider.
+/// A pure marker: every behavior comes from the protocol defaults driven by
+/// `ProviderProfile.meta`, including the Meta arm of the Responses request
+/// patch. Port of `MetaProvider` (`xai-grok-sampler/src/provider.rs:388-395`).
+public struct MetaProvider: ProviderAdapter {
+    public init() {}
+    public var provider: ModelProvider { .meta }
+}
+
 public struct OpenCodeGoProvider: ProviderAdapter {
     public init() {}
     public var provider: ModelProvider { .openCodeGo }
@@ -422,6 +439,9 @@ public struct WaferProvider: ProviderAdapter {
     public var provider: ModelProvider { .wafer }
 
     public func sanitizeChatRequest(_ request: inout ChatCompletionWireRequest) {
+        // Wafer does not accept `reasoning_effort`; unlike Fireworks there is
+        // no restore gate, so effort never reaches this wire (provider.rs:422).
+        request.reasoningEffort = nil
         for i in request.messages.indices {
             request.messages[i].modelId = nil
         }
@@ -445,6 +465,7 @@ private let codexProvider = CodexProvider()
 private let kimiProvider = KimiProvider()
 private let fireworksProvider = FireworksProvider()
 private let deepSeekProvider = DeepSeekProvider()
+private let metaProvider = MetaProvider()
 private let openCodeGoProvider = OpenCodeGoProvider()
 private let waferProvider = WaferProvider()
 
@@ -455,6 +476,7 @@ public let PROVIDER_REGISTRY: [ProviderRegistration] = [
     ProviderRegistration(provider: .kimi, adapter: kimiProvider),
     ProviderRegistration(provider: .fireworks, adapter: fireworksProvider),
     ProviderRegistration(provider: .deepseek, adapter: deepSeekProvider),
+    ProviderRegistration(provider: .meta, adapter: metaProvider),
     ProviderRegistration(provider: .openCodeGo, adapter: openCodeGoProvider),
     ProviderRegistration(provider: .wafer, adapter: waferProvider),
 ]
@@ -467,6 +489,7 @@ public func providerAdapter(_ provider: ModelProvider) -> any ProviderAdapter {
     case .kimi: return kimiProvider
     case .fireworks: return fireworksProvider
     case .deepseek: return deepSeekProvider
+    case .meta: return metaProvider
     case .openCodeGo: return openCodeGoProvider
     case .wafer: return waferProvider
     }
@@ -549,16 +572,19 @@ private func responseMetadataHeaderValue(_ value: JSONValue) -> String? {
     }
 }
 
+/// Return true only when the decoder rejected the top-level Responses event
+/// *kind* — the serialization message literally names ``unknown variant
+/// `<type>` `` — never when a known event was malformed internally. Anything
+/// looser turns a truncated known event (a half `response.output_text.delta`)
+/// into silently missing tokens. Port of
+/// `is_unknown_top_level_response_event`
+/// (`xai-grok-sampler/src/provider.rs:834-847`).
 func isUnknownTopLevelResponseEvent(error: SamplingError, data: String) -> Bool {
-    guard case .serialization = error else { return false }
-    // Unknown top-level `type` fields on Responses events.
-    guard let value = try? JSONDecoder().decode(JSONValue.self, from: Data(data.utf8)) else {
-        return false
-    }
-    guard let type = value["type"]?.stringValue else { return false }
-    let knownPrefixes = ["response.", "error"]
-    // If it looks like a response event type we don't know, Codex may ignore it.
-    return type.hasPrefix("response.") || knownPrefixes.contains(where: { type.hasPrefix($0) })
+    guard case .serialization(let message) = error else { return false }
+    guard let value = try? JSONDecoder().decode(JSONValue.self, from: Data(data.utf8)),
+          let type = value["type"]?.stringValue
+    else { return false }
+    return message.contains("unknown variant `\(type)`")
 }
 
 func patchCodexResponsesRequest(_ body: inout JSONValue, policy: ResponsesRequestPolicy) {
@@ -573,16 +599,15 @@ func patchCodexResponsesRequest(_ body: inout JSONValue, policy: ResponsesReques
             body = .object(obj)
         }
     } else {
-        // Drop summary when unsupported / disabled.
+        // Drop summary when unsupported / disabled. Upstream leaves the
+        // emptied `reasoning` object in place (provider.rs:613-620); the
+        // base projection may still be carrying `reasoning.effort`, and an
+        // empty object is valid on the wire, so do not remove it here.
         if case .object(var obj) = body,
            case .object(var reasoning) = obj["reasoning"]
         {
             reasoning.removeValue(forKey: "summary")
-            if reasoning.isEmpty {
-                obj.removeValue(forKey: "reasoning")
-            } else {
-                obj["reasoning"] = .object(reasoning)
-            }
+            obj["reasoning"] = .object(reasoning)
             body = .object(obj)
         }
     }
@@ -680,6 +705,32 @@ func patchDeepSeekResponsesRequest(_ body: inout JSONValue, policy: ResponsesReq
 
     if case .object(let reasoning) = obj["reasoning"], reasoning.isEmpty {
         obj.removeValue(forKey: "reasoning")
+    }
+
+    body = .object(obj)
+}
+
+/// Meta's Responses endpoint is stateless: OpenAI's continuity and cache
+/// controls are unsupported, replayed `reasoning` input items are rejected,
+/// and no summary is ever generated. Reasoning effort passes through
+/// unchanged — Meta accepts the standard effort menu, unlike DeepSeek's
+/// remap above, so do not add a mapping here. Port of
+/// `patch_meta_responses_request` (`xai-grok-sampler/src/provider.rs:713-729`).
+func patchMetaResponsesRequest(_ body: inout JSONValue) {
+    guard case .object(var obj) = body else { return }
+
+    for field in ["include", "prompt_cache_key", "prompt_cache_retention", "store"] {
+        obj.removeValue(forKey: field)
+    }
+
+    if case .array(var input) = obj["input"] {
+        input.removeAll { $0["type"]?.stringValue == "reasoning" }
+        obj["input"] = .array(input)
+    }
+
+    if case .object(var reasoning) = obj["reasoning"] {
+        reasoning.removeValue(forKey: "summary")
+        obj["reasoning"] = .object(reasoning)
     }
 
     body = .object(obj)

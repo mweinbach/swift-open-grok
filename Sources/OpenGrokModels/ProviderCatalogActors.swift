@@ -12,8 +12,8 @@
 //   * An actor returns only its own provider's entries; the merge layer
 //     additionally retains by provider (`CatalogResolution.swift`).
 //   * Only Codex and xAI have disk caches, and they are separate files.
-//     Kimi/Fireworks/DeepSeek/OpenCode Go/Wafer are process-lifetime only —
-//     upstream has no cache file for them (see INTEGRATION-catalog.md).
+//     Kimi/Fireworks/DeepSeek/Meta/OpenCode Go/Wafer are process-lifetime
+//     only — upstream has no cache file for them (see INTEGRATION-catalog.md).
 
 import Foundation
 import OpenGrokSamplingTypes
@@ -26,7 +26,7 @@ public enum ModelCatalogTimeouts {
     public static let codex: TimeInterval = 5
     /// Every API-key provider uses 10s: `wafer_models.rs:18`,
     /// `kimi_models.rs:24`, `fireworks_models.rs:20`, `deepseek_models.rs:22`,
-    /// `opencode_go_models.rs:23`.
+    /// `meta_models.rs:17`, `opencode_go_models.rs:23`.
     public static let apiKeyProvider: TimeInterval = 10
 }
 
@@ -505,6 +505,27 @@ public enum ProviderCatalogActors {
             project: { data, base in
                 let available = try DeepSeekModels.parseAvailableSlugs(data)
                 var catalog = DeepSeekModels.curatedCatalog(baseURL: base)
+                catalog.retain { _, entry in available.contains(entry.info.model) }
+                return catalog
+            }
+        )
+    }
+
+    /// Meta's `/models` names which curated Muse Spark models the key may
+    /// reach (`catalog_from_wire`, `meta_models.rs:203-224`).
+    public static func meta(
+        transport: any ModelCatalogTransport,
+        credentialSource: @escaping @Sendable () async -> ProviderCatalogCredential?,
+        baseURL: String = MetaModels.apiBaseURLDefault
+    ) -> APIKeyCatalogActor {
+        APIKeyCatalogActor(
+            partition: .meta,
+            transport: transport,
+            credentialSource: credentialSource,
+            baseURL: baseURL,
+            project: { data, base in
+                let available = try MetaModels.parseAvailableSlugs(data)
+                var catalog = MetaModels.curatedCatalog(baseURL: base)
                 catalog.retain { _, entry in available.contains(entry.info.model) }
                 return catalog
             }

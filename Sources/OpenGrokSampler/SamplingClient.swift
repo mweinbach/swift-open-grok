@@ -118,7 +118,7 @@ public final class SamplingClient: @unchecked Sendable {
         var req = request
         applyConversationDefaults(&req)
         var wire = projectChatCompletionRequest(req, defaults: defaults)
-        providerAdapter.sanitizeChatRequest(&wire)
+        sanitizeChatWireRequest(&wire)
         wire.stream = true
         wire.streamOptions = StreamOptionsWire(includeUsage: true)
         if wire.model == nil || wire.model?.isEmpty == true {
@@ -581,6 +581,27 @@ public final class SamplingClient: @unchecked Sendable {
             deploymentId: deploymentId,
             userId: userId
         )
+    }
+
+    /// Provider sanitize plus the Fireworks reasoning-effort gate. Fireworks
+    /// sanitize strips `reasoning_effort` unconditionally because most
+    /// Fireworks models 400 on it; a config-level effort is the signal that
+    /// the selected model's config declares effort support, so the request
+    /// effort (or that configured default) is restored after sanitize. With
+    /// no config effort, a request-level effort is deliberately lost here —
+    /// that is the gate, not a bug. Port of the gate inside `apply_defaults`
+    /// (`xai-grok-sampler/src/client.rs:1806-1813`).
+    func sanitizeChatWireRequest(_ wire: inout ChatCompletionWireRequest) {
+        let fireworksReasoningEffort: ReasoningEffort? = {
+            guard defaults.provider == .fireworks,
+                  let configured = defaults.reasoningEffort
+            else { return nil }
+            return wire.reasoningEffort ?? configured
+        }()
+        providerAdapter.sanitizeChatRequest(&wire)
+        if let effort = fireworksReasoningEffort {
+            wire.reasoningEffort = effort
+        }
     }
 
     private func applyConversationDefaults(_ request: inout ConversationRequest) {

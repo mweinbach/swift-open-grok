@@ -181,12 +181,24 @@ private func parseDefaultModelJSON(_ obj: [String: Any]) throws -> DefaultModelJ
         throw ModelsError.invalidDefaultModels("entry missing non-empty 'model'")
     }
     let apiBackend = WireCodec.apiBackend(obj["api_backend"] as? String) ?? .defaultValue
+    // A missing provider defaults to xAI (`#[serde(default)]`,
+    // `agent/config.rs:4115-4116`), but an unknown provider string fails hard
+    // exactly as upstream serde does: silently misattributing an entry to xAI
+    // would route another provider's model at xAI endpoints with xAI
+    // credentials. This is a baked-in corpus, so failing here is a developer
+    // error surfaced at first parse, not a runtime hazard.
     let provider: ModelProvider
     if let raw = obj["provider"] as? String {
-        provider = (try? JSONDecoder().decode(
-            ModelProvider.self,
-            from: Data("\"\(raw)\"".utf8)
-        )) ?? .defaultValue
+        do {
+            provider = try JSONDecoder().decode(
+                ModelProvider.self,
+                from: Data("\"\(raw)\"".utf8)
+            )
+        } catch {
+            throw ModelsError.invalidDefaultModels(
+                "unknown provider '\(raw)' for model '\(model)'"
+            )
+        }
     } else {
         provider = .defaultValue
     }
@@ -422,6 +434,18 @@ public func defaultModelConfigs(
         if m.provider == .fireworks {
             m.baseURL = FireworksModels.apiBaseURL()
             m.envKey = .single(FireworksModels.apiKeyEnv)
+        }
+        // Upstream rewrites every API-key provider's embedded endpoint and env
+        // key so the per-provider base-URL env override applies to embedded
+        // entries too (`agent/config.rs:4192-4207`). Wafer has no embedded
+        // entries in the corpus, so its arm stays out until one lands.
+        if m.provider == .deepseek {
+            m.baseURL = DeepSeekModels.apiBaseURL()
+            m.envKey = .single(DeepSeekModels.apiKeyEnv)
+        }
+        if m.provider == .meta {
+            m.baseURL = MetaModels.apiBaseURL()
+            m.envKey = .single(MetaModels.apiKeyEnv)
         }
 
         let key = m.id ?? m.model

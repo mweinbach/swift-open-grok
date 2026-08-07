@@ -151,6 +151,7 @@ private func parseProvider(_ value: String?) -> ModelProvider? {
     case "kimi", "moonshot", "moonshot_ai": return .kimi
     case "fireworks", "fireworks_ai": return .fireworks
     case "deepseek", "deep_seek", "deepseek_api": return .deepseek
+    case "meta", "meta_ai", "meta_api": return .meta
     case "opencode_go", "opencode-go": return .openCodeGo
     case "wafer", "wafer_ai": return .wafer
     default: return nil

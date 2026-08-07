@@ -773,7 +773,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
         if providerChanged {
             // Catalog capabilities are provider-local.
             switch entry.info.provider {
-            case .codex:
+            case .codex, .meta:
                 entry.info.apiBackend = .responses
             case .xai, .kimi, .fireworks, .deepseek, .openCodeGo, .wafer:
                 entry.info.apiBackend = .chatCompletions

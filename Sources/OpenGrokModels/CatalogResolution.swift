@@ -66,6 +66,8 @@ public func resolveModelListWithProviderCatalogs(
     fireworksAuthoritative: Bool,
     deepSeekRemote: OrderedModelMap? = nil,
     deepSeekAuthoritative: Bool = false,
+    metaRemote: OrderedModelMap? = nil,
+    metaAuthoritative: Bool = false,
     openCodeGoRemote: OrderedModelMap? = nil,
     openCodeGoAuthoritative: Bool = false
 ) -> OrderedModelMap {
@@ -149,6 +151,16 @@ public func resolveModelListWithProviderCatalogs(
         authoritative: deepSeekAuthoritative
     )
 
+    // Meta merges between DeepSeek and OpenCode Go, matching upstream's
+    // partition order (`config.rs:3844-3861`).
+    mergeRemoteProviderPartition(
+        resolved: &resolved,
+        defaults: defaults,
+        remote: metaRemote,
+        provider: .meta,
+        authoritative: metaAuthoritative
+    )
+
     mergeRemoteProviderPartition(
         resolved: &resolved,
         defaults: defaults,
@@ -199,6 +211,7 @@ public func resolveModelCatalog(
     kimiCatalog: KimiModelsCatalog? = nil,
     fireworksCatalog: FireworksModelsCatalog? = nil,
     deepSeekCatalog: DeepSeekModelsCatalog? = nil,
+    metaCatalog: MetaModelsCatalog? = nil,
     openCodeGoCatalog: OpenCodeGoModelsCatalog? = nil,
     waferCatalog: WaferModelsCatalog? = nil
 ) -> OrderedModelMap {
@@ -213,6 +226,8 @@ public func resolveModelCatalog(
         fireworksAuthoritative: fireworksCatalog?.isAuthoritative ?? false,
         deepSeekRemote: deepSeekCatalog?.entries,
         deepSeekAuthoritative: deepSeekCatalog?.isAuthoritative ?? false,
+        metaRemote: metaCatalog?.entries,
+        metaAuthoritative: metaCatalog?.isAuthoritative ?? false,
         openCodeGoRemote: openCodeGoCatalog?.entries,
         openCodeGoAuthoritative: openCodeGoCatalog?.isAuthoritative ?? false
     )
@@ -499,6 +514,9 @@ public func trustedBuiltInSessionEndpoint(provider: ModelProvider, baseURL: Stri
         }
         if provider == .deepseek {
             return DeepSeekModels.isTrustedAPIBaseURL(baseURL)
+        }
+        if provider == .meta {
+            return MetaModels.isTrustedAPIBaseURL(baseURL)
         }
         if provider == .openCodeGo {
             return OpenCodeGoModels.isTrustedAPIBaseURL(baseURL)

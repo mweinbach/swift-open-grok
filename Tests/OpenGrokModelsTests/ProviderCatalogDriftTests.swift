@@ -1,9 +1,10 @@
 // ProviderCatalogDriftTests.swift
 //
-// Provider-isolated catalog coverage for the three providers added upstream:
+// Provider-isolated catalog coverage for the providers added upstream:
 // DeepSeek direct (fb929feb, 3f83f287), OpenCode Go (1e2af500), Wafer AI
-// (9b2742fd). Derived from the Rust `deepseek_models.rs`, `opencode_go_models.rs`,
-// and `wafer_models.rs` suites.
+// (9b2742fd), and the Meta Model API. Derived from the Rust
+// `deepseek_models.rs`, `opencode_go_models.rs`, `wafer_models.rs`, and
+// `meta_models.rs` suites.
 
 import Foundation
 import Testing
@@ -208,6 +209,200 @@ struct DeepSeekCatalogTests {
         #expect(throws: ModelsError.self) {
             _ = try DeepSeekModels.parseAvailableSlugs(Data(#"{"models":[]}"#.utf8))
         }
+    }
+}
+
+@Suite("Meta catalog")
+struct MetaCatalogTests {
+    /// Provenance: Rust `trusted_hosts_are_provider_scoped`
+    /// (`meta_models.rs:292-299`).
+    @Test("only Meta-owned https hosts are trusted")
+    func trustedHosts() {
+        #expect(MetaModels.isTrustedAPIBaseURL(MetaModels.apiBaseURLDefault))
+        #expect(MetaModels.isTrustedAPIBaseURL("https://api.meta.ai/v1"))
+        #expect(!MetaModels.isTrustedAPIBaseURL("http://api.meta.ai/v1"))
+        #expect(!MetaModels.isTrustedAPIBaseURL("https://api.x.ai/v1"))
+        #expect(!MetaModels.isTrustedAPIBaseURL("https://meta.example/v1"))
+        #expect(!MetaModels.isTrustedAPIBaseURL("not a url"))
+    }
+
+    /// Provenance: Rust `stored_keys_never_leave_owned_hosts`
+    /// (`meta_models.rs:301-321`). A stored provider key must not follow a
+    /// redirected base URL to a foreign host.
+    @Test("a stored key never leaves Meta-owned hosts")
+    func storedKeyIsolation() {
+        #expect(
+            MetaModels.selectAPIKey(
+                baseURL: MetaModels.apiBaseURLDefault,
+                environmentKey: nil,
+                storedKey: "meta-stored-secret"
+            ) == "meta-stored-secret"
+        )
+        #expect(
+            MetaModels.selectAPIKey(
+                baseURL: "https://proxy.example/v1",
+                environmentKey: nil,
+                storedKey: "meta-stored-secret"
+            ) == nil
+        )
+        // An environment key is the user's explicit per-invocation choice.
+        #expect(
+            MetaModels.selectAPIKey(
+                baseURL: "https://proxy.example/v1",
+                environmentKey: "explicit-environment-secret",
+                storedKey: nil
+            ) == "explicit-environment-secret"
+        )
+    }
+
+    @Test("base URL resolves from the environment override, trimmed")
+    func baseURLOverride() {
+        #expect(MetaModels.apiBaseURL(environment: [:]) == "https://api.meta.ai/v1")
+        #expect(
+            MetaModels.apiBaseURL(
+                environment: [MetaModels.apiBaseURLEnv: "  https://proxy.example/v1/  "]
+            ) == "https://proxy.example/v1"
+        )
+        #expect(
+            MetaModels.apiBaseURL(environment: [MetaModels.apiBaseURLEnv: "   "])
+                == "https://api.meta.ai/v1"
+        )
+    }
+
+    /// Provenance: Rust `wire_catalog_preserves_curated_capabilities`
+    /// (`meta_models.rs:323-371`). All three Muse Spark models route to the
+    /// Responses backend with 1M context and hosted web search.
+    @Test("curated entries carry the Responses backend and Meta capabilities")
+    func curatedCapabilities() throws {
+        let catalog = MetaModels.curatedCatalog(baseURL: "https://api.meta.ai/v1")
+        #expect(catalog.keys == [
+            "meta:muse-spark-1.2",
+            "meta:muse-spark-1.1",
+            "meta:muse-spark-1.2-contributor",
+        ])
+        for entry in catalog.values() {
+            #expect(entry.info.provider == .meta)
+            #expect(entry.info.apiBackend == .responses)
+            #expect(entry.info.contextWindow == 1_000_000)
+            #expect(entry.info.supportsBackendSearch)
+            #expect(entry.info.supportedInApi)
+            #expect(entry.info.toolMode == .direct)
+            #expect(entry.envKey == .single(MetaModels.apiKeyEnv))
+            #expect(entry.apiKey == nil)
+        }
+
+        let model = try #require(catalog["meta:muse-spark-1.2"])
+        #expect(model.info.model == "muse-spark-1.2")
+        #expect(model.info.baseURL == "https://api.meta.ai/v1")
+        #expect(model.info.reasoningEffort == .medium)
+        #expect(
+            model.info.reasoningEfforts.map(\.value) == [.low, .medium, .high, .xhigh]
+        )
+        let defaults = model.info.reasoningEfforts.filter(\.isDefault)
+        #expect(defaults.count == 1)
+        #expect(defaults.first?.value == .medium)
+    }
+
+    /// Unknown future ids fail closed until their limits are reviewed here.
+    @Test("/models restricts to the curated partition in both directions")
+    func remoteRestriction() throws {
+        let body = Data(#"""
+        {"data":[
+          {"id":"muse-spark-1.2"},
+          {"id":"  muse-spark-1.1  "},
+          {"id":"muse-spark-9-unreleased"}
+        ]}
+        """#.utf8)
+        let slugs = try MetaModels.parseAvailableSlugs(body)
+        #expect(slugs == ["muse-spark-1.2", "muse-spark-1.1"])
+
+        // A missing `data` array is an empty catalog, not a hard failure
+        // (`#[serde(default)]`, `meta_models.rs:275-279`)…
+        #expect(try MetaModels.parseAvailableSlugs(Data("{}".utf8)).isEmpty)
+        // …but a malformed element fails the whole decode, as serde does.
+        #expect(throws: ModelsError.self) {
+            _ = try MetaModels.parseAvailableSlugs(Data(#"{"data":[{"model":"x"}]}"#.utf8))
+        }
+        #expect(throws: ModelsError.self) {
+            _ = try MetaModels.parseAvailableSlugs(Data(#"["muse-spark-1.2"]"#.utf8))
+        }
+    }
+
+    /// Provenance: Rust `error_excerpt_redacts_a_reflected_credential`
+    /// (`meta_models.rs:373-378`), against the shared excerpt helper the
+    /// Meta actor path uses.
+    @Test("error bodies are redacted and collapsed before surfacing")
+    func errorRedaction() {
+        let excerpt = safeCatalogErrorExcerpt(
+            "request rejected for meta-canary\ntry again",
+            apiKey: "meta-canary"
+        )
+        #expect(excerpt == "request rejected for [REDACTED] try again")
+    }
+
+    /// An empty snapshot is not authoritative: a key whose `/models` names no
+    /// curated slug keeps the embedded Meta entries (`meta_models.rs:134-136`).
+    @Test("an empty catalog is not authoritative")
+    func emptyIsNotAuthoritative() {
+        let empty = MetaModelsCatalog(entries: OrderedModelMap(), credentialFingerprint: "fp")
+        #expect(!empty.isAuthoritative)
+        let full = MetaModelsCatalog(
+            entries: MetaModels.curatedCatalog(),
+            credentialFingerprint: "fp"
+        )
+        #expect(full.isAuthoritative)
+    }
+
+    /// The embedded corpus carries the same three models
+    /// (`xai-grok-models/default_models.json:235-300`), with the endpoint and
+    /// env key rewritten through `MetaModels` (`agent/config.rs:4198-4201`).
+    @Test("the embedded corpus carries the curated Meta partition")
+    func embeddedMetaEntries() throws {
+        let map = defaultModelEntries()
+        for key in [
+            "meta:muse-spark-1.2",
+            "meta:muse-spark-1.1",
+            "meta:muse-spark-1.2-contributor",
+        ] {
+            let entry = try #require(map[key], "embedded Meta model \(key)")
+            #expect(entry.info.provider == .meta)
+            #expect(entry.info.apiBackend == .responses)
+            #expect(entry.info.baseURL == MetaModels.apiBaseURL())
+            #expect(entry.info.contextWindow == 1_000_000)
+            #expect(entry.info.toolMode == .direct)
+            #expect(entry.info.supportsBackendSearch)
+            #expect(entry.info.reasoningEffort == .medium)
+            #expect(entry.envKey?.primary == MetaModels.apiKeyEnv)
+        }
+    }
+
+    /// A published catalog whose fingerprint no longer matches the manager's
+    /// credential snapshot is rejected rather than shown. The embedded Meta
+    /// entries are always present, so the live snapshot is distinguished by a
+    /// marker name only the live entries carry.
+    @Test("a catalog from a superseded credential is not published")
+    func staleFingerprintRejected() throws {
+        let manager = ModelsManager(
+            credentials: EmptyCredentialSnapshot(metaCredentialFingerprint: "fp-current")
+        )
+
+        var liveEntries = MetaModels.curatedCatalog(baseURL: "https://api.meta.ai/v1")
+        for (key, var entry) in liveEntries.pairs() {
+            entry.info.name = "LIVE \(entry.info.model)"
+            liveEntries[key] = entry
+        }
+
+        manager.applyMetaCatalog(
+            MetaModelsCatalog(entries: liveEntries, credentialFingerprint: "fp-stale")
+        )
+        let afterStale = try #require(manager.catalogSnapshot()["meta:muse-spark-1.2"])
+        #expect(afterStale.info.name == "Muse Spark 1.2", "stale publish must be rejected")
+
+        manager.applyMetaCatalog(
+            MetaModelsCatalog(entries: liveEntries, credentialFingerprint: "fp-current")
+        )
+        let afterCurrent = try #require(manager.catalogSnapshot()["meta:muse-spark-1.2"])
+        #expect(afterCurrent.info.name == "LIVE muse-spark-1.2")
     }
 }
 
@@ -425,6 +620,10 @@ struct ProviderEndpointTrustTests {
         #expect(trustedBuiltInSessionEndpoint(provider: .deepseek, baseURL: "https://api.deepseek.com"))
         #expect(!trustedBuiltInSessionEndpoint(provider: .deepseek, baseURL: "https://pass.wafer.ai/v1"))
 
+        #expect(trustedBuiltInSessionEndpoint(provider: .meta, baseURL: "https://api.meta.ai/v1"))
+        #expect(!trustedBuiltInSessionEndpoint(provider: .meta, baseURL: "https://api.deepseek.com"))
+        #expect(!trustedBuiltInSessionEndpoint(provider: .deepseek, baseURL: "https://api.meta.ai/v1"))
+
         #expect(trustedBuiltInSessionEndpoint(provider: .wafer, baseURL: "https://pass.wafer.ai/v1"))
         #expect(!trustedBuiltInSessionEndpoint(provider: .wafer, baseURL: "https://api.deepseek.com"))
 
@@ -435,5 +634,59 @@ struct ProviderEndpointTrustTests {
             )
         )
         #expect(!trustedBuiltInSessionEndpoint(provider: .openCodeGo, baseURL: "https://api.x.ai/v1"))
+    }
+
+    /// Port of `stored_meta_and_wafer_keys_resolve_only_on_trusted_hosts`
+    /// (`agent/config.rs:7409-7458`) as far as it applies to this target: the
+    /// key-selection policy and the endpoint trust gate. The upstream test's
+    /// other half — `resolve_credentials` reading a key stored on disk through
+    /// the auth store — lives in the CLI's live credential resolver and is
+    /// deferred to the CLI slice.
+    @Test("stored Meta and Wafer keys resolve only on trusted hosts")
+    func storedMetaAndWaferKeysResolveOnlyOnTrustedHosts() {
+        // Meta: the stored key resolves on the provider-owned host…
+        #expect(
+            MetaModels.selectAPIKey(
+                baseURL: MetaModels.apiBaseURLDefault,
+                environmentKey: nil,
+                storedKey: "meta-stored-secret"
+            ) == "meta-stored-secret"
+        )
+        #expect(trustedBuiltInSessionEndpoint(
+            provider: .meta,
+            baseURL: MetaModels.apiBaseURLDefault
+        ))
+        // …and never on a proxy override.
+        #expect(
+            MetaModels.selectAPIKey(
+                baseURL: "https://proxy.example/v1",
+                environmentKey: nil,
+                storedKey: "meta-stored-secret"
+            ) == nil
+        )
+        #expect(!trustedBuiltInSessionEndpoint(
+            provider: .meta,
+            baseURL: "https://proxy.example/v1"
+        ))
+
+        // Wafer mirrors the same policy with its own host list.
+        #expect(
+            WaferModels.selectAPIKey(
+                baseURL: WaferModels.apiBaseURLDefault,
+                environmentKey: nil,
+                storedKey: "wafer-stored-secret"
+            ) == "wafer-stored-secret"
+        )
+        #expect(
+            WaferModels.selectAPIKey(
+                baseURL: "https://proxy.example/v1",
+                environmentKey: nil,
+                storedKey: "wafer-stored-secret"
+            ) == nil
+        )
+        #expect(!trustedBuiltInSessionEndpoint(
+            provider: .wafer,
+            baseURL: "https://proxy.example/v1"
+        ))
     }
 }

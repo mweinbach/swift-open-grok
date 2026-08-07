@@ -26,6 +26,8 @@ public protocol ModelCatalogCredentialSnapshot: Sendable {
     var fireworksCredentialFingerprint: String? { get }
     /// Non-secret digest for DeepSeek credential isolation.
     var deepSeekCredentialFingerprint: String? { get }
+    /// Non-secret digest for Meta credential isolation.
+    var metaCredentialFingerprint: String? { get }
     /// Non-secret digest for OpenCode Go credential isolation.
     var openCodeGoCredentialFingerprint: String? { get }
     /// Non-secret digest for Wafer credential isolation.
@@ -36,6 +38,7 @@ public extension ModelCatalogCredentialSnapshot {
     // Defaulted so existing conformers keep compiling; a snapshot that does not
     // model a provider simply never publishes that provider's live catalog.
     var deepSeekCredentialFingerprint: String? { nil }
+    var metaCredentialFingerprint: String? { nil }
     var openCodeGoCredentialFingerprint: String? { nil }
     var waferCredentialFingerprint: String? { nil }
 }
@@ -48,6 +51,7 @@ public struct EmptyCredentialSnapshot: ModelCatalogCredentialSnapshot {
     public var kimiCredentialFingerprint: String?
     public var fireworksCredentialFingerprint: String?
     public var deepSeekCredentialFingerprint: String?
+    public var metaCredentialFingerprint: String?
     public var openCodeGoCredentialFingerprint: String?
     public var waferCredentialFingerprint: String?
 
@@ -58,6 +62,7 @@ public struct EmptyCredentialSnapshot: ModelCatalogCredentialSnapshot {
         kimiCredentialFingerprint: String? = nil,
         fireworksCredentialFingerprint: String? = nil,
         deepSeekCredentialFingerprint: String? = nil,
+        metaCredentialFingerprint: String? = nil,
         openCodeGoCredentialFingerprint: String? = nil,
         waferCredentialFingerprint: String? = nil
     ) {
@@ -67,6 +72,7 @@ public struct EmptyCredentialSnapshot: ModelCatalogCredentialSnapshot {
         self.kimiCredentialFingerprint = kimiCredentialFingerprint
         self.fireworksCredentialFingerprint = fireworksCredentialFingerprint
         self.deepSeekCredentialFingerprint = deepSeekCredentialFingerprint
+        self.metaCredentialFingerprint = metaCredentialFingerprint
         self.openCodeGoCredentialFingerprint = openCodeGoCredentialFingerprint
         self.waferCredentialFingerprint = waferCredentialFingerprint
     }
@@ -141,6 +147,7 @@ public final class ModelsManager: @unchecked Sendable {
     private var kimiCatalog: KimiModelsCatalog?
     private var fireworksCatalog: FireworksModelsCatalog?
     private var deepSeekCatalog: DeepSeekModelsCatalog?
+    private var metaCatalog: MetaModelsCatalog?
     private var openCodeGoCatalog: OpenCodeGoModelsCatalog?
     private var waferCatalog: WaferModelsCatalog?
     private var models: OrderedModelMap
@@ -220,6 +227,23 @@ public final class ModelsManager: @unchecked Sendable {
     public func modelSwitchGenerationValue() -> UInt64 {
         lock.lock(); defer { lock.unlock() }
         return modelSwitchGeneration
+    }
+
+    /// The session-level reasoning effort. Port of
+    /// `current_reasoning_effort` (agent/models.rs:1295-1297).
+    public func currentReasoningEffortValue() -> ReasoningEffort? {
+        lock.lock(); defer { lock.unlock() }
+        return currentReasoningEffort
+    }
+
+    /// Record the effort a completed model switch applied. Port of
+    /// `set_current_reasoning_effort` (agent/models.rs:1299-1301); upstream
+    /// calls it right after `set_current_model_id` at the tail of
+    /// `set_session_model` (handlers/model_switch.rs:299-303), which is why
+    /// the CLI switch path calls the two together.
+    public func setCurrentReasoningEffort(_ effort: ReasoningEffort?) {
+        lock.lock(); defer { lock.unlock() }
+        currentReasoningEffort = effort
     }
 
     public func allowlistExcludesAllModels() -> Bool {
@@ -333,6 +357,19 @@ public final class ModelsManager: @unchecked Sendable {
         reassemble()
     }
 
+    public func applyMetaCatalog(_ catalog: MetaModelsCatalog?) {
+        lock.lock()
+        if let catalog,
+           let expected = credentials.metaCredentialFingerprint,
+           catalog.credentialFingerprint != expected {
+            lock.unlock()
+            return
+        }
+        self.metaCatalog = catalog
+        lock.unlock()
+        reassemble()
+    }
+
     public func applyOpenCodeGoCatalog(_ catalog: OpenCodeGoModelsCatalog?) {
         lock.lock()
         if let catalog,
@@ -367,6 +404,7 @@ public final class ModelsManager: @unchecked Sendable {
         kimiCatalog = nil
         fireworksCatalog = nil
         deepSeekCatalog = nil
+        metaCatalog = nil
         openCodeGoCatalog = nil
         waferCatalog = nil
         etag = nil
@@ -467,6 +505,7 @@ public final class ModelsManager: @unchecked Sendable {
             kimiCatalog: kimiCatalog,
             fireworksCatalog: fireworksCatalog,
             deepSeekCatalog: deepSeekCatalog,
+            metaCatalog: metaCatalog,
             openCodeGoCatalog: openCodeGoCatalog,
             waferCatalog: waferCatalog
         )

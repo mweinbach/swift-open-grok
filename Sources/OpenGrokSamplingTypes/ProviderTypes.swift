@@ -51,13 +51,14 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
     case kimi
     case fireworks
     case deepseek
+    case meta
     case openCodeGo
     case wafer
 
     public static let defaultValue: ModelProvider = .xai
 
     public enum CodingKeys: String, CodingKey {
-        case xai, codex, kimi, fireworks, deepseek, wafer
+        case xai, codex, kimi, fireworks, deepseek, meta, wafer
         case openCodeGo = "opencode_go"
     }
 
@@ -70,6 +71,7 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case "kimi", "moonshot", "moonshot_ai": self = .kimi
         case "fireworks", "fireworks_ai": self = .fireworks
         case "deepseek", "deep_seek", "deepseek_api": self = .deepseek
+        case "meta", "meta_ai", "meta_api": self = .meta
         case "opencode_go", "opencode-go": self = .openCodeGo
         case "wafer", "wafer_ai": self = .wafer
         default:
@@ -93,6 +95,7 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .kimi: return "kimi"
         case .fireworks: return "fireworks"
         case .deepseek: return "deepseek"
+        case .meta: return "meta"
         case .openCodeGo: return "opencode_go"
         case .wafer: return "wafer"
         }
@@ -106,6 +109,7 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .kimi: return "Kimi"
         case .fireworks: return "Fireworks AI"
         case .deepseek: return "DeepSeek"
+        case .meta: return "Meta API"
         case .openCodeGo: return "OpenCode Go"
         case .wafer: return "Wafer AI"
         }
@@ -116,6 +120,7 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
     public var isKimi: Bool { self == .kimi }
     public var isFireworks: Bool { self == .fireworks }
     public var isDeepSeek: Bool { self == .deepseek }
+    public var isMeta: Bool { self == .meta }
     public var isOpenCodeGo: Bool { self == .openCodeGo }
     public var isWafer: Bool { self == .wafer }
 
@@ -127,6 +132,7 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .kimi: return .kimi
         case .fireworks: return .fireworks
         case .deepseek: return .deepseek
+        case .meta: return .meta
         case .openCodeGo: return .openCodeGo
         case .wafer: return .wafer
         }
@@ -145,18 +151,22 @@ public enum ResponsesDialect: String, Codable, Sendable, Equatable, Hashable {
     /// DeepSeek's native OpenAI-compatible Responses API (V4 Flash and later).
     /// Stateless (`store: false`), with DeepSeek-owned reasoning-effort mapping.
     case deepSeek = "deepseek"
+    /// Meta Model API's OpenAI-compatible, stateless Responses contract.
+    case meta
 
     public var asString: String {
         switch self {
         case .xai: return "xai"
         case .codex: return "codex"
         case .deepSeek: return "deepseek"
+        case .meta: return "meta"
         }
     }
 
     public var isXai: Bool { self == .xai }
     public var isCodex: Bool { self == .codex }
     public var isDeepSeek: Bool { self == .deepSeek }
+    public var isMeta: Bool { self == .meta }
 }
 
 // MARK: - HostedToolDialect
@@ -325,6 +335,7 @@ public struct ProviderProfile: Codable, Sendable, Equatable, Hashable {
     public var isKimi: Bool { provider.isKimi }
     public var isFireworks: Bool { provider.isFireworks }
     public var isDeepSeek: Bool { provider.isDeepSeek }
+    public var isMeta: Bool { provider.isMeta }
     public var isOpenCodeGo: Bool { provider.isOpenCodeGo }
     public var isWafer: Bool { provider.isWafer }
     public var allowsXaiServices: Bool { xaiServices.allows }
@@ -388,6 +399,20 @@ public struct ProviderProfile: Codable, Sendable, Equatable, Hashable {
     public static let deepseek = ProviderProfile(
         provider: .deepseek,
         backends: ProviderBackends(chatCompletions: true, responses: .deepSeek, messages: false),
+        codeModeTransport: .functionEnvelope,
+        hostedToolDialect: .openAi,
+        nativeWebSearch: true,
+        requestMetadata: .standardHeadersOnly,
+        sessionAuth: .apiKeyOnly,
+        xaiServices: .denied
+    )
+
+    /// Meta's OpenAI-compatible Responses API. Muse Spark models use standard
+    /// function calls and OpenAI-shaped hosted web search with provider-local
+    /// API-key authentication.
+    public static let meta = ProviderProfile(
+        provider: .meta,
+        backends: ProviderBackends(chatCompletions: false, responses: .meta, messages: false),
         codeModeTransport: .functionEnvelope,
         hostedToolDialect: .openAi,
         nativeWebSearch: true,

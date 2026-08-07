@@ -2,8 +2,9 @@
 //
 // Provider-drift port coverage: DeepSeek direct + V4 Flash Responses dialect
 // (Rust fb929feb, 3f83f287, 053409a8), OpenCode Go (1e2af500), Wafer AI
-// (9b2742fd), the xAI client-version gate (631cee8c), and Codex Fast /
-// priority service-tier routing (1b1e52df).
+// (9b2742fd), the xAI client-version gate (631cee8c), Codex Fast /
+// priority service-tier routing (1b1e52df), and the Meta API provider
+// (upstream provider.rs Meta arms at the pinned reference commit).
 
 import Foundation
 import Testing
@@ -20,7 +21,7 @@ struct ProviderRegistryDriftTests {
     @Test("registry covers every built-in provider exactly once")
     func registryCoverage() {
         let expected: [ModelProvider] = [
-            .xai, .codex, .kimi, .fireworks, .deepseek, .openCodeGo, .wafer,
+            .xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer,
         ]
         #expect(PROVIDER_REGISTRY.count == expected.count)
         for provider in expected {
@@ -93,7 +94,7 @@ struct ProviderRegistryDriftTests {
     /// denied xAI-only service paths.
     @Test("new providers are isolated from xAI session auth and services")
     func credentialAndServiceIsolation() {
-        for profile in [ProviderProfile.deepseek, .openCodeGo, .wafer] {
+        for profile in [ProviderProfile.deepseek, .meta, .openCodeGo, .wafer] {
             #expect(profile.sessionAuth == .apiKeyOnly)
             #expect(profile.requestMetadata == .standardHeadersOnly)
             #expect(!profile.allowsXaiServices)
@@ -128,7 +129,7 @@ struct ProviderRegistryDriftTests {
     /// removed, including ones injected after client construction.
     @Test("x-grok headers never reach standard-headers-only providers")
     func xGrokHeaderSanitization() {
-        for provider in [ModelProvider.deepseek, .openCodeGo, .wafer] {
+        for provider in [ModelProvider.deepseek, .meta, .openCodeGo, .wafer] {
             var headers = [
                 "x-grok-conv-id": "c",
                 "x-grok-client-version": "1.2.3",
@@ -268,6 +269,203 @@ struct DeepSeekResponsesDialectTests {
         )
         let input = try? #require(body["input"]?.arrayValue)
         #expect(input?.count == 1)
+    }
+}
+
+// MARK: - Meta Responses dialect
+
+@Suite("Meta Responses dialect")
+struct MetaResponsesDialectTests {
+    /// Provenance: Rust `prompt_cache_and_event_policy_follow_provider_profile`
+    /// (provider.rs:992-998). Meta is stateless and Responses-only: no prompt
+    /// cache key, no turn state, no doom-loop opt-in, and it needs the
+    /// dependency-boundary event compatibility pass.
+    @Test("Meta claims no cache key or turn state and normalizes events")
+    func adapterPolicy() throws {
+        let adapter = providerAdapter(.meta)
+        #expect(adapter.promptCacheKey(sessionId: "session-1") == nil)
+        #expect(!adapter.supportsTurnState(backend: .responses))
+        #expect(!adapter.sendsDoomLoopOptIn)
+        #expect(adapter.normalizesResponseEvents)
+        // Unknown-event tolerance is a Codex-only allowance.
+        #expect(
+            !adapter.ignoresUnknownResponseEvent(
+                error: .serialization("unknown"),
+                data: #"{"type":"response.made_up"}"#
+            )
+        )
+
+        let profile = ProviderProfile.meta
+        #expect(!profile.supportsBackend(.chatCompletions))
+        #expect(profile.supportsBackend(.responses))
+        #expect(!profile.supportsBackend(.messages))
+        #expect(profile.responsesDialect == .meta)
+        try adapter.validateBackend(.responses)
+        do {
+            try adapter.validateBackend(.chatCompletions)
+            Issue.record("Meta must reject Chat Completions")
+        } catch {
+            // expected
+        }
+        do {
+            try adapter.validateBackend(.messages)
+            Issue.record("Meta must reject Messages")
+        } catch {
+            // expected
+        }
+    }
+
+    /// Provenance: Rust
+    /// `meta_responses_preserves_supported_effort_and_drops_unsupported_state`
+    /// (provider.rs:1044-1083). Meta takes the standard effort menu unchanged
+    /// — no DeepSeek-style remap — while the stateless fields and replayed
+    /// `reasoning` input items must never reach the wire.
+    @Test("supported efforts pass through; stateless fields and reasoning items drop")
+    func preservesEffortDropsState() throws {
+        for effort in ["low", "medium", "high", "xhigh"] {
+            var body = JSONValue.object([
+                "input": .array([
+                    .object(["type": .string("message"), "role": .string("user"), "content": .string("first question")]),
+                    .object([
+                        "type": .string("reasoning"),
+                        "id": .string("reasoning_1"),
+                        "summary": .array([.object(["type": .string("summary_text"), "text": .string("transient")])]),
+                    ]),
+                    .object(["type": .string("message"), "role": .string("assistant"), "content": .string("first answer")]),
+                    .object([
+                        "type": .string("function_call"),
+                        "call_id": .string("call_1"),
+                        "name": .string("lookup"),
+                        "arguments": .string(#"{"key":"value"}"#),
+                    ]),
+                    .object(["type": .string("function_call_output"), "call_id": .string("call_1"), "output": .string("result")]),
+                    .object(["type": .string("message"), "role": .string("user"), "content": .string("follow-up")]),
+                ]),
+                "include": .array([.string("reasoning.encrypted_content")]),
+                "prompt_cache_key": .string("must-not-send"),
+                "prompt_cache_retention": .string("24h"),
+                "reasoning": .object(["effort": .string(effort), "summary": .string("concise")]),
+                "store": .bool(true),
+            ])
+            providerAdapter(.meta).patchResponsesRequest(&body, policy: ResponsesRequestPolicy())
+            #expect(body["reasoning"]?["effort"]?.stringValue == effort)
+            #expect(body["reasoning"]?["summary"] == nil)
+            #expect(body["include"] == nil)
+            #expect(body["prompt_cache_key"] == nil)
+            #expect(body["prompt_cache_retention"] == nil)
+            #expect(body["store"] == nil)
+            let input = try #require(body["input"]?.arrayValue)
+            #expect(input.count == 5)
+            #expect(input.allSatisfy { $0["type"]?.stringValue != "reasoning" })
+            #expect(input[0]["role"]?.stringValue == "user")
+            #expect(input[1]["role"]?.stringValue == "assistant")
+            #expect(input[2]["type"]?.stringValue == "function_call")
+            #expect(input[3]["type"]?.stringValue == "function_call_output")
+            #expect(input[4]["role"]?.stringValue == "user")
+        }
+    }
+
+    /// Provenance: Rust `request_patching_is_selected_only_by_provider_adapter`
+    /// (provider.rs:889-932). One provider's Responses patch must never leak
+    /// into another's request.
+    @Test("request patching is selected only by the provider adapter")
+    func patchSelectionDrift() {
+        func baseRequest() -> JSONValue {
+            .object([
+                "input": .array([
+                    .object([
+                        "type": .string("message"),
+                        "role": .string("system"),
+                        "content": .array([.object(["type": .string("input_text"), "text": .string("base prompt")])]),
+                    ]),
+                    .object([
+                        "type": .string("message"),
+                        "role": .string("user"),
+                        "content": .array([.object(["type": .string("input_text"), "text": .string("hello")])]),
+                    ]),
+                ]),
+                "reasoning": .object(["effort": .string("xhigh"), "summary": .string("concise")]),
+            ])
+        }
+        for provider in [ModelProvider.xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer] {
+            var request = baseRequest()
+            let original = baseRequest()
+            providerAdapter(provider).patchResponsesRequest(
+                &request,
+                policy: ResponsesRequestPolicy(localEffort: .max)
+            )
+            switch provider {
+            case .codex:
+                #expect(request["instructions"]?.stringValue == "base prompt")
+                #expect(request["input"]?.arrayValue?.count == 1)
+                #expect(request["reasoning"]?["effort"]?.stringValue == "max")
+                #expect(request["reasoning"]?["summary"] == nil)
+            case .deepseek:
+                #expect(request["input"] == original["input"])
+                #expect(request["reasoning"]?["effort"]?.stringValue == "max")
+                #expect(request["reasoning"]?["summary"] == nil)
+            case .meta:
+                // Meta must NOT remap effort: xhigh stays xhigh.
+                #expect(request["input"] == original["input"])
+                #expect(request["reasoning"]?["effort"]?.stringValue == "xhigh")
+                #expect(request["reasoning"]?["summary"] == nil)
+            default:
+                #expect(request == original, "\(provider.asString) must not patch the request")
+            }
+        }
+    }
+}
+
+// MARK: - Raw-input replay gating
+
+/// Provenance: upstream `raw_responses_input_replacements`
+/// (xai-grok-sampling-types/src/conversation.rs:1614-1650): opaque Codex raw
+/// history replays only into the Codex dialect; DeepSeek and Meta fail closed
+/// with no replay.
+@Suite("Raw-input replay gating")
+struct RawInputReplayGatingTests {
+    private func requestWithCodexRawHistory() -> ConversationRequest {
+        ConversationRequest(items: [
+            .user(UserItem(content: [.text(text: "hello")])),
+            .backendToolCall(BackendToolCallItem(kind: .codexRawInput(
+                CodexRawInputItem(
+                    id: "raw-1",
+                    raw: .object([
+                        "type": .string("item_reference"),
+                        "id": .string("rs_opaque_1"),
+                    ])
+                )
+            ))),
+        ])
+    }
+
+    private func inputItems(provider: ModelProvider, model: String) throws -> [JSONValue] {
+        let body = projectResponsesRequestBody(
+            requestWithCodexRawHistory(),
+            model: model,
+            policy: ResponsesRequestPolicy(),
+            adapter: providerAdapter(provider)
+        )
+        return try #require(body["input"]?.arrayValue)
+    }
+
+    @Test("a Codex-dialect request still replays codex raw input")
+    func codexReplays() throws {
+        let input = try inputItems(provider: .codex, model: "gpt-5-codex")
+        #expect(input.contains { $0["id"]?.stringValue == "rs_opaque_1" })
+    }
+
+    @Test("Meta- and DeepSeek-dialect requests carry no codex raw input")
+    func metaAndDeepSeekFailClosed() throws {
+        for (provider, model) in [(ModelProvider.meta, "muse-spark"), (.deepseek, "deepseek-v4-flash")] {
+            let input = try inputItems(provider: provider, model: model)
+            #expect(
+                !input.contains { $0["id"]?.stringValue == "rs_opaque_1" },
+                "\(provider.asString) must not replay opaque Codex history"
+            )
+            // The rest of the conversation still projects.
+            #expect(input.contains { $0["role"]?.stringValue == "user" })
+        }
     }
 }
 

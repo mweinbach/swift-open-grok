@@ -28,6 +28,7 @@ public struct LiveCatalogRefreshers: Sendable {
     public var kimi: APIKeyCatalogActor?
     public var fireworks: APIKeyCatalogActor?
     public var deepSeek: APIKeyCatalogActor?
+    public var meta: APIKeyCatalogActor?
     public var openCodeGo: OpenCodeGoCatalogActor?
     public var wafer: APIKeyCatalogActor?
 
@@ -36,6 +37,7 @@ public struct LiveCatalogRefreshers: Sendable {
         kimi: APIKeyCatalogActor? = nil,
         fireworks: APIKeyCatalogActor? = nil,
         deepSeek: APIKeyCatalogActor? = nil,
+        meta: APIKeyCatalogActor? = nil,
         openCodeGo: OpenCodeGoCatalogActor? = nil,
         wafer: APIKeyCatalogActor? = nil
     ) {
@@ -43,6 +45,7 @@ public struct LiveCatalogRefreshers: Sendable {
         self.kimi = kimi
         self.fireworks = fireworks
         self.deepSeek = deepSeek
+        self.meta = meta
         self.openCodeGo = openCodeGo
         self.wafer = wafer
     }
@@ -90,6 +93,11 @@ public struct LiveCatalogRefreshers: Sendable {
                 transport: transport,
                 credentialSource: source(.deepSeek),
                 baseURL: DeepSeekModels.apiBaseURL(environment: environment)
+            ),
+            meta: ProviderCatalogActors.meta(
+                transport: transport,
+                credentialSource: source(.meta),
+                baseURL: MetaModels.apiBaseURL(environment: environment)
             ),
             openCodeGo: ProviderCatalogActors.openCodeGo(
                 transport: transport,
@@ -195,6 +203,18 @@ public extension ModelsManager {
                 }
                 applyDeepSeekCatalog(
                     DeepSeekModelsCatalog(
+                        entries: result.entries,
+                        credentialFingerprint: result.fingerprint
+                    )
+                )
+
+            case .meta:
+                guard let actor = refreshers.meta,
+                      let result = try await actor.fetch(cancellation: cancellation) else {
+                    return LiveCatalogRefreshOutcome(partition: partition, published: false)
+                }
+                applyMetaCatalog(
+                    MetaModelsCatalog(
                         entries: result.entries,
                         credentialFingerprint: result.fingerprint
                     )

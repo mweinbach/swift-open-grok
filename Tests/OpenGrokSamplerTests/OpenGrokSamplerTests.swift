@@ -335,8 +335,8 @@ struct ErrorInfoTests {
 struct ProviderTests {
     @Test("registry covers all providers")
     func registry() {
-        #expect(PROVIDER_REGISTRY.count == 7)
-        for p in [ModelProvider.xai, .codex, .kimi, .fireworks, .deepseek, .openCodeGo, .wafer] {
+        #expect(PROVIDER_REGISTRY.count == 8)
+        for p in [ModelProvider.xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer] {
             #expect(providerAdapter(p).provider == p)
         }
     }

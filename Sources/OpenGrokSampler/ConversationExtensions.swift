@@ -347,14 +347,51 @@ public func projectMessagesRequest(
         }
     }
 
+    // Anthropic tool_choice mapping (conversation.rs:5313-5322): `required`
+    // is Messages `any`; `none` maps to `auto` (upstream's default), and
+    // `custom` has no native Messages shape, so it is omitted.
+    let toolChoice: JSONValue? = req.toolChoice.flatMap { tc in
+        switch tc {
+        case .auto: return .object(["type": .string("auto")])
+        case .required: return .object(["type": .string("any")])
+        case .function(let name):
+            return .object(["type": .string("tool"), "name": .string(name)])
+        case .none: return .object(["type": .string("auto")])
+        case .custom: return nil
+        }
+    }
+
+    // Effort → output_config.effort (`none`/`minimal` unsupported, clamp to
+    // `"max"` above high; types.rs:737-745). thinking is driven by
+    // reasoning_effort only, not by json_schema, and `display: "summarized"`
+    // is required for newer models to surface thinking content at all
+    // (conversation.rs:5341-5352).
+    let effort = req.reasoningEffort.flatMap(\.messagesAPI)
+    let format: JSONValue? = req.jsonSchema.map { schema in
+        .object(["type": .string("json_schema"), "schema": schema])
+    }
+    let thinking: JSONValue? = effort.map { _ in
+        .object(["type": .string("adaptive"), "display": .string("summarized")])
+    }
+    var outputConfig: JSONValue?
+    if effort != nil || format != nil {
+        var oc: [String: JSONValue] = [:]
+        if let effort { oc["effort"] = .string(effort) }
+        if let format { oc["format"] = format }
+        outputConfig = .object(oc)
+    }
+
     return MessagesWireRequest(
         model: model,
         messages: messages,
         maxTokens: maxTokens,
         system: systemParts.isEmpty ? nil : .string(systemParts.joined(separator: "\n\n")),
         tools: tools,
+        toolChoice: toolChoice,
         temperature: req.temperature,
-        topP: req.topP
+        topP: req.topP,
+        thinking: thinking,
+        outputConfig: outputConfig
     )
 }
 
@@ -452,8 +489,19 @@ public func projectResponsesRequestBody(
                 "output": .string(text),
             ]))
         case .backendToolCall(let b):
-            // Preserve opaque backend history when we have a raw JSON form.
-            if case .codexRawInput(let raw) = b.kind {
+            // Opaque provider-native history replays only into the dialect
+            // that produced it (upstream `raw_responses_input_replacements`,
+            // xai-grok-sampling-types/src/conversation.rs:1614-1650). Codex
+            // raw items are Codex-private state; every other dialect —
+            // DeepSeek and Meta explicitly, per upstream — fails closed and
+            // replays nothing until its replay contract is defined. The cost:
+            // on a cross-dialect request this history silently thins instead
+            // of erroring, which is upstream's behavior too (an empty
+            // replacement list). Do not loosen this to "replay everywhere":
+            // that leaks one provider's opaque payloads to another.
+            if case .codexRawInput(let raw) = b.kind,
+               adapter.profile.responsesDialect == .codex
+            {
                 input.append(raw.raw)
             }
         }
@@ -519,6 +567,17 @@ public func projectResponsesRequestBody(
     if let key = adapter.promptCacheKey(sessionId: req.xGrokSessionId) {
         body["prompt_cache_key"] = .string(key)
     }
+    // Every Responses dialect gets the base reasoning object — always present,
+    // even with no effort selected (conversation.rs:3892-3895). The effort is
+    // clamped (`max`/`ultra` → `"xhigh"`), summary starts at "concise", and
+    // the dialect patchers below then override or strip: Codex re-raises
+    // `max`/`ultra` to `"max"` and applies its summary policy; DeepSeek and
+    // Meta drop the summary.
+    var reasoning: [String: JSONValue] = ["summary": .string("concise")]
+    if let effort = req.reasoningEffort {
+        reasoning["effort"] = .string(effortToResponsesAPI(effort))
+    }
+    body["reasoning"] = .object(reasoning)
     // Standard routing is the absence of the field, not `service_tier:
     // "default"`, so only a concrete tier id reaches the wire.
     if let tier = normalizedServiceTier(req.serviceTier) {
@@ -528,6 +587,22 @@ public func projectResponsesRequestBody(
     var value = JSONValue.object(body)
     adapter.patchResponsesRequest(&value, policy: policy)
     return value
+}
+
+/// Responses API `reasoning.effort` wire value. `max`/`ultra` clamp to
+/// `"xhigh"` — the Responses typed layer models nothing higher; the Codex
+/// request patcher restores the true selection (`"max"`) at the transport
+/// boundary. Port of `ReasoningEffort::to_responses_api`
+/// (`xai-grok-sampling-types/src/types.rs:699-708`).
+func effortToResponsesAPI(_ effort: ReasoningEffort) -> String {
+    switch effort {
+    case .none: return "none"
+    case .minimal: return "minimal"
+    case .low: return "low"
+    case .medium: return "medium"
+    case .high: return "high"
+    case .xhigh, .max, .ultra: return "xhigh"
+    }
 }
 
 /// Defaults snapshot used when projecting conversation requests.

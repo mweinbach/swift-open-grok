@@ -336,6 +336,28 @@ struct CatalogGoldenFixtureTests {
         #expect(catalog.values().allSatisfy { $0.info.provider == .deepseek })
     }
 
+    /// Provenance: `meta_models.rs:323-371`
+    /// (`wire_catalog_preserves_curated_capabilities`): unknown future ids
+    /// fail closed, and the curated capabilities survive the wire join.
+    @Test("Meta availability list intersects the curated catalog")
+    func metaGolden() throws {
+        let slugs = try MetaModels.parseAvailableSlugs(try fixture("meta_models.json"))
+        #expect(slugs == ["muse-spark-1.2", "muse-spark-1.1", "muse-spark-1.2-contributor"])
+
+        var catalog = MetaModels.curatedCatalog()
+        catalog.retain { _, entry in slugs.contains(entry.info.model) }
+        #expect(catalog.count == 3)
+        #expect(catalog.values().allSatisfy { $0.info.provider == .meta })
+
+        let model = try #require(catalog["meta:muse-spark-1.2"])
+        #expect(model.info.apiBackend == .responses)
+        #expect(model.info.contextWindow == 1_000_000)
+        #expect(model.info.supportsBackendSearch)
+        #expect(model.info.reasoningEffort == .medium)
+        #expect(model.info.reasoningEfforts.map(\.value) == [.low, .medium, .high, .xhigh])
+        #expect(model.envKey?.primary == MetaModels.apiKeyEnv)
+    }
+
     /// Provenance: `opencode_go_models.rs:313-337`. Fails closed on missing
     /// metadata and on an SDK with no known wire protocol.
     @Test("OpenCode Go joins availability with models.dev and fails closed")
@@ -766,6 +788,37 @@ struct CatalogPartitionIsolationTests {
         #expect(after["wafer:wafer-model"] != nil)
     }
 
+    /// Provenance: `meta_models.rs:380-414` (`model_query_uses_bearer_auth`).
+    /// The Meta query bearer-auths against `{base}/models` with only the Meta
+    /// partition's key.
+    @Test("the Meta query bearer-auths with only the Meta key")
+    func metaQueryUsesBearerAuth() async throws {
+        let broker = RecordingCredentialBroker()
+        await broker.setKey(.meta, apiKey: "meta-query-canary", fingerprint: "fp-meta")
+        await broker.setKey(.wafer, apiKey: "wafer-secret", fingerprint: "fp-wafer")
+
+        let transport = MockCatalogTransport()
+        await transport.route(
+            matching: "/models",
+            responses: [ok(try fixture("meta_models.json"))]
+        )
+
+        let actor = ProviderCatalogActors.meta(
+            transport: transport,
+            credentialSource: { await broker.credential(for: .meta) }
+        )
+        let result = try #require(try await actor.fetch())
+        #expect(result.entries.contains("meta:muse-spark-1.2"))
+        #expect(result.fingerprint == "fp-meta")
+
+        let request = try #require(await transport.recordedRequests().first)
+        #expect(request.url == "https://api.meta.ai/v1/models")
+        #expect(request.timeout == 10)
+        #expect(request.headerValue("Authorization") == "Bearer meta-query-canary")
+        // Only the Meta partition's credential was consulted.
+        #expect(await broker.asked().allSatisfy { $0 == .meta })
+    }
+
     /// A projection that tried to emit another provider's entry is filtered by
     /// the actor before publication, independently of the merge layer.
     @Test("an actor drops entries outside its own partition")
@@ -936,7 +989,7 @@ struct ModelsManagerLiveRefreshTests {
         let before = manager.catalogSnapshot().keys
 
         let outcomes = await manager.refreshBackgroundPartitions()
-        #expect(outcomes.count == 5)
+        #expect(outcomes.count == 6)
         #expect(outcomes.allSatisfy { !$0.published })
         #expect(outcomes.allSatisfy { $0.failure == nil })
         // No request was ever attempted.

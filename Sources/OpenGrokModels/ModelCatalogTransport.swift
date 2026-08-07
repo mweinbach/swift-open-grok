@@ -11,6 +11,7 @@
 //   kimi_models.rs:246-251       Kimi `/models`
 //   fireworks_models.rs:233-238  Fireworks `/models`
 //   deepseek_models.rs:197-206   DeepSeek `/models`
+//   meta_models.rs:178-201       Meta `/models`
 //   opencode_go_models.rs:165-195 OpenCode Go `/models` + models.dev
 
 import Foundation
@@ -27,6 +28,7 @@ public enum ModelCatalogPartition: String, Sendable, Equatable, Hashable, CaseIt
     case kimi
     case fireworks
     case deepSeek
+    case meta
     case openCodeGo
     case wafer
 
@@ -36,6 +38,7 @@ public enum ModelCatalogPartition: String, Sendable, Equatable, Hashable, CaseIt
         case .kimi: return .kimi
         case .fireworks: return .fireworks
         case .deepSeek: return .deepseek
+        case .meta: return .meta
         case .openCodeGo: return .openCodeGo
         case .wafer: return .wafer
         }
@@ -199,7 +202,7 @@ public enum ModelCatalogRequests {
         "\(trimTrailingSlashes(baseURL))/models"
     }
 
-    /// Bearer-only catalog request. Wafer, Kimi, Fireworks, DeepSeek and
+    /// Bearer-only catalog request. Wafer, Kimi, Fireworks, DeepSeek, Meta and
     /// OpenCode Go all send exactly this and nothing more — notably no
     /// originator/version headers, which are Codex-only.
     public static func bearerRequest(

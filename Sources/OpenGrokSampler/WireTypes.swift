@@ -304,12 +304,14 @@ public struct MessagesWireRequest: Encodable, Sendable, Equatable {
     public var topP: Float?
     public var stream: Bool?
     public var thinking: JSONValue?
+    public var outputConfig: JSONValue?
 
     public enum CodingKeys: String, CodingKey {
         case model, messages, system, tools, temperature, stream, thinking
         case maxTokens = "max_tokens"
         case toolChoice = "tool_choice"
         case topP = "top_p"
+        case outputConfig = "output_config"
     }
 
     public init(
@@ -322,7 +324,8 @@ public struct MessagesWireRequest: Encodable, Sendable, Equatable {
         temperature: Float? = nil,
         topP: Float? = nil,
         stream: Bool? = nil,
-        thinking: JSONValue? = nil
+        thinking: JSONValue? = nil,
+        outputConfig: JSONValue? = nil
     ) {
         self.model = model
         self.messages = messages
@@ -334,5 +337,6 @@ public struct MessagesWireRequest: Encodable, Sendable, Equatable {
         self.topP = topP
         self.stream = stream
         self.thinking = thinking
+        self.outputConfig = outputConfig
     }
 }
