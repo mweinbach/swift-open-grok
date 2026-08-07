@@ -82,7 +82,10 @@ struct PagerNewSlashCommandTests {
 
     @Test("/btw without a question is refused with its usage line")
     func btwRequiresAQuestion() async throws {
-        let harness = try await CommandHarness.run(submitting: ["/btw"])
+        // The trailing space lands the draft in the argument phase, where
+        // Enter is a plain send; a bare "/btw" Enter now completes into that
+        // phase instead of dispatching (upstream's `is_command_complete`).
+        let harness = try await CommandHarness.run(submitting: ["/btw "])
         #expect(await harness.notices.contains("Usage: /btw <question>"))
     }
 
@@ -98,7 +101,10 @@ struct PagerNewSlashCommandTests {
 
     @Test("/effort forwards the level query to the render layer, nil when bare")
     func effortForwardsQuery() async throws {
-        let harness = try await CommandHarness.run(submitting: ["/effort", "/effort high"])
+        // Trailing space on the bare form: a bare "/effort" Enter completes
+        // into the argument phase now, so the dispatching press is the one
+        // from the phase itself (upstream's `is_command_complete`).
+        let harness = try await CommandHarness.run(submitting: ["/effort ", "/effort high"])
         #expect(await harness.overlayRequests == [
             .reasoningEffort(query: nil),
             .reasoningEffort(query: "high"),
@@ -120,8 +126,8 @@ struct PagerNewSlashCommandTests {
 
     @Test("/rename without a title is refused with upstream's usage copy")
     func renameRequiresTitle() async throws {
-        // rename.rs:48-50.
-        let harness = try await CommandHarness.run(submitting: ["/rename"])
+        // rename.rs:48-50. Trailing space: see btwRequiresAQuestion.
+        let harness = try await CommandHarness.run(submitting: ["/rename "])
         #expect(await harness.overlayRequests.isEmpty)
         #expect(await harness.notices.contains("Usage: /rename <new title>"))
     }

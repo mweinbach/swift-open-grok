@@ -54,6 +54,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case historyNext
         case completionMove(Int)
         case completionAccept
+        /// `Enter` with the dropdown open — accept the highlighted row, then
+        /// either send it (complete command) or stay open for its required
+        /// arguments. Never escapes `applyEditorEvent`, which rewrites it to
+        /// `.submit` or `.changed` (upstream's `is_command_complete` gate,
+        /// `app/agent_view/prompt.rs:186-274`).
+        case completionCommit
         case viewport(OpenGrokPagerViewportCommand)
         /// `Tab` on a closed dropdown — hand the keyboard to the scrollback.
         case focusScrollback
@@ -304,6 +310,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             if isMultiline != wantsNewline {
                 insert(["\n"])
                 return .changed
+            }
+            // The dropdown owns a sending Enter in the COMMAND phase: accept
+            // the highlighted row, then send only if the command is complete
+            // — upstream's dropdown intercept ahead of the send path
+            // (`prompt.rs:186-274`). The argument phase deliberately keeps
+            // Enter as plain send: a typed argument must pass through as
+            // typed ("/theme tokyonight" stays tokyonight), and Tab remains
+            // the explicit accept for a suggestion.
+            if !completions.isEmpty, !characters.contains(where: \.isWhitespace) {
+                return .completionCommit
             }
             // This press would have sent. A line ending in a backslash says
             // "not yet" — the rescue only applies here, on the send path, and
@@ -1031,7 +1047,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         let action = applyEditorEvent(event)
                         switch action {
                         case .changed, .historyPrevious, .historyNext,
-                             .completionMove, .completionAccept:
+                             .completionMove, .completionAccept,
+                             // `.completionCommit` is rewritten to `.submit`
+                             // or `.changed` inside `applyEditorEvent`; listed
+                             // for exhaustiveness, reached never.
+                             .completionCommit:
                             try await emit(.promptChanged(promptState()))
                             await inputPumpGate.resume()
                         case .focusScrollback:
@@ -1379,6 +1399,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 await inputPumpGate.resume()
                             case .changed, .historyPrevious, .historyNext,
                                  .completionMove, .completionAccept,
+                                 // Rewritten inside `applyEditorEvent`;
+                                 // listed for exhaustiveness, reached never.
+                                 .completionCommit,
                                  .escape, .interrupt, .eof, .resize:
                                 try await emit(.promptChanged(promptState()))
                                 await inputPumpGate.resume()
@@ -1815,23 +1838,52 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 }
             }
         case .completionAccept:
-            if let index = editor.selectedCompletion,
-               editor.completions.indices.contains(index) {
-                let suggestion = editor.completions[index]
-                // Accepting a *command* row records MRU; an argument row does
-                // not (`record_mru = snap.cursor_in_command`,
-                // `prompt_widget/mod.rs:1206-1211`).
-                if Self.argumentPhase(for: editor.text) == nil {
-                    recordSlashMruUse(commandNamed: suggestion.name)
-                }
-                editor.replace(with: suggestion.insertText)
+            acceptSelectedCompletion()
+            editor.completions = []
+            editor.selectedCompletion = nil
+        case .completionCommit:
+            // Enter on a row: accept it, then upstream's `is_command_complete`
+            // gate decides. A command whose usage requires an argument
+            // (`/effort <level>`) completes into the argument phase — the
+            // draft becomes "/effort " with the argument dropdown open — and
+            // a complete command sends on this same press.
+            let accepted = acceptSelectedCompletion()
+            if let accepted,
+               case .available(let command) = commands.resolve(
+                   PagerCommandInvocation(name: accepted.name)
+               ),
+               command.requiresArguments,
+               Self.argumentPhase(for: editor.text) == nil {
+                editor.replace(with: editor.text + " ")
+                refreshCompletions()
+                return .changed
             }
             editor.completions = []
             editor.selectedCompletion = nil
+            return .submit
         default:
             break
         }
         return action
+    }
+
+    /// Replace the draft with the highlighted row's insert text, recording
+    /// MRU for command-phase accepts. Returns the accepted row, or nil when
+    /// no row was highlighted (the caller then treats the press as if the
+    /// dropdown were closed).
+    @discardableResult
+    private func acceptSelectedCompletion() -> OpenGrokPagerCommandSuggestion? {
+        guard let index = editor.selectedCompletion,
+              editor.completions.indices.contains(index) else { return nil }
+        let suggestion = editor.completions[index]
+        // Accepting a *command* row records MRU; an argument row does
+        // not (`record_mru = snap.cursor_in_command`,
+        // `prompt_widget/mod.rs:1206-1211`).
+        if Self.argumentPhase(for: editor.text) == nil {
+            recordSlashMruUse(commandNamed: suggestion.name)
+        }
+        editor.replace(with: suggestion.insertText)
+        return suggestion
     }
 
     /// Record an accepted slash command in the MRU and hand a persistence

@@ -72,6 +72,18 @@ public struct PagerCommandDefinition: Codable, Equatable, Hashable, Sendable, Id
         !name.isEmpty && !name.contains(where: { $0.isWhitespace || $0 == "/" })
     }
 
+    /// Upstream's `args_required` bit (`is_command_complete`,
+    /// `slash/mod.rs`), derived from the usage grammar this port already
+    /// carries verbatim: a `<placeholder>` marks a required argument, a
+    /// `[placeholder]` an optional one. Enter on a required-argument command
+    /// completes into the argument phase instead of sending. Derived rather
+    /// than a second hand-set bit so the usage string stays the single
+    /// source of truth; the test suite pins the derived set by name so a
+    /// reworded usage that flips a bit fails loudly.
+    public var requiresArguments: Bool {
+        usage?.contains("<") ?? false
+    }
+
     public var allNames: [String] { [name] + aliases }
 
     public static func normalize(_ value: String) -> String {

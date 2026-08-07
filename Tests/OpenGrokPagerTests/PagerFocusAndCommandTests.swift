@@ -38,6 +38,44 @@ struct PagerFocusAndCommandTests {
         #expect(await harness.lastPromptText == "/help")
     }
 
+    @Test("Enter completes an argument-required command into its argument phase instead of sending")
+    func enterCompletesArgsRequiredCommand() async throws {
+        // Upstream's `is_command_complete` gate: `/effort` requires a level,
+        // so Enter on its dropdown row completes the draft to "/effort " and
+        // stays in the argument phase rather than dispatching an incomplete
+        // command (`app/agent_view/prompt.rs:186-274`).
+        let harness = try await Harness.run([
+            .paste("/eff"),
+            .key(KeyEvent(key: .enter)),
+        ])
+
+        #expect(await harness.lastPromptText == "/effort ")
+        #expect(await harness.turnPrompts.isEmpty)
+        #expect(await harness.overlayRequests.isEmpty)
+    }
+
+    @Test("Enter on a complete command row accepts and sends on the same press")
+    func enterSendsCompleteCommandRow() async throws {
+        let harness = try await Harness.run([
+            .paste("/hel"),
+            .key(KeyEvent(key: .enter)),
+        ])
+
+        #expect(await harness.overlayRequests == [.help])
+        #expect(await harness.lastPromptText == "")
+    }
+
+    @Test("the usage grammar pins exactly the argument-required builtins")
+    func argumentRequiredBuiltinsArePinned() {
+        // `requiresArguments` derives from the usage string's `<placeholder>`
+        // markers; this pin makes a reworded usage that silently flips a
+        // command's Enter behavior fail here instead of in someone's session.
+        let required = OpenGrokPagerInteractiveController.builtinCommands
+            .filter(\.requiresArguments)
+            .map(\.name)
+        #expect(Set(required) == Set(["effort", "rename", "btw", "recall", "flush"]))
+    }
+
     @Test("the focused scrollback never leaks a keystroke to the composer")
     func scrollbackSwallowsTypedText() async throws {
         let harness = try await Harness.run([
