@@ -81,27 +81,34 @@ enum LiveBackgroundTaskTools {
     // MARK: - Tool specs
 
     static func toolSpecs(
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        subagentsPresent: Bool = false
     ) -> [ToolSpec] {
         let cap = formatWaitCap(maxWaitBlockMilliseconds(environment: environment))
         return [
-            getTaskOutputSpec(waitCap: cap),
-            waitTasksSpec(waitCap: cap),
-            killTaskSpec,
+            getTaskOutputSpec(waitCap: cap, subagentsPresent: subagentsPresent),
+            waitTasksSpec(waitCap: cap, subagentsPresent: subagentsPresent),
+            killTaskSpec(subagentsPresent: subagentsPresent),
         ]
     }
 
     /// Wording mirrors `xai_tool_types::build_task_output_description` for the
-    /// shape this session actually finalizes: bash present, no monitor tool and
-    /// no subagent tool, so the target suffix and monitor note are both empty.
-    static func getTaskOutputSpec(waitCap: String) -> ToolSpec {
-        ToolSpec(
+    /// shape this session actually finalizes: bash present, no monitor tool,
+    /// and the subagent suffix only when the session advertises
+    /// `spawn_subagent` — the description must never name a surface the model
+    /// cannot reach.
+    static func getTaskOutputSpec(waitCap: String, subagentsPresent: Bool = false) -> ToolSpec {
+        let target = subagentsPresent ? "background task or subagent" : "background task"
+        let sources = subagentsPresent
+            ? "is_background=true commands or background=true subagents"
+            : "is_background=true commands"
+        return ToolSpec(
             name: getTaskOutputName,
             description: """
-            Get output and status from a background task.
+            Get output and status from a \(target).
 
             Usage notes:
-            - Pass task_ids with one or more ids from is_background=true commands; for a single task use a one-element array. Multiple ids with a positive timeout_ms wait until all complete
+            - Pass task_ids with one or more ids from \(sources); for a single task use a one-element array. Multiple ids with a positive timeout_ms wait until all complete
             - Omit timeout_ms or pass 0 for a non-blocking status snapshot; set a positive timeout_ms to wait up to that many milliseconds, capped at \(waitCap)
             - Returns current output, status, and exit code if completed
             - If output is large, use read_file on the output_file path
@@ -130,8 +137,11 @@ enum LiveBackgroundTaskTools {
     /// this tool only as a compatibility alias for prompts that still emit it —
     /// `get_task_output` with a positive `timeout_ms` is the preferred path —
     /// but `wait_any` exists only here, so it is not purely redundant.
-    static func waitTasksSpec(waitCap: String) -> ToolSpec {
-        ToolSpec(
+    static func waitTasksSpec(waitCap: String, subagentsPresent: Bool = false) -> ToolSpec {
+        let sources = subagentsPresent
+            ? "is_background=true or background=true"
+            : "is_background=true commands"
+        return ToolSpec(
             name: waitTasksName,
             description: """
             Wait for multiple background tasks or subagents to complete.
@@ -139,7 +149,7 @@ enum LiveBackgroundTaskTools {
             Prefer get_task_output with task_ids and a positive timeout_ms. This tool is kept for compatibility.
 
             Usage notes:
-            - task_ids: list of task IDs from is_background=true commands
+            - task_ids: list of task IDs from \(sources)
             - mode: 'wait_all' or 'wait_any'
             - timeout_ms: optional max wait, default 30s, capped at \(waitCap)
             """,
@@ -169,17 +179,23 @@ enum LiveBackgroundTaskTools {
     }
 
     /// Mirrors `xai_tool_types::build_kill_task_description` with
-    /// `bash_present: true`, no monitor tool and no subagent tool.
-    static let killTaskSpec = ToolSpec(
-        name: killTaskName,
-        description: """
-        Terminate a running background task.
+    /// `bash_present: true` and no monitor tool; the subagent clause appears
+    /// exactly when the session can spawn one.
+    static func killTaskSpec(subagentsPresent: Bool = false) -> ToolSpec {
+        let target = subagentsPresent ? "background task or subagent" : "background task"
+        let action = subagentsPresent
+            ? "Sends SIGTERM/SIGKILL to a bash task; sends Cancel+Shutdown to a subagent."
+            : "Sends SIGTERM/SIGKILL to a bash task."
+        return ToolSpec(
+            name: killTaskName,
+            description: """
+            Terminate a running \(target).
 
-        Usage notes:
-        - Pass its task_id.
-        - Sends SIGTERM/SIGKILL to a bash task.
-        - Returns success if the task was killed or had already exited.
-        """,
+            Usage notes:
+            - Pass its task_id.
+            - \(action)
+            - Returns success if the task was killed or had already exited.
+            """,
         parameters: .object([
             "type": .string("object"),
             "properties": .object([
@@ -190,15 +206,21 @@ enum LiveBackgroundTaskTools {
             ]),
             "required": .array([.string("task_id")]),
             "additionalProperties": .bool(false),
-        ])
-    )
+            ])
+        )
+    }
 
     // MARK: - Dispatch
 
+    /// `subagents` is the session's subagent host when `spawn_subagent` is
+    /// live. Task ids share one namespace (upstream unifies them in
+    /// `task_output/mod.rs` / `kill_task/mod.rs`): an id the shell does not
+    /// own falls through to the coordinator.
     static func invoke(
         name: String,
         args: JSONValue,
         process: any OpenGrokShellProcessExecution,
+        subagents: (any LiveSubagentQuerying)? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
         guard let canonical = canonicalName(for: name) else {
@@ -209,11 +231,11 @@ enum LiveBackgroundTaskTools {
         }
         switch canonical {
         case getTaskOutputName:
-            return await getTaskOutput(object, process: process, environment: environment)
+            return await getTaskOutput(object, process: process, subagents: subagents, environment: environment)
         case waitTasksName:
-            return await waitTasks(object, process: process, environment: environment)
+            return await waitTasks(object, process: process, subagents: subagents, environment: environment)
         case killTaskName:
-            return await killTask(object, process: process)
+            return await killTask(object, process: process, subagents: subagents)
         default:
             return .failure(.unsupported("unknown tool '\(name)'"))
         }
@@ -221,9 +243,24 @@ enum LiveBackgroundTaskTools {
 
     // MARK: get_task_output
 
+    /// One resolved id: a shell task or a subagent, never both (the shell
+    /// wins a collision, matching upstream's terminal-first order).
+    private enum ResolvedTask {
+        case shell(ShellTaskSnapshot)
+        case subagent(LiveSubagentSnapshot)
+
+        var completed: Bool {
+            switch self {
+            case .shell(let snapshot): return snapshot.completed
+            case .subagent(let snapshot): return snapshot.completed
+            }
+        }
+    }
+
     private static func getTaskOutput(
         _ object: [String: JSONValue],
         process: any OpenGrokShellProcessExecution,
+        subagents: (any LiveSubagentQuerying)?,
         environment: [String: String]
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
         let taskIDs = resolveTaskIDs(object)
@@ -237,13 +274,19 @@ enum LiveBackgroundTaskTools {
             ? min(requested ?? defaultWaitTimeoutMilliseconds, maxWaitBlockMilliseconds(environment: environment))
             : 0
 
-        let snapshots: [String: ShellTaskSnapshot?]
+        let snapshots: [String: ResolvedTask?]
         if waits {
-            snapshots = await waitAll(taskIDs, budgetMilliseconds: budget, process: process)
+            snapshots = await waitAll(taskIDs, budgetMilliseconds: budget, process: process, subagents: subagents)
         } else {
-            var polled: [String: ShellTaskSnapshot?] = [:]
+            var polled: [String: ResolvedTask?] = [:]
             for taskID in taskIDs {
-                polled[taskID] = await process.taskSnapshot(taskID)
+                if let shell = await process.taskSnapshot(taskID) {
+                    polled[taskID] = .shell(shell)
+                } else if let subagents, let subagent = await subagents.subagentSnapshot(id: taskID) {
+                    polled[taskID] = .subagent(subagent)
+                } else {
+                    polled[taskID] = nil
+                }
             }
             snapshots = polled
         }
@@ -253,27 +296,39 @@ enum LiveBackgroundTaskTools {
         // other ids still have answers worth returning, so unknown ids become
         // "not_found" rows instead of failing the whole call.
         if taskIDs.count == 1, snapshots[taskIDs[0]] ?? nil == nil {
-            return .success(await notFoundResult(taskIDs[0], process: process))
+            return .success(await notFoundResult(taskIDs[0], process: process, subagents: subagents))
         }
 
         let results = taskIDs.map { taskID -> JSONValue in
-            guard let snapshot = snapshots[taskID] ?? nil else {
+            guard let resolved = snapshots[taskID] ?? nil else {
                 return .object([
                     "task_id": .string(taskID),
                     "status": .string("not_found"),
                 ])
             }
-            return resultValue(for: snapshot)
+            switch resolved {
+            case .shell(let snapshot): return resultValue(for: snapshot)
+            case .subagent(let snapshot): return subagentResultValue(for: snapshot)
+            }
         }
 
         if taskIDs.count == 1, case .object(let single) = results[0] {
-            return .success(OpenGrokShellToolCallResult(
-                value: .object(single),
-                promptText: promptText(
-                    for: snapshots[taskIDs[0]] ?? nil,
+            let text: String
+            switch snapshots[taskIDs[0]] ?? nil {
+            case .shell(let snapshot):
+                text = promptText(
+                    for: snapshot,
                     taskID: taskIDs[0],
                     waited: waits ? budget : nil
                 )
+            case .subagent(let snapshot):
+                text = subagentPromptText(for: snapshot, waited: waits ? budget : nil)
+            case nil:
+                text = "Task \(taskIDs[0]) not found."
+            }
+            return .success(OpenGrokShellToolCallResult(
+                value: .object(single),
+                promptText: text
             ))
         }
 
@@ -294,6 +349,7 @@ enum LiveBackgroundTaskTools {
     private static func waitTasks(
         _ object: [String: JSONValue],
         process: any OpenGrokShellProcessExecution,
+        subagents: (any LiveSubagentQuerying)?,
         environment: [String: String]
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
         let taskIDs = resolveTaskIDs(object)
@@ -311,21 +367,24 @@ enum LiveBackgroundTaskTools {
             maxWaitBlockMilliseconds(environment: environment)
         )
 
-        let snapshots: [String: ShellTaskSnapshot?]
+        let snapshots: [String: ResolvedTask?]
         if mode == "wait_any" {
-            snapshots = await waitAny(taskIDs, budgetMilliseconds: budget, process: process)
+            snapshots = await waitAny(taskIDs, budgetMilliseconds: budget, process: process, subagents: subagents)
         } else {
-            snapshots = await waitAll(taskIDs, budgetMilliseconds: budget, process: process)
+            snapshots = await waitAll(taskIDs, budgetMilliseconds: budget, process: process, subagents: subagents)
         }
 
         let results = taskIDs.map { taskID -> JSONValue in
-            guard let snapshot = snapshots[taskID] ?? nil else {
+            guard let resolved = snapshots[taskID] ?? nil else {
                 return .object([
                     "task_id": .string(taskID),
                     "status": .string("not_found"),
                 ])
             }
-            return resultValue(for: snapshot)
+            switch resolved {
+            case .shell(let snapshot): return resultValue(for: snapshot)
+            case .subagent(let snapshot): return subagentResultValue(for: snapshot)
+            }
         }
         let completed = taskIDs.filter { (snapshots[$0] ?? nil)?.completed == true }.count
         let summary = "\(completed) of \(taskIDs.count) task(s) complete."
@@ -343,7 +402,8 @@ enum LiveBackgroundTaskTools {
 
     private static func killTask(
         _ object: [String: JSONValue],
-        process: any OpenGrokShellProcessExecution
+        process: any OpenGrokShellProcessExecution,
+        subagents: (any LiveSubagentQuerying)?
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
         guard let taskID = string(object["task_id"])?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -373,7 +433,34 @@ enum LiveBackgroundTaskTools {
                 promptText: "Task \(taskID) had already exited."
             ))
         case .notFound:
-            let message = await notFoundMessage(taskID, process: process)
+            // The id may name a subagent rather than a shell task (upstream
+            // `kill_task/mod.rs:214-249`: terminal miss → coordinator cancel).
+            if let subagents {
+                switch await subagents.cancelSubagent(id: taskID) {
+                case .cancelled:
+                    return .success(OpenGrokShellToolCallResult(
+                        value: .object([
+                            "task_id": .string(taskID),
+                            "outcome": .string("killed"),
+                            "message": .string("Subagent cancellation initiated"),
+                        ]),
+                        promptText: "Subagent cancellation initiated"
+                    ))
+                case .alreadyFinished(let status):
+                    let message = "Subagent already \(status)"
+                    return .success(OpenGrokShellToolCallResult(
+                        value: .object([
+                            "task_id": .string(taskID),
+                            "outcome": .string("already_exited"),
+                            "message": .string(message),
+                        ]),
+                        promptText: message
+                    ))
+                case .notFound:
+                    break
+                }
+            }
+            let message = await notFoundMessage(taskID, process: process, subagents: subagents)
             return .success(OpenGrokShellToolCallResult(
                 value: .object([
                     "task_id": .string(taskID),
@@ -387,33 +474,50 @@ enum LiveBackgroundTaskTools {
 
     // MARK: - Waiting
 
-    /// Wait for every id, sharing one overall budget. Each `waitForCompletion`
-    /// gets the remaining time rather than the full budget, so N ids cannot
-    /// block for N × the ceiling the model was told about.
+    /// Wait for every id, sharing one overall budget. Each wait gets the
+    /// remaining time rather than the full budget, so N ids cannot block for
+    /// N × the ceiling the model was told about. Shell-owned ids wait on the
+    /// process backend; ids it disowns wait on the subagent coordinator.
     private static func waitAll(
         _ taskIDs: [String],
         budgetMilliseconds: Int,
-        process: any OpenGrokShellProcessExecution
-    ) async -> [String: ShellTaskSnapshot?] {
+        process: any OpenGrokShellProcessExecution,
+        subagents: (any LiveSubagentQuerying)?
+    ) async -> [String: ResolvedTask?] {
         let deadline = Date().addingTimeInterval(TimeInterval(budgetMilliseconds) / 1_000)
-        var snapshots: [String: ShellTaskSnapshot?] = [:]
+        var snapshots: [String: ResolvedTask?] = [:]
         for taskID in taskIDs {
             let remaining = deadline.timeIntervalSinceNow
-            if remaining <= 0 {
-                snapshots[taskID] = await process.taskSnapshot(taskID)
+            if remaining > 0 {
+                // The shell waits first, exactly as before the unification:
+                // a positive timeout must reach `waitForCompletion` even for
+                // an id a poll would already answer. A nil return means "not
+                // owned" or "still running" — the poll below disambiguates.
+                if let waited = await process.waitForCompletion(
+                    taskID,
+                    timeout: .seconds(remaining)
+                ) {
+                    snapshots[taskID] = .shell(waited)
+                    continue
+                }
+            }
+            if let shell = await process.taskSnapshot(taskID) {
+                snapshots[taskID] = .shell(shell)
                 continue
             }
-            let waited = await process.waitForCompletion(
-                taskID,
-                timeout: .seconds(remaining)
-            )
-            // A nil here can mean either "not owned" or "still running", so fall
-            // back to a poll before concluding the id is unknown.
-            if let waited {
-                snapshots[taskID] = waited
-            } else {
-                snapshots[taskID] = await process.taskSnapshot(taskID)
+            // Not a shell task: the id may name a subagent.
+            if let subagents {
+                let remainingAfterShell = deadline.timeIntervalSinceNow
+                if remainingAfterShell > 0 {
+                    snapshots[taskID] = await subagents
+                        .awaitSubagent(id: taskID, timeoutMS: UInt64(remainingAfterShell * 1_000))
+                        .map { .subagent($0) }
+                } else {
+                    snapshots[taskID] = await subagents.subagentSnapshot(id: taskID).map { .subagent($0) }
+                }
+                continue
             }
+            snapshots[taskID] = nil
         }
         return snapshots
     }
@@ -423,29 +527,45 @@ enum LiveBackgroundTaskTools {
     private static func waitAny(
         _ taskIDs: [String],
         budgetMilliseconds: Int,
-        process: any OpenGrokShellProcessExecution
-    ) async -> [String: ShellTaskSnapshot?] {
+        process: any OpenGrokShellProcessExecution,
+        subagents: (any LiveSubagentQuerying)?
+    ) async -> [String: ResolvedTask?] {
         let timeout = TimeInterval(budgetMilliseconds) / 1_000
-        let winner: ShellTaskSnapshot? = await withTaskGroup(
-            of: ShellTaskSnapshot?.self
+        let winner: (String, ResolvedTask)? = await withTaskGroup(
+            of: (String, ResolvedTask)?.self
         ) { group in
             for taskID in taskIDs {
                 group.addTask {
-                    await process.waitForCompletion(taskID, timeout: .seconds(timeout))
+                    if let snapshot = await process.waitForCompletion(taskID, timeout: .seconds(timeout)),
+                       snapshot.completed {
+                        return (taskID, .shell(snapshot))
+                    }
+                    if let subagents,
+                       let snapshot = await subagents.awaitSubagent(id: taskID, timeoutMS: UInt64(timeout * 1_000)),
+                       snapshot.completed {
+                        return (taskID, .subagent(snapshot))
+                    }
+                    return nil
                 }
             }
-            for await snapshot in group where snapshot?.completed == true {
-                group.cancelAll()
-                return snapshot
+            for await result in group {
+                if let result {
+                    group.cancelAll()
+                    return result
+                }
             }
             return nil
         }
-        var snapshots: [String: ShellTaskSnapshot?] = [:]
+        var snapshots: [String: ResolvedTask?] = [:]
         for taskID in taskIDs {
-            if let winner, winner.taskID == taskID {
-                snapshots[taskID] = winner
+            if let winner, winner.0 == taskID {
+                snapshots[taskID] = winner.1
+            } else if let shell = await process.taskSnapshot(taskID) {
+                snapshots[taskID] = .shell(shell)
+            } else if let subagents, let subagent = await subagents.subagentSnapshot(id: taskID) {
+                snapshots[taskID] = .subagent(subagent)
             } else {
-                snapshots[taskID] = await process.taskSnapshot(taskID)
+                snapshots[taskID] = nil
             }
         }
         return snapshots
@@ -490,6 +610,45 @@ enum LiveBackgroundTaskTools {
         return .object(object)
     }
 
+    /// The subagent twin of `resultValue(for:)` — the same
+    /// `TaskOutputResult` shape upstream's `format_subagent_snapshot`
+    /// produces, with no `output_file` (a subagent's output lives in the
+    /// coordinator, not on disk).
+    private static func subagentResultValue(for snapshot: LiveSubagentSnapshot) -> JSONValue {
+        .object([
+            "task_id": .string(snapshot.subagentID),
+            "command": .string("[subagent:\(snapshot.subagentType)] \(snapshot.description)"),
+            "status": .string(snapshot.status),
+            "exit_code": snapshot.exitCode.map { .number(.int64(Int64($0))) } ?? .null,
+            "started": .string(iso8601.string(from: snapshot.startedAt)),
+            "ended": snapshot.completed
+                ? .string(iso8601.string(from: snapshot.startedAt.addingTimeInterval(Double(snapshot.durationMS) / 1_000)))
+                : .null,
+            "duration_secs": .number(.double(Double(snapshot.durationMS) / 1_000)),
+            "output": .string(snapshot.output),
+            "output_file": .string(""),
+            "truncated": .bool(false),
+            "raw_output_bytes": .number(.int64(Int64(snapshot.output.utf8.count))),
+        ])
+    }
+
+    /// The model-facing text for a subagent row. A terminal row's text is the
+    /// output itself — unlike a shell task there is no `output_file` to point
+    /// at, so a status-only line would hide the very answer the tool exists
+    /// to return. A running row carries the live progress body plus the wait
+    /// hint; the hint promises no completion notification because this
+    /// composition has no auto-wake (deferred, recorded in the slice report).
+    private static func subagentPromptText(for snapshot: LiveSubagentSnapshot, waited: Int?) -> String {
+        guard !snapshot.completed else {
+            return snapshot.output
+        }
+        guard let waited, waited > 0 else {
+            return snapshot.output + "\n\nUse timeout_ms to wait for completion."
+        }
+        let label = waited < 1_000 ? "\(waited)ms" : "\(waited / 1_000)s"
+        return snapshot.output + "\n\nWaited \(label); the subagent is still running. You do not need to call this again."
+    }
+
     private static func promptText(
         for snapshot: ShellTaskSnapshot?,
         taskID: String,
@@ -511,9 +670,10 @@ enum LiveBackgroundTaskTools {
 
     private static func notFoundResult(
         _ taskID: String,
-        process: any OpenGrokShellProcessExecution
+        process: any OpenGrokShellProcessExecution,
+        subagents: (any LiveSubagentQuerying)?
     ) async -> OpenGrokShellToolCallResult {
-        let message = await notFoundMessage(taskID, process: process)
+        let message = await notFoundMessage(taskID, process: process, subagents: subagents)
         return OpenGrokShellToolCallResult(
             value: .object([
                 "task_id": .string(taskID),
@@ -528,10 +688,19 @@ enum LiveBackgroundTaskTools {
     /// guessed or truncated an id can correct itself without another tool call.
     private static func notFoundMessage(
         _ taskID: String,
-        process: any OpenGrokShellProcessExecution
+        process: any OpenGrokShellProcessExecution,
+        subagents: (any LiveSubagentQuerying)?
     ) async -> String {
-        let known = await process.listTasks().map(\.taskID)
+        let shellIDs = await process.listTasks().map(\.taskID)
+        let subagentIDs = await subagents?.knownSubagentIDs() ?? []
+        let known = shellIDs + subagentIDs
         if known.isEmpty {
+            // With subagents live the empty message names them, matching
+            // upstream's "No background tasks or subagents exist in this
+            // session."; without them the original wording stands.
+            if subagents != nil {
+                return "Task \(taskID) not found. No background tasks or subagents exist in this session."
+            }
             return "Task \(taskID) not found. No background tasks exist in this session."
         }
         return "Task \(taskID) not found. Known task IDs: [\(known.joined(separator: ", "))]"
