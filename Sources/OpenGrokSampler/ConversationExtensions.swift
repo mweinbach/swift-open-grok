@@ -491,18 +491,21 @@ public func projectResponsesRequestBody(
         case .backendToolCall(let b):
             // Opaque provider-native history replays only into the dialect
             // that produced it (upstream `raw_responses_input_replacements`,
-            // xai-grok-sampling-types/src/conversation.rs:1614-1650). Codex
-            // raw items are Codex-private state; every other dialect —
-            // DeepSeek and Meta explicitly, per upstream — fails closed and
-            // replays nothing until its replay contract is defined. The cost:
-            // on a cross-dialect request this history silently thins instead
-            // of erroring, which is upstream's behavior too (an empty
+            // xai-grok-sampling-types/src/conversation.rs:1614-1650). xAI
+            // replays only X Search as its `x_search_call` wire item; Codex
+            // replays only Codex raw items. DeepSeek and Meta explicitly
+            // replay nothing until their replay contracts are defined. The
+            // cost: on a cross-dialect request this history silently thins
+            // instead of erroring, which is upstream's behavior too (an empty
             // replacement list). Do not loosen this to "replay everywhere":
             // that leaks one provider's opaque payloads to another.
-            if case .codexRawInput(let raw) = b.kind,
-               adapter.profile.responsesDialect == .codex
-            {
+            switch (adapter.profile.responsesDialect, b.kind) {
+            case (.some(.xai), .xSearch(let call)):
+                input.append(xSearchCallWireValue(call))
+            case (.some(.codex), .codexRawInput(let raw)):
                 input.append(raw.raw)
+            case (.some(.deepSeek), _), (.some(.meta), _), (.none, _), (_, _):
+                break
             }
         }
     }
