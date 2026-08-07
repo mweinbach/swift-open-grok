@@ -522,10 +522,10 @@ public enum LiveAuthComposition {
     // MARK: - Misc
 
     static func describe(_ error: Error) -> String {
-        if let convertible = error as? any CustomStringConvertible {
-            return convertible.description
-        }
-        return String(describing: error)
+        // `String(describing:)` already prefers `CustomStringConvertible`, so
+        // the previous explicit cast (an always-succeeding `as?` warning) was
+        // pure noise with identical behavior.
+        String(describing: error)
     }
 
     /// Best-effort browser launch. Failures are silent: the URL was already

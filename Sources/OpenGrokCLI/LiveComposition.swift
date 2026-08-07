@@ -3,6 +3,7 @@ import OpenGrokAgentDefinitions
 import OpenGrokACPRuntime
 import OpenGrokAuth
 import OpenGrokCodeMode
+import OpenGrokCompaction
 import OpenGrokConfig
 import OpenGrokFileTools
 import OpenGrokHTTP
@@ -10,8 +11,10 @@ import OpenGrokHooks
 import OpenGrokHooksPluginTypes
 import OpenGrokModels
 import OpenGrokPager
+import OpenGrokPagerCommandUI
 import OpenGrokPagerMinimal
 import OpenGrokPagerRender
+import OpenGrokTokenEstimation
 import OpenGrokProviderSession
 import OpenGrokSampler
 import OpenGrokSamplingTypes
@@ -27,6 +30,69 @@ import OpenGrokTTY
 import OpenGrokWebMediaTools
 import OpenGrokWorkspace
 
+/// The catalog entry's model-tuning facts, carried from resolution into the
+/// live `SamplerConfig` construction. Before these were threaded, the single
+/// live `SamplingClient` was built with none of them, so a catalog effort like
+/// grok-4.5's `high` never reached an outbound request — the classic
+/// "compiles, returns, quietly does nothing" port failure.
+public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
+    /// The effort the sampler sends, and — per the sampler's contract — the
+    /// "this model supports effort" signal for the Fireworks strip gate
+    /// (`sanitizeChatWireRequest`; upstream client.rs:1806-1813). `nil` when
+    /// the model declares no effort support, never a guessed default.
+    public var reasoningEffort: ReasoningEffort?
+    /// Responses `reasoning.summary` policy. `nil` means "no summary policy":
+    /// the Codex patcher strips the base `concise` (provider.rs:613-620).
+    public var reasoningSummary: ReasoningSummary?
+    public var codexMultiAgentV2: Bool
+    public var temperature: Float?
+    public var topP: Float?
+    public var maxCompletionTokens: UInt32?
+    public var contextWindow: UInt64?
+
+    public init(
+        reasoningEffort: ReasoningEffort? = nil,
+        reasoningSummary: ReasoningSummary? = nil,
+        codexMultiAgentV2: Bool = false,
+        temperature: Float? = nil,
+        topP: Float? = nil,
+        maxCompletionTokens: UInt32? = nil,
+        contextWindow: UInt64? = nil
+    ) {
+        self.reasoningEffort = reasoningEffort
+        self.reasoningSummary = reasoningSummary
+        self.codexMultiAgentV2 = codexMultiAgentV2
+        self.temperature = temperature
+        self.topP = topP
+        self.maxCompletionTokens = maxCompletionTokens
+        self.contextWindow = contextWindow
+    }
+
+    /// Project a resolved catalog entry, with an optional validated per-switch
+    /// effort override. The override applies only when the entry declares
+    /// effort support (`model_supports_reasoning_effort` gate,
+    /// handlers/model_switch.rs:139-158); a non-supporting model keeps `nil`
+    /// so the sampler's provider gates see "no effort declared".
+    public init(entry: ModelEntry, effortOverride: ReasoningEffort? = nil) {
+        let info = entry.info
+        self.init(
+            reasoningEffort: info.supportsReasoningEffort
+                ? (effortOverride ?? info.reasoningEffort)
+                : nil,
+            // `.none` is the catalog's "no summary" sentinel; the sampler's
+            // policy hook wants absence, not the string "none".
+            reasoningSummary: info.defaultReasoningSummary == .none
+                ? nil
+                : info.defaultReasoningSummary,
+            codexMultiAgentV2: info.codexMultiAgentV2,
+            temperature: info.temperature,
+            topP: info.topP,
+            maxCompletionTokens: info.maxCompletionTokens,
+            contextWindow: info.contextWindow
+        )
+    }
+}
+
 public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     public let model: String
     public let baseURL: String
@@ -37,9 +103,14 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     /// account pinning (`ChatGPT-Account-ID`, `X-OpenAI-Fedramp`) arrives here.
     public let extraHeaders: [String: String]
     public let queryParams: [String: String]
+    /// Model-tuning facts from the catalog entry (effort, summary, sampling
+    /// scalars). Defaults to empty for compositions with no catalog entry.
+    public let tuning: OpenGrokLiveSamplingTuning
     public let bearerResolver: (any BearerResolver)?
     public let credentialProvider: (any AuthCredentialProvider)?
     public let transport: (any HTTPTransport)?
+
+    public var reasoningEffort: ReasoningEffort? { tuning.reasoningEffort }
 
     public init(
         model: String,
@@ -49,6 +120,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         apiBackend: ApiBackend = .chatCompletions,
         extraHeaders: [String: String] = [:],
         queryParams: [String: String] = [:],
+        tuning: OpenGrokLiveSamplingTuning = OpenGrokLiveSamplingTuning(),
         bearerResolver: (any BearerResolver)? = nil,
         credentialProvider: (any AuthCredentialProvider)? = nil,
         transport: (any HTTPTransport)? = nil
@@ -60,6 +132,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         self.apiBackend = apiBackend
         self.extraHeaders = extraHeaders
         self.queryParams = queryParams
+        self.tuning = tuning
         self.bearerResolver = bearerResolver
         self.credentialProvider = credentialProvider
         self.transport = transport
@@ -68,7 +141,8 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     public static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.model == rhs.model && lhs.baseURL == rhs.baseURL && lhs.apiKey == rhs.apiKey &&
         lhs.provider == rhs.provider && lhs.apiBackend == rhs.apiBackend &&
-        lhs.extraHeaders == rhs.extraHeaders && lhs.queryParams == rhs.queryParams
+        lhs.extraHeaders == rhs.extraHeaders && lhs.queryParams == rhs.queryParams &&
+        lhs.tuning == rhs.tuning
     }
 }
 
@@ -224,16 +298,29 @@ public struct OpenGrokLiveSampler: Sendable {
             transport = baseTransport
             bearerResolver = configuration.bearerResolver
         }
+        // The tuning fields ride on the config, not per-request: the sampler
+        // backfills them in `applyConversationDefaults`, which is upstream's
+        // `apply_defaults` seam (xai-grok-sampler client.rs:1148, :1460,
+        // :3231-3233). Dropping any of them here silently reverts the model
+        // to provider defaults — the audit that motivated this found NO
+        // effort ever reaching an outbound request.
         let client = try SamplingClient(config: SamplerConfig(
             apiKey: configuration.apiKey,
             baseURL: configuration.baseURL,
             model: configuration.model,
+            maxCompletionTokens: configuration.tuning.maxCompletionTokens,
+            temperature: configuration.tuning.temperature,
+            topP: configuration.tuning.topP,
             apiBackend: configuration.apiBackend,
             provider: configuration.provider,
             extraHeaders: configuration.extraHeaders
                 .sorted { $0.key < $1.key }
                 .map { (name: $0.key, value: $0.value) },
             queryParams: configuration.queryParams,
+            contextWindow: configuration.tuning.contextWindow ?? 0,
+            reasoningEffort: configuration.tuning.reasoningEffort,
+            reasoningSummary: configuration.tuning.reasoningSummary,
+            codexMultiAgentV2: configuration.tuning.codexMultiAgentV2,
             bearerResolver: bearerResolver
         ), transport: transport)
         return OpenGrokLiveSampler { request, emit in
@@ -976,7 +1063,16 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 conversationHistory: stack.conversationHistory,
                 conversationStore: foundation.conversationStore,
                 toolExecutor: foundation.toolExecutor,
-                compaction: stack.compaction
+                compaction: stack.compaction,
+                modelSwitch: modelSwitch
+            )
+            // Seed the manager's session route so `/effort`'s "current" and
+            // the effort dropdown's "(active)" marker reflect the model this
+            // session actually started on — the same seeding upstream's
+            // session creation performs on `ModelState` before any switch.
+            stack.catalogStore.noteModelSwitch(
+                catalogID: providerConfiguration.initialModelID,
+                effort: foundation.samplingConfiguration.reasoningEffort
             )
             if options.mode == .interactive {
                 let pagerMode = try Self.resolveInteractivePagerMode(
@@ -1009,6 +1105,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         workflowRegistry: workflowRegistry,
                         workflowsEnabled: workflowsEnabled,
                         terminalProgram: context.environment["TERM_PROGRAM"],
+                        // The composer border shows the session's live effort
+                        // from the first frame; before this the parameter had
+                        // no production caller and rendered nil forever.
+                        reasoningEffort: foundation.samplingConfiguration
+                            .reasoningEffort?.asString,
                         compaction: stack.compaction,
                         sessionID: sessionID,
                         // The tool executor's own aggregate, not a second one:
@@ -1017,7 +1118,25 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         // `memory_search` reads.
                         sessionServices: toolExecutor.sessionServices,
                         conversationHistory: stack.conversationHistory,
-                        sessionCatalog: LiveSessionCatalog(openGrokHome: openGrokHome)
+                        sessionCatalog: LiveSessionCatalog(openGrokHome: openGrokHome),
+                        // The connection outcomes `/mcps` renders — the tool
+                        // executor recorded them when it brought the session's
+                        // configured servers online.
+                        mcpServers: toolExecutor.mcpServerConnections,
+                        openGrokHome: openGrokHome,
+                        // The paint ceiling: `GROK_MIN_DRAW_MS` wins, then the
+                        // `[ui.display_refresh]` auto-cadence policy (inert
+                        // until a display probe exists — `probedRefreshHz` is
+                        // nil, which resolves to upstream's `probe_skip`
+                        // default), then the 16 ms default.
+                        paintCadence: PagerFrameClock.cadence(
+                            environment: context.environment,
+                            policy: Self.resolveDisplayRefreshPolicy(
+                                workingDirectory: cwd,
+                                environment: context.environment
+                            ),
+                            probedRefreshHz: nil
+                        )
                     )
                     let controller = OpenGrokPagerInteractiveController(
                         input: interactiveInput.events,
@@ -1053,19 +1172,72 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         },
                         workflowsEnabled: workflowsEnabled
                     )
+                    // The render side reports what is moving (welcome logo,
+                    // visible streaming blocks, finish flashes) and the
+                    // controller's ticker arms or parks on it — this is what
+                    // turns the welcome shimmer on with no turn running. The
+                    // controller is captured weakly: it owns the renderer
+                    // strongly, and a cycle here would keep both alive past
+                    // shutdown.
+                    await renderer.setMotionStateSink { [weak controller] state in
+                        await controller?.setMotionState(state)
+                    }
+                    // Slash-command recency persists at
+                    // `<opengrok home>/slash-mru.json`, upstream's grok_home
+                    // location (`mru.rs:78-80`).
+                    await controller.setSlashMru(PagerSlashMru(directory: openGrokHome))
                     // Typing `/model ` drops the dropdown into the catalog, as
                     // upstream's `ModelCommand::suggest_args` does. Rows insert
                     // the provider-qualified selector, so accepting one
                     // produces a command the resolver cannot find ambiguous.
                     let completionCatalog = stack.catalogStore.pickerEntries()
                     let activeModelID = providerConfiguration.initialModelID
+                    let suggestionCatalogStore = stack.catalogStore
+                    let suggestionCWD = cwd
                     await controller.setArgumentSuggestions { command, query in
-                        guard command == "model" else { return [] }
-                        return LiveModelPicker.suggestions(
-                            query: query,
-                            entries: completionCatalog,
-                            currentModelID: activeModelID
-                        )
+                        switch command {
+                        case "model", "m":
+                            return LiveModelPicker.suggestions(
+                                query: query,
+                                entries: completionCatalog,
+                                currentModelID: activeModelID
+                            )
+                        case "effort":
+                            // The current model's effort menu with the active
+                            // level marked (`EffortCommand::suggest_args` over
+                            // `build_effort_arg_items`, effort.rs:44-55).
+                            guard let entry = suggestionCatalogStore.currentModelEntry(),
+                                  entry.supportsReasoningEffort
+                            else { return [] }
+                            let menu = LiveModelEffort.options(
+                                supportsReasoningEffort: entry.supportsReasoningEffort,
+                                declaredEfforts: entry.reasoningEfforts
+                            )
+                            let active = suggestionCatalogStore.currentReasoningEffort()
+                            let needle = query
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                                .lowercased()
+                            return menu
+                                .filter { needle.isEmpty || $0.id.lowercased().contains(needle) }
+                                .map { option in
+                                    OpenGrokPagerCommandSuggestion(
+                                        name: option.value == active
+                                            ? "\(option.label) (active)"
+                                            : option.label,
+                                        summary: option.description ?? "",
+                                        insertText: "/effort \(option.id)"
+                                    )
+                                }
+                        case "export":
+                            // Path completion for the export target
+                            // (`list_path_completions`, export.rs:83-160).
+                            return LiveExportPathSuggestions.suggestions(
+                                query: query,
+                                workingDirectory: suggestionCWD
+                            )
+                        default:
+                            return []
+                        }
                     }
                     let request = OpenGrokPagerRequest(
                         prompt: prompt,
@@ -1275,9 +1447,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     ///
     /// Flags deliberately absent from this list are the ones whose absence is
     /// merely a missing refinement rather than a wrong answer (`--verbatim`,
-    /// `--reasoning-effort`, `--no-plan`, `--include-partial-messages`, the
-    /// hidden operational flags), plus everything under
-    /// `common.permissions`, which the permission and sandbox layer consumes.
+    /// `--no-plan`, `--include-partial-messages`, the hidden operational
+    /// flags), plus everything under `common.permissions`, which the
+    /// permission and sandbox layer consumes. `--reasoning-effort` left this
+    /// list when `resolveSamplingConfiguration` started validating and
+    /// applying it to the initial session.
     private static func unhonoredLaunchFlag(_ options: CLIExecutionOptions) -> String? {
         if options.agentOptions.tools != nil { return "--tools" }
         if options.agentOptions.disallowedTools != nil { return "--disallowed-tools" }
@@ -1702,12 +1876,23 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             )
             : nil
         let conversationHistory = foundation.conversationHistory
+        // The store reads the session's environment and home, not the
+        // process's: `--cwd`/injected-env launches (and hermetic tests) must
+        // see the same credential and endpoint chain the session resolved.
         let catalogStore = LiveModelCatalogStore(
             input: liveCatalogResolutionInput(
                 workingDirectory: foundation.cwd,
                 environment: context.environment
-            )
+            ),
+            environment: context.environment,
+            openGrokHome: foundation.openGrokHome
         )
+        // Post-readiness one-shot remote catalog refresh, upstream's
+        // `spawn_background_refresh` (agent/models.rs:1817-1835, fired from
+        // acp/spawn.rs:210 and app.rs:194/:1250 after session readiness).
+        // Never awaited: a slow or failing provider catalog must not delay
+        // the first prompt.
+        catalogStore.spawnBackgroundRefresh()
         let configuredProviderDefinitions = parseConfiguredModelCatalog(
             from: ((try? loadAuthorityComposition(
                 cwd: foundation.cwd,
@@ -2059,9 +2244,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             )
         } else {
             do {
+                // The resolved endpoint travels with the request so a stored
+                // provider key is withheld from an untrusted host (upstream
+                // resolve_credentials, agent/config.rs:5486-5503).
                 credential = try await resolver.resolve(
                     provider: provider,
                     explicitAPIKey: explicitAPIKey,
+                    baseURL: baseURL,
                     scope: "cli:\(sessionID)"
                 )
             } catch let error as LiveCredentialError {
@@ -2073,6 +2262,47 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             credentialHeaders: credential.extraHeaders,
             configuredHeaders: configuredEntry?.info.extraHeaders ?? []
         )
+        // The assembled catalog entry for the selected model carries the
+        // tuning facts (effort menu, summary policy, sampling scalars) the
+        // sampler config needs. `configuredEntry` already is that entry when
+        // the user named a model; the default-model path re-looks it up by
+        // catalog key so the embedded profile's derived fields (Codex
+        // `.detailed` summary, multiAgentV2) are not lost in the
+        // DefaultModelJSON projection.
+        let tuningEntry = configuredEntry ?? selectedProfile.flatMap { profile in
+            findModelByID(configuredCatalogMap, modelID: profile.id ?? profile.model)
+        }
+        let effortOverride = try resolveStartupReasoningEffort(
+            token: options.agentOptions.reasoningEffort,
+            supportsReasoningEffort: tuningEntry?.info.supportsReasoningEffort
+                ?? selectedProfile?.supportsReasoningEffort
+                ?? false,
+            declaredEfforts: tuningEntry?.info.reasoningEfforts
+                ?? selectedProfile?.reasoningEfforts
+                ?? []
+        )
+        let tuning: OpenGrokLiveSamplingTuning
+        if let tuningEntry {
+            tuning = OpenGrokLiveSamplingTuning(entry: tuningEntry, effortOverride: effortOverride)
+        } else if let profile = selectedProfile {
+            // No assembled entry (e.g. an allowlist filtered it out): derive
+            // from the embedded profile with the same Codex rules as
+            // `defaultModelConfigs` (DefaultModels.swift:486, :494-495).
+            tuning = OpenGrokLiveSamplingTuning(
+                reasoningEffort: profile.supportsReasoningEffort
+                    ? (effortOverride ?? profile.reasoningEffort)
+                    : nil,
+                reasoningSummary: profile.provider == .codex ? .detailed : nil,
+                codexMultiAgentV2: profile.provider == .codex
+                    && profile.multiAgentVersion == "v2",
+                temperature: profile.temperature,
+                topP: profile.topP,
+                maxCompletionTokens: profile.maxCompletionTokens,
+                contextWindow: profile.contextWindow
+            )
+        } else {
+            tuning = OpenGrokLiveSamplingTuning()
+        }
         let sampling = OpenGrokLiveSamplingConfiguration(
             model: model,
             baseURL: baseURL,
@@ -2081,10 +2311,42 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             apiBackend: apiBackend,
             extraHeaders: headers,
             queryParams: configuredEntry?.queryParams ?? [:],
+            tuning: tuning,
             bearerResolver: namedAuthResolver.map(NamedAuthBearerResolver.init),
             credentialProvider: credential.binding.authCredentialProvider
         )
         return (sampling, credential)
+    }
+
+    /// Validate `--effort`/`--reasoning-effort` against the startup model.
+    ///
+    /// Port of `apply_headless_model_and_effort` (xai-grok-pager
+    /// headless.rs:744-800): a model with no effort support *soft-ignores*
+    /// the flag (upstream only logs a warning and still applies `-m`), while
+    /// a genuinely unknown token hard-fails with the classified error copy —
+    /// silently sending an unvalidated level would 400 on the API instead.
+    static func resolveStartupReasoningEffort(
+        token: String?,
+        supportsReasoningEffort: Bool,
+        declaredEfforts: [ReasoningEffortOption]
+    ) throws -> ReasoningEffort? {
+        guard let token = token?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty
+        else { return nil }
+        switch LiveModelEffort.resolve(
+            token: token,
+            supportsReasoningEffort: supportsReasoningEffort,
+            declaredEfforts: declaredEfforts
+        ) {
+        case .success(let effort):
+            return effort
+        case .failure(.unsupported):
+            return nil
+        case .failure(let error):
+            throw CLIApplicationError.failed(
+                "--effort/--reasoning-effort: \(error.message)"
+            )
+        }
     }
 
     /// Credential-owned headers must never be replaced by model metadata.
@@ -2167,6 +2429,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // plus the short `opencode` / `go` selectors.
         case "deepseek", "deep_seek", "deep-seek", "deepseek_api", "deepseek-api":
             return .deepseek
+        // Upstream accepts Meta at the CLI/pager level: `from_provider_name`
+        // (app/app_view.rs:441-446: meta, meta_ai, meta-api) plus
+        // `provider_action`'s meta-ai (login.rs:96); `ModelProvider` decode
+        // adds meta_api. Rejecting it here was a B3-CLI-1 leftover from
+        // before the Meta provider went end-to-end.
+        case "meta", "meta_ai", "meta-ai", "meta_api", "meta-api":
+            return .meta
         case "opencode_go", "opencode-go", "opencode", "go":
             return .openCodeGo
         case "wafer", "wafer_ai", "wafer-ai":
@@ -2210,7 +2479,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         switch provider {
         case .xai:
             return .chatCompletions
-        case .codex:
+        // Meta is Responses-only (types.rs:1349-1362), same reset target as
+        // the provider-override mapping in agent/config.rs:4545-4553.
+        case .codex, .meta:
             return .responses
         case .kimi, .fireworks, .deepseek, .openCodeGo, .wafer:
             return .chatCompletions
@@ -2257,6 +2528,37 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    /// The `[ui.display_refresh]` policy the paint cadence resolves from
+    /// (`DisplayRefreshSettings`, UIConfig.swift:214-221 for the key names;
+    /// defaults per `defaults_probe_on_auto_off`, display_refresh.rs:367-378).
+    /// Read from the same config chain the rest of the session uses; a key
+    /// with the wrong type falls back to its default, matching the tolerant
+    /// decoder on the Codable twin.
+    static func resolveDisplayRefreshPolicy(
+        workingDirectory: URL,
+        environment: [String: String]
+    ) -> PagerDisplayRefreshPolicy {
+        let document = (try? loadAuthorityComposition(
+            cwd: workingDirectory,
+            environment: environment
+        ).effective()) ?? .table(TOMLTable())
+        func flag(_ key: String) -> Bool? {
+            document[path: ["ui", "display_refresh", key]]?.boolValue
+        }
+        func integer(_ key: String) -> Int? {
+            document[path: ["ui", "display_refresh", key]]?.int64Value.map(Int.init)
+        }
+        let defaults = PagerDisplayRefreshPolicy()
+        return PagerDisplayRefreshPolicy(
+            probeEnabled: flag("probe_enabled") ?? defaults.probeEnabled,
+            autoCadenceEnabled: flag("auto_cadence_enabled") ?? defaults.autoCadenceEnabled,
+            floorMs: integer("floor_ms") ?? defaults.floorMs,
+            ceilingMs: integer("ceiling_ms") ?? defaults.ceilingMs,
+            minHz: integer("min_hz") ?? defaults.minHz,
+            maxHz: integer("max_hz") ?? defaults.maxHz
+        )
+    }
+
     static func resolveProviderBaseURL(
         provider: ModelProvider,
         model: DefaultModelJSON?,
@@ -2289,6 +2591,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         case .wafer:
             overrideKey = WaferModels.apiBaseURLEnv
             fallback = model?.apiBaseURL ?? model?.baseURL ?? WaferModels.apiBaseURLDefault
+        case .meta:
+            // Meta endpoint constants (meta_models.rs:14-16): the
+            // OPENGROK_META_API_BASE_URL override, else the model's own URL,
+            // else https://api.meta.ai/v1 — the same ladder as the other
+            // API-key providers.
+            overrideKey = MetaModels.apiBaseURLEnv
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? MetaModels.apiBaseURLDefault
         }
         return nonEmptyEnvironmentValue(overrideKey, environment: environment)
             ?? fallback
@@ -2329,6 +2638,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             keys = [OpenCodeGoModels.apiKeyEnv]
         case .wafer:
             keys = [WaferModels.apiKeyEnv]
+        case .meta:
+            // META_API_KEY (meta_models.rs:16, :74-76).
+            keys = [MetaModels.apiKeyEnv]
         }
         return keys.lazy.compactMap { key in
             nonEmptyEnvironmentValue(key, environment: environment)
@@ -2356,6 +2668,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             return "FIREWORKS_API_KEY"
         case .deepseek:
             return DeepSeekModels.apiKeyEnv
+        case .meta:
+            // Upstream's Meta credential env key (meta_models.rs:16).
+            return "META_API_KEY"
         case .openCodeGo:
             return OpenCodeGoModels.apiKeyEnv
         case .wafer:
@@ -2773,6 +3088,11 @@ struct LiveToolExecutor: Sendable {
     /// that filtered one out cannot reach it by calling it anyway.
     private let backgroundTaskToolNames: Set<String>
     private let mcpConnections: MCPSessionConnections
+    /// Per-server connection outcomes recorded when the session brought its
+    /// configured MCP servers online. `/mcps` renders these; before they were
+    /// captured, `connectConfiguredServers`' report was discarded and the
+    /// session had no way to say which server failed or why.
+    let mcpServerConnections: [MCPServerConnection]
     /// Rewind snapshots, memory and goals. Optional so every construction site
     /// that predates them keeps compiling and simply advertises none of their
     /// tools; see `LiveSessionServices.swift`.
@@ -2978,7 +3298,7 @@ struct LiveToolExecutor: Sendable {
         // is untrusted, so a hostile repo's `.opengrok/config.toml` servers are
         // simply not present here — they never reach `makeTransport`, which is
         // what spawns the process.
-        await LiveMCPComposition.connectConfiguredServers(
+        let mcpServerConnections = await LiveMCPComposition.connectConfiguredServers(
             document: security.document,
             toolset: fileToolBridge.toolset,
             connections: mcpConnections,
@@ -3009,6 +3329,7 @@ struct LiveToolExecutor: Sendable {
         self.composition = composition
         self.fileToolBridge = fileToolBridge
         self.mcpConnections = mcpConnections
+        self.mcpServerConnections = mcpServerConnections
         self.registryToolNames = Set(allowedFileToolDefinitions.map(\.name))
         self.workingDirectory = standardizedWorkingDirectory
         self.sessionServices = sessionServices
@@ -3524,6 +3845,11 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
     var currentModelID: String?
     var currentProvider: ModelProvider?
     var everUsedNonXAI: Bool?
+    /// User-chosen session title (`/rename`, upstream rename.rs:42-53).
+    /// `nil` means "never renamed"; readers derive a title from the first
+    /// real user turn instead. Optional so records written before this field
+    /// existed keep decoding unchanged.
+    var title: String?
 
     init(
         sessionID: String,
@@ -3535,7 +3861,8 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         sandboxProfile: String? = nil,
         currentModelID: String? = nil,
         currentProvider: ModelProvider? = nil,
-        everUsedNonXAI: Bool? = nil
+        everUsedNonXAI: Bool? = nil,
+        title: String? = nil
     ) {
         self.sessionID = sessionID
         self.workingDirectory = workingDirectory
@@ -3547,6 +3874,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         self.currentModelID = currentModelID
         self.currentProvider = currentProvider
         self.everUsedNonXAI = everUsedNonXAI
+        self.title = title
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -3560,6 +3888,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         case currentModelID = "current_model_id"
         case currentProvider = "current_provider"
         case everUsedNonXAI = "ever_used_codex"
+        case title
     }
 
     static func new(
@@ -3734,7 +4063,8 @@ actor LiveConversationStore {
             sandboxProfile: source.sandboxProfile,
             currentModelID: source.currentModelID,
             currentProvider: source.currentProvider,
-            everUsedNonXAI: source.everUsedNonXAI
+            everUsedNonXAI: source.everUsedNonXAI,
+            title: source.title
         )
 
         do {
@@ -3981,6 +4311,19 @@ actor LiveConversationHistory {
             throw CLIApplicationError.failed("conversation session mismatch: \(sessionID)")
         }
         record.items = items
+        record.updatedAt = Date()
+        try await store.save(record)
+    }
+
+    /// `/rename` (upstream rename.rs:42-53): set the session's stored title
+    /// and persist it.
+    ///
+    /// The write goes through this actor's own record — not a second reader
+    /// of the same file — because the turn loop re-saves the whole record on
+    /// every commit; a title written around this actor would silently vanish
+    /// at the next turn's save.
+    func rename(title: String) async throws {
+        record.title = title
         record.updatedAt = Date()
         try await store.save(record)
     }
@@ -4319,7 +4662,16 @@ private actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenG
     private let conversationStore: LiveConversationStore
     private let toolExecutor: LiveToolExecutor?
     private let compaction: LiveCompactionCoordinator?
-    private var createdSessionID: SessionID?
+    /// The route the next turn actually runs on. `/resume` reconciles the
+    /// restored record against this rather than the launch configuration,
+    /// because `/model` may have moved the session since launch.
+    private let modelSwitch: LiveModelSwitchCoordinator?
+    /// The one session id turns may currently run against, and every id this
+    /// process has already created in the shell. Two values because `/resume`
+    /// can revisit a session created earlier in this run — recreating it in
+    /// the shell would fail, but switching back to it must not.
+    private var activeShellSessionID: SessionID?
+    private var createdSessionIDs: Set<SessionID> = []
 
     init(
         shell: OpenGrokShell,
@@ -4328,7 +4680,8 @@ private actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenG
         conversationHistory: LiveConversationHistory,
         conversationStore: LiveConversationStore,
         toolExecutor: LiveToolExecutor? = nil,
-        compaction: LiveCompactionCoordinator? = nil
+        compaction: LiveCompactionCoordinator? = nil,
+        modelSwitch: LiveModelSwitchCoordinator? = nil
     ) {
         self.shell = shell
         self.cwd = cwd
@@ -4337,6 +4690,7 @@ private actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenG
         self.conversationStore = conversationStore
         self.toolExecutor = toolExecutor
         self.compaction = compaction
+        self.modelSwitch = modelSwitch
     }
 
     func makeSession(
@@ -4345,19 +4699,21 @@ private actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenG
         _ = try await shell.start()
         let shellEvents = await shell.events()
         let sessionID = SessionID(request.sessionID ?? providerConfiguration.sessionID)
-        if let createdSessionID {
-            guard createdSessionID == sessionID else {
+        if let activeShellSessionID {
+            guard activeShellSessionID == sessionID else {
                 throw CLIApplicationError.failed("interactive runtime cannot switch session IDs")
             }
-        } else {
+        }
+        if !createdSessionIDs.contains(sessionID) {
             _ = try await shell.createSession(OpenGrokShellSessionRequest(
                 sessionID: sessionID,
                 cwd: cwd,
                 providerConfiguration: providerConfiguration,
                 restorePersistedState: false
             ))
-            createdSessionID = sessionID
+            createdSessionIDs.insert(sessionID)
         }
+        activeShellSessionID = sessionID
         let handle = try await shell.submitTurn(
             sessionID: sessionID,
             request: OpenGrokShellTurnRequest(text: request.prompt)
@@ -4409,8 +4765,71 @@ private actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenG
         try await conversationHistory.replace(with: record)
         await compaction?.replaceSessionID(newSessionID)
         providerConfiguration = configuration
-        createdSessionID = SessionID(newSessionID)
+        createdSessionIDs.insert(SessionID(newSessionID))
+        activeShellSessionID = SessionID(newSessionID)
         return newSessionID
+    }
+
+    /// `/resume`: swap the live conversation to the stored session
+    /// `sessionID`, keeping the current provider stack.
+    ///
+    /// Ordering mirrors `replaceSession`: the shell session and the persisted
+    /// record land before the in-memory spine flips, so a failure partway
+    /// leaves the previous session fully live. The restored history is then
+    /// reconciled against the route the session is *currently* running
+    /// (`reconcileRoute`), which strips provider-opaque carriers when the
+    /// stored record came from a different provider — the same isolation
+    /// `/model` applies, because a resume across providers is the same seam.
+    func resumeSession(sessionID: String) async throws -> String {
+        try LiveConversationStore.validateSessionID(sessionID)
+        guard var record = try await conversationStore.loadIfPresent(sessionID: sessionID) else {
+            throw CLIApplicationError.failed("session not found: \(sessionID)")
+        }
+        // The session continues in this process's working directory, exactly
+        // as a cold-start `--resume` rebinds it (`resolveConversationRecord`).
+        record.workingDirectory = cwd.standardizedFileURL.path
+        let configuration = ProviderSessionConfiguration(
+            sessionID: sessionID,
+            modelCatalog: providerConfiguration.modelCatalog,
+            initialModelID: providerConfiguration.initialModelID,
+            credentialBindings: providerConfiguration.credentialBindings,
+            fallbackModelIDs: providerConfiguration.fallbackModelIDs,
+            auxiliaryModelIDs: providerConfiguration.auxiliaryModelIDs,
+            toolRequest: providerConfiguration.toolRequest,
+            retryPolicy: providerConfiguration.retryPolicy,
+            openGrokHome: providerConfiguration.openGrokHome,
+            environment: providerConfiguration.environment,
+            everUsedNonXAI: record.everUsedNonXAI
+        )
+
+        _ = try await shell.start()
+        let shellSessionID = SessionID(sessionID)
+        if !createdSessionIDs.contains(shellSessionID) {
+            _ = try await shell.createSession(OpenGrokShellSessionRequest(
+                sessionID: shellSessionID,
+                cwd: cwd,
+                providerConfiguration: configuration,
+                restorePersistedState: false
+            ))
+            createdSessionIDs.insert(shellSessionID)
+        }
+        try await conversationStore.save(record)
+        try await toolExecutor?.registerSession(
+            sessionID: sessionID,
+            workingDirectory: cwd
+        )
+        try await conversationHistory.replace(with: record)
+        if let modelSwitch {
+            let snapshot = await modelSwitch.snapshot()
+            _ = try await conversationHistory.reconcileRoute(
+                modelID: snapshot.modelID,
+                provider: snapshot.provider
+            )
+        }
+        await compaction?.replaceSessionID(sessionID)
+        providerConfiguration = configuration
+        activeShellSessionID = shellSessionID
+        return sessionID
     }
 }
 
@@ -4700,6 +5119,58 @@ private struct LivePagerConversationState {
         toolIndicesByCallID.removeAll(keepingCapacity: true)
     }
 
+    /// Rebuild the visible transcript from a persisted conversation — what
+    /// `/resume` paints after the runtime swaps sessions.
+    ///
+    /// The projection matches what this renderer would have accumulated live:
+    /// real user prompts, assistant prose (markdown-styled), and one settled
+    /// tool card per assistant tool call with its result attached. Synthetic
+    /// user turns, system prompts and reasoning payloads are provider/context
+    /// plumbing and never rendered as blocks in a live session either.
+    mutating func seed(from conversationItems: [ConversationItem]) {
+        removeAll()
+        // Pair tool calls with their results up front; an unpaired call
+        // renders with no output rather than being dropped.
+        var resultsByCallID: [String: String] = [:]
+        for item in conversationItems {
+            if case .toolResult(let result) = item {
+                resultsByCallID[result.toolCallId] = result.content
+            }
+        }
+        for item in conversationItems {
+            switch item {
+            case .user(let user):
+                guard user.syntheticReason == nil else { continue }
+                let text = user.content.compactMap { part -> String? in
+                    if case .text(let value) = part { return value }
+                    return nil
+                }.joined(separator: "\n")
+                guard !text.isEmpty else { continue }
+                items.append(.message(PagerMessage(role: .user, text: text)))
+            case .assistant(let assistant):
+                let text = assistant.content
+                if !text.isEmpty {
+                    items.append(.message(PagerMessage(
+                        role: .assistant,
+                        text: text,
+                        styledLines: styledLines(for: text)
+                    )))
+                }
+                for call in assistant.toolCalls {
+                    items.append(.tool(PagerToolCard(
+                        name: call.name,
+                        input: call.arguments,
+                        output: resultsByCallID[call.id],
+                        state: .succeeded
+                    )))
+                }
+            case .system, .toolResult, .customToolOutput, .backendToolCall,
+                 .reasoning:
+                continue
+            }
+        }
+    }
+
     /// In-place edit of the blocks, for the fold/raw effects the scrollback's
     /// selection applies. Deliberately narrow: nothing outside may append or
     /// remove through this, which would desynchronize the streaming indices.
@@ -4746,12 +5217,31 @@ private struct LivePagerConversationState {
         self.activeAssistantIndex = nil
     }
 
-    mutating func apply(_ tool: OpenGrokPagerToolUpdate) {
+    /// `atSeconds` is the motion clock's now, used to stamp
+    /// `PagerToolCard.finishedAt` the first time a tool reaches a terminal
+    /// state — the input to the 400 ms finish flash. `nil` (motion disabled,
+    /// transcript paths) renders the block already-static.
+    mutating func apply(_ tool: OpenGrokPagerToolUpdate, atSeconds seconds: TimeInterval? = nil) {
+        let state = Self.renderState(for: tool.state)
+        var finishedAt: TimeInterval?
+        if state != .running, state != .pending {
+            // First terminal update wins: a re-delivered terminal state must
+            // not restart the flash.
+            if let index = toolIndicesByCallID[tool.callID],
+               items.indices.contains(index),
+               case .tool(let existing) = items[index],
+               let existingFinish = existing.finishedAt {
+                finishedAt = existingFinish
+            } else {
+                finishedAt = seconds
+            }
+        }
         let card = PagerToolCard(
             name: tool.name,
             input: tool.input,
             output: tool.output,
-            state: Self.renderState(for: tool.state)
+            state: state,
+            finishedAt: finishedAt
         )
         if let index = toolIndicesByCallID[tool.callID], items.indices.contains(index) {
             items[index] = .tool(card)
@@ -4826,7 +5316,10 @@ private struct LivePagerConversationState {
     }
 }
 
-private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
+// Internal (not private) so the reachability suites can drive the real
+// adapter: a command's overlay/effect only exists here, and a test that
+// cannot construct the renderer can only test the registry.
+actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private let mode: OpenGrokPagerMode
     private let terminal: OpenGrokLiveTerminal
     private let sink: any PagerTerminalSink
@@ -4854,8 +5347,47 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     private var queuedPromptCount = 0
     private var turnActivity: String?
     private var turnStartedAt: Date?
-    private var animationTick = 0
     private var isCancelling = false
+
+    /// The animation clock, fed exclusively by the controller's wall-clock
+    /// ticker through `renderAnimationTick`. The old per-event counter is
+    /// gone on purpose: an event-count "tick" froze the spinner on a silent
+    /// turn and raced ahead on a chatty one.
+    private var motion = PagerMotionSnapshot()
+    /// Whether this terminal can animate at all, resolved once — a non-TTY or
+    /// `TERM=dumb` renders still frames forever.
+    private let motionEnabled: Bool
+    /// Last shimmer frame painted for a `.slow` tick, so the welcome logo only
+    /// repaints when its animation actually advanced (app_view.rs:5760-5766).
+    private var lastShimmerFrame = -1
+    /// One-shot timer for a repaint folded into the paint cadence window;
+    /// without it a coalesced frame would never paint (see
+    /// `PagerTerminalRenderer.scheduledFrameAt`).
+    private var pendingFlushTask: Task<Void, Never>?
+    /// Reports what is moving on screen to the controller's motion ticker.
+    /// Installed by the composition after the controller exists; `nil` (tests,
+    /// headless) simply never arms the ticker from render-side changes.
+    private var motionSink: (@Sendable (PagerMotionState) async -> Void)?
+    private var lastPublishedMotionState: PagerMotionState?
+    /// Turn start on the motion clock, for the status row's elapsed readout.
+    /// `turnStartedAt` (wall time) stays as the fallback for motion-disabled
+    /// terminals, where no animation frame ever advances `motion.seconds`.
+    private var turnStartedAtSeconds: TimeInterval?
+    /// UTF-8 bytes of assistant output streamed this turn, for the status
+    /// row's ⇣ token counter. An estimate (bytes/4) by design: this turn path
+    /// carries no provider-reported `TokenUsage`, and the estimator is the
+    /// same one `/usage` already documents as the honest option.
+    private var turnOutputUTF8Count = 0
+    /// The compaction coordinator's context accounting, refreshed at turn
+    /// boundaries. Feeds the status bar's context ramp with the same numbers
+    /// auto-compaction decides on.
+    private var contextUsage: ContextUsage?
+    /// Per-server MCP connection outcomes, recorded at session start; the
+    /// read-only `/mcps` overlay renders them.
+    private let mcpServers: [MCPServerConnection]
+    /// The auth-store home the settings modal's secret saves write to — the
+    /// same store `readProviderAPIKey` reads.
+    private let openGrokHome: URL
 
     /// Viewport state. The last frame's geometry is cached so a page-sized
     /// scroll can be expressed in rows without re-laying out the transcript.
@@ -4944,13 +5476,19 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         sessionID: String = "",
         sessionServices: LiveSessionServices? = nil,
         conversationHistory: LiveConversationHistory? = nil,
-        sessionCatalog: LiveSessionCatalog? = nil
+        sessionCatalog: LiveSessionCatalog? = nil,
+        mcpServers: [MCPServerConnection] = [],
+        openGrokHome: URL? = nil,
+        paintCadence: TimeInterval = PagerMotion.defaultPaintCadence
     ) {
         self.mode = mode
         self.sessionID = sessionID
         self.sessionServices = sessionServices
         self.conversationHistory = conversationHistory
         self.sessionCatalog = sessionCatalog
+        self.mcpServers = mcpServers
+        self.openGrokHome = openGrokHome ?? OpenGrokHomeResolver
+            .resolve(environment: ProcessInfo.processInfo.environment)
         self.terminal = terminal
         self.sink = sink
         self.workingDirectory = workingDirectory
@@ -4986,6 +5524,10 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         self.themePreference = themePreference
         self.renderTheme = resolution.theme
         self.colorLevel = level
+        self.motionEnabled = PagerMotionState.motionEnabled(
+            environment: environment,
+            isTTY: terminal.isTTY()
+        )
 
         let size = terminal.size() ?? OpenGrokLiveTerminalSize(width: 80, height: 24)
         self.terminalSize = OpenGrokTerminalCore.TerminalSize(
@@ -5000,9 +5542,22 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                     : .inline(height: max(1, min(12, size.height))),
                 useAlternateScreen: mode == .fullScreen,
                 useSynchronizedOutput: true,
-                useMouseReporting: enableMouseReporting
+                useMouseReporting: enableMouseReporting,
+                paintCadence: paintCadence
             )
         )
+    }
+
+    /// Install the controller-facing motion feed. Called by the composition
+    /// after the controller exists (the renderer is constructed first), and
+    /// immediately publishes the current state so a welcome logo that is
+    /// already on screen arms the shimmer ticker without waiting for input.
+    func setMotionStateSink(
+        _ sink: (@Sendable (PagerMotionState) async -> Void)?
+    ) {
+        motionSink = sink
+        lastPublishedMotionState = nil
+        publishMotionState()
     }
 
     func begin() async throws {
@@ -5022,6 +5577,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 capturesInput: false
             ))
         }
+        await refreshContextUsage()
         try renderState()
     }
 
@@ -5032,7 +5588,6 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     }
 
     func render(_ event: OpenGrokPagerInteractiveEvent) async throws {
-        animationTick += 1
         switch event {
         case .lifecycle(let lifecycle):
             if lifecycle == .cancelling { isCancelling = true }
@@ -5047,16 +5602,22 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             conversation.startTurn(prompt: request.prompt)
             turnActivity = "Thinking\u{2026}"
             turnStartedAt = Date()
+            turnStartedAtSeconds = motion.seconds
+            turnOutputUTF8Count = 0
             isCancelling = false
+            await refreshContextUsage()
         case .session(let event):
             apply(event)
         case .turnFinished:
             finishAssistant()
             endTurn()
+            await refreshContextUsage()
         case .sessionReplaced(let sessionID):
             resetForNewSession(sessionID: sessionID)
+        case .sessionResumed(let sessionID):
+            await applyResumedSession(sessionID: sessionID)
         case .notice(let message):
-            conversation.appendMessage(PagerMessage(role: .system, text: message))
+            appendMessage(PagerMessage(role: .system, text: message))
         case .focusChanged(let region):
             switch region {
             case .scrollback:
@@ -5081,7 +5642,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             try await present(request)
         case .turnCancelled:
             finishAssistant()
-            conversation.appendMessage(PagerMessage(role: .system, text: "Cancelled."))
+            appendMessage(PagerMessage(role: .system, text: "Cancelled."))
             // A cancelled turn must not leave a tool parked on a sheet the user
             // just walked away from.
             await resolveOutstandingPermissions()
@@ -5095,7 +5656,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             endTurn()
         case .failed(let message):
             finishAssistant()
-            conversation.appendMessage(PagerMessage(role: .error, text: message))
+            appendMessage(PagerMessage(role: .error, text: message))
             await resolveOutstandingPermissions()
             endTurn()
         }
@@ -5105,6 +5666,8 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     private func endTurn() {
         turnActivity = nil
         turnStartedAt = nil
+        turnStartedAtSeconds = nil
+        turnOutputUTF8Count = 0
         isCancelling = false
     }
 
@@ -5178,6 +5741,11 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     func restoreTerminal() async throws {
         guard !restored else { return }
         restored = true
+        // A flush firing after restore would paint into a torn-down screen;
+        // `flushPendingFrameNow` also re-checks `restored` for the task that
+        // is already past its sleep.
+        pendingFlushTask?.cancel()
+        pendingFlushTask = nil
         // Detach the presenter first, so a tool that asks after this point
         // fails closed instead of suspending on a sheet nobody will paint.
         await permissionCoordinator?.setPresenter(nil)
@@ -5200,6 +5768,9 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             }
         case .output(let text):
             appendAssistant(text)
+            // Estimated bytes/4, not provider-reported: this event path
+            // carries no `TokenUsage` (see `LiveUsageComposition.report`).
+            turnOutputUTF8Count += text.utf8.count
             turnActivity = "Responding\u{2026}"
         case .status(let text):
             turnActivity = text
@@ -5225,7 +5796,12 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     }
 
     private func apply(_ tool: OpenGrokPagerToolUpdate) {
-        conversation.apply(tool)
+        // Terminal states are stamped with the motion clock so the block gets
+        // its 400 ms finish flash. `motion.seconds` is at most one tick stale
+        // (~33 ms at 30 fps), well inside the flash window; with motion
+        // disabled the stamp is 0 and the flash renderer treats it as
+        // already-static.
+        conversation.apply(tool, atSeconds: motionEnabled ? motion.seconds : nil)
         // While a tool runs, the turn-status row shows the tool's own title —
         // the reference has no separate "tool running" phrasing.
         if tool.state == .running {
@@ -5265,7 +5841,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 }
                 try sink.flush()
             } catch {
-                conversation.appendMessage(PagerMessage(
+                appendMessage(PagerMessage(
                     role: .error,
                     text: "Could not reach the clipboard: \(error)"
                 ))
@@ -5273,10 +5849,10 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             }
         }
         if let url = outcome.url {
-            conversation.appendMessage(PagerMessage(role: .system, text: url))
+            appendMessage(PagerMessage(role: .system, text: url))
         }
         if let notice = outcome.notice {
-            conversation.appendMessage(PagerMessage(role: .system, text: notice))
+            appendMessage(PagerMessage(role: .system, text: notice))
         }
     }
 
@@ -5323,17 +5899,44 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             // than to the overlay, so `/model <typo>` never silently becomes
             // "pick something else" (upstream returns `Unknown model: …`).
             if let query, !query.isEmpty {
-                guard let modelID = LiveModelPicker.resolve(
+                // Whole-string match first: display names contain spaces
+                // ("Grok 4.5"), so splitting the last token first would let a
+                // shorter entry steal the prefix and treat "4.5" as an effort
+                // (upstream model.rs:76-83).
+                if let modelID = LiveModelPicker.resolve(
                     query: query,
                     entries: entries
-                ) else {
-                    conversation.appendMessage(PagerMessage(
-                        role: .error,
-                        text: LiveModelPicker.unknownModelMessage(query)
-                    ))
+                ) {
+                    await switchModel(to: modelID)
                     return
                 }
-                await switchModel(to: modelID)
+                // `/model <name> <effort>`: trailing effort token on a
+                // reasoning model (upstream model.rs:85-104). A rejected
+                // level surfaces the effort error with the model's offered
+                // ids — not "Unknown model: … none".
+                if let (prefix, token) = LiveModelPicker.splitTrailingToken(query),
+                   let modelID = LiveModelPicker.resolve(query: prefix, entries: entries),
+                   let entry = entries.first(where: { $0.id == modelID }),
+                   entry.supportsReasoningEffort {
+                    switch LiveModelEffort.resolve(
+                        token: token,
+                        supportsReasoningEffort: entry.supportsReasoningEffort,
+                        declaredEfforts: entry.reasoningEfforts
+                    ) {
+                    case .success(let effort):
+                        await switchModel(to: modelID, effort: effort)
+                    case .failure(let error):
+                        appendMessage(PagerMessage(
+                            role: .error,
+                            text: error.message
+                        ))
+                    }
+                    return
+                }
+                appendMessage(PagerMessage(
+                    role: .error,
+                    text: LiveModelPicker.unknownModelMessage(query)
+                ))
                 return
             }
             overlays.push(LiveModelPicker.overlay(
@@ -5343,7 +5946,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         case .toggleMouseReporting:
             mouseReportingEnabled.toggle()
             try renderer.setMouseReporting(mouseReportingEnabled)
-            conversation.appendMessage(PagerMessage(
+            appendMessage(PagerMessage(
                 role: .system,
                 text: mouseReportingEnabled
                     ? "Mouse reporting on. Wheel scrolls the transcript; click selects overlay rows."
@@ -5351,7 +5954,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             ))
         case .workflows:
             guard let workflowRegistry else {
-                conversation.appendMessage(PagerMessage(
+                appendMessage(PagerMessage(
                     role: .system,
                     text: "No workflow runs in this session. Launch one with --workflow <file>."
                 ))
@@ -5488,7 +6091,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 lines: LivePagerOverlayText.tutorialLines()
             ))
         case .easterEgg:
-            conversation.appendMessage(PagerMessage(
+            appendMessage(PagerMessage(
                 role: .system,
                 text: LivePagerOverlayText.easterEgg
             ))
@@ -5513,7 +6116,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             case .notNeeded:
                 note("Nothing to compact — the context is not close to full.")
             case .unableToCompact(let reason):
-                conversation.appendMessage(PagerMessage(
+                appendMessage(PagerMessage(
                     role: .error,
                     text: "Could not compact: \(reason)"
                 ))
@@ -5527,14 +6130,14 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             // a pointless second step.
             if let query, !query.isEmpty {
                 guard let message = applyTheme(named: query) else {
-                    conversation.appendMessage(PagerMessage(
+                    appendMessage(PagerMessage(
                         role: .error,
                         text: "Unknown theme: \(query). Try "
                             + availableThemeNames.joined(separator: ", ") + "."
                     ))
                     return
                 }
-                conversation.appendMessage(PagerMessage(role: .system, text: message))
+                appendMessage(PagerMessage(role: .system, text: message))
                 return
             }
             overlays.push(.list(
@@ -5589,10 +6192,154 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 note("Goal set. Send this to brief the model on it, or just keep going:")
                 note(text)
             }
+        case .sessionPicker:
+            // `/resume` (upstream resume.rs:21-23). Row ids are session ids;
+            // choosing one round-trips through the controller as
+            // `/resume <id>`, which is what reaches the runtime swap.
+            guard let sessionCatalog else {
+                note("Session storage is unavailable in this session, so there is nothing to resume.")
+                return
+            }
+            let listings = (try? sessionCatalog.list()) ?? []
+            overlays.push(LiveSessionPicker.overlay(listings: listings))
+        case .usage:
+            // `/usage` (upstream usage.rs:59, `Action::ShowUsage`) rendered as
+            // a text modal the way `/context` is. The numbers come from
+            // `LiveUsageComposition`, which documents why they are estimates.
+            let context: ContextUsage?
+            if let compaction {
+                context = await compaction.usage()
+            } else {
+                context = nil
+            }
+            let usageItems: [ConversationItem]
+            if let conversationHistory {
+                usageItems = await conversationHistory.items
+            } else {
+                usageItems = []
+            }
+            let report = await LiveUsageComposition.report(
+                context: context,
+                items: usageItems
+            )
+            overlays.push(.sessionInfo(
+                id: "usage",
+                title: "Usage",
+                lines: LiveUsageComposition.render(report)
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .map { PagerStyledLine(text: String($0)) }
+            ))
+        case .mcpServers:
+            overlays.push(.sessionInfo(
+                id: "mcps",
+                title: "MCP servers",
+                lines: LiveMCPStatusOverlay.lines(connections: mcpServers)
+                    .map { PagerStyledLine(text: $0) }
+            ))
+        case .reasoningEffort(let query):
+            await applyEffortCommand(query: query)
+        case .renameSession(let title):
+            await renameSession(title: title)
         case .dismissAll:
             overlays.removeAll()
             currentPermissionRequestID = nil
         }
+    }
+
+    // MARK: - /resume, /effort, /rename
+
+    /// Repaint the transcript the runtime just restored. The runtime has
+    /// already swapped the conversation history, so this is a pure projection
+    /// of what is now on disk.
+    private func applyResumedSession(sessionID: String) async {
+        self.sessionID = sessionID
+        let items = await conversationHistory?.items ?? []
+        conversation.seed(from: items)
+        selection.unfocus()
+        followsBottom = true
+        scrollOffset = 0
+        lastMaximumScrollOffset = 0
+        queuedPromptCount = 0
+        currentPermissionRequestID = nil
+        endTurn()
+        overlays.removeAll()
+        hasStartedFirstTurn = !conversation.items.isEmpty
+        if conversation.items.isEmpty {
+            overlays.push(.welcome(
+                PagerWelcomeOverlay(subtitle: LivePagerChrome.collapseHome(workingDirectory)),
+                capturesInput: false
+            ))
+        }
+        note("Resumed session \(String(sessionID.prefix(8))) — "
+            + "\(conversation.items.count) block\(conversation.items.count == 1 ? "" : "s") restored.")
+        await refreshContextUsage()
+    }
+
+    /// `/effort [level]` — reasoning effort on the current model, upstream
+    /// effort.rs:57-92: the model id stays fixed and only the effort moves,
+    /// through the same switch path `/model <name> <effort>` uses.
+    private func applyEffortCommand(query: String?) async {
+        // The composer border carries the wire model name; resolve it back to
+        // its catalog entry for the effort menu. A model the catalog no
+        // longer knows classifies as unsupported, which is also what
+        // upstream's option-less menu resolves to.
+        let entry = catalogStore?.entryForWireModel(modelName)
+            ?? modelCatalog.first { $0.id == modelName }
+        let supportsEffort = entry?.supportsReasoningEffort ?? false
+        let declaredEfforts = entry?.reasoningEfforts ?? []
+
+        guard let query, !query.isEmpty else {
+            // Bare `/effort`: upstream's usage error listing the current
+            // model's own option ids and the session's current effort
+            // (effort.rs:63-81). The current effort reads through the
+            // manager's session-level tracker (`currentReasoningEffortValue`),
+            // seeded at launch and updated by every switch.
+            let offered = LiveModelEffort.options(
+                supportsReasoningEffort: supportsEffort,
+                declaredEfforts: declaredEfforts
+            ).map(\.id)
+            let levels = offered.isEmpty ? "<level>" : offered.joined(separator: "|")
+            let current = (catalogStore?.currentReasoningEffort()?.asString ?? reasoningEffort)
+                .map { " (current: \($0))" } ?? ""
+            appendMessage(PagerMessage(
+                role: .error,
+                text: "Usage: /effort <\(levels)>\(current)"
+            ))
+            return
+        }
+        switch LiveModelEffort.resolve(
+            token: query,
+            supportsReasoningEffort: supportsEffort,
+            declaredEfforts: declaredEfforts
+        ) {
+        case .success(let effort):
+            // Same wire path as `/model <name> <effort>` — the coordinator
+            // treats an effort-only re-pick of the active model as a real
+            // switch, and `switchModel` updates the composer's effort label.
+            await switchModel(to: entry?.id ?? modelName, effort: effort)
+        case .failure(let error):
+            appendMessage(PagerMessage(role: .error, text: error.message))
+        }
+    }
+
+    /// `/rename <title>` — one title-write through the conversation history
+    /// actor (upstream rename.rs:42-53, `Action::RenameSession`).
+    private func renameSession(title: String) async {
+        guard let conversationHistory else {
+            // Upstream's no-session refusal (rename.rs:43-45).
+            appendMessage(PagerMessage(role: .error, text: "No active session"))
+            return
+        }
+        do {
+            try await conversationHistory.rename(title: title)
+        } catch {
+            appendMessage(PagerMessage(
+                role: .error,
+                text: "Could not rename the session: \(error)"
+            ))
+            return
+        }
+        note("Session renamed to \u{201C}\(title)\u{201D}.")
     }
 
     // MARK: - Session-scoped commands
@@ -5642,7 +6389,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         do {
             try await conversationHistory.commit(sessionID: sessionID, items: truncated)
         } catch {
-            conversation.appendMessage(PagerMessage(
+            appendMessage(PagerMessage(
                 role: .error,
                 text: "Files were restored, but the conversation could not be truncated: \(error)"
             ))
@@ -5697,7 +6444,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             do {
                 try await conversationHistory.commit(sessionID: sessionID, items: [])
             } catch {
-                conversation.appendMessage(PagerMessage(
+                appendMessage(PagerMessage(
                     role: .error,
                     text: "Could not clear the in-memory conversation, so nothing was deleted: \(error)"
                 ))
@@ -5710,7 +6457,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 return
             }
         } catch {
-            conversation.appendMessage(PagerMessage(
+            appendMessage(PagerMessage(
                 role: .error,
                 text: "Could not delete the session: \(error)"
             ))
@@ -5746,7 +6493,22 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     }
 
     private func note(_ text: String) {
-        conversation.appendMessage(PagerMessage(role: .system, text: text))
+        appendMessage(PagerMessage(role: .system, text: text))
+    }
+
+    /// The one door for transcript messages: the welcome overlay blanks the
+    /// entire transcript area (contentRows = screenHeight in
+    /// PagerOverlayRender), so a message appended while it is up paints
+    /// underneath it and never reaches the screen. Upstream never has this
+    /// problem because its welcome is a separate view whose command errors
+    /// land in a visible agent transcript (app_view.rs ActiveView::Welcome vs
+    /// Agent). Cost: a notice arriving on the welcome screen replaces the
+    /// logo instead of toasting over it like upstream — visible words win.
+    /// Deliberate welcome re-shows (session delete, `.welcomeScreen`) push
+    /// *after* their notes, so append-time dismissal leaves them up.
+    private func appendMessage(_ message: PagerMessage) {
+        overlays.dismiss(id: "welcome")
+        conversation.appendMessage(message)
     }
 
     /// Write to a file when one is named, otherwise to the clipboard.
@@ -5757,12 +6519,12 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                     try sink.write(String(decoding: data, as: UTF8.self))
                 }
                 try sink.flush()
-                conversation.appendMessage(PagerMessage(
+                appendMessage(PagerMessage(
                     role: .system,
                     text: "\(label) copied — \(text.count) characters."
                 ))
             } catch {
-                conversation.appendMessage(PagerMessage(
+                appendMessage(PagerMessage(
                     role: .error,
                     text: "Could not reach the clipboard: \(error)"
                 ))
@@ -5772,12 +6534,12 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         let url = LivePagerClipboard.resolve(filePath, relativeTo: workingDirectory)
         do {
             try text.write(to: url, atomically: true, encoding: .utf8)
-            conversation.appendMessage(PagerMessage(
+            appendMessage(PagerMessage(
                 role: .system,
                 text: "\(label) written to \(url.path)."
             ))
         } catch {
-            conversation.appendMessage(PagerMessage(
+            appendMessage(PagerMessage(
                 role: .error,
                 text: "Could not write \(url.path): \(error)"
             ))
@@ -5792,7 +6554,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
               let command = LiveWorkflowOverlayBuilder.command(forRowID: rowID)
         else { return false }
         let message = await LiveWorkflowOverlayBuilder.apply(command, registry: workflowRegistry)
-        conversation.appendMessage(PagerMessage(role: .system, text: message))
+        appendMessage(PagerMessage(role: .system, text: message))
         let views = (try? await workflowRegistry.views()) ?? []
         overlays.dismiss(id: "workflows")
         overlays.push(.workflows(rows: LiveWorkflowOverlayBuilder.rows(from: views)))
@@ -5853,12 +6615,23 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         switch overlayID {
         case "model":
             await switchModel(to: rowID)
+        case LiveSessionPicker.overlayID:
+            // Row ids are session ids ("none" is the empty-list placeholder).
+            // The command round-trip is how the selection reaches the runtime:
+            // only the controller owns it, so the row resolves to the exact
+            // `/resume <id>` the controller's resume handler services.
+            guard rowID != "none" else { return nil }
+            guard rowID != sessionID else {
+                note("Already in session \(String(rowID.prefix(8))).")
+                return nil
+            }
+            return "/resume \(rowID)"
         case "theme":
             // The row id is the theme name, so a click takes the identical path
             // a typed `/theme <name>` does — including the downgrade notice on
             // a terminal that cannot render it.
             if let message = applyTheme(named: rowID) {
-                conversation.appendMessage(PagerMessage(role: .system, text: message))
+                appendMessage(PagerMessage(role: .system, text: message))
             }
         case "command-palette":
             // The row id is the command's insert text, so handing it back runs
@@ -5904,26 +6677,38 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
     ///
     /// A refused switch is reported as an error row and leaves `modelName` — and
     /// therefore the composer's border and the next turn's provider — alone.
-    private func switchModel(to modelID: String) async {
+    ///
+    /// `effort` is a validated `/model <name> <effort>` override; `nil` keeps
+    /// the model's catalog default.
+    private func switchModel(to modelID: String, effort: ReasoningEffort? = nil) async {
         guard let modelSwitch else {
             // No provider session behind this renderer; the picker can still
             // relabel, but it must not claim the session changed.
             modelName = modelID
-            conversation.appendMessage(PagerMessage(
+            appendMessage(PagerMessage(
                 role: .system,
                 text: "Model set to \(modelID). It applies to new sessions — "
                     + "this session keeps its current model."
             ))
             return
         }
-        switch await modelSwitch.apply(modelID: modelID) {
+        switch await modelSwitch.apply(modelID: modelID, effort: effort) {
         case .unchanged:
-            conversation.appendMessage(PagerMessage(
+            appendMessage(PagerMessage(
                 role: .system,
                 text: "Already using \(modelID)."
             ))
         case .switched(let summary):
             modelName = summary.modelID
+            reasoningEffort = summary.reasoningEffort?.asString
+            // Mirror of upstream `set_session_model`'s tail
+            // (handlers/model_switch.rs:299-303): the manager's current
+            // model/effort track the session so `/model` defaults and any
+            // future `/effort` surface read the applied state.
+            catalogStore?.noteModelSwitch(
+                catalogID: summary.requestedID,
+                effort: summary.reasoningEffort
+            )
             if let providerBoundarySync {
                 do {
                     let boundary = await conversationHistory?.sharedExportBoundary
@@ -5932,12 +6717,12 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                     note("Provider boundary summary could not be persisted: \(error)")
                 }
             }
-            conversation.appendMessage(PagerMessage(
+            appendMessage(PagerMessage(
                 role: .system,
                 text: summary.transcriptMessage
             ))
         case .failed(let modelID, let message):
-            conversation.appendMessage(PagerMessage(
+            appendMessage(PagerMessage(
                 role: .error,
                 text: "Could not switch to \(modelID): \(message). "
                     + "Staying on \(modelName)."
@@ -6201,7 +6986,7 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 // own copy is the whole of their state.
                 return
             } catch {
-                conversation.appendMessage(PagerMessage(
+                appendMessage(PagerMessage(
                     role: .error,
                     text: "Could not save \(key): \(error)"
                 ))
@@ -6214,13 +6999,23 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 try store.writeMultiSelect(key: key, enabled: current)
                 reloadCatalogInput()
             } catch {
-                conversation.appendMessage(PagerMessage(
+                appendMessage(PagerMessage(
                     role: .error,
                     text: "Could not save \(key): \(error)"
                 ))
             }
 
         case .resetRequested(let key):
+            // A secret row's reset is a credential *removal*, not a config
+            // write — upstream maps `SecretStatus::Missing` to the provider's
+            // Clear action (`dispatch/settings/ui.rs:1447-1448`). Routed here
+            // because `store.reset` classifies secret rows `notPersistable`
+            // and would silently swallow the request.
+            if let meta = PagerSettingsRegistry.default.entries.first(where: { $0.key == key }),
+               case .secretStore = meta.storage {
+                applySecret(key: key, value: "")
+                return
+            }
             do {
                 try store.reset(key: key)
                 if key == "theme" { _ = applyTheme(named: "groknight") }
@@ -6228,22 +7023,66 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             } catch PagerSettingsStoreError.notPersistable {
                 return
             } catch {
-                conversation.appendMessage(PagerMessage(
+                appendMessage(PagerMessage(
                     role: .error,
                     text: "Could not reset \(key): \(error)"
                 ))
             }
 
-        case .secret:
-            // Credentials belong in the owner-protected auth store, not in
-            // config.toml. Until that path is wired, say so rather than
-            // pretending the key was saved.
-            conversation.appendMessage(PagerMessage(
-                role: .system,
-                text: "Saving API keys from the settings modal is not wired yet; "
-                    + "use `open-grok login` instead."
-            ))
+        case .secret(let key, let value):
+            applySecret(key: key, value: value)
         }
+    }
+
+    /// Persist a settings-modal secret into the owner-protected auth store —
+    /// the SAME store the live credential resolver reads
+    /// (`readProviderAPIKey` over `providerAPIKeyScope`, Storage.swift:183),
+    /// never `config.toml`. An empty value removes the key (upstream
+    /// `SecretStatus::Missing` → the Clear action, ui.rs:1447-1448; write
+    /// path `store_provider_api_key` / `clear_provider_api_key`,
+    /// effects/mod.rs:832-843).
+    private func applySecret(key: String, value: String) {
+        guard let meta = PagerSettingsRegistry.default.entries.first(where: { $0.key == key }),
+              case .secretStore(let account) = meta.storage
+        else {
+            appendMessage(PagerMessage(
+                role: .error,
+                text: "Setting \(key) has no secret storage; nothing was saved."
+            ))
+            return
+        }
+        // Row account → auth.json scope. Kimi Platform deliberately reuses
+        // the historical `kimi::api_key` scope so existing logins keep
+        // working (`kimi_api_key_scope`, ProviderScopes.swift:46-51); every
+        // other account is its provider's own `<provider>::api_key`.
+        let scope = account == "kimi_platform"
+            ? kimiAPIKeyScope(.platform)
+            : providerAPIKeyScope(account)
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            if trimmed.isEmpty {
+                try clearScopedAPIKey(grokHome: openGrokHome, scope: scope)
+                note("Removed \(meta.label). New sessions and model switches no longer see it.")
+            } else {
+                try storeScopedAPIKey(grokHome: openGrokHome, scope: scope, apiKey: trimmed)
+                note("Saved \(meta.label). It applies to new sessions and model switches; "
+                    + "the running session keeps its current credential.")
+            }
+        } catch {
+            appendMessage(PagerMessage(
+                role: .error,
+                text: "Could not save \(meta.label): \(error)"
+            ))
+            return
+        }
+        // Make the change visible to the catalog publish gate and kick the
+        // background refresh, mirroring upstream's post-store
+        // `apply_meta_models` (effects/mod.rs:844-861). KNOWN DEFERRAL: the
+        // upstream rebind of LIVE sessions after a credential change
+        // (task_result.rs:1087-1300) is not ported — the new key reaches new
+        // sessions and `/model` switches only.
+        catalogStore?.refreshCredentialSnapshot()
+        catalogStore?.spawnBackgroundRefresh()
     }
 
     /// `$OPENGROK_HOME/config.toml`, the user-level config the reference writes.
@@ -6261,7 +7100,24 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
         ))
     }
 
+    /// Repaint through the coalesced path: however many state changes arrive
+    /// inside one paint-cadence window fold into a single frame, and a folded
+    /// frame is guaranteed to paint by the one-shot flush timer. This is the
+    /// other half of the animation ticker — 30 fps of ticks plus per-event
+    /// repaints must not become 30+ paints per second.
     private func renderState() throws {
+        let result = layOutCurrentFrame()
+        if try renderer.requestFrame(result, at: Self.monotonicNow()) == nil {
+            armFlushTimerIfNeeded()
+        }
+        publishMotionState()
+    }
+
+    /// Run the frame function and refresh the geometry bookkeeping mouse
+    /// routing reads. Split out of `renderState` because the flush timer
+    /// re-lays-out at flush time — a folded frame must paint the *latest*
+    /// state, not the one that was folded.
+    private func layOutCurrentFrame() -> PagerRenderResult {
         let result = renderPagerFrame(renderState(conversation: conversation.items))
         // Fresh every frame: a modal that no longer fits publishes no bounds.
         lastOverlayBounds = result.overlays
@@ -6271,7 +7127,112 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             result.layout.totalContentLines - result.layout.conversation.height
         )
         if followsBottom { scrollOffset = lastMaximumScrollOffset }
-        try renderer.render(result)
+        return result
+    }
+
+    /// Arm a one-shot timer for `renderer.scheduledFrameAt`. Idempotent: at
+    /// most one flush is ever pending, and a fresh request folded while one
+    /// is armed rides the same flush.
+    private func armFlushTimerIfNeeded() {
+        guard pendingFlushTask == nil,
+              let scheduled = renderer.scheduledFrameAt
+        else { return }
+        let delay = max(0, scheduled - Self.monotonicNow())
+        // Inherits this actor's isolation; the sleep suspends without
+        // holding it.
+        pendingFlushTask = Task {
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000) + 1_000_000)
+            self.flushPendingFrameNow()
+        }
+    }
+
+    private func flushPendingFrameNow() {
+        pendingFlushTask = nil
+        guard !restored, renderer.scheduledFrameAt != nil else { return }
+        let result = layOutCurrentFrame()
+        // A throw here has the same recovery as the next event's repaint;
+        // surfacing it has no channel that would not kill the run.
+        _ = try? renderer.flushPendingFrame(result, at: Self.monotonicNow())
+        // Not yet due (the timer raced a fresher fold): re-arm rather than
+        // drop the frame.
+        armFlushTimerIfNeeded()
+    }
+
+    /// Monotonic seconds for the paint clock. Only ever compared against
+    /// itself, so the epoch (process uptime) does not matter.
+    private static func monotonicNow() -> TimeInterval {
+        Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+    }
+
+    // MARK: - Animation
+
+    /// One wall-clock tick from the controller's motion ticker: sample the
+    /// clock into the frame state and repaint through the coalesced path.
+    func renderAnimationTick(_ frame: OpenGrokPagerAnimationFrame) async throws {
+        motion = PagerMotionSnapshot(
+            tick: frame.tick,
+            seconds: frame.seconds,
+            enabled: motionEnabled
+        )
+        if frame.demand == .slow {
+            // The welcome shimmer advances at 12 fps of *frames*; a slow tick
+            // that lands inside the same shimmer frame would repaint an
+            // identical screen (app_view.rs:5760-5766).
+            let shimmerFrame = PagerMotion.shimmerFrame(atSeconds: frame.seconds)
+            guard shimmerFrame != lastShimmerFrame else { return }
+            lastShimmerFrame = shimmerFrame
+        }
+        try renderState()
+    }
+
+    /// Report what is moving on screen to the controller's ticker whenever it
+    /// changes. This is what turns the ticker on for the welcome shimmer with
+    /// no turn running, and what lets it park when the screen goes still.
+    private func publishMotionState() {
+        let state = PagerMotionState(
+            hasRunningTurn: turnActivity != nil,
+            // Approximated as "a streaming block exists and the viewport
+            // follows the tail". A block streaming above a scrolled-away
+            // viewport misses the reference's finer visibility test and stays
+            // animated; the cost is spare frames, never a frozen spinner.
+            hasVisibleRunningBlock: followsBottom && hasStreamingBlock,
+            hasBackgroundTasks: false,
+            showsWelcomeLogo: overlays.contains(id: "welcome"),
+            hasPendingFlash: hasPendingFlash,
+            motionEnabled: motionEnabled
+        )
+        guard state != lastPublishedMotionState else { return }
+        lastPublishedMotionState = state
+        guard let motionSink else { return }
+        Task { await motionSink(state) }
+    }
+
+    private var hasStreamingBlock: Bool {
+        conversation.items.contains { item in
+            switch item {
+            case .message(let message): return message.isStreaming
+            case .tool(let tool): return tool.state == .running || tool.state == .pending
+            case .separator: return false
+            }
+        }
+    }
+
+    private var hasPendingFlash: Bool {
+        guard motionEnabled else { return false }
+        return conversation.items.contains { item in
+            guard case .tool(let tool) = item, let finishedAt = tool.finishedAt else {
+                return false
+            }
+            return PagerMotion.isFlashing(finishedAt: finishedAt, now: motion.seconds)
+        }
+    }
+
+    /// Re-read the compaction coordinator's context accounting — the status
+    /// bar's ramp shows the same numbers auto-compaction decides on. Called
+    /// at turn boundaries; between turns the figures cannot move.
+    private func refreshContextUsage() async {
+        guard let compaction else { return }
+        contextUsage = await compaction.usage()
     }
 
     /// The frame model for a given block list.
@@ -6294,10 +7255,19 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 },
                 selectedIndex: prompt.selectedCompletion
             )
+        // Elapsed rides the motion clock so the readout and the spinner agree
+        // frame-for-frame; the wall-clock fallback only serves motion-disabled
+        // terminals, where no animation frame ever advances `motion.seconds`.
+        let elapsed: TimeInterval? = motionEnabled
+            ? turnStartedAtSeconds.map { max(0, motion.seconds - $0) }
+            : turnStartedAt.map { Date().timeIntervalSince($0) }
+        let streamedTokens = Int(estimateTokens(bytes: turnOutputUTF8Count))
         return PagerRenderState(
             size: terminalSize,
             statusBar: PagerStatusBar(
                 workingDirectory: LivePagerChrome.collapseHome(workingDirectory),
+                contextUsedTokens: contextUsage.map { Int($0.usedTokens) },
+                contextTotalTokens: contextUsage.map { Int($0.contextWindow) },
                 queuedPromptCount: queuedPromptCount
             ),
             conversation: blocks,
@@ -6305,12 +7275,21 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
                 PagerTurnStatus(
                     label: isCancelling ? "Cancelling\u{2026}" : label,
                     isCancelling: isCancelling,
-                    tick: animationTick,
-                    elapsed: turnStartedAt.map { Date().timeIntervalSince($0) },
+                    tick: motion.tick,
+                    elapsed: elapsed,
+                    tokenCount: streamedTokens > 0 ? streamedTokens : nil,
                     queuedPromptCount: queuedPromptCount,
                     // Bare Enter force-sends the head only when the composer is
                     // empty; with a draft, Enter queues it behind the others.
-                    queueIsSendable: queuedPromptCount > 0 && prompt.text.isEmpty
+                    queueIsSendable: queuedPromptCount > 0 && prompt.text.isEmpty,
+                    // The pulsing "waiting on you" diamond while a permission
+                    // sheet blocks the turn (`turn_status.rs:484-486`). The
+                    // idle-monitor pulse is deliberately not produced: this
+                    // session has no idle-watcher feed, and a guessed monitor
+                    // glyph would claim watchers that do not exist.
+                    indicator: currentPermissionRequestID != nil
+                        ? .pendingUserDiamond
+                        : .spinner
                 )
             },
             completions: completions,
@@ -6339,7 +7318,8 @@ private actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderA
             scrollPosition: followsBottom ? .followTail : .offset(scrollOffset),
             theme: renderTheme,
             selectedBlockIndex: selection.index,
-            overlays: overlays
+            overlays: overlays,
+            motion: motion
         )
     }
 

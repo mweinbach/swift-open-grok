@@ -156,6 +156,39 @@ public actor MCPSessionConnections {
     }
 }
 
+// MARK: - /mcps status overlay
+
+/// The `/mcps` read-only status body, built from the connection outcomes the
+/// session recorded when it brought its configured servers online (upstream
+/// opens the extensions modal's MCP tab, `slash/commands/mcps.rs:19-24`; this
+/// port renders the same facts — name, connected/failed, tools — as text).
+enum LiveMCPStatusOverlay {
+    static func lines(connections: [MCPServerConnection]) -> [String] {
+        guard !connections.isEmpty else {
+            return ["No MCP servers configured for this session."]
+        }
+        var lines: [String] = []
+        for connection in connections.sorted(by: { $0.name < $1.name }) {
+            if let failure = connection.failure {
+                lines.append("✗ \(connection.name) — \(failure)")
+                continue
+            }
+            let toolCount = connection.toolNames.count
+            lines.append(
+                "● \(connection.name) — connected, "
+                    + "\(toolCount) tool\(toolCount == 1 ? "" : "s")"
+            )
+            for tool in connection.toolNames.sorted() {
+                lines.append("    \(tool)")
+            }
+            for (tool, reason) in connection.skipped.sorted(by: { $0.key < $1.key }) {
+                lines.append("    (skipped) \(tool) — \(reason)")
+            }
+        }
+        return lines
+    }
+}
+
 // MARK: - Composition
 
 public enum LiveMCPComposition {

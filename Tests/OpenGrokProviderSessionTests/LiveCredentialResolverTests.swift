@@ -9,6 +9,7 @@ import Foundation
 import Testing
 @testable import OpenGrokProviderSession
 import OpenGrokAuth
+import OpenGrokModels
 import OpenGrokSamplingTypes
 
 private struct ResolverFixture {
@@ -219,6 +220,141 @@ struct LiveCredentialResolverTests {
             )
         ) {
             _ = try await resolver.resolve(provider: .fireworks, scope: "cli:test")
+        }
+    }
+
+    @Test("a stored Meta key resolves and hints once the provider store holds one")
+    func metaStoredCredentialAndHint() async throws {
+        let fixture = try ResolverFixture()
+        defer { fixture.dispose() }
+        let resolver = fixture.resolver()
+
+        #expect(!resolver.hasStoredCredential(for: .meta))
+        try storeProviderAPIKey(
+            grokHome: fixture.home,
+            provider: ModelProvider.meta.asString,
+            apiKey: "meta-stored-secret"
+        )
+        #expect(resolver.hasStoredCredential(for: .meta))
+        #expect(LiveCredentialResolver.credentialHint(.meta) == "META_API_KEY")
+
+        let resolved = try await resolver.resolve(
+            provider: .meta,
+            baseURL: MetaModels.apiBaseURLDefault,
+            scope: "cli:test"
+        )
+        #expect(resolved.bearer == "meta-stored-secret")
+        #expect(resolved.source == .storedAPIKey)
+        #expect(resolved.authKind == .apiKeyOnly)
+    }
+}
+
+/// Resolver half of upstream's regression test
+/// `stored_meta_and_wafer_keys_resolve_only_on_trusted_hosts`
+/// (xai-grok-shell agent/config.rs:7418-7458 at HEAD 70002584): a stored
+/// first-party provider key resolves only when the model's endpoint is that
+/// provider's trusted host; environment keys are the user's explicit choice
+/// and are not host-gated (`select_api_key`, meta_models.rs:78-88).
+@Suite("Stored provider keys are host-gated")
+struct StoredKeyTrustedHostTests {
+    @Test("stored Meta and Wafer keys resolve only on trusted hosts")
+    func storedMetaAndWaferKeysResolveOnlyOnTrustedHosts() async throws {
+        let fixture = try ResolverFixture()
+        defer { fixture.dispose() }
+        try storeProviderAPIKey(
+            grokHome: fixture.home,
+            provider: ModelProvider.meta.asString,
+            apiKey: "meta-stored-secret"
+        )
+        try storeProviderAPIKey(
+            grokHome: fixture.home,
+            provider: ModelProvider.wafer.asString,
+            apiKey: "wafer-stored-secret"
+        )
+        let resolver = fixture.resolver()
+
+        let meta = try await resolver.resolve(
+            provider: .meta,
+            baseURL: MetaModels.apiBaseURLDefault,
+            scope: "cli:test"
+        )
+        #expect(meta.bearer == "meta-stored-secret")
+        #expect(meta.source == .storedAPIKey)
+
+        await #expect(throws: LiveCredentialError.missingCredential(
+            provider: .meta,
+            hint: LiveCredentialResolver.credentialHint(.meta)
+        )) {
+            _ = try await resolver.resolve(
+                provider: .meta,
+                baseURL: "https://proxy.example/v1",
+                scope: "cli:test"
+            )
+        }
+
+        let wafer = try await resolver.resolve(
+            provider: .wafer,
+            baseURL: WaferModels.apiBaseURLDefault,
+            scope: "cli:test"
+        )
+        #expect(wafer.bearer == "wafer-stored-secret")
+        #expect(wafer.source == .storedAPIKey)
+
+        await #expect(throws: LiveCredentialError.missingCredential(
+            provider: .wafer,
+            hint: LiveCredentialResolver.credentialHint(.wafer)
+        )) {
+            _ = try await resolver.resolve(
+                provider: .wafer,
+                baseURL: "https://proxy.example/v1",
+                scope: "cli:test"
+            )
+        }
+    }
+
+    @Test("an environment key is not host-gated and outranks the stored key")
+    func environmentKeyResolvesOnUntrustedHost() async throws {
+        let fixture = try ResolverFixture()
+        defer { fixture.dispose() }
+        try storeProviderAPIKey(
+            grokHome: fixture.home,
+            provider: ModelProvider.meta.asString,
+            apiKey: "meta-stored-secret"
+        )
+        let resolver = fixture.resolver()
+
+        // Upstream sends the env key to whatever base_url the user
+        // configured — it is their explicit per-invocation choice
+        // (`select_api_key`, meta_models.rs:78-88).
+        let resolved = try await resolver.resolve(
+            provider: .meta,
+            explicitAPIKey: "meta-env-key",
+            baseURL: "https://proxy.example/v1",
+            scope: "cli:test"
+        )
+        #expect(resolved.bearer == "meta-env-key")
+        #expect(resolved.source == .explicitAPIKey)
+    }
+
+    @Test("no base URL fails closed for the stored-key rung")
+    func nilBaseURLWithholdsStoredKey() async throws {
+        let fixture = try ResolverFixture()
+        defer { fixture.dispose() }
+        try storeProviderAPIKey(
+            grokHome: fixture.home,
+            provider: ModelProvider.meta.asString,
+            apiKey: "meta-stored-secret"
+        )
+        let resolver = fixture.resolver()
+
+        // An endpoint the caller cannot name is an endpoint we cannot vouch
+        // for: the stored key stays home rather than following an unknown
+        // host (AGENTS.md §5 — fail-closed means fail-closed).
+        await #expect(throws: LiveCredentialError.missingCredential(
+            provider: .meta,
+            hint: LiveCredentialResolver.credentialHint(.meta)
+        )) {
+            _ = try await resolver.resolve(provider: .meta, scope: "cli:test")
         }
     }
 }

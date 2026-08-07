@@ -77,7 +77,9 @@ struct LiveSessionDocument: Sendable, Equatable {
         return LiveSessionDocument(
             sessionID: record.sessionID,
             workingDirectory: record.workingDirectory,
-            title: title,
+            // Same precedence as the catalog listing: a stored `/rename`
+            // title wins over the derived first prompt.
+            title: record.title ?? title,
             updatedAt: record.updatedAt,
             content: String(content.prefix(contentLimit))
         )

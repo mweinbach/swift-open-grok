@@ -226,7 +226,10 @@ struct LiveSessionCatalog {
             sessionID: record.sessionID,
             workingDirectory: record.workingDirectory,
             parentSessionID: record.parentSessionID,
-            title: title,
+            // A `/rename`d title wins over the derived first-prompt one
+            // (upstream stores the rename as the session's summary,
+            // `rename.rs:42-53`); sessions never renamed keep deriving.
+            title: record.title ?? title,
             model: model,
             createdAt: record.createdAt,
             lastActivityAt: record.updatedAt,

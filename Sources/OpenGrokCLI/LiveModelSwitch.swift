@@ -149,12 +149,18 @@ struct LiveModelCatalogResolver: Sendable {
                 name: entry.info.name ?? entry.info.model,
                 description: entry.info.description,
                 contextWindow: entry.info.contextWindow,
-                supportsReasoningEffort: entry.info.supportsReasoningEffort
+                supportsReasoningEffort: entry.info.supportsReasoningEffort,
+                reasoningEfforts: entry.info.reasoningEfforts
             )
         }
     }
 
-    func resolve(modelID: String) async throws -> LiveModelResolution {
+    /// `effort` is a validated per-switch reasoning-effort override
+    /// (`/model <name> <effort>`). It applies only when the catalog entry
+    /// declares effort support; on a non-supporting model it is ignored and
+    /// the switch proceeds, exactly like upstream's meta override
+    /// (`set_session_model`, handlers/model_switch.rs:139-158).
+    func resolve(modelID: String, effort: ReasoningEffort? = nil) async throws -> LiveModelResolution {
         let catalog = catalogSource()
         guard let entry = findModelByID(catalog, modelID: modelID) else {
             throw LiveModelSwitchError.unknownModel(modelID)
@@ -252,9 +258,13 @@ struct LiveModelCatalogResolver: Sendable {
             )
         } else {
             do {
+                // The resolved endpoint travels with the request so a stored
+                // provider key can be withheld from an untrusted host
+                // (upstream resolve_credentials, agent/config.rs:5486-5503).
                 credential = try await makeCredentialResolver(environment, openGrokHome).resolve(
                     provider: provider,
                     explicitAPIKey: explicitAPIKey,
+                    baseURL: baseURL,
                     scope: "cli:\(sessionID)"
                 )
             } catch let error as LiveCredentialError {
@@ -275,6 +285,7 @@ struct LiveModelCatalogResolver: Sendable {
                 apiBackend: backend,
                 extraHeaders: headers,
                 queryParams: entry.queryParams,
+                tuning: OpenGrokLiveSamplingTuning(entry: entry, effortOverride: effort),
                 bearerResolver: namedAuthResolver.map(NamedAuthBearerResolver.init),
                 credentialProvider: credential.binding.authCredentialProvider
             ),
@@ -303,6 +314,10 @@ struct LiveModelSwitchSummary: Sendable, Equatable {
     let previousProvider: ModelProvider
     /// Provider-opaque history items dropped because the provider changed.
     let droppedOpaqueItems: Int
+    /// The reasoning effort the new sampling stack sends — the chosen override
+    /// when one was given, else the model's catalog default, `nil` on models
+    /// with no selectable effort. The composer's border renders this.
+    let reasoningEffort: ReasoningEffort?
 
     var changedProvider: Bool { provider != previousProvider }
 
@@ -381,20 +396,30 @@ actor LiveModelSwitchCoordinator {
     ///
     /// Resolution, credential lookup and sampler construction all happen before
     /// any state changes, so a failure leaves the session exactly as it was.
-    func apply(modelID: String) async -> LiveModelSwitchOutcome {
+    ///
+    /// `effort` is a validated reasoning-effort override from
+    /// `/model <name> <effort>`. Re-picking the active model is only a no-op
+    /// when the effort would not change either — upstream applies an effort
+    /// override through the same SetSessionModel path even when the model id
+    /// is unchanged (handlers/model_switch.rs:139-158, :280).
+    func apply(modelID: String, effort: ReasoningEffort? = nil) async -> LiveModelSwitchOutcome {
         let previous = sampling
-        if modelID == previous.model || modelID == activeCatalogID(for: previous) {
+        let picksActiveModel = modelID == previous.model
+            || modelID == activeCatalogID(for: previous)
+        if picksActiveModel, effort == nil || effort == previous.reasoningEffort {
             return .unchanged(modelID: modelID)
         }
         let resolution: LiveModelResolution
         do {
-            resolution = try await resolver.resolve(modelID: modelID)
+            resolution = try await resolver.resolve(modelID: modelID, effort: effort)
         } catch let error as LiveModelSwitchError {
             return .failed(modelID: modelID, message: error.description)
         } catch {
             return .failed(modelID: modelID, message: String(describing: error))
         }
-        guard resolution.sampling.model != previous.model else {
+        guard resolution.sampling.model != previous.model
+            || resolution.sampling.reasoningEffort != previous.reasoningEffort
+        else {
             return .unchanged(modelID: modelID)
         }
         let rebuilt: OpenGrokLiveSampler
@@ -430,7 +455,8 @@ actor LiveModelSwitchCoordinator {
             provider: resolution.sampling.provider,
             previousModelID: previous.model,
             previousProvider: previous.provider,
-            droppedOpaqueItems: dropped
+            droppedOpaqueItems: dropped,
+            reasoningEffort: resolution.sampling.reasoningEffort
         ))
     }
 
@@ -449,6 +475,13 @@ actor LiveModelSwitchCoordinator {
 /// final catalog filters.
 final class LiveModelCatalogStore: @unchecked Sendable {
     private let manager: ModelsManager
+    private let lock = NSLock()
+    private var backgroundRefresh: Task<Void, Never>?
+    /// Retained so `refreshCredentialSnapshot` recomputes the fingerprint from
+    /// the same inputs the initializer used — a snapshot rebuilt against a
+    /// different home would gate publishes on a key nobody stored.
+    private let environment: [String: String]
+    private let openGrokHome: URL
 
     init(
         input: CatalogResolutionInput,
@@ -456,6 +489,8 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         openGrokHome: URL? = nil
     ) {
         let home = openGrokHome ?? Self.resolveOpenGrokHome(environment: environment)
+        self.environment = environment
+        self.openGrokHome = home
         let credentialResolver = LiveCredentialResolver(
             environment: environment,
             openGrokHome: home
@@ -470,7 +505,11 @@ final class LiveModelCatalogStore: @unchecked Sendable {
             grokHome: home,
             environment: environment
         )
-        manager = ModelsManager(input: input, liveCatalogs: refreshers)
+        manager = ModelsManager(
+            input: input,
+            credentials: Self.credentialSnapshot(environment: environment, openGrokHome: home),
+            liveCatalogs: refreshers
+        )
     }
 
     func snapshot() -> OrderedModelMap {
@@ -489,11 +528,84 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         manager.applyOpenCodeGoCatalog(catalog)
     }
 
-    func refreshOpenCodeGo() async {
-        let outcome = await manager.refreshPartition(.openCodeGo)
-        if !outcome.published, outcome.failure != nil {
-            return
+    /// Record a completed live model switch, mirroring the tail of upstream's
+    /// `set_session_model` (handlers/model_switch.rs:299-303):
+    /// `set_current_model_id` then `set_current_reasoning_effort`.
+    func noteModelSwitch(catalogID: String, effort: ReasoningEffort?) {
+        manager.setCurrentModelID(catalogID)
+        manager.setCurrentReasoningEffort(effort)
+    }
+
+    /// The session-level effort the manager tracks — the read half of the
+    /// `/effort` surface (`current_reasoning_effort`, agent/models.rs:
+    /// 1295-1297). Correct only after `noteModelSwitch` has seeded the
+    /// session's route, which the interactive composition does at startup.
+    func currentReasoningEffort() -> ReasoningEffort? {
+        manager.currentReasoningEffortValue()
+    }
+
+    /// The picker entry for the manager's tracked session model, for the
+    /// `/effort` dropdown (`EffortCommand::suggest_args`, effort.rs:44-55).
+    func currentModelEntry() -> LiveModelPickerEntry? {
+        entryForWireModel(manager.currentModel().id)
+    }
+
+    /// The picker entry whose *wire* model name (or catalog key) is `model`.
+    ///
+    /// The composer border carries the wire name (`glm-5p2`'s full path, not
+    /// `glm-5.2`), so `/effort` has to resolve the current model back to its
+    /// catalog entry before it can read the effort menu.
+    func entryForWireModel(_ model: String) -> LiveModelPickerEntry? {
+        let entries = pickerEntries()
+        if let match = entries.first(where: { $0.id == model }) { return match }
+        guard let key = snapshot().pairs().first(where: { $0.1.model == model })?.0 else {
+            return nil
         }
+        return entries.first { $0.id == key }
+    }
+
+    /// Recompute the credential fingerprint snapshot from disk — called after
+    /// a settings-modal secret save so the new key is visible to the catalog
+    /// publish gate and to the next background refresh, mirroring upstream's
+    /// post-store `apply_meta_models` re-read (effects/mod.rs:832-861).
+    func refreshCredentialSnapshot() {
+        manager.updateCredentials(Self.credentialSnapshot(
+            environment: environment,
+            openGrokHome: openGrokHome
+        ))
+    }
+
+    /// One-shot background catalog refresh after session readiness — the port
+    /// of `spawn_background_refresh` (xai-grok-shell agent/models.rs:1817-1835
+    /// at HEAD), which upstream fires post-readiness from the pager spawn
+    /// (acp/spawn.rs:210) and app run (agent/app.rs:194, :1250) without ever
+    /// awaiting it. Fire-and-forget: a failed partition logs nothing louder
+    /// than its outcome and the embedded models stay in place.
+    ///
+    /// The task handle is retained (`backgroundRefreshTask`) so the
+    /// reachability test can await completion instead of sleeping; production
+    /// callers ignore it. Upstream's xAI catalog-retry half
+    /// (`spawn_catalog_retry`) is deliberately not fired here: this store's
+    /// `ModelsManager` has no live xAI/Codex list transport wired yet, so the
+    /// call would be a silent no-op pretending to refresh.
+    func spawnBackgroundRefresh() {
+        let manager = self.manager
+        // The per-partition outcomes are deliberately unread here: upstream's
+        // spawn is equally fire-and-forget, and the reachability test asserts
+        // the published catalog rather than the return value.
+        let task = Task<Void, Never> {
+            await manager.refreshBackgroundPartitions()
+        }
+        lock.lock()
+        backgroundRefresh = task
+        lock.unlock()
+    }
+
+    /// The in-flight (or finished) background refresh, for tests.
+    var backgroundRefreshTask: Task<Void, Never>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return backgroundRefresh
     }
 
     private static func resolveOpenGrokHome(environment: [String: String]) -> URL {
@@ -504,6 +616,37 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         return URL(fileURLWithPath: home, isDirectory: true)
             .appendingPathComponent(".opengrok", isDirectory: true)
             .standardizedFileURL
+    }
+
+    /// The production credential snapshot for `applyMetaCatalog`'s publish
+    /// gate: the fingerprint of the key the Meta partition would fetch with
+    /// (`credential_fingerprint` over `select_api_key`, upstream
+    /// meta_models.rs:78-96), computed with the same
+    /// `liveCatalogCredentialFingerprint` the broker stamps onto fetched
+    /// catalogs — so a catalog fetched under one key cannot publish after the
+    /// key changes (`catalog_matches_current_credential` in
+    /// `refresh_meta_models`, agent/models.rs:806-820).
+    ///
+    /// Only the Meta fingerprint is populated here. The other partitions'
+    /// fingerprints stay `nil`, which keeps their publish gates in today's
+    /// accept-anything mode — activating them belongs to their own slices,
+    /// because a fingerprint that drifts from what their broker actually
+    /// resolves would silently block every publish for that provider.
+    private static func credentialSnapshot(
+        environment: [String: String],
+        openGrokHome: URL
+    ) -> EmptyCredentialSnapshot {
+        let metaKey = MetaModels.selectAPIKey(
+            baseURL: MetaModels.apiBaseURL(environment: environment),
+            environmentKey: environment[MetaModels.apiKeyEnv],
+            storedKey: readProviderAPIKey(
+                grokHome: openGrokHome,
+                provider: ModelProvider.meta.asString
+            )
+        )
+        return EmptyCredentialSnapshot(
+            metaCredentialFingerprint: metaKey.map(liveCatalogCredentialFingerprint)
+        )
     }
 }
 
@@ -543,6 +686,11 @@ private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
         guard let credential = try? await resolver.resolve(
             provider: provider,
             explicitAPIKey: explicit,
+            // The endpoint the partition actor will actually fetch from, so a
+            // stored provider key is withheld when an env override points the
+            // partition at an untrusted host (`select_api_key`,
+            // meta_models.rs:78-88; env keys still resolve unconditionally).
+            baseURL: partitionBaseURL(for: partition),
             scope: "catalog:\(partition.rawValue)"
         ) else {
             return nil
@@ -572,10 +720,35 @@ private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
             key = OpenCodeGoModels.apiKeyEnv
         case .wafer:
             key = WaferModels.apiKeyEnv
+        case .meta:
+            // Upstream's Meta credential env key (meta_models.rs:16, :74-76).
+            key = MetaModels.apiKeyEnv
         case .kimi, .xai, .codex:
             key = nil
         }
         return key.flatMap { environment[$0] }
+    }
+
+    /// The same per-partition base URL `LiveCatalogRefreshers.live` hands each
+    /// actor, recomputed from the same environment — the two cannot disagree
+    /// because both read the identical `*ApiBaseURL(environment:)` helper.
+    private func partitionBaseURL(for partition: ModelCatalogPartition) -> String {
+        switch partition {
+        case .codex:
+            return CodexModels.defaultInferenceBaseURL
+        case .kimi:
+            return KimiModels.apiBaseURL(.platform, environment: environment)
+        case .fireworks:
+            return FireworksModels.apiBaseURL(environment: environment)
+        case .deepSeek:
+            return DeepSeekModels.apiBaseURL(environment: environment)
+        case .meta:
+            return MetaModels.apiBaseURL(environment: environment)
+        case .openCodeGo:
+            return OpenCodeGoModels.apiBaseURL(environment: environment)
+        case .wafer:
+            return WaferModels.apiBaseURL(environment: environment)
+        }
     }
 }
 

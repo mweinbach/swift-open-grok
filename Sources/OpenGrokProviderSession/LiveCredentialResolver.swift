@@ -17,6 +17,7 @@
 
 import Foundation
 import OpenGrokAuth
+import OpenGrokModels
 import OpenGrokSamplingTypes
 
 /// Which rung of the precedence ladder produced a credential.
@@ -130,10 +131,24 @@ public struct LiveCredentialResolver: Sendable {
     ///
     /// `explicitAPIKey` is whatever the caller already extracted from the model
     /// profile or the provider's environment variable; when non-empty it wins
-    /// over any stored OAuth session.
+    /// over any stored OAuth session. Explicit and environment keys are the
+    /// user's per-invocation choice and are deliberately *not* host-gated —
+    /// upstream sends them to whatever `base_url` the user configured
+    /// (`select_api_key`, `meta_models.rs:78-88`).
+    ///
+    /// `baseURL` is the endpoint the resolved credential will travel to. For
+    /// the API-key providers, a *stored* first-party key resolves only when
+    /// that endpoint is the provider's trusted host — a config-overridden
+    /// `base_url` must not receive the stored key
+    /// (`trusted_built_in_session_endpoint` applied inside
+    /// `resolve_credentials`, xai-grok-shell `agent/config.rs:5430-5437`,
+    /// `:5486-5503`). Passing `nil` fails closed for that rung: an endpoint we
+    /// cannot vouch for is treated as untrusted, so the route ends in
+    /// `missingCredential` rather than in a stored key on an unknown host.
     public func resolve(
         provider: ModelProvider,
         explicitAPIKey: String? = nil,
+        baseURL: String? = nil,
         scope: String
     ) async throws -> LiveResolvedCredential {
         let explicit = Self.trimmed(explicitAPIKey)
@@ -155,9 +170,13 @@ public struct LiveCredentialResolver: Sendable {
             return try await resolveCodex(scope: scope)
         }
 
-        if let stored = Self.trimmed(
-            readProviderAPIKey(grokHome: openGrokHome, provider: provider.asString)
-        ) {
+        let storedKeyEndpointTrusted = baseURL.map {
+            trustedBuiltInSessionEndpoint(provider: provider, baseURL: $0)
+        } ?? false
+        if storedKeyEndpointTrusted,
+           let stored = Self.trimmed(
+               readProviderAPIKey(grokHome: openGrokHome, provider: provider.asString)
+           ) {
             return Self.apiKeyCredential(
                 provider: provider,
                 scope: scope,
@@ -176,11 +195,13 @@ public struct LiveCredentialResolver: Sendable {
     public func binding(
         provider: ModelProvider,
         explicitAPIKey: String? = nil,
+        baseURL: String? = nil,
         scope: String
     ) async throws -> ProviderCredentialBinding {
         try await resolve(
             provider: provider,
             explicitAPIKey: explicitAPIKey,
+            baseURL: baseURL,
             scope: scope
         ).binding
     }
@@ -201,7 +222,12 @@ public struct LiveCredentialResolver: Sendable {
                 || store[apiKeyScope] != nil
         case .codex:
             return isCodexLoggedIn(at: codexAuthFile)
-        case .kimi, .fireworks, .deepseek, .openCodeGo, .wafer:
+        case .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer:
+            // Meta joins the other API-key providers: the provider-scoped
+            // stored key (`meta::api_key`, upstream `stored_api_key` at
+            // meta_models.rs:74-76). This is only the "can authenticate at
+            // all" hint; whether the key may travel to a given endpoint is
+            // decided per-resolve by the trusted-host gate above.
             return readProviderAPIKey(grokHome: openGrokHome, provider: provider.asString) != nil
         }
     }
@@ -353,6 +379,9 @@ public struct LiveCredentialResolver: Sendable {
             return "FIREWORKS_API_KEY"
         case .deepseek:
             return "DEEPSEEK_API_KEY or `open-grok login --deepseek`"
+        case .meta:
+            // Upstream's Meta credential env key (meta_models.rs:16).
+            return "META_API_KEY"
         case .openCodeGo:
             return "OPENCODE_API_KEY"
         case .wafer:
@@ -368,9 +397,9 @@ public struct LiveCredentialResolver: Sendable {
     }
 
     private static func describe(_ error: Error) -> String {
-        if let convertible = error as? any CustomStringConvertible {
-            return convertible.description
-        }
-        return String(describing: error)
+        // `String(describing:)` already prefers `CustomStringConvertible`, so
+        // the previous explicit cast (an always-succeeding `as?` warning) was
+        // pure noise with identical behavior.
+        String(describing: error)
     }
 }

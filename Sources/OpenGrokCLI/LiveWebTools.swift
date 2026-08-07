@@ -183,6 +183,11 @@ enum LiveWebToolComposition {
             return legacyToggle && perplexityAvailable ? .perplexity : .xai
         case .codex:
             return xaiAvailable ? .xai : .native
+        // Meta keeps its native hosted search (`effective_source_for`,
+        // tools/config.rs:540); for a non-xAI provider "native" resolves to
+        // no client search tool, so Meta stays inert here.
+        case .meta:
+            return .native
         case .xai, .fireworks, .deepseek, .wafer, .openCodeGo:
             return .xai
         }
@@ -207,6 +212,7 @@ enum LiveWebToolComposition {
             key = kimiEndpoint(environment: environment) == .code ? "kimi_code" : "kimi_platform"
         case .fireworks: key = "fireworks"
         case .deepseek: key = "deepseek"
+        case .meta: key = "meta"
         case .wafer: key = "wafer"
         case .openCodeGo: key = "opencode_go"
         }

@@ -34,6 +34,9 @@ struct LiveModelPickerEntry: Sendable, Equatable {
     var description: String?
     var contextWindow: UInt64?
     var supportsReasoningEffort: Bool
+    /// The model's declared effort menu; empty falls back to the built-in
+    /// legacy menu when `supportsReasoningEffort` is set.
+    var reasoningEfforts: [ReasoningEffortOption]
 
     init(
         id: String,
@@ -41,7 +44,8 @@ struct LiveModelPickerEntry: Sendable, Equatable {
         name: String,
         description: String? = nil,
         contextWindow: UInt64? = nil,
-        supportsReasoningEffort: Bool = false
+        supportsReasoningEffort: Bool = false,
+        reasoningEfforts: [ReasoningEffortOption] = []
     ) {
         self.id = id
         self.providerID = providerID
@@ -49,6 +53,114 @@ struct LiveModelPickerEntry: Sendable, Equatable {
         self.description = description
         self.contextWindow = contextWindow
         self.supportsReasoningEffort = supportsReasoningEffort
+        self.reasoningEfforts = reasoningEfforts
+    }
+}
+
+// MARK: - Reasoning effort
+
+/// Why an effort token could not be applied to a model. Port of
+/// `EffortTokenError` (xai-grok-pager acp/model_state.rs:29-60) with
+/// upstream's exact message copy, shared by `/model <name> <effort>` and the
+/// `--reasoning-effort` startup flag so both surfaces classify identically.
+enum LiveEffortTokenError: Error, Equatable {
+    /// The target model does not advertise reasoning-effort support.
+    case unsupported
+    /// The token is neither a menu id nor a canonical value the model's menu
+    /// offers. `offered` lists only this model's option ids — never a
+    /// hardcoded global set, so blocked levels (`none`/`minimal`) are not
+    /// advertised.
+    case unknownToken(token: String, offered: [String])
+
+    var message: String {
+        switch self {
+        case .unsupported:
+            return "current model does not support reasoning effort"
+        case .unknownToken(let token, let offered):
+            if offered.isEmpty {
+                return "unknown effort level '\(token)'; "
+                    + "this model has no selectable effort levels"
+            }
+            return "unknown effort level '\(token)'; use one of: "
+                + offered.joined(separator: ", ")
+        }
+    }
+}
+
+/// The shared effort-token policy: gate on the model's support flag first,
+/// then resolve the token against the model's menu. Port of
+/// `resolve_effort_for_model` / `reasoning_effort_options_for`
+/// (acp/model_state.rs:288-364) over the catalog's option lists.
+enum LiveModelEffort {
+    /// Built-in fallback menu when a reasoning model pins no menu, strongest
+    /// first (`EFFORT_LEVELS`, slash/commands/effort_levels.rs:9-14).
+    /// `none`/`minimal` stay reachable for power users via the canonical
+    /// parse, matching upstream's `ReasoningEffort::from_str` note.
+    static let legacyLevels: [ReasoningEffort] = [.xhigh, .high, .medium, .low]
+
+    /// `effort_description` (effort_levels.rs:16-27).
+    static func description(for level: ReasoningEffort) -> String {
+        switch level {
+        case .none: return "No reasoning"
+        case .minimal: return "Minimal reasoning"
+        case .low: return "Faster, lighter reasoning"
+        case .medium: return "Balanced reasoning"
+        case .high: return "Heavy reasoning"
+        case .xhigh: return "Extra-high reasoning"
+        case .max: return "Maximum reasoning"
+        case .ultra: return "Maximum reasoning with automatic task delegation"
+        }
+    }
+
+    /// `legacy_effort_options` (effort_levels.rs:33-45): lowercase level as
+    /// id and label, `default` unset.
+    static func legacyOptions() -> [ReasoningEffortOption] {
+        legacyLevels.map { level in
+            ReasoningEffortOption(
+                id: level.asString,
+                value: level,
+                label: level.asString,
+                description: description(for: level),
+                isDefault: false
+            )
+        }
+    }
+
+    /// The menu offered for a model: its declared options, else the built-in
+    /// fallback; nothing for a model with no effort support
+    /// (`reasoning_effort_options_for`, acp/model_state.rs:288-299).
+    static func options(
+        supportsReasoningEffort: Bool,
+        declaredEfforts: [ReasoningEffortOption]
+    ) -> [ReasoningEffortOption] {
+        guard supportsReasoningEffort else { return [] }
+        return declaredEfforts.isEmpty ? legacyOptions() : declaredEfforts
+    }
+
+    /// `resolve_effort_for_model` (acp/model_state.rs:339-364): a menu option
+    /// id (case-insensitive) or a canonical level that appears as a value in
+    /// the menu. Levels the model does not offer are rejected here so they
+    /// fail in the TUI instead of 400ing on the API.
+    static func resolve(
+        token: String,
+        supportsReasoningEffort: Bool,
+        declaredEfforts: [ReasoningEffortOption]
+    ) -> Result<ReasoningEffort, LiveEffortTokenError> {
+        guard supportsReasoningEffort else { return .failure(.unsupported) }
+        let menu = options(
+            supportsReasoningEffort: supportsReasoningEffort,
+            declaredEfforts: declaredEfforts
+        )
+        if let option = menu.first(where: {
+            $0.id.caseInsensitiveCompare(token) == .orderedSame
+        }) {
+            return .success(option.value)
+        }
+        if let parsed = parseCanonicalEffortToken(token),
+           let option = menu.first(where: { $0.value == parsed }) {
+            return .success(option.value)
+        }
+        return .failure(.unknownToken(token: token, offered: menu.map(\.id)))
     }
 }
 
@@ -83,6 +195,7 @@ enum LiveModelPicker {
         case "kimi", "moonshot", "moonshot_ai": return "Kimi"
         case "fireworks", "fireworks_ai": return "Fireworks AI"
         case "deepseek", "deep_seek", "deepseek_api": return "DeepSeek"
+        case "meta", "meta_ai", "meta_api": return "Meta API"
         case "opencode_go", "opencode-go": return "OpenCode Go"
         case "wafer", "wafer_ai": return "Wafer AI"
         default: return providerID
@@ -153,6 +266,20 @@ enum LiveModelPicker {
         "Unknown model: \(query.trimmingCharacters(in: .whitespacesAndNewlines))"
     }
 
+    /// Split `args` into `(prefix, lastToken)` on the final whitespace run,
+    /// or `nil` when there is no interior whitespace to split on. Port of
+    /// `split_trailing_token` (upstream model.rs:223-231); the caller resolves
+    /// the token to an effort against the picked model's options.
+    static func splitTrailingToken(_ args: String) -> (prefix: String, token: String)? {
+        let trimmed = args.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let splitIndex = trimmed.lastIndex(where: \.isWhitespace) else { return nil }
+        let prefix = String(trimmed[..<splitIndex])
+            .trimmingCharacters(in: .whitespaces)
+        let token = String(trimmed[trimmed.index(after: splitIndex)...])
+        guard !prefix.isEmpty, !token.isEmpty else { return nil }
+        return (prefix, token)
+    }
+
     // MARK: Rows
 
     /// Provider-then-name ordering, with the catalog slug as the final
@@ -187,9 +314,10 @@ enum LiveModelPicker {
                 matchText: "\(entry.name) "
                     + "\(catalogSlug(id: entry.id, providerID: entry.providerID)) "
                     + (providerLabel ?? ""),
-                // A trailing space on reasoning models signals "more input
-                // expected", so Enter advances to the effort sub-menu instead
-                // of submitting.
+                // A trailing space on reasoning models keeps the composer in
+                // the argument phase, and `completions` answers a query that
+                // already names a reasoning model with the effort sub-menu —
+                // upstream's chained autocomplete (model.rs:60-65).
                 insertText: entry.supportsReasoningEffort ? "\(selector) " : selector,
                 isCurrent: isCurrent
             )
@@ -249,6 +377,73 @@ enum LiveModelPicker {
         }
     }
 
+    /// The effort phase of `/model`'s chained autocomplete: when the query
+    /// already names a reasoning model, suggest that model's effort levels
+    /// instead of the model list (`detect_effort_phase` + `build_effort_items`,
+    /// upstream model.rs:60-65, :234-260).
+    ///
+    /// Upstream detects the phase by a trailing space after the model name.
+    /// This port's controller trims the argument query before handing it
+    /// over, so the space is unrecoverable here; instead the phase opens when
+    /// the query is exactly a reasoning model's selector (what accepting a
+    /// model row leaves behind, minus its trailing space) or that selector
+    /// plus a partial effort token. Longest-selector-first disambiguates
+    /// selectors that share a prefix, as upstream sorts by name length.
+    static func effortPhase(
+        query: String,
+        entries: [LiveModelPickerEntry]
+    ) -> (entry: LiveModelPickerEntry, effortQuery: String)? {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let candidates = entries
+            .filter(\.supportsReasoningEffort)
+            .map { (entry: $0, selector: selector(for: $0)) }
+            .sorted { $0.selector.count > $1.selector.count }
+        for (entry, selector) in candidates {
+            if selector.caseInsensitiveCompare(trimmed) == .orderedSame {
+                return (entry, "")
+            }
+            if trimmed.count > selector.count,
+               trimmed.lowercased().hasPrefix(selector.lowercased()),
+               let boundary = trimmed.index(
+                   trimmed.startIndex,
+                   offsetBy: selector.count,
+                   limitedBy: trimmed.endIndex
+               ),
+               trimmed[boundary].isWhitespace {
+                let rest = trimmed[boundary...]
+                    .trimmingCharacters(in: .whitespaces)
+                return (entry, rest)
+            }
+        }
+        return nil
+    }
+
+    /// Effort rows for the chained `/model` dropdown. `insertText` carries
+    /// the full command back (`/model <selector> <effort-id>`) because the
+    /// composer replaces its whole text on accept.
+    static func effortSuggestions(
+        entry: LiveModelPickerEntry,
+        effortQuery: String,
+        command: String = "model"
+    ) -> [OpenGrokPagerCommandSuggestion] {
+        let menu = LiveModelEffort.options(
+            supportsReasoningEffort: entry.supportsReasoningEffort,
+            declaredEfforts: entry.reasoningEfforts
+        )
+        let selector = selector(for: entry)
+        let needle = effortQuery.lowercased()
+        return menu
+            .filter { needle.isEmpty || $0.id.lowercased().contains(needle) }
+            .map { option in
+                OpenGrokPagerCommandSuggestion(
+                    name: option.label,
+                    summary: option.description ?? "",
+                    insertText: "/\(command) \(selector) \(option.id)"
+                )
+            }
+    }
+
     /// The same rows as dropdown suggestions.
     ///
     /// `insertText` carries the command back with the selector because the
@@ -260,7 +455,18 @@ enum LiveModelPicker {
         currentModelID: String? = nil,
         command: String = "model"
     ) -> [OpenGrokPagerCommandSuggestion] {
-        completions(query: query, entries: entries, currentModelID: currentModelID)
+        // A query that already names a reasoning model chains into that
+        // model's effort sub-menu instead of re-listing the catalog
+        // (upstream model.rs:60-65).
+        if let (entry, effortQuery) = effortPhase(query: query, entries: entries) {
+            let effortRows = effortSuggestions(
+                entry: entry,
+                effortQuery: effortQuery,
+                command: command
+            )
+            if !effortRows.isEmpty { return effortRows }
+        }
+        return completions(query: query, entries: entries, currentModelID: currentModelID)
             .map { row in
                 OpenGrokPagerCommandSuggestion(
                     name: row.label,
