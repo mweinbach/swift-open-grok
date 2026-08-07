@@ -386,7 +386,7 @@ struct CodeModeCompositionTests {
         // a foreground spawn parks the turn on the child
         // (`is_code_mode_direct_only_tool`, session/code_mode.rs:68).
         #expect(
-            Set(names) == ["get_command_or_subagent_output", "wait_commands_or_subagents", "kill_command_or_subagent", "spawn_subagent", "exec", "wait"]
+            Set(names) == ["get_command_or_subagent_output", "wait_commands_or_subagents", "kill_command_or_subagent", "spawn_subagent", "enter_plan_mode", "exit_plan_mode", "exec", "wait"]
         )
         // The transport pair is always last, after any direct-only tool.
         #expect(names.suffix(2) == ["exec", "wait"])

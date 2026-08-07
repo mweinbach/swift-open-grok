@@ -1493,6 +1493,7 @@ struct ParityCompositionTests {
             "image_gen", "image_edit",
             "get_command_or_subagent_output", "wait_commands_or_subagents", "kill_command_or_subagent",
             "spawn_subagent",
+            "enter_plan_mode", "exit_plan_mode",
             "web_search", "web_fetch", "x_search",
             "todo_write"
         ]))

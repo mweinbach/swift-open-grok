@@ -157,7 +157,7 @@ struct LiveSubagentAdvertisementTests {
         #expect(spec?.description?.contains("**explore**") == true)
         // The description must point at the retrieval tool this session
         // actually advertises, never a renamed one it does not.
-        #expect(spec?.description?.contains("get_task_output") == true)
+        #expect(spec?.description?.contains("get_command_or_subagent_output") == true)
     }
 
     @Test("--no-subagents launches and strips the spawn surface")
@@ -377,7 +377,7 @@ struct LiveSubagentSpawnTests {
             workingDirectory: foundation.cwd,
             call: ToolCall(
                 id: "call-output-1",
-                name: "get_task_output",
+                name: "get_command_or_subagent_output",
                 arguments: #"{"task_ids":["\#(ids[0])"]}"#
             )
         )
@@ -395,7 +395,7 @@ struct LiveSubagentSpawnTests {
             workingDirectory: foundation.cwd,
             call: ToolCall(
                 id: "call-wait-1",
-                name: "wait_tasks",
+                name: "wait_commands_or_subagents",
                 arguments: #"{"task_ids":["\#(ids[0])"],"mode":"wait_all","timeout_ms":1000}"#
             )
         )
@@ -486,7 +486,7 @@ struct LiveSubagentSpawnTests {
             workingDirectory: foundation.cwd,
             call: ToolCall(
                 id: "call-kill-1",
-                name: "kill_task",
+                name: "kill_command_or_subagent",
                 arguments: #"{"task_id":"\#(childID)"}"#
             )
         )
@@ -502,7 +502,7 @@ struct LiveSubagentSpawnTests {
             workingDirectory: foundation.cwd,
             call: ToolCall(
                 id: "call-output-1",
-                name: "get_task_output",
+                name: "get_command_or_subagent_output",
                 arguments: #"{"task_ids":["\#(childID)"],"timeout_ms":10000}"#
             )
         )
