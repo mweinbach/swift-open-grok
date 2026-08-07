@@ -62,6 +62,11 @@ between the Wave 14 record and this section's verification snapshot.
   the endpoint ladder's env-override rung (previously dead on switch — a switched-to model
   reached a different endpoint than a started-on one; the override lookup is one shared
   helper now). Codex `web_search` gets upstream's live-access grant (`provider.rs:594-607`).
+  **Hermeticity incident, recorded:** the unit's own parity test ESCAPED to the real ChatGPT
+  backend under the first gate run — the dead override rung meant the fixture's mock-server
+  env pin was ignored — and the real 401 body is what exposed the divergence. Mock-server
+  fixtures must pin every endpoint env var a path can read (`GROK_CODEX_AUTH_BASE_URL`
+  included, or an expired-token test's refresh goes live).
   The pre-first-turn "Provider boundary summary could not be persisted" wart was ordering:
   upstream marks the boundary at session open (`persistence.rs:2745-2775`); the port's lazy
   shell session now defers the sync through the runtime adapter and seeds the created record

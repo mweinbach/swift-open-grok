@@ -156,6 +156,8 @@ Order within the wave is forced:
 4. **B9** config-agents/personas modal; release-notes viewer; privacy banner.
 
 ### Wave 19 — Long tail (parallelizable, mostly XL each)
+Mouse block selection (click selects a transcript block; upstream's scrollback click
+handling — the live pipeline is proven and pinned, Wave 14.1, only the feature is absent) ·
 LSP tool (pull-diagnostics rewrite) · scheduler trio + `monitor` · video tools
 (`image_to_video`/`reference_to_video`) · `search_tool`/`use_tool` MCP meta-discovery ·
 voice live seam (B7: macOS capture + `__mic-capture` intercept + pipeline) · media
