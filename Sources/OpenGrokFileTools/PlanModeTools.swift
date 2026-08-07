@@ -12,12 +12,15 @@
 // enforcement (read-only + plan-file gating) lives in the permission pipeline
 // plan gate, not in these handlers.
 //
-// Divergence recorded: upstream's `exit_plan_mode` raises a dedicated
-// plan-approval reverse-request rendered by the pager's plan-approval view
-// (`xai-grok-pager/src/views/plan_approval_view.rs`). The Swift pager lacks
-// that view (backing B4), so exit approval is routed through the existing
-// permission ask sheet (`PermissionPipeline.requestExitPlanApproval`). See
-// `PermissionPipeline.requestExitPlanApproval` for the cost of that trade.
+// Exit approval routes through `PermissionPipeline.requestExitPlanApproval`:
+// the dedicated plan-approval view when the composition installed one (the
+// port of upstream's plan-approval reverse-request,
+// `xai-grok-pager/src/views/plan_approval_view.rs`), otherwise the generic
+// permission ask sheet with its pre-dedicated-view semantics. The three
+// dedicated-view outcomes map exactly as upstream's mid-turn intercept does
+// (`xai-grok-shell/src/session/acp_session_impl/tool_calls.rs:1820-1901`):
+// approved exits plan mode, revise stays in plan mode and returns the
+// feedback, abandoned *disables* plan mode and tells the model not to retry.
 
 import Foundation
 import OpenGrokShared
@@ -77,13 +80,37 @@ public struct EnterPlanModeToolHandler: ToolHandler {
     }
 }
 
+/// Model-facing result when the user abandons the plan on the dedicated view.
+/// Quoted from the upstream mid-turn intercept (`tool_calls.rs:1836-1839`),
+/// with `exit_plan_mode` in place of upstream's `call.function.name` — the
+/// only name this handler is registered under.
+public let exitPlanModeAbandonedText =
+    "The user chose to abandon the plan entirely (via the Abandon option in the plan approval dialog). Plan mode has been disabled. Do not call exit_plan_mode again unless the user explicitly asks to re-enter plan mode."
+
+/// Model-facing result when the user requests changes with no plan on disk.
+/// Quoted from `tool_calls.rs:1859-1862`.
+public let exitPlanModeEmptyPlanReviseText =
+    "The user does not want to exit plan mode. Continue planning and ask the user what they would like to do."
+
+/// `revise_plan_message` (`tool_calls.rs:391-400`): the model-facing result
+/// when the user requests changes on a plan that exists.
+public func exitPlanModeReviseText(feedback: String) -> String {
+    let trimmed = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty {
+        return "The user wants to revise the plan. Ask the user what changes they would like to make."
+    }
+    return "The user wants to revise the plan. The user said:\n\(trimmed)"
+}
+
 /// ToolHandler for `exit_plan_mode`.
 ///
-/// Reads the plan file from disk, then routes approval through the existing
-/// permission ask sheet (`PermissionPipeline.requestExitPlanApproval`). On
-/// approval, disarms the plan gate so non-plan edits flow again. On denial,
-/// leaves plan mode armed and returns a "user declined" result so the model
-/// sees the rejection without the gate silently dropping.
+/// Reads the plan file from disk, then routes approval through
+/// `PermissionPipeline.requestExitPlanApproval`. The dedicated view's three
+/// outcomes follow upstream's mid-turn intercept (`tool_calls.rs:1820-1901`):
+/// approved disarms the gate, revise keeps it armed and returns the feedback,
+/// abandoned disarms it with the do-not-retry message. The generic-sheet
+/// fallback keeps the pre-dedicated-view mapping byte for byte: allow disarms,
+/// everything else is a "user declined" failure with the gate still armed.
 public struct ExitPlanModeToolHandler: ToolHandler {
     public init() {}
 
@@ -102,47 +129,109 @@ public struct ExitPlanModeToolHandler: ToolHandler {
         let planPath = await pipeline.planFileResolvedPath()
         let planContent = (try? SessionFS.readText(at: planPath)) ?? ""
         let trimmed = planContent.trimmingCharacters(in: .whitespacesAndNewlines)
-        let decision = await pipeline.requestExitPlanApproval(toolCallId: ctx.callId.rawValue)
-        switch decision {
-        case .allow:
-            await pipeline.exitPlanMode()
-            let message: String
-            let value: JSONValue
-            if trimmed.isEmpty {
-                message = "Plan mode exit approved. No plan content was found — you can proceed."
-                value = .object([
-                    "status": .string("exited"),
-                    "message": .string(message),
-                    "plan_file_path": .string(planPath),
-                    "plan_content": .string(""),
-                ])
-            } else {
-                message = "Your plan has been approved. You can now start coding."
-                value = .object([
-                    "status": .string("exited"),
-                    "message": .string(message),
-                    "plan_file_path": .string(planPath),
-                    "plan_content": .string(planContent),
-                ])
-            }
+        // Empty/whitespace plans present as "no plan", mirroring upstream's
+        // `classify_plan_file_read` (`tool_calls.rs:193-200`), which is what
+        // makes the view show its empty-plan placeholder.
+        let result = await pipeline.requestExitPlanApproval(
+            toolCallId: ctx.callId.rawValue,
+            planContent: trimmed.isEmpty ? nil : planContent
+        )
+        switch result {
+        case .plan(.approved):
+            return await approvedOutput(
+                pipeline: pipeline,
+                planPath: planPath,
+                planContent: planContent,
+                trimmed: trimmed
+            )
+        case .plan(.revise(let feedback)):
+            // Stay in plan mode; the feedback goes back to the model
+            // (`tool_calls.rs:1856-1879`). A completed result, not an error —
+            // upstream marks the tool call Completed with this text.
+            let message = trimmed.isEmpty
+                ? exitPlanModeEmptyPlanReviseText
+                : exitPlanModeReviseText(feedback: feedback)
             return .success(TypedToolOutput(
                 toolId: exitPlanModeToolId,
-                value: value,
+                value: .object([
+                    "status": .string("revising"),
+                    "message": .string(message),
+                    "plan_file_path": .string(planPath),
+                ]),
                 modelOutput: [.text(text: message)]
             ))
-        case .reject(let reason), .policyDeny(let reason):
-            return .failure(.permissionDenied(
-                "user declined to exit plan mode: \(reason)"
+        case .plan(.abandoned):
+            // Upstream *leaves* plan mode on abandon — `leave_plan_mode_to_
+            // default()` in the intercept (`tool_calls.rs:1833-1854`) and
+            // `ResumeAction::LeaveOnly` on resume (`tool_calls.rs:410-419`) —
+            // so the gate disarms here too, and the message forbids a retry.
+            await pipeline.exitPlanMode()
+            return .success(TypedToolOutput(
+                toolId: exitPlanModeToolId,
+                value: .object([
+                    "status": .string("abandoned"),
+                    "message": .string(exitPlanModeAbandonedText),
+                    "plan_file_path": .string(planPath),
+                ]),
+                modelOutput: [.text(text: exitPlanModeAbandonedText)]
             ))
-        case .cancelled:
-            return .failure(.permissionDenied("user cancelled plan approval"))
-        case .ask, .followupMessage:
-            // The ask sheet did not resolve to an allow; treat as a decline so
-            // the gate stays armed rather than silently exiting on ambiguity.
-            return .failure(.permissionDenied(
-                "plan exit was not approved (decision: \(decision))"
-            ))
+        case .generic(let decision):
+            switch decision {
+            case .allow:
+                return await approvedOutput(
+                    pipeline: pipeline,
+                    planPath: planPath,
+                    planContent: planContent,
+                    trimmed: trimmed
+                )
+            case .reject(let reason), .policyDeny(let reason):
+                return .failure(.permissionDenied(
+                    "user declined to exit plan mode: \(reason)"
+                ))
+            case .cancelled:
+                return .failure(.permissionDenied("user cancelled plan approval"))
+            case .ask, .followupMessage:
+                // The ask sheet did not resolve to an allow; treat as a
+                // decline so the gate stays armed rather than silently
+                // exiting on ambiguity.
+                return .failure(.permissionDenied(
+                    "plan exit was not approved (decision: \(decision))"
+                ))
+            }
         }
+    }
+
+    private func approvedOutput(
+        pipeline: PermissionPipeline,
+        planPath: String,
+        planContent: String,
+        trimmed: String
+    ) async -> Result<TypedToolOutput, ToolError> {
+        await pipeline.exitPlanMode()
+        let message: String
+        let value: JSONValue
+        if trimmed.isEmpty {
+            message = "Plan mode exit approved. No plan content was found — you can proceed."
+            value = .object([
+                "status": .string("exited"),
+                "message": .string(message),
+                "plan_file_path": .string(planPath),
+                "plan_content": .string(""),
+            ])
+        } else {
+            message = "Your plan has been approved. You can now start coding."
+            value = .object([
+                "status": .string("exited"),
+                "message": .string(message),
+                "plan_file_path": .string(planPath),
+                "plan_content": .string(planContent),
+            ])
+        }
+        return .success(TypedToolOutput(
+            toolId: exitPlanModeToolId,
+            value: value,
+            modelOutput: [.text(text: message)]
+        ))
     }
 }
 

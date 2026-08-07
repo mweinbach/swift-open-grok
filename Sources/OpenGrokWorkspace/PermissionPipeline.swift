@@ -136,6 +136,10 @@ public actor PermissionPipeline {
     public var isolation: IsolationMode
     /// YOLO pin reason — never disables sandbox requirements.
     public private(set) var yoloPinReason: String?
+    /// The dedicated plan-approval view, when the composition installed one.
+    /// `nil` (headless, tests, ACP) keeps exit-plan approval on the generic
+    /// permission ask sheet — today's behavior, never an auto-approve.
+    private var planApprovals: (any PlanApprovalPrompting)?
 
     public init(
         permissions: PermissionHandle,
@@ -188,26 +192,43 @@ public actor PermissionPipeline {
         planMode.isActive
     }
 
-    /// Route exit-plan approval through the existing permission ask sheet.
+    /// Install (or clear) the dedicated plan-approval view. The interactive
+    /// TUI composition is the only caller; everything else leaves the slot
+    /// `nil` and stays on the generic-sheet fallback below.
+    public func installPlanApprovalPrompter(_ prompter: (any PlanApprovalPrompting)?) {
+        planApprovals = prompter
+    }
+
+    /// Route exit-plan approval to the dedicated plan-approval view when one
+    /// is installed and presentable (the port of upstream's plan-approval
+    /// reverse-request, `xai-grok-pager/src/views/plan_approval_view.rs`);
+    /// otherwise fall back to the generic permission ask sheet — the exact
+    /// pre-dedicated-view behavior, preserved so a composition without the
+    /// view neither loosens nor auto-approves. Fail closed both ways: absence
+    /// of a prompter can only produce `.generic`, whose deny keeps plan mode
+    /// armed; it can never fabricate a `.plan(.approved)`.
     ///
-    /// Divergence from upstream, recorded: upstream's `exit_plan_mode` raises
-    /// a dedicated plan-approval reverse-request and the pager renders a
-    /// plan-approval view (`xai-grok-pager/src/views/plan_approval_view.rs`).
-    /// The Swift pager lacks that view (backing B4), so we reuse the prompter
-    /// the file tools already paint. Cost: the ask copy is generic permission
-    /// copy, not plan-approval-specific, and a denied exit returns a
-    /// "permission denied" shape rather than a "plan not approved" shape —
-    /// so the model may retry the exit where upstream would not. That is the
-    /// trade for not shipping a half-built approval surface; do not loosen it
-    /// by auto-approving here, and do not widen the prompter to special-case
-    /// plan approval without also adding the dedicated view.
-    public func requestExitPlanApproval(toolCallId: String) async -> PermissionDecision {
+    /// Cost of the fallback, recorded: the generic ask copy is not
+    /// plan-approval-specific, it never shows the plan content, and a denied
+    /// exit returns a "permission denied" shape rather than upstream's
+    /// revise/abandon shapes — so a headless model may retry the exit where
+    /// upstream's would not. Do not loosen it by auto-approving here.
+    public func requestExitPlanApproval(
+        toolCallId: String,
+        planContent: String?
+    ) async -> ExitPlanApprovalResult {
+        if let planApprovals, await planApprovals.canPresent {
+            return .plan(await planApprovals.decision(
+                toolCallId: toolCallId,
+                planContent: planContent
+            ))
+        }
         let prompter = await permissions.prompter
-        return await prompter.prompt(
+        return .generic(await prompter.prompt(
             access: .read(nil),
             toolName: "exit_plan_mode",
             toolCallId: toolCallId
-        )
+        ))
     }
 
     public func setRemotePolicy(available: Bool, denied: Bool = false) {

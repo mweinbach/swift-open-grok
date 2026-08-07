@@ -209,6 +209,14 @@ private func renderCenteredModal(
             buffer: &buffer,
             theme: theme
         )
+    case .planApproval(let prompt):
+        drawPlanApprovalBody(
+            prompt,
+            in: content,
+            background: theme.bgBase,
+            buffer: &buffer,
+            theme: theme
+        )
     case .welcome(let welcome):
         rows = drawWelcomeBody(welcome, in: content, buffer: &buffer, theme: theme, motion: motion)
     case .workflows(let runs):
@@ -592,6 +600,10 @@ func pagerBottomSheetHeight(
     case .question(let prompt):
         // pad + header + question + gap + option rows (incl. Other) + pad
         contentRows = 2 + 1 + 1 + 1 + prompt.rowCount
+    case .planApproval(let prompt):
+        // pad + title + status + gap + plan body (capped; the sheet's own
+        // 80% ceiling is the real bound) + feedback row
+        contentRows = 2 + 1 + 1 + 1 + min(prompt.bodyLines.count, 15) + 1
     case .list(let list):
         contentRows = 2 + min(list.filteredRows.count, 15) + 1
     case .text(let text):
@@ -663,6 +675,14 @@ private func renderBottomSheet(
         )
     case .question(let prompt):
         drawQuestionBody(
+            prompt,
+            in: content,
+            background: theme.bgLight,
+            buffer: &buffer,
+            theme: theme
+        )
+    case .planApproval(let prompt):
+        drawPlanApprovalBody(
             prompt,
             in: content,
             background: theme.bgLight,
@@ -1024,6 +1044,75 @@ private func drawQuestionBody(
         otherSpans.append(PagerStyledSpan(text: "  type your own answer", foreground: theme.gray))
     }
     writeSpans(otherSpans, rowBackground: otherBackground)
+}
+
+// MARK: - Plan approval body
+
+/// "Plan approval", the waiting/empty status label, then the plan body from
+/// `scrollOffset` and — while the user is typing revision feedback, or has a
+/// stashed draft — a trailing feedback row with the same inline editor the
+/// question sheet's Other row uses.
+///
+/// Publishes no hit-test rows, for the question sheet's reason: the generic
+/// mouse router treats an unknown row id as "dismiss and select", which
+/// would tear the sheet down without resolving the coordinator.
+private func drawPlanApprovalBody(
+    _ prompt: PagerPlanApprovalPrompt,
+    in area: TerminalRect,
+    background: TerminalColor,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme
+) {
+    guard area.width > 0, area.height > 0 else { return }
+    var y = area.y
+
+    func writeSpans(_ spans: [PagerStyledSpan], rowBackground: TerminalColor? = nil) {
+        guard y < area.bottom else { return }
+        paintSpans(
+            &buffer,
+            spans: truncateSpans(spans, to: area.width),
+            x: area.x,
+            y: y,
+            limit: area.right,
+            background: rowBackground ?? background,
+            inheritForeground: theme.textPrimary
+        )
+        y += 1
+    }
+
+    writeSpans([
+        PagerStyledSpan(text: "Plan approval", foreground: theme.accentUser, style: [.bold])
+    ])
+    writeSpans([
+        PagerStyledSpan(text: prompt.statusLabel, foreground: theme.gray)
+    ])
+    y += 1
+
+    let showFeedbackRow = prompt.focus == .feedbackInput || !prompt.feedbackText.isEmpty
+    let bodyBottom = showFeedbackRow ? area.bottom - 1 : area.bottom
+    let lines = prompt.bodyLines
+    var index = min(max(0, prompt.scrollOffset), max(0, lines.count))
+    while y < bodyBottom, lines.indices.contains(index) {
+        writeSpans([
+            PagerStyledSpan(text: lines[index], foreground: theme.textPrimary)
+        ])
+        index += 1
+    }
+
+    guard showFeedbackRow else { return }
+    y = max(y, area.bottom - 1)
+    var feedbackSpans: [PagerStyledSpan] = [
+        PagerStyledSpan(
+            text: "Feedback: ",
+            foreground: theme.accentUser,
+            style: prompt.focus == .feedbackInput ? [.bold] : []
+        ),
+        PagerStyledSpan(text: prompt.feedbackText, foreground: theme.textPrimary)
+    ]
+    if prompt.focus == .feedbackInput {
+        feedbackSpans.append(PagerStyledSpan(text: "▌", foreground: theme.accentUser))
+    }
+    writeSpans(feedbackSpans, rowBackground: theme.bgVisual)
 }
 
 // MARK: - Welcome

@@ -851,6 +851,123 @@ public struct PagerQuestionPrompt: Sendable, Equatable {
     }
 }
 
+// MARK: - Plan approval prompt
+
+/// Placeholder body when `exit_plan_mode` arrives with no plan content.
+/// Quoted verbatim from `EMPTY_PLAN_PLACEHOLDER`
+/// (`xai-grok-pager/src/views/plan_approval_view.rs:15-23`).
+public let pagerEmptyPlanPlaceholder = """
+# No plan written yet
+
+The agent exited plan mode without writing a plan.
+
+- **Approve** — leave plan mode and start implementing
+- **Request changes** — send the agent back to planning
+- **Quit** — abandon and turn plan mode off
+
+"""
+
+/// A plan awaiting the user's approval. The render layer reports a
+/// `PagerPlanApprovalOutcome`; `PagerPlanApprovalCoordinator` joins it to the
+/// blocked `exit_plan_mode` call.
+public struct PagerPlanApprovalRequest: Sendable, Equatable, Identifiable {
+    public var id: String
+    public var toolCallID: String
+    /// `nil` means "no plan": the initializer normalizes whitespace-only
+    /// bodies to `nil`, the same filter upstream applies on receipt
+    /// (`plan_approval_view.rs:94`), so "has a plan" is one check with no
+    /// second whitespace-only state to keep in sync.
+    public private(set) var planContent: String?
+
+    public init(
+        id: String = UUID().uuidString,
+        toolCallID: String,
+        planContent: String?
+    ) {
+        self.id = id
+        self.toolCallID = toolCallID
+        let trimmed = planContent?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.planContent = (trimmed?.isEmpty ?? true) ? nil : planContent
+    }
+}
+
+/// What the user did with the plan. Mirrors the view's three wire outcomes —
+/// approved / cancelled-with-feedback / abandoned
+/// (`plan_approval_view.rs:177-191`) — with `revise` carrying the typed
+/// feedback the way upstream's prompt submit does.
+public enum PagerPlanApprovalOutcome: Sendable, Equatable {
+    case approved
+    case revise(feedback: String)
+    case abandoned
+}
+
+/// Interactive state for the plan-approval bottom sheet.
+///
+/// Divergence from upstream, recorded: `plan_approval_view.rs` hosts the plan
+/// in the fullscreen line viewer with per-line commenting (`c`/Enter enter
+/// commenting, comments become structured feedback) and an approve-with-
+/// comments path that interjects into the next turn (`plan.rs:189-215`).
+/// Neither commenting nor interject exists in this port, so the sheet is
+/// deliberately smaller: a scrollable plan body plus upstream's `a`/`s`/`q`
+/// grammar (`viewer.rs:151-166`), with `s` opening the same inline free-text
+/// editor the question sheet's "Other" row uses. The cost: feedback is one
+/// freeform message, never line-anchored comments.
+public struct PagerPlanApprovalPrompt: Sendable, Equatable {
+    public enum Focus: Sendable, Equatable {
+        /// Keys act on the plan: scroll, `a`/`s`/`q`.
+        case viewing
+        /// Typing revision feedback (upstream's `PlanApprovalFocus::Prompt`,
+        /// reached by `s`, `viewer.rs:157-162`).
+        case feedbackInput
+    }
+
+    public var request: PagerPlanApprovalRequest
+    public private(set) var focus: Focus
+    public private(set) var feedbackText: String
+    public var scrollOffset: Int
+
+    public init(request: PagerPlanApprovalRequest) {
+        self.request = request
+        self.focus = .viewing
+        self.feedbackText = ""
+        self.scrollOffset = 0
+    }
+
+    public var hasPlan: Bool { request.planContent != nil }
+
+    /// `plan_approval_status_label` (`plan_approval_view.rs:29-35`).
+    public var statusLabel: String {
+        hasPlan ? "Waiting on plan approval" : "No plan written — approve or request changes"
+    }
+
+    /// The plan body, or the empty-plan placeholder. Split on any newline
+    /// (`Character.isNewline`) because plan files come off disk and may carry
+    /// CRLF — AGENTS.md §2's delimiter trap.
+    public var bodyLines: [String] {
+        (request.planContent ?? pagerEmptyPlanPlaceholder)
+            .split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            .map(String.init)
+    }
+
+    public mutating func enterFeedbackInput() {
+        focus = .feedbackInput
+    }
+
+    /// Esc while typing: back to the plan, keeping the draft so `s` resumes it.
+    public mutating func leaveFeedbackInput() {
+        focus = .viewing
+    }
+
+    public mutating func appendFeedback(_ character: Character) {
+        feedbackText.append(character)
+    }
+
+    public mutating func deleteFeedbackBackward() {
+        guard !feedbackText.isEmpty else { return }
+        feedbackText.removeLast()
+    }
+}
+
 // MARK: - Overlay
 
 public enum PagerOverlayContent: Sendable, Equatable {
@@ -859,6 +976,7 @@ public enum PagerOverlayContent: Sendable, Equatable {
     case welcome(PagerWelcomeOverlay)
     case permission(PagerPermissionPrompt)
     case question(PagerQuestionPrompt)
+    case planApproval(PagerPlanApprovalPrompt)
     case workflows(PagerWorkflowsOverlay)
     case settings(PagerSettingsOverlay)
 }
@@ -1096,6 +1214,29 @@ extension PagerOverlay {
             dismissOnEscape: false
         )
     }
+
+    /// The `exit_plan_mode` plan-approval bottom sheet. `dismissOnEscape` is
+    /// false for the question sheet's reason: Esc here is an *abandon
+    /// outcome* the coordinator must see (the tool is blocked on it), never a
+    /// plain dismissal that would leave the tool suspended forever.
+    public static func planApproval(
+        _ request: PagerPlanApprovalRequest,
+        id: String? = nil
+    ) -> PagerOverlay {
+        PagerOverlay(
+            id: id ?? "plan-approval:\(request.id)",
+            title: "Plan approval",
+            presentation: .bottomSheet,
+            hints: [
+                PagerOverlayHint(key: "a", label: "approve"),
+                PagerOverlayHint(key: "s", label: "request changes"),
+                PagerOverlayHint(key: "q", label: "abandon"),
+                PagerOverlayHint(key: "↑/↓", label: "scroll")
+            ],
+            content: .planApproval(PagerPlanApprovalPrompt(request: request)),
+            dismissOnEscape: false
+        )
+    }
 }
 
 // MARK: - Focus routing
@@ -1112,6 +1253,7 @@ public enum PagerOverlayOutcome: Sendable, Equatable {
     case selected(id: String, rowID: String)
     case permission(id: String, requestID: String, decision: PagerPermissionDecision)
     case question(id: String, requestID: String, outcome: PagerQuestionOutcome)
+    case planApproval(id: String, requestID: String, outcome: PagerPlanApprovalOutcome)
     /// The settings modal decided something the session has to act on — commit
     /// a value, preview a theme, store a secret, apply a default.
     case setting(id: String, event: PagerSettingsEvent)
@@ -1175,11 +1317,12 @@ public struct PagerOverlayStack: Sendable, Equatable {
         // The settings modal owns Escape outright: inside a chooser or an editor
         // it means "back out one level", and only browse-Escape closes. Handling
         // it here would collapse every sub-pane into a dismissal.
-        // The question sheet owns it too: Esc there is a *cancel outcome* the
-        // coordinator must see (the tool is blocked on it), never a dismissal.
+        // The question and plan-approval sheets own it too: Esc there is an
+        // *outcome* the coordinator must see (the tool is blocked on it),
+        // never a dismissal.
         let ownsEscape: Bool
         switch overlay.content {
-        case .settings, .question: ownsEscape = true
+        case .settings, .question, .planApproval: ownsEscape = true
         default: ownsEscape = false
         }
 
@@ -1216,6 +1359,14 @@ public struct PagerOverlayStack: Sendable, Equatable {
         case .question(var prompt):
             outcome = handleQuestion(&prompt, overlay: overlay, event: event)
             overlay.content = .question(prompt)
+        case .planApproval(var prompt):
+            outcome = handlePlanApproval(
+                &prompt,
+                overlay: overlay,
+                event: event,
+                viewportHeight: viewportHeight
+            )
+            overlay.content = .planApproval(prompt)
         case .workflows(var runs):
             outcome = handleWorkflows(&runs, overlay: overlay, event: event, viewportHeight: viewportHeight)
             overlay.content = .workflows(runs)
@@ -1533,6 +1684,101 @@ public struct PagerOverlayStack: Sendable, Equatable {
         }
     }
 
+    /// Keys for the plan-approval sheet, upstream's grammar reduced to the
+    /// port's sheet (`agent_view/viewer.rs:151-166`): `a` approves, `s`
+    /// focuses the feedback editor, `q` abandons; arrows and the text-overlay
+    /// vim keys scroll the plan body. Esc/Ctrl+C in viewing abandon — a
+    /// deliberate divergence from upstream, where Esc on the plan viewer is a
+    /// selection-clearing no-op (`viewer.rs:108-124`) and only `q` ends the
+    /// review; with no fullscreen viewer to back out of, a do-nothing Esc
+    /// would leave the sheet with no obvious dismissal at all. In the editor,
+    /// Enter submits the typed text as the revise outcome (upstream's
+    /// Enter-from-Prompt send, `plan.rs:244-271`) and Esc stashes the draft
+    /// back to viewing.
+    private func handlePlanApproval(
+        _ prompt: inout PagerPlanApprovalPrompt,
+        overlay: PagerOverlay,
+        event: KeyEvent,
+        viewportHeight: Int
+    ) -> PagerOverlayOutcome {
+        func finish(_ outcome: PagerPlanApprovalOutcome) -> PagerOverlayOutcome {
+            .planApproval(id: overlay.id, requestID: prompt.request.id, outcome: outcome)
+        }
+        let isCtrlC = event.key == .char("c") && event.modifiers.contains(.control)
+
+        switch prompt.focus {
+        case .feedbackInput:
+            switch event.key {
+            case .escape:
+                prompt.leaveFeedbackInput()
+                return .redraw
+            case .enter:
+                // Empty feedback is a valid revise upstream: `send_cancelled`
+                // filters it to no-feedback (`plan_approval_view.rs:154`) and
+                // the shell answers with the ask-what-changes copy
+                // (`tool_calls.rs:391-400`).
+                return finish(.revise(
+                    feedback: prompt.feedbackText
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                ))
+            case .backspace:
+                prompt.deleteFeedbackBackward()
+                return .redraw
+            case .char(let character):
+                if isCtrlC {
+                    // Ctrl+C in the editor backs out to viewing, mirroring
+                    // the question sheet; abandoning from there is one more.
+                    prompt.leaveFeedbackInput()
+                    return .redraw
+                }
+                guard event.modifiers.subtracting(.shift).isEmpty, !character.isNewline else {
+                    return .consumed
+                }
+                prompt.appendFeedback(character)
+                return .redraw
+            default:
+                return .consumed
+            }
+        case .viewing:
+            if isCtrlC {
+                return finish(.abandoned)
+            }
+            let page = max(1, viewportHeight)
+            let maximum = max(0, prompt.bodyLines.count - page)
+            func scroll(by delta: Int) -> PagerOverlayOutcome {
+                let target = min(max(0, prompt.scrollOffset + delta), maximum)
+                guard target != prompt.scrollOffset else { return .consumed }
+                prompt.scrollOffset = target
+                return .redraw
+            }
+            switch event.key {
+            case .escape:
+                return finish(.abandoned)
+            case .up: return scroll(by: -1)
+            case .down: return scroll(by: 1)
+            case .pageUp: return scroll(by: -page)
+            case .pageDown: return scroll(by: page)
+            case .home: return scroll(by: -maximum)
+            case .end: return scroll(by: maximum)
+            case .char(let character) where event.modifiers.isEmpty:
+                switch character {
+                case "a": return finish(.approved)
+                case "s":
+                    prompt.enterFeedbackInput()
+                    return .redraw
+                case "q": return finish(.abandoned)
+                case "j": return scroll(by: 1)
+                case "k": return scroll(by: -1)
+                case "g": return scroll(by: -maximum)
+                case "G": return scroll(by: maximum)
+                default: return .consumed
+                }
+            default:
+                return .consumed
+            }
+        }
+    }
+
     private func handlePermission(
         _ prompt: inout PagerPermissionPrompt,
         overlay: PagerOverlay,
@@ -1721,6 +1967,89 @@ public actor PagerQuestionCoordinator {
         queue.removeAll()
         for waiter in waiters {
             waiter.continuation.resume(returning: .cancelled)
+        }
+        if let presenter {
+            Task { await presenter(nil) }
+        }
+    }
+}
+
+// MARK: - Plan approval coordinator
+
+/// Joins the blocking `exit_plan_mode` approval to the render loop —
+/// `PagerQuestionCoordinator`'s shape with a plan payload.
+///
+/// The tool `await`s `decision(for:)`, which suspends without touching the
+/// renderer. The presenter callback pushes or pops the plan sheet, and
+/// `resolve(requestID:outcome:)` resumes the waiter. Upstream cancels a stale
+/// approval when a new one arrives (`acp_handler/interactions.rs:199-209`);
+/// here the tool runtime serializes calls, so the queue drains in order
+/// instead of displacing.
+public actor PagerPlanApprovalCoordinator {
+    private struct Waiter {
+        var request: PagerPlanApprovalRequest
+        var continuation: CheckedContinuation<PagerPlanApprovalOutcome, Never>
+    }
+
+    private var queue: [Waiter] = []
+    private var presenter: (@Sendable (PagerPlanApprovalRequest?) async -> Void)?
+
+    public init() {}
+
+    /// The plan the overlay should currently display, or `nil`.
+    public var currentRequest: PagerPlanApprovalRequest? { queue.first?.request }
+
+    public var pendingCount: Int { queue.count }
+
+    /// Whether anything is listening. A caller with no presenter would
+    /// suspend forever, so the pipeline checks this and falls back to the
+    /// generic permission sheet instead.
+    public var hasPresenter: Bool { presenter != nil }
+
+    /// Called whenever the head of the queue changes, so a controller can
+    /// push or pop the overlay without polling.
+    public func setPresenter(_ presenter: (@Sendable (PagerPlanApprovalRequest?) async -> Void)?) async {
+        self.presenter = presenter
+        await presenter?(queue.first?.request)
+    }
+
+    /// Suspend until the user decides. Safe to call from any task.
+    public func decision(for request: PagerPlanApprovalRequest) async -> PagerPlanApprovalOutcome {
+        let wasIdle = queue.isEmpty
+        let result = await withCheckedContinuation { (continuation: CheckedContinuation<PagerPlanApprovalOutcome, Never>) in
+            queue.append(Waiter(request: request, continuation: continuation))
+            if wasIdle, let presenter {
+                Task { await presenter(request) }
+            }
+        }
+        return result
+    }
+
+    /// Resolve the head request. Ignored when `requestID` is not the head, so
+    /// a stale key from a previous overlay cannot resolve the wrong request.
+    public func resolve(requestID: String, outcome: PagerPlanApprovalOutcome) {
+        guard let head = queue.first, head.request.id == requestID else { return }
+        queue.removeFirst()
+        head.continuation.resume(returning: outcome)
+        let next = queue.first?.request
+        if let presenter {
+            Task { await presenter(next) }
+        }
+    }
+
+    /// Resolve every outstanding approval — session teardown, turn
+    /// cancellation. The resolution is a no-feedback revise, upstream's
+    /// stale-cancel: a torn-down approval sends `cancelled` with no feedback
+    /// (`plan_approval_view.rs:189-191`), which the shell maps to *stay in
+    /// plan mode* (`tool_calls.rs:347-368`, `:416-418`). Fail closed: the
+    /// plan gate stays armed. Not `.abandoned` — that would disarm the gate
+    /// on a teardown the user never chose, and not `.approved` for the same
+    /// reason twice over.
+    public func resolveAll() {
+        let waiters = queue
+        queue.removeAll()
+        for waiter in waiters {
+            waiter.continuation.resume(returning: .revise(feedback: ""))
         }
         if let presenter {
             Task { await presenter(nil) }

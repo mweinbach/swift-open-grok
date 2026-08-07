@@ -1154,6 +1154,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         },
                         permissionCoordinator: permissionCoordinator,
                         questionCoordinator: foundation.questionCoordinator,
+                        planApprovalCoordinator: foundation.planApprovalCoordinator,
                         permissionMode: toolExecutor.sessionPermissionMode,
                         workflowRegistry: workflowRegistry,
                         workflowsEnabled: workflowsEnabled,
@@ -1771,6 +1772,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         /// (`xai-grok-agent/src/builder.rs:819-825`), driven by composition
         /// shape instead of a flag.
         let questionCoordinator: PagerQuestionCoordinator?
+        /// The `exit_plan_mode` plan-approval surface, gated exactly like the
+        /// question coordinator: interactive TTY launches only. Its absence
+        /// leaves the pipeline's dedicated-view slot empty, which keeps exit
+        /// approval on the generic permission sheet — never an auto-approve.
+        let planApprovalCoordinator: PagerPlanApprovalCoordinator?
         let telemetryBootstrapContext: LiveTelemetryBootstrapContext
         let toolExecutor: LiveToolExecutor
         /// The subagent stack for this root session: one coordinator plus the
@@ -1983,6 +1989,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             options.mode == .interactive && dependencies.terminal.isTTY()
                 ? PagerQuestionCoordinator()
                 : nil
+        // Same gate for the plan-approval view: it exists exactly when the
+        // pager renderer (its only presenter) will be constructed. Absence
+        // keeps `exit_plan_mode` approval on the generic permission sheet.
+        let planApprovalCoordinator: PagerPlanApprovalCoordinator? =
+            options.mode == .interactive && dependencies.terminal.isTTY()
+                ? PagerPlanApprovalCoordinator()
+                : nil
         let toolExecutor = try await LiveToolExecutor(
             processBackend: processBackend,
             sessionID: sessionID,
@@ -1998,7 +2011,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             sessionServices: sessionServices,
             permissionOptions: options.common.permissions,
             subagentHost: subagentHost,
-            userQuestions: questionCoordinator.map { LiveUserQuestionBroker(coordinator: $0) }
+            userQuestions: questionCoordinator.map { LiveUserQuestionBroker(coordinator: $0) },
+            planApprovals: planApprovalCoordinator.map { LivePlanApprovalBroker(coordinator: $0) }
         )
         conversationRecord.sandboxProfile = sandboxDecision.profileName
         try await conversationStore.save(conversationRecord)
@@ -2019,6 +2033,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             processBackend: processBackend,
             permissionCoordinator: permissionCoordinator,
             questionCoordinator: questionCoordinator,
+            planApprovalCoordinator: planApprovalCoordinator,
             telemetryBootstrapContext: telemetryBootstrapContext,
             toolExecutor: toolExecutor,
             subagentHost: subagentHost,
@@ -3551,7 +3566,13 @@ struct LiveToolExecutor: Sendable {
         // absence of the surface must mean absence of the tool, never a tool
         // that errors (§4: no dead dropdown rows). Only the interactive TUI
         // foundation passes one.
-        userQuestions: (any UserQuestionPresenting)? = nil
+        userQuestions: (any UserQuestionPresenting)? = nil,
+        // The dedicated `exit_plan_mode` plan-approval view. Defaulted to nil
+        // so every other construction keeps the generic permission-sheet
+        // fallback (`PermissionPipeline.requestExitPlanApproval`) — the
+        // pre-dedicated-view behavior, never an auto-approve. Only the
+        // interactive TUI foundation passes one.
+        planApprovals: (any PlanApprovalPrompting)? = nil
     ) async throws {
         self.subagentHost = subagentHost
         let composition = OpenGrokShellToolRuntimeComposition(
@@ -3634,6 +3655,13 @@ struct LiveToolExecutor: Sendable {
             resolved: security.permissions,
             sandboxAutoAllowBash: sandboxPredicate
         )
+        // The dedicated plan-approval view, root sessions only: a child's
+        // plan sheet would be indistinguishable from the parent's (the same
+        // reason the plan-mode tools themselves are stripped below), and the
+        // subagent guard means a child pipeline can never present one.
+        if !subagent, let planApprovals, let pipeline = fileToolResources.permissionPipeline {
+            await pipeline.installPlanApprovalPrompter(planApprovals)
+        }
         // The build pack plus, when the session's credentials allow it, the
         // image tools. Both go through one `finalize`, so image tools inherit
         // the same capability filter, permission pipeline and dispatch path.
@@ -6296,6 +6324,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// exactly like the permission coordinator. `nil` in compositions with
     /// no question surface (tests that opt out, headless).
     private let questionCoordinator: PagerQuestionCoordinator?
+    /// The `exit_plan_mode` plan-approval surface, presenter-installed in
+    /// `begin()` exactly like the question coordinator. `nil` in
+    /// compositions with no plan-approval surface (tests that opt out,
+    /// headless), which keeps exit approval on the generic permission sheet.
+    private let planApprovalCoordinator: PagerPlanApprovalCoordinator?
     /// Live permission-mode handle shared with the tool executor's pipeline.
     private let permissionMode: LiveSessionPermissionMode?
     /// Composer border flags derived from `permissionMode`; refreshed whenever
@@ -6337,6 +6370,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// permission queue drains.
     private var currentQuestionRequestID: String?
     private var pendingQuestionRequest: PagerQuestionRequest?
+    /// The plan-approval sheet currently on screen, and the one parked behind
+    /// an open permission sheet — the question sheet's parking pattern, for
+    /// the same reason: permission outranks everything below it
+    /// (`app/agent_view/input.rs:879-1112`). A plan sheet and a question
+    /// sheet cannot coexist because the tool runtime serializes calls.
+    private var currentPlanApprovalRequestID: String?
+    private var pendingPlanApprovalRequest: PagerPlanApprovalRequest?
     private var hasStartedFirstTurn = false
     /// The scrollback's focus and selected block. `selection.isFocused` is what
     /// unfocuses the composer, so the two halves of the focus model cannot
@@ -6395,6 +6435,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         providerBoundarySync: (@Sendable (Bool) async throws -> Void)? = nil,
         permissionCoordinator: PagerPermissionCoordinator? = nil,
         questionCoordinator: PagerQuestionCoordinator? = nil,
+        planApprovalCoordinator: PagerPlanApprovalCoordinator? = nil,
         permissionMode: LiveSessionPermissionMode? = nil,
         workflowRegistry: RhaiWorkflowRunRegistry? = nil,
         workflowsEnabled: Bool = true,
@@ -6436,6 +6477,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.providerBoundarySync = providerBoundarySync
         self.permissionCoordinator = permissionCoordinator
         self.questionCoordinator = questionCoordinator
+        self.planApprovalCoordinator = planApprovalCoordinator
         self.permissionMode = permissionMode
         self.workflowRegistry = workflowRegistry
         self.workflowsEnabled = workflowsEnabled
@@ -6625,6 +6667,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 await self?.showQuestion(request)
             }
         }
+        if let planApprovalCoordinator {
+            await planApprovalCoordinator.setPresenter { [weak self] request in
+                await self?.showPlanApproval(request)
+            }
+        }
         // The welcome screen only makes sense on an empty session, and it must
         // not capture input: the reference paints a live composer beneath it.
         if conversation.items.isEmpty {
@@ -6711,21 +6758,25 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // just walked away from.
             await resolveOutstandingPermissions()
             await resolveOutstandingQuestions()
+            await resolveOutstandingPlanApprovals()
             endTurn()
         case .eof, .shutdown:
             await resolveOutstandingPermissions()
             await resolveOutstandingQuestions()
+            await resolveOutstandingPlanApprovals()
             endTurn()
         case .cancelled:
             finishAssistant()
             await resolveOutstandingPermissions()
             await resolveOutstandingQuestions()
+            await resolveOutstandingPlanApprovals()
             endTurn()
         case .failed(let message):
             finishAssistant()
             appendMessage(PagerMessage(role: .error, text: message))
             await resolveOutstandingPermissions()
             await resolveOutstandingQuestions()
+            await resolveOutstandingPlanApprovals()
             endTurn()
         }
         try renderState()
@@ -6752,6 +6803,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         currentPermissionRequestID = nil
         currentQuestionRequestID = nil
         pendingQuestionRequest = nil
+        currentPlanApprovalRequestID = nil
+        pendingPlanApprovalRequest = nil
         endTurn()
         overlays.removeAll()
         overlays.push(.welcome(
@@ -6825,10 +6878,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // treats as a normal decision (`format.rs:16-22`).
         await questionCoordinator?.setPresenter(nil)
         await questionCoordinator?.resolveAll()
+        // Same order for plan approvals: presenter detached first, then the
+        // outstanding approvals resolve as upstream's stale cancel — plan
+        // mode stays armed (fail closed; see the coordinator's `resolveAll`).
+        await planApprovalCoordinator?.setPresenter(nil)
+        await planApprovalCoordinator?.resolveAll()
         overlays.removeAll()
         currentPermissionRequestID = nil
         currentQuestionRequestID = nil
         pendingQuestionRequest = nil
+        currentPlanApprovalRequestID = nil
+        pendingPlanApprovalRequest = nil
         try renderer.restore()
         if mode == .fullScreen {
             try sink.write(transcript)
@@ -7758,6 +7818,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         if let request {
             overlays.push(.permission(request))
             currentPermissionRequestID = request.id
+        } else if let parked = pendingPlanApprovalRequest {
+            // The approval the plan sheet was waiting behind is resolved;
+            // surface the parked plan now. (At most one of the two parked
+            // slots is occupied — the tool runtime serializes calls.)
+            pendingPlanApprovalRequest = nil
+            overlays.push(.planApproval(parked))
+            currentPlanApprovalRequestID = parked.id
         } else if let parked = pendingQuestionRequest {
             // The approval the question was waiting behind is resolved;
             // surface the parked questionnaire now.
@@ -7817,6 +7884,42 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             currentQuestionRequestID = nil
         }
         pendingQuestionRequest = nil
+    }
+
+    /// Push or replace the plan-approval sheet. Driven by the plan
+    /// coordinator's presenter callback; `nil` means its queue drained.
+    /// Permission outranks it (`input.rs:879-1112`), so a plan arriving
+    /// mid-approval parks in `pendingPlanApprovalRequest` and
+    /// `showPermission(nil)` presents it when the approvals drain.
+    private func showPlanApproval(_ request: PagerPlanApprovalRequest?) async {
+        if let current = currentPlanApprovalRequestID {
+            overlays.dismiss(id: "plan-approval:\(current)")
+            currentPlanApprovalRequestID = nil
+        }
+        pendingPlanApprovalRequest = nil
+        if let request {
+            if currentPermissionRequestID != nil {
+                pendingPlanApprovalRequest = request
+            } else {
+                overlays.push(.planApproval(request))
+                currentPlanApprovalRequestID = request.id
+            }
+        }
+        try? renderState()
+    }
+
+    /// Resolve every outstanding plan approval — teardown, turn
+    /// cancellation. The coordinator resolves them as upstream's stale
+    /// cancel (no-feedback revise), so the plan gate stays armed — fail
+    /// closed, never an approve or an abandon the user did not choose.
+    private func resolveOutstandingPlanApprovals() async {
+        guard let planApprovalCoordinator else { return }
+        await planApprovalCoordinator.resolveAll()
+        if let current = currentPlanApprovalRequestID {
+            overlays.dismiss(id: "plan-approval:\(current)")
+            currentPlanApprovalRequestID = nil
+        }
+        pendingPlanApprovalRequest = nil
     }
 
     /// Apply the outcome of a row choice, whether it came from `Enter` or a
@@ -7985,6 +8088,16 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         await questionCoordinator?.resolve(requestID: requestID, outcome: outcome)
     }
 
+    private func resolvePlanApproval(
+        overlayID: String,
+        requestID: String,
+        outcome: PagerPlanApprovalOutcome
+    ) async {
+        overlays.dismiss(id: overlayID)
+        if currentPlanApprovalRequestID == requestID { currentPlanApprovalRequestID = nil }
+        await planApprovalCoordinator?.resolve(requestID: requestID, outcome: outcome)
+    }
+
     // MARK: - Input routing
 
     func handleInput(_ event: InputEvent) async throws -> OpenGrokPagerInputRouting {
@@ -8007,6 +8120,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 return .consumed
             case .question(let id, let requestID, let outcome):
                 await resolveQuestion(overlayID: id, requestID: requestID, outcome: outcome)
+                try renderState()
+                return .consumed
+            case .planApproval(let id, let requestID, let outcome):
+                await resolvePlanApproval(overlayID: id, requestID: requestID, outcome: outcome)
                 try renderState()
                 return .consumed
             case .setting(_, let event):
@@ -8097,6 +8214,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 await resolve(overlayID: id, requestID: requestID, decision: decision)
             case .question(let id, let requestID, let outcome):
                 await resolveQuestion(overlayID: id, requestID: requestID, outcome: outcome)
+            case .planApproval(let id, let requestID, let outcome):
+                await resolvePlanApproval(overlayID: id, requestID: requestID, outcome: outcome)
             case .setting(_, let event):
                 await applySetting(event)
             case .ignored, .redraw, .consumed, .dismissed:
