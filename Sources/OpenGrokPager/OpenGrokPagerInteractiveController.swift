@@ -2116,6 +2116,21 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             name: "jump",
             summary: "Jump to a turn in the conversation"
         ),
+        // `/login` and `/logout` sit after `/jump`, upstream's display order
+        // (`slash/commands/mod.rs:143-145`). Summaries and usage are verbatim
+        // (`login.rs:108-114`, `logout.rs:13-19`); both arguments are
+        // optional (`[...]`), so a bare Enter dispatches instead of parking
+        // in the argument phase.
+        PagerCommandDefinition(
+            name: "login",
+            summary: "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, or OpenCode Go",
+            usage: "/login [xai|codex|kimi|fireworks|deepseek|meta|wafer|opencode-go]"
+        ),
+        PagerCommandDefinition(
+            name: "logout",
+            summary: "Log out of xAI or OpenAI Codex",
+            usage: "/logout [codex]"
+        ),
         PagerCommandDefinition(
             name: "delete",
             summary: "Delete this session and return home"
@@ -2257,35 +2272,48 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     }
 
     /// Argument rows for commands whose vocabulary lives inside the pager
-    /// targets. Today that is `/theme`: `auto` first, then the selectable
-    /// themes in catalog order, fuzzy-filtered by the typed fragment —
-    /// `ThemeCommand::suggest_args` (`slash/commands/theme.rs:81-110`) run
-    /// through the arg matcher (`slash/mod.rs:1070-1085`).
+    /// targets: `/theme` (`ThemeCommand::suggest_args`,
+    /// `slash/commands/theme.rs:81-110`, run through the arg matcher,
+    /// `slash/mod.rs:1070-1085`), `/login`, and `/logout` (their provider
+    /// tables live in `PagerLoginProviders`).
     ///
-    /// The `(active)` marker upstream appends is deliberately absent: the
-    /// controller does not own the live theme (the render layer does), and a
-    /// guessed marker would be wrong exactly when it matters.
+    /// The `(active)` marker upstream appends to `/theme` rows is
+    /// deliberately absent: the controller does not own the live theme (the
+    /// render layer does), and a guessed marker would be wrong exactly when
+    /// it matters.
     static func builtinArgumentSuggestions(
         command: String,
         query: String
     ) -> [OpenGrokPagerCommandSuggestion] {
-        guard command == "theme" || command == "t" else { return [] }
-        let names = ["auto"] + PagerThemeKind.selectable.map(\.displayName)
-        let rows = names.map { name in
-            OpenGrokPagerCommandSuggestion(
-                name: name,
-                summary: name == "auto" ? "auto (follow system)" : name,
-                // The row commits the whole composer text, not the bare
-                // argument — accepting must leave `/theme Tokyo Night`.
-                insertText: "/theme \(name)"
-            )
+        switch command {
+        case "theme", "t":
+            let names = ["auto"] + PagerThemeKind.selectable.map(\.displayName)
+            let rows = names.map { name in
+                OpenGrokPagerCommandSuggestion(
+                    name: name,
+                    summary: name == "auto" ? "auto (follow system)" : name,
+                    // The row commits the whole composer text, not the bare
+                    // argument — accepting must leave `/theme Tokyo Night`.
+                    insertText: "/theme \(name)"
+                )
+            }
+            let trimmed = query.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return rows }
+            let matcher = PagerFuzzyMatcher()
+            return matcher
+                .rank(rows, query: trimmed, limit: rows.count) { $0.name }
+                .map { rows[$0.index] }
+        case "login":
+            // `LoginCommand::suggest_args` (`login.rs:124-126`) — the eight
+            // providers with the provider-neutral descriptions; live secret
+            // statuses belong to the bare-`/login` modal only.
+            return PagerLoginProviders.suggestions(query: query)
+        case "logout":
+            // `LogoutCommand::suggest_args` (`logout.rs:29-36`).
+            return PagerLoginProviders.logoutSuggestions(query: query)
+        default:
+            return []
         }
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return rows }
-        let matcher = PagerFuzzyMatcher()
-        return matcher
-            .rank(rows, query: trimmed, limit: rows.count) { $0.name }
-            .map { rows[$0.index] }
     }
 
     /// `/model codex:` → `(command: "model", query: "codex:")`.
@@ -2638,6 +2666,50 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case "toggle-mouse-reporting":
                 try await emit(.overlay(.toggleMouseReporting))
                 return .handled
+            case "login":
+                // Bare `/login` opens the provider picker
+                // (`login.rs:129-131`); a typed provider resolves through the
+                // alias table (`provider_action`, `login.rs:85-101`), whose
+                // unknown-provider error echoes the argument as typed.
+                let typed = Self.rejoined(invocation.arguments)
+                guard !typed.isEmpty else {
+                    try await emit(.overlay(.loginProviderPicker))
+                    return .handled
+                }
+                guard let provider = PagerLoginProviders.resolve(typed) else {
+                    try await emit(.notice(
+                        PagerLoginProviders.unknownProviderMessage(typed)
+                    ))
+                    return .handled
+                }
+                switch provider.route {
+                case .xai:
+                    try await emit(.overlay(.loginXAI))
+                case .codex:
+                    try await emit(.overlay(.loginCodex))
+                case .apiKey(let settingsKey):
+                    // Upstream opens a dedicated per-provider key editor
+                    // (`Action::Open*ApiKeyEditor`); the port deep-links the
+                    // settings modal at the same row — the identical save
+                    // path (recorded divergence).
+                    try await emit(.overlay(.settings(deepLinkKey: settingsKey)))
+                }
+                return .handled
+            case "logout":
+                // `logout.rs:38-45`: bare → xAI, exactly `codex` → Codex
+                // (case-sensitive upstream, kept), anything else errors.
+                let account = Self.rejoined(invocation.arguments)
+                switch account {
+                case "":
+                    try await emit(.overlay(.logout(account: .xai)))
+                case "codex":
+                    try await emit(.overlay(.logout(account: .codex)))
+                default:
+                    try await emit(.notice(
+                        PagerLoginProviders.unknownAccountMessage(account)
+                    ))
+                }
+                return .handled
             default:
                 try await emit(.notice("unknown command: /\(command.name)"))
                 return .handled
@@ -2783,6 +2855,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /vim-mode                 Vim keys for the focused scrollback
       /settings   /config       Open the settings modal
       /privacy                  Coding data, retention and training settings
+      /login [provider]         Connect xAI, OpenAI Codex, or an API-key provider
+      /logout [codex]           Log out of xAI or OpenAI Codex
       /theme [name]  /t         Switch the color theme
       /tutorial                 Quick tips
       /workflows                Show workflow runs

@@ -413,7 +413,31 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// The empty-title refusal happens in the controller, so `title` here is
     /// always non-empty.
     case renameSession(title: String)
+    /// Bare `/login` — the provider chooser (upstream
+    /// `Action::OpenLoginProviderPicker`, `dispatch/auth.rs:26-66`). The rows
+    /// and alias table live in `PagerLoginProviders`; only the render layer
+    /// can add the live API-key statuses upstream's modal shows.
+    case loginProviderPicker
+    /// `/login xai` (upstream `Action::Login`, `dispatch/auth.rs:668-706`).
+    /// The port has no xAI browser OAuth wired at the live seam; the renderer
+    /// answers with the honest CLI route rather than faking a flow.
+    case loginXAI
+    /// `/login codex` (upstream `Action::LoginCodex`,
+    /// `dispatch/auth.rs:111-127`) — browser OAuth into the isolated Codex
+    /// store, run without blocking the turn loop.
+    case loginCodex
+    /// `/logout` / `/logout codex` (upstream `Action::Logout` /
+    /// `Action::LogoutCodex`, `slash/commands/logout.rs:38-45`). Credential
+    /// removal happens in the render layer, which owns the auth-store home.
+    case logout(account: OpenGrokPagerAuthAccount)
     case dismissAll
+}
+
+/// Which credential store `/logout` targets. Two stores, never one file:
+/// `auth.json` (xAI and provider API keys) and the isolated `codex-auth.json`.
+public enum OpenGrokPagerAuthAccount: String, Sendable, Equatable, Hashable {
+    case xai
+    case codex
 }
 
 /// Whether the renderer already consumed an input event.

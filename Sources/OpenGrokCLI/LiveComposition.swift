@@ -1222,6 +1222,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             ),
                             probedRefreshHz: nil
                         ),
+                        // The audited env, not ProcessInfo: `/login` and
+                        // `/logout` resolve auth paths and env-override
+                        // statuses against it (AGENTS.md §2, applied to env).
+                        environment: context.environment,
                         toolExecutor: toolExecutor
                     )
                     let controller = OpenGrokPagerInteractiveController(
@@ -6384,6 +6388,20 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// The auth-store home the settings modal's secret saves write to — the
     /// same store `readProviderAPIKey` reads.
     private let openGrokHome: URL
+    /// The audited environment (AGENTS.md §2's process-default trap applies
+    /// to env too): auth-file paths, Codex endpoints, and the picker's
+    /// env-override statuses all resolve against this copy.
+    private let environment: [String: String]
+    /// Injectable side effects of `/login codex` and `/logout codex` —
+    /// transport, browser flow, browser opener. Tests substitute fakes so no
+    /// socket, browser, or network is touched.
+    private let authServices: LivePagerAuthServices
+    /// The in-flight `/login codex` browser flow. Single-flight: upstream's
+    /// only guard is the fixed-port listener bind (`codex_auth.rs:706-714`,
+    /// second flow lands on the fallback port), so a second dispatch here
+    /// would bind a second callback server; this port refuses it with a
+    /// notice instead.
+    private var codexLoginTask: Task<Void, Never>?
 
     /// Viewport state. The last frame's geometry is cached so a page-sized
     /// scroll can be expressed in rows without re-laying out the transcript.
@@ -6533,7 +6551,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         announcements: LiveAnnouncementsComposition? = nil,
         paintCadence: TimeInterval = PagerMotion.defaultPaintCadence,
         environment: [String: String]? = nil,
-        toolExecutor: LiveToolExecutor? = nil
+        toolExecutor: LiveToolExecutor? = nil,
+        authServices: LivePagerAuthServices = .production
     ) {
         self.mode = mode
         self.sessionID = sessionID
@@ -6573,6 +6592,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // preference against what this terminal can render, so a truecolor-only
         // theme degrades to GrokNight instead of to mush.
         let environment = environment ?? ProcessInfo.processInfo.environment
+        self.environment = environment
+        self.authServices = authServices
         let resolvedUIConfiguration = uiConfiguration ?? Self.resolveUIConfig(
             workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
             environment: environment
@@ -7488,9 +7509,183 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await applyEffortCommand(query: query)
         case .renameSession(let title):
             await renameSession(title: title)
+        case .loginProviderPicker:
+            // Upstream's ArgPicker over `provider_items` with live secret
+            // statuses (`dispatch/auth.rs:26-51`). Statuses are read fresh at
+            // open so a key saved through settings shows up immediately.
+            overlays.push(LiveLoginProviderPicker.overlay(
+                statuses: LiveLoginProviderPicker.statuses(
+                    openGrokHome: openGrokHome,
+                    environment: environment
+                )
+            ))
+        case .loginXAI:
+            // RECORDED DIVERGENCE: upstream `Action::Login` starts the xAI
+            // OAuth flow (`dispatch/auth.rs:668-706`). This port's only wired
+            // xAI sign-in is the CLI's API-key route
+            // (`LiveAuthComposition.loginXAI`), and the running session
+            // resolves credentials at startup — so the honest answer names
+            // that route instead of pretending a flow started.
+            note("xAI sign-in runs in the CLI for now: quit, run `open-grok login` "
+                + "(paste an xAI API key), then restart Open Grok.")
+        case .loginCodex:
+            startCodexLogin()
+        case .logout(let account):
+            switch account {
+            case .xai:
+                await performXAILogout()
+            case .codex:
+                startCodexLogout()
+            }
         case .dismissAll:
             overlays.removeAll()
             currentPermissionRequestID = nil
+        }
+    }
+
+    // MARK: - /login, /logout
+
+    /// `/login codex` — the browser OAuth flow into the isolated Codex store,
+    /// spawned so the turn loop keeps running while the user is in the
+    /// browser (upstream spawns the same way, `effects/mod.rs:1684-1709`).
+    private func startCodexLogin() {
+        guard codexLoginTask == nil else {
+            // Single-flight. Upstream would bind a second callback server on
+            // the fallback port (`codex_auth.rs:706-714`); this port refuses
+            // the second flow outright (recorded divergence).
+            note("A Codex sign-in is already in progress. Finish it in your browser, or wait for it to time out.")
+            return
+        }
+        // Upstream's dispatch notice (`dispatch/auth.rs:119-121`).
+        note("Opening your browser to connect OpenAI Codex\u{2026}")
+        let authFile = OpenGrokAuthPaths.codexAuthFileURL(environment: environment)
+        let endpoints = CodexEndpoints.fromEnvironment(environment)
+        let transport = authServices.makeTransport()
+        let flow = authServices.codexBrowserLogin
+        let openBrowser = authServices.openBrowser
+        codexLoginTask = Task {
+            let result: Result<CodexCredentials, any Error>
+            do {
+                let credentials = try await flow(authFile, endpoints, transport, { url in
+                    // The auth URL lands in the transcript — upstream's CLI
+                    // announce copy (`codex_auth.rs:823-824`), which its
+                    // raw-terminal TUI path cannot print (recorded
+                    // divergence: upstream's TUI shows no URL at all).
+                    Task { await self.announceCodexAuthURL(url) }
+                    openBrowser?(url)
+                })
+                result = .success(credentials)
+            } catch {
+                result = .failure(error)
+            }
+            self.finishCodexLogin(result)
+        }
+    }
+
+    private func announceCodexAuthURL(_ url: URL) {
+        note("Open this URL if your browser does not open automatically:\n  \(url.absoluteString)")
+        try? renderState()
+    }
+
+    /// Completion messages are upstream's, byte for byte
+    /// (`dispatch/task_result.rs:3853-3871`).
+    private func finishCodexLogin(_ result: Result<CodexCredentials, any Error>) {
+        codexLoginTask = nil
+        switch result {
+        case .success(let credentials):
+            note(liveCodexConnectedMessage(
+                email: credentials.email,
+                planType: credentials.planType
+            ))
+            // Upstream refreshes the Codex model catalog on login
+            // (`effects/mod.rs:1690-1699`); this is the settings secret-save
+            // path's equivalent. Without it the login "succeeds" and `/model`
+            // still offers no Codex rows.
+            catalogStore?.refreshCredentialSnapshot()
+            catalogStore?.spawnBackgroundRefresh()
+        case .failure(let error):
+            appendMessage(PagerMessage(
+                role: .error,
+                text: "OpenAI Codex login failed: \(LiveAuthComposition.describe(error))"
+            ))
+        }
+        try? renderState()
+    }
+
+    /// `/logout` — remove the xAI credential from `auth.json`, the same
+    /// deletion the CLI route performs (`AuthManager.clear()`). Local file
+    /// surgery only, so it runs inline; the notice is upstream's completion
+    /// copy (`dispatch/task_result.rs:3798`, `:3826`), chosen by whether the
+    /// isolated Codex store survives.
+    private func performXAILogout() async {
+        let manager = AuthManager(
+            grokHome: openGrokHome,
+            config: GrokComConfig.default(environment: environment),
+            environment: environment
+        )
+        let result: LogoutResult
+        do {
+            result = try await manager.clear()
+        } catch {
+            appendMessage(PagerMessage(
+                role: .error,
+                text: "xAI logout failed: \(LiveAuthComposition.describe(error))"
+            ))
+            return
+        }
+        let codexRemains = isCodexLoggedIn(
+            at: OpenGrokAuthPaths.codexAuthFileURL(environment: environment)
+        )
+        note(codexRemains
+            ? "xAI Grok disconnected. ChatGPT Codex remains connected."
+            : "xAI Grok is disconnected. Sign in to ChatGPT Codex or xAI Grok to continue.")
+        // Not upstream copy (its pager logout is an ACP revocation): after a
+        // local deletion an env key silently keeps authenticating, which is
+        // exactly the "succeeds, does nothing" trap — say so, as the CLI
+        // route does.
+        if result.apiKeyStillSet {
+            note("XAI_API_KEY is still set in your environment and will continue to authenticate requests.")
+        }
+    }
+
+    /// `/logout codex` — best-effort token revoke, then store deletion
+    /// (`logoutCodex`, CodexAuth.swift). Spawned because the revoke leg is a
+    /// network call; the completion notice is upstream's
+    /// (`dispatch/task_result.rs:3890-3894`).
+    private func startCodexLogout() {
+        let authFile = OpenGrokAuthPaths.codexAuthFileURL(environment: environment)
+        let endpoints = CodexEndpoints.fromEnvironment(environment)
+        let transport = authServices.makeTransport()
+        Task {
+            let message: PagerMessage
+            var storeRemoved = false
+            do {
+                storeRemoved = try await logoutCodex(
+                    at: authFile,
+                    endpoints: endpoints,
+                    transport: transport
+                )
+                message = PagerMessage(
+                    role: .system,
+                    text: storeRemoved
+                        ? "OpenAI Codex disconnected."
+                        : "OpenAI Codex was not connected."
+                )
+            } catch {
+                message = PagerMessage(
+                    role: .error,
+                    text: "OpenAI Codex logout failed: \(LiveAuthComposition.describe(error))"
+                )
+            }
+            self.appendMessage(message)
+            if storeRemoved {
+                // Upstream clears the Codex catalog on logout
+                // (`effects/mod.rs:1721-1725`): the credential snapshot must
+                // stop resolving Codex before the republish.
+                self.catalogStore?.refreshCredentialSnapshot()
+                self.catalogStore?.spawnBackgroundRefresh()
+            }
+            try? self.renderState()
         }
     }
 
@@ -8067,6 +8262,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // `SendSlashCommandPreservingDraft` (`app/modals.rs:932`). The
             // composer is untouched, which is the "preserving draft" half.
             return rowID
+        case LiveLoginProviderPicker.overlayID:
+            // The row id is the provider token, so a click dispatches the
+            // exact typed form through the controller's alias table —
+            // upstream shares `provider_action` between both paths
+            // (`login.rs:82-84`).
+            return "/login \(rowID)"
         case LiveJumpPicker.overlayID:
             guard let index = Int(rowID) else { return nil }
             try? revealBlock(at: index)

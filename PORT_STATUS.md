@@ -8,6 +8,55 @@
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
+## Wave 15 — Slash-command parity batch (2026-08-07, in progress)
+
+**Scope.** The remaining upstream slash commands with live backings, audited from the Rust
+side and landed in dependency order: D1 `/login` + `/logout` (this entry), D2 `/plan` +
+`/view-plan`, D3 `/fork` + `/tasks` (pending).
+
+### D1 — in-pager `/login` and `/logout` (serial gate: exit 0, 4,377 tests, zero issues)
+
+`/login` opens upstream's 8-provider picker (order, display copy, and the full alias table
+verbatim from `login.rs:30-101`) with live secret statuses read fresh at open
+(env override → stored → missing, `dispatch/settings/ui.rs:37-48`); `/login codex` runs the
+browser OAuth flow non-blocking against the real callback listener and refreshes the model
+catalog on success (`effects/mod.rs:1690-1699`) so Codex rows appear in `/model`; `/logout`
+and `/logout codex` delete the real credential stores under their file locks (xAI scope +
+API-key scope via `AuthManager.clear()`; codex via best-effort revoke then store removal)
+with upstream's completion copy and an added env-key warning. 19 new tests: 11
+controller-seam (registry/dispatch/alias/error-copy/completion pins) and 8 live-seam
+(painted picker round-trip, real-listener codex flow, single-flight guard, all four logout
+outcomes on real store files in isolated homes).
+
+**Lead fix after delegate handoff:** the delegate's never-run paint test caught its own
+unit's §3 trap — picker statuses rode `PagerListRow.summary`, which the list painter never
+draws (`summary` is filter-haystack only; `detail` is the painted right-aligned channel).
+Statuses were computed and invisible. Fixed by routing through `detail`; the one-shot
+single-flight counter read was also converted to a bounded poll (it flaked at 0 under
+parallel-suite load before the spawned flow's first statement ran).
+
+**Recorded divergences:**
+
+- `/login xai` prints an honest CLI-route notice instead of upstream's in-TUI xAI OAuth
+  flow (`dispatch/auth.rs:668-706`); the only wired xAI sign-in is the CLI API-key route.
+  Cost: no in-TUI xAI sign-in until the OIDC browser flow is wired at this seam.
+- API-key providers deep-link the settings modal at the provider's key row instead of
+  upstream's dedicated `Open*ApiKeyEditor` modals. Same save path and scopes; cost is the
+  extra visual context of the full settings list.
+- Codex login is single-flight behind an explicit guard with a notice; upstream's only
+  guard is the port-bind fallback ladder (`codex_auth.rs:706-714`).
+- The auth URL prints into the transcript with upstream's CLI announce copy
+  (`codex_auth.rs:823-824`); upstream's raw-terminal TUI shows no URL at all.
+- `/logout` is local store deletion, not upstream's ACP revocation + tab teardown
+  (`effects/mod.rs:1657-1678`). Cost worth knowing: the running session's in-memory
+  credential survives until restart or a new session.
+
+**Known limitations, deliberate:** an abandoned `/login codex` flow has no cancellation
+plumbing — the listener thread blocks until its 600 s timeout (the CLI route shares this),
+and `restoreTerminal` does not cancel the pending task. Separately noted render gap:
+`PagerListRow.summary` is documented as upstream's indented sub-line (`picker.rs:900`) but
+no painter draws it anywhere — any future row description needs `detail` or a painter fix.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was
