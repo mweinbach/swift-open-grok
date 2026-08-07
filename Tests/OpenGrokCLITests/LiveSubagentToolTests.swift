@@ -513,6 +513,88 @@ struct LiveSubagentSpawnTests {
         #expect(outputResult.value["status"]?.stringValue == "cancelled")
     }
 
+    /// The advertised `resume_from` path: a completed child's persisted
+    /// transcript seeds the resumed child's next turn, and a type mismatch is
+    /// rejected with the resolution module's own error.
+    @Test("resume_from continues a completed child's persisted transcript")
+    func resumeFromContinuesTheChild() async throws {
+        let fixture = try SubagentFixture()
+        defer { fixture.dispose() }
+
+        let firstPrompt = "first keystone task \(UUID().uuidString)"
+        let secondPrompt = "follow-up keystone task \(UUID().uuidString)"
+        try fixture.server.enqueueResponse(
+            path: "/v1/responses",
+            response: .sse(SseEvents.responsesApiEventsExact(text: "first child answer", model: "grok-4.5"))
+        )
+        try fixture.server.enqueueResponse(
+            path: "/v1/responses",
+            response: .sse(SseEvents.responsesApiEventsExact(text: "resumed child answer", model: "grok-4.5"))
+        )
+
+        let foundation = try await fixture.makeFoundation()
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+
+        let first = await foundation.toolExecutor.invoke(
+            sessionID: foundation.sessionID,
+            workingDirectory: foundation.cwd,
+            call: ToolCall(
+                id: "call-spawn-1",
+                name: "spawn_subagent",
+                arguments: #"{"prompt":"\#(firstPrompt)","description":"first probe","subagent_type":"general-purpose","background":false}"#
+            )
+        )
+        guard case .success(let firstResult) = first else {
+            Issue.record("first spawn failed: \(first)")
+            return
+        }
+        #expect(firstResult.promptText.contains("first child answer"))
+        guard let firstID = firstResult.value["subagent_id"]?.stringValue else {
+            Issue.record("first spawn carried no subagent_id: \(firstResult.value)")
+            return
+        }
+
+        // A mismatched type is rejected before anything spawns.
+        let mismatch = await foundation.toolExecutor.invoke(
+            sessionID: foundation.sessionID,
+            workingDirectory: foundation.cwd,
+            call: ToolCall(
+                id: "call-spawn-2",
+                name: "spawn_subagent",
+                arguments: #"{"prompt":"\#(secondPrompt)","description":"mismatch probe","subagent_type":"explore","background":false,"resume_from":"\#(firstID)"}"#
+            )
+        )
+        guard case .failure(let mismatchError) = mismatch else {
+            Issue.record("a type-mismatched resume unexpectedly spawned")
+            return
+        }
+        #expect(mismatchError.description.contains("Resumed sessions must use the same subagent type as the source"))
+
+        let resumed = await foundation.toolExecutor.invoke(
+            sessionID: foundation.sessionID,
+            workingDirectory: foundation.cwd,
+            call: ToolCall(
+                id: "call-spawn-3",
+                name: "spawn_subagent",
+                arguments: #"{"prompt":"\#(secondPrompt)","description":"resume probe","subagent_type":"general-purpose","background":false,"resume_from":"\#(firstID)"}"#
+            )
+        )
+        guard case .success(let resumedResult) = resumed else {
+            Issue.record("resume spawn failed: \(resumed)")
+            return
+        }
+        #expect(resumedResult.promptText.contains("resumed child answer"))
+
+        // The resumed child's sample carries the source transcript (the first
+        // task prompt) plus the new one — the continuation upstream promises.
+        let requests = fixture.responsesRequests()
+        #expect(requests.count == 2)
+        let resumedBody = SubagentFixture.bodyText(requests[1])
+        #expect(resumedBody.contains(firstPrompt))
+        #expect(resumedBody.contains("first child answer"))
+        #expect(resumedBody.contains(secondPrompt))
+    }
+
     // MARK: Validation copy
 
     @Test("an unknown subagent type fails with the available roster")
