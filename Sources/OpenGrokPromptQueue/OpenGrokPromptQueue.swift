@@ -260,6 +260,17 @@ public actor PromptQueue {
         return wireSnapshot().entries.last!
     }
 
+    /// Insert ahead of every waiting entry for upstream's send-now path.
+    ///
+    /// `dispatch_send_prompt_now` cancels the running turn and runs this text
+    /// next, ahead of queued follow-ups
+    /// (`app/dispatch/interject.rs:121-194`).
+    @discardableResult
+    public func enqueueFront(_ entry: QueueEntryMeta) -> QueueEntryWire {
+        entries.insert(entry, at: 0)
+        return wireSnapshot().entries[0]
+    }
+
     /// Pop the front entry and mark it running. Fails if already running.
     public func beginNext() throws -> QueueEntryMeta {
         if runningPromptId != nil {

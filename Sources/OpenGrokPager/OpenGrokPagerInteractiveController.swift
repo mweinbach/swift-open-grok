@@ -95,7 +95,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     }
 
     private enum Signal: Sendable {
-        case session(StreamRead<OpenGrokPagerEvent>)
+        /// `generation` is the turn that owns the event. A preempted turn's
+        /// dying session races its `.cancelled` into the mailbox after the
+        /// loop has already decided `.turnPreempted`; the send-now drain goes
+        /// straight into the next turn without passing the idle loop (which
+        /// swallows stale session signals), so an untagged event would be
+        /// adopted by the next turn, reported as that turn's cancellation,
+        /// and end the whole run with the queue discarded.
+        case session(generation: UInt64, StreamRead<OpenGrokPagerEvent>)
         case input(StreamRead<InputEvent>)
         case control(Control)
     }
@@ -336,6 +343,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case ".", "x": return .shortcutsHelp
             // `Ctrl+;` primary, `Ctrl+'` alternate (`defaults.rs:551-578`).
             case ";", "'": return .toggleQueue
+            // Upstream's send-now chord is Ctrl+Enter with Ctrl+I, Ctrl+O, or
+            // Ctrl+L alternates (`defaults.rs:635-651`). Ctrl+Enter is the same
+            // CR byte as Enter here, Ctrl+I is Tab, Ctrl+O already toggles
+            // always-approve, and Ctrl+L stays reserved for extensions. Send-now
+            // is therefore reachable through `enter_steers` or an empty-composer
+            // force-send. The cost is no one-keystroke send-now for a full
+            // composer while `enter_steers` is off.
             case "o": return .toggleAlwaysApprove
             default: return nil
             }
@@ -599,6 +613,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private var activeSession: (any OpenGrokPagerSessionAdapter)?
     private var activeSessionCancelled = false
     private var activeSessionClosed = false
+    /// Monotonic turn counter stamped onto `.session` signals; see `Signal`.
+    private var turnGeneration: UInt64 = 0
     private var signalMailbox: SignalMailbox?
     private var inputPumpGate: InputPumpGate?
     private var inputPump: Task<Void, Never>?
@@ -646,10 +662,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private var focus: OpenGrokPagerFocusRegion = .prompt
     private var modes = OpenGrokPagerInputModes()
 
-    /// Interjections the user sent mid-turn with `Ctrl+Enter` or, under
-    /// `enter_steers`, a bare `Enter`. Drained into the next prompt so a
-    /// steer that arrives after the sampler has already committed to the turn
-    /// is never silently dropped.
+    /// Side questions buffered by `/btw`. Drained into the next prompt so a
+    /// follow-up that arrives after the sampler has committed to the turn is
+    /// never silently dropped. Enter-steers does not write here: it is
+    /// cancel-and-send per `defaults.rs:630-632`.
     private let interjections = EventQueue<KindedInterjection<String>>()
 
     private let commands: PagerCommandRegistry
@@ -790,8 +806,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         )
     }
 
-    /// Seed the runtime-toggleable modes. Call before `run`; after that they
-    /// belong to `/multiline`, `/vim-mode` and `Ctrl+M`.
+    /// Replace the runtime-toggleable mode snapshot before or during `run`.
+    ///
+    /// A mid-run call is safe because the controller is an actor and the input
+    /// loop reads `modes` at await points. The cost is that a mode flip lands
+    /// between keystrokes, never midway through one keystroke.
     public func setInputModes(_ newModes: OpenGrokPagerInputModes) {
         modes = newModes
         editor.isMultiline = newModes.isMultiline
@@ -1180,23 +1199,28 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         try await emit(.turnStarted(request))
         try await transition(to: .running)
 
+        turnGeneration &+= 1
+        let generation = turnGeneration
         let sessionTask = Task {
             var reachedTerminalEvent = false
             do {
                 for try await event in session.events {
-                    await mailbox.send(.session(.element(event)))
+                    await mailbox.send(.session(generation: generation, .element(event)))
                     if isTerminal(event) {
                         reachedTerminalEvent = true
                         break
                     }
                 }
                 if !reachedTerminalEvent {
-                    await mailbox.send(.session(.end))
+                    await mailbox.send(.session(generation: generation, .end))
                 }
             } catch is CancellationError {
                 return
             } catch {
-                await mailbox.send(.session(.failure(String(describing: error))))
+                await mailbox.send(.session(
+                    generation: generation,
+                    .failure(String(describing: error))
+                ))
             }
         }
         await Task.yield()
@@ -1213,7 +1237,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     continue
                 }
                 switch signal {
-                case .session(let read):
+                case .session(let signalGeneration, let read):
+                    // A stale signal is a previous turn's death, not this
+                    // turn's; adopting it would cancel this turn and discard
+                    // the queue (see `Signal.session`).
+                    guard signalGeneration == generation else { continue }
                     switch read {
                     case .element(let event):
                         try await emit(.session(event))
@@ -1285,9 +1313,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                     // Bare Enter on an empty composer with a
                                     // follow-up waiting force-sends the head of
-                                    // the queue. The Swift runtime has no
-                                    // mid-turn injection, so "send now" ends the
-                                    // running turn and starts the queued prompt.
+                                    // the queue. Send-now cancels the running
+                                    // turn and lets `.turnPreempted` drain that
+                                    // already-frontmost prompt next.
                                     if await promptQueue.isEmpty {
                                         try await emit(.notice("prompt cannot be empty"))
                                         await inputPumpGate.resume()
@@ -1323,11 +1351,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                         try await emit(.promptChanged(promptState()))
                                         await inputPumpGate.resume()
                                     case .notACommand where modes.enterSteers:
-                                        // `enter_steers` (`defs.rs:724`): the
-                                        // draft joins the running turn rather
-                                        // than the queue behind it.
-                                        try await interject(prompt, kind: .steer)
-                                        await inputPumpGate.resume()
+                                        // With `enter_steers` on, Enter takes
+                                        // upstream's cancel-and-send role
+                                        // (`defaults.rs:630-632`): the draft
+                                        // runs next, ahead of waiting follow-ups.
+                                        try await enqueue(prompt, insertion: .front)
+                                        await cancelActiveSession()
+                                        turnOutcome = .turnPreempted
                                     case .notACommand:
                                         try await enqueue(prompt)
                                         await inputPumpGate.resume()
@@ -1411,32 +1441,45 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
 
     // MARK: - Queue
 
-    /// Put a prompt at the tail of the queue and clear the composer.
+    private enum QueueInsertion {
+        case front
+        case tail
+    }
+
+    /// Put a prompt in the queue and clear the composer.
     ///
-    /// Enqueuing is what `Enter` does in both states; the only difference is
-    /// whether a drain follows immediately.
-    private func enqueue(_ prompt: String, historyText: String? = nil) async throws {
+    /// Normal follow-ups use the tail. Send-now uses the front, then cancels the
+    /// active turn so the existing drain path runs it next.
+    private func enqueue(
+        _ prompt: String,
+        historyText: String? = nil,
+        insertion: QueueInsertion = .tail
+    ) async throws {
         nextPromptSequence += 1
-        await promptQueue.enqueue(QueueEntryMeta(
+        let entry = QueueEntryMeta(
             id: "prompt-\(nextPromptSequence)",
             kind: "prompt",
             text: prompt
-        ))
+        )
+        switch insertion {
+        case .front:
+            await promptQueue.enqueueFront(entry)
+        case .tail:
+            await promptQueue.enqueue(entry)
+        }
         recordHistory(historyText ?? prompt)
         editor.reset()
         try await emit(.promptChanged(promptState()))
         try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
     }
 
-    /// Buffer a mid-turn message instead of queueing it behind the turn.
+    /// Buffer `/btw` outside the prompt queue.
     ///
-    /// The Swift runtime has no mid-turn injection — a sampler that has already
-    /// committed to a turn cannot be handed another user message — so the
-    /// honest port of upstream's `InterjectPrompt` and `enter_steers` is to
-    /// hold the text in `OpenGrokInterjection`'s buffer and fold it into the
-    /// very next prompt, framed by `formatInterjection` exactly as the shell
-    /// frames one. Nothing is dropped and nothing pretends to have steered a
-    /// turn it could not reach.
+    /// The Swift runtime cannot hand a side question to a sampler that already
+    /// committed to a turn, so `/btw` holds the text until the next prompt and
+    /// frames it with `formatInterjection`. Enter-steers deliberately does not
+    /// use this soft-interjection path; upstream defines it as cancel-and-send
+    /// (`defaults.rs:630-632`).
     private func interject(_ text: String, kind: InterjectionKind) async throws {
         interjections.push(KindedInterjection(kind: kind, text: text))
         recordHistory(text)

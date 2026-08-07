@@ -235,6 +235,30 @@ struct PromptQueueStateMachineTests {
         #expect(snap.sessionId == "sess")
     }
 
+    @Test("enqueueFront renumbers the wire queue and begins before existing entries")
+    func enqueueFrontRunsNext() async throws {
+        let queue = PromptQueue(sessionId: "sess")
+        let first = await queue.enqueue(
+            QueueEntryMeta(id: "p1", kind: "prompt", text: "one")
+        )
+        let second = await queue.enqueue(
+            QueueEntryMeta(id: "p2", kind: "prompt", text: "two")
+        )
+        let urgent = await queue.enqueueFront(
+            QueueEntryMeta(id: "now", kind: "prompt", text: "run next")
+        )
+
+        #expect(first.position == 0)
+        #expect(second.position == 1)
+        #expect(urgent.position == 0)
+        let snapshot = await queue.wireSnapshot()
+        #expect(snapshot.entries.map(\.id) == ["now", "p1", "p2"])
+        #expect(snapshot.entries.map(\.position) == [0, 1, 2])
+
+        let next = try await queue.beginNext()
+        #expect(next.id == "now")
+    }
+
     @Test("beginNext marks running and completeRunning clears it")
     func beginAndComplete() async throws {
         let queue = PromptQueue(sessionId: "s")

@@ -660,31 +660,56 @@ struct PagerFocusAndCommandTests {
         #expect(await harness.turnPrompts.contains("second\n\nthird"))
     }
 
-    @Test("enter_steers folds a mid-turn draft into the next prompt instead of queueing it")
-    func enterSteersInterjects() async throws {
+    @Test("enter_steers cancels the turn and runs the draft before queued follow-ups")
+    func enterSteersSendsNow() async throws {
         let held = HoldingSession(sessionID: "held")
         let harness = try await Harness.run(
             [
                 .paste("opening"),
                 .key(KeyEvent(key: .enter)),
-                .paste("actually use tabs"),
+                .paste("/defer"),
                 .key(KeyEvent(key: .enter)),
-                .key(KeyEvent(key: .char("c"), modifiers: [.control], character: "c")),
-                .paste("carry on"),
+                .paste("send this now"),
                 .key(KeyEvent(key: .enter)),
             ],
             sessions: [held],
-            modes: OpenGrokPagerInputModes(enterSteers: true)
+            modes: OpenGrokPagerInputModes(enterSteers: true),
+            expectedTurns: 3,
+            generatedPrompt: "already queued"
         )
 
-        let notices = await harness.notices
-        #expect(notices.contains { $0.contains("lead the next prompt") })
+        #expect(await held.cancellationCount() == 1)
+        #expect(await harness.turnPrompts == [
+            "opening",
+            "send this now",
+            "already queued",
+        ])
+        #expect(await harness.notices.contains("sending the queued prompt now"))
+    }
 
-        let steered = await harness.turnPrompts.first { $0.contains("carry on") }
-        // The interjection leads, framed the way the shell frames one.
-        #expect(steered?.contains("The user sent a message while you were working:") == true)
-        #expect(steered?.contains("actually use tabs") == true)
-        #expect(steered?.hasSuffix("carry on") == true)
+    @Test("with enter_steers off, mid-turn drafts stay in tail order")
+    func enterSteersOffQueuesAtTail() async throws {
+        let held = HoldingSession(sessionID: "held")
+        let harness = try await Harness.run(
+            [
+                .paste("opening"),
+                .key(KeyEvent(key: .enter)),
+                .paste("first follow-up"),
+                .key(KeyEvent(key: .enter)),
+                .paste("second follow-up"),
+                .key(KeyEvent(key: .enter)),
+            ],
+            sessions: [held],
+            releaseAfterQueueReaches: 2,
+            expectedTurns: 3
+        )
+
+        #expect(await held.cancellationCount() == 0)
+        #expect(await harness.turnPrompts == [
+            "opening",
+            "first follow-up",
+            "second follow-up",
+        ])
     }
 }
 
@@ -732,11 +757,24 @@ private actor Harness {
         modes: OpenGrokPagerInputModes = OpenGrokPagerInputModes(),
         releaseAfterQueueReaches: Int? = nil,
         expectedTurns: Int? = nil,
-        stagedCommand: String? = nil
+        stagedCommand: String? = nil,
+        generatedPrompt: String? = nil
     ) async throws -> Harness {
         let renderer = FocusRecordingRenderer()
         if let stagedCommand { await renderer.stageCommand(stagedCommand) }
         let runtime = FocusTestRuntime(held: sessions)
+        let customCommands = generatedPrompt == nil
+            ? []
+            : [OpenGrokPagerCommandRegistration(
+                name: "defer",
+                summary: "Queue a generated test prompt"
+            )]
+        let customCommandHandler: OpenGrokPagerInteractiveController.CustomCommandHandler?
+        if let generatedPrompt {
+            customCommandHandler = { @Sendable _ in generatedPrompt }
+        } else {
+            customCommandHandler = nil
+        }
         // A test that waits for a *later* turn cannot let the input stream
         // finish: exhaustion ends the run from inside the turn loop, which
         // would race the drain it is trying to observe. Those tests keep the
@@ -745,7 +783,9 @@ private actor Harness {
             input: expectedTurns == nil ? makeStream(events) : makeOpenStream(events),
             runtime: runtime,
             renderer: renderer,
-            output: SilentOutput()
+            output: SilentOutput(),
+            customCommands: customCommands,
+            customCommandHandler: customCommandHandler
         )
         await controller.setInputModes(modes)
 
@@ -871,6 +911,7 @@ private final class HoldingSession: OpenGrokPagerSessionAdapter, @unchecked Send
     let sessionID: String?
     let events: AsyncThrowingStream<OpenGrokPagerEvent, Error>
     private let continuation: AsyncThrowingStream<OpenGrokPagerEvent, Error>.Continuation
+    private let cancellationRecorder = CancellationRecorder()
 
     init(sessionID: String) {
         self.sessionID = sessionID
@@ -885,12 +926,25 @@ private final class HoldingSession: OpenGrokPagerSessionAdapter, @unchecked Send
     }
 
     func cancel() async {
+        await cancellationRecorder.record()
         continuation.yield(.cancelled)
         continuation.finish()
     }
 
+    func cancellationCount() async -> Int {
+        await cancellationRecorder.count
+    }
+
     func close() async {
         continuation.finish()
+    }
+}
+
+private actor CancellationRecorder {
+    private(set) var count = 0
+
+    func record() {
+        count += 1
     }
 }
 

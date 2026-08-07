@@ -1126,6 +1126,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     ? try await dependencies.makeInteractiveInput()
                     : nil
                 if let interactiveInput, let terminalSink = dependencies.makeTerminalSink() {
+                    // One effective-config read seeds both halves of the mode
+                    // snapshot. Multiline remains session-local, while vim and
+                    // the two steering settings start from `[ui]`.
+                    let uiConfiguration = LiveInteractiveControllerRenderer.resolveUIConfig(
+                        workingDirectory: cwd,
+                        environment: context.environment
+                    )
+                    let initialInputModes = uiConfiguration.inputModes
                     let renderer = LiveInteractiveControllerRenderer(
                         mode: pagerMode,
                         terminal: dependencies.terminal,
@@ -1149,6 +1157,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         workflowRegistry: workflowRegistry,
                         workflowsEnabled: workflowsEnabled,
                         terminalProgram: context.environment["TERM_PROGRAM"],
+                        uiConfiguration: uiConfiguration,
                         // The composer border shows the session's live effort
                         // from the first frame; before this the parameter had
                         // no production caller and rendered nil forever.
@@ -1240,6 +1249,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         },
                         workflowsEnabled: workflowsEnabled
                     )
+                    await controller.setInputModes(initialInputModes)
+                    // Controller-originated `.modeChanged` events only refresh
+                    // the renderer's copy. They do not call this sink, or
+                    // `/multiline` and `/vim-mode` would bounce a second update
+                    // back into the controller.
+                    await renderer.setInputModesSink { [weak controller] modes in
+                        await controller?.setInputModes(modes)
+                    }
                     // The render side reports what is moving (welcome logo,
                     // visible streaming blocks, finish flashes) and the
                     // controller's ticker arms or parks on it — this is what
@@ -6126,6 +6143,11 @@ private struct LivePagerConversationState {
 // adapter: a command's overlay/effect only exists here, and a test that
 // cannot construct the renderer can only test the registry.
 actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
+    struct ResolvedUIConfiguration: Sendable {
+        let config: UiConfig
+        let inputModes: OpenGrokPagerInputModes
+    }
+
     private let mode: OpenGrokPagerMode
     private let terminal: OpenGrokLiveTerminal
     private let sink: any PagerTerminalSink
@@ -6174,6 +6196,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// Installed by the composition after the controller exists; `nil` (tests,
     /// headless) simply never arms the ticker from render-side changes.
     private var motionSink: (@Sendable (PagerMotionState) async -> Void)?
+    /// Carries settings-modal commits into the controller's actor-isolated mode
+    /// snapshot. Controller-originated mode events never invoke it, which keeps
+    /// slash-command updates from bouncing back through this bridge.
+    private var inputModesSink: (
+        @Sendable (OpenGrokPagerInputModes) async -> Void
+    )?
     /// `/transcript`'s suspend host: the input-suspension entry point and the
     /// audited environment, both owned by the composition. `nil` (tests,
     /// headless) makes the command report instead of suspending.
@@ -6308,6 +6336,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         workflowsEnabled: Bool = true,
         terminalProgram: String? = nil,
         enableMouseReporting: Bool = true,
+        uiConfiguration: ResolvedUIConfiguration? = nil,
         themePreference: PagerThemePreference? = nil,
         reasoningEffort: String? = nil,
         compaction: LiveCompactionCoordinator? = nil,
@@ -6358,13 +6387,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // preference against what this terminal can render, so a truecolor-only
         // theme degrades to GrokNight instead of to mush.
         let environment = environment ?? ProcessInfo.processInfo.environment
-        let uiConfig = Self.resolveUIConfig(
+        let resolvedUIConfiguration = uiConfiguration ?? Self.resolveUIConfig(
             workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
             environment: environment
         )
-        if let vimMode = uiConfig.vimMode {
-            inputModes.isVimMode = vimMode
-        }
+        inputModes = resolvedUIConfiguration.inputModes
+        let uiConfig = resolvedUIConfiguration.config
         let autoDark = Self.themeKind(from: uiConfig.autoDarkTheme)
         let autoLight = Self.themeKind(from: uiConfig.autoLightTheme)
         self.autoDarkThemeKind = autoDark
@@ -6409,16 +6437,35 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// Effective `[ui]` from the same config chain as `resolveDisplayRefreshPolicy`.
     /// A malformed section falls back to `UiConfig()` defaults rather than
     /// blocking startup — matching the tolerant decoders on the Codable twin.
-    private static func resolveUIConfig(
+    nonisolated static func resolveUIConfig(
         workingDirectory: URL,
         environment: [String: String]
-    ) -> UiConfig {
+    ) -> ResolvedUIConfiguration {
         let document = (try? loadAuthorityComposition(
             cwd: workingDirectory,
             environment: environment
         ).effective()) ?? .table(TOMLTable())
-        guard let ui = document[path: ["ui"]] else { return UiConfig() }
-        return (try? jsonValue(from: ui).decode(UiConfig.self)) ?? UiConfig()
+        guard let ui = document[path: ["ui"]] else {
+            return ResolvedUIConfiguration(
+                config: UiConfig(),
+                inputModes: OpenGrokPagerInputModes()
+            )
+        }
+        let config = (try? jsonValue(from: ui).decode(UiConfig.self)) ?? UiConfig()
+        return ResolvedUIConfiguration(
+            config: config,
+            inputModes: OpenGrokPagerInputModes(
+                isMultiline: false,
+                isVimMode: config.vimMode ?? false,
+                enterSteers: boolValue(ui[path: ["enter_steers"]]),
+                combineQueuedPrompts: boolValue(ui[path: ["combine_queued_prompts"]])
+            )
+        )
+    }
+
+    private nonisolated static func boolValue(_ value: TOMLValue?) -> Bool {
+        guard let value, case .boolean(let flag) = value else { return false }
+        return flag
     }
 
     private static func themePreference(from ui: UiConfig) -> PagerThemePreference {
@@ -6471,6 +6518,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         motionSink = sink
         lastPublishedMotionState = nil
         publishMotionState()
+    }
+
+    /// Install the settings-to-controller mode bridge after both actors exist.
+    /// The whole value crosses at once so no frame can observe a mixed snapshot.
+    func setInputModesSink(
+        _ sink: (@Sendable (OpenGrokPagerInputModes) async -> Void)?
+    ) {
+        inputModesSink = sink
     }
 
     /// Install `/transcript`'s suspend host. Post-construction like
@@ -6565,6 +6620,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 selection.unfocus()
             }
         case .modeChanged(let modes):
+            // This is controller-to-renderer feedback only. Calling
+            // `inputModesSink` here would send `/multiline` and `/vim-mode`
+            // straight back to the controller.
             inputModes = modes
         case .scrollback(let command):
             try await applyScrollback(command)
@@ -7906,14 +7964,21 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     ///
     /// The modal owns its own state and has already applied the change to
     /// itself, so this carries only the effects that reach past the overlay:
-    /// the two input modes this renderer reads directly, and then the write to
-    /// disk and the live theme swap.
+    /// the full input-mode snapshot shared with the controller, and then the
+    /// write to disk and the live theme swap.
     private func applySetting(_ event: PagerSettingsEvent) async {
         if case .commit(let key, .bool(let flag)) = event {
             switch key {
             case "multiline_mode": inputModes.isMultiline = flag
             case "vim_mode": inputModes.isVimMode = flag
-            default: break
+            case "enter_steers": inputModes.enterSteers = flag
+            case "combine_queued_prompts": inputModes.combineQueuedPrompts = flag
+            default:
+                await applySettingsEvent(event)
+                return
+            }
+            if let inputModesSink {
+                await inputModesSink(inputModes)
             }
         }
         await applySettingsEvent(event)
@@ -7976,7 +8041,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// have edited `config.toml` since, and a modal showing stale values would
     /// write them back on the next unrelated toggle.
     func settingsOverlay(deepLinkKey: String? = nil) -> PagerSettingsOverlay {
-        let store = PagerSettingsStore(configPath: LiveInteractiveControllerRenderer.configPath())
+        let store = PagerSettingsStore(
+            configPath: openGrokHome.appendingPathComponent("config.toml")
+        )
         let activeCatalog = catalogStore?.pickerEntries() ?? modelCatalog
         var overlay = PagerSettingsOverlay(
             values: (try? store.load()) ?? [:],
@@ -8013,7 +8080,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// modal has already redrawn the row as changed, so silence would leave the
     /// screen disagreeing with the disk.
     func applySettingsEvent(_ event: PagerSettingsEvent) async {
-        let store = PagerSettingsStore(configPath: LiveInteractiveControllerRenderer.configPath())
+        let store = PagerSettingsStore(
+            configPath: openGrokHome.appendingPathComponent("config.toml")
+        )
         switch event {
         case .preview(let key, let value):
             // Only the theme rows preview, and a preview is display-only.
@@ -8131,13 +8200,6 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // sessions and `/model` switches only.
         catalogStore?.refreshCredentialSnapshot()
         catalogStore?.spawnBackgroundRefresh()
-    }
-
-    /// `$OPENGROK_HOME/config.toml`, the user-level config the reference writes.
-    private static func configPath() -> URL {
-        OpenGrokHomeResolver
-            .resolve(environment: ProcessInfo.processInfo.environment)
-            .appendingPathComponent("config.toml")
     }
 
     private func reloadCatalogInput() {

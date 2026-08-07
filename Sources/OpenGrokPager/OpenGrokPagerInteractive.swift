@@ -216,8 +216,9 @@ public struct OpenGrokPagerInputModes: Sendable, Equatable, Hashable {
     /// `Enter`, `Tab` and the `Ctrl` chords act — upstream's `lookup_with_mode`
     /// (`actions/mod.rs:397-430`).
     public var isVimMode: Bool
-    /// `enter_steers` (`defs.rs:724`). On, `Enter` during a turn interjects the
-    /// draft into the running turn instead of parking it in the queue.
+    /// `enter_steers` (`defaults.rs:627-660`). On, `Enter` during a turn sends
+    /// now: it cancels the running turn and runs the draft next, ahead of queued
+    /// follow-ups. Off, `Enter` queues at the tail.
     public var enterSteers: Bool
     /// `combine_queued_prompts` (`defs.rs:708`). On, a drain takes the whole
     /// queue as one prompt instead of running each entry as its own turn.

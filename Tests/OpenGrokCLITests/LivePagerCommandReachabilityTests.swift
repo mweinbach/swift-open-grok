@@ -12,6 +12,7 @@ import OpenGrokAuth
 import OpenGrokPager
 import OpenGrokPagerRender
 import OpenGrokSamplingTypes
+import OpenGrokTerminalCore
 import Testing
 @testable import OpenGrokCLI
 
@@ -88,6 +89,7 @@ private struct RendererFixture {
     let home: URL
     let sink: CapturingSink
     let renderer: LiveInteractiveControllerRenderer
+    let initialInputModes: OpenGrokPagerInputModes
 
     init(
         modelName: String = "unknown",
@@ -114,6 +116,11 @@ private struct RendererFixture {
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
         ]
+        let uiConfiguration = LiveInteractiveControllerRenderer.resolveUIConfig(
+            workingDirectory: home,
+            environment: resolvedEnvironment
+        )
+        initialInputModes = uiConfiguration.inputModes
         sink = CapturingSink()
         let terminal = OpenGrokLiveTerminal(
             isTTY: { false },
@@ -127,6 +134,7 @@ private struct RendererFixture {
             workingDirectory: home.path,
             modelName: modelName,
             catalogStore: catalogStore,
+            uiConfiguration: uiConfiguration,
             compaction: compaction,
             sessionID: sessionID,
             conversationHistory: conversationHistory,
@@ -147,6 +155,21 @@ private struct RendererFixture {
         try? FileManager.default.removeItem(at: home)
     }
 
+    func makeController() async -> OpenGrokPagerInteractiveController {
+        let input = AsyncStream<InputEvent> { $0.finish() }
+        let controller = OpenGrokPagerInteractiveController(
+            input: input,
+            runtime: UnusedPagerRuntime(),
+            renderer: renderer,
+            output: DiscardingPagerOutput()
+        )
+        await controller.setInputModes(initialInputModes)
+        await renderer.setInputModesSink { [weak controller] modes in
+            await controller?.setInputModes(modes)
+        }
+        return controller
+    }
+
     /// Poll the sink until the painted screen contains `needle`. A repaint
     /// folded into the paint cadence lands via the flush timer, so the frame
     /// is not guaranteed on screen when `render(_:)` returns.
@@ -157,6 +180,21 @@ private struct RendererFixture {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return sink.strippedText.contains(needle)
+    }
+}
+
+private struct UnusedPagerRuntime: OpenGrokPagerRuntimeAdapter {
+    func makeSession(
+        for request: OpenGrokPagerRequest
+    ) async throws -> any OpenGrokPagerSessionAdapter {
+        _ = request
+        throw CancellationError()
+    }
+}
+
+private struct DiscardingPagerOutput: OpenGrokPagerInteractiveOutputAdapter {
+    func forward(_ event: OpenGrokPagerInteractiveEvent) async throws {
+        _ = event
     }
 }
 
@@ -329,12 +367,14 @@ struct LivePagerCommandReachabilityTests {
 
 @Suite("Live UI config hydration", .serialized)
 struct LiveUIConfigHydrationTests {
-    @Test("effective `[ui]` theme and vim_mode apply on first paint")
-    func startupHydratesThemeAndVimMode() async throws {
+    @Test("effective `[ui]` theme and input modes apply at composition")
+    func startupHydratesThemeAndInputModes() async throws {
         let fixture = try RendererFixture(configTOML: """
             [ui]
             theme = "grokday"
             vim_mode = true
+            enter_steers = true
+            combine_queued_prompts = true
             """)
         defer { fixture.dispose() }
 
@@ -350,8 +390,32 @@ struct LiveUIConfigHydrationTests {
 
         try await fixture.renderer.render(.overlay(.sessionInfo))
         #expect(await fixture.waitForFrame(containing: "vim"))
+        let controller = await fixture.makeController()
+        let modes = await controller.state().modes
+        #expect(modes.isMultiline == false)
+        #expect(modes.isVimMode)
+        #expect(modes.enterSteers)
+        #expect(modes.combineQueuedPrompts)
         try await fixture.renderer.restoreTerminal()
         try await defaultFixture.renderer.restoreTerminal()
+    }
+
+    @Test("settings commit pushes enter_steers into the controller")
+    func settingsCommitReachesController() async throws {
+        let fixture = try RendererFixture()
+        defer { fixture.dispose() }
+        let controller = await fixture.makeController()
+
+        try await fixture.renderer.begin()
+        try await fixture.renderer.render(.overlay(.settings(deepLinkKey: "enter_steers")))
+        let routing = try await fixture.renderer.handleInput(.key(KeyEvent(
+            key: .char(" "),
+            character: " "
+        )))
+
+        #expect(routing == .consumed)
+        #expect(await controller.state().modes.enterSteers)
+        try await fixture.renderer.restoreTerminal()
     }
 }
 

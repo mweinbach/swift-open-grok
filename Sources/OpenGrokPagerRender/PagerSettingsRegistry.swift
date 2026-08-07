@@ -571,7 +571,7 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             key: "enter_steers",
             category: .editor,
             label: "Enter steers mid-turn",
-            description: "When a turn is running, swap Enter and the send-now chord (Ctrl+Enter, or Ctrl+O / Ctrl+L on some terminals). Off (default): Enter queues a follow-up; the chord sends now (cancels the turn). On: Enter sends now; the chord queues.",
+            description: "Off (default): Enter queues a follow-up while a turn runs; with an empty composer Enter force-sends the top queued follow-up. On: Enter sends now, cancelling the running turn and running the draft next.",
             keywords: ["queue", "steer", "interject"],
             kind: .bool(default: false),
             storage: .config(path: "ui.enter_steers")
