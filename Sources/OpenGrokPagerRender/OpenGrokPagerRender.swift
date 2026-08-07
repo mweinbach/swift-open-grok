@@ -16,7 +16,8 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         state.conversation,
         width: max(1, baseContentWidth),
         theme: state.theme,
-        selectedIndex: state.selectedBlockIndex
+        selectedIndex: state.selectedBlockIndex,
+        motion: state.motion
     )
     let hasScrollbar = state.showScrollbar && baseContentWidth > 1
         && contentLines.count > chrome.conversation.height
@@ -25,7 +26,8 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
             state.conversation,
             width: max(1, baseContentWidth - 1),
             theme: state.theme,
-            selectedIndex: state.selectedBlockIndex
+            selectedIndex: state.selectedBlockIndex,
+            motion: state.motion
         )
     }
 
@@ -60,7 +62,13 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     var buffer = CellBuffer(area: bounds)
     var links: [LinkSpan] = []
     fill(&buffer, area: bounds, background: state.theme.bgBase, foreground: state.theme.textPrimary)
-    renderStatusBar(state.statusBar, in: chrome.statusBar, buffer: &buffer, theme: state.theme)
+    renderStatusBar(
+        state.statusBar,
+        in: chrome.statusBar,
+        buffer: &buffer,
+        theme: state.theme,
+        motion: state.motion
+    )
     renderConversation(
         contentLines,
         visibleRange: visibleRange,
@@ -93,7 +101,8 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         state.overlays,
         layout: layout,
         buffer: &buffer,
-        theme: state.theme
+        theme: state.theme,
+        motion: state.motion
     )
 
     return PagerRenderResult(
@@ -258,7 +267,8 @@ func makeConversationLines(
     _ items: [PagerConversationItem],
     width: Int,
     theme: PagerRenderTheme,
-    selectedIndex: Int? = nil
+    selectedIndex: Int? = nil,
+    motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) -> [PaintLine] {
     guard width > 0 else { return [] }
     var lines: [PaintLine] = []
@@ -268,7 +278,7 @@ func makeConversationLines(
         case .message(let message):
             appendMessage(message, width: width, theme: theme, into: &lines)
         case .tool(let tool):
-            appendToolCard(tool, width: width, theme: theme, into: &lines)
+            appendToolCard(tool, width: width, theme: theme, motion: motion, into: &lines)
         case .separator(let text):
             let separator = text.isEmpty ? String(repeating: "─", count: width) : text
             lines.append(PaintLine(separator, foreground: theme.grayDim))
@@ -498,16 +508,41 @@ private func appendToolCard(
     _ tool: PagerToolCard,
     width: Int,
     theme: PagerRenderTheme,
+    motion: PagerMotionSnapshot,
     into lines: inout [PaintLine]
 ) {
     let accent = pagerToolAccent(tool, theme: theme)
+    // Finish flash (`scrollback/state/types.rs:84`): a block that just reached
+    // a terminal state keeps its bright accent — rail included — for 400 ms,
+    // then settles into the static look below. Flashes ride along on frames
+    // that were happening anyway; they never demand a tick of their own
+    // (`scrollback/state/mod.rs:507-518`).
+    let isFlashing = motion.enabled
+        && tool.state != .running && tool.state != .pending
+        && tool.finishedAt.map { PagerMotion.isFlashing(finishedAt: $0, now: motion.seconds) } == true
     // A collapsed row renders entirely muted and drops the accent rail; the
     // bullet alone carries the status color.
-    let muted = !tool.isExpanded
+    let muted = !tool.isExpanded && !isFlashing
     let labelColor = muted ? theme.gray : theme.textPrimary
     let argumentColor = muted
         ? theme.gray
         : (tool.kind.argumentIsPath ? theme.path : theme.textPrimary)
+
+    // The accent wave (`tokyonight.rs:300-312`): a running block's rail rows
+    // shift phase with their on-screen row, so the accent travels down the
+    // block instead of blinking. The paint-line index is the phase input —
+    // stable while the transcript is still, advancing as content scrolls,
+    // which is the same thing the reference's per-row phase does.
+    func railAccent(row: Int) -> TerminalColor {
+        guard tool.state == .running else { return accent }
+        return PagerMotion.runningAccentColor(
+            theme: theme,
+            accent: accent,
+            tick: motion.tick,
+            row: row,
+            motionEnabled: motion.enabled
+        )
+    }
 
     var header: [PagerStyledSpan] = [
         PagerStyledSpan(text: PagerGlyphs.toolBullet + " ", foreground: accent)
@@ -536,7 +571,7 @@ private func appendToolCard(
             spans: row,
             foreground: labelColor,
             accentGlyph: index == 0 || accentGlyph != nil ? accentGlyph : nil,
-            accentColor: accent
+            accentColor: railAccent(row: lines.count)
         ))
     }
 
@@ -545,7 +580,7 @@ private func appendToolCard(
         "",
         foreground: theme.gray,
         accentGlyph: PagerGlyphs.accentBar,
-        accentColor: accent
+        accentColor: railAccent(row: lines.count)
     ))
     let previewColor = tool.state == .failed ? theme.accentError : theme.gray
     for row in toolPreviewRows(output, width: max(1, width - 2), theme: theme) {
@@ -553,7 +588,7 @@ private func appendToolCard(
             spans: [PagerStyledSpan(text: "  " + row.text, foreground: row.foreground ?? previewColor)],
             foreground: previewColor,
             accentGlyph: PagerGlyphs.accentBar,
-            accentColor: accent
+            accentColor: railAccent(row: lines.count)
         ))
     }
 }
@@ -597,12 +632,13 @@ private func renderStatusBar(
     _ status: PagerStatusBar?,
     in area: TerminalRect,
     buffer: inout CellBuffer,
-    theme: PagerRenderTheme
+    theme: PagerRenderTheme,
+    motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) {
     guard let status, area.height > 0, area.width > 0 else { return }
     paintBlank(&buffer, area: area, foreground: theme.gray, background: theme.bgBase)
 
-    let right = statusBarRightSpans(status, theme: theme)
+    let right = statusBarRightSpans(status, theme: theme, motion: motion)
     let rightWidth = right.reduce(0) { $0 + UnicodeDisplayWidth.width(of: $1.text) }
     let leftBudget = max(0, area.width - rightWidth - 1)
     let left = truncateSpans(statusBarLeftSpans(status, theme: theme), to: leftBudget)
@@ -651,12 +687,17 @@ private func statusBarLeftSpans(
 
 private func statusBarRightSpans(
     _ status: PagerStatusBar,
-    theme: PagerRenderTheme
+    theme: PagerRenderTheme,
+    motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) -> [PagerStyledSpan] {
     var groups: [[PagerStyledSpan]] = []
     if status.backgroundTaskCount > 0 {
+        // The chip spins while background tasks run (`agent_status.rs:278,317`
+        // draws `dot_spinner_frames()[tick / SPINNER_DIVISOR]`). With motion
+        // disabled the tick is pinned at 0 and this renders the first frame —
+        // the exact glyph this row always showed.
         groups.append([PagerStyledSpan(
-            text: "\(PagerGlyphs.dotSpinner[0]) \(status.backgroundTaskCount)",
+            text: "\(PagerMotion.dotFrame(tick: motion.enabled ? motion.tick : 0)) \(status.backgroundTaskCount)",
             foreground: theme.accentRunning
         )])
     }
@@ -714,11 +755,34 @@ private func renderTurnStatus(
     paintBlank(&buffer, area: area, foreground: theme.gray, background: theme.bgBase)
 
     let labelColor = status.isCancelling ? theme.accentError : theme.textSecondary
-    var left: [PagerStyledSpan] = [
-        PagerStyledSpan(
+    // Which cue leads the row (`turn_status.rs`): the braille spinner for a
+    // live turn (`:420`), the `◆` pulsing dim→bright in `accent_user` while
+    // the turn is parked on the user (`:484-486`), or the calm `○ ◎ ◉ ◎`
+    // monitor pulse for idle watcher work (`:322-325`).
+    let indicator: PagerStyledSpan
+    switch status.indicator {
+    case .spinner:
+        indicator = PagerStyledSpan(
             text: PagerGlyphs.brailleSpinnerFrame(status.tick) + " ",
             foreground: labelColor
-        ),
+        )
+    case .pendingUserDiamond:
+        indicator = PagerStyledSpan(
+            text: PagerGlyphs.toolBullet + " ",
+            foreground: PagerMotion.pendingDiamondColor(
+                theme: theme,
+                accent: theme.accentUser,
+                tick: status.tick
+            )
+        )
+    case .idleMonitor:
+        indicator = PagerStyledSpan(
+            text: PagerMotion.monitorPulseFrame(tick: status.tick) + " ",
+            foreground: theme.accentSystem
+        )
+    }
+    var left: [PagerStyledSpan] = [
+        indicator,
         PagerStyledSpan(text: status.label, foreground: labelColor)
     ]
     if status.queuedPromptCount > 0 {
@@ -772,7 +836,21 @@ private func renderCompletions(
     theme: PagerRenderTheme
 ) {
     guard let menu, !menu.isEmpty, area.height > 0, area.width > 0 else { return }
-    let start = min(max(0, menu.scrollOffset), max(0, menu.rows.count - 1))
+    // The dropdown paints at most `maxDropdownRows` rows but the match list is
+    // no longer capped upstream of here, so the window follows the selection:
+    // a selected row below the fold pulls the window down, one above pulls it
+    // up. This is what makes row seven reachable from a bare `/` — upstream
+    // leaves the same job to the dropdown renderer (`slash/mod.rs:866`,
+    // "No cap here -- the dropdown renderer handles scrolling").
+    var start = min(max(0, menu.scrollOffset), max(0, menu.rows.count - 1))
+    if let selected = menu.selectedIndex, menu.rows.indices.contains(selected) {
+        if selected < start {
+            start = selected
+        } else if selected >= start + area.height {
+            start = selected - area.height + 1
+        }
+    }
+    start = min(start, max(0, menu.rows.count - area.height))
     let end = min(menu.rows.count, start + area.height)
     let labelWidth = menu.rows[start..<end]
         .reduce(0) { max($0, UnicodeDisplayWidth.width(of: $1.label)) }

@@ -1,3 +1,4 @@
+import Foundation
 import OpenGrokTerminalCore
 
 public enum PagerTerminalMode: Sendable, Equatable {
@@ -61,17 +62,26 @@ public struct PagerTerminalRendererConfiguration: Sendable, Equatable {
     /// screen. DEC private modes are scoped per screen buffer on some
     /// terminals, so the disable has to land on the buffer that saw the enable.
     public var useMouseReporting: Bool
+    /// Minimum gap between coalesced frames — upstream's `min_draw_interval`
+    /// (`display_refresh_startup.rs:23`). Only the `requestFrame`/
+    /// `flushPendingFrame` path honors it; a bare `render` call stays
+    /// unthrottled for callers that own their own pacing. Resolve this with
+    /// `PagerFrameClock.cadence(environment:policy:probedRefreshHz:)` so the
+    /// `GROK_MIN_DRAW_MS` override and the auto-cadence setting both apply.
+    public var paintCadence: TimeInterval
 
     public init(
         mode: PagerTerminalMode = .fullscreen,
         useAlternateScreen: Bool = true,
         useSynchronizedOutput: Bool = true,
-        useMouseReporting: Bool = false
+        useMouseReporting: Bool = false,
+        paintCadence: TimeInterval = PagerMotion.defaultPaintCadence
     ) {
         self.mode = mode
         self.useAlternateScreen = useAlternateScreen
         self.useSynchronizedOutput = useSynchronizedOutput
         self.useMouseReporting = useMouseReporting
+        self.paintCadence = paintCadence
     }
 }
 

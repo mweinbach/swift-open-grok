@@ -83,7 +83,8 @@ func renderOverlays(
     _ stack: PagerOverlayStack,
     layout: PagerFrameLayout,
     buffer: inout CellBuffer,
-    theme: PagerRenderTheme
+    theme: PagerRenderTheme,
+    motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) -> [PagerOverlayBounds] {
     guard !stack.isEmpty else { return [] }
     var bounds: [PagerOverlayBounds] = []
@@ -95,7 +96,8 @@ func renderOverlays(
                 sizing: sizing,
                 area: layout.bounds,
                 buffer: &buffer,
-                theme: theme
+                theme: theme,
+                motion: motion
             ) {
                 bounds.append(result)
             }
@@ -106,7 +108,8 @@ func renderOverlays(
                 overlay,
                 layout: layout,
                 buffer: &buffer,
-                theme: theme
+                theme: theme,
+                motion: motion
             ) {
                 bounds.append(result)
             }
@@ -115,7 +118,8 @@ func renderOverlays(
                 overlay,
                 layout: layout,
                 buffer: &buffer,
-                theme: theme
+                theme: theme,
+                motion: motion
             ) {
                 bounds.append(result)
             }
@@ -131,7 +135,8 @@ private func renderCenteredModal(
     sizing: PagerModalSizing,
     area: TerminalRect,
     buffer: inout CellBuffer,
-    theme: PagerRenderTheme
+    theme: PagerRenderTheme,
+    motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) -> PagerOverlayBounds? {
     guard let frame = sizing.frame(in: area) else { return nil }
 
@@ -197,7 +202,7 @@ private func renderCenteredModal(
             theme: theme
         )
     case .welcome(let welcome):
-        rows = drawWelcomeBody(welcome, in: content, buffer: &buffer, theme: theme)
+        rows = drawWelcomeBody(welcome, in: content, buffer: &buffer, theme: theme, motion: motion)
     case .workflows(let runs):
         rows = drawWorkflowsBody(
             runs,
@@ -600,7 +605,8 @@ private func renderBottomSheet(
     _ overlay: PagerOverlay,
     layout: PagerFrameLayout,
     buffer: inout CellBuffer,
-    theme: PagerRenderTheme
+    theme: PagerRenderTheme,
+    motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) -> PagerOverlayBounds? {
     let area = layout.bounds
     guard area.width >= 10, area.height > 0 else { return nil }
@@ -665,7 +671,7 @@ private func renderBottomSheet(
     case .text(let text):
         drawTextBody(text, in: content, buffer: &buffer, theme: theme)
     case .welcome(let welcome):
-        rows = drawWelcomeBody(welcome, in: content, buffer: &buffer, theme: theme)
+        rows = drawWelcomeBody(welcome, in: content, buffer: &buffer, theme: theme, motion: motion)
     case .workflows(let runs):
         rows = drawWorkflowsBody(
             runs,
@@ -878,7 +884,8 @@ private func renderFullScreenOverlay(
     _ overlay: PagerOverlay,
     layout: PagerFrameLayout,
     buffer: inout CellBuffer,
-    theme: PagerRenderTheme
+    theme: PagerRenderTheme,
+    motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) -> PagerOverlayBounds? {
     let area = layout.bounds
     let bottom = layout.input.height > 0 ? layout.input.y : area.bottom
@@ -895,7 +902,7 @@ private func renderFullScreenOverlay(
     var rows: [PagerOverlayBounds.Row] = []
     switch overlay.content {
     case .welcome(let welcome):
-        rows = drawWelcomeBody(welcome, in: frame, buffer: &buffer, theme: theme)
+        rows = drawWelcomeBody(welcome, in: frame, buffer: &buffer, theme: theme, motion: motion)
     case .workflows(let runs):
         rows = drawWorkflowsBody(
             runs,
@@ -923,7 +930,8 @@ private func drawWelcomeBody(
     _ welcome: PagerWelcomeOverlay,
     in area: TerminalRect,
     buffer: inout CellBuffer,
-    theme: PagerRenderTheme
+    theme: PagerRenderTheme,
+    motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) -> [PagerOverlayBounds.Row] {
     guard area.width > 0, area.height > 0 else { return [] }
     let logo = PagerWelcomeLogo.art(forHeight: area.height)
@@ -935,10 +943,70 @@ private func drawWelcomeBody(
             logo: PagerWelcomeLogo.full,
             in: area,
             buffer: &buffer,
-            theme: theme
+            theme: theme,
+            motion: motion
         )
     }
-    return drawWelcomeStacked(welcome, logo: logo, in: area, buffer: &buffer, theme: theme)
+    return drawWelcomeStacked(
+        welcome,
+        logo: logo,
+        in: area,
+        buffer: &buffer,
+        theme: theme,
+        motion: motion
+    )
+}
+
+/// Paint one logo line, shimmering when motion is on.
+///
+/// With motion enabled each glyph is colored by its diagonal position and the
+/// wall clock (`shine_opacity`, `welcome/logo.rs:86-107`), which is the
+/// travelling glint. Disabled, the whole line paints in one call in
+/// `textPrimary` — byte-identical to what this port always drew.
+private func drawWelcomeLogoLine(
+    _ buffer: inout CellBuffer,
+    line: String,
+    x: Int,
+    y: Int,
+    rowIndex: Int,
+    rowCount: Int,
+    logoWidth: Int,
+    theme: PagerRenderTheme,
+    motion: PagerMotionSnapshot
+) {
+    guard motion.enabled else {
+        _ = buffer.setString(
+            x: x,
+            y: y,
+            text: line,
+            style: [],
+            foreground: theme.textPrimary,
+            background: theme.bgBase
+        )
+        return
+    }
+    // Diagonal runs 0 at the bottom-left glyph to 1 at the top-right, so the
+    // band sweeps corner to corner (`welcome/logo.rs:126-152`).
+    let diagonalSpan = Double(max(1, (logoWidth - 1) + (rowCount - 1)))
+    var column = x
+    for grapheme in line {
+        let glyph = String(grapheme)
+        let width = max(0, UnicodeDisplayWidth.width(ofGrapheme: glyph))
+        let diagonal = Double((column - x) + (rowCount - 1 - rowIndex)) / diagonalSpan
+        _ = buffer.setString(
+            x: column,
+            y: y,
+            text: glyph,
+            style: [],
+            foreground: PagerMotion.shimmerColor(
+                theme: theme,
+                diagonal: diagonal,
+                seconds: motion.seconds
+            ),
+            background: theme.bgBase
+        )
+        column += width
+    }
 }
 
 private func drawWelcomeHero(
@@ -946,13 +1014,21 @@ private func drawWelcomeHero(
     logo: [String],
     in area: TerminalRect,
     buffer: inout CellBuffer,
-    theme: PagerRenderTheme
+    theme: PagerRenderTheme,
+    motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) -> [PagerOverlayBounds.Row] {
     let boxWidth = min(max(0, area.width - 6), 120)
     let rightRows = 1 + (welcome.subtitle.isEmpty ? 0 : 1) + 1 + welcome.menu.count
     let boxHeight = 4 + max(logo.count, rightRows)
     guard boxWidth >= 20, boxHeight <= area.height else {
-        return drawWelcomeStacked(welcome, logo: logo, in: area, buffer: &buffer, theme: theme)
+        return drawWelcomeStacked(
+            welcome,
+            logo: logo,
+            in: area,
+            buffer: &buffer,
+            theme: theme,
+            motion: motion
+        )
     }
 
     let x = area.x + (area.width - boxWidth) / 2
@@ -995,13 +1071,16 @@ private func drawWelcomeHero(
     for (index, line) in logo.enumerated() {
         let row = frame.y + 2 + index
         guard row < frame.bottom - 1 else { break }
-        _ = buffer.setString(
+        drawWelcomeLogoLine(
+            &buffer,
+            line: line,
             x: logoX,
             y: row,
-            text: line,
-            style: [],
-            foreground: theme.textPrimary,
-            background: theme.bgBase
+            rowIndex: index,
+            rowCount: logo.count,
+            logoWidth: logoWidth,
+            theme: theme,
+            motion: motion
         )
     }
 
@@ -1077,21 +1156,25 @@ private func drawWelcomeStacked(
     logo: [String]?,
     in area: TerminalRect,
     buffer: inout CellBuffer,
-    theme: PagerRenderTheme
+    theme: PagerRenderTheme,
+    motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) -> [PagerOverlayBounds.Row] {
     var row = area.y + 1
     if let logo {
         let width = logo.map { UnicodeDisplayWidth.width(of: $0) }.max() ?? 0
         let x = area.x + max(0, (area.width - width) / 2)
-        for line in logo {
+        for (index, line) in logo.enumerated() {
             guard row < area.bottom else { break }
-            _ = buffer.setString(
+            drawWelcomeLogoLine(
+                &buffer,
+                line: line,
                 x: x,
                 y: row,
-                text: line,
-                style: [],
-                foreground: theme.textPrimary,
-                background: theme.bgBase
+                rowIndex: index,
+                rowCount: logo.count,
+                logoWidth: width,
+                theme: theme,
+                motion: motion
             )
             row += 1
         }

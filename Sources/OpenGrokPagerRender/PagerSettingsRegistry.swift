@@ -863,7 +863,7 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
         )
     ]
 
-    // MARK: Models (23)
+    // MARK: Models (24)
 
     rows += [
         PagerSettingMeta(
@@ -929,6 +929,17 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             keywords: ["deepseek", "api key"],
             kind: .secret,
             storage: .secretStore(account: "deepseek")
+        ),
+        // `meta_api_key` (`settings/defs.rs:1184-1202`): between the DeepSeek
+        // and OpenCode Go rows, exactly upstream's registry order.
+        PagerSettingMeta(
+            key: "meta_api_key",
+            category: .models,
+            label: "Meta API key",
+            description: "API key for Meta's Model API. Saving refreshes the curated Muse Spark model catalog.",
+            keywords: ["meta", "muse", "spark", "api", "key", "credential", "models"],
+            kind: .secret,
+            storage: .secretStore(account: "meta")
         ),
         PagerSettingMeta(
             key: "opencode_go_api_key",
@@ -1076,19 +1087,17 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
         )
     ]
 
-    // MARK: Advanced (28)
+    // MARK: Advanced (27 — upstream's 28 minus the hidden `show_tips`)
 
     rows += [
-        PagerSettingMeta(
-            key: "show_tips",
-            category: .advanced,
-            label: "Show tips",
-            description: "Show the tip-of-the-day banner on startup. Restart required.",
-            keywords: ["tips", "banner"],
-            kind: .bool(default: true),
-            storage: .config(path: "cli.show_tips"),
-            restartRequired: true
-        ),
+        // `show_tips` (`cli.show_tips`, upstream's tip-of-the-day banner) is
+        // deliberately NOT registered: the Swift port has no tips/ephemeral
+        // banner surface, so the row would be a knob with no reader — the
+        // same registered-no-op the house parity rule forbids on dropdowns.
+        // Re-add the row together with the banner, not before. The cost of
+        // hiding it: a config file carrying `cli.show_tips` keeps the value
+        // (storage round-trips unknown keys) but the modal will not show it
+        // until the feature exists.
         PagerSettingMeta(
             key: "contextual_hints",
             category: .advanced,

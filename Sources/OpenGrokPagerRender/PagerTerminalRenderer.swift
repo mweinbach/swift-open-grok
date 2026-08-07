@@ -1,3 +1,4 @@
+import Foundation
 import OpenGrokTerminalCore
 
 public final class PagerTerminalRenderer {
@@ -19,6 +20,7 @@ public final class PagerTerminalRenderer {
     private var synchronizedOutputActive = false
     private var pendingResize = false
     private var mouseReportingActive = false
+    private var frameClock: PagerFrameClock
 
     public init(
         sink: any PagerTerminalSink,
@@ -26,6 +28,7 @@ public final class PagerTerminalRenderer {
     ) {
         self.sink = sink
         self.configuration = configuration
+        self.frameClock = PagerFrameClock(cadence: configuration.paintCadence)
     }
 
     public var isStarted: Bool { started }
@@ -82,6 +85,86 @@ public final class PagerTerminalRenderer {
     @discardableResult
     public func render(_ state: PagerRenderState) throws -> PagerTerminalRenderReport {
         try render(engine.render(state))
+    }
+
+    // MARK: - Coalesced painting
+
+    /// When a folded repaint request is due to paint, or `nil` when nothing is
+    /// pending. The caller arms a timer for this instant and calls
+    /// `flushPendingFrame` when it fires — without that timer a request folded
+    /// inside the cadence window would never paint.
+    public var scheduledFrameAt: TimeInterval? {
+        frameClock.isDirty ? (frameClock.scheduledPaintAt ?? 0) : nil
+    }
+
+    /// Paint through the frame clock: at most one frame per cadence window,
+    /// with requests inside the window folded into one deferred frame — the
+    /// `Presenter` (`event_loop.rs:425-517`) with `request_throttled`'s
+    /// min-draw rule (`:480-489`).
+    ///
+    /// Returns `nil` when the request was coalesced; the frame it folded into
+    /// paints when the caller services `scheduledFrameAt`. `now` is any
+    /// monotonic seconds source — it only ever compares against itself.
+    /// A tick loop without this half trades a frozen UI for a busy one:
+    /// 30 fps of ticks plus per-event repaints must not become 30+ paints
+    /// per second.
+    @discardableResult
+    public func requestFrame(
+        _ state: PagerRenderState,
+        at now: TimeInterval
+    ) throws -> PagerTerminalRenderReport? {
+        guard frameClock.requestPaint(at: now) else { return nil }
+        return try paintCoalescedFrame(state, at: now)
+    }
+
+    /// Paint the deferred frame scheduled by an earlier folded request, if it
+    /// has come due. The caller passes the *latest* state — the whole point of
+    /// folding is that only the newest frame is worth painting.
+    @discardableResult
+    public func flushPendingFrame(
+        _ state: PagerRenderState,
+        at now: TimeInterval
+    ) throws -> PagerTerminalRenderReport? {
+        guard frameClock.isPaintDue(at: now) else { return nil }
+        return try paintCoalescedFrame(state, at: now)
+    }
+
+    private func paintCoalescedFrame(
+        _ state: PagerRenderState,
+        at now: TimeInterval
+    ) throws -> PagerTerminalRenderReport? {
+        guard frameClock.beginFrame(at: now) else { return nil }
+        defer { frameClock.endFrame() }
+        return try render(state)
+    }
+
+    /// `requestFrame` for a caller that has already run the frame function —
+    /// the live adapter needs the `PagerRenderResult` for its own overlay
+    /// hit-testing bookkeeping, and rendering the state a second time inside
+    /// this class would double the cost of every painted frame.
+    @discardableResult
+    public func requestFrame(
+        _ result: PagerRenderResult,
+        at now: TimeInterval
+    ) throws -> PagerTerminalRenderReport? {
+        guard frameClock.requestPaint(at: now) else { return nil }
+        guard frameClock.beginFrame(at: now) else { return nil }
+        defer { frameClock.endFrame() }
+        return try render(result)
+    }
+
+    /// `flushPendingFrame` over a pre-rendered result. The caller re-renders
+    /// at flush time so the deferred paint shows the *latest* state — the
+    /// whole point of folding is that only the newest frame is worth painting.
+    @discardableResult
+    public func flushPendingFrame(
+        _ result: PagerRenderResult,
+        at now: TimeInterval
+    ) throws -> PagerTerminalRenderReport? {
+        guard frameClock.isPaintDue(at: now) else { return nil }
+        guard frameClock.beginFrame(at: now) else { return nil }
+        defer { frameClock.endFrame() }
+        return try render(result)
     }
 
     @discardableResult

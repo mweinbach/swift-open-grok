@@ -66,12 +66,26 @@ public protocol OpenGrokPagerRuntimeAdapter: Sendable {
     ) async throws -> any OpenGrokPagerSessionAdapter
 
     func replaceSession(from request: OpenGrokPagerRequest) async throws -> String
+
+    /// Swap the live conversation to the stored session `sessionID` — the
+    /// commit half of `/resume` (upstream `Action::ShowSessionPicker`,
+    /// `slash/commands/resume.rs:21-23`, resolved by the picker's selection).
+    /// Returns the resumed session's id.
+    func resumeSession(sessionID: String) async throws -> String
 }
 
 public extension OpenGrokPagerRuntimeAdapter {
     func replaceSession(from request: OpenGrokPagerRequest) async throws -> String {
         _ = request
         throw OpenGrokPagerError.sessionReplacementUnsupported
+    }
+
+    // Defaulted so existing adapters keep compiling; the default fails loudly
+    // rather than pretending to resume, and the controller surfaces the error
+    // as a notice instead of ending the run.
+    func resumeSession(sessionID: String) async throws -> String {
+        _ = sessionID
+        throw OpenGrokPagerError.sessionResumeUnsupported
     }
 }
 
@@ -93,6 +107,7 @@ public enum OpenGrokPagerError: Error, Sendable, Equatable, CustomStringConverti
     case alreadyRunning
     case shutdown
     case sessionReplacementUnsupported
+    case sessionResumeUnsupported
 
     public var description: String {
         switch self {
@@ -102,6 +117,8 @@ public enum OpenGrokPagerError: Error, Sendable, Equatable, CustomStringConverti
             return "pager has been shut down"
         case .sessionReplacementUnsupported:
             return "pager runtime does not support session replacement"
+        case .sessionResumeUnsupported:
+            return "pager runtime does not support resuming stored sessions"
         }
     }
 }
@@ -131,6 +148,8 @@ public actor OpenGrokPagerForwardingFrontend: OpenGrokPagerFrontend {
     private var activeSession: (any OpenGrokPagerSessionAdapter)?
     private var restorationGate: PagerTerminalRestorationGate?
     private var running = false
+    /// A relayed cancel that beat `run` onto this actor; honored at entry.
+    private var cancelledBeforeRun = false
 
     public init(
         renderer: any OpenGrokPagerRenderAdapter,
@@ -149,6 +168,14 @@ public actor OpenGrokPagerForwardingFrontend: OpenGrokPagerFrontend {
         activeSession = session
         let gate = PagerTerminalRestorationGate(renderer: renderer)
         restorationGate = gate
+        // A cancel relayed by the pager can land on this actor before this
+        // method does (the pager publishes its `activeFrontend` a suspension
+        // earlier). Honor it now: finishing the stream with `.cancelled`
+        // lets the loop below run normally and report a cancelled result.
+        if cancelledBeforeRun {
+            cancelledBeforeRun = false
+            await session.cancel()
+        }
 
         do {
             try await renderer.begin()
@@ -200,10 +227,29 @@ public actor OpenGrokPagerForwardingFrontend: OpenGrokPagerFrontend {
     }
 
     public func cancel() async {
-        await activeSession?.cancel()
+        guard let session = activeSession else {
+            // The pager relays cancels here the moment it publishes its
+            // `activeFrontend` — which is one suspension *before* our own
+            // `run` entry stores `activeSession`. A cancel that wins that
+            // race used to no-op, and `run` then awaited a session stream
+            // whose producer was never told to stop: a permanent suspension
+            // for whoever awaited the run. Latch it for `run` to honor.
+            // Cost: with no run in flight at all this cancels the *next*
+            // run instead of no-oping. Acceptable — the pager builds a
+            // fresh frontend per run and only relays cancels mid-run, so
+            // the stale-latch case needs a caller driving the frontend
+            // directly, and for that caller "cancel then run" reading as
+            // cancelled is the less surprising of the two behaviors.
+            cancelledBeforeRun = true
+            return
+        }
+        await session.cancel()
     }
 
     public func shutdown() async {
+        if activeSession == nil {
+            cancelledBeforeRun = true
+        }
         await activeSession?.cancel()
         try? await restorationGate?.restore()
     }
@@ -246,6 +292,10 @@ public actor OpenGrokPager {
     private var lifecycle: OpenGrokGrokPagerLifecycle = .idle
     private var activeSession: (any OpenGrokPagerSessionAdapter)?
     private var activeFrontend: (any OpenGrokPagerFrontend)?
+    /// A cancel that arrived while `run` was still between `.starting` and
+    /// publishing `activeSession` — there was nothing to cancel yet, so the
+    /// request waits here for `run` to honor at its publish point.
+    private var cancelRequested = false
 
     public init(
         runtime: any OpenGrokPagerRuntimeAdapter,
@@ -266,6 +316,9 @@ public actor OpenGrokPager {
         guard activeSession == nil else { throw OpenGrokPagerError.alreadyRunning }
 
         lifecycle = .starting
+        // A latch left by a cancel against a *previous* run (one that failed
+        // between `.starting` and publishing) must not kill this one.
+        cancelRequested = false
         let session = try await runtime.makeSession(for: request)
         let frontend: any OpenGrokPagerFrontend
         do {
@@ -278,6 +331,16 @@ public actor OpenGrokPager {
 
         activeSession = session
         activeFrontend = frontend
+        // Honor a cancel that landed while the two awaits above held the
+        // actor open. Cancelling the session here finishes its stream with
+        // `.cancelled`, so the frontend still runs its whole loop — begin,
+        // forward the terminal event, restore the terminal — and reports
+        // `.cancelled` exactly like a mid-run cancel, just decided earlier.
+        if cancelRequested {
+            cancelRequested = false
+            lifecycle = .cancelling
+            await session.cancel()
+        }
 
         do {
             let result = try await withTaskCancellationHandler {
@@ -313,7 +376,21 @@ public actor OpenGrokPager {
     }
 
     public func cancel() async {
-        guard activeSession != nil else { return }
+        guard activeSession != nil else {
+            // `run` suspends in `makeSession` and `makeFrontend` before it
+            // publishes anything cancellable. A cancel landing in that
+            // window used to return having done nothing — and the swallowed
+            // cancel was a permanent hang, not a glitch: the run went on to
+            // await a session stream whose producer was never told to stop,
+            // and whoever awaited `run` suspended forever (this wedged the
+            // whole OpenGrokPagerTests product for 18+ minutes in serial
+            // suite runs). Latch the request for `run` to honor at its
+            // publish point. The deliberate cost: a cancel with no run in
+            // flight at all remains a silent no-op, which is why the latch
+            // is gated on `.starting`.
+            if lifecycle == .starting { cancelRequested = true }
+            return
+        }
         lifecycle = .cancelling
         await activeFrontend?.cancel()
         if activeFrontend == nil {
@@ -322,6 +399,12 @@ public actor OpenGrokPager {
     }
 
     public func shutdown() async {
+        // The same unpublished-startup window as `cancel()`: a shutdown
+        // during `.starting` must not let the in-flight run sail into a
+        // session stream nobody will ever finish.
+        if lifecycle == .starting, activeSession == nil {
+            cancelRequested = true
+        }
         lifecycle = .shutdown
         await activeFrontend?.cancel()
         await activeFrontend?.shutdown()

@@ -34,13 +34,17 @@ struct PagerCommandRegistryTests {
         PagerCommandDefinition(name: "help", summary: "Show help")
     ])
 
-    @Test("completion is sorted and includes unavailable state")
+    @Test("completion ranks fuzzily and includes unavailable state")
     func completesCommands() {
         let completions = registry.completions(for: "/m")
 
+        // `m` scores identically against `memory`, `model`, and the alias
+        // `m`; ties fall to display order (`slash/mod.rs:1003`).
         #expect(completions.map(\.commandName) == ["memory", "model"])
         #expect(completions[0].availability.isAvailable == false)
-        #expect(completions[1].matchedAlias == nil)
+        // At equal score the exact alias trigger wins the per-command dedupe
+        // (`slash/mod.rs:934-940`), so the model row records the alias hit.
+        #expect(completions[1].matchedAlias == "m")
     }
 
     @Test("autocomplete selection wraps and accepts the canonical command")

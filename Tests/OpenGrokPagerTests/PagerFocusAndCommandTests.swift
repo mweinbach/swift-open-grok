@@ -342,18 +342,23 @@ struct PagerFocusAndCommandTests {
         }
     }
 
-    /// Ranking by registration order is load-bearing, not cosmetic. `/q` is a
-    /// prefix of both `quit` and `queue`; alphabetical ordering would hand the
-    /// run-ending one to whichever sorted first, which is not the command the
-    /// user reaching for `/q` means. Upstream registers `quit` first
-    /// (`slash/commands/mod.rs:78`) for exactly this reason.
-    @Test("an ambiguous prefix offers the earliest-registered command first")
-    func prefixMatchesFollowRegistrationOrder() {
+    /// `/q` ties `quit` and `queue` at the same fuzzy score; upstream's
+    /// ranked dropdown settles ties by recency, then display order
+    /// (`slash/mod.rs:996-1003`), so a cold `/q` offers `queue` first and a
+    /// recently used `quit` overtakes it. The old port resolved this with an
+    /// invented per-command `priority` knob; that was a divergence, removed
+    /// with the move to the fuzzy pipeline.
+    @Test("an ambiguous query resolves ties by recency, then display order")
+    func ambiguousQueryTiebreaks() {
         let registry = PagerCommandRegistry(
             commands: OpenGrokPagerInteractiveController.builtinCommands
         )
-        #expect(registry.completions(for: "/q").first?.commandName == "quit")
-        // An exact match still wins over registration order.
+        #expect(registry.completions(for: "/q").first?.commandName == "queue")
+        #expect(
+            registry.completions(for: "/q", recency: ["quit": 100])
+                .first?.commandName == "quit"
+        )
+        // A fully typed name matches only itself.
         #expect(registry.completions(for: "/queue").first?.commandName == "queue")
         #expect(registry.completions(for: "/h").first?.commandName == "help")
     }
@@ -434,14 +439,16 @@ struct PagerFocusAndCommandTests {
     /// item list a streaming sampler is reading from has to carry it, and this
     /// pins the membership so a new command cannot join silently. `/rewind`
     /// earns it for the same reason `/compact` does — a forced rewind truncates
-    /// history and restores files underneath the running turn.
+    /// history and restores files underneath the running turn — and `/resume`
+    /// because swapping in a stored session replaces the whole conversation,
+    /// the same deferral `/new` takes.
     @Test("only history-mutating commands carry the deferral flag")
     func onlyCompactMutatesHistory() {
         let mutating = OpenGrokPagerInteractiveController.builtinCommands
             .filter(\.mutatesConversationHistory)
             .map(\.name)
             .sorted()
-        #expect(mutating == ["compact", "new", "rewind"])
+        #expect(mutating == ["compact", "new", "resume", "rewind"])
     }
 
     @Test("/rewind cannot execute while a turn is in flight")

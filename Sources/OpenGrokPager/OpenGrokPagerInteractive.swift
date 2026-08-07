@@ -1,7 +1,29 @@
 import Foundation
+import OpenGrokPagerRender
 import OpenGrokTerminalCore
 
 public typealias OpenGrokPagerInputEventStream = AsyncThrowingStream<InputEvent, Error>
+
+/// One wall-clock animation tick from the controller's motion ticker.
+///
+/// `tick` is derived from elapsed wall time (`elapsed / tickInterval`), never
+/// from an event counter — the whole point of the ticker is that a silent
+/// operation keeps the spinner moving. `seconds` is the same clock in seconds
+/// for the wall-time animations (welcome shimmer, finish flash); feed it to
+/// `PagerMotionSnapshot.seconds` and stamp `PagerToolCard.finishedAt` from it.
+public struct OpenGrokPagerAnimationFrame: Sendable, Equatable {
+    public let tick: Int
+    public let seconds: TimeInterval
+    /// The demand this frame was scheduled under — `.slow` frames arrive at
+    /// ~12 fps, `.fast` at the configured animation fps (default 30).
+    public let demand: PagerTickDemand
+
+    public init(tick: Int, seconds: TimeInterval, demand: PagerTickDemand) {
+        self.tick = tick
+        self.seconds = seconds
+        self.demand = demand
+    }
+}
 
 public enum OpenGrokPagerInteractiveLifecycle: String, Sendable, Equatable {
     case idle
@@ -361,6 +383,29 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     case flush(text: String)
     /// `/goal [objective|status|pause|resume|clear]` — the goal tracker.
     case goal(argument: String)
+    /// `/resume` — the stored-session picker (upstream
+    /// `Action::ShowSessionPicker`, `slash/commands/resume.rs:21-23`). The
+    /// session store is a CLI-layer concern, so the intent carries no rows.
+    case sessionPicker
+    /// `/usage`, alias `/cost` — session token usage as a text modal
+    /// (upstream `Action::ShowUsage`, `slash/commands/usage.rs:59`). The
+    /// billing-surface arm (`manage`) is not ported; see the controller.
+    case usage
+    /// `/mcps` — per-server MCP connection status (upstream opens the
+    /// extensions modal's MCP tab, `slash/commands/mcps.rs:19-24`; this port
+    /// renders the same facts as a read-only list).
+    case mcpServers
+    /// `/effort [level]` — reasoning effort on the *current* model (upstream
+    /// `slash/commands/effort.rs:57-92`, a thin wrapper over
+    /// `Action::SwitchModel` with the session's model id). Same shape as
+    /// `.modelPicker`: the controller cannot resolve the level because it
+    /// does not own the model catalog.
+    case reasoningEffort(query: String?)
+    /// `/rename <title>`, alias `/title` — retitle the current session
+    /// (upstream `Action::RenameSession`, `slash/commands/rename.rs:42-53`).
+    /// The empty-title refusal happens in the controller, so `title` here is
+    /// always non-empty.
+    case renameSession(title: String)
     case dismissAll
 }
 
@@ -395,6 +440,10 @@ public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {
     /// The live runtime committed a fresh session and the renderer must clear
     /// its transcript without deleting the previous session's record.
     case sessionReplaced(sessionID: String)
+    /// The live runtime swapped the conversation to a stored session
+    /// (`/resume`). Distinct from `.sessionReplaced`: the renderer paints the
+    /// restored transcript instead of the welcome screen.
+    case sessionResumed(sessionID: String)
     case notice(String)
     /// The user moved the transcript viewport.
     case viewport(OpenGrokPagerViewportCommand)
@@ -437,6 +486,20 @@ public protocol OpenGrokPagerInteractiveRenderAdapter: Sendable {
     /// controller offers every event here before interpreting it. Renderers
     /// with neither default to `.notHandled` and behave exactly as before.
     func handleInput(_ event: InputEvent) async throws -> OpenGrokPagerInputRouting
+
+    /// A wall-clock animation tick. Fired by the controller's motion ticker
+    /// while something on screen demands frames (upstream's `schedule_tick`,
+    /// `event_loop.rs:3172-3189`); never fired while the demand is `.none`,
+    /// which is why an idle screen costs no wakeups.
+    ///
+    /// A live renderer stores `frame.tick`/`frame.seconds` into its
+    /// `PagerMotionSnapshot` and repaints — through a coalescing path
+    /// (`PagerTerminalRenderer.requestFrame`) so tick-rate requests fold into
+    /// the min-draw cadence. This is a protocol extension default (no-op)
+    /// rather than an event enum case so existing adapters keep compiling
+    /// and simply stay still; the cost is that this seam is easy to forget —
+    /// a renderer that never implements it silently keeps the frozen UI.
+    func renderAnimationTick(_ frame: OpenGrokPagerAnimationFrame) async throws
 }
 
 extension OpenGrokPagerInteractiveRenderAdapter {
@@ -447,6 +510,10 @@ extension OpenGrokPagerInteractiveRenderAdapter {
     public func handleInput(_ event: InputEvent) async throws -> OpenGrokPagerInputRouting {
         _ = event
         return .notHandled
+    }
+
+    public func renderAnimationTick(_ frame: OpenGrokPagerAnimationFrame) async throws {
+        _ = frame
     }
 }
 

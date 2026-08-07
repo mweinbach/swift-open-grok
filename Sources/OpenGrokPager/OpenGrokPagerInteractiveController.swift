@@ -1,7 +1,9 @@
+import Dispatch
 import Foundation
 import OpenGrokInterjection
 import OpenGrokPagerCommandUI
 import OpenGrokPagerMinimal
+import OpenGrokPagerRender
 import OpenGrokPromptQueue
 import OpenGrokTerminalCore
 
@@ -106,6 +108,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         /// dropdown intercept ahead of the history step.
         var completions: [OpenGrokPagerCommandSuggestion] = []
         var selectedCompletion: Int?
+        /// Esc closed the dropdown (`slash_close`, `prompt.rs:229-233`); it
+        /// stays closed until the text actually changes. Without the latch,
+        /// the refresh that follows any `.changed` action — cursor moves
+        /// included — would reopen the menu the same keystroke that closed it.
+        var completionsDismissed = false
         /// Set while history browsing is open. Without it, `Down` would stop
         /// browsing the moment `Up` filled the composer with a recalled prompt.
         var isBrowsingHistory = false
@@ -154,11 +161,24 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             cursor = 0
             completions = []
             selectedCompletion = nil
+            completionsDismissed = false
         }
 
         mutating func replace(with value: String) {
             characters = Array(value)
             cursor = characters.count
+            completionsDismissed = false
+        }
+
+        /// Close the dropdown, latching it shut until the text changes.
+        /// Returns whether there was anything to close, so the Esc handler
+        /// can fall through to the cancel/clear ladder when there was not.
+        mutating func dismissCompletions() -> Bool {
+            guard !completions.isEmpty else { return false }
+            completions = []
+            selectedCompletion = nil
+            completionsDismissed = true
+            return true
         }
 
         private mutating func apply(_ event: KeyEvent) -> PromptAction {
@@ -177,6 +197,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 // the whole of `/multiline` upstream.
                 return resolveEnter(modifiers: event.modifiers)
             case .escape:
+                // Unreachable in a live run: the input pump classifies a bare
+                // Esc as a control signal before the editor sees the event.
+                // The dropdown intercept therefore lives in
+                // `handleInterrupt`, not here — an editor-side close was
+                // landed once and silently did nothing.
                 return .escape
             case .tab:
                 // Tab accepts the highlighted completion; with the dropdown
@@ -196,17 +221,27 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 if !completions.isEmpty { return .completionMove(1) }
                 return isEmpty || isBrowsingHistory ? .historyNext : .viewport(.lineDown)
             case .pageUp:
+                // With the dropdown open the paging keys page the menu
+                // (`prompt.rs:187-198`), one visible window per press.
+                if !completions.isEmpty {
+                    return .completionMove(-PagerLayoutMetrics.maxDropdownRows)
+                }
                 return .viewport(.pageUp)
             case .pageDown:
+                if !completions.isEmpty {
+                    return .completionMove(PagerLayoutMetrics.maxDropdownRows)
+                }
                 return .viewport(.pageDown)
             case .backspace:
                 guard cursor > 0 else { return .ignored }
                 characters.remove(at: cursor - 1)
                 cursor -= 1
+                completionsDismissed = false
                 return .changed
             case .delete:
                 guard cursor < characters.count else { return .ignored }
                 characters.remove(at: cursor)
+                completionsDismissed = false
                 return .changed
             case .left:
                 guard cursor > 0 else { return .ignored }
@@ -341,6 +376,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             guard !values.isEmpty else { return }
             characters.insert(contentsOf: values, at: cursor)
             cursor += values.count
+            // New text lifts the Esc dismissal: typing after closing the
+            // dropdown is a fresh query.
+            completionsDismissed = false
         }
     }
 
@@ -581,6 +619,28 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// An armed double-press confirmation and the instant it expires.
     private var pendingConfirmation: (key: String, label: String, deadline: Date)?
 
+    /// What the render layer last reported as moving on screen. Merged with
+    /// the controller's own turn state in `currentMotionDemand()`; the
+    /// controller cannot see a visible running block or the welcome logo, and
+    /// the renderer cannot see a turn that has produced no events yet, so
+    /// neither view alone is the truth.
+    private var externalMotionState = PagerMotionState()
+    /// `[animation].fps` (`appearance/config.rs:371-397`), clamped 1...60.
+    private var motionFPS = PagerMotion.defaultFPS
+    /// The motion epoch, as monotonic uptime nanoseconds. The animation tick
+    /// is `elapsed / tickInterval` — derived from this wall clock, never from
+    /// an event counter, so a silent turn cannot freeze the spinner.
+    private var motionEpochNanos: UInt64?
+    /// The demand-driven ticker (`schedule_tick`, `event_loop.rs:3172-3189`).
+    /// `nil` exactly when no tick is armed, which is the idle case and the
+    /// reason a still screen costs no wakeups.
+    private var motionTicker: Task<Void, Never>?
+
+    /// Slash-command recency. Defaults to the in-memory store, exactly like
+    /// upstream's default controllers (`mru.rs:9-10`); the live composition
+    /// injects the disk-backed store via `setSlashMru`.
+    private var slashMru = PagerSlashMru()
+
     /// Which region owns the keyboard. `Tab` moves it; nothing else does.
     private var focus: OpenGrokPagerFocusRegion = .prompt
     private var modes = OpenGrokPagerInputModes()
@@ -691,6 +751,30 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         argumentSuggestions = provider
     }
 
+    /// Report what the render layer knows is in motion — visible running
+    /// blocks, the welcome logo, background-task chips, and whether the
+    /// terminal can animate at all. Callable at any time, including mid-run;
+    /// a rising demand arms the ticker, a falling one lets it park itself.
+    public func setMotionState(_ state: PagerMotionState) {
+        externalMotionState = state
+        armMotionTickerIfNeeded()
+    }
+
+    /// Set the animation tick rate (`[animation].fps`). Call before `run`;
+    /// the tick derivation divides wall time by this, so changing it mid-run
+    /// would make the tick counter jump.
+    public func setMotionFPS(_ fps: Int) {
+        motionFPS = min(max(fps, PagerMotion.minimumFPS), PagerMotion.maximumFPS)
+    }
+
+    /// Install the slash-command MRU store. Call before `run`. Without this
+    /// the controller uses an isolated in-memory store — recency boosts work
+    /// within the session but do not persist, mirroring upstream's default
+    /// controllers (`mru.rs:9-10`).
+    public func setSlashMru(_ mru: PagerSlashMru) {
+        slashMru = mru
+    }
+
     public func state() -> OpenGrokPagerInteractiveState {
         OpenGrokPagerInteractiveState(
             lifecycle: lifecycle,
@@ -752,6 +836,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         currentRequest = request
         rendererBegan = false
         terminalRestored = false
+        // One epoch per run: every animation frame's tick and seconds are
+        // measured from here, so all motion styles share one clock.
+        motionEpochNanos = DispatchTime.now().uptimeNanoseconds
         let mailbox = SignalMailbox()
         signalMailbox = mailbox
         let inputReader = ThrowingStreamReader(input)
@@ -1027,6 +1114,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             await cancelActiveSession()
             try? await emit(.failed(String(describing: error)))
         }
+
+        // Stop the motion ticker and wait for it to land before touching the
+        // terminal: a tick racing `restoreTerminal` could paint into a
+        // restored screen. Awaiting is safe — the ticker's sleeps are actor
+        // suspensions, so it observes the cancellation promptly.
+        motionTicker?.cancel()
+        if let motionTicker {
+            _ = await motionTicker.value
+        }
+        motionTicker = nil
 
         await closeActiveSession()
         inputPump?.cancel()
@@ -1664,12 +1761,26 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             if !editor.completions.isEmpty {
                 let count = editor.completions.count
                 let current = editor.selectedCompletion ?? 0
-                editor.selectedCompletion = ((current + offset) % count + count) % count
+                if abs(offset) == 1 {
+                    // Arrow steps wrap (`slash_move_selection`).
+                    editor.selectedCompletion = ((current + offset) % count + count) % count
+                } else {
+                    // Page steps clamp at the ends, no wrap-around
+                    // (`slash_scroll_selection`, `prompt_widget/mod.rs:1185-1190`).
+                    editor.selectedCompletion = min(max(current + offset, 0), count - 1)
+                }
             }
         case .completionAccept:
             if let index = editor.selectedCompletion,
                editor.completions.indices.contains(index) {
-                editor.replace(with: editor.completions[index].insertText)
+                let suggestion = editor.completions[index]
+                // Accepting a *command* row records MRU; an argument row does
+                // not (`record_mru = snap.cursor_in_command`,
+                // `prompt_widget/mod.rs:1206-1211`).
+                if Self.argumentPhase(for: editor.text) == nil {
+                    recordSlashMruUse(commandNamed: suggestion.name)
+                }
+                editor.replace(with: suggestion.insertText)
             }
             editor.completions = []
             editor.selectedCompletion = nil
@@ -1679,6 +1790,24 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         return action
     }
 
+    /// Record an accepted slash command in the MRU and hand a persistence
+    /// snapshot to the serialized writer. The write happens off this actor; a
+    /// failed write re-marks the store dirty so the next accept retries —
+    /// upstream's exact recovery (`prompt_widget/mod.rs:1268`, `mru.rs:
+    /// 411-421`).
+    private func recordSlashMruUse(commandNamed name: String) {
+        slashMru.touch(name, now: UInt64(Date().timeIntervalSince1970))
+        guard let snapshot = slashMru.takePersistSnapshot() else { return }
+        Task {
+            // The Task inherits this actor's isolation, so re-marking dirty
+            // after a failed write mutates the store race-free.
+            let written = await PagerSlashMruWriter.shared.write(snapshot)
+            if !written {
+                self.slashMru.markDirty()
+            }
+        }
+    }
+
     /// Slash commands the TUI honors locally. The reference registers ~71 and
     /// routes most of them to a pager `Action`; this port lists only the ones
     /// backed by working Swift wiring, so the dropdown never offers a no-op.
@@ -1686,19 +1815,21 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// Summaries are upstream's verbatim (`src/slash/commands/*.rs`) so the
     /// dropdown reads identically for every command both sides have.
     static let builtinCommands: [PagerCommandDefinition] = [
+        // Registration order is display order: a bare `/` lists exactly this
+        // sequence, mirroring upstream's `builtin_commands()` ("in display
+        // order", `slash/commands/mod.rs:78-81`). `quit` and `help` lead for
+        // the same reason they lead upstream. Ranked queries no longer read
+        // an explicit priority — ordering is fuzzy score, then recency, then
+        // display (`slash/mod.rs:996-1003`), so `/q` resolves its tie by
+        // display order, exactly as upstream's dropdown does.
         PagerCommandDefinition(
             name: "quit",
             aliases: ["exit"],
-            summary: "Quit the application",
-            // `/q` also prefixes `/queue`; upstream registers `quit` first
-            // (`slash/commands/mod.rs:78`) so the short form stays `quit`.
-            priority: 1
+            summary: "Quit the application"
         ),
         PagerCommandDefinition(
             name: "help",
-            summary: "Browse commands and keyboard shortcuts",
-            // `/h` also prefixes `/history`.
-            priority: 1
+            summary: "Browse commands and keyboard shortcuts"
         ),
         PagerCommandDefinition(
             name: "home",
@@ -1709,6 +1840,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             name: "new",
             aliases: ["clear"],
             summary: "Start a new session",
+            mutatesConversationHistory: true
+        ),
+        // `/resume` (`slash/commands/resume.rs:9-19`). Committing a picked
+        // session replaces the live conversation, so it takes the same
+        // mid-turn deferral `/new` does.
+        PagerCommandDefinition(
+            name: "resume",
+            summary: "Resume a previous session",
+            usage: "/resume",
             mutatesConversationHistory: true
         ),
         PagerCommandDefinition(
@@ -1734,11 +1874,29 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             name: "context",
             summary: "View context usage"
         ),
+        // `/usage`, alias `/cost` (`slash/commands/usage.rs:10-16`). The
+        // usage string is the non-consumer grammar (`usage.rs:57-61`, bare
+        // `/usage` only): this port has no billing surface, so advertising
+        // upstream's `[show|manage]` arms would register rows with no
+        // backing.
+        PagerCommandDefinition(
+            name: "usage",
+            aliases: ["cost"],
+            summary: "View session token usage",
+            usage: "/usage"
+        ),
         PagerCommandDefinition(
             name: "model",
             aliases: ["m"],
             summary: "Switch the active model",
             usage: "/model [name]"
+        ),
+        // `/effort` (`slash/commands/effort.rs:14-30`): reasoning effort on
+        // the current model without re-picking it.
+        PagerCommandDefinition(
+            name: "effort",
+            summary: "Set reasoning effort for the current model",
+            usage: "/effort <level>"
         ),
         PagerCommandDefinition(
             name: "multiline",
@@ -1757,6 +1915,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             name: "workflows",
             summary: "Show workflow runs (phases, agents, progress)"
         ),
+        // `/mcps` (`slash/commands/mcps.rs:7-17`).
+        PagerCommandDefinition(
+            name: "mcps",
+            summary: "Show MCP server status",
+            usage: "/mcps"
+        ),
         PagerCommandDefinition(
             name: "toggle-mouse-reporting",
             summary: "Toggle terminal mouse reporting (native click-drag copy/paste)"
@@ -1764,6 +1928,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         PagerCommandDefinition(
             name: "queue",
             summary: "List the prompts queued behind the running turn"
+        ),
+        // `/btw` (`slash/commands/btw.rs:12-38`). Upstream fires an ACP ext
+        // method that bypasses the prompt queue; this port maps it onto the
+        // interjection buffer, which is the same promise — the question rides
+        // ahead of the queue instead of behind it.
+        PagerCommandDefinition(
+            name: "btw",
+            summary: "Ask a side question without interrupting",
+            usage: "/btw <question>"
         ),
         PagerCommandDefinition(
             name: "compact",
@@ -1810,6 +1983,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         PagerCommandDefinition(
             name: "delete",
             summary: "Delete this session and return home"
+        ),
+        // `/rename`, alias `/title` (`slash/commands/rename.rs:10-28`).
+        PagerCommandDefinition(
+            name: "rename",
+            aliases: ["title"],
+            summary: "Rename the current session",
+            usage: "/rename <title>"
         ),
         PagerCommandDefinition(
             name: "remember",
@@ -1893,19 +2073,37 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     }
 
     private func refreshCompletions() {
+        // Esc closed the menu; it stays closed until the text changes.
+        guard !editor.completionsDismissed else {
+            editor.completions = []
+            editor.selectedCompletion = nil
+            return
+        }
         let suggestions: [OpenGrokPagerCommandSuggestion]
         if let argumentPhase = Self.argumentPhase(for: editor.text) {
             // Once the command name is settled the dropdown belongs to the
             // arguments — `commands.completions` would return nothing here
-            // anyway, since it refuses any input containing whitespace.
-            suggestions = Array(
-                (argumentSuggestions?(argumentPhase.command, argumentPhase.query) ?? [])
-                    .prefix(6)
-            )
+            // anyway, since it refuses any input containing whitespace. The
+            // host's provider gets first refusal; commands whose argument
+            // vocabulary lives pager-side fall through to the built-ins.
+            let provided = argumentSuggestions?(argumentPhase.command, argumentPhase.query) ?? []
+            suggestions = provided.isEmpty
+                ? Self.builtinArgumentSuggestions(
+                    command: argumentPhase.command,
+                    query: argumentPhase.query
+                )
+                : provided
         } else {
+            // Recency scores resolved in one pass, keyed by canonical name —
+            // one keystroke, one store read (`slash/mod.rs:985-992`).
+            let now = UInt64(Date().timeIntervalSince1970)
+            var recency: [String: UInt64] = [:]
+            for command in commands.commands where !command.isHidden {
+                let score = slashMru.rankScore(command.name, now: now)
+                if score > 0 { recency[command.name] = score }
+            }
             suggestions = commands
-                .completions(for: editor.text)
-                .prefix(6)
+                .completions(for: editor.text, recency: recency)
                 .map {
                     OpenGrokPagerCommandSuggestion(
                         name: $0.displayName,
@@ -1914,8 +2112,44 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     )
                 }
         }
+        // No row cap: every match rides through and the dropdown renderer
+        // scrolls the six-row window ("No cap here -- the dropdown renderer
+        // handles scrolling", `slash/mod.rs:866-867`). The old `prefix(6)`
+        // here is what made `/theme` unreachable from a bare `/`.
         editor.completions = suggestions
         editor.selectedCompletion = editor.completions.isEmpty ? nil : 0
+    }
+
+    /// Argument rows for commands whose vocabulary lives inside the pager
+    /// targets. Today that is `/theme`: `auto` first, then the selectable
+    /// themes in catalog order, fuzzy-filtered by the typed fragment —
+    /// `ThemeCommand::suggest_args` (`slash/commands/theme.rs:81-110`) run
+    /// through the arg matcher (`slash/mod.rs:1070-1085`).
+    ///
+    /// The `(active)` marker upstream appends is deliberately absent: the
+    /// controller does not own the live theme (the render layer does), and a
+    /// guessed marker would be wrong exactly when it matters.
+    static func builtinArgumentSuggestions(
+        command: String,
+        query: String
+    ) -> [OpenGrokPagerCommandSuggestion] {
+        guard command == "theme" || command == "t" else { return [] }
+        let names = ["auto"] + PagerThemeKind.selectable.map(\.displayName)
+        let rows = names.map { name in
+            OpenGrokPagerCommandSuggestion(
+                name: name,
+                summary: name == "auto" ? "auto (follow system)" : name,
+                // The row commits the whole composer text, not the bare
+                // argument — accepting must leave `/theme Tokyo Night`.
+                insertText: "/theme \(name)"
+            )
+        }
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return rows }
+        let matcher = PagerFuzzyMatcher()
+        return matcher
+            .rank(rows, query: trimmed, limit: rows.count) { $0.name }
+            .map { rows[$0.index] }
     }
 
     /// `/model codex:` → `(command: "model", query: "codex:")`.
@@ -1987,6 +2221,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// otherwise swallowed — it never exits — whereas Ctrl+C on an empty
     /// composer arms a quit.
     private func handleInterrupt(isEscape: Bool, isTurnRunning: Bool) -> InterruptOutcome {
+        // The dropdown intercepts Esc ahead of the whole cancel/clear ladder
+        // (`prompt.rs:229-233`), idle or mid-turn: close the menu, keep the
+        // draft, arm nothing. This must live here rather than in the
+        // editor's key map — the input pump classifies a bare Esc as a
+        // control signal before the editor ever sees the event, so an
+        // editor-side close is unreachable in a live run.
+        if isEscape, editor.dismissCompletions() {
+            return .consumed
+        }
         if isTurnRunning {
             if !isEscape, !editor.text.isEmpty {
                 editor.reset()
@@ -2098,6 +2341,61 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 return .handled
             case "context":
                 try await emit(.overlay(.contextUsage))
+                return .handled
+            case "usage":
+                // Non-consumer arm only (`usage.rs:57-61`): bare `/usage`
+                // shows the readout; any argument is refused with upstream's
+                // copy. `show`/`manage` belong to the billing surface this
+                // port does not have.
+                let usageArgument = Self.rejoined(invocation.arguments)
+                guard usageArgument.isEmpty else {
+                    try await emit(.notice(
+                        "Unknown argument: \(usageArgument). Use /usage"
+                    ))
+                    return .handled
+                }
+                try await emit(.overlay(.usage))
+                return .handled
+            case "resume":
+                // Bare `/resume` opens the picker (`resume.rs:21-23`); the
+                // argument form exists only as the picker's return path — a
+                // selected row round-trips as `/resume <session-id>`.
+                let sessionArgument = Self.rejoined(invocation.arguments)
+                guard !sessionArgument.isEmpty else {
+                    try await emit(.overlay(.sessionPicker))
+                    return .handled
+                }
+                try await resumeStoredSession(sessionID: sessionArgument)
+                return .handled
+            case "btw":
+                let question = Self.rejoined(invocation.arguments)
+                guard !question.isEmpty else {
+                    try await emit(.notice("Usage: /btw <question>"))
+                    return .handled
+                }
+                // Upstream's SendBtw bypasses the prompt queue (`btw.rs:3-4`).
+                // The port's equivalent out-of-band channel is the
+                // interjection buffer: the question leads the next prompt
+                // instead of queueing behind the backlog.
+                try await interject(question, kind: .followUp)
+                return .handled
+            case "mcps":
+                try await emit(.overlay(.mcpServers))
+                return .handled
+            case "effort":
+                let level = Self.rejoined(invocation.arguments)
+                try await emit(.overlay(.reasoningEffort(
+                    query: level.isEmpty ? nil : level
+                )))
+                return .handled
+            case "rename":
+                let title = Self.rejoined(invocation.arguments)
+                guard !title.isEmpty else {
+                    // Upstream's empty-title refusal (`rename.rs:48-50`).
+                    try await emit(.notice("Usage: /rename <new title>"))
+                    return .handled
+                }
+                try await emit(.overlay(.renameSession(title: title)))
                 return .handled
             case "session-info":
                 try await emit(.overlay(.sessionInfo))
@@ -2221,6 +2519,31 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         try await emit(.sessionReplaced(sessionID: sessionID))
     }
 
+    /// Commit a `/resume` selection: swap the runtime to the stored session
+    /// and tell the renderer to paint its transcript.
+    ///
+    /// A refused resume is a notice, not a run failure — the current session
+    /// is untouched on every error path because the runtime mutates nothing
+    /// until its own swap succeeds. Queue and interjections are cleared like
+    /// `/new`: they were written against the conversation being left behind.
+    private func resumeStoredSession(sessionID: String) async throws {
+        let resumedID: String
+        do {
+            resumedID = try await runtime.resumeSession(sessionID: sessionID)
+        } catch {
+            try await emit(.notice(
+                "Could not resume session \(sessionID): \(String(describing: error))"
+            ))
+            return
+        }
+        lastSessionID = resumedID
+        activeSessionID = nil
+        editor.reset()
+        await promptQueue.removeAll()
+        interjections.clear()
+        try await emit(.sessionResumed(sessionID: resumedID))
+    }
+
     /// `/copy [N] [file]` — `N` is 1-based and counts back from the newest
     /// response, so a bare `/copy` is `/copy 1`. A single non-numeric argument
     /// is the file, which is what upstream's parse does too.
@@ -2281,12 +2604,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     Commands
       /help                     Browse commands and keyboard shortcuts
       /model [name]  /m         Switch the active model
+      /effort <level>           Set reasoning effort for the current model
       /new    /clear            Start a new session
+      /resume                   Resume a previous session
+      /rename <title>  /title   Rename the current session
       /home   /welcome          Return to the welcome screen
       /history                  Search prompt history
       /queue                    Prompts queued behind the running turn
+      /btw <question>           Ask a side question without interrupting
       /context                  View context usage
+      /usage  /cost             View session token usage
       /session-info             Show session info
+      /mcps                     Show MCP server status
       /copy [N] [file]          Copy a response to the clipboard or a file
       /export [file]            Export the conversation
       /find [text]              Search the conversation scrollback
@@ -2351,6 +2680,76 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private func transition(to newLifecycle: OpenGrokPagerInteractiveLifecycle) async throws {
         lifecycle = newLifecycle
         try await emit(.lifecycle(newLifecycle))
+        // A lifecycle change is a demand change: `.running` raises fast
+        // demand even before the render layer has seen a single event.
+        armMotionTickerIfNeeded()
+    }
+
+    // MARK: - Motion ticker
+
+    /// The demand right now: the render layer's report, plus what only the
+    /// controller knows — that a turn is running (`tick_demand`,
+    /// `app_view.rs:6078-6120` folds the same two kinds of source).
+    private func currentMotionDemand() -> PagerTickDemand {
+        var state = externalMotionState
+        state.hasRunningTurn = state.hasRunningTurn || lifecycle == .running
+        return state.demand
+    }
+
+    /// Arm the ticker when demanded and none is pending — `schedule_tick`
+    /// (`event_loop.rs:3172-3189`). Idempotent; called from every place the
+    /// demand can rise (run start, lifecycle transitions, `setMotionState`).
+    private func armMotionTickerIfNeeded() {
+        guard running, motionTicker == nil, currentMotionDemand() != .none else { return }
+        // The unstructured Task inherits the actor's isolation, so the loop
+        // body runs on the controller and `Task.sleep` suspends without
+        // holding it.
+        motionTicker = Task { await self.runMotionTicker() }
+    }
+
+    private func runMotionTicker() async {
+        defer { motionTicker = nil }
+        while !Task.isCancelled, running {
+            let demand = currentMotionDemand()
+            // Demand fell to none: park. The next `armMotionTickerIfNeeded`
+            // re-arms — this loop never spins on an idle screen.
+            guard demand != .none else { return }
+            // `.slow` is the welcome shimmer's ~12 fps (`SLOW_TICK_INTERVAL`,
+            // `app_view.rs:259`); `.fast` is the configured animation fps.
+            // A demand change mid-sleep is picked up on the next wake, so a
+            // slow→fast rise can lag one slow interval (≤83 ms) — the same
+            // bound upstream accepts between `schedule_tick` re-arms.
+            let interval = demand == .slow
+                ? PagerMotion.slowTickInterval
+                : PagerMotion.tickInterval(fps: motionFPS)
+            do {
+                try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, running, currentMotionDemand() != .none else { return }
+            do {
+                try await renderer.renderAnimationTick(makeAnimationFrame(demand: demand))
+            } catch {
+                // A renderer that throws on a tick gets no more ticks: a
+                // still UI beats a 30 Hz error loop. The cost is deliberate —
+                // motion stays off for the rest of the run even if the
+                // renderer recovers, because a tick has no channel to report
+                // failure without failing the run itself.
+                return
+            }
+        }
+    }
+
+    private func makeAnimationFrame(demand: PagerTickDemand) -> OpenGrokPagerAnimationFrame {
+        // DispatchTime is the monotonic clock available at this package's
+        // macOS 12 floor (ContinuousClock is 13+).
+        let nowNanos = DispatchTime.now().uptimeNanoseconds
+        let epoch = motionEpochNanos ?? nowNanos
+        if motionEpochNanos == nil { motionEpochNanos = epoch }
+        let seconds = Double(nowNanos &- epoch) / 1_000_000_000
+        let tick = Int(seconds / PagerMotion.tickInterval(fps: motionFPS))
+        return OpenGrokPagerAnimationFrame(tick: tick, seconds: seconds, demand: demand)
     }
 
     private func emit(_ event: OpenGrokPagerInteractiveEvent) async throws {

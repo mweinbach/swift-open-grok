@@ -67,11 +67,15 @@ private extension PagerSettingsOverlay {
 
 @Suite("Settings registry")
 struct PagerSettingsRegistryTests {
-    @Test("the catalog carries the reference's 90 rows across 8 categories")
+    @Test("the catalog carries 90 rows across 8 categories")
     func catalogSize() {
         let registry = PagerSettingsRegistry.default
+        // The reference registers 91; this port hides `show_tips` because the
+        // tips banner it backs does not exist here — a registered no-op row
+        // is the thing the parity rules forbid. Re-add it with the banner.
         #expect(registry.entries.count == 90)
         #expect(PagerSettingCategory.ordered.count == 8)
+        #expect(!registry.entries.contains { $0.key == "show_tips" })
     }
 
     @Test("per-category counts match the reference's registry")
@@ -82,10 +86,12 @@ struct PagerSettingsRegistryTests {
         #expect(registry.rows(in: .editor).count == 7)
         #expect(registry.rows(in: .agent).count == 9)
         #expect(registry.rows(in: .privacy).count == 1)
-        #expect(registry.rows(in: .models).count == 23)
-        // 21 top-level Advanced rows plus the 7 contextual-hint children, which
-        // are registered but only reachable inside the group sheet.
-        #expect(registry.rows(in: .advanced).count == 28)
+        // 24 includes `meta_api_key` (`settings/defs.rs:1184-1202`).
+        #expect(registry.rows(in: .models).count == 24)
+        // 20 top-level Advanced rows plus the 7 contextual-hint children, which
+        // are registered but only reachable inside the group sheet. Upstream
+        // has one more (`show_tips`), hidden here until the tips banner exists.
+        #expect(registry.rows(in: .advanced).count == 27)
         #expect(registry.rows(in: .session).isEmpty)
     }
 

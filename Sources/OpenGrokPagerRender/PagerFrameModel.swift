@@ -117,6 +117,12 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
     public var detail: String?
     public var state: PagerToolState
     public var isExpanded: Bool
+    /// When the tool reached a terminal state, in `PagerMotionSnapshot.seconds`
+    /// time. A just-finished block keeps its bright accent for the 400 ms
+    /// finish flash (`scrollback/state/types.rs:84`); `nil` means "unknown",
+    /// which renders as already-static — a producer that never stamps this
+    /// simply gets no flash, not a stuck-bright block.
+    public var finishedAt: TimeInterval?
 
     public init(
         name: String,
@@ -125,7 +131,8 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
         output: String? = nil,
         detail: String? = nil,
         state: PagerToolState = .pending,
-        isExpanded: Bool = false
+        isExpanded: Bool = false,
+        finishedAt: TimeInterval? = nil
     ) {
         self.name = name
         self.kind = kind ?? PagerToolKind.infer(fromToolNamed: name)
@@ -134,6 +141,7 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
         self.detail = detail
         self.state = state
         self.isExpanded = isExpanded
+        self.finishedAt = finishedAt
     }
 }
 
@@ -209,6 +217,22 @@ public struct PagerStatusBar: Sendable, Equatable, Hashable {
 
 // MARK: - Turn status row
 
+/// Which glyph leads the turn-status row, and how it animates.
+///
+/// Upstream picks between three cues in `turn_status.rs`: the braille turn
+/// spinner (`:420`), the pulsing "waiting on you" diamond (`:484-486`), and
+/// the calm `○ ◎ ◉ ◎` monitor pulse for idle-with-watchers (`:322-325`).
+public enum PagerTurnIndicator: Sendable, Equatable, Hashable {
+    /// The braille spinner — a turn is actively running.
+    case spinner
+    /// `◆` pulsing dim→bright in `accent_user` — the turn is parked on the
+    /// user (permission prompt, ask-user question, drain blocked).
+    case pendingUserDiamond
+    /// `○ ◎ ◉ ◎` at half the spinner's rate — the agent is idle but watcher
+    /// work (background tasks, monitors) is still alive.
+    case idleMonitor
+}
+
 public struct PagerTurnStatus: Sendable, Equatable, Hashable {
     /// One of the reference's fixed activity labels — `"Thinking…"`,
     /// `"Responding…"`, `"Cancelling…"`, a running tool's title, and so on.
@@ -216,12 +240,15 @@ public struct PagerTurnStatus: Sendable, Equatable, Hashable {
     public var label: String
     public var isCancelling: Bool
     /// Monotonic animation tick; the spinner advances every fourth tick.
+    /// Live producers should feed the wall-clock tick from the controller's
+    /// animation frames, not an event counter.
     public var tick: Int
     public var elapsed: TimeInterval?
     public var tokenCount: Int?
     public var queuedPromptCount: Int
     /// Whether a bare Enter would force-send the top queued row.
     public var queueIsSendable: Bool
+    public var indicator: PagerTurnIndicator
 
     public init(
         label: String,
@@ -230,7 +257,8 @@ public struct PagerTurnStatus: Sendable, Equatable, Hashable {
         elapsed: TimeInterval? = nil,
         tokenCount: Int? = nil,
         queuedPromptCount: Int = 0,
-        queueIsSendable: Bool = false
+        queueIsSendable: Bool = false,
+        indicator: PagerTurnIndicator = .spinner
     ) {
         self.label = label
         self.isCancelling = isCancelling
@@ -239,6 +267,7 @@ public struct PagerTurnStatus: Sendable, Equatable, Hashable {
         self.tokenCount = tokenCount
         self.queuedPromptCount = queuedPromptCount
         self.queueIsSendable = queueIsSendable
+        self.indicator = indicator
     }
 }
 
@@ -449,6 +478,10 @@ public struct PagerRenderState: Sendable, Equatable {
     /// Overlays layered above the transcript. A non-empty stack also holds
     /// input focus — see `PagerOverlayStack.handle`.
     public var overlays: PagerOverlayStack
+    /// The animation clock this frame samples. Defaults to disabled, so a
+    /// producer that never wires the tick loop renders the same still frame
+    /// as before — see `PagerMotionSnapshot`.
+    public var motion: PagerMotionSnapshot
 
     public init(
         size: TerminalSize,
@@ -462,7 +495,8 @@ public struct PagerRenderState: Sendable, Equatable {
         theme: PagerRenderTheme = .default,
         showScrollbar: Bool = true,
         selectedBlockIndex: Int? = nil,
-        overlays: PagerOverlayStack = PagerOverlayStack()
+        overlays: PagerOverlayStack = PagerOverlayStack(),
+        motion: PagerMotionSnapshot = PagerMotionSnapshot()
     ) {
         self.overlays = overlays
         self.selectedBlockIndex = selectedBlockIndex
@@ -476,6 +510,7 @@ public struct PagerRenderState: Sendable, Equatable {
         self.scrollPosition = scrollPosition
         self.theme = theme
         self.showScrollbar = showScrollbar
+        self.motion = motion
     }
 }
 

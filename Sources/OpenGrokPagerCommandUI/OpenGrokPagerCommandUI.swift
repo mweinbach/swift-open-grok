@@ -40,16 +40,13 @@ public struct PagerCommandDefinition: Codable, Equatable, Hashable, Sendable, Id
     /// (`slash/commands/compact.rs:49`) instead of resolving locally — and this
     /// flag is how the port keeps that guarantee while still dispatching the
     /// harmless majority inline.
-    public let mutatesConversationHistory: Bool
-    /// Tie-break for an ambiguous prefix, highest first. Zero — the default —
-    /// leaves suggestions in plain name order.
     ///
-    /// A prefix like `/q` matches both `quit` and `queue`, and which one the
-    /// dropdown offers should be a decision, not an artifact of the alphabet.
-    /// Upstream settles it with registration order (`slash/commands/mod.rs:78`
-    /// registers `quit` first); this is the same decision made explicit, so a
-    /// command added later cannot quietly take a prefix away from an older one.
-    public let priority: Int
+    /// (An earlier `priority` prefix tie-break was removed with the move to
+    /// fuzzy matching: upstream's ordering is score → recency → display
+    /// (`slash/mod.rs:996-1003`) and carries no per-command priority, so a
+    /// knob here would be an invented ordering input with no upstream
+    /// counterpart.)
+    public let mutatesConversationHistory: Bool
 
     public init(
         name: String,
@@ -58,8 +55,7 @@ public struct PagerCommandDefinition: Codable, Equatable, Hashable, Sendable, Id
         usage: String? = nil,
         availability: PagerCommandAvailability = .available,
         isHidden: Bool = false,
-        mutatesConversationHistory: Bool = false,
-        priority: Int = 0
+        mutatesConversationHistory: Bool = false
     ) {
         let normalizedName = Self.normalize(name)
         self.id = normalizedName
@@ -70,7 +66,6 @@ public struct PagerCommandDefinition: Codable, Equatable, Hashable, Sendable, Id
         self.availability = availability
         self.isHidden = isHidden
         self.mutatesConversationHistory = mutatesConversationHistory
-        self.priority = priority
     }
 
     public var isValid: Bool {
@@ -203,23 +198,19 @@ public struct PagerCommandCompletion: Codable, Equatable, Hashable, Sendable, Id
     public let summary: String
     public let availability: PagerCommandAvailability
     public let matchedAlias: String?
-    /// Copied from the definition so the sort can tie-break without a lookup.
-    public let priority: Int
 
     public init(
         commandName: String,
         displayName: String,
         summary: String,
         availability: PagerCommandAvailability,
-        matchedAlias: String? = nil,
-        priority: Int = 0
+        matchedAlias: String? = nil
     ) {
         self.commandName = commandName
         self.displayName = displayName
         self.summary = summary
         self.availability = availability
         self.matchedAlias = matchedAlias
-        self.priority = priority
         self.id = commandName
     }
 
@@ -227,12 +218,16 @@ public struct PagerCommandCompletion: Codable, Equatable, Hashable, Sendable, Id
 }
 
 public struct PagerCommandRegistry: Equatable, Hashable, Sendable {
+    /// Registration order, preserved. Upstream's `builtin_commands()` is "the
+    /// single source of truth ... in display order" (`slash/commands/mod.rs:
+    /// 78-81`), and a bare `/` lists exactly that order (`slash/mod.rs:
+    /// 865-899`) — alphabetizing here is what used to bury `/theme` below the
+    /// six-row fold.
     public let commands: [PagerCommandDefinition]
     public init(commands: [PagerCommandDefinition] = []) {
         var seen = Set<String>()
         self.commands = commands
             .filter { $0.isValid }
-            .sorted { $0.name < $1.name }
             .filter { definition in
                 guard !seen.contains(definition.name) else { return false }
                 seen.insert(definition.name)
@@ -254,30 +249,124 @@ public struct PagerCommandRegistry: Equatable, Hashable, Sendable {
     }
 
     public func completions(for input: String) -> [PagerCommandCompletion] {
+        completions(for: input, recency: [:])
+    }
+
+    /// Suggestions for a slash query — `command_suggestions`
+    /// (`slash/mod.rs:849-1010`).
+    ///
+    /// A bare `/` lists every visible command in registration order with no
+    /// cap ("the dropdown renderer handles scrolling", `slash/mod.rs:867`).
+    /// A non-empty query fuzzy-ranks every trigger (canonical name and each
+    /// alias), keeps the best trigger per command with upstream's tie-break
+    /// (exact match text, then canonical over alias, then match text order —
+    /// `slash/mod.rs:922-953`), and sorts by fuzzy score descending, recency
+    /// descending, then display ascending (`slash/mod.rs:996-1003`).
+    ///
+    /// `recency` maps canonical command names to `PagerSlashMru.rankScore`
+    /// values. Upstream inserts a builtin-over-plugin tie-break between
+    /// recency and display; this registry has no source tag on a definition,
+    /// so that key is skipped — the only observable difference is ordering
+    /// between a builtin and a custom command at identical score and recency.
+    public func completions(
+        for input: String,
+        recency: [String: UInt64]
+    ) -> [PagerCommandCompletion] {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.first == "/", !trimmed.contains(where: { $0.isWhitespace }) else { return [] }
-        let query = String(trimmed.dropFirst()).lowercased()
-        return commands.compactMap { command in
-            guard !command.isHidden else { return nil }
-            let canonicalMatch = command.name.hasPrefix(query)
-            let alias = command.aliases.first(where: { $0.hasPrefix(query) })
-            guard canonicalMatch || alias != nil else { return nil }
-            return PagerCommandCompletion(
-                commandName: command.name,
-                displayName: "/\(command.name)",
-                summary: command.summary.isEmpty ? command.availability.label : command.summary,
-                availability: command.availability,
-                matchedAlias: canonicalMatch ? nil : alias,
-                priority: command.priority
-            )
+        // Not lowercased: smart case belongs to the matcher, which folds an
+        // all-lowercase query and respects an uppercase one.
+        let query = String(trimmed.dropFirst())
+        let visible = commands.filter { !$0.isHidden }
+
+        if query.isEmpty {
+            return visible.map { row(for: $0, matchedAlias: nil) }
         }
-        .sorted { lhs, rhs in
-            let lhsExact = lhs.commandName == query
-            let rhsExact = rhs.commandName == query
-            if lhsExact != rhsExact { return lhsExact }
-            if lhs.priority != rhs.priority { return lhs.priority > rhs.priority }
-            return lhs.commandName < rhs.commandName
+        // Reject double-slash sequences (`slash/mod.rs:901-904`).
+        guard !query.contains("/") else { return [] }
+
+        struct Trigger {
+            let commandIndex: Int
+            let matchText: String
+            let alias: String?
         }
+        var triggers: [Trigger] = []
+        for (index, command) in visible.enumerated() {
+            triggers.append(Trigger(commandIndex: index, matchText: command.name, alias: nil))
+            for alias in command.aliases {
+                triggers.append(Trigger(commandIndex: index, matchText: alias, alias: alias))
+            }
+        }
+
+        let matcher = PagerFuzzyMatcher()
+        let hits = matcher.rank(triggers, query: query, limit: triggers.count) { $0.matchText }
+
+        // Best trigger per command (`slash/mod.rs:922-953`).
+        var bestPerCommand: [Int: (score: Int, triggerIndex: Int)] = [:]
+        for (triggerIndex, score) in hits {
+            let trigger = triggers[triggerIndex]
+            guard let current = bestPerCommand[trigger.commandIndex] else {
+                bestPerCommand[trigger.commandIndex] = (score, triggerIndex)
+                continue
+            }
+            let dominates: Bool
+            if score != current.score {
+                dominates = score > current.score
+            } else {
+                let currentTrigger = triggers[current.triggerIndex]
+                let newExact = trigger.matchText == query
+                let currentExact = currentTrigger.matchText == query
+                if newExact != currentExact {
+                    dominates = newExact
+                } else {
+                    let newCanonical = trigger.alias == nil
+                    let currentCanonical = currentTrigger.alias == nil
+                    if newCanonical != currentCanonical {
+                        dominates = newCanonical
+                    } else {
+                        dominates = trigger.matchText < currentTrigger.matchText
+                    }
+                }
+            }
+            if dominates {
+                bestPerCommand[trigger.commandIndex] = (score, triggerIndex)
+            }
+        }
+
+        return bestPerCommand
+            .map { entry in
+                (
+                    commandIndex: entry.key,
+                    score: entry.value.score,
+                    triggerIndex: entry.value.triggerIndex
+                )
+            }
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score { return lhs.score > rhs.score }
+                let lhsRecency = recency[visible[lhs.commandIndex].name] ?? 0
+                let rhsRecency = recency[visible[rhs.commandIndex].name] ?? 0
+                if lhsRecency != rhsRecency { return lhsRecency > rhsRecency }
+                return visible[lhs.commandIndex].name < visible[rhs.commandIndex].name
+            }
+            .map { entry in
+                row(
+                    for: visible[entry.commandIndex],
+                    matchedAlias: triggers[entry.triggerIndex].alias
+                )
+            }
+    }
+
+    private func row(
+        for command: PagerCommandDefinition,
+        matchedAlias: String?
+    ) -> PagerCommandCompletion {
+        PagerCommandCompletion(
+            commandName: command.name,
+            displayName: "/\(command.name)",
+            summary: command.summary.isEmpty ? command.availability.label : command.summary,
+            availability: command.availability,
+            matchedAlias: matchedAlias
+        )
     }
 
     public func autocompleteState(for input: String) -> PagerCommandAutocompleteState {

@@ -260,7 +260,10 @@ struct OpenGrokPagerInteractiveControllerTests {
 
         let states = await renderer.promptStates
         #expect(states.contains { $0.completions.contains { $0.name == "/quit" } })
-        #expect(states.last?.text == "/quit")
+        // `/q` ties `queue` and `quit`; with no recency the display-order
+        // tiebreak puts `/queue` first (`slash/mod.rs:996-1003`), so Tab
+        // accepts it.
+        #expect(states.last?.text == "/queue")
         #expect(states.last?.completions.isEmpty == true)
     }
 

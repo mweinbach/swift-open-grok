@@ -267,6 +267,112 @@ extension PagerMotion {
     }
 }
 
+// MARK: - Motion snapshot
+
+/// The animation inputs one painted frame samples: the wall-clock tick, the
+/// wall-clock seconds, and whether motion is on at all.
+///
+/// `tick` and `seconds` are two views of the same clock — the reference keeps
+/// both because the spinner/wave family counts *ticks* (`scrollback/state/
+/// mod.rs:449-451`) while the shimmer and the finish flash read *wall time*
+/// (`welcome/logo.rs:70`, `scrollback/state/types.rs:84`), so a frame at a
+/// non-default fps animates the tick family slower without stretching the
+/// 400 ms flash.
+///
+/// The default is *disabled at tick zero*: a caller that does not supply a
+/// snapshot renders exactly the still frame this port always rendered. That
+/// keeps every existing snapshot test byte-identical, at the cost that the
+/// live composition must construct the snapshot explicitly before anything
+/// moves — which is the CLI slice's half of this seam.
+public struct PagerMotionSnapshot: Sendable, Equatable, Hashable {
+    /// Animation tick derived from wall time (`elapsed / tickInterval`), not
+    /// from an event counter — a silent turn must not freeze the spinner.
+    public var tick: Int
+    /// Seconds since the UI's motion epoch, on the same clock as
+    /// `PagerToolCard.finishedAt`.
+    public var seconds: TimeInterval
+    public var enabled: Bool
+
+    public init(tick: Int = 0, seconds: TimeInterval = 0, enabled: Bool = false) {
+        self.tick = tick
+        self.seconds = seconds
+        self.enabled = enabled
+    }
+}
+
+// MARK: - Display-refresh cadence policy
+
+/// The `[ui.display_refresh]` policy the paint cadence is resolved from —
+/// `DisplayRefreshPolicy` (`display_refresh.rs`), defaults per
+/// `defaults_probe_on_auto_off` (`display_refresh.rs:367-378`): probe on,
+/// auto **off**, floor 8 ms, ceiling 16 ms, Hz band 55...165.
+public struct PagerDisplayRefreshPolicy: Sendable, Equatable, Hashable {
+    public var probeEnabled: Bool
+    /// The "Match display refresh rate" settings row
+    /// (`ui.display_refresh.auto_cadence_enabled`). This type is that row's
+    /// reader: `PagerFrameClock.cadence(environment:policy:probedRefreshHz:)`
+    /// only lets a probed Hz shorten the paint cadence when this is true.
+    public var autoCadenceEnabled: Bool
+    public var floorMs: Int
+    public var ceilingMs: Int
+    public var minHz: Int
+    public var maxHz: Int
+
+    public init(
+        probeEnabled: Bool = true,
+        autoCadenceEnabled: Bool = false,
+        floorMs: Int = 8,
+        ceilingMs: Int = 16,
+        minHz: Int = 55,
+        maxHz: Int = 165
+    ) {
+        self.probeEnabled = probeEnabled
+        self.autoCadenceEnabled = autoCadenceEnabled
+        // `order_bounds` upstream repairs an inverted pair rather than
+        // trusting it; a floor above the ceiling would invert the clamp.
+        self.floorMs = min(floorMs, ceilingMs)
+        self.ceilingMs = max(floorMs, ceilingMs)
+        self.minHz = min(minHz, maxHz)
+        self.maxHz = max(minHz, maxHz)
+    }
+}
+
+extension PagerFrameClock {
+    /// Resolve the paint cadence from policy, probe, and environment —
+    /// `resolve_motion_cadence` (`display_refresh.rs:326-339`) plus the
+    /// `GROK_MIN_DRAW_MS` override rule (`display_refresh_startup.rs:41-48`).
+    ///
+    /// Order of authority, highest first:
+    ///   1. `GROK_MIN_DRAW_MS` — *presence* wins, even unparsable (upstream
+    ///      counts a set-but-invalid var as "set", clamped default).
+    ///   2. Auto cadence: probe on + flag on + Hz inside `[minHz, maxHz]` →
+    ///      `clamp(round(1000/hz), floor, ceiling)` (`decide_auto_cadence`,
+    ///      `display_refresh.rs:255-291`).
+    ///   3. The 16 ms default.
+    ///
+    /// `probedRefreshHz` is a parameter because this port has no display
+    /// probe FFI yet; until the CLI supplies one the auto branch resolves to
+    /// upstream's `probe_skip` (default cadence), which is exactly what the
+    /// row's "Restart required" caption already promises.
+    public static func cadence(
+        environment: [String: String],
+        policy: PagerDisplayRefreshPolicy,
+        probedRefreshHz: Int?
+    ) -> TimeInterval {
+        if environment["GROK_MIN_DRAW_MS"] != nil {
+            return cadence(environment: environment)
+        }
+        guard policy.probeEnabled,
+              policy.autoCadenceEnabled,
+              let hz = probedRefreshHz,
+              hz >= policy.minHz, hz <= policy.maxHz
+        else { return PagerMotion.defaultPaintCadence }
+        let raw = max(1, Int((1000.0 / Double(hz)).rounded()))
+        let clamped = min(max(raw, policy.floorMs), policy.ceilingMs)
+        return Double(clamped) / 1000
+    }
+}
+
 // MARK: - Tick demand
 
 /// How urgently the frame loop needs to tick (`TickDemand`,
