@@ -646,6 +646,10 @@ struct PagerSettingsCloseTests {
     @Test("the footer follows the mode, so the keys shown are the keys that work")
     func footerFollowsMode() {
         var overlay = PagerSettingsOverlay()
+        // Focus an explicit boolean row: the catalog's first selectable row is
+        // no longer a toggle now that reader-less appearance rows are hidden,
+        // and this test pins hint/kind agreement, not catalog ordering.
+        focus(&overlay, "vim_mode")
         #expect(pagerSettingsHints(overlay).contains { $0.key == "Space" })
 
         focus(&overlay, "theme")
