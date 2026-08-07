@@ -37,9 +37,18 @@ private final class CapturingSink: PagerTerminalSink, @unchecked Sendable {
     /// after stripping.
     var strippedText: String {
         lock.lock(); defer { lock.unlock() }
+        return stripANSI(bytes)
+    }
+
+    /// Raw bytes for assertions on truecolor sequences the stripper removes.
+    var rawBytes: [UInt8] {
+        lock.lock(); defer { lock.unlock() }
+        return bytes
+    }
+
+    private func stripANSI(_ data: [UInt8]) -> String {
         var output = ""
         var index = 0
-        let data = bytes
         while index < data.count {
             guard data[index] == 0x1B else {
                 output.unicodeScalars.append(Unicode.Scalar(data[index]))
@@ -87,11 +96,24 @@ private struct RendererFixture {
         sessionCatalogHome: URL? = nil,
         sessionID: String = "live-session",
         mcpServers: [MCPServerConnection] = [],
-        compaction: LiveCompactionCoordinator? = nil
+        compaction: LiveCompactionCoordinator? = nil,
+        environment: [String: String]? = nil,
+        configTOML: String? = nil
     ) throws {
         home = FileManager.default.temporaryDirectory
             .appendingPathComponent("opengrok-pager-reach-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        if let configTOML {
+            try configTOML.write(
+                to: home.appendingPathComponent("config.toml"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+        let resolvedEnvironment = environment ?? [
+            "HOME": home.path,
+            "OPENGROK_HOME": home.path,
+        ]
         sink = CapturingSink()
         let terminal = OpenGrokLiveTerminal(
             isTTY: { false },
@@ -116,7 +138,8 @@ private struct RendererFixture {
             // The shortest legal cadence, so a folded frame's flush timer
             // fires within a couple of milliseconds and the poll below stays
             // fast.
-            paintCadence: PagerMotion.minimumPaintCadence
+            paintCadence: PagerMotion.minimumPaintCadence,
+            environment: resolvedEnvironment
         )
     }
 
@@ -299,6 +322,36 @@ struct LivePagerCommandReachabilityTests {
         try await fixture.renderer.render(.overlay(.reasoningEffort(query: "turbo")))
         #expect(await fixture.waitForFrame(containing: "'turbo';"))
         try await fixture.renderer.restoreTerminal()
+    }
+}
+
+// MARK: - Startup `[ui]` hydration
+
+@Suite("Live UI config hydration", .serialized)
+struct LiveUIConfigHydrationTests {
+    @Test("effective `[ui]` theme and vim_mode apply on first paint")
+    func startupHydratesThemeAndVimMode() async throws {
+        let fixture = try RendererFixture(configTOML: """
+            [ui]
+            theme = "grokday"
+            vim_mode = true
+            """)
+        defer { fixture.dispose() }
+
+        let defaultFixture = try RendererFixture()
+        defer { defaultFixture.dispose() }
+
+        try await fixture.renderer.begin()
+        try await defaultFixture.renderer.begin()
+
+        // First paint with `[ui] theme = grokday` must differ from the
+        // hard-default GrokNight the unconfigured renderer still uses.
+        #expect(fixture.sink.rawBytes != defaultFixture.sink.rawBytes)
+
+        try await fixture.renderer.render(.overlay(.sessionInfo))
+        #expect(await fixture.waitForFrame(containing: "vim"))
+        try await fixture.renderer.restoreTerminal()
+        try await defaultFixture.renderer.restoreTerminal()
     }
 }
 

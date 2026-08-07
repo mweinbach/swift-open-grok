@@ -466,26 +466,19 @@ private let contextualHintsChildren = [
     "contextual_hints.ssh_wrap"
 ]
 
-/// `default_settings()` (`defs.rs:604-2427`) — all 90 rows.
-///
-/// Order within a category is the reference's registration order, which is not
-/// its line order: the modal groups by category and paints in registration
-/// order inside each group.
+/// `default_settings()` (`defs.rs:604-2427`) — all 90 rows upstream; this
+/// port registers fewer because rows without a live renderer reader are hidden
+/// (same rule as `show_tips`).
 public let pagerDefaultSettings: [PagerSettingMeta] = {
     var rows: [PagerSettingMeta] = []
 
-    // MARK: Appearance (17)
+    // MARK: Appearance (7 — upstream 17 minus 10 without live readers)
 
     rows += [
-        PagerSettingMeta(
-            key: "compact_mode",
-            category: .appearance,
-            label: "Compact mode",
-            description: "Reduce padding around messages for more content density. Auto-enabled while the terminal is 20 rows or shorter.",
-            keywords: ["density", "padding"],
-            kind: .bool(default: false),
-            storage: .config(path: "ui.compact_mode")
-        ),
+        // Hidden until the renderer reads them (config round-trips; modal omits):
+        // `compact_mode`, `show_timestamps`, `show_timeline`, `page_flip_on_send`,
+        // `simple_mode`, `render_mermaid`, `max_thoughts_width`, `show_thinking_blocks`,
+        // `group_tool_verbs`, `collapsed_edit_blocks`.
         PagerSettingMeta(
             key: "screen_mode",
             category: .appearance,
@@ -495,44 +488,6 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             kind: .enumeration(default: "fullscreen", choices: PagerSettingChoices.screenMode, supportsPreview: false),
             storage: .config(path: "ui.screen_mode"),
             restartRequired: true
-        ),
-        PagerSettingMeta(
-            key: "show_timestamps",
-            category: .appearance,
-            label: "Show timestamps",
-            description: "Show clock time next to user messages and agent responses.",
-            keywords: ["clock", "time"],
-            kind: .bool(default: true),
-            storage: .config(path: "ui.show_timestamps")
-        ),
-        PagerSettingMeta(
-            key: "show_timeline",
-            category: .appearance,
-            label: "Timeline sidebar",
-            description: "Per-turn tick rail in place of the scrollbar: hover previews a turn, click jumps to it.",
-            keywords: ["sidebar", "scrollbar", "turns"],
-            kind: .bool(default: false),
-            storage: .config(path: "ui.show_timeline"),
-            hiddenInMinimal: true
-        ),
-        PagerSettingMeta(
-            key: "page_flip_on_send",
-            category: .appearance,
-            label: "Snap prompt to top on send",
-            description: "When you send a prompt, scroll it to the top of the screen so the response starts on a fresh page (default). Turn off to leave the scroll position unchanged when you send.",
-            keywords: ["scroll", "page"],
-            kind: .bool(default: true),
-            storage: .config(path: "ui.page_flip_on_send"),
-            hiddenInMinimal: true
-        ),
-        PagerSettingMeta(
-            key: "simple_mode",
-            category: .appearance,
-            label: "Disable vim input mode",
-            description: "Use plain readline-style input instead of vim keys in the prompt. Experimental.",
-            keywords: ["vim", "readline", "input"],
-            kind: .bool(default: true),
-            storage: .config(path: "ui.simple_mode")
         ),
         PagerSettingMeta(
             key: "vim_mode",
@@ -574,33 +529,6 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             hiddenInMinimal: true
         ),
         PagerSettingMeta(
-            key: "render_mermaid",
-            category: .appearance,
-            label: "Render Mermaid diagrams",
-            description: "How mermaid code blocks are shown: auto/on add a clickable row to open the rendered diagram; off shows the raw source.",
-            keywords: ["diagram", "mermaid"],
-            kind: .enumeration(default: "auto", choices: PagerSettingChoices.renderMermaid, supportsPreview: false),
-            storage: .config(path: "ui.render_mermaid")
-        ),
-        PagerSettingMeta(
-            key: "max_thoughts_width",
-            category: .appearance,
-            label: "Max thoughts width",
-            description: "Column width budget for the agent's thoughts panel (40-500, default 120).",
-            keywords: ["thinking", "width", "wrap"],
-            kind: .integer(default: 120, minimum: 40, maximum: 500),
-            storage: .config(path: "ui.max_thoughts_width")
-        ),
-        PagerSettingMeta(
-            key: "show_thinking_blocks",
-            category: .appearance,
-            label: "Show thinking blocks",
-            description: "Show agent thinking/reasoning blocks in the scrollback while streaming.",
-            keywords: ["thinking", "reasoning"],
-            kind: .bool(default: true),
-            storage: .config(path: "ui.show_thinking_blocks")
-        ),
-        PagerSettingMeta(
             key: "respect_manual_folds",
             category: .appearance,
             label: "Respect manual folds",
@@ -608,24 +536,6 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             keywords: ["fold", "collapse", "scroll"],
             kind: .bool(default: false),
             storage: .sessionLocal
-        ),
-        PagerSettingMeta(
-            key: "group_tool_verbs",
-            category: .appearance,
-            label: "Group tool calls",
-            description: "Fold consecutive read/search/list tool calls and subagent rows into one summary row; finished thoughts fold into the group too.",
-            keywords: ["tools", "group", "fold"],
-            kind: .bool(default: true),
-            storage: .config(path: "ui.group_tool_verbs")
-        ),
-        PagerSettingMeta(
-            key: "collapsed_edit_blocks",
-            category: .appearance,
-            label: "Collapsed edit blocks",
-            description: "Show edits as one-line +N/-M diffstat summaries and merge back-to-back edits to the same file into one block; expand a row to see the diffs.",
-            keywords: ["diff", "edit", "collapse"],
-            kind: .bool(default: false),
-            storage: .config(path: "ui.collapsed_edit_blocks")
         ),
         PagerSettingMeta(
             key: "display_refresh_auto_cadence",
@@ -640,57 +550,12 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
         )
     ]
 
-    // MARK: Mouse (5)
+    // MARK: Mouse (0 — upstream 5; scroll/selection rows have no live reader)
 
-    rows += [
-        PagerSettingMeta(
-            key: "scroll_speed",
-            category: .mouse,
-            label: "Scroll speed",
-            description: "Mouse-wheel and trackpad scroll speed multiplier (1-100). Higher = faster.",
-            keywords: ["wheel", "trackpad"],
-            kind: .integer(default: 50, minimum: 1, maximum: 100),
-            storage: .config(path: "ui.scroll_speed")
-        ),
-        PagerSettingMeta(
-            key: "scroll_mode",
-            category: .mouse,
-            label: "Scroll input",
-            description: "Force wheel or trackpad scroll behavior when auto-detection misreads your device.",
-            keywords: ["wheel", "trackpad", "detect"],
-            kind: .enumeration(default: "auto", choices: PagerSettingChoices.scrollMode, supportsPreview: false),
-            storage: .config(path: "ui.scroll_mode")
-        ),
-        PagerSettingMeta(
-            key: "scroll_lines",
-            category: .mouse,
-            label: "Scroll lines",
-            description: "Lines per scroll tick for both wheel and trackpad (1-10). Until set, each terminal's own profile applies.",
-            keywords: ["wheel", "lines"],
-            kind: .integer(default: 3, minimum: 1, maximum: 10),
-            storage: .config(path: "ui.scroll_lines")
-        ),
-        PagerSettingMeta(
-            key: "invert_scroll",
-            category: .mouse,
-            label: "Invert scroll",
-            description: "Reverse vertical scroll direction (natural scrolling).",
-            keywords: ["natural", "reverse"],
-            kind: .bool(default: false),
-            storage: .config(path: "ui.invert_scroll")
-        ),
-        PagerSettingMeta(
-            key: "keep_text_selection",
-            category: .mouse,
-            label: "Text selection",
-            description: "How long in-app selection stays on screen and what double-click does (fold vs. select & copy a word). For your terminal or multiplexer's own selection, hold Shift while dragging (native copy).",
-            keywords: ["copy", "select", "double-click"],
-            kind: .enumeration(default: "flash", choices: PagerSettingChoices.textSelection, supportsPreview: false),
-            storage: .config(path: "ui.keep_text_selection")
-        )
-    ]
+    // Hidden: `scroll_speed`, `scroll_mode`, `scroll_lines`, `invert_scroll`,
+    // `keep_text_selection` — the port's wheel handler does not read them yet.
 
-    // MARK: Editor & Input (7)
+    // MARK: Editor & Input (6 — upstream 7 minus `prompt_suggestions`)
 
     rows += [
         PagerSettingMeta(
@@ -720,15 +585,7 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             kind: .bool(default: false),
             storage: .sessionLocal
         ),
-        PagerSettingMeta(
-            key: "prompt_suggestions",
-            category: .editor,
-            label: "Prompt suggestions",
-            description: "After each turn, predict your likely next prompt and show it as ghost text in the input (Tab to accept). Uses a small model call per turn.",
-            keywords: ["ghost", "autocomplete"],
-            kind: .bool(default: true),
-            storage: .config(path: "ui.prompt_suggestions")
-        ),
+        // Hidden: `prompt_suggestions` — no ghost-text reader in this port yet.
         PagerSettingMeta(
             key: "voice_keybind_enabled",
             category: .editor,
