@@ -1470,10 +1470,11 @@ struct ParityCompositionTests {
         // when the session's resolved credentials can actually reach an image
         // endpoint. `ImageToolCompositionTests` pins both directions.
         //
-        // `get_task_output` / `wait_tasks` / `kill_task` ride along with
-        // `run_terminal_cmd`: it can background a command — on request, or on
-        // its own once the foreground budget runs out — and these are the only
-        // way to read, wait on, or stop the task it hands back.
+        // `get_command_or_subagent_output` / `wait_commands_or_subagents` /
+        // `kill_command_or_subagent` ride along with `run_terminal_cmd`: it can
+        // background a command — on request, or on its own once the foreground
+        // budget runs out — and these are the only way to read, wait on, or stop
+        // the task it hands back.
         //
         // `web_search` / `web_fetch` / `x_search` follow the image-tool rule:
         // this session's `XAI_API_KEY` resolves an xAI search backend, so all
@@ -1484,7 +1485,7 @@ struct ParityCompositionTests {
             "run_terminal_cmd", "read_file", "list_dir", "grep",
             "glob", "view_image", "search_replace", "write", "apply_patch",
             "image_gen", "image_edit",
-            "get_task_output", "wait_tasks", "kill_task",
+            "get_command_or_subagent_output", "wait_commands_or_subagents", "kill_command_or_subagent",
             "web_search", "web_fetch", "x_search",
             "todo_write"
         ]))

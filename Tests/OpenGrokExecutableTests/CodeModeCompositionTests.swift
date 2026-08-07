@@ -384,7 +384,7 @@ struct CodeModeCompositionTests {
         // cannot survive — the timer would hand control back to the model while
         // the wait is still outstanding.
         #expect(
-            Set(names) == ["get_task_output", "wait_tasks", "kill_task", "exec", "wait"]
+            Set(names) == ["get_command_or_subagent_output", "wait_commands_or_subagents", "kill_command_or_subagent", "exec", "wait"]
         )
         // The transport pair is always last, after any direct-only tool.
         #expect(names.suffix(2) == ["exec", "wait"])

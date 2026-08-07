@@ -4213,22 +4213,22 @@ struct LiveAgentToolPolicy: Sendable, Equatable {
         if liveToolName == "run_terminal_cmd" {
             return [liveToolName, "run_terminal_command"]
         }
-        // Every profile in `AgentDefinitionSchema` names the background-task
-        // tools the way upstream's grok-build preset renames them, while the
-        // live surface advertises the canonical registry names — the same split
-        // `run_terminal_cmd` already has. Without both spellings here, a
-        // profile that grants `get_command_or_subagent_output` would silently
-        // fail to match the `get_task_output` the session advertises.
-        if let renamed = Self.backgroundTaskRenames[liveToolName] {
-            return [liveToolName, renamed]
+        // The live surface advertises upstream's production names
+        // (`xai-grok-agent/src/config.rs:161-173`); permission rules may still
+        // spell either the production name or the registry alias. Without both
+        // spellings here, a profile that grants `get_task_output` would
+        // silently fail to match the `get_command_or_subagent_output` the
+        // session advertises.
+        if let alias = Self.backgroundTaskAliases[liveToolName] {
+            return [liveToolName, alias]
         }
         return [liveToolName]
     }
 
-    private static let backgroundTaskRenames: [String: String] = [
-        "get_task_output": "get_command_or_subagent_output",
-        "wait_tasks": "wait_commands_or_subagents",
-        "kill_task": "kill_command_or_subagent",
+    private static let backgroundTaskAliases: [String: String] = [
+        "get_command_or_subagent_output": "get_task_output",
+        "wait_commands_or_subagents": "wait_tasks",
+        "kill_command_or_subagent": "kill_task",
     ]
 
     private static func matches(_ entries: [String], aliases: Set<String>) -> Bool {
