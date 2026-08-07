@@ -702,7 +702,10 @@ extension OpenGrokLiveInteractiveInput {
         )
     }
 
-    private static func translate(_ event: TerminalInputEvent) -> [InputEvent] {
+    /// Internal (not private) so the live byte chain — PosixTerminalInput
+    /// decode into pager InputEvents — can be regression-tested end to end;
+    /// synthetic `.mouse` injections in the parity tests never exercise it.
+    static func translate(_ event: TerminalInputEvent) -> [InputEvent] {
         switch event {
         case .key(let key):
             return translate(key)
