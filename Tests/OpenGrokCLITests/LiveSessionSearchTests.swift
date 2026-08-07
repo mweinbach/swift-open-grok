@@ -18,6 +18,59 @@ import OpenGrokToolsAPI
 import Testing
 @testable import OpenGrokCLI
 
+// MARK: - Memory workspace
+
+/// Non-ephemeral scratch workspace for memory reachability tests.
+private struct LiveMemoryTestWorkspace {
+    let root: URL
+    let grokHome: URL
+    var environment: [String: String]
+
+    static func make(memoryEnabled: Bool = false) -> LiveMemoryTestWorkspace {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let canonical = packageRoot.resolvingSymlinksInPath().standardizedFileURL.path
+        let isTempPackage = canonical.hasPrefix("/tmp/")
+            || canonical.hasPrefix("/private/tmp/")
+            || canonical.hasPrefix("/var/tmp/")
+        let scratchParent: URL
+        if isTempPackage {
+            scratchParent = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".opengrok-test-scratch", isDirectory: true)
+                .appendingPathComponent("cli-memory-gate", isDirectory: true)
+        } else {
+            scratchParent = packageRoot
+                .appendingPathComponent(".build", isDirectory: true)
+                .appendingPathComponent("cli-memory-gate", isDirectory: true)
+        }
+        let base = scratchParent
+            .appendingPathComponent(UUID().uuidString)
+            .resolvingSymlinksInPath()
+        let root = base.appendingPathComponent("repo")
+        let home = base.appendingPathComponent("home")
+        let grokHome = home.appendingPathComponent(".opengrok")
+        for directory in [root, home, grokHome] {
+            try? FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true
+            )
+        }
+        var environment = [
+            "HOME": home.path,
+            "OPENGROK_HOME": grokHome.path,
+        ]
+        if memoryEnabled {
+            environment["OPENGROK_MEMORY"] = "1"
+        }
+        return LiveMemoryTestWorkspace(root: root, grokHome: grokHome, environment: environment)
+    }
+
+    func cleanup() {
+        try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
+    }
+}
+
 // MARK: - Fixtures
 
 private func record(
@@ -224,6 +277,70 @@ func memoryConfigurationGate() {
     // The knobs the audit called out as parsed-but-ignored now have a reader.
     #expect(viaEnvironment.search.maxResults == 6)
     #expect(viaEnvironment.initialInjection.enabled)
+}
+
+@Test("memory tool specs are empty when memory is disabled")
+func memoryToolSpecsAbsentWhenDisabled() {
+    #expect(LiveMemoryTools.toolSpecs(configuration: .disabled).isEmpty)
+    #expect(LiveMemoryTools.advertisedToolNames(configuration: .disabled).isEmpty)
+}
+
+@Test("makeSessionServices omits memory tools when memory is off")
+func memoryToolsNotAdvertisedWhenDisabled() async {
+    let base = LiveMemoryTestWorkspace.make()
+    defer { base.cleanup() }
+
+    let services = await OpenGrokLiveApplicationLauncher.makeSessionServices(
+        sessionID: "live-session",
+        workingDirectory: base.root,
+        openGrokHome: base.grokHome,
+        conversationRecord: LiveConversationRecord.new(
+            sessionID: "live-session",
+            workingDirectory: base.root
+        ),
+        environment: base.environment
+    )
+    #expect(services.memory == nil)
+    let names = Set(services.toolSpecs.map(\.name))
+    #expect(!names.contains(LiveMemoryTools.searchToolName))
+    #expect(!names.contains(LiveMemoryTools.getToolName))
+}
+
+@Test("makeSessionServices advertises memory tools when memory is on")
+func memoryToolsAdvertisedWhenEnabled() async {
+    let base = LiveMemoryTestWorkspace.make(memoryEnabled: true)
+    defer { base.cleanup() }
+
+    let services = await OpenGrokLiveApplicationLauncher.makeSessionServices(
+        sessionID: "live-session",
+        workingDirectory: base.root,
+        openGrokHome: base.grokHome,
+        conversationRecord: LiveConversationRecord.new(
+            sessionID: "live-session",
+            workingDirectory: base.root
+        ),
+        environment: base.environment
+    )
+    #expect(services.memory != nil)
+    let names = Set(services.toolSpecs.map(\.name))
+    #expect(names.contains(LiveMemoryTools.searchToolName))
+    #expect(names.contains(LiveMemoryTools.getToolName))
+}
+
+@Test("/remember, /recall, and /flush surface notices when memory is disabled")
+func memorySlashCommandsWhenDisabled() async {
+    let remember = await LiveMemoryCommands.remember("note", backend: nil)
+    #expect(remember.contains("Memory is not enabled"))
+
+    let recall = await LiveMemoryCommands.recall("query", backend: nil)
+    #expect(recall.contains("Memory is not enabled"))
+
+    let flush = await LiveMemoryCommands.flush(
+        "session notes",
+        sessionID: "live-session",
+        backend: nil
+    )
+    #expect(flush.contains("Memory is not enabled"))
 }
 
 @Test("a disabled memory backend answers the tool without pretending to search")

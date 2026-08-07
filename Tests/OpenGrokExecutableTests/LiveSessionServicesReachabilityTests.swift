@@ -82,16 +82,28 @@ private struct LiveWorkspace {
     var environment: [String: String]
 
     /// `<package>/.build/w8s-session-tests`, derived from this file's own path
-    /// so it does not depend on the process working directory.
+    /// so it does not depend on the process working directory. When the package
+    /// lives under a temp directory (e.g. an isolated git worktree in `/tmp`),
+    /// `.build` is ephemeral too — fall back to a scratch dir under `$HOME`.
     static let scratchRoot: URL = {
         // .../Tests/OpenGrokExecutableTests/<thisFile> → package root
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        return packageRoot
+        let packageScratch = packageRoot
             .appendingPathComponent(".build", isDirectory: true)
             .appendingPathComponent("w8s-session-tests", isDirectory: true)
+        let canonical = packageRoot.resolvingSymlinksInPath().standardizedFileURL.path
+        let isTempPackage = canonical.hasPrefix("/tmp/")
+            || canonical.hasPrefix("/private/tmp/")
+            || canonical.hasPrefix("/var/tmp/")
+        if isTempPackage {
+            return FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".opengrok-test-scratch", isDirectory: true)
+                .appendingPathComponent("w8s-session-tests", isDirectory: true)
+        }
+        return packageScratch
     }()
 
     init(memoryEnabled: Bool) {
@@ -303,10 +315,33 @@ struct LiveSessionServicesReachabilityTests {
         let workspace = LiveWorkspace(memoryEnabled: false)
         defer { workspace.cleanup() }
 
-        let (executor, _) = try await makeLiveExecutor(workspace)
+        let (executor, services) = try await makeLiveExecutor(workspace)
+        #expect(services.memory == nil)
         let advertised = Set(executor.tools.map(\.name))
         #expect(!advertised.contains("memory_search"))
         #expect(!advertised.contains("memory_get"))
+    }
+
+    @Test("/remember, /recall, and /flush stay user commands when memory is disabled")
+    func memorySlashCommandsWhenDisabled() async throws {
+        let workspace = LiveWorkspace(memoryEnabled: false)
+        defer { workspace.cleanup() }
+
+        let (_, services) = try await makeLiveExecutor(workspace)
+        #expect(services.memory == nil)
+
+        let remember = await LiveMemoryCommands.remember("cross-session note", backend: services.memory)
+        #expect(remember.contains("Memory is not enabled"))
+
+        let recall = await LiveMemoryCommands.recall("cross-session", backend: services.memory)
+        #expect(recall.contains("Memory is not enabled"))
+
+        let flush = await LiveMemoryCommands.flush(
+            "wrap-up notes",
+            sessionID: "live-session",
+            backend: services.memory
+        )
+        #expect(flush.contains("Memory is not enabled"))
     }
 
     @Test("memory_search dispatches through the executor and returns real output")
