@@ -1161,7 +1161,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                 environment: context.environment
                             ),
                             probedRefreshHz: nil
-                        )
+                        ),
+                        toolExecutor: toolExecutor
                     )
                     let controller = OpenGrokPagerInteractiveController(
                         input: interactiveInput.events,
@@ -2064,7 +2065,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             providerFactory: ProviderSessionFactoryAdapter(),
             turnDriver: turnDriver
         ))
-        return LiveAgentStack(
+        let stack = LiveAgentStack(
             toolSurface: toolSurface,
             codeMode: codeMode,
             conversationHistory: conversationHistory,
@@ -2076,6 +2077,17 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             launchAutoUpdateTask: launchAutoUpdateTask,
             announcements: announcements
         )
+        // SessionStart fires once the agent stack is ready — the tool
+        // surface, Code Mode, history, model switch, compaction and turn
+        // driver all exist — matching upstream's post-readiness dispatch
+        // (run_loop.rs:1836-1857). Source is "startup"; modelId and
+        // agentType are omitted (nil) to match the fire site
+        // (event.rs:343-349).
+        foundation.toolExecutor.fireObserveHook(
+            event: .sessionStart,
+            payload: ["source": .string("startup")]
+        )
+        return stack
     }
 
     /// The prompt driver the `acp` route uses.
@@ -3600,6 +3612,161 @@ struct LiveToolExecutor: Sendable {
         )
     }
 
+    /// Fire an observe-only hook event (SessionStart, UserPromptSubmit,
+    /// PostToolUse, PostToolUseFailure, PermissionDenied, StopFailure,
+    /// Notification, PreCompact, PostCompact, SessionEnd).
+    ///
+    /// Fire-and-forget: the spawned task awaits the dispatch and records its
+    /// results in the gate's buffer, but the turn never waits on it. Observe
+    /// events cannot gate the turn (PORT_PLAN.md gate order), so a slow or
+    /// failing hook command must not stretch the turn's critical path.
+    ///
+    /// Cost: a hook spawned here may outlive the turn or even the session, and
+    /// its records land in the gate's buffer whenever they land — a test that
+    /// asserts "the hook ran" must poll the side-effect file the hook writes,
+    /// not the turn's completion. The alternative (awaiting inline) would put
+    /// a subprocess on every turn's critical path, which is exactly the
+    /// failure mode observe events exist to avoid.
+    func fireObserveHook(
+        event: HookEvent,
+        promptID: String? = nil,
+        payload: [String: HookJSONValue] = [:]
+    ) {
+        guard let hookPermissionGate else { return }
+        Task {
+            _ = await hookPermissionGate.dispatchObserve(
+                event: event,
+                promptId: promptID,
+                payload: payload
+            )
+        }
+    }
+
+    /// Fire `PermissionDenied` for a tool the pipeline refused to authorize.
+    /// Payload mirrors upstream's `HookPayload::PermissionDenied`
+    /// (event.rs:441-451): `toolName`, `toolUseId`, `toolInput`,
+    /// `toolInputTruncated`. The tool never ran, so the caller returns
+    /// `.denied` and `executeToolCalls` fires this instead of
+    /// `PostToolUseFailure`.
+    private func firePermissionDenied(
+        call: ToolCall,
+        args: JSONValue,
+        reason: String
+    ) {
+        let (toolInput, truncated) = hookTruncatedPayload(from: args)
+        fireObserveHook(
+            event: .permissionDenied,
+            payload: [
+                "toolName": .string(call.name),
+                "toolUseId": .string(call.callId),
+                "toolInput": toolInput,
+                "toolInputTruncated": .boolean(truncated),
+            ]
+        )
+    }
+
+    /// Fire `PostToolUse` for a tool that ran and succeeded. Payload mirrors
+    /// upstream's `HookPayload::PostToolUse` (event.rs:406-426). `durationMs`
+    /// is omitted (nil) to match the fire site at tool_calls.rs:893, which
+    /// passes `None`; `isBackgrounded` is false; `subagentType` is omitted for
+    /// the top-level session.
+    func firePostToolUse(call: ToolCall, result: OpenGrokShellToolCallResult) {
+        let (toolInput, inputTruncated) = hookTruncatedPayload(from: parseToolInput(call.arguments))
+        let (toolResult, resultTruncated) = hookTruncatedPayload(from: result.value)
+        fireObserveHook(
+            event: .postToolUse,
+            payload: [
+                "toolName": .string(call.name),
+                "toolUseId": .string(call.callId),
+                "toolInput": toolInput,
+                "toolResult": toolResult,
+                "toolInputTruncated": .boolean(inputTruncated),
+                "toolResultTruncated": .boolean(resultTruncated),
+                "isBackgrounded": .boolean(false),
+            ]
+        )
+    }
+
+    /// Fire `PostToolUseFailure` for a tool that ran and errored. Payload
+    /// mirrors upstream's `HookPayload::PostToolUseFailure`
+    /// (event.rs:427-440). A denied tool never ran, so the caller must use
+    /// `firePermissionDenied` instead — see `.denied` in `executeToolCalls`.
+    func firePostToolUseFailure(call: ToolCall, error: OpenGrokShellToolRuntimeError) {
+        let (toolInput, inputTruncated) = hookTruncatedPayload(from: parseToolInput(call.arguments))
+        fireObserveHook(
+            event: .postToolUseFailure,
+            payload: [
+                "toolName": .string(call.name),
+                "toolUseId": .string(call.callId),
+                "toolInput": toolInput,
+                "toolInputTruncated": .boolean(inputTruncated),
+                "error": .string(error.description),
+            ]
+        )
+    }
+
+    /// Fire a `Notification` hook for a user-attention event. Payload
+    /// mirrors upstream's `HookPayload::Notification` (event.rs:457-467):
+    /// `notificationType`, optional `message`/`title`/`level`. The primary
+    /// fire sites upstream are the session-update fan-out paths
+    /// (DiffReview, AutoRecoveryExhausted, RetryState::Exhausted/Failed,
+    /// hook_dispatch.rs:64-93); the port's analog is the auth-retry
+    /// exhaustion point in the turn loop, which is on the sampler-driven
+    /// seam. The ACP/pager notification fan-out is not on this seam and is
+    /// not wired here yet.
+    func fireNotification(
+        type: String,
+        message: String? = nil,
+        title: String? = nil,
+        level: String? = nil
+    ) {
+        var payload: [String: HookJSONValue] = ["notificationType": .string(type)]
+        if let message { payload["message"] = .string(message) }
+        if let title { payload["title"] = .string(title) }
+        if let level { payload["level"] = .string(level) }
+        fireObserveHook(event: .notification, payload: payload)
+    }
+
+    /// Parse a tool's raw argument JSON string into a `JSONValue`, falling
+    /// back to null — matching the Rust fire site's
+    /// `serde_json::from_str(...).unwrap_or(Null)` (tool_calls.rs:842-843).
+    private func parseToolInput(_ raw: String) -> JSONValue {
+        guard let data = raw.data(using: .utf8),
+              let parsed = try? JSONDecoder().decode(JSONValue.self, from: data)
+        else { return .null }
+        return parsed
+    }
+
+    /// Encode `value` as the hook envelope's JSON and truncate it to the
+    /// 128 KiB ceiling upstream applies (`MAX_PAYLOAD_SIZE`, event.rs:4),
+    /// returning the truncated value plus whether truncation happened. A
+    /// payload over the ceiling would let a hook command read unbounded
+    /// stdin, so the wire shape keeps a hard cap.
+    private func hookTruncatedPayload(from value: JSONValue) -> (HookJSONValue, Bool) {
+        let encoded = hookJSON(from: value)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(encoded) else {
+            return (encoded, false)
+        }
+        let limit = 128 * 1024
+        if data.count <= limit {
+            return (encoded, false)
+        }
+        // Cut on a UTF-8 boundary at or below the limit, then mark it.
+        var end = limit
+        while end > 0 {
+            if let _ = String(data: data.subdata(in: 0..<end), encoding: .utf8) {
+                break
+            }
+            end -= 1
+        }
+        guard end > 0, let truncated = String(data: data.subdata(in: 0..<end), encoding: .utf8) else {
+            return (encoded, false)
+        }
+        return (.string(truncated + " [truncated]"), true)
+    }
+
     /// Listing gate: a read-only agent profile never sees a mutating tool.
     /// A profile that declares no capability mode gets the pack's default.
     private static func capabilityMode(
@@ -3759,7 +3926,8 @@ struct LiveToolExecutor: Sendable {
         if prepared.mayDispatch { return nil }
         switch prepared.decision {
         case .policyDeny(let reason), .reject(let reason):
-            return .failed(reason)
+            firePermissionDenied(call: call, args: args, reason: reason)
+            return .denied(reason)
         case .cancelled:
             return .cancelled
         case .followupMessage(let message):
@@ -3803,7 +3971,8 @@ struct LiveToolExecutor: Sendable {
 
         switch prepared.decision {
         case .policyDeny(let reason), .reject(let reason):
-            return .failed(reason)
+            firePermissionDenied(call: call, args: args, reason: reason)
+            return .denied(reason)
         case .cancelled:
             return .cancelled
         case .followupMessage(let message):
@@ -3817,6 +3986,16 @@ struct LiveToolExecutor: Sendable {
     }
 
     func shutdown() async {
+        // SessionEnd fires before the session's process-bearing resources
+        // come down, matching upstream (run_loop.rs:471-490 channel-closed and
+        // :2216-2235 shutdown paths both fire BEFORE memory auto-save). The
+        // port has no memory auto-save yet, so the ordering is preserved by
+        // firing first. Payload carries the reason (event.rs:350-356); turn
+        // and tool-call counts are omitted (nil) to match the fire sites.
+        fireObserveHook(
+            event: .sessionEnd,
+            payload: ["reason": .string("shutdown")]
+        )
         await mcpConnections.shutdown()
         await composition.shutdown()
     }
@@ -4642,37 +4821,47 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         let services = toolExecutor.sessionServices
         items = await services?.injectMemoryContext(into: items, prompt: request.text) ?? items
 
+        // UserPromptSubmit fires once the user message is staged and before
+        // the turn loop starts, matching upstream (turn.rs:919-927). Payload
+        // carries the prompt text (event.rs:453-456).
+        toolExecutor.fireObserveHook(
+            event: .userPromptSubmit,
+            promptID: request.promptID,
+            payload: ["prompt": .string(request.text)]
+        )
+
         var toolRoundCount = 0
         var stopHookContinuations = 0
         var stopHookActive = false
         var authRetrySchedule = AuthRetrySchedule()
 
-        while true {
-            try Task.checkCancellation()
-            // Before every sample, not only the first: a tool round can add
-            // more to the prompt than the whole preceding turn did, and the
-            // request that dies at the context wall is usually the one after a
-            // large tool result, not the one that opened the turn.
-            items = await compactIfNeeded(items: items, emit: emit)
-            var response: OpenGrokLiveSamplingResponse?
-            while response == nil {
-                do {
-                    response = try await sampler.sample(OpenGrokLiveSamplingRequest(
-                        sessionID: context.sessionID,
-                        turnID: context.turnID,
-                        model: active.modelID,
-                        prompt: request.text,
-                        items: items,
-                        tools: toolSurface.modelTools
-                    )) { event in
-                        switch event {
-                        case .output(let text):
-                            await emit(.assistantText(text))
-                        case .status(let status):
-                            await emit(.status(status))
+        do {
+            while true {
+                try Task.checkCancellation()
+                // Before every sample, not only the first: a tool round can add
+                // more to the prompt than the whole preceding turn did, and the
+                // request that dies at the context wall is usually the one after a
+                // large tool result, not the one that opened the turn.
+                items = await compactIfNeeded(items: items, emit: emit)
+                var response: OpenGrokLiveSamplingResponse?
+                while response == nil {
+                    do {
+                        response = try await sampler.sample(OpenGrokLiveSamplingRequest(
+                            sessionID: context.sessionID,
+                            turnID: context.turnID,
+                            model: active.modelID,
+                            prompt: request.text,
+                            items: items,
+                            tools: toolSurface.modelTools
+                        )) { event in
+                            switch event {
+                            case .output(let text):
+                                await emit(.assistantText(text))
+                            case .status(let status):
+                                await emit(.status(status))
+                            }
                         }
-                    }
-                    authRetrySchedule.resetOnSuccess()
+                        authRetrySchedule.resetOnSuccess()
                 } catch let error as SamplingError {
                     guard case .auth(_, let credential) = error else { throw error }
                     switch authRetrySchedule.onRecovered401(credential) {
@@ -4683,53 +4872,96 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             nanoseconds: UInt64(max(0, delaySeconds) * 1_000_000_000)
                         )
                     case .exhausted, .runawayGuard:
+                        // Notification fires on auth-retry exhaustion, the
+                        // port's analog of upstream's `RetryState::Exhausted`
+                        // (hook_dispatch.rs:80-85 → `agent_error`).
+                        toolExecutor.fireNotification(
+                            type: "agent_error",
+                            message: "authentication retries exhausted",
+                            level: "error"
+                        )
                         throw error
                     }
                 }
-            }
-            guard let response else { throw CLIApplicationError.failed("sampling produced no response") }
-            items.append(contentsOf: response.items)
-
-            guard !response.toolCalls.isEmpty else {
-                try Task.checkCancellation()
-                if stopHookContinuations < 8 {
-                    let stopResult = await toolExecutor.runStop(
-                        promptID: request.promptID,
-                        payload: [
-                            "reason": .string("end_turn"),
-                            "stopHookActive": .boolean(stopHookActive),
-                            "lastAssistantMessage": .string(response.output),
-                        ]
-                    )
-                    if stopResult.preventContinuation == nil,
-                       stopResult.wantsContinuation {
-                        stopHookContinuations += 1
-                        stopHookActive = true
-                        items.append(.autoContinue(formatLiveStopFeedback(stopResult)))
-                        continue
-                    }
                 }
-                try await conversationHistory.commit(
+                guard let response else { throw CLIApplicationError.failed("sampling produced no response") }
+                items.append(contentsOf: response.items)
+
+                guard !response.toolCalls.isEmpty else {
+                    try Task.checkCancellation()
+                    if stopHookContinuations < 8 {
+                        let stopResult = await toolExecutor.runStop(
+                            promptID: request.promptID,
+                            payload: [
+                                "reason": .string("end_turn"),
+                                "stopHookActive": .boolean(stopHookActive),
+                                "lastAssistantMessage": .string(response.output),
+                            ]
+                        )
+                        if stopResult.preventContinuation == nil,
+                           stopResult.wantsContinuation {
+                            stopHookContinuations += 1
+                            stopHookActive = true
+                            items.append(.autoContinue(formatLiveStopFeedback(stopResult)))
+                            continue
+                        }
+                    }
+                    try await conversationHistory.commit(
+                        sessionID: context.sessionID,
+                        items: items
+                    )
+                    return OpenGrokShellSamplingResult(
+                        output: response.output,
+                        stopReason: response.stopReason
+                    )
+                }
+                guard toolRoundCount < 16 else {
+                    throw CLIApplicationError.failed(
+                        "tool loop exceeded 16 rounds"
+                    )
+                }
+                toolRoundCount += 1
+                items.append(contentsOf: try await executeToolCalls(
+                    response.toolCalls,
                     sessionID: context.sessionID,
-                    items: items
-                )
-                return OpenGrokShellSamplingResult(
-                    output: response.output,
-                    stopReason: response.stopReason
-                )
+                    emit: emit
+                ))
             }
-            guard toolRoundCount < 16 else {
-                throw CLIApplicationError.failed(
-                    "tool loop exceeded 16 rounds"
-                )
-            }
-            toolRoundCount += 1
-            items.append(contentsOf: try await executeToolCalls(
-                response.toolCalls,
-                sessionID: context.sessionID,
-                emit: emit
-            ))
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // StopFailure fires when the turn ends due to an API/turn error
+            // rather than a genuine stop, matching upstream (turn.rs:1224-1234).
+            // Payload carries the error class, details, and the rendered
+            // message (event.rs:376-387). A cancellation is not a failure and
+            // is rethrown without firing.
+            toolExecutor.fireObserveHook(
+                event: .stopFailure,
+                promptID: request.promptID,
+                payload: [
+                    "error": .string(stopFailureKind(for: error)),
+                    "errorDetails": .string(String(describing: error)),
+                    "lastAssistantMessage": .string(String(describing: error)),
+                ]
+            )
+            throw error
         }
+    }
+
+    /// Map a thrown turn error to upstream's `StopFailureKind` snake_case
+    /// token (event.rs:294-301). The port does not classify every provider
+    /// error yet, so unknown errors map to `unknown` rather than guessing.
+    private func stopFailureKind(for error: Error) -> String {
+        if error is CancellationError { return "unknown" }
+        if let sampling = error as? SamplingError {
+            switch sampling {
+            case .auth: return "authentication_failed"
+            case .api(let status, _, _, _, _):
+                return status.code == 429 ? "rate_limit" : "server_error"
+            default: return "unknown"
+            }
+        }
+        return "unknown"
     }
 
     /// Keep the prompt under the model's context window, reporting what it did.
@@ -4753,6 +4985,13 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         // — same ellipsis character, and the renderer already gives a
         // `.status(text)` the spinner and the phase timer.
         switch await compaction.compactIfNeeded(items: items, willCompact: {
+            // PreCompact fires once the coordinator has decided to compact
+            // and before the work begins, matching upstream (compaction.rs:1488).
+            // The automatic path's source is "auto" (event.rs:493-496).
+            toolExecutor.fireObserveHook(
+                event: .preCompact,
+                payload: ["source": .string("auto")]
+            )
             await emit(.status("Compacting\u{2026}"))
         }) {
         case .notNeeded:
@@ -4761,6 +5000,12 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             await emit(.status("could not compact the conversation: \(reason)"))
             return items
         case .compacted(let replacement, let report):
+            // PostCompact fires after a successful compaction, matching
+            // upstream (compaction.rs:1081-1089). Source is "auto" here.
+            toolExecutor.fireObserveHook(
+                event: .postCompact,
+                payload: ["source": .string("auto")]
+            )
             await emit(.status(report.notice))
             return replacement
         }
@@ -4818,6 +5063,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             state: .succeeded
                         )))
                         await emit(.status("tool \(call.name) completed"))
+                        toolExecutor.firePostToolUse(call: call, result: result)
                     case .failure(.cancelled):
                         await emit(.tool(OpenGrokShellToolUpdate(
                             callID: call.callId,
@@ -4827,6 +5073,20 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             state: .cancelled
                         )))
                         throw CancellationError()
+                    case .failure(.denied):
+                        // The pipeline refused to authorize the call, so the
+                        // tool never ran. `PermissionDenied` already fired at
+                        // the gate; `PostToolUseFailure` is for a tool that
+                        // executed and errored, so it must not fire here.
+                        content = "Tool \(call.name) was not executed: denied"
+                        await emit(.tool(OpenGrokShellToolUpdate(
+                            callID: call.callId,
+                            name: call.name,
+                            input: call.arguments,
+                            output: content,
+                            state: .failed
+                        )))
+                        await emit(.status("tool \(call.name) denied"))
                     case .failure(let error):
                         content = "Tool \(call.name) failed: \(error.description)"
                         await emit(.tool(OpenGrokShellToolUpdate(
@@ -4837,6 +5097,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             state: .failed
                         )))
                         await emit(.status("tool \(call.name) failed"))
+                        toolExecutor.firePostToolUseFailure(call: call, error: error)
                     }
                     return (index, ToolResultItem(
                         toolCallId: call.callId,
@@ -5627,6 +5888,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// automatic one share a compaction counter — which is the whole reason
     /// that instance is shared rather than rebuilt here.
     private let compaction: LiveCompactionCoordinator?
+    /// The tool executor whose hook gate the `/compact` command fires
+    /// `PreCompact`/`PostCompact` through. `nil` in constructions that
+    /// predate the hook wiring (tests, non-interactive minimal sessions),
+    /// in which case `/compact` compacts without firing hooks.
+    private let toolExecutor: LiveToolExecutor?
     /// The session this renderer belongs to, and the three things the
     /// session-scoped commands act on.
     ///
@@ -5713,7 +5979,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         openGrokHome: URL? = nil,
         announcements: LiveAnnouncementsComposition? = nil,
         paintCadence: TimeInterval = PagerMotion.defaultPaintCadence,
-        environment: [String: String]? = nil
+        environment: [String: String]? = nil,
+        toolExecutor: LiveToolExecutor? = nil
     ) {
         self.mode = mode
         self.sessionID = sessionID
@@ -5739,6 +6006,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.workflowRegistry = workflowRegistry
         self.workflowsEnabled = workflowsEnabled
         self.compaction = compaction
+        self.toolExecutor = toolExecutor
         self.wheelTuning = MouseWheelTuning(
             eventsPerTick: MouseWheelTuning.eventsPerTick(forTerminalProgram: terminalProgram)
         )
@@ -6433,6 +6701,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 note("This session has no compaction coordinator, so /compact has nothing to act on.")
                 return
             }
+            // PreCompact fires before the manual compaction begins; source is
+            // "manual" (event.rs:493-496).
+            toolExecutor?.fireObserveHook(
+                event: .preCompact,
+                payload: ["source": .string("manual")]
+            )
             note("Compacting\u{2026}")
             try renderState()
             switch await compaction.compactNow(userContext: instructions) {
@@ -6440,6 +6714,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 // `compactNow` has already written the replacement back to the
                 // persisted conversation, so there is nothing to apply here —
                 // only to report.
+                toolExecutor?.fireObserveHook(
+                    event: .postCompact,
+                    payload: ["source": .string("manual")]
+                )
                 note(report.notice)
             case .notNeeded:
                 note("Nothing to compact — the context is not close to full.")

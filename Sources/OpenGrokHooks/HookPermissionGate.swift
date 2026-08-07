@@ -119,6 +119,45 @@ public final class HookPermissionGate: PreToolUseHookRunner, @unchecked Sendable
         }
     }
 
+    // MARK: Observe
+
+    /// Fire-and-forget dispatch for observe-only events (SessionStart,
+    /// UserPromptSubmit, PostToolUse, PostToolUseFailure, PermissionDenied,
+    /// StopFailure, Notification, PreCompact, PostCompact, SessionEnd).
+    ///
+    /// Returns the run records so a caller that wants to record them inline
+    /// can; the live seam instead spawns a detached task and never awaits,
+    /// because observe events must not gate the turn (PORT_PLAN.md §gate order:
+    /// only PreToolUse and Stop feed back). A failed hook command lands here
+    /// as a `.failed` record and nothing else — the turn is unaffected.
+    public func dispatchObserve(
+        event: HookEvent,
+        promptId: String? = nil,
+        payload: [String: HookJSONValue] = [:]
+    ) async -> [HookRunRecord] {
+        guard dispatcher.registry.hasEnabledHooks(
+            for: event,
+            disabledNames: dispatcher.disabledNames
+        ) else { return [] }
+        let envelope = HookEventEnvelope(
+            hookEventName: event,
+            sessionId: context.sessionId,
+            cwd: context.cwd,
+            workspaceRoot: context.workspaceRoot.path,
+            transcriptPath: context.transcriptPath,
+            clientIdentifier: context.clientIdentifier,
+            promptId: promptId,
+            payload: payload
+        )
+        let records = await dispatcher.dispatchNonBlocking(
+            event: event,
+            envelope: envelope,
+            context: context.runContext
+        )
+        append(records)
+        return records
+    }
+
     // MARK: Stop
 
     /// Turn-end `Stop` dispatch. Returns the blocks and additional context the
@@ -201,8 +240,9 @@ public final class HookPermissionGate: PreToolUseHookRunner, @unchecked Sendable
 }
 
 /// Bridge `JSONValue` (tool/permission layer) into the hook envelope's own
-/// JSON representation.
-func hookJSON(from value: JSONValue) -> HookJSONValue {
+/// JSON representation. Public so the live composition can build observe
+/// payloads from tool inputs without reimplementing the mapping.
+public func hookJSON(from value: JSONValue) -> HookJSONValue {
     switch value {
     case .null:
         return .null
