@@ -88,7 +88,6 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         theme: state.theme,
         links: &links
     )
-    renderCompletions(state.completions, in: chrome.completions, buffer: &buffer, theme: state.theme)
     renderTurnStatus(state.turnStatus, in: chrome.turnStatus, buffer: &buffer, theme: state.theme)
     // An active overlay owns input focus, so the composer paints unfocused and
     // surrenders the terminal cursor for as long as the stack is non-empty.
@@ -112,6 +111,12 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         theme: state.theme,
         motion: state.motion
     )
+    // After the overlays: the slash dropdown must win over the full-screen
+    // welcome hero (upstream paints its dropdown beside the prompt regardless
+    // of the hero). Safe with every other overlay because they capture input,
+    // so no completion state can exist while one is up — only the
+    // non-capturing welcome coexists with a focused composer.
+    renderCompletions(state.completions, in: chrome.completions, buffer: &buffer, theme: state.theme)
 
     return PagerRenderResult(
         buffer: buffer,

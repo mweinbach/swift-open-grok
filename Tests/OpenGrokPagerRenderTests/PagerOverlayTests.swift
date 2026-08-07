@@ -154,6 +154,30 @@ struct PagerOverlayChromeTests {
         #expect(painted.contains { $0.contains("Esc close") })
     }
 
+    @Test("the slash dropdown paints over the welcome screen")
+    func completionsPaintOverWelcome() {
+        // Regression: the full-screen welcome hero used to be painted after
+        // the completions band, so typing `/` on a fresh session showed no
+        // dropdown until the first message dismissed the hero.
+        let result = renderPagerFrame(
+            PagerRenderState(
+                size: TerminalSize(width: 80, height: 30),
+                conversation: [],
+                completions: PagerCompletionMenu(
+                    rows: [PagerCompletionRow(label: "/help", summary: "Browse commands")],
+                    selectedIndex: 0
+                ),
+                input: PagerComposerState(text: "/"),
+                overlays: PagerOverlayStack([
+                    .welcome(PagerWelcomeOverlay(subtitle: "~/repo"), capturesInput: false)
+                ])
+            )
+        )
+        let painted = result.snapshot()
+        #expect(painted.contains("/help"))
+        #expect(painted.contains("Browse commands"))
+    }
+
     @Test("the welcome screen paints the braille logo and hero box")
     func welcomeOverlay() {
         let welcome = PagerWelcomeOverlay(
