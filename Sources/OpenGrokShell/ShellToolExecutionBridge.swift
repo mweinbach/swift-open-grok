@@ -212,6 +212,13 @@ public enum OpenGrokShellToolRuntimeError: Error, Sendable, Equatable, CustomStr
     case invalidCall(String)
     case unsupported(String)
     case failed(String)
+    /// The permission pipeline refused to authorize the call. Distinct from
+    /// `failed` so a caller can fire `PermissionDenied` rather than
+    /// `PostToolUseFailure`: a denied tool never ran, and upstream keeps the
+    /// two hook events separate (tool_calls.rs:1718-1741 fires
+    /// `PermissionDenied` at the decision site; `PostToolUseFailure` fires
+    /// only for a tool that executed and errored).
+    case denied(String)
 
     public var description: String {
         switch self {
@@ -223,6 +230,8 @@ public enum OpenGrokShellToolRuntimeError: Error, Sendable, Equatable, CustomStr
             return "unsupported shell tool operation: \(message)"
         case let .failed(message):
             return "shell tool runtime failed: \(message)"
+        case let .denied(message):
+            return "shell tool denied: \(message)"
         }
     }
 }
