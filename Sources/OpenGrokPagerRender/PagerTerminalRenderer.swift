@@ -21,6 +21,11 @@ public final class PagerTerminalRenderer {
     private var pendingResize = false
     private var mouseReportingActive = false
     private var frameClock: PagerFrameClock
+    /// Non-nil while a child owns the tty (`suspend_for_child`,
+    /// event_loop.rs:356-423), carrying the modes `resumeFromChild` must
+    /// re-enter. One optional instead of a flag pair: "suspended but unsure
+    /// what to restore" is unrepresentable.
+    private var suspendedModes: (alternateScreen: Bool, mouseReporting: Bool)?
 
     public init(
         sink: any PagerTerminalSink,
@@ -73,6 +78,12 @@ public final class PagerTerminalRenderer {
     @discardableResult
     public func setMouseReporting(_ enabled: Bool) throws -> Bool {
         guard started, !restorationAttempted else { return false }
+        if suspendedModes != nil {
+            // A toggle while a child owns the tty must not write into its
+            // screen; retarget what `resumeFromChild` re-enters instead.
+            suspendedModes?.mouseReporting = enabled
+            return false
+        }
         guard enabled != mouseReportingActive else { return false }
         mouseReportingActive = enabled
         try sink.write(enabled ? ANSIMouse.enableReporting : ANSIMouse.disableReporting)
@@ -81,6 +92,84 @@ public final class PagerTerminalRenderer {
     }
 
     public var isMouseReportingEnabled: Bool { mouseReportingActive }
+
+    // MARK: - Suspend for a child process
+
+    public var isSuspended: Bool { suspendedModes != nil }
+
+    /// Tear the TUI modes down so a child process can own the tty — the
+    /// renderer half of `suspend_for_child` (event_loop.rs:394-398), emitted
+    /// in `restore()`'s order and template. Unlike `restore()` this does not
+    /// latch: `resumeFromChild` re-enters the same modes afterwards.
+    ///
+    /// The trailing flush is also the port of upstream's
+    /// `writer_sync.wait_drained` (event_loop.rs:372-386): this port's sink
+    /// writes are synchronous, so once the flush returns there is no queued
+    /// frame left to drain.
+    public func suspendToChild() throws {
+        guard !restorationAttempted else {
+            throw PagerTerminalRendererError.alreadyRestored
+        }
+        guard started, suspendedModes == nil else { return }
+
+        let modes = (
+            alternateScreen: enteredAlternateScreen,
+            mouseReporting: mouseReportingActive
+        )
+        var output = ""
+        if synchronizedOutputActive {
+            output += ANSIOutput.endSynchronizedUpdate
+            synchronizedOutputActive = false
+        }
+        output += "\u{1B}[0m"
+        if sink.capabilities.supportsCursorVisibility {
+            output += "\u{1B}[?25h"
+            cursorVisible = true
+        }
+        // Same "unconditional when the session ever asked" reasoning as
+        // `restore()`: a terminal that silently kept a mode must not feed the
+        // child escape bursts.
+        if mouseReportingActive || configuration.useMouseReporting {
+            output += ANSIMouse.trackingReset
+            mouseReportingActive = false
+        }
+        if enteredAlternateScreen {
+            output += "\u{1B}[?1049l"
+            enteredAlternateScreen = false
+        }
+        try sink.write(output)
+        try sink.flush()
+        suspendedModes = modes
+        // The child owns the screen from here; the first frame after resume
+        // must be a full repaint rather than a diff against a screen state we
+        // can no longer vouch for (event_loop.rs:717-721).
+        previousFrame = nil
+    }
+
+    /// Re-enter the modes `suspendToChild` recorded, in `start()`'s order —
+    /// alt screen first, mouse enable last, so the enables land on the buffer
+    /// the matching disables will run against.
+    public func resumeFromChild() throws {
+        guard let modes = suspendedModes else { return }
+        var output = ""
+        if modes.alternateScreen {
+            output += "\u{1B}[?1049h"
+            enteredAlternateScreen = true
+        }
+        if sink.capabilities.supportsCursorVisibility {
+            output += "\u{1B}[?25l"
+            cursorVisible = false
+        }
+        if modes.mouseReporting {
+            output += ANSIMouse.enableReporting
+            mouseReportingActive = true
+        }
+        try sink.write(output)
+        try sink.flush()
+        suspendedModes = nil
+        // The terminal may have resized under the child.
+        pendingResize = true
+    }
 
     @discardableResult
     public func render(_ state: PagerRenderState) throws -> PagerTerminalRenderReport {
@@ -93,8 +182,14 @@ public final class PagerTerminalRenderer {
     /// pending. The caller arms a timer for this instant and calls
     /// `flushPendingFrame` when it fires — without that timer a request folded
     /// inside the cadence window would never paint.
+    ///
+    /// `nil` while suspended: a pre-suspend fold stays in the past forever,
+    /// and a caller that kept arming timers for it would spin its flush loop
+    /// at full speed for the child's whole runtime. The frame it folded is
+    /// stale anyway — resume forces a full repaint.
     public var scheduledFrameAt: TimeInterval? {
-        frameClock.isDirty ? (frameClock.scheduledPaintAt ?? 0) : nil
+        guard suspendedModes == nil else { return nil }
+        return frameClock.isDirty ? (frameClock.scheduledPaintAt ?? 0) : nil
     }
 
     /// Paint through the frame clock: at most one frame per cadence window,
@@ -113,6 +208,7 @@ public final class PagerTerminalRenderer {
         _ state: PagerRenderState,
         at now: TimeInterval
     ) throws -> PagerTerminalRenderReport? {
+        guard suspendedModes == nil else { return nil }
         guard frameClock.requestPaint(at: now) else { return nil }
         return try paintCoalescedFrame(state, at: now)
     }
@@ -125,6 +221,7 @@ public final class PagerTerminalRenderer {
         _ state: PagerRenderState,
         at now: TimeInterval
     ) throws -> PagerTerminalRenderReport? {
+        guard suspendedModes == nil else { return nil }
         guard frameClock.isPaintDue(at: now) else { return nil }
         return try paintCoalescedFrame(state, at: now)
     }
@@ -147,6 +244,7 @@ public final class PagerTerminalRenderer {
         _ result: PagerRenderResult,
         at now: TimeInterval
     ) throws -> PagerTerminalRenderReport? {
+        guard suspendedModes == nil else { return nil }
         guard frameClock.requestPaint(at: now) else { return nil }
         guard frameClock.beginFrame(at: now) else { return nil }
         defer { frameClock.endFrame() }
@@ -161,6 +259,7 @@ public final class PagerTerminalRenderer {
         _ result: PagerRenderResult,
         at now: TimeInterval
     ) throws -> PagerTerminalRenderReport? {
+        guard suspendedModes == nil else { return nil }
         guard frameClock.isPaintDue(at: now) else { return nil }
         guard frameClock.beginFrame(at: now) else { return nil }
         defer { frameClock.endFrame() }
@@ -169,6 +268,18 @@ public final class PagerTerminalRenderer {
 
     @discardableResult
     public func render(_ result: PagerRenderResult) throws -> PagerTerminalRenderReport {
+        // Load-bearing gate, not an optimization: the port's motion ticker is
+        // a separate task that keeps ticking through a suspension — unlike
+        // upstream, where the blocked event loop is the only painter — so an
+        // ungated render here would paint frames into the child's screen.
+        guard suspendedModes == nil else {
+            return PagerTerminalRenderReport(
+                changedCellCount: 0,
+                didUseFullRedraw: false,
+                didResize: false,
+                usedSynchronizedOutput: false
+            )
+        }
         try start()
         let projected = try project(result)
         let areaChanged = previousFrame?.buffer.area != projected.buffer.area
@@ -228,6 +339,9 @@ public final class PagerTerminalRenderer {
         }
         pendingResize = true
         guard started else { return }
+        // A resize under the child is recorded (`pendingResize`) but painted
+        // only after resume — the clear writes below would land in its screen.
+        guard suspendedModes == nil else { return }
 
         let nextArea = try projectedArea(for: size)
         let oldArea = previousFrame?.buffer.area
@@ -253,6 +367,10 @@ public final class PagerTerminalRenderer {
         guard !restorationAttempted else { return }
         restorationAttempted = true
         guard started else { return }
+        // Restoring mid-suspension still latches; the mode flags are already
+        // false (suspendToChild undid them), so the writes below skip the
+        // alt-screen leave and only re-assert the harmless resets.
+        suspendedModes = nil
 
         var output = ""
         if synchronizedOutputActive {

@@ -532,17 +532,32 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
 public struct OpenGrokLiveInteractiveInput: Sendable {
     public let events: AsyncThrowingStream<InputEvent, Error>
     private let closeOperation: @Sendable () async -> Void
+    /// Suspend-for-child entry point (`suspend_for_child`,
+    /// event_loop.rs:356-423). `nil` on inputs that cannot suspend, which is
+    /// every construction that does not own a real reader and raw-mode lease.
+    private let suspendControl: (@Sendable () async -> LiveInputSuspension?)?
 
     public init(
         events: AsyncThrowingStream<InputEvent, Error>,
-        close: @escaping @Sendable () async -> Void
+        close: @escaping @Sendable () async -> Void,
+        suspendControl: (@Sendable () async -> LiveInputSuspension?)? = nil
     ) {
         self.events = events
         self.closeOperation = close
+        self.suspendControl = suspendControl
     }
 
     public func close() async {
         await closeOperation()
+    }
+
+    /// Park the terminal reader and release the raw-mode lease. `nil` when
+    /// this input cannot suspend or the reader did not park within its
+    /// bounded wait; the returned one-shot ticket's `end()` is the only way
+    /// back to a reading input.
+    public func beginSuspension() async -> LiveInputSuspension? {
+        guard let suspendControl else { return nil }
+        return await suspendControl()
     }
 }
 
@@ -622,7 +637,8 @@ extension OpenGrokLiveInteractiveInput {
         let resource = LiveInteractiveInputResource(
             input: input,
             resizeSource: resizeSource,
-            lease: lease
+            lease: lease,
+            rawModeTTY: inputTTY
         )
         let inputTask = Task {
             var pasteBuffer: String?
@@ -678,7 +694,11 @@ extension OpenGrokLiveInteractiveInput {
         await resource.install(inputTask: inputTask, resizeTask: resizeTask)
         return OpenGrokLiveInteractiveInput(
             events: events,
-            close: { await resource.close() }
+            close: { await resource.close() },
+            suspendControl: {
+                guard await resource.beginSuspension() else { return nil }
+                return LiveInputSuspension(end: { try await resource.endSuspension() })
+            }
         )
     }
 
@@ -1236,6 +1256,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     // cache (sync, local) and the persistent hide-key set (async,
                     // local), so it does not block on the network.
                     await renderer.refreshAnnouncementBanner()
+                    // `/transcript`'s suspend host. The environment is the
+                    // context's audited copy, passed explicitly — reading
+                    // `ProcessInfo` inside the renderer would resolve `$PAGER`
+                    // against process-global state (AGENTS.md §2's
+                    // process-default trap, applied to env).
+                    await renderer.setSuspendHost(LiveTUISuspendHost(
+                        beginInputSuspension: { await interactiveInput.beginSuspension() },
+                        environment: context.environment
+                    ))
                     // Slash-command recency persists at
                     // `<opengrok home>/slash-mru.json`, upstream's grok_home
                     // location (`mru.rs:78-80`).
@@ -5648,19 +5677,28 @@ private final class LivePagerSession: OpenGrokPagerMinimalSessionAdapter, @unche
 private actor LiveInteractiveInputResource {
     private let input: any TerminalInput
     private let resizeSource: any TerminalResizeSource
-    private let lease: any RawModeLease
+    /// Swapped on suspend/resume: `beginSuspension` releases it (upstream's
+    /// `disable_raw_mode`, event_loop.rs:399) and `endSuspension` stores the
+    /// fresh lease from re-entry (event_loop.rs:401).
+    private var lease: any RawModeLease
+    /// The adapter the lease came from, kept for raw re-entry after a child
+    /// owned the tty. `nil` in constructions that never suspend.
+    private let rawModeTTY: (any TTYAdapter)?
     private var inputTask: Task<Void, Never>?
     private var resizeTask: Task<Void, Never>?
     private var closed = false
+    private var suspended = false
 
     init(
         input: any TerminalInput,
         resizeSource: any TerminalResizeSource,
-        lease: any RawModeLease
+        lease: any RawModeLease,
+        rawModeTTY: (any TTYAdapter)? = nil
     ) {
         self.input = input
         self.resizeSource = resizeSource
         self.lease = lease
+        self.rawModeTTY = rawModeTTY
     }
 
     func install(
@@ -5669,6 +5707,39 @@ private actor LiveInteractiveInputResource {
     ) {
         self.inputTask = inputTask
         self.resizeTask = resizeTask
+    }
+
+    /// Park the reader, then release the raw-mode lease — the input half of
+    /// `suspend_for_child` (event_loop.rs:365-371 + :399). Single attempt:
+    /// a park timeout changes nothing here and returns `false` for the
+    /// caller to report; upstream instead requeues the request on a deferred
+    /// retry timer (event_loop.rs:646-671, 700-712). Cost of the divergence:
+    /// a reader busy at the wrong 500 ms means the user re-runs the command
+    /// rather than it firing later on its own.
+    func beginSuspension() async -> Bool {
+        guard !closed, !suspended else { return false }
+        guard await input.pauseReads() else { return false }
+        suspended = true
+        await lease.release()
+        return true
+    }
+
+    /// Re-enter raw mode and swap the lease, then discard the bytes the
+    /// terminal buffered while the child ran (DA/DSR replies,
+    /// event_loop.rs:407-411), then resume the reader. Raw comes first:
+    /// resuming reads into a cooked terminal would hand the user's next
+    /// keystrokes to the shell's line discipline.
+    func endSuspension() async throws {
+        guard suspended else { return }
+        if let rawModeTTY {
+            // A failed re-entry is a genuinely broken terminal: leave the
+            // reader paused and surface the error rather than resuming into
+            // a cooked tty silently.
+            lease = try await rawModeTTY.enterRawMode()
+        }
+        suspended = false
+        input.discardPendingInput()
+        input.resumeReads()
     }
 
     func close() async {
@@ -6103,6 +6174,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// Installed by the composition after the controller exists; `nil` (tests,
     /// headless) simply never arms the ticker from render-side changes.
     private var motionSink: (@Sendable (PagerMotionState) async -> Void)?
+    /// `/transcript`'s suspend host: the input-suspension entry point and the
+    /// audited environment, both owned by the composition. `nil` (tests,
+    /// headless) makes the command report instead of suspending.
+    private var suspendHost: LiveTUISuspendHost?
     private var lastPublishedMotionState: PagerMotionState?
     /// Turn start on the motion clock, for the status row's elapsed readout.
     /// `turnStartedAt` (wall time) stays as the fallback for motion-disabled
@@ -6396,6 +6471,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         motionSink = sink
         lastPublishedMotionState = nil
         publishMotionState()
+    }
+
+    /// Install `/transcript`'s suspend host. Post-construction like
+    /// `setMotionStateSink`, because both halves live in the composition: the
+    /// input resource owns park/lease, and the environment is the context's
+    /// audited copy rather than `ProcessInfo` (AGENTS.md §2's process-global
+    /// trap, applied to env).
+    func setSuspendHost(_ host: LiveTUISuspendHost?) {
+        suspendHost = host
     }
 
     /// Pull the current announcement banner from the live composition into
@@ -6918,6 +7002,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             try deliver(response, to: filePath, label: "Response")
         case .exportConversation(let filePath):
             try deliver(transcript, to: filePath, label: "Conversation")
+        case .transcriptPager:
+            try await presentTranscriptPager()
         case .scrollbackSearch(let query):
             guard let query, !query.isEmpty else {
                 note("Usage: /find <text>")
@@ -7380,6 +7466,95 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private func appendMessage(_ message: PagerMessage) {
         overlays.dismiss(id: "welcome")
         conversation.appendMessage(message)
+    }
+
+    /// `/transcript` — write the transcript to a temp file and open `$PAGER`
+    /// over a suspended TUI (`dispatch/transcript.rs:239-279`; the suspend
+    /// sequence is `suspend_for_child`, `event_loop.rs:356-423`, consumed by
+    /// the `$PAGER` arm at `event_loop.rs:739-814`).
+    ///
+    /// Upstream's cursor-position probes around the child
+    /// (`event_loop.rs:388-393, 412-418`) are skipped: they exist to
+    /// re-anchor minimal mode's inline viewport, and this port's inline
+    /// renderer repaints with absolute positioning, so the forced full
+    /// redraw after resume recovers on its own. Cost: none for fullscreen;
+    /// for inline, a pager that printed to the main screen leaves that text
+    /// above the repainted viewport instead of being re-anchored under it.
+    private func presentTranscriptPager() async throws {
+        let content = transcript
+        // dispatch/transcript.rs:256-263.
+        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            note("No conversation transcript to view yet")
+            return
+        }
+        guard let suspendHost else {
+            note("This session has no suspendable terminal input, so /transcript cannot open $PAGER.")
+            return
+        }
+        // dispatch/transcript.rs:265-277.
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("open-grok-transcript-\(UUID().uuidString).md")
+        do {
+            try content.write(to: file, atomically: true, encoding: .utf8)
+        } catch {
+            note("Failed to write transcript: \(error)")
+            return
+        }
+        let pager = LiveTUISuspendHost.resolvePager(environment: suspendHost.environment)
+
+        // Park the reader and drop raw mode (event_loop.rs:365-371, :399; the
+        // port releases the lease with the park so the input resource stays
+        // the single owner of termios — escape output is unaffected by the
+        // cooked/raw order swap). On timeout, upstream's error text, nothing
+        // torn down, and the suspend aborts; see
+        // `LiveInteractiveInputResource.beginSuspension` for what the
+        // single-attempt divergence costs.
+        guard let suspension = await suspendHost.beginInputSuspension() else {
+            note("terminal input reader did not park before suspend")
+            try? FileManager.default.removeItem(at: file)
+            return
+        }
+        do {
+            try renderer.suspendToChild()
+        } catch {
+            try? await suspension.end()
+            note("Could not suspend the terminal for $PAGER: \(error)")
+            try? FileManager.default.removeItem(at: file)
+            return
+        }
+        // Blocking this path is correct — upstream blocks its event loop in
+        // `run_child` (event_loop.rs:400). The await suspends this actor, so
+        // the motion ticker's queued ticks DO run during the child; the
+        // renderer's suspended gate is what keeps them from painting into
+        // its screen.
+        let launchError = await LiveTUISuspendHost.runChild(
+            program: pager.program,
+            arguments: pager.arguments + [file.path],
+            environment: suspendHost.environment
+        )
+        do {
+            try renderer.resumeFromChild()
+            try await suspension.end()
+        } catch {
+            // Either the tty rejected the re-entry writes or raw mode failed:
+            // a genuinely broken terminal. Latch the renderer down so nothing
+            // paints into a screen we cannot own — the terminal ends fully
+            // cooked, never half — and fail the run loudly instead of
+            // wedging with a paused reader.
+            try? renderer.restore()
+            try? FileManager.default.removeItem(at: file)
+            throw error
+        }
+        if let launchError {
+            // Deliberate divergence: upstream discards the pager's status
+            // entirely (event_loop.rs:783-786). A launch failure here says
+            // why the screen flickered and showed nothing.
+            note("Could not run pager \(pager.program): \(launchError)")
+        }
+        try? FileManager.default.removeItem(at: file) // event_loop.rs:807
+        // `resumeFromChild` dropped the previous frame, so the repaint at the
+        // end of `render(_:)` is the full-viewport redraw upstream requests
+        // after a child (event_loop.rs:811-812, :717-721).
     }
 
     /// Write to a file when one is named, otherwise to the clipboard.

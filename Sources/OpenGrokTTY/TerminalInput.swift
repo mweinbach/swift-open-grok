@@ -90,6 +90,27 @@ public protocol TerminalInput: Sendable {
     func readByte() async throws -> UInt8?
     func readEvent() async throws -> TerminalInputEvent?
     func close() async
+
+    /// Park the reader ahead of a terminal handoff to a child process — the
+    /// port of upstream's `park_input_reader` (`xai-grok-pager/src/app/`
+    /// `event_loop.rs:326-348`). Returns whether the park was acknowledged
+    /// within the bounded wait; while parked, no read touches the input fd.
+    /// The default `false` means "this input cannot suspend", which is what
+    /// fakes and unsupported platforms report.
+    func pauseReads() async -> Bool
+    /// Undo `pauseReads`: wake any read that parked and read the fd again.
+    func resumeReads()
+    /// Drop every byte the terminal buffered while paused (child-exit ANSI
+    /// query replies — DA/DSR; `event_loop.rs:407-411`) and reset the escape
+    /// decoder, so a half-swallowed sequence cannot corrupt the first
+    /// post-resume key. Only meaningful while paused.
+    func discardPendingInput()
+}
+
+extension TerminalInput {
+    public func pauseReads() async -> Bool { false }
+    public func resumeReads() {}
+    public func discardPendingInput() {}
 }
 
 public protocol TerminalResizeSource: Sendable {
@@ -453,7 +474,15 @@ private enum PosixByteReadResult: Sendable {
 private struct PosixPendingRead {
     let token: UInt64
     let continuation: CheckedContinuation<PosixByteReadResult, Error>
+    /// Kept so a read parked by `pauseReads` can restart its poll with the
+    /// timeout it was issued with. An escape-disambiguation timeout stretches
+    /// across a suspension; the decoder's `finish()` handles the late fire.
+    let timeoutMilliseconds: Int32?
     var cancelled = false
+    /// A parked read has no poll worker: nothing touches the input fd until
+    /// `resumeReads` re-dispatches one, and close/cancel must resume the
+    /// continuation directly because no worker will.
+    var parked = false
 }
 
 public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
@@ -469,6 +498,15 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
     private var pendingRead: PosixPendingRead?
     private var closed = false
     private var decoder = TerminalInputDecoder()
+    /// Suspend-for-child state (`park_input_reader`, event_loop.rs:326-348).
+    /// Guarded by `stateLock` like the read/cancel state it interacts with:
+    /// a pause wake and a concurrent cancel share the wake pipe, and the
+    /// worker decides between them under the same lock.
+    private var paused = false
+    /// Resumed exactly once, by whichever of {worker park, finished read,
+    /// timeout, resume, close} takes it first — taking is nil-ing it out
+    /// under `stateLock`.
+    private var parkWaiter: CheckedContinuation<Bool, Never>?
 
     public init(
         fd: Int32 = STDIN_FILENO,
@@ -554,11 +592,144 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
         markClosed()
     }
 
+    /// Park the reader for a terminal handoff, bounded at 500 ms
+    /// (event_loop.rs:365-371). Single attempt: a timeout un-pauses and
+    /// returns `false` so the caller can report and abort the suspend.
+    public func pauseReads() async -> Bool {
+        // Locked work lives in sync helpers: NSLock is unavailable from
+        // async contexts, and nothing here suspends while holding it.
+        if markPausedAndCheckSettled() {
+            return true
+        }
+        return await withCheckedContinuation { continuation in
+            installParkWaiter(continuation)
+        }
+    }
+
+    /// Mark the pause and report whether the park is already satisfied —
+    /// closed, no read in flight, or the in-flight read already parked.
+    private func markPausedAndCheckSettled() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if closed {
+            // A closed input reads nothing; the park is trivially satisfied.
+            return true
+        }
+        paused = true
+        return pendingRead == nil || pendingRead?.parked == true
+    }
+
+    private func installParkWaiter(_ continuation: CheckedContinuation<Bool, Never>) {
+        stateLock.lock()
+        // The worker may have finished or parked the read between the two
+        // critical sections; a drained slot parks trivially because
+        // `beginRead` now sees `paused`.
+        if pendingRead == nil || pendingRead?.parked == true {
+            stateLock.unlock()
+            continuation.resume(returning: true)
+            return
+        }
+        parkWaiter = continuation
+        stateLock.unlock()
+        signalWake()
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            self?.parkTimedOut()
+        }
+    }
+
+    /// Clear the pause and restart the poll for a read that parked under it.
+    public func resumeReads() {
+        stateLock.lock()
+        paused = false
+        // Defensive exactly-once: a resume racing an unacknowledged pause
+        // must not leave that pause's waiter suspended forever.
+        let waiter = parkWaiter
+        parkWaiter = nil
+        var redispatch: (token: UInt64, timeoutMilliseconds: Int32?)?
+        if let pending = pendingRead, pending.parked {
+            pendingRead?.parked = false
+            redispatch = (pending.token, pending.timeoutMilliseconds)
+        }
+        stateLock.unlock()
+        waiter?.resume(returning: false)
+        if let redispatch {
+            dispatchPollWorker(
+                token: redispatch.token,
+                timeoutMilliseconds: redispatch.timeoutMilliseconds
+            )
+        }
+    }
+
+    /// Drain and drop everything buffered on the input fd, then reset the
+    /// escape decoder. Safe only while paused: the reader is parked, so
+    /// nothing else reads the fd or feeds the decoder concurrently.
+    public func discardPendingInput() {
+        stateLock.lock()
+        let canDiscard = paused && !closed
+        stateLock.unlock()
+        guard canDiscard else { return }
+
+        var buffer = [UInt8](repeating: 0, count: 256)
+        while true {
+            var descriptor = pollfd(fd: inputFD, events: Int16(POLLIN), revents: 0)
+            let ready = withUnsafeMutablePointer(to: &descriptor) { pointer in
+                poll(pointer, 1, 0)
+            }
+            guard ready > 0, (descriptor.revents & Int16(POLLIN)) != 0 else { break }
+            let bytesRead = buffer.withUnsafeMutableBytes { raw in
+                read(inputFD, raw.baseAddress, raw.count)
+            }
+            if bytesRead <= 0 { break }
+        }
+        decoder = TerminalInputDecoder()
+    }
+
+    /// Abort an unacknowledged park: un-pause so reads keep flowing, restart
+    /// any worker that parked in the race window, and report `false`. The
+    /// port takes this single attempt where upstream requeues the request on
+    /// a deferred retry timer (event_loop.rs:646-671, 700-712); the cost is
+    /// that a reader busy at the wrong 500 ms makes the user re-run the
+    /// command instead of it firing later on its own.
+    private func parkTimedOut() {
+        stateLock.lock()
+        guard let waiter = parkWaiter else {
+            stateLock.unlock()
+            return
+        }
+        parkWaiter = nil
+        paused = false
+        var redispatch: (token: UInt64, timeoutMilliseconds: Int32?)?
+        if let pending = pendingRead, pending.parked {
+            pendingRead?.parked = false
+            redispatch = (pending.token, pending.timeoutMilliseconds)
+        }
+        stateLock.unlock()
+        if let redispatch {
+            dispatchPollWorker(
+                token: redispatch.token,
+                timeoutMilliseconds: redispatch.timeoutMilliseconds
+            )
+        }
+        waiter.resume(returning: false)
+    }
+
     private func markClosed() {
         stateLock.lock()
         closed = true
-        pendingRead?.cancelled = true
+        var parkedRead: PosixPendingRead?
+        if let pending = pendingRead, pending.parked {
+            // No worker owns a parked read, so close must resume it here.
+            parkedRead = pending
+            pendingRead = nil
+        } else {
+            pendingRead?.cancelled = true
+        }
+        let waiter = parkWaiter
+        parkWaiter = nil
         stateLock.unlock()
+        parkedRead?.continuation.resume(throwing: TerminalInputError.closed)
+        waiter?.resume(returning: false)
         signalWake()
     }
 
@@ -598,9 +769,27 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
         }
         let token = nextReadToken
         nextReadToken &+= 1
-        pendingRead = PosixPendingRead(token: token, continuation: continuation)
+        var readSlot = PosixPendingRead(
+            token: token,
+            continuation: continuation,
+            timeoutMilliseconds: timeoutMilliseconds
+        )
+        if paused {
+            // While parked, no read may touch the input fd: the continuation
+            // waits here (not spinning) until `resumeReads` dispatches a
+            // worker for it.
+            readSlot.parked = true
+            pendingRead = readSlot
+            stateLock.unlock()
+            return
+        }
+        pendingRead = readSlot
         stateLock.unlock()
 
+        dispatchPollWorker(token: token, timeoutMilliseconds: timeoutMilliseconds)
+    }
+
+    private func dispatchPollWorker(token: UInt64, timeoutMilliseconds: Int32?) {
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             pollForByte(token: token, timeoutMilliseconds: timeoutMilliseconds)
         }
@@ -608,8 +797,13 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
 
     private func pollForByte(token: UInt64, timeoutMilliseconds: Int32?) {
         while true {
+            // Cancel outranks park: a cancelled read must resume its caller,
+            // and a park would strand it until resume.
             if pendingReadIsCancelled(token: token) {
                 finishRead(token: token, result: nil, error: .cancelled)
+                return
+            }
+            if parkPendingRead(token: token) {
                 return
             }
 
@@ -643,6 +837,9 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
                 drainWakePipe()
                 if pendingReadIsCancelled(token: token) {
                     finishRead(token: token, result: nil, error: .cancelled)
+                    return
+                }
+                if parkPendingRead(token: token) {
                     return
                 }
             }
@@ -679,6 +876,27 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
         }
     }
 
+    /// Park the pending read when a pause is in force: keep its continuation
+    /// suspended, drop the worker, and acknowledge the park. Returns whether
+    /// this worker should exit.
+    private func parkPendingRead(token: UInt64) -> Bool {
+        stateLock.lock()
+        guard paused,
+              let pending = pendingRead,
+              pending.token == token,
+              !pending.parked
+        else {
+            stateLock.unlock()
+            return false
+        }
+        pendingRead?.parked = true
+        let waiter = parkWaiter
+        parkWaiter = nil
+        stateLock.unlock()
+        waiter?.resume(returning: true)
+        return true
+    }
+
     private func finishRead(
         token: UInt64,
         result: PosixByteReadResult?,
@@ -690,7 +908,13 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
             return
         }
         self.pendingRead = nil
+        // A read that completes while a pause waits satisfies the park: no
+        // poll remains in flight, and the caller's next `beginRead` parks
+        // without touching the fd.
+        let waiter = parkWaiter
+        parkWaiter = nil
         stateLock.unlock()
+        waiter?.resume(returning: true)
 
         if let error {
             pendingRead.continuation.resume(throwing: error)
@@ -710,10 +934,20 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
 
     private func cancelPendingRead() {
         stateLock.lock()
-        let hasPendingRead = pendingRead != nil
+        guard let pending = pendingRead else {
+            stateLock.unlock()
+            return
+        }
+        if pending.parked {
+            // No worker owns a parked read; resume its caller directly.
+            pendingRead = nil
+            stateLock.unlock()
+            pending.continuation.resume(throwing: TerminalInputError.cancelled)
+            return
+        }
         pendingRead?.cancelled = true
         stateLock.unlock()
-        if hasPendingRead { signalWake() }
+        signalWake()
     }
 
     private func wakeReadFDSnapshot() -> Int32 {

@@ -329,6 +329,12 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// `/export [file]` — the whole conversation to a file, or to the clipboard
     /// when `filePath` is nil.
     case exportConversation(filePath: String?)
+    /// `/transcript` (alias `/log`) — the conversation transcript written to a
+    /// temp file and opened in `$PAGER` over a suspended TUI
+    /// (`slash/commands/transcript.rs`, `dispatch/transcript.rs:239-279`).
+    /// An intent rather than a modal because only the render layer can park
+    /// input and tear the terminal down around a child process.
+    case transcriptPager
     /// `/find [text]` — search the scrollback.
     case scrollbackSearch(query: String?)
     /// `/home`, `/welcome` — put the welcome screen back.

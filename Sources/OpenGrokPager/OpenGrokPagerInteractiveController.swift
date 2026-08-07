@@ -1871,6 +1871,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Export the current conversation to a file or clipboard",
             usage: "/export [filename]"
         ),
+        // `/transcript`, alias `/log` (`slash/commands/transcript.rs:16-34`);
+        // summary is upstream's description verbatim (`transcript.rs:24-26`),
+        // placed after `/export` in upstream's display order
+        // (`slash/commands/mod.rs:94-95`). Not history-mutating: the pager
+        // view is read-only, so upstream dispatches it mid-turn too.
+        PagerCommandDefinition(
+            name: "transcript",
+            aliases: ["log"],
+            summary: "View the full conversation transcript in your pager ($PAGER)",
+            usage: "/transcript"
+        ),
         PagerCommandDefinition(
             name: "context",
             summary: "View context usage"
@@ -2409,6 +2420,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 let path = invocation.arguments.first
                 try await emit(.overlay(.exportConversation(filePath: path)))
                 return .handled
+            case "transcript":
+                // Arguments are ignored — same dispatch either way
+                // (`transcript.rs:36-41`, `Action::OpenTranscriptPager`).
+                try await emit(.overlay(.transcriptPager))
+                return .handled
             case "find":
                 let query = invocation.arguments
                     .joined(separator: " ")
@@ -2621,6 +2637,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /mcps                     Show MCP server status
       /copy [N] [file]          Copy a response to the clipboard or a file
       /export [file]            Export the conversation
+      /transcript  /log         View the transcript in your pager ($PAGER)
       /find [text]              Search the conversation scrollback
       /jump                     Jump to a turn in the conversation
       /rewind [n]  /undo        Rewind to before a previous turn
