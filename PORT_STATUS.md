@@ -1,12 +1,121 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-06 (Wave 12 Meta re-pin, fundamentals closures, and macOS green gate)
+**As of:** 2026-08-07 (Wave 13 parity-fleet: subagents live, hooks/plan-mode wired, honesty batch)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `70002584da34e4c37ea14a3bce35341b7d04f9a7` (re-pinned **2026-08-06** from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05`; +3 commits, release `v0.1.220-open-grok.57` — the Meta API provider delta: `0f8dc87b` provider, `666b2ceb` login/settings, `70002584` stored-key unlock fix. The prior 2026-08-05 re-pin moved from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`; before that the 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` (`/tmp/open-grok-reference` when present).
 **Fixture pin:** `ProtocolFixtures/` was re-evaluated against `70002584da34e4c37ea14a3bce35341b7d04f9a7` on 2026-08-06, with `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` recorded as the immediate previous revision. The Meta delta touched no fixture family's upstream source (all fourteen family diffs across `9ed09e2a..70002584`, including `Cargo.lock`, are empty), so the only recaptures are the two release-stamped artifacts (CLI version fixture and the GCRX sample, both restamped `0.1.220-open-grok.57` — the GCRX golden by same-length in-place substitution at offset 32); unchanged families carry explicit `9ed09e2a..70002584` diff evidence.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
+
+## Wave 13 — Parity fleet: subagents live, hooks/plan-mode wired, honesty batch (2026-08-07)
+
+**Scope.** A seven-domain read-only audit swarm (recorded in `PARITY_ROADMAP.md`) mapped the
+remaining gap to full Rust parity at pin `70002584`; a 13-agent implementation fleet then
+executed the roadmap's cheapest and highest-leverage slices, each in an isolated git worktree
+on its own branch with a private build lock and mandatory self-tests, merged serially by the
+lead. The recurring finding — libraries built and tested but constructed by nothing — drove
+the keystone.
+
+### Verification snapshot (2026-08-07, authoritative serial gate)
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh build-tests` | Exit 0. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | **Exit 0** — 102 Swift Testing runs, **4,262 tests / 614 suites**, zero failures (non-`/tmp` checkout). Note: in a `/tmp` worktree one `OpenGrokBuildSupportTests` fixture-validator path-containment test fails on the `/tmp`↔`/private/tmp` symlink; it passes 56/56 in any real checkout, so the gate is run non-`/tmp`. |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | Exit 0. |
+
+### Subagent keystone — the model can spawn a subagent end-to-end
+
+- `OpenGrokAgentCoordinator`, `OpenGrokSubagentResolution`, and the task-tool types were fully
+  implemented+tested but **constructed by nothing**. Now: one coordinator per root session
+  (`LiveSubagentHost`), a shell-parity child runner (own conversation/persistence, parent
+  credentials, spawn/collaboration tools stripped, capability clamps, coordinator-owned
+  cancel), definition resolution through `OpenGrokSubagentResolution`, and `spawn_subagent`
+  advertised/gated upstream-exactly (`subagents_enabled` + non-empty roster; `builder.rs:848-896`).
+  `--no-subagents` left the refuse list and is honored as the kill switch. Subagent ids are
+  unified into the background-task family (`get_command_or_subagent_output`/`wait`/`kill`).
+  Deferred and recorded: `agent_swarm`, the collaboration quartet/mailbox tools, foreground
+  await-budget auto-backgrounding, worktree isolation, durable cross-process resume, child
+  usage folding, and executor reparenting of a completed child's background tasks.
+- A real parity bug the live seam exposed: the resolution module toggle-filtered on the
+  *resolution* path, so a disabled subagent type read as "unknown"; upstream filters only the
+  advertised roster and lets resolution find the definition for the gate to reject `.disabled`.
+  Fixed and pinned.
+
+### Live-seam closures (each was implemented-unwired or dishonest before)
+
+- **Hook events**: the full observe table now fires at the live seam (SessionStart,
+  UserPromptSubmit, PostToolUse±Failure, PermissionDenied, StopFailure, Notification,
+  Pre/PostCompact, SessionEnd) — fire-and-forget, failures recorded, never on the turn's
+  critical path. A new typed `.denied` tool-runtime case keeps PermissionDenied distinct from
+  PostToolUseFailure. Subagent hook events deferred (they need a live subagent turn); compaction
+  events wired but honestly reported as not reachable from the hermetic canned-sampler seam.
+- **Plan mode**: `enter_plan_mode`/`exit_plan_mode` ported and registered on the live tool list
+  with the subagent strip rule encoded; the plan tracker and a real `HunkTrackerActor` are now
+  passed into the live `makeResources`, so the plan gate arms and hunk attribution records
+  after successful writes (and records nothing on a denied edit). Divergence recorded: exit
+  approval routes through the generic permission ask sheet until the pager's plan-approval view
+  (backing B4) exists — cost named in code.
+- **Always-approve / permission-mode toggle**: `Ctrl+O` / Shift+Tab now mutate the live
+  permission handle (deny rules still win); the composer shows the active mode.
+- **Reasoning-effort / UI at startup**: the live renderer now hydrates `[ui]` theme + vim mode
+  from effective config at construction (theme previously hard-defaulted at launch); 16
+  Appearance/Mouse/Editor settings rows with no live reader were hidden rather than left lying
+  (listed below), matching the `show_tips` precedent.
+- **Announcements**: fetch→cache spawns post-readiness (export-boundary + `remote_fetch` gated),
+  the first non-hidden announcement renders as a pager banner, and `/announcements hide`
+  persists across relaunch. Listing overlay deliberately not registered (banner+hide is the
+  shipped scope). Deliberate stricter divergence: the Swift fetch is gated on the xAI export
+  boundary, so a Codex session issues no request.
+- **Launch auto-update**: a non-blocking check runs after readiness (cadence-cached, gated by
+  `--no-auto-update` / `[cli] auto_update` / env kill-switches / debug builds), printing
+  upstream's availability notice; never blocks or fails launch.
+- **ACP extension router**: the single-handler slot is replaced by a name-indexed + prefix
+  router (first-match, `methodNotFound` otherwise); `x.ai/feedback` re-registered through it.
+  This is the seam the `open-grok/*/models/apply` and `x.ai/mcp/*` families plug into next.
+- **xAI `x_search` replay**: the recorded Wave 12 gap is closed — xAI-dialect Responses input
+  now replays `x_search_call` items (byte-parity with `x_search_call_wire_value`), Codex stays
+  codex-only, DeepSeek/Meta replay nothing.
+- **Honesty batch**: 16 accepted-and-ignored CLI flags now fail closed (`--no-plan`,
+  `--no-ask-user`, `--todo-gate`, `--compaction-*`, `--hunk-tracker-mode`, `--storage-mode`,
+  `--client-identifier`, `--installer`, `--terminal`, `--fs-read/-write`, `--force-login`,
+  `--log-sampling`, `--no-wait-for-background`, `--background-wait-timeout`); memory tools are
+  no longer advertised to the model when memory is disabled; background-task tools advertise
+  upstream production names (`get_command_or_subagent_output` family) with short names as
+  dispatch aliases; plugin marketplace update now rolls back the tree + registry on failure.
+
+### Hidden settings rows (no live reader; un-hide when the backing lands — roadmap B6)
+
+`compact_mode`, `show_timestamps`, `show_timeline`, `page_flip_on_send`, `simple_mode`,
+`render_mermaid`, `max_thoughts_width`, `show_thinking_blocks`, `group_tool_verbs`,
+`collapsed_edit_blocks`, `scroll_speed`, `scroll_mode`, `scroll_lines`, `invert_scroll`,
+`keep_text_selection`, `prompt_suggestions`.
+
+### Ledger corrections (stale rows every domain audit tripped over)
+
+- The 2026-08-04 crate-inventory table labels Hooks / PluginMarketplace / ComputerHub* /
+  WorkspaceClient / Update / WebMediaTools / Memory / Goals as **orphaned**; Waves 8–13 wired
+  them. Those rows are superseded by this section and the per-wave records.
+- The route-liveness snapshot (~L346) claiming most CLI routes throw unsupported is superseded:
+  `mcp`, `sessions`, `worktree`, `workspace`, `plugin`, `update`, `workflow`, `share`, `leader`,
+  `serve`, `acp`, `login`/`logout` are live (some partial, noted per wave).
+- The Wave-2 "queued prompts / steering still unimplemented" line (~L1122) is superseded (live
+  since Wave 3).
+- `CRATE_MAP.md` row 83's proposed `OpenGrokWorkflowEngine` target does not exist and should
+  not: the Rhai engine landed inside `OpenGrokWorkflow`. The legacy dual `WorkflowHost`/
+  `WorkflowEngine` in that target remains a retire-candidate (roadmap Wave 19).
+
+### Still absent / deliberately deferred (the roadmap's remaining waves)
+
+Full ACP extension surface beyond the router (`open-grok/*/models/apply` + live-session
+credential rebind, `x.ai/mcp/*`), MCP OAuth + credential store, `agent_swarm` + collaboration
+tools, `ask_user_question` + a real plan-approval view, MCP OAuth, the multi-agent
+dashboard/AppView runtime and its dependents (`/cd`, tasks pane), native scrollback + the full
+minimal frontend, TUI suspend/restore (`$EDITOR`/`$PAGER`/screen-mode/in-pager `/login`),
+xAI browser-OAuth login, voice live seam, video/scheduler/monitor/LSP/search_tool tools,
+foreign sessions, memory embeddings + dream, auto-mode LLM classifier, Computer Hub MCP
+adapter. See `PARITY_ROADMAP.md` for the dependency-ordered plan.
 
 ## Wave 12 — Meta provider catch-up, re-pin to 70002584, and fundamentals closures (2026-08-06)
 
