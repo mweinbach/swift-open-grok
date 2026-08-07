@@ -336,6 +336,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case ".", "x": return .shortcutsHelp
             // `Ctrl+;` primary, `Ctrl+'` alternate (`defaults.rs:551-578`).
             case ";", "'": return .toggleQueue
+            case "o": return .toggleAlwaysApprove
             default: return nil
             }
         }
@@ -2591,8 +2592,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 return
             }
             try await startNewSession()
-        case .cyclePermissionMode, .toggleTodos, .toggleTasks, .sendToBackground,
-             .toggleAlwaysApprove, .openDashboard, .openSessions, .openExtensions:
+        case .cyclePermissionMode, .toggleAlwaysApprove:
+            try await emit(.global(command))
+        case .toggleTodos, .toggleTasks, .sendToBackground,
+             .openDashboard, .openSessions, .openExtensions:
             // Unbound in `globalAction(for:)` until the backing surface exists.
             break
         }
