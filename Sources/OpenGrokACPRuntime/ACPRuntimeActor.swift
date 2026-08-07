@@ -21,7 +21,7 @@ public actor ACPAgentRuntime {
     private let store: any ACPSessionStore
     private let promptDriver: any ACPPromptDriver
     private let workspaceBoundary: (any ACPWorkspaceBoundary)?
-    private let extensionHandler: (any ACPAgentExtensionHandler)?
+    private let extensionRouter: ACPExtensionMethodRouter?
     private let reverseRequests: ACPReverseRequestBroker
     private let makeSessionId: @Sendable () -> String
     private let timestamp: @Sendable () -> String
@@ -39,6 +39,7 @@ public actor ACPAgentRuntime {
         store: any ACPSessionStore = InMemoryACPSessionStore(),
         promptDriver: any ACPPromptDriver = ACPNoopPromptDriver(),
         workspaceBoundary: (any ACPWorkspaceBoundary)? = nil,
+        extensionRouter: ACPExtensionMethodRouter? = nil,
         extensionHandler: (any ACPAgentExtensionHandler)? = nil,
         reverseRequests: ACPReverseRequestBroker = ACPReverseRequestBroker(),
         makeSessionId: @escaping @Sendable () -> String = { UUID().uuidString },
@@ -48,7 +49,15 @@ public actor ACPAgentRuntime {
         self.store = store
         self.promptDriver = promptDriver
         self.workspaceBoundary = workspaceBoundary
-        self.extensionHandler = extensionHandler
+        if let extensionRouter {
+            self.extensionRouter = extensionRouter
+        } else if let extensionHandler {
+            self.extensionRouter = ACPExtensionMethodRouter().register(
+                catchAll: extensionHandler
+            )
+        } else {
+            self.extensionRouter = nil
+        }
         self.reverseRequests = reverseRequests
         self.makeSessionId = makeSessionId
         self.timestamp = timestamp
@@ -269,10 +278,10 @@ public actor ACPAgentRuntime {
         case AgentMethodNames.sessionSetConfigOption:
             return try await setConfigOption(route.params)
         default:
-            guard let extensionHandler else {
+            guard let extensionRouter else {
                 throw ACPRuntimeError.methodNotFound(route.method)
             }
-            return try await extensionHandler.handle(method: route.method, params: route.params)
+            return try await extensionRouter.dispatch(method: route.method, params: route.params)
         }
     }
 
@@ -648,5 +657,77 @@ public actor ACPAgentRuntime {
             return AcpError(code: .invalidParams, message: "invalid params")
         }
         return AcpError.internalError(String(describing: error))
+    }
+}
+
+// MARK: - Extension method router
+//
+// Upstream dispatches ACP extension methods through a name-indexed match
+// (`crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs:3794-4471`).
+// This router is the Swift seam for the same shape: exact-name handlers plus
+// optional prefix families, first-match dispatch, and `methodNotFound` for
+// anything unmatched.
+//
+// Intended consumers (later slices — not registered here):
+//   * `open-grok/codex/models/*`, `open-grok/kimi/models/*`,
+//     `open-grok/fireworks/models/apply` — model refresh/apply family
+//   * `x.ai/mcp/*` — MCP bridge extension methods
+//   * other `x.ai/*` vendor extensions beyond feedback
+
+public struct ACPExtensionMethodRouter: ACPAgentExtensionHandler, Sendable {
+    private enum Route: Sendable {
+        case exact(String, any ACPAgentExtensionHandler)
+        case prefix(String, any ACPAgentExtensionHandler)
+        case catchAll(any ACPAgentExtensionHandler)
+    }
+
+    private let routes: [Route]
+
+    public init() {
+        routes = []
+    }
+
+    private init(routes: [Route]) {
+        self.routes = routes
+    }
+
+    public func register(
+        exact method: String,
+        handler: any ACPAgentExtensionHandler
+    ) -> ACPExtensionMethodRouter {
+        ACPExtensionMethodRouter(routes: routes + [.exact(method, handler)])
+    }
+
+    public func register(
+        prefix: String,
+        handler: any ACPAgentExtensionHandler
+    ) -> ACPExtensionMethodRouter {
+        ACPExtensionMethodRouter(routes: routes + [.prefix(prefix, handler)])
+    }
+
+    fileprivate func register(
+        catchAll handler: any ACPAgentExtensionHandler
+    ) -> ACPExtensionMethodRouter {
+        ACPExtensionMethodRouter(routes: routes + [.catchAll(handler)])
+    }
+
+    public func dispatch(method: String, params: JSONValue) async throws -> JSONValue {
+        for route in routes {
+            switch route {
+            case .exact(let name, let handler):
+                guard method == name else { continue }
+                return try await handler.handle(method: method, params: params)
+            case .prefix(let prefix, let handler):
+                guard method.hasPrefix(prefix) else { continue }
+                return try await handler.handle(method: method, params: params)
+            case .catchAll(let handler):
+                return try await handler.handle(method: method, params: params)
+            }
+        }
+        throw ACPRuntimeError.methodNotFound(method)
+    }
+
+    public func handle(method: String, params: JSONValue) async throws -> JSONValue {
+        try await dispatch(method: method, params: params)
     }
 }
