@@ -9,6 +9,7 @@ import OpenGrokFileTools
 import OpenGrokHTTP
 import OpenGrokHooks
 import OpenGrokHooksPluginTypes
+import OpenGrokHunkTracker
 import OpenGrokModels
 import OpenGrokPager
 import OpenGrokPagerCommandUI
@@ -3347,7 +3348,18 @@ struct LiveToolExecutor: Sendable {
         // construction sites that predate the flags keep compiling; a session
         // that passes nothing simply has no CLI permission tier.
         permissionOptions: CLIPermissionOptions = CLIPermissionOptions(),
-        sandboxAutoAllowBash: (@Sendable () -> Bool)? = nil
+        sandboxAutoAllowBash: (@Sendable () -> Bool)? = nil,
+        // Plan mode is a root-session interaction: a subagent calling
+        // `exit_plan_mode` would present a plan dialog indistinguishable from
+        // the parent's, so upstream strips the plan-mode tools from every
+        // subagent toolset (`strip_plan_mode_tools`,
+        // `xai-grok-agent/src/builder.rs:798-803`). The Swift port has no
+        // live subagent sessions yet, so this defaults to false and the strip
+        // rule is encoded as the branch that drops the plan-mode tools here.
+        // The day a subagent session exists, this is the single switch that
+        // keeps the lifecycle out of its hands; do not register the tools and
+        // then no-op them — that violates §4.
+        subagent: Bool = false
     ) async throws {
         let composition = OpenGrokShellToolRuntimeComposition(
             processBackend: processBackend,
@@ -3399,12 +3411,33 @@ struct LiveToolExecutor: Sendable {
         let sandboxPredicate: @Sendable () -> Bool = sandboxAutoAllowBash ?? {
             sandboxIsEnforced && shouldAutoAllowBash()
         }
+        // One live hunk tracker per session. Attribution is recorded inside
+        // `SessionFS.writeText` / `ApplyPatchTool` *only after* a successful
+        // write (gate order step 7), so a denied or failed edit records
+        // nothing — wiring the actor here is what makes that reachability
+        // real rather than a tested library no live session constructs.
+        let hunkTracker = HunkTrackerActor(
+            sessionId: sessionID,
+            workingDir: standardizedWorkingDirectory.path,
+            defaultAgentId: "main"
+        )
+        // One live plan tracker per session, rooted at the workspace. The
+        // plan gate (PermissionPipeline step 1) and plan-file auto-approval
+        // (step 3) consult this; without a live tracker the gate could never
+        // arm, so `enter_plan_mode` would be a no-op dropdown row.
+        let planMode = PlanModeTracker(
+            state: .inactive,
+            planFilePath: ".opengrok/plan.md",
+            sessionDirectory: standardizedWorkingDirectory.path
+        )
         let fileToolResources = FileToolSession.makeResources(
             workspaceRoot: standardizedWorkingDirectory.path,
             sessionId: sessionID,
             agentId: "main",
             policy: fileAccessPolicy,
+            planMode: planMode,
             hooks: hooks.gate.map { $0 as any PreToolUseHookRunner } ?? FailOpenPreToolUseHookRunner(),
+            hunkTracker: hunkTracker,
             resolved: security.permissions,
             sandboxAutoAllowBash: sandboxPredicate
         )
@@ -3459,6 +3492,32 @@ struct LiveToolExecutor: Sendable {
             BuiltinToolCatalog.todoWriteQualifiedId,
             kind: BuiltinToolCatalog.sessionStateToolKinds[BuiltinToolCatalog.todoWriteQualifiedId]
         ))
+        // `enter_plan_mode` / `exit_plan_mode` — the agent-initiated plan-mode
+        // lifecycle. Registered on the live tool list only for the root session;
+        // a subagent session never sees them (see `subagent` above and
+        // `strip_plan_mode_tools` upstream). The handlers arm/disarm the
+        // session's `PlanModeTracker` through the live `PermissionPipeline`,
+        // so the plan gate (step 1) and plan-file auto-approval (step 3) can
+        // finally fire on the live path.
+        if !subagent {
+            builder.setHandler(
+                qualifiedId: BuiltinToolCatalog.enterPlanModeQualifiedId,
+                handler: EnterPlanModeToolHandler()
+            )
+            builder.setHandler(
+                qualifiedId: BuiltinToolCatalog.exitPlanModeQualifiedId,
+                handler: ExitPlanModeToolHandler()
+            )
+            let planModeKinds = BuiltinToolCatalog.planModeToolKinds
+            toolConfig.tools.append(ToolConfig.fromId(
+                BuiltinToolCatalog.enterPlanModeQualifiedId,
+                kind: planModeKinds[BuiltinToolCatalog.enterPlanModeQualifiedId]
+            ))
+            toolConfig.tools.append(ToolConfig.fromId(
+                BuiltinToolCatalog.exitPlanModeQualifiedId,
+                kind: planModeKinds[BuiltinToolCatalog.exitPlanModeQualifiedId]
+            ))
+        }
         if let webToolContext {
             let availability = webToolContext.availability
             if availability.advertisesAnything {

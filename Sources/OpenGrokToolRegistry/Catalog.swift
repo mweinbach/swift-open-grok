@@ -469,9 +469,52 @@ public enum BuiltinToolCatalog {
 
     public static let todoWriteQualifiedId = "GrokBuild:todo_write"
 
+    // MARK: Plan-mode lifecycle tools
+
+    /// `enter_plan_mode` / `exit_plan_mode` — the agent-initiated plan-mode
+    /// lifecycle. Upstream ships both in `grok_build` with `ToolScope::Read`
+    /// (`enter_plan_mode/mod.rs:93-100`, `exit_plan_mode/mod.rs:104-110`):
+    /// neither mutates user files directly, so they never prompt as edits.
+    /// Plan-mode enforcement (read-only + plan-file gating) lives in the
+    /// permission pipeline's plan gate, not in these tools.
+    ///
+    /// Both tools carry `.enterPlan` / `.exitPlan` so the capability filter
+    /// keeps them in every mode (`CapabilityFilter.kindAllowed` meta arm) and
+    /// `accessKind(for:)` routes them to `.read(nil)` — the same arm upstream's
+    /// `From<&ToolInput> for AccessKind` reaches for unknown input kinds.
+    public static let enterPlanModeDescription = """
+        Use this tool when a task has ambiguity about the right approach or when the user asks you to write a plan. This tool enables a read-only plan mode where you explore the codebase and create an implementation plan for the user.
+        """
+
+    public static let exitPlanModeDescription = """
+        Exit plan mode and present your plan to the user.
+
+        Use this after you have finished writing your plan to the plan file in plan mode.
+        """
+
+    public static let planModeTools: [RegisteredToolSpec] = [
+        RegisteredToolSpec(
+            namespace: .grokBuild, id: "enter_plan_mode", kind: .enterPlan,
+            description: enterPlanModeDescription,
+            inputSchema: objectSchema(properties: [:])
+        ),
+        RegisteredToolSpec(
+            namespace: .grokBuild, id: "exit_plan_mode", kind: .exitPlan,
+            description: exitPlanModeDescription,
+            inputSchema: objectSchema(properties: [:])
+        ),
+    ]
+
+    public static var planModeToolKinds: [String: ProductToolKind] {
+        Dictionary(uniqueKeysWithValues: planModeTools.map { ($0.qualifiedId, $0.kind) })
+    }
+
+    public static let enterPlanModeQualifiedId = "GrokBuild:enter_plan_mode"
+    public static let exitPlanModeQualifiedId = "GrokBuild:exit_plan_mode"
+
     /// Every spec `ToolRegistryBuilder(registerBuiltins: true)` installs.
     public static var builtinTools: [RegisteredToolSpec] {
-        fileTools + mediaTools + webTools + sessionStateTools
+        fileTools + mediaTools + webTools + sessionStateTools + planModeTools
     }
 
     public static var allQualifiedIds: Set<String> {
