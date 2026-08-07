@@ -8,6 +8,79 @@
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
+## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
+
+**Scope.** The user drove the freshly built TUI and reported five defects; each was
+root-caused before fixing, with per-unit full-suite gates. All units are commits on main
+between the Wave 14 record and this section's verification snapshot.
+
+### Verification snapshot (2026-08-07, authoritative serial gate)
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh build` / `build-tests` | Exit 0. |
+| `SWIFT_SAFE_TIMEOUT_SECONDS=1800 zsh workflows/swift-safe-verify.zsh test --no-parallel` | **Exit 0** — **4,357 tests / 634 suites**, zero recorded issues (~228 s; Wave 14's gate was 4,339 / 629). |
+| `zsh workflows/verify-transcript-pager.zsh` | PROOF-OK (re-run by the turn-resilience unit post-fix). |
+
+### Fixes
+
+- **Interactive-surface gate** (commit 2def4c3): closes the Wave 14 review finding — see the
+  amended known-limitation row under Wave 14 B4.
+- **Slash dropdown on the welcome screen** (commit 0619c0d): typing `/` on a fresh session
+  showed no completions; the full-screen welcome hero painted after the completions band.
+  Dropdown now paints after overlays — safe because every overlay except the non-capturing
+  welcome swallows keys, so no completion state can coexist with one.
+- **Enter completes argument-required commands** (commit 2af55c0): port of upstream's
+  `is_command_complete` gate (`prompt.rs:186-274`). Command-phase Enter accepts the
+  highlighted row, sends complete commands, and completes `/effort`-style commands into the
+  argument phase instead of dispatching an unknown prefix. The argument phase keeps Enter as
+  plain send (typed arguments pass through as typed; the `/theme tokyonight` pin caught the
+  first too-wide version of this change). `requiresArguments` derives from the usage
+  grammar's `<placeholder>` markers; the derived set is pinned by name.
+- **Turn failures no longer kill the TUI** (commit 1b5dd09): any failed turn used to rethrow
+  as `sessionFailed` and unwind the whole run — a codex switch against a failing endpoint
+  reliably took the TUI down. Now a `turnFailed` event renders upstream's "Turn failed: …"
+  marker (`session_event.rs:172`), sheets resolve as on a cancel, and the queue keeps
+  draining (`dispatch/prompt.rs:1399-1402`, `:1622`). PTY repro script kept under
+  `scratchpad/`. Not yet ported: upstream's dedicated-modal failure classes (rate limit,
+  paywall, credit 403, re-auth, context overflow) all render the generic marker.
+- **Mouse pipeline pinned live** (commit db44efa): the "mouse doesn't work" report was
+  investigated by instrumenting the real binary in a PTY; every layer (SGR enable, byte
+  decode, translate, pump, focused-overlay hit test) verified correct, and two regression
+  tests now cover the previously untested byte-chain and painted-bounds seams. The remaining
+  truth behind the report: **mouse block selection is a feature gap** — upstream selects
+  transcript blocks by click; this port's non-overlay clicks do nothing — and wheel scroll
+  has nothing to move on a non-overflowing transcript. The gap belongs to the roadmap's
+  pager-surface work.
+- **Codex request parity + boundary ordering** (commit 4167a7f): Responses bodies now send
+  upstream's unconditional `store: false` + encrypted-reasoning include
+  (`client.rs:2453-2462`, applied before the adapter patch so the DeepSeek/Meta strippers
+  still remove them; compaction bodies excluded per their contract) — the best offline
+  explanation of the live HTTP 400. The `/model` switch path is unified with the cold start
+  three ways: refresh-capable codex OAuth resolver, the guarded credential-header merge
+  (a catalog entry can no longer override `Authorization`/account-pinning mid-switch), and
+  the endpoint ladder's env-override rung (previously dead on switch — a switched-to model
+  reached a different endpoint than a started-on one; the override lookup is one shared
+  helper now). Codex `web_search` gets upstream's live-access grant (`provider.rs:594-607`).
+  The pre-first-turn "Provider boundary summary could not be persisted" wart was ordering:
+  upstream marks the boundary at session open (`persistence.rs:2745-2775`); the port's lazy
+  shell session now defers the sync through the runtime adapter and seeds the created record
+  from the live `ExportBoundary`, guard untouched. **Open: one live-credential run** (switch
+  to a codex model, observe the turn complete) to confirm the server's exact 400 cause; all
+  wire pins are mock-server byte assertions plus upstream citations — no codex family exists
+  under `ProtocolFixtures/`. Also recorded: remote-compaction-v2 still lacks upstream's
+  `parallel_tool_calls`/`store`/`stream`/`include` set (`client.rs:2127-2140`).
+
+### Notes
+
+- `liveFoundationNonZDRControlKeepsOptedInTelemetryReachable` failed in two of six parallel
+  runs on process-global `Telemetry.current()` state; it passes in isolation and under the
+  serial gate every time. A recurring parallel-order flake, pre-existing, worth a root-cause
+  slice of its own (isolate the process-global telemetry handle per test the way the
+  worktree fixtures were made parallel-safe this wave).
+- The Wave 14 ledger commit was amended locally after its pre-amend form reached origin; the
+  divergence was resolved by a merge keeping the amended (superset) side (commit 6e0b9ea).
+
 ## Wave 14 — TUI foundation: suspend host, steering honesty, interaction gates (2026-08-07)
 
 **Scope.** A four-explorer audit (upstream slash surface, upstream TUI foundation, port slash
@@ -95,14 +168,12 @@ with per-unit full-suite gates and lead review of every diff. Reference pin unch
   for byte; teardown resolves as revise-with-no-feedback (stay armed, fail closed). Deferred
   and recorded: upstream's per-line commenting + approve-with-comments (needs soft interject).
 - The B4 roadmap backing is now closed except the deferred commenting path.
-- **Known limitation (cross-model review finding, deferred):** the coordinator gate probes
-  stdout (`dependencies.terminal.isTTY()`), but the presenter only exists when interactive
-  INPUT construction succeeds (stdin). In the stdout-TTY/stdin-non-TTY composition
-  (`open-grok < file`) `ask_user_question` is advertised yet every call fails closed via the
-  `canPresent` guard, and `exit_plan_mode` falls back to the generic sheet — no hang, no
-  bypass, but an advertised tool with no working backing violates the §4 rule in that one
-  composition. Fix belongs to a slice that moves the coordinator decision to where the input
-  outcome is known (`LiveComposition.swift:~1105` vs `~1982`).
+- **Known limitation (cross-model review finding), fixed same day in Wave 14.1:** the
+  coordinator gate probed stdout while the presenter needed stdin, so `open-grok < file`
+  advertised `ask_user_question` with no one to answer. The launcher now constructs the
+  interactive input+sink first and derives the gate from both (commit 2def4c3); the
+  foundation half of the gate is pinned for both values in
+  `LiveAskUserQuestionReachabilityTests`.
 
 ### Suite-health repairs the wave forced (commit 00f8d99) and infrastructure (commit 827795f)
 
