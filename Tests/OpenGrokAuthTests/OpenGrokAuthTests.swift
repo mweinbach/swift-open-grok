@@ -691,6 +691,32 @@ struct ProtocolSeamTests {
         #expect(p.codeChallenge != p.codeVerifier)
     }
 
+    @Test func codexAuthorizeURLMatchesUpstreamBytes() {
+        // Byte-for-byte against upstream's `build_authorize_url`
+        // (codex_auth.rs:643-663) with Rust `append_pair` form encoding:
+        // localhost redirect (Hydra validates the registered string exactly —
+        // the 127.0.0.1 variant produced a live
+        // `authorize_hydra_invalid_request` page), upstream's parameter
+        // order, `+` for spaces, and `%3A%2F%2F` in the redirect.
+        let url = buildCodexAuthorizeURL(
+            endpoints: CodexEndpoints(),
+            redirectURI: codexRedirectURI(port: 1455),
+            pkce: PKCE(codeVerifier: "verifier", codeChallenge: "challenge"),
+            state: "state"
+        )
+        #expect(url?.absoluteString == "https://auth.openai.com/oauth/authorize"
+            + "?response_type=code"
+            + "&client_id=app_EMoamEEZ73f0CkXaXp7hrann"
+            + "&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"
+            + "&scope=openid+profile+email+offline_access+api.connectors.read+api.connectors.invoke"
+            + "&code_challenge=challenge"
+            + "&code_challenge_method=S256"
+            + "&id_token_add_organizations=true"
+            + "&codex_cli_simplified_flow=true"
+            + "&state=state"
+            + "&originator=codex_cli_rs")
+    }
+
     @Test func authorizeURLContainsPKCE() {
         let pkce = PKCE.from(verifier: "v")
         let url = buildAuthorizeURL(

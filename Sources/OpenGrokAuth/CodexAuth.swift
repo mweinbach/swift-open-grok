@@ -768,26 +768,56 @@ public func accessTokenIsFresh(_ store: CodexAuthStore, now: Date = Date()) -> B
     return false
 }
 
+/// The callback redirect the Codex browser flow registers and exchanges.
+///
+/// `localhost`, never `127.0.0.1`: Hydra validates `redirect_uri` as an
+/// exact string against the client's registered URIs, and the registered one
+/// is `http://localhost:{port}/auth/callback` (`codex_auth.rs:801`). The
+/// numeric form produced a live `authorize_hydra_invalid_request` error page.
+/// The listener still binds 127.0.0.1; only the advertised string differs.
+public func codexRedirectURI(port: UInt16) -> String {
+    "http://localhost:\(port)/auth/callback"
+}
+
+/// Byte-for-byte per Rust's `Url::append_pair` (form urlencoding: space as
+/// `+`, `:` and `/` percent-encoded), which is what upstream — and the real
+/// Codex CLI this flow impersonates (`originator=codex_cli_rs`) — sends.
+private func formURLEncodeQueryValue(_ value: String) -> String {
+    var allowed = CharacterSet.alphanumerics
+    allowed.insert(charactersIn: "*-._")
+    let encoded = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    return encoded.replacingOccurrences(of: "%20", with: "+")
+}
+
 public func buildCodexAuthorizeURL(
     endpoints: CodexEndpoints,
     redirectURI: String,
     pkce: PKCE,
     state: String
 ) -> URL? {
-    buildAuthorizeURL(
-        authorizationEndpoint: "\(endpoints.issuer.trimmingCharacters(in: CharacterSet(charactersIn: "/")))/oauth/authorize",
-        clientID: endpoints.clientID,
-        redirectURI: redirectURI,
-        scopes: codexScope.split(separator: " ").map(String.init),
-        pkce: pkce,
-        state: state,
-        nonce: nil,
-        extraQuery: [
-            "id_token_add_organizations": "true",
-            "codex_cli_simplified_flow": "true",
-            "originator": codexOriginator,
-        ]
-    )
+    // Hand-built rather than the generic OIDC builder: this URL must be
+    // byte-identical to upstream's `build_authorize_url`
+    // (`codex_auth.rs:643-663`) — same parameter ORDER (the generic builder
+    // sorts its extras and places `state` earlier) and the same form
+    // urlencoding (URLComponents leaves `:` `/` and spaces differently).
+    // Identical bytes are the contract; the live Hydra endpoint has already
+    // rejected a merely-equivalent variant once.
+    let base = endpoints.issuer.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    let query = [
+        ("response_type", "code"),
+        ("client_id", endpoints.clientID),
+        ("redirect_uri", redirectURI),
+        ("scope", codexScope),
+        ("code_challenge", pkce.codeChallenge),
+        ("code_challenge_method", "S256"),
+        ("id_token_add_organizations", "true"),
+        ("codex_cli_simplified_flow", "true"),
+        ("state", state),
+        ("originator", codexOriginator),
+    ]
+    .map { "\($0)=\(formURLEncodeQueryValue($1))" }
+    .joined(separator: "&")
+    return URL(string: "\(base)/oauth/authorize?\(query)")
 }
 
 /// Codex bearer resolver that fails closed on identity drift.

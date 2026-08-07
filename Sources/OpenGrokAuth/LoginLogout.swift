@@ -105,7 +105,7 @@ public func loginCodexBrowser(
         fallbackPort: callbackPort ?? 1457
     )
     defer { listener.closeListener() }
-    let redirectURI = "http://127.0.0.1:\(listener.port)/auth/callback"
+    let redirectURI = codexRedirectURI(port: listener.port)
     guard let authURL = buildCodexAuthorizeURL(
         endpoints: endpoints,
         redirectURI: redirectURI,
