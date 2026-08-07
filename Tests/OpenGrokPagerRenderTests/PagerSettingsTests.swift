@@ -63,27 +63,42 @@ private extension PagerSettingsOverlay {
     }
 }
 
+/// One integer row for stepper editor tests — `max_thoughts_width` is hidden
+/// from the live registry because the renderer does not read it yet.
+private let stepperTestRegistry = PagerSettingsRegistry(entries: [
+    PagerSettingMeta(
+        key: "max_thoughts_width",
+        category: .appearance,
+        label: "Max thoughts width",
+        description: "Fixture row for int stepper coverage.",
+        keywords: ["thinking"],
+        kind: .integer(default: 120, minimum: 40, maximum: 500),
+        storage: .config(path: "ui.max_thoughts_width")
+    )
+])
+
 // MARK: - Registry
 
 @Suite("Settings registry")
 struct PagerSettingsRegistryTests {
-    @Test("the catalog carries 90 rows across 8 categories")
+    @Test("the catalog carries 74 rows across 8 categories")
     func catalogSize() {
         let registry = PagerSettingsRegistry.default
-        // The reference registers 91; this port hides `show_tips` because the
-        // tips banner it backs does not exist here — a registered no-op row
-        // is the thing the parity rules forbid. Re-add it with the banner.
-        #expect(registry.entries.count == 90)
+        // Upstream registers 91; this port hides `show_tips` plus every `[ui]`
+        // row whose value the live renderer never reads — registered no-ops are
+        // forbidden by the parity rules. Re-add a row with its reader.
+        #expect(registry.entries.count == 74)
         #expect(PagerSettingCategory.ordered.count == 8)
         #expect(!registry.entries.contains { $0.key == "show_tips" })
+        #expect(!registry.entries.contains { $0.key == "compact_mode" })
     }
 
     @Test("per-category counts match the reference's registry")
     func categoryCounts() {
         let registry = PagerSettingsRegistry.default
-        #expect(registry.rows(in: .appearance).count == 17)
-        #expect(registry.rows(in: .mouse).count == 5)
-        #expect(registry.rows(in: .editor).count == 7)
+        #expect(registry.rows(in: .appearance).count == 7)
+        #expect(registry.rows(in: .mouse).count == 0)
+        #expect(registry.rows(in: .editor).count == 6)
         #expect(registry.rows(in: .agent).count == 9)
         #expect(registry.rows(in: .privacy).count == 1)
         // 24 includes `meta_api_key` (`settings/defs.rs:1184-1202`).
@@ -134,7 +149,7 @@ struct PagerSettingsRegistryTests {
         #expect(registry.find("auto_update")?.restartRequired == true)
         #expect(registry.find("diagnostics.crash_handler")?.restartRequired == true)
         #expect(registry.find("theme")?.restartRequired == false)
-        #expect(registry.find("compact_mode")?.restartRequired == false)
+        #expect(registry.find("vim_mode")?.restartRequired == false)
     }
 
     @Test("group children never surface as top-level rows")
@@ -159,8 +174,8 @@ struct PagerSettingsBrowseTests {
         #expect(joined.contains("─ Settings ─"))
         #expect(joined.contains("search:"))
         #expect(joined.contains("Appearance"))
-        #expect(joined.contains("Compact mode"))
-        // Bool rows read `on`/`off`; `compact_mode` defaults off.
+        #expect(joined.contains("Vim scrollback"))
+        // Bool rows read `on`/`off`; `vim_mode` defaults off.
         #expect(joined.contains("off"))
         #expect(joined.contains("Theme"))
         // The default theme row shows the choice's display name, not its
@@ -181,9 +196,8 @@ struct PagerSettingsBrowseTests {
     @Test("expanding a row reveals its description; restart-required adds the pill")
     func expansionAndRestartPill() {
         var overlay = PagerSettingsOverlay()
-        // `screen_mode` is the second Appearance row and is restart-required.
-        _ = overlay.handle(key(.down))
-        #expect(overlay.selectedKey == "screen_mode")
+        // `screen_mode` is the first Appearance row and is restart-required.
+        focus(&overlay, "screen_mode")
         #expect(overlay.handle(key(.right)) == .redraw)
 
         let joined = painted(settingsFrame(overlay)).joined(separator: "\n")
@@ -200,8 +214,8 @@ struct PagerSettingsBrowseTests {
     @Test("headers are skipped by the cursor in both directions")
     func cursorSkipsHeaders() {
         var overlay = PagerSettingsOverlay()
-        #expect(overlay.selectedKey == "compact_mode")
-        // Walk to the end of Appearance and into Mouse; every landing is a row.
+        #expect(overlay.selectedKey == "screen_mode")
+        // Walk to the end of Appearance and into Editor; every landing is a row.
         for _ in 0..<20 {
             _ = overlay.handle(key(.down))
             #expect(overlay.selectedKey != nil)
@@ -210,7 +224,7 @@ struct PagerSettingsBrowseTests {
             _ = overlay.handle(key(.up))
             #expect(overlay.selectedKey != nil)
         }
-        #expect(overlay.selectedKey == "compact_mode")
+        #expect(overlay.selectedKey == "screen_mode")
     }
 
     @Test("g and G jump to the first and last selectable rows")
@@ -219,15 +233,16 @@ struct PagerSettingsBrowseTests {
         _ = overlay.handle(character("G"))
         #expect(overlay.selectedKey == "tools.respect_gitignore")
         _ = overlay.handle(character("g"))
-        #expect(overlay.selectedKey == "compact_mode")
+        #expect(overlay.selectedKey == "screen_mode")
     }
 
     @Test("space toggles a bool in place and reports the commit")
     func toggleBool() {
         var overlay = PagerSettingsOverlay()
+        focus(&overlay, "vim_mode")
         let outcome = overlay.handle(character(" "))
-        #expect(outcome == .event(.commit(key: "compact_mode", value: .bool(true))))
-        #expect(overlay.value(for: "compact_mode") == .bool(true))
+        #expect(outcome == .event(.commit(key: "vim_mode", value: .bool(true))))
+        #expect(overlay.value(for: "vim_mode") == .bool(true))
         // And the frame reflects it without the caller writing anything back.
         #expect(painted(settingsFrame(overlay)).joined().contains("on"))
     }
@@ -235,11 +250,12 @@ struct PagerSettingsBrowseTests {
     @Test("d asks for a reset rather than applying one")
     func resetIsAConfirmation() {
         var overlay = PagerSettingsOverlay()
-        overlay.values["compact_mode"] = .bool(true)
+        overlay.values["vim_mode"] = .bool(true)
+        focus(&overlay, "vim_mode")
         let outcome = overlay.handle(character("d"))
-        #expect(outcome == .event(.resetRequested(key: "compact_mode")))
+        #expect(outcome == .event(.resetRequested(key: "vim_mode")))
         // Nothing changed yet — the caller confirms first.
-        #expect(overlay.value(for: "compact_mode") == .bool(true))
+        #expect(overlay.value(for: "vim_mode") == .bool(true))
     }
 
     @Test("a locked row cannot be toggled or reset, and shows its reason")
@@ -477,7 +493,7 @@ struct PagerSettingsGroupTests {
 @Suite("Settings editors")
 struct PagerSettingsEditorTests {
     private func openStepper() -> PagerSettingsOverlay {
-        var overlay = PagerSettingsOverlay()
+        var overlay = PagerSettingsOverlay(registry: stepperTestRegistry)
         focus(&overlay, "max_thoughts_width")
         _ = overlay.handle(key(.enter))
         return overlay
@@ -617,11 +633,13 @@ struct PagerSettingsCloseTests {
 
     @Test("the stack forwards a settings decision to the session")
     func stackForwardsEvents() {
-        var stack = PagerOverlayStack([PagerOverlay.settings(PagerSettingsOverlay())])
+        var overlay = PagerSettingsOverlay()
+        focus(&overlay, "vim_mode")
+        var stack = PagerOverlayStack([PagerOverlay.settings(overlay)])
         let outcome = stack.handle(character(" "))
         #expect(outcome == .setting(
             id: "settings",
-            event: .commit(key: "compact_mode", value: .bool(true))
+            event: .commit(key: "vim_mode", value: .bool(true))
         ))
     }
 
@@ -652,26 +670,24 @@ struct PagerSettingsStoreTests {
     @Test("a bool commit lands at its dotted path and reads back")
     func boolRoundTrip() throws {
         let store = PagerSettingsStore(configPath: temporaryConfig())
-        let path = try store.write(key: "compact_mode", value: .bool(true))
-        #expect(path == "ui.compact_mode")
+        let path = try store.write(key: "vim_mode", value: .bool(true))
+        #expect(path == "ui.vim_mode")
 
         let text = try String(contentsOf: store.configPath, encoding: .utf8)
         #expect(text.contains("[ui]"))
-        #expect(text.contains("compact_mode = true"))
-        #expect(try store.load()["compact_mode"] == .bool(true))
+        #expect(text.contains("vim_mode = true"))
+        #expect(try store.load()["vim_mode"] == .bool(true))
     }
 
     @Test("an enum, an int, and a deep path all round-trip")
     func mixedRoundTrip() throws {
         let store = PagerSettingsStore(configPath: temporaryConfig())
         try store.write(key: "theme", value: .string("tokyonight"))
-        try store.write(key: "max_thoughts_width", value: .integer(200))
         try store.write(key: "display_refresh_auto_cadence", value: .bool(true))
         try store.write(key: "toolset.x_search.enabled", value: .bool(false))
 
         let values = try store.load()
         #expect(values["theme"] == .string("tokyonight"))
-        #expect(values["max_thoughts_width"] == .integer(200))
         #expect(values["display_refresh_auto_cadence"] == .bool(true))
         #expect(values["toolset.x_search.enabled"] == .bool(false))
     }
@@ -682,13 +698,13 @@ struct PagerSettingsStoreTests {
         try FileManager.default.createDirectory(
             at: store.configPath.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        try "[ui]\ncompact_mode = false\nsomething_else = \"keep me\"\n"
+        try "[ui]\nold_key = false\nsomething_else = \"keep me\"\n"
             .write(to: store.configPath, atomically: true, encoding: .utf8)
 
-        try store.write(key: "compact_mode", value: .bool(true))
+        try store.write(key: "vim_mode", value: .bool(true))
         let text = try String(contentsOf: store.configPath, encoding: .utf8)
         #expect(text.contains("something_else = \"keep me\""))
-        #expect(text.contains("compact_mode = true"))
+        #expect(text.contains("vim_mode = true"))
     }
 
     @Test("reset removes the key rather than writing today's default")
@@ -738,8 +754,8 @@ struct PagerSettingsStoreTests {
     @Test("a wrong-typed value is refused rather than written")
     func typeMismatchThrows() {
         let store = PagerSettingsStore(configPath: temporaryConfig())
-        #expect(throws: PagerSettingsStoreError.typeMismatch(key: "compact_mode")) {
-            try store.write(key: "compact_mode", value: .string("yes"))
+        #expect(throws: PagerSettingsStoreError.typeMismatch(key: "vim_mode")) {
+            try store.write(key: "vim_mode", value: .string("yes"))
         }
     }
 
@@ -751,7 +767,7 @@ struct PagerSettingsStoreTests {
         )
         try "ui = \"dark\"\n".write(to: store.configPath, atomically: true, encoding: .utf8)
         #expect(throws: PagerSettingsStoreError.pathBlocked(path: "ui")) {
-            try store.write(key: "compact_mode", value: .bool(true))
+            try store.write(key: "vim_mode", value: .bool(true))
         }
         // The user's line survives.
         #expect(try String(contentsOf: store.configPath, encoding: .utf8).contains("ui = \"dark\""))
@@ -759,7 +775,10 @@ struct PagerSettingsStoreTests {
 
     @Test("an out-of-range stored int is clamped on read")
     func clampsOnRead() throws {
-        let store = PagerSettingsStore(configPath: temporaryConfig())
+        let store = PagerSettingsStore(
+            configPath: temporaryConfig(),
+            registry: stepperTestRegistry
+        )
         try FileManager.default.createDirectory(
             at: store.configPath.deletingLastPathComponent(), withIntermediateDirectories: true
         )

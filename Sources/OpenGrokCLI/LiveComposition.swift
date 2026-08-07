@@ -5489,6 +5489,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private var themePreference: PagerThemePreference
     private var renderTheme: PagerRenderTheme
     private let colorLevel: PagerColorLevel
+    /// Auto-theme companions loaded from `[ui] auto_{dark,light}_theme` at
+    /// startup and passed through `pagerResolveTheme` whenever preference is
+    /// `.auto` (system_appearance.rs:95-104 via PagerSystemAppearance.themeKind).
+    private var autoDarkThemeKind: PagerThemeKind?
+    private var autoLightThemeKind: PagerThemeKind?
 
     /// Reasoning effort for the active model, shown after the model name on the
     /// composer's bottom border. `nil` on models with no selectable effort.
@@ -5509,7 +5514,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         workflowsEnabled: Bool = true,
         terminalProgram: String? = nil,
         enableMouseReporting: Bool = true,
-        themePreference: PagerThemePreference = .fixed(.grokNight),
+        themePreference: PagerThemePreference? = nil,
         reasoningEffort: String? = nil,
         compaction: LiveCompactionCoordinator? = nil,
         sessionID: String = "",
@@ -5518,7 +5523,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         sessionCatalog: LiveSessionCatalog? = nil,
         mcpServers: [MCPServerConnection] = [],
         openGrokHome: URL? = nil,
-        paintCadence: TimeInterval = PagerMotion.defaultPaintCadence
+        paintCadence: TimeInterval = PagerMotion.defaultPaintCadence,
+        environment: [String: String]? = nil
     ) {
         self.mode = mode
         self.sessionID = sessionID
@@ -5552,15 +5558,29 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // reference's terminal-native lock. Everything else resolves the stored
         // preference against what this terminal can render, so a truecolor-only
         // theme degrades to GrokNight instead of to mush.
-        let environment = ProcessInfo.processInfo.environment
+        let environment = environment ?? ProcessInfo.processInfo.environment
+        let uiConfig = Self.resolveUIConfig(
+            workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
+            environment: environment
+        )
+        if let vimMode = uiConfig.vimMode {
+            inputModes.isVimMode = vimMode
+        }
+        let autoDark = Self.themeKind(from: uiConfig.autoDarkTheme)
+        let autoLight = Self.themeKind(from: uiConfig.autoLightTheme)
+        self.autoDarkThemeKind = autoDark
+        self.autoLightThemeKind = autoLight
+        let resolvedPreference = themePreference ?? Self.themePreference(from: uiConfig)
         let level = pagerDetectColorLevel(environment: environment, isTTY: terminal.size() != nil)
         let resolution = pagerResolveTheme(
-            preference: themePreference,
+            preference: resolvedPreference,
             colorLevel: level,
-            appearance: themePreference == .auto ? PagerSystemAppearance.detect() : nil,
+            appearance: resolvedPreference == .auto ? PagerSystemAppearance.detect() : nil,
+            darkTheme: autoDark,
+            lightTheme: autoLight,
             terminalNativeLock: mode != .fullScreen
         )
-        self.themePreference = themePreference
+        self.themePreference = resolvedPreference
         self.renderTheme = resolution.theme
         self.colorLevel = level
         self.motionEnabled = PagerMotionState.motionEnabled(
@@ -5585,6 +5605,61 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 paintCadence: paintCadence
             )
         )
+    }
+
+    /// Effective `[ui]` from the same config chain as `resolveDisplayRefreshPolicy`.
+    /// A malformed section falls back to `UiConfig()` defaults rather than
+    /// blocking startup — matching the tolerant decoders on the Codable twin.
+    private static func resolveUIConfig(
+        workingDirectory: URL,
+        environment: [String: String]
+    ) -> UiConfig {
+        let document = (try? loadAuthorityComposition(
+            cwd: workingDirectory,
+            environment: environment
+        ).effective()) ?? .table(TOMLTable())
+        guard let ui = document[path: ["ui"]] else { return UiConfig() }
+        return (try? jsonValue(from: ui).decode(UiConfig.self)) ?? UiConfig()
+    }
+
+    private static func themePreference(from ui: UiConfig) -> PagerThemePreference {
+        guard let raw = ui.theme?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let preference = PagerThemePreference.named(raw)
+        else { return .fixed(.grokNight) }
+        return preference
+    }
+
+    private static func themeKind(from name: String?) -> PagerThemeKind? {
+        guard let raw = name?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty
+        else { return nil }
+        return PagerThemeKind.named(raw)
+    }
+
+    /// Bridge the effective-config TOML subtree into `UiConfig`'s JSON decoder.
+    /// Wrong-typed leaves become absent fields upstream would treat as inherit.
+    private static func jsonValue(from toml: TOMLValue) -> JSONValue {
+        switch toml {
+        case .string(let value):
+            return .string(value)
+        case .integer(let value):
+            return .number(.int64(value))
+        case .float(let value):
+            return .number(.double(value))
+        case .boolean(let value):
+            return .bool(value)
+        case .datetime(let value):
+            return .string(value)
+        case .array(let values):
+            return .array(values.map { jsonValue(from: $0) })
+        case .table(let table):
+            var object: [String: JSONValue] = [:]
+            for (key, value) in table.pairs {
+                object[key] = jsonValue(from: value)
+            }
+            return .object(object)
+        }
     }
 
     /// Install the controller-facing motion feed. Called by the composition
@@ -6936,6 +7011,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             preference: preference,
             colorLevel: colorLevel,
             appearance: preference == .auto ? PagerSystemAppearance.detect() : nil,
+            darkTheme: autoDarkThemeKind,
+            lightTheme: autoLightThemeKind,
             terminalNativeLock: mode != .fullScreen
         )
         themePreference = preference
