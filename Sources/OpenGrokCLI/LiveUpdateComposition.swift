@@ -6,10 +6,14 @@
 // `unsupported(route:)` — an installed user could never upgrade.
 //
 // Ports:
+//   * `xai-grok-pager-bin/src/main.rs:948-956` (`run_update_if_available`
+//     NonBlocking) and `:2189-2207` (`should_check_for_updates`).
 //   * `xai-grok-pager-bin/src/main.rs:2249-2296` (`run_update_command`) — flag
 //     validation order and the exact refusal strings.
 //   * `xai-grok-update/src/auto_update.rs:49-100` (`UpdateStatus`,
 //     `print_update_status`) — the `--check` surface and its JSON field names.
+//   * `xai-grok-update/src/auto_update.rs:457-668` (`check_update_background`,
+//     `run_update_if_available`, cadence cache) — launch-time background check.
 //   * `xai-grok-update/src/version_policy.rs:98-107`
 //     (`enforce_version_policy_or_exit`) — the managed `required_minimum` /
 //     `required_maximum` startup gate.
@@ -19,10 +23,167 @@
 // presentation only.
 
 import Foundation
+import OpenGrokAuth
 import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokUpdate
 import OpenGrokVersion
+
+// MARK: - Launch-time background update check
+
+/// Port of upstream's non-blocking launch update check
+/// (`auto_update.rs:546-668`, fired from `main.rs:948-956`).
+public enum LiveLaunchAutoUpdate {
+    public struct Request: Sendable {
+        public let noAutoUpdate: Bool
+        public let services: LiveUpdateServices
+
+        public init(noAutoUpdate: Bool, services: LiveUpdateServices) {
+            self.noAutoUpdate = noAutoUpdate
+            self.services = services
+        }
+    }
+
+    private static let disableAutoUpdaterEnvironmentKeys = [
+        "OPENGROK_DISABLE_AUTOUPDATER",
+        "GROK_DISABLE_AUTOUPDATER",
+    ]
+
+    /// Gate automatic update checks without affecting an explicit
+    /// `open-grok update` (`main.rs:2189-2207`).
+    public static func shouldCheckForUpdates(
+        noAutoUpdateFlag: Bool,
+        environment: [String: String]
+    ) -> Bool {
+        let disabledByEnvironment = Self.disableAutoUpdaterEnvironmentKeys.contains { name in
+            environment[name].map(envFlagEnabled) ?? false
+        }
+        let testLaunchUpdateOverride = environment["OPENGROK_TEST_LAUNCH_UPDATE"].map(envFlagEnabled) ?? false
+        return updateChecksAllowed(
+            noAutoUpdateFlag: noAutoUpdateFlag,
+            debugBuild: _isDebugBuild() && !testLaunchUpdateOverride,
+            disabledByEnvironment: disabledByEnvironment
+        )
+    }
+
+    static func updateChecksAllowed(
+        noAutoUpdateFlag: Bool,
+        debugBuild: Bool,
+        disabledByEnvironment: Bool
+    ) -> Bool {
+        !noAutoUpdateFlag && !debugBuild && !disabledByEnvironment
+    }
+
+    /// Reads `[cli].auto_update`. `nil`/absent defaults to enabled
+    /// (`auto_update.rs:569`, registry default).
+    static func cliAutoUpdateConfigValue(environment: [String: String]) -> Bool? {
+        guard let layers = try? ConfigLayers.load(environment: environment),
+              case .boolean(let value)? = layers.effectiveConfigBase()[path: ["cli", "auto_update"]]
+        else { return nil }
+        return value
+    }
+
+    /// Fire-and-forget after session readiness. Never awaited by callers; a slow
+    /// or failing feed must not delay or fail launch (`auto_update.rs:457-467`).
+    public static func spawnIfNeeded(
+        request: Request?,
+        environment: [String: String],
+        streams: CLIStreams
+    ) -> Task<Void, Never>? {
+        guard let request else { return nil }
+        guard shouldCheckForUpdates(
+            noAutoUpdateFlag: request.noAutoUpdate,
+            environment: environment
+        ) else {
+            return nil
+        }
+        let services = request.services
+        return Task {
+            await runUpdateIfAvailable(
+                services: services,
+                environment: environment,
+                streams: streams
+            )
+        }
+    }
+
+    static func runUpdateIfAvailable(
+        services: LiveUpdateServices,
+        environment: [String: String],
+        streams: CLIStreams
+    ) async {
+        if await isVersionCacheFresh(environment: environment) {
+            return
+        }
+        if cliAutoUpdateConfigValue(environment: environment) == false {
+            return
+        }
+
+        let current = OpenGrokCLIVersion.installed(environment: environment)
+        let policy = LiveUpdateComposition.resolveVersionPolicy(environment: environment)
+        let channel = UpdateChannel.stable
+
+        let release: ReleaseCandidate
+        do {
+            release = try await services.fetchLatestRelease(environment)
+        } catch {
+            return
+        }
+
+        let decision = UpdatePlanner.decide(
+            current: current,
+            target: release.version,
+            channel: channel,
+            installer: .openGrok,
+            policy: policy
+        )
+        guard decision.shouldUpdate else {
+            try? await writeVersionCache(version: release.version, environment: environment)
+            return
+        }
+
+        let channelLabel = " [\(channel.rawValue)]"
+        streams.err(
+            "A new version of Open Grok is available: "
+                + "\(current) -> \(decision.targetVersion)\(channelLabel)\n"
+        )
+        await performBackgroundInstall(
+            release: release,
+            decision: decision,
+            environment: environment,
+            services: services
+        )
+    }
+
+    static func performBackgroundInstall(
+        release: ReleaseCandidate,
+        decision: UpdateDecision,
+        environment: [String: String],
+        services: LiveUpdateServices
+    ) async {
+        let platform = ReleasePlatform.current
+        guard platform.isSupportedForRelease else { return }
+        guard let asset = try? ReleaseSelector.asset(named: platform.assetName, in: release) else {
+            return
+        }
+        if (try? await services.install(
+            decision.targetVersion,
+            asset,
+            environment,
+            { _ in }
+        )) != nil {
+            try? await writeVersionCache(version: release.version, environment: environment)
+        }
+    }
+
+    private static func _isDebugBuild() -> Bool {
+        #if DEBUG
+        return true
+        #else
+        return false
+        #endif
+    }
+}
 
 // MARK: - Composition
 
