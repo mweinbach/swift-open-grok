@@ -276,7 +276,8 @@ struct LivePermissionModeToggleTests {
             output: SilentInteractiveOutput()
         )
 
-        _ = try await controller.run(.init(prompt: "", mode: .inline))
+        let chordResult = try await controller.run(.init(prompt: "", mode: .inline))
+        #expect(chordResult.submittedPrompts.isEmpty)
 
         let deadline = Date().addingTimeInterval(5)
         while Date() < deadline {
@@ -284,5 +285,49 @@ struct LivePermissionModeToggleTests {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         #expect(sink.strippedText.contains("always-approve"))
+    }
+
+    @Test("/always-approve toggles always-approve through the live renderer")
+    func alwaysApproveSlashCommandRepaintsFlag() async throws {
+        // Same live seam as Ctrl+O: slash → handleGlobal → applyGlobal.
+        let stack = makeLivePermissionStack(rules: [])
+        let sink = CapturingSink()
+        let terminal = OpenGrokLiveTerminal(
+            isTTY: { false },
+            size: { OpenGrokLiveTerminalSize(width: 100, height: 30) },
+            write: { _ in }
+        )
+        let renderer = LiveInteractiveControllerRenderer(
+            mode: .inline,
+            terminal: terminal,
+            sink: sink,
+            workingDirectory: "/work",
+            modelName: "test-model",
+            permissionMode: stack.mode,
+            paintCadence: PagerMotion.minimumPaintCadence
+        )
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeInputStream([
+                .paste("/always-approve"),
+                .key(KeyEvent(key: .enter)),
+            ]),
+            runtime: StubInteractiveRuntime(),
+            renderer: renderer,
+            output: SilentInteractiveOutput()
+        )
+
+        let slashResult = try await controller.run(.init(prompt: "", mode: .inline))
+        #expect(slashResult.submittedPrompts.isEmpty)
+
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if sink.strippedText.contains("always-approve") { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(sink.strippedText.contains("always-approve"))
+
+        let autoPrepared = await stack.pipeline.prepare(bashRequest("git push"))
+        #expect(autoPrepared.mayDispatch)
+        #expect(await stack.prompter.recorded().isEmpty)
     }
 }

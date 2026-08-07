@@ -1953,6 +1953,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Set reasoning effort for the current model",
             usage: "/effort <level>"
         ),
+        // `/always-approve` (`slash/commands/always_approve.rs:16-32`);
+        // summary is upstream's description verbatim (`always_approve.rs:21-23`),
+        // placed after `/effort` and before `/multiline` because this port
+        // has neither `/fast` nor `/auto` (`slash/commands/mod.rs:103-109`).
+        PagerCommandDefinition(
+            name: "always-approve",
+            summary: "Toggle always-approve mode (skip all permission prompts)",
+            usage: "/always-approve"
+        ),
         PagerCommandDefinition(
             name: "multiline",
             aliases: ["ml"],
@@ -2443,6 +2452,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     query: level.isEmpty ? nil : level
                 )))
                 return .handled
+            case "always-approve":
+                // Arguments are ignored — same dispatch either way
+                // (`always_approve.rs:29-32`, `Action::SetYoloMode(!current)`).
+                // Routes through the same global chord Ctrl+O already uses;
+                // the live handle owns the flip.
+                try await handleGlobal(.toggleAlwaysApprove, isTurnRunning: isTurnRunning)
+                return .handled
             case "rename":
                 let title = Self.rejoined(invocation.arguments)
                 guard !title.isEmpty else {
@@ -2667,6 +2683,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /help                     Browse commands and keyboard shortcuts
       /model [name]  /m         Switch the active model
       /effort <level>           Set reasoning effort for the current model
+      /always-approve           Toggle always-approve mode (skip all permission prompts)
       /new    /clear            Start a new session
       /resume                   Resume a previous session
       /rename <title>  /title   Rename the current session
