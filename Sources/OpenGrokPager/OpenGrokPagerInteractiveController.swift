@@ -75,6 +75,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case eof
         /// The user cancelled the turn; the run continues at the prompt.
         case turnCancelled
+        /// The turn's session failed. The failure is rendered as a transcript
+        /// marker and the run continues at the prompt — upstream pushes
+        /// `SessionEvent::TurnFailed` and keeps the event loop alive
+        /// (`dispatch/prompt.rs:1399-1402`); ending the run here is how one
+        /// bad provider request used to take the whole TUI down.
+        case turnFailed(message: String)
         /// A bare `Enter` on an empty composer force-sent the head of the
         /// queue. The turn ends the same way a cancel does, but the queue keeps
         /// draining instead of parking at the composer.
@@ -1292,7 +1298,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         try await emit(.turnFinished(result))
                         turnOutcome = .finished(result)
                     case .failure(let message):
-                        throw OpenGrokPagerInteractiveError.sessionFailed(message)
+                        // A failed turn is not a failed run. Surface it and
+                        // hand control back to the composer; only input death
+                        // and external cancels may end the run from here.
+                        turnOutcome = .turnFailed(message: message)
                     case .cancelled:
                         throw CancellationError()
                     }
@@ -1638,6 +1647,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case .turnPreempted:
             await promptQueue.cancelRunning()
             try await emit(.notice("sending the queued prompt now"))
+            try await transition(to: .editing)
+            try await emit(.promptChanged(promptState()))
+            await inputPumpGate.resume()
+            return .drainNext
+        case .turnFailed(let message):
+            // The failed prompt is consumed, not requeued, and queued
+            // follow-ups still drain — upstream runs `maybe_drain_queue`
+            // on the generic error path too (`dispatch/prompt.rs:1622`);
+            // only its dedicated-modal failures skip the drain.
+            await promptQueue.completeRunning()
+            try await emit(.turnFailed(message: message))
             try await transition(to: .editing)
             try await emit(.promptChanged(promptState()))
             await inputPumpGate.resume()

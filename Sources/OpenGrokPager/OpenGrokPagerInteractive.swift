@@ -471,6 +471,12 @@ public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {
     /// A turn was cancelled but the session stays open for the next prompt —
     /// distinct from `.cancelled`, which ends the run.
     case turnCancelled
+    /// A turn failed but the session stays open for the next prompt — the
+    /// renderer paints upstream's `SessionEvent::TurnFailed` marker
+    /// (`scrollback/blocks/session_event.rs:172`). Distinct from `.failed`,
+    /// which ends the whole run: a provider error is a property of one turn,
+    /// not of the session (`dispatch/prompt.rs:1399-1402`).
+    case turnFailed(message: String)
     /// The number of prompts waiting behind the running turn changed. Carried
     /// as a count rather than the queue itself: the renderer paints `+{n}` and
     /// the `"Enter to send now"` suffix, and needs nothing else.

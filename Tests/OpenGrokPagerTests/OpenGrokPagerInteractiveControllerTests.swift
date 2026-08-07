@@ -105,6 +105,48 @@ struct OpenGrokPagerInteractiveControllerTests {
         #expect(await session.cancelCount >= 1)
     }
 
+    @Test("a failed turn renders a marker and returns to the prompt")
+    func failedTurnKeepsRunAlive() async throws {
+        let failing = TestInteractiveSession(sessionID: "fails")
+        let follow = TestInteractiveSession(sessionID: "next")
+        await follow.emit(.completed(.init(sessionID: "next")))
+        let runtime = TestInteractiveRuntime(sessions: [failing, follow])
+        let renderer = RecordingInteractiveRenderer()
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeOpenInputStream([
+                .paste("alpha"),
+                .key(KeyEvent(key: .enter)),
+                .paste("beta"),
+                .key(KeyEvent(key: .enter)),
+            ]),
+            runtime: runtime,
+            renderer: renderer,
+            output: RecordingInteractiveOutput()
+        )
+
+        let task = Task { try await controller.run(.init(prompt: "", mode: .inline)) }
+        await runtime.waitForFirstRequest()
+        await failing.fail("provider exploded")
+
+        // The regression this guards: a session failure used to be rethrown
+        // as `sessionFailed` and end the whole run — one bad provider request
+        // took the whole TUI down. A failed turn returns to the composer and
+        // the queue keeps draining, exactly like upstream's generic error
+        // path (`TurnFailed` marker then `maybe_drain_queue`,
+        // dispatch/prompt.rs:1399-1402, :1622).
+        #expect(await waitUntil { await runtime.requests.count == 2 })
+        #expect(await waitUntil {
+            await renderer.turnFailures.contains { $0.contains("provider exploded") }
+        })
+        await controller.shutdown()
+        let result = await runResult(of: task)
+
+        #expect(result?.lifecycle == .shutdown)
+        #expect(result?.submittedPrompts == ["alpha", "beta"])
+        // Only the follow-up counts as completed; the failed turn does not.
+        #expect(result?.completedTurnCount == 1)
+    }
+
     @Test("Esc on an idle prompt arms a clear and never exits")
     func escapeArmsClear() async throws {
         let renderer = RecordingInteractiveRenderer()
@@ -711,6 +753,12 @@ private actor TestInteractiveSession: OpenGrokPagerSessionAdapter {
         continuation.finish()
     }
 
+    /// Fail the turn on demand — the shape a provider error arrives in
+    /// (`LivePagerSession` finishes its stream throwing on `.turnFailed`).
+    func fail(_ message: String) {
+        continuation.finish(throwing: TestInteractiveError.turnExploded(message))
+    }
+
     func cancel() {
         cancelCount += 1
         continuation.yield(.cancelled)
@@ -779,6 +827,13 @@ private actor RecordingInteractiveRenderer: OpenGrokPagerInteractiveRenderAdapte
         }
     }
 
+    var turnFailures: [String] {
+        events.compactMap { event in
+            if case .turnFailed(let message) = event { return message }
+            return nil
+        }
+    }
+
     private(set) var sizes: [TerminalSize] = []
     private(set) var beginCount = 0
     private(set) var restoreCount = 0
@@ -836,4 +891,5 @@ private func makeInputStream(_ events: [InputEvent]) -> AsyncStream<InputEvent> 
 
 private enum TestInteractiveError: Error, Sendable {
     case noSession
+    case turnExploded(String)
 }

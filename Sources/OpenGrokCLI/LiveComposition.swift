@@ -6782,6 +6782,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await resolveOutstandingQuestions()
             await resolveOutstandingPlanApprovals()
             endTurn()
+        case .turnFailed(let message):
+            finishAssistant()
+            // Upstream's marker wording (`session_event.rs:172`). The session
+            // stays open; the run-ending `.failed` arm below is the only one
+            // that may end the transcript.
+            appendMessage(PagerMessage(role: .error, text: "Turn failed: \(message)"))
+            // Same rule as a cancel: the turn that raised a sheet is gone.
+            await resolveOutstandingPermissions()
+            await resolveOutstandingQuestions()
+            await resolveOutstandingPlanApprovals()
+            endTurn()
         case .eof, .shutdown:
             await resolveOutstandingPermissions()
             await resolveOutstandingQuestions()
