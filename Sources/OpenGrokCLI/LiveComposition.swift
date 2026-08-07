@@ -2023,9 +2023,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     await foundation.toolExecutor.shutdown()
                 }
             )
+            let extensionRouter = ACPExtensionMethodRouter()
+                .register(
+                    exact: LiveFeedbackACPHandler.method,
+                    handler: LiveFeedbackACPHandler(composition: foundation.feedback)
+                )
             return LiveACPLaunchComponents(
                 promptDriver: promptDriver,
-                extensionHandler: LiveFeedbackACPHandler(composition: foundation.feedback)
+                extensionHandler: extensionRouter
             )
         })
     }
