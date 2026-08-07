@@ -979,11 +979,30 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     terminal: dependencies.terminal
                 )
             }
-            let foundation = try await Self.makeSessionFoundation(
-                options: options,
-                context: context,
-                dependencies: dependencies
-            )
+            // The interactive surface is created BEFORE the foundation so the
+            // ask-user/plan-approval coordinators can be gated on what will
+            // actually exist: stdout being a TTY says nothing about stdin, and
+            // a coordinator without its presenter advertises a tool no one can
+            // answer (wave 14 review finding). Cost: raw mode is entered a few
+            // hundred milliseconds earlier, so a foundation error printed to
+            // stderr renders staircased — error paths only, and the input is
+            // closed on that throw below.
+            let interactiveInput = options.mode == .interactive && dependencies.terminal.isTTY()
+                ? try await dependencies.makeInteractiveInput()
+                : nil
+            let interactiveSink = interactiveInput != nil ? dependencies.makeTerminalSink() : nil
+            let foundation: LiveSessionFoundation
+            do {
+                foundation = try await Self.makeSessionFoundation(
+                    options: options,
+                    context: context,
+                    dependencies: dependencies,
+                    interactiveSurfaceAvailable: interactiveInput != nil && interactiveSink != nil
+                )
+            } catch {
+                await interactiveInput?.close()
+                throw error
+            }
             let cwd = foundation.cwd
             let agentProfile = foundation.agentProfile
             let openGrokHome = foundation.openGrokHome
@@ -1122,10 +1141,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     options: options,
                     terminal: dependencies.terminal
                 )
-                let interactiveInput = dependencies.terminal.isTTY()
-                    ? try await dependencies.makeInteractiveInput()
-                    : nil
-                if let interactiveInput, let terminalSink = dependencies.makeTerminalSink() {
+                if let interactiveInput, let terminalSink = interactiveSink {
                     // One effective-config read seeds both halves of the mode
                     // snapshot. Multiline remains session-local, while vim and
                     // the two steering settings start from `[ui]`.
@@ -1822,7 +1838,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     static func makeSessionFoundation(
         options: CLIExecutionOptions,
         context: CLIApplicationContext,
-        dependencies: OpenGrokLiveCompositionDependencies
+        dependencies: OpenGrokLiveCompositionDependencies,
+        /// Whether the interactive controller renderer — the only presenter
+        /// for question and plan-approval sheets — will actually be
+        /// constructed. The caller derives it from the real input and sink,
+        /// not from stdout TTY-ness; a `false` here keeps `ask_user_question`
+        /// off the advertised list and plan approval on the generic sheet.
+        interactiveSurfaceAvailable: Bool = false
     ) async throws -> LiveSessionFoundation {
         let sourceCwd = try resolveWorkingDirectory(options.common.cwd)
         let openGrokHome = resolveOpenGrokHome(environment: context.environment)
@@ -1977,25 +1999,25 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             webToolContext: webToolContext,
             environment: context.environment
         )
-        // `ask_user_question` needs a human at a terminal. Interactive + TTY
-        // is exactly the condition under which the pager renderer (the only
-        // presenter) is constructed below, so the coordinator — and with it
-        // the advertised tool — exists precisely when an answer is possible.
-        // Headless (`-p`) and non-TTY launches get `nil`, which the executor
-        // treats as "do not advertise", the same absence-means-absence shape
-        // `spawn_subagent` uses. Upstream's equivalent gate strips the tool
-        // from the config when disabled (`builder.rs:819-825`).
+        // `ask_user_question` needs a human at a terminal. The caller passes
+        // `interactiveSurfaceAvailable` derived from the constructed input and
+        // sink, so the coordinator — and with it the advertised tool — exists
+        // precisely when the pager renderer (the only presenter) will be too.
+        // Headless (`-p`), non-TTY, and ACP launches get `nil`, which the
+        // executor treats as "do not advertise", the same absence-means-
+        // absence shape `spawn_subagent` uses. Upstream's equivalent gate
+        // strips the tool from the config when disabled (`builder.rs:819-825`).
         let questionCoordinator: PagerQuestionCoordinator? =
-            options.mode == .interactive && dependencies.terminal.isTTY()
-                ? PagerQuestionCoordinator()
-                : nil
+            interactiveSurfaceAvailable ? PagerQuestionCoordinator() : nil
         // Same gate for the plan-approval view: it exists exactly when the
         // pager renderer (its only presenter) will be constructed. Absence
         // keeps `exit_plan_mode` approval on the generic permission sheet.
+        // `interactiveSurfaceAvailable` is derived from the real input+sink
+        // (stdin AND stdout), not stdout alone — the wave 14 review found the
+        // stdout-only probe advertised `ask_user_question` in
+        // `open-grok < file` launches where no presenter could ever attach.
         let planApprovalCoordinator: PagerPlanApprovalCoordinator? =
-            options.mode == .interactive && dependencies.terminal.isTTY()
-                ? PagerPlanApprovalCoordinator()
-                : nil
+            interactiveSurfaceAvailable ? PagerPlanApprovalCoordinator() : nil
         let toolExecutor = try await LiveToolExecutor(
             processBackend: processBackend,
             sessionID: sessionID,

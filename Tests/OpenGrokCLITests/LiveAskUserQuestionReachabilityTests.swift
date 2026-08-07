@@ -311,6 +311,59 @@ struct LiveAskUserQuestionReachabilityTests {
         #expect(error.description.contains("unknown tool"))
     }
 
+    @Test("the foundation gates the question surface on the real interactive input, not stdout")
+    func foundationGatesOnInteractiveSurface() async throws {
+        // Wave 14 review finding: the coordinators used to gate on stdout
+        // TTY-ness alone, so an `open-grok < file` launch (stdout a TTY,
+        // stdin not) advertised a tool no presenter could ever answer. The
+        // launcher now derives `interactiveSurfaceAvailable` from the
+        // constructed input AND sink; this pins the foundation half of that
+        // gate for both values.
+        let workspace = QuestionWorkspace()
+        defer { workspace.cleanup() }
+        let command = try CLICommandParser.parseOrThrow(
+            ["interactive", "--cwd", workspace.root.path]
+        )
+        guard case .launch(let options) = command else {
+            Issue.record("fixture did not parse to a launch")
+            return
+        }
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in
+                OpenGrokLiveSampler { _, _ in
+                    OpenGrokLiveSamplingResponse(output: "unused", stopReason: "stop")
+                }
+            }
+        )
+        func foundation(interactiveSurfaceAvailable: Bool) async throws -> OpenGrokLiveApplicationLauncher.LiveSessionFoundation {
+            let (streams, _, _) = CLIStreams.buffered()
+            return try await OpenGrokLiveApplicationLauncher.makeSessionFoundation(
+                options: options,
+                context: CLIApplicationContext(
+                    environment: [
+                        "HOME": workspace.root.path,
+                        "OPENGROK_HOME": workspace.root.appendingPathComponent("state").path,
+                        "XAI_API_KEY": "test-key",
+                    ],
+                    streams: streams,
+                    control: .never
+                ),
+                dependencies: dependencies,
+                interactiveSurfaceAvailable: interactiveSurfaceAvailable
+            )
+        }
+
+        let withSurface = try await foundation(interactiveSurfaceAvailable: true)
+        #expect(withSurface.questionCoordinator != nil)
+        #expect(withSurface.planApprovalCoordinator != nil)
+        #expect(Set(withSurface.toolExecutor.tools.map(\.name)).contains("ask_user_question"))
+
+        let withoutSurface = try await foundation(interactiveSurfaceAvailable: false)
+        #expect(withoutSurface.questionCoordinator == nil)
+        #expect(withoutSurface.planApprovalCoordinator == nil)
+        #expect(!Set(withoutSurface.toolExecutor.tools.map(\.name)).contains("ask_user_question"))
+    }
+
     @Test("a subagent executor does not advertise ask_user_question even with a broker")
     func subagentDoesNotAdvertise() async throws {
         let workspace = QuestionWorkspace()
