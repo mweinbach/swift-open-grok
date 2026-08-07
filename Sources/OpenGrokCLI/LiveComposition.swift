@@ -1106,6 +1106,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             )
                         },
                         permissionCoordinator: permissionCoordinator,
+                        permissionMode: toolExecutor.sessionPermissionMode,
                         workflowRegistry: workflowRegistry,
                         workflowsEnabled: workflowsEnabled,
                         terminalProgram: context.environment["TERM_PROGRAM"],
@@ -3108,6 +3109,75 @@ struct LiveSecurityContext: Sendable {
     }
 }
 
+/// Runtime permission-mode control for the live pager session.
+///
+/// Mutates the session's `PermissionPipeline` handle — the same one
+/// `FileToolSession.makePipeline` wired — so deny rules still win over
+/// always-approve (`PermissionManager.request` evaluates policy before yolo;
+/// `FileToolSession.swift:104-124`).
+actor LiveSessionPermissionMode {
+    enum DisplayMode: String, Sendable, Equatable {
+        case ask
+        case alwaysApprove = "always-approve"
+    }
+
+    private let pipeline: PermissionPipeline
+    private let yoloPinReason: String?
+    private(set) var displayMode: DisplayMode
+
+    init(pipeline: PermissionPipeline, resolved: ResolvedPermissions) {
+        self.pipeline = pipeline
+        self.yoloPinReason = resolved.yoloPinReason
+        if resolved.alwaysApprove, resolved.yoloPinReason == nil {
+            displayMode = .alwaysApprove
+        } else {
+            displayMode = .ask
+        }
+    }
+
+    func permissionModeLabel() -> String { displayMode.rawValue }
+
+    func composerFlags() -> [PagerComposerFlag] {
+        switch displayMode {
+        case .alwaysApprove:
+            return [PagerComposerFlag(label: displayMode.rawValue)]
+        case .ask:
+            return []
+        }
+    }
+
+    /// Toggle always-approve (`Ctrl+O`, upstream `dispatch_toggle_yolo`).
+    func toggleAlwaysApprove() async -> String? {
+        if displayMode == .ask, let yoloPinReason {
+            return yoloPinReason
+        }
+        let enabling = displayMode == .ask
+        await apply(enabling ? .alwaysApprove : .ask)
+        return enabling
+            ? "\u{26A0} Always-approve ON: all tool actions auto-run"
+            : "\u{2713} Always-approve off"
+    }
+
+    /// Shift+Tab cycle without plan/auto arms (upstream legacy path when auto
+    /// is gated off: ask ↔ always-approve, `modes.rs:693-695`).
+    func cyclePermissionMode() async -> String? {
+        switch displayMode {
+        case .ask:
+            if let yoloPinReason { return yoloPinReason }
+            await apply(.alwaysApprove)
+            return "Mode: Always-Approve"
+        case .alwaysApprove:
+            await apply(.ask)
+            return "Mode: Normal"
+        }
+    }
+
+    private func apply(_ newMode: DisplayMode) async {
+        displayMode = newMode
+        await pipeline.permissions.setYoloMode(newMode == .alwaysApprove)
+    }
+}
+
 struct LiveToolExecutor: Sendable {
     let tools: [ToolSpec]
     let workingDirectory: URL
@@ -3118,6 +3188,9 @@ struct LiveToolExecutor: Sendable {
     /// dispatch straight to `composition.invoke`, so shell execution never saw
     /// a deny rule, a PreToolUse hook, or the permission modal.
     private let permissionPipeline: PermissionPipeline?
+    /// Mutable permission-mode state the pager toggles at runtime (`Ctrl+O`,
+    /// Shift+Tab). Shares the pipeline handle the tool gate consults.
+    let sessionPermissionMode: LiveSessionPermissionMode?
     private let hookPermissionGate: HookPermissionGate?
     /// The OS sandbox this session runs under. `profileName` is what a session
     /// writer persists so a resume is pinned to the same profile.
@@ -3364,6 +3437,14 @@ struct LiveToolExecutor: Sendable {
         }
         self.backgroundTaskToolNames = Set(backgroundTaskTools.map(\.name))
         self.permissionPipeline = fileToolResources.permissionPipeline
+        if let permissionPipeline = fileToolResources.permissionPipeline {
+            self.sessionPermissionMode = LiveSessionPermissionMode(
+                pipeline: permissionPipeline,
+                resolved: security.permissions
+            )
+        } else {
+            self.sessionPermissionMode = nil
+        }
         self.hookPermissionGate = hooks.gate
         self.composition = composition
         self.fileToolBridge = fileToolBridge
@@ -3585,7 +3666,8 @@ struct LiveToolExecutor: Sendable {
         let prepared = await permissionPipeline.prepare(PrepareToolAccessRequest(
             access: .bash("kill_task \(taskID)"),
             toolName: call.name,
-            toolCallId: call.callId
+            toolCallId: call.callId,
+            permissionModeLabel: await sessionPermissionMode?.permissionModeLabel()
         ))
         if prepared.mayDispatch { return nil }
         switch prepared.decision {
@@ -3627,7 +3709,8 @@ struct LiveToolExecutor: Sendable {
         let prepared = await permissionPipeline.prepare(PrepareToolAccessRequest(
             access: .bash(command),
             toolName: call.name,
-            toolCallId: call.callId
+            toolCallId: call.callId,
+            permissionModeLabel: await sessionPermissionMode?.permissionModeLabel()
         ))
         if prepared.mayDispatch { return nil }
 
@@ -5442,6 +5525,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private var overlays = PagerOverlayStack()
     private var lastOverlayBounds: [PagerOverlayBounds] = []
     private let permissionCoordinator: PagerPermissionCoordinator?
+    /// Live permission-mode handle shared with the tool executor's pipeline.
+    private let permissionMode: LiveSessionPermissionMode?
+    /// Composer border flags derived from `permissionMode`; refreshed whenever
+    /// the mode changes so `renderState` stays synchronous.
+    private var permissionModeFlags: [PagerComposerFlag] = []
     /// The background workflow registry, when this session has one. `/workflows`
     /// reads it live at present time rather than caching rows, so the dashboard
     /// reflects runs started after the session began — including ones another
@@ -5510,6 +5598,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         modelSwitch: LiveModelSwitchCoordinator? = nil,
         providerBoundarySync: (@Sendable (Bool) async throws -> Void)? = nil,
         permissionCoordinator: PagerPermissionCoordinator? = nil,
+        permissionMode: LiveSessionPermissionMode? = nil,
         workflowRegistry: RhaiWorkflowRunRegistry? = nil,
         workflowsEnabled: Bool = true,
         terminalProgram: String? = nil,
@@ -5545,6 +5634,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.modelSwitch = modelSwitch
         self.providerBoundarySync = providerBoundarySync
         self.permissionCoordinator = permissionCoordinator
+        self.permissionMode = permissionMode
         self.workflowRegistry = workflowRegistry
         self.workflowsEnabled = workflowsEnabled
         self.compaction = compaction
@@ -5692,6 +5782,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             ))
         }
         await refreshContextUsage()
+        if let permissionMode {
+            permissionModeFlags = await permissionMode.composerFlags()
+        }
         try renderState()
     }
 
@@ -5973,10 +6066,6 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     // MARK: - Global chords
 
     /// Route an application-level chord.
-    ///
-    /// The three that open overlays are the ones this renderer can service; the
-    /// pane toggles and session chords have no backing state here yet and are
-    /// explicit no-ops rather than silent misbehaviour.
     private func applyGlobal(_ command: OpenGrokPagerGlobalCommand) async throws {
         switch command {
         case .commandPalette:
@@ -5987,9 +6076,22 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             try await present(.modelPicker(query: nil))
         case .toggleQueue:
             try await present(.promptQueue(entries: []))
+        case .cyclePermissionMode:
+            guard let permissionMode else { return }
+            if let notice = await permissionMode.cyclePermissionMode() {
+                appendMessage(PagerMessage(role: .system, text: notice))
+            }
+            permissionModeFlags = await permissionMode.composerFlags()
+            try renderState()
+        case .toggleAlwaysApprove:
+            guard let permissionMode else { return }
+            if let notice = await permissionMode.toggleAlwaysApprove() {
+                appendMessage(PagerMessage(role: .system, text: notice))
+            }
+            permissionModeFlags = await permissionMode.composerFlags()
+            try renderState()
         case .toggleTodos, .toggleTasks, .sendToBackground, .newSession,
-             .cyclePermissionMode, .toggleAlwaysApprove, .openDashboard,
-             .openSettings, .openSessions, .openExtensions:
+             .openDashboard, .openSettings, .openSessions, .openExtensions:
             // Unbound in the controller's key table until the backing surface
             // exists, so these arrive only from a caller that built them by
             // hand. Nothing to do beats a misleading approximation.
@@ -7418,6 +7520,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 cursorVisible: !selection.isFocused,
                 modelName: modelName,
                 reasoningEffort: reasoningEffort,
+                flags: permissionModeFlags,
                 isMultiline: inputModes.isMultiline,
                 maximumHeight: max(3, terminalSize.height / 2)
             ),
