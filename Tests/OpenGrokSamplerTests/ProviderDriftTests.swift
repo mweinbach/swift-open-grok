@@ -418,12 +418,18 @@ struct MetaResponsesDialectTests {
 
 // MARK: - Raw-input replay gating
 
-/// Provenance: upstream `raw_responses_input_replacements`
-/// (xai-grok-sampling-types/src/conversation.rs:1614-1650): opaque Codex raw
-/// history replays only into the Codex dialect; DeepSeek and Meta fail closed
-/// with no replay.
+/// Provenance: upstream `raw_responses_input_replacements` and
+/// `x_search_call_wire_value` (xai-grok-sampling-types/src/conversation.rs:
+/// 1614-1650, 1978-1997): xAI replays only X Search, Codex replays only raw
+/// Codex history, and DeepSeek and Meta fail closed with no replay.
 @Suite("Raw-input replay gating")
 struct RawInputReplayGatingTests {
+    private let xSearchAction: JSONValue = .object([
+        "type": .string("search"),
+        "query": .string("Swift Open Grok"),
+    ])
+    private let xSearchInput = #"{"type":"search","query":"Swift Open Grok"}"#
+
     private func requestWithCodexRawHistory() -> ConversationRequest {
         ConversationRequest(items: [
             .user(UserItem(content: [.text(text: "hello")])),
@@ -439,9 +445,36 @@ struct RawInputReplayGatingTests {
         ])
     }
 
-    private func inputItems(provider: ModelProvider, model: String) throws -> [JSONValue] {
+    private func requestWithMixedNativeHistory() -> ConversationRequest {
+        ConversationRequest(items: [
+            .user(UserItem(content: [.text(text: "hello")])),
+            .backendToolCall(BackendToolCallItem(kind: .xSearch(
+                CustomToolCall(
+                    id: "x_search_item_1",
+                    callId: "x_search_call_1",
+                    name: "x_keyword_search",
+                    input: xSearchInput
+                )
+            ))),
+            .backendToolCall(BackendToolCallItem(kind: .codexRawInput(
+                CodexRawInputItem(
+                    id: "raw-1",
+                    raw: .object([
+                        "type": .string("item_reference"),
+                        "id": .string("rs_opaque_1"),
+                    ])
+                )
+            ))),
+        ])
+    }
+
+    private func inputItems(
+        _ request: ConversationRequest,
+        provider: ModelProvider,
+        model: String
+    ) throws -> [JSONValue] {
         let body = projectResponsesRequestBody(
-            requestWithCodexRawHistory(),
+            request,
             model: model,
             policy: ResponsesRequestPolicy(),
             adapter: providerAdapter(provider)
@@ -451,20 +484,58 @@ struct RawInputReplayGatingTests {
 
     @Test("a Codex-dialect request still replays codex raw input")
     func codexReplays() throws {
-        let input = try inputItems(provider: .codex, model: "gpt-5-codex")
+        let input = try inputItems(
+            requestWithCodexRawHistory(),
+            provider: .codex,
+            model: "gpt-5-codex"
+        )
         #expect(input.contains { $0["id"]?.stringValue == "rs_opaque_1" })
     }
 
     @Test("Meta- and DeepSeek-dialect requests carry no codex raw input")
     func metaAndDeepSeekFailClosed() throws {
         for (provider, model) in [(ModelProvider.meta, "muse-spark"), (.deepseek, "deepseek-v4-flash")] {
-            let input = try inputItems(provider: provider, model: model)
+            let input = try inputItems(
+                requestWithCodexRawHistory(),
+                provider: provider,
+                model: model
+            )
             #expect(
                 !input.contains { $0["id"]?.stringValue == "rs_opaque_1" },
                 "\(provider.asString) must not replay opaque Codex history"
             )
             // The rest of the conversation still projects.
             #expect(input.contains { $0["role"]?.stringValue == "user" })
+        }
+    }
+
+    @Test("each dialect replays only its own provider-native history")
+    func replaysProviderNativeHistoryOnlyIntoItsOwnDialect() throws {
+        let request = requestWithMixedNativeHistory()
+
+        let xaiInput = try inputItems(request, provider: .xai, model: "grok-4.5")
+        let xSearchItem = try #require(
+            xaiInput.first { $0["type"]?.stringValue == "x_search_call" }
+        )
+        #expect(xSearchItem == .object([
+            "type": .string("x_search_call"),
+            "id": .string("x_search_item_1"),
+            "status": .string("completed"),
+            "call_id": .string("x_search_call_1"),
+            "name": .string("x_keyword_search"),
+            "arguments": .string(xSearchInput),
+            "action": xSearchAction,
+        ]))
+        #expect(!xaiInput.contains { $0["id"]?.stringValue == "rs_opaque_1" })
+
+        let codexInput = try inputItems(request, provider: .codex, model: "gpt-5-codex")
+        #expect(codexInput.contains { $0["id"]?.stringValue == "rs_opaque_1" })
+        #expect(!codexInput.contains { $0["type"]?.stringValue == "x_search_call" })
+
+        for (provider, model) in [(ModelProvider.deepseek, "deepseek-v4-flash"), (.meta, "muse-spark")] {
+            let input = try inputItems(request, provider: provider, model: model)
+            #expect(!input.contains { $0["type"]?.stringValue == "x_search_call" })
+            #expect(!input.contains { $0["id"]?.stringValue == "rs_opaque_1" })
         }
     }
 }
