@@ -2645,6 +2645,16 @@ struct ParityCompositionTests {
         }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
+        // An explicit `--cwd` keeps the session out of this repository's own
+        // checkout: without it the session cwd is the process cwd, live skill
+        // discovery finds the repo's committed `.cursor/skills`, and a
+        // "newly discovered skills" system item lands ahead of the asserted
+        // request items. Broke the moment a real skill was committed.
+        let isolatedCwd = root.appendingPathComponent("cwd", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: isolatedCwd,
+            withIntermediateDirectories: true
+        )
         let dependencies = OpenGrokLiveCompositionDependencies(
             makeSampler: { _ in sampler.makeSampler() },
             terminal: terminal.terminal,
@@ -2659,7 +2669,7 @@ struct ParityCompositionTests {
         let (streams, out, err) = CLIStreams.buffered()
 
         let code = await CLIRunner.run(
-            ["interactive"],
+            ["interactive", "--cwd", isolatedCwd.path],
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,

@@ -119,7 +119,7 @@ struct LiveWorktreeLauncherReachabilityTests {
     @Test("missing worktree targets propagate a failure")
     func missingTargetFails() async throws {
         let home = FileManager.default.temporaryDirectory
-            .appendingPathComponent("open-grok-worktree-negative-(UUID().uuidString)")
+            .appendingPathComponent("open-grok-worktree-negative-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: home) }
         let command = try CLICommandParser.parseOrThrow(["worktree", "show", "missing"])
@@ -141,8 +141,12 @@ struct LiveWorktreeLauncherReachabilityTests {
     }
 
     private func makeRepository() throws -> URL {
+        // Unique per call: two tests in this suite build repositories in
+        // parallel, and a shared literal path made their `git init`s race
+        // ("File exists") in any parallel run while the serial gate stayed
+        // green.
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("open-grok-worktree-(UUID().uuidString)")
+            .appendingPathComponent("open-grok-worktree-\(UUID().uuidString)")
         let repository = root.appendingPathComponent("repo", isDirectory: true)
         try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
         func git(_ args: [String]) throws {
