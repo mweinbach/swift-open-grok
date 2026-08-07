@@ -161,6 +161,55 @@ public actor PermissionPipeline {
         planMode = tracker
     }
 
+    /// Arm plan mode for this session (the live `enter_plan_mode` tool calls this).
+    /// Mirrors `PlanModeTracker.enter` but mutates the pipeline-owned tracker so
+    /// the very next `prepare` sees the active gate without a replace race.
+    public func enterPlanMode(planFilePath: String? = nil, sessionDirectory: String? = nil) {
+        planMode.enter(planFilePath: planFilePath, sessionDirectory: sessionDirectory)
+    }
+
+    /// Disarm plan mode for this session (the live `exit_plan_mode` tool calls
+    /// this once the user approves the exit). After this, non-plan edits flow
+    /// through the ordinary permission engine again.
+    public func exitPlanMode() {
+        planMode.exit()
+    }
+
+    /// The absolute plan-file path the live plan-mode tools seed and read.
+    /// The enter/exit handlers route through this so the file they touch is
+    /// exactly the file the plan-file auto-approval gate compares against.
+    public func planFileResolvedPath() -> String {
+        planMode.resolvedPlanFilePath()
+    }
+
+    /// Whether plan mode is currently armed. The live tool surface and tests
+    /// assert through this rather than reaching into the tracker directly.
+    public var planModeActive: Bool {
+        planMode.isActive
+    }
+
+    /// Route exit-plan approval through the existing permission ask sheet.
+    ///
+    /// Divergence from upstream, recorded: upstream's `exit_plan_mode` raises
+    /// a dedicated plan-approval reverse-request and the pager renders a
+    /// plan-approval view (`xai-grok-pager/src/views/plan_approval_view.rs`).
+    /// The Swift pager lacks that view (backing B4), so we reuse the prompter
+    /// the file tools already paint. Cost: the ask copy is generic permission
+    /// copy, not plan-approval-specific, and a denied exit returns a
+    /// "permission denied" shape rather than a "plan not approved" shape —
+    /// so the model may retry the exit where upstream would not. That is the
+    /// trade for not shipping a half-built approval surface; do not loosen it
+    /// by auto-approving here, and do not widen the prompter to special-case
+    /// plan approval without also adding the dedicated view.
+    public func requestExitPlanApproval(toolCallId: String) async -> PermissionDecision {
+        let prompter = await permissions.prompter
+        return await prompter.prompt(
+            access: .read(nil),
+            toolName: "exit_plan_mode",
+            toolCallId: toolCallId
+        )
+    }
+
     public func setRemotePolicy(available: Bool, denied: Bool = false) {
         remotePolicyAvailable = available
         remotePolicyDenied = denied
