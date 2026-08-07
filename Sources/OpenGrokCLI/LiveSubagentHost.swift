@@ -1,0 +1,965 @@
+// LiveSubagentHost.swift
+//
+// The live half of the subagent stack: one `OpenGrokAgentCoordinator` per root
+// session, plus the shell-child runner that turns a `spawn_subagent` tool call
+// into a real headless child session.
+//
+// Parity anchors (pin 70002584):
+//   * spawn validation order and error copy — `xai-grok-tools/.../task/mod.rs`
+//     (`TaskTool::run` steps 1-6).
+//   * child construction — `xai-grok-shell/.../subagent/handle_request.rs`
+//     (`run_shell_child`): the child gets its own conversation and session
+//     persistence, the parent's credentials (the same sampler), a tool policy
+//     with the nested-spawn and plan surfaces stripped, capability clamping
+//     against the parent ceiling, and cancellation owned by the coordinator.
+//   * the `get_task_output` / `wait_tasks` / `kill_task` unification —
+//     `xai-grok-tools/.../task_output/mod.rs` and `kill_task/mod.rs`: shell
+//     task ids and subagent ids share one namespace; a miss on the shell side
+//     falls through to the coordinator.
+//
+// Deliberately absent here (recorded in the slice report): `agent_swarm`, the
+// collaboration quartet, worktree isolation, the foreground await budget with
+// auto-backgrounding, Antigravity runners, and durable cross-process resume
+// metadata. Resume works within the session through the same conversation
+// store the root session uses.
+
+import Foundation
+import OpenGrokAgentCoordinator
+import OpenGrokAgentDefinitions
+import OpenGrokFileTools
+import OpenGrokHooks
+import OpenGrokHooksPluginTypes
+import OpenGrokSamplingTypes
+import OpenGrokShared
+import OpenGrokShell
+import OpenGrokShellBase
+import OpenGrokSubagentResolution
+import OpenGrokToolTypes
+
+/// Outcome of a `kill_task` aimed at a subagent id. Mirrors Rust
+/// `SubagentCancelOutcome` (task/types.rs).
+enum LiveSubagentCancelOutcome: Sendable, Equatable {
+    case cancelled
+    case alreadyFinished(status: String)
+    case notFound
+}
+
+/// A render-ready view of one child for the background-task family.
+///
+/// The coordinator owns lifecycle truth; this carries what
+/// `LiveBackgroundTaskTools` needs to render the upstream
+/// `format_subagent_snapshot` shapes (task_output/mod.rs:624+) without
+/// knowing about the coordinator at all.
+struct LiveSubagentSnapshot: Sendable, Equatable {
+    var subagentID: String
+    var subagentType: String
+    var description: String
+    /// `running`, `completed`, `failed`, or `cancelled` — the terminal
+    /// vocabulary `TaskOutputResult.isTerminal` already recognizes.
+    var status: String
+    var output: String
+    var startedAt: Date
+    var durationMS: UInt64
+    var exitCode: Int32?
+
+    var completed: Bool { status != "running" }
+}
+
+/// The seam `LiveBackgroundTaskTools` consumes. One conformer: the session's
+/// `LiveSubagentHost`. The protocol exists so the background-task tools stay
+/// testable without standing up a sampler.
+protocol LiveSubagentQuerying: Sendable {
+    func subagentSnapshot(id: String) async -> LiveSubagentSnapshot?
+    func awaitSubagent(id: String, timeoutMS: UInt64) async -> LiveSubagentSnapshot?
+    func cancelSubagent(id: String) async -> LiveSubagentCancelOutcome
+    func knownSubagentIDs() async -> [String]
+}
+
+actor LiveSubagentHost: LiveSubagentQuerying {
+    /// Everything a child inherits from the root session, gathered once so
+    /// `spawn` does not grow a dozen loose parameters. The sampler carries the
+    /// parent's resolved credentials; the security context and sandbox
+    /// decision are the parent's own, so a child runs under exactly the
+    /// session's policy rather than a re-resolved one that could drift.
+    struct Context: Sendable {
+        var sampler: OpenGrokLiveSampler
+        var parentModel: String
+        var workingDirectory: URL
+        /// The root session id. Children are scoped to it: cancellation of
+        /// the session tears them down, and their ids share the background
+        /// task namespace only within this session.
+        var sessionID: String
+        var openGrokHome: URL
+        var conversationStore: LiveConversationStore
+        var processBackend: any ShellProcessBackend
+        var securityContext: LiveSecurityContext
+        var sandboxDecision: LiveSandboxDecision
+        var permissionOptions: CLIPermissionOptions
+        var fileAccessPolicy: FileToolAccessPolicy
+        var telemetryBootstrapContext: LiveTelemetryBootstrapContext
+        var imageToolContext: LiveImageToolContext?
+        var webToolContext: LiveWebToolContext?
+        var environment: [String: String]
+        /// The parent session's capability ceiling. `nil` (no agent profile)
+        /// means no clamp, matching upstream's `Option<SubagentCapabilityMode>`.
+        var parentCapabilityCeiling: OpenGrokSubagentResolution.SubagentCapabilityMode?
+        var definitionContext: DefinitionResolutionContext
+        /// Public catalog slugs the `model` parameter may name.
+        var modelSlugs: [String]
+        /// Matches the root turn loop's ceiling (`LiveComposition.swift`
+        /// `runTurn`): a child that has not converged in this many tool
+        /// rounds is looping.
+        var maxToolRounds: Int = 16
+    }
+
+    /// The one coordinator per root session (scope item 1). Exposed
+    /// `nonisolated let` so the session can also tear it down directly.
+    nonisolated let coordinator: OpenGrokAgentCoordinator
+    /// The spec the live tool list advertises. Built once: the roster and the
+    /// model catalog are launch-time facts here, exactly as upstream builds
+    /// the description in `AgentBuilder::build`.
+    nonisolated let toolSpec: ToolSpec
+
+    private let context: Context
+
+    /// Bookkeeping the coordinator deliberately does not carry (its request
+    /// type is a wire-frozen Codable): spawn wall-clock, the model-facing
+    /// type/description, live progress, terminal stats, and the in-session
+    /// resume index.
+    private struct Bookkeeping {
+        var startedAt: Date
+        var subagentType: String
+        var description: String
+        var model: String
+        var turns: UInt32 = 0
+        var toolCalls: UInt32 = 0
+        var toolsUsed: [String] = []
+        var errors: UInt32 = 0
+        var terminalToolCalls: UInt32?
+        var terminalTurns: UInt32?
+    }
+    private var bookkeeping: [String: Bookkeeping] = [:]
+    private var childExecutors: [String: LiveToolExecutor] = [:]
+
+    init(context: Context) {
+        self.context = context
+        self.coordinator = OpenGrokAgentCoordinator()
+        self.toolSpec = Self.makeToolSpec(context: context)
+    }
+
+    // MARK: - Tool spec (advertised as `spawn_subagent`)
+
+    /// The production name upstream's grok-build preset renames `task` to
+    /// (`xai-grok-agent/src/config.rs:152-156`), with `run_in_background`
+    /// renamed to `background`. The canonical `task` spelling stays accepted
+    /// at dispatch, the inverse of how the background-task family advertises
+    /// canonical names and accepts the production ones.
+    nonisolated static let advertisedToolName = "spawn_subagent"
+    nonisolated static let dispatchNames: Set<String> = ["spawn_subagent", "task"]
+
+    private static func makeToolSpec(context: Context) -> ToolSpec {
+        let fragmentNaming = SubagentToolNaming(
+            execute: "run_terminal_cmd",
+            read: "read_file",
+            edit: "search_replace",
+            list: "list_dir",
+            search: "grep",
+            webSearch: "web_search",
+            plan: "todo_write"
+        )
+        // Upstream lists built-ins first in catalog order, then discovered
+        // entries (`discovery.rs` `merge_subagents`); `availableAgentNames`
+        // is alphabetical, so the built-in order is restored by hand.
+        let names = availableAgentNames(context: context.definitionContext)
+        let builtinOrder = AgentDefinition.subagentNames
+        let ordered = names.sorted { lhs, rhs in
+            switch (builtinOrder.firstIndex(of: lhs), builtinOrder.firstIndex(of: rhs)) {
+            case let (l?, r?): return l < r
+            case (_?, nil): return true
+            case (nil, _?): return false
+            case (nil, nil): return lhs < rhs
+            }
+        }
+        let descriptors = ordered.map { name -> SubagentDescriptor in
+            let definition = discoverAgentDefinition(subagentType: name, context: context.definitionContext)
+            // Only a true built-in carries the tool-access fragment; a
+            // shadowing project definition's raw description stands alone
+            // (builder.rs `build_task_description`).
+            let tools = definition?.scope == .builtIn
+                ? builtinSubagentByName(name)?.renderTools(fragmentNaming)
+                : nil
+            return SubagentDescriptor(
+                name: name,
+                description: definition?.description ?? name,
+                tools: tools
+            )
+        }
+        var description = buildTaskDescription(
+            subagents: descriptors,
+            naming: TaskToolNaming(
+                taskTool: advertisedToolName,
+                subagentTypeParam: "subagent_type",
+                runInBackgroundParam: "background",
+                resumeFromParam: "resume_from",
+                // The name this session actually advertises for retrieval —
+                // the port's background-task family keeps the canonical
+                // registry names (recorded divergence from the production
+                // rename table).
+                backgroundRetrievalTool: LiveBackgroundTaskTools.getTaskOutputName,
+                isolationParam: "isolation"
+            )
+        )
+        description += modelGuidance(slugs: context.modelSlugs)
+        return ToolSpec(
+            name: advertisedToolName,
+            description: description,
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "prompt": .object([
+                        "type": .string("string"),
+                        "description": .string("The full task prompt for the subagent to execute."),
+                    ]),
+                    "description": .object([
+                        "type": .string("string"),
+                        "description": .string("Short description of the task (3-5 words)."),
+                    ]),
+                    "subagent_type": .object([
+                        "type": .string("string"),
+                        "description": .string("Name of the subagent type to launch. Built-in types: \"general-purpose\", \"explore\", \"plan\". Additional user-defined types may also be available."),
+                    ]),
+                    "background": .object([
+                        "type": .string("boolean"),
+                        "description": .string("Returns immediately with a subagent_id. Use the task output tool to retrieve results. This is set to true by default."),
+                    ]),
+                    "capability_mode": .object([
+                        "type": .string("string"),
+                        "enum": .array([.string("read-only"), .string("read-write"), .string("execute"), .string("all")]),
+                        "description": .string("Capability mode: \"read-only\", \"read-write\", \"execute\", or \"all\". Controls which tool classes the child can use. Default is determined by the role."),
+                    ]),
+                    "isolation": .object([
+                        "type": .string("string"),
+                        "enum": .array([.string("none"), .string("worktree")]),
+                        "description": .string("Isolation mode: \"none\" (default, shared workspace) or \"worktree\" (isolated git worktree). Worktree mode prevents the child's edits from affecting the parent workspace until explicitly merged."),
+                    ]),
+                    "resume_from": .object([
+                        "type": .string("string"),
+                        "description": .string("Resume from a previously completed subagent's conversation. Pass the subagent_id returned by a prior task call. The new subagent continues the previous one's raw transcript with the new task prompt appended. The source must be completed (not running), belong to the current session, and use the same subagent_type."),
+                    ]),
+                    "cwd": .object([
+                        "type": .string("string"),
+                        "description": .string("Explicit working directory for the subagent. The path must exist and be a directory. Mutually exclusive with isolation=\"worktree\". Ignored when resume_from is set (the resumed child inherits its source's cwd/worktree)."),
+                    ]),
+                    "model": .object([
+                        "type": .string("string"),
+                        "description": .string("Optional model slug for this agent. If provided, it must resolve to one of the available model slugs, and its provider must have usable credentials. If omitted, the subagent uses the same model as the parent agent."),
+                    ]),
+                ]),
+                "required": .array([.string("prompt"), .string("description")]),
+                "additionalProperties": .bool(false),
+            ])
+        )
+    }
+
+    /// `task_model_guidance` (builder.rs:1362-1383) with the `model` param
+    /// name resolved — upstream renders `${{ params.task.model }}` at
+    /// finalize time; this composition builds descriptions directly.
+    private static func modelGuidance(slugs: [String]) -> String {
+        let sorted = Array(Set(slugs)).sorted()
+        guard !sorted.isEmpty else {
+            return "\n\nNo explicit model slugs are currently available. Omit `model` to inherit the parent model."
+        }
+        let list = sorted.map { "- \($0)" }.joined(separator: "\n")
+        return "\n\nYou may choose a different model or provider for a subagent when it materially fits the delegated task better (for example, speed, cost, depth, or provider capabilities). You MUST use only model slugs from this list:\n"
+            + list
+            + "\n\nOmit `model` to inherit the parent model when no listed model is a better fit."
+    }
+
+    // MARK: - Spawn (the `task` tool path)
+
+    /// Execute one `spawn_subagent` call. Validation order and error copy
+    /// follow `TaskTool::run`: sanitize, cwd check, eager type validation,
+    /// model check, then background fire-and-forget or a foreground await.
+    func spawn(
+        args: JSONValue,
+        toolCallID: String
+    ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
+        guard case .object(var object) = args else {
+            return .failure(.invalidCall("\(Self.advertisedToolName) requires an object argument"))
+        }
+        // The production rename is client-facing only; map it back before the
+        // canonical decoder runs (`with_param_rename`, registry/types.rs:166).
+        if object["run_in_background"] == nil, let background = object["background"] {
+            object["run_in_background"] = background
+        }
+        let input: TaskToolInput
+        do {
+            input = try JSONDecoder().decode(TaskToolInput.self, from: JSONEncoder().encode(object))
+        } catch {
+            return .failure(.invalidCall("\(Self.advertisedToolName) arguments are invalid: \(error)"))
+        }
+
+        // cwd: sanitize, then validate it names a real directory (skipped on
+        // resume, where the source's cwd wins anyway).
+        let sanitizedCwd = sanitizeOptionalArg(input.cwd)
+        let resumeID = sanitizeOptionalArg(input.resumeFrom)
+        let childCWD: URL
+        if let sanitizedCwd, resumeID == nil {
+            let path = (sanitizedCwd as NSString).isAbsolutePath
+                ? sanitizedCwd
+                : context.workingDirectory.appendingPathComponent(sanitizedCwd).standardizedFileURL.path
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else {
+                return .failure(.invalidCall("cwd \"\(sanitizedCwd)\" does not exist"))
+            }
+            guard isDirectory.boolValue else {
+                return .failure(.invalidCall("cwd \"\(sanitizedCwd)\" exists but is not a directory"))
+            }
+            childCWD = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+        } else {
+            childCWD = context.workingDirectory
+        }
+
+        // Eager type validation, before any background spawn can escape with
+        // a bad roster entry (task/mod.rs step 2).
+        let definition: AgentDefinition
+        do {
+            definition = try resolveAgentDefinition(
+                subagentType: input.subagentType,
+                context: context.definitionContext
+            )
+        } catch let error as ResolutionError {
+            return .failure(.invalidCall(Self.validationMessage(error)))
+        } catch {
+            return .failure(.invalidCall("Cannot validate subagent '\(input.subagentType)'"))
+        }
+
+        // Explicit model slugs must resolve against the public catalog
+        // (task/mod.rs step 2b); the error vocabulary is the resolution
+        // module's own (`ResolutionError.modelUnavailable`).
+        if let requestedModel = sanitizeOptionalArg(input.model),
+           !context.modelSlugs.contains(requestedModel) {
+            return .failure(.invalidCall("subagent model \"\(requestedModel)\" is unavailable"))
+        }
+
+        let requestedCapability = input.capabilityMode.map { mode -> OpenGrokSubagentResolution.SubagentCapabilityMode in
+            switch mode {
+            case .readOnly: return .readOnly
+            case .readWrite: return .readWrite
+            case .execute: return .execute
+            case .all: return .all
+            }
+        }
+        var runtime = resolveRuntimeConfig(
+            subagentType: input.subagentType,
+            overrides: SubagentRuntimeOverrides(
+                model: sanitizeOptionalArg(input.model),
+                capabilityMode: requestedCapability,
+                isolation: input.isolation,
+                allowNestedSubagents: false
+            ),
+            roles: [:],
+            personas: [:],
+            cwd: childCWD,
+            definition: definition,
+            parent: ParentRuntimeDefaults(
+                model: context.parentModel,
+                capabilityMode: context.parentCapabilityCeiling
+            )
+        )
+        if runtime.personaResolutionFatal, let personaError = runtime.personaError {
+            return .failure(.invalidCall(personaError))
+        }
+        // `run_shell_child` intersects once more with the definition's own
+        // ceiling after resolution (handle_request.rs:540-543).
+        runtime.capabilityMode = intersectCapabilityModes(
+            requested: runtime.capabilityMode,
+            ceiling: definition.capabilityMode.map { mode -> OpenGrokSubagentResolution.SubagentCapabilityMode in
+                switch mode {
+                case .readOnly: return .readOnly
+                case .readWrite: return .readWrite
+                case .execute: return .execute
+                case .all: return .all
+                }
+            }
+        )
+
+        // Resume: the source must be a completed child of this session with a
+        // persisted transcript; identity validation is the resolution
+        // module's own (`validate_resume_identity`).
+        var resumeItems: [ConversationItem]? = nil
+        if let resumeID {
+            let activeIDs = await coordinator.listActive(parentSessionID: context.sessionID)
+                .map { $0.request.id }
+            if activeIDs.contains(resumeID) {
+                return .failure(.invalidCall(
+                    "Cannot resume from subagent '\(resumeID)': it is still running. Wait for it to complete before resuming."
+                ))
+            }
+            guard let source = bookkeeping[resumeID] else {
+                return .failure(.invalidCall(Self.resumeNotFoundMessage(resumeID)))
+            }
+            do {
+                try validateResumeIdentity(
+                    requestedType: input.subagentType,
+                    requestedPersona: nil,
+                    source: ResumeSourceData(
+                        subagentID: resumeID,
+                        subagentType: source.subagentType,
+                        childCWD: childCWD.path,
+                        childSessionID: resumeID
+                    )
+                )
+            } catch {
+                return .failure(.invalidCall(String(describing: error)))
+            }
+            guard let record = try? await context.conversationStore.loadIfPresent(sessionID: resumeID) else {
+                return .failure(.invalidCall(Self.resumeNotFoundMessage(resumeID)))
+            }
+            resumeItems = record.items
+            // A resumed child pins the source's model; an explicit override is
+            // ignored, mirroring `run_shell_child`'s resume arm.
+            runtime.model = source.model
+        }
+
+        let childModel = runtime.model ?? context.parentModel
+        // Upstream assigns `Uuid::now_v7()`. The port has no v7 helper; a v4
+        // UUID costs the time-ordered id sort (cosmetic only — completion
+        // order is tracked separately), noted in the slice report.
+        let childID = sanitizeOptionalArg(input.taskId) ?? UUID().uuidString.lowercased()
+
+        // The child's tool policy: the resolved definition after the nested
+        // spawn/plan strip and the capability filter, so the child can never
+        // hold a surface the policy removed — and it never sees a subagent
+        // host, so `spawn_subagent` is absent from its list twice over.
+        var strippedDefinition = definition
+        applyChildToolPolicy(
+            definition: &strippedDefinition,
+            capabilityMode: runtime.capabilityMode,
+            allowNestedSubagents: false
+        )
+        strippedDefinition.capabilityMode = runtime.capabilityMode.map { mode in
+            switch mode {
+            case .readOnly: return AgentCapabilityMode.readOnly
+            case .readWrite: return AgentCapabilityMode.readWrite
+            case .execute: return AgentCapabilityMode.execute
+            case .all: return AgentCapabilityMode.all
+            }
+        }
+        // Frozen for the @Sendable child closure: a captured `var` is a
+        // concurrency error, and these never change after this point.
+        let childDefinition = strippedDefinition
+        let childRuntime = runtime
+        let inheritedItems = resumeItems
+
+        bookkeeping[childID] = Bookkeeping(
+            startedAt: Date(),
+            subagentType: input.subagentType,
+            description: input.description,
+            model: childModel
+        )
+        let request = OpenGrokChildRequest(
+            id: childID,
+            parentSessionID: context.sessionID,
+            owner: .task,
+            runInBackground: input.runInBackground,
+            capabilityMode: runtime.capabilityMode?.rawValue,
+            reasoningEffort: runtime.reasoningEffort,
+            resumeFrom: resumeID,
+            surfaceCompletion: true
+        )
+        do {
+            try await coordinator.spawn(request) { [context, weak self] in
+                guard let self else {
+                    return OpenGrokChildResult(
+                        id: childID,
+                        success: false,
+                        error: "subagent host was torn down before the child ran"
+                    )
+                }
+                return await self.runChild(
+                    childID: childID,
+                    prompt: input.prompt,
+                    definition: childDefinition,
+                    runtime: childRuntime,
+                    model: childModel,
+                    cwd: childCWD,
+                    resumeItems: inheritedItems
+                )
+            }
+        } catch let error as OpenGrokCoordinatorError {
+            bookkeeping.removeValue(forKey: childID)
+            return .failure(.failed(error.description))
+        } catch {
+            bookkeeping.removeValue(forKey: childID)
+            return .failure(.failed("subagent \(childID) could not be registered: \(error)"))
+        }
+
+        if input.runInBackground {
+            let text = formatSubagentStartedBackground(
+                subagentId: childID,
+                subagentType: input.subagentType,
+                description: input.description,
+                taskOutputToolName: LiveBackgroundTaskTools.getTaskOutputName
+            )
+            return .success(OpenGrokShellToolCallResult(
+                value: .object([
+                    "subagent_id": .string(childID),
+                    "subagent_type": .string(input.subagentType),
+                    "description": .string(input.description),
+                    "status": .string("background"),
+                ]),
+                promptText: text
+            ))
+        }
+
+        // Foreground: await the child, forwarding a turn cancellation to the
+        // coordinator so the child dies with the turn (upstream's
+        // `cancellation_forwarder`, task/mod.rs:370-379). The foreground
+        // await budget that auto-backgrounds a slow child upstream is not
+        // wired here — a foreground spawn waits until completion or cancel.
+        let result: OpenGrokChildResult
+        do {
+            result = try await withTaskCancellationHandler {
+                try await coordinator.awaitResult(childID)
+            } onCancel: { [coordinator] in
+                Task { await coordinator.cancel(.childID(childID)) }
+            }
+        } catch is CancellationError {
+            return .failure(.cancelled)
+        } catch {
+            return .failure(.failed("subagent \(childID) did not produce a result: \(error)"))
+        }
+
+        if result.success {
+            let stats = bookkeeping[childID]
+            let output = SubagentCompletedOutput(
+                output: result.output,
+                subagentId: childID,
+                subagentType: input.subagentType,
+                toolCalls: stats?.terminalToolCalls ?? 0,
+                turns: stats?.terminalTurns ?? 0,
+                durationMs: result.durationMS
+            )
+            let encoded = (try? JSONEncoder().encode(output)).flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) } ?? .null
+            return .success(OpenGrokShellToolCallResult(
+                value: encoded,
+                promptText: output.toModelText()
+            ))
+        }
+        if result.cancelled {
+            return .failure(.cancelled)
+        }
+        // Upstream surfaces partial work and the resume hint on a terminal
+        // failure (task/mod.rs step 6 else-arm).
+        var message = result.error ?? "Unknown subagent error"
+        let partial = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !partial.isEmpty {
+            let truncated = partial.count > 4_000
+            message += "\n\nPartial output before the failure\(truncated ? " (truncated)" : ""):\n"
+                + String(partial.prefix(4_000))
+        }
+        let stats = bookkeeping[childID]
+        message += "\n\nThe subagent's session was preserved (\(stats?.terminalToolCalls ?? 0) tool calls, \(stats?.terminalTurns ?? 0) turns). To retry or continue it, call this tool again with resume_from: \"\(childID)\"."
+        return .failure(.invalidCall(message))
+    }
+
+    private static func validationMessage(_ error: ResolutionError) -> String {
+        switch error {
+        case .unknown(let subagentType, let available):
+            let suffix = available.isEmpty ? "" : ". Available types: \(available.joined(separator: ", "))"
+            return "Unknown subagent type: \(subagentType)\(suffix)"
+        case .disabled(let subagentType):
+            return "Subagent '\(subagentType)' is disabled via [subagents.toggle] in config.toml"
+        case .notAllowed(let subagentType, let allowed):
+            return "agent can only spawn: \(allowed.joined(separator: ", ")); '\(subagentType)' not allowed"
+        default:
+            return error.description
+        }
+    }
+
+    private static func resumeNotFoundMessage(_ resumeID: String) -> String {
+        "Cannot resume from subagent '\(resumeID)': not found. The subagent may have been evicted or the ID is invalid."
+    }
+
+    // MARK: - Child runner
+
+    /// One child session end to end: build the clamped tool surface, run the
+    /// turn loop against the parent's sampler, persist the transcript, and
+    /// report to the coordinator. Modelled on `LiveWorkflowChildAgent.run`;
+    /// the differences are the definition-rendered system prompt, the
+    /// session persistence (a workflow child's durable record is the journal;
+    /// a task child's is its resumable transcript), and the stop-hook event.
+    private func runChild(
+        childID: String,
+        prompt: String,
+        definition: AgentDefinition,
+        runtime: EffectiveRuntimeConfig,
+        model: String,
+        cwd: URL,
+        resumeItems: [ConversationItem]?
+    ) async -> OpenGrokChildResult {
+        let startedAt = Date()
+        let executor: LiveToolExecutor
+        do {
+            executor = try await LiveToolExecutor(
+                processBackend: context.processBackend,
+                sessionID: childID,
+                workingDirectory: cwd,
+                toolPolicy: LiveAgentToolPolicy(definition: definition),
+                telemetryBootstrapContext: context.telemetryBootstrapContext,
+                fileAccessPolicy: context.fileAccessPolicy,
+                environment: context.environment,
+                imageToolContext: context.imageToolContext,
+                webToolContext: context.webToolContext,
+                sandboxDecision: context.sandboxDecision,
+                securityContext: context.securityContext,
+                // Children get no rewind/memory surface in this slice; the
+                // capability lists keep their names harmlessly (nothing
+                // advertised matches them).
+                sessionServices: nil,
+                permissionOptions: context.permissionOptions
+            )
+        } catch {
+            return OpenGrokChildResult(
+                id: childID,
+                success: false,
+                error: "child agent tool surface unavailable: \(error)",
+                durationMS: Self.milliseconds(since: startedAt)
+            )
+        }
+        childExecutors[childID] = executor
+
+        var items = resumeItems ?? []
+        if resumeItems == nil {
+            if let systemPrompt = renderSubagentSystemPrompt(
+                definition: definition,
+                runtime: runtime,
+                workingDirectory: cwd
+            ) {
+                items.append(.system(systemPrompt))
+            }
+            // "Subagents receive a compacted version of project instructions"
+            // (the tool description's own promise): the AGENTS.md chain rides
+            // as the first user message, as
+            // `renderSubagentInitialUserMessage` renders it.
+            if let agentsBody = renderSubagentInitialUserMessage(
+                definition: definition,
+                workingDirectory: cwd
+            ) {
+                items.append(.user(agentsBody))
+            }
+        }
+        items.append(.user(prompt))
+
+        var record = LiveConversationRecord.new(sessionID: childID, workingDirectory: cwd)
+        record.parentSessionID = context.sessionID
+        let history = LiveConversationHistory(record: record, store: context.conversationStore)
+
+        var characters = prompt.count
+        var stopHookContinuations = 0
+        var stopHookActive = false
+        var finalOutput = ""
+        var terminalError: String? = nil
+        var cancelled = false
+
+        while true {
+            do {
+                try Task.checkCancellation()
+            } catch {
+                cancelled = true
+                terminalError = "Subagent was cancelled"
+                break
+            }
+            let response: OpenGrokLiveSamplingResponse
+            do {
+                response = try await context.sampler.sample(OpenGrokLiveSamplingRequest(
+                    sessionID: childID,
+                    turnID: "\(childID)-\(bookkeeping[childID]?.turns ?? 0)",
+                    model: model,
+                    prompt: prompt,
+                    items: items,
+                    tools: executor.tools
+                )) { _ in
+                    // A child's tokens stream to no pane; the parent reads the
+                    // finished result, same as a workflow child.
+                }
+            } catch is CancellationError {
+                cancelled = true
+                terminalError = "Subagent was cancelled"
+                break
+            } catch {
+                terminalError = "\(error)"
+                break
+            }
+            characters += response.output.count
+            items.append(contentsOf: response.items)
+
+            guard !response.toolCalls.isEmpty else {
+                if stopHookContinuations < 8 {
+                    let stopResult = await executor.runStop(
+                        event: .subagentStop,
+                        promptID: childID,
+                        payload: [
+                            "phase": .string("gate"),
+                            "subagentId": .string(childID),
+                            "subagentType": .string(bookkeeping[childID]?.subagentType ?? ""),
+                            "reason": .string("end_turn"),
+                            "stopHookActive": .boolean(stopHookActive),
+                            "lastAssistantMessage": .string(response.output),
+                        ]
+                    )
+                    if stopResult.preventContinuation == nil, stopResult.wantsContinuation {
+                        stopHookContinuations += 1
+                        stopHookActive = true
+                        items.append(.autoContinue(formatLiveStopFeedback(stopResult)))
+                        continue
+                    }
+                }
+                finalOutput = response.output
+                break
+            }
+            let round = (bookkeeping[childID]?.turns ?? 0) + 1
+            guard round <= context.maxToolRounds else {
+                terminalError = "agent \(childID) exceeded \(context.maxToolRounds) tool rounds"
+                break
+            }
+            bookkeeping[childID]?.turns = UInt32(round)
+            do {
+                let toolItems = try await executeChildCalls(
+                    response.toolCalls,
+                    childID: childID,
+                    cwd: cwd,
+                    executor: executor
+                )
+                items.append(contentsOf: toolItems)
+            } catch is CancellationError {
+                cancelled = true
+                terminalError = "Subagent was cancelled"
+                break
+            } catch {
+                terminalError = "\(error)"
+                break
+            }
+        }
+
+        let stats = bookkeeping[childID]
+        bookkeeping[childID]?.terminalToolCalls = stats?.toolCalls
+        bookkeeping[childID]?.terminalTurns = stats?.turns
+        // The transcript is the resume substrate: only a child whose save
+        // landed joins the resume index, so `resume_from` never promises a
+        // conversation that is not on disk.
+        if await persistChild(history: history, childID: childID, items: items) {
+            bookkeeping[childID]?.model = model
+        }
+        await executor.shutdown()
+        childExecutors.removeValue(forKey: childID)
+
+        return OpenGrokChildResult(
+            id: childID,
+            success: terminalError == nil,
+            output: terminalError == nil ? finalOutput : Self.lastAssistantText(items),
+            cancelled: cancelled,
+            error: terminalError,
+            tokensUsed: UInt64(max(0, characters) / 4),
+            durationMS: Self.milliseconds(since: startedAt)
+        )
+    }
+
+    /// Parallel, order-preserving tool execution with the workflow child's
+    /// failure rule: a failed tool is the model's problem to route around, a
+    /// cancelled one ends the child.
+    private func executeChildCalls(
+        _ calls: [ToolCall],
+        childID: String,
+        cwd: URL,
+        executor: LiveToolExecutor
+    ) async throws -> [ConversationItem] {
+        var results = [ConversationItem?](repeating: nil, count: calls.count)
+        try await withThrowingTaskGroup(of: (Int, ToolResultItem).self) { group in
+            for (index, call) in calls.enumerated() {
+                group.addTask { [self] in
+                    let outcome = await executor.invoke(
+                        sessionID: childID,
+                        workingDirectory: cwd,
+                        call: call
+                    )
+                    let content: String
+                    switch outcome {
+                    case .success(let value):
+                        content = value.promptText
+                    case .failure(.cancelled):
+                        throw CancellationError()
+                    case .failure(let error):
+                        // A failed tool is the model's problem to route
+                        // around: the child sees the failure text and gets
+                        // another round.
+                        content = "Tool \(call.name) failed: \(error.description)"
+                        await self.noteChildToolCall(childID: childID, name: call.name, failed: true)
+                        return (index, ToolResultItem(toolCallId: call.callId, content: content))
+                    }
+                    await self.noteChildToolCall(childID: childID, name: call.name, failed: false)
+                    return (index, ToolResultItem(toolCallId: call.callId, content: content))
+                }
+            }
+            for try await (index, result) in group {
+                results[index] = .toolResult(result)
+            }
+        }
+        return results.compactMap { $0 }
+    }
+
+    private func noteChildToolCall(childID: String, name: String, failed: Bool) {
+        bookkeeping[childID]?.toolCalls += 1
+        if failed {
+            bookkeeping[childID]?.errors += 1
+        }
+        if bookkeeping[childID]?.toolsUsed.contains(name) == false {
+            bookkeeping[childID]?.toolsUsed.append(name)
+        }
+    }
+
+    private func persistChild(
+        history: LiveConversationHistory,
+        childID: String,
+        items: [ConversationItem]
+    ) async -> Bool {
+        do {
+            try await history.commit(sessionID: childID, items: items)
+            return true
+        } catch {
+            // A lost save means `resume_from` reports not-found later — the
+            // honest failure — rather than resuming into a stale transcript.
+            return false
+        }
+    }
+
+    private static func lastAssistantText(_ items: [ConversationItem]) -> String {
+        for item in items.reversed() {
+            if case .assistant(let assistant) = item, !assistant.content.isEmpty {
+                return assistant.content
+            }
+        }
+        return ""
+    }
+
+    private static func milliseconds(since start: Date) -> UInt64 {
+        UInt64(max(0, Date().timeIntervalSince(start)) * 1_000)
+    }
+
+    // MARK: - LiveSubagentQuerying
+
+    func subagentSnapshot(id: String) async -> LiveSubagentSnapshot? {
+        if let active = await coordinator.listActive(parentSessionID: context.sessionID)
+            .first(where: { $0.request.id == id }) {
+            let meta = bookkeeping[id]
+            let started = meta?.startedAt ?? Date()
+            return LiveSubagentSnapshot(
+                subagentID: id,
+                subagentType: meta?.subagentType ?? "unknown",
+                description: meta?.description ?? "",
+                status: "running",
+                output: runningOutput(id: id, meta: meta, startedAt: started),
+                startedAt: started,
+                durationMS: Self.milliseconds(since: started),
+                exitCode: nil
+            )
+        }
+        guard let completed = await coordinator.listCompleted()
+            .first(where: { $0.request.id == id }),
+              let result = completed.result else { return nil }
+        let meta = bookkeeping[id]
+        let started = meta?.startedAt ?? Date()
+        let status = completed.state
+        let output: String
+        switch status {
+        case "completed":
+            // The upstream Completed arm: output, then `<subagent_meta>`, then
+            // the resume footer (task_output/mod.rs:700-720).
+            let toolCalls = meta?.terminalToolCalls ?? 0
+            let turns = meta?.terminalTurns ?? 0
+            output = result.output
+                + "\n\n<subagent_meta>id=\(id), type=\(meta?.subagentType ?? "unknown"), tool_calls=\(toolCalls), turns=\(turns), duration_ms=\(result.durationMS)</subagent_meta>"
+                + "\n\n" + formatResumeFooter(
+                    subagentId: id,
+                    subagentType: meta?.subagentType ?? "unknown",
+                    persona: nil
+                )
+        case "failed":
+            output = result.error ?? "Unknown subagent error"
+        default:
+            output = result.error ?? "Subagent was cancelled"
+        }
+        return LiveSubagentSnapshot(
+            subagentID: id,
+            subagentType: meta?.subagentType ?? "unknown",
+            description: meta?.description ?? "",
+            status: status,
+            output: output,
+            startedAt: started,
+            durationMS: result.durationMS,
+            exitCode: status == "completed" ? 0 : 1
+        )
+    }
+
+    /// The Running arm of `format_subagent_snapshot`, minus the context-token
+    /// fraction this composition does not measure (recorded divergence).
+    private func runningOutput(id: String, meta: Bookkeeping?, startedAt: Date) -> String {
+        let elapsed = Double(Self.milliseconds(since: startedAt)) / 1_000
+        let tools = meta?.toolsUsed.isEmpty == false ? (meta?.toolsUsed.joined(separator: ", ") ?? "") : "none yet"
+        return """
+        Subagent is still running.
+        Type: \(meta?.subagentType ?? "unknown")
+        Description: \(meta?.description ?? "")
+        Elapsed: \(String(format: "%.1f", elapsed))s
+        Progress: turn \(meta?.turns ?? 0), \(meta?.toolCalls ?? 0) tool calls
+        Tools used: \(tools)
+        Errors: \(meta?.errors ?? 0)
+        """
+    }
+
+    func awaitSubagent(id: String, timeoutMS: UInt64) async -> LiveSubagentSnapshot? {
+        guard let current = await subagentSnapshot(id: id) else { return nil }
+        if current.completed { return current }
+        do {
+            // The awaited result is re-read through `subagentSnapshot` either
+            // way — the snapshot is the single rendering path — so the value
+            // itself is intentionally unused; the throws are the status.
+            _ = try await coordinator.awaitResult(id, timeoutMS: timeoutMS)
+        } catch OpenGrokCoordinatorError.childNotFound {
+            return nil
+        } catch {
+            // Timeout: fall through to the still-running snapshot.
+        }
+        return await subagentSnapshot(id: id)
+    }
+
+    func cancelSubagent(id: String) async -> LiveSubagentCancelOutcome {
+        let active = await coordinator.listActive(parentSessionID: context.sessionID)
+        if active.contains(where: { $0.request.id == id }) {
+            let cancelled = await coordinator.cancel(.childID(id))
+            return cancelled > 0 ? .cancelled : .notFound
+        }
+        if let completed = await coordinator.listCompleted().first(where: { $0.request.id == id }) {
+            return .alreadyFinished(status: completed.state)
+        }
+        return .notFound
+    }
+
+    func knownSubagentIDs() async -> [String] {
+        let active = await coordinator.listActive(parentSessionID: context.sessionID).map { $0.request.id }
+        let completed = await coordinator.listCompleted().map { $0.request.id }
+        return (active + completed).sorted()
+    }
+
+    /// Session teardown: cancel every child of this session and release the
+    /// tool surfaces they built (MCP connections, shell sessions).
+    func shutdown() async {
+        await coordinator.teardown(sessionID: context.sessionID)
+        let executors = Array(childExecutors.values)
+        childExecutors.removeAll()
+        for executor in executors {
+            await executor.shutdown()
+        }
+    }
+}

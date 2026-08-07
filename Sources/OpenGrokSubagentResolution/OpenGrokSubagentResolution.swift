@@ -645,6 +645,12 @@ public struct DefinitionResolutionContext: Sendable {
     public var maximumDepth: Int
     public var parentRuntime: ParentRuntimeDefaults?
     public var includeFilesystemDefinitions: Bool
+    /// The session's environment for user-level discovery (`OPENGROK_HOME`,
+    /// `HOME`). `nil` reads the process environment — the legacy default,
+    /// kept so existing call sites compile unchanged; a live session must
+    /// pass its own environment or a `--cwd`/injected-env launch (and every
+    /// hermetic test) would scan the developer's real home directory.
+    public var environment: [String: String]?
 
     public init(
         cwd: URL,
@@ -655,7 +661,8 @@ public struct DefinitionResolutionContext: Sendable {
         currentDepth: Int = 0,
         maximumDepth: Int = 1,
         parentRuntime: ParentRuntimeDefaults? = nil,
-        includeFilesystemDefinitions: Bool = true
+        includeFilesystemDefinitions: Bool = true,
+        environment: [String: String]? = nil
     ) {
         self.cwd = cwd
         self.definitions = definitions
@@ -666,6 +673,7 @@ public struct DefinitionResolutionContext: Sendable {
         self.maximumDepth = maximumDepth
         self.parentRuntime = parentRuntime
         self.includeFilesystemDefinitions = includeFilesystemDefinitions
+        self.environment = environment
     }
 }
 
@@ -791,7 +799,14 @@ public func discoverAgentDefinition(
 }
 
 public func availableAgentNames(context: DefinitionResolutionContext) -> [String] {
-    mergedDefinitions(context: context).keys.sorted()
+    // The toggle filter belongs to the advertised roster only
+    // (`discovery.rs` `merge_subagents` step 3). Spawn-time resolution must
+    // still FIND a disabled definition so the gate can reject it as
+    // `.disabled` — filtering here too would misreport it as unknown.
+    mergedDefinitions(context: context)
+        .filter { context.toggles[$0.key] != false }
+        .keys
+        .sorted()
 }
 
 public func availableAgentNames(_ context: DefinitionResolutionContext) -> [String] {
@@ -1327,7 +1342,12 @@ private func mergedDefinitions(context: DefinitionResolutionContext) -> [String:
         AgentDefinition.builtIn(named: name).map { SubagentDefinition(definition: $0, source: .builtIn) }
     })
     candidates.append(contentsOf: context.cliAgents.map { SubagentDefinition(definition: $0, source: .cli) })
-    if context.includeFilesystemDefinitions { candidates.append(contentsOf: filesystemDefinitions(cwd: context.cwd)) }
+    if context.includeFilesystemDefinitions {
+        candidates.append(contentsOf: filesystemDefinitions(
+            cwd: context.cwd,
+            environment: context.environment ?? ProcessInfo.processInfo.environment
+        ))
+    }
 
     var selected: [String: SubagentDefinition] = [:]
     for candidate in candidates {
@@ -1337,7 +1357,9 @@ private func mergedDefinitions(context: DefinitionResolutionContext) -> [String:
            candidate.source != .builtIn { continue }
         selected[candidate.name] = candidate
     }
-    return selected.filter { context.toggles[$0.key] != false }
+    // No toggle filter here: resolution (unlike advertisement) must see
+    // disabled definitions. `availableAgentNames` applies the filter.
+    return selected
 }
 
 private func bestDefinition(named name: String, context: DefinitionResolutionContext) -> SubagentDefinition? {
@@ -1356,12 +1378,11 @@ private func isBuiltinSubagentName(_ name: String) -> Bool {
     AgentDefinition.subagentNames.contains(name)
 }
 
-private func filesystemDefinitions(cwd: URL) -> [SubagentDefinition] {
+private func filesystemDefinitions(cwd: URL, environment: [String: String]) -> [SubagentDefinition] {
     var result: [SubagentDefinition] = []
     for directory in projectAgentDirectories(cwd: cwd) {
         result.append(contentsOf: loadDefinitions(in: directory, source: .project))
     }
-    let environment = ProcessInfo.processInfo.environment
     let home = environment["HOME"].map { URL(fileURLWithPath: $0) }
     let grokHome = environment["OPENGROK_HOME"].map { URL(fileURLWithPath: $0) }
         ?? home?.appendingPathComponent(".opengrok")

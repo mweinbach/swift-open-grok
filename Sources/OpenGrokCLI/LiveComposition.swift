@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokAgentCoordinator
 import OpenGrokAgentDefinitions
 import OpenGrokACPRuntime
 import OpenGrokAuth
@@ -25,8 +26,10 @@ import OpenGrokShared
 import OpenGrokShell
 import OpenGrokShellBase
 import OpenGrokShellSessionSupport
+import OpenGrokSubagentResolution
 import OpenGrokTerminalCore
 import OpenGrokToolRegistry
+import OpenGrokToolTypes
 import OpenGrokTTY
 import OpenGrokWebMediaTools
 import OpenGrokWorkspace
@@ -1500,18 +1503,20 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     /// - `--verbatim` and `--include-partial-messages`: output-shaping
     ///   preferences whose wrong answer is incomplete streaming, not a silently
     ///   widened tool surface — tolerated until structured output honors them.
-    /// - `--no-auto-update`: excluded while the update composition wires it.
+    /// - `--no-auto-update`: honored by the launch update composition.
+    /// - `--no-subagents`: honored as the spawn-surface kill switch in the
+    ///   subagent host, so it is a real control, not an ignored flag.
     /// - Everything under `common.permissions`, which the permission and
     ///   sandbox layer consumes.
     /// `--reasoning-effort` left this list when `resolveSamplingConfiguration`
     /// started validating and applying it to the initial session.
+
     private static func unhonoredLaunchFlag(_ options: CLIExecutionOptions) -> String? {
         if options.agentOptions.tools != nil { return "--tools" }
         if options.agentOptions.disallowedTools != nil { return "--disallowed-tools" }
         if options.agentOptions.agent != nil { return "--agent" }
         if options.agentOptions.agentsJSON != nil { return "--agents" }
         if options.agentOptions.maxTurns != nil { return "--max-turns" }
-        if options.agentOptions.noSubagents { return "--no-subagents" }
         if options.agentOptions.noPlan { return "--no-plan" }
         if options.agentOptions.noAskUser { return "--no-ask-user" }
         if options.agentOptions.rules != nil { return "--rules" }
@@ -1713,6 +1718,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let permissionCoordinator: PagerPermissionCoordinator
         let telemetryBootstrapContext: LiveTelemetryBootstrapContext
         let toolExecutor: LiveToolExecutor
+        /// The subagent stack for this root session: one coordinator plus the
+        /// child runner. `nil` when gated off (`--no-subagents` or an empty
+        /// roster); the tool executor holds the same reference.
+        let subagentHost: LiveSubagentHost?
         let discoveredSkills: [SkillInfo]
         let skillCatalog: [LiveSkills.SkillCommand]
         let feedback: LiveFeedbackComposition
@@ -1864,6 +1873,49 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             experimentalMemory: options.agentOptions.experimentalMemory,
             noMemory: options.agentOptions.noMemory
         )
+        let imageToolContext = LiveImageToolContext(
+            availability: LiveImageToolComposition.resolveAvailability(
+                workingDirectory: cwd,
+                openGrokHome: openGrokHome,
+                environment: context.environment,
+                samplingProvider: samplingConfiguration.provider,
+                samplingAPIKey: samplingConfiguration.apiKey,
+                samplingBaseURL: samplingConfiguration.baseURL
+            ),
+            transport: dependencies.makeImageTransport()
+        )
+        let webToolContext = LiveWebToolContext(
+            availability: LiveWebToolComposition.resolveAvailability(
+                workingDirectory: cwd,
+                openGrokHome: openGrokHome,
+                environment: context.environment,
+                samplingProvider: samplingConfiguration.provider,
+                samplingAPIKey: samplingConfiguration.apiKey,
+                samplingBaseURL: samplingConfiguration.baseURL,
+                disableWebSearch: options.agentOptions.disableWebSearch
+            ),
+            // Web requests reuse the image transport: same HTTP stack, same
+            // test seam. Nothing about it is image-specific.
+            transport: dependencies.makeImageTransport()
+        )
+        let subagentHost = Self.makeSubagentHost(
+            options: options,
+            cwd: cwd,
+            sessionID: sessionID,
+            openGrokHome: openGrokHome,
+            agentProfile: agentProfile,
+            samplingConfiguration: samplingConfiguration,
+            sampler: sampler,
+            conversationStore: conversationStore,
+            processBackend: processBackend,
+            securityContext: securityContext,
+            sandboxDecision: sandboxDecision,
+            fileAccessPolicy: fileAccessPolicy,
+            telemetryBootstrapContext: telemetryBootstrapContext,
+            imageToolContext: imageToolContext,
+            webToolContext: webToolContext,
+            environment: context.environment
+        )
         let toolExecutor = try await LiveToolExecutor(
             processBackend: processBackend,
             sessionID: sessionID,
@@ -1872,35 +1924,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             telemetryBootstrapContext: telemetryBootstrapContext,
             fileAccessPolicy: fileAccessPolicy,
             environment: context.environment,
-            imageToolContext: LiveImageToolContext(
-                availability: LiveImageToolComposition.resolveAvailability(
-                    workingDirectory: cwd,
-                    openGrokHome: openGrokHome,
-                    environment: context.environment,
-                    samplingProvider: samplingConfiguration.provider,
-                    samplingAPIKey: samplingConfiguration.apiKey,
-                    samplingBaseURL: samplingConfiguration.baseURL
-                ),
-                transport: dependencies.makeImageTransport()
-            ),
-            webToolContext: LiveWebToolContext(
-                availability: LiveWebToolComposition.resolveAvailability(
-                    workingDirectory: cwd,
-                    openGrokHome: openGrokHome,
-                    environment: context.environment,
-                    samplingProvider: samplingConfiguration.provider,
-                    samplingAPIKey: samplingConfiguration.apiKey,
-                    samplingBaseURL: samplingConfiguration.baseURL,
-                    disableWebSearch: options.agentOptions.disableWebSearch
-                ),
-                // Web requests reuse the image transport: same HTTP stack, same
-                // test seam. Nothing about it is image-specific.
-                transport: dependencies.makeImageTransport()
-            ),
+            imageToolContext: imageToolContext,
+            webToolContext: webToolContext,
             sandboxDecision: sandboxDecision,
             securityContext: securityContext,
             sessionServices: sessionServices,
-            permissionOptions: options.common.permissions
+            permissionOptions: options.common.permissions,
+            subagentHost: subagentHost
         )
         conversationRecord.sandboxProfile = sandboxDecision.profileName
         try await conversationStore.save(conversationRecord)
@@ -1922,10 +1952,83 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             permissionCoordinator: permissionCoordinator,
             telemetryBootstrapContext: telemetryBootstrapContext,
             toolExecutor: toolExecutor,
+            subagentHost: subagentHost,
             discoveredSkills: discoveredSkills,
             skillCatalog: skillCatalog,
             feedback: feedback
         )
+    }
+
+    /// The session's subagent host, or `nil` when the spawn surface is gated
+    /// off. The gates are upstream's (`AgentBuilder::build`,
+    /// `xai-grok-agent/src/builder.rs:848-896`): subagents disabled
+    /// (`--no-subagents`) strips the surface, and so does an empty roster —
+    /// every built-in toggled off in `[subagents.toggle]` with nothing
+    /// discovered means there is nothing to spawn, so there is nothing to
+    /// advertise.
+    ///
+    /// Toggles are read from the trust-gated security document, not a raw
+    /// config load: an untrusted repo's `.opengrok/config.toml` must not
+    /// reach this decision any more than it reaches permissions.
+    private static func makeSubagentHost(
+        options: CLIExecutionOptions,
+        cwd: URL,
+        sessionID: String,
+        openGrokHome: URL,
+        agentProfile: LiveAgentProfile?,
+        samplingConfiguration: OpenGrokLiveSamplingConfiguration,
+        sampler: OpenGrokLiveSampler,
+        conversationStore: LiveConversationStore,
+        processBackend: any ShellProcessBackend,
+        securityContext: LiveSecurityContext,
+        sandboxDecision: LiveSandboxDecision,
+        fileAccessPolicy: FileToolAccessPolicy,
+        telemetryBootstrapContext: LiveTelemetryBootstrapContext,
+        imageToolContext: LiveImageToolContext,
+        webToolContext: LiveWebToolContext,
+        environment: [String: String]
+    ) -> LiveSubagentHost? {
+        guard !options.agentOptions.noSubagents else { return nil }
+        var toggles: [String: Bool] = [:]
+        if let table = securityContext.document[path: ["subagents", "toggle"]]?.table {
+            for (key, value) in table.pairs {
+                if let enabled = value.boolValue { toggles[key] = enabled }
+            }
+        }
+        let definitionContext = DefinitionResolutionContext(
+            cwd: cwd,
+            toggles: toggles,
+            includeFilesystemDefinitions: true,
+            environment: environment
+        )
+        guard !availableAgentNames(context: definitionContext).isEmpty else { return nil }
+        return LiveSubagentHost(context: LiveSubagentHost.Context(
+            sampler: sampler,
+            parentModel: samplingConfiguration.model,
+            workingDirectory: cwd,
+            sessionID: sessionID,
+            openGrokHome: openGrokHome,
+            conversationStore: conversationStore,
+            processBackend: processBackend,
+            securityContext: securityContext,
+            sandboxDecision: sandboxDecision,
+            permissionOptions: options.common.permissions,
+            fileAccessPolicy: fileAccessPolicy,
+            telemetryBootstrapContext: telemetryBootstrapContext,
+            imageToolContext: imageToolContext,
+            webToolContext: webToolContext,
+            environment: environment,
+            parentCapabilityCeiling: agentProfile?.toolPolicy.capabilityMode.map { mode in
+                switch mode {
+                case .readOnly: return OpenGrokSubagentResolution.SubagentCapabilityMode.readOnly
+                case .readWrite: return OpenGrokSubagentResolution.SubagentCapabilityMode.readWrite
+                case .execute: return OpenGrokSubagentResolution.SubagentCapabilityMode.execute
+                case .all: return OpenGrokSubagentResolution.SubagentCapabilityMode.all
+                }
+            },
+            definitionContext: definitionContext,
+            modelSlugs: LiveModelCatalogResolver.catalog().map(\.id)
+        ))
     }
 
     static func makeAgentStack(
@@ -3299,6 +3402,15 @@ struct LiveToolExecutor: Sendable {
     /// actually advertised. Only an advertised name is dispatched, so a profile
     /// that filtered one out cannot reach it by calling it anyway.
     private let backgroundTaskToolNames: Set<String>
+    /// The session's subagent host: one `OpenGrokAgentCoordinator` per root
+    /// session plus the child runner. `nil` when the surface is gated off
+    /// (`--no-subagents` or an empty roster), which also strips the spawn
+    /// tool from the advertised list.
+    let subagentHost: LiveSubagentHost?
+    /// The advertised spawn-surface names (at most `["spawn_subagent"]`).
+    /// Dispatch accepts the canonical `task` spelling too, but only while
+    /// this set is non-empty — an unadvertised surface is unreachable.
+    private let subagentToolNames: Set<String>
     private let mcpConnections: MCPSessionConnections
     /// Per-server connection outcomes recorded when the session brought its
     /// configured MCP servers online. `/mcps` renders these; before they were
@@ -3359,11 +3471,17 @@ struct LiveToolExecutor: Sendable {
         // The day a subagent session exists, this is the single switch that
         // keeps the lifecycle out of its hands; do not register the tools and
         // then no-op them — that violates §4.
-        subagent: Bool = false
+        subagent: Bool = false,
+        // The subagent host. Defaulted to nil so every construction site that
+        // predates the subagent stack keeps compiling and simply advertises
+        // no spawn surface; children are built with nil here, which is half
+        // of the nested-spawn strip (the other half is the policy filter).
+        subagentHost: LiveSubagentHost? = nil
     ) async throws {
+        self.subagentHost = subagentHost
         let composition = OpenGrokShellToolRuntimeComposition(
             processBackend: processBackend,
-            runtime: LiveRunTerminalToolRuntime()
+            runtime: LiveRunTerminalToolRuntime(subagents: subagentHost)
         )
         try await composition.registerSession(
             sessionID: sessionID,
@@ -3578,6 +3696,22 @@ struct LiveToolExecutor: Sendable {
         let allowedFileToolDefinitions = fileToolDefinitions.filter {
             toolPolicy?.allows(liveToolName: $0.name) ?? true
         }
+        // The spawn surface's own requirement expr (task/mod.rs:120-128): it
+        // exists only alongside the retrieval and kill surfaces for what it
+        // spawns. Both must survive the profile filter below.
+        let outputToolAllowed = toolPolicy?.allows(
+            liveToolName: LiveBackgroundTaskTools.getTaskOutputName
+        ) ?? true
+        let killToolAllowed = toolPolicy?.allows(
+            liveToolName: LiveBackgroundTaskTools.killTaskName
+        ) ?? true
+        let advertisesSubagents = subagentHost != nil
+            && (toolPolicy?.allows(liveToolName: LiveSubagentHost.advertisedToolName) ?? true)
+            && outputToolAllowed
+            && killToolAllowed
+        self.subagentToolNames = advertisesSubagents
+            ? [LiveSubagentHost.advertisedToolName]
+            : []
         // The background-task consumers only make sense alongside the producer:
         // without `run_terminal_cmd` there is no task for them to read, wait on
         // or kill. Upstream registers all three in every preset that has bash
@@ -3589,11 +3723,14 @@ struct LiveToolExecutor: Sendable {
             terminalTools = []
         } else {
             backgroundTaskTools = LiveBackgroundTaskTools
-                .toolSpecs(environment: environment)
+                .toolSpecs(environment: environment, subagentsPresent: advertisesSubagents)
                 .filter { toolPolicy?.allows(liveToolName: $0.name) ?? true }
             terminalTools = [Self.runTerminalTool] + backgroundTaskTools
         }
         self.backgroundTaskToolNames = Set(backgroundTaskTools.map(\.name))
+        let spawnTools: [ToolSpec] = advertisesSubagents
+            ? subagentHost.map { [$0.toolSpec] } ?? []
+            : []
         self.permissionPipeline = fileToolResources.permissionPipeline
         if let permissionPipeline = fileToolResources.permissionPipeline {
             self.sessionPermissionMode = LiveSessionPermissionMode(
@@ -3636,6 +3773,7 @@ struct LiveToolExecutor: Sendable {
         // downgrading that tool's gating.
         let dispatchedToolNames = registryToolNames
             .union(backgroundTaskToolNames)
+            .union(subagentToolNames)
             .union([Self.runTerminalTool.name])
         assert(
             Set(sessionTools.map(\.name)).isDisjoint(with: dispatchedToolNames),
@@ -3647,7 +3785,7 @@ struct LiveToolExecutor: Sendable {
             and background-task tools get.
             """
         )
-        self.tools = terminalTools + sessionTools + allowedFileToolDefinitions.map { definition in
+        self.tools = terminalTools + spawnTools + sessionTools + allowedFileToolDefinitions.map { definition in
             ToolSpec(
                 name: definition.name,
                 description: definition.description,
@@ -3892,6 +4030,18 @@ struct LiveToolExecutor: Sendable {
             }
         }
 
+        // The spawn surface. Checked before the terminal guard: it is neither
+        // a registry tool nor a shell tool, and it answers to the canonical
+        // `task` spelling as well as the advertised production name.
+        if !subagentToolNames.isEmpty,
+           LiveSubagentHost.dispatchNames.contains(call.name),
+           let subagentHost {
+            if let denial = await gateSpawnSubagent(args: args, call: call) {
+                return .failure(denial)
+            }
+            return await subagentHost.spawn(args: args, toolCallID: call.callId)
+        }
+
         guard call.name == Self.runTerminalTool.name
             || backgroundTaskToolNames.contains(call.name)
         else {
@@ -3942,6 +4092,44 @@ struct LiveToolExecutor: Sendable {
         } catch {
             return .failure(.failed(String(describing: error)))
         }
+    }
+
+    /// Run `spawn_subagent` through the session's PreToolUse hooks.
+    ///
+    /// Deliberately hooks-only, unlike the `kill_task` gate: the permission
+    /// rule vocabulary has no spawn kind upstream either (`ToolFilter` covers
+    /// any/bash/edit/read/grep/mcp/web_fetch/web_search), and modelling the
+    /// call as `.bash` for the *engine* would feed "spawn_subagent explore"
+    /// to the shell command classifier, which denies unknown commands under a
+    /// headless prompter — a wrong answer, not a safer one. The access string
+    /// below only reaches hook payloads, where a hook can match the tool name
+    /// and see what is being spawned. The security-relevant surface is the
+    /// child's own tool calls, and those pass through the child's full
+    /// pipeline, built from this session's security context.
+    private func gateSpawnSubagent(
+        args: JSONValue,
+        call: ToolCall
+    ) async -> OpenGrokShellToolRuntimeError? {
+        // No pipeline means no hooks to run — PreToolUse's recorded posture
+        // is fail-open, so the spawn proceeds.
+        guard let permissionPipeline else { return nil }
+        let subagentType: String
+        if case .object(let object) = args, case .string(let raw) = object["subagent_type"] {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            subagentType = trimmed.isEmpty ? defaultSubagentType : trimmed
+        } else {
+            subagentType = defaultSubagentType
+        }
+        let decision = await permissionPipeline.hooks.runPreToolUse(
+            toolName: call.name,
+            toolCallId: call.callId,
+            access: .bash("spawn_subagent \(subagentType)"),
+            permissionMode: nil
+        )
+        if case .deny(let reason, let hookName) = decision {
+            return .failed("hook \(hookName) denied: \(reason)")
+        }
+        return nil
     }
 
     /// Run `kill_task` through the permission pipeline.
@@ -4055,6 +4243,10 @@ struct LiveToolExecutor: Sendable {
             event: .sessionEnd,
             payload: ["reason": .string("shutdown")]
         )
+        // Children first: a child holds its own MCP connections and shell
+        // session, and its coordinator entry must not outlive the parent's
+        // tool surface.
+        await subagentHost?.shutdown()
         await mcpConnections.shutdown()
         await composition.shutdown()
     }
@@ -4107,6 +4299,12 @@ struct LiveToolExecutor: Sendable {
 }
 
 private struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
+    /// The session's subagent host, so `get_task_output` / `wait_tasks` /
+    /// `kill_task` resolve subagent ids against the coordinator when the
+    /// shell disowns them. `nil` in sessions without the spawn surface (and
+    /// in every child session).
+    let subagents: (any LiveSubagentQuerying)?
+
     func invoke(
         _ call: OpenGrokShellToolCall,
         using process: any OpenGrokShellProcessExecution
@@ -4115,7 +4313,8 @@ private struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
             return await LiveBackgroundTaskTools.invoke(
                 name: call.name,
                 args: call.args,
-                process: process
+                process: process,
+                subagents: subagents
             )
         }
         guard call.name == "run_terminal_cmd" else {
@@ -4643,6 +4842,13 @@ struct LiveAgentToolPolicy: Sendable, Equatable {
         // session advertises.
         if let alias = Self.backgroundTaskAliases[liveToolName] {
             return [liveToolName, alias]
+        }
+        // The spawn surface goes the other way: advertised under the
+        // production name `spawn_subagent` (config.rs:152-156), matched under
+        // the canonical registry id `task` as well, so a profile written
+        // against either spelling gates the same surface.
+        if liveToolName == LiveSubagentHost.advertisedToolName {
+            return [liveToolName, "task"]
         }
         return [liveToolName]
     }
