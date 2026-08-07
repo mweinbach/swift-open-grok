@@ -1052,6 +1052,21 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     services: updateServices
                 )
             )
+            // `/announcements hide` is the keyboard dismissal the banner
+            // advertises (`hide: /announcements hide`). Registered only when a
+            // live announcements surface exists — a headless launch with no
+            // transport has no banner to hide, so advertising the command would
+            // be a dead surface. This is the hide action alone; the listing
+            // overlay (`/announcements` show) is deliberately not registered
+            // (see PORT_STATUS.md) — the banner + hide is the shipped scope.
+            let announcementsHideCommands: [OpenGrokPagerCommandRegistration] =
+                stack.announcements != nil
+                    ? [OpenGrokPagerCommandRegistration(
+                        name: "announcements",
+                        summary: "Hide the current announcement banner",
+                        usage: "/announcements hide"
+                    )]
+                    : []
             let sharedExportBoundary = await stack.conversationHistory.sharedExportBoundary
             exportBoundaries.register(
                 sessionID: sessionID,
@@ -1129,6 +1144,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         // configured servers online.
                         mcpServers: toolExecutor.mcpServerConnections,
                         openGrokHome: openGrokHome,
+                        // The announcements surface: fetch → cache → banner plus
+                        // the `/announcements hide` dismissal. `nil` only when
+                        // the session has no live transport (headless launches),
+                        // in which case the renderer closes the banner slot.
+                        announcements: stack.announcements,
                         // The paint ceiling: `GROK_MIN_DRAW_MS` wins, then the
                         // `[ui.display_refresh]` auto-cadence policy (inert
                         // until a display probe exists — `probedRefreshHz` is
@@ -1157,9 +1177,27 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                 sessionID: sessionID
                             )
                         },
-                        localCommands: feedbackCommands,
+                        localCommands: feedbackCommands + announcementsHideCommands,
                         localCommandHandler: { invocation in
-                            guard invocation.name == "feedback" else { return nil }
+                            guard invocation.name == "feedback" else {
+                                // `/announcements hide`: persist the hide key
+                                // for the banner's selected announcement, then
+                                // pull the next non-hidden one (if any) into the
+                                // renderer's cached projection. The controller
+                                // re-renders off the returned notice, so the
+                                // banner swaps (or closes) in the same frame.
+                                guard invocation.name == "announcements" else { return nil }
+                                let sub = invocation.arguments.first?
+                                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                                guard sub == "hide" else {
+                                    return "usage: /announcements hide"
+                                }
+                                let next = try await stack.announcements?.hideCurrent()
+                                await renderer.refreshAnnouncementBanner()
+                                return next == nil
+                                    ? "no announcement to hide"
+                                    : "announcement hidden"
+                            }
                             let text = invocation.arguments.joined(separator: " ")
                                 .trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !text.isEmpty else {
@@ -1187,6 +1225,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     await renderer.setMotionStateSink { [weak controller] state in
                         await controller?.setMotionState(state)
                     }
+                    // Pull the cached announcement banner into the renderer's
+                    // projection so the first frame can show it. The composition
+                    // already spawned the post-readiness refresh; this reads the
+                    // cache (sync, local) and the persistent hide-key set (async,
+                    // local), so it does not block on the network.
+                    await renderer.refreshAnnouncementBanner()
                     // Slash-command recency persists at
                     // `<opengrok home>/slash-mru.json`, upstream's grok_home
                     // location (`mru.rs:78-80`).
@@ -1696,6 +1740,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         /// Retained only so reachability tests can await the post-readiness
         /// launch update check; production callers ignore it.
         let launchAutoUpdateTask: Task<Void, Never>?
+        /// The announcements surface for this session: fetch → cache → banner
+        /// plus the hide dismissal. `nil` only in compositions that opt out of
+        /// the live announcements feed (tests, headless launches without a
+        /// transport); the renderer treats `nil` as "no banner slot."
+        let announcements: LiveAnnouncementsComposition?
     }
 
     static func makeSessionFoundation(
@@ -1726,7 +1775,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let skillCatalog = LiveSkills.commandCatalog(
             skills: discoveredSkills,
             reservedNames: OpenGrokPagerInteractiveController.builtinCommandNames
-                .union(["feedback"])
+                .union(["feedback", "announcements"])
         )
         let conversationStore = LiveConversationStore(openGrokHome: openGrokHome)
         var conversationRecord = try await resolveConversationRecord(
@@ -1927,6 +1976,43 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             environment: context.environment,
             streams: context.streams
         )
+        // Announcements: same post-readiness spawn pattern, upstream's
+        // `spawn_announcements_refresh` (agent_ops.rs:1830). The feed rides
+        // the chat proxy's `/v1/settings`; the export-boundary and
+        // `features.remote_fetch` gates are checked before any request, so a
+        // Codex (xAI-export-denied) or firewalled session issues nothing. The
+        // transport is the same one the sampler/catalog use; `nil` (headless
+        // compositions without a transport) opts out of the live feed and the
+        // renderer treats the absence as "no banner slot."
+        let announcements: LiveAnnouncementsComposition? = {
+            guard let transport = foundation.samplingConfiguration.transport else {
+                return nil
+            }
+            // The chat-proxy base the announcements feed rides. Same resolution
+            // order as the catalog/feedback transports: the `--cli-chat-proxy-
+            // base-url` flag, then `GROK_CLI_CHAT_PROXY_BASE_URL`, then the
+            // built-in default. `AnnouncementsService` appends the full
+            // `v1/settings` path, so the `/v1` suffix the default carries is
+            // stripped inside the composition.
+            let proxyBase = foundation.options.advanced.cliChatProxyBaseURL
+                ?? context.environment["GROK_CLI_CHAT_PROXY_BASE_URL"]
+                ?? CLI_CHAT_PROXY_BASE_URL_DEFAULT
+            let authorization = foundation.samplingConfiguration.apiKey.isEmpty
+                ? nil
+                : "Bearer \(foundation.samplingConfiguration.apiKey)"
+            let composition = LiveAnnouncementsComposition.live(
+                transport: transport,
+                openGrokHome: foundation.openGrokHome,
+                environment: context.environment,
+                provider: foundation.samplingConfiguration.provider,
+                proxyBaseURL: proxyBase,
+                authorization: authorization
+            )
+            // Spawn is non-blocking and gated internally; a denied provider
+            // or `remote_fetch = false` issues no request.
+            composition.spawnBackgroundRefresh()
+            return composition
+        }()
         let configuredProviderDefinitions = parseConfiguredModelCatalog(
             from: ((try? loadAuthorityComposition(
                 cwd: foundation.cwd,
@@ -1987,7 +2073,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             compaction: compaction,
             turnDriver: turnDriver,
             shell: shell,
-            launchAutoUpdateTask: launchAutoUpdateTask
+            launchAutoUpdateTask: launchAutoUpdateTask,
+            announcements: announcements
         )
     }
 
@@ -5587,6 +5674,18 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// composer's bottom border. `nil` on models with no selectable effort.
     private var reasoningEffort: String?
 
+    /// The announcements surface for this session: fetch → cache → banner plus
+    /// the hide dismissal. `nil` in compositions without a live announcements
+    /// feed (tests, headless launches); the renderer treats `nil` as "no
+    /// banner slot." The banner projection is pulled from the composition
+    /// (`refreshAnnouncementBanner`) and cached here so a frame never blocks
+    /// on the hide-key state store.
+    private let announcements: LiveAnnouncementsComposition?
+    /// The last-derived announcement banner projection. `nil` means "no slot
+    /// this frame" — either the composition is absent, the cache is empty, or
+    /// every live announcement is hidden.
+    private var announcementBanner: PagerAnnouncementBanner?
+
     init(
         mode: OpenGrokPagerMode,
         terminal: OpenGrokLiveTerminal,
@@ -5612,6 +5711,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         sessionCatalog: LiveSessionCatalog? = nil,
         mcpServers: [MCPServerConnection] = [],
         openGrokHome: URL? = nil,
+        announcements: LiveAnnouncementsComposition? = nil,
         paintCadence: TimeInterval = PagerMotion.defaultPaintCadence,
         environment: [String: String]? = nil
     ) {
@@ -5623,6 +5723,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.mcpServers = mcpServers
         self.openGrokHome = openGrokHome ?? OpenGrokHomeResolver
             .resolve(environment: ProcessInfo.processInfo.environment)
+        self.announcements = announcements
         self.terminal = terminal
         self.sink = sink
         self.workingDirectory = workingDirectory
@@ -5762,6 +5863,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         motionSink = sink
         lastPublishedMotionState = nil
         publishMotionState()
+    }
+
+    /// Pull the current announcement banner from the live composition into
+    /// the cached projection the renderer paints. Called after construction
+    /// (so the first frame shows a cached banner without blocking on the
+    /// hide-key store) and after a hide dismissal (so the next non-hidden
+    /// announcement, if any, takes the slot). A no-op when the composition is
+    /// absent — the banner stays `nil` and the slot is closed.
+    func refreshAnnouncementBanner() async {
+        guard let announcements else { return }
+        announcementBanner = await announcements.refreshVisibleBanner()
     }
 
     func begin() async throws {
@@ -7488,6 +7600,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 contextTotalTokens: contextUsage.map { Int($0.contextWindow) },
                 queuedPromptCount: queuedPromptCount
             ),
+            announcementBanner: announcementBanner,
             conversation: blocks,
             turnStatus: turnActivity.map { label in
                 PagerTurnStatus(
