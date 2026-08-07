@@ -12,6 +12,15 @@ DIVERGED, judged at the live seam (`Sources/OpenGrokCLI`), never at the library.
 (`650c1db7…`: a reasoning hardening + the `.58` release). Fold that micro-delta into
 whichever wave lands first.
 
+**Wave 14 corrections (2026-08-07):** B3's "shared by in-pager `/login` … screen-mode
+relaunch" was wrong: upstream `/login` never suspends (in-TUI OAuth/device code) and
+screen-mode switch is a full-process exec relaunch (`screen_mode_relaunch.rs:222-247`).
+B3's real consumers are `$PAGER` (landed, Wave 14) and `$EDITOR` (open). Wave 16 items
+1 (question view + plan approval), 2 (plan tracker into `makeResources` — already landed
+in Wave 13), and 5 (always-approve toggle, Wave 13; slash command, Wave 14) are done;
+item 6's honest scope is send-now (landed) — true mid-turn injection needs the soft
+`x.ai/interject` seam, which remains open.
+
 ---
 
 ## The shape of the gap

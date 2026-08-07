@@ -1,12 +1,112 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-07 (Wave 13 parity-fleet: subagents live, hooks/plan-mode wired, honesty batch)
+**As of:** 2026-08-07 (Wave 14 TUI foundation: suspend host + /transcript, steering honesty, /always-approve, ask_user_question + plan approval)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `70002584da34e4c37ea14a3bce35341b7d04f9a7` (re-pinned **2026-08-06** from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05`; +3 commits, release `v0.1.220-open-grok.57` — the Meta API provider delta: `0f8dc87b` provider, `666b2ceb` login/settings, `70002584` stored-key unlock fix. The prior 2026-08-05 re-pin moved from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`; before that the 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` (`/tmp/open-grok-reference` when present).
 **Fixture pin:** `ProtocolFixtures/` was re-evaluated against `70002584da34e4c37ea14a3bce35341b7d04f9a7` on 2026-08-06, with `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` recorded as the immediate previous revision. The Meta delta touched no fixture family's upstream source (all fourteen family diffs across `9ed09e2a..70002584`, including `Cargo.lock`, are empty), so the only recaptures are the two release-stamped artifacts (CLI version fixture and the GCRX sample, both restamped `0.1.220-open-grok.57` — the GCRX golden by same-length in-place substitution at offset 32); unchanged families carry explicit `9ed09e2a..70002584` diff evidence.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
+
+## Wave 14 — TUI foundation: suspend host, steering honesty, interaction gates (2026-08-07)
+
+**Scope.** A four-explorer audit (upstream slash surface, upstream TUI foundation, port slash
+liveness, port TUI internals) refreshed the B-backing map, then four serialized units landed
+with per-unit full-suite gates and lead review of every diff. Reference pin unchanged at
+`70002584` (audited against the clone at `650c1db7`, the recorded 2-commit drift).
+
+### Verification snapshot (2026-08-07, authoritative serial gate)
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh build` | Exit 0. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` | Exit 0. |
+| `SWIFT_SAFE_TIMEOUT_SECONDS=1800 zsh workflows/swift-safe-verify.zsh test --no-parallel` | **Exit 0** — **4,339 tests / 629 suites**, zero recorded issues (~212 s; Wave 13 baseline was 4,262 / 614). |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | Exit 0. |
+| `zsh workflows/verify-transcript-pager.zsh` (live PTY proof) | **PROOF-OK** — the real binary, driven by expect(1) in a PTY, suspended into a recording fake `$PAGER` on `/transcript` and the child received a transcript containing the typed prompt; TUI restored and quit cleanly. |
+
+### B3 — TUI suspend/restore host + `/transcript` (commit 0130a34)
+
+- Port of `suspend_for_child` (`event_loop.rs:356-423`) + the `$PAGER` arm of
+  `run_pending_suspends` (`event_loop.rs:739-814`). The park primitive lives inside
+  `PosixTerminalInput` (the live seam runs a free-running reader; a park without an ack would
+  race the pager for keystrokes); the renderer gained re-enterable `suspendToChild`/
+  `resumeFromChild` with every paint path (including `scheduledFrameAt`) gated while suspended,
+  because the port's motion ticker keeps ticking where upstream's blocked event loop is the
+  only painter. Child wait is `terminationHandler` bridged to a continuation (§2 trap).
+- Recorded divergences: single-attempt park vs upstream's retry timer; CPR probes skipped
+  (absolute-position repaint recovers; cost named for inline mode); launch failures noticed
+  rather than discarded (`event_loop.rs:783-786`); temp file `open-grok-transcript-<uuid>.md`.
+- **Roadmap correction:** the B3 backing note "shared by in-pager `/login` … screen-mode
+  relaunch" overclaims. Upstream `/login` never uses the suspend host (in-TUI OAuth/device
+  code), and screen-mode switch is a full-process exec relaunch
+  (`screen_mode_relaunch.rs:222-247`), not a suspension. B3's real consumers are `$PAGER`
+  (landed) and `$EDITOR` (open, needs the minimal-mode composer seam).
+
+### Steering honesty — `enter_steers`/`combine_queued_prompts` live, send-now semantics (commit 734ea31)
+
+- The two settings rows previously persisted config nothing read (§3's exact failure mode).
+  One effective-config read now seeds controller and renderer; settings-modal commits reach
+  the controller through an installed snapshot sink.
+- `enter_steers` corrected to upstream's cancel-and-send (`defaults.rs:627-660`): Enter
+  mid-turn cancels the running turn and runs the draft next (`PromptQueue.enqueueFront`),
+  ahead of queued follow-ups. The interjection buffer is `/btw`-only now.
+- **Recorded divergence:** the send-now chord is unbindable — Ctrl+Enter is byte-identical to
+  Enter in this decoder, Ctrl+I is Tab, Ctrl+O toggles always-approve, Ctrl+L is reserved
+  (`defaults.rs:635-651`). Send-now is reachable via `enter_steers` and the empty-composer
+  force-send; cost recorded at the chord table.
+- The unit's live-seam test exposed a pre-existing preempt race shared with the empty-composer
+  force-send: a preempted turn's dying session raced its `.cancelled` into the mailbox and the
+  next drained turn adopted it, ending the run and discarding the queue. Session signals now
+  carry the owning turn's generation; stale ones are ignored.
+- **Ledger correction:** the Wave 13 line "queued prompts / steering … live since Wave 3"
+  (L103-104) overclaimed for steering. The queue was live; mid-turn steering was
+  next-prompt-buffering until this wave, and true mid-turn injection into a RUNNING turn still
+  does not exist (upstream's soft `x.ai/interject` remains open).
+
+### `/always-approve` (commit 83d1e39)
+
+- Registered on the live permission toggle Ctrl+O already used (`always_approve.rs`); the live
+  test asserts through the pipeline (post-toggle, a bash request prepares dispatchable), not
+  just the composer chip.
+
+### B4 — `ask_user_question` + question sheet (commit 621fc4a); plan-approval view (this wave)
+
+- `ask_user_question` is live end to end: tool → `PagerQuestionCoordinator` (permission
+  coordinator's shape) → bottom-sheet question view → answers formatted byte-identically to
+  upstream `format.rs`, cancel sentence verbatim. Advertisement is composition-shaped: the
+  coordinator exists only for interactive TTY launches, so headless/ACP/subagent compositions
+  never see the tool (upstream's `builder.rs:819-825` gate, expressed structurally). Children
+  strip it (recorded divergence from upstream's inherit-gate, `subagent/mod.rs:196-198` — the
+  port's child runner has no question surface). Permission sheets outrank questions.
+- Recorded divergences: sequential question-i-of-n instead of the tab strip; Esc cancels;
+  reduced key grammar; **no answer timeout** — `toolset.ask_user_question.timeout_enabled`
+  (PagerSettingsRegistry) is a settings row with no reader as of this wave, and the
+  `--no-ask-user` kill-switch (`builder.rs:590-601`) plus `RemoteSettings` ask-user key remain
+  unwired. Recorded here rather than hidden because the row predates this wave.
+- Plan-approval view (commit 736ce76): `exit_plan_mode` now presents a dedicated bottom sheet
+  painting the plan body (or upstream's empty-plan placeholder) with the `a`/`s`/`q` grammar.
+  Approve disarms the gate; revise stays armed and returns the feedback in upstream's
+  `revise_plan_message` shape; abandon *disables* plan mode with the do-not-retry message
+  (`tool_calls.rs:1820-1901`, verified against the reference). `ExitPlanApprovalResult` keeps
+  the dedicated view's outcomes apart from the generic-sheet fallback so a generic deny (which
+  has always meant "stay in plan mode") can never fold into abandon (which disarms) — the
+  fail-open is unrepresentable. Headless/ACP/subagent compositions keep the generic sheet byte
+  for byte; teardown resolves as revise-with-no-feedback (stay armed, fail closed). Deferred
+  and recorded: upstream's per-line commenting + approve-with-comments (needs soft interject).
+- The B4 roadmap backing is now closed except the deferred commenting path.
+
+### Suite-health repairs the wave forced (commit 00f8d99) and infrastructure (commit 827795f)
+
+- Two pre-existing test defects the serial gate never saw: the worktree reachability fixtures
+  shared one literal path (missing `\` in an interpolation) and collided under parallel runs;
+  the interactive multi-turn parity test inherited the repo checkout as its session cwd, so
+  live skill discovery found the committed `.cursor/skills` and injected a "newly discovered
+  skills" system item ahead of its asserted request items — it broke the moment a real skill
+  landed in the repo (9afdf33). Both fixed at the root (unique paths; explicit `--cwd`).
+- `workflows/swift-safe-verify.zsh` now enforces a 900 s wall-clock ceiling per invocation
+  (`SWIFT_SAFE_TIMEOUT_SECONDS`, exit 124, TERM→KILL escalation, watchdog detached from the
+  caller's pipes) so a wedged build cannot hold the shared lock forever.
 
 ## Wave 13 — Parity fleet: subagents live, hooks/plan-mode wired, honesty batch (2026-08-07)
 
