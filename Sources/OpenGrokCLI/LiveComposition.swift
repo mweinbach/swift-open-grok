@@ -1153,6 +1153,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             )
                         },
                         permissionCoordinator: permissionCoordinator,
+                        questionCoordinator: foundation.questionCoordinator,
                         permissionMode: toolExecutor.sessionPermissionMode,
                         workflowRegistry: workflowRegistry,
                         workflowsEnabled: workflowsEnabled,
@@ -1762,6 +1763,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let providerConfiguration: ProviderSessionConfiguration
         let processBackend: any ShellProcessBackend
         let permissionCoordinator: PagerPermissionCoordinator
+        /// The `ask_user_question` surface. Unlike the permission coordinator
+        /// (constructed unconditionally, gating on `hasPresenter`), this one
+        /// exists only for interactive TTY launches: its absence is what keeps
+        /// the tool off the advertised list everywhere no one could answer —
+        /// upstream's `with_ask_user_question_enabled(false)` strip
+        /// (`xai-grok-agent/src/builder.rs:819-825`), driven by composition
+        /// shape instead of a flag.
+        let questionCoordinator: PagerQuestionCoordinator?
         let telemetryBootstrapContext: LiveTelemetryBootstrapContext
         let toolExecutor: LiveToolExecutor
         /// The subagent stack for this root session: one coordinator plus the
@@ -1962,6 +1971,18 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             webToolContext: webToolContext,
             environment: context.environment
         )
+        // `ask_user_question` needs a human at a terminal. Interactive + TTY
+        // is exactly the condition under which the pager renderer (the only
+        // presenter) is constructed below, so the coordinator — and with it
+        // the advertised tool — exists precisely when an answer is possible.
+        // Headless (`-p`) and non-TTY launches get `nil`, which the executor
+        // treats as "do not advertise", the same absence-means-absence shape
+        // `spawn_subagent` uses. Upstream's equivalent gate strips the tool
+        // from the config when disabled (`builder.rs:819-825`).
+        let questionCoordinator: PagerQuestionCoordinator? =
+            options.mode == .interactive && dependencies.terminal.isTTY()
+                ? PagerQuestionCoordinator()
+                : nil
         let toolExecutor = try await LiveToolExecutor(
             processBackend: processBackend,
             sessionID: sessionID,
@@ -1976,7 +1997,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             securityContext: securityContext,
             sessionServices: sessionServices,
             permissionOptions: options.common.permissions,
-            subagentHost: subagentHost
+            subagentHost: subagentHost,
+            userQuestions: questionCoordinator.map { LiveUserQuestionBroker(coordinator: $0) }
         )
         conversationRecord.sandboxProfile = sandboxDecision.profileName
         try await conversationStore.save(conversationRecord)
@@ -1996,6 +2018,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             providerConfiguration: providerConfiguration,
             processBackend: processBackend,
             permissionCoordinator: permissionCoordinator,
+            questionCoordinator: questionCoordinator,
             telemetryBootstrapContext: telemetryBootstrapContext,
             toolExecutor: toolExecutor,
             subagentHost: subagentHost,
@@ -3522,7 +3545,13 @@ struct LiveToolExecutor: Sendable {
         // predates the subagent stack keeps compiling and simply advertises
         // no spawn surface; children are built with nil here, which is half
         // of the nested-spawn strip (the other half is the policy filter).
-        subagentHost: LiveSubagentHost? = nil
+        subagentHost: LiveSubagentHost? = nil,
+        // The `ask_user_question` surface. Defaulted to nil so headless, ACP
+        // and subagent-child constructions simply never advertise the tool —
+        // absence of the surface must mean absence of the tool, never a tool
+        // that errors (§4: no dead dropdown rows). Only the interactive TUI
+        // foundation passes one.
+        userQuestions: (any UserQuestionPresenting)? = nil
     ) async throws {
         self.subagentHost = subagentHost
         let composition = OpenGrokShellToolRuntimeComposition(
@@ -3680,6 +3709,28 @@ struct LiveToolExecutor: Sendable {
             toolConfig.tools.append(ToolConfig.fromId(
                 BuiltinToolCatalog.exitPlanModeQualifiedId,
                 kind: planModeKinds[BuiltinToolCatalog.exitPlanModeQualifiedId]
+            ))
+        }
+        // `ask_user_question` — root sessions with a live interactive question
+        // surface, and nothing else. The `userQuestions` gate is the honest
+        // form of upstream's `ask_user_question_enabled` strip
+        // (`xai-grok-agent/src/builder.rs:819-825`): headless/ACP/child
+        // compositions pass no surface, so the model is never offered a tool
+        // that would block on a sheet no one can see. The subagent guard also
+        // diverges from upstream's inherit-the-parent-gate
+        // (`xai-grok-shell/src/agent/subagent/mod.rs:196-198`) — see the strip
+        // in `applyChildToolPolicy` for why the port's children cannot ask.
+        if !subagent, let userQuestions {
+            fileToolResources.userQuestions = userQuestions
+            builder.setHandler(
+                qualifiedId: BuiltinToolCatalog.askUserQuestionQualifiedId,
+                handler: AskUserQuestionToolHandler()
+            )
+            toolConfig.tools.append(ToolConfig.fromId(
+                BuiltinToolCatalog.askUserQuestionQualifiedId,
+                kind: BuiltinToolCatalog.askUserQuestionToolKinds[
+                    BuiltinToolCatalog.askUserQuestionQualifiedId
+                ]
             ))
         }
         if let webToolContext {
@@ -6241,6 +6292,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private var overlays = PagerOverlayStack()
     private var lastOverlayBounds: [PagerOverlayBounds] = []
     private let permissionCoordinator: PagerPermissionCoordinator?
+    /// The `ask_user_question` surface, presenter-installed in `begin()`
+    /// exactly like the permission coordinator. `nil` in compositions with
+    /// no question surface (tests that opt out, headless).
+    private let questionCoordinator: PagerQuestionCoordinator?
     /// Live permission-mode handle shared with the tool executor's pipeline.
     private let permissionMode: LiveSessionPermissionMode?
     /// Composer border flags derived from `permissionMode`; refreshed whenever
@@ -6274,6 +6329,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private let conversationHistory: LiveConversationHistory?
     private let sessionCatalog: LiveSessionCatalog?
     private var currentPermissionRequestID: String?
+    /// The question sheet currently on screen, and the one parked behind an
+    /// open permission sheet. Permission outranks question — upstream renders
+    /// the permission prompt above the question view and routes keys to it
+    /// first (`app/agent_view/input.rs:879-1112`, `render.rs:906-927`) — so a
+    /// questionnaire arriving mid-approval waits here and presents when the
+    /// permission queue drains.
+    private var currentQuestionRequestID: String?
+    private var pendingQuestionRequest: PagerQuestionRequest?
     private var hasStartedFirstTurn = false
     /// The scrollback's focus and selected block. `selection.isFocused` is what
     /// unfocuses the composer, so the two halves of the focus model cannot
@@ -6331,6 +6394,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         modelSwitch: LiveModelSwitchCoordinator? = nil,
         providerBoundarySync: (@Sendable (Bool) async throws -> Void)? = nil,
         permissionCoordinator: PagerPermissionCoordinator? = nil,
+        questionCoordinator: PagerQuestionCoordinator? = nil,
         permissionMode: LiveSessionPermissionMode? = nil,
         workflowRegistry: RhaiWorkflowRunRegistry? = nil,
         workflowsEnabled: Bool = true,
@@ -6371,6 +6435,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.modelSwitch = modelSwitch
         self.providerBoundarySync = providerBoundarySync
         self.permissionCoordinator = permissionCoordinator
+        self.questionCoordinator = questionCoordinator
         self.permissionMode = permissionMode
         self.workflowRegistry = workflowRegistry
         self.workflowsEnabled = workflowsEnabled
@@ -6555,6 +6620,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 await self?.showPermission(request)
             }
         }
+        if let questionCoordinator {
+            await questionCoordinator.setPresenter { [weak self] request in
+                await self?.showQuestion(request)
+            }
+        }
         // The welcome screen only makes sense on an empty session, and it must
         // not capture input: the reference paints a live composer beneath it.
         if conversation.items.isEmpty {
@@ -6640,18 +6710,22 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // A cancelled turn must not leave a tool parked on a sheet the user
             // just walked away from.
             await resolveOutstandingPermissions()
+            await resolveOutstandingQuestions()
             endTurn()
         case .eof, .shutdown:
             await resolveOutstandingPermissions()
+            await resolveOutstandingQuestions()
             endTurn()
         case .cancelled:
             finishAssistant()
             await resolveOutstandingPermissions()
+            await resolveOutstandingQuestions()
             endTurn()
         case .failed(let message):
             finishAssistant()
             appendMessage(PagerMessage(role: .error, text: message))
             await resolveOutstandingPermissions()
+            await resolveOutstandingQuestions()
             endTurn()
         }
         try renderState()
@@ -6676,6 +6750,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         prompt = OpenGrokPagerInteractivePromptState()
         hasStartedFirstTurn = false
         currentPermissionRequestID = nil
+        currentQuestionRequestID = nil
+        pendingQuestionRequest = nil
         endTurn()
         overlays.removeAll()
         overlays.push(.welcome(
@@ -6744,8 +6820,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // fails closed instead of suspending on a sheet nobody will paint.
         await permissionCoordinator?.setPresenter(nil)
         await permissionCoordinator?.resolveAll(with: .deny)
+        // Same order for questions; the resolution is cancel, not deny — a
+        // torn-down questionnaire is a user walking away, which upstream
+        // treats as a normal decision (`format.rs:16-22`).
+        await questionCoordinator?.setPresenter(nil)
+        await questionCoordinator?.resolveAll()
         overlays.removeAll()
         currentPermissionRequestID = nil
+        currentQuestionRequestID = nil
+        pendingQuestionRequest = nil
         try renderer.restore()
         if mode == .fullScreen {
             try sink.write(transcript)
@@ -7675,6 +7758,40 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         if let request {
             overlays.push(.permission(request))
             currentPermissionRequestID = request.id
+        } else if let parked = pendingQuestionRequest {
+            // The approval the question was waiting behind is resolved;
+            // surface the parked questionnaire now.
+            pendingQuestionRequest = nil
+            overlays.push(.question(parked))
+            currentQuestionRequestID = parked.id
+        }
+        try? renderState()
+    }
+
+    /// Push or replace the question sheet. Driven by the question
+    /// coordinator's presenter callback; `nil` means its queue drained.
+    /// Permission outranks question (`input.rs:879-1112`): while an approval
+    /// sheet is up the questionnaire parks in `pendingQuestionRequest` and
+    /// `showPermission(nil)` presents it when the approvals drain.
+    ///
+    /// No composer stash: upstream stashes and restores the prompt draft
+    /// around the question because its view *replaces* the composer
+    /// (`acp_handler/interactions.rs:98-108`); this sheet renders above the
+    /// composer like the permission sheet does, so the draft survives
+    /// untouched without one.
+    private func showQuestion(_ request: PagerQuestionRequest?) async {
+        if let current = currentQuestionRequestID {
+            overlays.dismiss(id: "question:\(current)")
+            currentQuestionRequestID = nil
+        }
+        pendingQuestionRequest = nil
+        if let request {
+            if currentPermissionRequestID != nil {
+                pendingQuestionRequest = request
+            } else {
+                overlays.push(.question(request))
+                currentQuestionRequestID = request.id
+            }
         }
         try? renderState()
     }
@@ -7686,6 +7803,20 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             overlays.dismiss(id: "permission:\(current)")
             currentPermissionRequestID = nil
         }
+    }
+
+    /// Cancel every outstanding questionnaire — the question analog of
+    /// `resolveOutstandingPermissions`, with cancel (not deny) as the
+    /// resolution because upstream treats a dismissed question as a normal
+    /// user decision (`format.rs:16-22`).
+    private func resolveOutstandingQuestions() async {
+        guard let questionCoordinator else { return }
+        await questionCoordinator.resolveAll()
+        if let current = currentQuestionRequestID {
+            overlays.dismiss(id: "question:\(current)")
+            currentQuestionRequestID = nil
+        }
+        pendingQuestionRequest = nil
     }
 
     /// Apply the outcome of a row choice, whether it came from `Enter` or a
@@ -7844,6 +7975,16 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         await permissionCoordinator?.resolve(requestID: requestID, decision: decision)
     }
 
+    private func resolveQuestion(
+        overlayID: String,
+        requestID: String,
+        outcome: PagerQuestionOutcome
+    ) async {
+        overlays.dismiss(id: overlayID)
+        if currentQuestionRequestID == requestID { currentQuestionRequestID = nil }
+        await questionCoordinator?.resolve(requestID: requestID, outcome: outcome)
+    }
+
     // MARK: - Input routing
 
     func handleInput(_ event: InputEvent) async throws -> OpenGrokPagerInputRouting {
@@ -7862,6 +8003,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 return command.map { .runCommand($0) } ?? .consumed
             case .permission(let id, let requestID, let decision):
                 await resolve(overlayID: id, requestID: requestID, decision: decision)
+                try renderState()
+                return .consumed
+            case .question(let id, let requestID, let outcome):
+                await resolveQuestion(overlayID: id, requestID: requestID, outcome: outcome)
                 try renderState()
                 return .consumed
             case .setting(_, let event):
@@ -7950,6 +8095,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 command = await select(overlayID: id, rowID: rowID)
             case .permission(let id, let requestID, let decision):
                 await resolve(overlayID: id, requestID: requestID, decision: decision)
+            case .question(let id, let requestID, let outcome):
+                await resolveQuestion(overlayID: id, requestID: requestID, outcome: outcome)
             case .setting(_, let event):
                 await applySetting(event)
             case .ignored, .redraw, .consumed, .dismissed:

@@ -175,4 +175,22 @@ struct SubagentResolutionTests {
         applyChildToolPolicy(definition: &definition, capabilityMode: .readOnly, allowNestedSubagents: false)
         #expect(definition.toolConfig.toolNames == ["read_file", "grep"])
     }
+
+    @Test("child tool policy strips ask_user_question and nothing else beside it")
+    func askUserStrippedFromChildren() {
+        // A definition that names the ask tool explicitly (the plan profiles
+        // do — `AgentDefinitionSchema.swift`); the child runner has no
+        // question surface, so an advertised tool would block the child
+        // forever. Recorded divergence from upstream's inherit-parent-gate
+        // (`xai-grok-shell/src/agent/subagent/mod.rs:196-198`).
+        var definition = AgentDefinition(
+            name: "child",
+            description: "Child",
+            toolConfig: AgentToolConfiguration(tools: [
+                "read_file", "grep", "ask_user_question", "todo_write"
+            ].map { AgentToolDefinition(id: $0) })
+        )
+        applyChildToolPolicy(definition: &definition, capabilityMode: nil, allowNestedSubagents: false)
+        #expect(definition.toolConfig.toolNames == ["read_file", "grep", "todo_write"])
+    }
 }

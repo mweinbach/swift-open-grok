@@ -512,9 +512,92 @@ public enum BuiltinToolCatalog {
     public static let enterPlanModeQualifiedId = "GrokBuild:enter_plan_mode"
     public static let exitPlanModeQualifiedId = "GrokBuild:exit_plan_mode"
 
+    // MARK: Ask-user-question tool
+
+    /// `ask_user_question` — quoted from `AskUserQuestionTool::description_template`
+    /// (`ask_user_question/mod.rs:246-251`).
+    public static let askUserQuestionDescription = """
+        Ask the user one or more multiple-choice questions.
+
+        - Every question automatically gets an "Other" choice where the user can type their own answer.
+        - Put your recommended option first and append "(Recommended)" to its label.
+        """
+
+    /// Schema mirrors `AskUserQuestionInput` (`ask_user_question/mod.rs:144-217`):
+    /// questions with options (label/description/preview) and snake_case
+    /// `multi_select`, the spelling the model-facing schema advertises
+    /// (`mod.rs:185-194`).
+    ///
+    /// Kind `.askUser` keeps it in every capability mode
+    /// (`CapabilityFilter.kindAllowed` meta arm) and routes `accessKind` to
+    /// `.read(nil)` — upstream marks the tool `is_read_only` with
+    /// `ToolScope::Read` (`mod.rs:336-342`), so it never prompts as an edit.
+    public static let askUserQuestionTools: [RegisteredToolSpec] = [
+        RegisteredToolSpec(
+            namespace: .grokBuild, id: "ask_user_question", kind: .askUser,
+            description: askUserQuestionDescription,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "questions": .object([
+                        "type": .string("array"),
+                        "description": .string("The questions to ask, each with its own options."),
+                        "items": .object([
+                            "type": .string("object"),
+                            "properties": .object([
+                                "question": .object([
+                                    "type": .string("string"),
+                                    "description": .string("The question to ask, phrased as a full question."),
+                                ]),
+                                "options": .object([
+                                    "type": .string("array"),
+                                    "description": .string("The choices for this question."),
+                                    "items": .object([
+                                        "type": .string("object"),
+                                        "properties": .object([
+                                            "label": .object([
+                                                "type": .string("string"),
+                                                "description": .string("Option text shown to the user. A few words at most."),
+                                            ]),
+                                            "description": .object([
+                                                "type": .string("string"),
+                                                "description": .string("What picking this option means or implies."),
+                                            ]),
+                                            "preview": .object([
+                                                "type": .string("string"),
+                                                "description": .string("Optional content shown while the option is focused — mockups, code snippets, anything the user should compare. Single-select questions only."),
+                                            ]),
+                                        ]),
+                                        "required": .array([.string("label"), .string("description")]),
+                                    ]),
+                                ]),
+                                "multi_select": .object([
+                                    "type": .string("boolean"),
+                                    "description": .string("Let the user pick more than one option (default false)."),
+                                ]),
+                            ]),
+                            "required": .array([.string("question"), .string("options")]),
+                        ]),
+                    ]),
+                ]),
+                "required": .array([.string("questions")]),
+            ])
+        ),
+    ]
+
+    public static var askUserQuestionToolKinds: [String: ProductToolKind] {
+        Dictionary(uniqueKeysWithValues: askUserQuestionTools.map { ($0.qualifiedId, $0.kind) })
+    }
+
+    public static let askUserQuestionQualifiedId = "GrokBuild:ask_user_question"
+
     /// Every spec `ToolRegistryBuilder(registerBuiltins: true)` installs.
+    /// `askUserQuestionTools` is in the catalog so `setHandler` can bind, but
+    /// it only reaches an advertised toolset when the live composition appends
+    /// it — which it does exclusively when an interactive question surface
+    /// exists (see `LiveComposition.swift`).
     public static var builtinTools: [RegisteredToolSpec] {
-        fileTools + mediaTools + webTools + sessionStateTools + planModeTools
+        fileTools + mediaTools + webTools + sessionStateTools + planModeTools + askUserQuestionTools
     }
 
     public static var allQualifiedIds: Set<String> {
@@ -547,6 +630,12 @@ public final class ToolResources: @unchecked Sendable {
     /// Optional path boundary roots (workspace sandbox).
     public var allowedRoots: [String]
     public var extras: TypedExtensions
+    /// The interactive question surface for `ask_user_question`, mirroring
+    /// upstream's `UserQuestionSender` resource (`ask_user_question/mod.rs:379-402`).
+    /// `nil` in every composition that has no one to ask (headless, ACP,
+    /// subagent children) — and absence gates *advertisement*, not just
+    /// dispatch, at the registration site.
+    public var userQuestions: (any UserQuestionPresenting)?
 
     public init(
         cwd: String,

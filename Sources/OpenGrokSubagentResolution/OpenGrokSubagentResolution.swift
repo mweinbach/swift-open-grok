@@ -951,8 +951,16 @@ public func applyChildToolPolicy(
     if let capabilityMode {
         definition.toolConfig.tools = originalTools.filter { toolIsAllowed($0.id, under: capabilityMode) }
     }
+    // `ask_user_question` is stripped alongside the plan tools. Recorded
+    // divergence: upstream subagents *inherit* the parent's ask-user gate
+    // (`xai-grok-shell/src/agent/subagent/mod.rs:196-198`) because their
+    // questions ride a session-routed ACP reverse-request back to the pager.
+    // The port's child runner has no question surface at all — an advertised
+    // tool here would block the child forever on a sheet no one can present.
     definition.toolConfig.tools.removeAll { tool in
-        isPlanTool(tool.id) || (!allowNestedSubagents && isNestedSpawnTool(tool.id))
+        isPlanTool(tool.id)
+            || isAskUserTool(tool.id)
+            || (!allowNestedSubagents && isNestedSpawnTool(tool.id))
     }
     pruneOrphanedLifecycleTools(in: &definition.toolConfig)
 }
@@ -1588,6 +1596,11 @@ public func applySubagentEnablement(
 private func isPlanTool(_ id: String) -> Bool {
     let name = id.split(separator: ":").last.map(String.init)?.lowercased() ?? id.lowercased()
     return ["enter_plan_mode", "exit_plan_mode"].contains(name)
+}
+
+private func isAskUserTool(_ id: String) -> Bool {
+    let name = id.split(separator: ":").last.map(String.init)?.lowercased() ?? id.lowercased()
+    return name == "ask_user_question"
 }
 
 private func pruneOrphanedLifecycleTools(in configuration: inout AgentToolConfiguration) {

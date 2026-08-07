@@ -576,6 +576,281 @@ public struct PagerPermissionPrompt: Sendable, Equatable, Hashable {
     public static let collapsedDiffRows = 5
 }
 
+// MARK: - User question prompt
+
+/// One choice within a question (`QuestionOption`,
+/// `xai-grok-tools/src/implementations/grok_build/ask_user_question/mod.rs:144-167`).
+public struct PagerQuestionOption: Sendable, Equatable, Hashable {
+    public var label: String
+    public var description: String
+    /// Shown while the option is focused; single-select only upstream.
+    public var preview: String?
+
+    public init(label: String, description: String = "", preview: String? = nil) {
+        self.label = label
+        self.description = description
+        self.preview = preview
+    }
+}
+
+/// One question of an `ask_user_question` questionnaire (`Question`,
+/// `ask_user_question/mod.rs:169-200`).
+public struct PagerQuestion: Sendable, Equatable, Hashable {
+    public var text: String
+    public var options: [PagerQuestionOption]
+    public var isMultiSelect: Bool
+
+    public init(text: String, options: [PagerQuestionOption], isMultiSelect: Bool = false) {
+        self.text = text
+        self.options = options
+        self.isMultiSelect = isMultiSelect
+    }
+}
+
+/// A questionnaire awaiting the user's answers. The render layer reports a
+/// `PagerQuestionOutcome`; `PagerQuestionCoordinator` joins it to the tool.
+public struct PagerQuestionRequest: Sendable, Equatable, Hashable, Identifiable {
+    public var id: String
+    public var toolCallID: String
+    public var questions: [PagerQuestion]
+
+    public init(
+        id: String = UUID().uuidString,
+        toolCallID: String,
+        questions: [PagerQuestion]
+    ) {
+        self.id = id
+        self.toolCallID = toolCallID
+        self.questions = questions
+    }
+}
+
+/// The user's answer to one question. The initializer takes the first label
+/// separately so an answer with no selection cannot be constructed — the
+/// question view refuses Enter on an empty multi-select instead of producing
+/// an empty answer here.
+public struct PagerQuestionAnswer: Sendable, Equatable, Hashable {
+    public var question: String
+    public private(set) var labels: [String]
+    /// Free text typed on the "Other" row (`annotations[q].notes` upstream).
+    public var notes: String?
+
+    public init(question: String, label: String, extraLabels: [String] = [], notes: String? = nil) {
+        self.question = question
+        self.labels = [label] + extraLabels
+        self.notes = notes
+    }
+}
+
+/// What the user did with the questionnaire. There is no "submitted empty"
+/// case: submit is only reachable by confirming every question, and each
+/// confirmation carries at least one label (see `PagerQuestionAnswer`).
+public enum PagerQuestionOutcome: Sendable, Equatable, Hashable {
+    case answered([PagerQuestionAnswer])
+    case cancelled
+}
+
+/// Interactive state for the question bottom sheet.
+///
+/// Divergence from upstream, recorded: `question_view.rs` renders one tab per
+/// question with h/l/Tab jumping between them and allows submitting with some
+/// questions unanswered (they are omitted from the answers map). This port
+/// renders the questions *sequentially* — "Question i of n" in the header,
+/// Enter on the last submits — with the same advance semantics and simpler
+/// chrome. The cost: no jumping back to an earlier question, and therefore no
+/// partially-answered submit; the only way out without answering everything
+/// is cancelling the whole questionnaire. `answeredSoFar` is the structural
+/// form of that decision — the current question index is its count, so a
+/// "go back" bug cannot desynchronize the two.
+public struct PagerQuestionPrompt: Sendable, Equatable {
+    public enum Focus: Sendable, Equatable {
+        /// Cursor moves over option rows and the "Other" row.
+        case navigation
+        /// Typing into the "Other" free-text row (`QuestionFocus::InputMode`,
+        /// `question_view.rs:74-81`).
+        case freeformInput
+    }
+
+    public var request: PagerQuestionRequest
+    /// Confirmed answers for questions before the current one.
+    public private(set) var answeredSoFar: [PagerQuestionAnswer]
+    /// Toggled option indices for the current question. Single-select keeps
+    /// at most one member (`toggle_option`, `question_view.rs:755-773`).
+    public private(set) var selectedOptionIndices: Set<Int>
+    /// Cursor over the current question's rows: options, then the Other row.
+    public private(set) var cursor: Int
+    public private(set) var freeformText: String
+    /// Whether the Other row is part of the submission
+    /// (`per_question_freeform_selected`, `question_view.rs:169-172`).
+    public private(set) var freeformSelected: Bool
+    public private(set) var focus: Focus
+
+    public init(request: PagerQuestionRequest) {
+        self.request = request
+        self.answeredSoFar = []
+        self.selectedOptionIndices = []
+        self.cursor = 0
+        self.freeformText = ""
+        self.freeformSelected = false
+        self.focus = .navigation
+    }
+
+    public var questionIndex: Int { answeredSoFar.count }
+
+    public var currentQuestion: PagerQuestion? {
+        let index = questionIndex
+        guard request.questions.indices.contains(index) else { return nil }
+        return request.questions[index]
+    }
+
+    /// `"Question i of n"` — the sequential header standing in for upstream's
+    /// tab strip.
+    public var title: String {
+        "Question \(min(questionIndex + 1, request.questions.count)) of \(request.questions.count)"
+    }
+
+    /// Option rows plus the trailing Other row. Tool-driven questions always
+    /// carry the freeform choice — the tool description promises it
+    /// ("Every question automatically gets an \"Other\" choice",
+    /// `ask_user_question/mod.rs:246-251`); upstream's `no_freeform` exists
+    /// only for pager-local questions this overlay never hosts.
+    public var rowCount: Int {
+        (currentQuestion?.options.count ?? 0) + 1
+    }
+
+    public var isOnFreeformRow: Bool {
+        cursor == rowCount - 1
+    }
+
+    public mutating func moveCursor(by delta: Int) {
+        cursor = min(max(0, cursor + delta), max(0, rowCount - 1))
+    }
+
+    /// Space: toggle the cursor's option, or enter the Other row
+    /// (`handle_question_key`, `agent_view/interactions.rs:466-485`).
+    public mutating func toggleAtCursor() {
+        guard let question = currentQuestion else { return }
+        if isOnFreeformRow {
+            enterFreeformInput()
+            return
+        }
+        let index = cursor
+        guard question.options.indices.contains(index) else { return }
+        if question.isMultiSelect {
+            if selectedOptionIndices.contains(index) {
+                selectedOptionIndices.remove(index)
+            } else {
+                selectedOptionIndices.insert(index)
+            }
+        } else if selectedOptionIndices.contains(index) {
+            selectedOptionIndices.remove(index)
+        } else {
+            selectedOptionIndices = [index]
+            // Single-select exclusivity with the freeform row
+            // (`toggle_option` caller, interactions.rs:474-483).
+            freeformSelected = false
+        }
+    }
+
+    public mutating func enterFreeformInput() {
+        freeformSelected = true
+        if let question = currentQuestion, !question.isMultiSelect {
+            // `activate_freeform_input` clears the option selection on
+            // single-select (`question_view.rs:803-819`).
+            selectedOptionIndices = []
+        }
+        focus = .freeformInput
+    }
+
+    public mutating func appendFreeform(_ character: Character) {
+        freeformText.append(character)
+    }
+
+    public mutating func deleteFreeformBackward() {
+        guard !freeformText.isEmpty else { return }
+        freeformText.removeLast()
+    }
+
+    /// Esc in input mode: stash the text and return to navigation; non-empty
+    /// text keeps the Other row selected (`interactions.rs:308-339`).
+    public mutating func leaveFreeformInput() {
+        freeformSelected = !freeformText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if freeformSelected, let question = currentQuestion, !question.isMultiSelect {
+            selectedOptionIndices = []
+        }
+        focus = .navigation
+    }
+
+    public enum ConfirmResult: Sendable, Equatable {
+        /// Nothing selected on a multi-select — upstream requires at least
+        /// one answer, so Enter is refused rather than recording an empty one.
+        case refused
+        /// Answer recorded; a later question is now current.
+        case advanced
+        /// Answer recorded on the last question; the questionnaire is done.
+        case submitted([PagerQuestionAnswer])
+    }
+
+    /// Enter: confirm the current question and advance or submit
+    /// (`interactions.rs:486-504`; single-select Enter takes the highlighted
+    /// option exactly as upstream's `select_option` call does).
+    public mutating func confirmAtCursor() -> ConfirmResult {
+        guard let question = currentQuestion else { return .refused }
+        if isOnFreeformRow, focus == .navigation {
+            // Enter on the Other row opens the editor, like upstream
+            // (`interactions.rs:487-489`); the *next* Enter confirms.
+            enterFreeformInput()
+            return .refused
+        }
+        if focus == .navigation, !question.isMultiSelect {
+            selectedOptionIndices = [cursor]
+            freeformSelected = false
+        }
+        return confirmCurrentQuestion(question)
+    }
+
+    /// Enter while typing in the Other row: commit the text and confirm
+    /// (`EnterOutcome::Submit`, `interactions.rs:355-394`).
+    public mutating func confirmFreeform() -> ConfirmResult {
+        guard let question = currentQuestion else { return .refused }
+        leaveFreeformInput()
+        return confirmCurrentQuestion(question)
+    }
+
+    private mutating func confirmCurrentQuestion(_ question: PagerQuestion) -> ConfirmResult {
+        let labels = selectedOptionIndices.sorted().compactMap { index in
+            question.options.indices.contains(index) ? question.options[index].label : nil
+        }
+        let trimmedNotes = freeformText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let notes = freeformSelected && !trimmedNotes.isEmpty ? freeformText : nil
+        let answer: PagerQuestionAnswer
+        if let first = labels.first {
+            answer = PagerQuestionAnswer(
+                question: question.text,
+                label: first,
+                extraLabels: Array(labels.dropFirst()),
+                notes: notes
+            )
+        } else if let notes {
+            // Freeform-only: label "Other", typed text as notes
+            // (`build_accepted_response`, `question_view.rs:879-959`).
+            answer = PagerQuestionAnswer(question: question.text, label: "Other", notes: notes)
+        } else {
+            return .refused
+        }
+        answeredSoFar.append(answer)
+        selectedOptionIndices = []
+        cursor = 0
+        freeformText = ""
+        freeformSelected = false
+        focus = .navigation
+        if answeredSoFar.count == request.questions.count {
+            return .submitted(answeredSoFar)
+        }
+        return .advanced
+    }
+}
+
 // MARK: - Overlay
 
 public enum PagerOverlayContent: Sendable, Equatable {
@@ -583,6 +858,7 @@ public enum PagerOverlayContent: Sendable, Equatable {
     case text(PagerTextOverlay)
     case welcome(PagerWelcomeOverlay)
     case permission(PagerPermissionPrompt)
+    case question(PagerQuestionPrompt)
     case workflows(PagerWorkflowsOverlay)
     case settings(PagerSettingsOverlay)
 }
@@ -797,6 +1073,29 @@ extension PagerOverlay {
             dismissOnEscape: false
         )
     }
+
+    /// The `ask_user_question` bottom sheet. `dismissOnEscape` is false
+    /// because Esc is not a dismissal here: it cancels the questionnaire,
+    /// which must resolve the coordinator so the blocked tool call returns —
+    /// a plain dismiss would leave the tool suspended forever.
+    public static func question(
+        _ request: PagerQuestionRequest,
+        id: String? = nil
+    ) -> PagerOverlay {
+        PagerOverlay(
+            id: id ?? "question:\(request.id)",
+            title: "",
+            presentation: .bottomSheet,
+            hints: [
+                PagerOverlayHint(key: "↑/↓", label: "nav"),
+                PagerOverlayHint(key: "Space", label: "toggle"),
+                PagerOverlayHint(key: "Enter", label: "confirm"),
+                PagerOverlayHint(key: "Esc", label: "cancel")
+            ],
+            content: .question(PagerQuestionPrompt(request: request)),
+            dismissOnEscape: false
+        )
+    }
 }
 
 // MARK: - Focus routing
@@ -812,6 +1111,7 @@ public enum PagerOverlayOutcome: Sendable, Equatable {
     case dismissed(id: String)
     case selected(id: String, rowID: String)
     case permission(id: String, requestID: String, decision: PagerPermissionDecision)
+    case question(id: String, requestID: String, outcome: PagerQuestionOutcome)
     /// The settings modal decided something the session has to act on — commit
     /// a value, preview a theme, store a secret, apply a default.
     case setting(id: String, event: PagerSettingsEvent)
@@ -875,8 +1175,13 @@ public struct PagerOverlayStack: Sendable, Equatable {
         // The settings modal owns Escape outright: inside a chooser or an editor
         // it means "back out one level", and only browse-Escape closes. Handling
         // it here would collapse every sub-pane into a dismissal.
+        // The question sheet owns it too: Esc there is a *cancel outcome* the
+        // coordinator must see (the tool is blocked on it), never a dismissal.
         let ownsEscape: Bool
-        if case .settings = overlay.content { ownsEscape = true } else { ownsEscape = false }
+        switch overlay.content {
+        case .settings, .question: ownsEscape = true
+        default: ownsEscape = false
+        }
 
         if event.key == .escape, event.modifiers.isEmpty, !ownsEscape {
             // A run's detail view is a layer inside the overlay, not a second
@@ -908,6 +1213,9 @@ public struct PagerOverlayStack: Sendable, Equatable {
         case .permission(var prompt):
             outcome = handlePermission(&prompt, overlay: overlay, event: event)
             overlay.content = .permission(prompt)
+        case .question(var prompt):
+            outcome = handleQuestion(&prompt, overlay: overlay, event: event)
+            overlay.content = .question(prompt)
         case .workflows(var runs):
             outcome = handleWorkflows(&runs, overlay: overlay, event: event, viewportHeight: viewportHeight)
             overlay.content = .workflows(runs)
@@ -1135,6 +1443,96 @@ public struct PagerOverlayStack: Sendable, Equatable {
         }
     }
 
+    /// Keys for the question sheet (`handle_question_key`,
+    /// `xai-grok-pager/src/app/agent_view/interactions.rs:301-619`, reduced to
+    /// the sequential flow):
+    /// Up/Down and j/k move the cursor, Space toggles, Enter confirms the
+    /// current question (advancing, or submitting on the last), typing on the
+    /// Other row opens free-text entry, Esc leaves it. Esc/Ctrl+C in
+    /// navigation cancel the questionnaire — a deliberate divergence from
+    /// upstream, where Esc clears the selection (interactions.rs:569-572) and
+    /// only Ctrl+C/Ctrl+Y end it; with no tab strip to back out through, a
+    /// selection-clearing Esc would leave no obvious cancel key at all.
+    private func handleQuestion(
+        _ prompt: inout PagerQuestionPrompt,
+        overlay: PagerOverlay,
+        event: KeyEvent
+    ) -> PagerOverlayOutcome {
+        func finish(_ outcome: PagerQuestionOutcome) -> PagerOverlayOutcome {
+            .question(id: overlay.id, requestID: prompt.request.id, outcome: outcome)
+        }
+        func confirm(_ result: PagerQuestionPrompt.ConfirmResult) -> PagerOverlayOutcome {
+            switch result {
+            case .refused, .advanced:
+                return .redraw
+            case .submitted(let answers):
+                return finish(.answered(answers))
+            }
+        }
+        let isCtrlC = event.key == .char("c") && event.modifiers.contains(.control)
+
+        switch prompt.focus {
+        case .freeformInput:
+            switch event.key {
+            case .escape:
+                prompt.leaveFreeformInput()
+                return .redraw
+            case .enter:
+                return confirm(prompt.confirmFreeform())
+            case .backspace:
+                prompt.deleteFreeformBackward()
+                return .redraw
+            case .char(let character):
+                if isCtrlC {
+                    // Ctrl+C in input mode backs out to navigation, like
+                    // upstream (interactions.rs:348-352); cancelling from
+                    // there is one more Ctrl+C.
+                    prompt.leaveFreeformInput()
+                    return .redraw
+                }
+                guard event.modifiers.subtracting(.shift).isEmpty, !character.isNewline else {
+                    return .consumed
+                }
+                prompt.appendFreeform(character)
+                return .redraw
+            default:
+                return .consumed
+            }
+        case .navigation:
+            if isCtrlC {
+                return finish(.cancelled)
+            }
+            switch event.key {
+            case .escape:
+                return finish(.cancelled)
+            case .up:
+                prompt.moveCursor(by: -1)
+                return .redraw
+            case .down:
+                prompt.moveCursor(by: 1)
+                return .redraw
+            case .enter:
+                return confirm(prompt.confirmAtCursor())
+            case .char(" "):
+                prompt.toggleAtCursor()
+                return .redraw
+            case .char(let character) where event.modifiers.subtracting(.shift).isEmpty:
+                if event.modifiers.isEmpty, character == "j" { prompt.moveCursor(by: 1); return .redraw }
+                if event.modifiers.isEmpty, character == "k" { prompt.moveCursor(by: -1); return .redraw }
+                if prompt.isOnFreeformRow {
+                    // Typing on the Other row starts editing with that
+                    // character, as upstream does (interactions.rs:420-428).
+                    prompt.enterFreeformInput()
+                    prompt.appendFreeform(character)
+                    return .redraw
+                }
+                return .consumed
+            default:
+                return .consumed
+            }
+        }
+    }
+
     private func handlePermission(
         _ prompt: inout PagerPermissionPrompt,
         overlay: PagerOverlay,
@@ -1244,6 +1642,85 @@ public actor PagerPermissionCoordinator {
         queue.removeAll()
         for waiter in waiters {
             waiter.continuation.resume(returning: decision)
+        }
+        if let presenter {
+            Task { await presenter(nil) }
+        }
+    }
+}
+
+// MARK: - Question coordinator
+
+/// Joins the blocking `ask_user_question` tool call to the render loop —
+/// `PagerPermissionCoordinator`'s shape with a questionnaire payload.
+///
+/// The tool `await`s `answers(for:)`, which suspends without touching the
+/// renderer. The presenter callback pushes or pops the question sheet, and
+/// `resolve(requestID:outcome:)` resumes the waiter — so a queued second
+/// questionnaire surfaces as soon as the first is answered, which stands in
+/// for upstream's cancel-and-replace on a new `x.ai/ask_user_question`
+/// (`acp_handler/interactions.rs:57-96`): here the tool runtime serializes
+/// calls, so the queue drains in order instead of displacing.
+public actor PagerQuestionCoordinator {
+    private struct Waiter {
+        var request: PagerQuestionRequest
+        var continuation: CheckedContinuation<PagerQuestionOutcome, Never>
+    }
+
+    private var queue: [Waiter] = []
+    private var presenter: (@Sendable (PagerQuestionRequest?) async -> Void)?
+
+    public init() {}
+
+    /// The questionnaire the overlay should currently display, or `nil`.
+    public var currentRequest: PagerQuestionRequest? { queue.first?.request }
+
+    public var pendingCount: Int { queue.count }
+
+    /// Whether anything is listening. A caller with no presenter would
+    /// suspend forever, so the tool checks this and fails closed instead.
+    public var hasPresenter: Bool { presenter != nil }
+
+    /// Called whenever the head of the queue changes, so a controller can
+    /// push or pop the overlay without polling.
+    public func setPresenter(_ presenter: (@Sendable (PagerQuestionRequest?) async -> Void)?) async {
+        self.presenter = presenter
+        await presenter?(queue.first?.request)
+    }
+
+    /// Suspend until the user answers or cancels. Safe to call from any task.
+    public func answers(for request: PagerQuestionRequest) async -> PagerQuestionOutcome {
+        let wasIdle = queue.isEmpty
+        let result = await withCheckedContinuation { (continuation: CheckedContinuation<PagerQuestionOutcome, Never>) in
+            queue.append(Waiter(request: request, continuation: continuation))
+            if wasIdle, let presenter {
+                Task { await presenter(request) }
+            }
+        }
+        return result
+    }
+
+    /// Resolve the head request. Ignored when `requestID` is not the head, so
+    /// a stale key from a previous overlay cannot resolve the wrong request.
+    public func resolve(requestID: String, outcome: PagerQuestionOutcome) {
+        guard let head = queue.first, head.request.id == requestID else { return }
+        queue.removeFirst()
+        head.continuation.resume(returning: outcome)
+        let next = queue.first?.request
+        if let presenter {
+            Task { await presenter(next) }
+        }
+    }
+
+    /// Cancel every outstanding questionnaire — session teardown, turn
+    /// cancellation. Cancel, not an error: upstream treats a dismissed
+    /// question as a normal user decision (`format.rs:16-22`) and the turn
+    /// continues.
+    public func resolveAll() {
+        let waiters = queue
+        queue.removeAll()
+        for waiter in waiters {
+            waiter.continuation.resume(returning: .cancelled)
         }
         if let presenter {
             Task { await presenter(nil) }

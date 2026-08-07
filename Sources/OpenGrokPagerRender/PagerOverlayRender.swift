@@ -201,6 +201,14 @@ private func renderCenteredModal(
             buffer: &buffer,
             theme: theme
         )
+    case .question(let prompt):
+        drawQuestionBody(
+            prompt,
+            in: content,
+            background: theme.bgBase,
+            buffer: &buffer,
+            theme: theme
+        )
     case .welcome(let welcome):
         rows = drawWelcomeBody(welcome, in: content, buffer: &buffer, theme: theme, motion: motion)
     case .workflows(let runs):
@@ -581,6 +589,9 @@ func pagerBottomSheetHeight(
         // pad + title + optional detail + diff + gap + options + pad
         contentRows = 2 + 1 + (prompt.request.detail == nil ? 0 : 1)
             + diffRows + 1 + prompt.request.options.count
+    case .question(let prompt):
+        // pad + header + question + gap + option rows (incl. Other) + pad
+        contentRows = 2 + 1 + 1 + 1 + prompt.rowCount
     case .list(let list):
         contentRows = 2 + min(list.filteredRows.count, 15) + 1
     case .text(let text):
@@ -644,6 +655,14 @@ private func renderBottomSheet(
     switch overlay.content {
     case .permission(let prompt):
         rows = drawPermissionBody(
+            prompt,
+            in: content,
+            background: theme.bgLight,
+            buffer: &buffer,
+            theme: theme
+        )
+    case .question(let prompt):
+        drawQuestionBody(
             prompt,
             in: content,
             background: theme.bgLight,
@@ -875,6 +894,136 @@ private func drawPermissionBody(
         y += 1
     }
     return rows
+}
+
+// MARK: - Question body
+
+/// `"Question i of n"`, the question text, then the option rows and the
+/// trailing Other row.
+///
+/// Row grammar follows the permission sheet's cursor band; the selection
+/// marker distinguishes single-select `(●)` from multi-select `[x]`, the
+/// same radio/checkbox split upstream's question view draws
+/// (`question_view.rs`, `build_flat_option_lines`).
+///
+/// Publishes no hit-test rows: mouse interaction with the question sheet is
+/// deferred (recorded divergence — upstream supports click-to-select). The
+/// generic mouse router treats an unknown overlay row id as "dismiss and
+/// select", which would tear the sheet down without resolving the
+/// coordinator, so no rows is the fail-safe shape until a real mouse path
+/// exists.
+private func drawQuestionBody(
+    _ prompt: PagerQuestionPrompt,
+    in area: TerminalRect,
+    background: TerminalColor,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme
+) {
+    guard area.width > 0, area.height > 0, let question = prompt.currentQuestion else { return }
+    var y = area.y
+
+    func writeSpans(_ spans: [PagerStyledSpan], rowBackground: TerminalColor? = nil) {
+        guard y < area.bottom else { return }
+        paintSpans(
+            &buffer,
+            spans: truncateSpans(spans, to: area.width),
+            x: area.x,
+            y: y,
+            limit: area.right,
+            background: rowBackground ?? background,
+            inheritForeground: theme.textPrimary
+        )
+        y += 1
+    }
+
+    writeSpans([
+        PagerStyledSpan(text: prompt.title, foreground: theme.accentUser, style: [.bold])
+    ])
+    writeSpans([
+        PagerStyledSpan(text: question.text, foreground: theme.textPrimary, style: [.bold])
+    ])
+    y += 1
+
+    for (index, option) in question.options.enumerated() {
+        guard y < area.bottom else { return }
+        let isCursor = prompt.focus == .navigation && index == prompt.cursor
+        let isSelected = prompt.selectedOptionIndices.contains(index)
+        let rowBackground = isCursor ? theme.bgVisual : background
+        if isCursor {
+            paintBlank(
+                &buffer,
+                area: TerminalRect(x: max(0, area.x - 1), y: y, width: area.width + 2, height: 1),
+                foreground: theme.textPrimary,
+                background: rowBackground
+            )
+        }
+        let marker: String
+        if question.isMultiSelect {
+            marker = isSelected ? "[x] " : "[ ] "
+        } else {
+            marker = isSelected ? "(\(PagerGlyphs.filledDot)) " : "(\(PagerGlyphs.emptyDot)) "
+        }
+        var spans: [PagerStyledSpan] = [
+            PagerStyledSpan(
+                text: isCursor ? PagerGlyphs.promptArrow : "  ",
+                foreground: theme.accentUser,
+                style: isCursor ? [.bold] : []
+            ),
+            PagerStyledSpan(
+                text: marker,
+                foreground: isSelected || isCursor ? theme.textPrimary : theme.gray,
+                style: isCursor ? [.bold] : []
+            ),
+            PagerStyledSpan(
+                text: option.label,
+                foreground: theme.textPrimary,
+                style: isCursor ? [.bold] : []
+            )
+        ]
+        if !option.description.isEmpty {
+            spans.append(PagerStyledSpan(text: "  \(option.description)", foreground: theme.gray))
+        }
+        writeSpans(spans, rowBackground: rowBackground)
+    }
+
+    // The Other row. In input mode it shows the live text plus a block
+    // cursor, the minimal inline editor the settings string field also uses.
+    guard y < area.bottom else { return }
+    let onOther = prompt.isOnFreeformRow || prompt.focus == .freeformInput
+    let otherBackground = onOther ? theme.bgVisual : background
+    if onOther {
+        paintBlank(
+            &buffer,
+            area: TerminalRect(x: max(0, area.x - 1), y: y, width: area.width + 2, height: 1),
+            foreground: theme.textPrimary,
+            background: otherBackground
+        )
+    }
+    let otherMarker = question.isMultiSelect
+        ? (prompt.freeformSelected ? "[x] " : "[ ] ")
+        : (prompt.freeformSelected ? "(\(PagerGlyphs.filledDot)) " : "(\(PagerGlyphs.emptyDot)) ")
+    var otherSpans: [PagerStyledSpan] = [
+        PagerStyledSpan(
+            text: onOther ? PagerGlyphs.promptArrow : "  ",
+            foreground: theme.accentUser,
+            style: onOther ? [.bold] : []
+        ),
+        PagerStyledSpan(
+            text: otherMarker,
+            foreground: prompt.freeformSelected || onOther ? theme.textPrimary : theme.gray,
+            style: onOther ? [.bold] : []
+        ),
+        PagerStyledSpan(text: "Other", foreground: theme.textPrimary, style: onOther ? [.bold] : [])
+    ]
+    if prompt.focus == .freeformInput {
+        otherSpans.append(PagerStyledSpan(text: ": \(prompt.freeformText)", foreground: theme.textPrimary))
+        otherSpans.append(PagerStyledSpan(text: "▌", foreground: theme.accentUser))
+    } else if !prompt.freeformText.isEmpty {
+        otherSpans.append(PagerStyledSpan(text: ": \(prompt.freeformText)", foreground: theme.textPrimary))
+    } else {
+        otherSpans.append(PagerStyledSpan(text: "  type your own answer", foreground: theme.gray))
+    }
+    writeSpans(otherSpans, rowBackground: otherBackground)
 }
 
 // MARK: - Welcome
