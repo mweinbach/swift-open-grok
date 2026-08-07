@@ -1046,7 +1046,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             let stack = await Self.makeAgentStack(
                 foundation: foundation,
                 context: context,
-                dependencies: dependencies
+                dependencies: dependencies,
+                launchAutoUpdate: LiveLaunchAutoUpdate.Request(
+                    noAutoUpdate: options.advanced.noAutoUpdate,
+                    services: updateServices
+                )
             )
             let sharedExportBoundary = await stack.conversationHistory.sharedExportBoundary
             exportBoundaries.register(
@@ -1688,6 +1692,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let compaction: LiveCompactionCoordinator
         let turnDriver: ProviderSessionTurnDriver
         let shell: OpenGrokShell
+        /// Retained only so reachability tests can await the post-readiness
+        /// launch update check; production callers ignore it.
+        let launchAutoUpdateTask: Task<Void, Never>?
     }
 
     static func makeSessionFoundation(
@@ -1872,7 +1879,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     static func makeAgentStack(
         foundation: LiveSessionFoundation,
         context: CLIApplicationContext,
-        dependencies: OpenGrokLiveCompositionDependencies
+        dependencies: OpenGrokLiveCompositionDependencies,
+        launchAutoUpdate: LiveLaunchAutoUpdate.Request? = nil
     ) async -> LiveAgentStack {
         // Code Mode is a session-wide decision: the tool surface it
         // projects is fixed for the life of the timeline, which is what
@@ -1913,6 +1921,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // Never awaited: a slow or failing provider catalog must not delay
         // the first prompt.
         catalogStore.spawnBackgroundRefresh()
+        let launchAutoUpdateTask = LiveLaunchAutoUpdate.spawnIfNeeded(
+            request: launchAutoUpdate,
+            environment: context.environment,
+            streams: context.streams
+        )
         let configuredProviderDefinitions = parseConfiguredModelCatalog(
             from: ((try? loadAuthorityComposition(
                 cwd: foundation.cwd,
@@ -1972,7 +1985,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             modelSwitch: modelSwitch,
             compaction: compaction,
             turnDriver: turnDriver,
-            shell: shell
+            shell: shell,
+            launchAutoUpdateTask: launchAutoUpdateTask
         )
     }
 
