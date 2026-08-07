@@ -1317,6 +1317,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     // `<opengrok home>/slash-mru.json`, upstream's grok_home
                     // location (`mru.rs:78-80`).
                     await controller.setSlashMru(PagerSlashMru(directory: openGrokHome))
+                    // `/plan <description>`'s already-in-plan refusal
+                    // (`dispatch/modes.rs:48-52`) reads the live plan tracker
+                    // through the executor — the same tracker the
+                    // `enter_plan_mode` tool arms — so the slash path and the
+                    // tool path can never disagree about the session's mode.
+                    await controller.setPlanModeStateProvider {
+                        await toolExecutor.planModeActive()
+                    }
                     // Typing `/model ` drops the dropdown into the catalog, as
                     // upstream's `ModelCommand::suggest_args` does. Rows insert
                     // the provider-qualified selector, so accepting one
@@ -4151,6 +4159,47 @@ struct LiveToolExecutor: Sendable {
         case .all: return .all
         case nil: return .readWrite
         }
+    }
+
+    // MARK: - Plan mode (the `/plan` / `/view-plan` slash seam)
+
+    /// Whether the session's plan gate is armed, read from the same live
+    /// `PermissionPipeline` the `enter_plan_mode` tool handler mutates —
+    /// never a renderer-side mirror, which is exactly the parallel flag the
+    /// tool path could not see. `false` when the session has no pipeline
+    /// (nothing to arm).
+    func planModeActive() async -> Bool {
+        guard let permissionPipeline else { return false }
+        return await permissionPipeline.planModeActive
+    }
+
+    /// Arm the plan gate for `/plan` through the same
+    /// `PermissionPipeline.enterPlanMode` seam `EnterPlanModeToolHandler`
+    /// calls (`PlanModeTools.swift:62-65`). The nil arguments keep the
+    /// composition-configured plan path — `.opengrok/plan.md` under the
+    /// workspace root, the identical values the tool passes explicitly
+    /// (its `sessionFolder` IS the workspace root) — so both paths arm one
+    /// tracker at one path. Deliberately does NOT seed the plan file:
+    /// upstream's slash path arms via the session-mode switch alone
+    /// (`xai-grok-shell/src/session/acp_session_impl/session_mode.rs:30-51`)
+    /// and only the `enter_plan_mode` TOOL seeds.
+    /// Status-returning on purpose: a nil pipeline means the gate cannot
+    /// arm, and the caller must not announce "Plan mode: on" for an arm
+    /// that did not happen. Same no-pipeline convention as `gateKillTask` /
+    /// `gateTerminalCommand` — explicit refusal, never silence.
+    func armPlanMode() async -> Bool {
+        guard let permissionPipeline else { return false }
+        await permissionPipeline.enterPlanMode()
+        return true
+    }
+
+    /// The absolute plan-file path `/view-plan` reads — the live tracker's
+    /// resolved path, i.e. exactly the file the plan-file auto-approval gate
+    /// compares edits against — not a second, recomputed location. `nil`
+    /// when the session has no pipeline.
+    func planFileResolvedPath() async -> String? {
+        guard let permissionPipeline else { return nil }
+        return await permissionPipeline.planFileResolvedPath()
     }
 
     func invoke(
@@ -7537,6 +7586,26 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             case .codex:
                 startCodexLogout()
             }
+        case .planModeOn:
+            // Bare `/plan` — upstream `set_plan_mode(On)`
+            // (`dispatch/modes.rs:122-195`): idempotent (already armed →
+            // toast only, no second arm), toast via
+            // `save_success_toast("Plan mode", true)` (`settings/ui.rs:89-92`),
+            // mapped onto a transcript note like every toast here.
+            await armPlanModeFromSlash()
+        case .enterPlanMode:
+            // `/plan <description>`'s mode-switch half
+            // (`dispatch/modes.rs:37-120`). The controller AWAITS this render
+            // before it enqueues the description, so returning with the gate
+            // armed IS the port of upstream's `SetModeThenPrompt` ordering.
+            // RECORDED DIVERGENCE on the note: upstream toasts nothing here —
+            // its composer paints a persistent plan indicator off
+            // `plan_mode_pending` — but this port has no plan chip, so a
+            // silent arm would leave the mode switch with no announcement at
+            // all. Cost: one transcript line upstream does not print.
+            await armPlanModeFromSlash()
+        case .showPlan:
+            await showPlan()
         case .dismissAll:
             overlays.removeAll()
             currentPermissionRequestID = nil
@@ -8205,6 +8274,79 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             currentPlanApprovalRequestID = nil
         }
         pendingPlanApprovalRequest = nil
+    }
+
+    // MARK: - /plan, /view-plan
+
+    /// Arm plan mode for `/plan`, through `LiveToolExecutor.armPlanMode()` →
+    /// `PermissionPipeline.enterPlanMode` — the SAME seam the
+    /// `enter_plan_mode` tool handler mutates, so the slash path and the
+    /// tool path share one tracker and one plan-file path. Idempotent like
+    /// upstream's `set_plan_mode` (`dispatch/modes.rs:152-159`): an armed
+    /// session gets the toast without a second arm. The toast copy is
+    /// `save_success_toast("Plan mode", true)` byte for byte
+    /// (`settings/ui.rs:89-92`).
+    private func armPlanModeFromSlash() async {
+        guard let toolExecutor else {
+            // Upstream's refusal when the mode switch has nowhere to land
+            // (`dispatch/modes.rs:144-147`), copy byte-identical. The
+            // interactive composition always passes an executor, so this arm
+            // is reachable only from partial (test/headless) constructions.
+            note("No active session")
+            return
+        }
+        if await !toolExecutor.planModeActive() {
+            guard await toolExecutor.armPlanMode() else {
+                // Executor without a pipeline: the arm has nowhere to land.
+                // Refusing here (instead of noting "on") keeps the note
+                // truthful — same copy as the executor-nil arm above.
+                note("No active session")
+                return
+            }
+        }
+        note("\u{2713} Plan mode: on")
+    }
+
+    /// `/view-plan` — upstream `dispatch_show_plan` (`dispatch/modes.rs:16-25`):
+    /// a pending plan approval reopens its decision sheet; otherwise the
+    /// saved plan opens in a preview, or the "No plan written yet." toast.
+    private func showPlan() async {
+        // Reopen first (`modes.rs:18-19`, `reopen_plan_approval`): the head
+        // of the coordinator queue is a suspended `exit_plan_mode` call, and
+        // re-presenting it restores the decision surface (a/s/q).
+        // `showPlanApproval` dismisses any stale copy of the sheet before
+        // re-pushing and keeps the permission-outranks parking rule.
+        if let pending = await planApprovalCoordinator?.currentRequest {
+            await showPlanApproval(pending)
+            return
+        }
+        // `show_plan_preview` (`agent_view/plan.rs:125-146`), reduced to the
+        // body sources this port has: approval-carried content is the branch
+        // above, there is no inline-plan-content channel (upstream's
+        // `latest_inline_plan_content`, `plan.rs:102-108` — recorded
+        // divergence), which leaves the on-disk plan file — read at the live
+        // tracker's resolved path, the same file the plan-file auto-approval
+        // gate compares edits against.
+        let planPath = await toolExecutor?.planFileResolvedPath()
+        let content = planPath.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
+        guard let content,
+              !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            // Upstream's toast, byte for byte (`agent_view/plan.rs:144`).
+            note("No plan written yet.")
+            return
+        }
+        // Upstream opens a fullscreen markdown line viewer titled `plan.md`
+        // (`plan.rs:147-153`); this is the port's read-only text modal over
+        // the same body. Markdown that renders to nothing paints raw — the
+        // renderer's own contract — split on `Character.isNewline` because
+        // plan files come off disk and may carry CRLF (AGENTS.md §2).
+        let rendered = PagerMarkdownRenderer().render(content)
+        let lines = rendered.isEmpty
+            ? content
+                .split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+                .map { PagerStyledLine(text: String($0)) }
+            : rendered
+        overlays.push(.sessionInfo(id: "plan-preview", title: "plan.md", lines: lines))
     }
 
     /// Apply the outcome of a row choice, whether it came from `Enter` or a

@@ -57,6 +57,45 @@ and `restoreTerminal` does not cancel the pending task. Separately noted render 
 `PagerListRow.summary` is documented as upstream's indented sub-line (`picker.rs:900`) but
 no painter draws it anywhere — any future row description needs `detail` or a painter fix.
 
+### D2 — `/plan` and `/view-plan` (serial gate: exit 0, 4,392 tests, zero issues)
+
+Bare `/plan` arms the live plan gate through the SAME `PermissionPipeline.enterPlanMode`
+seam the `enter_plan_mode` tool uses (no controller-side mirror; the already-in-plan check
+reads `permissionPipeline.planModeActive`); `/plan <description>` preserves upstream's
+`SetModeThenPrompt` ordering (`dispatch/modes.rs:31-36`) — the renderer's arm completes
+inside `emit` before the returned `.submit` enqueues the description, so the description's
+turn cannot start with the gate disarmed; `/view-plan` (aliases `show-plan`, `plan-view`)
+reopens a pending `exit_plan_mode` approval or previews the tracker-resolved on-disk plan,
+with upstream's "No plan written yet." copy for the empty case. 15 new tests: 9
+controller-seam (registry/alias/dispatch/ordering pins) and 6 live-seam (the arm observed
+by real tool dispatch via a plan-gated write probe, idempotence after a real tool arm,
+painted preview of a real plan file, no-plan note, approval reopen).
+
+**Lead fix after delegate handoff:** the slash arm's nil-pipeline path was silent —
+`armPlanMode()` no-opped and the caller still noted "✓ Plan mode: on", a false success
+report on a permission control (this file's own convention, `gateKillTask` /
+`gateTerminalCommand`, is explicit refusal when the pipeline is missing). `armPlanMode()`
+is now status-returning and the slash path refuses with "No active session" when the arm
+has nowhere to land. Residual, recorded: on the description form in that same partial
+construction the controller still submits the prompt after the refusal note (stopping it
+needs a status channel through `emit`; the interactive composition always has a pipeline).
+
+**Recorded divergences:**
+
+- Preview is a read-only scrollable text modal titled `plan.md`, not upstream's fullscreen
+  line viewer with commenting and action buttons (`agent_view/plan.rs:125-167`). Cost: no
+  plan commenting from the preview.
+- Plan body precedence: no `latest_inline_plan_content` channel (`plan.rs:93-112`) —
+  approval content serves the reopen branch, disk otherwise. A plan not yet flushed to
+  disk shows "No plan written yet."
+- Plan file location: the tracker's resolved path (`<workspace>/.opengrok/plan.md`), not
+  upstream's `<grok home>/sessions/<urlencoded_cwd>/<session_id>/plan.md` (`plan.rs:29-41`)
+  — reused deliberately so `/view-plan` and the plan-file auto-approval gate name one file.
+- The description form prints "✓ Plan mode: on" where upstream shows a persistent plan
+  chip instead of a toast; the port has no chip (roadmap: status-bar surface).
+- Shared-parser whitespace collapse in the description (precedent: `/remember`, `/btw`);
+  `SetPlanMode(Off)` and the dashboard/session-less offering have no port surface.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was

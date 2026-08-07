@@ -710,6 +710,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         @Sendable (String, String) -> [OpenGrokPagerCommandSuggestion]
     )?
 
+    /// Whether the session is effectively in plan mode right now, read from
+    /// the live plan tracker — the same one the `enter_plan_mode` tool arms —
+    /// so `/plan <description>`'s already-in-plan refusal
+    /// (`dispatch/modes.rs:48-52`) and the tool path can never disagree. A
+    /// controller-side mirror would be exactly the parallel flag the tool
+    /// path cannot see. `nil` (compositions with no live plan state)
+    /// resolves to false, so `/plan <description>` arms-and-sends there.
+    private var planModeState: (@Sendable () async -> Bool)?
+
     public init(
         input: AsyncThrowingStream<InputEvent, Error>,
         runtime: any OpenGrokPagerRuntimeAdapter,
@@ -788,6 +797,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         _ provider: (@Sendable (String, String) -> [OpenGrokPagerCommandSuggestion])?
     ) {
         argumentSuggestions = provider
+    }
+
+    /// Install the live plan-mode state source for `/plan <description>`'s
+    /// already-in-plan refusal. Call before `run`.
+    public func setPlanModeStateProvider(
+        _ provider: (@Sendable () async -> Bool)?
+    ) {
+        planModeState = provider
     }
 
     /// Report what the render layer knows is in motion — visible running
@@ -2147,6 +2164,26 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Save a memory note",
             usage: "/remember [text]"
         ),
+        // `/plan` and `/view-plan` sit after `/remember`, upstream's display
+        // order (`slash/commands/mod.rs:123-126`; `/swarm`, which sits
+        // between them upstream, is not ported). Names, aliases, summaries
+        // and usage are verbatim (`plan.rs:15-43`, `view_plan.rs:10-28`).
+        // Both arguments are optional, so a bare Enter dispatches. Upstream's
+        // `arg_placeholder("[description]")` (`plan.rs:41-43`) has no port
+        // channel — `PagerCommandDefinition` carries no placeholder field —
+        // so the usage string is the only argument hint (recorded
+        // divergence).
+        PagerCommandDefinition(
+            name: "plan",
+            summary: "Enter plan mode",
+            usage: "/plan [description]"
+        ),
+        PagerCommandDefinition(
+            name: "view-plan",
+            aliases: ["show-plan", "plan-view"],
+            summary: "View the current plan",
+            usage: "/view-plan"
+        ),
         PagerCommandDefinition(
             name: "recall",
             summary: "Search workspace memory",
@@ -2650,6 +2687,44 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case "goal":
                 try await emit(.overlay(.goal(argument: Self.rejoined(invocation.arguments))))
                 return .handled
+            case "plan":
+                // `/plan` (`plan.rs:45-53`): bare or whitespace-only args arm
+                // plan mode; a description enters plan mode and then starts a
+                // turn with it. The parser's rejoin collapses interior
+                // whitespace runs where upstream's `args.trim()` keeps them —
+                // recorded divergence, shared with every prose-argument
+                // command here (`/remember`, `/btw`, `/rename`).
+                let description = Self.rejoined(invocation.arguments)
+                guard !description.isEmpty else {
+                    try await emit(.overlay(.planModeOn))
+                    return .handled
+                }
+                if await planModeState?() == true {
+                    // Upstream stops without re-arming or sending the prompt
+                    // (`dispatch/modes.rs:48-52`); copy byte-identical.
+                    try await emit(.notice(
+                        "Already in plan mode. Use /view-plan to view the current plan."
+                    ))
+                    return .handled
+                }
+                // ORDERING IS LOAD-BEARING (`dispatch/modes.rs:31-36`):
+                // upstream bundles the mode switch and the prompt into one
+                // sequential `SetModeThenPrompt` effect so the switch
+                // completes before the prompt dispatches. Here the guarantee
+                // is that `emit` awaits the renderer's `.enterPlanMode`
+                // handling — which arms the live plan gate — before the
+                // returned `.submit` enqueues the description. Reversed, the
+                // description's turn could start sampling with the gate
+                // disarmed, and the model's first edits would not be
+                // plan-gated.
+                try await emit(.overlay(.enterPlanMode))
+                return .submit(description)
+            case "view-plan":
+                // Arguments are ignored — upstream's `ViewPlanCommand::run`
+                // declares none and discards what it gets
+                // (`view_plan.rs:30-32`).
+                try await emit(.overlay(.showPlan))
+                return .handled
             case "gboom":
                 try await emit(.overlay(.easterEgg))
                 return .handled
@@ -2851,6 +2926,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /recall <query>           Search workspace memory
       /flush <notes>            Write notes to this session's memory log
       /goal [objective]         Set or inspect the session goal
+      /plan [description]       Enter plan mode
+      /view-plan  /show-plan    View the current plan
       /multiline  /ml           Swap what Enter and Shift+Enter do
       /vim-mode                 Vim keys for the focused scrollback
       /settings   /config       Open the settings modal

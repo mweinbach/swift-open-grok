@@ -390,6 +390,23 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     case flush(text: String)
     /// `/goal [objective|status|pause|resume|clear]` — the goal tracker.
     case goal(argument: String)
+    /// Bare `/plan` — arm plan mode (upstream `Action::SetPlanMode(On)`,
+    /// `slash/commands/plan.rs:45-49`, dispatched by `set_plan_mode`,
+    /// `dispatch/modes.rs:122-195`). Idempotent at the live seam: an
+    /// already-armed session gets the toast without a second arm.
+    case planModeOn
+    /// `/plan <description>` — the mode-switch half of upstream's
+    /// `Action::EnterPlanMode` (`plan.rs:50-52`, `dispatch/modes.rs:37-120`).
+    /// Carries no description on purpose: the controller emits this intent
+    /// and AWAITS its handling before enqueueing the description as a normal
+    /// prompt, which is how the port keeps upstream's `SetModeThenPrompt`
+    /// ordering — the arm must land before the prompt's turn starts.
+    case enterPlanMode
+    /// `/view-plan` — upstream `Action::ShowPlan` (`view_plan.rs:30-32`):
+    /// a pending plan approval reopens its sheet, else the saved plan opens
+    /// in a preview, else the "No plan written yet." toast
+    /// (`dispatch/modes.rs:16-25`, `agent_view/plan.rs:125-146`).
+    case showPlan
     /// `/resume` — the stored-session picker (upstream
     /// `Action::ShowSessionPicker`, `slash/commands/resume.rs:21-23`). The
     /// session store is a CLI-layer concern, so the intent carries no rows.
