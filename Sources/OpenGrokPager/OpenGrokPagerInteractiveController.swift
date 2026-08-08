@@ -2154,6 +2154,20 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Ask a side question without interrupting",
             usage: "/btw <question>"
         ),
+        // `/recap` follows `/btw`, upstream's display order
+        // (`slash/commands/mod.rs:130-131`). Name, alias, description and
+        // usage are verbatim (`recap.rs:14-32`). Divergence, shared with
+        // `/fast`: upstream's registry hides the row until the shell
+        // advertises `session_recap` (default ON, `agent/config.rs:2657-2667`);
+        // this registry is fixed at construction, so the row is always
+        // registered and the render layer answers a disabled or session-less
+        // invocation with upstream's copy instead.
+        PagerCommandDefinition(
+            name: "recap",
+            aliases: ["summarize"],
+            summary: "Summarize the session so far",
+            usage: "/recap"
+        ),
         PagerCommandDefinition(
             name: "compact",
             summary: "Compact conversation history",
@@ -2689,6 +2703,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 // interjection buffer: the question leads the next prompt
                 // instead of queueing behind the backlog.
                 try await interject(question, kind: .followUp)
+                return .handled
+            case "recap":
+                // Arguments are ignored — upstream's `RecapCommand::run`
+                // declares none and discards what it gets (recap.rs:34,
+                // `_args`). The snapshot, the helper model, and the failure
+                // copy all live in the render layer, which owns the live
+                // sampling stack.
+                try await emit(.overlay(.recap))
                 return .handled
             case "mcps":
                 try await emit(.overlay(.mcpServers))

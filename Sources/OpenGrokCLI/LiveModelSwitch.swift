@@ -586,6 +586,91 @@ actor LiveModelSwitchCoordinator {
             .first { $0.1.model == configuration.model }
             .map { $0.0 }
     }
+
+    /// The `/recap` side-call's sampling route, resolved WITHOUT switching the
+    /// session (`prepare_auxiliary_sampling`, sampler_turn.rs:1100-1197).
+    ///
+    /// * An explicit `[models] recap` pin (or the Codex Automatic helper)
+    ///   resolves through the SAME catalog/credential ladder `/model` uses,
+    ///   with `serviceTier` pinned to nil: the aux sampler config upstream
+    ///   builds sets `service_tier: None` (`sampling_config_for_model`,
+    ///   agent/config.rs:6097), so an explicitly resolved recap never rides
+    ///   the session's Fast tier.
+    /// * An automatic helper choice is provider-local by contract; an explicit
+    ///   choice is the only opt-in to sending recap content to another
+    ///   provider (sampler_turn.rs:1133-1138). Any resolution failure —
+    ///   unknown model, missing credentials, wrong provider — falls back to
+    ///   the active model, mirroring upstream's warn-and-use-active arms
+    ///   (sampler_turn.rs:1140-1159).
+    /// * The active-model fallback keeps the session's full config — service
+    ///   tier included (`reconstruct_full_config` carries it,
+    ///   sampler_turn.rs:850) — with only the reasoning effort adjusted to
+    ///   the auxiliary policy (sampler_turn.rs:1162-1175). Never `nil`: a
+    ///   recap must not fail merely because no helper resolved.
+    func auxiliaryRecapRoute(
+        explicitModelID: String?
+    ) async -> (configuration: OpenGrokLiveSamplingConfiguration, sampler: OpenGrokLiveSampler) {
+        let active = sampling
+        let catalog = resolver.catalogSource()
+        if let desired = LiveRecap.desiredModel(
+            configured: explicitModelID,
+            activeProvider: active.provider
+        ), let entry = findModelByID(catalog, modelID: desired.modelID) {
+            let effort = acceptedAuxiliaryEffort(info: entry.info)
+            do {
+                let resolution = try await resolver.resolve(
+                    modelID: desired.modelID,
+                    effort: effort,
+                    serviceTier: nil
+                )
+                if desired.explicit || resolution.sampling.provider == active.provider {
+                    return (resolution.sampling, try makeSampler(resolution.sampling))
+                }
+            } catch {
+                // Fall through to the active model — upstream's
+                // no-credentials arm (sampler_turn.rs:1147-1151).
+            }
+        }
+
+        // config = active (sampler_turn.rs:1162): the session's own route,
+        // reasoning effort re-derived under the auxiliary policy.
+        let activeInfo = resolver.catalogSource().pairs()
+            .first { $0.1.model == active.model }?.1.info
+        var tuning = active.tuning
+        tuning.reasoningEffort = activeInfo.flatMap(acceptedAuxiliaryEffort(info:))
+        guard tuning != active.tuning else { return (active, sampler) }
+        let adjusted = OpenGrokLiveSamplingConfiguration(
+            model: active.model,
+            baseURL: active.baseURL,
+            apiKey: active.apiKey,
+            provider: active.provider,
+            apiBackend: active.apiBackend,
+            extraHeaders: active.extraHeaders,
+            queryParams: active.queryParams,
+            tuning: tuning,
+            bearerResolver: active.bearerResolver,
+            credentialProvider: active.credentialProvider,
+            transport: active.transport
+        )
+        guard let rebuilt = try? makeSampler(adjusted) else { return (active, sampler) }
+        return (adjusted, rebuilt)
+    }
+
+    /// The auxiliary effort for one catalog entry, dropped when the model's
+    /// declared effort menu does not accept it — the port of the
+    /// `model_accepts_reasoning_effort` filter (sampler_turn.rs:1169-1174).
+    private func acceptedAuxiliaryEffort(info: ModelInfo) -> ReasoningEffort? {
+        let effort = LiveRecap.auxiliaryReasoningEffort(
+            provider: info.provider,
+            supported: info.supportsReasoningEffort,
+            modelDefault: info.reasoningEffort
+        )
+        guard let effort else { return nil }
+        guard info.reasoningEfforts.isEmpty
+            || info.reasoningEfforts.contains(where: { $0.value == effort })
+        else { return nil }
+        return effort
+    }
 }
 
 /// Whether a session tier selection means Fast mode is on: the tier is the

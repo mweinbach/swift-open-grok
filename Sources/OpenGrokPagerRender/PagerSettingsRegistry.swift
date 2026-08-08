@@ -922,7 +922,14 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             description: "Model used for conversation recaps. Automatic chooses an economical model for the active provider.",
             keywords: ["recap", "summary", "model"],
             kind: .dynamicEnum(default: "", source: .auxiliaryModelCatalog, supportsPreview: false),
-            storage: .config(path: "models.recap_model")
+            // The setting key is `recap_model` but the TOML pin upstream
+            // persists is `[models] recap` (`set_recap_model`,
+            // util/config/settings_writes.rs:386-394) — the same key
+            // `models_manager.recap_model()` reads back (models.rs:1176-1179)
+            // and the key the live `/recap` resolves through. Writing
+            // `models.recap_model` here left the row a dead surface: it
+            // saved a key nothing reads.
+            storage: .config(path: "models.recap")
         ),
         PagerSettingMeta(
             key: "memory_model",

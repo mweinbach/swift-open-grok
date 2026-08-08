@@ -266,6 +266,38 @@ today, so the tier follows that pre-existing gap; out of the box only Fireworks 
 models are fast-capable (Codex tiers go live when the remote catalog carries
 `service_tiers`).
 
+### E4 — `/recap` on a real one-shot side-call (serial gate: exit 0, 4,528 tests, zero issues; 2026-08-08)
+
+`/recap` (alias `/summarize`) samples a READ-ONLY snapshot: the session's conversation
+prefix verbatim (reasoning stripped, trailing tool-run popped for a clean boundary) plus
+upstream's instruction turn — machine-extracted from `session_recap.rs:38-59` and pinned
+by SHA-256 so drift fails the suite — resolved through upstream's model-choice policy
+(explicit `models.recap` → Codex-only Automatic economical pick → active route), tidied
+(upstream's own tidy tests ported) and painted as "Recap — {summary}". Failures paint
+upstream's unavailable copy and never break the session; the conversation is provably
+unmutated (the live test pins the NEXT turn's request body free of recap items). The
+`recap_model` settings row's dead storage path was fixed (`models.recap_model` →
+`models.recap`, the key upstream persists and `recap_model()` reads) — the "parses,
+nothing reads" pair from the roadmap is now closed from both ends. 28 new tests.
+
+**Brief correction, delegate-verified and lead-accepted:** the tier-None claim holds only
+for the RESOLVED aux route (`agent/config.rs:6097`); the non-Codex Automatic fallback is
+`config = active` and carries the session tier (`sampler_turn.rs:850,1162`). Both
+behaviors are pinned live: an explicit recap pin on a Fast session sends no
+`service_tier` while surrounding turns carry `"priority"`; the Automatic fallback on a
+Fireworks Fast session carries it.
+
+**Recorded divergences:** the side-call goes tool-free (upstream ships the main turn's
+tool specs for prefix-cache parity and forbids use through the instruction alone,
+`recap.rs:354-358`; the render layer has no reach into the live tool surface — same
+choice as the compaction sampler); in-progress paints a "Recap…" note instead of
+upstream's in-place spinner block; the over-budget front-trim (`budget_recap_items`) is
+not ported (sessions auto-compact at the same 85% threshold; degenerate overflow fails
+into the unavailable copy); no remote-settings leg on the `session_recap` gate; no
+request artifacts or conv-id stamp. The auto arm (watermark, idle gate) is out of scope
+by design. **Flagged for future slices:** `memory_model` and `fork_secondary_model`
+settings rows share the dead-storage-path defect fixed here for `recap_model`.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was

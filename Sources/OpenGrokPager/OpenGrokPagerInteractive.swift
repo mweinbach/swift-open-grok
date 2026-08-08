@@ -432,6 +432,14 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// the current toggle state because it does not own the model catalog or
     /// the live sampling stack.
     case fastMode
+    /// `/recap` (alias `/summarize`) — upstream `Action::SendRecap{auto:false}`
+    /// (`slash/commands/recap.rs:34-36`): a one-shot side-call that summarizes
+    /// the session so far and paints the result as a display-only "Recap —"
+    /// line. It bypasses the prompt queue and NEVER mutates the conversation
+    /// (`session_recap.rs:1-12`). Carries nothing: the conversation snapshot,
+    /// the helper-model choice and the failure copy all live in the render
+    /// layer, the only layer that owns the live sampling stack.
+    case recap
     /// `/rename <title>`, alias `/title` — retitle the current session
     /// (upstream `Action::RenameSession`, `slash/commands/rename.rs:42-53`).
     /// The empty-title refusal happens in the controller, so `title` here is

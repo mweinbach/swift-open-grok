@@ -6521,6 +6521,16 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// would bind a second callback server; this port refuses it with a
     /// notice instead.
     private var codexLoginTask: Task<Void, Never>?
+    /// The in-flight `/recap` side-call, if any — the port of upstream's
+    /// `recap_in_flight` claim (recap.rs:294-306): manual re-requests while
+    /// one is generating answer with the unavailable copy instead of
+    /// stacking side-calls.
+    private var recapTask: Task<Void, Never>?
+    /// Bumped when a new turn starts or the session is swapped, so a recap
+    /// that finishes late is discarded instead of painting into a
+    /// conversation it no longer describes — upstream's `recap_epoch`
+    /// cancellation (recap.rs:509-517, :430-455).
+    private var recapEpoch: UInt64 = 0
 
     /// Viewport state. The last frame's geometry is cached so a page-sized
     /// scroll can be expressed in rows without re-laying out the transcript.
@@ -6929,6 +6939,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         case .promptChanged(let prompt):
             self.prompt = prompt
         case .turnStarted(let request):
+            // A real prompt invalidates an in-flight recap: a late recap must
+            // not land mid-turn (cancel_pending_recap_for_new_prompt,
+            // recap.rs:509-512).
+            recapEpoch &+= 1
             // The welcome screen's lifetime is exactly "before the first turn".
             if !hasStartedFirstTurn {
                 hasStartedFirstTurn = true
@@ -6948,8 +6962,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             endTurn()
             await refreshContextUsage()
         case .sessionReplaced(let sessionID):
+            // A swapped conversation invalidates an in-flight recap the same
+            // way a new prompt does — it no longer describes this session.
+            recapEpoch &+= 1
             resetForNewSession(sessionID: sessionID)
         case .sessionResumed(let sessionID):
+            recapEpoch &+= 1
             await applyResumedSession(sessionID: sessionID)
         case .notice(let message):
             appendMessage(PagerMessage(role: .system, text: message))
@@ -7636,6 +7654,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await applyEffortCommand(query: query)
         case .fastMode:
             await applyFastCommand()
+        case .recap:
+            await startRecap()
         case .renameSession(let title):
             await renameSession(title: title)
         case .loginProviderPicker:
@@ -7887,6 +7907,147 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 role: .error,
                 text: "OpenAI Codex login failed: \(LiveAuthComposition.describe(error))"
             ))
+        }
+        try? renderState()
+    }
+
+    // MARK: - /recap
+
+    /// `/recap` — kick off the session-recap side-call (the manual arm of
+    /// `handle_recap`, acp_session_impl/recap.rs:250-507). One read-only
+    /// snapshot of the live conversation, ONE tool-free model call on the
+    /// independently resolved recap route, and a display-only transcript
+    /// line; the conversation is never touched. Spawned so the sample never
+    /// blocks the input loop, single-flight like upstream's `recap_in_flight`
+    /// claim (recap.rs:294-306).
+    private func startRecap() async {
+        let workingDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        // The shell-side gate is authoritative; default ON
+        // (resolve_session_recap, agent/config.rs:2657-2667). Refusal copy is
+        // the pager's skip arm (dispatch_send_recap, notes.rs:372-377).
+        guard LiveRecap.enabled(
+            workingDirectory: workingDirectoryURL,
+            openGrokHome: openGrokHome,
+            environment: environment
+        ) else {
+            note("Session recap is not enabled")
+            return
+        }
+        // No live sampling stack or conversation behind this renderer means
+        // no session to recap (notes.rs:379-384).
+        guard let modelSwitch, let conversationHistory else {
+            note("No active session")
+            return
+        }
+        guard recapTask == nil else {
+            // Another recap is generating; upstream's in-flight skip answers
+            // the manual re-request through the unavailable toast
+            // (recap.rs:296-302 → notes.rs:331-340).
+            note(LiveRecap.unavailableToast(hasUserMessages: true))
+            return
+        }
+        let conversation = await conversationHistory.items
+        // recap_gate's manual arm (session_recap.rs:232-241): nothing to
+        // summarize yet — the empty-state copy, and no request leaves the
+        // machine.
+        guard LiveRecap.mainTurnCount(conversation) > 0 else {
+            note(LiveRecap.unavailableToast(hasUserMessages: false))
+            return
+        }
+        // RECORDED DIVERGENCE on the in-progress presentation: upstream shows
+        // a loading block whose "Recap" header carries an animated sidebar
+        // and is filled in place (notes.rs:398-420, apply_recap_block). This
+        // port's transcript has no fill-in-place channel, so the running
+        // state is a note in the `/compact` "Compacting…" convention. Cost:
+        // the running line stays in scrollback above the result.
+        note("Recap\u{2026}")
+        try? renderState()
+
+        let configured = LiveRecap.configuredModel(
+            workingDirectory: workingDirectoryURL,
+            openGrokHome: openGrokHome,
+            environment: environment
+        )
+        let epoch = recapEpoch
+        let sessionID = self.sessionID
+        recapTask = Task {
+            // Explicit `[models] recap` wins; Automatic picks the economical
+            // model for the active provider; anything unresolvable falls back
+            // to the active session route (sampler_turn.rs:1100-1197).
+            let route = await modelSwitch.auxiliaryRecapRoute(explicitModelID: configured)
+            // Reasoning strips only where the backend rejects replayed
+            // thinking blocks (Anthropic Messages); every other backend keeps
+            // the prefix verbatim so the provider prompt cache stays warm
+            // (session_recap.rs:62-74).
+            let items = LiveRecap.buildItems(
+                conversation: conversation,
+                tag: "system-reminder",
+                stripReasoning: route.configuration.apiBackend == .messages
+            )
+            // Tool-free request: `tools: []` serializes NO tools field.
+            // RECORDED DIVERGENCE: upstream ships the main turn's tool specs
+            // unchanged so the cached token prefix matches, and suppresses
+            // tool USE through the instruction text alone (recap.rs:354-358);
+            // this render layer has no reach into the live tool surface, so
+            // the side-call goes tool-free like the compaction sampler
+            // (LiveCompaction.swift:69). Cost: the provider's prefix cache
+            // diverges from the main turn at the tools block.
+            let result: Result<String, any Error>
+            do {
+                let response = try await route.sampler.sample(
+                    OpenGrokLiveSamplingRequest(
+                        sessionID: sessionID,
+                        turnID: "xai-recap-\(UUID().uuidString)",
+                        model: route.configuration.model,
+                        prompt: LiveRecap.instruction(tag: "system-reminder"),
+                        items: items,
+                        tools: []
+                    )
+                ) { _ in
+                    // Display-only side-call: deltas must never stream into
+                    // the transcript as assistant text.
+                }
+                result = .success(response.output)
+            } catch {
+                result = .failure(error)
+            }
+            self.finishRecap(epoch: epoch, result: result)
+        }
+    }
+
+    /// Land the recap. The conversation is deliberately untouched on every
+    /// arm — a recap is generated from a read-only snapshot and surfaced for
+    /// display only (session_recap.rs:1-12).
+    private func finishRecap(epoch: UInt64, result: Result<String, any Error>) {
+        recapTask = nil
+        // A prompt accepted (or a session swapped) while generating: keep the
+        // late recap out of a conversation it no longer describes; the manual
+        // path still clears its feedback (recap.rs:430-455).
+        guard epoch == recapEpoch else {
+            note(LiveRecap.unavailableToast(hasUserMessages: true))
+            try? renderState()
+            return
+        }
+        switch result {
+        case .success(let raw):
+            let summary = LiveRecap.cleanText(raw)
+            if summary.isEmpty {
+                // Empty after the tidy pass reads as no recap
+                // (recap.rs:405-428).
+                note(LiveRecap.unavailableToast(hasUserMessages: true))
+            } else {
+                // The pager owns the label — manual and auto render the same
+                // "Recap — {summary}" line (SessionEvent::Recap `message()`,
+                // scrollback/blocks/session_event.rs:253-256).
+                note("Recap \u{2014} \(summary)")
+            }
+        case .failure:
+            // A failed side-call must never break the session: the failure
+            // copy paints and the session keeps working (recap.rs:378-401 →
+            // recap_unavailable_toast, notes.rs:331-340). The error detail is
+            // deliberately not painted — upstream sends it to tracing, never
+            // to the client.
+            note(LiveRecap.unavailableToast(hasUserMessages: true))
         }
         try? renderState()
     }
