@@ -17,8 +17,13 @@
 //     task ids and subagent ids share one namespace; a miss on the shell side
 //     falls through to the coordinator.
 //
-// Deliberately absent here (recorded in the slice report): `agent_swarm`, the
-// collaboration quartet, worktree isolation, the foreground await budget with
+// `agent_swarm` lives in `LiveSubagentSwarm.swift` as an extension on this
+// actor: the swarm scheduler drives the same coordinator and the same
+// `runChild` runner, so a swarm member is a real child in every observable
+// way (`/tasks`, `get_task_output`, `kill_task`, `resume_from`).
+//
+// Deliberately absent here (recorded in the slice report): the collaboration
+// quartet, worktree isolation, the foreground await budget with
 // auto-backgrounding, Antigravity runners, and durable cross-process resume
 // metadata. Resume works within the session through the same conversation
 // store the root session uses.
@@ -119,14 +124,20 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     /// model catalog are launch-time facts here, exactly as upstream builds
     /// the description in `AgentBuilder::build`.
     nonisolated let toolSpec: ToolSpec
+    /// What the running turn is parked on. `agent_swarm` raises the
+    /// orchestration depth for the duration of its cohort; the interactive
+    /// controller reads it on the send-now path so an arriving prompt
+    /// promotes instead of cancelling (the port of `BlockingWaitState`,
+    /// shell tools/tool_context.rs:76-117).
+    nonisolated let foregroundWait = LiveForegroundWaitState()
 
-    private let context: Context
+    let context: Context
 
     /// Bookkeeping the coordinator deliberately does not carry (its request
     /// type is a wire-frozen Codable): spawn wall-clock, the model-facing
     /// type/description, live progress, terminal stats, and the in-session
     /// resume index.
-    private struct Bookkeeping {
+    struct Bookkeeping {
         var startedAt: Date
         var subagentType: String
         var description: String
@@ -138,7 +149,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         var terminalToolCalls: UInt32?
         var terminalTurns: UInt32?
     }
-    private var bookkeeping: [String: Bookkeeping] = [:]
+    var bookkeeping: [String: Bookkeeping] = [:]
     private var childExecutors: [String: LiveToolExecutor] = [:]
 
     init(context: Context) {
@@ -564,7 +575,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         return .failure(.invalidCall(message))
     }
 
-    private static func validationMessage(_ error: ResolutionError) -> String {
+    static func validationMessage(_ error: ResolutionError) -> String {
         switch error {
         case .unknown(let subagentType, let available):
             let suffix = available.isEmpty ? "" : ". Available types: \(available.joined(separator: ", "))"
@@ -578,7 +589,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         }
     }
 
-    private static func resumeNotFoundMessage(_ resumeID: String) -> String {
+    static func resumeNotFoundMessage(_ resumeID: String) -> String {
         "Cannot resume from subagent '\(resumeID)': not found. The subagent may have been evicted or the ID is invalid."
     }
 
@@ -590,7 +601,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     /// the differences are the definition-rendered system prompt, the
     /// session persistence (a workflow child's durable record is the journal;
     /// a task child's is its resumable transcript), and the stop-hook event.
-    private func runChild(
+    func runChild(
         childID: String,
         prompt: String,
         definition: AgentDefinition,

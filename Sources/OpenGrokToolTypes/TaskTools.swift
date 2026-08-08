@@ -209,6 +209,10 @@ public struct AgentSwarmToolInput: Codable, Sendable, Hashable {
     public var description: String
     public var subagentType: String
     public var model: String?
+    /// Optional reasoning effort applied to every swarm member, including
+    /// resumed members (Rust `AgentSwarmToolInput.reasoning_effort`,
+    /// task.rs:158-166).
+    public var reasoningEffort: String?
     public var promptTemplate: String?
     public var items: [String]?
     public var resumeAgentIds: OrderedResumeAgentMap?
@@ -217,6 +221,7 @@ public struct AgentSwarmToolInput: Codable, Sendable, Hashable {
         case description
         case subagentType = "subagent_type"
         case model
+        case reasoningEffort = "reasoning_effort"
         case promptTemplate = "prompt_template"
         case items
         case resumeAgentIds = "resume_agent_ids"
@@ -226,6 +231,7 @@ public struct AgentSwarmToolInput: Codable, Sendable, Hashable {
         description: String,
         subagentType: String = defaultSubagentType,
         model: String? = nil,
+        reasoningEffort: String? = nil,
         promptTemplate: String? = nil,
         items: [String]? = nil,
         resumeAgentIds: OrderedResumeAgentMap? = nil
@@ -233,6 +239,7 @@ public struct AgentSwarmToolInput: Codable, Sendable, Hashable {
         self.description = description
         self.subagentType = subagentType
         self.model = model
+        self.reasoningEffort = reasoningEffort
         self.promptTemplate = promptTemplate
         self.items = items
         self.resumeAgentIds = resumeAgentIds
@@ -243,6 +250,7 @@ public struct AgentSwarmToolInput: Codable, Sendable, Hashable {
         self.description = try c.decode(String.self, forKey: .description)
         self.subagentType = try c.decodeIfPresent(String.self, forKey: .subagentType) ?? defaultSubagentType
         self.model = try c.decodeIfPresent(String.self, forKey: .model)
+        self.reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort)
         self.promptTemplate = try c.decodeIfPresent(String.self, forKey: .promptTemplate)
         self.items = try c.decodeIfPresent([String].self, forKey: .items)
         self.resumeAgentIds = try c.decodeIfPresent(OrderedResumeAgentMap.self, forKey: .resumeAgentIds)
@@ -302,9 +310,13 @@ public struct OrderedResumeAgentMap: Codable, Sendable, Hashable {
     }
 
     public init(from decoder: Decoder) throws {
-        // Decode as an ordered sequence of key/value pairs. Swift's
-        // KeyedDecodingContainer does not preserve order, so we decode
-        // via the dynamic AnyCodingKey path and walk all keys.
+        // Values decode through the dynamic AnyCodingKey path, but Swift's
+        // KeyedDecodingContainer does NOT preserve JSON source order (it
+        // hands keys back in dictionary order), where upstream's serde map
+        // keeps insertion order. Callers that own the RAW argument text
+        // must restore order with `reordered(bySourceOrderIn:)` — the
+        // swarm dispatch does. Decode order here is value-correct but
+        // key-order-unspecified.
         let dyn = try decoder.container(keyedBy: AnyCodingKey.self)
         var seen: [String: Int] = [:]
         var out: [Entry] = []
@@ -327,6 +339,143 @@ public struct OrderedResumeAgentMap: Codable, Sendable, Hashable {
             try dyn.encode(e.value, forKey: AnyCodingKey(stringValue: e.key))
         }
     }
+
+    /// Recover the JSON SOURCE order of the `resume_agent_ids` object's keys
+    /// from the raw argument text, honoring upstream's slot-order contract
+    /// (`ordered_resume_object_deserializes_in_source_order`,
+    /// agent_swarm/mod.rs:977-990) that Foundation's decoder cannot: resumed
+    /// members occupy slots in the order the model wrote them. The scanner
+    /// is string-aware (escapes respected) and nesting-aware; it returns
+    /// the keys of the first `"resume_agent_ids"` object, or nil when the
+    /// field is absent or the text is malformed — callers keep decode order
+    /// in that case, which is the pre-scan behavior.
+    public static func sourceOrderedKeys(inRawJSON raw: String) -> [String]? {
+        let chars = Array(raw)
+        var i = 0
+
+        func skipWhitespace() {
+            while i < chars.count, chars[i].isWhitespace { i += 1 }
+        }
+
+        // Reads the string whose opening quote is at `i`; leaves `i` one
+        // past the closing quote. Returns nil on malformed input.
+        func readString() -> String? {
+            guard i < chars.count, chars[i] == "\"" else { return nil }
+            i += 1
+            var out = ""
+            while i < chars.count {
+                let c = chars[i]
+                if c == "\\" {
+                    guard i + 1 < chars.count else { return nil }
+                    let e = chars[i + 1]
+                    switch e {
+                    case "\"": out.append("\"")
+                    case "\\": out.append("\\")
+                    case "/": out.append("/")
+                    case "n": out.append("\n")
+                    case "t": out.append("\t")
+                    case "r": out.append("\r")
+                    case "u":
+                        guard i + 5 < chars.count,
+                              let scalarValue = UInt32(String(chars[(i + 2)...(i + 5)]), radix: 16),
+                              let scalar = Unicode.Scalar(scalarValue)
+                        else { return nil }
+                        out.unicodeScalars.append(scalar)
+                        i += 4
+                    default: out.append(e)
+                    }
+                    i += 2
+                    continue
+                }
+                if c == "\"" {
+                    i += 1
+                    return out
+                }
+                out.append(c)
+                i += 1
+            }
+            return nil
+        }
+
+        // Skips the value starting at `i` (string, object, array, or
+        // scalar literal), string-aware inside containers.
+        func skipValue() -> Bool {
+            skipWhitespace()
+            guard i < chars.count else { return false }
+            switch chars[i] {
+            case "\"":
+                return readString() != nil
+            case "{", "[":
+                var depth = 0
+                while i < chars.count {
+                    let c = chars[i]
+                    if c == "\"" {
+                        guard readString() != nil else { return false }
+                        continue
+                    }
+                    if c == "{" || c == "[" { depth += 1 }
+                    if c == "}" || c == "]" {
+                        depth -= 1
+                        if depth == 0 { i += 1; return true }
+                    }
+                    i += 1
+                }
+                return false
+            default:
+                while i < chars.count, !",}]".contains(chars[i]) { i += 1 }
+                return true
+            }
+        }
+
+        // Walk top-level and nested strings until the field name appears as
+        // an object KEY (a string followed by ':'), then collect that
+        // object's keys in source order.
+        while i < chars.count {
+            guard chars[i] == "\"" else { i += 1; continue }
+            guard let name = readString() else { return nil }
+            skipWhitespace()
+            guard i < chars.count, chars[i] == ":" else { continue }
+            i += 1
+            skipWhitespace()
+            if name == "resume_agent_ids", i < chars.count, chars[i] == "{" {
+                i += 1
+                var keys: [String] = []
+                while true {
+                    skipWhitespace()
+                    guard i < chars.count else { return nil }
+                    if chars[i] == "}" { return keys }
+                    guard let key = readString() else { return nil }
+                    keys.append(key)
+                    skipWhitespace()
+                    guard i < chars.count, chars[i] == ":" else { return nil }
+                    i += 1
+                    guard skipValue() else { return nil }
+                    skipWhitespace()
+                    if i < chars.count, chars[i] == "," { i += 1 }
+                }
+            }
+            // Not our field: skip its value so a nested object cannot
+            // shadow the search position.
+            guard skipValue() else { return nil }
+        }
+        return nil
+    }
+
+    /// Entries reordered to the raw text's key order; keys the scanner did
+    /// not see keep their decode order after the ordered ones.
+    public func reordered(bySourceOrderIn raw: String) -> OrderedResumeAgentMap {
+        guard let keys = Self.sourceOrderedKeys(inRawJSON: raw) else { return self }
+        let byKey = Dictionary(entries.map { ($0.key, $0.value) }) { _, last in last }
+        var out: [Entry] = []
+        var used = Set<String>()
+        for key in keys where used.insert(key).inserted {
+            if let value = byKey[key] { out.append(Entry(key: key, value: value)) }
+        }
+        for entry in entries where !used.contains(entry.key) {
+            out.append(entry)
+        }
+        return OrderedResumeAgentMap(entries: out)
+    }
 }
 
 // MARK: - Sentinel helpers
@@ -342,6 +491,47 @@ public func isNotSentinel(_ s: String) -> Bool {
     if t.lowercased() == "none" { return false }
     if t.lowercased() == "undefined" { return false }
     return true
+}
+
+/// Reasoning-effort levels a subagent request may name.
+///
+/// Mirrors Rust `SUBAGENT_REASONING_EFFORT_VALUES` (task.rs:262-264).
+public let subagentReasoningEffortValues: [String] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+]
+
+/// A model-facing argument rejection whose message is the whole payload.
+/// Rust returns `Err(String)` from these normalizers; Swift needs a
+/// nominal `Error`, so this carries the same string unmodified.
+public struct SubagentArgumentError: Error, Hashable, Sendable, CustomStringConvertible {
+    public let message: String
+    public init(_ message: String) { self.message = message }
+    public var description: String { message }
+}
+
+/// Normalize an optional model-facing subagent reasoning effort: sentinels
+/// and whitespace collapse to `nil`, known levels lowercase, anything else
+/// is an error carrying the full accepted list.
+///
+/// Mirrors Rust `normalize_subagent_reasoning_effort` (task.rs:271-293).
+public func normalizeSubagentReasoningEffort(
+    _ value: String?
+) -> Result<String?, SubagentArgumentError> {
+    guard let value else { return .success(nil) }
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty
+        || trimmed.lowercased() == "null"
+        || trimmed.lowercased() == "undefined" {
+        return .success(nil)
+    }
+    let normalized = trimmed.lowercased()
+    if subagentReasoningEffortValues.contains(normalized) {
+        return .success(normalized)
+    }
+    return .failure(SubagentArgumentError(
+        "invalid reasoning_effort \"\(value)\" (expected one of: "
+            + subagentReasoningEffortValues.joined(separator: ", ") + ")"
+    ))
 }
 
 /// Drop sentinels and trim; return `nil` for sentinel/whitespace values.

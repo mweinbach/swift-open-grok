@@ -407,6 +407,21 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// in a preview, else the "No plan written yet." toast
     /// (`dispatch/modes.rs:16-25`, `agent_view/plan.rs:125-146`).
     case showPlan
+    /// `/swarm`, `/swarm on`, `/swarm off` — set swarm mode persistently
+    /// (upstream `Action::SetSwarmMode{trigger:"manual", persist:true}`,
+    /// `swarm.rs:45-59`, dispatched by `set_swarm_mode`,
+    /// `dispatch/modes.rs:199-248`). The controller resolves the bare
+    /// toggle against the live tracker before emitting, so the intent
+    /// always carries the resolved target state.
+    case setSwarmMode(enabled: Bool)
+    /// `/swarm <task>`'s mode-switch half — upstream's ordered
+    /// `SwarmModeThenPrompt` effect (`router.rs:1052-1093`,
+    /// `effects/mod.rs:3148-3188`): the session observes swarm mode (one-shot
+    /// `task` trigger, no persist) BEFORE the task prompt dispatches.
+    /// Carries no task text on purpose: the controller emits this intent
+    /// and AWAITS its handling before enqueueing the task as a normal
+    /// prompt — the same ordering discipline as `.enterPlanMode`.
+    case swarmTaskMode
     /// `/resume` — the stored-session picker (upstream
     /// `Action::ShowSessionPicker`, `slash/commands/resume.rs:21-23`). The
     /// session store is a CLI-layer concern, so the intent carries no rows.

@@ -1380,6 +1380,32 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     await controller.setPlanModeStateProvider {
                         await toolExecutor.planModeActive()
                     }
+                    // `/swarm`'s bare toggle resolves against the SAME
+                    // tracker the tool trigger and the turn reminders read
+                    // (upstream reads `ctx.pager_state.swarm_mode`,
+                    // swarm.rs:45-48).
+                    await controller.setSwarmModeStateProvider {
+                        await toolExecutor.swarmMode.enabled
+                    }
+                    // The send-now cancel exemption: while an `agent_swarm`
+                    // cohort holds the turn in an orchestration wait, an
+                    // arriving prompt is promoted, never cancelled
+                    // (prompt_queue.rs:222-233). Read straight off the live
+                    // host's wait state — the same counter `runSwarm`
+                    // raises around its scheduler.
+                    if let host = toolExecutor.subagentHost {
+                        await controller.setOrchestrationWaitStateProvider {
+                            host.foregroundWait.orchestrationDepth > 0
+                        }
+                    }
+                    // Persisted swarm preference seeds the session the way
+                    // upstream's `session_swarm_mode` spawn flag does
+                    // (spawn.rs:773-775): a restored session keeps only the
+                    // manual trigger. This is `ui.swarm_mode`'s reader —
+                    // the key parsed with no consumer until this slice.
+                    if uiConfiguration.config.swarmMode == true {
+                        await toolExecutor.swarmMode.enter(.manual)
+                    }
                     // The mid-turn interjection seam: `/btw` delivers into
                     // the RUNNING turn's buffer (drained between sampler
                     // rounds by `LiveShellSamplingDriver`), and turn-end
@@ -1433,6 +1459,24 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                         insertText: "/effort \(option.id)"
                                     )
                                 }
+                        case "swarm":
+                            // Upstream `SwarmCommand::suggest_args`
+                            // (swarm.rs:25-40): the on/off rows filtered by
+                            // the trimmed prefix; the task arm is free prose
+                            // and gets no rows.
+                            let prefix = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                            return [
+                                ("on", "Enable swarm mode persistently"),
+                                ("off", "Disable swarm mode persistently"),
+                            ]
+                            .filter { $0.0.hasPrefix(prefix) }
+                            .map { value, description in
+                                OpenGrokPagerCommandSuggestion(
+                                    name: value,
+                                    summary: description,
+                                    insertText: "/swarm \(value)"
+                                )
+                            }
                         case "export":
                             // Path completion for the export target
                             // (`list_path_completions`, export.rs:83-160).
@@ -3625,6 +3669,14 @@ struct LiveToolExecutor: Sendable {
     /// Dispatch accepts the canonical `task` spelling too, but only while
     /// this set is non-empty — an unadvertised surface is unreachable.
     private let subagentToolNames: Set<String>
+    /// The advertised swarm-surface names (at most `["agent_swarm"]`).
+    /// Same reachability rule: an unadvertised surface is undispatchable.
+    private let swarmToolNames: Set<String>
+    /// Session-local swarm-mode tracker, shared by the `/swarm` slash path,
+    /// the `agent_swarm` tool trigger, and the turn loop's reminder
+    /// injection — one tracker, so the three can never disagree (the port
+    /// of the `swarm_mode` field on session state, acp_session.rs:320).
+    let swarmMode = LiveSwarmModeState()
     private let mcpConnections: MCPSessionConnections
     /// Per-server connection outcomes recorded when the session brought its
     /// configured MCP servers online. `/mcps` renders these; before they were
@@ -3967,6 +4019,18 @@ struct LiveToolExecutor: Sendable {
         self.subagentToolNames = advertisesSubagents
             ? [LiveSubagentHost.advertisedToolName]
             : []
+        // `agent_swarm` exists only alongside the task surface it
+        // orchestrates: upstream strips task, agent_swarm, workflow and the
+        // collaboration tools together when subagents are disabled or the
+        // roster is empty (builder.rs:848-869), and the tool's own
+        // requirement expression demands the Task tool
+        // (`requires_expr`, agent_swarm/mod.rs:237-239). `advertisesSubagents`
+        // is that gate; the profile filter can still strip the swarm alone.
+        let advertisesSwarm = advertisesSubagents
+            && (toolPolicy?.allows(liveToolName: LiveSubagentHost.swarmToolName) ?? true)
+        self.swarmToolNames = advertisesSwarm
+            ? [LiveSubagentHost.swarmToolName]
+            : []
         // The background-task consumers only make sense alongside the producer:
         // without `run_terminal_cmd` there is no task for them to read, wait on
         // or kill. Upstream registers all three in every preset that has bash
@@ -3984,7 +4048,9 @@ struct LiveToolExecutor: Sendable {
         }
         self.backgroundTaskToolNames = Set(backgroundTaskTools.map(\.name))
         let spawnTools: [ToolSpec] = advertisesSubagents
-            ? subagentHost.map { [$0.toolSpec] } ?? []
+            ? subagentHost.map { host in
+                [host.toolSpec] + (advertisesSwarm ? [LiveSubagentHost.swarmToolSpec] : [])
+            } ?? []
             : []
         self.permissionPipeline = fileToolResources.permissionPipeline
         if let permissionPipeline = fileToolResources.permissionPipeline {
@@ -4029,6 +4095,7 @@ struct LiveToolExecutor: Sendable {
         let dispatchedToolNames = registryToolNames
             .union(backgroundTaskToolNames)
             .union(subagentToolNames)
+            .union(swarmToolNames)
             .union([Self.runTerminalTool.name])
         assert(
             Set(sessionTools.map(\.name)).isDisjoint(with: dispatchedToolNames),
@@ -4336,6 +4403,27 @@ struct LiveToolExecutor: Sendable {
                 return .failure(denial)
             }
             return await subagentHost.spawn(args: args, toolCallID: call.callId)
+        }
+
+        // The swarm surface. The parent call is auto-approved at the
+        // permission gate upstream (`swarm_parent_auto_approve`,
+        // tool_calls.rs:1533-1545) — each member's own tool calls carry the
+        // real permission decisions — so the only gate here is the same
+        // PreToolUse hook pass the spawn surface runs.
+        if !swarmToolNames.isEmpty,
+           call.name == LiveSubagentHost.swarmToolName,
+           let subagentHost {
+            if let denial = await gateSpawnSubagent(args: args, call: call) {
+                return .failure(denial)
+            }
+            return await subagentHost.runSwarm(
+                args: args,
+                toolCallID: call.callId,
+                // The raw text is the only place JSON object order survives
+                // (the JSONValue hop is a Dictionary) — the resume map's
+                // slot order depends on it.
+                rawArguments: call.arguments
+            )
         }
 
         guard call.name == Self.runTerminalTool.name
@@ -5341,6 +5429,9 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             // Buffer left intact: entries that raced past the final drain are
             // flushed into prompt turns by the controller (run_loop.rs:432-447).
             await interjections.endTurn()
+            // One-shot swarm mode (task/tool trigger) ends with the turn
+            // (run_loop.rs:419 → auto_exit_turn); manual mode survives.
+            await toolExecutor.swarmMode.autoExitTurn()
             await services?.endPrompt()
             return result
         } catch {
@@ -5354,6 +5445,10 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 // completion arm handles Err results too (run_loop.rs:416-447).
                 await interjections.endTurn()
             }
+            // The completion arm runs auto-exit for Err and cancelled
+            // resolutions too: a one-shot swarm turn that died must not
+            // leave the next unrelated turn in swarm mode.
+            await toolExecutor.swarmMode.autoExitTurn()
             await services?.endPrompt()
             throw error
         }
@@ -5418,6 +5513,20 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         // carries a `<memory-context>` block.
         let services = toolExecutor.sessionServices
         items = await services?.injectMemoryContext(into: items, prompt: request.text) ?? items
+
+        // Swarm mode's entire turn-behavior payload: the `<system-reminder>`
+        // user items the tracker queued (run_loop.rs:676 →
+        // `maybe_inject_swarm_reminder`, reminders.rs:579-593) — the exit
+        // notice first, then the entry steering text, both persisted with
+        // the turn like every other item. Injected before compaction so the
+        // reminder counts toward the budget like everything else.
+        let swarmReminders = await toolExecutor.swarmMode.takeReminders()
+        if swarmReminders.exit {
+            items.append(.user(wrapSystemReminder(swarmModeExitReminder)))
+        }
+        if swarmReminders.inject {
+            items.append(.user(wrapSystemReminder(swarmModeReminder)))
+        }
 
         // UserPromptSubmit fires once the user message is staged and before
         // the turn loop starts, matching upstream (turn.rs:919-927). Payload
@@ -5654,11 +5763,40 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         }
     }
 
+    /// Byte-identical copy of the exclusive-batch refusal
+    /// (tool_calls.rs:460).
+    static let swarmExclusiveBatchError =
+        "`agent_swarm` must be the only tool call in its batch. Inspect briefly, "
+        + "then make one exclusive agent_swarm call for independent work; use "
+        + "ordinary task calls for heterogeneous small work."
+
     private func executeToolCalls(
         _ calls: [ToolCall],
         sessionID: String,
         emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
     ) async throws -> [ConversationItem] {
+        // `agent_swarm` must be the only call in its batch
+        // (tool_calls.rs:456-468): every call in a violating batch gets the
+        // fixed refusal as its tool result and nothing executes.
+        let swarmCall = calls.contains { $0.name == LiveSubagentHost.swarmToolName }
+        if swarmCall, calls.count != 1 {
+            return calls.map {
+                ConversationItem.toolResult(ToolResultItem(
+                    toolCallId: $0.callId,
+                    content: Self.swarmExclusiveBatchError
+                ))
+            }
+        }
+        if swarmCall {
+            // A swarm call while the mode is off enters it with the `tool`
+            // trigger (tool_calls.rs:469-475): no reminder is queued — the
+            // model already made the call the reminder exists to elicit —
+            // and the mode auto-exits at the turn boundary.
+            if await !toolExecutor.swarmMode.enabled {
+                await toolExecutor.swarmMode.enter(.tool)
+            }
+        }
+
         // `exec` and `wait` are transport, not tools: they raise no card and
         // never announce themselves, so the transcript shows only the nested
         // calls the cell made (turn.rs:1998). They also mutate one runtime, so
@@ -7806,6 +7944,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await armPlanModeFromSlash()
         case .showPlan:
             await showPlan()
+        case .setSwarmMode(let enabled):
+            await setSwarmModeFromSlash(enabled: enabled)
+        case .swarmTaskMode:
+            await enterSwarmTaskModeFromSlash()
         case .fork(let worktreeOverride, let directive):
             await performFork(worktreeOverride: worktreeOverride, directive: directive)
         case .showTasks:
@@ -8901,6 +9043,49 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         note("\u{2713} Plan mode: on")
     }
 
+    // MARK: - /swarm
+
+    /// `/swarm [on|off]` — upstream `set_swarm_mode(persist: true)`
+    /// (`dispatch/modes.rs:199-248`): the live tracker moves first (the
+    /// session-notify half, `SessionCommand::SetSwarmMode` →
+    /// `enter_swarm_mode`/`exit`, run_loop.rs:1120-1138), then the
+    /// preference persists to `ui.swarm_mode` through the same settings
+    /// store the modal row writes, then the
+    /// `save_success_toast("Swarm mode", enabled)` copy byte for byte
+    /// (`settings/ui.rs:89-92`). A manual disable exits whatever trigger is
+    /// current — upstream's non-task disable arm (run_loop.rs:1128-1132).
+    private func setSwarmModeFromSlash(enabled: Bool) async {
+        if let toolExecutor {
+            if enabled {
+                await toolExecutor.swarmMode.enter(.manual)
+            } else {
+                await toolExecutor.swarmMode.exit()
+            }
+        }
+        await applySettingsEvent(.commit(key: "swarm_mode", value: .bool(enabled)))
+        note("\u{2713} Swarm mode: \(enabled ? "on" : "off")")
+    }
+
+    /// `/swarm <task>`'s mode-switch half — the session-observing side of
+    /// upstream's ordered `SwarmModeThenPrompt` effect (`router.rs:1052-1093`,
+    /// `effects/mod.rs:3148-3188`): the one-shot `task` trigger enters the
+    /// live tracker BEFORE the controller enqueues the task prompt (the
+    /// controller awaits this render). Nothing persists — upstream's task
+    /// arm never touches `ui.swarm_mode`. The toast is `router.rs:1090`'s,
+    /// byte for byte.
+    private func enterSwarmTaskModeFromSlash() async {
+        guard let toolExecutor else {
+            // The mode switch has nowhere to land — same refusal copy as
+            // the plan arm (`dispatch/modes.rs:144-147`). Without it the
+            // task would run as a plain prompt while claiming to be a
+            // swarm task.
+            note("No active session")
+            return
+        }
+        await toolExecutor.swarmMode.enter(.task)
+        note("Starting swarm task...")
+    }
+
     /// `/view-plan` — upstream `dispatch_show_plan` (`dispatch/modes.rs:16-25`):
     /// a pending plan approval reopens its decision sheet; otherwise the
     /// saved plan opens in a preview, or the "No plan written yet." toast.
@@ -9286,6 +9471,23 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// write to disk and the live theme swap.
     private func applySetting(_ event: PagerSettingsEvent) async {
         if case .commit(let key, .bool(let flag)) = event {
+            if key == "swarm_mode" {
+                // The settings row applies live, exactly like `/swarm on|off`
+                // — the row's own promise ("Active sessions update
+                // immediately", settings/defs.rs:776-784); upstream routes
+                // the modal toggle through `Action::SetSwarmMode`
+                // (views/settings_modal/state.rs). The persist half is the
+                // shared store write below.
+                if let toolExecutor {
+                    if flag {
+                        await toolExecutor.swarmMode.enter(.manual)
+                    } else {
+                        await toolExecutor.swarmMode.exit()
+                    }
+                }
+                await applySettingsEvent(event)
+                return
+            }
             switch key {
             case "multiline_mode": inputModes.isMultiline = flag
             case "vim_mode": inputModes.isVimMode = flag

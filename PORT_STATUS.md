@@ -400,6 +400,45 @@ fix. **Remaining for full parity:** live `/mcps` re-probe after `mcp login` in a
 session (tokens apply next session), scope-upgrade on 403, revocation on server removal,
 the ext-method surface.
 
+### E8 — swarm runtime: `agent_swarm` + orchestration wait + `/swarm` (serial gate: exit 0, 4,633 tests, zero issues; 2026-08-08)
+
+Closes roadmap Wave 14 item 5. `agent_swarm` runs real cohorts through the live host's
+coordinator and child runner: fail-fast validation ladder (byte-identical error copy),
+burst-5/ramp-700ms scheduler with the `OPENGROK_/KIMI_` concurrency env grammar,
+per-member 2 h timeout, resume slots pinning prior models, slot-ordered
+`<agent_swarm_result>` XML byte-for-byte. Registration strips with the task surface
+(builder.rs:848-869) plus the tool's own Task requirement; the parent call is
+auto-approved at the gate per upstream's `swarm_parent_auto_approve` (each member's own
+calls carry the real permission decisions). The orchestration-wait exemption lands at the
+controller's send-now sites: a prompt arriving mid-swarm is promoted WITHOUT cancelling
+the turn (`prompt_queue.rs:222-233`); Esc/Ctrl+C still cancel unconditionally, matching
+upstream's only `orchestration_depth` consumer. Swarm MODE's entire payload — the
+`<system-reminder>` injections (entry steering text, exit notice) at the turn loop's
+drain point, exclusive-batch refusal, turn-end auto-exit — gives `ui.swarm_mode` and the
+`swarm_mode` settings row their first reader. `/swarm [on|off|task]` registers in
+upstream's position with the mode-then-prompt ordering. 40+ tests across five seams.
+
+**Lead fixes after delegate handoff:** (1) resume-map JSON source order — upstream's
+serde map preserves insertion order for slot assignment (agent_swarm/mod.rs:977-990),
+but the port's `JSONValue.object` is a Dictionary and Foundation's decoder hands keys
+back unordered, so order died before the handler; a string-aware, nesting-aware raw-JSON
+scanner now recovers the `resume_agent_ids` key order from `call.arguments` at dispatch.
+(2) The delegate's steer tests pressed Esc after pasting plain text mid-turn — a bare
+Esc with no dropdown IS the interrupt, so the harness was cancelling the very turn the
+exemption was supposed to protect; the tests now probe MID-TURN with a trailing `/queue`
+snapshot (promoted-but-queued under orchestration; drained after a real preempt).
+(3) The missing `/swarm` help-text line; the XML-escaped resume-error needle
+(`&apos;`); the two composition pins updated for `agent_swarm` (code-mode direct-only
+per `code_mode.rs:77`; headless advertised set).
+
+**Recorded divergences:** no rate-limit adaptive scheduler (a 429 fails the member; no
+port rate-limit status channel); `reasoning_effort` validated fail-fast and carried but
+not applied to child sampling (the task tool's existing gap — same future slice);
+resume-only swarms with an unresolvable subagent_type fail fast; member ids UUIDv4;
+no per-tab swarm chip or `SwarmModeChanged` channel (single-session); `ui.swarm_mode`
+seeds interactive compositions only; `/swarm <task>` whitespace-collapse (the standing
+parser divergence); cancellation returns `.cancelled` rather than dropping the future.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was

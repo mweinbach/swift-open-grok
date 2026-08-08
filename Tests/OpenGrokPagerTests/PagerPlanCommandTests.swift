@@ -39,14 +39,15 @@ struct PagerPlanCommandTests {
         #expect(viewPlan?.aliases == ["plan-view", "show-plan"])
         #expect(viewPlan?.requiresArguments == false)
 
-        // Registration order is display order: `/plan` follows `/remember`
-        // and `/view-plan` follows `/plan` (`slash/commands/mod.rs:123-126`;
-        // `/swarm`, between them upstream, is not ported).
+        // Registration order is display order: `/plan` follows `/remember`,
+        // `/swarm` follows `/plan`, and `/view-plan` follows `/swarm`
+        // (`slash/commands/mod.rs:123-126`).
         let names = commands.map(\.name)
         let rememberIndex = names.firstIndex(of: "remember")
         #expect(rememberIndex != nil)
         #expect(names.firstIndex(of: "plan") == rememberIndex.map { $0 + 1 })
-        #expect(names.firstIndex(of: "view-plan") == rememberIndex.map { $0 + 2 })
+        #expect(names.firstIndex(of: "swarm") == rememberIndex.map { $0 + 2 })
+        #expect(names.firstIndex(of: "view-plan") == rememberIndex.map { $0 + 3 })
 
         // The commands are visible in `/help` (and therefore in the palette
         // fallback, which parses this text) — D1 shipped a registered

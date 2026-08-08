@@ -759,6 +759,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// resolves to false, so `/plan <description>` arms-and-sends there.
     private var planModeState: (@Sendable () async -> Bool)?
 
+    /// Live swarm-mode state for `/swarm`'s bare toggle — the controller
+    /// resolves the target state against the tracker the session actually
+    /// consults, never a controller-side mirror the tool trigger cannot
+    /// see. `nil` (compositions with no live swarm state) resolves to
+    /// false, so a bare `/swarm` there enables.
+    private var swarmModeState: (@Sendable () async -> Bool)?
+
+    /// Whether the running turn is parked in an orchestration wait (an
+    /// `agent_swarm` cohort). The send-now paths read it: an arriving
+    /// prompt is promoted to run next but must NOT cancel the turn,
+    /// because cancelling would kill every live member — upstream's
+    /// `cancel_running_turn = send_now && … && !orchestrating`
+    /// (prompt_queue.rs:222-233). `nil` resolves to false: without a live
+    /// wait state, send-now keeps its cancel-and-run behavior.
+    private var orchestrationWaitState: (@Sendable () async -> Bool)?
+
     public init(
         input: AsyncThrowingStream<InputEvent, Error>,
         runtime: any OpenGrokPagerRuntimeAdapter,
@@ -845,6 +861,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         _ provider: (@Sendable () async -> Bool)?
     ) {
         planModeState = provider
+    }
+
+    /// Install the live swarm-mode state source for `/swarm`'s bare
+    /// toggle. Call before `run`.
+    public func setSwarmModeStateProvider(
+        _ provider: (@Sendable () async -> Bool)?
+    ) {
+        swarmModeState = provider
+    }
+
+    /// Install the live orchestration-wait source for the send-now cancel
+    /// exemption. Call before `run`.
+    public func setOrchestrationWaitStateProvider(
+        _ provider: (@Sendable () async -> Bool)?
+    ) {
+        orchestrationWaitState = provider
     }
 
     /// Install the live mid-turn interjection seam. Call before `run`.
@@ -1451,6 +1483,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                     if await promptQueue.isEmpty {
                                         try await emit(.notice("prompt cannot be empty"))
                                         await inputPumpGate.resume()
+                                    } else if await orchestrationWaitState?() == true {
+                                        // An `agent_swarm` cohort is parked in
+                                        // an orchestration wait: the prompt is
+                                        // promoted (it is already at the head)
+                                        // but the turn is NOT cancelled —
+                                        // aborting would kill every live
+                                        // member (prompt_queue.rs:222-233).
+                                        // The queue drains when the swarm turn
+                                        // ends.
+                                        await inputPumpGate.resume()
                                     } else {
                                         await cancelActiveSession()
                                         turnOutcome = .turnPreempted
@@ -1496,8 +1538,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                         // (`defaults.rs:630-632`): the draft
                                         // runs next, ahead of waiting follow-ups.
                                         try await enqueue(prompt, insertion: .front)
-                                        await cancelActiveSession()
-                                        turnOutcome = .turnPreempted
+                                        if await orchestrationWaitState?() == true {
+                                            // Promote-without-cancel: the swarm
+                                            // turn keeps the wheel; the steered
+                                            // prompt still runs first after it
+                                            // (prompt_queue.rs:222-233 — the
+                                            // same shape upstream's actor test
+                                            // pins for explicit send-now).
+                                            await inputPumpGate.resume()
+                                        } else {
+                                            await cancelActiveSession()
+                                            turnOutcome = .turnPreempted
+                                        }
                                     case .notACommand:
                                         try await enqueue(prompt)
                                         await inputPumpGate.resume()
@@ -2386,19 +2438,24 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Save a memory note",
             usage: "/remember [text]"
         ),
-        // `/plan` and `/view-plan` sit after `/remember`, upstream's display
-        // order (`slash/commands/mod.rs:123-126`; `/swarm`, which sits
-        // between them upstream, is not ported). Names, aliases, summaries
-        // and usage are verbatim (`plan.rs:15-43`, `view_plan.rs:10-28`).
-        // Both arguments are optional, so a bare Enter dispatches. Upstream's
-        // `arg_placeholder("[description]")` (`plan.rs:41-43`) has no port
-        // channel — `PagerCommandDefinition` carries no placeholder field —
-        // so the usage string is the only argument hint (recorded
+        // `/plan`, `/swarm` and `/view-plan` sit after `/remember`, in
+        // upstream's display order (`slash/commands/mod.rs:123-126`). Names,
+        // aliases, summaries and usage are verbatim (`plan.rs:15-43`,
+        // `swarm.rs:9-23`, `view_plan.rs:10-28`). All three arguments are
+        // optional, so a bare Enter dispatches. Upstream's
+        // `arg_placeholder` hints (`plan.rs:41-43`, `swarm.rs:21-23`) have
+        // no port channel — `PagerCommandDefinition` carries no placeholder
+        // field — so the usage string is the only argument hint (recorded
         // divergence).
         PagerCommandDefinition(
             name: "plan",
             summary: "Enter plan mode",
             usage: "/plan [description]"
+        ),
+        PagerCommandDefinition(
+            name: "swarm",
+            summary: "Toggle swarm mode or run a one-shot swarm task",
+            usage: "/swarm [on|off|task]"
         ),
         PagerCommandDefinition(
             name: "view-plan",
@@ -3035,6 +3092,39 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 // plan-gated.
                 try await emit(.overlay(.enterPlanMode))
                 return .submit(description)
+            case "swarm":
+                // `/swarm` (`swarm.rs:42-62`): bare toggles the persisted
+                // mode, `on`/`off` set it, anything else is a one-shot swarm
+                // task. The bare toggle resolves against the LIVE tracker
+                // (upstream reads `ctx.pager_state.swarm_mode`), so the
+                // emitted intent always carries the resolved target state.
+                // Same rejoin-vs-trim divergence as `/plan` on the task arm.
+                let argument = Self.rejoined(invocation.arguments)
+                switch argument {
+                case "":
+                    let enabled = await swarmModeState?() ?? false
+                    try await emit(.overlay(.setSwarmMode(enabled: !enabled)))
+                    return .handled
+                case "on":
+                    try await emit(.overlay(.setSwarmMode(enabled: true)))
+                    return .handled
+                case "off":
+                    try await emit(.overlay(.setSwarmMode(enabled: false)))
+                    return .handled
+                default:
+                    // ORDERING IS LOAD-BEARING (`router.rs:1052-1093`):
+                    // upstream replaces the prompt send with one ordered
+                    // `SwarmModeThenPrompt` effect so the session observes
+                    // swarm mode before it receives the prompt. Here the
+                    // guarantee is that `emit` awaits the renderer's
+                    // `.swarmTaskMode` handling — which enters the one-shot
+                    // task mode on the live tracker — before the returned
+                    // `.submit` enqueues the task. Reversed, the task's turn
+                    // could start sampling without the swarm reminder, and
+                    // the mode toggle would change nothing this turn.
+                    try await emit(.overlay(.swarmTaskMode))
+                    return .submit(argument)
+                }
             case "view-plan":
                 // Arguments are ignored — upstream's `ViewPlanCommand::run`
                 // declares none and discards what it gets
@@ -3262,6 +3352,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /flush <notes>            Write notes to this session's memory log
       /goal [objective]         Set or inspect the session goal
       /plan [description]       Enter plan mode
+      /swarm [on|off|task]      Toggle swarm mode or run a one-shot swarm task
       /view-plan  /show-plan    View the current plan
       /multiline  /ml           Swap what Enter and Shift+Enter do
       /vim-mode                 Vim keys for the focused scrollback

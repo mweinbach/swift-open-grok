@@ -1,0 +1,663 @@
+// LiveSubagentSwarmTests.swift
+//
+// `agent_swarm` through the LIVE seam (AGENTS.md §3): the composition the
+// executable runs — `makeSessionFoundation`, the real production sampler
+// factory against the mock inference server, and real `LiveToolExecutor`
+// dispatch — plus unit pins on the planner, the env grammar, and the XML
+// renderer, each mirroring the upstream test of the same behavior
+// (agent_swarm/mod.rs tests, pin 650c1db7).
+//
+// Covered, in order:
+//   * advertisement: `agent_swarm` reaches the model exactly when the
+//     spawn surface does (builder.rs:848-869; `requires_expr` demands the
+//     Task tool, agent_swarm/mod.rs:237-239), with the upstream description
+//     pins;
+//   * planner/env/XML unit pins with byte-identical error copy;
+//   * end-to-end: one `agent_swarm` call spawns a real cohort whose member
+//     turns run against the mock server, members cannot see any spawn
+//     surface (the flat-tree strip), and the results aggregate into the
+//     `<agent_swarm_result>` shape in slot order;
+//   * the orchestration wait: raised while the cohort runs, restored after,
+//     and a cancelled swarm kills every member at the host;
+//   * `resume_agent_ids`: a completed member's transcript seeds the resumed
+//     member, `mode="resume"` lands in the XML;
+//   * fail-fast validation copy through the live dispatch.
+
+import Foundation
+import Testing
+import OpenGrokSamplingTypes
+import OpenGrokShared
+import OpenGrokShell
+import OpenGrokTestSupport
+import OpenGrokToolTypes
+@testable import OpenGrokCLI
+
+// MARK: - Fixture (the spawn-test fixture, file-private there)
+
+private struct SwarmFixture {
+    let home: URL
+    let workspace: URL
+    let server: MockInferenceServer
+    let environment: [String: String]
+
+    init(extraEnvironment: [String: String] = [:], userConfig: String? = nil) throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opengrok-swarm-\(UUID().uuidString)", isDirectory: true)
+        home = root.appendingPathComponent("home", isDirectory: true)
+        workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        server = try MockInferenceServer()
+        var config = """
+            [endpoints]
+            xai_api_base_url = "\(server.url)"
+            """
+        if let userConfig {
+            config += "\n\n" + userConfig
+        }
+        try config.write(
+            to: home.appendingPathComponent("config.toml"),
+            atomically: true,
+            encoding: .utf8
+        )
+        var env = [
+            "HOME": home.path,
+            "OPENGROK_HOME": home.path,
+            "XDG_STATE_HOME": home.appendingPathComponent("state").path,
+            "XAI_API_KEY": "test-xai-key",
+        ]
+        for (key, value) in extraEnvironment { env[key] = value }
+        environment = env
+    }
+
+    func dispose() {
+        server.stop()
+        try? FileManager.default.removeItem(at: home.deletingLastPathComponent())
+    }
+
+    func launchOptions(_ arguments: [String]) throws -> CLIExecutionOptions {
+        let command = try CLICommandParser.parseOrThrow(
+            ["headless", "--prompt", "hello", "--cwd", workspace.path] + arguments
+        )
+        guard case .launch(let options) = command else {
+            throw CLIApplicationError.failed("fixture did not parse to a launch")
+        }
+        return options
+    }
+
+    func context() -> CLIApplicationContext {
+        CLIApplicationContext(
+            environment: environment,
+            streams: CLIStreams(out: { _ in }, err: { _ in }),
+            control: .never
+        )
+    }
+
+    func makeFoundation(_ arguments: [String] = ["--model", "grok-4.5"]) async throws
+        -> OpenGrokLiveApplicationLauncher.LiveSessionFoundation {
+        try await OpenGrokLiveApplicationLauncher.makeSessionFoundation(
+            options: launchOptions(arguments),
+            context: context(),
+            dependencies: OpenGrokLiveCompositionDependencies(
+                makeSampler: OpenGrokLiveSampler.production(configuration:)
+            )
+        )
+    }
+
+    func responsesRequests() -> [LogEntry] {
+        server.requests().filter { $0.method == "POST" && $0.path.contains("responses") }
+    }
+
+    static func bodyText(_ entry: LogEntry) -> String {
+        (try? entry.body?.encodeString()) ?? ""
+    }
+}
+
+private func toolNames(in entry: LogEntry) -> [String] {
+    entry.body?["tools"].arrayValue?.compactMap { $0["name"].stringValue } ?? []
+}
+
+/// Every `agent_id="…"` attribute value in an `agent_swarm_result` payload,
+/// in document order.
+private func agentIDs(in xml: String) -> [String] {
+    xml.components(separatedBy: "agent_id=\"").dropFirst().compactMap {
+        $0.components(separatedBy: "\"").first
+    }
+}
+
+// MARK: - Planner / env / XML unit pins
+
+@Suite("agent_swarm planner and grammar")
+struct AgentSwarmPlannerTests {
+    private func input(
+        items: [String]? = nil,
+        resumes: [(String, String)]? = nil,
+        template: String? = nil
+    ) -> AgentSwarmToolInput {
+        AgentSwarmToolInput(
+            description: "work",
+            promptTemplate: template,
+            items: items,
+            resumeAgentIds: resumes.map { OrderedResumeAgentMap(entries: $0) }
+        )
+    }
+
+    // Upstream `validation_requires_two_items_without_resume` (:950-953).
+    @Test("two items are required without resumes")
+    func requiresTwoItems() {
+        guard case .failure(let error) = validateAndPlanSwarm(
+            input(items: ["a"], template: "{{item}}")
+        ) else {
+            Issue.record("a one-item swarm must be rejected")
+            return
+        }
+        #expect(error.message
+            == "agent_swarm requires at least 2 items unless resume_agent_ids is supplied")
+    }
+
+    // Upstream `validation_uses_ordered_resume_prompt_mapping_exactly`
+    // (:955-968): resumes first, ids trimmed, prompt bytes preserved.
+    @Test("resume slots launch first with exact prompt bytes")
+    func resumeSlotsFirst() throws {
+        let plan = try validateAndPlanSwarm(input(
+            items: ["a", "b"],
+            resumes: [(" old ", "  exact resume prompt  "), ("next", "p2")],
+            template: "do {{item}}"
+        )).get()
+        #expect(plan[0].resumeFrom == "old")
+        #expect(plan[0].prompt == "  exact resume prompt  ")
+        #expect(plan[0].isResume)
+        #expect(plan[1].prompt == "p2")
+        #expect(plan[2].item == "a")
+        #expect(plan[2].prompt == "do a")
+        #expect(!plan[2].isResume)
+        #expect(plan.map(\.index) == [0, 1, 2, 3])
+    }
+
+    // Upstream
+    // `validation_rejects_missing_template_duplicate_expansion_and_empty_resume_id`
+    // (:970-975), with the byte-identical copy pinned per arm.
+    @Test("missing template, duplicate expansion and empty resume ids are rejected")
+    func rejectionCopy() {
+        func message(_ input: AgentSwarmToolInput) -> String? {
+            guard case .failure(let error) = validateAndPlanSwarm(input) else { return nil }
+            return error.message
+        }
+        #expect(message(input(items: ["a", "b"]))
+            == "prompt_template is required when items is supplied")
+        #expect(message(input(items: ["a", "b"], template: "no placeholder"))
+            == "prompt_template must contain literal {{item}} when items is supplied")
+        #expect(message(input(items: ["a", "a"], template: "{{item}}"))
+            == "prompt_template must expand to distinct prompts for each item")
+        #expect(message(input(resumes: [(" ", "prompt")]))
+            == "resume_agent_ids must not contain empty or placeholder agent IDs")
+        #expect(message(input(items: (0..<129).map(String.init), template: "{{item}}"))
+            == "agent_swarm supports at most 128 total members")
+    }
+
+    /// `.success` payload, or `.failure` surfaced as a recorded issue.
+    private func cap(_ environment: [String: String]) -> Int? {
+        switch swarmConcurrencyFromEnvironment(environment) {
+        case .success(let value): return value
+        case .failure(let error):
+            Issue.record("cap must parse: \(error.message)")
+            return nil
+        }
+    }
+
+    private func timeout(_ environment: [String: String]) -> UInt64? {
+        switch swarmSubagentTimeoutFromEnvironment(environment) {
+        case .success(let value): return value
+        case .failure(let error):
+            Issue.record("timeout must parse: \(error.message)")
+            return nil
+        }
+    }
+
+    // Upstream `positive_cap_parser_rejects_invalid_nonempty_values`
+    // (:1002-1008) through the two-variable fallback grammar (:525-529).
+    @Test("concurrency env grammar")
+    func concurrencyEnvGrammar() {
+        #expect(cap([:]) == nil)
+        #expect(cap(["OPENGROK_AGENT_SWARM_MAX_CONCURRENCY": "3"]) == 3)
+        #expect(cap(["OPENGROK_AGENT_SWARM_MAX_CONCURRENCY": " "]) == nil)
+        #expect(cap(["KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY": "2"]) == 2)
+        guard case .failure(let zero) = swarmConcurrencyFromEnvironment(
+            ["OPENGROK_AGENT_SWARM_MAX_CONCURRENCY": "0"]
+        ) else {
+            Issue.record("zero must be rejected")
+            return
+        }
+        #expect(zero.message
+            == "OPENGROK_AGENT_SWARM_MAX_CONCURRENCY must be a positive integer when set")
+        guard case .failure(let bad) = swarmConcurrencyFromEnvironment(
+            ["KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY": "bad"]
+        ) else {
+            Issue.record("a non-integer must be rejected")
+            return
+        }
+        #expect(bad.message
+            == "KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY must be a positive integer when set")
+    }
+
+    // Upstream `subagent_timeout_from_env` arms (:531-546).
+    @Test("timeout env grammar: default two hours, zero disables")
+    func timeoutEnvGrammar() {
+        #expect(timeout([:]) == 2 * 60 * 60 * 1_000)
+        #expect(timeout(["OPENGROK_SUBAGENT_TIMEOUT_MS": "  "]) == 2 * 60 * 60 * 1_000)
+        #expect(timeout(["OPENGROK_SUBAGENT_TIMEOUT_MS": "1500"]) == 1_500)
+        #expect(timeout(["KIMI_SUBAGENT_TIMEOUT_MS": "800"]) == 800)
+        #expect(timeout(["OPENGROK_SUBAGENT_TIMEOUT_MS": "0"]) == nil,
+                "an explicit 0 disables the timeout")
+        guard case .failure(let error) = swarmSubagentTimeoutFromEnvironment(
+            ["OPENGROK_SUBAGENT_TIMEOUT_MS": "soon"]
+        ) else {
+            Issue.record("a non-integer must be rejected")
+            return
+        }
+        #expect(error.message
+            == "OPENGROK_SUBAGENT_TIMEOUT_MS must be a non-negative integer when set")
+    }
+
+    // Upstream `initial_launches_respect_cap_and_uncapped_burst` (:1010-1015).
+    @Test("initial burst respects the cap and the uncapped ceiling")
+    func initialBurst() {
+        #expect(swarmInitialLaunchCount(total: 128, concurrencyCap: nil) == 5)
+        #expect(swarmInitialLaunchCount(total: 128, concurrencyCap: 2) == 2)
+        #expect(swarmInitialLaunchCount(total: 128, concurrencyCap: 99) == 5)
+        #expect(swarmInitialLaunchCount(total: 3, concurrencyCap: nil) == 3)
+    }
+
+    // Upstream `xml_is_ordered_escaped_and_only_hints_incomplete_members`
+    // (:1238-1279).
+    @Test("XML is ordered, escaped, and only hints incomplete members")
+    func xmlShape() {
+        let xml = renderSwarmXML([
+            SwarmMemberResult(
+                index: 0, item: nil, agentID: "resume&",
+                outcome: .failed, isResume: true, body: "<failure>"
+            ),
+            SwarmMemberResult(
+                index: 1, item: "<item>", agentID: "done",
+                outcome: .completed, isResume: false, body: "<&>"
+            ),
+        ])
+        #expect(xml.hasPrefix("<agent_swarm_result>"))
+        #expect(xml.contains("<summary>completed=1 failed=1 aborted=0</summary>"))
+        #expect(xml.contains(
+            "<resume_hint>Call agent_swarm with resume_agent_ids mapping unfinished agent_id values to continuation prompts.</resume_hint>"
+        ))
+        #expect(xml.contains(
+            "agent_id=\"resume&amp;\" outcome=\"failed\" state=\"started\" mode=\"resume\""
+        ))
+        #expect(xml.contains("item=\"&lt;item&gt;\""))
+        #expect(xml.contains("&lt;&amp;&gt;"))
+        if let resumeAt = xml.range(of: "resume&amp;"),
+           let doneAt = xml.range(of: "agent_id=\"done\"") {
+            #expect(resumeAt.lowerBound < doneAt.lowerBound)
+        } else {
+            Issue.record("both members must render")
+        }
+        #expect(!xml.contains("<output>"))
+
+        let complete = renderSwarmXML([
+            SwarmMemberResult(
+                index: 0, item: nil, agentID: "done",
+                outcome: .completed, isResume: false, body: "ok"
+            ),
+        ])
+        #expect(!complete.contains("resume_hint"))
+    }
+}
+
+// MARK: - Advertisement
+
+@Suite("agent_swarm advertisement", .serialized)
+struct LiveAgentSwarmAdvertisementTests {
+    @Test("a default session advertises agent_swarm beside the spawn surface")
+    func advertisesSwarmTool() async throws {
+        let fixture = try SwarmFixture()
+        defer { fixture.dispose() }
+        let foundation = try await fixture.makeFoundation()
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+
+        let advertised = Set(foundation.toolExecutor.tools.map(\.name))
+        #expect(advertised.contains("spawn_subagent"))
+        #expect(advertised.contains("agent_swarm"))
+
+        // The upstream description pins, from its own test
+        // (`tool_description_pins_swarm_workflow_and_flat_tree`,
+        // agent_swarm/mod.rs:1037-1046).
+        let spec = foundation.toolExecutor.tools.first { $0.name == "agent_swarm" }
+        #expect(spec?.description?.contains("literal {{item}}") == true)
+        #expect(spec?.description?.contains("capped at 128") == true)
+        #expect(spec?.description?.contains("only tool call") == true)
+        #expect(spec?.description?.contains("Keep the tree flat") == true)
+        #expect(spec?.description?.contains("reasoning_effort") == true)
+    }
+
+    @Test("--no-subagents strips agent_swarm together with the spawn surface")
+    func noSubagentsStripsSwarm() async throws {
+        let fixture = try SwarmFixture()
+        defer { fixture.dispose() }
+        let foundation = try await fixture.makeFoundation(["--model", "grok-4.5", "--no-subagents"])
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+
+        let advertised = Set(foundation.toolExecutor.tools.map(\.name))
+        #expect(!advertised.contains("agent_swarm"))
+
+        // The unadvertised surface is also undispatchable — absence of the
+        // tool must mean absence, not a tool that errors differently.
+        let result = await foundation.toolExecutor.invoke(
+            sessionID: foundation.sessionID,
+            workingDirectory: foundation.cwd,
+            call: ToolCall(
+                id: "call-swarm-1",
+                name: "agent_swarm",
+                arguments: #"{"description":"d","prompt_template":"{{item}}","items":["a","b"]}"#
+            )
+        )
+        guard case .failure(let error) = result else {
+            Issue.record("a stripped surface must not dispatch")
+            return
+        }
+        #expect(error.description.contains("unknown tool"))
+    }
+}
+
+// MARK: - End-to-end cohort
+
+@Suite("agent_swarm end-to-end", .serialized)
+struct LiveAgentSwarmEndToEndTests {
+    @Test("a two-item cohort runs real member turns and aggregates in slot order")
+    func cohortRunsAndAggregates() async throws {
+        let fixture = try SwarmFixture()
+        defer { fixture.dispose() }
+        let marker = UUID().uuidString
+        try fixture.server.enqueueResponse(
+            path: "/v1/responses",
+            response: .sse(SseEvents.responsesApiEventsExact(
+                text: "member answer one", model: "grok-4.5"
+            ))
+        )
+        try fixture.server.enqueueResponse(
+            path: "/v1/responses",
+            response: .sse(SseEvents.responsesApiEventsExact(
+                text: "member answer two", model: "grok-4.5"
+            ))
+        )
+        let foundation = try await fixture.makeFoundation()
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+
+        let result = await foundation.toolExecutor.invoke(
+            sessionID: foundation.sessionID,
+            workingDirectory: foundation.cwd,
+            call: ToolCall(
+                id: "call-swarm-1",
+                name: "agent_swarm",
+                arguments: #"{"description":"probe","subagent_type":"general-purpose","prompt_template":"investigate {{item}} \#(marker)","items":["alpha","beta"]}"#
+            )
+        )
+        guard case .success(let output) = result else {
+            Issue.record("swarm failed: \(result)")
+            return
+        }
+        let xml = output.promptText
+        #expect(xml.hasPrefix("<agent_swarm_result>"))
+        #expect(xml.contains("<summary>completed=2 failed=0 aborted=0</summary>"))
+        #expect(!xml.contains("resume_hint"), "a fully-completed swarm carries no resume hint")
+        // Slot order is input order: alpha's element precedes beta's.
+        if let alphaAt = xml.range(of: "item=\"alpha\""),
+           let betaAt = xml.range(of: "item=\"beta\"") {
+            #expect(alphaAt.lowerBound < betaAt.lowerBound)
+        } else {
+            Issue.record("both item attributes must render: \(xml)")
+        }
+        #expect(xml.contains("outcome=\"completed\" state=\"started\""))
+        #expect(xml.contains("member answer one"))
+        #expect(xml.contains("member answer two"))
+
+        // Each member's own turn ran against the mock server with the
+        // expanded prompt, and — the flat-tree strip
+        // (handle_request.rs:121, `!is_swarm`) — no spawn surface of any
+        // spelling.
+        let requests = fixture.responsesRequests()
+        #expect(requests.count == 2)
+        let bodies = requests.map(SwarmFixture.bodyText)
+        #expect(bodies.contains { $0.contains("investigate alpha \(marker)") })
+        #expect(bodies.contains { $0.contains("investigate beta \(marker)") })
+        for request in requests {
+            let tools = toolNames(in: request)
+            #expect(!tools.isEmpty)
+            #expect(!tools.contains("spawn_subagent"))
+            #expect(!tools.contains("task"))
+            #expect(!tools.contains("agent_swarm"))
+            #expect(!tools.contains("workflow"))
+        }
+
+        // Members are real children of the session: both ids are known to
+        // the background-task family, in the XML's own vocabulary.
+        let ids = agentIDs(in: xml)
+        #expect(ids.count == 2)
+        let known = await foundation.subagentHost?.knownSubagentIDs() ?? []
+        #expect(Set(ids).isSubset(of: Set(known)))
+    }
+
+    @Test("resume_agent_ids continues a member's transcript with mode=\"resume\"")
+    func resumeContinuesMemberTranscript() async throws {
+        let fixture = try SwarmFixture()
+        defer { fixture.dispose() }
+        let marker = UUID().uuidString
+        for text in ["first member answer", "second member answer", "resumed member answer"] {
+            try fixture.server.enqueueResponse(
+                path: "/v1/responses",
+                response: .sse(SseEvents.responsesApiEventsExact(text: text, model: "grok-4.5"))
+            )
+        }
+        let foundation = try await fixture.makeFoundation()
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+
+        let first = await foundation.toolExecutor.invoke(
+            sessionID: foundation.sessionID,
+            workingDirectory: foundation.cwd,
+            call: ToolCall(
+                id: "call-swarm-1",
+                name: "agent_swarm",
+                arguments: #"{"description":"probe","prompt_template":"probe {{item}} \#(marker)","items":["one","two"]}"#
+            )
+        )
+        guard case .success(let firstOutput) = first else {
+            Issue.record("first swarm failed: \(first)")
+            return
+        }
+        let ids = agentIDs(in: firstOutput.promptText)
+        #expect(ids.count == 2)
+        guard let resumeID = ids.first else { return }
+
+        let resumed = await foundation.toolExecutor.invoke(
+            sessionID: foundation.sessionID,
+            workingDirectory: foundation.cwd,
+            call: ToolCall(
+                id: "call-swarm-2",
+                name: "agent_swarm",
+                arguments: #"{"description":"probe","resume_agent_ids":{"\#(resumeID)":"continue \#(marker)"}}"#
+            )
+        )
+        guard case .success(let resumedOutput) = resumed else {
+            Issue.record("resume swarm failed: \(resumed)")
+            return
+        }
+        #expect(resumedOutput.promptText.contains("mode=\"resume\""))
+        #expect(resumedOutput.promptText.contains("<summary>completed=1 failed=0 aborted=0</summary>"))
+        #expect(resumedOutput.promptText.contains("resumed member answer"))
+
+        // The resumed member's request carries the source transcript plus
+        // the continuation prompt — the continuation the tool description
+        // promises.
+        let requests = fixture.responsesRequests()
+        #expect(requests.count == 3)
+        let resumedBody = SwarmFixture.bodyText(requests[2])
+        #expect(resumedBody.contains("probe one \(marker)") || resumedBody.contains("probe two \(marker)"))
+        #expect(resumedBody.contains("continue \(marker)"))
+    }
+
+    @Test("an unknown resume id fails that member, not the whole swarm")
+    func unknownResumeIDFailsTheMember() async throws {
+        let fixture = try SwarmFixture()
+        defer { fixture.dispose() }
+        let foundation = try await fixture.makeFoundation()
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+
+        let result = await foundation.toolExecutor.invoke(
+            sessionID: foundation.sessionID,
+            workingDirectory: foundation.cwd,
+            call: ToolCall(
+                id: "call-swarm-1",
+                name: "agent_swarm",
+                arguments: #"{"description":"probe","resume_agent_ids":{"nosuchagent":"continue"}}"#
+            )
+        )
+        guard case .success(let output) = result else {
+            Issue.record("a member failure must not fail the tool call: \(result)")
+            return
+        }
+        #expect(output.promptText.contains("<summary>completed=0 failed=1 aborted=0</summary>"))
+        // The member body is XML-escaped inside <subagent> (apostrophes
+        // become &apos;) — assert the bytes the model actually receives.
+        #expect(output.promptText.contains(
+            "Cannot resume from subagent &apos;nosuchagent&apos;: not found."
+        ))
+        #expect(output.promptText.contains("resume_hint"))
+    }
+}
+
+// MARK: - Orchestration wait and cancel
+
+@Suite("agent_swarm orchestration wait", .serialized)
+struct LiveAgentSwarmOrchestrationTests {
+    /// The cohort parks the turn in an orchestration wait; a cancelled
+    /// swarm kills every member at the host. Members park inside a real
+    /// `sleep` (their own tool call through their own clamped surface), so
+    /// the cancel lands on genuinely running children.
+    @Test("the wait is raised while the cohort runs and cancel kills the members")
+    func orchestrationWaitAndCancel() async throws {
+        let fixture = try SwarmFixture()
+        defer { fixture.dispose() }
+        let marker = UUID().uuidString
+        for callID in ["call-sleep-1", "call-sleep-2"] {
+            try fixture.server.enqueueResponse(
+                path: "/v1/responses",
+                response: .sse(SseEvents.responsesApiReasoningThenToolCallEvents(
+                    reasoning: "Working \(marker).",
+                    callId: callID,
+                    name: "run_terminal_cmd",
+                    arguments: #"{"command":"sleep 30","timeout_ms":30000}"#,
+                    model: "grok-4.5"
+                ))
+            )
+        }
+        // `--yolo` so the members' own `run_terminal_cmd` passes the
+        // permission pipeline without a prompter.
+        let foundation = try await fixture.makeFoundation(["--model", "grok-4.5", "--yolo"])
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+        guard let host = foundation.subagentHost else {
+            Issue.record("the default session must have a subagent host")
+            return
+        }
+        #expect(host.foregroundWait.orchestrationDepth == 0)
+
+        let executor = foundation.toolExecutor
+        let sessionID = foundation.sessionID
+        let cwd = foundation.cwd
+        let swarmTask = Task {
+            await executor.invoke(
+                sessionID: sessionID,
+                workingDirectory: cwd,
+                call: ToolCall(
+                    id: "call-swarm-1",
+                    name: "agent_swarm",
+                    arguments: #"{"description":"parking probe","prompt_template":"park {{item}} \#(marker)","items":["one","two"]}"#
+                )
+            )
+        }
+
+        // The wait must be up while the cohort is live — this is the state
+        // the controller's send-now exemption reads.
+        var sawWait = false
+        var sawBothMembers = false
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline {
+            if host.foregroundWait.orchestrationDepth == 1 { sawWait = true }
+            let active = await host.coordinator.listActive(parentSessionID: sessionID)
+            if sawWait && active.count == 2 {
+                sawBothMembers = true
+                break
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        #expect(sawWait, "the swarm must raise the orchestration depth")
+        #expect(sawBothMembers, "both members must be live children of the session")
+
+        // Cancel the turn's tool call: upstream forwards the tool
+        // cancellation into every member (agent_swarm/mod.rs:381-388);
+        // here structured cancellation reaches the per-member forwarders.
+        swarmTask.cancel()
+        let result = await swarmTask.value
+        guard case .failure(.cancelled) = result else {
+            Issue.record("a cancelled swarm must report cancellation, got \(result)")
+            return
+        }
+
+        // Every member dies with the cohort, and the wait is restored.
+        let drainDeadline = Date().addingTimeInterval(20)
+        var activeCount = -1
+        while Date() < drainDeadline {
+            activeCount = await host.coordinator.listActive(parentSessionID: sessionID).count
+            if activeCount == 0 { break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        #expect(activeCount == 0, "cancelling the swarm must kill every live member")
+        #expect(host.foregroundWait.orchestrationDepth == 0,
+                "the orchestration wait must be restored after the swarm ends")
+    }
+}
+
+// MARK: - Fail-fast validation through the live dispatch
+
+@Suite("agent_swarm validation through dispatch", .serialized)
+struct LiveAgentSwarmValidationTests {
+    @Test("the fail-fast ladder rejects before any child spawns, copy byte-identical")
+    func failFastLadder() async throws {
+        let fixture = try SwarmFixture()
+        defer { fixture.dispose() }
+        let foundation = try await fixture.makeFoundation()
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+
+        func failure(_ arguments: String) async -> String? {
+            let result = await foundation.toolExecutor.invoke(
+                sessionID: foundation.sessionID,
+                workingDirectory: foundation.cwd,
+                call: ToolCall(id: "call-\(UUID().uuidString)", name: "agent_swarm", arguments: arguments)
+            )
+            guard case .failure(let error) = result else { return nil }
+            return error.description
+        }
+
+        #expect(await failure(#"{"description":"d","items":["a"],"prompt_template":"{{item}}"}"#)?
+            .contains("agent_swarm requires at least 2 items unless resume_agent_ids is supplied") == true)
+        #expect(await failure(#"{"description":"d","items":["a","b"]}"#)?
+            .contains("prompt_template is required when items is supplied") == true)
+        #expect(await failure(#"{"description":"d","items":["a","b"],"prompt_template":"static"}"#)?
+            .contains("prompt_template must contain literal {{item}} when items is supplied") == true)
+        #expect(await failure(#"{"description":"d","items":["a","b"],"prompt_template":"{{item}}","subagent_type":"nosuchagent"}"#)?
+            .contains("Unknown subagent type: nosuchagent") == true)
+        #expect(await failure(#"{"description":"d","items":["a","b"],"prompt_template":"{{item}}","reasoning_effort":"turbo"}"#)?
+            .contains("invalid reasoning_effort \"turbo\"") == true)
+        #expect(await failure(#"{"description":"d","items":["a","b"],"prompt_template":"{{item}}","model":"nosuchmodel"}"#)?
+            .contains("subagent model \"nosuchmodel\" is unavailable") == true)
+
+        // Fail-fast means fail-fast: nothing spawned, nothing sampled.
+        #expect(await foundation.subagentHost?.knownSubagentIDs().isEmpty == true)
+        #expect(fixture.responsesRequests().isEmpty)
+    }
+}
