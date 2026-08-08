@@ -160,6 +160,15 @@ private func targets() -> [Target] {
     // CLI/pager wiring is a separate serial slice, and the library's tests
     // build with no pager import as the disjointness guarantee.
     t.append(.target(name: "OpenGrokDiagnostics", dependencies: dep(["OpenGrokShared"])))
+    // OpenGrokScheduler: the PURE scheduler library (interval parsing, the
+    // ScheduledTask/SchedulerState store with next-fire math against an
+    // injected clock) from `xai-grok-tools/.../grok_build/scheduler/`.
+    // Foundation-only on purpose: it must never grow an OpenGrokCLI or
+    // OpenGrokPager edge — the /loop command, scheduler_* tool handlers, and
+    // the session-actor timer are separate runtime slices that import this,
+    // and the library's tests building with no pager/CLI import is the
+    // disjointness guarantee.
+    t.append(.target(name: "OpenGrokScheduler", dependencies: dep()))
 
     // ---- Wave 1 ----
     // W1-S1: layered tool stack (types -> protocol -> runtime -> api).
@@ -361,6 +370,7 @@ private func targets() -> [Target] {
     t.append(contentsOf: tests(w0s3))
     t.append(contentsOf: tests(w0s4))
     t.append(contentsOf: tests(["OpenGrokDiagnostics"]))
+    t.append(contentsOf: tests(["OpenGrokScheduler"]))
     t.append(contentsOf: tests(["OpenGrokToolTypes", "OpenGrokToolProtocol", "OpenGrokToolRuntime", "OpenGrokToolsAPI"]))
     t.append(contentsOf: tests(w1s2))
     t.append(contentsOf: tests(["OpenGrokSamplingTypes", "OpenGrokChatState", "OpenGrokTokenEstimation"]))

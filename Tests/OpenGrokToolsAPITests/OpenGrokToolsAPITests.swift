@@ -258,13 +258,48 @@ struct SlashCommandTests {
         #expect(text.contains("FFmpeg"))
     }
 
+    // slash_commands.rs:242-270
     @Test("loop instruction carries args and contract tokens")
     func loop() {
-        let text = loopScheduleInstruction("every 30 minutes do x")
-        #expect(text.contains("every 30 minutes do x"))
-        #expect(text.contains("<number><unit>"))
-        #expect(text.contains("ask the user how often"))
-        #expect(!text.contains("10m"))
+        for mode in [LoopFireMode.detached, .inSession] {
+            let text = loopScheduleInstruction("every 30 minutes do x", mode: mode)
+            #expect(text.contains("every 30 minutes do x"), "\(mode)")
+            #expect(text.contains("<number><unit>"), "\(mode)")
+            #expect(text.contains("ask the user how often"), "\(mode)")
+            #expect(!text.contains("10m"), "no host-side default interval: \(mode)")
+            #expect(
+                !text.contains("recurring:"),
+                "the retired one-shot flag must not be referenced: \(mode)"
+            )
+            #expect(text.contains("task_id"), "must teach in-place updates via task_id: \(mode)")
+            #expect(
+                text.contains("delete and recreate"),
+                "must steer away from delete+recreate: \(mode)"
+            )
+            #expect(
+                text.contains("scheduler_delete <task_id>"),
+                "every mode must authorize the fire to end the task: \(mode)"
+            )
+        }
+    }
+
+    // slash_commands.rs:272-288
+    @Test("each fire mode describes its own runtime")
+    func loopFireModes() {
+        let detached = loopScheduleInstruction("5m check ci", mode: .detached)
+        let inSession = loopScheduleInstruction("5m check ci", mode: .inSession)
+
+        #expect(detached.contains("cannot see this conversation"))
+        #expect(!detached.contains("arrives as a new turn in this conversation"))
+
+        #expect(inSession.contains("arrives as a new turn in this conversation"))
+        #expect(!inSession.contains("cannot see this conversation"))
+
+        // The two levers the A/B showed carry the behavior are mode-independent.
+        for text in [detached, inSession] {
+            #expect(text.contains("report it and call"))
+            #expect(text.contains("Keep it short and concrete"))
+        }
     }
 
     @Test("goal instruction carries objective and contract tokens")

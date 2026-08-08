@@ -7,7 +7,9 @@
 
 import Foundation
 
-/// Canonical tool name advertised by the scheduler create tool.
+/// Canonical tool name advertised by the scheduler create tool. Gating code
+/// (shell `CommandAvailability`, pager `required_tools`, host command lists)
+/// keys `/loop` availability on this name.
 public let schedulerCreateToolName = "scheduler_create"
 
 /// Usage hint shown when `/loop` is invoked with no arguments.
@@ -21,31 +23,94 @@ public func loopUsageMessage() -> String {
     """
 }
 
+/// Where a scheduled fire runs, which decides what the stored prompt can rely on.
+///
+/// Resolved from `[scheduler] background_loops` (env, config, managed policy and
+/// remote settings all feed it), so `/loop` describes the runtime the user
+/// actually has rather than hedging across both.
+public enum LoopFireMode: Sendable, Equatable {
+    /// Each fire runs in a detached background subagent that cannot see this
+    /// conversation. The default.
+    case detached
+    /// Each fire runs as a turn in this conversation, where earlier results from
+    /// the same task may still be visible.
+    case inSession
+}
+
 /// Build the model instruction that `/loop` expands into for `args`.
-public func loopScheduleInstruction(_ args: String) -> String {
-    """
+///
+/// The model, not brittle host parsing, turns the request into the
+/// `scheduler_create` interval, accepting every natural phrasing and erroring
+/// on bad input rather than silently defaulting. See `loopUsageMessage()`.
+///
+/// Only the framing differs by `mode`; the stop condition and length guidance
+/// are identical, because both hold wherever the fire runs.
+public func loopScheduleInstruction(_ args: String, mode: LoopFireMode) -> String {
+    // The rendered text has no indentation on wrapped lines: upstream builds
+    // it with Rust `\`-continuations, which strip the continuation line's
+    // leading whitespace (`slash_commands.rs:41-96`). Indenting these lines
+    // "nicely" here would break byte parity.
+    let fireContext: String
+    switch mode {
+    case .detached:
+        fireContext = """
+        Each fire runs in a detached background subagent, not in this conversation,
+        so the prompt you store must stand on its own.
+
+        ## Writing a prompt that survives a fresh fire
+        - Inline the state a fire needs: paths, job/PR/branch ids, the command that checks
+        status, and what "healthy" looks like. A fire cannot see this conversation, and
+        a long-running task restarts from a short summary every few iterations.
+        - Only a short status comes back here, so say what that status must contain.
+        """
+    case .inSession:
+        fireContext = """
+        Each fire arrives as a new turn in this conversation, and earlier results from
+        the same task may still be above it. The stored prompt is re-sent verbatim every
+        time, so write a standing order rather than a one-off request.
+
+        ## Writing a prompt that reads well on every fire
+        - Name the state that must not be guessed: paths, job/PR/branch ids, the command
+        that checks status, and what "healthy" looks like. This conversation is
+        compacted as it grows, so do not rely on details staying visible.
+        - Earlier fires may be above you: continue from them instead of restarting.
+        """
+    }
+    return """
     # /loop -- schedule a recurring prompt
 
-    Parse the input below into an interval and a prompt, then schedule it with scheduler_create.
+    Turn the input below into a scheduler_create call. \(fireContext)
+    - Say what one fire does and when it bails: "if still pending, report one line and
+    stop." A fire must not poll inline.
+    - Give it a stop condition and an exit: "when <condition> holds, report it and call
+    scheduler_delete <task_id>." Without that the loop runs until it expires.
+    - Keep it short and concrete -- the stored prompt is re-sent on every fire.
 
     ## Deriving the interval
-    Read how often to run from the user's request — however they phrase it — and convert it
-    to a compact `<number><unit>` string, where unit is one of `s` (seconds), `m` (minutes),
-    `h` (hours), or `d` (days). The interval may appear at the start or end of the request;
-    extract it and use the remaining text as the prompt.
-
-    The minimum interval is 60 seconds; shorter values are raised to 60s, so tell the user if that applies.
-
-    If the request contains no interval at all, ask the user how often it should run before
-    scheduling. Do NOT invent or assume a default interval.
+    Convert the user's cadence -- however phrased, at either end of the request -- into a
+    compact `<number><unit>` string (`s`/`m`/`h`/`d`); the remaining text is the prompt.
+    The minimum is 60 seconds and shorter values are raised, so say so when it applies.
+    If no cadence is given, ask the user how often it should run -- never invent one.
 
     ## Action
-    1. Call scheduler_create with: interval (the compact string you derived), prompt,
-       recurring: true, fire_immediately: true. If the interval is unparseable, the tool
-       returns an error — fix the interval string rather than guessing.
-    2. Confirm: what's scheduled, the cadence, that it auto-expires after 7 days,
-       and that they can cancel with scheduler_delete (include the job ID).
-    3. Do NOT execute the prompt inline. The scheduler will fire it immediately.
+    Schedule from what the user already gave you \u{2014} do not explore the workspace or run
+    checks before scheduling; the first fire does that.
+    1. Call scheduler_create with the interval, the prompt, and fire_immediately: true.
+    If the interval is rejected, fix the string rather than guessing.
+    2. Confirm what's scheduled, the cadence, its stop condition, that it auto-expires
+    after 7 days, and the task_id to cancel with scheduler_delete.
+    3. Do NOT execute the prompt inline. The scheduler fires it immediately.
+
+    ## Wrong tool for the job
+    - "Tell me when X finishes" -> a background command or watch tool that wakes you on
+    the event, not a recurring loop that re-checks on a timer.
+    - "Do X once in N minutes" -> background `sleep <secs> && <command>`; scheduling is
+    recurring-only.
+
+    ## Changing an existing loop
+    Call scheduler_create with its task_id and only the changed fields; do not
+    delete and recreate. If later work changes what a loop should do, update its
+    prompt the same way.
 
     ## Input
     \(args)

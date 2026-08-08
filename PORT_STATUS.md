@@ -608,6 +608,41 @@ rate-limit/auth codes unported); cosmetic JSON key-order/timestamp-precision dif
 The interjection seam itself stays (the collaboration quartet still produces into it);
 only `/btw`'s routing changed.
 
+## Wave 17 — Scheduler + chrome readers (2026-08-08, in progress)
+
+### E17 — `OpenGrokScheduler` library (IMPLEMENTED-UNWIRED; serial gate: exit 0, 4,881 tests, zero issues)
+
+The pure scheduler library as a standalone target (Foundation only — imports neither CLI
+nor pager, confirmed): interval parsing with upstream's 60 s clamp
+(`scheduler/interval.rs:3,44`) and exact human strings, `ScheduledTask` next-fire
+(`lastFiredAt ?? createdAt + interval`, `types.rs:281-284`)/expiry (recurring → 7 days)/
+`fireImmediately` backdate, `SchedulerState` with the 50-task cap (`actor.rs:26` — the
+delegate corrected the brief's `types.rs` citation; `types.rs:234`'s same-valued constant
+is the version-clock reservation cap, a different control), and the `ScheduledTaskInfo`
+display DTO. Also brought `SlashCommands.swift`'s `/loop` wording to PROVEN byte parity
+with upstream (`slash_commands.rs:5-96`) — the delegate compiled both sides and `cmp`'d
+the rendered strings byte-identical, locking the Rust line-continuation whitespace
+stripping. Golden tests ported from upstream's interval/types/actor/slash-command suites.
+`parseInterval` throws rather than returning optional, deliberately, so the runtime slice
+inherits upstream's `invalid_arguments(e.to_string())` message instead of inventing one.
+
+**This is LIBRARY ONLY**: no `/loop` command, no `scheduler_*` tool handlers, no
+session-actor timer — `/loop` stays SKIP-ABSENT and the `/tasks` Scheduled section stays
+unrendered until the runtime + surface slices land. Recorded implemented-unwired per §7.
+Design guardrail carried into those slices (from the scheduler research): fires ride a
+dedicated sleep-until-due plus the prompt-queue Cron path (upstream's `enqueue_cron_prompt`
+→ synthetic turn), NEVER the PagerMotion UI ticker or the mid-turn interjection seam.
+
+### Chrome readers (`/timestamps`, `/timeline`, `/compact-mode`) — research complete, queued
+
+Wave 18 B6. The three ship independently, ordered compact_mode → timestamps → timeline
+(honest-now/smallest to largest). Critical seam correction from the research: the readers
+belong on the live `OpenGrokPagerRender` frame builder, NOT the `OpenGrokPagerConversationUI`
+typed model (which only its own tests exercise). compact_mode is a pure layout-parameter
+reader (no new metadata); timestamps needs a `createdAt` stamp on `PagerMessage` at append/
+resume; timeline needs a new rail module replacing the scrollbar gutter (turns already
+enumerated by `/jump`). All three unhide their Wave-13-hidden settings rows.
+
 ## Wave 16 — Pager surfaces, first parallel worktree batch (2026-08-08)
 
 **Parallelization incident, recorded for honesty.** This batch was the first attempt to run
