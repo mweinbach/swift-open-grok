@@ -447,6 +447,20 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// `Action::LogoutCodex`, `slash/commands/logout.rs:38-45`). Credential
     /// removal happens in the render layer, which owns the auth-store home.
     case logout(account: OpenGrokPagerAuthAccount)
+    /// `/fork [--worktree|--no-worktree] [directive]` — upstream
+    /// `Action::Fork(ForkArgs)` (`slash/commands/fork.rs:130-135`). The
+    /// controller owns the verbatim grammar (`PagerForkArguments.parse`);
+    /// the render layer owns the session store, so the parsed payload rides
+    /// the intent. Upstream's dispatch spawns a peer agent tab in the
+    /// multi-agent dashboard; this single-session port's live backing is
+    /// the on-disk session fork, so the renderer decides which arms it can
+    /// honestly serve.
+    case fork(worktreeOverride: Bool?, directive: String?)
+    /// `/tasks` — upstream `Action::ShowTasks` (`slash/commands/tasks.rs:36`),
+    /// dispatched by `dispatch_show_tasks` (`app/dispatch/status.rs:362-370`)
+    /// as a read-only system block. The task sources (workflow registry,
+    /// subagent host, shell background tasks) live in the render layer.
+    case showTasks
     case dismissAll
 }
 

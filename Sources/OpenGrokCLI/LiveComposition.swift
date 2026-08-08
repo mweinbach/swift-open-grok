@@ -1199,6 +1199,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         sessionServices: toolExecutor.sessionServices,
                         conversationHistory: stack.conversationHistory,
                         sessionCatalog: LiveSessionCatalog(openGrokHome: openGrokHome),
+                        // `/fork` copies records through the SAME store the
+                        // runtime adapter persists with — a rebuilt store
+                        // pointed at the same files is how two writers
+                        // appear.
+                        conversationStore: foundation.conversationStore,
                         // The connection outcomes `/mcps` renders — the tool
                         // executor recorded them when it brought the session's
                         // configured servers online.
@@ -4482,6 +4487,22 @@ struct LiveToolExecutor: Sendable {
         )
     }
 
+    /// The session's live background tasks, for `/tasks` — the same
+    /// owner-scoped `listTasks()` the background-task tools consult, read
+    /// through the session's registered execution. An unregistered session
+    /// returns empty truthfully: no `run_terminal_cmd` can have run through
+    /// it, so no task it owns can exist.
+    func backgroundTaskSnapshots(
+        sessionID: String,
+        workingDirectory: URL
+    ) async -> [ShellTaskSnapshot] {
+        guard let execution = try? await composition.execution(
+            for: sessionID,
+            workingDirectory: workingDirectory
+        ) else { return [] }
+        return await execution.listTasks()
+    }
+
     private static let runTerminalTool = ToolSpec(
         name: "run_terminal_cmd",
         description: "Run a validated shell command in the workspace with bounded output and cancellable process cleanup.",
@@ -6507,6 +6528,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private let sessionServices: LiveSessionServices?
     private let conversationHistory: LiveConversationHistory?
     private let sessionCatalog: LiveSessionCatalog?
+    /// The session store `/fork` copies records through — the SAME instance
+    /// the runtime adapter persists with (`foundation.conversationStore`),
+    /// never a rebuilt one, for the same one-writer reason as
+    /// `sessionServices` above. `nil` in compositions with no session
+    /// persistence (tests that opt out, headless), where `/fork` refuses.
+    private let conversationStore: LiveConversationStore?
     private var currentPermissionRequestID: String?
     /// The question sheet currently on screen, and the one parked behind an
     /// open permission sheet. Permission outranks question — upstream renders
@@ -6595,6 +6622,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         sessionServices: LiveSessionServices? = nil,
         conversationHistory: LiveConversationHistory? = nil,
         sessionCatalog: LiveSessionCatalog? = nil,
+        conversationStore: LiveConversationStore? = nil,
         mcpServers: [MCPServerConnection] = [],
         openGrokHome: URL? = nil,
         announcements: LiveAnnouncementsComposition? = nil,
@@ -6608,6 +6636,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.sessionServices = sessionServices
         self.conversationHistory = conversationHistory
         self.sessionCatalog = sessionCatalog
+        self.conversationStore = conversationStore
         self.mcpServers = mcpServers
         self.openGrokHome = openGrokHome ?? OpenGrokHomeResolver
             .resolve(environment: ProcessInfo.processInfo.environment)
@@ -7606,10 +7635,105 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await armPlanModeFromSlash()
         case .showPlan:
             await showPlan()
+        case .fork(let worktreeOverride, let directive):
+            await performFork(worktreeOverride: worktreeOverride, directive: directive)
+        case .showTasks:
+            await presentTasksBlock()
         case .dismissAll:
             overlays.removeAll()
             currentPermissionRequestID = nil
         }
+    }
+
+    // MARK: - /fork, /tasks
+
+    /// `/fork` — the honest subset of upstream's peer-agent fork
+    /// (`dispatch_fork_resolved`): a REAL on-disk copy of the current
+    /// session through `LiveConversationStore.fork` (transcript, rewind
+    /// sidecar, `parentSessionID`, export boundary), plus the exact
+    /// commands that open it. The destination id is generated the way the
+    /// CLI's `--fork-session` route generates it
+    /// (`resolveConversationRecord`: `options.sessionID ?? UUID().uuidString`)
+    /// — one id scheme, not two.
+    ///
+    /// Arms this port cannot back refuse by name (`LivePagerForkCommand`):
+    /// `--worktree` (no fork-into-worktree backing) and a directive (no
+    /// persisted first-prompt channel). Upstream's bare-`/fork` worktree
+    /// question modal is skipped — with the worktree arm refused, the
+    /// question has exactly one honest answer, so bare `/fork` and
+    /// `--no-worktree` both fork in place (recorded divergence).
+    private func performFork(worktreeOverride: Bool?, directive: String?) async {
+        guard !sessionID.isEmpty else {
+            note(LivePagerForkCommand.noActiveSession)
+            return
+        }
+        guard let conversationStore else {
+            // A session with no persistence (headless and test
+            // compositions) has no record to copy — saying "no active
+            // session" here would be false.
+            note("Session forking is unavailable: this session has no session store.")
+            return
+        }
+        if worktreeOverride == true {
+            note(LivePagerForkCommand.worktreeRefusal)
+            return
+        }
+        if directive != nil {
+            // Refused BEFORE the disk fork: forking and dropping the
+            // directive would silently lose user text (AGENTS.md §3).
+            note(LivePagerForkCommand.directiveRefusal)
+            return
+        }
+        let destinationID = UUID().uuidString
+        do {
+            let child = try await conversationStore.fork(
+                sourceSessionID: sessionID,
+                destinationSessionID: destinationID,
+                workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            )
+            note(LivePagerForkCommand.forkedNote(sessionID: child.sessionID))
+        } catch let error as CLIApplicationError {
+            // The store's own copy — "session not found", the legacy
+            // boundary refusal — is already user-facing.
+            note(error.description)
+        } catch {
+            note("failed to fork session \(sessionID): \(error)")
+        }
+    }
+
+    /// `/tasks` — upstream `dispatch_show_tasks`
+    /// (`app/dispatch/status.rs:362-370`): the `tasks_block_text` block
+    /// committed to the transcript. The three sources the port has are read
+    /// live at present time — the workflow registry (like `/workflows`),
+    /// the subagent host's children, and the session's owner-scoped shell
+    /// background tasks.
+    private func presentTasksBlock() async {
+        // `tasks.rs:33-35`, byte for byte — the one session-less state.
+        guard !sessionID.isEmpty else {
+            note(LivePagerForkCommand.noActiveSession)
+            return
+        }
+        var workflowViews: [RhaiWorkflowRunView] = []
+        if let workflowRegistry {
+            workflowViews = (try? await workflowRegistry.views()) ?? []
+        }
+        var subagents: [LiveSubagentSnapshot] = []
+        if let host = toolExecutor?.subagentHost {
+            for id in await host.knownSubagentIDs() {
+                if let snapshot = await host.subagentSnapshot(id: id) {
+                    subagents.append(snapshot)
+                }
+            }
+        }
+        let shellTasks = await toolExecutor?.backgroundTaskSnapshots(
+            sessionID: sessionID,
+            workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        ) ?? []
+        note(LivePagerTasksBlock.text(
+            workflows: workflowViews,
+            subagents: subagents,
+            tasks: shellTasks
+        ))
     }
 
     // MARK: - /login, /logout

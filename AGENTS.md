@@ -36,6 +36,16 @@ zsh workflows/swift-safe-verify.zsh build --product open-grok
 - **`build-tests` compiles but does not link.** A test-target link error passes
   straight through it and only appears under `test`. "build-tests green" is
   necessary, not sufficient.
+- **Every build and every suite run has a 10-minute wall-clock ceiling**, enforced
+  by the wrapper (`SWIFT_SAFE_TIMEOUT_SECONDS`, default 600). A healthy run
+  finishes well inside it; a run that hits the ceiling is a hang or a runaway
+  test, not a slow build — investigate, don't just raise the ceiling. Raise it
+  per-run (`SWIFT_SAFE_TIMEOUT_SECONDS=1200 zsh workflows/…`) only for a known
+  cold build. If you interrupt a `test` run by hand, **check for an orphaned
+  `swiftpm-testing-helper`** (`pgrep -fl swiftpm-testing-helper`) — the wrapper's
+  kill cleans up its own tree, but an interrupt can strand the helper, and a
+  stranded helper running an animated-renderer test has ballooned to 100+ GB of
+  RSS here before anyone noticed.
 
 ### When several agents share the tree
 

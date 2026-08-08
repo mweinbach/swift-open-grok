@@ -1407,7 +1407,13 @@ private func projectAgentDirectories(cwd: URL) -> [URL] {
         directories.append(current.appendingPathComponent(".opengrok/agents"))
         directories.append(current.appendingPathComponent(".claude/agents"))
         let parent = current.deletingLastPathComponent()
-        if parent.path == current.path { break }
+        // A real parent is strictly shorter. The parent of "/" depends on
+        // the URL flavor: `fileURLWithPath` repeats "/" (equality would
+        // stop), but URLs built by chained `appendingPathComponent`
+        // (NSURL-bridged) GROW "/.." forever — a `parent.path ==
+        // current.path` guard spun this walk unbounded and ballooned a
+        // live-seam test runner past 100 GB before it was caught.
+        if parent.path.count >= current.path.count { break }
         current = parent
     }
     return directories
@@ -1621,7 +1627,10 @@ private func agentsFiles(from directory: URL) -> [URL] {
         let candidate = current.appendingPathComponent("AGENTS.md")
         if FileManager.default.fileExists(atPath: candidate.path) { result.append(candidate) }
         let parent = current.deletingLastPathComponent()
-        if parent.path == current.path { break }
+        // Strictly-shorter guard, not equality: NSURL-bridged URLs grow
+        // "/.." above the root instead of repeating "/" (see
+        // `projectAgentDirectories`).
+        if parent.path.count >= current.path.count { break }
         current = parent
     }
     return result.reversed()

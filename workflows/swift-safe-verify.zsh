@@ -9,10 +9,12 @@ readonly lock_timeout_seconds="${SWIFT_SAFE_LOCK_TIMEOUT_SECONDS:-1800}"
 readonly lock_dir="${SWIFT_SAFE_LOCK_DIR:-${TMPDIR:-/tmp}/swift-open-grok-swiftpm.lock}"
 # Hard wall-clock ceiling on the swift invocation itself. A wedged build or a
 # hung serial suite otherwise runs forever while holding the shared lock and
-# starving every other agent. Cost: a legitimately slow cold build on a loaded
-# machine can be killed at the ceiling — raise SWIFT_SAFE_TIMEOUT_SECONDS for
-# that one run rather than removing the ceiling.
-readonly run_timeout_seconds="${SWIFT_SAFE_TIMEOUT_SECONDS:-900}"
+# starving every other agent. A healthy build or suite here finishes well
+# inside 10 minutes; anything longer is a hang, a runaway test, or a machine
+# problem — kill it and investigate. Cost: a legitimately slow cold build on
+# a loaded machine can be killed at the ceiling — raise
+# SWIFT_SAFE_TIMEOUT_SECONDS for that one run rather than removing the ceiling.
+readonly run_timeout_seconds="${SWIFT_SAFE_TIMEOUT_SECONDS:-600}"
 
 if (( $# == 0 )); then
   print -u2 "usage: $0 <build|build-tests|test> [arguments...]"
@@ -38,11 +40,30 @@ fi
 # KILL 20 s later for a toolchain that ignores TERM. The marker file (not the
 # 143 exit status) is what distinguishes "we killed it" from "it died", so a
 # suite that happens to exit 143 on its own cannot masquerade as a timeout.
+#
+# Kills target the command's PROCESS GROUP, not just the front pid: `swift
+# test` runs the suite in a `swiftpm-testing-helper` grandchild, and a
+# pid-only KILL strands it — a stranded helper running a wedged suite has
+# ballooned past 100 GB RSS here. The group kill also fires from the EXIT
+# trap, so an interrupted wrapper takes its helper down with it.
+active_cmd_pgid=""
+kill_active_command_group() {
+  if [[ -n "$active_cmd_pgid" ]]; then
+    kill -TERM -- "-$active_cmd_pgid" 2>/dev/null \
+      || kill -TERM "$active_cmd_pgid" 2>/dev/null || true
+  fi
+}
 run_with_timeout() {
   local marker="${scratch_path:h}/timeout-marker.$$"
   rm -f "$marker"
-  "$@" &
+  # Re-exec through perl's setpgrp so the command becomes its own process
+  # group leader (pgid = pid), which is what makes the group kills below
+  # reach the whole tree. (`setopt monitor` would be the shell-native way,
+  # but zsh refuses MONITOR without a tty in exactly the CI/agent contexts
+  # this wrapper exists for.)
+  perl -e 'setpgrp(0, 0); exec @ARGV or die "exec: $!"' -- "$@" &
   local cmd_pid=$!
+  active_cmd_pgid=$cmd_pid
   # The watchdog is detached from the caller's stdio: an inherited pipe fd on
   # its `sleep` child would hold a caller's pipeline open for the whole
   # ceiling after the build already finished.
@@ -50,15 +71,16 @@ run_with_timeout() {
     sleep "$run_timeout_seconds"
     if kill -0 "$cmd_pid" 2>/dev/null; then
       print -r -- "1" > "$marker"
-      kill -TERM "$cmd_pid" 2>/dev/null || true
+      kill -TERM -- "-$cmd_pid" 2>/dev/null || kill -TERM "$cmd_pid" 2>/dev/null || true
       sleep 20
-      kill -KILL "$cmd_pid" 2>/dev/null || true
+      kill -KILL -- "-$cmd_pid" 2>/dev/null || kill -KILL "$cmd_pid" 2>/dev/null || true
     fi
   ) < /dev/null > /dev/null 2>&1 &
   local watchdog_pid=$!
   # `status` is zsh's read-only alias of `$?`, hence the prefix.
   local cmd_status=0
   wait "$cmd_pid" || cmd_status=$?
+  active_cmd_pgid=""
   # Reap the watchdog's sleep child too; TERM on the subshell alone orphans it.
   pkill -TERM -P "$watchdog_pid" 2>/dev/null || true
   kill -TERM "$watchdog_pid" 2>/dev/null || true
@@ -73,6 +95,7 @@ run_with_timeout() {
 
 lock_acquired=false
 cleanup_lock() {
+  kill_active_command_group
   if [[ "$lock_acquired" == true ]]; then
     rm -f "$lock_dir/pid"
     rmdir "$lock_dir" 2>/dev/null || true

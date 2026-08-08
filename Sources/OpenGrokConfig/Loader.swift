@@ -183,7 +183,12 @@ public func projectDirChain(
         out.append(current)
         if let stop = stop, current.path == stop.path { break }
         let parent = current.deletingLastPathComponent()
-        if parent.path == current.path { break } // filesystem root
+        // Strictly-shorter guard, not equality: NSURL-bridged URLs grow
+        // "/.." above the root instead of repeating "/", so an equality
+        // check would pad the chain with junk "/..*" entries up to
+        // maxDepth (see OpenGrokSubagentResolution.projectAgentDirectories
+        // for the unbounded variant of the same trap).
+        if parent.path.count >= current.path.count { break } // filesystem root
         current = parent
         depth += 1
     }

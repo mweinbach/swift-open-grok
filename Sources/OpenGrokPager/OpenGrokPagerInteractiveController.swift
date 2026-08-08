@@ -1975,6 +1975,20 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Start a new session",
             mutatesConversationHistory: true
         ),
+        // `/fork` follows `/new`, upstream's display order
+        // (`slash/commands/mod.rs:88-89`). Name, summary and usage are
+        // verbatim (`fork.rs:102-116`); both flags and the directive are
+        // optional (`args_required() == false`, `fork.rs:122-124`), so a
+        // bare Enter dispatches. Upstream's `arg_placeholder("[directive]")`
+        // (`fork.rs:126-128`) has no port channel —
+        // `PagerCommandDefinition` carries no placeholder field — so the
+        // usage string is the only argument hint (recorded divergence,
+        // shared with `/plan`).
+        PagerCommandDefinition(
+            name: "fork",
+            summary: "Branch the current session into a peer agent",
+            usage: "/fork [--worktree|--no-worktree] [directive]"
+        ),
         // `/resume` (`slash/commands/resume.rs:9-19`). Committing a picked
         // session replaces the live conversation, so it takes the same
         // mid-turn deferral `/new` does.
@@ -2081,6 +2095,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         PagerCommandDefinition(
             name: "queue",
             summary: "List the prompts queued behind the running turn"
+        ),
+        // `/tasks` follows `/queue`, upstream's display order
+        // (`slash/commands/mod.rs:148-149`). Name, summary and usage are
+        // verbatim (`tasks.rs:16-30`).
+        PagerCommandDefinition(
+            name: "tasks",
+            summary: "List background tasks, subagents, and scheduled tasks",
+            usage: "/tasks"
         ),
         // `/btw` (`slash/commands/btw.rs:12-38`). Upstream fires an ACP ext
         // method that bypasses the prompt queue; this port maps it onto the
@@ -2583,6 +2605,31 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case "mcps":
                 try await emit(.overlay(.mcpServers))
                 return .handled
+            case "fork":
+                // The grammar runs on the raw argument tail, not the
+                // tokenizer's unquoted `arguments`: flags are recognized
+                // only at the start and an unknown token conservatively
+                // starts the directive (`parse_fork_args`, fork.rs:34-49),
+                // so re-splitting would corrupt it. A parse error is
+                // upstream's `CommandResult::Error` (fork.rs:133), mapped
+                // onto the notice channel like every command error here.
+                switch PagerForkArguments.parse(Self.rawArgumentTail(of: invocation)) {
+                case .success(let arguments):
+                    try await emit(.overlay(.fork(
+                        worktreeOverride: arguments.worktreeOverride,
+                        directive: arguments.directive
+                    )))
+                case .failure(let error):
+                    try await emit(.notice(error.message))
+                }
+                return .handled
+            case "tasks":
+                // Arguments are ignored — upstream's `TasksCommand::run`
+                // declares none and discards what it gets (tasks.rs:32-37).
+                // Its "No active session" arm lives in the live renderer,
+                // the only layer that owns a session id here.
+                try await emit(.overlay(.showTasks))
+                return .handled
             case "effort":
                 let level = Self.rejoined(invocation.arguments)
                 try await emit(.overlay(.reasoningEffort(
@@ -2801,6 +2848,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         arguments.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// The raw argument tail after the command token — upstream's
+    /// `parse_invocation` slice (`slash/mod.rs:1236-1258`): everything after
+    /// the first whitespace run, leading whitespace dropped, interior
+    /// whitespace and quotes untouched. `/fork` needs this because its
+    /// grammar is position- and whitespace-sensitive; the tokenizer's
+    /// `arguments` would unquote and re-space it.
+    static func rawArgumentTail(of invocation: PagerCommandInvocation) -> String {
+        let line = invocation.rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let boundary = line.firstIndex(where: \.isWhitespace) else { return "" }
+        return String(line[line.index(after: boundary)...].drop(while: \.isWhitespace))
+    }
+
     private func startNewSession() async throws {
         guard let currentRequest else {
             throw OpenGrokPagerInteractiveError.sessionFailed("no active request for new session")
@@ -2904,11 +2963,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /effort <level>           Set reasoning effort for the current model
       /always-approve           Toggle always-approve mode (skip all permission prompts)
       /new    /clear            Start a new session
+      /fork [directive]         Branch the current session into a peer agent
       /resume                   Resume a previous session
       /rename <title>  /title   Rename the current session
       /home   /welcome          Return to the welcome screen
       /history                  Search prompt history
       /queue                    Prompts queued behind the running turn
+      /tasks                    List background tasks, subagents, and scheduled tasks
       /btw <question>           Ask a side question without interrupting
       /context                  View context usage
       /usage  /cost             View session token usage

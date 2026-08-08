@@ -96,6 +96,57 @@ needs a status channel through `emit`; the interactive composition always has a 
 - Shared-parser whitespace collapse in the description (precedent: `/remember`, `/btw`);
   `SetPlanMode(Off)` and the dashboard/session-less offering have no port surface.
 
+### D3 — `/fork` and `/tasks` (serial gate: exit 0, 4,434 tests, zero issues, ~225 s)
+
+`/fork` ports `parse_fork_args` verbatim (`fork.rs:50-96`, byte-identical error copy:
+mutual exclusion, duplicate flags, the `--at` deferral, unknown-flags-start-the-directive)
+and performs a REAL on-disk fork of the current session through the same
+`LiveConversationStore.fork` the CLI `--fork-session` route uses (id validation,
+legacy-boundary refusal, items + rewind-sidecar copy, `parentSessionID`); the note names
+both open routes. `/tasks` paints the `tasks_block_text` port (`status_blocks.rs:48-178`)
+fed by the live workflow registry, subagent host, and shell task list. 42 new tests
+(25 controller-seam, 17 live-seam/formatter). Recorded divergences: fork spawns no peer
+tab (single-session port; one extra step to open the fork), `--worktree` and the directive
+form refuse honestly (no backing that both forks and isolates; no pending-prompt field in
+the session record — refusing beats silently dropping user text), no scheduled/Monitor/
+"stopping" rows (no `/loop`, no monitor tool, no `pending_kill` flag), workflow durations
+derived from the journal (no stored end time), `/fork` dispatch reads the raw argument
+tail so the whitespace-sensitive grammar sees arguments as typed.
+
+**Product bug found by this unit's live-seam test — walk-up infinite loop (the 128 GB
+incident).** `projectAgentDirectories(cwd:)` (and the sibling `agentsFiles` walk) guarded
+its ancestor loop with `parent.path == current.path`. The parent of `/` depends on URL
+flavor: `URL(fileURLWithPath:)` repeats `/` (terminates), but URLs built by chained
+`appendingPathComponent` (NSURL-bridged) grow `/..` forever — the loop never breaks and
+each iteration percent-decodes an ever-longer path. The D3 subagent-host test passed a
+chained-flavor cwd and `LiveSubagentHost.init` spun unbounded, ballooning the test runner
+past 100 GB RSS (sampled stacks pinned the loop at `OpenGrokSubagentResolution.swift:1408`
+inside `_xzm_malloc_large_huge`). The live app dodges it only because its cwd happens to
+be `fileURLWithPath`-flavored — a reachability argument, not a guarantee. Fixed with a
+strictly-shorter-parent guard at the three URL-parameter walk sites
+(`projectAgentDirectories`, `agentsFiles`, `Config.projectDirChain` — the last was
+depth-bounded but emitted junk `/..` entries); audited the remaining walk-up loops:
+`SkillDiscovery` standardizes each parent (`/..` collapses back to `/`, terminates),
+`FastWorktree.rejectSymlinkEscape` loops on `path != "/"` (reached), and the
+FSNotify/GitStatus walks build their URLs internally from String paths (terminating
+flavor by construction).
+
+**Lead fixes to the delegate's tests:** the capturing sink decoded frame bytes one
+scalar per byte, mangling every multi-byte glyph ("·" → "Â·") so the
+"Task · long sleeper" needle missed a frame that contained it — now byte-level ANSI strip
+then UTF-8 decode; the fixture's 1 ms paint cadence let a 30-second running-task
+animation accumulate frames at >100 MB/s into the sink — now 10 fps; the sink carries a
+compact `customMirror` so a failed `#expect` can never again dump the whole byte buffer
+as decimal text.
+
+**Verification-infrastructure hardening (same incident):** `swift-safe-verify.zsh`'s
+wall-clock ceiling default dropped 900 s → 600 s (a healthy build or suite finishes well
+inside 10 minutes; AGENTS.md §1 now says so), and the ceiling/trap kills now target the
+command's process group via a `setpgrp` re-exec — a pid-only kill stranded
+`swiftpm-testing-helper`, and the stranded helper is what ran the wedged suite to 100+ GB
+unnoticed. Kill path proven live: a 60 s ceiling tripped mid-suite exited 124 with no
+surviving helper.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was
