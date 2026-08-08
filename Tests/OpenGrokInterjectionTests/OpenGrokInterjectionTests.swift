@@ -160,6 +160,27 @@ struct FormattingTests {
         let out = formatInterjection("hi")
         #expect(!out.contains("[truncated]"))
     }
+
+    /// Full-output equality, not substring checks: the exact bytes upstream's
+    /// `format_interjection` emits (xai-interjection-core format.rs:16-33,
+    /// pinned at 650c1db7). The session turn loop injects this string
+    /// verbatim as the synthetic user item, so any drift here is model-visible.
+    @Test("formatInterjection output is byte-exact against upstream")
+    func formatInterjectionByteExact() {
+        #expect(
+            formatInterjection("hurry up")
+                == "The user sent a message while you were working:\n<user_query>\nhurry up\n</user_query>"
+        )
+        // Truncation joint, byte-exact: an ASCII body one byte over the
+        // threshold cuts to exactly `largePromptThreshold` bytes plus the
+        // `... [truncated]` suffix inside the same envelope.
+        let over = String(repeating: "a", count: largePromptThreshold + 1)
+        let expectedBody = String(repeating: "a", count: largePromptThreshold) + "... [truncated]"
+        #expect(
+            formatInterjection(over)
+                == "The user sent a message while you were working:\n<user_query>\n\(expectedBody)\n</user_query>"
+        )
+    }
 }
 
 // MARK: - InterjectionBuffer / drainFormatted

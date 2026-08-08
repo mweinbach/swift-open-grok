@@ -1,6 +1,5 @@
 import Dispatch
 import Foundation
-import OpenGrokInterjection
 import OpenGrokPagerCommandUI
 import OpenGrokPagerMinimal
 import OpenGrokPagerRender
@@ -19,6 +18,30 @@ import OpenGrokTerminalCore
 public enum PagerLocalCommandOutcome: Sendable, Equatable {
     case notice(String)
     case submit(String)
+}
+
+/// The single-process stand-in for upstream's `x.ai/interject` wire hop: the
+/// composition installs closures that reach the live session actor directly.
+///
+/// `deliver` is the `SessionCommand::Interject` decision
+/// (run_loop.rs:1962-1989): `true` means the text was buffered into an
+/// actually-running turn and the turn loop will merge it at the next safe
+/// drain point; `false` means no turn runs and the CONTROLLER must queue the
+/// text as its own front-of-queue prompt turn (the queue lives on this side
+/// in this port). `collectStranded` drains interjections that raced past the
+/// completed turn's final drain, for the completion-arm flush
+/// (`flush_stranded_interjections`, run_loop.rs:432-447).
+public struct OpenGrokPagerInterjectionSeam: Sendable {
+    public let deliver: @Sendable (String) async -> Bool
+    public let collectStranded: @Sendable () async -> [String]
+
+    public init(
+        deliver: @escaping @Sendable (String) async -> Bool,
+        collectStranded: @escaping @Sendable () async -> [String]
+    ) {
+        self.deliver = deliver
+        self.collectStranded = collectStranded
+    }
 }
 
 public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFrontend {
@@ -698,11 +721,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private var focus: OpenGrokPagerFocusRegion = .prompt
     private var modes = OpenGrokPagerInputModes()
 
-    /// Side questions buffered by `/btw`. Drained into the next prompt so a
-    /// follow-up that arrives after the sampler has committed to the turn is
-    /// never silently dropped. Enter-steers does not write here: it is
-    /// cancel-and-send per `defaults.rs:630-632`.
-    private let interjections = EventQueue<KindedInterjection<String>>()
+    /// The live mid-turn interjection seam, installed by the composition.
+    /// `nil` (no live session behind the controller) falls back to the
+    /// idle path: the text queues as its own front-of-queue prompt turn,
+    /// exactly what upstream's dispatch does with an interject when no turn
+    /// runs (run_loop.rs:1980-1989). Enter-steers does not come here: it is
+    /// cancel-and-send per upstream (`prompt.rs:616-631`,
+    /// `defaults.rs:630-632`).
+    private var interjectionSeam: OpenGrokPagerInterjectionSeam?
 
     private let commands: PagerCommandRegistry
     private let paletteRows: [OpenGrokPagerCommandSuggestion]
@@ -820,6 +846,26 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     ) {
         planModeState = provider
     }
+
+    /// Install the live mid-turn interjection seam. Call before `run`.
+    /// Without it, `/btw` still works — every interjection takes the idle
+    /// fallback and runs as its own prompt turn.
+    public func setInterjectionSeam(_ seam: OpenGrokPagerInterjectionSeam?) {
+        interjectionSeam = seam
+    }
+
+    /// Prompt-id prefix for interjections converted into standalone prompt
+    /// turns (arrived while idle, or stranded past the running turn's final
+    /// drain). Byte-identical to upstream's `INTERJECT_FALLBACK_PROMPT_PREFIX`
+    /// (interjection.rs:25); the prefix keeps the fallback turn's user echo
+    /// persist-only, because the pager already painted the text at dispatch.
+    public static let interjectFallbackPromptPrefix = "interject-fallback-"
+
+    /// Metadata key stamped onto a fallback turn's request so the renderer
+    /// skips the user-block half of the turn-start paint — this port's
+    /// carrier for upstream's persist-only user echo (interjection.rs:20-24).
+    /// The value is the queue entry's full `interject-fallback-…` id.
+    public static let interjectionFallbackMetadataKey = "interjectionFallbackPromptID"
 
     /// Report what the render layer knows is in motion — visible running
     /// blocks, the welcome logo, background-task chips, and whether the
@@ -1065,6 +1111,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             ) {
                                 outcome = lifecycle
                             }
+                        case .drain:
+                            // An interjection fallback prompt waits at the
+                            // front; idle means this loop must start it.
+                            if let lifecycle = try await drainQueue(
+                                request: request,
+                                mailbox: mailbox,
+                                inputPumpGate: inputPumpGate
+                            ) {
+                                outcome = lifecycle
+                            }
                         case .handled, .notACommand:
                             // The draft is deliberately untouched — upstream's
                             // `SendSlashCommandPreservingDraft`.
@@ -1133,6 +1189,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 continue
                             case .submit(let generatedPrompt):
                                 try await enqueue(generatedPrompt, historyText: prompt)
+                                if let lifecycle = try await drainQueue(
+                                    request: request,
+                                    mailbox: mailbox,
+                                    inputPumpGate: inputPumpGate
+                                ) {
+                                    outcome = lifecycle
+                                }
+                                continue
+                            case .drain:
+                                // An interjection fallback prompt waits at
+                                // the front; idle means this loop must start
+                                // it — the port of `maybe_start_running_task`
+                                // (run_loop.rs:1984-1988).
+                                recordHistory(prompt)
+                                editor.reset()
+                                try await emit(.promptChanged(promptState()))
                                 if let lifecycle = try await drainQueue(
                                     request: request,
                                     mailbox: mailbox,
@@ -1410,6 +1482,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                         editor.reset()
                                         try await emit(.promptChanged(promptState()))
                                         await inputPumpGate.resume()
+                                    case .drain:
+                                        // The fallback prompt waits at the
+                                        // front of the queue; it drains when
+                                        // this turn ends (`.drainNext`).
+                                        recordHistory(prompt)
+                                        editor.reset()
+                                        try await emit(.promptChanged(promptState()))
+                                        await inputPumpGate.resume()
                                     case .notACommand where modes.enterSteers:
                                         // With `enter_steers` on, Enter takes
                                         // upstream's cancel-and-send role
@@ -1483,7 +1563,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         case .submit(let generatedPrompt):
                             try await enqueue(generatedPrompt, historyText: text)
                             await inputPumpGate.resume()
-                        case .handled, .notACommand:
+                        case .drain, .handled, .notACommand:
+                            // `.drain` mid-turn: the fallback prompt waits at
+                            // the front; the queue drains at turn end.
                             try await emit(.promptChanged(promptState()))
                             await inputPumpGate.resume()
                         }
@@ -1536,28 +1618,66 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
     }
 
-    /// Buffer `/btw` outside the prompt queue.
+    /// Dispatch a mid-turn interjection — the port of `dispatch_interject`
+    /// (app/dispatch/interject.rs:44-119) fused with the shell's
+    /// `SessionCommand::Interject` decision (run_loop.rs:1962-1989), because
+    /// this port is single-process.
     ///
-    /// The Swift runtime cannot hand a side question to a sampler that already
-    /// committed to a turn, so `/btw` holds the text until the next prompt and
-    /// frames it with `formatInterjection`. Enter-steers deliberately does not
-    /// use this soft-interjection path; upstream defines it as cancel-and-send
-    /// (`defaults.rs:630-632`).
-    private func interject(_ text: String, kind: InterjectionKind) async throws {
-        interjections.push(KindedInterjection(kind: kind, text: text))
+    /// The optimistic user-block echo and the "Interjection sent" toast copy
+    /// paint at dispatch regardless of turn state, exactly as upstream's
+    /// pager does; the running/idle split only decides delivery. Running:
+    /// the seam buffers the text into the live turn and the turn loop merges
+    /// it at the next safe drain point. Idle (or the running check lost the
+    /// race with turn end): the text becomes its own front-of-queue prompt
+    /// turn, and `.drain` tells an idle caller to kick the queue — the port
+    /// of `maybe_start_running_task` after the fallback enqueue
+    /// (run_loop.rs:1984-1988).
+    private func interject(_ text: String) async throws -> SlashOutcome {
         recordHistory(text)
         editor.reset()
         try await emit(.promptChanged(promptState()))
-        try await emit(.notice(
-            "Held for the running turn — it will lead the next prompt."
-        ))
+        try await emit(.interjected(text: text))
+        try await emit(.notice("Interjection sent"))
+        if let interjectionSeam, await interjectionSeam.deliver(text) {
+            return .handled
+        }
+        try await queueInterjectionFallbackPrompt(text)
+        return .drain
     }
 
-    /// Fold any buffered interjections into the front of `prompt`.
-    private func withInterjections(_ prompt: String) -> String {
-        let drained = drainKindedFormatted(interjections)
-        guard !drained.isEmpty else { return prompt }
-        return (drained.map(\.formatted.text) + [prompt]).joined(separator: "\n\n")
+    /// Convert an interjection with no running turn into a queued prompt
+    /// turn at the FRONT of the queue — send-now semantics: the user asked
+    /// for "now", queued rows asked for "later". The port of
+    /// `queue_interjection_fallback_prompt` (interjection.rs:46-99). The
+    /// raw text rides as the prompt, never the `formatInterjection`
+    /// envelope — upstream's fallback blocks carry the bare text too
+    /// (interjection.rs:53). Upstream re-validates front placement against a
+    /// running front row; this port's queue never contains the running
+    /// prompt (`beginNext` removes it), so a plain front insert cannot
+    /// displace one.
+    private func queueInterjectionFallbackPrompt(_ text: String) async throws {
+        let entry = QueueEntryMeta(
+            id: Self.interjectFallbackPromptPrefix + UUID().uuidString,
+            kind: "prompt",
+            text: text
+        )
+        await promptQueue.enqueueFront(entry)
+        try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
+    }
+
+    /// Flush interjections that raced past the completed (or failed) turn's
+    /// final drain into front-of-queue prompt turns, original order. The
+    /// port of `flush_stranded_interjections` (interjection.rs:105-116) at
+    /// the completion arm's call site (run_loop.rs:432-447). Reversed
+    /// front-inserts keep entry 0 front-most. Cancelled turns never come
+    /// here: the driver already cleared the buffer (run_loop.rs:989-991).
+    private func flushStrandedInterjections() async throws {
+        guard let interjectionSeam else { return }
+        let stranded = await interjectionSeam.collectStranded()
+        guard !stranded.isEmpty else { return }
+        for text in stranded.reversed() {
+            try await queueInterjectionFallbackPrompt(text)
+        }
     }
 
     /// Throw away everything still queued. Reserved for the ways a run *ends* —
@@ -1597,7 +1717,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 switch try await runSlashCommand(entry.text) {
                 case .submit(let generatedPrompt):
                     try await enqueue(generatedPrompt, historyText: entry.text)
-                case .quit, .handled, .notACommand:
+                case .drain, .quit, .handled, .notACommand:
+                    // `.drain`: the fallback prompt is already at the front;
+                    // this loop picks it up on the next iteration.
                     break
                 }
                 try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
@@ -1609,19 +1731,32 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // waiting are folded in — anything enqueued during the turn stays
             // for the next drain, so a fast typist cannot starve the model.
             var promptText = entry.text
+            var foldedBacklog = false
             if modes.combineQueuedPrompts {
                 let rest = await promptQueue.removeAll().map(\.text)
                 if !rest.isEmpty {
                     promptText = ([entry.text] + rest).joined(separator: "\n\n")
+                    foldedBacklog = true
                 }
             }
             try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
 
+            // A fallback interjection turn keeps its user echo persist-only:
+            // the interject dispatch already painted the text as a user
+            // block, so the renderer must not paint it a second time at turn
+            // start (upstream's `interject-fallback-` prompt-id contract,
+            // interjection.rs:20-25). Not when the combine fold changed the
+            // body — that combined text was never painted.
+            var turnMetadata = request.metadata
+            if !foldedBacklog,
+               entry.id.hasPrefix(Self.interjectFallbackPromptPrefix) {
+                turnMetadata[Self.interjectionFallbackMetadataKey] = entry.id
+            }
             let turnRequest = OpenGrokPagerRequest(
-                prompt: withInterjections(promptText),
+                prompt: promptText,
                 mode: request.mode,
                 sessionID: lastSessionID ?? request.sessionID,
-                metadata: request.metadata
+                metadata: turnMetadata
             )
             let session = try await runtime.makeSession(for: turnRequest)
             submittedPrompts.append(promptText)
@@ -1658,6 +1793,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 return .end(.cancelled)
             }
             completedTurnCount += 1
+            // Interjections that raced past the turn's final drain become
+            // front-of-queue prompt turns before `.drainNext` picks the next
+            // entry — upstream's completion-arm flush (run_loop.rs:432-447).
+            try await flushStrandedInterjections()
             try await transition(to: .editing)
             try await emit(.promptChanged(promptState()))
             return .drainNext
@@ -1688,6 +1827,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // on the generic error path too (`dispatch/prompt.rs:1622`);
             // only its dedicated-modal failures skip the drain.
             await promptQueue.completeRunning()
+            // A failed turn flushes stranded interjections exactly like a
+            // completed one — upstream's completion arm handles Err results
+            // too (run_loop.rs:416-447). Cancelled turns never reach here:
+            // the driver cleared the buffer (run_loop.rs:989-991).
+            try await flushStrandedInterjections()
             try await emit(.turnFailed(message: message))
             try await transition(to: .editing)
             try await emit(.promptChanged(promptState()))
@@ -2146,9 +2290,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             usage: "/tasks"
         ),
         // `/btw` (`slash/commands/btw.rs:12-38`). Upstream fires an ACP ext
-        // method that bypasses the prompt queue; this port maps it onto the
-        // interjection buffer, which is the same promise — the question rides
-        // ahead of the queue instead of behind it.
+        // method that bypasses the prompt queue; this port routes it through
+        // the live interjection seam — mid-turn the question merges into the
+        // RUNNING turn, idle it runs as its own front-of-queue prompt turn —
+        // the same promise: the question never waits behind the backlog.
         PagerCommandDefinition(
             name: "btw",
             summary: "Ask a side question without interrupting",
@@ -2547,6 +2692,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case handled
         case quit
         case submit(String)
+        /// The command already put work at the front of the queue (an
+        /// interjection fallback prompt) — an idle caller must kick the
+        /// drain, the port of `maybe_start_running_task` after the fallback
+        /// enqueue (run_loop.rs:1984-1988). Mid-turn callers treat it as
+        /// `.handled`: the queue drains when the running turn ends.
+        case drain
     }
 
     /// Run a slash command.
@@ -2698,12 +2849,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     try await emit(.notice("Usage: /btw <question>"))
                     return .handled
                 }
-                // Upstream's SendBtw bypasses the prompt queue (`btw.rs:3-4`).
-                // The port's equivalent out-of-band channel is the
-                // interjection buffer: the question leads the next prompt
-                // instead of queueing behind the backlog.
-                try await interject(question, kind: .followUp)
-                return .handled
+                // Recorded divergence: upstream's `/btw` is a SIDE question
+                // answered off-conversation (`x.ai/btw` →
+                // `handle_side_question`); this port routes it through the
+                // mid-turn interjection seam instead, so the question merges
+                // into the RUNNING turn as a synthetic user item — or runs
+                // as its own front-of-queue prompt turn when idle.
+                return try await interject(question)
             case "recap":
                 // Arguments are ignored — upstream's `RecapCommand::run`
                 // declares none and discards what it gets (recap.rs:34,
@@ -2989,7 +3141,6 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         activeSessionID = nil
         editor.reset()
         await promptQueue.removeAll()
-        interjections.clear()
         try await emit(.sessionReplaced(sessionID: sessionID))
     }
 
@@ -2998,8 +3149,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     ///
     /// A refused resume is a notice, not a run failure — the current session
     /// is untouched on every error path because the runtime mutates nothing
-    /// until its own swap succeeds. Queue and interjections are cleared like
-    /// `/new`: they were written against the conversation being left behind.
+    /// until its own swap succeeds. The queue is cleared like `/new`: it was
+    /// written against the conversation being left behind. (Interjections
+    /// need no clear here: the session-side buffer only holds entries while
+    /// a turn runs, and both swaps happen from the idle loop.)
     private func resumeStoredSession(sessionID: String) async throws {
         let resumedID: String
         do {
@@ -3014,7 +3167,6 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         activeSessionID = nil
         editor.reset()
         await promptQueue.removeAll()
-        interjections.clear()
         try await emit(.sessionResumed(sessionID: resumedID))
     }
 

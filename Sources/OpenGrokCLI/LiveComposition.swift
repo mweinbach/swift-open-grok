@@ -11,6 +11,7 @@ import OpenGrokHTTP
 import OpenGrokHooks
 import OpenGrokHooksPluginTypes
 import OpenGrokHunkTracker
+import OpenGrokInterjection
 import OpenGrokModels
 import OpenGrokPager
 import OpenGrokPagerCommandUI
@@ -1379,6 +1380,17 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     await controller.setPlanModeStateProvider {
                         await toolExecutor.planModeActive()
                     }
+                    // The mid-turn interjection seam: `/btw` delivers into
+                    // the RUNNING turn's buffer (drained between sampler
+                    // rounds by `LiveShellSamplingDriver`), and turn-end
+                    // stranded entries flow back for the fallback-prompt
+                    // conversion. The single-process port of `x.ai/interject`
+                    // → `SessionCommand::Interject` (run_loop.rs:1947-1990).
+                    let interjections = stack.interjections
+                    await controller.setInterjectionSeam(OpenGrokPagerInterjectionSeam(
+                        deliver: { text in await interjections.interject(text) },
+                        collectStranded: { await interjections.collectStranded() }
+                    ))
                     // Typing `/model ` drops the dropdown into the catalog, as
                     // upstream's `ModelCommand::suggest_args` does. Rows insert
                     // the provider-qualified selector, so accepting one
@@ -1900,6 +1912,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let compaction: LiveCompactionCoordinator
         let turnDriver: ProviderSessionTurnDriver
         let shell: OpenGrokShell
+        /// The mid-turn interjection seam: the controller's `/btw` dispatch
+        /// produces into it, the turn loop drains it between sampler rounds.
+        let interjections: LiveSessionInterjections
         /// Retained only so reachability tests can await the post-readiness
         /// launch update check; production callers ignore it.
         let launchAutoUpdateTask: Task<Void, Never>?
@@ -2332,6 +2347,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             sessionID: foundation.sessionID,
             openGrokHome: foundation.openGrokHome
         )
+        let interjections = LiveSessionInterjections()
         let turnDriver = ProviderSessionTurnDriver(
             sampler: LiveShellSamplingDriver(
                 modelSwitch: modelSwitch,
@@ -2341,7 +2357,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 skillsListing: LiveSkills.listing(foundation.discoveredSkills),
                 toolSurface: toolSurface,
                 codeMode: codeMode,
-                compaction: compaction
+                compaction: compaction,
+                interjections: interjections
             )
         )
         let shell = OpenGrokShell(configuration: OpenGrokShellConfiguration(
@@ -2359,6 +2376,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             compaction: compaction,
             turnDriver: turnDriver,
             shell: shell,
+            interjections: interjections,
             launchAutoUpdateTask: launchAutoUpdateTask,
             announcements: announcements
         )
@@ -5295,6 +5313,10 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     /// so a test can build a driver without a model catalog; a live session
     /// always has one, and without it a long session dies at the wall.
     let compaction: LiveCompactionCoordinator?
+    /// Mid-turn interjection buffer, drained between sampler rounds. The
+    /// producer is the interactive controller's `/btw` dispatch through the
+    /// installed seam.
+    let interjections: LiveSessionInterjections
 
     func sample(
         context: OpenGrokShellProviderTurnContext,
@@ -5310,11 +5332,28 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         // following prompt's point.
         let services = toolExecutor.sessionServices
         await services?.beginPrompt(text: request.text)
+        // Interjections may merge into this turn from here on — the port of
+        // `current_prompt_id` becoming Some for the Interject arm's
+        // running-turn check (run_loop.rs:1968-1974).
+        await interjections.beginTurn()
         do {
             let result = try await sampleTurn(context: context, request: request, emit: emit)
+            // Buffer left intact: entries that raced past the final drain are
+            // flushed into prompt turns by the controller (run_loop.rs:432-447).
+            await interjections.endTurn()
             await services?.endPrompt()
             return result
         } catch {
+            if error is CancellationError {
+                // Upstream's Cancel arm clears pending interjections — a
+                // cancelled turn has nothing to inject into (run_loop.rs:989-991).
+                await interjections.cancelTurn()
+            } else {
+                // A failed turn still flushes stranded interjections into
+                // prompt turns, exactly like a completed one — upstream's
+                // completion arm handles Err results too (run_loop.rs:416-447).
+                await interjections.endTurn()
+            }
             await services?.endPrompt()
             throw error
         }
@@ -5397,6 +5436,14 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         do {
             while true {
                 try Task.checkCancellation()
+                // Mid-turn interjections land at the top of every sampler
+                // round. Upstream drains right before each request is built
+                // (turn.rs:2413) AND immediately after tool results land
+                // (tool_calls.rs:509); in this loop those are the same point,
+                // because control re-enters here after `executeToolCalls`.
+                // Before compaction on purpose: the injected user item must
+                // count toward the budget like everything else.
+                items.append(contentsOf: await drainPendingInterjections())
                 // Before every sample, not only the first: a tool round can add
                 // more to the prompt than the whole preceding turn did, and the
                 // request that dies at the context wall is usually the one after a
@@ -5465,10 +5512,28 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             continue
                         }
                     }
+                    // Pre-completion drain (turn.rs:2956-2959): an
+                    // interjection that arrived during the final sampler
+                    // round gets one more round instead of missing the turn.
+                    let preCompletion = await drainPendingInterjections()
+                    if !preCompletion.isEmpty {
+                        items.append(contentsOf: preCompletion)
+                        continue
+                    }
                     try await conversationHistory.commit(
                         sessionID: context.sessionID,
                         items: items
                     )
+                    // Late drain during turn-end bookkeeping
+                    // (turn.rs:2968-2973): the commit above is this port's
+                    // `finalize_turn_bookkeeping`, and an interjection that
+                    // landed during it still merges into THIS turn. The next
+                    // commit re-saves the record with the extra items.
+                    let late = await drainPendingInterjections()
+                    if !late.isEmpty {
+                        items.append(contentsOf: late)
+                        continue
+                    }
                     return OpenGrokShellSamplingResult(
                         output: response.output,
                         stopReason: response.stopReason
@@ -5521,6 +5586,25 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             }
         }
         return "unknown"
+    }
+
+    /// Drain all pending interjections into synthetic user items — the port
+    /// of `drain_pending_interjections` (interjection.rs:290-338): FIFO, one
+    /// item per entry, never merged, never appended to tool results, each
+    /// wrapped by the shared `formatInterjection` and tagged
+    /// `syntheticReason: .interjection` so compaction, replay, and analytics
+    /// see the steering text as its own user turn.
+    ///
+    /// Deliberately narrower than upstream, both recorded divergences:
+    /// upstream's image-placeholder sanitizer (interjection.rs:304-305) has
+    /// nothing to strip here — this port's interjection path carries no
+    /// image placeholders — and the `<skill_information>` expansion for
+    /// `/skill` interjections (interjection.rs:239-279) is unported, so a
+    /// slash-prefixed interjection reaches the model as bare text.
+    private func drainPendingInterjections() async -> [ConversationItem] {
+        await interjections.drainAll().map { entry in
+            .interjection(formatInterjection(entry.text))
+        }
     }
 
     /// Keep the prompt under the model's context window, reporting what it did.
@@ -6188,9 +6272,14 @@ private struct LivePagerConversationState {
         return markdown.render(text)
     }
 
-    mutating func startTurn(prompt: String) {
+    mutating func startTurn(prompt: String, paintUserBlock: Bool = true) {
         toolIndicesByCallID.removeAll(keepingCapacity: true)
-        items.append(.message(PagerMessage(role: .user, text: prompt)))
+        // `paintUserBlock: false` is the interjection-fallback turn: the
+        // dispatch already painted the text as a user block, so the turn's
+        // own echo stays persist-only (interjection.rs:20-25).
+        if paintUserBlock {
+            items.append(.message(PagerMessage(role: .user, text: prompt)))
+        }
         items.append(.message(PagerMessage(
             role: .assistant,
             text: "",
@@ -6948,7 +7037,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 hasStartedFirstTurn = true
                 overlays.dismiss(id: "welcome")
             }
-            conversation.startTurn(prompt: request.prompt)
+            conversation.startTurn(
+                prompt: request.prompt,
+                // An interjection-fallback turn's text was already painted at
+                // dispatch; a second user block here would duplicate it.
+                paintUserBlock: request.metadata[
+                    OpenGrokPagerInteractiveController.interjectionFallbackMetadataKey
+                ] == nil
+            )
             turnActivity = "Thinking\u{2026}"
             turnStartedAt = Date()
             turnStartedAtSeconds = motion.seconds
@@ -6971,6 +7067,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await applyResumedSession(sessionID: sessionID)
         case .notice(let message):
             appendMessage(PagerMessage(role: .system, text: message))
+        case .interjected(let text):
+            // The mid-turn interjection echo: a standard user prompt block,
+            // upstream's `RenderBlock::interjection_prompt`
+            // (acp_handler/mod.rs:743-745).
+            appendMessage(PagerMessage(role: .user, text: text))
         case .focusChanged(let region):
             switch region {
             case .scrollback:

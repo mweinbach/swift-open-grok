@@ -298,6 +298,41 @@ request artifacts or conv-id stamp. The auto arm (watermark, idle gate) is out o
 by design. **Flagged for future slices:** `memory_model` and `fork_secondary_model`
 settings rows share the dead-storage-path defect fixed here for `recap_model`.
 
+### E5 — true mid-turn interjection (serial gate: exit 0, 4,537 tests, zero issues; 2026-08-08)
+
+Closes Wave 16 item 6. A session-side buffer (`LiveSessionInterjections` actor) drains at
+upstream's four points — top of every sampler round (upstream's before-request and
+after-tool-results drains are one point here, since the loop re-enters the top after
+tools; deliberately BEFORE compaction so injected items count toward the budget), the
+pre-completion drain (an interjection during the final round gets one more round), and
+the late drain during turn-end bookkeeping — injecting synthetic user items
+(`syntheticReason: .interjection`) that persist at turn commit. `/btw` reroutes through
+the controller→session seam (the single-process stand-in for `x.ai/interject`): mid-turn
+it merges into the running turn with a user-block echo; idle or stranded it becomes an
+`interject-fallback-`-prefixed front-of-queue prompt (upstream's
+`flush_stranded_interjections` at the completion and `.turnFailed` arms); cancellation
+drops the buffer (run_loop.rs:989-991). The old hold-until-next-prompt buffer and its
+"Held for the running turn" copy are gone. `formatInterjection` verified drift-free
+against upstream's `format_interjection` (byte-length gate, scalar-walk truncation,
+identical envelope). 11 tests across three seams (format pins, session-actor wire tests
+with a canned tool-round sampler asserting the round-2 items array, live typed `/btw`).
+
+**Brief departure, delegate-verified and lead-re-verified:** the brief asked to reroute
+Enter-steers through the seam; upstream's steer is cancel-and-send
+(`Action::SendPromptNow`, `agent_view/prompt.rs:616-631`), which the port already
+matches (Wave 14 steering honesty) — rerouting would have invented UX upstream lacks.
+Upstream's other `Action::Interject` producers (queue force-interject, queued-row
+edit-save, plan review comments) have no port surfaces yet; the seam is ready for them.
+
+**Recorded divergences:** `/btw` remains a divergence, upgraded — upstream answers it
+off-conversation as a side question in a panel; the port injects into the conversation
+(now genuinely mid-turn). Skill expansion at the interjection seam unported. Drained
+interjections persist at turn commit, not at injection (a turn cancelled after a drain
+loses them with the rest of the turn's items — existing port-wide behavior). Fallback id
+is UUIDv4 behind the byte-identical prefix. The leader-client pager installs no seam, so
+`/btw` there degrades to the idle fallback. The auth-retry inner loop re-samples without
+re-draining.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was

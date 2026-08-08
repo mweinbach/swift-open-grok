@@ -538,6 +538,14 @@ public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {
     /// restored transcript instead of the welcome screen.
     case sessionResumed(sessionID: String)
     case notice(String)
+    /// A mid-turn interjection was dispatched: paint the text as a standard
+    /// user prompt block WITHOUT starting a turn. The port of upstream's
+    /// optimistic local echo at interject dispatch plus the
+    /// `x.ai/session/interjection` broadcast every pane renders as
+    /// `RenderBlock::interjection_prompt` (app/dispatch/interject.rs:84-91,
+    /// acp_handler/mod.rs:713-746). Single-pane, so there is no broadcast to
+    /// dedup — this one event IS the echo.
+    case interjected(text: String)
     /// The user moved the transcript viewport.
     case viewport(OpenGrokPagerViewportCommand)
     /// Keyboard focus moved between the composer and the scrollback. The
