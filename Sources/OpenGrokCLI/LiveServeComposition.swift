@@ -103,8 +103,12 @@ public enum LiveServeComposition {
 
         // Built once and shared by every connection. This is what upstream's
         // persistent `MvpAgent` gives it (`server.rs:293-302`): reconnecting
-        // must not rebuild the sampler stack or re-read credentials.
-        let promptDriver = try await services.makePromptDriver(
+        // must not rebuild the sampler stack or re-read credentials. The
+        // full components — prompt driver AND extension router — are built
+        // together so the ws:// carrier serves the same ext-method surface
+        // stdio serves (upstream's server bridges into the same agent, so
+        // `open-grok/*` and `x.ai/*` methods work identically on both).
+        let launchComponents = try await services.makeComponents(
             LiveACPLaunch(
                 workingDirectory: cwd,
                 openGrokHome: home,
@@ -113,6 +117,7 @@ public enum LiveServeComposition {
                 options: CLIExecutionOptions(mode: .acp, common: options.common)
             )
         )
+        let promptDriver = launchComponents.promptDriver
 
         // Shared across reconnects so a session created on one connection is
         // still addressable on the next. `DefaultOpenGrokShellACPRuntimeFactory`
@@ -134,7 +139,8 @@ public enum LiveServeComposition {
                 ACPAgentRuntime(
                     store: store,
                     promptDriver: promptDriver,
-                    workspaceBoundary: boundary
+                    workspaceBoundary: boundary,
+                    extensionHandler: launchComponents.extensionHandler
                 )
             },
             log: { message in context.streams.err("open-grok: \(message)\n") }

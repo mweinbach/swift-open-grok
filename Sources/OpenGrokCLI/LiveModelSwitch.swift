@@ -349,6 +349,20 @@ enum LiveModelSwitchOutcome: Sendable, Equatable {
     case failed(modelID: String, message: String)
 }
 
+/// What a mid-session credential rebind did
+/// (`LiveModelSwitchCoordinator.rebindCredential`).
+enum LiveCredentialRebindOutcome: Sendable, Equatable {
+    /// The session is on a different provider; its sampler holds no
+    /// credential of the applied provider, so there is nothing to rebind.
+    case notActive(activeProvider: ModelProvider)
+    /// The active route re-resolved and the sampler was swapped; the next
+    /// sampling request carries the freshly resolved credential.
+    case rebound(provider: ModelProvider)
+    /// Resolution or sampler construction failed; the previous sampler and
+    /// its previous credential remain live.
+    case failed(message: String)
+}
+
 struct LiveModelSwitchSummary: Sendable, Equatable {
     /// The wire model name now being sent. This is what the composer's border
     /// shows, so it has to be the name the provider actually receives.
@@ -568,6 +582,58 @@ actor LiveModelSwitchCoordinator {
         ))
     }
 
+    /// Re-resolve the ACTIVE model's credential from its stores and swap the
+    /// sampler, without changing model, effort, or tier.
+    ///
+    /// This is the port's live-session half of
+    /// `open-grok/{provider}/models/apply`. Upstream needs no explicit rebind
+    /// for the resident root session because its provider stack re-reads the
+    /// stored key at use time (`api_key_for_base_url` →
+    /// `stored_api_key()` reads disk per call, fireworks_models.rs:113-140);
+    /// only spawn-captured subagent samplers get cancelled
+    /// (acp_agent.rs:3835-3850). This port's sampler captures the key when
+    /// the sampler is BUILT (the E6 measurement: a static API-key session
+    /// kept the old key until a re-pick or restart), so the same observable
+    /// contract — "the next sampling request carries the applied key" —
+    /// requires rebuilding the sampler here.
+    ///
+    /// Fail-closed like `apply`: nothing mutates unless resolution AND
+    /// sampler construction succeed. In particular, applying a CLEARED key
+    /// leaves the old sampler (and its old credential) live and reports the
+    /// failure — the session is not torn down mid-turn, matching upstream,
+    /// where a resident root session also keeps working until its next
+    /// credential read fails.
+    func rebindCredential(provider: ModelProvider) async -> LiveCredentialRebindOutcome {
+        let active = sampling
+        guard active.provider == provider else {
+            return .notActive(activeProvider: active.provider)
+        }
+        let modelID = activeCatalogID(for: active) ?? active.model
+        let resolution: LiveModelResolution
+        do {
+            resolution = try await resolver.resolve(
+                modelID: modelID,
+                effort: active.reasoningEffort,
+                serviceTier: active.serviceTier
+            )
+        } catch let error as LiveModelSwitchError {
+            return .failed(message: error.description)
+        } catch {
+            return .failed(message: String(describing: error))
+        }
+        let rebuilt: OpenGrokLiveSampler
+        do {
+            rebuilt = try makeSampler(resolution.sampling)
+        } catch {
+            return .failed(message: String(describing: error))
+        }
+        // Same model and provider by construction: no history reconcile and
+        // no Code Mode invalidation — only the credential route changed.
+        sampling = resolution.sampling
+        sampler = rebuilt
+        return .rebound(provider: provider)
+    }
+
     /// Whether the (post-switch) active model still advertises a fast tier —
     /// the second conjunct of `fast_mode_enabled` (acp/model_state.rs:232-237).
     private func resolvedEntrySupportsFast(
@@ -696,33 +762,73 @@ final class LiveModelCatalogStore: @unchecked Sendable {
     /// different home would gate publishes on a key nobody stored.
     private let environment: [String: String]
     private let openGrokHome: URL
+    /// Retained so a Kimi endpoint switch can rebuild the partition actors
+    /// against the SAME transport the boot set used — upstream rebuilds its
+    /// `kimi_client` inside `apply_config` (agent/models.rs:1029-1043), and
+    /// a rebuild over a different transport would silently unhook the
+    /// hermetic transport a test (or offline composition) injected.
+    private let catalogTransport: any ModelCatalogTransport
+    /// The service the LIVE Kimi partition actor is currently built against —
+    /// the port of `effective_kimi_endpoint` (the endpoint of the resident
+    /// `kimi_client`, agent/models.rs:1172-1174). Guarded by `lock`.
+    private var liveKimiEndpoint: KimiApiEndpoint
 
     init(
         input: CatalogResolutionInput,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        openGrokHome: URL? = nil
+        openGrokHome: URL? = nil,
+        transport: any HTTPTransport = URLSessionHTTPTransport()
     ) {
         let home = openGrokHome ?? Self.resolveOpenGrokHome(environment: environment)
         self.environment = environment
         self.openGrokHome = home
-        let credentialResolver = LiveCredentialResolver(
-            environment: environment,
-            openGrokHome: home
-        )
-        let broker = LiveModelCatalogCredentialBroker(
-            resolver: credentialResolver,
-            environment: environment
-        )
-        let refreshers = LiveCatalogRefreshers.live(
-            transport: LiveModelCatalogHTTPTransport(transport: URLSessionHTTPTransport()),
-            broker: broker,
-            grokHome: home,
-            environment: environment
-        )
+        let catalogTransport = LiveModelCatalogHTTPTransport(transport: transport)
+        self.catalogTransport = catalogTransport
+        // The boot refreshers honor the configured `[models] kimi_endpoint`
+        // rather than assuming Platform, so `effective` == `selected` from
+        // the first fetch (upstream's client is likewise built from
+        // `cfg.models.kimi_endpoint`).
+        let bootKimiEndpoint = input.models.kimiEndpoint
+        self.liveKimiEndpoint = bootKimiEndpoint
         manager = ModelsManager(
             input: input,
             credentials: Self.credentialSnapshot(environment: environment, openGrokHome: home),
-            liveCatalogs: refreshers
+            // Explicit, never defaulted: the manager's own cache managers
+            // otherwise resolve against the PROCESS environment
+            // (`OpenGrokStatePaths.stateDirectory(ProcessInfo...)`), and
+            // `clearPartition(.codex)` deletes the codex cache file — a
+            // hermetic composition handed a temp home must never reach the
+            // user's real `~/.opengrok` (AGENTS §2's ambient-default footgun).
+            grokHome: home,
+            liveCatalogs: Self.buildRefreshers(
+                transport: catalogTransport,
+                environment: environment,
+                openGrokHome: home,
+                kimiEndpoint: bootKimiEndpoint
+            )
+        )
+    }
+
+    private static func buildRefreshers(
+        transport: any ModelCatalogTransport,
+        environment: [String: String],
+        openGrokHome: URL,
+        kimiEndpoint: KimiApiEndpoint
+    ) -> LiveCatalogRefreshers {
+        let broker = LiveModelCatalogCredentialBroker(
+            resolver: LiveCredentialResolver(
+                environment: environment,
+                openGrokHome: openGrokHome
+            ),
+            environment: environment,
+            kimiEndpoint: kimiEndpoint
+        )
+        return LiveCatalogRefreshers.live(
+            transport: transport,
+            broker: broker,
+            grokHome: openGrokHome,
+            kimiEndpoint: kimiEndpoint,
+            environment: environment
         )
     }
 
@@ -749,6 +855,114 @@ final class LiveModelCatalogStore: @unchecked Sendable {
     /// gate still applies.
     func applyFireworksCatalog(_ catalog: FireworksModelsCatalog?) {
         manager.applyFireworksCatalog(catalog)
+    }
+
+    // MARK: ACP credential-family seams
+    //
+    // Backings for the `open-grok/*/models/*` extension methods
+    // (`LiveModelsACPHandler`), mirroring the upstream handlers'
+    // models-manager calls at the acp_agent.rs:3794+ dispatch.
+
+    /// The catalog key of the tracked session model — upstream's
+    /// `current_model_id()` (agent/models.rs:1232-1234), which every family
+    /// payload embeds as `models.currentModelId`.
+    func currentModelID() -> String {
+        manager.currentModel().id
+    }
+
+    /// One live partition refetch, publish-gated by the manager. The
+    /// `open-grok/{provider}/models/apply` handlers call this AFTER
+    /// `refreshCredentialSnapshot()`, mirroring upstream's
+    /// `refresh_*_models` half of `apply_*_credential_change`
+    /// (agent/models.rs:708-715 fireworks; :781-788 deepseek; :847-854
+    /// meta; :924-931 opencode-go; :990-997 wafer).
+    func refreshPartition(_ partition: ModelCatalogPartition) async -> LiveCatalogRefreshOutcome {
+        await manager.refreshPartition(partition)
+    }
+
+    /// The forced-online Codex refresh behind `open-grok/codex/models/refresh`
+    /// (`refresh_codex_models(true)`, acp_agent.rs:3796-3800).
+    func refreshCodexForced() async -> LiveCatalogRefreshOutcome {
+        await manager.refreshCodexBlocking(forceOnline: true)
+    }
+
+    /// The clear arm of the family (`clear_*_models`); returns upstream's
+    /// "was there anything to clear" bool. Discardable because the
+    /// no-usable-key arm of `apply_*_credential_change` drops it upstream
+    /// too (`self.clear_fireworks_models();`, agent/models.rs:712) — it is
+    /// a had-anything report, not a success/failure status.
+    @discardableResult
+    func clearPartition(_ partition: ModelCatalogPartition) -> Bool {
+        manager.clearPartition(partition)
+    }
+
+    /// Whether the applied provider currently has a usable credential, from
+    /// the SAME env+store inputs the partition broker resolves with — the
+    /// port of `has_usable_api_key` deciding refresh-vs-clear in
+    /// `apply_*_credential_change` (agent/models.rs:708-715). Env keys
+    /// resolve unconditionally; a stored key counts only for the partition's
+    /// own (trusted) endpoint, exactly like the broker's fetch-time resolve.
+    func hasUsableCredential(for partition: ModelCatalogPartition) async -> Bool {
+        let kimiEndpoint = lock.withLock { liveKimiEndpoint }
+        let broker = LiveModelCatalogCredentialBroker(
+            resolver: LiveCredentialResolver(
+                environment: environment,
+                openGrokHome: openGrokHome
+            ),
+            environment: environment,
+            kimiEndpoint: kimiEndpoint
+        )
+        return await broker.credential(for: partition) != nil
+    }
+
+    /// Apply a Kimi service selection: swap the config knob, rebuild the
+    /// partition actors at the new service's base URL, then attempt a live
+    /// `/models` refresh — the port of `apply_kimi_endpoint`
+    /// (agent/models.rs:1029-1043; both services support the query,
+    /// kimi_models.rs:231-236).
+    func applyKimiEndpoint(_ endpoint: KimiApiEndpoint) async -> LiveCatalogRefreshOutcome {
+        manager.applyKimiEndpointSelection(endpoint)
+        guard manager.kimiEndpointSelection() == endpoint else {
+            // Upstream's readback bail (agent/models.rs:1034-1036). The
+            // Swift knob-swap cannot currently reject, so this arm is
+            // unreachable today; it stays so a future validating
+            // `applyKimiEndpointSelection` fails loudly here instead of
+            // refreshing against a service the manager refused.
+            return LiveCatalogRefreshOutcome(
+                partition: .kimi,
+                published: false,
+                failure: "Kimi endpoint change was rejected by model catalog validation"
+            )
+        }
+        manager.updateLiveCatalogRefreshers(Self.buildRefreshers(
+            transport: catalogTransport,
+            environment: environment,
+            openGrokHome: openGrokHome,
+            kimiEndpoint: endpoint
+        ))
+        lock.withLock { liveKimiEndpoint = endpoint }
+        return await manager.refreshPartition(.kimi)
+    }
+
+    /// The service the live Kimi partition actor is on
+    /// (`effective_kimi_endpoint`, agent/models.rs:1172-1174).
+    func effectiveKimiEndpoint() -> KimiApiEndpoint {
+        lock.withLock { liveKimiEndpoint }
+    }
+
+    /// OpenCode Go settings surface (`opencode_go_models` /
+    /// `opencode_go_enabled_models` / `apply_opencode_go_enabled_models`,
+    /// agent/models.rs:999-1023).
+    func openCodeGoDescriptors() -> [OpenCodeGoModelDescriptor] {
+        manager.openCodeGoDescriptors()
+    }
+
+    func openCodeGoEnabledModels() -> [String] {
+        manager.openCodeGoEnabledModels()
+    }
+
+    func applyOpenCodeGoEnabledModels(_ enabledModels: [String]) {
+        manager.applyOpenCodeGoEnabledModels(enabledModels)
     }
 
     /// Record a completed live model switch, mirroring the tail of upstream's
@@ -902,6 +1116,11 @@ private struct LiveModelCatalogHTTPTransport: ModelCatalogTransport {
 private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
     let resolver: LiveCredentialResolver
     let environment: [String: String]
+    /// The Kimi service this broker resolves for. Platform and Code carry
+    /// non-interchangeable keys and endpoints (kimi_models.rs:26-34), so the
+    /// broker built for one service must not hand its key to the other's
+    /// base URL after an endpoint switch.
+    var kimiEndpoint: KimiApiEndpoint = .platform
 
     func credential(for partition: ModelCatalogPartition) async -> ProviderCatalogCredential? {
         let provider = partition.provider
@@ -930,8 +1149,16 @@ private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
 
     private func environmentKey(for provider: ModelProvider) -> String? {
         if provider == .kimi {
-            return environment[KimiModels.platformAPIKeyEnv]
-                ?? environment[KimiModels.codeAPIKeyEnv]
+            switch kimiEndpoint {
+            case .platform:
+                // Preserves the pre-endpoint-switch fallback chain the boot
+                // path always used; Code is strict because its key must not
+                // be inferred from the Platform variable.
+                return environment[KimiModels.platformAPIKeyEnv]
+                    ?? environment[KimiModels.codeAPIKeyEnv]
+            case .code:
+                return environment[KimiModels.codeAPIKeyEnv]
+            }
         }
         let key: String?
         switch provider {
@@ -960,7 +1187,7 @@ private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
         case .codex:
             return CodexModels.defaultInferenceBaseURL
         case .kimi:
-            return KimiModels.apiBaseURL(.platform, environment: environment)
+            return KimiModels.apiBaseURL(kimiEndpoint, environment: environment)
         case .fireworks:
             return FireworksModels.apiBaseURL(environment: environment)
         case .deepSeek:

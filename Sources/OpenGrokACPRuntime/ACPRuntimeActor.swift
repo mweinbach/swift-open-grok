@@ -665,14 +665,13 @@ public actor ACPAgentRuntime {
 // Upstream dispatches ACP extension methods through a name-indexed match
 // (`crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs:3794-4471`).
 // This router is the Swift seam for the same shape: exact-name handlers plus
-// optional prefix families, first-match dispatch, and `methodNotFound` for
-// anything unmatched.
+// optional prefix families, first-match dispatch, and upstream's terminal
+// unknown-method error for anything unmatched.
 //
-// Intended consumers (later slices — not registered here):
-//   * `open-grok/codex/models/*`, `open-grok/kimi/models/*`,
-//     `open-grok/fireworks/models/apply` — model refresh/apply family
-//   * `x.ai/mcp/*` — MCP bridge extension methods
-//   * other `x.ai/*` vendor extensions beyond feedback
+// Registered by the live composition (`LiveACPExtensionMethods.swift`):
+// `x.ai/feedback` and the `open-grok/*/models` credential family. Remaining
+// upstream families (`x.ai/mcp/*`, session admin, btw/recap, …) belong to
+// their own slices; until they land they fall through to the terminal arm.
 
 public struct ACPExtensionMethodRouter: ACPAgentExtensionHandler, Sendable {
     private enum Route: Sendable {
@@ -724,7 +723,23 @@ public struct ACPExtensionMethodRouter: ACPAgentExtensionHandler, Sendable {
                 return try await handler.handle(method: method, params: params)
             }
         }
-        throw ACPRuntimeError.methodNotFound(method)
+        throw Self.unknownExtensionMethodError(method)
+    }
+
+    /// Upstream's terminal ext-method arm, byte-exact
+    /// (`acp_agent.rs:4467-4471`): `acp::Error::method_not_found()` — code
+    /// -32601, message "Method not found" — with the method name in `data`.
+    /// This is deliberately NOT `ACPRuntimeError.methodNotFound`, whose
+    /// message embeds the method name; upstream's ext surface keeps the
+    /// standard message and puts the specifics in `data`, and clients match
+    /// on that copy. Every method this port has not implemented falls
+    /// through to here — a refusal with the right error, never a silent arm.
+    public static func unknownExtensionMethodError(_ method: String) -> AcpError {
+        AcpError(
+            code: .methodNotFound,
+            message: AcpErrorCode.methodNotFound.displayName,
+            data: .string("unknown ACP extension method: \(method)")
+        )
     }
 
     public func handle(method: String, params: JSONValue) async throws -> JSONValue {

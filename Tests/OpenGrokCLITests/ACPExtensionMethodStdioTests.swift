@@ -177,8 +177,11 @@ struct ACPExtensionMethodStdioTests {
             Issue.record("expected error response, got \(response)")
             return
         }
+        // Upstream's terminal ext-method arm, byte-exact (acp_agent.rs:
+        // 4467-4471): standard message, method name in `data`.
         #expect(error?.code == .methodNotFound)
-        #expect(error?.message == "Method not found: x.ai/mcp/list")
+        #expect(error?.message == "Method not found")
+        #expect(error?.data == .string("unknown ACP extension method: x.ai/mcp/list"))
 
         await host.shutdown()
     }

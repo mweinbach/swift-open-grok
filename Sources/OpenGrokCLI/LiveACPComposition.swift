@@ -60,7 +60,12 @@ public struct LiveACPServices: Sendable {
         }
     }
 
-    fileprivate func makeComponents(
+    /// Internal (not fileprivate): `LiveServeComposition` builds the same
+    /// components so the ws:// carrier serves the same extension-method
+    /// surface stdio serves — a serve host that silently dropped the router
+    /// would answer every `open-grok/*`/`x.ai/*` method "unknown" while the
+    /// stdio agent answered them, an untestable carrier divergence.
+    func makeComponents(
         _ launch: LiveACPLaunch
     ) async throws -> LiveACPLaunchComponents {
         try await makeComponentsOperation(launch)

@@ -164,7 +164,12 @@ public final class ModelsManager: @unchecked Sendable {
     private let codexCache: CodexModelsCacheManager
     private let xaiTransport: any XaiModelsTransport
     private let codexTransport: any CodexModelsTransport
-    private let liveCatalogs: LiveCatalogRefreshers
+    // Mutable (under `lock`) because a Kimi endpoint switch must rebuild the
+    // Kimi partition actor at the new service's base URL — upstream rebuilds
+    // its `kimi_client` inside `apply_config` (agent/models.rs:1029-1043).
+    // A fixed refresher set would leave `open-grok/kimi/endpoint/apply`
+    // refreshing against the OLD service while reporting the new one.
+    private var liveCatalogs: LiveCatalogRefreshers
 
     public init(
         input: CatalogResolutionInput = .default,
@@ -252,7 +257,17 @@ public final class ModelsManager: @unchecked Sendable {
     }
 
     /// Partition actors, for the refresh entry points in `LiveCatalogRefresh.swift`.
-    var liveCatalogRefreshers: LiveCatalogRefreshers { liveCatalogs }
+    var liveCatalogRefreshers: LiveCatalogRefreshers {
+        lock.withLock { liveCatalogs }
+    }
+
+    /// Swap the partition actors — the Kimi endpoint switch's rebuild seam
+    /// (upstream rebuilds `kimi_client` in `apply_config`,
+    /// agent/models.rs:1029-1043). Callers pass a full set built by
+    /// `LiveCatalogRefreshers.live`, so no partition is silently dropped.
+    public func updateLiveCatalogRefreshers(_ refreshers: LiveCatalogRefreshers) {
+        lock.withLock { liveCatalogs = refreshers }
+    }
 
     /// The Kimi service partition a published live catalog belongs to.
     /// Platform and Code are non-interchangeable, so the snapshot records which.
@@ -394,6 +409,109 @@ public final class ModelsManager: @unchecked Sendable {
         self.waferCatalog = catalog
         lock.unlock()
         reassemble()
+    }
+
+    /// Drop ONE provider's live catalog partition, report whether anything
+    /// was actually dropped, and reselect if the current model vanished.
+    ///
+    /// Port of upstream's per-provider `clear_*_models` family
+    /// (`agent/models.rs:556-570` codex, `:623-634` kimi, `:692-703`
+    /// fireworks, `:768-779` deepseek, `:834-845` meta, `:911-922`
+    /// opencode-go, `:977-988` wafer): take the partition, rebuild, reselect
+    /// if the current model is gone. Codex is the only partition with a
+    /// disk cache; its arm also invalidates that cache and its `Bool` ORs
+    /// in `had_cache` (`:560-562`), so "cleared: true" is honest when only
+    /// the file existed. Upstream's per-partition generation counters are
+    /// not ported — this manager serializes partition publishes under one
+    /// lock, so the logout/publish race the counters guard cannot occur;
+    /// the fingerprint gates in `apply*Catalog` still reject a stale-key
+    /// publish.
+    @discardableResult
+    public func clearPartition(_ partition: ModelCatalogPartition) -> Bool {
+        lock.lock()
+        let hadCatalog: Bool
+        var hadCache = false
+        switch partition {
+        case .codex:
+            hadCatalog = codexCatalog != nil
+            codexCatalog = nil
+            hadCache = FileManager.default.fileExists(atPath: codexCache.path.path)
+        case .kimi:
+            hadCatalog = kimiCatalog != nil
+            kimiCatalog = nil
+        case .fireworks:
+            hadCatalog = fireworksCatalog != nil
+            fireworksCatalog = nil
+        case .deepSeek:
+            hadCatalog = deepSeekCatalog != nil
+            deepSeekCatalog = nil
+        case .meta:
+            hadCatalog = metaCatalog != nil
+            metaCatalog = nil
+        case .openCodeGo:
+            hadCatalog = openCodeGoCatalog != nil
+            openCodeGoCatalog = nil
+        case .wafer:
+            hadCatalog = waferCatalog != nil
+            waferCatalog = nil
+        }
+        lock.unlock()
+        if partition == .codex {
+            codexCache.invalidate()
+        }
+        reassemble()
+        reselectAfterFetch(wasFirstFetch: false)
+        return hadCatalog || hadCache
+    }
+
+    /// The `[models] kimi_endpoint` selection driving embedded-catalog
+    /// assembly — the read half of `kimi_endpoint()`
+    /// (`agent/models.rs:1168-1170`).
+    public func kimiEndpointSelection() -> KimiApiEndpoint {
+        lock.withLock { input.models.kimiEndpoint }
+    }
+
+    /// Apply a Kimi service selection to the resident catalog: swap the
+    /// config knob and rebuild the embedded partition synchronously, exactly
+    /// the config half of upstream's `apply_kimi_endpoint`
+    /// (`agent/models.rs:1029-1036` — `cfg.models.kimi_endpoint = endpoint;
+    /// self.apply_config(cfg)`). The live-refresh half stays with the caller,
+    /// which must also swap the partition actors (`updateLiveCatalogRefreshers`)
+    /// before refreshing, or the refresh hits the old service.
+    public func applyKimiEndpointSelection(_ endpoint: KimiApiEndpoint) {
+        lock.lock()
+        input.models.kimiEndpoint = endpoint
+        lock.unlock()
+        reassemble()
+        reselectAfterFetch(wasFirstFetch: false)
+    }
+
+    /// The configured OpenCode Go allowlist
+    /// (`opencode_go_enabled_models`, agent/models.rs:1008-1015).
+    public func openCodeGoEnabledModels() -> [String] {
+        lock.withLock { input.models.opencodeGoEnabledModels }
+    }
+
+    /// Port of `apply_opencode_go_enabled_models` (agent/models.rs:1017-1023):
+    /// sort + dedupe, swap the config knob, rebuild, reselect if the current
+    /// model fell out of the allowlist.
+    public func applyOpenCodeGoEnabledModels(_ enabledModels: [String]) {
+        var enabled = enabledModels
+        enabled.sort()
+        var seen = Set<String>()
+        enabled.removeAll { !seen.insert($0).inserted }
+        lock.lock()
+        input.models.opencodeGoEnabledModels = enabled
+        lock.unlock()
+        reassemble()
+        reselectAfterFetch(wasFirstFetch: false)
+    }
+
+    /// The unfiltered OpenCode Go catalog descriptors for Settings
+    /// (`opencode_go_models`, agent/models.rs:999-1006): empty when the
+    /// partition has never been fetched.
+    public func openCodeGoDescriptors() -> [OpenCodeGoModelDescriptor] {
+        lock.withLock { openCodeGoCatalog?.descriptors ?? [] }
     }
 
     /// Clear provider-isolated remotes on identity change.

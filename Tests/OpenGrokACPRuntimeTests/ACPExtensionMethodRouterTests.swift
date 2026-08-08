@@ -59,7 +59,7 @@ struct ACPExtensionMethodRouterTests {
         #expect(result["token"]?.stringValue == "exact")
     }
 
-    @Test("unknown methods surface methodNotFound through the runtime")
+    @Test("unknown methods surface upstream's terminal ext error through the runtime")
     func unknownMethod() async throws {
         let router = ACPExtensionMethodRouter()
             .register(exact: "x.ai/feedback", handler: StubExtensionHandler(token: "feedback", result: .null))
@@ -81,8 +81,12 @@ struct ACPExtensionMethodRouterTests {
             Issue.record("expected protocol error")
             return
         }
+        // Byte-exact upstream terminal arm (acp_agent.rs:4467-4471): the
+        // standard "Method not found" message with the specifics in `data`,
+        // NOT the runtime's method-in-message spelling.
         #expect(error?.code == .methodNotFound)
-        #expect(error?.message == "Method not found: x.ai/unregistered")
+        #expect(error?.message == "Method not found")
+        #expect(error?.data == .string("unknown ACP extension method: x.ai/unregistered"))
     }
 
     @Test("empty router leaves extension methods unhandled")

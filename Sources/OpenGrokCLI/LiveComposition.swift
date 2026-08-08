@@ -2492,11 +2492,20 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     await foundation.toolExecutor.shutdown()
                 }
             )
-            let extensionRouter = ACPExtensionMethodRouter()
-                .register(
-                    exact: LiveFeedbackACPHandler.method,
-                    handler: LiveFeedbackACPHandler(composition: foundation.feedback)
+            // The ext-method surface (acp_agent.rs:3794+ dispatch): feedback
+            // plus the `open-grok/*/models` credential family, bound to THIS
+            // stack's catalog store and switch coordinator so an applied key
+            // reaches the running session's sampler, not a parallel copy.
+            // Unregistered methods get upstream's unknown-method error from
+            // the router's terminal arm — see LiveACPExtensionMethods.swift
+            // for the full routed/refused table.
+            let extensionRouter = LiveACPExtensionRouter.build(
+                feedback: LiveFeedbackACPHandler(composition: foundation.feedback),
+                models: LiveModelsACPHandler(
+                    catalogStore: stack.catalogStore,
+                    modelSwitch: stack.modelSwitch
                 )
+            )
             return LiveACPLaunchComponents(
                 promptDriver: promptDriver,
                 extensionHandler: extensionRouter

@@ -478,6 +478,46 @@ in OpenGrokToolTypes still uses `.sortedKeys` (unused by the live path; flagged)
 workflow children are not on the mailbox (upstream's would be); follow-up loss window
 at child exit shared with upstream.
 
+### E10 — ACP extension router + credential family with live rebind (serial gate: exit 0, 4,657 tests, zero issues; 2026-08-08)
+
+Closes roadmap Wave 15 items 1-2 and the recorded Wave 12 deferral. The ext-method
+router serves the full upstream table (`acp_agent.rs:3794-4472`) on BOTH carriers
+(stdio and the ws:// serve host, which previously dropped the router entirely): 13
+methods routed to real backings — the `open-grok/{provider}/models/apply|refresh|clear`
+family for fireworks/deepseek/meta/wafer/opencode-go, codex refresh/clear, kimi
+query/clear and `kimi/endpoint/apply` (config swap + refresher rebuild at the new
+service's base URL — Kimi key saves ride this method upstream), plus the pre-existing
+`x.ai/feedback` — and 76 methods refused fail-closed with upstream's byte-exact
+unknown-method error, each pinned by name. **The slice persists no keys** (upstream's
+client persists before calling apply); the handler re-reads the store, refreshes or
+clears the partition per the usable-credential probe (the SAME trust ladder the broker
+fetches with — stored keys released only to the provider's official host, no gate
+widened), and REBINDS the running session: the coordinator re-resolves the active
+model and swaps the sampler fail-closed (same model/provider by construction — no
+history reconcile, no Code Mode invalidation), so an applied key reaches the next
+sampling request without restart. A rebind failure surfaces in the response's
+`warning` field — the silent case announces itself. The ws:// e2e pins the whole
+contract: `Bearer fw-old` → apply → catalog refetch under `fw-new` → next prompt's
+sampling request carries `fw-new`.
+
+**Bonus fix (latent footgun, the §2 process-default family):** `LiveModelCatalogStore`
+built its `ModelsManager` without `grokHome`, so cache managers resolved against the
+PROCESS environment — a hermetic test's codex-cache clear would have deleted the real
+user's cache. Now pinned. Boot refreshers also honor configured `[models]
+kimi_endpoint` instead of assuming Platform.
+
+**Recorded divergences:** the rebind is a sampler rebuild (upstream's resident session
+re-reads stored keys per call and needs none; its spawn-captured subagents get a
+provider-scoped cancel the port lacks — a resident child keeps its credential until it
+finishes); the `models` payload omits upstream's provider-auth availability filter and
+`_meta` capability block (belongs with the ACP session-surface slice); refusals use the
+unknown-method copy for methods upstream knows (a probing peer cannot distinguish
+unimplemented from nonexistent, but always gets a well-formed fail-closed error);
+`x.ai/recap` stays refused despite the E4 backing (the ACP runtime has no notification
+path from an ext handler — acking while dropping the summary would be a silent no-op);
+`x.ai/mcp/auth_trigger` stays refused (the E7 CLI verb owns that seam). Wave 15 items
+3-7 remain, now behind an honest router.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was
