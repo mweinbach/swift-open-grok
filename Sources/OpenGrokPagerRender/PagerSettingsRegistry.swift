@@ -472,11 +472,11 @@ private let contextualHintsChildren = [
 public let pagerDefaultSettings: [PagerSettingMeta] = {
     var rows: [PagerSettingMeta] = []
 
-    // MARK: Appearance (9 — upstream 17 minus 8 without live readers)
+    // MARK: Appearance (10 — upstream 17 minus 7 without live readers)
 
     rows += [
         // Hidden until the renderer reads them (config round-trips; modal omits):
-        // `show_timeline`, `page_flip_on_send`,
+        // `page_flip_on_send`,
         // `simple_mode`, `render_mermaid`, `max_thoughts_width`, `show_thinking_blocks`,
         // `group_tool_verbs`, `collapsed_edit_blocks`.
         //
@@ -521,6 +521,26 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             keywords: ["timestamps", "time", "clock", "date"],
             kind: .bool(default: true),
             storage: .config(path: "ui.show_timestamps")
+        ),
+        // `show_timeline` follows `show_timestamps`, upstream's Appearance
+        // order (`defs.rs:672-686`); label, description, and keywords are
+        // upstream's verbatim. The default is `false` — the rail is opt-in
+        // (`defs.rs:680-681`: `ui_default.show_timeline_enabled()`, whose
+        // single source is `SHOW_TIMELINE_DEFAULT = false`,
+        // `ui_config.rs:392`). Hidden in minimal mode like upstream
+        // (`defs.rs:684-685`: minimal has no interactive scrollback pane
+        // for the rail). The renderer reads it in `renderPagerFrame` (rail
+        // reserve + tick/chevron paint replacing the scrollbar), so it is a
+        // live row, not a registered no-op.
+        PagerSettingMeta(
+            key: "show_timeline",
+            category: .appearance,
+            label: "Timeline sidebar",
+            description: "Per-turn tick rail in place of the scrollbar: hover previews a turn, click jumps to it.",
+            keywords: ["timeline", "sidebar", "ticks", "turns", "navigator", "rail"],
+            kind: .bool(default: false),
+            storage: .config(path: "ui.show_timeline"),
+            hiddenInMinimal: true
         ),
         PagerSettingMeta(
             key: "vim_mode",

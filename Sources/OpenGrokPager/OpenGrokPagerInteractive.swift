@@ -324,6 +324,15 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// carries the same toggle semantics with no target state — the exact
     /// shape `.toggleCompactMode` established.
     case toggleTimestamps
+    /// `/timeline` — flip `[ui] show_timeline`, the per-turn tick rail in
+    /// the scrollbar's gutter. Upstream computes the new value itself and
+    /// dispatches the typed `Action::SetTimeline(!current)`
+    /// (`slash/commands/timeline.rs:31-34` → `set_timeline`,
+    /// `dispatch/settings/setters.rs:1574-1590`); same no-target-state
+    /// toggle shape as `.toggleTimestamps`. Upstream's
+    /// `ModeSupport::FullscreenOnly` gate (`timeline.rs:21-25`) lives with
+    /// the render layer, which is the side that knows the session's mode.
+    case toggleTimeline
     /// `/workflows` — the background workflow-run overlay.
     case workflows
     /// `Ctrl+P` and `/help`'s upstream target (`OpenCommandPalette`) — every

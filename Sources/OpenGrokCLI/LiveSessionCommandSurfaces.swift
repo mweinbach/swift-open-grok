@@ -29,16 +29,20 @@ enum LiveJumpPicker {
     /// the answer is scroll to that block. Carrying the index the caller already
     /// needs removes a lookup that could go stale between building the overlay
     /// and acting on it — the transcript grows while a modal is open.
+    ///
+    /// The turn list is `pagerTimelineTurnBlockIndices` — the same
+    /// enumeration the timeline rail's geometry partitions — so the two
+    /// navigators can never disagree about what a turn is (upstream's
+    /// counterpart: both `/jump` and the rail read `ScrollbackState::turns`,
+    /// `dispatch/jump.rs:22` and `agent_view/render.rs:1209-1213`).
     static func overlay(items: [PagerConversationItem]) -> PagerOverlay {
         var rows: [PagerListRow] = []
-        var turn = 0
-        for (index, item) in items.enumerated() {
-            guard case .message(let message) = item, message.role == .user else { continue }
-            turn += 1
+        for (turn, index) in pagerTimelineTurnBlockIndices(items).enumerated() {
+            guard case .message(let message) = items[index] else { continue }
             rows.append(PagerListRow(
                 id: String(index),
                 label: LivePagerOverlayText.singleLine(message.text),
-                detail: "turn \(turn)"
+                detail: "turn \(turn + 1)"
             ))
         }
         return PagerOverlay.list(

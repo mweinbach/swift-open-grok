@@ -589,6 +589,16 @@ public struct PagerRenderState: Sendable, Equatable {
     /// composition's explicit pass-through — including the absent-config
     /// default of `true` — is pinned by `LiveTimestampsTests`.
     public var showTimestamps: Bool
+    /// `[ui] show_timeline` — upstream's `appearance.show_timeline`
+    /// (`appearance/config.rs:36-37`), the timeline sidebar's per-turn tick
+    /// rail in place of the scrollbar. Like `showTimestamps` this IS the
+    /// user value (`set_timeline_inner`, `setters.rs:1561-1572` copies it
+    /// straight across); the rail's own eligibility gates (terminal width,
+    /// turn count, scrollbar config, row budget) are applied at the paint
+    /// site, never folded into this flag. The default is `false` — opt-in,
+    /// `SHOW_TIMELINE_DEFAULT` (`ui_config.rs:392`) — so unlike
+    /// `showTimestamps` the init default below is also the semantic one.
+    public var showTimeline: Bool
 
     public init(
         size: TerminalSize,
@@ -606,7 +616,8 @@ public struct PagerRenderState: Sendable, Equatable {
         overlays: PagerOverlayStack = PagerOverlayStack(),
         motion: PagerMotionSnapshot = PagerMotionSnapshot(),
         compactMode: Bool = false,
-        showTimestamps: Bool = false
+        showTimestamps: Bool = false,
+        showTimeline: Bool = false
     ) {
         self.overlays = overlays
         self.selectedBlockIndex = selectedBlockIndex
@@ -624,6 +635,7 @@ public struct PagerRenderState: Sendable, Equatable {
         self.motion = motion
         self.compactMode = compactMode
         self.showTimestamps = showTimestamps
+        self.showTimeline = showTimeline
     }
 }
 
@@ -641,6 +653,14 @@ public struct PagerFrameLayout: Sendable, Equatable {
     public var visibleContentLines: Range<Int>
     public var scrollOffset: Int
     public var hasScrollbar: Bool
+    /// The timeline rail this frame painted, exposed for mouse hit-testing
+    /// the same way `overlays` is — upstream computes the geometry once per
+    /// frame and both the renderer and `mouse.rs` consume that one value so
+    /// they cannot drift (`views/timeline.rs:5-6`; the click resolution is
+    /// `mouse.rs:415-427`). `nil` = no rail this frame (setting off, too few
+    /// turns, narrow terminal, short viewport, or scrollbar config off), so
+    /// a router never acts on a previous frame's geometry.
+    public var timelineRail: PagerTimelineRail?
 
     public init(
         bounds: TerminalRect,
@@ -655,7 +675,8 @@ public struct PagerFrameLayout: Sendable, Equatable {
         totalContentLines: Int,
         visibleContentLines: Range<Int>,
         scrollOffset: Int,
-        hasScrollbar: Bool
+        hasScrollbar: Bool,
+        timelineRail: PagerTimelineRail? = nil
     ) {
         self.bounds = bounds
         self.statusBar = statusBar
@@ -670,6 +691,7 @@ public struct PagerFrameLayout: Sendable, Equatable {
         self.visibleContentLines = visibleContentLines
         self.scrollOffset = scrollOffset
         self.hasScrollbar = hasScrollbar
+        self.timelineRail = timelineRail
     }
 }
 

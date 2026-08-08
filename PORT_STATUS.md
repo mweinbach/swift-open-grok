@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-08 (Wave 17 E20: `/timestamps` live — createdAt stamps, rewind-sidecar resume instants, unhidden settings row)
+**As of:** 2026-08-08 (Wave 17 E21: `/timeline` rail live — chrome-reader trio complete: compact_mode, show_timestamps, show_timeline)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `70002584da34e4c37ea14a3bce35341b7d04f9a7` (re-pinned **2026-08-06** from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05`; +3 commits, release `v0.1.220-open-grok.57` — the Meta API provider delta: `0f8dc87b` provider, `666b2ceb` login/settings, `70002584` stored-key unlock fix. The prior 2026-08-05 re-pin moved from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`; before that the 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08); the pinned commit is reachable in `/Users/mweinbach/Projects/open-grok` history — read it via `git show 70002584:<path>` / `git grep <pat> 70002584 -- crates` (crates prefixed `crates/codegen/`), NOT that clone's working tree, which sits one substantive commit newer (`650c1db7`, release `.58`).
@@ -755,10 +755,55 @@ collision instead of overpainting; `arg_placeholder` "on/off" has no port channe
 `PagerRenderState.showTimestamps` init-defaults `false` (semantic default `true` rides
 the live pass-through, pinned).
 
-### Chrome readers remaining (`/timeline`) — queued
+### E21 — `/timeline` rail live (serial gate: exit 0, 4,980 tests, zero issues)
 
-Last of the three: a new rail module replacing the scrollbar gutter (turns already
-enumerated by `/jump`), unhiding its Wave-13-hidden settings row.
+The last chrome reader; the trio is closed. `PagerTimelineRail.swift` is a near
+line-for-line port of `views/timeline.rs` (verified at the pin): `RAIL_WIDTH 2` /
+`MIN_TERMINAL_WIDTH 60` / `MIN_TURNS 2` (`:18-25`), `compute_rail` windowing/centering
+(`:109-168`), whole-width hit-testing (`:187-204`), and `chevron_target` derived from the
+same fields that dim the chevrons so display and action cannot disagree (`:177-183`),
+plus the viewport reads from `scrollback/state/timeline.rs:83-137` (active = last prompt
+at/above the viewport top; ▲ strictly-above — upstream's stuck-▲ fix; ▼ next-below)
+partitioned over the prompt blocks' first painted line indices —
+`makeConversationLines` grew into `makeConversationLayout` returning per-block start
+lines, the port's `virtual_y`. The rail REPLACES the scrollbar in its gutter
+(`agent_view/render.rs:1737-1749`), takes 2 columns out of the wrap width, is forced off
+by scrollbar-config-off (`views/agent.rs:364-368`) and by viewports under 3 rows, and is
+gated to fullscreen at the frame pass-through (`agent_view/render.rs:1157` — the rail
+render path exists only there; the port's inline mode rides the same frame builder, so
+without the gate a config-on would paint a rail into the inline strip). THE turn
+enumeration is `pagerTimelineTurnBlockIndices`, now consumed by both the rail and
+`LiveJumpPicker` — one list, two navigators, no drift (upstream: both read
+`ScrollbackState::turns`). Click-to-jump is wired through per-frame geometry published
+on `PagerFrameLayout.timelineRail` (replace-wholesale like overlay bounds, so a click
+never acts on a stale frame), resolving via `chevron_target` and jumping through the
+same `revealBlock` seam `/jump` uses; capturing overlays block the rail; dim-chevron
+clicks are consumed without acting. `/timeline` (copy verbatim, between `/timestamps`
+and `/toggle-mouse-reporting`) refuses in inline mode BEFORE any flip or persist with
+upstream's `ModeSupport::FullscreenOnly` refusal byte-parity (`mode_support.rs:38-57`,
+verified), then toggles + persists with rollback; toast `✓ Timeline sidebar: on|off`
+(plain arm). Startup hydrates `showTimeline ?? false` (opt-in, `SHOW_TIMELINE_DEFAULT`);
+modal commit live-flips; reset re-derives `false`; the row is unhidden after
+`show_timestamps` with `defs.rs:672-686` copy verbatim (verified), `hiddenInMinimal:
+true`. 32 net-new tests (geometry/viewport/paint, controller pins, live persistence +
+startup + modal-flip + click-to-jump in isolated homes).
+
+**Recorded divergences (each in-source):** hover is not ported — no bright
+hovered tick/chevron and no tick preview popup (`views/timeline.rs:224-237,255-263,
+275-357`); they need the mouse position at paint time, the same missing channel E20
+recorded (cost: no pointer feedback or preview; clicks still jump; the row description
+keeps upstream's "hover previews a turn" verbatim per parity rules, so it over-promises).
+No over-scroll on jump: `revealBlock` clamps to `maximumOffset`, so trailing-turn clicks
+scroll to bottom rather than prompt-to-top (pre-existing `/jump` behavior). Click does
+not select/focus the prompt entry. `/timeline` registers in both modes and refuses at
+dispatch rather than hiding from inline completions (the `/jump`/`/find` precedent).
+`is_subagent_view` gate vacuously false (no subagent scrollback view). Legacy-ConHost
+glyph fallbacks not ported (the `PagerGlyphs` table's standing policy).
+
+**Chrome readers: complete.** All three Wave-13-hidden rows with readers
+(`compact_mode`, `show_timestamps`, `show_timeline`) are now live; the hidden list
+retains only `page_flip_on_send`, `simple_mode`, `render_mermaid`, `max_thoughts_width`,
+`show_thinking_blocks`, `group_tool_verbs`, `collapsed_edit_blocks`.
 
 ## Wave 16 — Pager surfaces, first parallel worktree batch (2026-08-08)
 

@@ -2482,10 +2482,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Show MCP server status",
             usage: "/mcps"
         ),
-        // `/timestamps` immediately before `/toggle-mouse-reporting`,
-        // upstream's display order (`slash/commands/mod.rs:137-139`; the one
-        // upstream row between them, `/timeline`, is not yet ported, and
-        // `/imagine`/`/imagine-video` before it are CLI-layer commands in
+        // `/timestamps`, `/timeline`, `/toggle-mouse-reporting` — upstream's
+        // display order, three adjacent rows (`slash/commands/mod.rs:137-139`;
+        // `/imagine`/`/imagine-video` before them are CLI-layer commands in
         // this port). Name, description, and usage verbatim
         // (`timestamps.rs:12-23`); no aliases upstream. Upstream's
         // `arg_placeholder` "on/off" (`timestamps.rs:25-27`) has no
@@ -2495,6 +2494,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             name: "timestamps",
             summary: "Toggle message timestamps on/off",
             usage: "/timestamps"
+        ),
+        // Copy verbatim from `timeline.rs:13-19,27-29`; no aliases and no
+        // `arg_placeholder` upstream. Upstream's
+        // `ModeSupport::FullscreenOnly` (`timeline.rs:21-25`) has no
+        // `PagerCommandDefinition` channel; the mode gate lives with the
+        // render layer's toggle handler, the `/jump` precedent.
+        PagerCommandDefinition(
+            name: "timeline",
+            summary: "Toggle the timeline sidebar",
+            usage: "/timeline"
         ),
         PagerCommandDefinition(
             name: "toggle-mouse-reporting",
@@ -3388,6 +3397,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 // persist path, so the intent carries no target state.
                 try await emit(.overlay(.toggleTimestamps))
                 return .handled
+            case "timeline":
+                // Arguments are ignored — upstream's `TimelineCommand::run`
+                // declares `_args` and computes the toggle itself from the
+                // cached value (`timeline.rs:31-34`), so `/timeline on` is
+                // the same toggle, never a setter. The fullscreen-only gate
+                // rides with the toggle handler on the render side, which is
+                // the half that knows the session's mode.
+                try await emit(.overlay(.toggleTimeline))
+                return .handled
             case "toggle-mouse-reporting":
                 try await emit(.overlay(.toggleMouseReporting))
                 return .handled
@@ -3618,6 +3636,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /tutorial                 Quick tips
       /workflows                Show workflow runs
       /timestamps               Toggle message timestamps on/off
+      /timeline                 Toggle the timeline sidebar
       /toggle-mouse-reporting   Toggle mouse reporting (native copy/paste)
       /quit   /exit             Quit the application
 

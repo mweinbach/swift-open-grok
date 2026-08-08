@@ -189,6 +189,17 @@ public enum PagerGlyphs {
     public static let emptyDot = "\u{25CB}"         // ○
     public static let ballotX = "\u{2717}"          // ✗
 
+    /// Timeline rail glyphs (`glyphs.rs:279-285,291-297,320-329`;
+    /// `views/timeline.rs:262-264`). Upstream's legacy-ConHost fallbacks
+    /// (`▲`/`▼`/`══`) have no port seam — every `PagerGlyphs` constant here
+    /// is the non-legacy form, the pre-existing policy of this table.
+    public static let timelineChevronUp = "\u{25B4}"            // ▴
+    public static let timelineChevronDown = "\u{25BE}"          // ▾
+    public static let timelineTickActive = "\u{2501}\u{2501}"   // ━━
+    /// Short dim tick in the rightmost cell (precomposed pad + light
+    /// horizontal, `views/timeline.rs:262-264`).
+    public static let timelineTickIdle = " \u{2500}"            // " ─"
+
     /// Modal windows use a square border (`Borders::ALL` with the default
     /// border type), unlike the composer's rounded box.
     public static let modalTopLeft: Character = "\u{250C}"      // ┌

@@ -34,17 +34,18 @@ struct PagerTimestampsCommandTests {
         #expect(command.usage == "/timestamps")
     }
 
-    @Test("/timestamps sits immediately before /toggle-mouse-reporting, upstream's display order")
-    func registeredBeforeToggleMouseReporting() {
+    @Test("/timestamps sits immediately before /timeline, upstream's display order")
+    func registeredBeforeTimeline() {
         // slash/commands/mod.rs:137-139: timestamps, timeline,
-        // toggle_mouse_reporting — /timeline is not yet ported, so the pin is
-        // direct adjacency until it lands between them.
+        // toggle_mouse_reporting — all three ported, so the pin is the full
+        // adjacent triple (the /timeline half is in
+        // PagerTimelineCommandTests).
         let names = OpenGrokPagerInteractiveController.builtinCommands.map(\.name)
         let timestampsIndex = names.firstIndex(of: "timestamps")
-        let mouseIndex = names.firstIndex(of: "toggle-mouse-reporting")
-        #expect(timestampsIndex != nil && mouseIndex != nil)
-        if let timestampsIndex, let mouseIndex {
-            #expect(mouseIndex == timestampsIndex + 1)
+        let timelineIndex = names.firstIndex(of: "timeline")
+        #expect(timestampsIndex != nil && timelineIndex != nil)
+        if let timestampsIndex, let timelineIndex {
+            #expect(timelineIndex == timestampsIndex + 1)
         }
     }
 

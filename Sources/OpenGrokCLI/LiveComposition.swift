@@ -7278,6 +7278,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// would hit-test against an overlay that is not on screen.
     private var overlays = PagerOverlayStack()
     private var lastOverlayBounds: [PagerOverlayBounds] = []
+    /// The timeline rail the last frame painted, refreshed alongside
+    /// `lastOverlayBounds` on the same replace-wholesale rule: upstream
+    /// computes the geometry once per frame and mouse routing consumes that
+    /// one value (`views/timeline.rs:5-6`, `mouse.rs:415-427`), so a frame
+    /// with no rail clears this and a click can never act on a previous
+    /// frame's ticks.
+    private var lastTimelineRail: PagerTimelineRail?
     private let permissionCoordinator: PagerPermissionCoordinator?
     /// The `ask_user_question` surface, presenter-installed in `begin()`
     /// exactly like the permission coordinator. `nil` in compositions with
@@ -7367,6 +7374,16 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// `userCompactMode` there is no derivation — the render value IS the
     /// user value, passed straight into every frame.
     private var userShowTimestamps = true
+    /// `[ui] show_timeline` — upstream's `appearance.show_timeline`
+    /// (`appearance/config.rs:36-37`), hydrated from the effective config at
+    /// construction (`event_loop.rs:1497`: `initial_config.show_timeline =
+    /// load_show_timeline()`) and flipped by `/timeline` and the settings
+    /// modal (`set_timeline_inner`, `setters.rs:1561-1572`). Like
+    /// timestamps, no derivation — but the frame flag is gated on fullscreen
+    /// at the pass-through, because upstream's rail render path exists only
+    /// in the fullscreen agent view (`agent_view/render.rs:1157`; minimal
+    /// mode has no interactive scrollback pane for it).
+    private var userShowTimeline = false
 
     /// Mouse. `linesPerEvent` folds the terminal's reports-per-notch into a
     /// per-report line count, which is the whole of the port's wheel handling —
@@ -7499,6 +7516,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // `TIMESTAMPS_DEFAULT = true` (`appearance/cache.rs:28`), the same
         // `unwrap_or(true)` every upstream read applies.
         userShowTimestamps = uiConfig.showTimestamps ?? true
+        // `[ui] show_timeline` hydrates the same way (`event_loop.rs:1497`
+        // via `load_show_timeline`, `appearance/cache.rs:122-134`). The key
+        // is `Option<bool>` (`ui_config.rs:114`) and ABSENT MEANS OFF — the
+        // rail is opt-in, `SHOW_TIMELINE_DEFAULT = false` (`ui_config.rs:392`,
+        // the single source `show_timeline_enabled()` resolves through).
+        userShowTimeline = uiConfig.showTimeline ?? false
         let autoDark = Self.themeKind(from: uiConfig.autoDarkTheme)
         let autoLight = Self.themeKind(from: uiConfig.autoLightTheme)
         self.autoDarkThemeKind = autoDark
@@ -8204,6 +8227,50 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // conditional arm, unlike compact's. Mapped onto a transcript
             // note like every toast in this port.
             note("\u{2713} Timestamps: \(userShowTimestamps ? "on" : "off")")
+        case .toggleTimeline:
+            // Upstream's `ModeSupport::FullscreenOnly` refusal, byte-parity
+            // with `mode_support.rs:47-51` over `timeline.rs:21-25`'s
+            // remedy: in minimal mode the command errors BEFORE any flip or
+            // persist, so the config never changes from a mode that cannot
+            // paint the rail. (`.inline` is this port's minimal-shaped
+            // surface — the `/jump` gate above draws the same line.)
+            guard mode == .fullScreen else {
+                note("/timeline isn't available in minimal mode (the timeline rail needs the interactive scrollback pane). Run /fullscreen to switch this session.")
+                return
+            }
+            // The toggle: upstream computes `!load_show_timeline()` and
+            // dispatches `Action::SetTimeline` (`timeline.rs:31-34`), which
+            // flips both the `current_ui` snapshot and the appearance value
+            // the rail renders from (`set_timeline_inner`,
+            // `setters.rs:1561-1572`). The next paint reads the new value.
+            userShowTimeline.toggle()
+            // Persist `[ui] show_timeline` through the same store the
+            // settings modal writes — upstream's
+            // `Effect::PersistSetting{key: "show_timeline"}`
+            // (`setters.rs:1586-1590`) lands via `set_show_timeline`
+            // (`settings_writes.rs:241-245`). A failed write rolls the
+            // in-memory flip back, upstream's `rollback_value` semantics.
+            let timelineStore = PagerSettingsStore(
+                configPath: openGrokHome.appendingPathComponent("config.toml")
+            )
+            do {
+                try timelineStore.write(
+                    key: "show_timeline",
+                    value: .bool(userShowTimeline)
+                )
+            } catch {
+                userShowTimeline.toggle()
+                appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Could not save show_timeline: \(error)"
+                ))
+                return
+            }
+            // Toast copy from `set_timeline` (`setters.rs:1586`):
+            // `save_success_toast("Timeline sidebar", new)` (`ui.rs:89-92`)
+            // — plain arm like timestamps', no conditional. Mapped onto a
+            // transcript note like every toast in this port.
+            note("\u{2713} Timeline sidebar: \(userShowTimeline ? "on" : "off")")
         case .workflows:
             guard let workflowRegistry else {
                 appendMessage(PagerMessage(
@@ -10325,7 +10392,31 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             return nil
         }
 
-        guard event.kind == .down, event.resolvedButton == .left, let hit else { return nil }
+        guard event.kind == .down, event.resolvedButton == .left else { return nil }
+        // The timeline rail's click-to-jump (`mouse.rs:415-427`): resolve the
+        // hit through the same `pagerTimelineChevronTarget` that dimmed the
+        // chevrons at paint time, then jump through the `/jump` seam — both
+        // roads go through the one turn enumeration and the one reveal, so a
+        // tick click and a picker row cannot land differently. A capturing
+        // overlay blocks the rail exactly as upstream's modals do
+        // (`overlay_blocks_rail_hover`, `agent_view/render.rs:1195-1200`);
+        // a click on the rail that resolves no target (dim chevron, gap row)
+        // is consumed without acting (`mouse.rs:424-426`).
+        if hit == nil, !overlays.isActive, let rail = lastTimelineRail,
+           rail.rect.contains(x: event.x, y: event.y)
+        {
+            if let railHit = rail.hit(x: event.x, y: event.y),
+               let turnIndex = pagerTimelineChevronTarget(rail, railHit)
+            {
+                let turnBlocks = pagerTimelineTurnBlockIndices(conversation.items)
+                if turnBlocks.indices.contains(turnIndex) {
+                    try? revealBlock(at: turnBlocks[turnIndex])
+                    try renderState()
+                }
+            }
+            return nil
+        }
+        guard let hit else { return nil }
         if let close = hit.closeButton, close.contains(x: event.x, y: event.y) {
             overlays.dismiss(id: hit.id)
             if currentPermissionRequestID.map({ "permission:\($0)" }) == hit.id {
@@ -10388,6 +10479,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 // command reaches, so the very next paint reads the new
                 // value. The persist half is the shared store write below.
                 userShowTimestamps = flag
+                await applySettingsEvent(event)
+                return
+            }
+            if key == "show_timeline" {
+                // Same routing for the timeline rail — upstream's modal
+                // commit maps `("show_timeline", Bool) → Action::SetTimeline`
+                // (`ui.rs:1209`) into the same `set_timeline` the slash
+                // command reaches (`ui.rs:1506`: `set_timeline_inner`), so
+                // the very next paint reads the new value. The persist half
+                // is the shared store write below.
+                userShowTimeline = flag
                 await applySettingsEvent(event)
                 return
             }
@@ -10587,6 +10689,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 // `Option<bool>` with `None` read as on (`ui_config.rs:110`,
                 // `defs.rs:666-667` `unwrap_or(true)`).
                 if key == "show_timestamps" { userShowTimestamps = true }
+                // Same path for the timeline rail (`ui.rs:1506`:
+                // `set_timeline_inner`); the default is `false` — opt-in,
+                // `SHOW_TIMELINE_DEFAULT` (`ui_config.rs:392`, resolved by
+                // `show_timeline_enabled()`, the row default's single source
+                // `defs.rs:680-681`).
+                if key == "show_timeline" { userShowTimeline = false }
                 reloadCatalogInput()
             } catch PagerSettingsStoreError.notPersistable {
                 return
@@ -10682,6 +10790,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         let result = renderPagerFrame(renderState(conversation: conversation.items))
         // Fresh every frame: a modal that no longer fits publishes no bounds.
         lastOverlayBounds = result.overlays
+        lastTimelineRail = result.layout.timelineRail
         lastConversationHeight = max(1, result.layout.conversation.height)
         lastMaximumScrollOffset = max(
             0,
@@ -10894,7 +11003,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // NOT derived — upstream's appearance value IS the user setting
             // (`set_timestamps_inner`, `setters.rs:1530-1541` copies it
             // straight across; contrast the compact derivation above).
-            showTimestamps: userShowTimestamps
+            showTimestamps: userShowTimestamps,
+            // The user value gated on fullscreen, NOT a derivation of the
+            // value itself: upstream's rail render path exists only in the
+            // fullscreen agent view (`agent_view/render.rs:1157`; the
+            // minimal renderer has no scrollback pane), while this port's
+            // inline mode rides the same frame builder — without the gate a
+            // `show_timeline = true` config would paint a rail into the
+            // ≤12-row inline strip that upstream never grows.
+            showTimeline: mode == .fullScreen && userShowTimeline
         )
     }
 

@@ -16,19 +16,41 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     let chrome = makeChromeLayout(bounds: bounds, state: state, compact: compact)
 
     let baseContentWidth = max(0, chrome.conversation.width - PagerLayoutMetrics.chromeWidth)
-    var contentLines = makeConversationLines(
+    // The timeline rail's eligibility, decided BEFORE wrapping because the
+    // rail takes columns out of the wrap width. The turn list is the shared
+    // enumeration `/jump` reads too, so the two navigators cannot disagree.
+    // A disabled scrollbar config forces the rail off — it needs the
+    // scrollbar's gutter geometry (`views/agent.rs:364-368`) — and a
+    // viewport too short for 2 chevrons + 1 tick falls back to the
+    // scrollbar layout, upstream's `compute_rail` None arm re-running
+    // layout with `timeline_width: 0` (`agent_view/render.rs:1236-1268`).
+    let turnBlockIndices = pagerTimelineTurnBlockIndices(state.conversation)
+    var railWidth = state.showScrollbar
+        ? pagerTimelineRailWidth(
+            showTimeline: state.showTimeline,
+            terminalWidth: state.size.width,
+            turnCount: turnBlockIndices.count
+        )
+        : 0
+    if chrome.conversation.height < 3 { railWidth = 0 }
+    let hasTimelineRail = railWidth > 0
+
+    var conversationLayout = makeConversationLayout(
         state.conversation,
-        width: max(1, baseContentWidth),
+        width: max(1, baseContentWidth - railWidth),
         theme: state.theme,
         selectedIndex: state.selectedBlockIndex,
         motion: state.motion,
         compact: compact,
         showTimestamps: state.showTimestamps
     )
-    let hasScrollbar = state.showScrollbar && baseContentWidth > 1
-        && contentLines.count > chrome.conversation.height
+    // The rail replaces the scrollbar in its gutter while shown
+    // (`views/timeline.rs:1-2`; the paint-side half is
+    // `agent_view/render.rs:1737-1749`, `if !rail_shown { render_scrollbar }`).
+    let hasScrollbar = !hasTimelineRail && state.showScrollbar && baseContentWidth > 1
+        && conversationLayout.lines.count > chrome.conversation.height
     if hasScrollbar {
-        contentLines = makeConversationLines(
+        conversationLayout = makeConversationLayout(
             state.conversation,
             width: max(1, baseContentWidth - 1),
             theme: state.theme,
@@ -38,8 +60,9 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
             showTimestamps: state.showTimestamps
         )
     }
+    let contentLines = conversationLayout.lines
 
-    let contentWidth = max(0, baseContentWidth - (hasScrollbar ? 1 : 0))
+    let contentWidth = max(0, baseContentWidth - (hasTimelineRail ? railWidth : (hasScrollbar ? 1 : 0)))
     let visibleHeight = chrome.conversation.height
     let maximumOffset = max(0, contentLines.count - visibleHeight)
     let scrollOffset: Int
@@ -51,6 +74,28 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     }
     let visibleEnd = min(contentLines.count, scrollOffset + visibleHeight)
     let visibleRange = scrollOffset..<visibleEnd
+
+    // Rail geometry, derived AFTER the scroll offset resolves because the
+    // active turn is a viewport-top read. The prompt rows come from the same
+    // laid-out lines the frame paints, so the partition can never disagree
+    // with what is on screen (upstream partitions the layout cache's
+    // `virtual_y` the same way, `scrollback/state/timeline.rs:120-137`).
+    var timelineRail: PagerTimelineRail?
+    if hasTimelineRail {
+        let promptLineIndices = turnBlockIndices.map {
+            conversationLayout.blockStartLines[$0]
+        }
+        timelineRail = pagerComputeTimelineRail(
+            scrollbackArea: chrome.conversation,
+            railX: chrome.conversation.x + PagerLayoutMetrics.chromeWidth + contentWidth,
+            turnCount: turnBlockIndices.count,
+            viewport: pagerTimelineViewport(
+                promptLineIndices: promptLineIndices,
+                scrollOffset: scrollOffset,
+                maximumOffset: maximumOffset
+            )
+        )
+    }
 
     let layout = PagerFrameLayout(
         bounds: bounds,
@@ -65,7 +110,8 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         totalContentLines: contentLines.count,
         visibleContentLines: visibleRange,
         scrollOffset: scrollOffset,
-        hasScrollbar: hasScrollbar
+        hasScrollbar: hasScrollbar,
+        timelineRail: timelineRail
     )
 
     var buffer = CellBuffer(area: bounds)
@@ -96,6 +142,9 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         theme: state.theme,
         links: &links
     )
+    if let timelineRail {
+        renderTimelineRail(timelineRail, buffer: &buffer, theme: state.theme)
+    }
     renderTurnStatus(state.turnStatus, in: chrome.turnStatus, buffer: &buffer, theme: state.theme)
     // An active overlay owns input focus, so the composer paints unfocused and
     // surrenders the terminal cursor for as long as the stack is non-empty.
@@ -321,10 +370,43 @@ func makeConversationLines(
     compact: Bool = false,
     showTimestamps: Bool = false
 ) -> [PaintLine] {
-    guard width > 0 else { return [] }
+    makeConversationLayout(
+        items,
+        width: width,
+        theme: theme,
+        selectedIndex: selectedIndex,
+        motion: motion,
+        compact: compact,
+        showTimestamps: showTimestamps
+    ).lines
+}
+
+/// The laid-out transcript plus each block's first line index — the port's
+/// counterpart of upstream's layout cache `virtual_y` rows
+/// (`scrollback/state/layout.rs`), which the timeline rail partitions to
+/// find the viewport-top turn. One entry per item, recorded as the lines
+/// are appended so it can never drift from what paints.
+struct ConversationLayout {
+    var lines: [PaintLine]
+    var blockStartLines: [Int]
+}
+
+func makeConversationLayout(
+    _ items: [PagerConversationItem],
+    width: Int,
+    theme: PagerRenderTheme,
+    selectedIndex: Int? = nil,
+    motion: PagerMotionSnapshot = PagerMotionSnapshot(),
+    compact: Bool = false,
+    showTimestamps: Bool = false
+) -> ConversationLayout {
+    guard width > 0 else { return ConversationLayout(lines: [], blockStartLines: []) }
     var lines: [PaintLine] = []
+    var blockStartLines: [Int] = []
+    blockStartLines.reserveCapacity(items.count)
     for (index, item) in items.enumerated() {
         let blockStart = lines.count
+        blockStartLines.append(blockStart)
         switch item {
         case .message(let message):
             appendMessage(
@@ -364,7 +446,7 @@ func makeConversationLines(
             lines.append(PaintLine("", foreground: theme.textPrimary))
         }
     }
-    return lines
+    return ConversationLayout(lines: lines, blockStartLines: blockStartLines)
 }
 
 private func appendMessage(
@@ -1696,6 +1778,57 @@ private func renderConversation(
             text: isThumb ? "█" : "│",
             style: [],
             foreground: isThumb ? theme.scrollbarForeground : theme.bgLight,
+            background: theme.bgBase
+        )
+    }
+}
+
+/// Paint the timeline rail: chevrons + one tick row per windowed turn. The
+/// rail draws directly on the scrollback background — no dark track strip
+/// (`render_rail`, `views/timeline.rs:207-267`). Chevron dim state derives
+/// from the same `pagerTimelineChevronTarget` the click handler uses, so a
+/// dim chevron is guaranteed to be a no-op (`views/timeline.rs:220-223`).
+///
+/// Upstream's hover arms — the bright hovered tick/chevron
+/// (`views/timeline.rs:224-237,255-263`) and the tick preview popup
+/// (`render_tick_hover_popup`, `:275-357`) — are NOT ported: they need the
+/// mouse position at paint time, a seam `PagerRenderState` does not carry
+/// (the same missing channel recorded for `/timestamps`' hover-expanded
+/// format). Cost: the rail gives no visual feedback under the pointer and
+/// no turn preview; clicks still jump.
+private func renderTimelineRail(
+    _ rail: PagerTimelineRail,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme
+) {
+    let upEnabled = pagerTimelineChevronTarget(rail, .up) != nil
+    let downEnabled = pagerTimelineChevronTarget(rail, .down) != nil
+    // Chevrons live in the rail's rightmost cell (`views/timeline.rs:238`).
+    let chevronX = rail.rect.x + PagerTimelineMetrics.railWidth - 1
+    _ = buffer.setString(
+        x: chevronX,
+        y: rail.upY,
+        text: PagerGlyphs.timelineChevronUp,
+        style: [],
+        foreground: upEnabled ? theme.gray : theme.grayDim,
+        background: theme.bgBase
+    )
+    _ = buffer.setString(
+        x: chevronX,
+        y: rail.downY,
+        text: PagerGlyphs.timelineChevronDown,
+        style: [],
+        foreground: downEnabled ? theme.gray : theme.grayDim,
+        background: theme.bgBase
+    )
+    for (row, turnIndex) in rail.window.enumerated() {
+        let isActive = rail.active == turnIndex
+        _ = buffer.setString(
+            x: rail.rect.x,
+            y: rail.ticksY + row,
+            text: isActive ? PagerGlyphs.timelineTickActive : PagerGlyphs.timelineTickIdle,
+            style: [],
+            foreground: isActive ? theme.textPrimary : theme.grayDim,
             background: theme.bgBase
         )
     }
