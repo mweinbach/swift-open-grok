@@ -979,6 +979,7 @@ public enum PagerOverlayContent: Sendable, Equatable {
     case planApproval(PagerPlanApprovalPrompt)
     case workflows(PagerWorkflowsOverlay)
     case settings(PagerSettingsOverlay)
+    case extensions(PagerExtensionsOverlay)
 }
 
 public struct PagerOverlay: Sendable, Equatable {
@@ -1132,6 +1133,28 @@ extension PagerOverlay {
             content: .settings(settings),
             // Escape is routed into the modal, which decides whether it means
             // "back out" or "close" — see `PagerOverlayStack.handle`.
+            dismissOnEscape: false
+        )
+    }
+
+    /// `/hooks`, `/plugins`, `/marketplace`, `/skills`, and `Ctrl+L` — the
+    /// read-only extensions modal.
+    ///
+    /// The title is empty on purpose: the tab bar identifies the modal
+    /// contents (`extensions_modal.rs:3383-3384`). Footer hints are
+    /// recomputed from the modal's own state at paint time.
+    public static func extensions(
+        _ extensions: PagerExtensionsOverlay,
+        id: String = "extensions"
+    ) -> PagerOverlay {
+        PagerOverlay(
+            id: id,
+            title: "",
+            presentation: .centeredModal(PagerExtensionsMetrics.sizing),
+            hints: pagerExtensionsHints(extensions),
+            content: .extensions(extensions),
+            // Escape is routed into the modal, which decides whether it means
+            // "clear the search" or "close" — see `PagerOverlayStack.handle`.
             dismissOnEscape: false
         )
     }
@@ -1320,9 +1343,11 @@ public struct PagerOverlayStack: Sendable, Equatable {
         // The question and plan-approval sheets own it too: Esc there is an
         // *outcome* the coordinator must see (the tool is blocked on it),
         // never a dismissal.
+        // The extensions modal owns it too: with search active, Esc clears
+        // the query instead of closing.
         let ownsEscape: Bool
         switch overlay.content {
-        case .settings, .question, .planApproval: ownsEscape = true
+        case .settings, .question, .planApproval, .extensions: ownsEscape = true
         default: ownsEscape = false
         }
 
@@ -1387,6 +1412,23 @@ public struct PagerOverlayStack: Sendable, Equatable {
                 overlays[index] = overlay
                 overlays.remove(at: index)
                 return .setting(id: overlay.id, event: settingsEvent)
+            }
+        case .extensions(var extensions):
+            let result = extensions.handle(event)
+            overlay.content = .extensions(extensions)
+            switch result {
+            case .redraw:
+                outcome = .redraw
+            case .consumed:
+                outcome = .consumed
+            case .close:
+                overlays.remove(at: index)
+                return .dismissed(id: overlay.id)
+            case .reload(let tab):
+                // The overlay cannot reach the loaders; the composition
+                // rebuilds the snapshot. Rides the row-selection channel the
+                // way the workflows overlay's p/r/x already do.
+                outcome = .selected(id: overlay.id, rowID: "reload:\(tab.rawValue)")
             }
         }
 

@@ -379,9 +379,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         ///
         /// Only the ones this port routes to a real surface are bound. The
         /// unbound half of upstream's `AgentScreen` table — `Ctrl+T` todos,
-        /// `Ctrl+G` tasks, `Ctrl+B` background, `Ctrl+S` sessions, `Ctrl+L`
-        /// extensions, `Ctrl+\` dashboard — stays inert on purpose, for the
-        /// same reason the dropdown lists no no-op command.
+        /// `Ctrl+G` tasks, `Ctrl+B` background, `Ctrl+S` sessions,
+        /// `Ctrl+\` dashboard — stays inert on purpose, for the same reason
+        /// the dropdown lists no no-op command. `Ctrl+L` extensions joined
+        /// the bound half when the read-only extensions modal landed.
         static func globalAction(for event: KeyEvent) -> OpenGrokPagerGlobalCommand? {
             // `F2` carries no modifier, so it is resolved ahead of the Ctrl
             // gate (`defaults.rs:839`). The bare form only: a modified `F2` is
@@ -410,6 +411,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // force-send. The cost is no one-keystroke send-now for a full
             // composer while `enter_steers` is off.
             case "o": return .toggleAlwaysApprove
+            // `Ctrl+L` opens the extensions modal on the Plugins tab
+            // (`defaults.rs:594-613`, dispatched at
+            // `agent_view/input.rs:1266-1271`). Upstream unbinds it in the
+            // VS Code terminal family, where Ctrl+L is the interject chord;
+            // this port has no per-family key table, so the chord is bound
+            // unconditionally — recorded divergence.
+            case "l": return .openExtensions
             default: return nil
             }
         }
@@ -2287,6 +2295,33 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             name: "vim-mode",
             summary: "Toggle vim-style scrollback keybindings (j/k, h/l, g/G, y/Y, …)"
         ),
+        // `/hooks`, `/plugins`, `/marketplace`, `/skills`
+        // (`slash/commands/plugin.rs:15-106`): names, descriptions and usage
+        // verbatim, in upstream's display order after `/vim-mode`
+        // (`slash/commands/mod.rs:110-114`; upstream's `/share` neighbor is
+        // not ported). All four open the tabbed extensions modal on their
+        // tab — a read-only viewer here, so the modal advertises no
+        // add/remove/toggle/install keys (recorded divergence).
+        PagerCommandDefinition(
+            name: "hooks",
+            summary: "View hooks",
+            usage: "/hooks"
+        ),
+        PagerCommandDefinition(
+            name: "plugins",
+            summary: "View plugins",
+            usage: "/plugins"
+        ),
+        PagerCommandDefinition(
+            name: "marketplace",
+            summary: "View marketplace",
+            usage: "/marketplace"
+        ),
+        PagerCommandDefinition(
+            name: "skills",
+            summary: "View skills",
+            usage: "/skills"
+        ),
         PagerCommandDefinition(
             name: "session-info",
             summary: "Show session info"
@@ -2909,6 +2944,21 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case "mcps":
                 try await emit(.overlay(.mcpServers))
                 return .handled
+            case "hooks", "plugins", "marketplace", "skills":
+                // Arguments are ignored — upstream's four commands declare
+                // none and discard what they get (`plugin.rs:28,52,76,100`,
+                // `_args`); each dispatches `Action::OpenExtensionsModal`
+                // with its tab. The snapshots live in the render layer,
+                // which owns the loaders.
+                let tab: OpenGrokPagerExtensionsTab
+                switch command.name {
+                case "hooks": tab = .hooks
+                case "plugins": tab = .plugins
+                case "marketplace": tab = .marketplace
+                default: tab = .skills
+                }
+                try await emit(.overlay(.extensions(tab: tab)))
+                return .handled
             case "fork":
                 // The grammar runs on the raw argument tail, not the
                 // tokenizer's unquoted `arguments`: flags are recognized
@@ -3294,8 +3344,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             try await startNewSession()
         case .cyclePermissionMode, .toggleAlwaysApprove:
             try await emit(.global(command))
+        case .openExtensions:
+            // `Ctrl+L` — upstream opens the extensions modal on the Plugins
+            // tab (`agent_view/input.rs:1266-1271`).
+            try await emit(.overlay(.extensions(tab: .plugins)))
         case .toggleTodos, .toggleTasks, .sendToBackground,
-             .openDashboard, .openSessions, .openExtensions:
+             .openDashboard, .openSessions:
             // Unbound in `globalAction(for:)` until the backing surface exists.
             break
         }
@@ -3341,6 +3395,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /view-plan  /show-plan    View the current plan
       /multiline  /ml           Swap what Enter and Shift+Enter do
       /vim-mode                 Vim keys for the focused scrollback
+      /hooks                    View hooks
+      /plugins                  View plugins
+      /marketplace              View marketplace
+      /skills                   View skills
       /settings   /config       Open the settings modal
       /privacy                  Coding data, retention and training settings
       /login [provider]         Connect xAI, OpenAI Codex, or an API-key provider

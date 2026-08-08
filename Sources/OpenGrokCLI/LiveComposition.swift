@@ -7778,8 +7778,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             }
             permissionModeFlags = await permissionMode.composerFlags()
             try renderState()
+        case .openExtensions:
+            // `Ctrl+L` — upstream opens the extensions modal on the Plugins
+            // tab (`agent_view/input.rs:1266-1271`).
+            try await present(.extensions(tab: .plugins))
         case .toggleTodos, .toggleTasks, .sendToBackground, .newSession,
-             .openDashboard, .openSettings, .openSessions, .openExtensions:
+             .openDashboard, .openSettings, .openSessions:
             // Unbound in the controller's key table until the backing surface
             // exists, so these arrive only from a caller that built them by
             // hand. Nothing to do beats a misleading approximation.
@@ -8152,6 +8156,20 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 lines: LiveMCPStatusOverlay.lines(connections: mcpServers)
                     .map { PagerStyledLine(text: $0) }
             ))
+        case .extensions(let tab):
+            // `/hooks`, `/plugins`, `/marketplace`, `/skills`, `Ctrl+L` —
+            // the read-only extensions modal, every data tab snapshotted
+            // fresh from the live loaders at open. Re-running the command
+            // while open replaces the modal on the requested tab, exactly
+            // what pushing the shared id does.
+            overlays.push(.extensions(LiveExtensionsComposition.overlay(
+                tab: LiveExtensionsComposition.tab(for: tab),
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                sessionID: sessionID,
+                connections: mcpServers,
+                environment: environment
+            )))
         case .reasoningEffort(let query):
             await applyEffortCommand(query: query)
         case .fastMode:
@@ -9551,6 +9569,32 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// — only the command palette produces that. The renderer cannot run a
     /// command itself: the vocabulary and the mid-turn deferral both live in the
     /// controller, and duplicating either here is how the two would drift.
+    /// Rebuild one extensions tab's rows from its live loader and swap them
+    /// into the open modal. The row id carries the tab
+    /// (`"reload:{tab}"` — see `PagerOverlayStack.handle`'s `.extensions`
+    /// arm); an id this function does not recognize does nothing, because a
+    /// stale click must never fabricate a reload.
+    private func reloadExtensionsOverlay(rowID: String) {
+        guard rowID.hasPrefix(LiveExtensionsComposition.reloadRowPrefix),
+              let tab = PagerExtensionsTab(
+                  rawValue: String(rowID.dropFirst(LiveExtensionsComposition.reloadRowPrefix.count))
+              ),
+              let existing = overlays.overlays.first(
+                  where: { $0.id == LiveExtensionsComposition.overlayID }
+              ),
+              case .extensions(let current) = existing.content
+        else { return }
+        overlays.push(.extensions(LiveExtensionsComposition.reloaded(
+            current,
+            tab: tab,
+            workingDirectory: workingDirectory,
+            openGrokHome: openGrokHome,
+            sessionID: sessionID,
+            connections: mcpServers,
+            environment: environment
+        )))
+    }
+
     @discardableResult
     private func select(overlayID: String, rowID: String) async -> String? {
         if overlayID.hasPrefix("permission:") {
@@ -9569,6 +9613,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // refreshes the rows, it does not close the surface the user is
             // working in.
             _ = await handleWorkflowSelection(rowID: rowID)
+            return nil
+        }
+        if overlayID == LiveExtensionsComposition.overlayID {
+            // `r` reload: rebuild the active tab's rows from the live
+            // loaders and swap them in. The modal stays open and keeps its
+            // navigation state — reload is a data refresh, not a reset.
+            reloadExtensionsOverlay(rowID: rowID)
             return nil
         }
         overlays.dismiss(id: overlayID)

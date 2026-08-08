@@ -608,6 +608,77 @@ rate-limit/auth codes unported); cosmetic JSON key-order/timestamp-precision dif
 The interjection seam itself stays (the collaboration quartet still produces into it);
 only `/btw`'s routing changed.
 
+## Wave 16 — Pager surfaces, first parallel worktree batch (2026-08-08)
+
+**Parallelization incident, recorded for honesty.** This batch was the first attempt to run
+implementation slices concurrently. The `best-of-n-runner` subagents did NOT get isolated
+git worktrees as the lead assumed — `git worktree list` showed one tree — so three slices
+(`/btw`, extensions, diagnostics) wrote the SHARED main tree at once. Their file sets were
+disjoint from each other, so they did not corrupt one another, but the lead's `/btw`
+commit (`1f3be45`) used `git add -A` and swept up seven in-progress diagnostics draft
+files plus one extensions file. That commit stayed green because the extras were inert
+(the diagnostics target was not yet in `Package.swift`; the extensions overlay compiled
+unreferenced). Recovery: the lead stopped launching concurrent tree-writers, waited for
+both slices to finish, and integrated on a quiescent tree with a single authoritative
+serial gate. **Correction adopted:** real concurrent implementation needs verified
+worktree isolation, which was not present; parallelism is now limited to read-only
+research plus a single implementation track until isolation is proven.
+
+### E14 — Extensions modal, read-only (serial gate below)
+
+`/hooks`, `/plugins`, `/marketplace`, `/skills` (verbatim from `plugin.rs:15-106`, display
+order after `/vim-mode`) plus Ctrl+L open a new tabbed `.extensions` overlay
+(`PagerOverlayContent.extensions`, centered-modal sizing) fed by live snapshots: the hook
+loader (`LiveHooksComposition`), skill discovery (`LiveSkills.discover`), the plugin
+install registry, and session MCP connections. Read-only by design — NO mutation key is
+handled or advertised (upstream's add/remove/toggle/install verbs are deferred, each
+cited); Marketplace honestly defers to `open-grok plugin marketplace`; `/mcps` keeps its
+existing text overlay in parallel (recorded divergence — upstream folds it into this
+modal). 34 tests.
+
+**Lead-fixed during integration (all real bugs the never-run tests exposed):**
+(1) a cross-cutting shared-painter footgun — `paintSpans` (OpenGrokPagerRender.swift:1631)
+BREAKS the run on the first empty-text span, so a top-level row's empty indent span
+blanked the whole line (group headers, skills, plugins all invisible); the extensions
+painter now omits the empty indent span. (2) Hook source labels classified the session's
+`$OPENGROK_HOME` hooks dir as "Custom: {path}" — macOS `contentsOfDirectory(at:)` returns
+symlink-resolved (`/private/var/…`) paths while the session home stayed `/var/…`, so no
+prefix matched; `sourceLabel` now canonicalizes both sides (the AGENTS §2 process/path
+footgun). (3) A live-fixture capture bug misread as a dropped character — the frame differ
+correctly skipped re-emitting a cell the welcome hero had already painted there; the real
+screen was always correct, and the live fixture's raw-glyph capture was replaced with a
+cursor-addressed screen replay (production rendering untouched; a byte-stream seam test now
+guards a genuine drop). **Flagged for a future slice:** `skillSource` carries the same raw
+`hasPrefix` pattern (not yet failing).
+
+### E15 — `OpenGrokDiagnostics` library (IMPLEMENTED-UNWIRED)
+
+The pure `/doctor` engine as a standalone target depending only on `OpenGrokShared`
+(imports neither CLI nor pager): the report model, `view`, `format_doctor`, the CLI
+human/JSON formatters, the `managed_text` block engine, and the fail-closed fix engine
+with all five terminal fixes (managed shell/tmux config writes under a
+`SafeAbsoluteDirectory` guard — absolute, no `..`/`~`/control chars — SSH-refused,
+`O_CREAT|O_EXCL` never-clobber, atomic publish + rollback). Golden byte-equality tests
+ported from upstream's `view_tests`, `doctor_format_tests`, `doctor_cmd/tests`,
+`fix_tests`, `managed_text/tests`. **This is LIBRARY ONLY: `/doctor` is NOT registered and
+the CLIRunner stub still stands** — the command remains SKIP-ABSENT to the user until the
+thin wiring slice lands. Recorded implemented-unwired per §7.
+
+**Lead-fixed during integration:** (1) `commonmarkCodeSpan` sized the fence to the longest
+backtick-FREE segment instead of the longest run of consecutive backticks (a path with one
+backtick produced a 7-backtick fence); rewritten to CommonMark's actual rule. (2) the
+managed-text symlink test compared against an under-canonicalized temp root
+(`resolvingSymlinksInPath` left `/var/…` where the resolver's `realpath` yields
+`/private/var/…`); the test's `TempDir` now uses `realpath`, matching the resolver.
+Deferred pending the TUI-probe wave (injectable, `Unavailable` in standalone): XTVERSION
+round-trip, kitty flag push, fullscreen evidence, notification/sandbox findings, voice.
+
+### Verification snapshot (2026-08-08, authoritative serial gate for the batch)
+
+| Command | Outcome |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | **Exit 0 — 4,820 tests, zero recorded issues** (quiescent tree, both slices integrated). |
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was

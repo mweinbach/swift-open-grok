@@ -432,8 +432,17 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     case usage
     /// `/mcps` — per-server MCP connection status (upstream opens the
     /// extensions modal's MCP tab, `slash/commands/mcps.rs:19-24`; this port
-    /// renders the same facts as a read-only list).
+    /// renders the same facts as a read-only list, kept alongside the
+    /// extensions modal's MCP Servers tab — recorded divergence).
     case mcpServers
+    /// `/hooks`, `/plugins`, `/marketplace`, `/skills` (upstream
+    /// `Action::OpenExtensionsModal{tab}`, `slash/commands/plugin.rs:28-105`)
+    /// and `Ctrl+L` (Plugins tab, `agent_view/input.rs:1266-1271`) — the
+    /// tabbed extensions modal, a read-only viewer in this port. The data
+    /// snapshots live in the render layer, which owns the hook loader, skill
+    /// discovery, the plugin install registry, and the session's MCP
+    /// connections.
+    case extensions(tab: OpenGrokPagerExtensionsTab)
     /// `/effort [level]` — reasoning effort on the *current* model (upstream
     /// `slash/commands/effort.rs:57-92`, a thin wrapper over
     /// `Action::SwitchModel` with the session's model id). Same shape as
@@ -526,6 +535,19 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
 public enum OpenGrokPagerAuthAccount: String, Sendable, Equatable, Hashable {
     case xai
     case codex
+}
+
+/// Which tab the extensions modal opens on — upstream's `ExtensionsTab`
+/// (`views/extensions_modal.rs:495-501`) carried on the intent the way the
+/// tab rides `Action::OpenExtensionsModal`. The controller cannot hold the
+/// render layer's modal type, so the tab travels as this mirror and the
+/// composition maps it onto `PagerExtensionsTab`.
+public enum OpenGrokPagerExtensionsTab: String, Sendable, Equatable, Hashable {
+    case hooks
+    case plugins
+    case marketplace
+    case skills
+    case mcpServers
 }
 
 /// Whether the renderer already consumed an input event.
