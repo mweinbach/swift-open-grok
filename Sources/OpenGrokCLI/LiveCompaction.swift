@@ -380,7 +380,14 @@ actor LiveCompactionCoordinator {
             ),
             modelID: snapshot.modelID,
             compactionHash: contract.compactionHash,
-            compactionsRemaining: contract.compactionsRemaining
+            compactionsRemaining: contract.compactionsRemaining,
+            // The session tier rides compaction too — upstream keeps
+            // `service_tier` in the Codex compact body (client.rs:668-692;
+            // its test at :3827-3858 pins `"priority"` surviving), and the
+            // local summarize path inherits it through the same sampler
+            // defaults as inference (client.rs:1806-1808). A Fast session's
+            // compaction is deliberately NOT excluded from priority routing.
+            serviceTier: snapshot.configuration.serviceTier
         )
         return CompactionEngine(
             configuration: configuration,

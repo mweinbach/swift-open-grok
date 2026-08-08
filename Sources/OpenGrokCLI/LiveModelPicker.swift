@@ -37,6 +37,8 @@ struct LiveModelPickerEntry: Sendable, Equatable {
     /// The model's declared effort menu; empty falls back to the built-in
     /// legacy menu when `supportsReasoningEffort` is set.
     var reasoningEfforts: [ReasoningEffortOption]
+    /// The model's declared service tiers (`/fast` reads the fast id here).
+    var serviceTiers: [ModelServiceTier]
 
     init(
         id: String,
@@ -45,7 +47,8 @@ struct LiveModelPickerEntry: Sendable, Equatable {
         description: String? = nil,
         contextWindow: UInt64? = nil,
         supportsReasoningEffort: Bool = false,
-        reasoningEfforts: [ReasoningEffortOption] = []
+        reasoningEfforts: [ReasoningEffortOption] = [],
+        serviceTiers: [ModelServiceTier] = []
     ) {
         self.id = id
         self.providerID = providerID
@@ -54,6 +57,13 @@ struct LiveModelPickerEntry: Sendable, Equatable {
         self.contextWindow = contextWindow
         self.supportsReasoningEffort = supportsReasoningEffort
         self.reasoningEfforts = reasoningEfforts
+        self.serviceTiers = serviceTiers
+    }
+
+    /// The fast tier id when this model advertises one
+    /// (`current_fast_service_tier_id`, acp/model_state.rs:224-230).
+    var fastServiceTierID: String? {
+        serviceTiers.first(where: \.isFast)?.id
     }
 }
 

@@ -425,6 +425,13 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// `.modelPicker`: the controller cannot resolve the level because it
     /// does not own the model catalog.
     case reasoningEffort(query: String?)
+    /// `/fast` — toggle Fast mode (priority routing) on the current model
+    /// (upstream `slash/commands/fast.rs:31-52`, an `Action::SwitchModel` to
+    /// the SAME model with only the service tier moved). Same shape as
+    /// `.reasoningEffort`: the controller cannot resolve the fast tier id or
+    /// the current toggle state because it does not own the model catalog or
+    /// the live sampling stack.
+    case fastMode
     /// `/rename <title>`, alias `/title` — retitle the current session
     /// (upstream `Action::RenameSession`, `slash/commands/rename.rs:42-53`).
     /// The empty-title refusal happens in the controller, so `title` here is

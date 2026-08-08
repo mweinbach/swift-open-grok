@@ -102,6 +102,14 @@ public enum FireworksModels {
         info.supportsReasoningEffort = false
         info.reasoningEfforts = []
         info.reasoningEffort = nil
+        // Every curated Fireworks model advertises the Fast / priority tier
+        // (fireworks_models.rs:167-171); Fireworks chat requests forward
+        // `service_tier` unchanged (provider.rs:1090-1102 pins this).
+        info.serviceTiers = [ModelServiceTier(
+            id: SERVICE_TIER_FAST_REQUEST_VALUE,
+            name: "Fast",
+            description: "Fireworks priority processing"
+        )]
         info.supportedInApi = true
         return ModelEntry(
             info: info,

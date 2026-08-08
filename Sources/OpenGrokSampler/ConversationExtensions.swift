@@ -242,6 +242,12 @@ public func projectChatCompletionRequest(
         tools: tools,
         toolChoice: toolChoice,
         reasoningEffort: req.reasoningEffort ?? defaults?.reasoningEffort,
+        // The same standard-routing rule as the Responses projection: only a
+        // concrete tier id reaches the wire ("fast" normalizes to "priority",
+        // "default"/empty to absence). Upstream carries the config tier onto
+        // chat requests via `apply_defaults` (client.rs:1806-1808) and
+        // serializes it skip-if-none (types.rs:89-90).
+        serviceTier: normalizedServiceTier(req.serviceTier ?? defaults?.serviceTier),
         responseFormat: responseFormat
     )
     wire.xGrokConvId = req.xGrokConvId

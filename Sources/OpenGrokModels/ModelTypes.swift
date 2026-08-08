@@ -57,6 +57,11 @@ public struct ModelInfo: Sendable, Equatable, Codable {
     public var reasoningEffort: ReasoningEffort?
     public var supportsReasoningEffort: Bool
     public var reasoningEfforts: [ReasoningEffortOption]
+    /// Service tiers this model can run with (Codex/Fireworks Fast routing).
+    /// Port of `ModelInfo.service_tiers` (agent/config.rs:4770-4772). Config
+    /// entries never carry tiers — upstream's config conversion pins
+    /// `Vec::new()` (config.rs:4873) — so only provider catalogs populate this.
+    public var serviceTiers: [ModelServiceTier]
     public var supportsReasoningSummaryParameter: Bool
     public var defaultReasoningSummary: ReasoningSummary
     public var supportsBackendSearch: Bool
@@ -94,6 +99,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         reasoningEffort: ReasoningEffort? = nil,
         supportsReasoningEffort: Bool = false,
         reasoningEfforts: [ReasoningEffortOption] = [],
+        serviceTiers: [ModelServiceTier] = [],
         supportsReasoningSummaryParameter: Bool = true,
         defaultReasoningSummary: ReasoningSummary = .none,
         supportsBackendSearch: Bool = false,
@@ -130,6 +136,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         self.reasoningEffort = reasoningEffort
         self.supportsReasoningEffort = supportsReasoningEffort
         self.reasoningEfforts = reasoningEfforts
+        self.serviceTiers = serviceTiers
         self.supportsReasoningSummaryParameter = supportsReasoningSummaryParameter
         self.defaultReasoningSummary = defaultReasoningSummary
         self.supportsBackendSearch = supportsBackendSearch
@@ -148,6 +155,19 @@ public struct ModelInfo: Sendable, Equatable, Codable {
             supportsReasoningSummaryParameter: false,
             defaultReasoningSummary: .none
         )
+    }
+
+    /// The Fast / priority routing tier id when this model advertises one.
+    /// Port of `current_fast_service_tier_id` (pager acp/model_state.rs:
+    /// 224-230) over the catalog entry instead of ACP meta.
+    public var fastServiceTierID: String? {
+        serviceTiers.first(where: \.isFast)?.id
+    }
+
+    /// Whether this model advertises Fast / priority routing (`/fast`).
+    /// Port of `model_supports_fast_service_tier` (agent/models.rs:1358-1363).
+    public var supportsFastServiceTier: Bool {
+        serviceTiers.contains(where: \.isFast)
     }
 
     /// Derive legacy effort gate/default from `reasoningEfforts`.
@@ -201,6 +221,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         case reasoningEffort = "reasoning_effort"
         case supportsReasoningEffort = "supports_reasoning_effort"
         case reasoningEfforts = "reasoning_efforts"
+        case serviceTiers = "service_tiers"
         case supportsReasoningSummaryParameter = "supports_reasoning_summary_parameter"
         case defaultReasoningSummary = "default_reasoning_summary"
         case supportsBackendSearch = "supports_backend_search"
@@ -262,6 +283,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         }
         supportsReasoningEffort = try c.decodeIfPresent(Bool.self, forKey: .supportsReasoningEffort) ?? false
         reasoningEfforts = try c.decodeIfPresent([ReasoningEffortOption].self, forKey: .reasoningEfforts) ?? []
+        serviceTiers = try c.decodeIfPresent([ModelServiceTier].self, forKey: .serviceTiers) ?? []
         supportsReasoningSummaryParameter =
             try c.decodeIfPresent(Bool.self, forKey: .supportsReasoningSummaryParameter) ?? true
         if let raw = try c.decodeIfPresent(String.self, forKey: .defaultReasoningSummary) {
@@ -315,6 +337,9 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         if !reasoningEfforts.isEmpty {
             try c.encode(reasoningEfforts, forKey: .reasoningEfforts)
         }
+        if !serviceTiers.isEmpty {
+            try c.encode(serviceTiers, forKey: .serviceTiers)
+        }
         try c.encode(supportsReasoningSummaryParameter, forKey: .supportsReasoningSummaryParameter)
         try c.encode(defaultReasoningSummary.rawValue, forKey: .defaultReasoningSummary)
         try c.encode(supportsBackendSearch, forKey: .supportsBackendSearch)
@@ -354,6 +379,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
             && lhs.reasoningEffort == rhs.reasoningEffort
             && lhs.supportsReasoningEffort == rhs.supportsReasoningEffort
             && lhs.reasoningEfforts == rhs.reasoningEfforts
+            && lhs.serviceTiers == rhs.serviceTiers
             && lhs.supportsReasoningSummaryParameter == rhs.supportsReasoningSummaryParameter
             && lhs.defaultReasoningSummary == rhs.defaultReasoningSummary
             && lhs.supportsBackendSearch == rhs.supportsBackendSearch
@@ -788,6 +814,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
             entry.info.reasoningEffort = nil
             entry.info.supportsReasoningEffort = false
             entry.info.reasoningEfforts = []
+            entry.info.serviceTiers = []
             let supportsSummary = entry.info.provider == .codex
             entry.info.supportsReasoningSummaryParameter = supportsSummary
             entry.info.defaultReasoningSummary = supportsSummary ? .detailed : .none

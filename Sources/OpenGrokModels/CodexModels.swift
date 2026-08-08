@@ -253,6 +253,43 @@ private func parseCodexWireModel(_ obj: [String: Any], baseURL: String) -> Codex
         ?? .detailed
     let supportsSearch = obj["supports_search_tool"] as? Bool ?? false
 
+    // Service tiers (Codex Fast / priority routing), port of the wire parse
+    // in codex_models.rs:664-704: blank ids dropped, a blank name defaults to
+    // the id, and a blank description becomes nil.
+    var serviceTiers: [ModelServiceTier] = []
+    if let wireTiers = obj["service_tiers"] as? [[String: Any]] {
+        for tier in wireTiers {
+            guard let rawID = tier["id"] as? String else { continue }
+            let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty else { continue }
+            let name = (tier["name"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let description = (tier["description"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            serviceTiers.append(ModelServiceTier(
+                id: id,
+                name: name.isEmpty ? id : name,
+                description: description.isEmpty ? nil : description
+            ))
+        }
+    }
+    // Legacy catalogs advertise Fast via `additional_speed_tiers` without a
+    // full service_tiers entry (codex_models.rs:688-700).
+    let legacySpeedTiers = obj["additional_speed_tiers"] as? [String] ?? []
+    let hasLegacyFast = legacySpeedTiers.contains {
+        $0.lowercased() == SERVICE_TIER_FAST_NAME
+    }
+    if hasLegacyFast, !serviceTiers.contains(where: \.isFast) {
+        serviceTiers.append(ModelServiceTier(
+            id: SERVICE_TIER_FAST_REQUEST_VALUE,
+            name: "Fast",
+            description: "Fastest inference with increased plan usage"
+        ))
+    }
+    // `default_service_tier` is catalog metadata only; it is not auto-applied
+    // to requests (codex_models.rs:701-703, matching codex-rs
+    // service_tier_for_request).
+
     var info = ModelInfo.fallback(slug: slug)
     info.model = slug
     info.baseURL = baseURL
@@ -273,6 +310,7 @@ private func parseCodexWireModel(_ obj: [String: Any], baseURL: String) -> Codex
     if !efforts.isEmpty {
         info.reasoningEffort = efforts.first(where: \.isDefault)?.value ?? efforts.first?.value
     }
+    info.serviceTiers = serviceTiers
     info.supportsReasoningSummaryParameter = supportsSummary
     info.defaultReasoningSummary = supportsSummary ? defaultSummary : .none
     info.supportsBackendSearch = supportsSearch

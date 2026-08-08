@@ -164,7 +164,8 @@ struct LiveModelCatalogResolver: Sendable {
                 description: entry.info.description,
                 contextWindow: entry.info.contextWindow,
                 supportsReasoningEffort: entry.info.supportsReasoningEffort,
-                reasoningEfforts: entry.info.reasoningEfforts
+                reasoningEfforts: entry.info.reasoningEfforts,
+                serviceTiers: entry.info.serviceTiers
             )
         }
     }
@@ -174,7 +175,16 @@ struct LiveModelCatalogResolver: Sendable {
     /// declares effort support; on a non-supporting model it is ignored and
     /// the switch proceeds, exactly like upstream's meta override
     /// (`set_session_model`, handlers/model_switch.rs:139-158).
-    func resolve(modelID: String, effort: ReasoningEffort? = nil) async throws -> LiveModelResolution {
+    ///
+    /// `serviceTier` is the session's tier selection (`/fast`). It survives
+    /// the switch only when the target entry advertises the tier id; a model
+    /// without it resolves to standard routing, which is upstream's
+    /// clear-if-unsupported rule (`set_current`, acp/model_state.rs:199-212).
+    func resolve(
+        modelID: String,
+        effort: ReasoningEffort? = nil,
+        serviceTier: String? = nil
+    ) async throws -> LiveModelResolution {
         let catalog = catalogSource()
         guard let entry = findModelByID(catalog, modelID: modelID) else {
             throw LiveModelSwitchError.unknownModel(modelID)
@@ -317,7 +327,11 @@ struct LiveModelCatalogResolver: Sendable {
                 apiBackend: backend,
                 extraHeaders: headers,
                 queryParams: entry.queryParams,
-                tuning: OpenGrokLiveSamplingTuning(entry: entry, effortOverride: effort),
+                tuning: OpenGrokLiveSamplingTuning(
+                    entry: entry,
+                    effortOverride: effort,
+                    serviceTier: serviceTier
+                ),
                 bearerResolver: namedAuthResolver.map(NamedAuthBearerResolver.init),
                 credentialProvider: credential.binding.authCredentialProvider
             ),
@@ -350,11 +364,36 @@ struct LiveModelSwitchSummary: Sendable, Equatable {
     /// when one was given, else the model's catalog default, `nil` on models
     /// with no selectable effort. The composer's border renders this.
     let reasoningEffort: ReasoningEffort?
+    /// The effort before this switch, for the tier-only-toggle classification
+    /// below (upstream's `model_or_effort_changed`, lifecycle.rs:1407-1408).
+    let previousReasoningEffort: ReasoningEffort?
+    /// The service tier the new sampling stack sends (`"priority"` when Fast
+    /// mode is on); `nil` is standard routing.
+    let serviceTier: String?
+    /// The tier before this switch, so the renderer can tell a tier-only
+    /// toggle (which upstream reports as "Fast mode enabled/disabled",
+    /// dispatch/session/lifecycle.rs:1412-1417) from a model change.
+    let previousServiceTier: String?
+    /// Whether Fast mode is on after this switch — the tier equals the fast
+    /// wire value (or its `fast` alias) AND the model still advertises it
+    /// (`fast_mode_enabled`, acp/model_state.rs:232-237).
+    let fastModeEnabled: Bool
 
     var changedProvider: Bool { provider != previousProvider }
+    var serviceTierChanged: Bool { serviceTier != previousServiceTier }
 
     /// The system message the transcript records for this switch.
+    ///
+    /// A tier-only toggle takes upstream's copy byte-for-byte
+    /// (lifecycle.rs:1413-1417); a model/effort change keeps this port's
+    /// message shape with upstream's " · Fast" marker appended while Fast
+    /// mode stays on (lifecycle.rs:1424-1426).
     var transcriptMessage: String {
+        if modelID == previousModelID,
+           reasoningEffort == previousReasoningEffort,
+           serviceTierChanged {
+            return fastModeEnabled ? "Fast mode enabled" : "Fast mode disabled"
+        }
         var text = "Switched to \(requestedID)"
         if changedProvider {
             text += " (\(previousProvider.asString) → \(provider.asString))"
@@ -364,6 +403,9 @@ struct LiveModelSwitchSummary: Sendable, Equatable {
             let plural = droppedOpaqueItems == 1 ? "item" : "items"
             text += " Dropped \(droppedOpaqueItems) provider-specific history "
                 + "\(plural); the conversation text is preserved."
+        }
+        if fastModeEnabled {
+            text += " · Fast"
         }
         return text
     }
@@ -423,6 +465,9 @@ actor LiveModelSwitchCoordinator {
 
     var activeModelID: String { sampling.model }
     var activeProvider: ModelProvider { sampling.provider }
+    /// The tier the live sampler is actually built with — the `/fast` state
+    /// derives from here, never from a controller-side mirror.
+    var activeServiceTier: String? { sampling.serviceTier }
 
     /// Rebuild the sampling stack for `modelID`.
     ///
@@ -434,16 +479,39 @@ actor LiveModelSwitchCoordinator {
     /// when the effort would not change either — upstream applies an effort
     /// override through the same SetSessionModel path even when the model id
     /// is unchanged (handlers/model_switch.rs:139-158, :280).
-    func apply(modelID: String, effort: ReasoningEffort? = nil) async -> LiveModelSwitchOutcome {
+    ///
+    /// `serviceTier` follows upstream's `SwitchModel.service_tier:
+    /// Option<Option<String>>` (app/actions.rs via fast.rs:39-51): the outer
+    /// `nil` preserves the session's tier across the switch (cleared by the
+    /// resolver when the target model does not advertise it), `.some(nil)` is
+    /// the explicit return to standard routing, and `.some(.some(id))`
+    /// selects a tier. `/fast` is a switch to the SAME model with a different
+    /// tier — the toggle rides this path rather than a parallel tier-set one.
+    func apply(
+        modelID: String,
+        effort: ReasoningEffort? = nil,
+        serviceTier: String?? = nil
+    ) async -> LiveModelSwitchOutcome {
         let previous = sampling
+        let requestedTier: String?
+        switch serviceTier {
+        case .none: requestedTier = previous.serviceTier
+        case .some(let selection): requestedTier = selection
+        }
         let picksActiveModel = modelID == previous.model
             || modelID == activeCatalogID(for: previous)
-        if picksActiveModel, effort == nil || effort == previous.reasoningEffort {
+        if picksActiveModel,
+           effort == nil || effort == previous.reasoningEffort,
+           requestedTier == previous.serviceTier {
             return .unchanged(modelID: modelID)
         }
         let resolution: LiveModelResolution
         do {
-            resolution = try await resolver.resolve(modelID: modelID, effort: effort)
+            resolution = try await resolver.resolve(
+                modelID: modelID,
+                effort: effort,
+                serviceTier: requestedTier
+            )
         } catch let error as LiveModelSwitchError {
             return .failed(modelID: modelID, message: error.description)
         } catch {
@@ -451,6 +519,7 @@ actor LiveModelSwitchCoordinator {
         }
         guard resolution.sampling.model != previous.model
             || resolution.sampling.reasoningEffort != previous.reasoningEffort
+            || resolution.sampling.serviceTier != previous.serviceTier
         else {
             return .unchanged(modelID: modelID)
         }
@@ -488,8 +557,25 @@ actor LiveModelSwitchCoordinator {
             previousModelID: previous.model,
             previousProvider: previous.provider,
             droppedOpaqueItems: dropped,
-            reasoningEffort: resolution.sampling.reasoningEffort
+            reasoningEffort: resolution.sampling.reasoningEffort,
+            previousReasoningEffort: previous.reasoningEffort,
+            serviceTier: resolution.sampling.serviceTier,
+            previousServiceTier: previous.serviceTier,
+            fastModeEnabled: liveFastModeEnabled(
+                serviceTier: resolution.sampling.serviceTier,
+                supportsFast: resolvedEntrySupportsFast(resolution.sampling)
+            )
         ))
+    }
+
+    /// Whether the (post-switch) active model still advertises a fast tier —
+    /// the second conjunct of `fast_mode_enabled` (acp/model_state.rs:232-237).
+    private func resolvedEntrySupportsFast(
+        _ configuration: OpenGrokLiveSamplingConfiguration
+    ) -> Bool {
+        resolver.catalogSource().pairs()
+            .first { $0.1.model == configuration.model }?
+            .1.info.supportsFastServiceTier ?? false
     }
 
     /// The catalog id (`glm-5.2`) for a wire model name
@@ -500,6 +586,17 @@ actor LiveModelSwitchCoordinator {
             .first { $0.1.model == configuration.model }
             .map { $0.0 }
     }
+}
+
+/// Whether a session tier selection means Fast mode is on: the tier is the
+/// fast wire value (or its `fast` alias) AND the active model still advertises
+/// a fast tier. Port of `fast_mode_enabled` (pager acp/model_state.rs:232-237)
+/// over the live coordinator's state instead of a controller-side mirror.
+func liveFastModeEnabled(serviceTier: String?, supportsFast: Bool) -> Bool {
+    guard let tier = serviceTier else { return false }
+    let isFastTier = tier == SERVICE_TIER_FAST_REQUEST_VALUE
+        || tier.lowercased() == SERVICE_TIER_FAST_NAME
+    return isFastTier && supportsFast
 }
 
 /// Shared live catalog owner. The manager is the source of truth for both the
@@ -558,6 +655,15 @@ final class LiveModelCatalogStore: @unchecked Sendable {
 
     func applyOpenCodeGoCatalog(_ catalog: OpenCodeGoModelsCatalog?) {
         manager.applyOpenCodeGoCatalog(catalog)
+    }
+
+    /// Publish a Fireworks provider catalog into the manager — the same
+    /// mutation the store's own background refresh performs, exposed so a
+    /// hermetic composition (tests, offline tools) can model the
+    /// post-refresh catalog without network. The manager's fingerprint
+    /// gate still applies.
+    func applyFireworksCatalog(_ catalog: FireworksModelsCatalog?) {
+        manager.applyFireworksCatalog(catalog)
     }
 
     /// Record a completed live model switch, mirroring the tail of upstream's

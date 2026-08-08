@@ -48,6 +48,12 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
     /// Responses `reasoning.summary` policy. `nil` means "no summary policy":
     /// the Codex patcher strips the base `concise` (provider.rs:613-620).
     public var reasoningSummary: ReasoningSummary?
+    /// Session-selected service-tier id (`"priority"` when `/fast` is on).
+    /// `nil` is standard routing — the field is then absent on the wire.
+    /// Upstream carries this on the session's sampling config
+    /// (spawn.rs:723-736, sampler_turn.rs:834-850) and the sampler backfills
+    /// requests from it (client.rs:1806-1808, :3234-3236).
+    public var serviceTier: String?
     public var codexMultiAgentV2: Bool
     public var temperature: Float?
     public var topP: Float?
@@ -57,6 +63,7 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
     public init(
         reasoningEffort: ReasoningEffort? = nil,
         reasoningSummary: ReasoningSummary? = nil,
+        serviceTier: String? = nil,
         codexMultiAgentV2: Bool = false,
         temperature: Float? = nil,
         topP: Float? = nil,
@@ -65,6 +72,7 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
     ) {
         self.reasoningEffort = reasoningEffort
         self.reasoningSummary = reasoningSummary
+        self.serviceTier = serviceTier
         self.codexMultiAgentV2 = codexMultiAgentV2
         self.temperature = temperature
         self.topP = topP
@@ -77,7 +85,16 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
     /// effort support (`model_supports_reasoning_effort` gate,
     /// handlers/model_switch.rs:139-158); a non-supporting model keeps `nil`
     /// so the sampler's provider gates see "no effort declared".
-    public init(entry: ModelEntry, effortOverride: ReasoningEffort? = nil) {
+    ///
+    /// `serviceTier` is the session's tier selection (`/fast`). It applies
+    /// only when the entry advertises that tier id — a model without the tier
+    /// keeps `nil`, which is how upstream clears a stale selection on switch
+    /// (`set_current`, pager acp/model_state.rs:199-212).
+    public init(
+        entry: ModelEntry,
+        effortOverride: ReasoningEffort? = nil,
+        serviceTier: String? = nil
+    ) {
         let info = entry.info
         self.init(
             reasoningEffort: info.supportsReasoningEffort
@@ -88,6 +105,9 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
             reasoningSummary: info.defaultReasoningSummary == .none
                 ? nil
                 : info.defaultReasoningSummary,
+            serviceTier: serviceTier.flatMap { tier in
+                info.serviceTiers.contains { $0.id == tier } ? tier : nil
+            },
             codexMultiAgentV2: info.codexMultiAgentV2,
             temperature: info.temperature,
             topP: info.topP,
@@ -115,6 +135,8 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     public let transport: (any HTTPTransport)?
 
     public var reasoningEffort: ReasoningEffort? { tuning.reasoningEffort }
+    /// Session-selected service-tier id (`/fast`); `nil` = standard routing.
+    public var serviceTier: String? { tuning.serviceTier }
 
     public init(
         model: String,
@@ -323,6 +345,7 @@ public struct OpenGrokLiveSampler: Sendable {
             queryParams: configuration.queryParams,
             contextWindow: configuration.tuning.contextWindow ?? 0,
             reasoningEffort: configuration.tuning.reasoningEffort,
+            serviceTier: configuration.tuning.serviceTier,
             reasoningSummary: configuration.tuning.reasoningSummary,
             codexMultiAgentV2: configuration.tuning.codexMultiAgentV2,
             bearerResolver: bearerResolver
@@ -7611,6 +7634,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             ))
         case .reasoningEffort(let query):
             await applyEffortCommand(query: query)
+        case .fastMode:
+            await applyFastCommand()
         case .renameSession(let title):
             await renameSession(title: title)
         case .loginProviderPicker:
@@ -8017,6 +8042,46 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         case .failure(let error):
             appendMessage(PagerMessage(role: .error, text: error.message))
         }
+    }
+
+    /// `/fast` — toggle Fast mode (priority routing) on the current model,
+    /// upstream fast.rs:31-52: an `Action::SwitchModel` to the SAME model with
+    /// the session effort preserved and only the service tier moved. Enabling
+    /// selects the model's fast tier id; disabling sends the explicit
+    /// standard-routing clear (`Some(None)`, fast.rs:39-44) so a prior
+    /// selection cannot linger.
+    private func applyFastCommand() async {
+        guard let modelSwitch else {
+            // No live sampling stack behind this renderer — upstream's
+            // no-current-model refusal (fast.rs:32-34).
+            appendMessage(PagerMessage(role: .error, text: "No active model"))
+            return
+        }
+        let entry = catalogStore?.entryForWireModel(modelName)
+            ?? modelCatalog.first { $0.id == modelName }
+        guard let fastID = entry?.fastServiceTierID else {
+            // Upstream's unsupported-model refusal, byte-exact (fast.rs:35-37).
+            appendMessage(PagerMessage(
+                role: .error,
+                text: "current model does not support Fast mode"
+            ))
+            return
+        }
+        // The toggle state derives from the live coordinator — the tier the
+        // sampler is actually built with — never a renderer-side mirror.
+        let fastOn = liveFastModeEnabled(
+            serviceTier: await modelSwitch.activeServiceTier,
+            supportsFast: true
+        )
+        // Preserve the session effort when only the service tier changes
+        // (fast.rs:48-49); `nil` would re-resolve the catalog default and
+        // silently drop a `/effort` override.
+        let currentEffort = await modelSwitch.snapshot().configuration.reasoningEffort
+        await switchModel(
+            to: entry?.id ?? modelName,
+            effort: currentEffort,
+            serviceTier: fastOn ? String??.some(nil) : String??.some(fastID)
+        )
     }
 
     /// `/rename <title>` — one title-write through the conversation history
@@ -8648,7 +8713,16 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     ///
     /// `effort` is a validated `/model <name> <effort>` override; `nil` keeps
     /// the model's catalog default.
-    private func switchModel(to modelID: String, effort: ReasoningEffort? = nil) async {
+    ///
+    /// `serviceTier` follows the coordinator's `SwitchModel` semantics: outer
+    /// `nil` preserves the session tier (a `/model` switch keeps Fast on when
+    /// the target still supports it), `.some(nil)` clears to standard
+    /// routing, `.some(.some(id))` selects a tier — the `/fast` toggle.
+    private func switchModel(
+        to modelID: String,
+        effort: ReasoningEffort? = nil,
+        serviceTier: String?? = nil
+    ) async {
         guard let modelSwitch else {
             // No provider session behind this renderer; the picker can still
             // relabel, but it must not claim the session changed.
@@ -8660,7 +8734,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             ))
             return
         }
-        switch await modelSwitch.apply(modelID: modelID, effort: effort) {
+        switch await modelSwitch.apply(
+            modelID: modelID,
+            effort: effort,
+            serviceTier: serviceTier
+        ) {
         case .unchanged:
             appendMessage(PagerMessage(
                 role: .system,

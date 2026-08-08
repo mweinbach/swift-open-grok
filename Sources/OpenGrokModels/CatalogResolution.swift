@@ -386,6 +386,10 @@ func mergeRemoteProviderPartition(
                 entry.info.supportsReasoningEffort = donor.info.supportsReasoningEffort
                 entry.info.reasoningEffort = donor.info.reasoningEffort
             }
+            // And the service-tier menu (config.rs:3616-3618).
+            if entry.info.serviceTiers.isEmpty, !donor.info.serviceTiers.isEmpty {
+                entry.info.serviceTiers = donor.info.serviceTiers
+            }
         }
         remote[key] = entry
     }

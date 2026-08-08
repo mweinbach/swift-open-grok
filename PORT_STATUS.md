@@ -223,6 +223,49 @@ instruction, not upstream's `"/imagine {prompt}"` echo (typed text is preserved 
 history); conditionally-registered local commands list after the builtins, in upstream's
 relative order. `/imagine-video` stays unregistered — no video tool pack exists.
 
+### E3 — Fast service tier live + `/fast` (serial gate: exit 0, 4,497 tests, zero issues; 2026-08-08)
+
+The first backing-feature slice: the Fast (priority routing) tier now travels catalog →
+session sampling config → both wire backends. `ModelInfo.serviceTiers` parses from Codex
+wire catalogs (incl. legacy `additional_speed_tiers`) and the Fireworks curated builder
+(`fireworks_models.rs:167-171`); the donor merge inherits tiers on remote refresh; the
+chat-completions wire type gained its missing `service_tier` field and the Responses body
+emits only concrete tiers (standard routing is the ABSENCE of the field);
+Kimi/DeepSeek/OpenCodeGo/Wafer strip it, Fireworks forwards (`provider.rs` pins). The
+`/model` switch path carries a `String??` tier with upstream's preserve/clear/set
+semantics and validates it against the target entry; `/fast` toggles through that same
+switch path (effort preserved — `nil` would re-resolve the catalog default and drop an
+`/effort` override), with upstream's copy byte-exact ("No active model", "current model
+does not support Fast mode", "Fast mode enabled/disabled", the " · Fast" switch marker).
+
+**Brief-error caught by the delegate, verified by the lead:** the lead's brief claimed
+upstream pins compaction to `service_tier: None` (a misread of `sampler_turn.rs:757`, the
+no-config fallback). Upstream does the opposite — both Codex compact retain-lists keep
+`service_tier` (`client.rs:683,712`) and upstream's own test pins `"priority"` surviving
+in the compact body (`client.rs:3827-3858`). The port carries the tier on compaction, and
+the requested "compaction never carries it" test was deliberately NOT written. What
+upstream does pin to None: aux samplers and subagents.
+
+**Lead fixes to the delegate's tests:** two wire tests resolved models through the
+embedded default catalog, whose entries carry NO tiers — upstream's embedded defaults
+are identical (config.rs builds them with empty tier lists; tiered curated entries
+arrive only via the Fireworks provider-catalog refresh). The fixtures now model the
+post-refresh catalog (curated partition pinned at the mock's base URL), and
+`LiveModelCatalogStore` gained an `applyFireworksCatalog` pass-through (mirroring the
+OpenCodeGo seam; the manager's fingerprint gate still applies) so hermetic compositions
+can publish a provider catalog without network.
+
+**Recorded divergences:** `/fast` registers always (fixed registry) with upstream's error
+copy at dispatch instead of upstream's dynamic `visible()`; tier-only toggle copy is
+upstream's byte-exact but the base "Switched to X" shape keeps the port's pre-existing
+divergence; Fireworks curated reasoning-efforts assignment (`fireworks_models.rs:164-166`)
+not ported (pre-existing, out of slice); `default_service_tier` parsed and deliberately
+never auto-applied. **Deliberately unfinished:** resume does not restore a persisted tier
+— the port's resume path restores neither model nor effort into the live coordinator
+today, so the tier follows that pre-existing gap; out of the box only Fireworks curated
+models are fast-capable (Codex tiers go live when the remote catalog carries
+`service_tiers`).
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was

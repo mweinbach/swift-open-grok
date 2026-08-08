@@ -2084,10 +2084,23 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Set reasoning effort for the current model",
             usage: "/effort <level>"
         ),
+        // `/fast` (`slash/commands/fast.rs:11-29`); name, description and
+        // usage verbatim, placed immediately after `/effort`
+        // (`slash/commands/mod.rs:102-105`, "Immediately after /model (Codex
+        // catalogs expose Fast as a service tier)"). Divergence: upstream's
+        // `visible()` hides the row unless the current model supports Fast
+        // (fast.rs:27-29); this registry is fixed at construction, so the row
+        // is always registered and dispatch answers a non-supporting model
+        // with upstream's error copy (fast.rs:36) instead.
+        PagerCommandDefinition(
+            name: "fast",
+            summary: "Toggle Fast mode (priority routing) for the current model",
+            usage: "/fast"
+        ),
         // `/always-approve` (`slash/commands/always_approve.rs:16-32`);
         // summary is upstream's description verbatim (`always_approve.rs:21-23`),
-        // placed after `/effort` and before `/multiline` because this port
-        // has neither `/fast` nor `/auto` (`slash/commands/mod.rs:103-109`).
+        // placed after `/fast` and before `/multiline` because this port
+        // has no `/auto` (`slash/commands/mod.rs:106-109`).
         PagerCommandDefinition(
             name: "always-approve",
             summary: "Toggle always-approve mode (skip all permission prompts)",
@@ -2711,6 +2724,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     query: level.isEmpty ? nil : level
                 )))
                 return .handled
+            case "fast":
+                // Arguments are ignored — upstream's `FastCommand::run`
+                // declares none and discards what it gets (fast.rs:31,
+                // `_args`). The toggle itself needs the catalog and the live
+                // sampling stack, both of which live in the render layer.
+                try await emit(.overlay(.fastMode))
+                return .handled
             case "always-approve":
                 // Arguments are ignored — same dispatch either way
                 // (`always_approve.rs:29-32`, `Action::SetYoloMode(!current)`).
@@ -3040,6 +3060,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /docs [web|title]         Open How-to Guides or online Build docs
       /model [name]  /m         Switch the active model
       /effort <level>           Set reasoning effort for the current model
+      /fast                     Toggle Fast mode (priority routing) for the current model
       /always-approve           Toggle always-approve mode (skip all permission prompts)
       /new    /clear            Start a new session
       /fork [directive]         Branch the current session into a peer agent

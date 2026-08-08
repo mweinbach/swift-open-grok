@@ -205,6 +205,11 @@ public struct ChatCompletionWireRequest: Encodable, Sendable, Equatable {
     public var stream: Bool?
     public var streamOptions: StreamOptionsWire?
     public var reasoningEffort: ReasoningEffort?
+    /// Chat Completions `service_tier` routing id (`"priority"` for Fast
+    /// mode). `nil` omits the field — standard routing is the absence of the
+    /// field, never `"default"`. Port of `ChatCompletionRequest.service_tier`
+    /// (`xai-grok-sampling-types/src/types.rs:89-90`).
+    public var serviceTier: String?
     public var responseFormat: JSONValue?
 
     // Non-serialized tracking headers (carried alongside for client use).
@@ -230,6 +235,7 @@ public struct ChatCompletionWireRequest: Encodable, Sendable, Equatable {
         stream: Bool? = nil,
         streamOptions: StreamOptionsWire? = nil,
         reasoningEffort: ReasoningEffort? = nil,
+        serviceTier: String? = nil,
         responseFormat: JSONValue? = nil
     ) {
         self.model = model
@@ -245,6 +251,7 @@ public struct ChatCompletionWireRequest: Encodable, Sendable, Equatable {
         self.stream = stream
         self.streamOptions = streamOptions
         self.reasoningEffort = reasoningEffort
+        self.serviceTier = serviceTier
         self.responseFormat = responseFormat
     }
 
@@ -257,6 +264,7 @@ public struct ChatCompletionWireRequest: Encodable, Sendable, Equatable {
         case toolChoice = "tool_choice"
         case streamOptions = "stream_options"
         case reasoningEffort = "reasoning_effort"
+        case serviceTier = "service_tier"
         case responseFormat = "response_format"
     }
 
@@ -275,6 +283,7 @@ public struct ChatCompletionWireRequest: Encodable, Sendable, Equatable {
         try c.encodeIfPresent(stream, forKey: .stream)
         try c.encodeIfPresent(streamOptions, forKey: .streamOptions)
         try c.encodeIfPresent(reasoningEffort, forKey: .reasoningEffort)
+        try c.encodeIfPresent(serviceTier, forKey: .serviceTier)
         try c.encodeIfPresent(responseFormat, forKey: .responseFormat)
     }
 }

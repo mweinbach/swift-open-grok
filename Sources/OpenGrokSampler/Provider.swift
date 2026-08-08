@@ -291,6 +291,8 @@ public struct KimiProvider: ProviderAdapter {
         request.topP = nil
         request.frequencyPenalty = nil
         request.presencePenalty = nil
+        // Routing is provider-owned too (provider.rs:338).
+        request.serviceTier = nil
     }
 }
 
@@ -410,6 +412,8 @@ public struct DeepSeekProvider: ProviderAdapter {
         for i in request.messages.indices {
             request.messages[i].modelId = nil
         }
+        // DeepSeek does not accept `service_tier` (provider.rs:386).
+        request.serviceTier = nil
     }
 }
 
@@ -430,6 +434,8 @@ public struct OpenCodeGoProvider: ProviderAdapter {
         for i in request.messages.indices {
             request.messages[i].modelId = nil
         }
+        // OpenCode Go does not accept `service_tier` (provider.rs:411).
+        request.serviceTier = nil
     }
 }
 
@@ -442,6 +448,8 @@ public struct WaferProvider: ProviderAdapter {
         // Wafer does not accept `reasoning_effort`; unlike Fireworks there is
         // no restore gate, so effort never reaches this wire (provider.rs:422).
         request.reasoningEffort = nil
+        // Nor `service_tier` (provider.rs:426).
+        request.serviceTier = nil
         for i in request.messages.indices {
             request.messages[i].modelId = nil
         }

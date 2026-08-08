@@ -470,6 +470,14 @@ public struct CompactionEngineConfiguration: Sendable {
     /// Zero refuses the remote path and falls through to truncation rather than
     /// spending a call that will be rejected.
     public var compactionsRemaining: UInt64?
+    /// The session's service tier, replayed on the Codex compaction request.
+    /// Upstream deliberately KEEPS `service_tier` in the compact body — the
+    /// retain lists allow it (client.rs:668-692, :694-728) and
+    /// `codex_remote_compaction_v2_body_keeps_stream_contract_fields`
+    /// (client.rs:3827-3858) pins `"service_tier": "priority"` surviving — so
+    /// a Fast session's server-side compaction rides the same priority lane
+    /// as its sampling. `nil` omits the field (standard routing).
+    public var serviceTier: String?
     /// Disable to make a failed summary fatal instead of degrading. Off only in
     /// tests that assert the failure classification itself.
     public var truncationFallbackEnabled: Bool
@@ -482,6 +490,7 @@ public struct CompactionEngineConfiguration: Sendable {
         codexRetainedUserTokenBudget: UInt64 = CODEX_REMOTE_COMPACTION_V2_RETAINED_USER_TOKENS,
         compactionHash: String? = nil,
         compactionsRemaining: UInt64? = nil,
+        serviceTier: String? = nil,
         truncationFallbackEnabled: Bool = true
     ) {
         self.policy = policy
@@ -491,6 +500,7 @@ public struct CompactionEngineConfiguration: Sendable {
         self.codexRetainedUserTokenBudget = codexRetainedUserTokenBudget
         self.compactionHash = compactionHash
         self.compactionsRemaining = compactionsRemaining
+        self.serviceTier = serviceTier
         self.truncationFallbackEnabled = truncationFallbackEnabled
     }
 }
@@ -715,7 +725,8 @@ where Sampler.Item == ConversationItem {
         let request = CodexCompactionRequest(
             protocolVersion: codexProtocol,
             input: items,
-            compactionHash: configuration.compactionHash
+            compactionHash: configuration.compactionHash,
+            serviceTier: configuration.serviceTier
         )
         let result: CodexRemoteCompactionResult
         do {
