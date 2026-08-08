@@ -368,6 +368,38 @@ no `/user` enrichment or managed-config post-login sync (no port surfaces); stat
 UUIDv4 vs upstream's v7. The slice also caught its own CRLF trap (AGENTS §2) in the
 listener's request parser before landing.
 
+### E7 — MCP OAuth (serial gate: exit 0, 4,594 tests, zero issues; 2026-08-08)
+
+Closes roadmap Wave 15 item 4: an HTTP MCP server requiring OAuth works end-to-end from
+the running executable — discovery (SEP-985 + SSRF gates) → dynamic client registration
+→ PKCE S256 browser consent against a real loopback listener (GET+POST `/callback`, RFC
+9207 `iss`, upstream's HTML) → tokens in `$OPENGROK_HOME/mcp_credentials.json` in
+upstream's exact rmcp schema (locked 0600 atomic writes, freshness guard against
+refresh-token rollback, corrupt-recovery; the byte-identical Rust legacy fixture
+round-trips as a test pin) → session connect attaches `Authorization: Bearer` with a
+30 s proactive-refresh buffer and one 401 refresh-retry (token-changed disk check per
+upstream's same-stale-token guard) → tools land in the advertised set and `/mcps` shows
+the connection. **Brief correction from the delegate:** upstream's implementation
+delegates to the external rmcp 2.1 crate (`transport/auth.rs`, 5.6k lines); the port
+covers the subset upstream exercises. Triggers: `open-grok mcp login <name>` (the port
+stand-in for the `x.ai/mcp/auth_trigger` ext method — recorded new-verb divergence) and
+connect-time token attach with an auth-required `/mcps` notice; connect NEVER auto-opens
+a browser, matching upstream (the "spawns in background" doc comment upstream is stale —
+no such spawn exists in its code). 40 tests across four seams; binary smoke on the built
+executable proves the login route live.
+
+**Recorded divergences:** discovery validates the final response URL same-origin instead
+of hand-following redirects (cross-origin protection preserved); 401 recovery lives in
+the transport, no browser escalation on a failed tool call; non-interactive gate and
+callback-wait store poll unported (the failure modes they prevent cannot occur here);
+403 scope-upgrade, client-credentials flow, revocation, transient-refresh classification
+unported. **Lead posture note:** the MCP store's lock acquisition is `try?` (a lock
+failure degrades to unlocked-but-atomic writes) where `AuthManager.update` throws — the
+freshness guard bounds the worst-case race; aligning the postures is a one-line future
+fix. **Remaining for full parity:** live `/mcps` re-probe after `mcp login` in a running
+session (tokens apply next session), scope-upgrade on 403, revocation on server removal,
+the ext-method surface.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was

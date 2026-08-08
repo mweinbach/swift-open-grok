@@ -151,6 +151,7 @@ public enum OpenGrokHelp {
                   -H, --header "Name: Value" (repeatable)
                   --                        everything after goes to the server
               remove|enable|disable <NAME> [-s, --scope SCOPE]
+              login <NAME>                  browser OAuth sign-in for an HTTP server
               doctor [NAME] [--json]
 
             """

@@ -236,7 +236,8 @@ public extension MCPServerDeclaration {
     /// variant) needs an injected `HTTPTransport`.
     func makeTransport(
         httpTransport: @autoclosure () -> any HTTPTransport,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        authorization: (any MCPAuthorizationProviding)? = nil
     ) throws -> any MCPTransport {
         guard config.enabled else { throw MCPConnectError.disabled(name) }
 
@@ -272,8 +273,28 @@ public extension MCPServerDeclaration {
                     endpoint: endpoint,
                     headers: resolved,
                     timeout: config.toolTimeoutSec.map(TimeInterval.init)
-                )
+                ),
+                authorization: authorization
             )
         }
+    }
+
+    /// The HTTP endpoint for OAuth purposes, or `nil` for stdio servers and
+    /// servers whose resolved headers already carry static auth — upstream
+    /// skips OAuth discovery entirely when an `Authorization` header is
+    /// configured (xai-grok-mcp/src/servers.rs:4294-4304).
+    func oauthEligibleEndpoint(environment: [String: String]) -> URL? {
+        guard case let .streamableHttp(url, _, bearerTokenEnvVar, headers, _, _, _) =
+            config.transport else {
+            return nil
+        }
+        guard let endpoint = URL(string: url), endpoint.scheme != nil else { return nil }
+        let hasStaticHeader = headers?.keys.contains {
+            $0.caseInsensitiveCompare("Authorization") == .orderedSame
+        } ?? false
+        let hasBearerEnv = bearerTokenEnvVar
+            .flatMap { environment[$0] }
+            .map { !$0.isEmpty } ?? false
+        return (hasStaticHeader || hasBearerEnv) ? nil : endpoint
     }
 }

@@ -1044,6 +1044,10 @@ public enum CLICommandParser {
                     ["--scope": "--scope", "-s": "--scope"]
                 ) { current, _ in current }
                 grammar.flags = ["--json": "--json"]
+            case "login":
+                // The MCP OAuth trigger (LiveMCPComposition.runLogin) reads
+                // config like `get`; it takes no flags beyond `--config`.
+                grammar.valued = configFile
             case "doctor":
                 grammar.valued = configFile
                 grammar.flags = ["--json": "--json"]

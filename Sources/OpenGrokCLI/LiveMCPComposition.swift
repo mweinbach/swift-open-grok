@@ -194,8 +194,12 @@ enum LiveMCPStatusOverlay {
 public enum LiveMCPComposition {
     public static let routeName = "mcp"
 
-    /// Subcommands this route accepts.
-    public static let actions: Set<String> = ["list", "get", "add", "remove"]
+    /// Subcommands this route accepts. `login` is this port's explicit MCP
+    /// OAuth trigger — the honest equivalent of upstream's user-initiated
+    /// `x.ai/mcp/auth_trigger` ext method (xai-grok-shell/src/extensions/
+    /// mcp.rs:40,1526-1578 → `force_reauth(true)`), which has no ACP surface
+    /// in this port.
+    public static let actions: Set<String> = ["list", "get", "add", "remove", "login"]
 
     public static func handles(_ command: CLICommand) -> Bool {
         if case .mcp = command { return true }
@@ -210,6 +214,13 @@ public enum LiveMCPComposition {
     ) async throws -> CLIApplicationSession {
         guard case .mcp(let options) = command else {
             throw CLIApplicationError.unsupported(route: command.routeName)
+        }
+        // `login` runs a browser consent flow and so needs this async seam;
+        // the other actions stay on the synchronous `run` path shared with
+        // `CLIRunner.main`.
+        if options.action == "login" {
+            try await runLogin(options: options, environment: context.environment, streams: context.streams)
+            return CLIApplicationSession(waitForExit: {}, shutdown: {})
         }
         try run(options: options, environment: context.environment, streams: context.streams)
         return CLIApplicationSession(waitForExit: {}, shutdown: {})
@@ -251,7 +262,26 @@ public enum LiveMCPComposition {
         return results
     }
 
+    /// The `/mcps` row for an OAuth server with no usable stored token —
+    /// the port's rendering of upstream's `auth_required` session state
+    /// (xai-grok-shell/src/extensions/mcp.rs:149-153), pointing at the
+    /// trigger that exists here.
+    static func authorizationRequiredNotice(serverName: String) -> String {
+        "authorization required — run `open-grok mcp login \(serverName)` to sign in"
+    }
+
     /// Connect a single declaration. Exposed so tests can drive one server.
+    ///
+    /// OAuth wiring, mirroring upstream's connect-time posture
+    /// (`discover_and_prepare_auth`, xai-grok-mcp/src/servers.rs:1826-1906):
+    /// stored tokens attach through the live `MCPAuthorizationManager`
+    /// (proactive refresh + 401 recovery); a server that advertises OAuth but
+    /// has no stored token records an auth-required outcome for `/mcps`
+    /// instead of starting an unauthenticated worker; a server with a static
+    /// `Authorization` header (or bearer env var) skips OAuth entirely
+    /// (servers.rs:4294-4304). Upstream defers the browser to a user trigger
+    /// rather than opening it at connect; this port's trigger is
+    /// `open-grok mcp login <name>`.
     public static func connect(
         declaration: MCPServerDeclaration,
         toolset: FinalizedToolset,
@@ -259,11 +289,33 @@ public enum LiveMCPComposition {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         makeHTTPTransport: @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() }
     ) async -> MCPServerConnection {
+        var authorization: (any MCPAuthorizationProviding)?
+        if let endpoint = declaration.oauthEligibleEndpoint(environment: environment),
+           let home = userGrokHome(environment: environment) {
+            let storage = MCPFileCredentialStorage(
+                home: home, serverName: declaration.name, serverURL: endpoint)
+            if (try? storage.load())?.tokenResponse != nil {
+                authorization = MCPAuthorizationManager(
+                    baseURL: endpoint,
+                    transport: makeHTTPTransport(),
+                    storage: storage
+                )
+            } else if await MCPOAuthProbe.serverAdvertisesOAuth(
+                url: endpoint, transport: makeHTTPTransport()
+            ) {
+                return MCPServerConnection(
+                    name: declaration.name,
+                    failure: authorizationRequiredNotice(serverName: declaration.name)
+                )
+            }
+        }
+
         let transport: any MCPTransport
         do {
             transport = try declaration.makeTransport(
                 httpTransport: makeHTTPTransport(),
-                environment: environment
+                environment: environment,
+                authorization: authorization
             )
         } catch {
             return MCPServerConnection(name: declaration.name, failure: String(describing: error))
@@ -313,11 +365,104 @@ public enum LiveMCPComposition {
             try runAdd(options: options, environment: environment, streams: streams)
         case "remove":
             try runRemove(options: options, environment: environment, streams: streams)
+        case "login":
+            // Reachable only through `CLIRunner.main`'s synchronous seam; the
+            // executable's async path dispatches login in `session` above.
+            throw CLIApplicationError.failed(
+                "`mcp login` is interactive and needs the async runner; invoke it through the open-grok binary"
+            )
         default:
             throw CLIApplicationError.failed(
                 "unknown `mcp` subcommand '\(options.action)' (expected: \(actions.sorted().joined(separator: ", ")))"
             )
         }
+    }
+
+    // MARK: login
+
+    /// `open-grok mcp login <name>` — run the interactive OAuth flow for one
+    /// configured HTTP MCP server and persist tokens to the real
+    /// `$OPENGROK_HOME/mcp_credentials.json`.
+    ///
+    /// This is the port's user-initiated trigger, standing in for upstream's
+    /// `x.ai/mcp/auth_trigger` → `force_reauth(true)` (extensions/mcp.rs:
+    /// 1526-1578, acp_session_impl/mcp.rs:405-426): `force: true` skips the
+    /// dedup layers so a stale abandoned flow never blocks a fresh consent,
+    /// and the refresh-first arm inside the flow still avoids the browser
+    /// when a refresh grant suffices.
+    static func runLogin(
+        options: CLIResourceOptions,
+        environment: [String: String],
+        streams: CLIStreams,
+        cwd: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+        transport: (any HTTPTransport)? = nil,
+        openBrowser: (@Sendable (URL) -> Void)? = nil,
+        timeoutSeconds: TimeInterval = mcpBrowserAuthTimeoutSeconds
+    ) async throws {
+        guard let name = options.target, !name.isEmpty else {
+            throw CLIApplicationError.failed("`mcp login` needs a server name")
+        }
+        let loaded = try loadDeclarations(environment: environment, cwd: cwd)
+        guard let declaration = loaded.servers.first(where: { $0.name == name }) else {
+            let known = loaded.servers.map(\.name).sorted()
+            throw CLIApplicationError.failed(
+                known.isEmpty
+                    ? "no MCP server named '\(name)' (none are configured)"
+                    : "no MCP server named '\(name)' (configured: \(known.joined(separator: ", ")))"
+            )
+        }
+        guard case .streamableHttp = declaration.config.transport else {
+            // Upstream's auth trigger reports the same class of refusal for
+            // non-OAuth servers ("does not use OAuth").
+            throw CLIApplicationError.failed("MCP server '\(name)' does not use OAuth")
+        }
+        guard let endpoint = declaration.oauthEligibleEndpoint(environment: environment) else {
+            throw CLIApplicationError.failed(
+                "MCP server '\(name)' already authenticates with a configured Authorization header"
+            )
+        }
+        guard let home = userGrokHome(environment: environment) else {
+            throw CLIApplicationError.failed(
+                "cannot resolve the user config directory (set $OPENGROK_HOME or $HOME)"
+            )
+        }
+
+        let httpTransport = transport ?? URLSessionHTTPTransport()
+        let announce: @Sendable (URL) -> Void = { url in
+            streams.out("Opening browser for MCP OAuth consent:\n\(url.absoluteString)\n")
+            if let openBrowser {
+                openBrowser(url)
+            } else {
+                LiveAuthComposition.openInSystemBrowser(url)
+            }
+        }
+
+        do {
+            try await mcpAuthenticateServer(
+                serverName: name,
+                serverURL: endpoint,
+                home: home,
+                transport: httpTransport,
+                byoConfig: declaration.config.oauthConfig(environment: environment),
+                force: true,
+                openBrowser: announce,
+                timeoutSeconds: timeoutSeconds
+            )
+        } catch {
+            throw CLIApplicationError.failed(
+                "Authentication failed for MCP server '\(name)': \(error)"
+            )
+        }
+
+        // Assert the store write at the step it happened (AGENTS.md §3) —
+        // "flow returned" is not "token landed".
+        let storage = MCPFileCredentialStorage(home: home, serverName: name, serverURL: endpoint)
+        guard (try? storage.load())?.tokenResponse != nil else {
+            throw CLIApplicationError.failed(
+                "Authentication failed for MCP server '\(name)': no credentials were stored"
+            )
+        }
+        streams.out("Authenticated MCP server '\(name)'.\n")
     }
 
     // MARK: add / remove
