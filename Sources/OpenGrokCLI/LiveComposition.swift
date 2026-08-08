@@ -1098,21 +1098,27 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     services: updateServices
                 )
             )
-            // `/announcements hide` is the keyboard dismissal the banner
-            // advertises (`hide: /announcements hide`). Registered only when a
-            // live announcements surface exists — a headless launch with no
-            // transport has no banner to hide, so advertising the command would
-            // be a dead surface. This is the hide action alone; the listing
-            // overlay (`/announcements` show) is deliberately not registered
-            // (see PORT_STATUS.md) — the banner + hide is the shipped scope.
-            let announcementsHideCommands: [OpenGrokPagerCommandRegistration] =
-                stack.announcements != nil
-                    ? [OpenGrokPagerCommandRegistration(
-                        name: "announcements",
-                        summary: "Hide the current announcement banner",
-                        usage: "/announcements hide"
-                    )]
-                    : []
+            // `/announcements` — the banner's keyboard control: `hide` is
+            // the dismissal the banner advertises (`hide: /announcements
+            // hide`), `show` clears the session's persisted hide keys so the
+            // banner comes back (upstream `AnnouncementsCommand`,
+            // `announcements.rs:12-63`; router arms at `router.rs:974-1005`).
+            // Registered only when a live announcements surface exists — a
+            // headless launch with no transport has no banner to control, so
+            // the row would be dead. The gate deliberately diverges from
+            // upstream's has-announcements visibility; the copy, arms, and
+            // the divergence's cost live on `LiveAnnouncementsSlashCommand`.
+            let announcementsCommands = LiveAnnouncementsSlashCommand.registrations(
+                surfaceAvailable: stack.announcements != nil
+            )
+            // `/imagine` — registered only when this session's advertised
+            // toolset actually carries `image_gen` (upstream's
+            // `required_tools`, `imagine.rs:8`). The gate reads the same
+            // list the model is offered (`toolExecutor.tools`), so the row
+            // exists exactly when the injection it produces can be acted on.
+            let imagineCommands = LiveImagineCommand.registrations(
+                advertisedToolNames: Set(toolExecutor.tools.map(\.name))
+            )
             let sharedExportBoundary = await stack.conversationHistory.sharedExportBoundary
             exportBoundaries.register(
                 sessionID: sessionID,
@@ -1247,40 +1253,60 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                 sessionID: sessionID
                             )
                         },
-                        localCommands: feedbackCommands + announcementsHideCommands,
+                        // Local registration order is upstream's display
+                        // order for this subset: feedback, announcements,
+                        // imagine (`slash/commands/mod.rs:121-135`).
+                        localCommands: feedbackCommands + announcementsCommands
+                            + imagineCommands,
                         localCommandHandler: { invocation in
-                            guard invocation.name == "feedback" else {
-                                // `/announcements hide`: persist the hide key
-                                // for the banner's selected announcement, then
-                                // pull the next non-hidden one (if any) into the
-                                // renderer's cached projection. The controller
+                            switch invocation.name {
+                            case "announcements":
+                                // Dispatch, store mutation (hide persists the
+                                // selected banner's key; show clears the
+                                // session's keys) and the renderer refresh
+                                // live on `LiveAnnouncementsSlashCommand` so
+                                // tests reach the same arms. The controller
                                 // re-renders off the returned notice, so the
-                                // banner swaps (or closes) in the same frame.
-                                guard invocation.name == "announcements" else { return nil }
-                                let sub = invocation.arguments.first?
+                                // banner swaps, closes, or returns in the
+                                // same frame.
+                                return await LiveAnnouncementsSlashCommand.run(
+                                    rawArgumentTail: OpenGrokPagerInteractiveController
+                                        .rawArgumentTail(of: invocation),
+                                    surface: stack.announcements,
+                                    refreshBanner: {
+                                        await renderer.refreshAnnouncementBanner()
+                                    }
+                                )
+                            case "imagine":
+                                // The argument is prose: the raw tail as
+                                // typed (upstream's `args` slice), never the
+                                // tokenizer's unquoted rejoin. Empty → the
+                                // usage notice; otherwise `.submit` carries
+                                // `imagineInstruction(prompt)` into the same
+                                // enqueue path the skill commands use.
+                                return LiveImagineCommand.outcome(
+                                    rawArgumentTail: OpenGrokPagerInteractiveController
+                                        .rawArgumentTail(of: invocation)
+                                )
+                            case "feedback":
+                                let text = invocation.arguments.joined(separator: " ")
                                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                                guard sub == "hide" else {
-                                    return "usage: /announcements hide"
+                                guard !text.isEmpty else {
+                                    return .notice("usage: /feedback <text>")
                                 }
-                                let next = try await stack.announcements?.hideCurrent()
-                                await renderer.refreshAnnouncementBanner()
-                                return next == nil
-                                    ? "no announcement to hide"
-                                    : "announcement hidden"
-                            }
-                            let text = invocation.arguments.joined(separator: " ")
-                                .trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !text.isEmpty else {
-                                return "usage: /feedback <text>"
-                            }
-                            let outcome = try await foundation.feedback.submitText(text)
-                            switch outcome {
-                            case .persistedLocally:
-                                return "feedback saved locally; this session is not eligible for upload"
-                            case .persistedAndUploaded:
-                                return "feedback uploaded"
-                            case .persistedButUploadFailed:
-                                return "feedback saved locally; upload failed"
+                                let outcome = try await foundation.feedback.submitText(text)
+                                switch outcome {
+                                case .persistedLocally:
+                                    return .notice(
+                                        "feedback saved locally; this session is not eligible for upload"
+                                    )
+                                case .persistedAndUploaded:
+                                    return .notice("feedback uploaded")
+                                case .persistedButUploadFailed:
+                                    return .notice("feedback saved locally; upload failed")
+                                }
+                            default:
+                                return nil
                             }
                         },
                         workflowsEnabled: workflowsEnabled

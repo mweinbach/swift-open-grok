@@ -7,13 +7,27 @@ import OpenGrokPagerRender
 import OpenGrokPromptQueue
 import OpenGrokTerminalCore
 
+/// What a host-backed ("local") slash command resolved to.
+///
+/// `.notice` lands on the transcript notice channel — the port's mapping for
+/// upstream's toasts and `CommandResult::Error` / `Message` copy. `.submit`
+/// sends the text as the turn's prompt — upstream's
+/// `CommandResult::InjectSkill` shape (`/imagine`,
+/// `slash/commands/imagine.rs:47-54`), riding the same enqueue path the
+/// skill commands use, so a host command can expand into a model prompt
+/// without the controller knowing which command it was.
+public enum PagerLocalCommandOutcome: Sendable, Equatable {
+    case notice(String)
+    case submit(String)
+}
+
 public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFrontend {
     public typealias CustomCommandHandler = @Sendable (
         PagerCommandInvocation
     ) async throws -> String?
     public typealias LocalCommandHandler = @Sendable (
         PagerCommandInvocation
-    ) async throws -> String?
+    ) async throws -> PagerLocalCommandOutcome?
 
     private enum Control: Sendable {
         /// A user Esc or Ctrl+C, fast-pathed ahead of queued input so it lands
@@ -2544,10 +2558,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     try await emit(.notice("/\(command.name) is unavailable in this session"))
                     return .handled
                 }
-                if let notice = try await localCommandHandler(invocation), !notice.isEmpty {
-                    try await emit(.notice(notice))
+                switch try await localCommandHandler(invocation) {
+                case .notice(let notice)?:
+                    if !notice.isEmpty {
+                        try await emit(.notice(notice))
+                    }
+                    return .handled
+                case .submit(let generatedPrompt)?:
+                    // The host command expanded into a model prompt
+                    // (upstream's `CommandResult::InjectSkill` — `/imagine`).
+                    // Returning `.submit` here rides the same enqueue path
+                    // the skill commands use, including the mid-turn
+                    // deferral at every call site.
+                    return .submit(generatedPrompt)
+                case nil:
+                    return .handled
                 }
-                return .handled
             }
             if customCommandNames.contains(command.name) {
                 guard let customCommandHandler else {
@@ -2902,8 +2928,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// the first whitespace run, leading whitespace dropped, interior
     /// whitespace and quotes untouched. `/fork` needs this because its
     /// grammar is position- and whitespace-sensitive; the tokenizer's
-    /// `arguments` would unquote and re-space it.
-    static func rawArgumentTail(of invocation: PagerCommandInvocation) -> String {
+    /// `arguments` would unquote and re-space it. Public because host-side
+    /// local commands whose argument is prose (`/imagine`) or a raw token
+    /// stream (`/announcements`) need the same slice upstream's `run(args)`
+    /// receives.
+    public static func rawArgumentTail(of invocation: PagerCommandInvocation) -> String {
         let line = invocation.rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let boundary = line.firstIndex(where: \.isWhitespace) else { return "" }
         return String(line[line.index(after: boundary)...].drop(while: \.isWhitespace))

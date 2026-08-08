@@ -41,6 +41,7 @@ import Foundation
 import OpenGrokAnnouncements
 import OpenGrokConfig
 import OpenGrokHTTP
+import OpenGrokPager
 import OpenGrokPagerRender
 import OpenGrokPaths
 import OpenGrokSamplingTypes
@@ -242,6 +243,34 @@ public actor LiveAnnouncementsComposition {
         return await refreshVisibleBanner()
     }
 
+    /// Clear the persisted hide keys of every live session-surfaced
+    /// announcement and re-derive the banner — upstream's `AnnouncementsShow`
+    /// (`app/dispatch/router.rs:991-1005`). Un-hiding is a persisted store
+    /// mutation, not a transient repaint: the keys come out of the same state
+    /// file `hideCurrent()` writes into, so a re-launch keeps the banner
+    /// visible. The key set is `sessionAnnouncementHideKeys` over the RAW
+    /// cached feed (upstream reads `app.active_announcements`,
+    /// `views/announcements.rs:334-350`) — deliberately not the
+    /// hidden-filtered startup view, because the items being un-hidden are
+    /// exactly the ones that view no longer contains. Expired items keep
+    /// their keys (`session_announcement_hide_keys` filters them out);
+    /// prune owns that cleanup on the next fetch. The write is skipped when
+    /// no key was present (upstream's `changed` guard, router.rs:998), so a
+    /// `show` with nothing hidden does not touch the file.
+    @discardableResult
+    public func showSession(now: Date = Date()) async -> PagerAnnouncementBanner? {
+        let cached = service.store.read()?.announcements ?? []
+        var hidden = await service.stateStore.read()
+        var changed = false
+        for key in sessionAnnouncementHideKeys(cached, now: now) where hidden.remove(key) != nil {
+            changed = true
+        }
+        if changed {
+            await service.stateStore.write(hidden)
+        }
+        return await refreshVisibleBanner(now: now)
+    }
+
     /// Apply a pushed `x.ai/announcements/update` and re-derive the banner.
     /// A push is only accepted when its generation is at least the cached one
     /// (the service enforces this); a stale push is a no-op.
@@ -287,6 +316,90 @@ func stripTrailingV1(_ proxyBaseURL: String) -> URL {
         return URL(string: String(trimmed.dropLast(3))) ?? URL(string: trimmed)!
     }
     return URL(string: trimmed) ?? URL(string: proxyBaseURL)!
+}
+
+// MARK: - /announcements slash command
+
+/// The `/announcements` command surface — upstream `AnnouncementsCommand`
+/// (`slash/commands/announcements.rs:12-63`). Registration copy, the
+/// dispatch arms, and the byte-exact usage error live here, one seam below
+/// the interactive composition's closure, so tests reach the exact values
+/// the running executable installs.
+enum LiveAnnouncementsSlashCommand {
+    /// Upstream's usage error, byte-exact (`announcements.rs:6`). Both the
+    /// empty and the unknown-token arm return it (`args_required` plus the
+    /// `_` match arm, announcements.rs:57-62).
+    static let usageMessage = "Usage: /announcements hide | show"
+
+    /// The conditional registration the interactive composition installs.
+    /// Copy is upstream's verbatim: description "Show or hide announcements"
+    /// (`announcements.rs:16-18`), usage "/announcements hide | show"
+    /// (`announcements.rs:20-22`).
+    ///
+    /// GATE DIVERGENCE, deliberate: upstream lists the row iff the session
+    /// HAS live announcements (`visible()` = `has_session_announcements`,
+    /// announcements.rs:53-55 — ignoring the hidden set so `show` stays
+    /// reachable while everything is hidden). This port registers whenever a
+    /// live announcements SURFACE exists: the registry is fixed at controller
+    /// construction, before the detached feed fetch has necessarily landed,
+    /// so a feed-dependent gate would race the fetch and hide the command
+    /// from the very session it just fetched for. Cost: a session whose feed
+    /// is empty still lists `/announcements`; both arms then answer honestly
+    /// ("no announcement to …").
+    static func registrations(
+        surfaceAvailable: Bool
+    ) -> [OpenGrokPagerCommandRegistration] {
+        guard surfaceAvailable else { return [] }
+        return [OpenGrokPagerCommandRegistration(
+            name: "announcements",
+            summary: "Show or hide announcements",
+            usage: "/announcements hide | show"
+        )]
+    }
+
+    /// `AnnouncementsCommand::run` (`announcements.rs:57-63`): dispatch on
+    /// the first whitespace token of the raw tail and ignore the rest
+    /// (`args.split_whitespace().next()`) — `hide extra` hides; anything
+    /// else, including no argument, is the usage error. `hide` persists the
+    /// selected banner's hide key (router.rs:974-990); `show` clears every
+    /// session hide key from the same store (router.rs:991-1005). Upstream
+    /// is silent on success; the success/no-op notices are this port's
+    /// existing `/announcements hide` convention, kept so the transcript
+    /// says what the keystroke did.
+    static func run(
+        rawArgumentTail: String,
+        surface: LiveAnnouncementsComposition?,
+        refreshBanner: @Sendable () async -> Void
+    ) async -> PagerLocalCommandOutcome {
+        let arm = rawArgumentTail
+            .split(whereSeparator: \.isWhitespace)
+            .first
+            .map(String.init) ?? ""
+        switch arm {
+        case "hide":
+            guard let surface, await surface.currentBanner() != nil else {
+                return .notice("no announcement to hide")
+            }
+            // The return is the NEXT banner after the hide (nil when hiding
+            // closed the slot), not a success bit — the visible-banner
+            // precheck above is what distinguishes "hid the last one" from
+            // "nothing to hide".
+            await surface.hideCurrent()
+            await refreshBanner()
+            return .notice("announcement hidden")
+        case "show":
+            guard let surface else {
+                return .notice("no announcement to show")
+            }
+            let restored = await surface.showSession()
+            await refreshBanner()
+            return .notice(
+                restored == nil ? "no announcement to show" : "announcement shown"
+            )
+        default:
+            return .notice(usageMessage)
+        }
+    }
 }
 
 /// Re-derive the hide key for the banner's selected announcement. The banner

@@ -198,6 +198,31 @@ modal doesn't exist; `openExtensions` is inert), `/doctor` (~9.2k-line diagnosti
 and fix stack absent; the CLI route is an honest stub), `/scroll-debug`/`/debug` (no
 debug HUDs). These unlock bottom-up as the backing features land.
 
+### E2 — `/announcements show` + `/imagine` (serial gate: exit 0, 4,476 tests, zero issues; 2026-08-08)
+
+The survey's two BUILDABLE-NOW commands. `/announcements` now carries upstream's full
+"hide | show" surface (`announcements.rs:12-62`): `show` clears the session's hide keys
+from the REAL persisted store (skipping the write when nothing changed, mirroring
+`router.rs:991-1005`) and the banner repaints; the old hide arm's mislabeled
+last-announcement notice was fixed in passing (it keyed off `hideCurrent()`'s next-banner
+return and reported "no announcement to hide" when hiding the final one). `/imagine`
+registers ONLY when `image_gen` is in the session's advertised toolset — the gate reads
+the model-facing tool list, so it inherits credential failures and profile filters, not
+just the config flag — and expands into `imagineInstruction(prompt)` (byte-identical to
+`slash_commands.rs:98-125`, pinned as literals) submitted as the turn's prompt through a
+new `.notice`/`.submit` local-command outcome. 17 new tests.
+
+**Recorded divergences:** registration gates at surface-existence rather than upstream's
+`has_session_announcements` (the registry is fixed before the detached feed fetch lands;
+an empty-feed session lists the row and both arms answer honestly); the port notices on
+hide/show success where upstream is silent; `/announcements`' bare submit gets the usage
+error instead of parking in the argument phase (`requiresArguments` derives from `<`
+markers; "hide | show" has none); no argument-suggestion or placeholder channel (the
+standing `/docs`/`/fork` divergence); `/imagine`'s transcript paints the expanded
+instruction, not upstream's `"/imagine {prompt}"` echo (typed text is preserved in prompt
+history); conditionally-registered local commands list after the builtins, in upstream's
+relative order. `/imagine-video` stays unregistered — no video tool pack exists.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was
@@ -439,9 +464,11 @@ the keystone.
   (listed below), matching the `show_tips` precedent.
 - **Announcements**: fetch→cache spawns post-readiness (export-boundary + `remote_fetch` gated),
   the first non-hidden announcement renders as a pager banner, and `/announcements hide`
-  persists across relaunch. Listing overlay deliberately not registered (banner+hide is the
-  shipped scope). Deliberate stricter divergence: the Swift fetch is gated on the xAI export
-  boundary, so a Codex session issues no request.
+  persists across relaunch. ~~Listing overlay deliberately not registered (banner+hide is the
+  shipped scope).~~ *Superseded by Wave 15 E2: the `show` arm landed with upstream's
+  usage/description copy; the hide-only scope note no longer applies.* Deliberate stricter
+  divergence: the Swift fetch is gated on the xAI export boundary, so a Codex session issues
+  no request.
 - **Launch auto-update**: a non-blocking check runs after readiness (cadence-cached, gated by
   `--no-auto-update` / `[cli] auto_update` / env kill-switches / debug builds), printing
   upstream's availability notice; never blocks or fails launch.
