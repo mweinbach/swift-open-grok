@@ -836,9 +836,9 @@ public actor ACPAgentRuntime {
 //
 // Registered by the live composition (`LiveACPExtensionMethods.swift`):
 // `x.ai/feedback`, the `open-grok/*/models` credential family, `x.ai/recap`,
-// the `x.ai/mcp/` prefix family, and the session-admin trio
+// `x.ai/btw`, the `x.ai/mcp/` prefix family, and the session-admin trio
 // (`x.ai/session/rename`/`delete`/`fork`). Remaining upstream families
-// (btw/feedback-dismiss, the xAI auth family, …) belong to their own
+// (feedback-dismiss, the xAI auth family, …) belong to their own
 // slices; until they land they fall through to the terminal arm.
 
 public struct ACPExtensionMethodRouter: ACPAgentExtensionHandler, Sendable {

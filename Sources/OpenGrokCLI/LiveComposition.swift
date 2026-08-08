@@ -1406,12 +1406,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     if uiConfiguration.config.swarmMode == true {
                         await toolExecutor.swarmMode.enter(.manual)
                     }
-                    // The mid-turn interjection seam: `/btw` delivers into
-                    // the RUNNING turn's buffer (drained between sampler
-                    // rounds by `LiveShellSamplingDriver`), and turn-end
-                    // stranded entries flow back for the fallback-prompt
-                    // conversion. The single-process port of `x.ai/interject`
-                    // → `SessionCommand::Interject` (run_loop.rs:1947-1990).
+                    // The mid-turn interjection seam: the subagent
+                    // collaboration quartet delivers into the RUNNING turn's
+                    // buffer (drained between sampler rounds by
+                    // `LiveShellSamplingDriver`), and turn-end stranded
+                    // entries flow back for the fallback-prompt conversion.
+                    // The single-process port of `x.ai/interject` →
+                    // `SessionCommand::Interject` (run_loop.rs:1947-1990).
+                    // `/btw` no longer produces here — it is a real side
+                    // question (`.sideQuestion` → `startSideQuestion`).
                     let interjections = stack.interjections
                     await controller.setInterjectionSeam(OpenGrokPagerInterjectionSeam(
                         deliver: { text in await interjections.interject(text) },
@@ -1956,8 +1959,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let compaction: LiveCompactionCoordinator
         let turnDriver: ProviderSessionTurnDriver
         let shell: OpenGrokShell
-        /// The mid-turn interjection seam: the controller's `/btw` dispatch
-        /// produces into it, the turn loop drains it between sampler rounds.
+        /// The mid-turn interjection seam: the subagent collaboration
+        /// quartet produces into it, the turn loop drains it between sampler
+        /// rounds. (`/btw` left this seam when it became a real side
+        /// question — see `startSideQuestion`.)
         let interjections: LiveSessionInterjections
         /// Retained only so reachability tests can await the post-readiness
         /// launch update check; production callers ignore it.
@@ -2518,12 +2523,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             // the `open-grok/*/models` credential family — bound to THIS
             // stack's catalog store and switch coordinator so an applied key
             // reaches the running session's sampler, not a parallel copy —
-            // and `x.ai/recap`, whose backing reads the SAME conversation
-            // spine the turn driver appends to and samples on the running
-            // coordinator's auxiliary recap route. Unregistered methods get
-            // upstream's unknown-method error from the router's terminal arm
-            // — see LiveACPExtensionMethods.swift for the routed/refused
-            // table.
+            // and `x.ai/recap` + `x.ai/btw`, whose backings read the SAME
+            // conversation spine the turn driver appends to (recap samples
+            // the auxiliary recap route, btw the ACTIVE route). Unregistered
+            // methods get upstream's unknown-method error from the router's
+            // terminal arm — see LiveACPExtensionMethods.swift for the
+            // routed/refused table.
             let history = stack.conversationHistory
             let modelSwitch = stack.modelSwitch
             // The `x.ai/mcp/*` family operates on the RUNNING session's MCP
@@ -2575,6 +2580,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     workingDirectory: launch.workingDirectory,
                     openGrokHome: launch.openGrokHome,
                     environment: launch.environment
+                ),
+                // `x.ai/btw` answers synchronously — the answer rides the
+                // ext response itself (feedback.rs:46-93), so unlike recap
+                // it needs the gateway only for the session lookup. It
+                // samples the SAME conversation spine on the coordinator's
+                // ACTIVE route (upstream's prepare_chat_completion +
+                // session model, recap.rs:81-84, :110-112) and appends to
+                // the real `btw_history.jsonl` under the session directory.
+                btw: LiveBtwACPHandler(
+                    gateway: gateway,
+                    conversation: { await history.items },
+                    activeRoute: { await modelSwitch.snapshot() },
+                    history: LiveBtwHistoryStore(openGrokHome: launch.openGrokHome)
                 ),
                 mcp: mcpHandler,
                 sessionAdmin: sessionAdmin
@@ -5640,8 +5658,9 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     /// always has one, and without it a long session dies at the wall.
     let compaction: LiveCompactionCoordinator?
     /// Mid-turn interjection buffer, drained between sampler rounds. The
-    /// producer is the interactive controller's `/btw` dispatch through the
-    /// installed seam.
+    /// producer is the subagent collaboration quartet (`LiveSubagentHost`'s
+    /// root-delivery path); `/btw` stopped producing here when it became a
+    /// real side question.
     let interjections: LiveSessionInterjections
 
     func sample(
@@ -8137,6 +8156,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await applyEffortCommand(query: query)
         case .fastMode:
             await applyFastCommand()
+        case .sideQuestion(let question):
+            await startSideQuestion(question)
         case .recap:
             await startRecap()
         case .renameSession(let title):
@@ -8611,6 +8632,163 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // deliberately not painted — upstream sends it to tracing, never
             // to the client.
             note(LiveRecap.unavailableToast(hasUserMessages: true))
+        }
+        try? renderState()
+    }
+
+    // MARK: - /btw
+
+    /// `/btw <question>` — the side-question side-call
+    /// (`handle_side_question`, acp_session_impl/recap.rs:70-180). ONE
+    /// read-only snapshot of the live conversation, ONE tool-free model call
+    /// on the ACTIVE session route — upstream's
+    /// `prepare_chat_completion(false)` + session `sampling_config` model
+    /// (recap.rs:81-84, :110-112), never the recap helper route — and a
+    /// display-only transcript block; the conversation is never touched.
+    /// Every question appends a record to the session's `btw_history.jsonl`,
+    /// answered or failed. Spawned so a mid-turn `/btw` samples CONCURRENTLY
+    /// with the running turn; there is deliberately no single-flight claim
+    /// and no epoch cancel — upstream spawns each side question
+    /// independently (run_loop.rs:1913-1919) and carries neither.
+    ///
+    /// Recorded divergences (beyond the shared tool-free one at the call):
+    ///   * No overload-only retry (recap.rs:9-28): the port has no
+    ///     sampling-error classification seam, so the call is one-shot and
+    ///     the persisted `attempts` is honestly always 1. Cost: a transient
+    ///     overload fails a side question upstream would have retried twice.
+    ///   * Presentation: upstream shows a dismissible panel
+    ///     (`BtwOverlayState`, views/btw_overlay.rs) titled
+    ///     "/btw <question>"; this port has no side panel, so the running
+    ///     state paints "/btw <question>…" as a note and the answer paints
+    ///     as one self-contained note in the panel's scrollback-persist
+    ///     shape — header then body (`BtwBlock`, scrollback/blocks/
+    ///     btw.rs:48-73). Cost: the running line stays in scrollback above
+    ///     the result, and mid-turn output can interleave between the two.
+    private func startSideQuestion(_ question: String) async {
+        // No live sampling stack or conversation behind this renderer means
+        // no session to ask against (dispatch_send_btw, notes.rs:293-304).
+        guard let modelSwitch, let conversationHistory else {
+            note("No active session")
+            try? renderState()
+            return
+        }
+        note("/btw \(question)\u{2026}")
+        try? renderState()
+
+        let sessionID = self.sessionID
+        let store = LiveBtwHistoryStore(openGrokHome: openGrokHome)
+        Task {
+            let btwSessionID = LiveBtw.makeBtwSessionID()
+            let askedAt = Date()
+            let route = await modelSwitch.snapshot()
+            // Snapshot at dispatch; `/btw` can fire mid-turn, so the
+            // trailing incomplete tool run is truncated and reasoning strips
+            // only where the backend rejects replayed thinking blocks
+            // (recap.rs:86-108).
+            let items = LiveBtw.buildItems(
+                conversation: await conversationHistory.items,
+                question: question,
+                tag: "system-reminder",
+                stripReasoning: route.configuration.apiBackend == .messages
+            )
+            // Tool-free request: `tools: []` serializes NO tools field.
+            // RECORDED DIVERGENCE (shared with `/recap`): upstream ships the
+            // main turn's tool specs unchanged so the cached token prefix
+            // matches, and suppresses tool USE through the instruction text
+            // alone (recap.rs:106-108, :210-219); this render layer has no
+            // reach into the live tool surface. Cost: the provider's prefix
+            // cache diverges from the main turn at the tools block.
+            let result: Result<String, any Error>
+            do {
+                let response = try await route.sampler.sample(
+                    OpenGrokLiveSamplingRequest(
+                        sessionID: sessionID,
+                        turnID: LiveBtw.makeRequestID(),
+                        model: route.configuration.model,
+                        prompt: LiveBtw.instruction(
+                            tag: "system-reminder",
+                            question: question
+                        ),
+                        items: items,
+                        tools: []
+                    )
+                ) { _ in
+                    // Display-only side-call: deltas must never stream into
+                    // the transcript as assistant text.
+                }
+                result = .success(response.output)
+            } catch {
+                result = .failure(error)
+            }
+            // Persist BEFORE painting, success and failure alike — the
+            // history file is the question's only durable record
+            // (handle_side_question's `persist` closure, recap.rs:114-128,
+            // :162-179). An append failure is warn-and-continue upstream
+            // (persistence.rs:2430-2434); this port has no tracing at this
+            // seam, so the miss is silent by the same policy — the answer
+            // that already exists must still paint.
+            let record: LiveBtwEntry
+            switch result {
+            case .success(let answer) where !answer.isEmpty:
+                record = LiveBtwEntry(
+                    btwSessionId: btwSessionID,
+                    parentSessionId: sessionID,
+                    askedAt: askedAt,
+                    question: question,
+                    answer: answer,
+                    model: route.configuration.model,
+                    success: true,
+                    error: nil
+                )
+            case .success:
+                record = LiveBtwEntry(
+                    btwSessionId: btwSessionID,
+                    parentSessionId: sessionID,
+                    askedAt: askedAt,
+                    question: question,
+                    answer: "",
+                    model: route.configuration.model,
+                    success: false,
+                    error: LiveBtw.emptyResponseCopy
+                )
+            case .failure(let error):
+                record = LiveBtwEntry(
+                    btwSessionId: btwSessionID,
+                    parentSessionId: sessionID,
+                    askedAt: askedAt,
+                    question: question,
+                    answer: "",
+                    model: route.configuration.model,
+                    success: false,
+                    error: "side question model call failed: \(String(describing: error))"
+                )
+            }
+            do {
+                try await store.append(record)
+            } catch {
+                // See the persist note above.
+            }
+            self.finishSideQuestion(question: question, record: record)
+        }
+    }
+
+    /// Land the side question. The conversation is deliberately untouched on
+    /// every arm — the answer is generated from a read-only snapshot and
+    /// surfaced for display only, off-conversation by contract
+    /// (commands.rs:734-740).
+    private func finishSideQuestion(question: String, record: LiveBtwEntry) {
+        if record.success {
+            // The panel's scrollback-persist shape: "/btw <question>" header
+            // then the response body (`BtwBlock::output`, scrollback/blocks/
+            // btw.rs:48-73) — one self-contained block, so mid-turn output
+            // interleaving cannot orphan the answer from its question.
+            note("/btw \(question)\n\(record.answer)")
+        } else {
+            // Upstream's error arm paints the failure into the panel with
+            // the "side question failed: …" prefix (effects/mod.rs:
+            // 5641-5649); the empty-answer arm carries EmptyResponse's own
+            // copy (commands.rs:34-35).
+            note(LiveBtw.failureCopy(record.error ?? LiveBtw.emptyResponseCopy))
         }
         try? renderState()
     }

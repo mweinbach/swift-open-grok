@@ -10,9 +10,8 @@
 // (run_loop.rs:1974-1979); an idle session converts it into a front-of-queue
 // prompt turn instead (run_loop.rs:1980-1989, `queue_interjection_fallback_
 // prompt`). This port is single-process, so the wire hop collapses into a
-// direct call: the interactive controller (the pager half) calls `interject`
-// through an installed closure, and a `false` return is the controller's cue
-// to run the fallback-prompt path itself — the prompt queue lives on the
+// direct call through the buffer actor, and a `false` return is the
+// producer's cue to run the fallback path — the prompt queue lives on the
 // controller in this port, not in the shell.
 //
 // The running/idle decision and the buffer mutation live together in one
@@ -28,8 +27,10 @@
 import OpenGrokInterjection
 
 /// Mid-turn interjection buffer for one live session, shared between the
-/// producer (the interactive controller's `/btw` dispatch) and the consumer
-/// (`LiveShellSamplingDriver.runTurn`'s drain points).
+/// producer (the subagent collaboration quartet's root delivery,
+/// `LiveSubagentHost`) and the consumer (`LiveShellSamplingDriver.runTurn`'s
+/// drain points). `/btw` stopped producing here when it became a real side
+/// question (`startSideQuestion` in LiveComposition.swift).
 ///
 /// The attachment type is `String` for symmetry with the shared
 /// `InterjectionBuffer`; this port's composer has no image attachments on

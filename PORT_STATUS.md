@@ -578,6 +578,36 @@ updates journals, FTS), the `sdk_call` reverse bridge, and the
 `servers_updated`/`tools_changed` outbound notifications (no emit sites yet). Wave 15's
 open remainder: item 7 (real `x.ai/btw` side-question semantics).
 
+### E13 — real `/btw` side-question (serial gate: exit 0, 4,700 tests, zero issues; 2026-08-08)
+
+Closes roadmap Wave 15 item 7 — Wave 15 is now complete end to end. `/btw` no longer
+maps to the interjection buffer (E5's recorded divergence): it runs upstream's
+off-conversation side question (`handle_side_question`, `acp_session_impl/recap.rs:70-180`)
+— a tool-free one-shot sample on the ACTIVE session route over a conversation snapshot
+(reasoning stripped only on the Messages backend, trailing tool-run popped), the
+instruction byte-pinned by SHA against upstream, answer painted as the `BtwBlock`
+scrollback shape ("/btw {question}\n{answer}"), and a question+answer record appended to
+`sessions/<id>/btw_history.jsonl`. It never touches the conversation, queue, or running
+turn — the no-mutation contract is pinned mid-turn and idle (next turn's request body is
+clean of both question and answer). `x.ai/btw` moves from E10's refused table to a routed
+SYNCHRONOUS handler (answer in the ext response, not a notification — a brief correction
+the delegate verified: `extensions/feedback.rs:46-93`, refusal pin 71→70).
+
+**Brief corrections, delegate-verified:** the sample is on the active route, not the
+recap aux route (recap.rs:81-84,110-112); the ACP arm is synchronous, not recap-shaped
+async. **Lead fix — a bug the gate caught:** the JSONL torn-tail heal opened the file
+`forWritingAtPath` (write-only) and then READ the last byte to check for a missing
+newline — EBADF on every append to an existing file; two history tests failed. Fixed to
+`forUpdatingAtPath` (O_RDWR).
+
+**Recorded divergences:** no overload-only retry (no sampling-error classification seam;
+`attempts` is honestly always 1); tool-free side call (shared with `/recap`); no side
+panel — running state and answer both paint as transcript notes (mid-turn output can
+interleave between them); flat internal-error mapping for model failures (typed
+rate-limit/auth codes unported); cosmetic JSON key-order/timestamp-precision differences.
+The interjection seam itself stays (the collaboration quartet still produces into it);
+only `/btw`'s routing changed.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was

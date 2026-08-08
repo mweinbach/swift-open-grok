@@ -4,10 +4,9 @@
 // composition the executable actually runs — `makeSessionFoundation` →
 // `makeAgentStack` → the real `OpenGrokShell` driving the real
 // `LiveShellSamplingDriver` turn loop — with the evidence read off the
-// sampler REQUESTS (the items array the model is actually offered), the
-// persisted conversation record, and the painted transcript. A
-// composition-level test would pass just as happily when nothing drains the
-// buffer; these do not.
+// sampler REQUESTS (the items array the model is actually offered) and the
+// persisted conversation record. A composition-level test would pass just
+// as happily when nothing drains the buffer; these do not.
 //
 // Upstream ground truth at the pinned reference (650c1db7):
 // `drain_pending_interjections` call sites (turn.rs:2413, tool_calls.rs:509,
@@ -15,9 +14,15 @@
 // split (run_loop.rs:1962-1989), and the Cancel arm's buffer clear
 // (run_loop.rs:989-991).
 //
+// `/btw` no longer produces into this seam — it is a real side question
+// (Wave 15 item 7); its typed live-seam coverage lives in
+// `LiveBtwTests.swift`. The buffer's live producer is the subagent
+// collaboration quartet (`LiveSubagentHost`), and these tests drive the
+// seam directly, which is exactly the producer-side call that host makes.
+//
 // Fixture patterns follow `LiveHookEventsReachabilityTests.swift` (canned
 // sampler over the real stack) and `LiveRecapTests.swift` (hermetic home,
-// endpoint pins, UTF-8 sink, bounded polls).
+// endpoint pins, bounded polls).
 
 import Foundation
 import Testing
@@ -359,240 +364,5 @@ struct LiveInterjectionSessionActorTests {
         let requests = await store.agentRequests
         let lastItems = try #require(requests.last).items
         #expect(!lastItems.contains { isInterjectionItem($0, text: "never mind") })
-    }
-}
-
-// MARK: - Typed /btw through the real controller + renderer
-
-private final class InterjectionCapturingSink: PagerTerminalSink, CustomReflectable,
-    @unchecked Sendable {
-    private let lock = NSLock()
-    private var bytes: [UInt8] = []
-
-    var capabilities: PagerTerminalCapabilities { .standard }
-
-    func write(bytes newBytes: [UInt8]) throws {
-        lock.lock(); defer { lock.unlock() }
-        bytes.append(contentsOf: newBytes)
-    }
-
-    func flush() throws {}
-
-    var customMirror: Mirror {
-        lock.lock(); defer { lock.unlock() }
-        return Mirror(self, children: ["byteCount": bytes.count])
-    }
-
-    /// The painted text with CSI/OSC escape sequences stripped (the
-    /// `LiveRecapTests` scrubber).
-    var strippedText: String {
-        lock.lock(); defer { lock.unlock() }
-        var plain: [UInt8] = []
-        plain.reserveCapacity(bytes.count / 4)
-        var index = 0
-        while index < bytes.count {
-            guard bytes[index] == 0x1B else {
-                plain.append(bytes[index])
-                index += 1
-                continue
-            }
-            index += 1
-            guard index < bytes.count else { break }
-            switch bytes[index] {
-            case UInt8(ascii: "["):
-                index += 1
-                while index < bytes.count, !(0x40...0x7E).contains(bytes[index]) {
-                    index += 1
-                }
-                index += 1
-            case UInt8(ascii: "]"):
-                index += 1
-                while index < bytes.count {
-                    if bytes[index] == 0x07 { index += 1; break }
-                    if bytes[index] == 0x1B, index + 1 < bytes.count,
-                       bytes[index + 1] == UInt8(ascii: "\\") {
-                        index += 2
-                        break
-                    }
-                    index += 1
-                }
-            default:
-                index += 1
-            }
-        }
-        return String(decoding: plain, as: UTF8.self)
-    }
-
-    func paintedCompact() -> String {
-        strippedText.filter { !$0.isWhitespace }
-    }
-}
-
-private struct InterjectionDiscardingOutput: OpenGrokPagerInteractiveOutputAdapter {
-    func forward(_ event: OpenGrokPagerInteractiveEvent) async throws { _ = event }
-}
-
-@Suite("Mid-turn interjection: typed /btw live seam", .serialized)
-struct LiveInterjectionTypedSeamTests {
-    /// Typed `/btw` during a RUNNING turn reaches that turn through the real
-    /// controller, the real renderer, and the real runtime adapter: the
-    /// second sampler round carries the synthetic user item, the transcript
-    /// echoes the text with upstream's toast copy, and the record persists it.
-    @Test("typed /btw mid-turn merges into the running turn")
-    func typedBtwMidTurnMergesIntoRunningTurn() async throws {
-        let fixture = try InterjectionFixture()
-        defer { fixture.dispose() }
-        let store = InterjectionSamplerStore()
-        await store.enqueue([toolCallResponse()])
-        let (foundation, stack) = try await makeStack(fixture: fixture, store: store)
-        let interjections = stack.interjections
-        await store.gateFirstResponse { await !interjections.isEmpty }
-
-        var inputContinuation: AsyncStream<InputEvent>.Continuation!
-        let input = AsyncStream<InputEvent> { inputContinuation = $0 }
-        let sink = InterjectionCapturingSink()
-        let renderer = LiveInteractiveControllerRenderer(
-            mode: .fullScreen,
-            terminal: OpenGrokLiveTerminal(
-                isTTY: { false },
-                size: { OpenGrokLiveTerminalSize(width: 120, height: 40) },
-                write: { _ in }
-            ),
-            sink: sink,
-            workingDirectory: fixture.workspace.path,
-            modelName: "grok-4.5",
-            modelSwitch: stack.modelSwitch,
-            sessionID: foundation.sessionID,
-            conversationHistory: stack.conversationHistory,
-            openGrokHome: fixture.home,
-            paintCadence: PagerMotion.minimumPaintCadence,
-            environment: fixture.environment
-        )
-        let runtime = LivePagerRuntimeAdapter(
-            shell: stack.shell,
-            cwd: foundation.cwd,
-            providerConfiguration: foundation.providerConfiguration,
-            conversationHistory: stack.conversationHistory,
-            conversationStore: LiveConversationStore(openGrokHome: fixture.home)
-        )
-        let controller = OpenGrokPagerInteractiveController(
-            input: input,
-            runtime: runtime,
-            renderer: renderer,
-            output: InterjectionDiscardingOutput()
-        )
-        await controller.setInterjectionSeam(OpenGrokPagerInterjectionSeam(
-            deliver: { text in await interjections.interject(text) },
-            collectStranded: { await interjections.collectStranded() }
-        ))
-
-        let script = Task {
-            inputContinuation.yield(.paste("fix the bug"))
-            inputContinuation.yield(.key(KeyEvent(key: .enter)))
-            // Round one is in flight once the first agent request lands —
-            // and the seam is live from that point (the driver begins the
-            // turn before it samples), so the typed /btw cannot race idle.
-            _ = await store.waitForAgentRequests(atLeast: 1)
-            inputContinuation.yield(.paste("/btw hurry up"))
-            inputContinuation.yield(.key(KeyEvent(key: .enter)))
-            _ = await store.waitForAgentRequests(atLeast: 2)
-            // Let the final round land in the record before shutting down.
-            let deadline = Date().addingTimeInterval(15)
-            while Date() < deadline {
-                let items = await stack.conversationHistory.items
-                if items.contains(where: { isInterjectionItem($0, text: "hurry up") }) {
-                    break
-                }
-                try? await Task.sleep(nanoseconds: 10_000_000)
-            }
-            await controller.shutdown()
-            inputContinuation.finish()
-        }
-        _ = try? await controller.run(.init(prompt: "", mode: .inline))
-        _ = await script.value
-
-        // Wire: the second round carries the synthetic user item last.
-        let requests = await store.agentRequests
-        try #require(requests.count >= 2)
-        #expect(
-            isInterjectionItem(try #require(requests[1].items.last), text: "hurry up"),
-            "typed /btw must reach the running turn's next round, got \(requests[1].items)"
-        )
-        // Transcript: the optimistic user-block echo and upstream's toast copy.
-        #expect(sink.paintedCompact().contains("hurryup"))
-        #expect(sink.paintedCompact().contains("Interjectionsent"))
-        // Record: the interjection persisted as a real user item.
-        let reloaded = try await LiveConversationStore(openGrokHome: fixture.home)
-            .loadIfPresent(sessionID: foundation.sessionID)
-        #expect(reloaded?.items.contains { isInterjectionItem($0, text: "hurry up") } == true)
-    }
-
-    /// Typed `/btw` while IDLE takes upstream's fallback: the question runs
-    /// as its own prompt turn (raw text, no interjection envelope), started
-    /// immediately — the port of `queue_interjection_fallback_prompt` +
-    /// `maybe_start_running_task` (run_loop.rs:1980-1989).
-    @Test("typed /btw while idle runs as its own fallback prompt turn")
-    func typedBtwIdleRunsFallbackPrompt() async throws {
-        let fixture = try InterjectionFixture()
-        defer { fixture.dispose() }
-        let store = InterjectionSamplerStore()
-        let (foundation, stack) = try await makeStack(fixture: fixture, store: store)
-        let interjections = stack.interjections
-
-        var inputContinuation: AsyncStream<InputEvent>.Continuation!
-        let input = AsyncStream<InputEvent> { inputContinuation = $0 }
-        let sink = InterjectionCapturingSink()
-        let renderer = LiveInteractiveControllerRenderer(
-            mode: .fullScreen,
-            terminal: OpenGrokLiveTerminal(
-                isTTY: { false },
-                size: { OpenGrokLiveTerminalSize(width: 120, height: 40) },
-                write: { _ in }
-            ),
-            sink: sink,
-            workingDirectory: fixture.workspace.path,
-            modelName: "grok-4.5",
-            modelSwitch: stack.modelSwitch,
-            sessionID: foundation.sessionID,
-            conversationHistory: stack.conversationHistory,
-            openGrokHome: fixture.home,
-            paintCadence: PagerMotion.minimumPaintCadence,
-            environment: fixture.environment
-        )
-        let runtime = LivePagerRuntimeAdapter(
-            shell: stack.shell,
-            cwd: foundation.cwd,
-            providerConfiguration: foundation.providerConfiguration,
-            conversationHistory: stack.conversationHistory,
-            conversationStore: LiveConversationStore(openGrokHome: fixture.home)
-        )
-        let controller = OpenGrokPagerInteractiveController(
-            input: input,
-            runtime: runtime,
-            renderer: renderer,
-            output: InterjectionDiscardingOutput()
-        )
-        await controller.setInterjectionSeam(OpenGrokPagerInterjectionSeam(
-            deliver: { text in await interjections.interject(text) },
-            collectStranded: { await interjections.collectStranded() }
-        ))
-
-        let script = Task {
-            inputContinuation.yield(.paste("/btw is the cache warm"))
-            inputContinuation.yield(.key(KeyEvent(key: .enter)))
-            _ = await store.waitForAgentRequests(atLeast: 1)
-            await controller.shutdown()
-            inputContinuation.finish()
-        }
-        _ = try? await controller.run(.init(prompt: "", mode: .inline))
-        _ = await script.value
-
-        // The fallback turn runs with the RAW question as its prompt — never
-        // the interjection envelope (interjection.rs:53).
-        let requests = await store.agentRequests
-        try #require(requests.count >= 1)
-        #expect(requests[0].prompt == "is the cache warm")
-        #expect(!requests[0].items.contains { isInterjectionItem($0, text: "is the cache warm") })
-        #expect(sink.paintedCompact().contains("Interjectionsent"))
     }
 }

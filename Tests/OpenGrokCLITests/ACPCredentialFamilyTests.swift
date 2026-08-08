@@ -155,10 +155,11 @@ private struct HermeticFamily {
 /// 410-420). Each must be refused with the terminal arm's error — never
 /// silently mis-routed, never accepted as a no-op.
 ///
-/// Count discipline: 76 entries when the pin landed with E10; 71 now —
+/// Count discipline: 76 entries when the pin landed with E10; 70 now —
 /// `x.ai/session/rename`/`delete`/`fork` left with the session-admin trio
-/// (ACPSessionAdminExtensionTests pins their routing) and the two
-/// `x.ai/mcp/` representatives left with the MCP family
+/// (ACPSessionAdminExtensionTests pins their routing), `x.ai/btw` left with
+/// the side-question slice (ACPBtwExtensionTests pins its routing), and the
+/// two `x.ai/mcp/` representatives left with the MCP family
 /// (ACPMCPExtensionTests pins the routed seven AND the family's two
 /// refusal shapes: terminal-with-data for the unported
 /// setup/toggle/toggle_tool, upstream's bare method_not_found for unknown
@@ -187,9 +188,13 @@ private let refusedUpstreamMethods: [String] = [
     // :4154-4165
     "x.ai/session/repair", "x.ai/session/usage", "x.ai/memory/flush",
     "x.ai/memory/rewrite", "x.ai/skills/refresh-baseline", "x.ai/interject",
-    // :4166 — feedback dismiss and btw route to feedback::handle upstream;
-    // only `x.ai/feedback` has a port backing.
-    "x.ai/feedback/dismiss", "x.ai/btw",
+    // :4166 — feedback dismiss routes to feedback::handle upstream and has
+    // no port backing yet. Its `x.ai/btw` sibling left this list with the
+    // side-question slice: the live composition routes it
+    // (`LiveBtwACPHandler`), and this harness builds its router without a
+    // btw arm on purpose, so the method is exercised in
+    // ACPBtwExtensionTests instead.
+    "x.ai/feedback/dismiss",
     // `x.ai/recap` (:4169) left this list with the notification gateway:
     // the live composition routes it (`LiveRecapACPHandler`), and this
     // harness builds its router without a recap arm on purpose, so the

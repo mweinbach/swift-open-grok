@@ -447,6 +447,17 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// the current toggle state because it does not own the model catalog or
     /// the live sampling stack.
     case fastMode
+    /// `/btw <question>` — upstream `Action::SendBtw` (`slash/commands/
+    /// btw.rs:40-42`): a SIDE question answered off-conversation. The pager
+    /// fires `x.ai/btw`, the session snapshots its conversation, makes ONE
+    /// tool-free model call, and returns the answer for display only
+    /// (`handle_side_question`, acp_session_impl/recap.rs:70-180). It
+    /// bypasses the prompt queue — mid-turn or idle — and NEVER mutates the
+    /// conversation. Carries only the question: the snapshot, the model
+    /// route, the history append and the answer render live in the render
+    /// layer, the only layer that owns the live sampling stack (the
+    /// `.recap` shape).
+    case sideQuestion(question: String)
     /// `/recap` (alias `/summarize`) — upstream `Action::SendRecap{auto:false}`
     /// (`slash/commands/recap.rs:34-36`): a one-shot side-call that summarizes
     /// the session so far and paints the result as a display-only "Recap —"

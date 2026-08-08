@@ -722,10 +722,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private var modes = OpenGrokPagerInputModes()
 
     /// The live mid-turn interjection seam, installed by the composition.
-    /// `nil` (no live session behind the controller) falls back to the
-    /// idle path: the text queues as its own front-of-queue prompt turn,
-    /// exactly what upstream's dispatch does with an interject when no turn
-    /// runs (run_loop.rs:1980-1989). Enter-steers does not come here: it is
+    /// The controller consumes it only at turn end (`collectStranded` →
+    /// fallback prompt turns); the producers live in the render layer's
+    /// stack (the subagent collaboration quartet). `nil` means no live
+    /// session and nothing to flush. Enter-steers does not come here: it is
     /// cancel-and-send per upstream (`prompt.rs:616-631`,
     /// `defaults.rs:630-632`).
     private var interjectionSeam: OpenGrokPagerInterjectionSeam?
@@ -880,8 +880,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     }
 
     /// Install the live mid-turn interjection seam. Call before `run`.
-    /// Without it, `/btw` still works — every interjection takes the idle
-    /// fallback and runs as its own prompt turn.
+    /// The controller's only remaining use is the turn-end stranded flush:
+    /// the seam's producers live below the controller (the subagent
+    /// collaboration quartet in the render layer's stack). `/btw` no longer
+    /// produces here — it is a SIDE question routed through the
+    /// `.sideQuestion` overlay intent, never into the running turn.
     public func setInterjectionSeam(_ seam: OpenGrokPagerInterjectionSeam?) {
         interjectionSeam = seam
     }
@@ -1670,33 +1673,6 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
     }
 
-    /// Dispatch a mid-turn interjection — the port of `dispatch_interject`
-    /// (app/dispatch/interject.rs:44-119) fused with the shell's
-    /// `SessionCommand::Interject` decision (run_loop.rs:1962-1989), because
-    /// this port is single-process.
-    ///
-    /// The optimistic user-block echo and the "Interjection sent" toast copy
-    /// paint at dispatch regardless of turn state, exactly as upstream's
-    /// pager does; the running/idle split only decides delivery. Running:
-    /// the seam buffers the text into the live turn and the turn loop merges
-    /// it at the next safe drain point. Idle (or the running check lost the
-    /// race with turn end): the text becomes its own front-of-queue prompt
-    /// turn, and `.drain` tells an idle caller to kick the queue — the port
-    /// of `maybe_start_running_task` after the fallback enqueue
-    /// (run_loop.rs:1984-1988).
-    private func interject(_ text: String) async throws -> SlashOutcome {
-        recordHistory(text)
-        editor.reset()
-        try await emit(.promptChanged(promptState()))
-        try await emit(.interjected(text: text))
-        try await emit(.notice("Interjection sent"))
-        if let interjectionSeam, await interjectionSeam.deliver(text) {
-            return .handled
-        }
-        try await queueInterjectionFallbackPrompt(text)
-        return .drain
-    }
-
     /// Convert an interjection with no running turn into a queued prompt
     /// turn at the FRONT of the queue — send-now semantics: the user asked
     /// for "now", queued rows asked for "later". The port of
@@ -2342,10 +2318,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             usage: "/tasks"
         ),
         // `/btw` (`slash/commands/btw.rs:12-38`). Upstream fires an ACP ext
-        // method that bypasses the prompt queue; this port routes it through
-        // the live interjection seam — mid-turn the question merges into the
-        // RUNNING turn, idle it runs as its own front-of-queue prompt turn —
-        // the same promise: the question never waits behind the backlog.
+        // method that bypasses the prompt queue (`x.ai/btw` →
+        // `handle_side_question`); this port emits the `.sideQuestion`
+        // intent and the render layer runs the same off-conversation side
+        // sample — mid-turn or idle, the question never waits behind the
+        // backlog and never mutates the conversation.
         PagerCommandDefinition(
             name: "btw",
             summary: "Ask a side question without interrupting",
@@ -2749,11 +2726,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case handled
         case quit
         case submit(String)
-        /// The command already put work at the front of the queue (an
-        /// interjection fallback prompt) — an idle caller must kick the
-        /// drain, the port of `maybe_start_running_task` after the fallback
-        /// enqueue (run_loop.rs:1984-1988). Mid-turn callers treat it as
-        /// `.handled`: the queue drains when the running turn ends.
+        /// The command already put work at the front of the queue — an idle
+        /// caller must kick the drain, the port of
+        /// `maybe_start_running_task` after the fallback enqueue
+        /// (run_loop.rs:1984-1988). Mid-turn callers treat it as `.handled`:
+        /// the queue drains when the running turn ends. No command returns
+        /// this since `/btw` became a real side question (the stranded-flush
+        /// path enqueues outside the slash grammar); the arm stays for the
+        /// next front-inserting command.
         case drain
     }
 
@@ -2906,13 +2886,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     try await emit(.notice("Usage: /btw <question>"))
                     return .handled
                 }
-                // Recorded divergence: upstream's `/btw` is a SIDE question
-                // answered off-conversation (`x.ai/btw` →
-                // `handle_side_question`); this port routes it through the
-                // mid-turn interjection seam instead, so the question merges
-                // into the RUNNING turn as a synthetic user item — or runs
-                // as its own front-of-queue prompt turn when idle.
-                return try await interject(question)
+                // The real side-question semantics (`Action::SendBtw`,
+                // btw.rs:40-42 → `x.ai/btw` → `handle_side_question`,
+                // acp_session_impl/recap.rs:70-180): the question is
+                // answered OFF-conversation over a snapshot — mid-turn or
+                // idle, it bypasses the prompt queue and never touches the
+                // running turn. The snapshot, the model route and the
+                // render live in the render layer, which owns the live
+                // sampling stack. (E5 routed this through the interjection
+                // seam — a recorded divergence this slice closes; the seam
+                // itself stays for the subagent collaboration producers.)
+                try await emit(.overlay(.sideQuestion(question: question)))
+                return .handled
             case "recap":
                 // Arguments are ignored — upstream's `RecapCommand::run`
                 // declares none and discards what it gets (recap.rs:34,

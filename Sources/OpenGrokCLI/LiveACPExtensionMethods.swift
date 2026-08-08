@@ -11,7 +11,11 @@
 //     `x.ai/feedback` (`LiveFeedbackACPHandler`), `x.ai/recap`
 //     (`LiveRecapACPHandler`, LiveACPNotificationGateway.swift — the ack plus
 //     the async SessionRecap notification, now that the notification gateway
-//     gives the summary a delivery channel), the `x.ai/mcp/` prefix family
+//     gives the summary a delivery channel), `x.ai/btw`
+//     (`LiveBtwACPHandler`, LiveBtw.swift — the synchronous side question:
+//     the answer rides the ext response itself, `{"result": {"answer": …}}`,
+//     and the record lands on the real `btw_history.jsonl`; item 7, closing
+//     E10's refusal), the `x.ai/mcp/` prefix family
 //     (`LiveMCPACPHandler`, LiveMCPACPHandlers.swift — list / call /
 //     read_resource / auth_status / auth_trigger / upsert / delete over the
 //     live pool, the live toolset and the real config files; setup / toggle
@@ -43,8 +47,8 @@
 //     registry — the typed core `session/list` this runtime serves is the
 //     recorded divergence), `x.ai/memory/*` (:4156),
 //     `x.ai/skills/refresh-baseline` (:4159), `x.ai/interject` (:4165),
-//     `x.ai/feedback/dismiss` + `x.ai/btw` (:4166 — item 7),
-//     `x.ai/cloud/*` (:4170-4370), `x.ai/billing` +
+//     `x.ai/feedback/dismiss` (:4166 — its `x.ai/btw` sibling left this
+//     list with item 7), `x.ai/cloud/*` (:4170-4370), `x.ai/billing` +
 //     `x.ai/auto-topup-rule` (:4371-4374), `x.ai/share_session` (:4375),
 //     `x.ai/privacy/*` (:4376), `x.ai/rollout/survey` (:4379),
 //     `x.ai/prompt_history` (:4382), `x.ai/suggest`/`x.ai/suggestPrompt`
@@ -78,6 +82,7 @@ enum LiveACPExtensionRouter {
         feedback: LiveFeedbackACPHandler?,
         models: LiveModelsACPHandler,
         recap: LiveRecapACPHandler? = nil,
+        btw: LiveBtwACPHandler? = nil,
         mcp: LiveMCPACPHandler? = nil,
         sessionAdmin: LiveSessionAdminACPHandler? = nil
     ) -> ACPExtensionMethodRouter {
@@ -90,6 +95,12 @@ enum LiveACPExtensionRouter {
         }
         if let recap {
             router = router.register(exact: LiveRecapACPHandler.method, handler: recap)
+        }
+        if let btw {
+            // `x.ai/btw` (acp_agent.rs:4166 → extensions/feedback.rs:46-93).
+            // `nil` (compositions without a live sampler stack) keeps the
+            // method on the refused table rather than sampling from a void.
+            router = router.register(exact: LiveBtwACPHandler.method, handler: btw)
         }
         if let mcp {
             // The whole `x.ai/mcp/` prefix, mirroring upstream's

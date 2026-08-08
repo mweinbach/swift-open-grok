@@ -60,110 +60,65 @@ struct PagerNewSlashCommandTests {
         #expect(await harness.overlayRequests.contains(.help))
     }
 
-    // MARK: - /btw (mid-turn interjection dispatch)
+    // MARK: - /btw (side-question dispatch)
 
-    /// Idle `/btw` takes upstream's fallback (run_loop.rs:1980-1989): the
-    /// question becomes its own front-of-queue prompt turn — raw text, an
-    /// `interject-fallback-` id (surfaced through the request metadata that
-    /// keeps its user echo persist-only), started immediately — after the
-    /// optimistic echo and upstream's "Interjection sent" toast copy.
-    @Test("/btw while idle runs the question as its own fallback prompt turn")
-    func btwIdleRunsFallbackPromptTurn() async throws {
-        let harness = try await CommandHarness.run(
-            submitting: ["/btw is the cache warm"],
-            expectedTurns: 1
-        )
-        #expect(await harness.turnPrompts == ["is the cache warm"])
-        let metadata = await harness.turnRequests.first?.metadata[
-            OpenGrokPagerInteractiveController.interjectionFallbackMetadataKey
-        ]
-        #expect(
-            metadata?.hasPrefix(
-                OpenGrokPagerInteractiveController.interjectFallbackPromptPrefix
-            ) == true,
-            "the fallback turn must carry the interject-fallback- id, got \(String(describing: metadata))"
-        )
-        #expect(await harness.interjectionEchoes == ["is the cache warm"])
-        #expect(await harness.notices.contains("Interjection sent"))
+    /// `/btw` is a SIDE question (`Action::SendBtw`, btw.rs:40-42 →
+    /// `x.ai/btw` → `handle_side_question`): the controller emits the
+    /// `.sideQuestion` intent for the render layer's off-conversation
+    /// sample. Idle, NO prompt turn may start — the question does not enter
+    /// the queue — and nothing rides the interjection machinery.
+    @Test("/btw while idle emits the side-question intent and starts no turn")
+    func btwIdleEmitsSideQuestionIntent() async throws {
+        let harness = try await CommandHarness.run(submitting: ["/btw is the cache warm"])
+        #expect(await harness.overlayRequests == [
+            .sideQuestion(question: "is the cache warm"),
+        ])
+        #expect(await harness.turnPrompts.isEmpty)
+        #expect(await harness.interjectionEchoes.isEmpty)
+        #expect(!(await harness.notices.contains("Interjection sent")))
     }
 
-    /// Mid-turn `/btw` delivers through the installed seam into the RUNNING
-    /// turn (run_loop.rs:1974-1979): the seam sees the question, and no
-    /// fallback prompt turn ever runs.
-    @Test("/btw mid-turn delivers into the running turn through the seam")
-    func btwMidTurnDeliversThroughSeam() async throws {
-        let seam = RecordingSeam(deliverResult: true)
+    /// Mid-turn `/btw` bypasses the prompt queue WITHOUT touching the
+    /// running turn or the interjection seam (upstream fires the ext method
+    /// directly, notes.rs:282-329): the intent emits while the first turn
+    /// is still holding, the seam sees nothing, and the only turn is the
+    /// original prompt.
+    @Test("/btw mid-turn emits the intent without a fallback turn or seam delivery")
+    func btwMidTurnEmitsIntentWithoutSeamDelivery() async throws {
+        let seam = RecordingSeam(stranded: [])
         let harness = try await CommandHarness.run(
             submitting: ["first", "/btw hurry up"],
             seam: seam,
             holdFirstSession: true,
-            choreography: { runtime, controller in
-                _ = await seam.waitForDeliveries(atLeast: 1)
+            choreography: { runtime, controller, renderer in
+                _ = await renderer.waitForOverlayCount(atLeast: 1)
                 await runtime.releaseHeldSessions()
                 _ = await runtime.waitForRequestCountBounded(atLeast: 1)
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 await controller.shutdown()
             }
         )
-        #expect(await seam.delivered == ["hurry up"])
-        // Delivered live: the only turn is the original prompt.
+        #expect(await harness.overlayRequests == [.sideQuestion(question: "hurry up")])
+        #expect(await seam.delivered.isEmpty)
         #expect(await harness.turnPrompts == ["first"])
-        #expect(await harness.interjectionEchoes == ["hurry up"])
-        #expect(await harness.notices.contains("Interjection sent"))
-    }
-
-    /// The running check can lose the race with turn end (the seam refuses).
-    /// The text must then run as a fallback prompt turn at the FRONT of the
-    /// queue — ahead of an already-queued follow-up — with the fallback id
-    /// (queue_interjection_fallback_prompt's send-now semantics,
-    /// interjection.rs:38-45).
-    @Test("/btw whose delivery is refused queues a fallback prompt ahead of follow-ups")
-    func btwRefusedDeliveryQueuesFallbackAtFront() async throws {
-        let seam = RecordingSeam(deliverResult: false)
-        let harness = try await CommandHarness.run(
-            submitting: ["first", "queued follow-up", "/btw hurry up"],
-            seam: seam,
-            holdFirstSession: true,
-            choreography: { runtime, controller in
-                _ = await seam.waitForDeliveries(atLeast: 1)
-                await runtime.releaseHeldSessions()
-                _ = await runtime.waitForRequestCountBounded(atLeast: 3)
-                await controller.shutdown()
-            }
-        )
-        #expect(await harness.turnPrompts == ["first", "hurry up", "queued follow-up"])
-        let requests = await harness.turnRequests
-        let fallbackID = requests.count > 1 ? requests[1].metadata[
-            OpenGrokPagerInteractiveController.interjectionFallbackMetadataKey
-        ] : nil
-        #expect(
-            fallbackID?.hasPrefix(
-                OpenGrokPagerInteractiveController.interjectFallbackPromptPrefix
-            ) == true,
-            "the queue head after the turn must be the interject-fallback- prompt"
-        )
-        // The follow-up turn is a normal prompt: no fallback marker.
-        #expect(requests.count > 2 && requests[2].metadata[
-            OpenGrokPagerInteractiveController.interjectionFallbackMetadataKey
-        ] == nil)
+        #expect(await harness.interjectionEchoes.isEmpty)
     }
 
     /// Interjections stranded past the completed turn's final drain flush
     /// into front-of-queue prompt turns in original order — the port of
     /// `flush_stranded_interjections` at the completion arm
     /// (run_loop.rs:432-447): entry 0 front-most, ahead of queued rows.
+    /// (The seam's live producer is the subagent collaboration quartet;
+    /// `/btw` left it when it became a real side question.)
     @Test("stranded interjections flush to front prompt turns at turn end, in order")
     func strandedInterjectionsFlushAtTurnEnd() async throws {
-        let seam = RecordingSeam(
-            deliverResult: true,
-            stranded: [["stranded one", "stranded two"]]
-        )
+        let seam = RecordingSeam(stranded: [["stranded one", "stranded two"]])
         let harness = try await CommandHarness.run(
-            submitting: ["first", "queued follow-up", "/btw hurry up"],
+            submitting: ["first", "queued follow-up"],
             seam: seam,
             holdFirstSession: true,
-            choreography: { runtime, controller in
-                _ = await seam.waitForDeliveries(atLeast: 1)
+            choreography: { runtime, controller, _ in
+                _ = await runtime.waitForRequestCountBounded(atLeast: 1)
                 await runtime.releaseHeldSessions()
                 _ = await runtime.waitForRequestCountBounded(atLeast: 4)
                 await controller.shutdown()
@@ -192,6 +147,7 @@ struct PagerNewSlashCommandTests {
         // phase instead of dispatching (upstream's `is_command_complete`).
         let harness = try await CommandHarness.run(submitting: ["/btw "])
         #expect(await harness.notices.contains("Usage: /btw <question>"))
+        #expect(await harness.overlayRequests.isEmpty)
     }
 
     // MARK: - /mcps
@@ -240,36 +196,26 @@ struct PagerNewSlashCommandTests {
 
 // MARK: - Harness
 
-/// A recording stand-in for the live interjection seam: `deliver` answers
-/// with a fixed running/idle verdict and records the text; `collectStranded`
+/// A recording stand-in for the live interjection seam: `deliver` records
+/// the text (no slash command produces into the seam since `/btw` became a
+/// real side question — the recording proves exactly that); `collectStranded`
 /// pops one configured batch per turn end (then drains empty, like the real
 /// buffer).
 private actor RecordingSeam {
     private(set) var delivered: [String] = []
-    private let deliverResult: Bool
     private var strandedQueue: [[String]]
 
-    init(deliverResult: Bool, stranded: [[String]] = []) {
-        self.deliverResult = deliverResult
+    init(stranded: [[String]] = []) {
         self.strandedQueue = stranded
     }
 
     func deliver(_ text: String) -> Bool {
         delivered.append(text)
-        return deliverResult
+        return true
     }
 
     func collectStranded() -> [String] {
         strandedQueue.isEmpty ? [] : strandedQueue.removeFirst()
-    }
-
-    func waitForDeliveries(atLeast count: Int, timeout: TimeInterval = 15) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if delivered.count >= count { return true }
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
-        return delivered.count >= count
     }
 }
 
@@ -308,7 +254,11 @@ private actor CommandHarness {
         seam: RecordingSeam? = nil,
         holdFirstSession: Bool = false,
         choreography: (
-            @Sendable (CommandTestRuntime, OpenGrokPagerInteractiveController) async -> Void
+            @Sendable (
+                CommandTestRuntime,
+                OpenGrokPagerInteractiveController,
+                CommandRecordingRenderer
+            ) async -> Void
         )? = nil
     ) async throws -> CommandHarness {
         var events: [InputEvent] = []
@@ -334,7 +284,7 @@ private actor CommandHarness {
             ))
         }
         let stopper: Task<Void, Never>? = choreography.map { choreography in
-            Task { await choreography(runtime, controller) }
+            Task { await choreography(runtime, controller, renderer) }
         } ?? expectedTurns.map { turns in
             Task {
                 await runtime.waitForRequestCount(atLeast: turns)
@@ -359,6 +309,18 @@ private actor CommandRecordingRenderer: OpenGrokPagerInteractiveRenderAdapter {
 
     var overlayRequests: [OpenGrokPagerOverlayRequest] {
         events.compactMap { if case .overlay(let request) = $0 { return request } else { return nil } }
+    }
+
+    /// Bounded poll for overlay intents — the sync point for mid-turn
+    /// dispatch scenarios (the `.sideQuestion` emission has no turn or seam
+    /// side effect to wait on, by design).
+    func waitForOverlayCount(atLeast count: Int, timeout: TimeInterval = 15) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if overlayRequests.count >= count { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return overlayRequests.count >= count
     }
 
     var notices: [String] {

@@ -760,6 +760,291 @@ struct ACPRecapNotificationTests {
     }
 }
 
+// MARK: - x.ai/btw
+
+@Suite("x.ai/btw over ws://", .serialized)
+struct ACPBtwExtensionTests {
+    /// A production coordinator over a recording inference transport — the
+    /// recap suite's construction — so the side question's model call is
+    /// the request the shipping sampler forms, on the ACTIVE route.
+    private struct BtwStack {
+        let store: LiveModelCatalogStore
+        let coordinator: LiveModelSwitchCoordinator
+        let inferenceTransport: MockHTTPTransport
+        let home: URL
+        let environment: [String: String]
+
+        init(
+            home: URL,
+            environment: [String: String],
+            responses: [MockHTTPTransport.ScriptedResponse]
+        ) async throws {
+            self.home = home
+            self.environment = environment
+            try storeProviderAPIKey(
+                grokHome: home,
+                provider: ModelProvider.fireworks.asString,
+                apiKey: "fw-btw"
+            )
+            let store = LiveModelCatalogStore(
+                input: .default,
+                environment: environment,
+                openGrokHome: home,
+                transport: MockHTTPTransport(responses: [])
+            )
+            let resolver = LiveModelCatalogResolver(
+                environment: environment,
+                openGrokHome: home,
+                sessionID: "acp-btw-e2e",
+                workingDirectory: home,
+                catalogSource: { store.snapshot() },
+                makeCredentialResolver: { environment, openGrokHome in
+                    LiveCredentialResolver(environment: environment, openGrokHome: openGrokHome)
+                }
+            )
+            let inferenceTransport = MockHTTPTransport(responses: responses)
+            let makeSampler: @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler = { configuration in
+                try OpenGrokLiveSampler.production(configuration: OpenGrokLiveSamplingConfiguration(
+                    model: configuration.model,
+                    baseURL: configuration.baseURL,
+                    apiKey: configuration.apiKey,
+                    provider: configuration.provider,
+                    apiBackend: configuration.apiBackend,
+                    extraHeaders: configuration.extraHeaders,
+                    queryParams: configuration.queryParams,
+                    tuning: configuration.tuning,
+                    bearerResolver: configuration.bearerResolver,
+                    credentialProvider: configuration.credentialProvider,
+                    transport: inferenceTransport
+                ))
+            }
+            let initial = try await resolver.resolve(modelID: "glm-5.2")
+            self.store = store
+            self.inferenceTransport = inferenceTransport
+            self.coordinator = LiveModelSwitchCoordinator(
+                sampling: initial.sampling,
+                sampler: try makeSampler(initial.sampling),
+                resolver: resolver,
+                makeSampler: makeSampler,
+                history: nil
+            )
+        }
+    }
+
+    private func handler(
+        stack: BtwStack,
+        gateway: ACPNotificationGateway,
+        conversation: [ConversationItem]
+    ) -> LiveBtwACPHandler {
+        let coordinator = stack.coordinator
+        return LiveBtwACPHandler(
+            gateway: gateway,
+            conversation: { conversation },
+            activeRoute: { await coordinator.snapshot() },
+            history: LiveBtwHistoryStore(openGrokHome: stack.home)
+        )
+    }
+
+    /// The full round-trip (`handle_btw`, extensions/feedback.rs:46-93):
+    /// unlike recap there is NO ack-then-notification split — the answer
+    /// rides the ext RESPONSE itself, `{"result": {"answer": …}}` — and the
+    /// record lands on the REAL `btw_history.jsonl` under the requested
+    /// session's directory.
+    @Test("btw answers synchronously with the answer in the response and appends the record")
+    func btwAnswersSynchronouslyAndAppendsHistory() async throws {
+        let home = try makeTemporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let environment = pinnedEnvironment(home: home)
+        let stack = try await BtwStack(
+            home: home,
+            environment: environment,
+            responses: [sseResponse(text: "The ext route answers off-conversation.")]
+        )
+        let gateway = ACPNotificationGateway()
+        let btw = handler(
+            stack: stack,
+            gateway: gateway,
+            conversation: [.user("hello"), .assistant("hi there")]
+        )
+        let router = LiveACPExtensionRouter.build(
+            feedback: nil,
+            models: LiveModelsACPHandler(catalogStore: stack.store, modelSwitch: stack.coordinator),
+            btw: btw
+        )
+        let served = try await ServedRuntime.start(secret: "btw-secret") {
+            let runtime = ACPAgentRuntime(extensionRouter: router)
+            await gateway.attach(runtime)
+            return runtime
+        }
+        defer { Task { await served.stop() } }
+        try await served.initialize()
+        let sessionId = try await served.newSession(cwd: home.path)
+
+        // Unknown session first: upstream's invalid-params refusal
+        // (feedback.rs:61-65), and no model call may leave the process.
+        try await served.client.send(.request(
+            id: .number(20),
+            method: "x.ai/btw",
+            params: .object([
+                "sessionId": .string("nope"),
+                "question": .string("anyone home"),
+            ])
+        ))
+        let refused = try await wsDrain(served.client) { $0.id == .number(20) }
+        guard case .response(_, nil, let error?) = refused else {
+            Issue.record("unknown session must refuse: \(refused)")
+            return
+        }
+        #expect(error.code == .invalidParams)
+        #expect(error.data == .string("session not found: nope"))
+        #expect(stack.inferenceTransport.recordedRequests.isEmpty)
+
+        // The real request: the answer in the response itself.
+        try await served.client.send(.request(
+            id: .number(21),
+            method: "x.ai/btw",
+            params: .object([
+                "sessionId": .string(sessionId),
+                "question": .string("is the cache warm"),
+            ])
+        ))
+        let answered = try await wsDrain(served.client) { $0.id == .number(21) }
+        guard case .response(_, .object(let object)?, nil) = answered else {
+            Issue.record("btw must answer in the response: \(answered)")
+            return
+        }
+        #expect(
+            object["result"]?["answer"]?.stringValue
+                == "The ext route answers off-conversation."
+        )
+
+        // Exactly one model call, on the ACTIVE route with the stored key,
+        // carrying the conversation prefix plus the instruction+question.
+        #expect(stack.inferenceTransport.recordedRequests.count == 1)
+        let request = try #require(stack.inferenceTransport.recordedRequests.first)
+        #expect(request.headers["Authorization"] == "Bearer fw-btw")
+        let body = try JSONDecoder().decode(
+            JSONValue.self,
+            from: try #require(request.body)
+        )
+        let messages = body["messages"]?.arrayValue ?? []
+        #expect(messages.count == 3)
+        let instruction = messages.last
+        #expect(instruction?["role"]?.stringValue == "user")
+        let text = instruction?["content"]?.stringValue ?? ""
+        #expect(text.hasPrefix("<system-reminder>This is a side question from the user."))
+        #expect(text.hasSuffix("</system-reminder>\n\nis the cache warm"))
+
+        // The durable record on the real file, under the REQUESTED session
+        // (upstream's parent_session_id, recap.rs:78, :114-128).
+        let entries = await LiveBtwHistoryStore(openGrokHome: home).load(sessionID: sessionId)
+        #expect(entries.count == 1)
+        let entry = try #require(entries.first)
+        #expect(entry.parentSessionId == sessionId)
+        #expect(entry.question == "is the cache warm")
+        #expect(entry.answer == "The ext route answers off-conversation.")
+        #expect(entry.success == true)
+        #expect(entry.attempts == 1)
+    }
+
+    /// Parse failures refuse with invalid params before any lookup or model
+    /// call (extensions/mod.rs:53-56 via feedback.rs:48-55).
+    @Test("a missing question refuses with invalid params and samples nothing")
+    func btwMissingQuestionRefuses() async throws {
+        let home = try makeTemporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let environment = pinnedEnvironment(home: home)
+        let stack = try await BtwStack(home: home, environment: environment, responses: [])
+        let gateway = ACPNotificationGateway()
+        let btw = handler(stack: stack, gateway: gateway, conversation: [.user("hello")])
+        let runtime = ACPAgentRuntime(
+            extensionRouter: LiveACPExtensionRouter.build(
+                feedback: nil,
+                models: LiveModelsACPHandler(catalogStore: stack.store, modelSwitch: nil),
+                btw: btw
+            )
+        )
+        await gateway.attach(runtime)
+        _ = await runtime.handle(.request(
+            id: .string("init"),
+            method: AgentMethodNames.initialize,
+            params: try JSONValue.encode(InitializeRequest(protocolVersion: .v1))
+        ))
+        let output = await runtime.handle(.request(
+            id: .string("b1"),
+            method: "x.ai/btw",
+            params: .object(["sessionId": .string("any")])
+        ))
+        guard case .response(_, nil, let error?) = output[0] else {
+            Issue.record("missing question must refuse: \(output)")
+            return
+        }
+        #expect(error.code == .invalidParams)
+        #expect(error.data == .string("invalid params: missing field `question`"))
+        #expect(stack.inferenceTransport.recordedRequests.isEmpty)
+    }
+
+    /// An empty model answer is upstream's `SideQuestionError::EmptyResponse`
+    /// — internal error, message "No response from model", no data
+    /// (commands.rs:34-35, feedback.rs:84-91) — and the FAILED record still
+    /// appends (recap.rs:166-169).
+    @Test("an empty answer refuses with upstream's copy and records the failure")
+    func btwEmptyAnswerRecordsFailure() async throws {
+        let home = try makeTemporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let environment = pinnedEnvironment(home: home)
+        let stack = try await BtwStack(
+            home: home,
+            environment: environment,
+            responses: [sseResponse(text: "")]
+        )
+        let gateway = ACPNotificationGateway()
+        let btw = handler(stack: stack, gateway: gateway, conversation: [.user("hello")])
+        let runtime = ACPAgentRuntime(
+            store: InMemoryACPSessionStore(),
+            extensionRouter: LiveACPExtensionRouter.build(
+                feedback: nil,
+                models: LiveModelsACPHandler(catalogStore: stack.store, modelSwitch: nil),
+                btw: btw
+            ),
+            makeSessionId: { "btw-empty" }
+        )
+        await gateway.attach(runtime)
+        _ = await runtime.handle(.request(
+            id: .string("init"),
+            method: AgentMethodNames.initialize,
+            params: try JSONValue.encode(InitializeRequest(protocolVersion: .v1))
+        ))
+        _ = await runtime.handle(.request(
+            id: .string("new"),
+            method: AgentMethodNames.sessionNew,
+            params: try JSONValue.encode(NewSessionRequest(cwd: home.path))
+        ))
+        let output = await runtime.handle(.request(
+            id: .string("b1"),
+            method: "x.ai/btw",
+            params: .object([
+                "sessionId": .string("btw-empty"),
+                "question": .string("anything?"),
+            ])
+        ))
+        guard case .response(_, nil, let error?) = output[0] else {
+            Issue.record("empty answer must refuse: \(output)")
+            return
+        }
+        #expect(error.code == .internalError)
+        #expect(error.message == "No response from model")
+        #expect(error.data == nil)
+
+        let entries = await LiveBtwHistoryStore(openGrokHome: home).load(sessionID: "btw-empty")
+        #expect(entries.count == 1)
+        let entry = try #require(entries.first)
+        #expect(entry.success == false)
+        #expect(entry.answer.isEmpty)
+        #expect(entry.error == "No response from model")
+    }
+}
+
 // MARK: - SubagentMessage
 
 @Suite("SubagentMessage over ws://", .serialized)
