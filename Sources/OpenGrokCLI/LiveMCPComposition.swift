@@ -143,6 +143,19 @@ public actor MCPSessionConnections {
         clients[name] = client
     }
 
+    /// The retained client for one server, for the `x.ai/mcp/call` /
+    /// `read_resource` ext methods — the SAME client the session's bridged
+    /// tools call through, so a direct call and a model tool call cannot
+    /// observe different servers.
+    func client(named name: String) -> MCPClient? { clients[name] }
+
+    /// Remove one server's client from the pool WITHOUT closing it — the
+    /// caller owns the shutdown, because teardown must also unregister the
+    /// server's tools and only the caller holds the toolset.
+    func release(named name: String) -> MCPClient? {
+        clients.removeValue(forKey: name)
+    }
+
     public func names() -> [String] { clients.keys.sorted() }
 
     /// Close every server. Safe to call more than once.

@@ -546,6 +546,38 @@ in-memory (upstream persists the cleared state). The rest of the outbound
 `SessionUpdate` family (RetryState, AutoCompact*, TaskCompleted, SubagentSpawned/…) has
 no emitters yet — the delivery channel now exists for their slices.
 
+### E12 — `x.ai/mcp/*` family + session admin over ACP (serial gate: exit 0, 4,685 tests, zero issues; 2026-08-08)
+
+Closes roadmap Wave 15 items 3 and 6 (honest subsets). Newly routed with real backings:
+`x.ai/mcp/list` (trust-gated config layers + live connect outcomes + live toolset),
+`mcp/call` and `mcp/read_resource` (the session's retained client pool — the same
+clients the bridged tools use, upstream's timeout ladder), `mcp/auth_status`,
+`mcp/auth_trigger` (the REAL E7 flow, with the token-landed assertion AFTER the flow
+returns — "flow returned" is not "token landed"), `mcp/upsert`/`mcp/delete` (real user
+`config.toml` writes through the same functions `mcp add` uses, plus live toolset
+swap/teardown), and `x.ai/session/rename|delete|fork` on the real store (live-session
+rename goes through the history actor — a direct file write would be undone by the next
+turn commit; resident-session delete is REFUSED, no teardown seam). Inbound
+`x.ai/mcp/sdk_call` and unknown prefix names get upstream's OWN bare `method_not_found`
+(mcp.rs:387, byte-mirrored); `mcp/setup`/`toggle`/`toggle_tool` stay refused with the
+data-carrying terminal error (no preferences/disabled-list persistence — a toggle that
+doesn't survive restart would be "succeeds, does nothing later"). Refusal pin 76→71,
+counted mechanically. **Deliberate absence, load-bearing:** initialize `_meta` does NOT
+advertise `x.ai/mcp/sdk` — the SDK enables `transport="acp"` on that flag alone, and the
+reverse bridge is not implemented; a test pins the absence. **Lead fix:** that pin
+called `initialize` twice (the state machine refuses a second handshake); the harness
+now captures its own handshake response for meta pins.
+
+**Recorded divergences:** `mcp/list` omits managed connectors/gateway rows; upsert
+connects synchronously (handshake failures surface as internal_error where upstream's
+background init defers them); auth_trigger's static-header arm keeps the port's copy;
+no remote session writeback; fork refuses `newModelId`/`targetPromptIndex`/…
+loudly rather than dropping them; fork ids UUIDv4. Remaining refused: the session
+info/close/updates/state/import/search family (needs live SessionCommand plumbing,
+updates journals, FTS), the `sdk_call` reverse bridge, and the
+`servers_updated`/`tools_changed` outbound notifications (no emit sites yet). Wave 15's
+open remainder: item 7 (real `x.ai/btw` side-question semantics).
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was

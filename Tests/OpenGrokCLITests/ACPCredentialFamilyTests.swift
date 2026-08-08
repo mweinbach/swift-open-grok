@@ -154,19 +154,29 @@ private struct HermeticFamily {
 /// leader-internal names (`InternalMethod::name`, leader/protocol.rs:
 /// 410-420). Each must be refused with the terminal arm's error — never
 /// silently mis-routed, never accepted as a no-op.
+///
+/// Count discipline: 76 entries when the pin landed with E10; 71 now —
+/// `x.ai/session/rename`/`delete`/`fork` left with the session-admin trio
+/// (ACPSessionAdminExtensionTests pins their routing) and the two
+/// `x.ai/mcp/` representatives left with the MCP family
+/// (ACPMCPExtensionTests pins the routed seven AND the family's two
+/// refusal shapes: terminal-with-data for the unported
+/// setup/toggle/toggle_tool, upstream's bare method_not_found for unknown
+/// names under the prefix, mcp.rs:387 — a shape this harness cannot
+/// express because its router deliberately has no mcp arm).
 private let refusedUpstreamMethods: [String] = [
     // :4050
     "open-grok/toolset/perplexity-web-search/reload",
     // :4112
     "x.ai/getApiKey", "x.ai/setApiKey",
-    // :4115-4150
+    // :4115-4150. rename/delete/fork (:4146-4150) left this list with the
+    // session-admin trio — see the header note.
     "x.ai/session/info", "x.ai/session/close", "x.ai/session/list",
     "x.ai/sessions/list", "x.ai/workspaces/list", "x.ai/session/updates",
     "x.ai/session/state", "x.ai/session/import", "x.ai/session/load_history",
     "x.ai/session/search", "x.ai/session/resolve_local_for_worktree_resume",
     "x.ai/session/rehydrate", "x.ai/session/add_local_workspace",
-    "x.ai/session/rename", "x.ai/session/delete",
-    "x.ai/session/update_mcp_servers", "x.ai/session/fork",
+    "x.ai/session/update_mcp_servers",
     "x.ai/plugins/reload", "x.ai/commands/list",
     // :4151-4153 (InternalMethod::from_name)
     "x.ai/internal/auth_cleared", "x.ai/internal/evict_sessions",
@@ -190,12 +200,14 @@ private let refusedUpstreamMethods: [String] = [
     "x.ai/auto-topup-rule", "x.ai/share_session",
     "x.ai/privacy/setCodingDataRetention", "x.ai/rollout/survey",
     "x.ai/prompt_history", "x.ai/suggest", "x.ai/suggestPrompt",
-    // :4387-4466 — prefix families, one representative each.
+    // :4387-4466 — prefix families, one representative each. The
+    // `x.ai/mcp/` representatives (:4420) left this list with the routed
+    // family — see the header note.
     "x.ai/auth/get_url", "x.ai/session_summaries/latest",
     "x.ai/git/worktree/list", "x.ai/git/status", "x.ai/compact_conversation",
     "x.ai/plugins/list", "x.ai/marketplace/search", "x.ai/hooks/list",
-    "x.ai/hunk-tracker/state", "x.ai/pr/status", "x.ai/mcp/list",
-    "x.ai/mcp/auth_trigger", "x.ai/task/list", "x.ai/scheduler/list",
+    "x.ai/hunk-tracker/state", "x.ai/pr/status",
+    "x.ai/task/list", "x.ai/scheduler/list",
     "x.ai/subagent/list", "x.ai/terminal/create", "x.ai/fs/list",
     "x.ai/search/files", "x.ai/bundle/create", "x.ai/code/definition",
     "x.ai/skills/list", "x.ai/workflows/list", "x.ai/review",

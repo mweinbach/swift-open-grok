@@ -8,13 +8,24 @@
 // What routes and what refuses:
 //
 //   * Routed with real backings — the twelve `open-grok/*` methods below,
-//     `x.ai/feedback` (`LiveFeedbackACPHandler`), and `x.ai/recap`
+//     `x.ai/feedback` (`LiveFeedbackACPHandler`), `x.ai/recap`
 //     (`LiveRecapACPHandler`, LiveACPNotificationGateway.swift — the ack plus
 //     the async SessionRecap notification, now that the notification gateway
-//     gives the summary a delivery channel). Every routed method's
+//     gives the summary a delivery channel), the `x.ai/mcp/` prefix family
+//     (`LiveMCPACPHandler`, LiveMCPACPHandlers.swift — list / call /
+//     read_resource / auth_status / auth_trigger / upsert / delete over the
+//     live pool, the live toolset and the real config files; setup / toggle
+//     / toggle_tool refused with the terminal error, unknown names under
+//     the prefix refused with upstream's OWN bare method_not_found,
+//     mcp.rs:387), and the session-admin trio `x.ai/session/rename` /
+//     `x.ai/session/delete` / `x.ai/session/fork`
+//     (`LiveSessionAdminACPHandler`, LiveSessionAdminACPHandlers.swift —
+//     the real `$OPENGROK_HOME/sessions` store). Every routed method's
 //     payload mirrors the upstream payload builders byte-for-byte in copy
 //     (`acp_agent.rs:32-181`) inside upstream's `ExtMethodResult` envelope
-//     `{"result": <payload>}` (`session/result.rs:29-72`).
+//     `{"result": <payload>}` (`session/result.rs:29-72`) — except the
+//     session-admin trio, whose upstream handlers answer RAW
+//     (`to_raw_response`, extensions/mod.rs:69-73), mirrored here.
 //   * Everything else at the upstream pin falls through to the router's
 //     terminal arm and gets upstream's unknown-method error byte-exact
 //     (code -32601, message "Method not found", data
@@ -24,8 +35,13 @@
 //     would need: `open-grok/toolset/perplexity-web-search/reload` (:4050 —
 //     no per-session web-search reload command channel), `x.ai/getApiKey`/
 //     `x.ai/setApiKey` and `x.ai/auth/*` (:4112, :4387 — the xAI auth
-//     family, Wave 17), `x.ai/session*` admin/state/search/usage/repair
-//     (:4115-4155 — Wave 15 item 6), `x.ai/memory/*` (:4156),
+//     family, Wave 17), the rest of `x.ai/session*`
+//     admin/state/search/usage/repair (:4115-4155 — the item 6 remainder:
+//     info/close/updates/state/import/load_history/search/repair/usage need
+//     live-session command plumbing, updates journals or the FTS index;
+//     `x.ai/session/list`/`x.ai/sessions/list` merge the unported remote
+//     registry — the typed core `session/list` this runtime serves is the
+//     recorded divergence), `x.ai/memory/*` (:4156),
 //     `x.ai/skills/refresh-baseline` (:4159), `x.ai/interject` (:4165),
 //     `x.ai/feedback/dismiss` + `x.ai/btw` (:4166 — item 7),
 //     `x.ai/cloud/*` (:4170-4370), `x.ai/billing` +
@@ -35,13 +51,11 @@
 //     (:4385-4386), the prefix families `x.ai/session_summaries/`,
 //     `x.ai/git/`, `x.ai/compact_conversation`, `x.ai/plugins/`,
 //     `x.ai/marketplace/`, `x.ai/hooks/`, `x.ai/hunk-tracker/`, `x.ai/pr/`,
-//     `x.ai/mcp/` (:4420 — item 3; the E7 login flow is a CLI verb and the
-//     MCP OAuth slice owns that seam concurrently), `x.ai/task/`,
-//     `x.ai/scheduler/`, `x.ai/subagent/`, `x.ai/terminal/`, `x.ai/fs/`,
-//     `x.ai/search/`, `x.ai/bundle/`, `x.ai/code/`, `x.ai/skills/`,
-//     `x.ai/workflows/list`, `x.ai/review*`, `x.ai/debug/`, `x.ai/rewind*`
-//     (:4390-4466), and the leader-internal `x.ai/internal/*` names
-//     (leader/protocol.rs:398-434).
+//     `x.ai/task/`, `x.ai/scheduler/`, `x.ai/subagent/`, `x.ai/terminal/`,
+//     `x.ai/fs/`, `x.ai/search/`, `x.ai/bundle/`, `x.ai/code/`,
+//     `x.ai/skills/`, `x.ai/workflows/list`, `x.ai/review*`, `x.ai/debug/`,
+//     `x.ai/rewind*` (:4390-4466), and the leader-internal
+//     `x.ai/internal/*` names (leader/protocol.rs:398-434).
 
 import Foundation
 import OpenGrokACP
@@ -63,7 +77,9 @@ enum LiveACPExtensionRouter {
     static func build(
         feedback: LiveFeedbackACPHandler?,
         models: LiveModelsACPHandler,
-        recap: LiveRecapACPHandler? = nil
+        recap: LiveRecapACPHandler? = nil,
+        mcp: LiveMCPACPHandler? = nil,
+        sessionAdmin: LiveSessionAdminACPHandler? = nil
     ) -> ACPExtensionMethodRouter {
         var router = ACPExtensionMethodRouter()
         if let feedback {
@@ -74,6 +90,21 @@ enum LiveACPExtensionRouter {
         }
         if let recap {
             router = router.register(exact: LiveRecapACPHandler.method, handler: recap)
+        }
+        if let mcp {
+            // The whole `x.ai/mcp/` prefix, mirroring upstream's
+            // `starts_with(PREFIX)` arm (acp_agent.rs:4420-4422): the module
+            // owns its own refusal shape for unknown names under the prefix
+            // (bare method_not_found, mcp.rs:387), which the router's
+            // terminal arm would otherwise mis-spell with data. `nil`
+            // (compositions without a live MCP pool) keeps the family on
+            // the refused table rather than answering from a void pool.
+            router = router.register(prefix: LiveMCPACPHandler.prefix, handler: mcp)
+        }
+        if let sessionAdmin {
+            for method in LiveSessionAdminACPHandler.methods {
+                router = router.register(exact: method, handler: sessionAdmin)
+            }
         }
         return router
     }

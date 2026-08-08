@@ -2526,6 +2526,40 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             // table.
             let history = stack.conversationHistory
             let modelSwitch = stack.modelSwitch
+            // The `x.ai/mcp/*` family operates on the RUNNING session's MCP
+            // surfaces: the executor's retained client pool, its live
+            // toolset, and its composition-time connect outcomes — never a
+            // parallel pool (Wave 15 item 3). `userGrokHome` is the same
+            // resolution the `mcp add`/`login` CLI verbs edit and read, so
+            // an ext-method upsert and a CLI add land in the same file.
+            let mcpUserHome = userGrokHome(environment: launch.environment)
+                ?? launch.openGrokHome
+            let mcpHandler = LiveMCPACPHandler(
+                gateway: gateway,
+                state: LiveMCPACPState(
+                    connections: foundation.toolExecutor.mcpSessionConnections,
+                    toolset: foundation.toolExecutor.mcpToolset,
+                    outcomes: foundation.toolExecutor.mcpServerConnections
+                ),
+                declarations: LiveMCPACPHandler.trustGatedDeclarationSource(
+                    workspaceRoot: foundation.cwd,
+                    environment: launch.environment,
+                    cli: launch.options.common.permissions
+                ),
+                userConfigPath: mcpUserHome.appendingPathComponent("config.toml"),
+                openGrokHome: mcpUserHome,
+                environment: launch.environment
+            )
+            // The session-admin trio operates on the SAME on-disk store the
+            // launch path resumes from; the resident session's rename goes
+            // through the live history actor so the next turn commit cannot
+            // clobber the title (Wave 15 item 6).
+            let sessionAdmin = LiveSessionAdminACPHandler(
+                openGrokHome: foundation.openGrokHome,
+                gateway: gateway,
+                liveSessionID: foundation.sessionID,
+                renameLive: { title in try await history.rename(title: title) }
+            )
             let extensionRouter = LiveACPExtensionRouter.build(
                 feedback: LiveFeedbackACPHandler(composition: foundation.feedback),
                 models: LiveModelsACPHandler(
@@ -2541,7 +2575,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     workingDirectory: launch.workingDirectory,
                     openGrokHome: launch.openGrokHome,
                     environment: launch.environment
-                )
+                ),
+                mcp: mcpHandler,
+                sessionAdmin: sessionAdmin
             )
             // Inbound ext notifications land on the LIVE state, never a
             // mirror: yolo on the session permission-mode handle, swarm on
@@ -3780,6 +3816,13 @@ struct LiveToolExecutor: Sendable {
     /// captured, `connectConfiguredServers`' report was discarded and the
     /// session had no way to say which server failed or why.
     let mcpServerConnections: [MCPServerConnection]
+    /// The live MCP surfaces the `x.ai/mcp/*` ACP handlers operate on: the
+    /// SAME pool the session's bridged tools call through, and the SAME
+    /// toolset the model is offered — an ext-method mutation
+    /// (upsert/delete/auth_trigger) must land on the running session, never
+    /// on a parallel copy (AGENTS.md §3).
+    var mcpSessionConnections: MCPSessionConnections { mcpConnections }
+    var mcpToolset: FinalizedToolset { fileToolBridge.toolset }
     /// Rewind snapshots, memory and goals. Optional so every construction site
     /// that predates them keeps compiling and simply advertises none of their
     /// tools; see `LiveSessionServices.swift`.
@@ -5231,6 +5274,21 @@ actor LiveConversationStore {
         } catch {
             throw CLIApplicationError.failed("failed to save session \(record.sessionID): \(error)")
         }
+    }
+
+    /// `x.ai/session/rename` for a session that is NOT the live spine: load,
+    /// set the stored title, persist — one actor turn, so the read-modify-
+    /// write cannot interleave with another store call. Returns `false` when
+    /// no such session exists. The LIVE session must rename through its
+    /// `LiveConversationHistory` instead: the turn loop re-saves the whole
+    /// in-memory record on every commit, so a title written here for the
+    /// resident session would silently vanish at the next turn's save.
+    func renameStored(sessionID: String, title: String) throws -> Bool {
+        guard var record = try loadIfPresent(sessionID: sessionID) else { return false }
+        record.title = title
+        record.updatedAt = Date()
+        try save(record)
+        return true
     }
 
     /// Copy one session as a coupled transcript/rewind artifact transaction.
