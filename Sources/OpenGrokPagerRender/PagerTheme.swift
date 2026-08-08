@@ -228,6 +228,11 @@ public enum PagerLayoutMetrics {
     /// optional bottom padding rows collapse.
     public static let shortTerminalRows = 16
 
+    /// `AUTO_COMPACT_MAX_ROWS` (`views/agent.rs:87`): at or below this height
+    /// the render-value compact flag is forced on. Deliberately above
+    /// `shortTerminalRows`, which stays the hard-degradation gate.
+    public static let autoCompactMaxRows = 20
+
     /// `MAX_DROPDOWN_ROWS` (`views/slash_dropdown.rs:24`).
     public static let maxDropdownRows = 6
 
@@ -237,6 +242,17 @@ public enum PagerLayoutMetrics {
 
     /// Thinking truncation budget (`appearance/config.rs:570`).
     public static let thinkingTruncatedLines = 3
+}
+
+/// Render-value derivation for compact mode: the user setting, force-enabled
+/// while the terminal is `PagerLayoutMetrics.autoCompactMaxRows` or shorter
+/// (`effective_compact`, `views/agent.rs:96-98`).
+///
+/// Derived only — never persisted and never written back to the user setting,
+/// so growing the window restores the user's choice. `terminalRows == 0` means
+/// "not yet measured" and never forces compact.
+public func pagerEffectiveCompact(userCompact: Bool, terminalRows: Int) -> Bool {
+    userCompact || (terminalRows > 0 && terminalRows <= PagerLayoutMetrics.autoCompactMaxRows)
 }
 
 /// `context_bar.rs::fmt_tokens` — always four characters or fewer.

@@ -472,13 +472,29 @@ private let contextualHintsChildren = [
 public let pagerDefaultSettings: [PagerSettingMeta] = {
     var rows: [PagerSettingMeta] = []
 
-    // MARK: Appearance (7 — upstream 17 minus 10 without live readers)
+    // MARK: Appearance (8 — upstream 17 minus 9 without live readers)
 
     rows += [
         // Hidden until the renderer reads them (config round-trips; modal omits):
-        // `compact_mode`, `show_timestamps`, `show_timeline`, `page_flip_on_send`,
+        // `show_timestamps`, `show_timeline`, `page_flip_on_send`,
         // `simple_mode`, `render_mermaid`, `max_thoughts_width`, `show_thinking_blocks`,
         // `group_tool_verbs`, `collapsed_edit_blocks`.
+        //
+        // `compact_mode` is upstream's FIRST Appearance row (`defs.rs:614-629`)
+        // and the settings modal's default selection (`settings_e2e.rs:1905`);
+        // label, description, and keywords are upstream's verbatim. The
+        // renderer reads it in `renderPagerFrame` (gap rows, user-prompt vpad
+        // and prefix), so it is a live row, not a registered no-op.
+        PagerSettingMeta(
+            key: "compact_mode",
+            category: .appearance,
+            label: "Compact mode",
+            description: "Reduce padding around messages for more content density. "
+                + "Auto-enabled while the terminal is 20 rows or shorter.",
+            keywords: ["compact", "density", "padding", "tight", "small", "screen", "auto"],
+            kind: .bool(default: false),
+            storage: .config(path: "ui.compact_mode")
+        ),
         PagerSettingMeta(
             key: "screen_mode",
             category: .appearance,

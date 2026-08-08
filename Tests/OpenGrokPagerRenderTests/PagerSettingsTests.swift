@@ -81,22 +81,24 @@ private let stepperTestRegistry = PagerSettingsRegistry(entries: [
 
 @Suite("Settings registry")
 struct PagerSettingsRegistryTests {
-    @Test("the catalog carries 74 rows across 8 categories")
+    @Test("the catalog carries 75 rows across 8 categories")
     func catalogSize() {
         let registry = PagerSettingsRegistry.default
         // Upstream registers 91; this port hides `show_tips` plus every `[ui]`
         // row whose value the live renderer never reads — registered no-ops are
-        // forbidden by the parity rules. Re-add a row with its reader.
-        #expect(registry.entries.count == 74)
+        // forbidden by the parity rules. Re-add a row with its reader —
+        // `compact_mode` came back exactly that way once `renderPagerFrame`
+        // grew its reads (gap rows, user-prompt vpad and prefix).
+        #expect(registry.entries.count == 75)
         #expect(PagerSettingCategory.ordered.count == 8)
         #expect(!registry.entries.contains { $0.key == "show_tips" })
-        #expect(!registry.entries.contains { $0.key == "compact_mode" })
+        #expect(registry.entries.contains { $0.key == "compact_mode" })
     }
 
     @Test("per-category counts match the reference's registry")
     func categoryCounts() {
         let registry = PagerSettingsRegistry.default
-        #expect(registry.rows(in: .appearance).count == 7)
+        #expect(registry.rows(in: .appearance).count == 8)
         #expect(registry.rows(in: .mouse).count == 0)
         #expect(registry.rows(in: .editor).count == 6)
         #expect(registry.rows(in: .agent).count == 9)
@@ -214,7 +216,9 @@ struct PagerSettingsBrowseTests {
     @Test("headers are skipped by the cursor in both directions")
     func cursorSkipsHeaders() {
         var overlay = PagerSettingsOverlay()
-        #expect(overlay.selectedKey == "screen_mode")
+        // Default selection is `compact_mode`, the first setting — upstream's
+        // own pin (`settings_e2e.rs:1905`).
+        #expect(overlay.selectedKey == "compact_mode")
         // Walk to the end of Appearance and into Editor; every landing is a row.
         for _ in 0..<20 {
             _ = overlay.handle(key(.down))
@@ -224,7 +228,7 @@ struct PagerSettingsBrowseTests {
             _ = overlay.handle(key(.up))
             #expect(overlay.selectedKey != nil)
         }
-        #expect(overlay.selectedKey == "screen_mode")
+        #expect(overlay.selectedKey == "compact_mode")
     }
 
     @Test("g and G jump to the first and last selectable rows")
@@ -233,7 +237,9 @@ struct PagerSettingsBrowseTests {
         _ = overlay.handle(character("G"))
         #expect(overlay.selectedKey == "tools.respect_gitignore")
         _ = overlay.handle(character("g"))
-        #expect(overlay.selectedKey == "screen_mode")
+        // `g` must land on the first selectable row, not a header — and that
+        // row is `compact_mode` (`settings_e2e.rs:1894-1898`).
+        #expect(overlay.selectedKey == "compact_mode")
     }
 
     @Test("space toggles a bool in place and reports the commit")
@@ -646,9 +652,9 @@ struct PagerSettingsCloseTests {
     @Test("the footer follows the mode, so the keys shown are the keys that work")
     func footerFollowsMode() {
         var overlay = PagerSettingsOverlay()
-        // Focus an explicit boolean row: the catalog's first selectable row is
-        // no longer a toggle now that reader-less appearance rows are hidden,
-        // and this test pins hint/kind agreement, not catalog ordering.
+        // Focus an explicit boolean row: this test pins hint/kind agreement,
+        // not catalog ordering, so it names its row instead of trusting the
+        // default selection.
         focus(&overlay, "vim_mode")
         #expect(pagerSettingsHints(overlay).contains { $0.key == "Space" })
 

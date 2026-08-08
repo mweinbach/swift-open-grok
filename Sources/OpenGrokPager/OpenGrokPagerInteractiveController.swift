@@ -2429,6 +2429,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             aliases: ["ml"],
             summary: "Toggle multiline input mode (swap Enter and Shift+Enter)"
         ),
+        // `/compact-mode` between `/multiline` and `/vim-mode`, upstream's
+        // display order (`slash/commands/mod.rs:108-110`). Name, description,
+        // and usage verbatim (`compact_mode.rs:16-27`); no aliases upstream.
+        PagerCommandDefinition(
+            name: "compact-mode",
+            summary: "Toggle compact UI (less padding, more content)",
+            usage: "/compact-mode"
+        ),
         PagerCommandDefinition(
             name: "vim-mode",
             summary: "Toggle vim-style scrollback keybindings (j/k, h/l, g/G, y/Y, …)"
@@ -3215,6 +3223,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     ? "Vim scrollback keys on — Tab to focus the scrollback, then j/k/h/l/e/y."
                     : "Vim scrollback keys off — the scrollback still takes arrows, Enter and the Ctrl chords."))
                 return .handled
+            case "compact-mode":
+                // Arguments are ignored — upstream's `CompactModeCommand::run`
+                // declares none and discards what it gets
+                // (`compact_mode.rs:28`, `_args`). The toggle itself reads the
+                // USER value, which lives with the render layer alongside the
+                // persist path, so the intent carries no target state.
+                try await emit(.overlay(.toggleCompactMode))
+                return .handled
             case "compact":
                 let instructions = invocation.arguments
                     .joined(separator: " ")
@@ -3565,6 +3581,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /swarm [on|off|task]      Toggle swarm mode or run a one-shot swarm task
       /view-plan  /show-plan    View the current plan
       /multiline  /ml           Swap what Enter and Shift+Enter do
+      /compact-mode             Toggle compact UI (less padding, more content)
       /vim-mode                 Vim keys for the focused scrollback
       /hooks                    View hooks
       /plugins                  View plugins

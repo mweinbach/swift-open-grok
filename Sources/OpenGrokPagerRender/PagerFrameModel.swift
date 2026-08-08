@@ -550,6 +550,17 @@ public struct PagerRenderState: Sendable, Equatable {
     /// producer that never wires the tick loop renders the same still frame
     /// as before — see `PagerMotionSnapshot`.
     public var motion: PagerMotionSnapshot
+    /// The DERIVED render-value compact flag — upstream's
+    /// `AppearanceConfig.prompt.compact` (`appearance/config.rs:91-95`), which
+    /// every compact paint site reads and which is never the user setting
+    /// directly. Producers derive it per frame with `pagerEffectiveCompact`
+    /// (user value OR'd with short-terminal auto-compact), the port of
+    /// `AppView::apply_effective_compact` (`app_view.rs:2676-2690`). The cost
+    /// of carrying the derived value rather than deriving here: a producer
+    /// that passes the raw user value silently loses auto-compact on short
+    /// terminals — the live composition's pass-through is pinned by the
+    /// auto-compact toast test for exactly that reason.
+    public var compactMode: Bool
 
     public init(
         size: TerminalSize,
@@ -565,7 +576,8 @@ public struct PagerRenderState: Sendable, Equatable {
         showScrollbar: Bool = true,
         selectedBlockIndex: Int? = nil,
         overlays: PagerOverlayStack = PagerOverlayStack(),
-        motion: PagerMotionSnapshot = PagerMotionSnapshot()
+        motion: PagerMotionSnapshot = PagerMotionSnapshot(),
+        compactMode: Bool = false
     ) {
         self.overlays = overlays
         self.selectedBlockIndex = selectedBlockIndex
@@ -581,6 +593,7 @@ public struct PagerRenderState: Sendable, Equatable {
         self.theme = theme
         self.showScrollbar = showScrollbar
         self.motion = motion
+        self.compactMode = compactMode
     }
 }
 

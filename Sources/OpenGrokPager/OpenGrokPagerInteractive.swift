@@ -308,6 +308,14 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// `/toggle-mouse-reporting` — hand click-drag back to the terminal for
     /// native copy/paste, or take it back.
     case toggleMouseReporting
+    /// `/compact-mode` — flip the USER's `[ui] compact_mode` value (upstream
+    /// `Action::ToggleCompactMode`, `slash/commands/compact_mode.rs:28-30`,
+    /// dispatched by `dispatch_toggle_compact_mode`,
+    /// `dispatch/settings/ui.rs:815-820`). An intent rather than a mode flag on
+    /// `OpenGrokPagerInputModes` because the toggle reads the USER value the
+    /// render layer owns — the render value may be auto-forced on short
+    /// terminals — and the persist half writes the render layer's config home.
+    case toggleCompactMode
     /// `/workflows` — the background workflow-run overlay.
     case workflows
     /// `Ctrl+P` and `/help`'s upstream target (`OpenCommandPalette`) — every

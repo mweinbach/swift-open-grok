@@ -9,7 +9,11 @@ import OpenGrokTerminalCore
 /// row between each pair of occupied regions.
 public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     let bounds = TerminalRect(x: 0, y: 0, width: state.size.width, height: state.size.height)
-    let chrome = makeChromeLayout(bounds: bounds, state: state)
+    // The derived render-value compact flag — every compact read below
+    // consumes it, exactly as upstream's paint sites read the derived
+    // `appearance.prompt.compact` and never the user setting.
+    let compact = state.compactMode
+    let chrome = makeChromeLayout(bounds: bounds, state: state, compact: compact)
 
     let baseContentWidth = max(0, chrome.conversation.width - PagerLayoutMetrics.chromeWidth)
     var contentLines = makeConversationLines(
@@ -17,7 +21,8 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         width: max(1, baseContentWidth),
         theme: state.theme,
         selectedIndex: state.selectedBlockIndex,
-        motion: state.motion
+        motion: state.motion,
+        compact: compact
     )
     let hasScrollbar = state.showScrollbar && baseContentWidth > 1
         && contentLines.count > chrome.conversation.height
@@ -27,7 +32,8 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
             width: max(1, baseContentWidth - 1),
             theme: state.theme,
             selectedIndex: state.selectedBlockIndex,
-            motion: state.motion
+            motion: state.motion,
+            compact: compact
         )
     }
 
@@ -159,7 +165,11 @@ func pagerComposerTextWidth(_ input: PagerComposerState, width: Int) -> Int {
     return max(1, width - chrome - PagerGlyphs.promptArrowWidth)
 }
 
-private func makeChromeLayout(bounds: TerminalRect, state: PagerRenderState) -> ChromeLayout {
+private func makeChromeLayout(
+    bounds: TerminalRect,
+    state: PagerRenderState,
+    compact: Bool
+) -> ChromeLayout {
     let empty = TerminalRect(x: bounds.x, y: bounds.y, width: bounds.width, height: 0)
     guard bounds.height > 0, bounds.width > 0 else {
         return ChromeLayout(
@@ -183,23 +193,36 @@ private func makeChromeLayout(bounds: TerminalRect, state: PagerRenderState) -> 
 
     let statusHeight = state.statusBar != nil ? take(1) : 0
     // One blank row between the status bar and the banner (or transcript
-    // when no banner is showing).
-    let statusGap = statusHeight > 0 ? take(1) : 0
+    // when no banner is showing). Compact collapses it: upstream's
+    // `status_gap` is 0 whenever `top_vpad` is (`views/agent.rs:222`), and
+    // compact zeroes `top_vpad` through `eff_outer_vpad`
+    // (`appearance/config.rs:222-224`).
+    let statusGap = statusHeight > 0 && !compact ? take(1) : 0
 
     // Announcement banner: 0, 1, or 2 rows, slotted between the status bar
     // and the transcript — same precedence as upstream's agent view
     // (`app_view.rs:5222-5241`): critical (2 rows) wins, then promo (1 row).
+    // Its gap is NOT compact-dependent: upstream pushes an unconditional
+    // `Length(1)` before the banner (`views/agent.rs:237-238`), and the same
+    // holds for the turn-status and completions gaps below.
     let announcementHeight = state.announcementBanner.map { take($0.height) } ?? 0
     let announcementGap = announcementHeight > 0 ? take(1) : 0
 
     let shortcutsHeight = state.shortcuts != nil ? take(1) : 0
-    // The reference drops the bottom padding row on short terminals.
-    let bottomGap = shortcutsHeight > 0 && bounds.height > PagerLayoutMetrics.shortTerminalRows
+    // The reference drops the bottom padding row on short terminals, and in
+    // compact mode: `shortcuts_gap` is 0 whenever `bottom_vpad` is
+    // (`views/agent.rs:256`), and compact zeroes `bottom_vpad` the same way
+    // it zeroes `top_vpad`.
+    let bottomGap = shortcutsHeight > 0 && !compact
+        && bounds.height > PagerLayoutMetrics.shortTerminalRows
         ? take(1)
         : 0
 
     let composerHeight = take(pagerComposerHeight(state.input, width: bounds.width))
-    let promptGap = composerHeight > 0 ? take(1) : 0
+    // `prompt_gap` is 0 in compact mode (`agent_view/render.rs:1138-1145`;
+    // the turn-status-gap and short-terminal arms of that expression have no
+    // port seam yet — this port's turn status always keeps its own gap row).
+    let promptGap = composerHeight > 0 && !compact ? take(1) : 0
 
     let turnStatusHeight = state.turnStatus != nil ? take(1) : 0
     let turnStatusGap = turnStatusHeight > 0 ? take(1) : 0
@@ -292,7 +315,8 @@ func makeConversationLines(
     width: Int,
     theme: PagerRenderTheme,
     selectedIndex: Int? = nil,
-    motion: PagerMotionSnapshot = PagerMotionSnapshot()
+    motion: PagerMotionSnapshot = PagerMotionSnapshot(),
+    compact: Bool = false
 ) -> [PaintLine] {
     guard width > 0 else { return [] }
     var lines: [PaintLine] = []
@@ -300,7 +324,7 @@ func makeConversationLines(
         let blockStart = lines.count
         switch item {
         case .message(let message):
-            appendMessage(message, width: width, theme: theme, into: &lines)
+            appendMessage(message, width: width, theme: theme, compact: compact, into: &lines)
         case .tool(let tool):
             appendToolCard(tool, width: width, theme: theme, motion: motion, into: &lines)
         case .separator(let text):
@@ -337,11 +361,12 @@ private func appendMessage(
     _ message: PagerMessage,
     width: Int,
     theme: PagerRenderTheme,
+    compact: Bool = false,
     into lines: inout [PaintLine]
 ) {
     switch message.role {
     case .user:
-        appendUserPrompt(message, width: width, theme: theme, into: &lines)
+        appendUserPrompt(message, width: width, theme: theme, compact: compact, into: &lines)
     case .assistant:
         appendAssistantMessage(message, width: width, theme: theme, into: &lines)
     case .reasoning:
@@ -355,15 +380,23 @@ private func appendMessage(
 
 /// User prompts carry a `❯ ` prefix, a `bg_light` band behind every row, and
 /// one padded blank row above and below (`blocks/user.rs`).
+///
+/// Compact mode drops both the padding rows (`has_vpad_for`,
+/// `blocks/user.rs:513-515`: `prompt.vpad && !appearance.prompt.compact`) and
+/// the prefix column (`blocks/user.rs:490-494`: `show_prefix && !compact`) —
+/// the banded body rows are all that remain.
 private func appendUserPrompt(
     _ message: PagerMessage,
     width: Int,
     theme: PagerRenderTheme,
+    compact: Bool = false,
     into lines: inout [PaintLine]
 ) {
     let band = theme.bgLight
-    lines.append(PaintLine("", foreground: theme.textPrimary, background: band))
-    let prefixWidth = PagerGlyphs.promptArrowWidth
+    if !compact {
+        lines.append(PaintLine("", foreground: theme.textPrimary, background: band))
+    }
+    let prefixWidth = compact ? 0 : PagerGlyphs.promptArrowWidth
     let bodyWidth = max(1, width - prefixWidth)
     let indentation = String(repeating: " ", count: prefixWidth)
     var isFirstRow = true
@@ -371,12 +404,12 @@ private func appendUserPrompt(
         let wrapped = wrapDisplayLines(String(physical), width: bodyWidth)
         for row in (wrapped.isEmpty ? [""] : wrapped) {
             var spans: [PagerStyledSpan] = []
-            if isFirstRow {
+            if isFirstRow, !compact {
                 spans.append(PagerStyledSpan(
                     text: PagerGlyphs.promptArrow,
                     foreground: theme.accentUser
                 ))
-            } else {
+            } else if !indentation.isEmpty {
                 spans.append(PagerStyledSpan(text: indentation))
             }
             isFirstRow = false
@@ -390,12 +423,16 @@ private func appendUserPrompt(
     }
     if isFirstRow {
         lines.append(PaintLine(
-            spans: [PagerStyledSpan(text: PagerGlyphs.promptArrow, foreground: theme.accentUser)],
+            spans: compact
+                ? []
+                : [PagerStyledSpan(text: PagerGlyphs.promptArrow, foreground: theme.accentUser)],
             foreground: theme.textPrimary,
             background: band
         ))
     }
-    lines.append(PaintLine("", foreground: theme.textPrimary, background: band))
+    if !compact {
+        lines.append(PaintLine("", foreground: theme.textPrimary, background: band))
+    }
 }
 
 /// A recognized leading `/slash` token is painted in `accent_skill`

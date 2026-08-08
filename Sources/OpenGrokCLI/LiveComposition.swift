@@ -7308,6 +7308,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// Composer mode flags, carried as a whole snapshot so a missed event
     /// cannot leave the renderer disagreeing with the controller.
     private var inputModes = OpenGrokPagerInputModes()
+    /// The USER's `[ui] compact_mode` value — upstream's
+    /// `current_ui.compact_mode` (`ui_config.rs:82`), hydrated from the
+    /// effective config at construction (`event_loop.rs:1492` reads it into
+    /// the first frame) and flipped by `/compact-mode` and the settings
+    /// modal. The RENDER value is derived from this per paint in
+    /// `renderState(conversation:)` (auto-compact on short terminals), so this
+    /// var is never written by a resize — growing the window restores the
+    /// user's choice, exactly upstream's rule (`app_view.rs:2670-2675`).
+    private var userCompactMode = false
 
     /// Mouse. `linesPerEvent` folds the terminal's reports-per-notch into a
     /// per-report line count, which is the whole of the port's wheel handling —
@@ -7428,6 +7437,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         )
         inputModes = resolvedUIConfiguration.inputModes
         let uiConfig = resolvedUIConfiguration.config
+        // `[ui] compact_mode` reaches the first frame the same way the theme
+        // does — hydrated here, before `begin()` paints anything (upstream
+        // seeds the initial appearance from the user value + terminal rows at
+        // `event_loop.rs:1492`). `UIConfig.compactMode` round-trips the key
+        // (UIConfig.swift:420,468), so absent means the `false` default.
+        userCompactMode = uiConfig.compactMode
         let autoDark = Self.themeKind(from: uiConfig.autoDarkTheme)
         let autoLight = Self.themeKind(from: uiConfig.autoLightTheme)
         self.autoDarkThemeKind = autoDark
@@ -8061,6 +8076,43 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                     ? "Mouse reporting on. Wheel scrolls the transcript; click selects overlay rows."
                     : "Mouse reporting off. Click and drag now selects text for your terminal's copy/paste."
             ))
+        case .toggleCompactMode:
+            // The toggle flips the USER value (`dispatch_toggle_compact_mode`,
+            // `ui.rs:815-820`); the next paint re-derives the render value.
+            userCompactMode.toggle()
+            // Persist through the same store the settings modal writes —
+            // upstream's `Effect::PersistSetting{key: "compact_mode"}`
+            // (`setters.rs:1523-1528`) lands in `[ui] compact_mode` via
+            // `update_config` (`settings_writes.rs:230-232`). A failed write
+            // rolls the in-memory flip back, upstream's `rollback_value`
+            // semantics: a toggle that claims "on" while the file still says
+            // "off" would silently revert at next launch.
+            let store = PagerSettingsStore(
+                configPath: openGrokHome.appendingPathComponent("config.toml")
+            )
+            do {
+                try store.write(key: "compact_mode", value: .bool(userCompactMode))
+            } catch {
+                userCompactMode.toggle()
+                appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Could not save compact_mode: \(error)"
+                ))
+                return
+            }
+            // Toast copy from `set_compact_mode` (`setters.rs:1516-1522`):
+            // turning the setting off while the short-terminal derivation
+            // holds keeps the UI compact; say so instead of implying the
+            // layout will loosen. Mapped onto a transcript note like every
+            // toast in this port.
+            if !userCompactMode, pagerEffectiveCompact(
+                userCompact: false,
+                terminalRows: terminalSize.height
+            ) {
+                note("\u{2713} Compact mode: off (auto-compact active on small terminal)")
+            } else {
+                note("\u{2713} Compact mode: \(userCompactMode ? "on" : "off")")
+            }
         case .workflows:
             guard let workflowRegistry else {
                 appendMessage(PagerMessage(
@@ -10210,6 +10262,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// write to disk and the live theme swap.
     private func applySetting(_ event: PagerSettingsEvent) async {
         if case .commit(let key, .bool(let flag)) = event {
+            if key == "compact_mode" {
+                // The live half of the modal toggle — upstream routes it
+                // through the same `set_compact_mode` the slash command uses
+                // (`ui.rs:1207`: `("compact_mode", Bool) →
+                // Action::SetCompactMode`), so the very next paint re-derives
+                // the render value. The persist half is the shared store
+                // write below.
+                userCompactMode = flag
+                await applySettingsEvent(event)
+                return
+            }
             if key == "swarm_mode" {
                 // The settings row applies live, exactly like `/swarm on|off`
                 // — the row's own promise ("Active sessions update
@@ -10395,6 +10458,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             do {
                 try store.reset(key: key)
                 if key == "theme" { _ = applyTheme(named: "groknight") }
+                // A confirmed reset re-derives the render value from the
+                // registered default, upstream's reset-confirm path
+                // (`ui.rs:1504`: rollback/reset routes through
+                // `set_compact_mode_inner`). The default is `false`
+                // (`ui_config.rs:339`).
+                if key == "compact_mode" { userCompactMode = false }
                 reloadCatalogInput()
             } catch PagerSettingsStoreError.notPersistable {
                 return
@@ -10690,7 +10759,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             theme: renderTheme,
             selectedBlockIndex: selection.index,
             overlays: overlays,
-            motion: motion
+            motion: motion,
+            // Derived per frame from the user value and the live terminal
+            // height — the port of `AppView::apply_effective_compact`
+            // (`app_view.rs:2676-2690`), collapsed to a pure read because this
+            // renderer rebuilds the whole frame state on every paint anyway.
+            compactMode: pagerEffectiveCompact(
+                userCompact: userCompactMode,
+                terminalRows: terminalSize.height
+            )
         )
     }
 

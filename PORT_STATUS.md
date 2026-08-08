@@ -1,9 +1,9 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-08 (Wave 17 E18: scheduler runtime live — `scheduler_*` tools, `/loop`, `/tasks` Scheduled section, Cron fire path)
+**As of:** 2026-08-08 (Wave 17 E19: `/compact-mode` live on the render frame builder, with auto-compact and the unhidden settings row)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
-**Reference:** `xai-org/grok-build` at `70002584da34e4c37ea14a3bce35341b7d04f9a7` (re-pinned **2026-08-06** from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05`; +3 commits, release `v0.1.220-open-grok.57` — the Meta API provider delta: `0f8dc87b` provider, `666b2ceb` login/settings, `70002584` stored-key unlock fix. The prior 2026-08-05 re-pin moved from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`; before that the 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` (`/tmp/open-grok-reference` when present).
+**Reference:** `xai-org/grok-build` at `70002584da34e4c37ea14a3bce35341b7d04f9a7` (re-pinned **2026-08-06** from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05`; +3 commits, release `v0.1.220-open-grok.57` — the Meta API provider delta: `0f8dc87b` provider, `666b2ceb` login/settings, `70002584` stored-key unlock fix. The prior 2026-08-05 re-pin moved from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`; before that the 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08); the pinned commit is reachable in `/Users/mweinbach/Projects/open-grok` history — read it via `git show 70002584:<path>` / `git grep <pat> 70002584 -- crates` (crates prefixed `crates/codegen/`), NOT that clone's working tree, which sits one substantive commit newer (`650c1db7`, release `.58`).
 **Fixture pin:** `ProtocolFixtures/` was re-evaluated against `70002584da34e4c37ea14a3bce35341b7d04f9a7` on 2026-08-06, with `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` recorded as the immediate previous revision. The Meta delta touched no fixture family's upstream source (all fourteen family diffs across `9ed09e2a..70002584`, including `Cargo.lock`, are empty), so the only recaptures are the two release-stamped artifacts (CLI version fixture and the GCRX sample, both restamped `0.1.220-open-grok.57` — the GCRX golden by same-length in-place substitution at offset 32); unchanged families carry explicit `9ed09e2a..70002584` diff evidence.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
@@ -686,15 +686,44 @@ provisional keys are `provisional-<uuid>` not `provisional-<queue-id>`;
 `isIntervalToken` splits the last `Character` where Rust would panic on a multi-byte
 final byte (the shared `parseInterval` divergence).
 
-### Chrome readers (`/timestamps`, `/timeline`, `/compact-mode`) — research complete, queued
+### E19 — `/compact-mode` live (serial gate: exit 0, 4,928 tests, zero issues)
 
-Wave 18 B6. The three ship independently, ordered compact_mode → timestamps → timeline
-(honest-now/smallest to largest). Critical seam correction from the research: the readers
-belong on the live `OpenGrokPagerRender` frame builder, NOT the `OpenGrokPagerConversationUI`
-typed model (which only its own tests exercise). compact_mode is a pure layout-parameter
-reader (no new metadata); timestamps needs a `createdAt` stamp on `PagerMessage` at append/
-resume; timeline needs a new rail module replacing the scrollbar gutter (turns already
-enumerated by `/jump`). All three unhide their Wave-13-hidden settings rows.
+The first chrome reader, landed on the seam the research corrected to: the live
+`OpenGrokPagerRender` frame builder, not the typed conversation model. `renderPagerFrame`
+consumes a DERIVED `PagerRenderState.compactMode` (upstream reads
+`appearance.prompt.compact`, never the user setting; `appearance/config.rs:91-95`) —
+compact collapses the status gap (`views/agent.rs:222`), prompt gap
+(`agent_view/render.rs:1138-1145`), and bottom/shortcuts gap (`views/agent.rs:256`), and
+drops the user prompt's padding rows, `❯ ` prefix, and continuation indent
+(`blocks/user.rs:490-494,513-515`); the announcement/turn-status gaps stay unconditional,
+as upstream's are. `pagerEffectiveCompact` is a near doc-for-doc port of
+`effective_compact` (`views/agent.rs:96-98`) with `AUTO_COMPACT_MAX_ROWS = 20`
+(`agent.rs:87`, deliberately above the 16-row hard-degradation gate; 0 rows = "not yet
+measured", never forces). `/compact-mode` (name/copy/display-order verbatim,
+`compact_mode.rs:16-30`, `slash/commands/mod.rs:108-110`, no aliases) flips the USER
+value and persists `[ui] compact_mode` through the settings store, rolling the in-memory
+flip back on a failed write so the toggle can never claim a state the file lost; both
+toast arms are byte-parity (verified against `setters.rs:1516-1522` and
+`save_success_toast`, `ui.rs:89-92`, including the "off (auto-compact active on small
+terminal)" arm). Startup hydrates the user value from the effective config before the
+first paint; the settings-modal commit live-flips the same variable (`ui.rs:1207`
+routing); a confirmed reset re-derives from the `false` default; the settings row is
+unhidden as upstream's FIRST Appearance row with `defs.rs:614-629` copy verbatim
+(verified at the pin). 18 new tests: derivation pins, paint deltas (padding/prefix/gap
+rows, config-at-startup ≡ toggled-on frame), controller registry/dispatch/order pins,
+and live-seam persistence + startup + modal-flip + auto-compact-toast in isolated homes.
+
+**Recorded divergences:** upstream's prompt-gap expression also has turn-status-gap and
+short-terminal arms with no port seam yet — the port's turn status always keeps its own
+gap row (noted in-source at the read site); toasts ride transcript notes (the port-wide
+convention, not new here).
+
+### Chrome readers remaining (`/timestamps`, `/timeline`) — queued
+
+Ordered timestamps → timeline. From the research: timestamps needs a `createdAt` stamp on
+`PagerMessage` at append/resume; timeline needs a new rail module replacing the scrollbar
+gutter (turns already enumerated by `/jump`). Both unhide their Wave-13-hidden settings
+rows.
 
 ## Wave 16 — Pager surfaces, first parallel worktree batch (2026-08-08)
 
