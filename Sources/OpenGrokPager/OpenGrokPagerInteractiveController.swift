@@ -2377,6 +2377,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Summarize the session so far",
             usage: "/recap"
         ),
+        // `/doctor` follows `/recap`, upstream's display order
+        // (`slash/commands/mod.rs:131-132`). Name, aliases, description
+        // and usage are verbatim (`doctor.rs:45-59`).
+        PagerCommandDefinition(
+            name: "doctor",
+            aliases: ["terminal-setup", "terminal-check", "terminal-info"],
+            summary: "Check this session and show available fixes",
+            usage: "/doctor [fix [FIX]]"
+        ),
         PagerCommandDefinition(
             name: "compact",
             summary: "Compact conversation history",
@@ -2941,6 +2950,29 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 // sampling stack.
                 try await emit(.overlay(.recap))
                 return .handled
+            case "doctor":
+                // `DoctorCommand::run` (doctor.rs:104-117): the grammar runs
+                // on whitespace-split tokens of the RAW tail — upstream's
+                // `args.split_whitespace()` never unquotes, so re-splitting
+                // the tokenizer's unquoted arguments would accept forms
+                // upstream rejects. `fix <value>` ships the selector raw;
+                // the render layer owns `resolve_fix_id` and answers a typo
+                // with upstream's error + usage copy.
+                let doctorTokens = Self.rawArgumentTail(of: invocation)
+                    .split(whereSeparator: { $0.isWhitespace })
+                    .map(String.init)
+                if doctorTokens.isEmpty {
+                    try await emit(.overlay(.doctor(request: .report)))
+                } else if doctorTokens == ["fix"] {
+                    try await emit(.overlay(.doctor(request: .listFixes)))
+                } else if doctorTokens.count == 2, doctorTokens[0] == "fix" {
+                    try await emit(.overlay(.doctor(request: .fix(id: doctorTokens[1]))))
+                } else {
+                    // `CommandResult::Error(USAGE)` (doctor.rs:114-116) on
+                    // the notice channel, like every command error here.
+                    try await emit(.notice(OpenGrokPagerDoctorRequest.usage))
+                }
+                return .handled
             case "mcps":
                 try await emit(.overlay(.mcpServers))
                 return .handled
@@ -3378,6 +3410,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /usage  /cost             View session token usage
       /session-info             Show session info
       /mcps                     Show MCP server status
+      /doctor [fix [FIX]]       Check this session and show available fixes
       /copy [N] [file]          Copy a response to the clipboard or a file
       /export [file]            Export the conversation
       /transcript  /log         View the transcript in your pager ($PAGER)

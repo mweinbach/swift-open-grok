@@ -6,6 +6,7 @@ import OpenGrokAuth
 import OpenGrokCodeMode
 import OpenGrokCompaction
 import OpenGrokConfig
+import OpenGrokDiagnostics
 import OpenGrokFileTools
 import OpenGrokHTTP
 import OpenGrokHooks
@@ -8178,6 +8179,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await startSideQuestion(question)
         case .recap:
             await startRecap()
+        case .doctor(let request):
+            presentDoctor(request)
         case .renameSession(let title):
             await renameSession(title: title)
         case .loginProviderPicker:
@@ -8359,6 +8362,68 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             subagents: subagents,
             tasks: shellTasks
         ))
+    }
+
+    // MARK: - /doctor
+
+    /// `/doctor` — the render-layer half. Upstream's TUI dispatch
+    /// (`dispatch_doctor`, `app/dispatch/prompt.rs:87-117`) folds LIVE TUI
+    /// evidence (fullscreen state, pushed kitty flags, xtversion, runtime
+    /// notification findings) into the report before formatting; the port's
+    /// diagnostics library exposes only the standalone collectors, so the
+    /// in-session report carries env-only evidence and the runtime probes
+    /// surface honestly as "not run" notes (recorded divergence; cost: the
+    /// in-session report cannot confirm kitty-keyboard or fullscreen
+    /// behavior the way upstream's can, and never pretends to).
+    private func presentDoctor(_ request: OpenGrokPagerDoctorRequest) {
+        let terminal = standaloneTerminalContext(environment: environment)
+        switch request {
+        case .report:
+            // `DoctorRequest::Report` → a system scrollback block of
+            // `format_doctor` (prompt.rs:96-103) — a multi-section report
+            // belongs in the transcript, not a toast (the `/tasks` shape).
+            let snapshot = collectStandalone(terminal: terminal, environment: environment)
+            note(formatDoctor(DiagnosticsEngine.report(
+                snapshot: DiagnosticSnapshot(standalone: snapshot)
+            )))
+        case .listFixes:
+            // `DoctorRequest::ListFixes` → `format_applicable_automatic_fixes`
+            // delivered as a scrollback message (`effects/mod.rs:3900-3908`,
+            // `dispatch/task_result.rs:3152-3154`). The bounded live tmux
+            // probe runs only when the terminal is tmux-backed, exactly as
+            // the CLI list path does.
+            let snapshot = collectStandaloneFix(terminal: terminal, id: nil, environment: environment)
+            let report = DiagnosticsEngine.report(snapshot: DiagnosticSnapshot(standalone: snapshot))
+            note(formatApplicableAutomaticFixes(
+                report: report, terminal: terminal, environment: environment
+            ))
+        case .fix(let value):
+            // Resolution first, so a typo gets upstream's parse-time copy
+            // (doctor.rs:110-112) rather than the refusal below.
+            let id: OpenGrokDiagnostics.DiagnosticId
+            do {
+                id = try resolveFixID(value)
+            } catch {
+                note("\(error)\n\(OpenGrokPagerDoctorRequest.usage)")
+                return
+            }
+            // RECORDED DIVERGENCE — honest refusal instead of upstream's
+            // confirm-then-apply question (`open_doctor_fix_question`,
+            // prompt.rs:120-176). Applying a fix writes the user's shell or
+            // tmux config, and upstream never does that without an explicit
+            // confirmation; this port's question seam
+            // (PagerQuestionCoordinator) is scoped to tool calls mid-turn
+            // and is not reachable from the idle slash path, so the honest
+            // arms here are refuse or apply-unconfirmed — and an
+            // unconfirmed home-config write is the exact thing the
+            // confirmation gate exists to prevent (AGENTS.md §5). Cost: a
+            // TUI user types one CLI command instead of pressing "Apply".
+            let handle = automaticFixChoices().first { $0.0 == id }?.1 ?? id.description
+            note(
+                "Applying fixes inside the session is not supported in this port yet.\n"
+                    + "Preview and apply from your shell instead: open-grok doctor fix \(handle) --yes"
+            )
+        }
     }
 
     // MARK: - /login, /logout

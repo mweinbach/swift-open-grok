@@ -315,7 +315,11 @@ private func targets() -> [Target] {
     // join on the same grounds: the live session stack owns subagent
     // definition resolution and the per-session child coordinator for the
     // `spawn_subagent` tool. Both were previously reachable only transitively.
-    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s4, w2s5, w3s1, w3s2, w3s3, w4s2, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w6s5, w7s3, w7s4, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokToolTypes", "OpenGrokCodeMode", "OpenGrokReleaseValidation"])))
+    // `OpenGrokDiagnostics` joined when the `/doctor` wiring landed: the CLI
+    // route (`LiveDoctorComposition`) and the pager render layer
+    // (`presentDoctor`) both consume the pure engine; the edge stays one-way —
+    // the diagnostics target must never import back (see its declaration).
+    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s4, w2s5, w3s1, w3s2, w3s3, w4s2, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w6s5, w7s3, w7s4, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokToolTypes", "OpenGrokCodeMode", "OpenGrokReleaseValidation", "OpenGrokDiagnostics"])))
 
     // ---- Wave 11 (libraries + executable) ----
     // Distribution support only imports build support, version, and update

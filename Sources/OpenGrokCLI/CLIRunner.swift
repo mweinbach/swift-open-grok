@@ -94,6 +94,13 @@ public enum CLIRunner {
                 streams.err("open-grok: \(error).\n")
                 return ExitCode.failure.rawValue
             }
+        // `doctor` is synchronous end to end (standalone probes + managed
+        // config writes), so like `mcp` and `sessions` it runs without the
+        // async application seam.
+        case .doctor(let options):
+            return LiveDoctorComposition.run(
+                options: options, environment: environment, streams: streams
+            )
         case .invalid(let error):
             writeUsageError(error, streams: streams)
             return ExitCode.usage.rawValue
@@ -141,6 +148,12 @@ public enum CLIRunner {
         case .models(let options):
             writeModels(options: options, streams: streams)
             return ExitCode.success.rawValue
+        // Synchronous like the arms above; the live binary reaches `doctor`
+        // through this entry point (`OpenGrokExecutable/main.swift`).
+        case .doctor(let options):
+            return LiveDoctorComposition.run(
+                options: options, environment: environment, streams: streams
+            )
         case .invalid(let error):
             writeUsageError(error, streams: streams)
             return ExitCode.usage.rawValue
@@ -235,11 +248,6 @@ public enum CLIRunner {
         case .inspect:
             return "Configuration discovery is not wired up yet. "
                 + "'open-grok paths' reports the resolved state directories today."
-        case .doctor(let options):
-            return options.fix
-                ? "Terminal and clipboard remediation is not implemented yet; "
-                    + "there are no fixes to apply."
-                : "Terminal, clipboard, and color probing is not implemented yet."
         case .plugin(let options):
             if LivePluginComposition.actions.contains(options.action) {
                 return "The live plugin action '\(options.action)' requires the live application composition."

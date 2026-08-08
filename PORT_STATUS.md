@@ -673,11 +673,36 @@ managed-text symlink test compared against an under-canonicalized temp root
 Deferred pending the TUI-probe wave (injectable, `Unavailable` in standalone): XTVERSION
 round-trip, kitty flag push, fullscreen evidence, notification/sandbox findings, voice.
 
+### E16 — `/doctor` + `open-grok doctor` wired LIVE (serial gate: exit 0, 4,841 tests, zero issues)
+
+The thin wiring the diagnostics library (E15) was split from — `/doctor` is no longer
+SKIP-ABSENT. CLI: `open-grok doctor` prints the real report, `--json` emits versioned
+JSON, `doctor fix` lists applicable fixes, and `doctor fix <id> --yes` applies the managed
+config write — CONFIRMATION-GATED on `--yes` (verified on the built binary: refusal leaves
+an isolated HOME empty; apply writes the block and is byte-idempotent on re-run), with
+upstream's post-apply verification failing the command if the write landed but the finding
+survives (§3). TUI: `/doctor` (+ aliases terminal-setup/check/info, upstream display order
+after `/recap`) paints the report and fix list as system scrollback blocks. **Recorded
+divergences:** the TUI report is standalone-evidence only (the library exposes no live
+TUI-probe collectors yet — runtime probes surface honestly as Unavailable); the TUI
+`fix <id>` arm is an HONEST REFUSAL pointing at `open-grok doctor fix <id> --yes` because
+the port's only question seam (`PagerQuestionCoordinator`) is scoped to mid-turn tool
+calls, not the idle slash path — no config write without confirmation; `doctor fix --json`
+is refused at the route (upstream's clap conflict); no interactive `[y/N]` leg (no stdin
+seam on `CLIStreams`, so `--yes` is the sole gate). **Lead fix:** the alias registry pin
+compared registration order against the definition's sorted storage — corrected to an
+order-independent set comparison (aliases carry no order).
+
 ### Verification snapshot (2026-08-08, authoritative serial gate for the batch)
 
 | Command | Outcome |
 |---|---|
-| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | **Exit 0 — 4,820 tests, zero recorded issues** (quiescent tree, both slices integrated). |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | **Exit 0 — 4,841 tests, zero recorded issues** (E14 + E15 + E16 integrated). E15's diagnostics library is now LIVE via E16. |
+
+**Flake observed and cleared:** `ACPStdioWireGoldenTests` failed once in E16's first serial
+gate (`protocolVersion not found`) and passed in isolation and on the clean re-gate — an
+order-dependent process-global-ACP-state flake (same family as the recurring telemetry
+flake), not a regression; E16 touched no ACP code.
 
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 

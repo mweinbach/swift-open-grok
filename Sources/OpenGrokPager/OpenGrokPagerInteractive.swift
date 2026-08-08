@@ -475,6 +475,15 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// the helper-model choice and the failure copy all live in the render
     /// layer, the only layer that owns the live sampling stack.
     case recap
+    /// `/doctor` (aliases `/terminal-setup`, `/terminal-check`,
+    /// `/terminal-info`) — upstream `CommandResult::Doctor(DoctorRequest)`
+    /// (`slash/commands/doctor.rs:104-117`), dispatched by `dispatch_doctor`
+    /// (`app/dispatch/prompt.rs:87-117`) as a scrollback system block. The
+    /// controller owns the verbatim argument grammar; the diagnostics
+    /// engine, the report formatting, and the fix registry live in the
+    /// render layer, so the parsed request rides the intent — and the `fix`
+    /// selector rides RAW, because resolving it needs the registry.
+    case doctor(request: OpenGrokPagerDoctorRequest)
     /// `/rename <title>`, alias `/title` — retitle the current session
     /// (upstream `Action::RenameSession`, `slash/commands/rename.rs:42-53`).
     /// The empty-title refusal happens in the controller, so `title` here is
@@ -548,6 +557,22 @@ public enum OpenGrokPagerExtensionsTab: String, Sendable, Equatable, Hashable {
     case marketplace
     case skills
     case mcpServers
+}
+
+/// The parsed `/doctor` argument grammar — upstream's `DoctorRequest`
+/// (`slash/command.rs`), except that `fix` carries the raw user-typed
+/// selector instead of a resolved id: `resolve_fix_id` lives in the
+/// diagnostics engine's fix registry, which the pure controller does not
+/// import, so the render layer resolves and answers a typo with upstream's
+/// error + usage copy (`doctor.rs:110-112`).
+public enum OpenGrokPagerDoctorRequest: Sendable, Equatable, Hashable {
+    case report
+    case listFixes
+    case fix(id: String)
+
+    /// `USAGE` (`slash/commands/doctor.rs:10-11`), byte-exact.
+    public static let usage =
+        "Usage: /doctor [fix [ssh-wrap|tmux-clipboard|dcs-passthrough|tmux-extended-keys]]"
 }
 
 /// Whether the renderer already consumed an input event.

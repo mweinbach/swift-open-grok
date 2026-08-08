@@ -400,8 +400,33 @@ struct OpenGrokExecutableTests {
 
     @Test("management and recovery routes remain reachable outside managed range")
     func managedVersionExemptsManagementAndRecoveryRoutes() async {
-        let routes: [[String]] = [
+        // `doctor` is exempt AND synchronous since the diagnostics wiring
+        // landed: below the managed floor it must still produce its real
+        // report, and it never touches the application launcher.
+        let doctorRecorder = InvocationRecorder()
+        let doctorApplication = OpenGrokApplication(
+            launcher: CLIApplicationLauncher { command, _ in
+                doctorRecorder.append(command.routeName)
+                return CLIApplicationSession(waitForExit: {}, shutdown: {})
+            },
+            control: .never
+        )
+        let (doctorStreams, doctorOut, doctorErr) = CLIStreams.buffered()
+        let doctorCode = await CLIRunner.run(
             ["doctor"],
+            environment: [
+                "GROK_TEST_VERSION": "0.1.0",
+                "GROK_REQUIRED_MINIMUM_VERSION": "0.2.0"
+            ],
+            streams: doctorStreams,
+            application: doctorApplication
+        )
+        #expect(doctorCode == CLIRunner.ExitCode.success.rawValue)
+        #expect(doctorOut.contents.hasPrefix("Grok Doctor\n"))
+        #expect(doctorErr.contents.isEmpty)
+        #expect(doctorRecorder.snapshot.isEmpty)
+
+        let routes: [[String]] = [
             ["login"],
             ["update"],
             ["mcp", "list"],
