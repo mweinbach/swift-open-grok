@@ -22,11 +22,16 @@
 // `runChild` runner, so a swarm member is a real child in every observable
 // way (`/tasks`, `get_task_output`, `kill_task`, `resume_from`).
 //
-// Deliberately absent here (recorded in the slice report): the collaboration
-// quartet, worktree isolation, the foreground await budget with
-// auto-backgrounding, Antigravity runners, and durable cross-process resume
-// metadata. Resume works within the session through the same conversation
-// store the root session uses.
+// The collaboration quartet (`list_agents` / `send_message` / `followup_task`
+// / `wait_agent`) rides this host too: the coordinator owns the mailboxes,
+// `installCollaborationRouting` wires the live follow-up delivery (root
+// interjection seam + per-child round-boundary buffers below), and `runChild`
+// hands each child a `LiveAgentCollaboration` with its team identity.
+//
+// Deliberately absent here (recorded in the slice report): worktree
+// isolation, the foreground await budget with auto-backgrounding, Antigravity
+// runners, and durable cross-process resume metadata. Resume works within the
+// session through the same conversation store the root session uses.
 
 import Foundation
 import OpenGrokAgentCoordinator
@@ -34,6 +39,7 @@ import OpenGrokAgentDefinitions
 import OpenGrokFileTools
 import OpenGrokHooks
 import OpenGrokHooksPluginTypes
+import OpenGrokInterjection
 import OpenGrokSamplingTypes
 import OpenGrokShared
 import OpenGrokShell
@@ -152,10 +158,66 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     var bookkeeping: [String: Bookkeeping] = [:]
     private var childExecutors: [String: LiveToolExecutor] = [:]
 
+    /// Children whose `runChild` loop is live right now — the set the
+    /// follow-up router consults before buffering. Upstream's analog is the
+    /// child's session command channel staying open (`deliver_followup`,
+    /// subagent/mod.rs:468-478).
+    private var liveChildLoopIDs: Set<String> = []
+    /// Follow-ups awaiting a child's next sampler round. The port of the
+    /// child session's `pending_interjections` arm for
+    /// `SessionCommand::AgentMessage` (run_loop.rs:2006-2020): a running
+    /// recipient takes the message at the round boundary, never mid-round.
+    private var pendingChildFollowups: [String: [AgentMailboxMessage]] = [:]
+
     init(context: Context) {
         self.context = context
         self.coordinator = OpenGrokAgentCoordinator()
         self.toolSpec = Self.makeToolSpec(context: context)
+    }
+
+    // MARK: - Collaboration routing (the followup_task live-delivery seam)
+
+    /// Wire the coordinator's follow-up delivery to this host: root messages
+    /// go to the session's mid-turn interjection seam, child messages to the
+    /// per-child round-boundary buffers. Called from `makeAgentStack` once
+    /// the interjection actor exists; until then the coordinator queues every
+    /// follow-up, which is also its behavior for hosts with no live seam.
+    ///
+    /// Root divergence (recorded): upstream's idle root starts a synthetic
+    /// `agent-message-{id}` prompt turn (run_loop.rs:2012-2050); this port
+    /// has no session-owned prompt queue to start one, so an idle root's
+    /// follow-up queues in its mailbox (status "queued") and surfaces on the
+    /// root's next `wait_agent` instead of waking it.
+    func installCollaborationRouting(rootInterjections: LiveSessionInterjections) async {
+        let rootSessionID = context.sessionID
+        await coordinator.installMailboxHooks(deliverFollowup: { [weak self] target, message in
+            if target == rootSessionID {
+                return await rootInterjections.interject(agentMessageEnvelope(message))
+            }
+            guard let self else { return false }
+            return await self.deliverChildFollowup(target: target, message: message)
+        })
+    }
+
+    /// Buffer a follow-up for a child whose loop is live. `false` sends the
+    /// coordinator down its queue/error arms, exactly like upstream's failed
+    /// command-channel send.
+    private func deliverChildFollowup(target: String, message: AgentMailboxMessage) -> Bool {
+        guard liveChildLoopIDs.contains(target) else { return false }
+        pendingChildFollowups[target, default: []].append(message)
+        return true
+    }
+
+    /// Drain a child's buffered follow-ups into round-boundary items: the
+    /// same `formatInterjection` wrap the root drain applies, because
+    /// upstream routes a running recipient's agent message through the same
+    /// `pending_interjections` machinery as a user interjection
+    /// (run_loop.rs:2006-2020 → interjection.rs:290-338).
+    private func takeChildFollowups(_ childID: String) -> [ConversationItem] {
+        guard let pending = pendingChildFollowups.removeValue(forKey: childID),
+              !pending.isEmpty
+        else { return [] }
+        return pending.map { .interjection(formatInterjection(agentMessageEnvelope($0))) }
     }
 
     // MARK: - Tool spec (advertised as `spawn_subagent`)
@@ -611,6 +673,16 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         resumeItems: [ConversationItem]?
     ) async -> OpenGrokChildResult {
         let startedAt = Date()
+        // Live-loop registration brackets the whole run: a follow-up that
+        // arrives after the final drain but before this defer runs is
+        // accepted and never seen — the same window upstream has, where
+        // `deliver_followup`'s channel send can succeed against a child that
+        // is already terminating.
+        liveChildLoopIDs.insert(childID)
+        defer {
+            liveChildLoopIDs.remove(childID)
+            pendingChildFollowups.removeValue(forKey: childID)
+        }
         let executor: LiveToolExecutor
         do {
             executor = try await LiveToolExecutor(
@@ -629,7 +701,20 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 // capability lists keep their names harmlessly (nothing
                 // advertised matches them).
                 sessionServices: nil,
-                permissionOptions: context.permissionOptions
+                permissionOptions: context.permissionOptions,
+                // The team mailbox, with the child's own identity. Upstream
+                // children always carry the quartet: the builder pushes the
+                // collaboration tools past the definition's tool list
+                // (builder.rs:871-877), every capability mode allows the
+                // kind, and the nested strip keeps them
+                // (strip_nested_spawn_tools, task/types.rs:442-452).
+                agentCollaboration: LiveAgentCollaboration(
+                    coordinator: coordinator,
+                    identity: AgentMailboxIdentity(
+                        teamScopeID: context.sessionID,
+                        agentID: childID
+                    )
+                )
             )
         } catch {
             return OpenGrokChildResult(
@@ -682,6 +767,10 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 terminalError = "Subagent was cancelled"
                 break
             }
+            // Follow-ups land at the top of every sampler round — the child
+            // loop's "safe model boundary" (the root loop's identical drain
+            // point sits at LiveShellSamplingDriver.runTurn's round top).
+            items.append(contentsOf: takeChildFollowups(childID))
             let response: OpenGrokLiveSamplingResponse
             do {
                 response = try await context.sampler.sample(OpenGrokLiveSamplingRequest(

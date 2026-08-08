@@ -239,7 +239,14 @@ public actor OpenGrokAgentCoordinator {
     /// `ChildRunner::deliver_root_followup` (coordinator_state.rs:124-130).
     /// Returns `true` when the host handed the message to a running turn.
     /// The Rust defaults return `false`, and so does this one.
-    private var deliverFollowup: @Sendable (String, AgentMailboxMessage) -> Bool = { _, _ in false }
+    ///
+    /// `async` where Rust's hook is a synchronous channel send: the Swift
+    /// hosts deliver into actors (the subagent host's child buffers, the root
+    /// session's interjection actor), and a sync hook could not reach either.
+    /// The cost is actor reentrancy during the await — `sendAgentMessage`
+    /// re-checks for a waiter that parked mid-await before queueing, so a
+    /// racing `wait_agent` cannot be left parked beside a queued message.
+    private var deliverFollowup: @Sendable (String, AgentMailboxMessage) async -> Bool = { _, _ in false }
 
     /// Observer for every accepted send, mirroring Rust
     /// `ChildRunner::on_agent_message` (coordinator_state.rs:132-138).
@@ -252,7 +259,7 @@ public actor OpenGrokAgentCoordinator {
     /// drains, which is exactly the Rust behaviour when neither `deliver_*`
     /// override is provided.
     public func installMailboxHooks(
-        deliverFollowup: @escaping @Sendable (String, AgentMailboxMessage) -> Bool,
+        deliverFollowup: @escaping @Sendable (String, AgentMailboxMessage) async -> Bool,
         onAgentMessage: @escaping @Sendable (AgentMailboxMessage, AgentMessageDeliveryStatus) -> Void = { _, _ in }
     ) {
         self.deliverFollowup = deliverFollowup
@@ -440,7 +447,14 @@ public actor OpenGrokAgentCoordinator {
     /// and `worktree_path` are likewise absent: `OpenGrokChildRequest` does not
     /// carry them yet, and the wire omits `nil` optionals exactly as serde's
     /// `skip_serializing_if` does.
-    public func listAgents(identity: AgentMailboxIdentity) -> ListAgentsOutput {
+    /// Marked `async` even though the actor body never suspends: the
+    /// signature must be IDENTICAL to the `AgentMailboxBackend` requirement.
+    /// With a synchronous member, the protocol extension's no-backend
+    /// default (empty roster) is also visible on the concrete type, and
+    /// Swift prefers the nonisolated-async extension overload at direct
+    /// call sites — every direct `listAgents` call silently returned an
+    /// empty roster (AGENTS.md §3; caught by the pre-existing roster test).
+    public func listAgents(identity: AgentMailboxIdentity) async -> ListAgentsOutput {
         var agents = [
             AgentRosterEntry(
                 agentID: identity.teamScopeID,
@@ -517,7 +531,7 @@ public actor OpenGrokAgentCoordinator {
         identity: AgentMailboxIdentity,
         target rawTarget: String,
         message: AgentMailboxMessage
-    ) throws -> AgentMessageSendOutput {
+    ) async throws -> AgentMessageSendOutput {
         guard message.teamScopeID == identity.teamScopeID,
               message.fromAgentID == identity.agentID
         else { throw AgentMailboxError.identityMismatch }
@@ -537,7 +551,14 @@ public actor OpenGrokAgentCoordinator {
             waiter.resume(WaitAgentMessagesOutput(messages: [stamped], timedOut: false))
             status = .delivered
         } else if stamped.kind.wakesRecipient {
-            if deliverFollowup(target, stamped) {
+            if await deliverFollowup(target, stamped) {
+                status = .delivered
+            } else if let waiter = mailboxWaiters.removeValue(forKey: key) {
+                // The await above is a reentrancy window Rust does not have
+                // (its hook is a sync channel send): a `wait_agent` that
+                // parked during it would otherwise sit beside a queued
+                // message forever. Hand the message to that waiter instead.
+                waiter.resume(WaitAgentMessagesOutput(messages: [stamped], timedOut: false))
                 status = .delivered
             } else if target == identity.teamScopeID || active[target] != nil {
                 // Rust queues an undelivered follow-up only for a target still

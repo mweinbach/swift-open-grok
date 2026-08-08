@@ -15,6 +15,7 @@
 //     routing tests below mirror.
 
 import Foundation
+import OpenGrokAgentControlTools
 import OpenGrokToolTypes
 import Testing
 
@@ -63,6 +64,14 @@ struct AgentMailboxTests {
         let root = AgentMailboxIdentity(teamScopeID: "parent", agentID: "parent")
         let roster = await coordinator.listAgents(identity: root)
         #expect(roster.teamScopeID == "parent")
+        // The WITNESS path too: through the existential, the conformance
+        // must resolve to the coordinator's real roster, not the protocol
+        // extension's empty no-backend default — the overload trap that
+        // silently emptied every direct call when the concrete signature
+        // was synchronous.
+        let backend: any AgentMailboxBackend = coordinator
+        #expect(await backend.listAgents(identity: root).agents.map(\.agentID)
+            == ["parent", "mail-child"])
         #expect(roster.agents.first?.isRoot == true)
         #expect(roster.agents.map(\.agentID) == ["parent", "mail-child"])
         #expect(roster.agents.contains { $0.agentID == "mail-child" && $0.status == "running" })
@@ -206,6 +215,117 @@ struct AgentMailboxTests {
         let second = await coordinator.waitAgentMessages(identity: child, timeoutMS: 0)
         #expect(second.messages.count == 5)
         #expect(second.messages.first?.body == "b20")
+
+        await coordinator.teardown(sessionID: "parent")
+    }
+
+    /// Thread-safe recorder for the delivery hook, which is `@Sendable`.
+    private final class DeliveryRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [(target: String, body: String)] = []
+
+        func append(target: String, body: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            entries.append((target, body))
+        }
+
+        var recorded: [(target: String, body: String)] {
+            lock.lock()
+            defer { lock.unlock() }
+            return entries
+        }
+    }
+
+    @Test("a follow-up wakes a live recipient through the installed hook; a plain message never does")
+    func followupDeliversThroughHook() async throws {
+        let coordinator = OpenGrokAgentCoordinator()
+        try await spawnLiveChild(coordinator, id: "mail-child", parent: "parent")
+        let recorder = DeliveryRecorder()
+        await coordinator.installMailboxHooks(deliverFollowup: { target, message in
+            recorder.append(target: target, body: message.body)
+            return true
+        })
+
+        let root = AgentMailboxIdentity(teamScopeID: "parent", agentID: "parent")
+        let followup = try await coordinator.sendAgentMessage(
+            identity: root,
+            target: "mail-child",
+            message: message("f1", from: root, to: "mail-child", body: "wake", kind: .followupTask)
+        )
+        // Rust routes only `wakes_recipient()` kinds through the delivery
+        // hook (coordinator.rs:672-687); a successful hand-off is Delivered.
+        #expect(followup.status == .delivered)
+        #expect(recorder.recorded.map(\.target) == ["mail-child"])
+        #expect(recorder.recorded.map(\.body) == ["wake"])
+        // Delivered live, so nothing may also sit in the mailbox.
+        let child = AgentMailboxIdentity(teamScopeID: "parent", agentID: "mail-child")
+        #expect(await coordinator.queuedMessageCount(identity: child) == 0)
+
+        let plain = try await coordinator.sendAgentMessage(
+            identity: root,
+            target: "mail-child",
+            message: message("m1", from: root, to: "mail-child", body: "note", kind: .message)
+        )
+        #expect(plain.status == .queued)
+        #expect(recorder.recorded.count == 1)
+
+        await coordinator.teardown(sessionID: "parent")
+    }
+
+    @Test("an undeliverable follow-up to an active child queues instead of erroring")
+    func undeliverableFollowupQueues() async throws {
+        let coordinator = OpenGrokAgentCoordinator()
+        try await spawnLiveChild(coordinator, id: "mail-child", parent: "parent")
+        await coordinator.installMailboxHooks(deliverFollowup: { _, _ in false })
+
+        let root = AgentMailboxIdentity(teamScopeID: "parent", agentID: "parent")
+        let output = try await coordinator.sendAgentMessage(
+            identity: root,
+            target: "mail-child",
+            message: message("f1", from: root, to: "mail-child", body: "later", kind: .followupTask)
+        )
+        // Rust queues an undelivered follow-up only for a `pending` child;
+        // this coordinator has no pending phase, so root-plus-active is the
+        // equivalent set (the recorded divergence in `sendAgentMessage`).
+        #expect(output.status == .queued)
+        let child = AgentMailboxIdentity(teamScopeID: "parent", agentID: "mail-child")
+        #expect(await coordinator.queuedMessageCount(identity: child) == 1)
+
+        await coordinator.teardown(sessionID: "parent")
+    }
+
+    @Test("a send to a finished child refuses with the resume hint, byte for byte")
+    func finishedTargetCarriesResumeHint() async throws {
+        let coordinator = OpenGrokAgentCoordinator()
+        let request = OpenGrokChildRequest(id: "done-child", parentSessionID: "parent", owner: .task)
+        try await coordinator.spawn(request) {
+            OpenGrokChildResult(id: "done-child", success: true, output: "done")
+        }
+        // The completion hop is asynchronous; wait for the terminal record.
+        while await coordinator.listCompleted().first(where: { $0.request.id == "done-child" }) == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        let root = AgentMailboxIdentity(teamScopeID: "parent", agentID: "parent")
+        for kind in [AgentMailboxMessageKind.message, .followupTask] {
+            do {
+                _ = try await coordinator.sendAgentMessage(
+                    identity: root,
+                    target: "done-child",
+                    message: message("m-\(kind.rawValue)", from: root, to: "done-child", body: "more", kind: kind)
+                )
+                Issue.record("send to a finished child unexpectedly succeeded (\(kind))")
+            } catch let error as AgentMailboxError {
+                // The same refusal for BOTH kinds pins the reconciliation:
+                // `followup_task` does not restart or append to a completed
+                // child — upstream points at task(resume_from=…) instead
+                // (coordinator.rs:649-660).
+                #expect(error == .targetFinished("done-child"))
+                #expect(error.description == "Agent 'done-child' has finished. Continue it with "
+                    + "task(resume_from=\"done-child\") before sending more work.")
+            }
+        }
 
         await coordinator.teardown(sessionID: "parent")
     }

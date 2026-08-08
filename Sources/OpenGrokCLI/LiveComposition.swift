@@ -2392,6 +2392,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             openGrokHome: foundation.openGrokHome
         )
         let interjections = LiveSessionInterjections()
+        // Follow-up delivery needs the interjection actor, which is born
+        // here, after the foundation — so the routing installs late. Until
+        // this line the coordinator queues every follow-up, its no-hook
+        // default; nothing can have raced it, because the turn driver that
+        // makes children reachable does not exist yet either.
+        if let subagentHost = foundation.subagentHost {
+            await subagentHost.installCollaborationRouting(rootInterjections: interjections)
+        }
         let turnDriver = ProviderSessionTurnDriver(
             sampler: LiveShellSamplingDriver(
                 modelSwitch: modelSwitch,
@@ -3672,6 +3680,16 @@ struct LiveToolExecutor: Sendable {
     /// The advertised swarm-surface names (at most `["agent_swarm"]`).
     /// Same reachability rule: an unadvertised surface is undispatchable.
     private let swarmToolNames: Set<String>
+    /// The session's handle on the team mailbox — coordinator plus this
+    /// session's identity. Root sessions derive it from `subagentHost`;
+    /// children receive theirs from the host with the child identity. `nil`
+    /// when the collaboration surface is gated off, which also strips the
+    /// quartet from the advertised list.
+    let agentCollaboration: LiveAgentCollaboration?
+    /// The advertised collaboration-tool names (at most the quartet). Same
+    /// reachability rule as the spawn/swarm surfaces: only an advertised
+    /// name dispatches.
+    private let collaborationToolNames: Set<String>
     /// Session-local swarm-mode tracker, shared by the `/swarm` slash path,
     /// the `agent_swarm` tool trigger, and the turn loop's reminder
     /// injection — one tracker, so the three can never disagree (the port
@@ -3743,6 +3761,16 @@ struct LiveToolExecutor: Sendable {
         // no spawn surface; children are built with nil here, which is half
         // of the nested-spawn strip (the other half is the policy filter).
         subagentHost: LiveSubagentHost? = nil,
+        // The team-mailbox context for a CHILD composition. Root sessions
+        // leave this nil and derive their own from `subagentHost`; the
+        // subagent host passes one per child with the child's identity. A
+        // child context advertises the full quartet unfiltered — upstream
+        // children always carry it: the builder pushes the collaboration
+        // tools past the definition's tool list (builder.rs:871-877), every
+        // capability mode allows `ToolKind::AgentCollaboration`
+        // (task/types.rs:484-573), and the nested strip keeps them
+        // ("mailbox collaboration must remain", task/types.rs:1407-1434).
+        agentCollaboration: LiveAgentCollaboration? = nil,
         // The `ask_user_question` surface. Defaulted to nil so headless, ACP
         // and subagent-child constructions simply never advertise the tool —
         // absence of the surface must mean absence of the tool, never a tool
@@ -4031,6 +4059,34 @@ struct LiveToolExecutor: Sendable {
         self.swarmToolNames = advertisesSwarm
             ? [LiveSubagentHost.swarmToolName]
             : []
+        // The collaboration quartet. Enablement is the task surface's own
+        // (ad95b111 pins presence to subagents_enabled; builder.rs:848-877
+        // strips task, agent_swarm, workflow and the quartet together and
+        // pushes the quartet back only when the roster survives), then the
+        // per-tool profile filter applies on top — the same two-layer shape
+        // as `advertisesSwarm`. A CHILD composition arrives with an explicit
+        // `agentCollaboration` and no host: it advertises the full quartet
+        // unfiltered, the port of upstream's builder push past the
+        // definition tool list plus the nested strip keeping the mailbox
+        // tools (see the parameter comment above).
+        let collaborationTools: [ToolSpec]
+        if let agentCollaboration {
+            self.agentCollaboration = agentCollaboration
+            collaborationTools = LiveAgentCollaboration.toolSpecs()
+        } else if advertisesSubagents, let subagentHost {
+            let advertised = AgentCollaborationTool.allCases.filter {
+                toolPolicy?.allows(liveToolName: $0.toolID) ?? true
+            }
+            self.agentCollaboration = advertised.isEmpty ? nil : LiveAgentCollaboration(
+                coordinator: subagentHost.coordinator,
+                identity: AgentMailboxIdentity(teamScopeID: sessionID, agentID: sessionID)
+            )
+            collaborationTools = LiveAgentCollaboration.toolSpecs(for: advertised)
+        } else {
+            self.agentCollaboration = nil
+            collaborationTools = []
+        }
+        self.collaborationToolNames = Set(collaborationTools.map(\.name))
         // The background-task consumers only make sense alongside the producer:
         // without `run_terminal_cmd` there is no task for them to read, wait on
         // or kill. Upstream registers all three in every preset that has bash
@@ -4096,6 +4152,7 @@ struct LiveToolExecutor: Sendable {
             .union(backgroundTaskToolNames)
             .union(subagentToolNames)
             .union(swarmToolNames)
+            .union(collaborationToolNames)
             .union([Self.runTerminalTool.name])
         assert(
             Set(sessionTools.map(\.name)).isDisjoint(with: dispatchedToolNames),
@@ -4107,7 +4164,7 @@ struct LiveToolExecutor: Sendable {
             and background-task tools get.
             """
         )
-        self.tools = terminalTools + spawnTools + sessionTools + allowedFileToolDefinitions.map { definition in
+        self.tools = terminalTools + spawnTools + collaborationTools + sessionTools + allowedFileToolDefinitions.map { definition in
             ToolSpec(
                 name: definition.name,
                 description: definition.description,
@@ -4426,6 +4483,18 @@ struct LiveToolExecutor: Sendable {
             )
         }
 
+        // The collaboration quartet. Same hooks-only gate as the spawn and
+        // swarm surfaces (there is no permission-rule vocabulary for these
+        // upstream either); the mailbox itself enforces team scoping,
+        // identity, and the dead-target refusals.
+        if collaborationToolNames.contains(call.name),
+           let agentCollaboration {
+            if let denial = await gateCollaborationTool(args: args, call: call) {
+                return .failure(denial)
+            }
+            return await agentCollaboration.invoke(name: call.name, args: args)
+        }
+
         guard call.name == Self.runTerminalTool.name
             || backgroundTaskToolNames.contains(call.name)
         else {
@@ -4508,6 +4577,38 @@ struct LiveToolExecutor: Sendable {
             toolName: call.name,
             toolCallId: call.callId,
             access: .bash("spawn_subagent \(subagentType)"),
+            permissionMode: nil
+        )
+        if case .deny(let reason, let hookName) = decision {
+            return .failed("hook \(hookName) denied: \(reason)")
+        }
+        return nil
+    }
+
+    /// Run a collaboration tool through the session's PreToolUse hooks.
+    ///
+    /// Hooks-only, for the same reason as `gateSpawnSubagent`: the permission
+    /// rule vocabulary has no mailbox kind, and the access string below only
+    /// reaches hook payloads, where a hook can match the tool name and see
+    /// which agent is being addressed. The tools themselves are team-scoped
+    /// reads and bounded queue writes; the security-relevant surface is what
+    /// the RECIPIENT does with the text, and a recipient's tool calls pass
+    /// through its own full pipeline.
+    private func gateCollaborationTool(
+        args: JSONValue,
+        call: ToolCall
+    ) async -> OpenGrokShellToolRuntimeError? {
+        guard let permissionPipeline else { return nil }
+        var access = call.name
+        if case .object(let object) = args,
+           case .string(let target)? = object["target"] {
+            let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { access += " \(trimmed)" }
+        }
+        let decision = await permissionPipeline.hooks.runPreToolUse(
+            toolName: call.name,
+            toolCallId: call.callId,
+            access: .bash(access),
             permissionMode: nil
         )
         if case .deny(let reason, let hookName) = decision {

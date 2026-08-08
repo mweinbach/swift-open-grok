@@ -439,6 +439,45 @@ no per-tab swarm chip or `SwarmModeChanged` channel (single-session); `ui.swarm_
 seeds interactive compositions only; `/swarm <task>` whitespace-collapse (the standing
 parser divergence); cancellation returns `.cancelled` rather than dropping the future.
 
+### E9 — collaboration quartet + mailboxes (serial gate: exit 0, 4,647 tests, zero issues; 2026-08-08)
+
+Closes roadmap Wave 14 item 6 — the last subagent-stack item. `list_agents`,
+`send_message`, `followup_task`, `wait_agent` (upstream ships all four un-renamed at the
+pin; `wait_agent` is the caller's MAILBOX read and is distinct from
+`wait_commands_or_subagents`, upstream's completion wait — the roadmap's shorthand
+implied a rename that does not exist) ride the coordinator's mailboxes: per-recipient
+cap 128, parked-waiter hand-off, FIFO drain ≤20, finished-target refusal with the
+byte-exact `task(resume_from=…)` hint. Enablement is the task surface's own gate
+(upstream ad95b111 is the LOCK'S TEST, not the gate — `builder.rs:848-877` strips the
+quartet with task/agent_swarm/workflow and otherwise pushes it even when unlisted);
+children keep the quartet while every spawn surface stays stripped ("spawn tools must
+go, mailbox collaboration must remain", `task/types.rs:1407-1434`). Child→running-root
+`followup_task` rides the E5 interjection seam wrapped in upstream's byte-exact
+`<agent_message>` envelope with the untrusted-input trailer; children drain buffers at
+sampler-round boundaries. Result text is byte-exact serde pretty rendering, golden-pinned.
+
+**Lead fix — a live §3 catch:** the delegate's `AgentMailboxBackend` conformance made
+the protocol extension's no-backend DEFAULTS (empty roster, backendUnavailable) visible
+as overloads on the coordinator, and Swift prefers the nonisolated-async extension
+overload over an actor's SYNCHRONOUS member at direct call sites — every direct
+`listAgents` call silently returned an empty roster, caught by a pre-existing roster
+test the slice's own suite never ran. Fixed by making the concrete signature identical
+to the requirement (`async`, no body change); the roster test now also pins the WITNESS
+path through the existential. Two smaller test repairs: the delivered-status needle
+must match the escaped bytes a tool result embeds in a request-body JSON string, and
+both composition pins gained the quartet (code-mode direct-only per
+`code_mode.rs:83-86`).
+
+**Recorded divergences:** an idle root does not wake on a peer follow-up (no
+host-reachable prompt-queue seam; `status: queued`, read on the next `wait_agent` —
+upstream starts a synthetic `agent-message-{id}` turn); the delivery hook is async
+(Rust's is a sync channel send) with a post-await waiter re-check closing the
+reentrancy window; no client-facing `SubagentMessage` notifications; port profiles can
+strip individual quartet tools (upstream cannot); the `WaitAgentMessagesOutput.modelText`
+in OpenGrokToolTypes still uses `.sortedKeys` (unused by the live path; flagged);
+workflow children are not on the mailbox (upstream's would be); follow-up loss window
+at child exit shared with upstream.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was
