@@ -41,6 +41,11 @@ private enum ACPStdioWireGolden {
         #"{"id":2,"jsonrpc":"2.0","result":{"sessionId":"session-golden-0001"}}"#,
         #"{"jsonrpc":"2.0","method":"session\/update","params":{"sessionId":"session-golden-0001","update":{"content":{"text":"hello","type":"text"},"sessionUpdate":"user_message_chunk"}}}"#,
         #"{"jsonrpc":"2.0","method":"session\/update","params":{"sessionId":"session-golden-0001","update":{"content":{"text":"pong","type":"text"},"sessionUpdate":"agent_message_chunk"}}}"#,
+        // The turn-end broadcast (`x.ai/session/prompt_complete`,
+        // acp_agent.rs:2952-2986): the scripted request carries
+        // `_meta.promptId`/`_meta.turnId` so the frame is deterministic —
+        // an unscripted promptId is a fresh UUID and unpinnable.
+        #"{"jsonrpc":"2.0","method":"x.ai\/session\/prompt_complete","params":{"agentResult":null,"promptId":"prompt-golden-0001","sessionId":"session-golden-0001","stopReason":"end_turn","turnId":7}}"#,
         #"{"id":3,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}"#,
     ]
 }
@@ -130,10 +135,11 @@ struct ACPStdioWireGoldenTests {
         let script = [
             #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#,
             #"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"\#(cwd)","mcpServers":[]}}"#,
-            #"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"\#(ACPStdioWireGolden.sessionId)","prompt":[{"type":"text","text":"hello"}]}}"#,
+            #"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"\#(ACPStdioWireGolden.sessionId)","prompt":[{"type":"text","text":"hello"}],"_meta":{"promptId":"prompt-golden-0001","turnId":7}}}"#,
         ]
-        // initialize + session/new + two notifications + the prompt response.
-        let io = RecordingLineIO(script: script, expectedWrites: 5)
+        // initialize + session/new + two notifications + prompt_complete +
+        // the prompt response.
+        let io = RecordingLineIO(script: script, expectedWrites: 6)
         let runtime = ACPAgentRuntime(
             promptDriver: GoldenPromptDriver(),
             makeSessionId: { ACPStdioWireGolden.sessionId },
@@ -143,7 +149,7 @@ struct ACPStdioWireGoldenTests {
         await ACPStdioHost(runtime: runtime, transport: ACPStdioTransport(io: io)).run()
 
         let written = io.written
-        #expect(written.count == 5)
+        #expect(written.count == 6)
 
         // `initialize` carries a build-stamped version, so check its shape.
         let initialize = try #require(written.first)

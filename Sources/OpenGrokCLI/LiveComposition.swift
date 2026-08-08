@@ -2492,23 +2492,72 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     await foundation.toolExecutor.shutdown()
                 }
             )
-            // The ext-method surface (acp_agent.rs:3794+ dispatch): feedback
-            // plus the `open-grok/*/models` credential family, bound to THIS
+            // The notification gateway (Wave 15 item 5): the outbound handle
+            // the emitters below hold. The carrier composition attaches the
+            // runtime it builds, so everything emitted here rides the same
+            // stdio/ws channel `session/update` rides.
+            let gateway = ACPNotificationGateway()
+            // The mailbox's accepted-send observer → client-facing
+            // `SubagentMessage` on the root session's channel
+            // (`on_agent_message`, subagent_coordinator.rs:154-193). Installed
+            // AFTER `makeAgentStack` wired `deliverFollowup`, through the
+            // observer-only seam, so live follow-up routing stays intact.
+            if let subagentHost = foundation.subagentHost {
+                await subagentHost.installAgentMessageObserver { message, status in
+                    let update = LiveXaiSessionUpdates.subagentMessage(message, status: status)
+                    let rootSessionID = message.teamScopeID
+                    Task {
+                        await gateway.sendXaiSessionUpdate(
+                            sessionID: rootSessionID,
+                            update: update
+                        )
+                    }
+                }
+            }
+            // The ext-method surface (acp_agent.rs:3794+ dispatch): feedback,
+            // the `open-grok/*/models` credential family — bound to THIS
             // stack's catalog store and switch coordinator so an applied key
-            // reaches the running session's sampler, not a parallel copy.
-            // Unregistered methods get upstream's unknown-method error from
-            // the router's terminal arm — see LiveACPExtensionMethods.swift
-            // for the full routed/refused table.
+            // reaches the running session's sampler, not a parallel copy —
+            // and `x.ai/recap`, whose backing reads the SAME conversation
+            // spine the turn driver appends to and samples on the running
+            // coordinator's auxiliary recap route. Unregistered methods get
+            // upstream's unknown-method error from the router's terminal arm
+            // — see LiveACPExtensionMethods.swift for the routed/refused
+            // table.
+            let history = stack.conversationHistory
+            let modelSwitch = stack.modelSwitch
             let extensionRouter = LiveACPExtensionRouter.build(
                 feedback: LiveFeedbackACPHandler(composition: foundation.feedback),
                 models: LiveModelsACPHandler(
                     catalogStore: stack.catalogStore,
-                    modelSwitch: stack.modelSwitch
+                    modelSwitch: modelSwitch
+                ),
+                recap: LiveRecapACPHandler(
+                    gateway: gateway,
+                    conversation: { await history.items },
+                    recapRoute: { explicit in
+                        await modelSwitch.auxiliaryRecapRoute(explicitModelID: explicit)
+                    },
+                    workingDirectory: launch.workingDirectory,
+                    openGrokHome: launch.openGrokHome,
+                    environment: launch.environment
                 )
+            )
+            // Inbound ext notifications land on the LIVE state, never a
+            // mirror: yolo on the session permission-mode handle, swarm on
+            // the E8 tracker, permissions/reset on the pipeline's
+            // `PermissionHandle` (LiveACPNotificationGateway.swift).
+            let extensionNotifications = LiveACPInboundNotifications.build(
+                permissionMode: foundation.toolExecutor.sessionPermissionMode,
+                permissions: await foundation.toolExecutor.permissionHandle(),
+                swarmMode: foundation.toolExecutor.swarmMode,
+                gateway: gateway
             )
             return LiveACPLaunchComponents(
                 promptDriver: promptDriver,
-                extensionHandler: extensionRouter
+                extensionHandler: extensionRouter,
+                extensionNotifications: extensionNotifications,
+                notificationGateway: gateway
             )
         })
     }
@@ -3650,6 +3699,17 @@ actor LiveSessionPermissionMode {
         }
     }
 
+    /// The inbound `x.ai/yolo_mode_changed` arm (acp_agent.rs:4486-4513):
+    /// an explicit set rather than a toggle, pin-gated the same way the
+    /// Ctrl+O toggle is — a pinned enable is refused BEFORE the display mode
+    /// moves, so the composer flag can never claim an always-approve the
+    /// clamped `PermissionHandle` refused (the manager-side clamp upstream
+    /// leans on, run_loop.rs:1093-1105).
+    func applyInboundAlwaysApprove(_ enabled: Bool) async {
+        if enabled, yoloPinReason != nil { return }
+        await apply(enabled ? .alwaysApprove : .ask)
+    }
+
     private func apply(_ newMode: DisplayMode) async {
         displayMode = newMode
         await pipeline.permissions.setYoloMode(newMode == .alwaysApprove)
@@ -3669,6 +3729,16 @@ struct LiveToolExecutor: Sendable {
     /// Mutable permission-mode state the pager toggles at runtime (`Ctrl+O`,
     /// Shift+Tab). Shares the pipeline handle the tool gate consults.
     let sessionPermissionMode: LiveSessionPermissionMode?
+    /// The pipeline's live `PermissionHandle` — the state the tool gate
+    /// consults on every request. The ACP notification gateway's
+    /// `x.ai/permissions/reset` and auto-mode arms mutate THIS handle, never
+    /// a mirror, so an inbound reset lands where the next tool call looks.
+    /// (`async` because `PermissionPipeline` is an actor in another module,
+    /// where even a `let` hop is isolated.)
+    func permissionHandle() async -> PermissionHandle? {
+        guard let permissionPipeline else { return nil }
+        return await permissionPipeline.permissions
+    }
     private let hookPermissionGate: HookPermissionGate?
     /// The OS sandbox this session runs under. `profileName` is what a session
     /// writer persists so a resume is pinned to the same profile.

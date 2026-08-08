@@ -242,10 +242,15 @@ struct ACPStdioHostTests {
         #expect(result?["stopReason"] == .string("end_turn"))
 
         // The user's own turn is echoed back as a durable chunk before the
-        // agent's, so both must appear.
+        // agent's, so both must appear — plus the turn-end broadcast
+        // (`x.ai/session/prompt_complete`, acp_agent.rs:2952-2986), which
+        // rides the same channel and fires before the prompt response.
         let methods = notifications.compactMap(\.self.method)
-        #expect(methods.allSatisfy { $0 == ClientMethodNames.sessionUpdate })
-        #expect(notifications.count >= 2)
+        #expect(methods.filter { $0 == ClientMethodNames.sessionUpdate }.count >= 2)
+        #expect(methods.contains("x.ai/session/prompt_complete"))
+        #expect(methods.allSatisfy {
+            $0 == ClientMethodNames.sessionUpdate || $0 == "x.ai/session/prompt_complete"
+        })
 
         await host.shutdown()
     }

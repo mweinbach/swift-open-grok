@@ -89,13 +89,27 @@ public struct LiveACPServices: Sendable {
 public struct LiveACPLaunchComponents: Sendable {
     public let promptDriver: LiveACPPromptDriver
     public let extensionHandler: (any ACPAgentExtensionHandler)?
+    /// Inbound ext-notification dispatch (`x.ai/yolo_mode_changed`,
+    /// `x.ai/swarm_mode_changed`, `x.ai/permissions/reset`) — handed to the
+    /// runtime beside the method router.
+    public let extensionNotifications: ACPExtensionNotificationRouter?
+    /// Outbound gateway the composition's emitters (recap, swarm acks, the
+    /// subagent mailbox observer) hold. The carrier host attaches the built
+    /// runtime to it; a components value whose gateway is never attached
+    /// emits into the void, which is why both carrier compositions attach
+    /// immediately after construction.
+    public let notificationGateway: ACPNotificationGateway?
 
     public init(
         promptDriver: LiveACPPromptDriver,
-        extensionHandler: (any ACPAgentExtensionHandler)? = nil
+        extensionHandler: (any ACPAgentExtensionHandler)? = nil,
+        extensionNotifications: ACPExtensionNotificationRouter? = nil,
+        notificationGateway: ACPNotificationGateway? = nil
     ) {
         self.promptDriver = promptDriver
         self.extensionHandler = extensionHandler
+        self.extensionNotifications = extensionNotifications
+        self.notificationGateway = notificationGateway
     }
 }
 
@@ -268,8 +282,16 @@ public enum LiveACPComposition {
             cwd: cwd,
             workspace: workspace,
             promptDriver: launchComponents.promptDriver,
-            extensionHandler: launchComponents.extensionHandler
+            extensionHandler: launchComponents.extensionHandler,
+            extensionNotifications: launchComponents.extensionNotifications
         )
+        // The outbound half of the notification gateway: the components'
+        // emitters (recap, swarm acks, the mailbox observer) now target THIS
+        // runtime, whose notification sink is the stdio writer once the host
+        // serves it.
+        if let gateway = launchComponents.notificationGateway {
+            await gateway.attach(runtimeComponents.runtime)
+        }
         let host = ACPStdioHost(
             runtime: runtimeComponents.runtime,
             transport: transport ?? ACPStdioTransport(io: ACPStandardIO())

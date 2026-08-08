@@ -503,12 +503,36 @@ public struct DefaultOpenGrokShellACPRuntimeFactory: OpenGrokShellACPRuntimeFact
         promptDriver: any ACPPromptDriver,
         extensionHandler: (any ACPAgentExtensionHandler)? = nil
     ) -> OpenGrokShellACPComponents {
+        makeRuntime(
+            sessionID: sessionID,
+            cwd: cwd,
+            workspace: workspace,
+            promptDriver: promptDriver,
+            extensionHandler: extensionHandler,
+            extensionNotifications: nil
+        )
+    }
+
+    /// The full construction, with the inbound extension-notification router
+    /// the ACP/serve compositions install. A separate overload rather than a
+    /// protocol change: the protocol's other users (the shell's own session
+    /// components) have no notification surface yet, and a defaulted protocol
+    /// parameter cannot witness the existing requirement.
+    public func makeRuntime(
+        sessionID: SessionID,
+        cwd: URL,
+        workspace: any OpenGrokShellWorkspace,
+        promptDriver: any ACPPromptDriver,
+        extensionHandler: (any ACPAgentExtensionHandler)?,
+        extensionNotifications: ACPExtensionNotificationRouter?
+    ) -> OpenGrokShellACPComponents {
         let store = InMemoryACPSessionStore()
         let runtime = ACPAgentRuntime(
             store: store,
             promptDriver: promptDriver,
             workspaceBoundary: workspace.acpBoundary,
-            extensionHandler: extensionHandler
+            extensionHandler: extensionHandler,
+            extensionNotifications: extensionNotifications
         )
         return OpenGrokShellACPComponents(runtime: runtime, store: store)
     }

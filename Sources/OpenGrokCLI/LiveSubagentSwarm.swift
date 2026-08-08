@@ -103,6 +103,17 @@ actor LiveSwarmModeState {
         tracker.exit()
     }
 
+    /// Exit and report whether the mode had been on — the manual-disable arm
+    /// of `SessionCommand::SetSwarmMode` needs the before-state to decide
+    /// whether a `SwarmModeChanged { enabled: false }` broadcast is owed
+    /// (run_loop.rs:1124-1136).
+    @discardableResult
+    func exitReportingChange() -> Bool {
+        let wasEnabled = tracker.enabled
+        tracker.exit()
+        return wasEnabled
+    }
+
     @discardableResult
     func exitIfTrigger(_ trigger: SwarmModeTrigger) -> Bool {
         tracker.exitIfTrigger(trigger)

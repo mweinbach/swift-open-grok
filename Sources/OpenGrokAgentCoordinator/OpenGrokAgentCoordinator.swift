@@ -266,6 +266,17 @@ public actor OpenGrokAgentCoordinator {
         self.onAgentMessage = onAgentMessage
     }
 
+    /// Replace ONLY the accepted-send observer, leaving live-delivery routing
+    /// in place. The ACP notification gateway subscribes after the agent
+    /// stack has already wired `deliverFollowup` (the interjection/buffer
+    /// seams), and re-calling `installMailboxHooks` there would silently
+    /// clobber that routing back to queue-only.
+    public func installAgentMessageObserver(
+        _ observer: @escaping @Sendable (AgentMailboxMessage, AgentMessageDeliveryStatus) -> Void
+    ) {
+        onAgentMessage = observer
+    }
+
     @discardableResult
     public func spawn(
         _ request: OpenGrokChildRequest,

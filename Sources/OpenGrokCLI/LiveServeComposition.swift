@@ -136,12 +136,23 @@ public enum LiveServeComposition {
                 secret: secret.value
             ),
             makeRuntime: {
-                ACPAgentRuntime(
+                let runtime = ACPAgentRuntime(
                     store: store,
                     promptDriver: promptDriver,
                     workspaceBoundary: boundary,
-                    extensionHandler: launchComponents.extensionHandler
+                    extensionHandler: launchComponents.extensionHandler,
+                    extensionNotifications: launchComponents.extensionNotifications
                 )
+                // Re-attached per accepted connection: the serve host mints a
+                // runtime per client, and the gateway's emitters must follow
+                // the runtime whose sink is the LIVE socket — an emitter
+                // pointed at a closed connection's runtime broadcasts into
+                // nothing, exactly the reconnect gap upstream's persistent
+                // gateway relay avoids by repointing (server.rs:342).
+                if let gateway = launchComponents.notificationGateway {
+                    await gateway.attach(runtime)
+                }
+                return runtime
             },
             log: { message in context.streams.err("open-grok: \(message)\n") }
         )

@@ -199,6 +199,17 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         })
     }
 
+    /// Subscribe an observer to every accepted mailbox send — the port of
+    /// `ChildRunner::on_agent_message` (subagent_coordinator.rs:154-193). The
+    /// ACP composition points this at the notification gateway so each send
+    /// becomes a client-facing `SubagentMessage` session update on the root
+    /// session's channel.
+    func installAgentMessageObserver(
+        _ observer: @escaping @Sendable (AgentMailboxMessage, AgentMessageDeliveryStatus) -> Void
+    ) async {
+        await coordinator.installAgentMessageObserver(observer)
+    }
+
     /// Buffer a follow-up for a child whose loop is live. `false` sends the
     /// coordinator down its queue/error arms, exactly like upstream's failed
     /// command-channel send.

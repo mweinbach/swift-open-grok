@@ -2,6 +2,16 @@ import Foundation
 import OpenGrokACP
 import OpenGrokShared
 
+/// A prompt turn's result plus the error the driver actually threw, kept
+/// separately because the response flattens failures into `.refusal` while
+/// `prompt_complete` must report upstream's ("error", detail) pair from the
+/// same source the response came from (the invariant turn_end.rs:323-326
+/// documents: the two signals must never disagree).
+private struct PromptRunOutcome: Sendable {
+    var response: PromptResponse
+    var failure: AcpError?
+}
+
 private actor ACPTransportWriter {
     private let transport: any ACPTransport
 
@@ -22,13 +32,18 @@ public actor ACPAgentRuntime {
     private let promptDriver: any ACPPromptDriver
     private let workspaceBoundary: (any ACPWorkspaceBoundary)?
     private let extensionRouter: ACPExtensionMethodRouter?
+    /// Inbound extension-notification dispatch — upstream's `ext_notification`
+    /// surface (acp_agent.rs:4481-4720), a separate table from the ext-METHOD
+    /// router above: a JSON-RPC notification never reaches the method table
+    /// and an unmatched name is ignored, not answered with an error.
+    private let extensionNotifications: ACPExtensionNotificationRouter?
     private let reverseRequests: ACPReverseRequestBroker
     private let makeSessionId: @Sendable () -> String
     private let timestamp: @Sendable () -> String
 
     private var state: ACPConnectionState = .connected
     private var authenticated = false
-    private var activePrompts: [AcpSessionId: Task<PromptResponse, Never>] = [:]
+    private var activePrompts: [AcpSessionId: Task<PromptRunOutcome, Never>] = [:]
     private var requestIDs: Set<AcpRequestId> = []
     private var queuedNotifications: [ACPMessage] = []
     private var notificationSink: NotificationSink?
@@ -41,6 +56,7 @@ public actor ACPAgentRuntime {
         workspaceBoundary: (any ACPWorkspaceBoundary)? = nil,
         extensionRouter: ACPExtensionMethodRouter? = nil,
         extensionHandler: (any ACPAgentExtensionHandler)? = nil,
+        extensionNotifications: ACPExtensionNotificationRouter? = nil,
         reverseRequests: ACPReverseRequestBroker = ACPReverseRequestBroker(),
         makeSessionId: @escaping @Sendable () -> String = { UUID().uuidString },
         timestamp: @escaping @Sendable () -> String = { ISO8601DateFormatter().string(from: Date()) }
@@ -58,6 +74,7 @@ public actor ACPAgentRuntime {
         } else {
             self.extensionRouter = nil
         }
+        self.extensionNotifications = extensionNotifications
         self.reverseRequests = reverseRequests
         self.makeSessionId = makeSessionId
         self.timestamp = timestamp
@@ -179,13 +196,25 @@ public actor ACPAgentRuntime {
 
     public func serve(_ channel: AcpAgentChannel) async {
         setNotificationSink { message in
-            guard message.method == ClientMethodNames.sessionUpdate,
-                  let params = message.params,
-                  let notification = try? params.decode(SessionNotification.self) else {
+            if message.method == ClientMethodNames.sessionUpdate,
+               let params = message.params,
+               let notification = try? params.decode(SessionNotification.self) {
+                let args = AcpArgs(request: notification)
+                _ = channel.send(.sessionNotification(args))
                 return
             }
-            let args = AcpArgs(request: notification)
-            _ = channel.send(.sessionNotification(args))
+            // Extension notifications (`x.ai/session/prompt_complete`,
+            // `x.ai/session_notification`, ...) ride the typed channel as
+            // `.extNotification` client messages, the same classification
+            // `decodeAcpClientMessage` gives an unknown notification method.
+            guard case .notification(let method, let params) = message else { return }
+            let decoded = decodeAcpClientMessage(
+                method: method,
+                params: params,
+                isNotification: true
+            )
+            guard case .success(let clientMessage) = decoded else { return }
+            _ = channel.send(clientMessage)
         }
         setReverseSender { message in
             guard case .request(_, let method, let params) = message else {
@@ -223,10 +252,20 @@ public actor ACPAgentRuntime {
             _ = await reverseRequests.resolve(message)
             return []
         case .notification(let method, let params):
-            do {
-                _ = try await dispatch(method: method, params: params)
-            } catch {
-                await emitProtocolError(error)
+            let route = ACPMethodRoute.normalize(method: method, params: params)
+            if Self.coreAgentMethods.contains(route.method) {
+                do {
+                    _ = try await dispatch(method: method, params: params)
+                } catch {
+                    await emitProtocolError(error)
+                }
+            } else {
+                // Upstream routes every non-core JSON-RPC notification to
+                // `ext_notification`, which matches known names and silently
+                // ignores the rest (acp_agent.rs:4481-4720). The ext-METHOD
+                // router never sees notifications — a method table entry
+                // must not be executable without a response channel.
+                await extensionNotifications?.dispatch(method: route.method, params: route.params)
             }
             return []
         case .request(let id, let method, let params):
@@ -313,10 +352,41 @@ public actor ACPAgentRuntime {
         case .setSessionConfigOption(let args): await handleTyped(args)
         case .logout(let args): await handleTyped(args)
         case .extMethod(let args): await handleTyped(args)
-        case .extNotification(let args): await handleTyped(args)
+        case .extNotification(let args):
+            // Same table as the wire `.notification` arm: the typed channel's
+            // ext notifications go to `ext_notification` dispatch, never the
+            // method router, and always acknowledge empty (a notification has
+            // no failure channel — acp_agent.rs:4481 returns Ok on every arm).
+            await extensionNotifications?.dispatch(
+                method: args.request.method,
+                params: args.request.params
+            )
+            _ = args.respond(.success(EmptyAcpResponse()))
         case .askUserQuestion(let args): await handleTyped(args)
         }
     }
+
+    /// The core agent methods `dispatch` matches by name. A notification
+    /// naming anything else is an extension notification (upstream's split
+    /// between the generated core dispatch and `ext_notification`).
+    private static let coreAgentMethods: Set<String> = [
+        AgentMethodNames.initialize,
+        AgentMethodNames.authenticate,
+        AgentMethodNames.logout,
+        AgentMethodNames.sessionNew,
+        AgentMethodNames.sessionLoad,
+        AgentMethodNames.sessionResume,
+        AgentMethodNames.sessionFork,
+        AgentMethodNames.sessionList,
+        AgentMethodNames.sessionClose,
+        AgentMethodNames.sessionPrompt,
+        AgentMethodNames.sessionCancel,
+        AgentMethodNames.sessionSetMode,
+        AgentMethodNames.sessionSetModeCamel,
+        AgentMethodNames.sessionSetModel,
+        AgentMethodNames.sessionSetModelCamel,
+        AgentMethodNames.sessionSetConfigOption,
+    ]
 
     private func initialize(_ params: JSONValue) async throws -> JSONValue {
         guard state == .connected else {
@@ -492,23 +562,119 @@ public actor ACPAgentRuntime {
 
         let driver = promptDriver
         let runtime = self
-        let task = Task<PromptResponse, Never> {
+        let task = Task<PromptRunOutcome, Never> {
             do {
-                return try await driver.run(
+                let response = try await driver.run(
                     context: ACPPromptContext(session: session, request: request),
                     emit: { update, disposition in
                         await runtime.emit(update, disposition: disposition)
                     }
                 )
+                return PromptRunOutcome(response: response, failure: nil)
             } catch is CancellationError {
-                return PromptResponse(stopReason: .cancelled, userMessageId: request.messageId)
+                // Upstream reports a cancelled turn through the Ok arm —
+                // `prompt_complete` carries ("cancelled", null), not an error.
+                return PromptRunOutcome(
+                    response: PromptResponse(stopReason: .cancelled, userMessageId: request.messageId),
+                    failure: nil
+                )
             } catch {
-                return PromptResponse(stopReason: .refusal, userMessageId: request.messageId)
+                // The response flattens to refusal (this runtime's
+                // pre-existing contract), but the ORIGINAL error is kept so
+                // `prompt_complete` can carry upstream's ("error", detail) /
+                // ("rate_limit", null) pair instead of a lie about a refusal.
+                return PromptRunOutcome(
+                    response: PromptResponse(stopReason: .refusal, userMessageId: request.messageId),
+                    failure: runtime.protocolError(for: error)
+                )
             }
         }
         activePrompts[request.sessionId] = task
         defer { activePrompts.removeValue(forKey: request.sessionId) }
-        return try encode(await task.value)
+        let outcome = await task.value
+        await emitPromptComplete(request: request, outcome: outcome)
+        return try encode(outcome.response)
+    }
+
+    /// The `x.ai/session/prompt_complete` fire-and-forget broadcast the
+    /// prompt handler emits once the stop result is known, before the prompt
+    /// response returns (acp_agent.rs:2952-2986). `promptId` echoes the
+    /// client's `_meta.promptId` when present, else a fresh UUID
+    /// (acp_agent.rs:2671-2677); `turnId` rides through only when the client
+    /// sent an integer `_meta.turnId` (acp_agent.rs:2960-2974).
+    ///
+    /// Recorded divergence: upstream additionally attaches `cancelTrigger`
+    /// when the session's cancellation context named one
+    /// (acp_agent.rs:2942-2951, 2975-2977); this runtime has no cancellation
+    /// context seam, so the field is never present. Cost: a client that
+    /// distinguishes user-cancel from timeout-cancel sees neither here.
+    private func emitPromptComplete(request: PromptRequest, outcome: PromptRunOutcome) async {
+        let (stopReason, agentResult) = Self.promptCompleteFields(
+            response: outcome.response,
+            failure: outcome.failure
+        )
+        let promptId = request.meta?["promptId"]?.stringValue ?? UUID().uuidString
+        var payload: [String: JSONValue] = [
+            "sessionId": .string(request.sessionId.rawValue),
+            "promptId": .string(promptId),
+            "stopReason": stopReason,
+            "agentResult": agentResult,
+        ]
+        if case .number(let number)? = request.meta?["turnId"],
+           let turnId = number.int64Value, turnId >= 0 {
+            payload["turnId"] = .number(.int64(turnId))
+        }
+        await sendExtensionNotification(
+            method: ACPXaiNotificationMethods.promptComplete,
+            params: .object(payload)
+        )
+    }
+
+    /// `(stopReason, agentResult)` for `prompt_complete` — the port of
+    /// `prompt_complete_fields` (sampling/error.rs:308-331): success passes
+    /// the stop reason through with a null result; a rate-limit error
+    /// (code -32003, `RATE_LIMITED_ERROR_CODE`, sampling/error.rs:19) yields
+    /// ("rate_limit", null) so the client shows its own upgrade copy; any
+    /// other error yields ("error", detail), the detail being the error
+    /// data's `message` field, else the whole data value, else the message
+    /// string (`error_message_from_data`, sampling/error.rs:236-238).
+    static func promptCompleteFields(
+        response: PromptResponse,
+        failure: AcpError?
+    ) -> (stopReason: JSONValue, agentResult: JSONValue) {
+        guard let failure else {
+            return (.string(response.stopReason.rawValue), .null)
+        }
+        if failure.code.code == -32003 {
+            return (.string("rate_limit"), .null)
+        }
+        let detail: JSONValue
+        if let data = failure.data {
+            detail = data["message"] ?? data
+        } else {
+            detail = .string(failure.message)
+        }
+        return (.string("error"), detail)
+    }
+
+    /// Fire-and-forget one extension notification to the connected client —
+    /// the outbound half of the notification gateway. Rides the SAME queue
+    /// and sink `session/update` rides, so whichever carrier is serving this
+    /// runtime (stdio line, ws frame, typed channel) carries it too.
+    public func sendExtensionNotification(method: String, params: JSONValue) async {
+        let message = ACPMessage.notification(method: method, params: params)
+        queuedNotifications.append(message)
+        if let notificationSink {
+            await notificationSink(message)
+        }
+    }
+
+    /// Whether `sessionId` exists in this runtime's store. The two-step
+    /// spelling avoids `try?` flattening the store's `Snapshot?` into one
+    /// silent nil (AGENTS.md §2).
+    public func sessionExists(_ sessionId: AcpSessionId) async -> Bool {
+        let snapshot = (try? await store.read(sessionId)) ?? nil
+        return snapshot != nil
     }
 
     private func cancel(_ params: JSONValue) async throws -> JSONValue {
@@ -650,7 +816,7 @@ public actor ACPAgentRuntime {
         }
     }
 
-    private func protocolError(for error: Error) -> AcpError {
+    nonisolated private func protocolError(for error: Error) -> AcpError {
         if let acpError = error as? AcpError { return acpError }
         if let runtimeError = error as? ACPRuntimeError { return runtimeError.acpError }
         if error is DecodingError {

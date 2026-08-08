@@ -7,8 +7,11 @@
 //
 // What routes and what refuses:
 //
-//   * Routed with real backings — the twelve `open-grok/*` methods below and
-//     `x.ai/feedback` (`LiveFeedbackACPHandler`). Every routed method's
+//   * Routed with real backings — the twelve `open-grok/*` methods below,
+//     `x.ai/feedback` (`LiveFeedbackACPHandler`), and `x.ai/recap`
+//     (`LiveRecapACPHandler`, LiveACPNotificationGateway.swift — the ack plus
+//     the async SessionRecap notification, now that the notification gateway
+//     gives the summary a delivery channel). Every routed method's
 //     payload mirrors the upstream payload builders byte-for-byte in copy
 //     (`acp_agent.rs:32-181`) inside upstream's `ExtMethodResult` envelope
 //     `{"result": <payload>}` (`session/result.rs:29-72`).
@@ -25,10 +28,7 @@
 //     (:4115-4155 — Wave 15 item 6), `x.ai/memory/*` (:4156),
 //     `x.ai/skills/refresh-baseline` (:4159), `x.ai/interject` (:4165),
 //     `x.ai/feedback/dismiss` + `x.ai/btw` (:4166 — item 7),
-//     `x.ai/recap` (:4169 — the E4 recap backing exists but its output
-//     channel, the SessionRecap session-update notification, has no ACP
-//     sink; acking `{ok:true}` and dropping the summary would be a silent
-//     no-op), `x.ai/cloud/*` (:4170-4370), `x.ai/billing` +
+//     `x.ai/cloud/*` (:4170-4370), `x.ai/billing` +
 //     `x.ai/auto-topup-rule` (:4371-4374), `x.ai/share_session` (:4375),
 //     `x.ai/privacy/*` (:4376), `x.ai/rollout/survey` (:4379),
 //     `x.ai/prompt_history` (:4382), `x.ai/suggest`/`x.ai/suggestPrompt`
@@ -56,10 +56,14 @@ enum LiveACPExtensionRouter {
     /// The router the live ACP/serve compositions install. `modelSwitch` is
     /// the RUNNING session's coordinator; passing `nil` (compositions without
     /// a live sampler stack) keeps the catalog family working while the
-    /// rebind arm reports itself as skipped in the payload warning.
+    /// rebind arm reports itself as skipped in the payload warning. `recap`
+    /// is the `x.ai/recap` arm (acp_agent.rs:4169 → extensions/recap.rs) —
+    /// `nil` for compositions without a notification gateway, which keeps the
+    /// method on the refused table rather than acking into a void.
     static func build(
         feedback: LiveFeedbackACPHandler?,
-        models: LiveModelsACPHandler
+        models: LiveModelsACPHandler,
+        recap: LiveRecapACPHandler? = nil
     ) -> ACPExtensionMethodRouter {
         var router = ACPExtensionMethodRouter()
         if let feedback {
@@ -67,6 +71,9 @@ enum LiveACPExtensionRouter {
         }
         for method in LiveModelsACPHandler.methods {
             router = router.register(exact: method, handler: models)
+        }
+        if let recap {
+            router = router.register(exact: LiveRecapACPHandler.method, handler: recap)
         }
         return router
     }

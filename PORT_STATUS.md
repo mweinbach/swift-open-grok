@@ -518,6 +518,34 @@ path from an ext handler — acking while dropping the summary would be a silent
 `x.ai/mcp/auth_trigger` stays refused (the E7 CLI verb owns that seam). Wave 15 items
 3-7 remain, now behind an honest router.
 
+### E11 — ACP notification gateway (serial gate: exit 0, 4,667 tests, zero issues; 2026-08-08)
+
+Closes roadmap Wave 15 item 5 and the two walls prior slices recorded. Inbound ext
+notifications reach LIVE state, never mirrors: `x.ai/yolo_mode_changed` applies through
+`LiveSessionPermissionMode` (an inbound ENABLE is refused while a yolo pin reason exists
+— the pin guard reviewed at the landed line; the sender is the connected ACP peer, the
+same trust upstream extends at acp_agent.rs:4486-4553), `x.ai/swarm_mode_changed`
+reaches the E8 tracker with both broadcasts, `x.ai/permissions/reset` resets the live
+`PermissionHandle`. Outbound: `x.ai/session/prompt_complete` at turn end (all three
+field arms, byte-pinned in the stdio wire golden) and the `x.ai/session_notification`
+envelope (`{sessionId, update, _meta{eventId, agentTimestampMs}}`) on the same channel
+`session/update` rides. The unlocked routes: `x.ai/recap` moves from E10's refused
+table to routed — ack `{ok:true}` then the async `SessionRecap`/`SessionRecapUnavailable`
+notification off the E4 seam against the live conversation spine — and the mailbox's
+`onAgentMessage` observer emits upstream's `SubagentMessage` update (closing E9
+divergence 3). Five inbound names with no port surface are ignored silently (named in
+the file header — notifications have no error channel; silence matches upstream's
+unmatched arm). 9 new test suites over the real ws:// carrier.
+
+**Recorded divergences:** single-stack fan-out (`clientIdentifier` matching vacuous —
+one live stack per ACP process); auto-mode is flag-only pending the classifier seam;
+broadcasts are not persisted to `updates.jsonl` (a reconnecting client cannot replay);
+recap lacks the watermark/idle gate and new-prompt epoch cancel (an `auto:true` recap
+runs unconditionally); no `cancelTrigger` on prompt_complete; permissions reset is
+in-memory (upstream persists the cleared state). The rest of the outbound
+`SessionUpdate` family (RetryState, AutoCompact*, TaskCompleted, SubagentSpawned/…) has
+no emitters yet — the delivery channel now exists for their slices.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was

@@ -180,10 +180,10 @@ private let refusedUpstreamMethods: [String] = [
     // :4166 — feedback dismiss and btw route to feedback::handle upstream;
     // only `x.ai/feedback` has a port backing.
     "x.ai/feedback/dismiss", "x.ai/btw",
-    // :4169 — the E4 recap backing exists, but its output channel (the
-    // SessionRecap session-update notification) has no ACP sink; an ack
-    // that drops the summary would be a silent no-op.
-    "x.ai/recap",
+    // `x.ai/recap` (:4169) left this list with the notification gateway:
+    // the live composition routes it (`LiveRecapACPHandler`), and this
+    // harness builds its router without a recap arm on purpose, so the
+    // method is exercised in ACPNotificationGatewayTests instead.
     // :4170-4386
     "x.ai/cloud/terminate", "x.ai/cloud/env/list", "x.ai/cloud/env/create",
     "x.ai/cloud/env/update", "x.ai/cloud/env/delete", "x.ai/billing",
