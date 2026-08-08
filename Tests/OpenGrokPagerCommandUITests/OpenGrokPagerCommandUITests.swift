@@ -39,21 +39,36 @@ struct PagerCommandRegistryTests {
         let completions = registry.completions(for: "/m")
 
         // `m` scores identically against `memory`, `model`, and the alias
-        // `m`; ties fall to display order (`slash/mod.rs:1003`).
-        #expect(completions.map(\.commandName) == ["memory", "model"])
-        #expect(completions[0].availability.isAvailable == false)
+        // `m`; ties fall to the MATCHED trigger's display text — upstream's
+        // `rows[..].display.cmp` (`slash/mod.rs:1003`) compares the
+        // "/{alias-or-canonical}" string (`registry.rs:76`), so model's
+        // alias row "/m" sorts before "/memory". (An earlier port compared
+        // canonical names here, which inverted this order and ranked
+        // `/docs` above `/help` on `/h` once docs gained its `howto`
+        // alias.)
+        #expect(completions.map(\.commandName) == ["model", "memory"])
         // At equal score the exact alias trigger wins the per-command dedupe
         // (`slash/mod.rs:934-940`), so the model row records the alias hit.
-        #expect(completions[1].matchedAlias == "m")
+        #expect(completions[0].matchedAlias == "m")
+        #expect(completions[1].availability.isAvailable == false)
     }
 
     @Test("autocomplete selection wraps and accepts the canonical command")
     func selectsCompletion() {
+        // The alias-matched model row ranks first; accepting inserts the
+        // CANONICAL name, not the alias (the port's recorded divergence —
+        // upstream inserts the alias display text).
         var state = registry.autocompleteState(for: "/m")
-        state.moveSelection(by: -1)
         #expect(state.selectedSuggestion?.commandName == "model")
         #expect(state.acceptSelected() == "/model")
         #expect(state.renderDescription().height == 0)
+
+        // Wrapping backwards from the first row lands on the last —
+        // memory, which is unavailable, so accepting it refuses (nil).
+        var wrapped = registry.autocompleteState(for: "/m")
+        wrapped.moveSelection(by: -1)
+        #expect(wrapped.selectedSuggestion?.commandName == "memory")
+        #expect(wrapped.acceptSelected() == nil)
     }
 
     @Test("resolution keeps unavailable commands explicit")

@@ -1964,6 +1964,20 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             name: "help",
             summary: "Browse commands and keyboard shortcuts"
         ),
+        // `/docs` follows `/help`, upstream's display order
+        // (`slash/commands/mod.rs:84-85`). Name, aliases, description and
+        // usage are verbatim (`docs.rs:18-32`); the argument is optional
+        // (`args_required() == false`, docs.rs:38-40), so a bare Enter
+        // dispatches. Upstream's `arg_placeholder("[web|title]")`
+        // (docs.rs:42-44) has no port channel — `PagerCommandDefinition`
+        // carries no placeholder field — so the usage string is the only
+        // argument hint (recorded divergence, shared with `/plan`/`/fork`).
+        PagerCommandDefinition(
+            name: "docs",
+            aliases: ["howto", "guides"],
+            summary: "Open How-to Guides or online Build docs",
+            usage: "/docs [web|title]"
+        ),
         PagerCommandDefinition(
             name: "home",
             aliases: ["welcome"],
@@ -2362,6 +2376,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             return matcher
                 .rank(rows, query: trimmed, limit: rows.count) { $0.name }
                 .map { rows[$0.index] }
+        case "docs", "howto", "guides":
+            // `DocsCommand::suggest_args` (`docs.rs:46-68`) — "how-to" and
+            // "web" first, then every guide title. The corpus lives in this
+            // module (`PagerDocs`), so the rows do too. Aliases are
+            // enumerated because the argument phase hands over the typed
+            // name, not the canonical one — the `/theme`/`/t` convention.
+            return PagerDocs.argumentSuggestions(query: query)
         case "login":
             // `LoginCommand::suggest_args` (`login.rs:124-126`) — the eight
             // providers with the provider-neutral descriptions; live secret
@@ -2547,6 +2568,34 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 return .handled
             case "help":
                 try await emit(.overlay(.help))
+                return .handled
+            case "docs":
+                // `DocsCommand::run` (`docs.rs:70-87`). The argument is the
+                // raw tail trimmed — upstream's `args.trim()` — NOT the
+                // tokenizer's rejoin: a quoted or double-spaced title must
+                // fail the lookup exactly as it does upstream, and the
+                // unknown-target echo must quote what the user typed.
+                let target = Self.rawArgumentTail(of: invocation)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if target.isEmpty || PagerDocs.isHowtoListArgument(target) {
+                    try await emit(.overlay(.howtoGuides))
+                    return .handled
+                }
+                if PagerDocs.isWebArgument(target) {
+                    try await emit(.overlay(.openURL(PagerDocs.buildDocsURL)))
+                    return .handled
+                }
+                if let doc = PagerDocs.find(title: target) {
+                    try await emit(.overlay(.showDocument(
+                        title: doc.title,
+                        content: doc.content
+                    )))
+                    return .handled
+                }
+                // `CommandResult::Error` (docs.rs:83-85) on the notice
+                // channel, like every command error here; copy byte-exact
+                // including the Rust `{:?}` quoting.
+                try await emit(.notice(PagerDocs.unknownTargetMessage(target)))
                 return .handled
             case "home":
                 try await emit(.overlay(.welcomeScreen))
@@ -2959,6 +3008,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     public static let helpText = """
     Commands
       /help                     Browse commands and keyboard shortcuts
+      /docs [web|title]         Open How-to Guides or online Build docs
       /model [name]  /m         Switch the active model
       /effort <level>           Set reasoning effort for the current model
       /always-approve           Toggle always-approve mode (skip all permission prompts)

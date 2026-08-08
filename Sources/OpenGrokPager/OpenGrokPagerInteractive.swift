@@ -461,6 +461,22 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// as a read-only system block. The task sources (workflow registry,
     /// subagent host, shell background tasks) live in the render layer.
     case showTasks
+    /// Bare `/docs` (and its how-to-list argument forms) — upstream
+    /// `Action::OpenHowtoGuides` (`slash/commands/docs.rs:72-74`), dispatched
+    /// by `dispatch_open_howto_guides` (`dispatch/settings/ui.rs:248-262`)
+    /// as the "How-to Guides" DocPicker. The intent carries no rows: the
+    /// corpus is `PagerDocs`, which the render layer reads directly.
+    case howtoGuides
+    /// `/docs web` — upstream `Action::OpenUrl(BUILD_DOCS_URL)`
+    /// (`docs.rs:75-77`, dispatched at `dispatch/router.rs:1208-1223`).
+    /// The URL rides the intent exactly as it rides upstream's action; the
+    /// browser opener is a render-layer seam.
+    case openURL(String)
+    /// `/docs <title>` — upstream `Action::ShowReleaseNotes{title, content}`
+    /// (`docs.rs:78-82`), the reused fullscreen doc viewer. Content rides
+    /// along because the controller resolved the title (`find_doc`) and the
+    /// viewer needs nothing else.
+    case showDocument(title: String, content: String)
     case dismissAll
 }
 

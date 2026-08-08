@@ -7639,10 +7639,45 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await performFork(worktreeOverride: worktreeOverride, directive: directive)
         case .showTasks:
             await presentTasksBlock()
+        case .howtoGuides:
+            // Upstream's "How-to Guides" DocPicker, toggled closed if
+            // already open (`dispatch_open_howto_guides`,
+            // `dispatch/settings/ui.rs:248-262`). The toggle must be
+            // explicit: `overlays.push` on an existing id *replaces* the
+            // overlay (resetting its filter state), it does not dismiss it.
+            if overlays.dismiss(id: LiveHowtoGuidesPicker.overlayID) == nil {
+                overlays.push(LiveHowtoGuidesPicker.overlay())
+            }
+        case .openURL(let url):
+            openExternalURL(url)
+        case .showDocument(let title, let content):
+            overlays.push(LiveHowtoGuidesPicker.viewerOverlay(
+                title: title,
+                content: content
+            ))
         case .dismissAll:
             overlays.removeAll()
             currentPermissionRequestID = nil
         }
+    }
+
+    /// `Action::OpenUrl` for standard schemes (`dispatch/router.rs:1208-1223`
+    /// → `open_url_or_show`, `dispatch/ctx.rs:43-59`): opened silently on
+    /// success. The opener is the same injectable seam the codex login flow
+    /// uses (`LivePagerAuthServices.openBrowser`), so tests substitute a
+    /// capture and no real browser launches. A composition with no opener is
+    /// this port's "browser unavailable" arm, answered with upstream's
+    /// agent-view copy (`browser_unavailable_message`,
+    /// `pager-render/src/link_opener.rs:52-54`) minus the best-effort
+    /// clipboard leg (no OSC 52 channel here — recorded divergence; cost:
+    /// SSH users copy the URL by hand).
+    private func openExternalURL(_ url: String) {
+        guard let openBrowser = authServices.openBrowser,
+              let parsed = URL(string: url) else {
+            note("Could not open a browser. Open this URL manually:\n\(url)")
+            return
+        }
+        openBrowser(parsed)
     }
 
     // MARK: - /fork, /tasks
@@ -8534,6 +8569,18 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // upstream shares `provider_action` between both paths
             // (`login.rs:82-84`).
             return "/login \(rowID)"
+        case LiveHowtoGuidesPicker.overlayID:
+            // Row ids are doc titles; selecting one opens that guide in the
+            // content viewer — upstream's DocPicker → DocViewer hand-off
+            // (`app/modals.rs:1327-1345`). Upstream's Esc-returns-to-list
+            // shuttle is not ported (the overlay stack has no
+            // previous-modal channel — recorded divergence; cost: Esc
+            // closes the viewer outright and `/docs` reopens the list).
+            guard let doc = PagerDocs.find(title: rowID) else { return nil }
+            overlays.push(LiveHowtoGuidesPicker.viewerOverlay(
+                title: doc.title,
+                content: doc.content
+            ))
         case LiveJumpPicker.overlayID:
             guard let index = Int(rowID) else { return nil }
             try? revealBlock(at: index)

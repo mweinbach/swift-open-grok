@@ -147,6 +147,57 @@ command's process group via a `setpgrp` re-exec — a pid-only kill stranded
 unnoticed. Kill path proven live: a 60 s ceiling tripped mid-suite exited 124 with no
 surviving helper.
 
+### E1 — `/docs` with the How-to Guides corpus (serial gate: exit 0, 4,459 tests, zero issues)
+
+`/docs` (aliases `howto`, `guides`) ports `DocsCommand` verbatim (`docs.rs:70-102`): bare
+or a how-to token opens the in-TUI guides browser, a web token opens
+`https://docs.x.ai/build/overview` through the same injected opener seam the codex login
+uses, a guide title opens that guide's markdown viewer, and unknown targets get the
+byte-exact error (including Rust's `{:?}` quoting for the ASCII range). The 26-guide
+corpus (24 user-guide files + 2 reference docs, 464,214 bytes) lives as generated Swift
+source — NOT SwiftPM resources, which silently break under `swiftpm-testing-helper`
+(AGENTS.md §2) — mechanically emitted from the reference clone; the lead independently
+re-hashed the literals against the upstream markdown (all matched) and the suite pins
+per-file byte counts. 25 new tests.
+
+**Parity bug found during lead review — completion tie-break inverted.** The registry's
+final sort key compared CANONICAL command names where upstream compares the MATCHED
+trigger's display text (`slash/mod.rs:1003` via `registry.rs:76` — an alias row is
+"/howto", "/m"). The moment `/docs` gained its `howto` alias, a tied `/h` query ranked
+`/docs` above `/help` — upstream never does. Fixed in
+`OpenGrokPagerCommandUI.completions` (matched-trigger text ascending); two stale pins in
+`OpenGrokPagerCommandUITests` that encoded the buggy order were corrected to upstream's
+(`/m` → model-via-alias before memory; accepting an unavailable row returns nil).
+
+**Recorded divergences:** no `arg_placeholder` channel (shared with `/plan`, `/fork`);
+`{:?}` quoting exact for ASCII, not `escape_debug`'s exotic ranges; Esc closes the doc
+viewer outright (no upstream DocViewer→DocPicker modal shuttle); the opener is
+fire-and-forget (no `BrowserUnavailable` detection or OSC-52 clipboard leg — a
+composition with no opener paints the manual-URL fallback); label truncation in the
+narrower port sheet follows upstream's own label-yields-to-right-label rule
+(`picker.rs:1017-1023`) but bites sooner. Deliberately not built: `extract_user_guide_docs`
+(startup extraction for model consumption) and the model-facing `get_howto_doc` helpers —
+implemented-unwired surface until a consumer exists.
+
+### Slash-command surface: the audited remainder (2026-08-07 survey)
+
+A read-only survey classified every still-missing upstream command against live port
+backings. BUILDABLE-NOW: `/announcements show` (the hide arm is live; the surface lacks
+only an unhide API) and `/imagine` (inject-skill prompt; `imagineInstruction` and the
+live image tool pack exist — gate on `imageGenEnabled`). Everything else is SKIP-ABSENT
+until its backing feature lands, each verified at the dispatch layer: `/edit-prompt`
+(upstream itself is minimal-mode-only — `external_editor.rs:10-13` returns early in
+fullscreen and `dispatch/tests/router.rs:65-70` pins the refusal; a fullscreen-only port
+registering it would be a dead surface), `/fast` (no live per-session service-tier
+override; the wire types in `ServiceTier.swift` are implemented-unwired), `/auto` (no
+LLM classifier; the live permission toggle is deliberately ask↔always-approve only),
+`/swarm` (`agent_swarm` deliberately unwired in `LiveSubagentHost`), `/recap` (needs a
+real `x.ai/recap` aux side-call rendered to scrollback; the port's `/btw` interjection
+buffer is the wrong seam), `/hooks`/`/plugins`/`/marketplace`/`/skills` (the Extensions
+modal doesn't exist; `openExtensions` is inert), `/doctor` (~9.2k-line diagnostics probe
+and fix stack absent; the CLI route is an honest stub), `/scroll-debug`/`/debug` (no
+debug HUDs). These unlock bottom-up as the backing features land.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was

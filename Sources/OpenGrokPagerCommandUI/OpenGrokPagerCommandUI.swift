@@ -273,7 +273,12 @@ public struct PagerCommandRegistry: Equatable, Hashable, Sendable {
     /// alias), keeps the best trigger per command with upstream's tie-break
     /// (exact match text, then canonical over alias, then match text order —
     /// `slash/mod.rs:922-953`), and sorts by fuzzy score descending, recency
-    /// descending, then display ascending (`slash/mod.rs:996-1003`).
+    /// descending, then the MATCHED trigger's display text ascending —
+    /// upstream's `rows[..].display.cmp` (`slash/mod.rs:996-1003`) compares
+    /// the matched row text ("/howto"), not the canonical command name.
+    /// Comparing canonical names here once ranked `/docs` (matched via its
+    /// "howto" alias) above `/help` on a tied `/h` query, which upstream
+    /// never does.
     ///
     /// `recency` maps canonical command names to `PagerSlashMru.rankScore`
     /// values. Upstream inserts a builtin-over-plugin tie-break between
@@ -358,7 +363,10 @@ public struct PagerCommandRegistry: Equatable, Hashable, Sendable {
                 let lhsRecency = recency[visible[lhs.commandIndex].name] ?? 0
                 let rhsRecency = recency[visible[rhs.commandIndex].name] ?? 0
                 if lhsRecency != rhsRecency { return lhsRecency > rhsRecency }
-                return visible[lhs.commandIndex].name < visible[rhs.commandIndex].name
+                // The matched trigger text, not the canonical name — an
+                // alias match must compete under the alias it matched with.
+                return triggers[lhs.triggerIndex].matchText
+                    < triggers[rhs.triggerIndex].matchText
             }
             .map { entry in
                 row(
