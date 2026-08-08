@@ -82,7 +82,8 @@ private struct AuthRendererFixture {
 
     init(
         extraEnvironment: [String: String] = [:],
-        authServices: LivePagerAuthServices
+        authServices: LivePagerAuthServices,
+        catalogStore: LiveModelCatalogStore? = nil
     ) throws {
         home = FileManager.default.temporaryDirectory
             .appendingPathComponent("opengrok-pager-auth-\(UUID().uuidString)", isDirectory: true)
@@ -104,6 +105,7 @@ private struct AuthRendererFixture {
             terminal: terminal,
             sink: sink,
             workingDirectory: home.path,
+            catalogStore: catalogStore,
             sessionID: "live-auth-session",
             openGrokHome: home,
             paintCadence: PagerMotion.minimumPaintCadence,
@@ -148,13 +150,15 @@ private struct AuthRendererFixture {
 }
 
 /// Services whose network legs are scripted and whose browser is a no-op.
-/// The codex login flow itself defaults to the REAL `loginCodexBrowser`.
+/// The codex login flow itself defaults to the REAL `loginCodexBrowser`, and
+/// the xAI flow to the REAL `loginXAIBrowser` (the seam's own default).
 private func fakeAuthServices(
-    transport: MockHTTPTransport,
+    transport: any HTTPTransport,
     openBrowser: (@Sendable (URL) -> Void)? = nil,
-    codexBrowserLogin: LivePagerAuthServices.CodexLoginFlow? = nil
+    codexBrowserLogin: LivePagerAuthServices.CodexLoginFlow? = nil,
+    xaiBrowserLogin: LivePagerAuthServices.XAILoginFlow? = nil
 ) -> LivePagerAuthServices {
-    LivePagerAuthServices(
+    var services = LivePagerAuthServices(
         makeTransport: { transport },
         codexBrowserLogin: codexBrowserLogin ?? { authFile, endpoints, flowTransport, opener in
             try await loginCodexBrowser(
@@ -167,6 +171,104 @@ private func fakeAuthServices(
         },
         openBrowser: openBrowser
     )
+    if let xaiBrowserLogin {
+        services.xaiBrowserLogin = xaiBrowserLogin
+    }
+    return services
+}
+
+/// Hermeticity pins for the xAI flow (the Wave 14.1 rule): the issuer — the
+/// only endpoint env the flow reads — points at a dead loopback port, and
+/// the constructed dictionary carries no `GROK_OIDC_*`, `GROK_LOCAL_AUTH`,
+/// `XAI_API_KEY`, or `OPENGROK_AUTH*`.
+private let xaiPinnedEnvironment: [String: String] = [
+    "GROK_OAUTH2_ISSUER": "http://127.0.0.1:9",
+    "GROK_OAUTH2_CLIENT_ID": "pager-client",
+]
+
+/// Scripted xAI IdP: discovery + token exchange. The id_token's nonce claim
+/// must be the one the flow minted, which the fake browser reads off the
+/// authorize URL and stashes here before the exchange runs.
+private final class PagerXAIIdPTransport: HTTPTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var nonce: String?
+
+    func setNonce(_ value: String?) {
+        lock.lock(); nonce = value; lock.unlock()
+    }
+
+    func send(_ request: HTTPRequest) async throws -> HTTPResponse {
+        let path = request.url.path
+        if path.hasSuffix("/.well-known/openid-configuration") {
+            let body = """
+            {"issuer":"http://127.0.0.1:9",\
+            "authorization_endpoint":"http://127.0.0.1:9/authorize",\
+            "token_endpoint":"http://127.0.0.1:9/token"}
+            """
+            return HTTPResponse(
+                metadata: HTTPResponseMetadata(statusCode: 200),
+                body: Data(body.utf8)
+            )
+        }
+        if path.hasSuffix("/token") {
+            let currentNonce = lock.withLock { nonce ?? "" }
+            let idToken = makeTestJWT(payload: [
+                "sub": "user-7",
+                "email": "tui@x.ai",
+                "nonce": currentNonce,
+            ])
+            let body = """
+            {"access_token":"pager-xai-access","refresh_token":"pager-xai-refresh",\
+            "expires_in":3600,"id_token":"\(idToken)"}
+            """
+            return HTTPResponse(
+                metadata: HTTPResponseMetadata(statusCode: 200),
+                body: Data(body.utf8)
+            )
+        }
+        return HTTPResponse(
+            metadata: HTTPResponseMetadata(statusCode: 404),
+            body: Data()
+        )
+    }
+
+    func stream(_ request: HTTPRequest) -> AsyncThrowingStream<HTTPStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    let response = try await send(request)
+                    continuation.yield(.metadata(response.metadata))
+                    continuation.yield(.body(response.body))
+                    continuation.yield(.end)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+}
+
+/// The fake browser for the xAI flow: stash the nonce for the token leg,
+/// then deliver `code`+`state` to the REAL loopback listener.
+private func xaiDrivingBrowser(
+    transport: PagerXAIIdPTransport
+) -> @Sendable (URL) -> Void {
+    { authURL in
+        guard let components = URLComponents(url: authURL, resolvingAgainstBaseURL: false),
+              let items = components.queryItems else { return }
+        let value = { (name: String) in items.first(where: { $0.name == name })?.value }
+        transport.setNonce(value("nonce"))
+        guard let redirect = value("redirect_uri"),
+              let redirectURL = URL(string: redirect),
+              let port = redirectURL.port,
+              let state = value("state"),
+              let cbURL = URL(
+                string: "http://127.0.0.1:\(port)/callback?code=mock-code&state=\(state)"
+              )
+        else { return }
+        URLSession.shared.dataTask(with: cbURL).resume()
+    }
 }
 
 /// A structurally valid unsigned JWT — `persistCodexTokens` validates shape,
@@ -263,6 +365,156 @@ struct LiveLoginPickerTests {
             .key(KeyEvent(key: .enter))
         )
         #expect(selected == .runCommand("/login codex"))
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("selecting the xAI row hands back the typed form that starts the flow")
+    func pickerSelectsXAIRow() async throws {
+        let fixture = try AuthRendererFixture(
+            authServices: fakeAuthServices(transport: MockHTTPTransport())
+        )
+        defer { fixture.dispose() }
+        try await fixture.renderer.begin()
+        try await fixture.renderer.render(.overlay(.loginProviderPicker))
+        #expect(await fixture.waitForFrame(containing: "Grok"))
+
+        // Row 0 IS the xAI row; its "Sign in with xAI" description is now
+        // literal — the controller routes the returned typed form to
+        // `.overlay(.loginXAI)`, which runs the browser flow (no more
+        // CLI-route notice).
+        let selected = try await fixture.renderer.handleInput(
+            .key(KeyEvent(key: .enter))
+        )
+        #expect(selected == .runCommand("/login xai"))
+        try await fixture.renderer.restoreTerminal()
+    }
+}
+
+// MARK: - xAI login flow
+
+@Suite("Live /login xai browser flow", .serialized)
+struct LiveXAILoginFlowTests {
+    @Test("the xai flow runs against the real listener and lands in the real auth.json")
+    func xaiFlowLandsCredentials() async throws {
+        let transport = PagerXAIIdPTransport()
+        // A catalog store so the post-login refresh pair is observable at its
+        // own seam. Hermetic: no provider key env, so every background
+        // partition skips before any network I/O.
+        let storeHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opengrok-xai-catalog-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: storeHome, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: storeHome) }
+        let catalogStore = LiveModelCatalogStore(
+            input: liveCatalogResolutionInput(
+                workingDirectory: storeHome,
+                environment: xaiPinnedEnvironment
+            ),
+            environment: xaiPinnedEnvironment,
+            openGrokHome: storeHome
+        )
+        let fixture = try AuthRendererFixture(
+            extraEnvironment: xaiPinnedEnvironment,
+            authServices: fakeAuthServices(
+                transport: transport,
+                openBrowser: xaiDrivingBrowser(transport: transport)
+            ),
+            catalogStore: catalogStore
+        )
+        defer { fixture.dispose() }
+        try await fixture.renderer.begin()
+        try await fixture.renderer.render(.overlay(.loginXAI))
+
+        // The start header (welcome/mod.rs:1022) and the URL announce
+        // (oidc/login.rs:439-440) land in the transcript. Single-token
+        // needles: the cell differ can split multi-word strings.
+        #expect(await fixture.waitForFrame(containing: "authentication."))
+        #expect(await fixture.waitForFrame(containing: "URL"))
+
+        // Completion: the credential is in the REAL store file under the
+        // OAuth scope, and the connected copy is the CLI's `report_signed_in`
+        // (auth/flow.rs:872-878).
+        let xaiFile = fixture.xaiAuthFile
+        #expect(await fixture.wait {
+            (try? String(contentsOf: xaiFile, encoding: .utf8))?
+                .contains("pager-xai-access") == true
+        })
+        // Parse, don't substring: the auth encoder escapes forward slashes
+        // (JSON "http:\/\/…"), so a raw contains() on the scope key can
+        // never match the file bytes.
+        let storeKeys = (try JSONSerialization.jsonObject(
+            with: Data(contentsOf: xaiFile)
+        ) as? [String: Any])?.keys.sorted() ?? []
+        #expect(storeKeys.contains("http://127.0.0.1:9::pager-client"))
+        #expect(await fixture.waitForFrame(containing: "tui@x.ai"))
+
+        // The post-login pair fired: the background catalog refresh task
+        // exists (the codex arm's effects/mod.rs:1690-1699 equivalent).
+        #expect(await fixture.wait { catalogStore.backgroundRefreshTask != nil })
+        await catalogStore.backgroundRefreshTask?.value
+
+        // Round-trip: `/logout` clears exactly what this flow wrote.
+        try await fixture.renderer.render(.overlay(.logout(account: .xai)))
+        #expect(await fixture.wait {
+            !FileManager.default.fileExists(atPath: xaiFile.path)
+        })
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("a second /login xai while one flow is pending is refused, single-flight")
+    func pendingXAIFlowIsSingleFlight() async throws {
+        let counter = FlowCounter()
+        let blockedFlow: LivePagerAuthServices.XAILoginFlow = { _, _, _, _ in
+            await counter.increment()
+            // Park long enough for the second dispatch to hit the guard.
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            throw CancellationError()
+        }
+        let fixture = try AuthRendererFixture(
+            extraEnvironment: xaiPinnedEnvironment,
+            authServices: fakeAuthServices(
+                transport: MockHTTPTransport(),
+                xaiBrowserLogin: blockedFlow
+            )
+        )
+        defer { fixture.dispose() }
+        try await fixture.renderer.begin()
+        try await fixture.renderer.render(.overlay(.loginXAI))
+        try await fixture.renderer.render(.overlay(.loginXAI))
+
+        #expect(await fixture.waitForFrame(containing: "progress"))
+        // Bounded poll before the read: the spawned flow's increment races a
+        // one-shot read under parallel-suite load (the D1 lesson).
+        let deadline = Date().addingTimeInterval(5)
+        while await counter.started < 1, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(await counter.started == 1)
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("a failed flow reports upstream's failure copy")
+    func failureArmCarriesUpstreamCopy() async throws {
+        // The timeout arm: `OidcError::CallbackTimeout`'s display text inside
+        // the TUI failure format (task_result.rs:3231).
+        let failingFlow: LivePagerAuthServices.XAILoginFlow = { _, _, _, _ in
+            throw XAILoginFlowError.callbackTimeout
+        }
+        let fixture = try AuthRendererFixture(
+            extraEnvironment: xaiPinnedEnvironment,
+            authServices: fakeAuthServices(
+                transport: MockHTTPTransport(),
+                xaiBrowserLogin: failingFlow
+            )
+        )
+        defer { fixture.dispose() }
+        try await fixture.renderer.begin()
+        try await fixture.renderer.render(.overlay(.loginXAI))
+
+        // "xAI Grok login failed: Login timed out after 10 minutes. Please
+        // try again." — single-token needles.
+        #expect(await fixture.waitForFrame(containing: "failed:"))
+        #expect(await fixture.waitForFrame(containing: "timed"))
+        #expect(!FileManager.default.fileExists(atPath: fixture.xaiAuthFile.path))
         try await fixture.renderer.restoreTerminal()
     }
 }

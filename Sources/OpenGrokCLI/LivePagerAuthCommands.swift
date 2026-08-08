@@ -28,10 +28,30 @@ struct LivePagerAuthServices: Sendable {
         _ openBrowser: (@Sendable (URL) -> Void)?
     ) async throws -> CodexCredentials
 
+    /// The xAI browser OAuth flow (`/login xai`). Takes the REAL store's
+    /// manager so the credential lands in auth.json under its file lock; the
+    /// transport and opener are the injectable legs, like the codex flow's.
+    typealias XAILoginFlow = @Sendable (
+        _ manager: AuthManager,
+        _ environment: [String: String],
+        _ transport: any HTTPTransport,
+        _ openBrowser: (@Sendable (URL) -> Void)?
+    ) async throws -> GrokAuth
+
     /// Transport for the OAuth exchange and the logout's best-effort revoke.
     var makeTransport: @Sendable () -> any HTTPTransport
     /// The browser + local-callback OAuth flow.
     var codexBrowserLogin: CodexLoginFlow
+    /// The xAI browser + local-callback OAuth flow. Defaulted so existing
+    /// memberwise constructions (tests with inert codex flows) keep building.
+    var xaiBrowserLogin: XAILoginFlow = { manager, environment, transport, openBrowser in
+        try await loginXAIBrowser(
+            manager: manager,
+            environment: environment,
+            transport: transport,
+            openBrowser: openBrowser
+        )
+    }
     /// Best-effort system browser launch. `nil` disables opening; the auth
     /// URL is in the transcript either way.
     var openBrowser: (@Sendable (URL) -> Void)?

@@ -333,6 +333,41 @@ is UUIDv4 behind the byte-identical prefix. The leader-client pager installs no 
 `/btw` there degrades to the idle fallback. The auth-retry inner loop re-samples without
 re-draining.
 
+### E6 — in-TUI xAI browser OAuth (serial gate: exit 0, 4,554 tests, zero issues; 2026-08-08)
+
+Closes the D1 divergence: `/login xai` (and the picker's xAI row) runs the real loopback
+flow — discovery → PKCE → CORS-aware callback listener (accept LOOP with the
+accounts-app CORS grant, because upstream's consent page delivers the code via
+cross-origin fetch; a preflight or favicon probe must not consume a one-shot accept) →
+code exchange → the ONE store write via `AuthManager.update` under the auth.json file
+lock, with the team pin enforced BEFORE persist and personal logins requiring a
+nonce-bound id_token. The authorize URL is byte-pinned parameter-by-parameter against
+`protocol.rs:349-393` (lead re-read the upstream builder: order, `urlencoding::encode`
+semantics, `%20` spaces — note the deliberate contrast with codex's form encoding —
+numeric `127.0.0.1` redirect vs codex's `localhost`, `referrer=grok-build` default). All
+copies byte-exact. Post-login: catalog credential refresh + background refresh, `/logout`
+round-trip clears exactly what the flow wrote. 25 tests after lead fixes.
+
+**Mid-session credential answer, measured at the live seam:** a running OIDC route keeps
+serving the pre-login bearer until the first 401 self-heals it
+(`refreshAfterUnauthorized` adopts the disk sibling); a `/model` re-pick resolves fresh
+immediately; a session running on an API-key credential (static provider) needs a
+re-pick or restart. **Lead fix:** two store assertions substring-matched the scope key
+against raw file bytes — the auth encoder escapes forward slashes (`http:\/\/…`), so
+they could never match; both now parse the JSON and assert on keys.
+
+**Recorded divergences (security-flagged for a human read):** second `/login xai` refused
+with a notice (upstream aborts and restarts the prior attempt); no welcome-screen auth
+UI or manual paste channel (remote/SSH users whose browser can't reach 127.0.0.1 cannot
+complete the flow); external-auth/devbox/device arms not wired (device is opt-in
+upstream; browser-open failure keeps waiting, verified upstream and mirrored);
+**id_token accepted without JWKS signature validation** — nonce enforced, PKCE binds the
+exchange, and upstream's own comment (protocol.rs:164-172) names server-side
+re-validation the boundary, but client-side defense-in-depth is weaker than upstream's;
+no `/user` enrichment or managed-config post-login sync (no port surfaces); state/nonce
+UUIDv4 vs upstream's v7. The slice also caught its own CRLF trap (AGENTS §2) in the
+listener's request parser before landing.
+
 ## Wave 14.1 — Same-day fix batch from live use (2026-08-07)
 
 **Scope.** The user drove the freshly built TUI and reported five defects; each was

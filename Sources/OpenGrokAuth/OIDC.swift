@@ -5,6 +5,7 @@
 
 import Foundation
 import OpenGrokHTTP
+import OpenGrokVersion
 
 /// OIDC discovery document (subset).
 public struct OIDCDiscovery: Sendable, Equatable {
@@ -117,7 +118,13 @@ public func exchangeAuthorizationCode(
     let request = HTTPRequest(
         method: .post,
         url: tokenEndpoint,
-        headers: ["Content-Type": "application/x-www-form-urlencoded"],
+        headers: [
+            "Content-Type": "application/x-www-form-urlencoded",
+            // Upstream stamps the client version on every code exchange
+            // (`exchange_code`, auth/oidc/protocol.rs:415), both enterprise
+            // OIDC and xAI OAuth2.
+            "x-grok-client-version": OpenGrokVersion.compiledVersion,
+        ],
         body: Data(body.utf8),
         timeout: 30,
         idempotency: .nonIdempotent

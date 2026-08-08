@@ -450,9 +450,9 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// and alias table live in `PagerLoginProviders`; only the render layer
     /// can add the live API-key statuses upstream's modal shows.
     case loginProviderPicker
-    /// `/login xai` (upstream `Action::Login`, `dispatch/auth.rs:668-706`).
-    /// The port has no xAI browser OAuth wired at the live seam; the renderer
-    /// answers with the honest CLI route rather than faking a flow.
+    /// `/login xai` (upstream `Action::Login`, `dispatch/auth.rs:668-706`) —
+    /// the browser OAuth flow into the real xAI store, run by the render
+    /// layer (which owns the auth-store home) without blocking the turn loop.
     case loginXAI
     /// `/login codex` (upstream `Action::LoginCodex`,
     /// `dispatch/auth.rs:111-127`) — browser OAuth into the isolated Codex

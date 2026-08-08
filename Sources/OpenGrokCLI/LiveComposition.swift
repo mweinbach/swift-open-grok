@@ -6610,6 +6610,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// would bind a second callback server; this port refuses it with a
     /// notice instead.
     private var codexLoginTask: Task<Void, Never>?
+    /// The in-flight `/login xai` browser flow. Same single-flight shape as
+    /// the codex task above: upstream instead ABORTS the prior attempt and
+    /// starts fresh (`abort_prior_xai_auth`, dispatch/auth.rs:685); this port
+    /// has no cancellation plumbing into the blocking listener thread, so a
+    /// second dispatch is refused with a notice (recorded divergence).
+    private var xaiLoginTask: Task<Void, Never>?
     /// The in-flight `/recap` side-call, if any — the port of upstream's
     /// `recap_in_flight` claim (recap.rs:294-306): manual re-requests while
     /// one is generating answer with the unavailable copy instead of
@@ -7770,14 +7776,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 )
             ))
         case .loginXAI:
-            // RECORDED DIVERGENCE: upstream `Action::Login` starts the xAI
-            // OAuth flow (`dispatch/auth.rs:668-706`). This port's only wired
-            // xAI sign-in is the CLI's API-key route
-            // (`LiveAuthComposition.loginXAI`), and the running session
-            // resolves credentials at startup — so the honest answer names
-            // that route instead of pretending a flow started.
-            note("xAI sign-in runs in the CLI for now: quit, run `open-grok login` "
-                + "(paste an xAI API key), then restart Open Grok.")
+            startXAILogin()
         case .loginCodex:
             startCodexLogin()
         case .logout(let account):
@@ -8007,6 +8006,89 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             appendMessage(PagerMessage(
                 role: .error,
                 text: "OpenAI Codex login failed: \(LiveAuthComposition.describe(error))"
+            ))
+        }
+        try? renderState()
+    }
+
+    /// `/login xai` — upstream `Action::Login`'s browser OAuth arm
+    /// (`dispatch_login`, dispatch/auth.rs:668-706 → `run_auth_flow_interactive`
+    /// → `oidc::run_login_flow_with_config`), spawned non-blocking like the
+    /// codex flow so the turn loop keeps running while the user is in the
+    /// browser. The credential lands in the REAL store (auth.json via
+    /// `AuthManager` under its file lock) — the same store `/logout` clears.
+    ///
+    /// RECORDED DIVERGENCES: upstream renders this flow on the welcome screen
+    /// with a paste box and aborts a prior attempt on re-dispatch; this port's
+    /// transcript is the channel (start header, URL announce, completion),
+    /// there is no manual paste channel, and a second dispatch is refused.
+    /// The external-auth-provider / devbox pre-flight arms and the opt-in
+    /// device transport (flow.rs:640-724) are not wired at this seam.
+    private func startXAILogin() {
+        guard xaiLoginTask == nil else {
+            note("An xAI sign-in is already in progress. Finish it in your browser, or wait for it to time out.")
+            return
+        }
+        // Upstream's loopback-arm welcome header (views/welcome/mod.rs:1022).
+        note("A browser window will open for authentication.")
+        let env = environment
+        let manager = AuthManager(
+            grokHome: openGrokHome,
+            config: GrokComConfig.default(environment: env),
+            environment: env
+        )
+        let transport = authServices.makeTransport()
+        let flow = authServices.xaiBrowserLogin
+        let openBrowser = authServices.openBrowser
+        xaiLoginTask = Task {
+            let result: Result<GrokAuth, any Error>
+            do {
+                let auth = try await flow(manager, env, transport, { url in
+                    // The CLI announce copy (oidc/login.rs:439-440); upstream's
+                    // TUI paints the same URL on the welcome screen, which this
+                    // port does not have.
+                    Task { await self.announceXAIAuthURL(url) }
+                    openBrowser?(url)
+                })
+                result = .success(auth)
+            } catch {
+                result = .failure(error)
+            }
+            self.finishXAILogin(result)
+        }
+    }
+
+    private func announceXAIAuthURL(_ url: URL) {
+        note("Open this URL to sign in:\n  \(url.absoluteString)")
+        try? renderState()
+    }
+
+    /// Success copy is the CLI's `report_signed_in` (auth/flow.rs:872-878);
+    /// upstream's TUI shows no transcript toast — completion repaints the
+    /// welcome view — so the CLI line is the only upstream connected copy.
+    /// Failure copy is the TUI's startup-arm format (task_result.rs:3231).
+    private func finishXAILogin(_ result: Result<GrokAuth, any Error>) {
+        xaiLoginTask = nil
+        switch result {
+        case .success(let auth):
+            if let email = auth.email, !email.trimmingCharacters(in: .whitespaces).isEmpty {
+                note("✓ Signed in as \(email)")
+            } else {
+                note("✓ Signed in")
+            }
+            // Same post-login pair as the codex arm: recompute the credential
+            // snapshot and fire the background catalog refresh
+            // (effects/mod.rs:1690-1699's equivalent at this seam). The LIVE
+            // session's sampler keeps its old bearer until the first 401
+            // adopts the new disk credential (`AuthManager` sibling adoption
+            // via `refreshAfterUnauthorized`); a `/model` re-pick resolves
+            // fresh from disk immediately.
+            catalogStore?.refreshCredentialSnapshot()
+            catalogStore?.spawnBackgroundRefresh()
+        case .failure(let error):
+            appendMessage(PagerMessage(
+                role: .error,
+                text: "xAI Grok login failed: \(LiveAuthComposition.describe(error))"
             ))
         }
         try? renderState()
