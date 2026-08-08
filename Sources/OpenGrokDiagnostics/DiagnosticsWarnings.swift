@@ -191,7 +191,7 @@ func weztermShape(_ ctx: TerminalContext, xtversionPayload: String?) -> WezTermS
     let sshShape = ctx.brand == .unknown
         && ctx.multiplexer == .undetected
         && ctx.isSSH
-        && (xtversionPayload?.drop(while: { $0 == " " || $0 == "\t" }).hasPrefix("WezTerm") ?? false)
+        && (xtversionPayload?.drop(while: { $0.isWhitespace }).hasPrefix("WezTerm") ?? false)
     return sshShape ? .sshXtversion : nil
 }
 

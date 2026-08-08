@@ -153,6 +153,13 @@ private func targets() -> [Target] {
     // consumers can use the Rust-compatible `OpenGrokShared` boundary.
     t.append(.target(name: "OpenGrokCLIChatProxyTypes", dependencies: dep()))
     t.append(.target(name: "OpenGrokShared", dependencies: dep(["OpenGrokCLIChatProxyTypes"])))
+    // OpenGrokDiagnostics: the PURE `/doctor` diagnostics + fix engine
+    // (xai-grok-pager/src/diagnostics + xai-grok-config/src/managed_text).
+    // Deliberately minimal edge: only OpenGrokShared (clipboard OSC/SSH env
+    // helpers). It must never grow an OpenGrokCLI/OpenGrokPager edge — the
+    // CLI/pager wiring is a separate serial slice, and the library's tests
+    // build with no pager import as the disjointness guarantee.
+    t.append(.target(name: "OpenGrokDiagnostics", dependencies: dep(["OpenGrokShared"])))
 
     // ---- Wave 1 ----
     // W1-S1: layered tool stack (types -> protocol -> runtime -> api).
@@ -349,6 +356,7 @@ private func targets() -> [Target] {
     ))
     t.append(contentsOf: tests(w0s3))
     t.append(contentsOf: tests(w0s4))
+    t.append(contentsOf: tests(["OpenGrokDiagnostics"]))
     t.append(contentsOf: tests(["OpenGrokToolTypes", "OpenGrokToolProtocol", "OpenGrokToolRuntime", "OpenGrokToolsAPI"]))
     t.append(contentsOf: tests(w1s2))
     t.append(contentsOf: tests(["OpenGrokSamplingTypes", "OpenGrokChatState", "OpenGrokTokenEstimation"]))
