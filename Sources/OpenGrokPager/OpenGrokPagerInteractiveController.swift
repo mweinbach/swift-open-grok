@@ -2482,6 +2482,20 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Show MCP server status",
             usage: "/mcps"
         ),
+        // `/timestamps` immediately before `/toggle-mouse-reporting`,
+        // upstream's display order (`slash/commands/mod.rs:137-139`; the one
+        // upstream row between them, `/timeline`, is not yet ported, and
+        // `/imagine`/`/imagine-video` before it are CLI-layer commands in
+        // this port). Name, description, and usage verbatim
+        // (`timestamps.rs:12-23`); no aliases upstream. Upstream's
+        // `arg_placeholder` "on/off" (`timestamps.rs:25-27`) has no
+        // `PagerCommandDefinition` channel — and `run` ignores its args
+        // either way (`timestamps.rs:29`, `_args`).
+        PagerCommandDefinition(
+            name: "timestamps",
+            summary: "Toggle message timestamps on/off",
+            usage: "/timestamps"
+        ),
         PagerCommandDefinition(
             name: "toggle-mouse-reporting",
             summary: "Toggle terminal mouse reporting (native click-drag copy/paste)"
@@ -3365,6 +3379,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 try await emit(.overlay(.modelPicker(query: selector.isEmpty ? nil : selector)))
                 return .handled
+            case "timestamps":
+                // Arguments are ignored — upstream's `TimestampsCommand::run`
+                // declares `_args` and computes the toggle itself from the
+                // current cached value (`timestamps.rs:29-31`), so
+                // `/timestamps on` is the same toggle, never a setter. The
+                // current value lives with the render layer alongside the
+                // persist path, so the intent carries no target state.
+                try await emit(.overlay(.toggleTimestamps))
+                return .handled
             case "toggle-mouse-reporting":
                 try await emit(.overlay(.toggleMouseReporting))
                 return .handled
@@ -3594,6 +3617,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /theme [name]  /t         Switch the color theme
       /tutorial                 Quick tips
       /workflows                Show workflow runs
+      /timestamps               Toggle message timestamps on/off
       /toggle-mouse-reporting   Toggle mouse reporting (native copy/paste)
       /quit   /exit             Quit the application
 

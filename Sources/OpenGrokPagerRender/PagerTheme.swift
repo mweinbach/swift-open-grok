@@ -1,3 +1,4 @@
+import Foundation
 import OpenGrokTerminalCore
 
 /// The palette roles the Rust pager's `Theme` struct exposes, ported so frame
@@ -242,6 +243,16 @@ public enum PagerLayoutMetrics {
 
     /// Thinking truncation budget (`appearance/config.rs:570`).
     public static let thinkingTruncatedLines = 3
+
+    /// Columns reserved on the right of user/assistant message blocks while
+    /// `[ui] show_timestamps` is on, so wrapped text never collides with the
+    /// overlaid stamp — `EntryRenderer::timestamp_reserved`
+    /// (`entry_renderer.rs:384-393`: `10 // max short format: "  12:30 PM"`).
+    /// Reserved whenever the setting is on for a stamped role, even when the
+    /// block carries no instant — upstream's reserve ignores `created_at`
+    /// (`entry_renderer.rs:1548-1550`), so toggling never re-wraps text just
+    /// because one block lacks a stamp.
+    public static let timestampReservedColumns = 10
 }
 
 /// Render-value derivation for compact mode: the user setting, force-enabled
@@ -253,6 +264,24 @@ public enum PagerLayoutMetrics {
 /// "not yet measured" and never forces compact.
 public func pagerEffectiveCompact(userCompact: Bool, terminalRows: Int) -> Bool {
     userCompact || (terminalRows > 0 && terminalRows <= PagerLayoutMetrics.autoCompactMaxRows)
+}
+
+/// The short timestamp format, `ts.format("  %-I:%M %p")`
+/// (`entry_renderer.rs:952`): two leading spaces, 12-hour clock without a
+/// leading zero, minutes, `AM`/`PM` — e.g. `"  12:30 PM"`, `"  1:05 AM"`.
+/// Local time, as upstream's `DateTime<Local>` is; the POSIX locale pins the
+/// `AM`/`PM` symbols chrono's `%p` always emits.
+///
+/// The hover-expanded long format (`"  %H:%M:%S | %b %d"`,
+/// `entry_renderer.rs:950`) is NOT ported: it needs the mouse position at
+/// paint time, a seam `PagerRenderState` does not carry. Upstream itself
+/// always paints the short form for pushed sticky headers for the same
+/// reason (`scrollback_pane.rs:818-819`).
+public func pagerFormatTimestamp(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "  h:mm a"
+    return formatter.string(from: date)
 }
 
 /// `context_bar.rs::fmt_tokens` — always four characters or fewer.

@@ -22,7 +22,8 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         theme: state.theme,
         selectedIndex: state.selectedBlockIndex,
         motion: state.motion,
-        compact: compact
+        compact: compact,
+        showTimestamps: state.showTimestamps
     )
     let hasScrollbar = state.showScrollbar && baseContentWidth > 1
         && contentLines.count > chrome.conversation.height
@@ -33,7 +34,8 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
             theme: state.theme,
             selectedIndex: state.selectedBlockIndex,
             motion: state.motion,
-            compact: compact
+            compact: compact,
+            showTimestamps: state.showTimestamps
         )
     }
 
@@ -316,7 +318,8 @@ func makeConversationLines(
     theme: PagerRenderTheme,
     selectedIndex: Int? = nil,
     motion: PagerMotionSnapshot = PagerMotionSnapshot(),
-    compact: Bool = false
+    compact: Bool = false,
+    showTimestamps: Bool = false
 ) -> [PaintLine] {
     guard width > 0 else { return [] }
     var lines: [PaintLine] = []
@@ -324,7 +327,14 @@ func makeConversationLines(
         let blockStart = lines.count
         switch item {
         case .message(let message):
-            appendMessage(message, width: width, theme: theme, compact: compact, into: &lines)
+            appendMessage(
+                message,
+                width: width,
+                theme: theme,
+                compact: compact,
+                showTimestamps: showTimestamps,
+                into: &lines
+            )
         case .tool(let tool):
             appendToolCard(tool, width: width, theme: theme, motion: motion, into: &lines)
         case .separator(let text):
@@ -362,13 +372,33 @@ private func appendMessage(
     width: Int,
     theme: PagerRenderTheme,
     compact: Bool = false,
+    showTimestamps: Bool = false,
     into lines: inout [PaintLine]
 ) {
+    // The timestamp role gate, `EntryRenderer::should_show_timestamp`
+    // (`entry_renderer.rs:376-382`): user and agent messages only — never
+    // thinking traces, tool calls, or system messages. Upstream's third
+    // stamped arm, `RenderBlock::Btw`, has no port counterpart: this port's
+    // `/btw` answers ride system notes (a recorded divergence predating this
+    // reader), so they fall outside the gate here too.
     switch message.role {
     case .user:
-        appendUserPrompt(message, width: width, theme: theme, compact: compact, into: &lines)
+        appendUserPrompt(
+            message,
+            width: width,
+            theme: theme,
+            compact: compact,
+            showTimestamps: showTimestamps,
+            into: &lines
+        )
     case .assistant:
-        appendAssistantMessage(message, width: width, theme: theme, into: &lines)
+        appendAssistantMessage(
+            message,
+            width: width,
+            theme: theme,
+            showTimestamps: showTimestamps,
+            into: &lines
+        )
     case .reasoning:
         appendThinking(message, width: width, theme: theme, into: &lines)
     case .system:
@@ -390,15 +420,25 @@ private func appendUserPrompt(
     width: Int,
     theme: PagerRenderTheme,
     compact: Bool = false,
+    showTimestamps: Bool = false,
     into lines: inout [PaintLine]
 ) {
     let band = theme.bgLight
     if !compact {
         lines.append(PaintLine("", foreground: theme.textPrimary, background: band))
     }
+    // The timestamp column is reserved out of the wrap width whenever the
+    // setting is on for this role — with or without a stamp to paint
+    // (`timestamp_reserved`, entry_renderer.rs:384-393; the same subtraction
+    // upstream applies before wrapping, scrollback_pane.rs:660-670).
+    let tsReserved = showTimestamps ? PagerLayoutMetrics.timestampReservedColumns : 0
     let prefixWidth = compact ? 0 : PagerGlyphs.promptArrowWidth
-    let bodyWidth = max(1, width - prefixWidth)
+    let bodyWidth = max(1, width - prefixWidth - tsReserved)
     let indentation = String(repeating: " ", count: prefixWidth)
+    // The stamp overlays the FIRST CONTENT line — the row after the top
+    // padding row when one exists (`first_content_y = content_area.y + if
+    // vpad_top_visible { 1 } else { 0 }`, entry_renderer.rs:941-942).
+    let firstContentIndex = lines.count
     var isFirstRow = true
     for physical in message.text.split(separator: "\n", omittingEmptySubsequences: false) {
         let wrapped = wrapDisplayLines(String(physical), width: bodyWidth)
@@ -430,6 +470,14 @@ private func appendUserPrompt(
             background: band
         ))
     }
+    if showTimestamps, firstContentIndex < lines.count {
+        overlayTimestamp(
+            message.createdAt,
+            width: width,
+            theme: theme,
+            on: &lines[firstContentIndex]
+        )
+    }
     if !compact {
         lines.append(PaintLine("", foreground: theme.textPrimary, background: band))
     }
@@ -456,6 +504,7 @@ private func appendAssistantMessage(
     _ message: PagerMessage,
     width: Int,
     theme: PagerRenderTheme,
+    showTimestamps: Bool = false,
     into lines: inout [PaintLine]
 ) {
     var styledLines = message.styledLines
@@ -473,11 +522,56 @@ private func appendAssistantMessage(
             styledLines[styledLines.count - 1].spans.append(cursor)
         }
     }
+    // Same reserve-then-overlay shape as the user prompt: wrap at the
+    // reduced width (`timestamp_reserved`, entry_renderer.rs:384-393), stamp
+    // the first content line. An agent message has no padding rows, so the
+    // first appended line is the first content line.
+    let tsReserved = showTimestamps ? PagerLayoutMetrics.timestampReservedColumns : 0
+    let firstContentIndex = lines.count
     for styledLine in styledLines {
-        for row in wrapStyledSpans(styledLine.spans, width: width) {
+        for row in wrapStyledSpans(styledLine.spans, width: max(1, width - tsReserved)) {
             lines.append(PaintLine(spans: row, foreground: theme.textPrimary))
         }
     }
+    if showTimestamps, firstContentIndex < lines.count {
+        overlayTimestamp(
+            message.createdAt,
+            width: width,
+            theme: theme,
+            on: &lines[firstContentIndex]
+        )
+    }
+}
+
+/// Right-align the short timestamp on one content line — the port of the
+/// overlay at `entry_renderer.rs:930-960`: gated on the flag (call sites),
+/// on the block carrying an instant (`let Some(ts) = self.entry.created_at`,
+/// entry_renderer.rs:939 — `nil` paints nothing), and on the line being wide
+/// enough (`content_area.width > ts_width + 1`, entry_renderer.rs:956), with
+/// `theme.gray` as the stamp color (entry_renderer.rs:958).
+///
+/// Divergence from upstream's buffer overlay: this painter appends spans, it
+/// cannot overwrite cells, so a first line that already reaches into the
+/// reserved column — only the streaming cursor can get there, since text is
+/// wrapped short of it — skips the stamp for that frame instead of painting
+/// over content. Cost: a one-column collision upstream would overpaint is a
+/// missing stamp here until the next repaint moves the cursor.
+private func overlayTimestamp(
+    _ createdAt: Date?,
+    width: Int,
+    theme: PagerRenderTheme,
+    on line: inout PaintLine
+) {
+    guard let createdAt else { return }
+    let stamp = pagerFormatTimestamp(createdAt)
+    let stampWidth = UnicodeDisplayWidth.width(of: stamp)
+    guard width > stampWidth + 1 else { return }
+    let pad = width - stampWidth - UnicodeDisplayWidth.width(of: line.text)
+    guard pad >= 0 else { return }
+    if pad > 0 {
+        line.spans.append(PagerStyledSpan(text: String(repeating: " ", count: pad)))
+    }
+    line.spans.append(PagerStyledSpan(text: stamp, foreground: theme.gray))
 }
 
 /// `Thinking…` while streaming, collapsing to `Thought for 1.4s` when the turn

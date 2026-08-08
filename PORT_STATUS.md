@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-08 (Wave 17 E19: `/compact-mode` live on the render frame builder, with auto-compact and the unhidden settings row)
+**As of:** 2026-08-08 (Wave 17 E20: `/timestamps` live — createdAt stamps, rewind-sidecar resume instants, unhidden settings row)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `70002584da34e4c37ea14a3bce35341b7d04f9a7` (re-pinned **2026-08-06** from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05`; +3 commits, release `v0.1.220-open-grok.57` — the Meta API provider delta: `0f8dc87b` provider, `666b2ceb` login/settings, `70002584` stored-key unlock fix. The prior 2026-08-05 re-pin moved from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`; before that the 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08); the pinned commit is reachable in `/Users/mweinbach/Projects/open-grok` history — read it via `git show 70002584:<path>` / `git grep <pat> 70002584 -- crates` (crates prefixed `crates/codegen/`), NOT that clone's working tree, which sits one substantive commit newer (`650c1db7`, release `.58`).
@@ -718,12 +718,47 @@ short-terminal arms with no port seam yet — the port's turn status always keep
 gap row (noted in-source at the read site); toasts ride transcript notes (the port-wide
 convention, not new here).
 
-### Chrome readers remaining (`/timestamps`, `/timeline`) — queued
+### E20 — `/timestamps` live (serial gate: exit 0, 4,948 tests, zero issues)
 
-Ordered timestamps → timeline. From the research: timestamps needs a `createdAt` stamp on
-`PagerMessage` at append/resume; timeline needs a new rail module replacing the scrollbar
-gutter (turns already enumerated by `/jump`). Both unhide their Wave-13-hidden settings
-rows.
+The second chrome reader, same seam and shape as E19. `PagerMessage.createdAt: Date?`
+(upstream `ScrollbackEntry.created_at`, `entry.rs:105`, stamped `Local::now()` at
+construction, `entry.rs:198,230`) is stamped on every live producer — `startTurn`
+user+assistant, the streaming fallback, the `.interjected` echo — and `nil` paints
+nothing, upstream's `let Some(ts)` gate (`entry_renderer.rs:939`); the deliberate `nil`
+DEFAULT means a producer that forgets to stamp silently paints no stamp, so the live
+stamping is pinned through painted frames by `LiveTimestampsTests`. The renderer ports
+the full read-site set (verified at the pin): role gate user/agent only
+(`entry_renderer.rs:376-382`; upstream's `Btw` arm has no port counterpart — `/btw`
+rides system notes, pre-existing), the 10-column wrap reserve keyed on flag+role and
+ignoring `created_at` (`:384-393`), and the right-aligned `theme.gray` short stamp
+(`"  %-I:%M %p"` → `"  h:mm a"` POSIX) on the first content line with the
+`width > ts_width + 1` guard (`:930-960`). **Resume** sources original instants from the
+rewind sidecar (`LiveRewindPoint.createdAt`, semantically upstream's `turn_start_ms`,
+`acp/tracker.rs:1380-1385`), keyed by positional prompt index counted over
+`startsPromptTurn` — synthetic turn-starters spend a slot without painting, keeping the
+numbering aligned with `liveTruncateConversation`. `/timestamps` (copy/order verbatim,
+`timestamps.rs:12-23`, before `/toggle-mouse-reporting`) toggles + persists with
+rollback-on-failed-write; toast `✓ Timestamps: on|off`, no conditional arm; startup
+hydrates `showTimestamps ?? true` (**absent means ON** — `TIMESTAMPS_DEFAULT`,
+`appearance/cache.rs:28`); modal commit live-flips; reset re-derives `true`; the row is
+unhidden after `screen_mode` with `defs.rs:658-671` copy verbatim (verified). Unlike
+compact there is NO derivation — the render value IS the user value
+(`setters.rs:1530-1541`). 20 new tests, all fixed-instant.
+
+**Recorded divergences (each in-source):** restored ASSISTANT blocks carry no stamp (the
+port persists no per-assistant instant; nil is honest where turn-start or load time would
+lie — cost: after `/resume`, stamps show on restored prompts and new blocks, not restored
+replies); sidecar-less sessions restore un-stamped; no hover-expanded long format
+(`PagerRenderState` carries no mouse position; upstream's pushed sticky headers are
+short-only too); span-append overlay skips the stamp for one frame on a streaming-cursor
+collision instead of overpainting; `arg_placeholder` "on/off" has no port channel;
+`PagerRenderState.showTimestamps` init-defaults `false` (semantic default `true` rides
+the live pass-through, pinned).
+
+### Chrome readers remaining (`/timeline`) — queued
+
+Last of the three: a new rail module replacing the scrollbar gutter (turns already
+enumerated by `/jump`), unhiding its Wave-13-hidden settings row.
 
 ## Wave 16 — Pager surfaces, first parallel worktree batch (2026-08-08)
 

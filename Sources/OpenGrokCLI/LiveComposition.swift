@@ -6870,16 +6870,25 @@ private struct LivePagerConversationState {
 
     mutating func startTurn(prompt: String, paintUserBlock: Bool = true) {
         toolIndicesByCallID.removeAll(keepingCapacity: true)
+        // Both blocks carry the construction instant for the `/timestamps`
+        // overlay — upstream's `ScrollbackEntry` constructors stamp
+        // `created_at: Some(Local::now())` on push (`entry.rs:198,230`).
+        //
         // `paintUserBlock: false` is the interjection-fallback turn: the
         // dispatch already painted the text as a user block, so the turn's
         // own echo stays persist-only (interjection.rs:20-25).
         if paintUserBlock {
-            items.append(.message(PagerMessage(role: .user, text: prompt)))
+            items.append(.message(PagerMessage(
+                role: .user,
+                text: prompt,
+                createdAt: Date()
+            )))
         }
         items.append(.message(PagerMessage(
             role: .assistant,
             text: "",
-            isStreaming: true
+            isStreaming: true,
+            createdAt: Date()
         )))
         activeAssistantIndex = items.indices.last
     }
@@ -6916,7 +6925,19 @@ private struct LivePagerConversationState {
     /// tool card per assistant tool call with its result attached. Synthetic
     /// user turns, system prompts and reasoning payloads are provider/context
     /// plumbing and never rendered as blocks in a live session either.
-    mutating func seed(from conversationItems: [ConversationItem]) {
+    /// `promptInstants` carries the persisted instant of each restored user
+    /// turn, keyed by POSITIONAL prompt index — turns counted over
+    /// `startsPromptTurn` user items, the same rule `liveTruncateConversation`
+    /// and the rewind numbering use. The instants come from the session's
+    /// rewind sidecar (`LiveRewindPoint.createdAt`, stamped when the turn
+    /// opened) — the port of upstream restoring `created_at` from the replay
+    /// meta's `turn_start_ms` (`acp/tracker.rs:1380-1385`). Empty means "no
+    /// instants known": restored blocks paint no stamp, upstream's
+    /// `created_at: None` behavior (`entry_renderer.rs:939`), never load time.
+    mutating func seed(
+        from conversationItems: [ConversationItem],
+        promptInstants: [Int: Date] = [:]
+    ) {
         removeAll()
         // Pair tool calls with their results up front; an unpaired call
         // renders with no output rather than being dropped.
@@ -6926,19 +6947,39 @@ private struct LivePagerConversationState {
                 resultsByCallID[result.toolCallId] = result.content
             }
         }
+        var promptCount = 0
         for item in conversationItems {
             switch item {
             case .user(let user):
+                // Count EVERY turn-starting user item — synthetic
+                // turn-starters (scheduler fires, drains) spend a prompt slot
+                // in the rewind numbering even though they are not painted.
+                let startsTurn = user.syntheticReason.map(\.startsPromptTurn) ?? true
+                let promptIndex = promptCount
+                if startsTurn { promptCount += 1 }
                 guard user.syntheticReason == nil else { continue }
                 let text = user.content.compactMap { part -> String? in
                     if case .text(let value) = part { return value }
                     return nil
                 }.joined(separator: "\n")
                 guard !text.isEmpty else { continue }
-                items.append(.message(PagerMessage(role: .user, text: text)))
+                items.append(.message(PagerMessage(
+                    role: .user,
+                    text: text,
+                    createdAt: promptInstants[promptIndex]
+                )))
             case .assistant(let assistant):
                 let text = assistant.content
                 if !text.isEmpty {
+                    // RECORDED DIVERGENCE: restored assistant blocks carry no
+                    // instant. Upstream replays them with the original
+                    // `agentTimestampMs` from its notification journal
+                    // (`acp/tracker.rs:950-955`); this port's session store
+                    // persists no per-assistant-item instant, so the honest
+                    // projection paints no stamp (upstream's `created_at:
+                    // None` gate) rather than a load-time or turn-start lie.
+                    // Cost: after `/resume`, timestamps show on restored user
+                    // prompts and on new blocks, not on restored replies.
                     items.append(.message(PagerMessage(
                         role: .assistant,
                         text: text,
@@ -6979,7 +7020,8 @@ private struct LivePagerConversationState {
                 role: .assistant,
                 text: text,
                 isStreaming: true,
-                styledLines: styledLines(for: text)
+                styledLines: styledLines(for: text),
+                createdAt: Date()
             )))
             self.activeAssistantIndex = items.indices.last
             return
@@ -7317,6 +7359,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// var is never written by a resize — growing the window restores the
     /// user's choice, exactly upstream's rule (`app_view.rs:2670-2675`).
     private var userCompactMode = false
+    /// `[ui] show_timestamps` — upstream's `appearance.show_timestamps`
+    /// (`appearance/config.rs:35`), hydrated from the effective config at
+    /// construction (`event_loop.rs:1496`: `initial_config.show_timestamps =
+    /// load_timestamps()`) and flipped by `/timestamps` and the settings
+    /// modal (`set_timestamps_inner`, `setters.rs:1530-1541`). Unlike
+    /// `userCompactMode` there is no derivation — the render value IS the
+    /// user value, passed straight into every frame.
+    private var userShowTimestamps = true
 
     /// Mouse. `linesPerEvent` folds the terminal's reports-per-notch into a
     /// per-report line count, which is the whole of the port's wheel handling —
@@ -7443,6 +7493,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // `event_loop.rs:1492`). `UIConfig.compactMode` round-trips the key
         // (UIConfig.swift:420,468), so absent means the `false` default.
         userCompactMode = uiConfig.compactMode
+        // `[ui] show_timestamps` hydrates the same way (`event_loop.rs:1496`
+        // via `load_timestamps`, `appearance/cache.rs:96-108`). The key is
+        // `Option<bool>` (`ui_config.rs:110`) and ABSENT MEANS ON —
+        // `TIMESTAMPS_DEFAULT = true` (`appearance/cache.rs:28`), the same
+        // `unwrap_or(true)` every upstream read applies.
+        userShowTimestamps = uiConfig.showTimestamps ?? true
         let autoDark = Self.themeKind(from: uiConfig.autoDarkTheme)
         let autoLight = Self.themeKind(from: uiConfig.autoLightTheme)
         self.autoDarkThemeKind = autoDark
@@ -7687,8 +7743,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         case .interjected(let text):
             // The mid-turn interjection echo: a standard user prompt block,
             // upstream's `RenderBlock::interjection_prompt`
-            // (acp_handler/mod.rs:743-745).
-            appendMessage(PagerMessage(role: .user, text: text))
+            // (acp_handler/mod.rs:743-745), stamped at push like every
+            // entry (`entry.rs:198`).
+            appendMessage(PagerMessage(role: .user, text: text, createdAt: Date()))
         case .focusChanged(let region):
             switch region {
             case .scrollback:
@@ -8113,6 +8170,40 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             } else {
                 note("\u{2713} Compact mode: \(userCompactMode ? "on" : "off")")
             }
+        case .toggleTimestamps:
+            // The toggle: upstream's command computes `!load_timestamps()`
+            // and dispatches `Action::SetTimestamps` (`timestamps.rs:29-31`),
+            // which flips both the `current_ui` snapshot and the appearance
+            // value the paint sites read (`set_timestamps_inner`,
+            // `setters.rs:1530-1541`). The next paint reads the new value.
+            userShowTimestamps.toggle()
+            // Persist `[ui] show_timestamps` through the same store the
+            // settings modal writes — upstream's
+            // `Effect::PersistSetting{key: "show_timestamps"}`
+            // (`setters.rs:1553-1558`) lands via `set_show_timestamps`
+            // (`settings_writes.rs:237-239`). A failed write rolls the
+            // in-memory flip back, upstream's `rollback_value` semantics.
+            let timestampsStore = PagerSettingsStore(
+                configPath: openGrokHome.appendingPathComponent("config.toml")
+            )
+            do {
+                try timestampsStore.write(
+                    key: "show_timestamps",
+                    value: .bool(userShowTimestamps)
+                )
+            } catch {
+                userShowTimestamps.toggle()
+                appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Could not save show_timestamps: \(error)"
+                ))
+                return
+            }
+            // Toast copy from `set_timestamps` (`setters.rs:1551`):
+            // `save_success_toast("Timestamps", new)` (`ui.rs:89-92`) — no
+            // conditional arm, unlike compact's. Mapped onto a transcript
+            // note like every toast in this port.
+            note("\u{2713} Timestamps: \(userShowTimestamps ? "on" : "off")")
         case .workflows:
             guard let workflowRegistry else {
                 appendMessage(PagerMessage(
@@ -9220,7 +9311,24 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private func applyResumedSession(sessionID: String) async {
         self.sessionID = sessionID
         let items = await conversationHistory?.items ?? []
-        conversation.seed(from: items)
+        // The restored user prompts' original instants, for the
+        // `/timestamps` overlay — upstream restores `created_at` from the
+        // replay meta's `turn_start_ms` (`acp/tracker.rs:1380-1385`), whose
+        // durable source in this port is the rewind sidecar: one point per
+        // prompt turn, `created_at` stamped when the turn opened
+        // (`LiveRewindPoint`, LiveSessionRecovery.swift). A session with no
+        // sidecar (never wrote files, pruned, pre-rewind) restores with no
+        // stamps — upstream's `created_at: None` paints nothing — which is
+        // honest where re-stamping `Date()` would show load time.
+        let rewindPoints = await LiveRewindStore(
+            openGrokHome: openGrokHome,
+            sessionID: sessionID
+        ).load()
+        let promptInstants = Dictionary(
+            rewindPoints.map { ($0.promptIndex, $0.createdAt) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        conversation.seed(from: items, promptInstants: promptInstants)
         selection.unfocus()
         followsBottom = true
         scrollOffset = 0
@@ -10273,6 +10381,16 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 await applySettingsEvent(event)
                 return
             }
+            if key == "show_timestamps" {
+                // Same routing for timestamps — upstream's modal commit maps
+                // `("show_timestamps", Bool) → Action::SetTimestamps`
+                // (`ui.rs:1208`) into the same `set_timestamps` the slash
+                // command reaches, so the very next paint reads the new
+                // value. The persist half is the shared store write below.
+                userShowTimestamps = flag
+                await applySettingsEvent(event)
+                return
+            }
             if key == "swarm_mode" {
                 // The settings row applies live, exactly like `/swarm on|off`
                 // — the row's own promise ("Active sessions update
@@ -10464,6 +10582,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 // `set_compact_mode_inner`). The default is `false`
                 // (`ui_config.rs:339`).
                 if key == "compact_mode" { userCompactMode = false }
+                // Same path for timestamps (`ui.rs:1505`:
+                // `set_timestamps_inner`); the default is `true` — the key is
+                // `Option<bool>` with `None` read as on (`ui_config.rs:110`,
+                // `defs.rs:666-667` `unwrap_or(true)`).
+                if key == "show_timestamps" { userShowTimestamps = true }
                 reloadCatalogInput()
             } catch PagerSettingsStoreError.notPersistable {
                 return
@@ -10767,7 +10890,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             compactMode: pagerEffectiveCompact(
                 userCompact: userCompactMode,
                 terminalRows: terminalSize.height
-            )
+            ),
+            // NOT derived — upstream's appearance value IS the user setting
+            // (`set_timestamps_inner`, `setters.rs:1530-1541` copies it
+            // straight across; contrast the compact derivation above).
+            showTimestamps: userShowTimestamps
         )
     }
 

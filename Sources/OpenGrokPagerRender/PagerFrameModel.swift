@@ -26,6 +26,21 @@ public struct PagerMessage: Sendable, Equatable, Hashable {
     /// Reasoning blocks collapse to their one-line header when the turn ends,
     /// matching `thinking.rs`'s `finished_display_mode`.
     public var isCollapsed: Bool
+    /// When this block was created — upstream's
+    /// `ScrollbackEntry.created_at: Option<DateTime<Local>>` (`entry.rs:105`),
+    /// stamped `Local::now()` at construction (`entry.rs:198,230`) and
+    /// overwritten with the persisted instant on replay
+    /// (`acp/tracker.rs:954,1384`). Painted by the `[ui] show_timestamps`
+    /// overlay for user and assistant blocks only.
+    ///
+    /// `nil` paints no stamp, exactly upstream's `let Some(ts) =
+    /// entry.created_at` gate (`entry_renderer.rs:939`) — the honest state for
+    /// a block with no known instant. The cost of the `nil` DEFAULT here
+    /// (rather than `Date()`, upstream's constructor behavior): a live
+    /// producer that forgets to stamp silently paints no timestamp — the live
+    /// stamping is pinned by `LiveTimestampsTests` for exactly that reason.
+    /// (`Date()` as a default would also make every two frames unequal.)
+    public var createdAt: Date?
 
     public init(
         role: PagerMessageRole,
@@ -33,7 +48,8 @@ public struct PagerMessage: Sendable, Equatable, Hashable {
         isStreaming: Bool = false,
         styledLines: [PagerStyledLine] = [],
         duration: TimeInterval? = nil,
-        isCollapsed: Bool = false
+        isCollapsed: Bool = false,
+        createdAt: Date? = nil
     ) {
         self.role = role
         self.text = text
@@ -41,6 +57,7 @@ public struct PagerMessage: Sendable, Equatable, Hashable {
         self.styledLines = styledLines
         self.duration = duration
         self.isCollapsed = isCollapsed
+        self.createdAt = createdAt
     }
 }
 
@@ -561,6 +578,17 @@ public struct PagerRenderState: Sendable, Equatable {
     /// terminals — the live composition's pass-through is pinned by the
     /// auto-compact toast test for exactly that reason.
     public var compactMode: Bool
+    /// `[ui] show_timestamps` — upstream's `appearance.show_timestamps`
+    /// (`appearance/config.rs:35`), which IS the user value: unlike
+    /// `compactMode` there is no derivation, `set_timestamps_inner` copies the
+    /// setting straight into the appearance snapshot (`setters.rs:1530-1541`).
+    /// The SEMANTIC default is `true` (`TIMESTAMPS_DEFAULT`,
+    /// `appearance/cache.rs:28`; `Option<bool>` unwrapped `.unwrap_or(true)`
+    /// everywhere it is read). The `false` init default below exists so
+    /// producers and tests from before this field render unchanged; the live
+    /// composition's explicit pass-through — including the absent-config
+    /// default of `true` — is pinned by `LiveTimestampsTests`.
+    public var showTimestamps: Bool
 
     public init(
         size: TerminalSize,
@@ -577,7 +605,8 @@ public struct PagerRenderState: Sendable, Equatable {
         selectedBlockIndex: Int? = nil,
         overlays: PagerOverlayStack = PagerOverlayStack(),
         motion: PagerMotionSnapshot = PagerMotionSnapshot(),
-        compactMode: Bool = false
+        compactMode: Bool = false,
+        showTimestamps: Bool = false
     ) {
         self.overlays = overlays
         self.selectedBlockIndex = selectedBlockIndex
@@ -594,6 +623,7 @@ public struct PagerRenderState: Sendable, Equatable {
         self.showScrollbar = showScrollbar
         self.motion = motion
         self.compactMode = compactMode
+        self.showTimestamps = showTimestamps
     }
 }
 

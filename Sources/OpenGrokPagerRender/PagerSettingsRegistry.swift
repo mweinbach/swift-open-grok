@@ -472,11 +472,11 @@ private let contextualHintsChildren = [
 public let pagerDefaultSettings: [PagerSettingMeta] = {
     var rows: [PagerSettingMeta] = []
 
-    // MARK: Appearance (8 — upstream 17 minus 9 without live readers)
+    // MARK: Appearance (9 — upstream 17 minus 8 without live readers)
 
     rows += [
         // Hidden until the renderer reads them (config round-trips; modal omits):
-        // `show_timestamps`, `show_timeline`, `page_flip_on_send`,
+        // `show_timeline`, `page_flip_on_send`,
         // `simple_mode`, `render_mermaid`, `max_thoughts_width`, `show_thinking_blocks`,
         // `group_tool_verbs`, `collapsed_edit_blocks`.
         //
@@ -504,6 +504,23 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             kind: .enumeration(default: "fullscreen", choices: PagerSettingChoices.screenMode, supportsPreview: false),
             storage: .config(path: "ui.screen_mode"),
             restartRequired: true
+        ),
+        // `show_timestamps` follows `screen_mode`, upstream's Appearance
+        // order (`defs.rs:658-671`); label, description, and keywords are
+        // upstream's verbatim. The default is `true` — the config key is
+        // `Option<bool>` with `None` treated as `true`
+        // (`defs.rs:666-667`: `ui_default.show_timestamps.unwrap_or(true)`).
+        // The renderer reads it in `renderPagerFrame` (wrap reserve + stamp
+        // overlay on user/assistant blocks), so it is a live row, not a
+        // registered no-op.
+        PagerSettingMeta(
+            key: "show_timestamps",
+            category: .appearance,
+            label: "Show timestamps",
+            description: "Show clock time next to user messages and agent responses.",
+            keywords: ["timestamps", "time", "clock", "date"],
+            kind: .bool(default: true),
+            storage: .config(path: "ui.show_timestamps")
         ),
         PagerSettingMeta(
             key: "vim_mode",

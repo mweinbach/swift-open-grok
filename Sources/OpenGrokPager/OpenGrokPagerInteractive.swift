@@ -316,6 +316,14 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// render layer owns — the render value may be auto-forced on short
     /// terminals — and the persist half writes the render layer's config home.
     case toggleCompactMode
+    /// `/timestamps` — flip `[ui] show_timestamps`. Upstream's command reads
+    /// the current value itself and dispatches the typed
+    /// `Action::SetTimestamps(!current)` (`slash/commands/timestamps.rs:29-31`
+    /// → `set_timestamps`, `dispatch/settings/setters.rs:1544-1560`); this
+    /// port's controller cannot read the render layer's value, so the intent
+    /// carries the same toggle semantics with no target state — the exact
+    /// shape `.toggleCompactMode` established.
+    case toggleTimestamps
     /// `/workflows` — the background workflow-run overlay.
     case workflows
     /// `Ctrl+P` and `/help`'s upstream target (`OpenCommandPalette`) — every
