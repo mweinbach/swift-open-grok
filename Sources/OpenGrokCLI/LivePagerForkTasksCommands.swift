@@ -8,6 +8,7 @@
 // holds what tests must reach without a terminal.
 
 import Foundation
+import OpenGrokScheduler
 import OpenGrokSessionRuntime
 import OpenGrokShellBase
 
@@ -65,13 +66,10 @@ enum LivePagerForkCommand {
 
 /// `tasks_block_text` (`app/status_blocks.rs:48-178`) for the sections the
 /// port has task sources for: workflow runs (the `/workflows` registry),
-/// subagents (the `spawn_subagent` host), and shell background tasks (the
-/// session's owner-scoped `listTasks()`).
-///
-/// RECORDED DIVERGENCE: upstream's fourth section, scheduled `/loop` tasks
-/// (`status_blocks.rs:150-166`), has no port source — `/loop` is not ported
-/// and no scheduled-task store exists — so it renders nothing here rather
-/// than a fabricated empty section.
+/// subagents (the `spawn_subagent` host), shell background tasks (the
+/// session's owner-scoped `listTasks()`), and scheduled `/loop` tasks
+/// (`status_blocks.rs:150-166`, fed by the session's `LiveSchedulerHost`
+/// display map — the same store the `scheduler_*` tools mutate).
 enum LivePagerTasksBlock {
     /// Workflow row inputs, decoupled from `RhaiWorkflowRunView` so the
     /// formatter is testable with fixed clocks and so the elapsed rule
@@ -138,12 +136,14 @@ enum LivePagerTasksBlock {
         workflows: [RhaiWorkflowRunView],
         subagents: [LiveSubagentSnapshot],
         tasks: [ShellTaskSnapshot],
+        scheduled: [ScheduledTaskInfo] = [],
         now: Date = Date()
     ) -> String {
         text(
             workflowRows: workflows.map(WorkflowRow.init(view:)),
             subagents: subagents,
             tasks: tasks,
+            scheduled: scheduled,
             now: now
         )
     }
@@ -152,6 +152,7 @@ enum LivePagerTasksBlock {
         workflowRows: [WorkflowRow],
         subagents: [LiveSubagentSnapshot],
         tasks: [ShellTaskSnapshot],
+        scheduled: [ScheduledTaskInfo] = [],
         now: Date = Date()
     ) -> String {
         var rows: [String] = []
@@ -235,6 +236,25 @@ enum LivePagerTasksBlock {
             }
             rows.append(
                 "  \(padded(status))Task · \(oneLine)  (\(formatDuration(task.duration(at: now))))"
+            )
+        }
+
+        // ── Scheduled (/loop) tasks (`status_blocks.rs:150-166`) ──
+        //
+        // Row format `"  {:<9}{} · {} · {}"` with status "scheduled": nine
+        // characters exactly, so `{:<9}` adds NO trailing pad and the tag
+        // abuts the status ("  scheduledloop · …"). Upstream renders it that
+        // way; byte parity keeps it, don't "fix" the missing space.
+        let sortedScheduled = scheduled.sorted { a, b in
+            if a.tag != b.tag { return a.tag < b.tag }
+            if a.humanSchedule != b.humanSchedule {
+                return a.humanSchedule < b.humanSchedule
+            }
+            return a.taskId < b.taskId
+        }
+        for info in sortedScheduled {
+            rows.append(
+                "  \(padded("scheduled"))\(info.tag) · \(info.humanSchedule) · \(firstNonEmptyLine(info.prompt))"
             )
         }
 

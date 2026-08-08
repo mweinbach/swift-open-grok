@@ -66,6 +66,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         /// submit uses, including the mid-turn deferral for history-rewriting
         /// commands.
         case command(String)
+        /// A scheduler fire enqueued a Cron prompt from outside the input
+        /// loop. Idle, the loop must start the drain — the port of
+        /// `maybe_drain_queue` after `enqueue_cron_prompt`
+        /// (acp_handler/background.rs:499-507). Mid-turn it is a no-op: the
+        /// entry waits in the queue and the completion arm's `.drainNext`
+        /// picks it up.
+        case cronEnqueued
     }
 
     /// What an Esc or Ctrl+C resolved to.
@@ -738,6 +745,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// `defaults.rs:630-632`).
     private var interjectionSeam: OpenGrokPagerInterjectionSeam?
 
+    /// The scheduler task id of the RUNNING cron turn, if any — upstream's
+    /// `agent.cron_task_id` (`app/dispatch/queue.rs:340-344`), the second
+    /// half of the fire de-dup: a re-fire of the task that is currently
+    /// executing is skipped, not queued.
+    private var runningCronTaskID: String?
+
     private let commands: PagerCommandRegistry
     private let paletteRows: [OpenGrokPagerCommandSuggestion]
     private let customCommandNames: Set<String>
@@ -909,6 +922,25 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// carrier for upstream's persist-only user echo (interjection.rs:20-24).
     /// The value is the queue entry's full `interject-fallback-…` id.
     public static let interjectionFallbackMetadataKey = "interjectionFallbackPromptID"
+
+    /// Queue-entry kind for a scheduler-fired ("cron") prompt — upstream's
+    /// `QueueEntryKind::Cron` wire label (`views/queue_pane.rs:102-108`).
+    public static let cronQueueEntryKind = "cron"
+
+    /// Prompt-id prefix for a cron turn, byte-identical to upstream's
+    /// `scheduler-fired-` (`app/dispatch/queue.rs:519`). The runtime adapter
+    /// stamps it on the shell turn request, and the turn loop derives the
+    /// `schedulerFired` persistence tag from it — the port of
+    /// `PromptOrigin::from_prompt_id` (`session/mod.rs:126-127`).
+    public static let schedulerFiredPromptIDPrefix = "scheduler-fired-"
+
+    /// Metadata keys stamped onto a cron turn's request. The runtime adapter
+    /// reads them to frame the model prompt (`format_scheduled_task_prompt`)
+    /// and tag the turn's persistence; the request's own `prompt` stays the
+    /// RAW text so the turn-start user echo paints what the user scheduled
+    /// (upstream's `DISPLAY_TEXT` meta, `app/dispatch/queue.rs:538-546`).
+    public static let cronTaskIDMetadataKey = "schedulerCronTaskID"
+    public static let cronHumanScheduleMetadataKey = "schedulerCronHumanSchedule"
 
     /// Report what the render layer knows is in motion — visible running
     /// blocks, the welcome logo, background-task chips, and whether the
@@ -1169,6 +1201,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             // `SendSlashCommandPreservingDraft`.
                             try await emit(.promptChanged(promptState()))
                             await inputPumpGate.resume()
+                        }
+                    case .cronEnqueued:
+                        // A scheduler fire queued a Cron prompt while idle;
+                        // this loop must start it (the `.drain` shape) — the
+                        // port of `maybe_drain_queue` running the cron entry
+                        // when no turn holds the session.
+                        if let lifecycle = try await drainQueue(
+                            request: request,
+                            mailbox: mailbox,
+                            inputPumpGate: inputPumpGate
+                        ) {
+                            outcome = lifecycle
                         }
                     }
                 case .input(let read):
@@ -1632,6 +1676,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             try await emit(.promptChanged(promptState()))
                             await inputPumpGate.resume()
                         }
+                    case .cronEnqueued:
+                        // Mid-turn a cron entry just waits its turn in the
+                        // queue; the completion arm's `.drainNext` starts it
+                        // (upstream: the busy-agent case leaves the entry
+                        // queued, acp_handler/tests/scheduled_tasks.rs:150).
+                        // No pump interaction: this signal never came from
+                        // the input pump, so there is nothing to resume.
+                        break
                     }
                 }
             }
@@ -1679,6 +1731,50 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         editor.reset()
         try await emit(.promptChanged(promptState()))
         try await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
+    }
+
+    /// What `enqueueCronPrompt` did with a fire. The two skip cases are
+    /// upstream's de-dup guards (`handle_scheduled_task_inject_prompt`,
+    /// acp_handler/background.rs:483-496): a re-fire of a task that is
+    /// already queued or already running must not pile up.
+    public enum CronEnqueueOutcome: Sendable, Equatable {
+        case enqueued
+        case skippedTaskAlreadyQueued
+        case skippedTaskAlreadyRunning
+    }
+
+    /// Enqueue a scheduler-fired prompt as a Cron queue entry and, when the
+    /// controller is idle, wake the run loop to drain it — the single-process
+    /// port of `x.ai/scheduled_task_inject_prompt` → `enqueue_cron_prompt` →
+    /// `maybe_drain_queue` (acp_handler/background.rs:439-509). `prompt` is
+    /// the RAW stored text; framing for the model happens at the send seam.
+    public func enqueueCronPrompt(
+        prompt: String,
+        taskID: String,
+        humanSchedule: String
+    ) async -> CronEnqueueOutcome {
+        if runningCronTaskID == taskID {
+            return .skippedTaskAlreadyRunning
+        }
+        let alreadyQueued = await promptQueue.entries.contains { $0.taskID == taskID }
+        if alreadyQueued {
+            return .skippedTaskAlreadyQueued
+        }
+        await promptQueue.enqueue(QueueEntryMeta(
+            id: Self.schedulerFiredPromptIDPrefix + UUID().uuidString,
+            kind: Self.cronQueueEntryKind,
+            text: prompt,
+            taskID: taskID,
+            humanSchedule: humanSchedule
+        ))
+        // Best-effort chrome: a failed emit only means the `+n` queue count
+        // missed a beat — the entry is already queued, and the run loop
+        // surfaces a dead output stream on its next own emit. Deliberately
+        // not propagated: the caller is the scheduler timer, which has no
+        // recovery for a render error.
+        try? await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
+        await signalMailbox?.send(.control(.cronEnqueued))
+        return .enqueued
     }
 
     /// Convert an interjection with no running turn into a queued prompt
@@ -1747,8 +1843,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // other half of the mid-turn deferral: `/compact` was put here
             // precisely so it would run against a settled conversation, and
             // sending its text to the model instead would be worse than having
-            // run it early.
-            if case .command = PagerCommandParser.parse(entry.text) {
+            // run it early. A Cron entry is exempt: its text is the stored
+            // task prompt and is sent to the model even when it starts with
+            // "/" (upstream's Cron drain arm never parses commands,
+            // app/dispatch/queue.rs:518-560).
+            if entry.kind != Self.cronQueueEntryKind,
+               case .command = PagerCommandParser.parse(entry.text) {
                 await promptQueue.completeRunning()
                 switch try await runSlashCommand(entry.text) {
                 case .submit(let generatedPrompt):
@@ -1766,10 +1866,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // as one turn rather than one turn each. Only the entries already
             // waiting are folded in — anything enqueued during the turn stays
             // for the next drain, so a fast typist cannot starve the model.
+            // Cron entries never merge, in either direction: upstream's
+            // combine gate admits only plain `Prompt` rows
+            // (`agent.rs:1085-1098`), so the fold takes the plain-prompt
+            // prefix and stops at the first Cron row, and a Cron front runs
+            // alone.
             var promptText = entry.text
             var foldedBacklog = false
-            if modes.combineQueuedPrompts {
-                let rest = await promptQueue.removeAll().map(\.text)
+            if modes.combineQueuedPrompts, entry.kind != Self.cronQueueEntryKind {
+                var rest: [String] = []
+                for waiting in await promptQueue.entries {
+                    if waiting.kind == Self.cronQueueEntryKind { break }
+                    guard let removed = try? await promptQueue.remove(id: waiting.id) else {
+                        continue
+                    }
+                    rest.append(removed.text)
+                }
                 if !rest.isEmpty {
                     promptText = ([entry.text] + rest).joined(separator: "\n\n")
                     foldedBacklog = true
@@ -1788,6 +1900,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                entry.id.hasPrefix(Self.interjectFallbackPromptPrefix) {
                 turnMetadata[Self.interjectionFallbackMetadataKey] = entry.id
             }
+            // A Cron turn carries its scheduler identity in metadata: the
+            // runtime adapter frames the model prompt from it and stamps the
+            // `scheduler-fired-` prompt id, while `promptText` stays the RAW
+            // stored prompt for the user echo — upstream's split between
+            // `RenderBlock::cron_prompt` and the framed wire blocks
+            // (app/dispatch/queue.rs:518-560). "unknown" fallbacks are
+            // upstream's own (acp_handler/background.rs:458-459).
+            if entry.kind == Self.cronQueueEntryKind {
+                turnMetadata[Self.cronTaskIDMetadataKey] = entry.taskID ?? "unknown"
+                turnMetadata[Self.cronHumanScheduleMetadataKey] =
+                    entry.humanSchedule ?? "unknown"
+            }
             let turnRequest = OpenGrokPagerRequest(
                 prompt: promptText,
                 mode: request.mode,
@@ -1796,12 +1920,26 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             )
             let session = try await runtime.makeSession(for: turnRequest)
             submittedPrompts.append(promptText)
-            let turnOutcome = try await runTurn(
-                session: session,
-                request: turnRequest,
-                mailbox: mailbox,
-                inputPumpGate: inputPumpGate
-            )
+            if entry.kind == Self.cronQueueEntryKind {
+                runningCronTaskID = entry.taskID
+            }
+            let turnOutcome: TurnOutcome
+            do {
+                turnOutcome = try await runTurn(
+                    session: session,
+                    request: turnRequest,
+                    mailbox: mailbox,
+                    inputPumpGate: inputPumpGate
+                )
+                // The cron turn is over; a re-fire of the same task may
+                // queue again from here on. Cleared on the throw path too —
+                // a stale id would suppress that task's fires for the rest
+                // of the session.
+                runningCronTaskID = nil
+            } catch {
+                runningCronTaskID = nil
+                throw error
+            }
             switch try await apply(turnOutcome: turnOutcome, inputPumpGate: inputPumpGate) {
             case .drainNext:
                 continue

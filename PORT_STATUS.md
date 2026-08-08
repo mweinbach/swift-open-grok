@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-07 (Wave 14 TUI foundation: suspend host + /transcript, steering honesty, /always-approve, ask_user_question + plan approval)
+**As of:** 2026-08-08 (Wave 17 E18: scheduler runtime live — `scheduler_*` tools, `/loop`, `/tasks` Scheduled section, Cron fire path)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `70002584da34e4c37ea14a3bce35341b7d04f9a7` (re-pinned **2026-08-06** from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05`; +3 commits, release `v0.1.220-open-grok.57` — the Meta API provider delta: `0f8dc87b` provider, `666b2ceb` login/settings, `70002584` stored-key unlock fix. The prior 2026-08-05 re-pin moved from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`; before that the 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` (`/tmp/open-grok-reference` when present).
@@ -632,6 +632,59 @@ unrendered until the runtime + surface slices land. Recorded implemented-unwired
 Design guardrail carried into those slices (from the scheduler research): fires ride a
 dedicated sleep-until-due plus the prompt-queue Cron path (upstream's `enqueue_cron_prompt`
 → synthetic turn), NEVER the PagerMotion UI ticker or the mid-turn interjection seam.
+**Superseded by E18 below** — the runtime + surface landed and E17's library is now LIVE.
+
+### E18 — scheduler runtime, `/loop`, `/tasks` Scheduled section (LIVE; serial gate: exit 0, 4,910 tests, zero issues)
+
+The E17 library is now reachable end to end in the interactive TUI. `scheduler_create` /
+`scheduler_delete` / `scheduler_list` dispatch through the real executor (specs verbatim
+from `create.rs:14-121`/`delete.rs:38-42`/`list.rs:41-43`, `recurring` hidden per
+`#[schemars(skip)]`), gated three ways: the host exists only when
+`interactiveSurfaceAvailable` (the `ask_user_question` precedent — headless/ACP/children
+advertise nothing, because a create whose fires can never run is worse than an absent
+tool), `requires_expr` is honored (a profile stripping `scheduler_create` drops all
+three, `delete.rs:48-56`/`list.rs:45-53`), and dispatch runs the hooks-only PreToolUse
+gate (`gateSchedulerTool`, the `gateCollaborationTool` shape — upstream has no scheduler
+permission-rule kind; the fired prompt's own tool calls pass the full pipeline like any
+typed prompt). Fires ride the dedicated sleep-until-due timer (`LiveSchedulerHost`,
+generation-stamped, injected clock, deterministic `fireDue(now:)` — the E17 guardrail
+held: never the PagerMotion ticker, never the interjection seam), then the Cron path:
+`enqueueCronPrompt` with both upstream de-dup guards (already-queued, already-running;
+`background.rs:483-496`) → idle-loop `cronEnqueued` drain → a real turn whose wire text
+is `formatScheduledTaskPrompt` framing while the user echo stays the raw prompt, stamped
+`scheduler-fired-` and persisted as `.schedulerFired` via the prompt-id prefix
+(`PromptOrigin::from_prompt_id`, `session/mod.rs:126-127`). Cron entries never parse as
+slash commands and never merge under combine-queued-prompts, in either direction. `/loop`
+registers only when the session's advertised toolset carries `scheduler_create`
+(`loop_cmd.rs:107-109`), seeds the `provisional-` tasks-pane preview, and injects the
+in-session schedule instruction; `/tasks` renders the Scheduled section byte-exact off
+the SAME host the tools mutate — including upstream's `{:<9}` nine-char status quirk
+(`"  scheduledloop · …"`, no space before the tag; pinned with a test, don't "fix" it).
+Executor shutdown cancels the timer before children so a fire cannot land in a torn-down
+controller. 24 new tests across six suites (counted from the gate run, not the
+delegate's claim of 20), all live-seam or controller-seam: real
+dispatch + error catalogue, injected-clock fires (zero real sleeps), `/loop` gate +
+instruction pins, byte-exact Scheduled rows, controller Cron semantics (idle drain with
+metadata, mid-turn wait, both de-dup guards), and the end-to-end fire → drain → real
+shell turn → on-disk `.schedulerFired` persistence.
+
+**Deferred, deliberately (each cited in-source):** Detached loop-subagent fires and the
+`[scheduler] background_loops` config reader (wiring the key now would give it a parse
+with no behavioral reader — §3; `/loop` pins `.inSession` and the instruction describes
+the runtime the user actually has), the `monitor` tool (rows all render "Task"),
+scheduler persistence/durable removal (`durable: true` is stored but dies with the
+session — user-facing cost recorded), and headless/ACP/leader scheduler surfaces.
+
+**Recorded divergences:** single-process store (no `ScheduledTaskCreated/Fired/Removed`
+notification hop — nothing would consume it; a future ACP scheduler adds it); fires wait
+for the sink with no 10 s deadline (upstream `actor.rs:224-253`; sink installs before any
+task can exist today); sorted-key `Z`-suffixed tool-result JSON (cosmetic); lenient-bool
+fallback where upstream errors (more permissive on schema-forbidden inputs); cron
+scrollback paints a plain user block (no `RenderBlock::cron_prompt` ↻ styling); `/loop`
+echoes the injected instruction, not `/loop {args}` (the `/imagine` precedent);
+provisional keys are `provisional-<uuid>` not `provisional-<queue-id>`;
+`isIntervalToken` splits the last `Character` where Rust would panic on a multi-byte
+final byte (the shared `parseInterval` divergence).
 
 ### Chrome readers (`/timestamps`, `/timeline`, `/compact-mode`) — research complete, queued
 

@@ -54,6 +54,18 @@ public struct QueueEntryMeta: Hashable, Sendable {
     /// Plain prompt text for the shared queue display.
     public var text: String
 
+    /// Scheduler task id for a Cron ("cron"-kind) entry — the de-dup key the
+    /// enqueue path checks so a re-fire of an already-queued task does not
+    /// pile up. Port of `QueuedPrompt.task_id`, which upstream sets only in
+    /// `enqueue_cron_prompt` (`xai-grok-pager/src/app/agent.rs:1024-1038`).
+    /// `nil` for every other kind.
+    public var taskID: String?
+
+    /// Pre-rendered human schedule ("every 5 minutes") for a Cron entry, the
+    /// twin of `QueuedPrompt.human_schedule` (same enqueue site). Carried so
+    /// the drain can frame the model prompt without re-deriving the schedule.
+    public var humanSchedule: String?
+
     /// Create queue-entry metadata.
     public init(
         id: String,
@@ -61,7 +73,9 @@ public struct QueueEntryMeta: Hashable, Sendable {
         owner: String? = nil,
         lastEditor: String? = nil,
         kind: String,
-        text: String
+        text: String,
+        taskID: String? = nil,
+        humanSchedule: String? = nil
     ) {
         self.id = id
         self.version = version
@@ -69,6 +83,8 @@ public struct QueueEntryMeta: Hashable, Sendable {
         self.lastEditor = lastEditor
         self.kind = kind
         self.text = text
+        self.taskID = taskID
+        self.humanSchedule = humanSchedule
     }
 }
 

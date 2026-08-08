@@ -23,6 +23,7 @@ import OpenGrokProviderSession
 import OpenGrokSampler
 import OpenGrokSamplingTypes
 import OpenGrokSandbox
+import OpenGrokScheduler
 import OpenGrokSessionRuntime
 import OpenGrokShared
 import OpenGrokShell
@@ -1144,6 +1145,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             let imagineCommands = LiveImagineCommand.registrations(
                 advertisedToolNames: Set(toolExecutor.tools.map(\.name))
             )
+            // `/loop` — registered only when this session's advertised
+            // toolset actually carries `scheduler_create` (upstream's
+            // `required_tools`, loop_cmd.rs:12,107-109). Same gate shape as
+            // `/imagine`: the row exists exactly when the injection it
+            // produces can be acted on.
+            let loopCommands = LiveLoopCommand.registrations(
+                advertisedToolNames: Set(toolExecutor.tools.map(\.name))
+            )
             let sharedExportBoundary = await stack.conversationHistory.sharedExportBoundary
             exportBoundaries.register(
                 sessionID: sessionID,
@@ -1280,9 +1289,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         },
                         // Local registration order is upstream's display
                         // order for this subset: feedback, announcements,
-                        // imagine (`slash/commands/mod.rs:121-135`).
+                        // loop, imagine (`slash/commands/mod.rs:121-135`).
                         localCommands: feedbackCommands + announcementsCommands
-                            + imagineCommands,
+                            + loopCommands + imagineCommands,
                         localCommandHandler: { invocation in
                             switch invocation.name {
                             case "announcements":
@@ -1313,6 +1322,26 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                     rawArgumentTail: OpenGrokPagerInteractiveController
                                         .rawArgumentTail(of: invocation)
                                 )
+                            case "loop":
+                                // `/loop` — empty args echo the usage
+                                // message; otherwise the schedule instruction
+                                // becomes the turn's prompt (the model calls
+                                // `scheduler_create`) and the provisional
+                                // preview seeds the tasks pane before the
+                                // round-trip (`app/dispatch/prompt.rs:775-794`).
+                                switch LiveLoopCommand.dispatch(
+                                    rawArgumentTail: OpenGrokPagerInteractiveController
+                                        .rawArgumentTail(of: invocation)
+                                ) {
+                                case .usage(let message):
+                                    return .notice(message)
+                                case .schedule(let instruction, let preview):
+                                    await toolExecutor.schedulerHost?.insertProvisional(
+                                        prompt: preview.prompt,
+                                        humanSchedule: preview.humanSchedule
+                                    )
+                                    return .submit(instruction)
+                                }
                             case "feedback":
                                 let text = invocation.arguments.joined(separator: " ")
                                     .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1421,6 +1450,38 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         deliver: { text in await interjections.interject(text) },
                         collectStranded: { await interjections.collectStranded() }
                     ))
+                    // The scheduler fire seam: a due task's in-session fire
+                    // enqueues a Cron prompt through the controller's queue
+                    // and wakes the idle loop to drain it — the port of
+                    // `x.ai/scheduled_task_inject_prompt` →
+                    // `enqueue_cron_prompt` → `maybe_drain_queue`
+                    // (acp_handler/background.rs:439-509). Installed here,
+                    // after the controller exists, so a task that came due
+                    // during startup fires now instead of being lost
+                    // (upstream's wiring-grace shape, actor.rs:224-253).
+                    // NEVER the PagerMotion ticker or the interjection seam:
+                    // the ticker parks on a still screen and the seam only
+                    // exists mid-turn — both drop fires exactly when the
+                    // session is idle.
+                    if let schedulerHost = toolExecutor.schedulerHost {
+                        await schedulerHost.setFireSink { [weak controller] fire in
+                            guard let controller else { return }
+                            switch await controller.enqueueCronPrompt(
+                                prompt: fire.prompt,
+                                taskID: fire.taskID,
+                                humanSchedule: fire.humanSchedule
+                            ) {
+                            case .enqueued,
+                                 .skippedTaskAlreadyQueued,
+                                 .skippedTaskAlreadyRunning:
+                                // The skips are upstream's de-dup guards
+                                // (background.rs:483-496): a re-fire of a
+                                // queued or still-running task must not pile
+                                // up. Both are by-design no-ops here.
+                                break
+                            }
+                        }
+                    }
                     // Typing `/model ` drops the dropdown into the catalog, as
                     // upstream's `ModelCommand::suggest_args` does. Rows insert
                     // the provider-qualified selector, so accepting one
@@ -2158,6 +2219,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // `open-grok < file` launches where no presenter could ever attach.
         let planApprovalCoordinator: PagerPlanApprovalCoordinator? =
             interactiveSurfaceAvailable ? PagerPlanApprovalCoordinator() : nil
+        // The scheduler runtime, gated exactly like the question coordinator:
+        // it exists precisely when the interactive controller (the only
+        // in-session fire path) will be constructed. Headless (`-p`),
+        // non-TTY, and ACP launches get `nil`, which strips `scheduler_*`
+        // from the advertised list — a create whose fires can never run is
+        // worse than an absent tool (AGENTS.md §4). Headless/ACP scheduler
+        // support is a deferred slice.
+        let schedulerHost: LiveSchedulerHost? =
+            interactiveSurfaceAvailable ? LiveSchedulerHost() : nil
         let toolExecutor = try await LiveToolExecutor(
             processBackend: processBackend,
             sessionID: sessionID,
@@ -2174,7 +2244,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             permissionOptions: options.common.permissions,
             subagentHost: subagentHost,
             userQuestions: questionCoordinator.map { LiveUserQuestionBroker(coordinator: $0) },
-            planApprovals: planApprovalCoordinator.map { LivePlanApprovalBroker(coordinator: $0) }
+            planApprovals: planApprovalCoordinator.map { LivePlanApprovalBroker(coordinator: $0) },
+            schedulerHost: schedulerHost
         )
         conversationRecord.sandboxProfile = sandboxDecision.profileName
         try await conversationStore.save(conversationRecord)
@@ -3824,6 +3895,15 @@ struct LiveToolExecutor: Sendable {
     /// reachability rule as the spawn/swarm surfaces: only an advertised
     /// name dispatches.
     private let collaborationToolNames: Set<String>
+    /// The session's scheduler runtime: task store + sleep-until-due timer +
+    /// the in-session fire seam. `nil` when the composition has no fire path
+    /// (headless, ACP, children), which also strips the `scheduler_*` tools
+    /// from the advertised list — absence of the surface means absence of
+    /// the tool, never a create whose fires can never run (AGENTS.md §4).
+    let schedulerHost: LiveSchedulerHost?
+    /// The advertised scheduler-tool names (at most the trio). Same
+    /// reachability rule: an unadvertised surface is undispatchable.
+    private let schedulerToolNames: Set<String>
     /// Session-local swarm-mode tracker, shared by the `/swarm` slash path,
     /// the `agent_swarm` tool trigger, and the turn loop's reminder
     /// injection — one tracker, so the three can never disagree (the port
@@ -3923,7 +4003,12 @@ struct LiveToolExecutor: Sendable {
         // fallback (`PermissionPipeline.requestExitPlanApproval`) — the
         // pre-dedicated-view behavior, never an auto-approve. Only the
         // interactive TUI foundation passes one.
-        planApprovals: (any PlanApprovalPrompting)? = nil
+        planApprovals: (any PlanApprovalPrompting)? = nil,
+        // The scheduler runtime. Defaulted to nil so every construction site
+        // without an in-session fire path (headless, ACP, workflow children,
+        // subagent children) advertises no `scheduler_*` tools; only the
+        // interactive TUI foundation passes one.
+        schedulerHost: LiveSchedulerHost? = nil
     ) async throws {
         self.subagentHost = subagentHost
         let composition = OpenGrokShellToolRuntimeComposition(
@@ -4249,6 +4334,23 @@ struct LiveToolExecutor: Sendable {
                 [host.toolSpec] + (advertisesSwarm ? [LiveSubagentHost.swarmToolSpec] : [])
             } ?? []
             : []
+        // The scheduler trio. Enablement is the host's presence (only the
+        // interactive foundation constructs one — a session with no fire
+        // path must not accept creates whose fires never run), then the
+        // per-tool profile filter. `scheduler_delete`/`scheduler_list`
+        // require the create surface — upstream's `requires_expr` on both
+        // names `SchedulerCreateTool` (delete.rs:48-56, list.rs:45-53) —
+        // so a profile that strips `scheduler_create` drops all three.
+        self.schedulerHost = schedulerHost
+        let schedulerTools: [ToolSpec]
+        if schedulerHost != nil,
+           toolPolicy?.allows(liveToolName: LiveSchedulerTools.createToolName) ?? true {
+            schedulerTools = LiveSchedulerTools.toolSpecs()
+                .filter { toolPolicy?.allows(liveToolName: $0.name) ?? true }
+        } else {
+            schedulerTools = []
+        }
+        self.schedulerToolNames = Set(schedulerTools.map(\.name))
         self.permissionPipeline = fileToolResources.permissionPipeline
         if let permissionPipeline = fileToolResources.permissionPipeline {
             self.sessionPermissionMode = LiveSessionPermissionMode(
@@ -4294,6 +4396,7 @@ struct LiveToolExecutor: Sendable {
             .union(subagentToolNames)
             .union(swarmToolNames)
             .union(collaborationToolNames)
+            .union(schedulerToolNames)
             .union([Self.runTerminalTool.name])
         assert(
             Set(sessionTools.map(\.name)).isDisjoint(with: dispatchedToolNames),
@@ -4305,7 +4408,7 @@ struct LiveToolExecutor: Sendable {
             and background-task tools get.
             """
         )
-        self.tools = terminalTools + spawnTools + collaborationTools + sessionTools + allowedFileToolDefinitions.map { definition in
+        self.tools = terminalTools + spawnTools + collaborationTools + schedulerTools + sessionTools + allowedFileToolDefinitions.map { definition in
             ToolSpec(
                 name: definition.name,
                 description: definition.description,
@@ -4636,6 +4739,22 @@ struct LiveToolExecutor: Sendable {
             return await agentCollaboration.invoke(name: call.name, args: args)
         }
 
+        // The scheduler trio — session-state RPCs against the scheduler
+        // host. Same hooks-only gate: upstream runs these through the
+        // standard PreToolUse pass and has no scheduler permission-rule
+        // kind (`requires_expr` is `Expr::True` for create, create.rs:127-129).
+        if schedulerToolNames.contains(call.name),
+           let schedulerHost {
+            if let denial = await gateSchedulerTool(args: args, call: call) {
+                return .failure(denial)
+            }
+            return await LiveSchedulerTools.invoke(
+                name: call.name,
+                args: args,
+                host: schedulerHost
+            )
+        }
+
         guard call.name == Self.runTerminalTool.name
             || backgroundTaskToolNames.contains(call.name)
         else {
@@ -4718,6 +4837,44 @@ struct LiveToolExecutor: Sendable {
             toolName: call.name,
             toolCallId: call.callId,
             access: .bash("spawn_subagent \(subagentType)"),
+            permissionMode: nil
+        )
+        if case .deny(let reason, let hookName) = decision {
+            return .failed("hook \(hookName) denied: \(reason)")
+        }
+        return nil
+    }
+
+    /// Run a scheduler tool through the session's PreToolUse hooks.
+    ///
+    /// Hooks-only, the `gateCollaborationTool` shape: the permission rule
+    /// vocabulary has no scheduler kind upstream either, and the calls are
+    /// session-state RPCs — no file, no process. The security-relevant
+    /// surface is the FIRED prompt's own tool calls, and a cron turn's calls
+    /// pass through this session's full pipeline exactly like a typed
+    /// prompt's.
+    private func gateSchedulerTool(
+        args: JSONValue,
+        call: ToolCall
+    ) async -> OpenGrokShellToolRuntimeError? {
+        guard let permissionPipeline else { return nil }
+        var access = call.name
+        if case .object(let object) = args {
+            // Surface the schedule and target id to hook payloads, so a hook
+            // can match on what is being scheduled or cancelled.
+            if case .string(let interval)? = object["interval"] {
+                let trimmed = interval.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { access += " \(trimmed)" }
+            }
+            if case .string(let id)? = object["id"] {
+                let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { access += " \(trimmed)" }
+            }
+        }
+        let decision = await permissionPipeline.hooks.runPreToolUse(
+            toolName: call.name,
+            toolCallId: call.callId,
+            access: .bash(access),
             permissionMode: nil
         )
         if case .deny(let reason, let hookName) = decision {
@@ -4869,6 +5026,9 @@ struct LiveToolExecutor: Sendable {
             event: .sessionEnd,
             payload: ["reason": .string("shutdown")]
         )
+        // The scheduler timer first: a fire delivered into a torn-down
+        // controller would enqueue a cron prompt nothing can ever drain.
+        await schedulerHost?.shutdown()
         // Children first: a child holds its own MCP connections and shell
         // session, and its coordinator entry must not outlive the parent's
         // tool surface.
@@ -5610,9 +5770,17 @@ actor LiveConversationHistory {
         return shouldSanitize ? before.items.count - sanitized.count : 0
     }
 
-    func itemsForTurn(sessionID: String, prompt: String) -> [ConversationItem] {
+    func itemsForTurn(
+        sessionID: String,
+        prompt: String,
+        schedulerFired: Bool = false
+    ) -> [ConversationItem] {
         var items = sessionID == record.sessionID ? record.items : []
-        items.append(.user(prompt))
+        // A scheduler-fired prompt persists with the turn like any user item,
+        // tagged so compaction/replay/analytics see the cron turn — the port
+        // of `ConversationItem::scheduler_fired` at the same seam
+        // (acp_session_impl/turn.rs:858-860).
+        items.append(schedulerFired ? .schedulerFired(prompt) : .user(prompt))
         return items
     }
 
@@ -5749,7 +5917,13 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         let sampler = active.sampler
         var items = await conversationHistory.itemsForTurn(
             sessionID: context.sessionID,
-            prompt: request.text
+            prompt: request.text,
+            // Derived from the prompt-id prefix, exactly upstream's
+            // `PromptOrigin::from_prompt_id` (session/mod.rs:126-127) — the
+            // runtime adapter stamps `scheduler-fired-` on cron turns.
+            schedulerFired: request.promptID.hasPrefix(
+                OpenGrokPagerInteractiveController.schedulerFiredPromptIDPrefix
+            )
         )
         let combinedSystemPrompt = [systemPrompt, skillsListing]
             .compactMap { value in
@@ -6236,9 +6410,35 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
             }
         }
         activeShellSessionID = sessionID
+        // A Cron turn arrives with the RAW stored prompt plus scheduler
+        // metadata; this seam frames the model text and stamps the
+        // `scheduler-fired-` prompt id — the port of upstream's Cron drain
+        // arm (`app/dispatch/queue.rs:518-560`: `format_cron_prompt` on the
+        // wire text, raw text kept for display). The prompt-id prefix is what
+        // the turn loop later maps to the `.schedulerFired` persisted item
+        // (`PromptOrigin::from_prompt_id`, session/mod.rs:126-127).
+        let turnRequest: OpenGrokShellTurnRequest
+        if let cronTaskID = request.metadata[
+            OpenGrokPagerInteractiveController.cronTaskIDMetadataKey
+        ] {
+            let humanSchedule = request.metadata[
+                OpenGrokPagerInteractiveController.cronHumanScheduleMetadataKey
+            ] ?? "unknown"
+            turnRequest = OpenGrokShellTurnRequest(
+                promptID: OpenGrokPagerInteractiveController.schedulerFiredPromptIDPrefix
+                    + UUID().uuidString,
+                text: formatScheduledTaskPrompt(
+                    request.prompt,
+                    taskID: cronTaskID,
+                    humanSchedule: humanSchedule
+                )
+            )
+        } else {
+            turnRequest = OpenGrokShellTurnRequest(text: request.prompt)
+        }
         let handle = try await shell.submitTurn(
             sessionID: sessionID,
-            request: OpenGrokShellTurnRequest(text: request.prompt)
+            request: turnRequest
         )
         return LivePagerSession(shell: shell, handle: handle, shellEvents: shellEvents)
     }
@@ -8357,10 +8557,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             sessionID: sessionID,
             workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true)
         ) ?? []
+        // The scheduled `/loop` rows, read from the SAME host the
+        // `scheduler_*` tools mutate — provisional previews included.
+        var scheduled: [ScheduledTaskInfo] = []
+        if let schedulerHost = toolExecutor?.schedulerHost {
+            scheduled = await schedulerHost.displayInfos()
+        }
         note(LivePagerTasksBlock.text(
             workflows: workflowViews,
             subagents: subagents,
-            tasks: shellTasks
+            tasks: shellTasks,
+            scheduled: scheduled
         ))
     }
 
