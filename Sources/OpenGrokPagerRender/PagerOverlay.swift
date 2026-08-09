@@ -424,14 +424,17 @@ public struct PagerWelcomeOverlay: Sendable, Equatable, Hashable {
     public var version: String
     public var subtitle: String
     public var menu: [PagerWelcomeMenuItem]
-    public var selectedIndex: Int
+    /// `nil` paints no highlighted row — upstream's `welcome_menu_index:
+    /// Option<usize>` starts `None` (`app/app_view.rs:979,1912` at pin
+    /// 650c1db7) and only hover or explicit navigation sets it.
+    public var selectedIndex: Int?
 
     public init(
         productName: String = "Open Grok Beta",
         version: String = "",
         subtitle: String = "Thanks for trying Open Grok, give feedback with /feedback!",
         menu: [PagerWelcomeMenuItem] = [],
-        selectedIndex: Int = 0
+        selectedIndex: Int? = nil
     ) {
         self.productName = productName
         self.version = version
@@ -1398,6 +1401,26 @@ public struct PagerOverlayStack: Sendable, Equatable {
         return true
     }
 
+    /// Mutate an open welcome overlay's state in place — the hover seam.
+    ///
+    /// Hover moves the menu highlight (upstream `MouseEventKind::Moved`,
+    /// `app/app_view.rs:4428-4443` at pin 650c1db7) without reordering the
+    /// stack: `push` would lift the welcome above any capturing modal, so
+    /// this edits in place like `updateSettings`. Returns false when no
+    /// welcome overlay with that id is open.
+    @discardableResult
+    public mutating func updateWelcome(
+        id: String = "welcome",
+        _ transform: (inout PagerWelcomeOverlay) -> Void
+    ) -> Bool {
+        guard let index = overlays.firstIndex(where: { $0.id == id }),
+              case .welcome(var welcome) = overlays[index].content
+        else { return false }
+        transform(&welcome)
+        overlays[index].content = .welcome(welcome)
+        return true
+    }
+
     /// Route a key to the topmost overlay.
     ///
     /// `viewportHeight` is the row budget the overlay's scrollable body has;
@@ -1745,6 +1768,13 @@ public struct PagerOverlayStack: Sendable, Equatable {
         }
     }
 
+    /// Reachable only when a welcome overlay is pushed CAPTURING (tests);
+    /// every live push is `capturesInput: false`, so live keys fall through
+    /// to the composer — the reference's model, where welcome menu rows are
+    /// mouse/chord surfaces and a plain Enter always starts the session
+    /// (`app/app_view.rs:4104-4109` at pin 650c1db7). Navigation mirrors
+    /// `handle_menu_nav` (`:4518-4540`): Down wraps last→0 and starts at 0
+    /// from no selection; Up wraps 0→last and starts at last.
     private func handleWelcome(
         _ welcome: inout PagerWelcomeOverlay,
         overlay: PagerOverlay,
@@ -1753,14 +1783,26 @@ public struct PagerOverlayStack: Sendable, Equatable {
         guard !welcome.menu.isEmpty else { return .consumed }
         switch event.key {
         case .up:
-            welcome.selectedIndex = max(0, welcome.selectedIndex - 1)
+            switch welcome.selectedIndex {
+            case .some(let index) where index > 0:
+                welcome.selectedIndex = index - 1
+            default:
+                welcome.selectedIndex = welcome.menu.count - 1
+            }
             return .redraw
         case .down:
-            welcome.selectedIndex = min(welcome.menu.count - 1, welcome.selectedIndex + 1)
+            switch welcome.selectedIndex {
+            case .some(let index) where index + 1 < welcome.menu.count:
+                welcome.selectedIndex = index + 1
+            default:
+                welcome.selectedIndex = 0
+            }
             return .redraw
         case .enter:
-            guard welcome.menu.indices.contains(welcome.selectedIndex) else { return .consumed }
-            return .selected(id: overlay.id, rowID: welcome.menu[welcome.selectedIndex].id)
+            guard let index = welcome.selectedIndex,
+                  welcome.menu.indices.contains(index)
+            else { return .consumed }
+            return .selected(id: overlay.id, rowID: welcome.menu[index].id)
         default:
             return .consumed
         }

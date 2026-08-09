@@ -284,6 +284,17 @@ public struct ChangelogManager: Sendable {
         return Self.readCache(cachePath)
     }
 
+    /// The disk cache alone, no network — what backs the welcome menu's
+    /// Changelog row gate. Upstream shows that row from the first frame and
+    /// lets its dispatch no-op until `changelog_md` is populated
+    /// (`views/welcome/mod.rs:1751-1753`, `app/app_view.rs:4593-4600`); this
+    /// port has no startup prefetch yet (B2-W2), so the row paints only when
+    /// a cached CHANGELOG.md already exists and its dispatch re-reads the
+    /// same cache — never a 3 s CDN wait from a menu click.
+    public func cachedMarkdown() -> String? {
+        Self.readCache(mdCache)
+    }
+
     /// When set, `fetch` skips the CDN and only reads the disk cache. Used
     /// by harness tests that seed `CHANGELOG.{md,json}` under a temp home
     /// (`changelog.rs:196-198`: non-empty and not `"0"`).

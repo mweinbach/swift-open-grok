@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-09 (Wave 18 B9 COMPLETE: /release-notes, the privacy program, and the agents/personas modal all live with working backings)
+**As of:** 2026-08-09 (Wave 18 B2-W1: the welcome menu is live with per-row backings; W2 changelog slot next)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1343,6 +1343,100 @@ marker, bundle-catalog column.
 live-seam feed (`7477e0d`), read-only modal (`d50ade8`), mutations (`4914d60`), CRUD +
 detail (this entry). Every surface landed with working backings in dependency order;
 the docs corpus's descriptions of all three surfaces are now true.
+
+## Wave 18 B2 — native scrollback, pager-minimal, screen mode, welcome (research complete, queued)
+
+Research at the pin, with the headline corrections and lead rulings:
+
+1. **The roadmap's "six modules" undercounted: `xai-grok-pager-minimal` is NINE modules,
+   5,627 lines**, plus an 888-line pager-side read surface (`minimal/api.rs`) and a
+   fn-pointer hook seam (`minimal_hook.rs` — the pager cannot depend on minimal; when
+   the seam is not installed the minimal branches are inert). The minimal frontend is
+   an XL program (M1–M4 below), not one roadmap line.
+2. **§4 finding, the `[Opt in]` class:** the port's `screen_mode` settings row is a
+   registered, restart-required row writing `ui.screen_mode` — **a key with zero
+   readers** (`resolveInteractivePagerMode` consults only flags and TTY-ness); its
+   description also names `/minimal`//`/fullscreen`, which are ABSENT from the
+   59-command registry, and `/timeline`'s landed refusal copy tells users to "Run
+   /fullscreen". Three surfaces advertise a hole.
+3. **Screen-mode relaunch is a process-level `exec`, not the suspend seam** (verified:
+   `Action::RelaunchInScreenMode` → quit → restore → `execv` with `--resume <sid>` +
+   mode flag + consume-once `GROK_SCREEN_MODE`; Windows spawn-and-WAIT). The B3
+   dependency is already satisfied by the landed $PAGER/$EDITOR seams — relaunch needs
+   neither.
+4. **The port has zero terminal-scrollback-injection capability** — its non-fullscreen
+   mode is a bottom-anchored ≤12-row repainted strip; no `insert_before` analog exists
+   anywhere. Upstream's `insert_before` renders off-screen and scrolls rows into the
+   terminal's NATIVE scrollback (main screen, mouse capture OFF in minimal); the
+   commit pipeline is print-once with mark-only-after-successful-insert.
+5. **Welcome backings:** announcements live; changelog client live but no startup
+   prefetch; `bulletsFromEntries` consumer-less (the B9-a marker); the welcome menu
+   machinery half-exists (`PagerWelcomeMenuItem` + key handling + painters live, but
+   every live push is menu-less — constructed only in tests); no hero info slot; the
+   privacy banner's welcome tip slot blocked by the hero (the B9-c3 recorded
+   divergence, confirmed at the landed router comment).
+
+**Lead rulings:** (a) the four programs land as **W (welcome) → S1 (screen-mode config
+reader) → N (native scrollback layer, implemented-unwired) → M1–M4 (minimal frontend)
+→ S2 (`/minimal`//`/fullscreen` + exec relaunch + ModeSupport)** — S2 LAST, because
+relaunching into today's degraded strip would register commands whose advertised
+behavior their backing doesn't deliver; (b) native scrollback is separable and lands
+as a tested terminal-core layer with no consumer (the B9-b0 precedent); (c) S1 trims
+the settings-row description's `/minimal`//`/fullscreen` sentence until S2 restores it
+(never advertise an absent surface); (d) W1 omits any menu row whose backing the port
+lacks (checked per-row at implementation); (e) the inline-counts-as-fullscreen
+ModeSupport question is ruled at S2 with the refusal-copy fix. **Deferral-anchor
+bookkeeping:** the B9 welcome-menu anchor → W1; changelog prefetch/bullets/CTA →
+W2 (+W3 announcement arbitration); privacy-banner welcome slot → W4. §2 traps carried
+into N: CRLF segmentation (three prior byte-level bugs), synchronized-update
+bracketing, the tmux clear-last artifact, and both upstream bug comments on
+`set_viewport_height`.
+
+### B2-W1 — the welcome menu goes live (serial gate: exit 0, 5,255 tests, zero issues)
+
+The live welcome overlay now carries a real menu built per lead ruling (d), every
+painted row backed end-to-end: **Resume session** (`ctrl+s`, gated on a session
+catalog) → the real `/resume` picker; **Changelog** (click-only) → the cached
+`CHANGELOG.md` through the same document viewer `/release-notes` uses — cache-gated
+now (upstream paints it from frame one and no-ops until the fetch fills; the port has
+no prefetch until W2, and a menu row that no-ops or stalls 3 s on CDN would be the §4
+row — cost recorded: first-ever runs show no Changelog row until a fetch seeds the
+cache; W2 closes it); **Quit** (`ctrl+q`); the compiled version painted as the hero
+badge. **Omitted with citations:** New worktree (the port's only worktree verb refuses
+by name — no fork-into-worktree backing), Import Claude settings (no import surface
+exists), the gate-menu variant (the port never renders a pre-access welcome; no
+`AuthState` model at this seam). **The load-bearing routing decision, lead-verified at
+the pin:** upstream's plain-Enter arm (`app_view.rs:4104-4109`) returns `NewSession`
+BEFORE any menu dispatch — keyboard Enter can never dispatch a menu row; rows go by
+mouse and ctrl-chords only. The port matches: the welcome stays `capturesInput: false`,
+Enter/typing fall through to the live composer (pinned both ways, incl. the
+pre-existing end-to-end type-and-submit proof), and only welcome-scoped `ctrl+s`/`ctrl+q`
+are intercepted. Hover selection is live (the port's any-event mouse tracking carries
+`.move`). 8 net-new live-seam tests.
+
+**Recorded divergences:** keyboard `ctrl+q` quits in one press (upstream arms
+press-again confirmation via a global registry the port's controller-side `confirm()`
+cannot reach from overlay state; the cost is an accidental quit of an EMPTY
+pre-first-turn session — upstream's mouse quit is also immediate; a global confirmed
+Quit chord is its own slice); the vscode-family `ctrl+d` hint variant omitted (the
+port has no multi-marker family detector); the session picker opens as a modal over
+the welcome rather than upstream's in-welcome picker (the standing `/resume` shape);
+keyboard Up/Down menu nav not live (upstream's is dead behind the plain-Enter arm and
+needs an unfocused-prompt state the port lacks — hover/chords/click are the live
+paths, as upstream's effectively are).
+
+**E18 test race, lead-diagnosed and fixed in the same gate:** the W1 gate's first run
+failed `LiveSchedulerHostFireTests` "a due task fires through the trigger and
+re-anchors its cadence" (`fires.count == 0`) — a LATENT race in the E18 test, not a
+W1 or production bug: `createTask(fireImmediately: true)` with a sink installed arms a
+ZERO-delay timer whose own `fireDue` hop can win the actor against the test's explicit
+trigger; both paths are correct production behavior, but the assertion is on the
+trigger's return. It won ~20 consecutive gates and lost once. Fixed deterministically:
+the task is now due one interval out (the real-time timer sleeps ~300 wall seconds and
+cannot race the synchronously-advanced injected clock); `fireImmediately` delivery
+keeps its coverage in the no-sink test where no timer arms. This is the second
+one-off flake in 20+ gates (the interjection deadline race was the first, still
+unfixed-by-design pending recurrence); both diagnosed, neither a product bug.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

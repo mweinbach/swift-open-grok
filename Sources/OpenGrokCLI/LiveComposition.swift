@@ -7643,7 +7643,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// that no longer fits (below 20×6) publishes nothing, so a stale rect
     /// would hit-test against an overlay that is not on screen.
     private var overlays = PagerOverlayStack()
-    private var lastOverlayBounds: [PagerOverlayBounds] = []
+    /// Internal (not private) so the live-seam tests can drive mouse events
+    /// against the rects the REAL frame published — per AGENTS.md §3, the
+    /// welcome menu's click/hover proofs hit-test these bounds instead of
+    /// guessing coordinates.
+    private(set) var lastOverlayBounds: [PagerOverlayBounds] = []
     /// The timeline rail the last frame painted, refreshed alongside
     /// `lastOverlayBounds` on the same replace-wholesale rule: upstream
     /// computes the geometry once per frame and mouse routing consumes that
@@ -8511,6 +8515,90 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         }
     }
 
+    /// The welcome hero, menu included — upstream's authenticated row set
+    /// (`views/welcome/mod.rs:1755-1787` at pin 650c1db7) filtered per row
+    /// to what this port can actually dispatch (Wave 18 B2 lead ruling d —
+    /// never paint a row without a backing):
+    ///
+    /// - `Import Claude settings` (`ctrl+i  [x]`, conditional): OMITTED —
+    ///   the port has no Claude-import surface (upstream's
+    ///   `Action::ImportClaudeSettings` → `import_claude_modal`).
+    /// - `New worktree` (`ctrl+w`): OMITTED — upstream opens a labeled
+    ///   worktree dialog (`Action::OpenNewWorktreeDialog` →
+    ///   `NewWorktreeSession`); the port's only worktree verb, `/fork
+    ///   --worktree`, REFUSES by name (`LivePagerForkCommand`), so there is
+    ///   no end-to-end backing.
+    /// - `Resume session` (`ctrl+s`): landed when a session catalog exists
+    ///   — the row reaches the same picker `/resume` opens
+    ///   (`Action::FetchSessionList`, `app/app_view.rs:4608-4610`).
+    /// - `Changelog` (click-only, no key — `("", "Changelog")`,
+    ///   `mod.rs:1783-1785`): landed gated on a CACHED changelog. Upstream
+    ///   paints it from the first frame and lets dispatch no-op until the
+    ///   startup prefetch fills `changelog_md`; the port has no prefetch
+    ///   yet (B2-W2), so the gate keeps every painted row functional.
+    ///   Cost: no Changelog row until some `/release-notes` run seeds the
+    ///   cache.
+    /// - `Quit` (`ctrl+q`): landed — the `/quit` round-trip. Upstream swaps
+    ///   the hint to `ctrl+d` in VS Code-family embeds
+    ///   (`is_vscode_family`, `pager-render/src/terminal/mod.rs:120-127`);
+    ///   the port has no terminal-brand seam (only a raw TERM_PROGRAM
+    ///   string), so the variant is omitted and `ctrl+q` paints
+    ///   unconditionally.
+    ///
+    /// The gate-menu variant (`!has_access`: `[cta] / Logout / Quit`,
+    /// `mod.rs:1760-1762`) is absent with the rest of the gated welcome:
+    /// this port never renders a pre-access welcome (no `AuthState` model;
+    /// the overlay only exists inside an authenticated session).
+    ///
+    /// Version is upstream's hero-inline badge value (`render_version_badge`
+    /// `HeroInline`, `mod.rs:462-489` paints `xai_grok_version::VERSION`);
+    /// the port's analog honors the `GROK_TEST_VERSION` override.
+    private func welcomeOverlay() -> PagerWelcomeOverlay {
+        var menu: [PagerWelcomeMenuItem] = []
+        if sessionCatalog != nil {
+            menu.append(PagerWelcomeMenuItem(
+                id: Self.welcomeResumeRowID,
+                key: "ctrl+s",
+                label: "Resume session"
+            ))
+        }
+        if ChangelogManager.fromEnvironment(environment).cachedMarkdown() != nil {
+            menu.append(PagerWelcomeMenuItem(
+                id: Self.welcomeChangelogRowID,
+                key: "",
+                label: "Changelog"
+            ))
+        }
+        menu.append(PagerWelcomeMenuItem(
+            id: Self.welcomeQuitRowID,
+            key: "ctrl+q",
+            label: "Quit"
+        ))
+        return PagerWelcomeOverlay(
+            version: OpenGrokCLIVersion.installed(environment: environment),
+            subtitle: LivePagerChrome.collapseHome(workingDirectory),
+            menu: menu
+        )
+    }
+
+    static let welcomeOverlayID = "welcome"
+    static let welcomeResumeRowID = "resume"
+    static let welcomeChangelogRowID = "changelog"
+    static let welcomeQuitRowID = "quit"
+
+    /// Internal (not private) so the live-seam hover test can pin the
+    /// selection the REAL mouse router computed (AGENTS.md §3) — the
+    /// highlight itself is a background attribute the text-stripping test
+    /// sink cannot observe.
+    var welcomeMenuSelectionForTesting: Int? {
+        for overlay in overlays.overlays where overlay.id == Self.welcomeOverlayID {
+            if case .welcome(let welcome) = overlay.content {
+                return welcome.selectedIndex
+            }
+        }
+        return nil
+    }
+
     func begin() async throws {
         try renderer.start()
         if let permissionCoordinator {
@@ -8531,12 +8619,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // The welcome screen only makes sense on an empty session, and it must
         // not capture input: the reference paints a live composer beneath it.
         if conversation.items.isEmpty {
-            overlays.push(.welcome(
-                PagerWelcomeOverlay(
-                    subtitle: LivePagerChrome.collapseHome(workingDirectory)
-                ),
-                capturesInput: false
-            ))
+            overlays.push(.welcome(welcomeOverlay(), capturesInput: false))
         }
         // Privacy-banner gate state, hydrated at the pager-startup seam like
         // upstream's event_loop resolution (event_loop.rs:1007-1029). Local
@@ -8700,10 +8783,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         pendingPlanApprovalRequest = nil
         endTurn()
         overlays.removeAll()
-        overlays.push(.welcome(
-            PagerWelcomeOverlay(subtitle: LivePagerChrome.collapseHome(workingDirectory)),
-            capturesInput: false
-        ))
+        overlays.push(.welcome(welcomeOverlay(), capturesInput: false))
     }
 
     /// Move the transcript viewport.
@@ -9233,12 +9313,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 rows: matches
             ))
         case .welcomeScreen:
-            overlays.push(.welcome(
-                PagerWelcomeOverlay(
-                    subtitle: LivePagerChrome.collapseHome(workingDirectory)
-                ),
-                capturesInput: false
-            ))
+            overlays.push(.welcome(welcomeOverlay(), capturesInput: false))
         case .shortcutsHelp:
             overlays.push(.help(
                 id: "shortcuts-help",
@@ -10301,10 +10376,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         overlays.removeAll()
         hasStartedFirstTurn = !conversation.items.isEmpty
         if conversation.items.isEmpty {
-            overlays.push(.welcome(
-                PagerWelcomeOverlay(subtitle: LivePagerChrome.collapseHome(workingDirectory)),
-                capturesInput: false
-            ))
+            overlays.push(.welcome(welcomeOverlay(), capturesInput: false))
         }
         note("Resumed session \(String(sessionID.prefix(8))) — "
             + "\(conversation.items.count) block\(conversation.items.count == 1 ? "" : "s") restored.")
@@ -10543,10 +10615,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         selection.unfocus()
         followsBottom = true
         note("Session deleted. This session keeps its id, so anything you send now starts its history over.")
-        overlays.push(.welcome(
-            PagerWelcomeOverlay(subtitle: LivePagerChrome.collapseHome(workingDirectory)),
-            capturesInput: false
-        ))
+        overlays.push(.welcome(welcomeOverlay(), capturesInput: false))
     }
 
     /// Scroll so the block at `index` sits at the top of the transcript.
@@ -11191,6 +11260,40 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             }
             return nil
         }
+        if overlayID == Self.welcomeOverlayID {
+            // The welcome stays up: upstream's welcome view survives its own
+            // menu actions — only the first turn replaces it. Index dispatch
+            // is `dispatch_menu_action` (`app/app_view.rs:4584-4620` at pin
+            // 650c1db7); rows this port omitted (import, worktree) have no
+            // ids to arrive here.
+            switch rowID {
+            case Self.welcomeResumeRowID:
+                // `Action::FetchSessionList` (`:4608-4610`) — the exact
+                // picker `/resume` opens, honest refusal included when the
+                // composition has no session catalog.
+                try await present(.sessionPicker)
+            case Self.welcomeChangelogRowID:
+                // `Action::ShowReleaseNotes` from ALREADY-CACHED markdown
+                // only (`:4611-4618`); a vanished cache is upstream's
+                // `Unchanged` no-op, never a 3 s CDN wait from a click.
+                guard let markdown = ChangelogManager
+                    .fromEnvironment(environment).cachedMarkdown()
+                else { return nil }
+                overlays.push(LiveHowtoGuidesPicker.viewerOverlay(
+                    title: "Release Notes",
+                    content: markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+                ))
+            case Self.welcomeQuitRowID:
+                // `Action::Quit` (`:4619`). A mouse-dispatched quit is
+                // immediate upstream too (`apply_quit_confirmation` with no
+                // key event, `:3620-3621`); the round-trip is the same
+                // controller-owned `/quit` the command palette takes.
+                return "/quit"
+            default:
+                break
+            }
+            return nil
+        }
         overlays.dismiss(id: overlayID)
         switch overlayID {
         case "model":
@@ -11376,6 +11479,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func handleInput(_ event: InputEvent) async throws -> OpenGrokPagerInputRouting {
         switch event {
         case .key(let key):
+            if let welcomeRouting = try await handleWelcomeChord(key) {
+                return welcomeRouting
+            }
             guard overlays.isActive else { return .notHandled }
             switch overlays.handle(key, viewportHeight: overlayViewportHeight) {
             case .ignored:
@@ -11424,6 +11530,44 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         }
     }
 
+    /// The welcome screen's app-level chords — the port of upstream's
+    /// welcome-scoped key arms (`handle_welcome_input`,
+    /// `app/app_view.rs:4110-4134` at pin 650c1db7), which live OUTSIDE the
+    /// overlay-focus system exactly as these do: the welcome never captures
+    /// input, so plain typing and Enter keep falling through to the live
+    /// composer (upstream: text promotes to a session and forwards,
+    /// `:4173-4177`; a plain Enter always starts the session, `:4104-4109`).
+    ///
+    /// Only the chords whose rows landed are bound: `ctrl+s` resume
+    /// (`:4119-4121`) and `ctrl+q` quit. Upstream's `ctrl+w` worktree
+    /// (`:4116-4118`) and `ctrl+i` import (`:4128-4130`) go with their
+    /// omitted rows. `ctrl+q` reaches upstream's Quit through the global
+    /// action registry with a press-again confirmation
+    /// (`defaults.rs:764-785`, `app_view.rs:3598-3603`); this port's welcome
+    /// binding quits on ONE press — recorded divergence. Cost: an accidental
+    /// ctrl+q on the welcome exits immediately — of an empty, pre-first-turn
+    /// session, which is also what upstream's mouse quit does.
+    ///
+    /// A capturing overlay above the welcome owns the keys first
+    /// (`!overlays.isActive`), upstream's modal-blocks-welcome ordering.
+    private func handleWelcomeChord(_ key: KeyEvent) async throws -> OpenGrokPagerInputRouting? {
+        guard !overlays.isActive,
+              overlays.contains(id: Self.welcomeOverlayID),
+              key.modifiers.contains(.control),
+              case .char(let character) = key.key
+        else { return nil }
+        switch character.lowercased() {
+        case "s":
+            try await present(.sessionPicker)
+            try renderState()
+            return .consumed
+        case "q":
+            return .runCommand("/quit")
+        default:
+            return nil
+        }
+    }
+
     /// Row budget for the focused overlay's page keys, read off the last painted
     /// frame. Falls back to the transcript height when that overlay published no
     /// bounds, which is what a viewport too small to hold a modal looks like.
@@ -11463,6 +11607,34 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 return nil
             }
             try renderState()
+            return nil
+        }
+
+        if event.kind == .move {
+            // Hover moves the welcome menu highlight — upstream's
+            // `MouseEventKind::Moved` arm (`app/app_view.rs:4428-4443` at pin
+            // 650c1db7): the selection becomes the row under the pointer, or
+            // NONE off the rows, and only a change repaints. The `?1003`
+            // any-event tracking the driver enables is what delivers motion
+            // with no button held. A capturing overlay blocks hover exactly
+            // as it blocks the rail (`overlay_blocks_rail_hover`).
+            guard !overlays.isActive,
+                  let welcomeBounds = lastOverlayBounds.last(
+                      where: { $0.id == Self.welcomeOverlayID }
+                  )
+            else { return nil }
+            let hoveredRowID = welcomeBounds.row(atX: event.x, y: event.y)?.id
+            var changed = false
+            overlays.updateWelcome { welcome in
+                let target = hoveredRowID.flatMap { id in
+                    welcome.menu.firstIndex { $0.id == id }
+                }
+                if welcome.selectedIndex != target {
+                    welcome.selectedIndex = target
+                    changed = true
+                }
+            }
+            if changed { try renderState() }
             return nil
         }
 

@@ -456,8 +456,22 @@ struct PagerOverlayFocusTests {
             PagerWelcomeMenuItem(id: "quit", key: "ctrl+q", label: "Quit")
         ])
         var stack = PagerOverlayStack([.welcome(welcome)])
+        // No selection until navigation — upstream's `welcome_menu_index`
+        // starts `None` (app/app_view.rs:1912) and Enter with no selection
+        // dispatches nothing (`:4163-4165` requires `Some`).
+        #expect(stack.handle(key(.enter)) == .consumed)
+        // Down from no selection lands on the FIRST row; Up wraps to the
+        // last (`handle_menu_nav`, app/app_view.rs:4518-4540).
+        #expect(stack.handle(key(.down)) == .redraw)
         #expect(stack.handle(key(.down)) == .redraw)
         #expect(stack.handle(key(.enter)) == .selected(id: "welcome", rowID: "quit"))
+        // Wrap: Down from the last row returns to the first.
+        #expect(stack.handle(key(.down)) == .redraw)
+        #expect(stack.handle(key(.enter)) == .selected(id: "welcome", rowID: "resume"))
+        // Up from the first row wraps to the last.
+        #expect(stack.handle(key(.up)) == .redraw)
+        #expect(stack.handle(key(.up)) == .redraw)
+        #expect(stack.handle(key(.enter)) == .selected(id: "welcome", rowID: "resume"))
     }
 }
 
