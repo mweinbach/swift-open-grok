@@ -1255,6 +1255,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         // the session has no live transport (headless launches),
                         // in which case the renderer closes the banner slot.
                         announcements: stack.announcements,
+                        // The `/release-notes` changelog client, on the same
+                        // transport the sampler/catalog/announcements use and
+                        // gated on the same export boundary: a Codex
+                        // (xAI-export-denied) session issues no `x.ai`
+                        // changelog request (recorded divergence — upstream's
+                        // changelog fetch is ungated; see PORT_STATUS.md
+                        // Wave 18 B9).
+                        changelog: ChangelogManager.fromEnvironment(
+                            context.environment,
+                            transport: foundation.samplingConfiguration.transport,
+                            exportPolicy: foundation.samplingConfiguration
+                                .provider.profile.xaiServices
+                        ),
                         // The paint ceiling: `GROK_MIN_DRAW_MS` wins, then the
                         // `[ui.display_refresh]` auto-cadence policy (inert
                         // until a display probe exists — `probedRefreshHz` is
@@ -7741,6 +7754,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// every live announcement is hidden.
     private var announcementBanner: PagerAnnouncementBanner?
 
+    /// The `/release-notes` changelog client — CDN fetch, disk cache under
+    /// `$OPENGROK_HOME`, and the recorded export-boundary gate (the
+    /// announcements precedent). `nil` in compositions that never passed
+    /// one; the dispatch then builds a cache-only manager from this
+    /// renderer's environment, upstream's offline arm.
+    private let changelog: ChangelogManager?
+
     init(
         mode: OpenGrokPagerMode,
         terminal: OpenGrokLiveTerminal,
@@ -7771,6 +7791,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         mcpServers: [MCPServerConnection] = [],
         openGrokHome: URL? = nil,
         announcements: LiveAnnouncementsComposition? = nil,
+        changelog: ChangelogManager? = nil,
         paintCadence: TimeInterval = PagerMotion.defaultPaintCadence,
         environment: [String: String]? = nil,
         toolExecutor: LiveToolExecutor? = nil,
@@ -7786,6 +7807,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.openGrokHome = openGrokHome ?? OpenGrokHomeResolver
             .resolve(environment: ProcessInfo.processInfo.environment)
         self.announcements = announcements
+        self.changelog = changelog
         self.terminal = terminal
         self.sink = sink
         self.workingDirectory = workingDirectory
@@ -8977,6 +8999,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 title: title,
                 content: content
             ))
+        case .releaseNotes:
+            await presentReleaseNotes()
         case .dismissAll:
             overlays.removeAll()
             currentPermissionRequestID = nil
@@ -9000,6 +9024,38 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             return
         }
         openBrowser(parsed)
+    }
+
+    // MARK: - /release-notes
+
+    /// `/release-notes` — upstream `ReleaseNotesCommand::run`
+    /// (`release_notes.rs:27-35`): fetch through `ChangelogManager`, show
+    /// the markdown as `Action::ShowReleaseNotes { title: "Release Notes",
+    /// content: trimmed }`, or answer `CommandResult::Error` with the exact
+    /// offline copy. The viewer is the SAME document overlay `/docs` routes
+    /// through (`LiveHowtoGuidesPicker.viewerOverlay`) — upstream's
+    /// DocViewer reuse, no second render seam. The error rides `note`, this
+    /// port's channel for `CommandResult::Error` (the `/docs`
+    /// unknown-target precedent).
+    ///
+    /// The fetch re-resolves `$OPENGROK_HOME` and `GROK_CHANGELOG_OFFLINE`
+    /// from this renderer's audited environment on every call (upstream
+    /// re-runs `from_env_home` inside `fetch`), so a harness-injected home
+    /// always wins. A composition constructed without a client gets a
+    /// cache-only manager: with no transport there is nothing to fetch
+    /// with, which is exactly upstream's offline arm.
+    private func presentReleaseNotes() async {
+        let manager = changelog ?? ChangelogManager.fromEnvironment(environment)
+        let fetched = await manager.fetch(environment: environment)
+        guard let markdown = fetched.markdown else {
+            // Byte-exact upstream copy (release_notes.rs:33).
+            note("No release notes available (offline).")
+            return
+        }
+        overlays.push(LiveHowtoGuidesPicker.viewerOverlay(
+            title: "Release Notes",
+            content: markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+        ))
     }
 
     // MARK: - /fork, /tasks

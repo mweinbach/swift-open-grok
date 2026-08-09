@@ -2577,6 +2577,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "List background tasks, subagents, and scheduled tasks",
             usage: "/tasks"
         ),
+        // `/release-notes` follows `/tasks`, upstream's registry order
+        // (`slash/commands/mod.rs:150`, between `/tasks` and `/tutorial`;
+        // `/tutorial` sits further down this table, so the pinned RELATIVE
+        // pair is `/tasks` → `/release-notes` — the E20/E21 convention).
+        // Name, alias, description and usage are verbatim
+        // (`release_notes.rs:10-25`).
+        PagerCommandDefinition(
+            name: "release-notes",
+            aliases: ["changelog"],
+            summary: "View release notes for the current version",
+            usage: "/release-notes"
+        ),
         // `/btw` (`slash/commands/btw.rs:12-38`). Upstream fires an ACP ext
         // method that bypasses the prompt queue (`x.ai/btw` →
         // `handle_side_question`); this port emits the `.sideQuestion`
@@ -3241,6 +3253,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 // the only layer that owns a session id here.
                 try await emit(.overlay(.showTasks))
                 return .handled
+            case "release-notes":
+                // Arguments are ignored — upstream's `ReleaseNotesCommand::run`
+                // declares `_args` (release_notes.rs:27). The fetch, the
+                // `Action::ShowReleaseNotes` arm, and the offline error copy
+                // (release_notes.rs:28-34) all live with the render layer:
+                // the controller cannot do network.
+                try await emit(.overlay(.releaseNotes))
+                return .handled
             case "effort":
                 let level = Self.rejoined(invocation.arguments)
                 try await emit(.overlay(.reasoningEffort(
@@ -3689,6 +3709,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /login [provider]         Connect xAI, OpenAI Codex, or an API-key provider
       /logout [codex]           Log out of xAI or OpenAI Codex
       /theme [name]  /t         Switch the color theme
+      /release-notes /changelog View release notes for the current version
       /tutorial                 Quick tips
       /workflows                Show workflow runs
       /timestamps               Toggle message timestamps on/off

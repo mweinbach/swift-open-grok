@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-08 (Wave 17 R4/R5: Fireworks pacing gate + curated Kimi entries landed; reconcile deferral ruled — the .58 re-pin wave is closed)
+**As of:** 2026-08-08 (Wave 18 B9-a: /release-notes live on the ChangelogManager port; B9-c privacy and B9-b personas queued)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -990,6 +990,83 @@ absent into clearing; the test is the tripwire). 8 net-new tests.
 missing (predates `.58`). Cost today: an authoritative Fireworks refresh replaces the
 embedded partition, so post-refresh the port drops the two Kimi variants entirely.
 Queued as R4b alongside the pacing gate.
+
+### Wave 18 B9 — personas/agents modal, release-notes viewer, privacy banner (research complete, queued)
+
+Research at the `.58` pin, with three seam corrections and lead rulings:
+
+1. **Release-notes viewer needs no new render seam** — the live `/docs` document
+   overlay (`.showDocument` → `PagerTextOverlay`) IS upstream's DocViewer with
+   `standalone: true` semantics. The absent half is only the `ChangelogManager` data
+   source (`changelog.rs`: CDN `x.ai/cli/changelogs/{VERSION}.external.{md,json}`, 3 s
+   timeouts, parse-before-cache, `GROK_CHANGELOG_OFFLINE`), which follows the
+   announcements-pipeline precedent including its recorded stricter export-boundary
+   gate. **B9-a queued first** (a1 client S, a2 command S). Deferred with it: startup
+   prefetch + welcome bullets/menu/CTA (the port's welcome overlay has no menu or info
+   slot — Wave 18 B2 territory; cost: first `/release-notes` per session pays the 3 s
+   offline timeout).
+2. **The agents/personas modal must not land before personas feed the live seam** —
+   `LiveSubagentHost` resolves subagent runtime with `personas: [:]`, so persona CRUD
+   today would write files no session ever reads (the §3 "Saved, and permanently
+   unfindable" class). **Lead ruling: B9-b0 (feed `[subagents.personas]` + persona
+   dirs into `resolveRuntimeConfig`, proven through a real subagent's resolved
+   instructions) is a hard prerequisite**; then b1 read-only Agents tab (new
+   `.agents` overlay case, E14 extensions-modal precedent), b2 toggle/default-agent
+   writes, b3 Personas CRUD + detail modal. Deferred: bundled-catalog column (no
+   `x.ai/bundle/status` client exists — types only), `EditInEditor` (needs the
+   `/transcript` `$PAGER` suspend seam generalized to `$EDITOR`), session-agent-name
+   marker (no channel; resolved default shown, recorded).
+3. **The privacy banner is frame chrome, not an overlay** — second tenant of the live
+   frame builder's announcement-banner slot with upstream's critical-announcement-wins
+   rule; clicks ride the E21 per-frame-geometry channel; hover styling is the recorded
+   E20/E21 missing-channel divergence. **§4 finding: `[Opt in]` has no working backing**
+   — the port has no `PUT /privacy/coding-data-retention` client, and the
+   `coding_data_sharing` settings row is a non-persistable auth-metadata viewer, so
+   `/privacy` currently deep-links to a row that cannot change anything. **Lead
+   rulings:** (a) landing order c1 gate+ack plumbing (dark — rollout defaults false) →
+   c2 retention write client (un-lies the existing `/privacy` row, valuable standalone)
+   → c3 the banner, which therefore ships with BOTH buttons working — no one-button
+   variant; (b) mouse-only interaction ships as upstream has it (§4: no invented
+   keyboard affordance), cost recorded: without mouse reporting the banner is
+   dismissible only via the settings row. Deferred: welcome tip-slot placement (B2)
+   and consent-source telemetry.
+
+Landing order: **B9-a → B9-c → B9-b** (smallest first; c2 standalone value; b gated on
+b0). The docs corpus already documents all three surfaces, so each slice reduces
+existing over-promising. Remote keys `privacy_notice_rollout`/`privacy_banner_reshow_days`
+are parsed with zero readers today; B9-c1 adds their first readers.
+
+### B9-a — `/release-notes` on the ChangelogManager port (serial gate: exit 0, 5,081 tests, zero issues)
+
+`Sources/OpenGrokShellBase/Changelog.swift` (the crate map's home for
+`xai-grok-shell-base`, where upstream's `changelog.rs` lives): CDN
+`x.ai/cli/changelogs/{VERSION}.external.{md,json}` fetched in parallel with 3 s
+timeouts, disk cache `$OPENGROK_HOME/CHANGELOG.{md,json}` with per-call env-home
+re-resolution (harness homes win — upstream's `from_env_home`-inside-`fetch`), markdown
+write-through, JSON cached ONLY after a successful parse (upstream's poison-guard, why
+carried in the comment), CDN-miss fallback to disk at both levels,
+`GROK_CHANGELOG_OFFLINE` cache-only mode, tolerant entry decoding, and
+`bulletsFromEntries` ported+tested but consumer-less (awaiting the B2 welcome build-out,
+marked in-source, advertised nowhere). All FIVE upstream unit tests ported (the brief
+said four; the delegate corrected it) with the unreachable-base injectable-URL shape —
+no env mutation. `/release-notes` (alias `/changelog`, copy verbatim from
+`release_notes.rs:10-25`, verified at the pin; anchored after `/tasks` per
+`mod.rs:150`) emits a `.releaseNotes` intent; the renderer fetches and takes both
+upstream arms — markdown → the EXISTING `/docs` document overlay (the research's
+seam correction: no second viewer), absent → the byte-exact
+`No release notes available (offline).` notice. 24 net-new tests: 11 client, 7
+controller pins, 6 live-seam (painted seeded-cache content, scroll proof, exact error
+copy, and the no-request gate proof with a positive control).
+
+**Recorded divergence (lead-ruled):** the fetch is gated on the xAI export boundary,
+fail-closed by construction (`exportPolicy` defaults `.denied`; network requires
+allowed-AND-transport) — upstream's changelog fetch is ungated. Cost: a Codex-only
+session shows release notes only from a prior xAI session's cache, else the offline
+copy. **Deferred with the wave:** startup prefetch + welcome bullets/menu/CTA (B2; cost:
+first `/release-notes` per session pays the 3 s timeout when offline). Debugging note
+worth keeping (delegate's): the captured sink records the terminal DIFF stream, so a
+scroll test's marker must live in columns the replaced rows never painted — a
+coincidentally-identical cell emits nothing.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

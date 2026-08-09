@@ -561,6 +561,14 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// along because the controller resolved the title (`find_doc`) and the
     /// viewer needs nothing else.
     case showDocument(title: String, content: String)
+    /// `/release-notes` (alias `/changelog`) — upstream fetches the
+    /// changelog inside `run` and returns `Action::ShowReleaseNotes` with
+    /// the markdown, or `CommandResult::Error` when offline with no cache
+    /// (`slash/commands/release_notes.rs:27-35`). The controller cannot do
+    /// network, so unlike `.showDocument` no content rides the intent: the
+    /// `ChangelogManager` fetch and BOTH result arms live in the render
+    /// layer, which reuses the same document viewer `/docs` routes through.
+    case releaseNotes
     case dismissAll
 }
 
