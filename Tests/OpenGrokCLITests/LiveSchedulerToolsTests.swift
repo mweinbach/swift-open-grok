@@ -418,16 +418,29 @@ struct LiveSchedulerHostFireTests {
         let collector = FireCollector()
         await host.setFireSink { fire in await collector.record(fire) }
 
+        // NOT `fireImmediately`: a task due NOW with a sink installed arms a
+        // ZERO-delay timer whose own `fireDue` hop can win the actor against
+        // this test's explicit trigger — both paths are correct production
+        // behavior, but the assertion below is on the trigger's return, and
+        // the race cost one red gate (2026-08-09) after ~20 green ones. Due
+        // one interval out, the timer sleeps ~300 REAL seconds while the
+        // injected clock advances synchronously, so the trigger is the only
+        // deliverer this test can observe. `fireImmediately` delivery keeps
+        // its coverage in `noSinkHoldsTheFire` below, where no timer arms.
         let task = try await host.createTask(
             intervalSecs: 300,
             prompt: "check deploy status",
             durable: false,
             foreground: true,
-            fireImmediately: true
+            fireImmediately: false
         )
 
-        // `fireImmediately` backdates the anchor, so the task is due NOW —
-        // fired by the deterministic trigger, not by any wall-clock sleep.
+        // Not due yet at t0…
+        #expect(await host.fireDue(now: clock.current).isEmpty)
+
+        // …due exactly one interval later, fired by the deterministic
+        // trigger with the advanced injected clock — never a wall-clock sleep.
+        clock.advance(by: 300)
         let fires = await host.fireDue(now: clock.current)
         try #require(fires.count == 1)
         #expect(fires[0].taskID == task.id)
