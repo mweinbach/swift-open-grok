@@ -7639,6 +7639,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// with no rail clears this and a click can never act on a previous
     /// frame's ticks.
     private var lastTimelineRail: PagerTimelineRail?
+    /// The privacy banner's hit rects from the last painted frame, on the
+    /// rail's replace-wholesale rule (upstream re-arms them every draw and
+    /// clears them whenever the banner does not own the slot,
+    /// `agent_view/render.rs:2128-2148` at pin 650c1db7) — a click can
+    /// never act on a frame that no longer shows the banner. Internal (not
+    /// private) so the live-seam tests can pin what the REAL frame
+    /// published, per AGENTS.md §3.
+    private(set) var lastPrivacyBannerHits: PagerPrivacyBannerHitRects?
     private let permissionCoordinator: PagerPermissionCoordinator?
     /// The `ask_user_question` surface, presenter-installed in `begin()`
     /// exactly like the permission coordinator. `nil` in compositions with
@@ -7812,8 +7820,18 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// immediately so a slow proxy never blocks the input loop). Internal
     /// (not private) so the live-seam tests await the real spawned write
     /// instead of polling frames; the outcome is fully self-reported
-    /// (rollback + toast happen inside `setCodingDataSharing`).
+    /// (rollback + toast happen inside `setCodingDataSharing`). The
+    /// banner's `[Opt in]`/`[Opt out]` writes ride the same slot, so the
+    /// tests await those too.
     private(set) var pendingCodingDataWrite: Task<LiveCodingDataSharingOutcome, Never>?
+    /// `privacy_banner_opt_in_inflight` (app_view.rs:1275-1276): armed when
+    /// the banner's `[Opt in]` dispatches its write, so a second click
+    /// while the round trip is out is ignored (dispatch/status.rs:502) —
+    /// the debounce that keeps a double-click from issuing two consent
+    /// PUTs. Cleared when the write completes, success or failure alike
+    /// (status.rs:446-447, :487), so a failed opt-in leaves the banner up
+    /// AND clickable.
+    private var privacyBannerOptInInflight = false
 
     init(
         mode: OpenGrokPagerMode,
@@ -8341,6 +8359,144 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             _ = try? await manager.update(updated)
         }
         return result
+    }
+
+    // MARK: - Privacy banner surface (Wave 18 B9-c3)
+
+    /// Whether THIS frame offers the banner the announcement slot —
+    /// upstream's `privacy_banner_agent` (app_view.rs:4859-4863 at pin
+    /// 650c1db7): the gate says show AND no critical announcement holds
+    /// the slot. The render layer takes a `true` at face value (the
+    /// slot-ownership pin, agent_view/links.rs:573-580), so the
+    /// critical-outranks-privacy ranking lives HERE, where the resolved
+    /// announcement projection is. A promo does NOT outrank the banner —
+    /// upstream's fold gives the privacy banner the slot over one.
+    ///
+    /// Gated on fullscreen like `showTimeline`: upstream's banner slot
+    /// exists only in the fullscreen agent view (`agent_view/render.rs:
+    /// 888-892`; minimal has no banner chrome, and this port's inline
+    /// strip is a ≤12-row surface upstream never grows a consent banner
+    /// into). Cost: an inline session is never upsold and can only change
+    /// the setting from the `/privacy` row.
+    private var privacyBannerVisible: Bool {
+        mode == .fullScreen
+            && privacyBanner?.shouldShow() == true
+            && announcementBanner?.severity != .critical
+    }
+
+    /// `[Opt in]` — `dispatch_privacy_banner_opt_in` (dispatch/status.rs:
+    /// 501-514): opt in via the settings path; ack only after the write
+    /// confirms, so a failed round trip leaves the banner up instead of
+    /// recording a change that did not happen.
+    ///
+    /// The inflight arm mirrors upstream's `!effects.is_empty()`
+    /// (status.rs:510-513): `shouldShow()` already guarantees the
+    /// opted-out + unguarded state (its ZDR/team/opt-out arms are the same
+    /// mirror the write's guards read), so a click that passes it is
+    /// exactly a click whose effects would be non-empty — a `[Opt in]` on
+    /// an already-opted-in state never arms, because `shouldShow` is
+    /// already false (the `.unchanged` arm of c2's contract). If the state
+    /// flips between the click and the spawned write (a concurrent modal
+    /// commit), the write self-reports `.refused`/`.unchanged` and the
+    /// completion clears the flag, upstream's leave-it-clickable outcome.
+    private func dispatchPrivacyBannerOptIn() {
+        guard !privacyBannerOptInInflight,
+              privacyBanner?.shouldShow() == true else { return }
+        privacyBannerOptInInflight = true
+        // Spawned like the modal commit (status.rs:179-183 → the Effect
+        // task): a slow proxy must not block the input loop under a
+        // consent click either.
+        pendingCodingDataWrite = Task {
+            let outcome = await self.setCodingDataSharing(optedIn: true)
+            self.finishPrivacyBannerOptIn(outcome)
+            return outcome
+        }
+    }
+
+    /// The banner half of upstream's task-result handlers: clear inflight
+    /// (both arms — `handle_coding_data_sharing_updated` status.rs:446-447,
+    /// `handle_coding_data_sharing_failed` :487), and ack only a confirmed
+    /// opt-in (:448-450). The `opted_in` upstream reads there is the
+    /// CURRENT write's confirmed value; this port reads the live mirror
+    /// after the write instead, which lands the same place — and when a
+    /// concurrent opt-out superseded this write, the mirror says opt-out
+    /// and the banner correctly stays.
+    private func finishPrivacyBannerOptIn(_ outcome: LiveCodingDataSharingOutcome) {
+        privacyBannerOptInInflight = false
+        guard outcome == .saved,
+              privacyBanner?.codingDataRetentionOptOut == false else {
+            // `.failed`: c2 already rolled back and toasted; the banner
+            // stays up because no ack was recorded. `.refused`/`.unchanged`
+            // (a guard regressed between click and write): nothing to ack.
+            return
+        }
+        // Ack the banner (c1's seam). Deliberately no branch on the Bool:
+        // a failed disk write rolls the in-memory ack back inside
+        // `ackPrivacyBanner`, so the repaint below re-shows the banner —
+        // the failure announces itself on the surface it concerns (the c1
+        // recorded divergence from upstream's warn-and-hide).
+        ackPrivacyBanner()
+        try? renderState()
+    }
+
+    /// `[Opt out]` — `dispatch_privacy_banner_opt_out` (dispatch/status.rs:
+    /// 516-546): ack locally, then record the decline.
+    ///
+    /// The ack does NOT wait on the server, unlike `[Opt in]`'s: the user
+    /// asked for no change, so gating dismissal on a round trip would only
+    /// re-ask a question they answered (upstream's comment, :518-520).
+    ///
+    /// The decline deliberately BYPASSES `setCodingDataSharing`, whose
+    /// idempotent guard would skip it — the user is already opted out, and
+    /// recording that is the point (:522-525). Consent-source telemetry
+    /// (upstream's `log_coding_data_consent_selected`, :531-535) stays
+    /// lead-deferred with the rest of B9's telemetry.
+    private func dispatchPrivacyBannerOptOut() {
+        guard !privacyBannerOptInInflight,
+              privacyBanner?.shouldShow() == true else { return }
+        // Immediate local ack. No branch on the Bool for the same reason
+        // as the opt-in completion: a failed write already rolled the
+        // in-memory ack back, so the repaint below keeps the banner up —
+        // this port's self-announcing arm of upstream's fire-and-forget
+        // persist effect (:536).
+        ackPrivacyBanner()
+        pendingCodingDataWrite = Task {
+            await self.declinePrivacyBannerCodingDataSharing()
+        }
+        try? renderState()
+    }
+
+    /// The `[Opt out]` decline's envelope — upstream's directly-built
+    /// `Effect::SetCodingDataSharing { opted_in: false,
+    /// rollback_to_opted_in: false, seq: next }` (status.rs:537-544) plus
+    /// the halves of the shared task-result handlers it reaches: no
+    /// optimistic flip (the mirror already says opt-out), a claimed write
+    /// generation, success re-anchoring to the confirmed value
+    /// (status.rs:432-435), and failure applying the no-op `false`
+    /// rollback and the generic scrubbed toast (status.rs:469-477) — the
+    /// failure is NOT a banner concern: the ack already landed and the
+    /// banner stays dismissed, exactly upstream (nothing in the failure
+    /// handler touches the ack). A superseded reply touches nothing
+    /// (status.rs:429-431, :462-467).
+    private func declinePrivacyBannerCodingDataSharing() async -> LiveCodingDataSharingOutcome {
+        codingDataWriteSeq &+= 1
+        let seq = codingDataWriteSeq
+        switch await performCodingDataRetentionWrite(optOut: true) {
+        case .success(let confirmedOptOut):
+            guard seq == codingDataWriteSeq else { return .saved }
+            applyCodingDataSharingMirror(optOut: confirmedOptOut)
+            try? renderState()
+            return .saved
+        case .failure(let error):
+            guard seq == codingDataWriteSeq else { return .failed }
+            // `rollback_to_opted_in: false` — already opted out, so the
+            // revert is a no-op (upstream's comment, :540-542).
+            applyCodingDataSharingMirror(optOut: true)
+            note("\u{2717} Couldn't update coding data sharing: "
+                + pagerScrubErrorForToast(error.description))
+            try? renderState()
+            return .failed
+        }
     }
 
     func begin() async throws {
@@ -11098,6 +11254,43 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         }
 
         guard event.kind == .down, event.resolvedButton == .left else { return nil }
+        // The privacy banner's four click targets, resolved against the
+        // rects the LAST frame published (the rail's per-frame-geometry
+        // rule below) — upstream's banner-slot hit handling
+        // (`agent_view/links.rs:610-651`: opt-in/opt-out dispatch the
+        // banner actions, terms/policy dispatch `Action::OpenUrl`). A
+        // capturing overlay blocks the banner exactly as it blocks the
+        // rail (upstream's `overlay_blocks_rail_hover` family,
+        // `agent_view/render.rs:1195-1200`), and `hit == nil` keeps clicks
+        // inside ANY published overlay bounds — including the non-capturing
+        // welcome hero that overpaints this slot before the first turn —
+        // from reaching a banner that is not visibly on screen.
+        //
+        // Mouse-only by lead ruling, because upstream is (§4: no invented
+        // keyboard affordance). Cost: with mouse reporting off
+        // (`/toggle-mouse-reporting`, or a terminal without it), the
+        // banner cannot be dismissed here — only the `/privacy` settings
+        // row changes the preference, and only an ack hides the banner.
+        if hit == nil, !overlays.isActive, let banner = lastPrivacyBannerHits {
+            if let rect = banner.optIn, rect.contains(x: event.x, y: event.y) {
+                dispatchPrivacyBannerOptIn()
+                return nil
+            }
+            if let rect = banner.optOut, rect.contains(x: event.x, y: event.y) {
+                dispatchPrivacyBannerOptOut()
+                return nil
+            }
+            if let rect = banner.terms, rect.contains(x: event.x, y: event.y) {
+                openExternalURL(pagerPrivacyBannerTermsURL)
+                try renderState()
+                return nil
+            }
+            if let rect = banner.policy, rect.contains(x: event.x, y: event.y) {
+                openExternalURL(pagerPrivacyBannerPolicyURL)
+                try renderState()
+                return nil
+            }
+        }
         // The timeline rail's click-to-jump (`mouse.rs:415-427`): resolve the
         // hit through the same `pagerTimelineChevronTarget` that dimmed the
         // chevrons at paint time, then jump through the `/jump` seam — both
@@ -11543,6 +11736,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // Fresh every frame: a modal that no longer fits publishes no bounds.
         lastOverlayBounds = result.overlays
         lastTimelineRail = result.layout.timelineRail
+        lastPrivacyBannerHits = result.layout.privacyBanner
         lastConversationHeight = max(1, result.layout.conversation.height)
         lastMaximumScrollOffset = max(
             0,
@@ -11763,7 +11957,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // inline mode rides the same frame builder — without the gate a
             // `show_timeline = true` config would paint a rail into the
             // ≤12-row inline strip that upstream never grows.
-            showTimeline: mode == .fullScreen && userShowTimeline
+            showTimeline: mode == .fullScreen && userShowTimeline,
+            // Gate state and slot availability resolved HERE, per frame —
+            // the E19-E21 pass-through shape: the renderer receives the
+            // decided flag and never re-derives the gate
+            // (app_view.rs:4859-4863; see `privacyBannerVisible`).
+            privacyBanner: privacyBannerVisible
         )
     }
 

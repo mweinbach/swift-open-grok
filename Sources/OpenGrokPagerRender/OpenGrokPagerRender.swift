@@ -97,7 +97,7 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         )
     }
 
-    let layout = PagerFrameLayout(
+    var layout = PagerFrameLayout(
         bounds: bounds,
         statusBar: chrome.statusBar,
         announcementBanner: chrome.announcementBanner,
@@ -124,13 +124,32 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         theme: state.theme,
         motion: state.motion
     )
-    renderAnnouncementBanner(
-        state.announcementBanner,
-        in: chrome.announcementBanner,
-        buffer: &buffer,
-        theme: state.theme,
-        links: &links
-    )
+    // Slot ownership, upstream's `privacy_banner_owns_slot`
+    // (`agent_view/render.rs:2128-2148`): the flag plus enough rows to
+    // paint the banner whole. When the privacy banner owns the slot the
+    // announcement does not paint AND publishes no link span — upstream
+    // clears the announcement hit rects for the same reason
+    // (`render.rs:2134-2135`): a click where [hide] used to be must not
+    // dismiss an announcement that is not on screen. When ownership fails
+    // (flag off, or a squeezed slot below the banner's minimum height),
+    // the announcement paints exactly as before and the banner arms no
+    // rects (`render.rs:2130-2132`).
+    if state.privacyBanner,
+       chrome.announcementBanner.height >= pagerPrivacyBannerMinHeight {
+        layout.privacyBanner = renderPagerPrivacyBanner(
+            in: chrome.announcementBanner,
+            buffer: &buffer,
+            theme: state.theme
+        )
+    } else {
+        renderAnnouncementBanner(
+            state.announcementBanner,
+            in: chrome.announcementBanner,
+            buffer: &buffer,
+            theme: state.theme,
+            links: &links
+        )
+    }
     renderConversation(
         contentLines,
         visibleRange: visibleRange,
@@ -256,7 +275,18 @@ private func makeChromeLayout(
     // Its gap is NOT compact-dependent: upstream pushes an unconditional
     // `Length(1)` before the banner (`views/agent.rs:237-238`), and the same
     // holds for the turn-status and completions gaps below.
-    let announcementHeight = state.announcementBanner.map { take($0.height) } ?? 0
+    //
+    // The privacy banner is the slot's second tenant: when its flag is up,
+    // the slot grows to whichever tenant needs more rows — upstream's
+    // `banner_height.max(privacy_banner::height(inner_width))` fold
+    // (`agent_view/render.rs:888-892`). The banner sizes from its exported
+    // height-for-width, never a constant, because its body wraps.
+    let announcementRows = state.announcementBanner?.height ?? 0
+    let privacyBannerRows = state.privacyBanner
+        ? pagerPrivacyBannerHeight(width: bounds.width)
+        : 0
+    let bannerRows = max(announcementRows, privacyBannerRows)
+    let announcementHeight = bannerRows > 0 ? take(bannerRows) : 0
     let announcementGap = announcementHeight > 0 ? take(1) : 0
 
     let shortcutsHeight = state.shortcuts != nil ? take(1) : 0

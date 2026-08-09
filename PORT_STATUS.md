@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-09 (Wave 18 B9-c2: retention write client live, /privacy row un-lied; c3 banner next)
+**As of:** 2026-08-09 (Wave 18 B9-c3: privacy banner live — the B9-c program is closed; B9-b personas next)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1141,6 +1141,45 @@ number); on-demand hydration before consent guards (evaluating them against a
 default-constructed state would let a ZDR team's write through). **Deferred to c3:**
 banner paint, opt-in/opt-out handlers, the inflight flag; consent-source telemetry
 stays lead-deferred (the seam takes a source parameter when it lands).
+
+### B9-c3 — the privacy banner (serial gate: exit 0, 5,149 tests, zero issues). **The B9-c program is closed.**
+
+`PagerPrivacyBannerRender.swift` ports `views/privacy_banner.rs` whole with byte-parity
+copy (titles, description, `[Opt out]`/`[Opt in]`, all three legal variants, both x.ai
+legal URLs — lead-verified at the pin) and every paint invariant carried with its test:
+title-never-clipped compact fallback, legal line whole-from-widest-variant so both links
+stay reachable, **buttons whole-or-not-at-all** (upstream's stake comment carried: a
+clipped `[Opt in]` must not leave a click target in the blank margin where a stray
+click silently opts the user in), 4-row body cap with ellipsis, exported
+height-for-width. Painted as the SECOND TENANT of the frame-chrome announcement slot
+(the research's seam correction — no overlay case) with critical-announcement-wins
+(`app_view.rs:4859-4863`) and slot ownership per `render.rs:2128-2148` (the evicted
+announcement neither paints nor publishes its link span). Gate consumption is the c1
+`shouldShow()` on the render-state pass-through; rollout defaults false so nothing
+paints out of the box (`GROK_PRIVACY_NOTICE_ROLLOUT=1` is the live activation, matching
+upstream's own e2e). Four hit rects publish per-frame on `PagerFrameLayout`
+(replace-wholesale, the E21 rail pattern), blocked by capturing overlays AND the
+welcome hero so an invisible banner cannot take a consent click. Buttons carry
+upstream's exact asymmetry through the c2 seam (`status.rs:491-546`): opt-in arms the
+inflight debounce → write → `.saved` acks (with a live-mirror re-check that is
+upstream's `if opted_in` — a concurrent opt-out supersedes correctly), `.failed` clears
+inflight and the banner stays; opt-out acks locally IMMEDIATELY and fires the
+best-effort decline (bypassing the idempotence guard, `:522-546` — a failed decline
+toasts but never touches the ack). The deliberately un-branched `ackPrivacyBanner()`
+calls are commented: a failed disk write rolls the in-memory ack back inside the seam,
+so the repaint re-shows the banner — the failure announces itself on the surface it
+concerns. 17 net-new tests incl. the real-listener opt-in PUT, the parked-decline
+opt-out, inflight double-click = one request, and all four dark arms.
+
+**Recorded divergences:** no hover styling (the E20/E21 missing channel); mouse-only
+(lead ruling — cost: without mouse reporting, dismissal is via the `/privacy` row);
+fullscreen-only pass-through (upstream's slot exists only in the fullscreen agent
+view); welcome placement deferred to B2 (upstream shows the banner on the welcome
+screen first; here the hero overpaints the slot until the first turn, and the router
+treats welcome bounds as blocking); Optional rects vs `Rect::default()`
+(representation). `set_unless_dropdown` suppression not ported — the port's completions
+band cannot geometrically overlap the banner slot, so the click-through hazard it
+guards does not exist.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

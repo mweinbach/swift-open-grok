@@ -599,6 +599,17 @@ public struct PagerRenderState: Sendable, Equatable {
     /// `SHOW_TIMELINE_DEFAULT` (`ui_config.rs:392`) — so unlike
     /// `showTimestamps` the init default below is also the semantic one.
     public var showTimeline: Bool
+    /// The privacy upsell banner claims the announcement-banner slot this
+    /// frame — upstream's `BannerSlotParams.privacy_banner`
+    /// (`agent_view/render.rs:717-724` at pin 650c1db7). Like upstream's
+    /// render layer, a `true` here wins the slot even over a live
+    /// announcement (the slot-ownership pin, `agent_view/links.rs:573-580`);
+    /// the critical-outranks-privacy ranking lives with the PRODUCER, which
+    /// must pass `false` while a critical announcement is live
+    /// (`app_view.rs:4859-4863` — the live composition's pass-through).
+    /// Default `false`: a producer that never wires the gate paints exactly
+    /// the frames it painted before this field existed.
+    public var privacyBanner: Bool
 
     public init(
         size: TerminalSize,
@@ -617,7 +628,8 @@ public struct PagerRenderState: Sendable, Equatable {
         motion: PagerMotionSnapshot = PagerMotionSnapshot(),
         compactMode: Bool = false,
         showTimestamps: Bool = false,
-        showTimeline: Bool = false
+        showTimeline: Bool = false,
+        privacyBanner: Bool = false
     ) {
         self.overlays = overlays
         self.selectedBlockIndex = selectedBlockIndex
@@ -636,6 +648,7 @@ public struct PagerRenderState: Sendable, Equatable {
         self.compactMode = compactMode
         self.showTimestamps = showTimestamps
         self.showTimeline = showTimeline
+        self.privacyBanner = privacyBanner
     }
 }
 
@@ -661,6 +674,15 @@ public struct PagerFrameLayout: Sendable, Equatable {
     /// turns, narrow terminal, short viewport, or scrollbar config off), so
     /// a router never acts on a previous frame's geometry.
     public var timelineRail: PagerTimelineRail?
+    /// The privacy banner's hit rects, on the rail's per-frame-geometry
+    /// pattern above: what THIS frame painted, replaced wholesale every
+    /// frame (upstream re-arms them on every draw,
+    /// `agent_view/render.rs:2133-2148`, so a click never acts on stale
+    /// geometry). `nil` = the banner did not own the slot this frame (flag
+    /// off, or the slot shorter than its minimum height — upstream's
+    /// `privacy_banner_owns_slot`, `render.rs:2128-2132`); inside, each
+    /// button rect is `nil` when the row was too narrow to paint it whole.
+    public var privacyBanner: PagerPrivacyBannerHitRects?
 
     public init(
         bounds: TerminalRect,
@@ -676,7 +698,8 @@ public struct PagerFrameLayout: Sendable, Equatable {
         visibleContentLines: Range<Int>,
         scrollOffset: Int,
         hasScrollbar: Bool,
-        timelineRail: PagerTimelineRail? = nil
+        timelineRail: PagerTimelineRail? = nil,
+        privacyBanner: PagerPrivacyBannerHitRects? = nil
     ) {
         self.bounds = bounds
         self.statusBar = statusBar
@@ -692,6 +715,7 @@ public struct PagerFrameLayout: Sendable, Equatable {
         self.scrollOffset = scrollOffset
         self.hasScrollbar = hasScrollbar
         self.timelineRail = timelineRail
+        self.privacyBanner = privacyBanner
     }
 }
 
