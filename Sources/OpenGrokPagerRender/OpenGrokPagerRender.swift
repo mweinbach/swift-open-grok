@@ -148,7 +148,7 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         if case .welcome = overlay.content { return true }
         return false
     }
-    if state.privacyBanner,
+    if state.privacyBanner, !welcomeOwnsChrome,
        chrome.announcementBanner.height >= pagerPrivacyBannerMinHeight {
         layout.privacyBanner = renderPagerPrivacyBanner(
             in: chrome.announcementBanner,
@@ -201,6 +201,34 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         theme: state.theme,
         motion: state.motion
     )
+    // On the WELCOME the privacy banner owns the tip slot above the prompt
+    // instead of the chrome slot — upstream's welcome tip-slot priority
+    // (`views/welcome/mod.rs:2112-2137` at pin 650c1db7: "Privacy banner
+    // owns the tip slot when visible (above the prompt), except a
+    // pending-update notification, which outranks it"; the pending-update
+    // and foreign-resume tenants are ABSENT in this port — Wave 19 — so the
+    // ordering is banner-vs-nothing today, carried here so those tenants
+    // slot ABOVE this arm when they land, never below it). Painted AFTER
+    // the overlays because the full-screen hero would overpaint it; rects
+    // publish only from THIS visible paint, which is what lets the mouse
+    // router route them under the non-capturing welcome without reopening
+    // the invisible-banner click-through hazard (B9-c3's guard).
+    if state.privacyBanner, welcomeOwnsChrome {
+        let bannerHeight = pagerPrivacyBannerHeight(width: chrome.input.width)
+        let tipY = chrome.input.y - bannerHeight
+        if bannerHeight >= pagerPrivacyBannerMinHeight, tipY >= 0 {
+            layout.privacyBanner = renderPagerPrivacyBanner(
+                in: TerminalRect(
+                    x: chrome.input.x,
+                    y: tipY,
+                    width: chrome.input.width,
+                    height: bannerHeight
+                ),
+                buffer: &buffer,
+                theme: state.theme
+            )
+        }
+    }
     // After the overlays: the slash dropdown must win over the full-screen
     // welcome hero (upstream paints its dropdown beside the prompt regardless
     // of the hero). Safe with every other overlay because they capture input,

@@ -438,8 +438,13 @@ struct LivePrivacyBannerSurfaceTests {
         // broken gate would pass the eviction assertions below.
         #expect(await fixture.renderer.privacyBanner?.shouldShow() == true)
         #expect(await fixture.waitForFrame(containing: "Outage"))
+        // Current-frame semantics only: under B2-W4 the banner LEGITIMATELY
+        // paints on the welcome tip slot before the critical arrives
+        // (upstream also shows it until its announcements fetch fills), and
+        // this sink accumulates bytes — so eviction is pinned on the
+        // replace-wholesale rects, never on cumulative absence (the W3
+        // ledger note's convention).
         #expect(await fixture.renderer.lastPrivacyBannerHits == nil)
-        #expect(!fixture.sink.strippedText.contains("SpaceXAI"))
         try await fixture.renderer.restoreTerminal()
     }
 
@@ -668,9 +673,11 @@ struct LivePrivacyBannerSurfaceTests {
         try await fixture.seedAuth(optedOutXAIAuth())
         try await fixture.renderer.begin()
 
-        // Before the first turn the welcome hero overpaints the slot; its
-        // published bounds must swallow the click (a click on a banner the
-        // user cannot see must not opt anyone in).
+        // Before the first turn (B2-W4) the banner lives in the WELCOME TIP
+        // SLOT above the composer, not the chrome slot — so a click at the
+        // chrome coordinates hits cells where no banner is painted and must
+        // dispatch nothing (the welcome swallows it). The clickable-on-
+        // welcome positive lives in `bannerOwnsTheWelcomeTipSlot`.
         let welcomeClick = try await fixture.renderer.handleInput(.mouse(MouseEvent(
             kind: .down, x: 113, y: 2
         )))
@@ -705,6 +712,70 @@ struct LivePrivacyBannerSurfaceTests {
         let write = try #require(await fixture.renderer.pendingCodingDataWrite)
         #expect(await write.value == .saved)
         #expect(transport.recordedRequests.count == 1)
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    // MARK: B2-W4 — the welcome tip slot
+
+    @Test("the banner owns the welcome tip slot: painted above the composer and clickable")
+    func bannerOwnsTheWelcomeTipSlot() async throws {
+        let transport = MockHTTPTransport(responses: [
+            .init(metadata: HTTPResponseMetadata(statusCode: 200), body: Data("{}".utf8))
+        ])
+        let fixture = try BannerFixture(client: client(transport: transport))
+        defer { fixture.dispose() }
+        try await fixture.seedAuth(optedOutXAIAuth())
+        try await fixture.renderer.begin()
+
+        // Painted OVER the welcome (`views/welcome/mod.rs:2112-2137` at pin
+        // 650c1db7: the banner owns the tip slot above the prompt), with the
+        // rects published from the visible tip-slot paint — in the lower
+        // half of the screen, never the chrome slot's rows.
+        #expect(await fixture.waitForFrame(containing: "SpaceXAI"))
+        let rects = try #require(await fixture.renderer.lastPrivacyBannerHits)
+        let optIn = try #require(rects.optIn)
+        #expect(optIn.y > 20, "the tip slot sits above the composer, not in the chrome rows")
+
+        // The W4 router rule: banner rects route under the NON-CAPTURING
+        // welcome, because a published rect is a visible banner by
+        // construction. The click opts in through the real c2 seam.
+        let click = try await fixture.renderer.handleInput(.mouse(MouseEvent(
+            kind: .down, x: optIn.x + 1, y: optIn.y
+        )))
+        #expect(click == .consumed)
+        let write = try #require(await fixture.renderer.pendingCodingDataWrite)
+        #expect(await write.value == .saved)
+        #expect(transport.recordedRequests.count == 1)
+        #expect(await fixture.waitForAckOnDisk())
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("a capturing overlay still blocks the tip-slot banner at its own rects")
+    func capturingOverlayBlocksTheTipSlot() async throws {
+        let transport = MockHTTPTransport(responses: [
+            .init(metadata: HTTPResponseMetadata(statusCode: 200), body: Data("{}".utf8))
+        ])
+        let fixture = try BannerFixture(client: client(transport: transport))
+        defer { fixture.dispose() }
+        try await fixture.seedAuth(optedOutXAIAuth())
+        try await fixture.renderer.begin()
+        #expect(await fixture.waitForFrame(containing: "SpaceXAI"))
+        let rects = try #require(await fixture.renderer.lastPrivacyBannerHits)
+        let optIn = try #require(rects.optIn)
+
+        // A capturing modal over the welcome blocks the banner exactly as
+        // it blocks everything else (`!overlays.isActive` — upstream's
+        // modal rule); only the non-capturing welcome is routable-through.
+        try await fixture.renderer.render(.overlay(.showDocument(
+            title: "Doc",
+            content: "body"
+        )))
+        let blocked = try await fixture.renderer.handleInput(.mouse(MouseEvent(
+            kind: .down, x: optIn.x + 1, y: optIn.y
+        )))
+        #expect(blocked == .consumed)
+        #expect(await fixture.renderer.pendingCodingDataWrite == nil)
+        #expect(transport.recordedRequests.isEmpty)
         try await fixture.renderer.restoreTerminal()
     }
 }

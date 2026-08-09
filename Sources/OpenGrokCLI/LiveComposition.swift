@@ -11847,7 +11847,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // (`/toggle-mouse-reporting`, or a terminal without it), the
         // banner cannot be dismissed here — only the `/privacy` settings
         // row changes the preference, and only an ack hides the banner.
-        if hit == nil, !overlays.isActive, let banner = lastPrivacyBannerHits {
+        // `hit == nil` OR the non-capturing welcome: banner rects publish
+        // ONLY from a visible paint (the chrome slot with no welcome up, or
+        // the W4 tip slot painted OVER the welcome), so a rect that exists
+        // is a banner the user can see — routing under the welcome cannot
+        // reopen the invisible-banner click-through hazard this guard
+        // exists for (B9-c3). Capturing overlays still block via
+        // `!overlays.isActive`, upstream's modal rule.
+        if hit == nil || hit?.id == Self.welcomeOverlayID,
+           !overlays.isActive, let banner = lastPrivacyBannerHits {
             if let rect = banner.optIn, rect.contains(x: event.x, y: event.y) {
                 dispatchPrivacyBannerOptIn()
                 return nil

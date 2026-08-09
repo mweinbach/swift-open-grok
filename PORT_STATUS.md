@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-09 (Wave 18 B2-W3: announcement arm + arbitration live; W4 privacy welcome slot closes the W program)
+**As of:** 2026-08-09 (Wave 18 B2-W4: privacy banner on the welcome tip slot — the W program is closed; S1 screen-mode reader next)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1519,6 +1519,38 @@ the changelog arm legitimately paints before the announcements land (upstream do
 same until its fetch fills), then swaps in place. Negative assertions belong on the
 CURRENT frame's published rows (or in single-frame render tests); the arbitration test
 was corrected accordingly during authoring.
+
+### B2-W4 — the privacy banner's welcome tip slot (serial gate: exit 0, 5,271 tests, zero issues). **The B2-W program is closed.**
+
+Lead-implemented directly (three delegate deaths today made in-house the reliable
+path; the slice was small over the c3 machinery). While the welcome is up, the banner
+no longer paints into the chrome slot (where the hero overpainted it and the router
+had to block its armed-invisible rects — the B9-c3 recorded divergence, now closed);
+it paints AFTER the overlay pass into the tip slot directly above the composer,
+reusing `renderPagerPrivacyBanner` + `pagerPrivacyBannerHeight` whole. Upstream's
+tip-slot priority comment is carried with its ABSENT tenants recorded
+(`welcome/mod.rs:2112-2137`: pending-update outranks the banner; foreign-resume only
+when neither — both Wave 19; the ordering is banner-vs-nothing today, and the comment
+pins that those tenants slot ABOVE this arm when they land). **The router rule** is
+the slice's load-bearing change: banner rects now route when the hit is `nil` OR the
+non-capturing welcome — safe because rects publish ONLY from a visible paint (the
+chrome arm with no welcome, or the tip-slot arm painted OVER the welcome), so a rect
+that exists is a banner the user can see; the invisible-banner click-through hazard
+B9-c3's guard existed for cannot reopen, and capturing overlays still block via the
+modal rule. The c3 eviction test moved to current-frame rects semantics (under W4 the
+banner LEGITIMATELY paints on the welcome before a critical announcement arrives —
+upstream parity — so its cumulative negative hit the W3-documented sink trap); the c3
+welcome-blocks test's first arm was re-commented (its chrome-coordinate click now
+lands where no banner paints — same assertion, new reason). 2 net-new live tests
+(painted-and-clickable on the welcome with the real PUT + ack; capturing overlay still
+blocks at the tip rects) plus the two updated c3 arms. One authoring note: this
+fixture's `waitForFrame` searches RAW diff capture, so needles must be single words
+("SpaceXAI") — the multi-word-needle trap, hit and fixed during authoring.
+
+**The B2-W program is complete**: W1 welcome menu (`cf3dbb3`), W2 changelog prefetch +
+info slot (`c2c90ae`), W3 announcement arbitration (`4b34f83`), W4 privacy tip slot
+(this entry). All three B9 deferral anchors are absorbed; next per the lead rulings:
+S1 (screen-mode config reader), then N (native scrollback layer), then M1–M4, then S2.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 
