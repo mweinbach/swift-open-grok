@@ -495,11 +495,17 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             kind: .bool(default: false),
             storage: .config(path: "ui.compact_mode")
         ),
+        // B2-S1: the key gained its reader (`resolveInteractivePagerMode`
+        // consults `[ui] screen_mode` after the CLI flags), so "how Open
+        // Grok opens next time" is now true. The description's former
+        // "/minimal or /fullscreen" sentence is TRIMMED until B2-S2
+        // registers those commands (the lead ruling: never advertise an
+        // absent surface) — S2 restores it verbatim.
         PagerSettingMeta(
             key: "screen_mode",
             category: .appearance,
             label: "Default screen mode",
-            description: "How Open Grok opens next time: Fullscreen (default when unset) or Minimal. Writes [ui] screen_mode in config.toml. Restart required. Switch this session only with /minimal or /fullscreen.",
+            description: "How Open Grok opens next time: Fullscreen (default when unset) or Minimal. Writes [ui] screen_mode in config.toml. Restart required.",
             keywords: ["fullscreen", "minimal"],
             kind: .enumeration(default: "fullscreen", choices: PagerSettingChoices.screenMode, supportsPreview: false),
             storage: .config(path: "ui.screen_mode"),

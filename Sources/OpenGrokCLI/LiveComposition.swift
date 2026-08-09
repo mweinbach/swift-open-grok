@@ -1182,18 +1182,20 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 effort: foundation.samplingConfiguration.reasoningEffort
             )
             if options.mode == .interactive {
+                // One effective-config read seeds the screen-mode resolution
+                // AND both halves of the mode snapshot below. Multiline
+                // remains session-local, while vim and the two steering
+                // settings start from `[ui]`.
+                let uiConfiguration = LiveInteractiveControllerRenderer.resolveUIConfig(
+                    workingDirectory: cwd,
+                    environment: context.environment
+                )
                 let pagerMode = try Self.resolveInteractivePagerMode(
                     options: options,
-                    terminal: dependencies.terminal
+                    terminal: dependencies.terminal,
+                    configScreenMode: uiConfiguration.config.screenMode
                 )
                 if let interactiveInput, let terminalSink = interactiveSink {
-                    // One effective-config read seeds both halves of the mode
-                    // snapshot. Multiline remains session-local, while vim and
-                    // the two steering settings start from `[ui]`.
-                    let uiConfiguration = LiveInteractiveControllerRenderer.resolveUIConfig(
-                        workingDirectory: cwd,
-                        environment: context.environment
-                    )
                     let initialInputModes = uiConfiguration.inputModes
                     let renderer = LiveInteractiveControllerRenderer(
                         mode: pagerMode,
@@ -1852,7 +1854,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             }
             let pagerMode = try Self.resolveInteractivePagerMode(
                 options: options,
-                terminal: terminal
+                terminal: terminal,
+                // The leader launch reads the same effective `[ui]` document
+                // the local composition does — one screen-mode rule, both
+                // launch paths.
+                configScreenMode: LiveInteractiveControllerRenderer.resolveUIConfig(
+                    workingDirectory: workingDirectory,
+                    environment: context.environment
+                ).config.screenMode
             )
             let pager = OpenGrokPager(
                 runtime: runtime,
@@ -2005,9 +2014,36 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         }
     }
 
-    private static func resolveInteractivePagerMode(
+    /// Parse a `[ui] screen_mode` value with upstream's exact grammar
+    /// (`parse_screen_mode`, `app/screen_mode_relaunch.rs:316-328` at pin
+    /// 650c1db7): trimmed, case-insensitive `minimal` → minimal;
+    /// `fullscreen` / `full` → fullscreen; empty or ANYTHING ELSE → `nil`,
+    /// and normal resolution continues. Inline is deliberately not a valid
+    /// value — env/config can never force Inline (upstream rejects
+    /// `inline`/`auto`/`default`, pinned by its `parse_screen_mode_values`
+    /// test at `:733-771`).
+    static func parseConfiguredScreenMode(_ value: String?) -> OpenGrokPagerMode? {
+        guard let raw = value?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else {
+            return nil
+        }
+        if raw.caseInsensitiveCompare("minimal") == .orderedSame {
+            return .minimal
+        }
+        if raw.caseInsensitiveCompare("fullscreen") == .orderedSame
+            || raw.caseInsensitiveCompare("full") == .orderedSame {
+            return .fullScreen
+        }
+        return nil
+    }
+
+    // Internal (not private) so the resolution matrix is pinnable by tests
+    // without a full composition launch — the flag/config/TTY interplay is
+    // exactly the class of table upstream pins in `parse_screen_mode_values`
+    // and its resolution tests (`screen_mode_relaunch.rs:733-826`).
+    static func resolveInteractivePagerMode(
         options: CLIExecutionOptions,
-        terminal: OpenGrokLiveTerminal
+        terminal: OpenGrokLiveTerminal,
+        configScreenMode: String? = nil
     ) throws -> OpenGrokPagerMode {
         if options.noAltScreen {
             return .inline
@@ -2028,6 +2064,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             // inline rather than failing, since unlike `--fullscreen` this flag
             // is a preference about presentation, not a hard requirement.
             return terminal.isTTY() ? .minimal : .inline
+        }
+        // `[ui] screen_mode` — B2-S1, the key's FIRST reader (it was a
+        // registered settings row writing a dead key). CLI flags beat config,
+        // upstream's resolution order (`app/mod.rs:790-855`: env override →
+        // CLI → `[ui] screen_mode` → legacy pager.toml → auto-minimal →
+        // alt-screen policy; the env override lands with S2's relaunch, which
+        // is the only thing that sets it, and the two legacy/auto inputs have
+        // no port ground — recorded). A configured mode degrades to inline
+        // off a TTY exactly like the flags' arms above; it never THROWS like
+        // `--fullscreen`, because ambient config must not break piped runs
+        // the way an explicit flag's contradiction should.
+        if let configured = parseConfiguredScreenMode(configScreenMode) {
+            return terminal.isTTY() ? configured : .inline
         }
         return terminal.isTTY() ? .fullScreen : .inline
     }

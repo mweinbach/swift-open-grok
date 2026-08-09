@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-09 (Wave 18 B2-W4: privacy banner on the welcome tip slot — the W program is closed; S1 screen-mode reader next)
+**As of:** 2026-08-09 (Wave 18 B2-S1: [ui] screen_mode reader live on both launch paths; N native scrollback next)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1551,6 +1551,33 @@ fixture's `waitForFrame` searches RAW diff capture, so needles must be single wo
 info slot (`c2c90ae`), W3 announcement arbitration (`4b34f83`), W4 privacy tip slot
 (this entry). All three B9 deferral anchors are absorbed; next per the lead rulings:
 S1 (screen-mode config reader), then N (native scrollback layer), then M1–M4, then S2.
+
+### B2-S1 — `[ui] screen_mode` gets its first reader (serial gate: exit 0, 5,276 tests, zero issues)
+
+Lead-implemented. The key had a registered, restart-required settings row WRITING it
+and nothing reading it — the §3-class dead key the B2 research found. Now
+`resolveInteractivePagerMode` consults it through upstream's exact grammar
+(`parse_screen_mode`, `screen_mode_relaunch.rs:316-328`: trimmed, case-insensitive
+`minimal` / `fullscreen` / `full`, everything else — including `inline` — rejected so
+config can never force Inline), threaded at BOTH launch paths (local composition and
+leader launch) from the same effective-`[ui]` read the mode snapshot already used.
+Precedence is upstream's: CLI flags beat config (`app/mod.rs:790-855`); the
+`GROK_SCREEN_MODE` env override is deliberately NOT read yet — S2's relaunch is the
+only thing that sets it, so it lands with S2 — and the legacy-pager.toml / auto-minimal
+resolution legs have no port ground (recorded). **Recorded divergence (in-source):** a
+configured mode off a TTY degrades to inline instead of throwing — an explicit
+`--fullscreen` flag contradicting a pipe is an error worth surfacing (unchanged), but
+an ambient config key set weeks ago must not break every piped run. The settings row's
+"/minimal or /fullscreen" sentence is trimmed per the ruling (never advertise an
+absent surface); S2 restores it verbatim when the commands land. 5 net-new tests
+(grammar matrix mirroring `parse_screen_mode_values`, config-drives-default,
+CLI-beats-config, off-TTY degrade, row-description pin).
+
+**Flake observed (not S1's):** the first gate run failed once in
+`ACPStdioHostTests` "initialize, session/new and prompt round-trip over real
+descriptors" (`prompt_complete` notification not yet arrived — a timing race over real
+descriptors under serial-suite load). Passed 4/4 in isolation and on the full rerun.
+Same family as the V5 telemetry flake; root-cause pass still owed.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 
