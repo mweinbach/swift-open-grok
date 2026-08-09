@@ -7817,6 +7817,23 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// one; the dispatch then builds a cache-only manager from this
     /// renderer's environment, upstream's offline arm.
     private let changelog: ChangelogManager?
+    /// The startup prefetch's markdown — upstream's `app.changelog_markdown`
+    /// (`app/app_view.rs:836-837` at pin 650c1db7, stored by the
+    /// `ChangelogFetched` arm, `dispatch/task_result.rs:3097-3101`). `nil`
+    /// until the prefetch completes; what the welcome CTA/menu row and
+    /// `/release-notes` serve without re-fetching.
+    private var changelogMarkdown: String?
+    /// Upstream's `app.changelog_bullets = bullets_from_entries(&entries, 3)`
+    /// (`task_result.rs:3099-3100`) — the welcome hero info slot's content.
+    /// Empty until the prefetch completes; empty paints no slot.
+    private var changelogBullets: [String] = []
+    /// The one-shot startup prefetch — upstream's post-auth
+    /// `Effect::FetchChangelog` (`app/event_loop.rs:1811-1816`), spawned
+    /// once from `begin()` and never from a frame. Internal (not private)
+    /// so live-seam tests can await the REAL spawned fetch instead of
+    /// polling (the `pendingCodingDataWrite` precedent); `/release-notes`
+    /// awaits it too, so a command racing the prefetch is deterministic.
+    private(set) var changelogPrefetch: Task<Void, Never>?
 
     /// The coding-data retention write client (Wave 18 B9-c2) — what makes
     /// the `coding_data_sharing` settings row a real control instead of the
@@ -8532,12 +8549,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     ///   — the row reaches the same picker `/resume` opens
     ///   (`Action::FetchSessionList`, `app/app_view.rs:4608-4610`).
     /// - `Changelog` (click-only, no key — `("", "Changelog")`,
-    ///   `mod.rs:1783-1785`): landed gated on a CACHED changelog. Upstream
-    ///   paints it from the first frame and lets dispatch no-op until the
-    ///   startup prefetch fills `changelog_md`; the port has no prefetch
-    ///   yet (B2-W2), so the gate keeps every painted row functional.
-    ///   Cost: no Changelog row until some `/release-notes` run seeds the
-    ///   cache.
+    ///   `mod.rs:1783-1785`): upstream's availability rule is
+    ///   `has_access && !show_picker` (`mod.rs:1755`) — painted from the
+    ///   first frame, dispatch no-ops until the startup prefetch fills
+    ///   `changelog_md` (`app/app_view.rs:4607-4614`). This port's welcome
+    ///   only exists authenticated (`has_access` ≡ true here) and its
+    ///   picker is a modal above the welcome, not a welcome mode
+    ///   (`!show_picker` ≡ true) — so the remaining gate is data
+    ///   availability: markdown in memory (the B2-W2 prefetch) OR on disk
+    ///   (a prior session's cache), keeping lead ruling (d)'s "no painted
+    ///   row without a working dispatch" while the prefetch closes W1's
+    ///   recorded first-run gap as soon as it lands.
     /// - `Quit` (`ctrl+q`): landed — the `/quit` round-trip. Upstream swaps
     ///   the hint to `ctrl+d` in VS Code-family embeds
     ///   (`is_vscode_family`, `pager-render/src/terminal/mod.rs:120-127`);
@@ -8562,7 +8584,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 label: "Resume session"
             ))
         }
-        if ChangelogManager.fromEnvironment(environment).cachedMarkdown() != nil {
+        let markdownAvailable = changelogMarkdown != nil
+            || ChangelogManager.fromEnvironment(environment).cachedMarkdown() != nil
+        if markdownAvailable {
             menu.append(PagerWelcomeMenuItem(
                 id: Self.welcomeChangelogRowID,
                 key: "",
@@ -8577,7 +8601,16 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         return PagerWelcomeOverlay(
             version: OpenGrokCLIVersion.installed(environment: environment),
             subtitle: LivePagerChrome.collapseHome(workingDirectory),
-            menu: menu
+            menu: menu,
+            // The hero info slot's changelog arm (`render_hero_box`,
+            // `hero_box.rs:349-378`): bullets from the startup prefetch
+            // (`app_view.rs:5004`), clickability from markdown availability.
+            // Upstream's `changelog_has_full_notes` is in-memory-only
+            // (`:5005`); the disk arm here matches this port's row gate so
+            // the CTA and the row can never disagree about whether a click
+            // has something to open.
+            changelogBullets: changelogBullets,
+            changelogHasFullNotes: markdownAvailable
         )
     }
 
@@ -8597,6 +8630,65 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             }
         }
         return nil
+    }
+
+    /// Spawn the one-shot changelog prefetch (`Effect::FetchChangelog`,
+    /// `app/effects/mod.rs:3958-3977` at pin 650c1db7). One-shot by the
+    /// guard: upstream fires it once from event-loop startup
+    /// (`event_loop.rs:1811-1816`; its auth.rs re-dispatch sites re-arm on
+    /// login transitions this port's renderer never goes through — the
+    /// welcome only exists authenticated). The fetch goes through the B9-a
+    /// client, so the recorded export-boundary gate applies before any
+    /// request is built: a Codex (xAI-export-denied) session issues
+    /// nothing and takes the cache-only arm — no bullets unless a prior
+    /// xAI session's disk cache exists, which is the honest answer.
+    private func spawnChangelogPrefetch() {
+        guard changelogPrefetch == nil else { return }
+        changelogPrefetch = Task { [weak self] in
+            await self?.completeChangelogPrefetch()
+        }
+    }
+
+    /// The fetch + store half of the prefetch — upstream's
+    /// `TaskResult::ChangelogFetched` arm (`dispatch/task_result.rs:
+    /// 3097-3101`): markdown verbatim, bullets via
+    /// `bulletsFromEntries(entries, 3)`. Completion pushes the update into
+    /// an OPEN welcome: upstream repaints per-frame so bullets appear on
+    /// the next frame automatically; this port renders on events, so the
+    /// push is explicit (the W1 `updateWelcome` seam).
+    private func completeChangelogPrefetch() async {
+        let manager = changelog ?? ChangelogManager.fromEnvironment(environment)
+        let fetched = await manager.fetch(environment: environment)
+        changelogMarkdown = fetched.markdown
+        changelogBullets = bulletsFromEntries(fetched.entries ?? [], max: 3)
+        refreshWelcomeInPlace()
+    }
+
+    /// Rebuild an open welcome overlay in place with the current changelog
+    /// state — bullets, CTA clickability, and the (possibly newly
+    /// available) Changelog menu row — preserving hover state across the
+    /// swap: the selection is remapped by row id, because inserting the
+    /// Changelog row above Quit would otherwise silently move a highlight
+    /// sitting on Quit. No welcome open (the first turn already dismissed
+    /// it), nothing to do; no visible change, no repaint.
+    private func refreshWelcomeInPlace() {
+        let rebuilt = welcomeOverlay()
+        var changed = false
+        overlays.updateWelcome { welcome in
+            var next = rebuilt
+            let selectedID = welcome.selectedIndex.flatMap { index in
+                welcome.menu.indices.contains(index) ? welcome.menu[index].id : nil
+            }
+            next.selectedIndex = selectedID.flatMap { id in
+                next.menu.firstIndex { $0.id == id }
+            }
+            next.changelogHovered = welcome.changelogHovered
+            if welcome != next {
+                welcome = next
+                changed = true
+            }
+        }
+        if changed { try? renderState() }
     }
 
     func begin() async throws {
@@ -8621,6 +8713,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         if conversation.items.isEmpty {
             overlays.push(.welcome(welcomeOverlay(), capturesInput: false))
         }
+        // The changelog startup prefetch — upstream's one-shot post-auth
+        // effect, off the render path, "so the welcome screen can display
+        // bullets and /release-notes uses the cached result"
+        // (`app/event_loop.rs:1811-1816` at pin 650c1db7). Unconditional
+        // like upstream's (fired whether or not the welcome is up: the
+        // command consumes the result too); never awaited here — a slow or
+        // unreachable CDN costs zero launch time (the announcements spawn
+        // shape).
+        spawnChangelogPrefetch()
         // Privacy-banner gate state, hydrated at the pager-startup seam like
         // upstream's event_loop resolution (event_loop.rs:1007-1029). Local
         // file reads only (auth store + config.toml); nothing consumes it in
@@ -9639,10 +9740,34 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// always wins. A composition constructed without a client gets a
     /// cache-only manager: with no transport there is nothing to fetch
     /// with, which is exactly upstream's offline arm.
+    ///
+    /// POST-PREFETCH, this serves the startup prefetch's stored result and
+    /// does not refetch — a recorded divergence from upstream's command
+    /// mechanics, kept for upstream's stated intent. Upstream's prefetch
+    /// comment says it exists so "/release-notes uses the cached result"
+    /// (`app/event_loop.rs:1811-1812` at pin 650c1db7), but its command
+    /// re-runs `ChangelogManager::new().fetch()` (`release_notes.rs:26`) —
+    /// a fresh CDN round-trip whose "cached result" is only the warm DISK
+    /// fallback when the CDN is unreachable (a 3 s stall when offline, per
+    /// invocation). Upstream's welcome CTA and menu row already serve the
+    /// in-memory copy (`app_view.rs:4380-4388`, `:4607-4614`); this port
+    /// unifies the command on the same store. Cost of the divergence: a
+    /// changelog republished to the CDN mid-session is not picked up by a
+    /// later /release-notes in that session — bounded to nil in practice,
+    /// because the artifact is version-keyed (`{VERSION}.external.md`) and
+    /// this binary's version does not change mid-session. Awaiting the
+    /// in-flight prefetch (never nil after `begin()`) keeps a command
+    /// racing the startup fetch deterministic instead of double-fetching.
     private func presentReleaseNotes() async {
-        let manager = changelog ?? ChangelogManager.fromEnvironment(environment)
-        let fetched = await manager.fetch(environment: environment)
-        guard let markdown = fetched.markdown else {
+        await changelogPrefetch?.value
+        let markdown: String?
+        if let prefetched = changelogMarkdown {
+            markdown = prefetched
+        } else {
+            let manager = changelog ?? ChangelogManager.fromEnvironment(environment)
+            markdown = await manager.fetch(environment: environment).markdown
+        }
+        guard let markdown else {
             // Byte-exact upstream copy (release_notes.rs:33).
             note("No release notes available (offline).")
             return
@@ -11272,12 +11397,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 // picker `/resume` opens, honest refusal included when the
                 // composition has no session catalog.
                 try await present(.sessionPicker)
-            case Self.welcomeChangelogRowID:
-                // `Action::ShowReleaseNotes` from ALREADY-CACHED markdown
-                // only (`:4611-4618`); a vanished cache is upstream's
-                // `Unchanged` no-op, never a 3 s CDN wait from a click.
-                guard let markdown = ChangelogManager
-                    .fromEnvironment(environment).cachedMarkdown()
+            case Self.welcomeChangelogRowID, PagerWelcomeOverlay.changelogCTARowID:
+                // The menu row (`:4607-4614`) and the info-block CTA
+                // (`:4380-4388`) dispatch the same
+                // `Action::ShowReleaseNotes { "Release Notes", md.trim() }`
+                // from ALREADY-AVAILABLE markdown — the prefetch's
+                // in-memory copy first (upstream's only source), the disk
+                // cache as this port's pre-prefetch fallback. Neither
+                // fetches: a vanished cache is upstream's `Unchanged`
+                // no-op, never a 3 s CDN wait from a click.
+                guard let markdown = changelogMarkdown
+                    ?? ChangelogManager.fromEnvironment(environment).cachedMarkdown()
                 else { return nil }
                 overlays.push(LiveHowtoGuidesPicker.viewerOverlay(
                     title: "Release Notes",
@@ -11631,6 +11761,16 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 }
                 if welcome.selectedIndex != target {
                     welcome.selectedIndex = target
+                    changed = true
+                }
+                // Hover over the changelog info block brightens it —
+                // upstream's `over_cta != on_changelog_cta` change-only
+                // repaint (`app/app_view.rs:4447-4452` at pin 650c1db7).
+                // The CTA row is only published while the block is
+                // clickable, so the flag can never brighten an inert slot.
+                let overCTA = hoveredRowID == PagerWelcomeOverlay.changelogCTARowID
+                if welcome.changelogHovered != overCTA {
+                    welcome.changelogHovered = overCTA
                     changed = true
                 }
             }

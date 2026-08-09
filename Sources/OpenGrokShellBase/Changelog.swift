@@ -11,8 +11,8 @@
 // the format they need:
 // - `/release-notes` uses `changelog.markdown` for the document overlay
 // - the welcome screen uses `changelog.entries` for bullet rendering
-//   (that consumer is Wave 18 B2 territory and is NOT wired yet — see
-//   `bulletsFromEntries`)
+//   (via `bulletsFromEntries`, fed by the B2-W2 startup prefetch in
+//   `LiveComposition`)
 //
 // ONE deliberate divergence from upstream, recorded in PORT_STATUS.md
 // (Wave 18 B9): the CDN fetch is gated on the xAI export boundary
@@ -284,13 +284,14 @@ public struct ChangelogManager: Sendable {
         return Self.readCache(cachePath)
     }
 
-    /// The disk cache alone, no network — what backs the welcome menu's
-    /// Changelog row gate. Upstream shows that row from the first frame and
+    /// The disk cache alone, no network — the welcome menu's Changelog row
+    /// gate's disk arm. Upstream shows that row from the first frame and
     /// lets its dispatch no-op until `changelog_md` is populated
     /// (`views/welcome/mod.rs:1751-1753`, `app/app_view.rs:4593-4600`); this
-    /// port has no startup prefetch yet (B2-W2), so the row paints only when
-    /// a cached CHANGELOG.md already exists and its dispatch re-reads the
-    /// same cache — never a 3 s CDN wait from a menu click.
+    /// port paints the row only when markdown is actually available — the
+    /// B2-W2 startup prefetch's in-memory copy, or this cache from a prior
+    /// session — and its dispatch serves the same source, never a 3 s CDN
+    /// wait from a menu click.
     public func cachedMarkdown() -> String? {
         Self.readCache(mdCache)
     }
@@ -341,11 +342,10 @@ func stripMarkdownInline(_ s: String) -> String {
 /// each description, skips entries with empty descriptions (from tolerant
 /// deserialization), and returns at most `max` entries.
 ///
-/// NOT an advertised surface yet: upstream's consumer is the welcome
-/// screen's bullet list, which this port's welcome overlay has no slot for —
-/// Wave 18 B2 territory, deferred in the ledger. Ported now because it is
-/// part of this file and its unit tests; wiring it early would invent UX the
-/// port's welcome screen does not have.
+/// The live consumer is the welcome hero's info slot: the B2-W2 startup
+/// prefetch stores `bulletsFromEntries(entries, 3)` — upstream's
+/// `TaskResult::ChangelogFetched` arm (`dispatch/task_result.rs:3097-3101`)
+/// — and the welcome overlay paints them.
 public func bulletsFromEntries(_ entries: [ChangelogEntry], max: Int) -> [String] {
     entries
         .filter { !$0.description.isEmpty }

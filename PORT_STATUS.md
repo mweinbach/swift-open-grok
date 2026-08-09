@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-09 (Wave 18 B2-W1: the welcome menu is live with per-row backings; W2 changelog slot next)
+**As of:** 2026-08-09 (Wave 18 B2-W2: changelog prefetch + hero info slot live; W3 announcement arbitration next)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1437,6 +1437,45 @@ cannot race the synchronously-advanced injected clock); `fireImmediately` delive
 keeps its coverage in the no-sink test where no timer arms. This is the second
 one-off flake in 20+ gates (the interjection deadline race was the first, still
 unfixed-by-design pending recurrence); both diagnosed, neither a product bug.
+
+### B2-W2 — changelog startup prefetch + hero info slot + CTA (serial gate: exit 0, 5,261 tests, zero issues)
+
+**Process incident, recorded:** TWO delegate agents died on this slice — the first
+silently ~5 minutes in (partial implementation left on the tree, no tests, no report),
+the second by infrastructure ping-timeout mid-audit (no edits). The lead took the slice
+in-house: audited every predecessor hunk against the pin, verified the load-bearing
+paint/layout claims (`hero_box.rs:30-47` subtitle-hides/`right_col_height` formula,
+`render_hero_changelog` `:544-588` header style + " • " bullets + width−4 budget +
+`clickable.then_some(area)`, the stacked variant's centered/width≥20/"• " rules
+`mod.rs:1544-1600`, `changelog_height = 2 + bullets` collapsed-on-empty `:1745-1752`,
+`effective_changelog` all-or-nothing `:203-217`), and wrote the entire missing test set.
+**Audit verdict: every predecessor hunk KEPT** — the implementation was faithful and
+complete; what was missing was verification.
+
+What's live: the one-shot post-auth prefetch (`event_loop.rs:1811-1816`) spawned from
+`begin()` off the render path through the B9-a client (the recorded export-boundary
+gate applies — a denied boundary issues zero requests and the welcome honestly has no
+bullets); the `ChangelogFetched` store (markdown + `bulletsFromEntries(entries, 3)` —
+the B9-a consumer-less marker is now consumed); the hero info slot's changelog arm in
+both hero and stacked painters (header/blank/bullets, subtitle hidden while shown, CTA
+rect published only when full notes exist — a bullets-only slot paints but is inert);
+the Changelog menu row upgraded to upstream's availability rule (in-memory OR disk —
+closing W1's recorded first-run gap); in-place welcome refresh on prefetch completion
+with selection remapped by row id (inserting the row must not silently move a
+highlight); CTA hover brightening on the change-only repaint convention. 6 net-new
+live-seam tests (a URL-ROUTED test transport replaces the FIFO mock because the client
+fetches md+json in parallel — scripted order would race).
+
+**Lead-ruled divergence (in the kept code, endorsed):** post-prefetch,
+`/release-notes` serves the stored in-memory result and does NOT refetch. Upstream's
+prefetch comment states the intent ("so … /release-notes uses the cached result",
+`event_loop.rs:1811-1812`) but its command mechanically re-runs a fresh CDN fetch
+(`release_notes.rs:26`) — a 3 s stall per offline invocation — while its welcome CTA
+and menu row already serve the in-memory copy. The port unifies the command on the same
+store; the command additionally AWAITS an in-flight prefetch so a racing invocation is
+deterministic instead of double-fetching. Cost: a changelog republished to the CDN
+mid-session is not picked up that session — bounded to nil in practice because the
+artifact is version-keyed and the binary's version cannot change mid-session.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

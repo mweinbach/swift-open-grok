@@ -1292,7 +1292,22 @@ private func drawWelcomeHero(
     motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) -> [PagerOverlayBounds.Row] {
     let boxWidth = min(max(0, area.width - 6), 120)
-    let rightRows = 1 + (welcome.subtitle.isEmpty ? 0 : 1) + 1 + welcome.menu.count
+    // The in-box info slot, changelog arm: `changelog_height = 2 + bullets`
+    // (header + blank + one row per bullet, `views/welcome/mod.rs:1748-1752`
+    // at pin 650c1db7), collapsed to 0 when there are no bullets. The W3
+    // slice adds the announcement arm into this same slot (one at a time,
+    // announcement wins — `hero_box.rs:349-378`); the geometry below is the
+    // shared `hero_layout` shape both arms occupy.
+    let infoHeight = welcome.changelogBullets.isEmpty
+        ? 0
+        : 2 + welcome.changelogBullets.count
+    // The subtitle hides while the info slot is shown, to keep the box
+    // compact (`subtitle_rows`, `hero_box.rs:35-39`).
+    let subtitleRows = (infoHeight > 0 || welcome.subtitle.isEmpty) ? 0 : 1
+    let infoGap = infoHeight > 0 ? 1 : 0
+    // `right_col_height` (`hero_box.rs:41-47`): version(1) + subtitle +
+    // [info_gap + info] + gap-before-menu(1) + menu.
+    let rightRows = 1 + subtitleRows + infoGap + infoHeight + 1 + welcome.menu.count
     let boxHeight = 4 + max(logo.count, rightRows)
     guard boxWidth >= 20, boxHeight <= area.height else {
         return drawWelcomeStacked(
@@ -1379,12 +1394,40 @@ private func drawWelcomeHero(
         PagerStyledSpan(text: "\(welcome.productName)  ", foreground: theme.textPrimary, style: [.bold]),
         PagerStyledSpan(text: welcome.version, foreground: theme.gray)
     ])
-    if !welcome.subtitle.isEmpty {
+
+    var rows: [PagerOverlayBounds.Row] = []
+    if infoHeight > 0 {
+        // Info slot between the version and the menu, one gap row on each
+        // side (`right_header_rows = 1 + subtitle_rows + info_gap +
+        // info_height + 1`, `hero_box.rs:253-262`); the subtitle stays
+        // hidden per `subtitle_rows` above.
+        row += 1
+        let infoFrame = TerminalRect(x: rightX, y: row, width: rightWidth, height: infoHeight)
+        drawWelcomeChangelogBlock(
+            &buffer,
+            bullets: welcome.changelogBullets,
+            in: infoFrame,
+            clipBottom: frame.bottom - 1,
+            hovered: welcome.changelogHovered,
+            bulletPrefix: " \u{2022} ",
+            textInset: 4,
+            theme: theme
+        )
+        // The whole block is the click target, published only when full
+        // notes exist to open (`clickable.then_some(area)`,
+        // `hero_box.rs:587`) — a bullets-only slot paints but is inert.
+        if welcome.changelogHasFullNotes {
+            rows.append(PagerOverlayBounds.Row(
+                id: PagerWelcomeOverlay.changelogCTARowID,
+                frame: infoFrame
+            ))
+        }
+        row += infoHeight
+    } else if !welcome.subtitle.isEmpty {
         writeRight([PagerStyledSpan(text: welcome.subtitle, foreground: theme.gray)])
     }
     row += 1
 
-    var rows: [PagerOverlayBounds.Row] = []
     for (index, item) in welcome.menu.enumerated() {
         guard row < frame.bottom - 1 else { break }
         let isSelected = index == welcome.selectedIndex
@@ -1508,7 +1551,105 @@ private func drawWelcomeStacked(
         rows.append(PagerOverlayBounds.Row(id: item.id, frame: frame))
         row += 1
     }
+
+    // Stacked info slot BELOW the menu — upstream keeps the narrow layout's
+    // changelog too, centered to the menu width (`render_changelog_section`,
+    // `views/welcome/mod.rs:1544-1609` at pin 650c1db7, painted from the
+    // `layout.changelog` slot at `:1961-1993`). All-or-nothing: upstream's
+    // `effective_changelog` (`mod.rs:203-217`) allocates the gap + the full
+    // slot or collapses it to 0 — never a clipped header. Upstream also
+    // refuses a column narrower than 20 (`mod.rs:1569-1571`).
+    if !welcome.changelogBullets.isEmpty {
+        let slotHeight = 2 + welcome.changelogBullets.count
+        if menuWidth >= 20, row + 1 + slotHeight <= area.bottom {
+            row += 1
+            let slotFrame = TerminalRect(x: menuX, y: row, width: menuWidth, height: slotHeight)
+            drawWelcomeChangelogBlock(
+                &buffer,
+                bullets: welcome.changelogBullets,
+                in: slotFrame,
+                clipBottom: area.bottom,
+                hovered: welcome.changelogHovered,
+                // The stacked bullet is `"• {text}"` (`mod.rs:1592-1599`),
+                // unlike the hero's leading-space `" • {text}"`.
+                bulletPrefix: "\u{2022} ",
+                textInset: 2,
+                theme: theme
+            )
+            if welcome.changelogHasFullNotes {
+                rows.append(PagerOverlayBounds.Row(
+                    id: PagerWelcomeOverlay.changelogCTARowID,
+                    frame: slotFrame
+                ))
+            }
+            row += slotHeight
+        }
+    }
     return rows
+}
+
+/// The changelog info block, shared by the hero and stacked variants:
+/// "Changelog" header, one blank row, then a row per bullet — upstream's
+/// `render_hero_changelog` (`views/welcome/hero_box.rs:544-588` at pin
+/// 650c1db7) and `render_changelog_section` (`views/welcome/mod.rs:
+/// 1544-1609`), which differ only in the bullet prefix and the text budget
+/// it implies. `hovered` brightens header and bullets to `text_primary`
+/// (`hover_style`, `mod.rs:66-74`); the flag is only ever set while the
+/// block is clickable, so the painter needs no separate clickable input.
+private func drawWelcomeChangelogBlock(
+    _ buffer: inout CellBuffer,
+    bullets: [String],
+    in area: TerminalRect,
+    clipBottom: Int,
+    hovered: Bool,
+    bulletPrefix: String,
+    textInset: Int,
+    theme: PagerRenderTheme
+) {
+    guard area.width > 0, area.height > 0 else { return }
+    // Header: DIM gray-bright, hover-brightened (`hero_box.rs:559-572`).
+    if area.y < clipBottom {
+        _ = buffer.setString(
+            x: area.x,
+            y: area.y,
+            text: truncateToWidth("Changelog", width: area.width),
+            style: hovered ? [] : [.dim],
+            foreground: hovered ? theme.textPrimary : theme.grayBright,
+            background: theme.bgBase
+        )
+    }
+    // Bullets start 2 rows down (header + blank), matching the height
+    // budget (`hero_box.rs:574-585`). The text budget is upstream's
+    // literal: `width - 4` in the hero (`" • "` prefix + pad,
+    // `hero_box.rs:576`) and `width - 2` in the stacked variant (`"• "`
+    // prefix, `mod.rs:1592`).
+    let maxTextWidth = max(0, area.width - textInset)
+    for (index, bullet) in bullets.enumerated() {
+        let rowY = area.y + 2 + index
+        guard rowY < area.y + area.height, rowY < clipBottom else { break }
+        let text = bulletPrefix + truncateWithEllipsis(bullet, width: maxTextWidth)
+        _ = buffer.setString(
+            x: area.x,
+            y: rowY,
+            text: truncateToWidth(text, width: area.width),
+            style: [],
+            foreground: hovered ? theme.textPrimary : theme.grayBright,
+            background: theme.bgBase
+        )
+    }
+}
+
+/// Upstream `truncate_str` (`xai-grok-pager-render/src/render/line_utils.rs:
+/// 83-104` at pin 650c1db7): clip to `width` display columns, ending with a
+/// `…` when content was dropped — unlike the port's plain `truncateToWidth`,
+/// which clips silently. Upstream backs up one *char* for the ellipsis; this
+/// backs up to `width - 1` *columns*, identical for the 1-column characters
+/// changelog bullets carry and never wider than budget for the rest.
+private func truncateWithEllipsis(_ text: String, width: Int) -> String {
+    guard width > 0 else { return "" }
+    guard UnicodeDisplayWidth.width(of: text) > width else { return text }
+    guard width > 1 else { return PagerGlyphs.ellipsis }
+    return truncateToWidth(text, width: width - 1) + PagerGlyphs.ellipsis
 }
 
 private func drawWelcomeCell(

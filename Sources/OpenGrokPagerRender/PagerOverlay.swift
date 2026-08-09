@@ -420,6 +420,12 @@ public struct PagerWelcomeMenuItem: Sendable, Equatable, Hashable {
 /// The braille logo + hero box shown when a session starts with no history
 /// (`views/welcome/`).
 public struct PagerWelcomeOverlay: Sendable, Equatable, Hashable {
+    /// Row id the painters publish for the clickable changelog info block —
+    /// upstream's `changelog_cta_rect` (`views/welcome/hero_box.rs:587`,
+    /// `views/welcome/mod.rs:1608` at pin 650c1db7), carried through the
+    /// same rows channel the menu uses so the one mouse router serves both.
+    public static let changelogCTARowID = "changelog-cta"
+
     public var productName: String
     public var version: String
     public var subtitle: String
@@ -428,19 +434,43 @@ public struct PagerWelcomeOverlay: Sendable, Equatable, Hashable {
     /// Option<usize>` starts `None` (`app/app_view.rs:979,1912` at pin
     /// 650c1db7) and only hover or explicit navigation sets it.
     public var selectedIndex: Int?
+    /// Up to 3 changelog bullets for the hero info slot — upstream's
+    /// `changelog_bullets` (`app/app_view.rs:5004`), empty until the startup
+    /// prefetch fills it. Empty paints NO slot (never a bare header):
+    /// upstream's `changelog_height` collapses to 0 on empty bullets
+    /// (`views/welcome/mod.rs:1748-1752`).
+    public var changelogBullets: [String]
+    /// Whether full release notes exist to open — upstream's
+    /// `changelog_has_full_notes = changelog_markdown.is_some()`
+    /// (`app/app_view.rs:5005`). Gates the info block's clickability and
+    /// hover brightening (`render_hero_changelog`'s `clickable`).
+    public var changelogHasFullNotes: Bool
+    /// Whether the pointer is over the clickable info block — upstream's
+    /// `welcome_on_changelog_cta` (`app/app_view.rs:4447-4452`): upstream
+    /// re-derives hover from the live `mouse_pos` every frame; this port
+    /// repaints on the flag's change, the same convention hover selection
+    /// uses. Only ever true while a CTA rect is published (the block is
+    /// clickable), so the painters can brighten on the flag alone.
+    public var changelogHovered: Bool
 
     public init(
         productName: String = "Open Grok Beta",
         version: String = "",
         subtitle: String = "Thanks for trying Open Grok, give feedback with /feedback!",
         menu: [PagerWelcomeMenuItem] = [],
-        selectedIndex: Int? = nil
+        selectedIndex: Int? = nil,
+        changelogBullets: [String] = [],
+        changelogHasFullNotes: Bool = false,
+        changelogHovered: Bool = false
     ) {
         self.productName = productName
         self.version = version
         self.subtitle = subtitle
         self.menu = menu
         self.selectedIndex = selectedIndex
+        self.changelogBullets = changelogBullets
+        self.changelogHasFullNotes = changelogHasFullNotes
+        self.changelogHovered = changelogHovered
     }
 }
 
