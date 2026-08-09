@@ -981,6 +981,7 @@ public enum PagerOverlayContent: Sendable, Equatable {
     case settings(PagerSettingsOverlay)
     case extensions(PagerExtensionsOverlay)
     case agents(PagerAgentsOverlay)
+    case personaDetail(PagerPersonaDetailOverlay)
 }
 
 public struct PagerOverlay: Sendable, Equatable {
@@ -1179,6 +1180,31 @@ extension PagerOverlay {
             // Escape is routed into the modal, which decides whether it
             // means "clear the search" or "close" — see
             // `PagerOverlayStack.handle`.
+            dismissOnEscape: false
+        )
+    }
+
+    /// `Enter` on a persona in the agents modal — the persona detail/edit
+    /// modal (Wave 18 B9-b3), pushed OVER the agents modal exactly as
+    /// upstream keeps both alive (`agent_view/modals.rs:49-68`; closing
+    /// the detail refreshes the list beneath, `:126-132`).
+    ///
+    /// The title is upstream's `"persona: {name}"`
+    /// (`persona_detail.rs:382`); footer hints are recomputed from the
+    /// modal's own state at paint time.
+    public static func personaDetail(
+        _ detail: PagerPersonaDetailOverlay,
+        id: String = "persona-detail"
+    ) -> PagerOverlay {
+        PagerOverlay(
+            id: id,
+            title: "persona: \(detail.name)",
+            presentation: .centeredModal(PagerPersonaDetailMetrics.sizing),
+            hints: pagerPersonaDetailHints(detail),
+            content: .personaDetail(detail),
+            // Escape is routed into the modal: it cancels an open field
+            // edit or collapses expanded instructions before it closes
+            // (`persona_detail.rs:764-772`, `:840-843`).
             dismissOnEscape: false
         )
     }
@@ -1390,9 +1416,12 @@ public struct PagerOverlayStack: Sendable, Equatable {
         // The extensions modal owns it too: with search active, Esc clears
         // the query instead of closing. The agents modal follows the same
         // rule (search-Esc resets the query, `agents_modal.rs:1986-1990`).
+        // The persona detail owns it too: Esc there cancels an open field
+        // edit or collapses expanded instructions before it closes.
         let ownsEscape: Bool
         switch overlay.content {
-        case .settings, .question, .planApproval, .extensions, .agents: ownsEscape = true
+        case .settings, .question, .planApproval, .extensions, .agents, .personaDetail:
+            ownsEscape = true
         default: ownsEscape = false
         }
 
@@ -1502,6 +1531,34 @@ public struct PagerOverlayStack: Sendable, Equatable {
                 outcome = .selected(id: overlay.id, rowID: "toggle:\(entryIndex)")
             case .setDefaultAgent(let entryIndex):
                 outcome = .selected(id: overlay.id, rowID: "default:\(entryIndex)")
+            case .createPersona:
+                // The B9-b3 persona mutations too: the form/confirm state
+                // rides the overlay snapshot the composition reads back.
+                outcome = .selected(id: overlay.id, rowID: "persona:create")
+            case .deletePersona:
+                outcome = .selected(id: overlay.id, rowID: "persona:delete")
+            }
+        case .personaDetail(var detail):
+            let result = detail.handle(event)
+            overlay.content = .personaDetail(detail)
+            switch result {
+            case .redraw:
+                outcome = .redraw
+            case .consumed:
+                outcome = .consumed
+            case .close:
+                overlays.remove(at: index)
+                return .dismissed(id: overlay.id)
+            case .save:
+                // The committed value is already folded into the detail
+                // snapshot; the composition writes it to the source file
+                // (`save_to_file`, `persona_detail.rs:316-347`) and sets
+                // the Saved/failed message on the replacement.
+                outcome = .selected(id: overlay.id, rowID: "save")
+            case .editInEditor:
+                // `$EDITOR` over a suspended TUI — the composition owns
+                // the suspend seam (`agent_view/modals.rs:134-140`).
+                outcome = .selected(id: overlay.id, rowID: "edit-in-editor")
             }
         }
 

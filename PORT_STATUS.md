@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-09 (Wave 18 B9-b2: agents-tab mutations live with the spawn-gate proof; b3 personas CRUD is the wave's last slice)
+**As of:** 2026-08-09 (Wave 18 B9 COMPLETE: /release-notes, the privacy program, and the agents/personas modal all live with working backings)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1300,6 +1300,49 @@ comments on the first `t`/`s` press); `{e}` renders as Swift's error description
 chars matching upstream's `chars().take(w)` rather than the port's display-width
 convention. Deferred to b3: `n`/`d`, the create form, delete confirm, the persona
 detail modal, `EditInEditor`.
+
+### B9-b3 — personas CRUD, detail modal, EditInEditor (serial gate: exit 0, 5,247 tests, zero issues). **The Wave 18 B9 program is closed.**
+
+`n` create: the inline form state machine (field cycle, scope toggle, `Name is
+required` refusal), sanitization + refuse-overwrite + byte-exact template via
+`PagerPersonaFileStore`, success refreshing the list with `Created persona '{stem}'`.
+`d` delete: the y/n confirm machine over the canonical-path guard — verified faithful
+at the pin against `config_path_is_user_or_project` (`agents_modal.rs:651-697`):
+canonicalize-must-succeed FAIL-CLOSED (no canonical path = cannot validate = refuse),
+any `bundled` component refuses with byte-parity copy, user-personas prefix or any
+`.opengrok/personas` ancestor accepts. **The persona detail modal** (`persona_detail.rs`
+ported whole): structured fields, browse machine with instructions
+expand/collapse/scroll and Esc-collapses-first, INLINE EDITING landed (all three
+refusal arms; `save_to_file` with empty-removes-key; fresh re-read at Enter),
+close-refreshes-list on every dismissal path. **EditInEditor landed** through the
+generalized `/transcript` suspend seam (`$VISUAL`→`$EDITOR`→`vi`, shlex-style parse,
+child exit ignored, refresh ALWAYS — proven live by a fake editor that rewrites the
+file); delegate verified at the pin that `AgentsModalOutcome::EditInEditor` has no
+constructor outside the detail modal (the list-side arm is dead exhaustiveness), so
+detail-only is exact parity. Every message string byte-parity, 23 strings enumerated
+and pinned. Path-less inline-config personas paint their REAL resolved fields in the
+detail (upstream's `from_name_only` paints name-only because its path-less rows are
+catalog names; painting inline entries empty when a spawn resolves them non-empty
+would be the §3 silent-drop — recorded in-source). ~34 net-new tests; the flagship
+closes the b0 loop end to end: real keystrokes → exact-bytes file on disk → real
+session foundation → the created persona's instructions inside the `<persona>` block
+of a real spawned child's captured sampler request.
+
+**Recorded divergences:** append/backspace text entry (b1's LineEditor simplification;
+paste never reaches modal fields — the input router swallows paste while a modal is
+up); comments dropped on detail save (port-wide); paint-time instructions-scroll clamp;
+template byte-parity scoped to single-line values (all the form can produce), the
+unreachable serialization-failure arm not carried; editor-launch failures note
+in-transcript where upstream only warns (the transcript-pager precedent); `deletable`
+stamped at snapshot time with the guard re-run against live disk at delete. Deferred
+(recorded): form mouse paths (the B9 mouse-surface deferral), session-agent `active`
+marker, bundle-catalog column.
+
+**Wave 18 B9 is complete**: B9-a `/release-notes` (`b41cf18`); B9-c privacy — gate/ack
+(`44a4908`), retention client (`0944f23`), banner (`297f3d8`); B9-b agents/personas —
+live-seam feed (`7477e0d`), read-only modal (`d50ade8`), mutations (`4914d60`), CRUD +
+detail (this entry). Every surface landed with working backings in dependency order;
+the docs corpus's descriptions of all three surfaces are now true.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

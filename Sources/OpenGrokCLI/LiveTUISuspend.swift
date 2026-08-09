@@ -1,11 +1,15 @@
 // LiveTUISuspend.swift
 //
-// The suspend-for-child seam `/transcript` runs through: the one-shot input
-// suspension ticket, the composition-provided host the live renderer consumes,
-// `$PAGER` resolution, and the synchronous child runner. The suspend sequence
-// itself is the port of `suspend_for_child`
-// (`xai-grok-pager/src/app/event_loop.rs:356-423`), consumed by the `$PAGER`
-// arm of `run_pending_suspends` (`event_loop.rs:739-814`).
+// The suspend-for-child seam `/transcript` and the persona detail's
+// `i` (`$EDITOR`) run through: the one-shot input suspension ticket, the
+// composition-provided host the live renderer consumes, `$PAGER` and
+// `$VISUAL`/`$EDITOR` resolution, and the synchronous child runner. The
+// suspend sequence itself is the port of `suspend_for_child`
+// (`xai-grok-pager/src/app/event_loop.rs:356-423`), consumed by the
+// `$EDITOR` arm of `run_pending_suspends` (`event_loop.rs:677-736`) and
+// the `$PAGER` arm (`event_loop.rs:739-814`) — upstream's two arms share
+// the identical park/teardown/child/restore dance, which is why one host
+// serves both.
 
 import Foundation
 
@@ -58,6 +62,87 @@ struct LiveTUISuspendHost: Sendable {
         let parts = value.split(whereSeparator: \.isWhitespace).map(String.init)
         guard let program = parts.first else { return ("less", []) }
         return (program, Array(parts.dropFirst()))
+    }
+
+    /// `$VISUAL` → `$EDITOR` → `vi` (`external_editor.rs:131-137` at pin
+    /// 650c1db7: blank values fall through), split shlex-style
+    /// (`parse_editor_argv`, `:125-129` — quotes group arguments, so
+    /// `editor --name 'prompt draft'` carries a spaced argument). Returns
+    /// nil when the command cannot parse or yields no program — the
+    /// caller surfaces upstream's `"could not parse $VISUAL or $EDITOR"`.
+    static func resolveEditor(
+        environment: [String: String]
+    ) -> (program: String, arguments: [String])? {
+        let visual = environment["VISUAL"].flatMap { value -> String? in
+            value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : value
+        }
+        let editor = environment["EDITOR"].flatMap { value -> String? in
+            value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : value
+        }
+        let command = visual ?? editor ?? "vi"
+        guard let parts = shellSplit(command),
+              let program = parts.first, !program.isEmpty
+        else { return nil }
+        return (program, Array(parts.dropFirst()))
+    }
+
+    /// A minimal shlex: whitespace-separated words, single quotes literal,
+    /// double quotes with backslash escapes, backslash escaping outside
+    /// quotes. Nil on an unterminated quote or trailing backslash — the
+    /// parse failures upstream's `shlex::split` reports as `None`.
+    private static func shellSplit(_ command: String) -> [String]? {
+        var tokens: [String] = []
+        var current = ""
+        var hasToken = false
+        var iterator = command.makeIterator()
+
+        func nextCharacter() -> Character? {
+            iterator.next()
+        }
+
+        while let character = nextCharacter() {
+            if character.isWhitespace {
+                if hasToken {
+                    tokens.append(current)
+                    current = ""
+                    hasToken = false
+                }
+                continue
+            }
+            switch character {
+            case "'":
+                hasToken = true
+                var closed = false
+                while let inner = nextCharacter() {
+                    if inner == "'" { closed = true; break }
+                    current.append(inner)
+                }
+                guard closed else { return nil }
+            case "\"":
+                hasToken = true
+                var closed = false
+                while let inner = nextCharacter() {
+                    if inner == "\"" { closed = true; break }
+                    if inner == "\\" {
+                        guard let escaped = nextCharacter() else { return nil }
+                        current.append(escaped)
+                        continue
+                    }
+                    current.append(inner)
+                }
+                guard closed else { return nil }
+            case "\\":
+                guard let escaped = nextCharacter() else { return nil }
+                hasToken = true
+                current.append(escaped)
+            default:
+                hasToken = true
+                current.append(character)
+            }
+        }
+        if hasToken { tokens.append(current) }
+        guard !tokens.isEmpty else { return nil }
+        return tokens
     }
 
     /// Run the child with inherited stdio, through `/usr/bin/env` so a bare

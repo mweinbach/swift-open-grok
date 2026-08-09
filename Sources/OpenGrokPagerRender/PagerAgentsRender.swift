@@ -6,12 +6,14 @@
 // 650c1db7): the tab bar, the inline message line (`:1946-1959`, painted
 // first in each tab's content, `:1249-1251`/`:1519`), the `/ ` search
 // row, the Agents tab's scope-header/agent/description/detail flat rows
-// (`:1278-1494`), and the Personas tab's blurb + name/description/tags/
-// hint rows (`:1496-1758`). The footer hints carry only keys the overlay
-// actually handles: the Agents tab advertises `t toggle`/`s default`
-// (live as of B9-b2, labels verbatim from `:1080-1088`); the Personas
-// tab's mutation verbs (`n new` `:1163-1167`, `d delete` `:1168-1172`)
-// are B9-b3 and stay deliberately absent (AGENTS.md §4).
+// (`:1278-1494`), the Personas tab's blurb + name/description/tags/
+// hint rows (`:1496-1758`), and — as of B9-b3 — the create-persona form
+// (`render_persona_create_form`, `:1823-1896`) and the delete confirm
+// dialog (`render_persona_confirm_dialog`, `:1898-1930`), each replacing
+// the Personas tab body outright (`:1502-1515`). The footer carries only
+// keys the overlay actually handles: `t toggle`/`s default` on the
+// Agents tab (`:1080-1088`), `n new`/`d delete` on Personas
+// (`:1163-1172`), and the form/confirm footers (`:1105-1135`).
 
 import Foundation
 import OpenGrokTerminalCore
@@ -132,6 +134,30 @@ func drawAgentsBody(
         y += 1
     }
     if y < area.bottom { y += 1 }
+
+    // The create form and delete confirm replace the Personas tab body
+    // outright (`render_personas_tab`, `:1502-1515`); the inline message
+    // paints INSIDE the form (`:1507`), error-styled regardless of kind
+    // (`:1839-1846`).
+    if overlay.activeTab == .personas, let form = overlay.personaCreateForm {
+        drawPersonaCreateForm(
+            form,
+            message: overlay.message?.text,
+            in: TerminalRect(x: area.x, y: y, width: area.width, height: max(0, area.bottom - y)),
+            buffer: &buffer,
+            theme: theme
+        )
+        return []
+    }
+    if overlay.activeTab == .personas, let confirm = overlay.personaDeleteConfirm {
+        drawPersonaConfirmDialog(
+            confirm,
+            in: TerminalRect(x: area.x, y: y, width: area.width, height: max(0, area.bottom - y)),
+            buffer: &buffer,
+            theme: theme
+        )
+        return []
+    }
 
     // Body rows for the active tab, then upstream's search row placement
     // (the search paints ABOVE the list, after the blurbs on Personas —
@@ -555,6 +581,150 @@ private func drawPersonaBlurbs(
     return min(cursor + 1, area.bottom)
 }
 
+// MARK: - Create form / delete confirm (B9-b3)
+
+/// One labeled single-line text field of the create form
+/// (`render_create_text_field`, `:1783-1821`): accent label when active,
+/// the value, and — active only — the port's block-cursor glyph standing
+/// in for upstream's inverted cursor cell (the append-only editor keeps
+/// the cursor at the end). Returns the next row (`y + 2`).
+private func drawPersonaCreateField(
+    label: String,
+    text: String,
+    active: Bool,
+    in area: TerminalRect,
+    y: Int,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme
+) -> Int {
+    guard y < area.bottom else { return y }
+    var spans: [PagerStyledSpan] = [
+        PagerStyledSpan(
+            text: label,
+            foreground: active ? theme.accentUser : theme.gray
+        ),
+        PagerStyledSpan(text: text, foreground: theme.textPrimary)
+    ]
+    if active {
+        spans.append(PagerStyledSpan(text: "\u{258F}", foreground: theme.textPrimary))
+    }
+    paintSpans(
+        &buffer,
+        spans: truncateSpans(spans, to: area.width),
+        x: area.x, y: y, limit: area.right, background: theme.bgBase
+    )
+    return y + 2
+}
+
+/// `render_persona_create_form` (`agents_modal.rs:1823-1896`): title,
+/// error line, the three text fields, the scope row, and the hint line —
+/// copy byte-parity.
+func drawPersonaCreateForm(
+    _ form: PagerPersonaCreateForm,
+    message: String?,
+    in area: TerminalRect,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme
+) {
+    guard area.width > 0, area.height > 0 else { return }
+    var y = area.y
+    _ = buffer.setString(
+        x: area.x, y: y,
+        text: truncateToWidth("Create New Persona", width: area.width),
+        style: [.bold], foreground: theme.textPrimary, background: theme.bgBase
+    )
+    y += 2
+    if let message, y < area.bottom {
+        _ = buffer.setString(
+            x: area.x, y: y,
+            text: truncateToWidth(message, width: area.width),
+            style: [], foreground: theme.accentError, background: theme.bgBase
+        )
+        y += 2
+    }
+    y = drawPersonaCreateField(
+        label: "Name: ", text: form.name,
+        active: form.activeField == .name,
+        in: area, y: y, buffer: &buffer, theme: theme
+    )
+    y = drawPersonaCreateField(
+        label: "Description: ", text: form.description,
+        active: form.activeField == .description,
+        in: area, y: y, buffer: &buffer, theme: theme
+    )
+    y = drawPersonaCreateField(
+        label: "Instructions: ", text: form.instructions,
+        active: form.activeField == .instructions,
+        in: area, y: y, buffer: &buffer, theme: theme
+    )
+    if y < area.bottom {
+        // The scope row (`:1878-1892`).
+        let scopeActive = form.activeField == .scope
+        paintSpans(
+            &buffer,
+            spans: truncateSpans([
+                PagerStyledSpan(
+                    text: "Scope: ",
+                    foreground: scopeActive ? theme.accentUser : theme.gray
+                ),
+                PagerStyledSpan(text: "[\(form.scope.label)]", foreground: theme.textPrimary)
+            ], to: area.width),
+            x: area.x, y: y, limit: area.right, background: theme.bgBase
+        )
+    }
+    y += 2
+    if y < area.bottom {
+        let hint = "Tab/\u{2191}\u{2193}: field | Space/\u{2190}\u{2192} on scope: "
+            + "user/project | Enter: create | Esc: cancel"
+        _ = buffer.setString(
+            x: area.x, y: y,
+            text: truncateToWidth(hint, width: area.width),
+            style: [], foreground: theme.grayDim, background: theme.bgBase
+        )
+    }
+}
+
+/// `render_persona_confirm_dialog` (`agents_modal.rs:1898-1930`), copy
+/// byte-parity.
+func drawPersonaConfirmDialog(
+    _ confirm: PagerPersonaDeleteConfirm,
+    in area: TerminalRect,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme
+) {
+    guard area.width > 0, area.height > 0 else { return }
+    var y = area.y
+    _ = buffer.setString(
+        x: area.x, y: y,
+        text: truncateToWidth("Delete Persona", width: area.width),
+        style: [.bold], foreground: theme.accentError, background: theme.bgBase
+    )
+    y += 2
+    if y < area.bottom {
+        _ = buffer.setString(
+            x: area.x, y: y,
+            text: truncateToWidth("Delete persona '\(confirm.name)'?", width: area.width),
+            style: [], foreground: theme.textPrimary, background: theme.bgBase
+        )
+    }
+    y += 1
+    if y < area.bottom {
+        _ = buffer.setString(
+            x: area.x, y: y,
+            text: truncateToWidth("  \(confirm.path)", width: area.width),
+            style: [], foreground: theme.gray, background: theme.bgBase
+        )
+    }
+    y += 2
+    if y < area.bottom {
+        _ = buffer.setString(
+            x: area.x, y: y,
+            text: truncateToWidth("y: confirm | n/Esc: cancel", width: area.width),
+            style: [], foreground: theme.grayDim, background: theme.bgBase
+        )
+    }
+}
+
 /// `word_wrap` (`agents_modal.rs:830-856`): break at spaces; a word longer
 /// than the width gets its own line, never hard-broken; empty text yields
 /// one empty line.
@@ -584,14 +754,27 @@ func agentsWordWrap(_ text: String, maxWidth: Int) -> [String] {
 // MARK: - Footer
 
 /// The footer lists exactly the keys `PagerAgentsOverlay.handle` acts on,
-/// per tab. The Agents tab is upstream's full set
+/// per tab and mode. The Agents tab is upstream's full set
 /// (`build_agents_tab_shortcuts`, `:1052-1101`) including the b2 verbs
 /// `t toggle` (`:1080-1083`) and `s default` (`:1084-1088`). The
-/// Personas tab is the browse arm of `build_personas_tab_shortcuts`
-/// (`:1137-1183`) minus `n new`/`d delete`, whose B9-b3 backings do not
-/// exist yet — advertising them would be the no-op verb AGENTS.md §4
-/// forbids.
+/// Personas tab is `build_personas_tab_shortcuts` (`:1103-1187`): the
+/// create-form footer (`:1105-1122`), the confirm footer (`:1123-1135`),
+/// and the browse set including `n new` (`:1163-1167`) and `d delete`
+/// (`:1168-1172`) — advertised only now that B9-b3 backs them.
 func pagerAgentsHints(_ overlay: PagerAgentsOverlay) -> [PagerOverlayHint] {
+    if overlay.activeTab == .personas, overlay.personaCreateForm != nil {
+        return [
+            PagerOverlayHint(key: "Tab", label: "switch field"),
+            PagerOverlayHint(key: "Enter", label: "create"),
+            PagerOverlayHint(key: "Esc", label: "cancel")
+        ]
+    }
+    if overlay.activeTab == .personas, overlay.personaDeleteConfirm != nil {
+        return [
+            PagerOverlayHint(key: "y", label: "confirm"),
+            PagerOverlayHint(key: "n/Esc", label: "cancel")
+        ]
+    }
     if overlay.searchActive {
         return [
             PagerOverlayHint(key: "type", label: "to search"),
@@ -610,6 +793,10 @@ func pagerAgentsHints(_ overlay: PagerAgentsOverlay) -> [PagerOverlayHint] {
     if overlay.activeTab == .agents {
         hints.append(PagerOverlayHint(key: "t", label: "toggle"))
         hints.append(PagerOverlayHint(key: "s", label: "default"))
+    }
+    if overlay.activeTab == .personas {
+        hints.append(PagerOverlayHint(key: "n", label: "new"))
+        hints.append(PagerOverlayHint(key: "d", label: "delete"))
     }
     hints.append(PagerOverlayHint(key: "Tab", label: "switch tab"))
     hints.append(PagerOverlayHint(key: "Esc", label: "close"))

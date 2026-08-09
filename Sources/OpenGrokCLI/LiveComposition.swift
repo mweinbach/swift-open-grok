@@ -10676,6 +10676,65 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // after a child (event_loop.rs:811-812, :717-721).
     }
 
+    /// The persona detail's `i` — open a config file in `$VISUAL`/`$EDITOR`
+    /// over a suspended TUI. The `$EDITOR` arm of `run_pending_suspends`
+    /// (`event_loop.rs:677-736`) on the same suspend seam `/transcript`
+    /// uses; the exit status is logged-and-ignored upstream
+    /// (`external_editor.rs:274-276`) — the caller refreshes the modal tab
+    /// regardless, so an aborted edit still repaints what disk holds.
+    ///
+    /// Unlike the transcript path there is no temp file: the child edits
+    /// the persona file in place (`PendingEditorRequest::ConfigFile`,
+    /// `external_editor.rs:36-40`, materializes nothing).
+    private func suspendForEditor(path: String) async throws {
+        guard let suspendHost else {
+            note("This session has no suspendable terminal input, so $EDITOR cannot open.")
+            return
+        }
+        // `resolve_editor_argv` (`external_editor.rs:131-137`); a failed
+        // parse surfaces upstream's copy through the transcript notice,
+        // this port's `report_config_failure` surface (`:246-262`).
+        guard let editor = LiveTUISuspendHost.resolveEditor(
+            environment: suspendHost.environment
+        ) else {
+            note("could not parse $VISUAL or $EDITOR")
+            return
+        }
+        guard let suspension = await suspendHost.beginInputSuspension() else {
+            note("terminal input reader did not park before suspend")
+            return
+        }
+        do {
+            try renderer.suspendToChild()
+        } catch {
+            try? await suspension.end()
+            note("Could not suspend the terminal for $EDITOR: \(error)")
+            return
+        }
+        let launchError = await LiveTUISuspendHost.runChild(
+            program: editor.program,
+            arguments: editor.arguments + [path],
+            environment: suspendHost.environment
+        )
+        do {
+            try renderer.resumeFromChild()
+            try await suspension.end()
+        } catch {
+            // The tty rejected re-entry: latch the renderer down so nothing
+            // paints into a screen we cannot own and fail loudly — the
+            // transcript pager's identical arm.
+            try? renderer.restore()
+            throw error
+        }
+        if let launchError {
+            // Deliberate divergence, matching the pager arm: upstream only
+            // logs a child failure (`external_editor.rs:274-276`); a
+            // launch failure here says why the screen flickered and the
+            // file never changed.
+            note("Could not run editor \(editor.program): \(launchError)")
+        }
+    }
+
     /// Write to a file when one is named, otherwise to the clipboard.
     private func deliver(_ text: String, to filePath: String?, label: String) throws {
         guard let filePath, !filePath.isEmpty else {
@@ -11003,7 +11062,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     }
 
     @discardableResult
-    private func select(overlayID: String, rowID: String) async -> String? {
+    private func select(overlayID: String, rowID: String) async throws -> String? {
         if overlayID.hasPrefix("permission:") {
             // The sheet's row ids are `PagerPermissionDecision` raw values, so a
             // click resolves the request exactly as the keyboard would.
@@ -11035,13 +11094,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                   ),
                   case .agents(let current) = existing.content
             else { return nil }
-            // `t`/`s` (B9-b2): the writers run here, then the refreshed
-            // snapshot — rebuilt list after `t` (`rebuild_agents`,
-            // `agents_modal.rs:322-328`), re-resolved default + inline
-            // message after `s` (`:2161-2179`) — replaces the open modal
-            // in place; navigation state rides the snapshot. A failed
-            // write refreshes nothing, so the modal keeps stating what
-            // disk still holds, plus the error message.
+            // `t`/`s` (B9-b2) and the persona create/delete (B9-b3): the
+            // writers run here, then the refreshed snapshot — rebuilt
+            // list after `t` (`rebuild_agents`, `agents_modal.rs:322-328`),
+            // re-resolved default + inline message after `s` (`:2161-2179`),
+            // refreshed personas + success message after a create/delete
+            // (`:2372-2385`, `:2399-2410`) — replaces the open modal in
+            // place; navigation state rides the snapshot. A failed write
+            // refreshes nothing, so the modal keeps stating what disk
+            // still holds, plus the error message.
             if let updated = LiveAgentsComposition.applyingMutation(
                 rowID: rowID,
                 to: current,
@@ -11053,13 +11114,40 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 overlays.push(.agents(updated))
                 return nil
             }
-            // `Enter`/`o` view: resolve the payload from the OPEN modal's
-            // snapshot and push the document overlay ON TOP — the agents
-            // modal stays beneath, upstream's viewer-over-modal layering
-            // (Esc closes the viewer and the modal is still there,
-            // `agent_view/modals.rs:33-36`). A stale or unreadable target
-            // opens nothing, upstream's own silent `open_markdown` → None
-            // arm.
+            // `Enter`/`o` on a persona (B9-b3): the structured detail
+            // modal pushed ON TOP of the agents modal — upstream keeps
+            // both alive (`agent_view/modals.rs:49-68`) and refreshes the
+            // list when the detail closes (`:126-132`, the dismissal hook
+            // in `handleInput`). A load failure paints upstream's copy on
+            // the modal beneath (`:61-67`).
+            if rowID.hasPrefix(LiveAgentsComposition.viewPersonaRowPrefix) {
+                guard let index = Int(
+                          rowID.dropFirst(LiveAgentsComposition.viewPersonaRowPrefix.count)
+                      ),
+                      current.personas.indices.contains(index)
+                else { return nil }
+                let entry = current.personas[index]
+                if let detail = LiveAgentsComposition.personaDetail(
+                    for: entry,
+                    workingDirectory: workingDirectory,
+                    openGrokHome: openGrokHome,
+                    environment: environment
+                ) {
+                    overlays.push(.personaDetail(detail))
+                } else {
+                    var updated = current
+                    updated.message = .error("Failed to load persona '\(entry.name)'")
+                    overlays.push(.agents(updated))
+                }
+                return nil
+            }
+            // `Enter`/`o` view on an agent: resolve the payload from the
+            // OPEN modal's snapshot and push the document overlay ON TOP —
+            // the agents modal stays beneath, upstream's viewer-over-modal
+            // layering (Esc closes the viewer and the modal is still
+            // there, `agent_view/modals.rs:33-36`). A stale or unreadable
+            // target opens nothing, upstream's own silent `open_markdown`
+            // → None arm.
             guard let payload = LiveAgentsComposition.viewPayload(
                 rowID: rowID, overlay: current
             ) else { return nil }
@@ -11067,6 +11155,40 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 title: payload.title,
                 content: payload.content
             ))
+            return nil
+        }
+        if overlayID == LiveAgentsComposition.personaDetailOverlayID {
+            guard let existing = overlays.overlays.first(
+                      where: { $0.id == LiveAgentsComposition.personaDetailOverlayID }
+                  ),
+                  case .personaDetail(let detail) = existing.content
+            else { return nil }
+            if rowID == LiveAgentsComposition.personaDetailSaveRowID {
+                // The committed value is already in the detail snapshot;
+                // `save_to_file` runs here and the replacement overlay
+                // carries `"Saved"` / `"Save failed: {e}"`
+                // (`persona_detail.rs:855-864`). The list beneath is NOT
+                // refreshed per save — upstream refreshes only on detail
+                // close (`agent_view/modals.rs:126-132`).
+                overlays.push(.personaDetail(
+                    LiveAgentsComposition.savingPersonaDetail(detail)
+                ))
+                return nil
+            }
+            if rowID == LiveAgentsComposition.personaDetailEditInEditorRowID {
+                // `i` (`persona_detail.rs:824-828`): upstream closes the
+                // detail before queueing the suspend
+                // (`agent_view/modals.rs:134-140`), edits over the shared
+                // suspend seam, and refreshes the Personas tab on return
+                // (`external_editor.rs:277-283` — refresh even when the
+                // editor exits non-zero).
+                overlays.dismiss(id: LiveAgentsComposition.personaDetailOverlayID)
+                if let path = detail.sourcePath {
+                    try await suspendForEditor(path: path)
+                }
+                refreshAgentsPersonasSnapshot()
+                return nil
+            }
             return nil
         }
         overlays.dismiss(id: overlayID)
@@ -11258,11 +11380,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             switch overlays.handle(key, viewportHeight: overlayViewportHeight) {
             case .ignored:
                 return .notHandled
-            case .redraw, .consumed, .dismissed:
+            case .redraw, .consumed:
+                try renderState()
+                return .consumed
+            case .dismissed(let id):
+                handleOverlayDismissal(id)
                 try renderState()
                 return .consumed
             case .selected(let id, let rowID):
-                let command = await select(overlayID: id, rowID: rowID)
+                let command = try await select(overlayID: id, rowID: rowID)
                 try renderState()
                 return command.map { .runCommand($0) } ?? .consumed
             case .permission(let id, let requestID, let decision):
@@ -11407,11 +11533,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             if currentPermissionRequestID.map({ "permission:\($0)" }) == hit.id {
                 currentPermissionRequestID = nil
             }
+            handleOverlayDismissal(hit.id)
             try renderState()
             return nil
         }
         if let row = hit.row(atX: event.x, y: event.y) {
-            let command = await select(overlayID: hit.id, rowID: row.id)
+            let command = try await select(overlayID: hit.id, rowID: row.id)
             try renderState()
             return command
         }
@@ -11421,7 +11548,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         {
             switch overlays.handle(key, viewportHeight: max(1, hit.content.height)) {
             case .selected(let id, let rowID):
-                command = await select(overlayID: id, rowID: rowID)
+                command = try await select(overlayID: id, rowID: rowID)
             case .permission(let id, let requestID, let decision):
                 await resolve(overlayID: id, requestID: requestID, decision: decision)
             case .question(let id, let requestID, let outcome):
@@ -11430,12 +11557,42 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 await resolvePlanApproval(overlayID: id, requestID: requestID, outcome: outcome)
             case .setting(_, let event):
                 await applySetting(event)
-            case .ignored, .redraw, .consumed, .dismissed:
+            case .dismissed(let id):
+                handleOverlayDismissal(id)
+            case .ignored, .redraw, .consumed:
                 break
             }
             try renderState()
         }
         return command
+    }
+
+    /// Per-overlay dismissal side effects. Closing the persona detail
+    /// refreshes the personas list beneath in case edits were made —
+    /// upstream's `PersonaDetailOutcome::Close` arm
+    /// (`agent_view/modals.rs:126-132`, mouse close `:165-170`).
+    private func handleOverlayDismissal(_ id: String) {
+        if id == LiveAgentsComposition.personaDetailOverlayID {
+            refreshAgentsPersonasSnapshot()
+        }
+    }
+
+    /// Rebuild the OPEN agents modal's personas tab from the live loader
+    /// — `refresh_personas` (`agents_modal.rs:330-336`), also serving
+    /// `refresh_after_editor`'s Personas arm (`:337-343`). No open modal,
+    /// nothing to refresh.
+    private func refreshAgentsPersonasSnapshot() {
+        guard let existing = overlays.overlays.first(
+                  where: { $0.id == LiveAgentsComposition.overlayID }
+              ),
+              case .agents(let current) = existing.content
+        else { return }
+        overlays.push(.agents(LiveAgentsComposition.refreshingPersonas(
+            current,
+            workingDirectory: workingDirectory,
+            openGrokHome: openGrokHome,
+            environment: environment
+        )))
     }
 
     /// Session-side effects of a settings change.

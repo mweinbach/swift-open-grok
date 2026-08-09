@@ -1,14 +1,15 @@
 // PagerAgentsOverlayTests.swift
 //
-// The agents/personas modal at the overlay seam (Wave 18 B9-b1/b2): tab
+// The agents/personas modal at the overlay seam (Wave 18 B9-b1/b2/b3): tab
 // cycle (`agents_modal.rs:27-55` at upstream 650c1db7), selection clamping
 // and filter recovery (`:907-981`), search filtering (`:892-905`,
 // `:941-959`), the painted row shapes for BOTH tabs (`:1278-1494`,
 // `:1496-1758`), the b2 mutation keys `t`/`s` on the Agents tab ONLY
 // (`:2152-2196`) with the inline-message machinery (`:67-99`, `:1978`,
-// `:1946-1959`), and that the b3 keys (`n`, `d`) stay unhandled and
-// unadvertised. Full frames are painted through `renderPagerFrame` so the
-// assertions see what a user sees.
+// `:1946-1959`), and the b3 persona create form (`:149-228`, `:2336-2391`,
+// painted per `:1823-1896`) and delete confirm (`:2265-2282`, `:2393-2419`,
+// painted per `:1898-1930`). Full frames are painted through
+// `renderPagerFrame` so the assertions see what a user sees.
 
 import Foundation
 @testable import OpenGrokPagerRender
@@ -87,21 +88,33 @@ private func samplePersonas() -> [PagerAgentsPersonaEntry] {
             hasInputs: true,
             hasOutputs: true,
             sourcePath: "/tmp/home/personas/socratic.toml",
-            scopeLabel: "user"
+            scopeLabel: "user",
+            deletable: true
         ),
         PagerAgentsPersonaEntry(
             name: "auditor",
             description: "Reviews everything twice",
             sourcePath: "/tmp/proj/.opengrok/personas/auditor.toml",
-            scopeLabel: "project"
+            scopeLabel: "project",
+            deletable: true
         ),
         PagerAgentsPersonaEntry(
             name: "inline-one",
             description: nil,
-            scopeLabel: "config",
-            viewContent: "instructions = \"be inline\""
+            scopeLabel: "config"
         ),
     ]
+}
+
+/// A bundled persona: file-backed but failing the deletable guard.
+private func bundledPersona() -> PagerAgentsPersonaEntry {
+    PagerAgentsPersonaEntry(
+        name: "shipping",
+        description: "Ships with the CLI",
+        sourcePath: "/tmp/home/bundled/personas/shipping.toml",
+        scopeLabel: "bundled",
+        deletable: false
+    )
 }
 
 // MARK: - Tabs and keys
@@ -234,10 +247,10 @@ struct PagerAgentsTabTests {
         #expect(overlay.filteredPersonaIndices().isEmpty)
     }
 
-    @Test("Enter/o view: file-backed and body-backed entries produce view outcomes, bare ones are inert")
+    @Test("Enter/o view: file-backed and body-backed agents produce view outcomes; every persona opens the detail")
     func enterViewOutcomes() {
-        // `ViewAgent` (`:2124-2146`) and the personas Enter arm
-        // (`:2244-2260`, routed through the document overlay in b1).
+        // `ViewAgent` (`:2124-2146`) and the personas `OpenPersonaDetail`
+        // arm (`:2244-2260`).
         var overlay = PagerAgentsOverlay(
             agents: builtinEntries() + [projectEntry()],
             personas: samplePersonas()
@@ -245,16 +258,20 @@ struct PagerAgentsTabTests {
         #expect(overlay.handle(KeyEvent(key: .enter)) == .viewAgent(index: 0))
         overlay.selectedAgent = 5
         #expect(overlay.handle(character("o")) == .viewAgent(index: 5))
-        // An entry with neither path nor content is silently inert
+        // An AGENT with neither path nor content is silently inert
         // (upstream's `Unchanged` arm).
         var bare = PagerAgentsOverlay(agents: [
             PagerAgentsListEntry(name: "empty", description: "", scope: .builtIn)
         ])
         #expect(bare.handle(KeyEvent(key: .enter)) == .consumed)
-        // Personas tab.
+        // Personas tab: EVERY entry opens the detail, path-backed or not —
+        // upstream matches any `Some(persona)` (`:2245`); the path-less
+        // route is `from_name_only` (`agent_view/modals.rs:58-59`).
         overlay.activeTab = .personas
         overlay.selectedPersona = 2
         #expect(overlay.handle(KeyEvent(key: .enter)) == .viewPersona(index: 2))
+        overlay.selectedPersona = 0
+        #expect(overlay.handle(character("o")) == .viewPersona(index: 0))
     }
 
     @Test("t and s emit mutation outcomes on the Agents tab, for every entry kind")
@@ -285,23 +302,170 @@ struct PagerAgentsTabTests {
         #expect(empty.handle(character("s")) == .redraw)
     }
 
-    @Test("the b3 keys n and d stay consumed no-ops; t and s do nothing on the Personas tab")
-    func unbackedKeysStayInert() {
-        // `n` new (`:2261-2264`) and `d` delete (`:2265-2282`) are B9-b3.
-        // On the Personas tab upstream's handler has NO `t`/`s` arms
-        // (`:2202-2290`), so all four swallow there.
+    @Test("n and d act only on the Personas tab; t and s still do nothing there")
+    func personaKeysPerTab() {
+        // On the AGENTS tab upstream's handler has no `n`/`d` arms
+        // (`:2082-2199`), and on Personas no `t`/`s` (`:2202-2290`).
         var agents = PagerAgentsOverlay(agents: builtinEntries())
         for mutation in ["n", "d"] as [Character] {
             let before = agents
             #expect(agents.handle(character(mutation)) == .consumed)
-            #expect(agents == before, "b3 key \(mutation) changed Agents-tab state")
+            #expect(agents == before, "key \(mutation) changed Agents-tab state")
         }
         var personas = PagerAgentsOverlay(activeTab: .personas, personas: samplePersonas())
-        for mutation in ["t", "s", "n", "d"] as [Character] {
+        for mutation in ["t", "s"] as [Character] {
             let before = personas
             #expect(personas.handle(character(mutation)) == .consumed)
             #expect(personas == before, "key \(mutation) changed Personas-tab state")
         }
+        // `n` (`:2261-2264`) opens the form, fields empty, name focused,
+        // scope user.
+        #expect(personas.handle(character("n")) == .redraw)
+        #expect(personas.personaCreateForm == PagerPersonaCreateForm())
+        _ = personas.handle(KeyEvent(key: .escape))
+        // `d` on a deletable persona (`:2265-2276`) arms the confirm with
+        // the entry's name and path.
+        #expect(personas.handle(character("d")) == .redraw)
+        #expect(personas.personaDeleteConfirm == PagerPersonaDeleteConfirm(
+            name: "socratic", path: "/tmp/home/personas/socratic.toml"
+        ))
+    }
+
+    @Test("d refuses non-deletable personas with upstream's copy and never arms the confirm")
+    func deleteGuardsAtTheKey() {
+        // `:2267-2271`: the guard rejection paints
+        // `Cannot delete bundled personas` — upstream's one copy for ANY
+        // entry `persona_is_deletable` refuses, bundled or path-less.
+        var overlay = PagerAgentsOverlay(
+            activeTab: .personas,
+            personas: [bundledPersona(), samplePersonas()[2]]
+        )
+        #expect(overlay.handle(character("d")) == .redraw)
+        #expect(overlay.message == .error("Cannot delete bundled personas"))
+        #expect(overlay.personaDeleteConfirm == nil)
+        // The inline config persona (no path, not deletable): same arm.
+        overlay.selectedPersona = 1
+        #expect(overlay.handle(character("d")) == .redraw)
+        #expect(overlay.message == .error("Cannot delete bundled personas"))
+        #expect(overlay.personaDeleteConfirm == nil)
+        // An empty list falls through to Changed (`:2266` if-let, `:2281`).
+        var empty = PagerAgentsOverlay(activeTab: .personas)
+        #expect(empty.handle(character("d")) == .redraw)
+        #expect(empty.message == nil)
+    }
+
+    @Test("the create form cycles fields, toggles scope, and cancels on Esc")
+    func createFormMachine() {
+        // `handle_persona_create_form_key` (`:2336-2391`) with the field
+        // cycle (`:1767-1781`) and the scope toggle (`:2298-2314`).
+        var overlay = PagerAgentsOverlay(activeTab: .personas, personas: samplePersonas())
+        _ = overlay.handle(character("n"))
+        // Tab cycles name → description → instructions → scope → name.
+        for expected in [PagerPersonaCreateField.description, .instructions, .scope, .name] {
+            _ = overlay.handle(KeyEvent(key: .tab))
+            #expect(overlay.personaCreateForm?.activeField == expected)
+        }
+        // Shift-Tab goes backwards (name → scope).
+        _ = overlay.handle(KeyEvent(key: .backTab))
+        #expect(overlay.personaCreateForm?.activeField == .scope)
+        // Space/←/→ toggle scope only on the scope row.
+        _ = overlay.handle(character(" "))
+        #expect(overlay.personaCreateForm?.scope == .project)
+        _ = overlay.handle(KeyEvent(key: .left))
+        #expect(overlay.personaCreateForm?.scope == .user)
+        _ = overlay.handle(KeyEvent(key: .right))
+        #expect(overlay.personaCreateForm?.scope == .project)
+        // Up/Down navigate fields (`:2315-2324`).
+        _ = overlay.handle(KeyEvent(key: .down))
+        #expect(overlay.personaCreateForm?.activeField == .name)
+        _ = overlay.handle(KeyEvent(key: .up))
+        #expect(overlay.personaCreateForm?.activeField == .scope)
+        // Typed characters land in the ACTIVE text field; the scope row
+        // has no editor (upstream's `active_editor_mut` → None).
+        _ = overlay.handle(character("x"))
+        #expect(overlay.personaCreateForm?.name.isEmpty == true)
+        _ = overlay.handle(KeyEvent(key: .down)) // scope → name
+        for value in "review pal" { _ = overlay.handle(character(value)) }
+        #expect(overlay.personaCreateForm?.name == "review pal")
+        _ = overlay.handle(KeyEvent(key: .backspace))
+        #expect(overlay.personaCreateForm?.name == "review pa")
+        // Space on a TEXT field types a space, never toggles scope.
+        #expect(overlay.personaCreateForm?.scope == .project)
+        // Tab is field-cycling while the form is open — never a tab
+        // switch (`:1979-1981` route before the chrome).
+        _ = overlay.handle(KeyEvent(key: .tab))
+        #expect(overlay.activeTab == .personas)
+        #expect(overlay.personaCreateForm != nil)
+        // Esc cancels the form, not the modal (`:2344-2347`).
+        #expect(overlay.handle(KeyEvent(key: .escape)) == .redraw)
+        #expect(overlay.personaCreateForm == nil)
+    }
+
+    @Test("Enter in the form requires a name locally and emits the create outcome otherwise")
+    func createFormEnter() {
+        // `:2363-2371`: the empty-name refusal never leaves the overlay;
+        // a named form emits `.createPersona` for the composition.
+        var overlay = PagerAgentsOverlay(activeTab: .personas, personas: samplePersonas())
+        _ = overlay.handle(character("n"))
+        #expect(overlay.handle(KeyEvent(key: .enter)) == .redraw)
+        #expect(overlay.message == .error("Name is required"))
+        #expect(overlay.personaCreateForm != nil, "a refused create keeps the form open")
+        // Whitespace-only is still empty after upstream's trim (`:2364`).
+        for value in "   " { _ = overlay.handle(character(value)) }
+        #expect(overlay.handle(KeyEvent(key: .enter)) == .redraw)
+        #expect(overlay.message == .error("Name is required"))
+        for value in "pal" { _ = overlay.handle(character(value)) }
+        #expect(overlay.handle(KeyEvent(key: .enter)) == .createPersona)
+        // The form stays on the overlay for the composition to read; only
+        // a successful write clears it (`:2373-2380`).
+        #expect(overlay.personaCreateForm?.name == "   pal")
+    }
+
+    @Test("the delete confirm resolves y, cancels n/N/Esc, and swallows everything else")
+    func deleteConfirmMachine() {
+        // `handle_persona_confirm_key` (`:2393-2419`).
+        var overlay = PagerAgentsOverlay(activeTab: .personas, personas: samplePersonas())
+        _ = overlay.handle(character("d"))
+        #expect(overlay.personaDeleteConfirm != nil)
+        // `q` and navigation do NOT close or move anything — upstream's
+        // fall-through to Unchanged.
+        #expect(overlay.handle(character("q")) == .consumed)
+        #expect(overlay.handle(character("j")) == .consumed)
+        #expect(overlay.selectedPersona == 0)
+        // n cancels (`:2413-2416`).
+        #expect(overlay.handle(character("n")) == .redraw)
+        #expect(overlay.personaDeleteConfirm == nil)
+        #expect(overlay.personaCreateForm == nil, "n in a confirm cancels, never opens the form")
+        // Esc cancels too.
+        _ = overlay.handle(character("d"))
+        #expect(overlay.handle(KeyEvent(key: .escape)) == .redraw)
+        #expect(overlay.personaDeleteConfirm == nil)
+        // y (and Y) emit the delete for the composition; the confirm
+        // stays on the overlay for it to read (upstream `take()`s it in
+        // the same breath as the delete — here that IS the composition's
+        // resolution step).
+        _ = overlay.handle(character("d"))
+        #expect(overlay.handle(character("y")) == .deletePersona)
+        _ = overlay.handle(character("d"))
+        #expect(overlay.handle(character("Y", modifiers: [.shift])) == .deletePersona)
+    }
+
+    @Test("switching to the Agents tab clears the form and confirm")
+    func tabSwitchClearsPersonaOverlays() {
+        // `clear_overlays_for_tab` (`:1960-1968`): the create/confirm
+        // state belongs to the Personas tab and clears when the
+        // destination is Agents. (With a form open Tab cycles fields, so
+        // the switch path here is the programmatic one mouse tabs would
+        // take.)
+        var overlay = PagerAgentsOverlay(activeTab: .personas, personas: samplePersonas())
+        _ = overlay.handle(character("d"))
+        #expect(overlay.personaDeleteConfirm != nil)
+        overlay.switchTab(.agents)
+        #expect(overlay.personaDeleteConfirm == nil)
+        overlay.switchTab(.personas)
+        _ = overlay.handle(character("n"))
+        overlay.switchTab(.agents)
+        #expect(overlay.personaCreateForm == nil)
     }
 
     @Test("the inline message clears on the next key, whatever it is")
@@ -339,6 +503,18 @@ struct PagerAgentsTabTests {
         _ = stack.handle(KeyEvent(key: .tab))
         #expect(stack.handle(KeyEvent(key: .enter))
             == .selected(id: "agents", rowID: "view:persona:0"))
+        // The b3 persona mutations ride the same channel: `d` arms the
+        // confirm (state change only), `y` emits the delete row; `n`
+        // opens the form, Enter with a name emits the create row.
+        #expect(stack.handle(character("d")) == .redraw)
+        #expect(stack.handle(character("y"))
+            == .selected(id: "agents", rowID: "persona:delete"))
+        _ = stack.handle(KeyEvent(key: .escape)) // cancel the (still-armed) confirm
+        #expect(stack.handle(character("n")) == .redraw)
+        for value in "pal" { _ = stack.handle(character(value)) }
+        #expect(stack.handle(KeyEvent(key: .enter))
+            == .selected(id: "agents", rowID: "persona:create"))
+        _ = stack.handle(KeyEvent(key: .escape)) // cancel the form
         // Esc closes through the stack (the modal owns Escape).
         #expect(stack.handle(KeyEvent(key: .escape)) == .dismissed(id: "agents"))
         #expect(stack.isEmpty)
@@ -438,15 +614,15 @@ struct PagerAgentsRenderTests {
         #expect(painted(personas).contains("No matching personas"))
     }
 
-    @Test("the Agents footer advertises t toggle and s default in upstream's slot; Personas does not")
+    @Test("the Agents footer advertises t toggle and s default; Personas advertises n new and d delete")
     func footerHonesty() {
         // The Agents tab carries upstream's `t toggle`/`s default`
         // (`build_agents_tab_shortcuts`, `:1080-1088`) between `/ search`
-        // and `Tab switch tab`, live as of b2. The Personas tab's
-        // mutation verbs (`n new`/`d delete`, `:1163-1172`) are B9-b3 and
-        // stay absent, as does `t`/`s` there (upstream's personas footer
-        // has no such rows). `i` stays un-advertised on both (upstream
-        // only shows it under the vim hint, `push_vim_nav_search_hint`).
+        // and `Tab switch tab`, and no `n`/`d` (upstream's agents footer
+        // has none). The Personas tab carries `n new`/`d delete`
+        // (`:1163-1172`) in upstream's slot, and no `t`/`s`. `i` stays
+        // un-advertised on both (upstream only shows it under the vim
+        // hint, `push_vim_nav_search_hint`).
         let agentsHints = pagerAgentsHints(PagerAgentsOverlay(activeTab: .agents))
         #expect(agentsHints.map(\.key) == [
             "j/k", "e/\u{2192}", "E/\u{2190}", "Enter", "/", "t", "s", "Tab", "Esc",
@@ -456,16 +632,14 @@ struct PagerAgentsRenderTests {
             "toggle", "default", "switch tab", "close",
         ])
         let personasHints = pagerAgentsHints(PagerAgentsOverlay(activeTab: .personas))
-        let personasKeys = personasHints.map(\.key)
-        let personasLabels = personasHints.map(\.label)
-        #expect(personasKeys.contains("j/k"))
-        #expect(personasLabels.contains("view"))
-        for verb in ["toggle", "default", "new", "delete", "edit"] {
-            #expect(!personasLabels.contains(verb), "Personas footer advertises \(verb)")
-        }
-        for key in ["t", "s", "n", "d", "i"] {
-            #expect(!personasKeys.contains(key), "Personas footer advertises key \(key)")
-        }
+        #expect(personasHints.map(\.key) == [
+            "j/k", "e/\u{2192}", "E/\u{2190}", "Enter", "/", "n", "d", "Tab", "Esc",
+        ])
+        #expect(personasHints.map(\.label) == [
+            "nav", "expand", "collapse", "view", "search",
+            "new", "delete", "switch tab", "close",
+        ])
+        #expect(!personasHints.map(\.key).contains("i"))
         // The painted frames agree with the hint lists.
         let agentsFrame = painted(PagerAgentsOverlay(agents: builtinEntries()))
         #expect(agentsFrame.contains("t toggle"))
@@ -477,8 +651,66 @@ struct PagerAgentsRenderTests {
         ))
         #expect(!personasFrame.contains("t toggle"))
         #expect(!personasFrame.contains("s default"))
-        #expect(!personasFrame.contains("n new"))
-        #expect(!personasFrame.contains("d delete"))
+        #expect(personasFrame.contains("n new"))
+        #expect(personasFrame.contains("d delete"))
+    }
+
+    @Test("the form and confirm footers replace the browse set while either is up")
+    func modeFooters() {
+        // `build_personas_tab_shortcuts` branches (`:1105-1135`).
+        var overlay = PagerAgentsOverlay(activeTab: .personas, personas: samplePersonas())
+        _ = overlay.handle(character("n"))
+        #expect(pagerAgentsHints(overlay).map(\.label) == ["switch field", "create", "cancel"])
+        _ = overlay.handle(KeyEvent(key: .escape))
+        _ = overlay.handle(character("d"))
+        let confirmHints = pagerAgentsHints(overlay)
+        #expect(confirmHints.map(\.key) == ["y", "n/Esc"])
+        #expect(confirmHints.map(\.label) == ["confirm", "cancel"])
+    }
+
+    @Test("the create form paints title, fields, scope, hint, and the inline error inside it")
+    func createFormPaints() {
+        // `render_persona_create_form` (`:1823-1896`), copy byte-parity.
+        var overlay = PagerAgentsOverlay(activeTab: .personas, personas: samplePersonas())
+        _ = overlay.handle(character("n"))
+        for value in "review pal" { _ = overlay.handle(character(value)) }
+        var frame = painted(overlay)
+        #expect(frame.contains("Create New Persona"))
+        #expect(frame.contains("Name: review pal"))
+        #expect(frame.contains("Description: "))
+        #expect(frame.contains("Instructions: "))
+        #expect(frame.contains("Scope: [user]"))
+        #expect(frame.contains(
+            "Tab/\u{2191}\u{2193}: field | Space/\u{2190}\u{2192} on scope: "
+                + "user/project | Enter: create | Esc: cancel"
+        ))
+        // The list is replaced, not layered under (`:1502-1511` early
+        // return).
+        #expect(!frame.contains("\u{25B6} socratic"))
+        // The scope toggle repaints `[project]`.
+        for _ in 0..<3 { _ = overlay.handle(KeyEvent(key: .tab)) } // → scope
+        _ = overlay.handle(character(" "))
+        #expect(painted(overlay).contains("Scope: [project]"))
+        // A validation error paints INSIDE the form (`:1839-1846`),
+        // error-styled, form still up. Enter commits from any field.
+        overlay.personaCreateForm?.name = ""
+        _ = overlay.handle(KeyEvent(key: .enter))
+        frame = painted(overlay)
+        #expect(frame.contains("Name is required"))
+        #expect(frame.contains("Create New Persona"))
+    }
+
+    @Test("the delete confirm paints title, question, path, and hint")
+    func confirmPaints() {
+        // `render_persona_confirm_dialog` (`:1898-1930`), copy byte-parity.
+        var overlay = PagerAgentsOverlay(activeTab: .personas, personas: samplePersonas())
+        _ = overlay.handle(character("d"))
+        let frame = painted(overlay)
+        #expect(frame.contains("Delete Persona"))
+        #expect(frame.contains("Delete persona 'socratic'?"))
+        #expect(frame.contains("  /tmp/home/personas/socratic.toml"))
+        #expect(frame.contains("y: confirm | n/Esc: cancel"))
+        #expect(!frame.contains("\u{25B6} auditor"), "the confirm replaces the list")
     }
 
     @Test("the inline message paints one line above the tab content on both tabs")

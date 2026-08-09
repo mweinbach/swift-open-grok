@@ -14,15 +14,22 @@
 // config.toml, the repainted state after the in-place refresh, upstream's
 // inline-message copy, the failed-write arm, and — the §3 stake — the
 // same `[subagents.toggle]` file the writer produces gating a REAL
-// session's spawn surface through real executor dispatch. The controller
-// half (registry pins, dispatch, initial tab) is in
-// `Tests/OpenGrokPagerTests/PagerAgentsCommandTests.swift`.
+// session's spawn surface through real executor dispatch. As of B9-b3,
+// also the Personas CRUD round-trips (`n` create both scopes with the
+// byte-exact template, refuse-overwrite, `d` y/n delete, the bundled
+// refusal), the persona detail modal with a real inline-edit save landing
+// on disk, the `i`/$EDITOR suspend with a fake editor whose mutation
+// proves `refresh_after_editor`, and — the §3 stake — a persona the
+// modal's own writer created resolving onto a REAL child's sampler
+// request. The controller half (registry pins, dispatch, initial tab) is
+// in `Tests/OpenGrokPagerTests/PagerAgentsCommandTests.swift`.
 
 import Foundation
 import OpenGrokHTTP
 import OpenGrokPager
 import OpenGrokPagerRender
 import OpenGrokSamplingTypes
+import OpenGrokShared
 import OpenGrokTerminalCore
 import OpenGrokTestSupport
 import Testing
@@ -225,6 +232,24 @@ private struct AgentsRendererFixture {
         )
     }
 
+    /// A real persona file in the bundled cache directory
+    /// (`$OPENGROK_HOME/bundled/personas/{name}.toml`) — listed by the b0
+    /// loader, refused by every delete guard.
+    func writeBundledPersona(
+        named name: String = "shipping",
+        content: String = "description = \"Ships with the CLI\"\n"
+    ) throws {
+        let directory = home
+            .appendingPathComponent("bundled", isDirectory: true)
+            .appendingPathComponent("personas", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try content.write(
+            to: directory.appendingPathComponent("\(name).toml"),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+
     /// The user config the fresh effective-config read resolves
     /// (`$OPENGROK_HOME/config.toml`).
     func writeConfig(_ toml: String) throws {
@@ -250,6 +275,17 @@ private struct AgentsRendererFixture {
             .key(KeyEvent(key: .char(key), modifiers: []))
         )
         #expect(routing == .consumed, "key \(key) leaked past the open modal")
+    }
+
+    /// Press a non-character key (Tab, Enter, Esc, Backspace, …).
+    func pressKey(_ key: KeyEvent) async throws {
+        let routing = try await renderer.handleInput(.key(key))
+        #expect(routing == .consumed, "key \(key.key) leaked past the open modal")
+    }
+
+    /// Type a whole string through the key route.
+    func type(_ text: String) async throws {
+        for character in text { try await press(character) }
     }
 
     /// The reconstructed screen with all whitespace removed, so a
@@ -394,14 +430,14 @@ struct LiveAgentsReachabilityTests {
         // (`persona_detail_from_local_file`, `:538-550`).
         #expect(await fixture.waitForPaint(of: "auditor project"))
         #expect(await fixture.waitForPaint(of: "Review everything twice."))
-        // The Personas footer carries neither the b2 Agents-tab verbs
-        // (upstream's personas footer has no `t`/`s` rows) nor the b3
-        // ones.
+        // The Personas footer carries the b3 verbs (`n new`/`d delete`,
+        // `agents_modal.rs:1163-1172`) and still no `t`/`s` — upstream's
+        // personas footer has no such rows.
         let footer = fixture.paintedCompact()
         #expect(!footer.contains("ttoggle"))
         #expect(!footer.contains("sdefault"))
-        #expect(!footer.contains("nnew"))
-        #expect(!footer.contains("ddelete"))
+        #expect(footer.contains("nnew"))
+        #expect(footer.contains("ddelete"))
     }
 
     @Test("Enter routes the selected definition through the document overlay, layered over the modal")
@@ -436,8 +472,8 @@ struct LiveAgentsReachabilityTests {
         try await fixture.renderer.restoreTerminal()
     }
 
-    @Test("Enter on a persona views its real file through the document overlay")
-    func personaEnterViewsFile() async throws {
+    @Test("Enter on a persona opens the structured detail modal over the list")
+    func personaEnterOpensDetail() async throws {
         let fixture = try AgentsRendererFixture()
         defer { fixture.dispose() }
         try fixture.writeUserPersona()
@@ -447,10 +483,20 @@ struct LiveAgentsReachabilityTests {
 
         let routing = try await fixture.renderer.handleInput(.key(KeyEvent(key: .enter)))
         #expect(routing == .consumed)
-        // The b3 detail modal's title shape (`persona: {name}`,
-        // `persona_detail.rs:382`) over the persona file's own text.
+        // The b3 detail modal (`persona_detail.rs:375-668`): the title
+        // shape (`persona: {name}`, `:382`), the structured field labels
+        // (`:49-59`), the file's own values, and the source line.
         #expect(await fixture.waitForPaint(of: "persona: socratic"))
+        #expect(await fixture.waitForPaint(of: "Asks questions before answering"))
         #expect(await fixture.waitForPaint(of: "Lead with questions."))
+        #expect(await fixture.waitForPaint(of: "Instr. file"))
+        #expect(await fixture.waitForPaint(of: "Source: "))
+        // Esc closes the detail and the personas list is still there —
+        // the viewer-over-modal layering plus the close-refresh
+        // (`agent_view/modals.rs:126-132`).
+        try await fixture.pressKey(KeyEvent(key: .escape))
+        #expect(await fixture.waitForErase(of: "Instr. file"))
+        #expect(fixture.paintedCompact().contains("socraticuser"))
         try await fixture.renderer.restoreTerminal()
     }
 
@@ -486,26 +532,227 @@ struct LiveAgentsReachabilityTests {
         try await fixture.renderer.restoreTerminal()
     }
 
-    @Test("the b3 keys n and d stay swallowed without a write or a notice")
-    func unbackedKeysAreInert() async throws {
+    @Test("n creates a user persona from typed keys: exact template bytes, refreshed list, refuse-overwrite")
+    func createPersonaRoundTrip() async throws {
+        // The form Enter arm (`agents_modal.rs:2363-2385`) through the
+        // real key route into `create_persona_template` (`:620-646`).
         let fixture = try AgentsRendererFixture()
         defer { fixture.dispose() }
         try await fixture.renderer.begin()
-        try await fixture.renderer.render(.overlay(.agentsModal(initialTab: nil)))
-        #expect(await fixture.waitForPaint(of: "\u{2500}\u{2500} Built-in \u{2500}\u{2500}"))
+        try await fixture.renderer.render(.overlay(.agentsModal(initialTab: .personas)))
+        #expect(await fixture.waitForPaint(of: "No personas available"))
 
-        // The b3 persona keys: each is swallowed by the open modal (never
-        // leaks to the composer), changes nothing on screen, and — the
-        // real stake — writes nothing to config.toml. (`t`/`s` write as
-        // of b2 and are covered by the mutation tests below.)
-        for mutation in ["n", "d"] as [Character] {
-            try await fixture.press(mutation)
+        try await fixture.press("n")
+        #expect(await fixture.waitForPaint(of: "Create New Persona"))
+        try await fixture.type("review pal")
+        try await fixture.pressKey(KeyEvent(key: .tab))
+        try await fixture.type("Asks first")
+        try await fixture.pressKey(KeyEvent(key: .tab))
+        try await fixture.type("Lead with questions.")
+        try await fixture.pressKey(KeyEvent(key: .enter))
+
+        // Success copy quotes the SANITIZED name (`:2374-2379`), the form
+        // closes, and the refreshed list shows the new persona with its
+        // scope tag and sniffed description.
+        #expect(await fixture.waitForPaint(of: "Created persona 'review-pal'"))
+        #expect(await fixture.waitForPaint(of: "review-pal user"))
+        #expect(await fixture.waitForPaint(of: "Asks first"))
+        // The landed file: sanitized name in the user personas dir, the
+        // template byte-exact (trimmed fields, description first).
+        let path = fixture.home.appendingPathComponent("personas/review-pal.toml")
+        #expect(try String(contentsOf: path, encoding: .utf8)
+            == "description = \"Asks first\"\ninstructions = \"Lead with questions.\"\n")
+
+        // The same name again refuses overwrite (`:632-635`), the form
+        // stays open with the error inside it, and the file is untouched.
+        try await fixture.press("n")
+        try await fixture.type("review pal")
+        try await fixture.pressKey(KeyEvent(key: .enter))
+        #expect(await fixture.waitForPaint(of: "Persona 'review-pal' already exists"))
+        #expect(fixture.paintedCompact().contains("CreateNewPersona"))
+        #expect(try String(contentsOf: path, encoding: .utf8)
+            == "description = \"Asks first\"\ninstructions = \"Lead with questions.\"\n")
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("the scope row switches the create target to the project personas dir")
+    func createPersonaProjectScope() async throws {
+        // `personas_dir_for_scope` (`agents_modal.rs:606-611`) driven by
+        // the scope toggle (`try_toggle_create_scope`, `:2298-2314`).
+        let fixture = try AgentsRendererFixture()
+        defer { fixture.dispose() }
+        try await fixture.renderer.begin()
+        try await fixture.renderer.render(.overlay(.agentsModal(initialTab: .personas)))
+        #expect(await fixture.waitForPaint(of: "No personas available"))
+
+        try await fixture.press("n")
+        #expect(await fixture.waitForPaint(of: "Scope: [user]"))
+        try await fixture.type("proj-one")
+        for _ in 0..<3 { try await fixture.pressKey(KeyEvent(key: .tab)) }
+        try await fixture.press(" ")
+        #expect(await fixture.waitForPaint(of: "Scope: [project]"))
+        try await fixture.pressKey(KeyEvent(key: .enter))
+        #expect(await fixture.waitForPaint(of: "Created persona 'proj-one'"))
+        #expect(await fixture.waitForPaint(of: "proj-one project"))
+        let path = fixture.home
+            .appendingPathComponent(".opengrok/personas/proj-one.toml")
+        #expect(FileManager.default.fileExists(atPath: path.path))
+        #expect(try String(contentsOf: path, encoding: .utf8) == "")
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("d deletes through the y/n confirm and the file leaves disk and screen")
+    func deletePersonaRoundTrip() async throws {
+        // `d` (`agents_modal.rs:2265-2276`), the confirm machine
+        // (`:2393-2419`), and `delete_persona_file` (`:685-697`).
+        let fixture = try AgentsRendererFixture()
+        defer { fixture.dispose() }
+        try fixture.writeUserPersona()
+        try await fixture.renderer.begin()
+        try await fixture.renderer.render(.overlay(.agentsModal(initialTab: .personas)))
+        #expect(await fixture.waitForPaint(of: "socratic user"))
+
+        let path = fixture.home.appendingPathComponent("personas/socratic.toml").path
+        try await fixture.press("d")
+        #expect(await fixture.waitForPaint(of: "Delete persona 'socratic'?"))
+        // `n` cancels with nothing deleted (`:2413-2416`).
+        try await fixture.press("n")
+        #expect(await fixture.waitForErase(of: "Delete persona 'socratic'?"))
+        #expect(FileManager.default.fileExists(atPath: path))
+        // `y` confirms (`:2395-2411`): the file leaves disk, the success
+        // copy paints, and the refreshed list loses the row.
+        try await fixture.press("d")
+        #expect(await fixture.waitForPaint(of: "Delete persona 'socratic'?"))
+        try await fixture.press("y")
+        #expect(await fixture.waitForPaint(of: "Deleted persona 'socratic'"))
+        #expect(!FileManager.default.fileExists(atPath: path))
+        #expect(await fixture.waitForErase(of: "socratic user"))
+        #expect(await fixture.waitForPaint(of: "No personas available"))
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("bundled personas refuse deletion with upstream's copy and never lose their file")
+    func bundledDeleteRefusal() async throws {
+        // The list-level guard (`agents_modal.rs:2267-2271`) backed by the
+        // canonical-path check (`:651-671`): a `bundled` path component
+        // can never be removed from the modal.
+        let fixture = try AgentsRendererFixture()
+        defer { fixture.dispose() }
+        try fixture.writeUserPersona()
+        try fixture.writeBundledPersona()
+        try await fixture.renderer.begin()
+        try await fixture.renderer.render(.overlay(.agentsModal(initialTab: .personas)))
+        // Precedence grouping paints user before bundled.
+        #expect(await fixture.waitForPaint(of: "socratic user"))
+        #expect(await fixture.waitForPaint(of: "shipping bundled"))
+
+        try await fixture.press("j") // → shipping
+        try await fixture.press("d")
+        #expect(await fixture.waitForPaint(of: "Cannot delete bundled personas"))
+        #expect(!fixture.paintedCompact().contains("Deletepersona'shipping'?"),
+                "the confirm must never arm for a bundled persona")
+        let bundledPath = fixture.home
+            .appendingPathComponent("bundled/personas/shipping.toml").path
+        #expect(FileManager.default.fileExists(atPath: bundledPath))
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("an inline field edit in the detail modal saves to the real file and the closed list restates it")
+    func detailEditSavesToDisk() async throws {
+        // The edit machine (`persona_detail.rs:839-873`) through the real
+        // key route, `save_to_file` (`:316-347`) landing on disk, and the
+        // close-refresh (`agent_view/modals.rs:126-132`).
+        let fixture = try AgentsRendererFixture()
+        defer { fixture.dispose() }
+        try fixture.writeUserPersona()
+        try await fixture.renderer.begin()
+        try await fixture.renderer.render(.overlay(.agentsModal(initialTab: .personas)))
+        #expect(await fixture.waitForPaint(of: "socratic user"))
+        try await fixture.pressKey(KeyEvent(key: .enter))
+        #expect(await fixture.waitForPaint(of: "persona: socratic"))
+
+        // j → Description, e → edit, retype, Enter → save.
+        try await fixture.press("j")
+        try await fixture.press("e")
+        for _ in 0..<"Asks questions before answering".count {
+            try await fixture.pressKey(KeyEvent(key: .backspace))
         }
-        let configPath = fixture.home.appendingPathComponent("config.toml").path
-        #expect(
-            !FileManager.default.fileExists(atPath: configPath),
-            "an unbacked key must not create config.toml"
+        try await fixture.type("Edited live")
+        try await fixture.pressKey(KeyEvent(key: .enter))
+        #expect(await fixture.waitForPaint(of: "Saved"))
+        let saved = try String(
+            contentsOf: fixture.home.appendingPathComponent("personas/socratic.toml"),
+            encoding: .utf8
         )
+        #expect(saved.contains("description = \"Edited live\""))
+        #expect(saved.contains("instructions = \"Lead with questions.\""))
+        // Esc closes the detail; the refreshed list restates the edit.
+        try await fixture.pressKey(KeyEvent(key: .escape))
+        #expect(await fixture.waitForErase(of: "persona: socratic"))
+        #expect(await fixture.waitForPaint(of: "Edited live"))
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("i suspends into $EDITOR and the editor's mutation lands in the refreshed list")
+    func editInEditorSuspendsAndRefreshes() async throws {
+        // The `$EDITOR` arm on the shared suspend seam (`event_loop.rs:
+        // 677-736`): park → teardown → child → restore, then
+        // `refresh_after_editor(Personas)` (`external_editor.rs:277-283`)
+        // — a fake editor that REWRITES the file proves the refresh is a
+        // re-read, not a repaint of stale state.
+        let scriptDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opengrok-fake-editor-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: scriptDirectory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: scriptDirectory) }
+        let script = scriptDirectory.appendingPathComponent("fake-editor.sh")
+        try """
+        #!/bin/sh
+        printf 'description = "edited by editor"\\ninstructions = "Lead with questions."\\n' > "$1"
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: script.path
+        )
+
+        let fixture = try AgentsRendererFixture()
+        defer { fixture.dispose() }
+        try fixture.writeUserPersona()
+        try await fixture.renderer.begin()
+        // The recording suspend host carries `$EDITOR` — the host owns the
+        // environment the editor resolves from (`resolve_editor_argv`).
+        let log = AgentsSuspendLog()
+        await fixture.renderer.setSuspendHost(LiveTUISuspendHost(
+            beginInputSuspension: {
+                await log.record("park")
+                return LiveInputSuspension(end: { await log.record("end") })
+            },
+            environment: [
+                "EDITOR": script.path,
+                "PATH": "/usr/bin:/bin",
+            ]
+        ))
+        try await fixture.renderer.render(.overlay(.agentsModal(initialTab: .personas)))
+        #expect(await fixture.waitForPaint(of: "Asks questions before answering"))
+        try await fixture.pressKey(KeyEvent(key: .enter))
+        #expect(await fixture.waitForPaint(of: "persona: socratic"))
+
+        try await fixture.press("i")
+        // The ordered suspend ran exactly once.
+        #expect(await log.entries == ["park", "end"])
+        // The detail closed before the suspend (upstream closes it when
+        // queueing, `agent_view/modals.rs:134-140`)…
+        #expect(await fixture.waitForErase(of: "persona: socratic"))
+        // …the child actually rewrote the file…
+        let saved = try String(
+            contentsOf: fixture.home.appendingPathComponent("personas/socratic.toml"),
+            encoding: .utf8
+        )
+        #expect(saved.contains("edited by editor"))
+        // …and the refreshed list states the editor's content, not the
+        // open-time snapshot.
+        #expect(await fixture.waitForPaint(of: "edited by editor"))
+        #expect(await fixture.waitForErase(of: "Asks questions before answering"))
         try await fixture.renderer.restoreTerminal()
     }
 
@@ -728,5 +975,168 @@ struct LiveAgentsToggleSpawnGateTests {
         defer { Task { await foundation.toolExecutor.shutdown() } }
         #expect(foundation.subagentHost == nil)
         #expect(!foundation.toolExecutor.tools.map(\.name).contains("spawn_subagent"))
+    }
+}
+
+// MARK: - Suspend-order log for the $EDITOR test
+
+private actor AgentsSuspendLog {
+    private(set) var entries: [String] = []
+
+    func record(_ entry: String) {
+        entries.append(entry)
+    }
+}
+
+// MARK: - $EDITOR resolution pins
+
+/// `resolve_editor_argv`/`parse_editor_argv` (`external_editor.rs:125-137`
+/// at pin 650c1db7), pinned with upstream's own test vectors
+/// (`editor_resolution_and_parsing_follow_visual_editor_vi_order`,
+/// `external_editor.rs:365-378`).
+@Suite("editor resolution")
+struct LiveEditorResolutionTests {
+    @Test("VISUAL beats EDITOR, blanks fall through, vi is the default, quotes group")
+    func resolutionOrderAndParsing() {
+        let visualFirst = LiveTUISuspendHost.resolveEditor(
+            environment: ["VISUAL": "visual --wait", "EDITOR": "editor"]
+        )
+        #expect(visualFirst?.program == "visual")
+        #expect(visualFirst?.arguments == ["--wait"])
+        // A blank VISUAL falls through to EDITOR; quoted arguments group.
+        let quoted = LiveTUISuspendHost.resolveEditor(
+            environment: ["VISUAL": "  ", "EDITOR": "editor --name 'prompt draft'"]
+        )
+        #expect(quoted?.program == "editor")
+        #expect(quoted?.arguments == ["--name", "prompt draft"])
+        // Nothing set: vi.
+        let fallback = LiveTUISuspendHost.resolveEditor(environment: [:])
+        #expect(fallback?.program == "vi")
+        #expect(fallback?.arguments == [])
+        // An unterminated quote fails the parse — the caller notes
+        // upstream's `could not parse $VISUAL or $EDITOR`.
+        #expect(LiveTUISuspendHost.resolveEditor(
+            environment: ["VISUAL": "editor 'unterminated"]
+        ) == nil)
+    }
+}
+
+// MARK: - The created persona at the spawn surface (§3, the b0 flagship shape)
+
+/// The B9-b3 stake beyond pixels: the SAME `create_persona_template`
+/// output the `n` key lands (the keypress → file → exact-bytes loop is
+/// pinned by `createPersonaRoundTrip` above) is what a REAL session's
+/// spawn resolves against — loader → host context → `resolveRuntimeConfig`
+/// → `<persona>` block → wire, the b0 flagship's proof shape.
+@Suite("created personas reach the live spawn seam", .serialized)
+struct LiveAgentsPersonaCreateSpawnTests {
+    private struct SpawnFixture {
+        let root: URL
+        let home: URL
+        let workspace: URL
+        let server: MockInferenceServer
+
+        init() throws {
+            root = FileManager.default.temporaryDirectory
+                .appendingPathComponent(
+                    "opengrok-agents-create-spawn-\(UUID().uuidString)",
+                    isDirectory: true
+                )
+            home = root.appendingPathComponent("home", isDirectory: true)
+            workspace = root.appendingPathComponent("workspace", isDirectory: true)
+            try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: workspace,
+                withIntermediateDirectories: true
+            )
+            server = try MockInferenceServer()
+            try """
+            [endpoints]
+            xai_api_base_url = "\(server.url)"
+            """.write(
+                to: home.appendingPathComponent("config.toml"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+
+        func dispose() {
+            server.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        func makeFoundation() async throws
+            -> OpenGrokLiveApplicationLauncher.LiveSessionFoundation {
+            let command = try CLICommandParser.parseOrThrow([
+                "headless", "--prompt", "hello", "--cwd", workspace.path,
+                "--model", "grok-4.5",
+            ])
+            guard case .launch(let options) = command else {
+                throw CLIApplicationError.failed("fixture did not parse to a launch")
+            }
+            return try await OpenGrokLiveApplicationLauncher.makeSessionFoundation(
+                options: options,
+                context: CLIApplicationContext(
+                    environment: [
+                        "HOME": home.path,
+                        "OPENGROK_HOME": home.path,
+                        "XDG_STATE_HOME": home.appendingPathComponent("state").path,
+                        "XAI_API_KEY": "test-xai-key",
+                    ],
+                    streams: CLIStreams(out: { _ in }, err: { _ in }),
+                    control: .never
+                ),
+                dependencies: OpenGrokLiveCompositionDependencies(
+                    makeSampler: OpenGrokLiveSampler.production(configuration:)
+                )
+            )
+        }
+    }
+
+    @Test("a persona created by the modal's writer lands its instructions on a real child's request")
+    func createdPersonaResolvesOnTheWire() async throws {
+        let fixture = try SpawnFixture()
+        defer { fixture.dispose() }
+        let marker = "Cite the keystone ledger \(UUID().uuidString) in every answer."
+        // The SAME function the create form's Enter resolves through
+        // (`create_persona_template`, `agents_modal.rs:620-646`) — not a
+        // hand-written fixture file — so this proves the b3 template is
+        // the shape the b0 loader and a live spawn actually consume.
+        _ = try PagerPersonaFileStore.createPersonaTemplate(
+            name: "probe",
+            description: "created by the b3 form",
+            instructions: marker,
+            scope: .user,
+            cwd: fixture.workspace,
+            openGrokHome: fixture.home
+        )
+        try fixture.server.enqueueResponse(
+            path: "/v1/responses",
+            response: .sse(SseEvents.responsesApiEventsExact(text: "child done", model: "grok-4.5"))
+        )
+        let foundation = try await fixture.makeFoundation()
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+        let host = try #require(foundation.subagentHost)
+        let result = await host.spawn(
+            args: .object([
+                "prompt": .string("run the probe"),
+                "description": .string("persona probe"),
+                "subagent_type": .string("general-purpose"),
+                "background": .bool(false),
+            ]),
+            toolCallID: "call-created-persona",
+            persona: "probe"
+        )
+        guard case .success = result else {
+            Issue.record("created-persona spawn failed: \(result)")
+            return
+        }
+        let bodies = fixture.server.requests()
+            .filter { $0.method == "POST" && $0.path.contains("responses") }
+            .map { (try? $0.body?.encodeString()) ?? "" }
+        #expect(bodies.count == 1)
+        let childBody = try #require(bodies.first)
+        #expect(childBody.contains("<persona>"))
+        #expect(childBody.contains(marker))
     }
 }

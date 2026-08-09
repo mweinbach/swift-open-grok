@@ -46,6 +46,18 @@ enum LiveAgentsComposition {
     static let toggleRowPrefix = "toggle:"
     static let defaultRowPrefix = "default:"
 
+    /// Row ids for the B9-b3 persona mutations (`n` create form Enter,
+    /// `agents_modal.rs:2363-2385`; `d` confirm `y`, `:2395-2411`). The
+    /// form/confirm payloads ride the overlay snapshot itself.
+    static let createPersonaRowID = "persona:create"
+    static let deletePersonaRowID = "persona:delete"
+
+    /// The persona detail modal's overlay id and its two outcome row ids
+    /// (see `PagerOverlayStack.handle`'s `.personaDetail` arm).
+    static let personaDetailOverlayID = "persona-detail"
+    static let personaDetailSaveRowID = "save"
+    static let personaDetailEditInEditorRowID = "edit-in-editor"
+
     /// Map the controller's intent tab onto the render layer's modal tab.
     static func tab(for intent: OpenGrokPagerAgentsTab) -> PagerAgentsTab {
         switch intent {
@@ -426,10 +438,13 @@ enum LiveAgentsComposition {
             hasOutputs: !persona.outputs.isEmpty,
             sourcePath: persona.sourcePath,
             scopeLabel: personaScopeLabel(persona: persona, openGrokHome: openGrokHome, cwd: cwd),
-            // The `Enter` stand-in for inline entries, which have no file
-            // to open: their definition fields as TOML-shaped text. The
-            // b3 persona detail modal supersedes this.
-            viewContent: persona.sourcePath == nil ? inlinePersonaText(persona) : nil
+            // `persona_is_deletable`/`persona_is_editable` (`agents_modal.
+            // rs:673-683`) stamped at snapshot time — the canonical-path
+            // guard needs disk, which the overlay never touches. The
+            // delete itself re-runs the guard against live disk.
+            deletable: persona.sourcePath.map {
+                PagerPersonaFileStore.personaPathIsDeletable($0, openGrokHome: openGrokHome)
+            } ?? false
         )
     }
 
@@ -490,23 +505,218 @@ enum LiveAgentsComposition {
         return paragraph.joined(separator: " ")
     }
 
-    /// The inline-persona definition view: the fields the config table
-    /// declared, re-serialized as TOML-shaped text so the viewer shows the
-    /// same keys a file-backed persona's file would.
-    static func inlinePersonaText(_ persona: SubagentPersona) -> String {
-        var lines: [String] = []
-        if let description = persona.description {
-            lines.append("description = \"\(description)\"")
+    // MARK: - Persona mutations (`n`/`d`, B9-b3)
+
+    /// `refresh_personas` (`agents_modal.rs:330-336`): rebuild the tab
+    /// from the live loader, collapse every expansion, clamp the
+    /// selection. Also `refresh_after_editor`'s Personas arm (`:337-343`)
+    /// and the detail-close refresh (`agent_view/modals.rs:126-132`).
+    static func refreshingPersonas(
+        _ current: PagerAgentsOverlay,
+        workingDirectory: String,
+        openGrokHome: URL,
+        environment: [String: String]
+    ) -> PagerAgentsOverlay {
+        var updated = current
+        let cwd = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        updated.personas = personaRows(
+            document: effectiveDocument(cwd: cwd, environment: environment),
+            openGrokHome: openGrokHome,
+            cwd: cwd
+        )
+        updated.expandedPersonas = []
+        if updated.selectedPersona >= updated.personas.count {
+            updated.selectedPersona = max(0, updated.personas.count - 1)
         }
-        if let instructionsFile = persona.instructionsFile {
-            lines.append("instructions_file = \"\(instructionsFile)\"")
+        return updated
+    }
+
+    /// The create-form Enter arm (`agents_modal.rs:2363-2385`): run
+    /// `create_persona_template` against the form snapshot; success clears
+    /// the form, refreshes the list, and reports with the SANITIZED name
+    /// (the path's file stem, `:2374`); failure leaves the form open with
+    /// the error painted inside it.
+    static func creatingPersona(
+        from current: PagerAgentsOverlay,
+        workingDirectory: String,
+        openGrokHome: URL,
+        environment: [String: String]
+    ) -> PagerAgentsOverlay {
+        var updated = current
+        guard let form = current.personaCreateForm else { return current }
+        let cwd = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        do {
+            let path = try PagerPersonaFileStore.createPersonaTemplate(
+                name: form.name.trimmingCharacters(in: .whitespaces),
+                description: form.description.trimmingCharacters(in: .whitespaces),
+                instructions: form.instructions.trimmingCharacters(in: .whitespaces),
+                scope: form.scope,
+                cwd: cwd,
+                openGrokHome: openGrokHome
+            )
+            let label = path.deletingPathExtension().lastPathComponent
+            updated.personaCreateForm = nil
+            updated = refreshingPersonas(
+                updated,
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                environment: environment
+            )
+            updated.message = .success("Created persona '\(label)'")
+        } catch {
+            updated.message = .error(writerMessage(error))
         }
-        if let instructions = persona.instructions {
-            lines.append("instructions = \"\"\"")
-            lines.append(instructions)
-            lines.append("\"\"\"")
+        return updated
+    }
+
+    /// The confirm `y` arm (`agents_modal.rs:2395-2411`): take the pending
+    /// confirm (it clears whether the delete lands or fails — upstream's
+    /// `take()`), run `delete_persona_file` with its canonical-path
+    /// guards, refresh on success only.
+    static func deletingPersona(
+        from current: PagerAgentsOverlay,
+        workingDirectory: String,
+        openGrokHome: URL,
+        environment: [String: String]
+    ) -> PagerAgentsOverlay {
+        var updated = current
+        guard let confirm = current.personaDeleteConfirm else { return current }
+        updated.personaDeleteConfirm = nil
+        do {
+            try PagerPersonaFileStore.deletePersonaFile(
+                atPath: confirm.path,
+                openGrokHome: openGrokHome
+            )
+            updated = refreshingPersonas(
+                updated,
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                environment: environment
+            )
+            updated.message = .success("Deleted persona '\(confirm.name)'")
+        } catch {
+            updated.message = .error(writerMessage(error))
         }
-        return lines.joined(separator: "\n")
+        return updated
+    }
+
+    // MARK: - Persona detail (Enter/`o`, B9-b3)
+
+    /// Build the detail modal for a persona row — upstream's
+    /// `OpenPersonaDetail` handling (`agent_view/modals.rs:49-68`):
+    /// file-backed entries re-read their `.toml` fresh from disk
+    /// (`PersonaDetailState::from_toml_file`, `persona_detail.rs:152-227`);
+    /// nil means the load failed and the caller paints
+    /// `Failed to load persona '{name}'` on the agents modal.
+    ///
+    /// Path-less rows are this port's inline `[subagents.personas]`
+    /// entries — a surface upstream's modal never lists, so its
+    /// `from_name_only` (name-only, everything else "—") has no honest
+    /// equivalent here: the fields are re-read from the same live loader
+    /// a spawn resolves with, read-only (recorded divergence; painting
+    /// them empty when the session resolves them non-empty would be the
+    /// §3 silent-drop). A name the fresh document no longer carries fails
+    /// the load like a vanished file.
+    static func personaDetail(
+        for entry: PagerAgentsPersonaEntry,
+        workingDirectory: String,
+        openGrokHome: URL,
+        environment: [String: String]
+    ) -> PagerPersonaDetailOverlay? {
+        let scopeLabel = entry.scopeLabel ?? "bundled"
+        guard let path = entry.sourcePath else {
+            let cwd = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            let document = effectiveDocument(cwd: cwd, environment: environment)
+            let base = SubagentPersonaLoader.basePersonas(
+                configDocument: document,
+                openGrokHome: openGrokHome
+            )
+            let effective = SubagentPersonaLoader.effectivePersonas(
+                base: base,
+                cwd: cwd,
+                projectTrusted: true
+            )
+            guard let persona = effective[entry.name], persona.sourcePath == nil else {
+                return nil
+            }
+            return PagerPersonaDetailOverlay(
+                name: entry.name,
+                description: persona.description ?? "",
+                model: persona.model ?? "",
+                reasoningEffort: persona.reasoningEffort ?? "",
+                defaultIsolation: persona.defaultIsolation ?? "",
+                instructions: persona.instructions ?? "",
+                instructionsFile: persona.instructionsFile ?? "",
+                inputs: persona.inputs.map(detailIOEntry),
+                outputs: persona.outputs.map(detailIOEntry),
+                sourcePath: nil,
+                editable: false,
+                scopeLabel: scopeLabel
+            )
+        }
+        // `from_toml_file` (`persona_detail.rs:152-227`): unreadable or
+        // unparseable → nil; `name` falls back to the file stem; the I/O
+        // arrays decode tolerantly with upstream's defaults.
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8),
+              let parsed = try? parseTOML(Data(content.utf8)),
+              let table = parsed.table
+        else { return nil }
+        func string(_ key: String) -> String {
+            table[key]?.stringValue ?? ""
+        }
+        func ioEntries(_ key: String) -> [PagerPersonaIOEntry] {
+            (table[key]?.arrayValue ?? []).map { item in
+                PagerPersonaIOEntry(
+                    name: item.table?["name"]?.stringValue ?? "?",
+                    ioType: item.table?["io_type"]?.stringValue ?? "file",
+                    required: item.table?["required"]?.boolValue ?? false,
+                    description: item.table?["description"]?.stringValue ?? ""
+                )
+            }
+        }
+        let stemName = URL(fileURLWithPath: path)
+            .deletingPathExtension().lastPathComponent
+        let declaredName = string("name")
+        return PagerPersonaDetailOverlay(
+            name: declaredName.isEmpty ? stemName : declaredName,
+            description: string("description"),
+            model: string("model"),
+            reasoningEffort: string("reasoning_effort"),
+            defaultIsolation: string("default_isolation"),
+            instructions: string("instructions"),
+            instructionsFile: string("instructions_file"),
+            inputs: ioEntries("inputs"),
+            outputs: ioEntries("outputs"),
+            sourcePath: path,
+            editable: entry.deletable,
+            scopeLabel: scopeLabel
+        )
+    }
+
+    private static func detailIOEntry(_ field: PersonaIOField) -> PagerPersonaIOEntry {
+        PagerPersonaIOEntry(
+            name: field.name,
+            ioType: field.ioType,
+            required: field.required,
+            description: field.description
+        )
+    }
+
+    /// The detail modal's save round-trip (`handle_editing_key` →
+    /// `save_to_file`, `persona_detail.rs:844-865`): the write happens
+    /// here because the overlay owns no IO; the replacement overlay
+    /// carries upstream's exact message either way.
+    static func savingPersonaDetail(
+        _ detail: PagerPersonaDetailOverlay
+    ) -> PagerPersonaDetailOverlay {
+        var updated = detail
+        do {
+            try PagerPersonaFileStore.saveDetail(detail)
+            updated.message = "Saved"
+        } catch {
+            updated.message = "Save failed: \(writerMessage(error))"
+        }
+        return updated
     }
 
     // MARK: - Mutations (`t`/`s`, B9-b2)
@@ -521,13 +731,15 @@ enum LiveAgentsComposition {
             .flatMap { $0.isEmpty ? nil : $0 }
     }
 
-    /// Resolve a `t`/`s` mutation row against the real config writers and
-    /// return the refreshed overlay to swap in, or nil when the row id is
-    /// not a mutation (the view rows fall through to `viewPayload`).
+    /// Resolve a mutation row — `t`/`s` (b2) or the persona create/delete
+    /// (b3) — against the real writers and return the refreshed overlay to
+    /// swap in, or nil when the row id is not a mutation (the view rows
+    /// fall through to the detail/viewer routes).
     ///
-    /// Both writers target the USER config.toml
+    /// The `t`/`s` writers target the USER config.toml
     /// (`grok_home().join("config.toml")`, `agents_modal.rs:731`/`:755`),
-    /// never the project one — hence `openGrokHome`, not `cwd`.
+    /// never the project one — hence `openGrokHome`, not `cwd`; the
+    /// persona create writes to the FORM's scope directory (`:606-611`).
     static func applyingMutation(
         rowID: String,
         to current: PagerAgentsOverlay,
@@ -556,6 +768,22 @@ enum LiveAgentsComposition {
             return settingDefaultAgent(
                 at: index, current: current, store: store,
                 cwd: cwd, modelAgentType: modelAgentType, environment: environment
+            )
+        }
+        if rowID == createPersonaRowID {
+            return creatingPersona(
+                from: current,
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                environment: environment
+            )
+        }
+        if rowID == deletePersonaRowID {
+            return deletingPersona(
+                from: current,
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                environment: environment
             )
         }
         return nil
@@ -646,47 +874,31 @@ enum LiveAgentsComposition {
 
     // MARK: - View resolution (`Enter`/`o`)
 
-    /// Resolve the document-overlay payload for a view row id, from the
-    /// OPEN overlay's snapshot. Upstream opens its line viewer over the
-    /// modal from the same selection (`agent_view/modals.rs:27-47`); the
-    /// title is `"{name} — prompt extension"` (`agents_modal.rs:2127`) for
-    /// agents and the b3 detail modal's `"persona: {name}"`
-    /// (`persona_detail.rs:382`) for personas. Returns nil for a stale or
-    /// unreadable target — upstream's viewer-open failure is silent too
-    /// (`open_markdown` returning `None` opens nothing).
+    /// Resolve the document-overlay payload for an AGENT view row id, from
+    /// the OPEN overlay's snapshot. Upstream opens its line viewer over
+    /// the modal from the same selection (`agent_view/modals.rs:27-47`);
+    /// the title is `"{name} — prompt extension"` (`agents_modal.rs:2127`).
+    /// Persona rows no longer come here — as of B9-b3 they open the
+    /// structured detail modal (`personaDetail(for:)`), superseding b1's
+    /// raw-text viewer. Returns nil for a stale or unreadable target —
+    /// upstream's viewer-open failure is silent too (`open_markdown`
+    /// returning `None` opens nothing).
     static func viewPayload(
         rowID: String,
         overlay: PagerAgentsOverlay
     ) -> (title: String, content: String)? {
-        if rowID.hasPrefix(viewAgentRowPrefix) {
-            guard let index = Int(rowID.dropFirst(viewAgentRowPrefix.count)),
-                  overlay.agents.indices.contains(index)
-            else { return nil }
-            let entry = overlay.agents[index]
-            let title = "\(entry.name) \u{2014} prompt extension"
-            if let path = entry.sourcePath,
-               let content = try? String(contentsOfFile: path, encoding: .utf8) {
-                return (title, content)
-            }
-            if let content = entry.viewContent {
-                return (title, content)
-            }
-            return nil
+        guard rowID.hasPrefix(viewAgentRowPrefix) else { return nil }
+        guard let index = Int(rowID.dropFirst(viewAgentRowPrefix.count)),
+              overlay.agents.indices.contains(index)
+        else { return nil }
+        let entry = overlay.agents[index]
+        let title = "\(entry.name) \u{2014} prompt extension"
+        if let path = entry.sourcePath,
+           let content = try? String(contentsOfFile: path, encoding: .utf8) {
+            return (title, content)
         }
-        if rowID.hasPrefix(viewPersonaRowPrefix) {
-            guard let index = Int(rowID.dropFirst(viewPersonaRowPrefix.count)),
-                  overlay.personas.indices.contains(index)
-            else { return nil }
-            let entry = overlay.personas[index]
-            let title = "persona: \(entry.name)"
-            if let path = entry.sourcePath,
-               let content = try? String(contentsOfFile: path, encoding: .utf8) {
-                return (title, content)
-            }
-            if let content = entry.viewContent {
-                return (title, content)
-            }
-            return nil
+        if let content = entry.viewContent {
+            return (title, content)
         }
         return nil
     }
