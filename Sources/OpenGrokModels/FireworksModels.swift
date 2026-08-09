@@ -65,6 +65,33 @@ public enum FireworksModels {
         ),
     ]
 
+    /// The effort menu every curated Fireworks entry offers: Low/Medium/High
+    /// defaulting Medium, descriptions deliberately absent
+    /// (`fireworks_reasoning_efforts()`, fireworks_models.rs:182-197).
+    public static let reasoningEfforts: [ReasoningEffortOption] = [
+        ReasoningEffortOption(
+            id: ReasoningEffort.low.rawValue,
+            value: .low,
+            label: "Low",
+            description: nil,
+            isDefault: false
+        ),
+        ReasoningEffortOption(
+            id: ReasoningEffort.medium.rawValue,
+            value: .medium,
+            label: "Medium",
+            description: nil,
+            isDefault: true
+        ),
+        ReasoningEffortOption(
+            id: ReasoningEffort.high.rawValue,
+            value: .high,
+            label: "High",
+            description: nil,
+            isDefault: false
+        ),
+    ]
+
     public static func isTrustedAPIBaseURL(_ baseURL: String) -> Bool {
         guard let url = URL(string: baseURL), url.scheme?.lowercased() == "https" else {
             return false
@@ -99,9 +126,15 @@ public enum FireworksModels {
         info.provider = .fireworks
         info.toolMode = .direct
         info.contextWindow = max(1, contextWindow ?? curated.fallbackContextWindow)
-        info.supportsReasoningEffort = false
-        info.reasoningEfforts = []
-        info.reasoningEffort = nil
+        // Every curated entry carries the Low/Medium/High menu with Medium as
+        // the default (fireworks_models.rs:164-166). The non-nil catalog
+        // effort is ALSO what arms the sampler's Fireworks effort-restore
+        // gate — set these to nil again and every curated Fireworks request
+        // silently loses its `reasoning_effort` while the suite stays green
+        // (the gate itself fails closed, EffortShapingTests pins it).
+        info.supportsReasoningEffort = true
+        info.reasoningEfforts = reasoningEfforts
+        info.reasoningEffort = .medium
         // Every curated Fireworks model advertises the Fast / priority tier
         // (fireworks_models.rs:167-171); Fireworks chat requests forward
         // `service_tier` unchanged (provider.rs:1090-1102 pins this).

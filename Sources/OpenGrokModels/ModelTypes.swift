@@ -854,6 +854,17 @@ public struct ConfigModelOverride: Sendable, Equatable {
             entry.info.supportsReasoningEffort = true
         }
         if !reasoningEfforts.isEmpty { entry.info.reasoningEfforts = reasoningEfforts }
+        // An EXPLICIT `supports_reasoning_effort = false` also clears the
+        // effort and the menu — including values this same override set two
+        // branches above (config.rs:4653-4656). Without this arm, a leftover
+        // default or a conflicting user value survives into
+        // `deriveReasoningEffortFields`, which re-arms support from a
+        // non-empty menu, and the sampler sends an effort the user just
+        // declared unsupported. An ABSENT flag must not clear anything.
+        if supportsReasoningEffort == false {
+            entry.info.reasoningEffort = nil
+            entry.info.reasoningEfforts = []
+        }
         if let v = supportsReasoningSummaryParameter {
             entry.info.supportsReasoningSummaryParameter = v
         }

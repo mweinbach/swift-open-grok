@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-08 (Wave 17 E24/R0: reference re-pinned to `650c1db7` / release `.58`; version + fixtures restamped; R1–R5 provider slices queued)
+**As of:** 2026-08-08 (Wave 17 R1–R3: Fireworks curated efforts on the wire, OpenCode Go output-limit drop, override supports=false clearing)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -957,6 +957,39 @@ the deferral with the `.58` cite. **Not required by the re-pin (recorded):**
 `subagent/mod.rs` spawn-refresh reconciliation (children ride the parent sampler;
 covered by E10's recorded divergence — the `.58` cite belongs there when R-slices
 land).
+
+### R1–R3 — Fireworks efforts, OpenCode Go output drop, override clearing (serial gate: exit 0, 5,049 tests, zero issues)
+
+Three disjoint `.58` behavioral items, each verified against the pin by the lead. **R1:**
+every curated Fireworks entry now carries `supportsReasoningEffort = true`, the
+Low/Medium/High menu (Medium default, descriptions absent — byte-faithful to
+`fireworks_reasoning_efforts()`, `fireworks_models.rs:182-197`), and `.medium` as the
+catalog effort (`:164-166`) — closing E3's corrected divergence. The load-bearing note
+is in-source: the non-nil catalog effort is what arms the already-live sampler
+effort-restore gate, so reverting it silently strips `reasoning_effort` from every
+curated Fireworks request while the suite stays green. Proven in both directions on the
+live wire (real resolver → real sampler → mock server bytes): curated `glm-5.2` sends
+`"reasoning_effort": "medium"`; a genuinely non-curated user-config Fireworks model
+sends none (the fail-closed arm of `fireworks_reasoning_requires_explicit_model_support`).
+Embedded (pre-refresh) Fireworks defaults stay effort-less, as upstream's own
+`config.rs:14155` pin demands. **R2:** the `limit.output → maxCompletionTokens` mapping
+is deleted (`opencode_go_models.rs:243-259` assigns none at the pin — models.dev's
+1M-scale output caps became oversized request limits); the field stays parsed-but-unused
+with upstream's `_output` rename intent in a comment, and both oversized-value nil pins
+(1,000,000 / 500,000) are ported. Divergence kept: Swift keeps the name `output` (no
+`_`-prefix convention); the nil pins are the guard. **R3:** the override-apply clearing
+arm — explicit `supports_reasoning_effort = false` also clears `reasoning_effort` and
+the menu (`config.rs:4653-4656`, placement verified exact) — with both upstream tests
+ported through the tuning seam plus a port-added pin that an ABSENT flag clears nothing
+(the `Bool? == false` spelling invites a `!= true` "simplification" that would flip
+absent into clearing; the test is the tripwire). 8 net-new tests.
+
+**Pre-existing gap surfaced by R1, ruled by the lead → R4b:** the pin's
+`CURATED_FIREWORKS_MODELS` has 6 entries (`fireworks_models.rs:38-81`); the port's
+`FireworksModels.curated` has 4 — `fireworks:kimi-k3` and `fireworks:kimi-k3-fast` are
+missing (predates `.58`). Cost today: an authoritative Fireworks refresh replaces the
+embedded partition, so post-refresh the port drops the two Kimi variants entirely.
+Queued as R4b alongside the pacing gate.
 
 ## Wave 16 — Pager surfaces, first parallel worktree batch (2026-08-08)
 

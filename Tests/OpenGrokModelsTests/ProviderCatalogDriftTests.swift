@@ -512,9 +512,14 @@ struct OpenCodeGoCatalogTests {
         #expect(OpenCodeGoModels.protocolForSDK("@ai-sdk/unknown") == nil)
     }
 
-    /// Provenance: Rust `catalog_intersects_availability_and_fails_closed`.
-    /// A model the provider serves but models.dev does not describe, or whose
-    /// SDK has no known protocol, is dropped with a warning rather than guessed.
+    /// Provenance: Rust `catalog_intersects_availability_and_fails_closed`
+    /// (opencode_go_models.rs:370-473). A model the provider serves but
+    /// models.dev does not describe, or whose SDK has no known protocol, is
+    /// dropped with a warning rather than guessed. The `.58` update feeds
+    /// deliberately OVERSIZED `limit.output` values (1,000,000 / 500,000 —
+    /// opencode_go_models.rs:381-384, :395-398) and pins that neither reaches
+    /// `max_completion_tokens` (…:430-439): models.dev output caps must not
+    /// become oversized default request limits.
     @Test("availability intersects metadata and fails closed")
     func intersectionFailsClosed() throws {
         let metadata = ModelsDevProvider(
@@ -523,12 +528,12 @@ struct OpenCodeGoCatalogTests {
                 "gpt-ish": ModelsDevModel(
                     name: "GPT-ish",
                     description: "an openai-compatible model",
-                    limit: ModelsDevLimit(context: 400_000, output: 64_000)
+                    limit: ModelsDevLimit(context: 400_000, output: 1_000_000)
                 ),
                 "claude-ish": ModelsDevModel(
                     name: "Claude-ish",
                     provider: ModelsDevModelProvider(npm: "@ai-sdk/anthropic"),
-                    limit: ModelsDevLimit(context: 200_000, output: 32_000)
+                    limit: ModelsDevLimit(context: 200_000, output: 500_000)
                 ),
                 "mystery": ModelsDevModel(
                     name: "Mystery",
@@ -554,13 +559,17 @@ struct OpenCodeGoCatalogTests {
         #expect(openAIish.info.apiBackend == .chatCompletions)
         #expect(openAIish.info.authScheme == .bearer)
         #expect(openAIish.info.contextWindow == 400_000)
-        #expect(openAIish.info.maxCompletionTokens == 64_000)
         #expect(openAIish.info.name == "GPT-ish")
         #expect(openAIish.envKey == .single(OpenCodeGoModels.apiKeyEnv))
 
         let anthropicish = try #require(result.entries["opencode-go:claude-ish"])
         #expect(anthropicish.info.apiBackend == .messages)
         #expect(anthropicish.info.authScheme == .xApiKey)
+
+        // The two `.58` pins: parsed `limit.output` never maps onto the
+        // request limit, however large (opencode_go_models.rs:430-439).
+        #expect(openAIish.info.maxCompletionTokens == nil)
+        #expect(anthropicish.info.maxCompletionTokens == nil)
 
         // Descriptors are sorted by name then id for a stable menu.
         #expect(result.descriptors.map(\.name) == ["Claude-ish", "GPT-ish"])

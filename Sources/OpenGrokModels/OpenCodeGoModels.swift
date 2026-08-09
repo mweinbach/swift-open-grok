@@ -133,7 +133,10 @@ public enum OpenCodeGoModels {
             let name = model.name ?? id
             info.name = name
             info.description = model.description
-            info.maxCompletionTokens = model.limit?.output.flatMap { UInt32(exactly: $0) }
+            // `limit.output` deliberately does NOT map to `maxCompletionTokens`
+            // (the `.58` delta removed the mapping; opencode_go_models.rs:243-259
+            // assigns none): models.dev advertises 1M-scale output caps that
+            // became oversized default request limits on the wire.
             info.apiBackend = apiBackend
             info.authScheme = authScheme
             info.provider = .openCodeGo
@@ -258,6 +261,11 @@ public struct ModelsDevModelProvider: Sendable, Equatable {
 
 public struct ModelsDevLimit: Sendable, Equatable {
     public var context: UInt64?
+    /// Parsed but deliberately unused — upstream renamed the field `_output`
+    /// while keeping the JSON key (opencode_go_models.rs:344-350) so the
+    /// document still round-trips without the value ever reaching
+    /// `maxCompletionTokens`. Wiring it back up re-creates the oversized
+    /// request-limit bug the `.58` delta removed.
     public var output: UInt64?
 
     public init(context: UInt64?, output: UInt64?) {
