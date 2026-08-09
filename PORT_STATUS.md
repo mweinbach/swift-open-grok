@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-08 (Wave 18 B9-c1: privacy-banner gate + ack plumbing landed dark; c2 retention client next, then the banner)
+**As of:** 2026-08-09 (Wave 18 B9-c2: retention write client live, /privacy row un-lied; c3 banner next)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1103,6 +1103,44 @@ non-xAI credential counts Done and is blocked by the cleared opt-out — same ob
 result); the reshow overflow arm folds into `Date` saturation. **Deferred:** the
 opt-in/opt-out dispatch handlers and inflight guard ride c2/c3 (landing them now would
 register actions that lie — §4).
+
+### B9-c2 — coding-data-retention write client; the `/privacy` row un-lied (serial gate: exit 0, 5,132 tests, zero issues)
+
+`LivePrivacyRetentionClient` PUTs `{proxy}/v1/privacy/coding-data-retention` with
+upstream's exact wire contract (verified at the pin against `extensions/privacy.rs:
+30-94`: single-key `codingDataRetentionOptOut` body, Bearer + `X-XAI-Token-Auth` +
+version + client-mode headers, `HTTP request failed: {e}` transport copy, non-2xx
+`error`→`message`→`server returned HTTP {status}` fallback, confirmed-equals-requested
+echo). The `coding_data_sharing` row is now a real control on upstream's exact order
+(`dispatch/status.rs:141-183,424-491`): ZDR/non-admin guards, idempotent skip,
+optimistic flip FIRST, server write, success re-anchors to the confirmed value, failure
+reverts and toasts the scrubbed error (`pagerScrubErrorForToast`, the `status.rs:186-200`
+port), and a write-generation guard drops superseded replies (a superseded failure
+neither reverts nor toasts — its rollback predates the newer write). The mirror applies
+to the row, the open modal snapshot, AND the B9-c1 gate state in one place, so the row
+and `shouldShow` can never disagree; on success the auth.json mirror persists via
+`AuthManager.update` — **lead-verified: the port's `update` is a pure persist+swap with
+no background enrichment fetch, so it already IS upstream's `save_without_enrichment`
+and the stale-ACL overwrite race upstream dodges cannot occur here.** Storage kind
+stays `.authMetadata` (upstream's own; the row persists to the server + auth mirror,
+never config.toml — pinned that `persistedPath` is nil). The c3 seam is
+`setCodingDataSharing(optedIn:) → .refused/.unchanged/.saved/.failed` (`.saved` is the
+banner's ack trigger; `.unchanged` must not arm the inflight flag, `status.rs:513-516`).
+20 net-new tests: a real-socket PUT asserting method/path/body/header PRESENCE (never
+the secret value), all-three-mirrors flip, failure rollback + surfaced error, the
+denied-boundary zero-request proof with positive control, the superseded-reply pin via
+a hold-first transport, and registry pins.
+
+**Recorded divergences:** the write is export-boundary-gated (fail-closed `.denied`
+default + the feedback client's live send-time bail; upstream's is ungated — cost: a
+boundary-closed session cannot change the setting from the modal and sees the refusal);
+toasts ride transcript notes; best-effort auth-mirror disk write (upstream's own
+`let _ =`, cost in-source); message-passing collapsed to one awaitable seam with the
+generation guard preserving out-of-order semantics; 10 s timeout (announcements'
+number); on-demand hydration before consent guards (evaluating them against a
+default-constructed state would let a ZDR team's write through). **Deferred to c3:**
+banner paint, opt-in/opt-out handlers, the inflight flag; consent-source telemetry
+stays lead-deferred (the seam takes a source parameter when it lands).
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

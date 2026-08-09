@@ -1269,6 +1269,27 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             exportPolicy: foundation.samplingConfiguration
                                 .provider.profile.xaiServices
                         ),
+                        // The coding-data retention write client (B9-c2):
+                        // same transport and frozen export policy as the
+                        // changelog/announcements, same proxy-base
+                        // resolution as announcements, plus the session's
+                        // LIVE boundary so a mid-session switch to an
+                        // xAI-export-denied provider closes the write
+                        // without waiting for a rebuild.
+                        codingDataRetention: LiveCodingDataRetentionClient(
+                            transport: foundation.samplingConfiguration.transport,
+                            exportPolicy: foundation.samplingConfiguration
+                                .provider.profile.xaiServices,
+                            proxyBaseURL: URL(string:
+                                foundation.options.advanced.cliChatProxyBaseURL
+                                    ?? context.environment["GROK_CLI_CHAT_PROXY_BASE_URL"]
+                                    ?? CLI_CHAT_PROXY_BASE_URL_DEFAULT
+                            ),
+                            liveBoundary: sharedExportBoundary,
+                            tokenHeader: GrokComConfig
+                                .default(environment: context.environment)
+                                .tokenHeader
+                        ),
                         // The paint ceiling: `GROK_MIN_DRAW_MS` wins, then the
                         // `[ui.display_refresh]` auto-cadence policy (inert
                         // until a display probe exists — `probedRefreshHz` is
@@ -7773,6 +7794,27 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// renderer's environment, upstream's offline arm.
     private let changelog: ChangelogManager?
 
+    /// The coding-data retention write client (Wave 18 B9-c2) — what makes
+    /// the `coding_data_sharing` settings row a real control instead of the
+    /// non-persistable viewer §4 found. `nil` in compositions without a
+    /// live transport; a commit then rolls back and reports the refusal —
+    /// never a fake success (§5: this is a consent write to a server).
+    private let codingDataRetention: LiveCodingDataRetentionClient?
+    /// Newest retention-write generation — upstream's
+    /// `coding_data_write_seq` (app_view.rs:1277-1279, claimed per write at
+    /// dispatch/status.rs:87-92). Writes to this endpoint run concurrently
+    /// and can land out of order; a reply carrying a stale generation must
+    /// not touch state, because applying its rollback would silently undo
+    /// whatever the user did since (status.rs:96-110).
+    private var codingDataWriteSeq: UInt64 = 0
+    /// The spawned modal-commit write, upstream's Effect task
+    /// (effects/mod.rs:5366-5433 spawns; the commit handler returns
+    /// immediately so a slow proxy never blocks the input loop). Internal
+    /// (not private) so the live-seam tests await the real spawned write
+    /// instead of polling frames; the outcome is fully self-reported
+    /// (rollback + toast happen inside `setCodingDataSharing`).
+    private(set) var pendingCodingDataWrite: Task<LiveCodingDataSharingOutcome, Never>?
+
     init(
         mode: OpenGrokPagerMode,
         terminal: OpenGrokLiveTerminal,
@@ -7804,6 +7846,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         openGrokHome: URL? = nil,
         announcements: LiveAnnouncementsComposition? = nil,
         changelog: ChangelogManager? = nil,
+        codingDataRetention: LiveCodingDataRetentionClient? = nil,
         paintCadence: TimeInterval = PagerMotion.defaultPaintCadence,
         environment: [String: String]? = nil,
         toolExecutor: LiveToolExecutor? = nil,
@@ -7820,6 +7863,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             .resolve(environment: ProcessInfo.processInfo.environment)
         self.announcements = announcements
         self.changelog = changelog
+        self.codingDataRetention = codingDataRetention
         self.terminal = terminal
         self.sink = sink
         self.workingDirectory = workingDirectory
@@ -8135,6 +8179,168 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             privacyBanner = state
             return false
         }
+    }
+
+    // MARK: - Coding-data retention write (Wave 18 B9-c2)
+
+    static let codingDataSharingKey = "coding_data_sharing"
+
+    /// Set the coding-data-sharing preference — the port of
+    /// `set_coding_data_sharing_with_source` (dispatch/status.rs:137-183 at
+    /// pin 650c1db7) fused with its two task-result handlers
+    /// (`handle_coding_data_sharing_updated` :424-455,
+    /// `handle_coding_data_sharing_failed` :457-491), in upstream's exact
+    /// order: guards → idempotent skip → OPTIMISTIC flip → server write →
+    /// re-anchor on success / rollback + toast on failure. The write
+    /// generation (`codingDataWriteSeq`) is claimed before the await and
+    /// re-checked after it, so a reply superseded by a newer write touches
+    /// nothing — success or failure alike (status.rs:96-110, :462-467).
+    ///
+    /// This is also the seam B9-c3's banner `[Opt in]` calls with its
+    /// inflight guard: `.refused`/`.unchanged` mean no request was issued
+    /// (upstream's empty-effects arm, status.rs:513-516), `.saved` is the
+    /// ack trigger, `.failed` leaves the banner up. No banner code lands
+    /// in this slice.
+    ///
+    /// Success is silent (status.rs:167-168: "Success is silent; only the
+    /// refusals above and the failure handler toast"); every refusal and
+    /// failure toasts, mapped onto a transcript note like every toast in
+    /// this port.
+    @discardableResult
+    func setCodingDataSharing(optedIn: Bool) async -> LiveCodingDataSharingOutcome {
+        // The guards read the same mirror the banner gate reads. A
+        // renderer that never hydrated (headless constructions that skip
+        // `begin()`) hydrates now, from the same auth store — evaluating
+        // consent guards against a default-constructed state would let a
+        // ZDR team's write through.
+        if privacyBanner == nil { await refreshPrivacyBannerState() }
+        guard let state = privacyBanner else { return .refused }
+        // ── Guard 1: Enterprise ZDR (status.rs:141-145) ──
+        if state.isZDR {
+            note("\u{2717} Cannot change: Zero Data Retention enabled")
+            try? renderState()
+            return .refused
+        }
+        // ── Guard 2: non-admin team member (status.rs:146-156) ──
+        if state.isTeamNonAdmin {
+            note("\u{2717} Data sharing is controlled by your team admin")
+            try? renderState()
+            return .refused
+        }
+        let previousOptedIn = !state.codingDataRetentionOptOut
+        // Idempotent path: skip the round-trip (status.rs:163-166).
+        if previousOptedIn == optedIn { return .unchanged }
+
+        // Optimistic mutation + open-modal refresh (status.rs:169-170).
+        applyCodingDataSharingMirror(optOut: !optedIn)
+        try? renderState()
+
+        // Claim this write's generation BEFORE suspending (status.rs:87-92).
+        codingDataWriteSeq &+= 1
+        let seq = codingDataWriteSeq
+
+        switch await performCodingDataRetentionWrite(optOut: !optedIn) {
+        case .success(let confirmedOptOut):
+            // Superseded success: a newer write owns the state
+            // (status.rs:429-431 via is_current_coding_data_write). The
+            // server did accept THIS write; only the re-anchor is dropped.
+            guard seq == codingDataWriteSeq else { return .saved }
+            // Re-anchor to the CONFIRMED value (status.rs:432-435).
+            applyCodingDataSharingMirror(optOut: confirmedOptOut)
+            try? renderState()
+            return .saved
+        case .failure(let error):
+            // A superseded failure must not revert — its rollback predates
+            // the newer write — and must not toast: nothing the user is
+            // looking at failed (status.rs:462-467).
+            guard seq == codingDataWriteSeq else { return .failed }
+            // Revert the optimistic mutation: inner → refresh → toast
+            // (status.rs:468-479), with upstream's scrub on the way to the
+            // painted surface (status.rs:481-483).
+            applyCodingDataSharingMirror(optOut: !previousOptedIn)
+            note("\u{2717} Couldn't update coding data sharing: "
+                + pagerScrubErrorForToast(error.description))
+            try? renderState()
+            return .failed
+        }
+    }
+
+    /// What the OPEN settings modal currently shows for one row. Internal
+    /// (not private) for the live-seam tests: an async re-anchor or
+    /// rollback must be asserted against the modal the user is looking at,
+    /// not against a freshly built one — a fresh build would read the
+    /// mirror and pass even if the open overlay was never refreshed (§3).
+    /// `nil` when no settings modal is open or the row has no explicit
+    /// value in it.
+    func openSettingsRowValue(forKey key: String) -> PagerSettingValue? {
+        for overlay in overlays.overlays.reversed()
+        where overlay.id == "settings" {
+            if case .settings(let settings) = overlay.content {
+                return settings.values[key]
+            }
+        }
+        return nil
+    }
+
+    /// Flip the in-memory mirrors together: the banner-gate state (what
+    /// B9-c1's `shouldShow` reads — the row and the gate must never
+    /// disagree) and the open settings modal's row, upstream's
+    /// `set_coding_data_sharing_inner` + `refresh_open_settings_modals`
+    /// pair (status.rs:71-74 and :170).
+    private func applyCodingDataSharingMirror(optOut: Bool) {
+        if var state = privacyBanner {
+            state.codingDataRetentionOptOut = optOut
+            privacyBanner = state
+        }
+        overlays.updateSettings { settings in
+            settings.values[Self.codingDataSharingKey] = .string(
+                optOut ? "opt-out" : "opt-in"
+            )
+        }
+    }
+
+    /// Resolve the credential, PUT the flag, and mirror the confirmed value
+    /// into auth metadata — upstream's shell handler half
+    /// (extensions/privacy.rs:29-90). Every arm reports; nothing here can
+    /// silently succeed or silently drop the write.
+    private func performCodingDataRetentionWrite(
+        optOut: Bool
+    ) async -> Result<Bool, LiveCodingDataRetentionError> {
+        guard let client = codingDataRetention else {
+            return .failure(.unavailable)
+        }
+        // The same AuthManager construction the gate hydration uses
+        // (`refreshPrivacyBannerState`), so the credential this write rides
+        // is the credential the gate state came from. `auth()` is
+        // upstream's `auth_manager.auth().await` (privacy.rs:29-34): any
+        // failure maps to the auth-required arm and its exact copy.
+        let manager = AuthManager(
+            grokHome: openGrokHome,
+            config: GrokComConfig.default(environment: environment),
+            environment: environment
+        )
+        let auth: GrokAuth
+        do {
+            auth = try await manager.auth()
+        } catch {
+            return .failure(.notAuthenticated)
+        }
+        let result = await client.setOptOut(optOut, bearerToken: auth.key)
+        if case .success(let confirmedOptOut) = result {
+            // Update local auth state to match (privacy.rs:83-89). The
+            // port's `update` IS upstream's `save_without_enrichment` —
+            // no background `/user` enrichment exists here to race the
+            // flag. Best-effort exactly as upstream's `let _ =`
+            // (privacy.rs:90): the server accepted the consent, so a
+            // failed disk write must not roll the UI back. Cost, stated:
+            // if this write fails, the NEXT launch hydrates the pre-write
+            // value from disk until a login or upstream-style enrichment
+            // refreshes it; this session's mirrors stay correct.
+            var updated = auth
+            updated.codingDataRetentionOptOut = confirmedOptOut
+            _ = try? await manager.update(updated)
+        }
+        return result
     }
 
     func begin() async throws {
@@ -10959,6 +11165,31 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// the full input-mode snapshot shared with the controller, and then the
     /// write to disk and the live theme swap.
     private func applySetting(_ event: PagerSettingsEvent) async {
+        if case .commit(let key, .string(let choice)) = event,
+           key == Self.codingDataSharingKey {
+            // The consent row persists to the xAI service through the
+            // retention client, never to config.toml (`.authMetadata`
+            // storage) — falling through to the shared store write would
+            // hit its notPersistable arm and silently do nothing, the
+            // exact "row that cannot change anything" the B9 research
+            // found. Choice mapping is upstream's modal commit
+            // (settings_modal/state.rs:1148-1151); an unknown choice maps
+            // to no action there and is dropped the same way here. The
+            // write is SPAWNED like upstream's Effect (status.rs:179-183
+            // → effects/mod.rs:5366) so a slow proxy never blocks the
+            // input loop; the guards and the optimistic flip inside run
+            // before the first await, so the row repaints instantly.
+            let optedIn: Bool
+            switch choice {
+            case "opt-in": optedIn = true
+            case "opt-out": optedIn = false
+            default: return
+            }
+            pendingCodingDataWrite = Task {
+                await self.setCodingDataSharing(optedIn: optedIn)
+            }
+            return
+        }
         if case .commit(let key, .bool(let flag)) = event {
             if key == "compact_mode" {
                 // The live half of the modal toggle — upstream routes it
@@ -11086,8 +11317,29 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             configPath: openGrokHome.appendingPathComponent("config.toml")
         )
         let activeCatalog = catalogStore?.pickerEntries() ?? modelCatalog
+        var values = (try? store.load()) ?? [:]
+        var locks: [String: PagerSettingLock] = [:]
+        // The consent row's value lives in auth metadata, not config.toml
+        // (`.authMetadata` storage), so `store.load()` never carries it —
+        // upstream feeds the modal snapshot from the app mirror instead
+        // (`coding_data_sharing_opt_out: app.coding_data_retention_opt_out`,
+        // dispatch/settings/ui.rs:1097), which this renderer keeps in the
+        // privacy-banner gate state hydrated at `begin()`. Locks mirror
+        // `coding_data_sharing_lock()` (app_view.rs:1693-1703): a ZDR team
+        // or non-admin member sees the row locked with the reason, and the
+        // modal refuses to open its chooser. Before `begin()` (headless
+        // constructions) the mirror is nil and the row falls back to its
+        // registered default, exactly as it did before this seam existed.
+        if let privacy = privacyBanner {
+            values[Self.codingDataSharingKey] = .string(
+                privacy.codingDataRetentionOptOut ? "opt-out" : "opt-in"
+            )
+            if let lock = privacy.codingDataSharingLock {
+                locks[Self.codingDataSharingKey] = lock
+            }
+        }
         var overlay = PagerSettingsOverlay(
-            values: (try? store.load()) ?? [:],
+            values: values,
             dynamicChoices: [
                 .activeModelCatalog: LiveModelPicker.sorted(activeCatalog).map { entry in
                     PagerSettingChoice(
@@ -11101,6 +11353,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             multiSelectEnabled: [
                 "opencode_go_models": (try? store.loadMultiSelect(key: "opencode_go_models")) ?? []
             ],
+            locks: locks,
             // Minimal mode hides the rows the reference marks `hidden_in_minimal`,
             // because none of them have a surface there to affect.
             minimalMode: mode != .fullScreen

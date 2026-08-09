@@ -1328,6 +1328,26 @@ public struct PagerOverlayStack: Sendable, Equatable {
         overlays.contains { $0.id == id }
     }
 
+    /// Mutate an open settings overlay's state in place — the port's seam
+    /// for upstream's `refresh_open_settings_modals`
+    /// (dispatch/settings/ui.rs:96-160 at pin 650c1db7): an app-level value
+    /// changed underneath an open modal and the modal's snapshot must
+    /// follow, without rebuilding the overlay (a rebuild would reset the
+    /// cursor and any open sub-pane). Returns false when no settings
+    /// overlay with that id is open — upstream's early exit.
+    @discardableResult
+    public mutating func updateSettings(
+        id: String = "settings",
+        _ transform: (inout PagerSettingsOverlay) -> Void
+    ) -> Bool {
+        guard let index = overlays.firstIndex(where: { $0.id == id }),
+              case .settings(var settings) = overlays[index].content
+        else { return false }
+        transform(&settings)
+        overlays[index].content = .settings(settings)
+        return true
+    }
+
     /// Route a key to the topmost overlay.
     ///
     /// `viewportHeight` is the row budget the overlay's scrollable body has;

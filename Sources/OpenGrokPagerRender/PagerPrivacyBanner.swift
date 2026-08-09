@@ -204,6 +204,20 @@ public struct PagerPrivacyBannerState: Sendable, Equatable {
         isZDR && !zdrAccessEnabled
     }
 
+    /// Why the `coding_data_sharing` settings row is locked for this user,
+    /// `nil` when it is editable — `coding_data_sharing_lock`
+    /// (app_view.rs:1693-1703). Mirrors the dispatch guards in
+    /// `set_coding_data_sharing` (dispatch/status.rs:141-157), and the ZDR
+    /// arm deliberately outranks the team arm exactly as upstream orders
+    /// them: a ZDR team's non-admin member is told about ZDR, the harder
+    /// policy. A locked row is SHOWN with its reason, never hidden — a user
+    /// who cannot change data sharing still needs to see what it is set to.
+    public var codingDataSharingLock: PagerSettingLock? {
+        if isZDR { return .zeroDataRetention }
+        if isTeamNonAdmin { return .policyManaged }
+        return nil
+    }
+
     /// `privacy_banner_should_show` (app_view.rs:1705-1731), arm for arm.
     ///
     /// The opt-out arm reads inverted on first sight and is correct: the
