@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-08 (Wave 18 B9-a: /release-notes live on the ChangelogManager port; B9-c privacy and B9-b personas queued)
+**As of:** 2026-08-08 (Wave 18 B9-c1: privacy-banner gate + ack plumbing landed dark; c2 retention client next, then the banner)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1067,6 +1067,42 @@ first `/release-notes` per session pays the 3 s timeout when offline). Debugging
 worth keeping (delegate's): the captured sink records the terminal DIFF stream, so a
 scroll test's marker must live in columns the replaced rows never painted — a
 coincidentally-identical cell emits nothing.
+
+### B9-c1 — privacy banner gate + ack plumbing, DARK (serial gate: exit 0, 5,112 tests, zero issues)
+
+Nothing paints; the rollout flag resolves false at every live seam (the interactive
+composition has no remote-settings fetch — pre-existing recorded gap — and the default
+is false, `app_view.rs:2025`); env overrides are the only live activation path by
+design. `PagerPrivacyBanner.swift`: the gate ported arm-for-arm from
+`privacy_banner_should_show` (`app_view.rs:1705-1731`, verified at the pin by the lead)
+— minimal/rollout/ZDR/team-non-admin/not-opted-out/auth-trust-access preconditions, and
+the reshow window (`:1394-1407`) with the **unparseable-ack-fails-OPEN** arm pinned
+(plus the ordering pin that the days-guard precedes the parse, so unparseable+no-window
+still never re-shows — upstream's own short-circuit). `[privacy].privacy_banner_acked`
+round-trips through a dedicated store (upstream's `update_config` parse-mutate-serialize
+shape; deliberately NOT a `PagerSettingsStore` row — registry rows render in the modal,
+and the ack has no upstream row, so registering one would be invented UX; ruling
+recorded in-source). First readers for `privacy_notice_rollout` /
+`privacy_banner_reshow_days` with upstream's ACTUAL env-then-remote-then-default chain —
+deliberately not the E22 tier machinery, because upstream gives these keys no
+config/managed tiers and inventing them would let a repo layer switch on a consent
+upsell. **The auth hop was missing and now exists**: the renderer hydrates gate state
+in `begin()` through the same `AuthManager` seam `/login`/`/logout` use, mapping xAI
+credentials per `apply_auth_meta` (`app_view.rs:1753-1762`) and non-xAI per
+`clear_xai_access_controls` (`:1662-1675` — opt-out FALSE, so Codex-only sessions
+cannot be upsold; both arms verified at the pin). 31 net-new tests: the full gate
+matrix, ack round-trip + failed-write rollback, env-over-remote pins, and 7 live-seam
+tests hydrating from a real credential store in isolated homes.
+
+**Recorded divergences:** rollback on failed ack write (upstream only warns, leaving
+memory claiming an ack the disk never recorded — cost: this port re-shows immediately
+where upstream hides until next launch); `trustDone` constant true (folder trust is
+decided synchronously before the renderer exists; the input stays for a future trust
+prompt); `authDone` = credential-present (no `AuthState` machine at this seam; a
+non-xAI credential counts Done and is blocked by the cleared opt-out — same observable
+result); the reshow overflow arm folds into `Date` saturation. **Deferred:** the
+opt-in/opt-out dispatch handlers and inflight guard ride c2/c3 (landing them now would
+register actions that lie — §4).
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

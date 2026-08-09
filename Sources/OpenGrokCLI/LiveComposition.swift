@@ -6,6 +6,7 @@ import OpenGrokAuth
 import OpenGrokCodeMode
 import OpenGrokCompaction
 import OpenGrokConfig
+import OpenGrokConfigTypes
 import OpenGrokDiagnostics
 import OpenGrokFileTools
 import OpenGrokHTTP
@@ -7754,6 +7755,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// every live announcement is hidden.
     private var announcementBanner: PagerAnnouncementBanner?
 
+    /// The privacy banner's gate state — the `announcementBanner` shape for
+    /// the SECOND tenant of the frame builder's banner slot, resolved but
+    /// deliberately unconsumed by any frame this slice (Wave 18 B9-c1: the
+    /// rollout flag defaults false and the banner render is gated on the
+    /// retention write client). `nil` means "never hydrated" (headless
+    /// tests that skip `begin()`); a hydrated state answers
+    /// `shouldShow()` from upstream's gate (app_view.rs:1705-1731 at pin
+    /// 650c1db7). Internal (not private) so the live-seam tests can pin
+    /// what the REAL renderer resolved, per AGENTS.md §3.
+    private(set) var privacyBanner: PagerPrivacyBannerState?
+
     /// The `/release-notes` changelog client — CDN fetch, disk cache under
     /// `$OPENGROK_HOME`, and the recorded export-boundary gate (the
     /// announcements precedent). `nil` in compositions that never passed
@@ -8018,6 +8030,113 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         announcementBanner = await announcements.refreshVisibleBanner()
     }
 
+    /// Hydrate the privacy banner's gate state from what this session can
+    /// actually see — upstream's startup resolution (event_loop.rs:1007-1029
+    /// at pin 650c1db7), run from `begin()` because that is this port's
+    /// pager-startup seam.
+    ///
+    /// Inputs, and where each one honestly comes from at this seam:
+    ///  - Auth metadata (team, role, ZDR, retention opt-out) reads the REAL
+    ///    credential through `AuthManager` over the injected home and
+    ///    audited env — the same construction `/login`/`/logout` use, which
+    ///    is how auth-derived state flows to this renderer (there is no
+    ///    separate auth-metadata channel). An xAI credential applies its
+    ///    metadata (`apply_auth_meta`, app_view.rs:1753-1762); a non-xAI
+    ///    credential gets upstream's cleared access controls
+    ///    (`clear_xai_access_controls`, app_view.rs:1662-1675 — opt-out
+    ///    FALSE, so the banner cannot upsell a Codex-only session); no
+    ///    credential keeps the construction defaults with auth not Done.
+    ///  - `remoteSettings` is nil today: the interactive composition has no
+    ///    `/v1/settings` fetch (the recorded LiveShareComposition gap), so
+    ///    the rollout resolves FALSE — this slice ships dark — while the
+    ///    env overrides (`GROK_PRIVACY_NOTICE_ROLLOUT`,
+    ///    `GROK_PRIVACY_BANNER_RESHOW_DAYS`) stay live. When a settings
+    ///    fetch lands, it feeds this parameter and the same resolvers keep
+    ///    upstream's env-over-remote precedence
+    ///    (acp_handler/settings.rs:135-150).
+    ///  - `trustDone` is true because this port decides folder trust
+    ///    synchronously before the renderer exists
+    ///    (`LiveSecurityContext.resolve`; undecided is treated untrusted) —
+    ///    there is no pending trust question for a live renderer to wait
+    ///    on, unlike upstream's `TrustState`.
+    func refreshPrivacyBannerState(remoteSettings: RemoteSettings? = nil) async {
+        let env = environment
+        let manager = AuthManager(
+            grokHome: openGrokHome,
+            config: GrokComConfig.default(environment: env),
+            environment: env
+        )
+        let auth = await manager.currentOrExpired()
+        let acked = PagerPrivacyBannerAckStore(
+            configPath: openGrokHome.appendingPathComponent("config.toml")
+        ).read()
+
+        var state = PagerPrivacyBannerState(
+            minimalMode: mode == .minimal,
+            privacyNoticeRollout: resolvePrivacyNoticeRollout(
+                remoteSettings: remoteSettings,
+                environment: env
+            ),
+            privacyBannerReshowDays: resolvePrivacyBannerReshowDays(
+                remoteSettings: remoteSettings,
+                environment: env
+            ),
+            privacyBannerAcked: acked,
+            zdrAccessEnabled: remoteSettings?.zdrAccessEnabled ?? false,
+            // `has_access()` is "no gate": a gate exists only when remote
+            // settings carry a non-empty `gate_message`
+            // (`gate_from_settings`, app_view.rs:1739-1746).
+            hasAccess: remoteSettings?.gateMessage?.isEmpty ?? true,
+            trustDone: true
+        )
+        if let auth {
+            state.authDone = true
+            if auth.isXAIAuth {
+                state.teamName = auth.teamName
+                state.teamRole = auth.teamRole
+                state.isZDR = auth.isZDRTeam
+                state.codingDataRetentionOptOut = auth.codingDataRetentionOptOut
+            } else {
+                state.codingDataRetentionOptOut = false
+            }
+        }
+        privacyBanner = state
+    }
+
+    /// Stamp `[privacy].privacy_banner_acked` in memory and on disk —
+    /// upstream's `ack_privacy_banner` (dispatch/status.rs:491-496) plus
+    /// its persist effect, collapsed to one seam because this port has no
+    /// dispatch/effect split. No production caller yet: the banner's
+    /// buttons are the B9-c3 slice; landing the ack here means c3 wires
+    /// clicks to a tested write instead of inventing one.
+    ///
+    /// KEPT DIVERGENCE (lead-ruled): a failed write rolls the in-memory
+    /// ack back, this renderer's `rollback_value` convention (the
+    /// compact-mode/timestamps/timeline writes above) — upstream only
+    /// warns (effects/mod.rs:3989-4001), leaving memory claiming an ack
+    /// the disk never recorded. Cost: where upstream hides the banner
+    /// until next launch after a failed write, this port re-shows it
+    /// immediately; the open direction re-asks a question rather than
+    /// recording an answer that did not land.
+    @discardableResult
+    func ackPrivacyBanner(now: Date = Date()) -> Bool {
+        guard var state = privacyBanner else { return false }
+        let previous = state.privacyBannerAcked
+        let ackedAt = privacyBannerAckTimestamp(now: now)
+        state.privacyBannerAcked = ackedAt
+        privacyBanner = state
+        do {
+            try PagerPrivacyBannerAckStore(
+                configPath: openGrokHome.appendingPathComponent("config.toml")
+            ).write(ackedAt: ackedAt)
+            return true
+        } catch {
+            state.privacyBannerAcked = previous
+            privacyBanner = state
+            return false
+        }
+    }
+
     func begin() async throws {
         try renderer.start()
         if let permissionCoordinator {
@@ -8045,6 +8164,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 capturesInput: false
             ))
         }
+        // Privacy-banner gate state, hydrated at the pager-startup seam like
+        // upstream's event_loop resolution (event_loop.rs:1007-1029). Local
+        // file reads only (auth store + config.toml); nothing consumes it in
+        // a frame yet — see `privacyBanner`.
+        await refreshPrivacyBannerState()
         await refreshContextUsage()
         if let permissionMode {
             permissionModeFlags = await permissionMode.composerFlags()
