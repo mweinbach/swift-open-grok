@@ -13,7 +13,7 @@
 //
 // The regeneration script falls back to the `OPEN_GROK_VERSION` file at the
 // package root (matching the Rust release script's `version_file`), then to
-// the canonical Open Grok release string `0.1.220-open-grok.57`. Two clean
+// the canonical Open Grok release string `0.1.220-open-grok.58`. Two clean
 // builds with distinct `GROK_VERSION` values produce distinct
 // `OpenGrokVersion.compiledVersion` values after regeneration.
 
@@ -24,7 +24,7 @@ internal enum OpenGrokCompiledVersion {
     /// The compile-time Open Grok version, injected from `GROK_VERSION` at
     /// generation time. Mirrors the Rust `VERSION` constant.
     @usableFromInline
-    internal static let version: String = "0.1.220-open-grok.57"
+    internal static let version: String = "0.1.220-open-grok.58"
     @usableFromInline
     internal static let shortCommit: String? = nil
 }

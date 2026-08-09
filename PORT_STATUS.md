@@ -1,10 +1,10 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-08 (Wave 17 E23: scheduler persistence + durable-removal barriers + occurrence journal — the scheduler program is complete except headless/ACP surfaces)
+**As of:** 2026-08-08 (Wave 17 E24/R0: reference re-pinned to `650c1db7` / release `.58`; version + fixtures restamped; R1–R5 provider slices queued)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
-**Reference:** `xai-org/grok-build` at `70002584da34e4c37ea14a3bce35341b7d04f9a7` (re-pinned **2026-08-06** from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05`; +3 commits, release `v0.1.220-open-grok.57` — the Meta API provider delta: `0f8dc87b` provider, `666b2ceb` login/settings, `70002584` stored-key unlock fix. The prior 2026-08-05 re-pin moved from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`; before that the 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08); the pinned commit is reachable in `/Users/mweinbach/Projects/open-grok` history — read it via `git show 70002584:<path>` / `git grep <pat> 70002584 -- crates` (crates prefixed `crates/codegen/`), NOT that clone's working tree, which sits one substantive commit newer (`650c1db7`, release `.58`).
-**Fixture pin:** `ProtocolFixtures/` was re-evaluated against `70002584da34e4c37ea14a3bce35341b7d04f9a7` on 2026-08-06, with `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` recorded as the immediate previous revision. The Meta delta touched no fixture family's upstream source (all fourteen family diffs across `9ed09e2a..70002584`, including `Cargo.lock`, are empty), so the only recaptures are the two release-stamped artifacts (CLI version fixture and the GCRX sample, both restamped `0.1.220-open-grok.57` — the GCRX golden by same-length in-place substitution at offset 32); unchanged families carry explicit `9ed09e2a..70002584` diff evidence.
+**Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
+**Fixture pin:** `ProtocolFixtures/` was re-evaluated against `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` on 2026-08-08, with `70002584da34e4c37ea14a3bce35341b7d04f9a7` recorded as the immediate previous revision. The `.58` delta touched no fixture family's upstream source (every family's `referenceSources` diff across `70002584..650c1db7`, including `Cargo.lock` and the telemetry/tracing surfaces, verified empty by the lead), so the only recaptures are the two release-stamped artifacts (CLI version fixture and the GCRX sample, both restamped `0.1.220-open-grok.58` — the GCRX golden by same-length in-place substitution at offset 32); unchanged families carry explicit `70002584..650c1db7` diff evidence.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
@@ -259,7 +259,9 @@ can publish a provider catalog without network.
 copy at dispatch instead of upstream's dynamic `visible()`; tier-only toggle copy is
 upstream's byte-exact but the base "Switched to X" shape keeps the port's pre-existing
 divergence; Fireworks curated reasoning-efforts assignment (`fireworks_models.rs:164-166`)
-not ported (pre-existing, out of slice); `default_service_tier` parsed and deliberately
+not ported *(label corrected at the 2026-08-08 re-pin: this is NOT pre-existing — the
+assignment IS the `.58` delta this entry was unknowingly citing; closed by R1 in the
+re-pin wave)*; `default_service_tier` parsed and deliberately
 never auto-applied. **Deliberately unfinished:** resume does not restore a persisted tier
 — the port's resume path restores neither model nor effort into the live coordinator
 today, so the tier follows that pre-existing gap; out of the box only Fireworks curated
@@ -919,6 +921,42 @@ keys the port doesn't register — upstream's own behavior for unregistered type
 `SchedulerClock`/reservation machinery unported (stamps a cross-process notification
 stream this one-process port lacks; the version VALUES are ported since they live in
 the file format); restored-row display stamps use millisecond-spaced load instants.
+
+### E24/R0 — reference re-pin to `.58` (serial gate below; audit + lead-landed pin bump)
+
+The E24 audit enumerated `70002584..650c1db7` (release `.58`): two commits, one
+substantive (`f0a5a29f` "Harden provider reasoning and fast routing", 13 files,
++834/−55, entirely provider/reasoning/fast-tier). **Load-bearing audit finding:** the
+port had already absorbed roughly half the delta — the `service_tier` wire field and
+forwarding, the Kimi/DeepSeek/OpenCodeGo/Wafer/Fireworks strips, the Meta
+reasoning-item drop, the Fireworks effort-restore gate, and the
+`sampling_config_for_model` effort gating landed in Wave 16/E3/E15 with in-source
+citations (`client.rs:1806-1813`, `provider.rs:353/386/411/422`,
+`fireworks_models.rs:167-171`, `acp/model_state.rs:199-212`) that only resolve against
+the `.58` tree. Staying on `.57` would have meant a ledger whose provider citations
+don't resolve; the re-pin makes them honest. E18–E23's cited files (`scheduler/`,
+`monitor/`, `views/timeline.rs`, `scrollback/`, `settings/defs.rs`, `slash/commands/`,
+`reminders/mod.rs`, `toolset.rs`, `persistence.rs`, `registry/types.rs`) are untouched
+by the delta — verified. R0 (this entry, lead-landed): `OPEN_GROK_VERSION` and every
+compiled-version site restamped `.58`; `cli-version-and-home.json` recaptured; GCRX
+sample restamped by same-length offset-32 substitution with `crash-gcrx-format.json`
+provenance updated; `PROVENANCE.json` rewritten with per-family `70002584..650c1db7`
+evidence (every family diff verified empty by the lead, including `Cargo.lock` and the
+telemetry/tracing surfaces after catching one vacuous pathspec in the first
+verification pass); ledger headers and `CRATE_MAP.md` pin updated; E3's "pre-existing"
+label on the Fireworks effort divergence corrected in place.
+
+**Queued from the audit (R1–R5):** R1 (S) Fireworks curated reasoning efforts
+(`fireworks_models.rs:164-166` at `.58` — closes E3's corrected divergence); R2 (S)
+OpenCode Go output-limit drop (`opencode_go_models.rs` `_output` rename); R3 (S)
+`ConfigModelOverride` supports=false clearing (`config.rs:4653-4656`); R4 (M) Fireworks
+process-global 2-permit pacing gate with permit-held-until-stream-drop semantics; R5
+(S) catalog-refresh effort reconciliation — decide (wire a minimal reconcile) or record
+the deferral with the `.58` cite. **Not required by the re-pin (recorded):**
+`tool_calls.rs` unified-log telemetry enrichment (no unified log in the port) and
+`subagent/mod.rs` spawn-refresh reconciliation (children ride the parent sampler;
+covered by E10's recorded divergence — the `.58` cite belongs there when R-slices
+land).
 
 ## Wave 16 — Pager surfaces, first parallel worktree batch (2026-08-08)
 

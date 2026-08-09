@@ -20,17 +20,17 @@
     "start_time_unix_nano",
     "end_time_unix_nano"
   ],
-  "referenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
+  "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
   "provenance": {
     "source": "generated-from-swift-OTLPProtobuf-encoder-semantics",
-    "referenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
-    "previousReferenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
+    "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+    "previousReferenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
     "pinVerdict": "unchanged (verified)",
     "note": "Binary goldens match OpenGrokTelemetry.OTLPProtobuf with fixed nowNanos; not a hand-authored JSON summary of field names only.",
     "evidence": [
       "The OTLP wire schema comes from opentelemetry-proto, pinned at 0.32.0 in Cargo.lock at BOTH refs (opentelemetry 0.32.0, opentelemetry-otlp 0.32.0, opentelemetry_sdk 0.32.1 are likewise identical), so ExportTraceServiceRequest field numbering, the TraceService/Export RPC path, and the gRPC length-prefixed framing did not move.",
-      "git diff 9ed09e2a..70002584 -- crates/codegen/xai-grok-telemetry/src/otlp_http.rs => empty; the request body encoding and TLS-independent framing remain unchanged at the current pin.",
-      "The rest of the telemetry crate's drift (events.rs, external/*, unified_log.rs, session_ctx.rs) is the Mixpanel-style external event stream, not the OTLP span export these goldens capture.",
+      "git diff 70002584..650c1db7 -- crates/codegen/xai-grok-telemetry/src/otlp_http.rs => empty; the request body encoding and TLS-independent framing remain unchanged at the current pin.",
+      "git diff 70002584..650c1db7 -- crates/codegen/xai-grok-telemetry => entirely empty at this re-pin (the Mixpanel-style external event stream noted at the prior re-pin did not move either), so the OTLP span export these goldens capture is unchanged.",
       "ProtocolFixtures/otlp-export-trace-http.pb and ProtocolFixtures/otlp-export-trace-grpc.bin are byte-identical across the two pins and are still re-encoded and compared by Tests/OpenGrokTelemetryTests."
     ]
   },

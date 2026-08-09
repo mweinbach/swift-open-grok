@@ -15,12 +15,12 @@
   "networkFSUsesTruncate": true,
   "localFSUsesWAL": true,
   "truncateHostSuffixPattern": ".h-<host>",
-  "referenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
+  "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
   "referenceEnvOverride": "GROK_SQLITE_JOURNAL_MODE",
   "provenance": {
     "source": "OpenGrokSQLiteJournal.JournalMode vs xai-sqlite-journal",
-    "referenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
-    "previousReferenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
+    "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+    "previousReferenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
     "pinVerdict": "unchanged (verified)",
     "keyProvenance": {
       "journalModes/pragmaValues": "crates/codegen/xai-sqlite-journal/src/lib.rs:23-30 (JournalMode::Wal/Truncate) and :83-84 (pragma spellings \"WAL\"/\"TRUNCATE\")",
@@ -29,7 +29,7 @@
       "truncateHostSuffixPattern": "crates/codegen/xai-sqlite-journal/src/lib.rs:90-105 (per-host sibling file, TRUNCATE only)"
     },
     "evidence": [
-      "git diff 9ed09e2a..70002584 -- crates/codegen/xai-sqlite-journal => empty (no source or Cargo.toml change)"
+      "git diff 70002584..650c1db7 -- crates/codegen/xai-sqlite-journal => empty (no source or Cargo.toml change)"
     ]
   }
 }

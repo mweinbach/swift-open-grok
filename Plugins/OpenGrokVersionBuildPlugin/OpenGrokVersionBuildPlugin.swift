@@ -9,7 +9,7 @@
 // script):
 //   1. `GROK_VERSION` environment variable, if set and non-empty.
 //   2. The first line of `OPEN_GROK_VERSION` at the package root, if present.
-//   3. The canonical Open Grok release string `0.1.220-open-grok.57`.
+//   3. The canonical Open Grok release string `0.1.220-open-grok.58`.
 //
 // The plugin runs during SwiftPM's build planning phase. It determines the
 // version string and invokes a declared Swift generator executable to write
@@ -27,7 +27,7 @@ struct OpenGrokVersionBuildPlugin: BuildToolPlugin {
         // Resolve the version string (same resolution order as the Rust
         // crate and `regenerate-compiled-version.sh`).
         let env = ProcessInfo.processInfo.environment
-        let defaultVersion = "0.1.220-open-grok.57"
+        let defaultVersion = "0.1.220-open-grok.58"
 
         let version: String
         if let grokVersion = env["GROK_VERSION"], !grokVersion.isEmpty {

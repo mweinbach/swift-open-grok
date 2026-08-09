@@ -16,7 +16,7 @@
 # Resolution order (matches the Rust reference + the Open Grok release script):
 #   1. `GROK_VERSION` environment variable, if set and non-empty.
 #   2. The first line of `OPEN_GROK_VERSION` at the package root, if present.
-#   3. The canonical Open Grok release string `0.1.220-open-grok.57`
+#   3. The canonical Open Grok release string `0.1.220-open-grok.58`
 #      (the Rust `CARGO_PKG_VERSION` fallback equivalent for Open Grok).
 #
 # Usage:
@@ -31,7 +31,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 package_root="$(cd "${script_dir}/../.." && pwd)"
 generated_file="${script_dir}/CompiledVersion.generated.swift"
 version_file="${package_root}/OPEN_GROK_VERSION"
-default_version="0.1.220-open-grok.57"
+default_version="0.1.220-open-grok.58"
 short_commit="${GROK_COMMIT:-}"
 
 if [[ -n "${GROK_VERSION:-}" ]]; then
@@ -73,7 +73,7 @@ cat > "${generated_file}" <<EOF
 //
 // The regeneration script falls back to the \`OPEN_GROK_VERSION\` file at the
 // package root (matching the Rust release script's \`version_file\`), then to
-// the canonical Open Grok release string \`0.1.220-open-grok.57\`. Two clean
+// the canonical Open Grok release string \`0.1.220-open-grok.58\`. Two clean
 // builds with distinct \`GROK_VERSION\` values produce distinct
 // \`OpenGrokVersion.compiledVersion\` values after regeneration.
 

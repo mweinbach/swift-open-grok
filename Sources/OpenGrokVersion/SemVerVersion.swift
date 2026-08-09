@@ -1,7 +1,7 @@
 // SemVerVersion.swift
 //
 // A minimal Semantic Versioning parser that preserves the Open Grok
-// prerelease/channel strings (e.g. `0.1.220-open-grok.57`). The Rust reference
+// prerelease/channel strings (e.g. `0.1.220-open-grok.58`). The Rust reference
 // uses the `semver` crate; this Swift port implements the subset of semver
 // required by `xai-grok-version::installed_semver` and the Open Grok release
 // channel format.

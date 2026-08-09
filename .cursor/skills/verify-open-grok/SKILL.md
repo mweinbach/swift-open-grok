@@ -29,7 +29,7 @@ eval "$($CTRL launch)"       # builds if needed; stdout is exports only
 $CTRL doctor
 ```
 
-Ready when `doctor` prints `doctor ok` and the version matches `OPEN_GROK_VERSION` (currently `0.1.220-open-grok.57`). Binary path default:
+Ready when `doctor` prints `doctor ok` and the version matches `OPEN_GROK_VERSION` (currently `0.1.220-open-grok.58`). Binary path default:
 
 `.build/workflow-safe/out/Products/Debug/open-grok`
 

@@ -30,11 +30,11 @@
   "jsonOutputFormatting": [
     "sortedKeys"
   ],
-  "referenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
+  "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
   "provenance": {
     "source": "OpenGrokHunkTracker.HunkTrackerSnapshot Codable wire vs xai-hunk-tracker",
-    "referenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
-    "previousReferenceRevision": "9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05",
+    "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+    "previousReferenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
     "pinVerdict": "unchanged (verified)",
     "keyProvenance": {
       "sampleSnapshot": "crates/codegen/xai-hunk-tracker/src/types.rs:529-536 (HunkTrackerSnapshot: file_states, turn_index, session_stats)",
@@ -42,7 +42,7 @@
       "hunkSourceTypes": "crates/codegen/xai-hunk-tracker/src/types.rs HunkSource variants AgentEdit / ExternalEditOnAgentFile / External"
     },
     "evidence": [
-      "git diff 9ed09e2a..70002584 -- crates/codegen/xai-hunk-tracker => empty (the wire-bearing declarations remain unchanged at the current pin)",
+      "git diff 70002584..650c1db7 -- crates/codegen/xai-hunk-tracker => empty (the wire-bearing declarations remain unchanged at the current pin)",
       "HunkTrackerSnapshot and SessionStats keep the same fields and camelCase serde renaming, and the HunkSource variant set is unchanged."
     ]
   }
