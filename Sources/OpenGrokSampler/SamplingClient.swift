@@ -37,6 +37,13 @@ public final class SamplingClient: @unchecked Sendable {
     private let headerInjector: (any HeaderInjector)?
     private let codexTurnState: CodexTurnStateCell?
     private let forceHTTP1: Bool
+    /// The Fireworks pacing gate (client.rs:1706-1708 reads the process
+    /// global). Internal-and-settable is a port-added test seam upstream does
+    /// not need: its boundedness test exercises only the free function, but
+    /// this port also proves acquisition/release through the live request
+    /// path, which requires a private gate per test — the process global
+    /// would race other suites' Fireworks clients under parallel test runs.
+    var providerRequestGate: RequestPacingSemaphore = fireworksRequestGate
 
     public var apiBackend: ApiBackend { defaults.apiBackend }
     public var provider: ModelProvider { defaults.provider }
@@ -251,30 +258,63 @@ public final class SamplingClient: @unchecked Sendable {
         _ wire: ChatCompletionWireRequest
     ) async throws -> (AsyncStream<Result<ChatCompletionChunk, SamplingError>>, ResponseModelMetadata?) {
         let body = try JSONValue.encode(wire)
-        return try await postSSE(
-            path: "/v1/chat/completions",
-            body: body,
-            consumer: .chatCompletionsStream,
-            requestHeaders: providerRequestHeaders(
-                convId: wire.xGrokConvId,
-                reqId: wire.xGrokReqId,
-                modelId: wire.model ?? defaults.model,
-                sessionId: wire.xGrokSessionId,
-                turnIdx: wire.xGrokTurnIdx,
-                agentId: wire.xGrokAgentId,
-                deploymentId: wire.xGrokDeploymentId,
-                userId: wire.xGrokUserId
-            ),
-            doomLoop: nil,
-            decode: { data in
-                if data.trimmingCharacters(in: .whitespacesAndNewlines) == "[DONE]" {
-                    throw SSEDoneMarker()
+        // Fireworks pacing permit, taken after defaults/sanitize and before
+        // the HTTP send — upstream's `chat_completion_stream` acquisition
+        // point (client.rs:1937). Every other provider gets `nil` and
+        // bypasses the gate (client.rs:70-83). Only the Chat Completions
+        // family is gated at the pin; the Responses/Messages paths below go
+        // through `postSSE` with no permit, exactly as upstream leaves
+        // `create_response*`/`create_message*` ungated. Retries re-enter here
+        // per attempt, so a permit covers one wire attempt, never a retry
+        // loop. Cancellation while parked throws `CancellationError` with no
+        // permit consumed — nothing to release on that path.
+        let permit = try await acquireProviderRequestPermit()
+        do {
+            return try await postSSE(
+                path: "/v1/chat/completions",
+                body: body,
+                consumer: .chatCompletionsStream,
+                requestHeaders: providerRequestHeaders(
+                    convId: wire.xGrokConvId,
+                    reqId: wire.xGrokReqId,
+                    modelId: wire.model ?? defaults.model,
+                    sessionId: wire.xGrokSessionId,
+                    turnIdx: wire.xGrokTurnIdx,
+                    agentId: wire.xGrokAgentId,
+                    deploymentId: wire.xGrokDeploymentId,
+                    userId: wire.xGrokUserId
+                ),
+                doomLoop: nil,
+                permit: permit,
+                decode: { data in
+                    if data.trimmingCharacters(in: .whitespacesAndNewlines) == "[DONE]" {
+                        throw SSEDoneMarker()
+                    }
+                    if let streamErr = tryParseStreamError(data) {
+                        throw streamErr
+                    }
+                    return try JSONDecoder().decode(ChatCompletionChunk.self, from: Data(data.utf8))
                 }
-                if let streamErr = tryParseStreamError(data) {
-                    throw streamErr
-                }
-                return try JSONDecoder().decode(ChatCompletionChunk.self, from: Data(data.utf8))
-            }
+            )
+        } catch {
+            // `postSSE` threw before the response stream existed (bad URL,
+            // transport failure, non-2xx) — the stream termination handler
+            // that normally releases will never run, so release here. The
+            // permit's exactly-once guard makes the two sites safe together.
+            // Upstream gets this via RAII: the early `?` returns drop the
+            // permit (client.rs:1937 binding).
+            permit?.release()
+            throw error
+        }
+    }
+
+    /// Port of `SamplingClient::acquire_provider_request_permit`
+    /// (client.rs:1706-1708): the instance's provider against the
+    /// process-global Fireworks gate.
+    private func acquireProviderRequestPermit() async throws -> ProviderRequestPermit? {
+        try await OpenGrokSampler.acquireProviderRequestPermit(
+            provider: defaults.provider,
+            gate: providerRequestGate
         )
     }
 
@@ -288,6 +328,7 @@ public final class SamplingClient: @unchecked Sendable {
         consumer: SamplingConsumer,
         requestHeaders: ProviderRequestHeaders?,
         doomLoop: DoomLoopSignalCollector?,
+        permit: ProviderRequestPermit? = nil,
         decode: @escaping @Sendable (String) throws -> T
     ) async throws -> (AsyncStream<Result<T, SamplingError>>, ResponseModelMetadata?) {
         let url = try makeURL(path: path)
@@ -422,7 +463,18 @@ public final class SamplingClient: @unchecked Sendable {
                     continuation.finish()
                 }
             }
-            continuation.onTermination = { _ in task.cancel() }
+            // The pacing permit lives exactly as long as this stream: the
+            // termination handler fires exactly once whether the consumer
+            // drains to `finish()`, cancels mid-stream, or drops the stream
+            // unconsumed — the Swift seam for upstream moving the permit
+            // into the stream closure so it releases on stream drop
+            // (client.rs:2097-2100). Releasing here rather than relying on
+            // the permit's deinit keeps the release deterministic instead of
+            // tied to when the stream frees its closures.
+            continuation.onTermination = { _ in
+                task.cancel()
+                permit?.release()
+            }
         }
 
         return (resultStream, metadata)

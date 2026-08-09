@@ -49,6 +49,64 @@ struct FireworksReasoningCatalogTests {
         }
     }
 
+    /// The pin's `CURATED_FIREWORKS_MODELS` is `[CuratedFireworksModel; 6]`
+    /// (fireworks_models.rs:38-81) — the two Kimi K3 variants (…:67-80) were
+    /// missing from the port until R4b. The count and order are pinned
+    /// explicitly because every other assertion here iterates
+    /// `FireworksModels.curated` and would stay green with entries silently
+    /// dropped: an authoritative refresh REPLACES the embedded partition, so
+    /// a missing curated entry deletes that model from the post-refresh
+    /// catalog entirely.
+    @Test("the curated partition is exactly upstream's six entries, in order")
+    func curatedPartitionIsComplete() {
+        #expect(FireworksModels.curated.map(\.key) == [
+            "glm-5.2",
+            "glm-5.2-fast",
+            "deepseek-v4-pro",
+            "kimi-k2.7-code",
+            "fireworks:kimi-k3",
+            "fireworks:kimi-k3-fast",
+        ])
+
+        let kimiK3 = FireworksModels.curated[4]
+        #expect(kimiK3.slug == "accounts/fireworks/models/kimi-k3")
+        #expect(kimiK3.name == "Kimi K3")
+        #expect(kimiK3.description == "Moonshot's Kimi K3 flagship model on Fireworks AI")
+        #expect(kimiK3.fallbackContextWindow == 1_040_000)
+
+        let kimiK3Fast = FireworksModels.curated[5]
+        #expect(kimiK3Fast.slug == "accounts/fireworks/routers/kimi-k3-fast")
+        #expect(kimiK3Fast.name == "Kimi K3 Fast")
+        #expect(kimiK3Fast.description == "Kimi K3 on Fireworks AI's low-latency router")
+        #expect(kimiK3Fast.fallbackContextWindow == 1_040_000)
+    }
+
+    /// Provenance: Rust
+    /// `fast_variants_use_distinct_fireworks_router_paths_with_priority_tier`
+    /// (fireworks_models.rs:427-448) — the `-fast` keys route through
+    /// Fireworks' `routers/` paths, not the base `models/` paths, and still
+    /// carry the priority tier.
+    @Test("fast variants use distinct router paths with the priority tier")
+    func fastVariantsUseRouterPaths() throws {
+        let entries = FireworksModels.curatedCatalog(
+            baseURL: FireworksModels.apiBaseURLDefault
+        )
+        #expect(
+            try #require(entries["glm-5.2-fast"]).info.model
+                == "accounts/fireworks/routers/glm-5p2-fast"
+        )
+        #expect(
+            try #require(entries["fireworks:kimi-k3"]).info.model
+                == "accounts/fireworks/models/kimi-k3"
+        )
+        #expect(
+            try #require(entries["fireworks:kimi-k3-fast"]).info.model
+                == "accounts/fireworks/routers/kimi-k3-fast"
+        )
+        #expect(try #require(entries["glm-5.2-fast"]).info.serviceTiers[0].isFast)
+        #expect(try #require(entries["fireworks:kimi-k3-fast"]).info.serviceTiers[0].isFast)
+    }
+
     /// The menu itself (`fireworks_reasoning_efforts()`,
     /// fireworks_models.rs:182-197): ids are the canonical lowercase levels
     /// (`value.as_str()`), labels the capitalized display names, descriptions

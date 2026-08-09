@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-08 (Wave 17 R1–R3: Fireworks curated efforts on the wire, OpenCode Go output-limit drop, override supports=false clearing)
+**As of:** 2026-08-08 (Wave 17 R4/R5: Fireworks pacing gate + curated Kimi entries landed; reconcile deferral ruled — the .58 re-pin wave is closed)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -990,6 +990,58 @@ absent into clearing; the test is the tripwire). 8 net-new tests.
 missing (predates `.58`). Cost today: an authoritative Fireworks refresh replaces the
 embedded partition, so post-refresh the port drops the two Kimi variants entirely.
 Queued as R4b alongside the pacing gate.
+
+### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
+
+**R4** (`Sources/OpenGrokSampler/FireworksRequestGate.swift` + the client threading):
+the process-global 2-permit Fireworks pacing gate, ported from the `.58` delta with
+every upstream site enumerated at the pin — only the Chat Completions family acquires
+(`client.rs:1878,1937`; `create_response*`/`create_message*`/web-search/compaction
+bypass, exactly as upstream leaves them ungated), every non-Fireworks provider bypasses
+without touching the gate (`client.rs:70-83`), a permit covers one wire attempt (retry
+loops live above the client and re-enter), and on the streaming path the permit lives
+exactly as long as the stream — released once by the `AsyncStream` termination handler
+on drain, mid-stream cancel, or unconsumed drop (upstream's move-into-the-stream-closure,
+`client.rs:2097-2100`), with the pre-stream error path releasing in a `catch` and the
+two sites kept safe together by an exactly-once guard plus a `deinit` RAII backstop.
+The semaphore is an actor with FIFO direct-handoff (release hands to the head waiter,
+so a late arriver can never overtake), four mutually exclusive continuation-resume
+sites, an intent registry that makes cancel-after-grant a no-op, a
+cancelled-before-suspension marker for the cancel-first ordering, and an over-release
+`precondition` (tokio's add-beyond-max panic). A cancelled parked waiter throws
+`CancellationError`, consumes no permit, and leaves the queue. Lead-reviewed line by
+line: the `enqueueWaiter` re-check for a release interleaving before the continuation
+reaches the actor is load-bearing (every `await` entering the continuation is an actor
+suspension point). Kept divergences: an internal settable gate on the client as a test
+seam (the process global would race parallel suites; production never reassigns),
+explicit release + backstop instead of pure RAII, and `postSSE`'s `permit: nil` default
+(what keeps Responses/Messages bypassing). Note for future suite triage: the gate is
+live process-wide, so tests issuing >2 concurrent Fireworks chat requests serialize on
+it. **R4b**: both missing curated entries landed field-for-field from
+`fireworks_models.rs:67-80` (verified at the pin, including upstream's own
+`fireworks:`-prefixed-key inconsistency on exactly these two), inheriting the R1 effort
+menu and E3 fast tier through the shared builder; an all-6 keys-order pin is the
+tripwire the iterating tests lacked. 8 net-new tests across gate boundedness (observed
+as parked-queue state, no timeout races), live-seam permit-held/released-on-drop through
+a real `conversationStream`, bypass, failure-release, cancellation, and the curated
+pins.
+
+**R5 — lead ruling: deferral, recorded.** Upstream's `update_catalog` reconcile
+(`acp/model_state.rs:151-190` at the pin) re-derives the session effort when a refresh
+changes the current model and clears it when the SAME model loses effort support. The
+port has no catalog-refresh→live-session reconcile seam at all — the same family as the
+E3-recorded resume gap (resume restores neither model nor effort into the live
+coordinator). Wiring an effort-only reconcile would be a half-seam (effort reconciles;
+model identity, tier, and resume do not) — worse than the honest gap. Cost, stated
+precisely: if a mid-session authoritative refresh strips effort support from the
+currently selected model, the session's already-built sampling config keeps sending the
+now-unsupported effort until the next model switch. Closes with the full model-state
+reconcile seam whenever the E3 resume gap is taken up; this ruling adds the `.58` cite
+to that record. The two audit-recorded UNPORTED items keep their standing:
+`tool_calls.rs` unified-log telemetry enrichment (no unified log; the header/key
+sanitization test is the part worth porting if one ever lands) and `subagent/mod.rs`
+spawn-refresh reconciliation (children ride the parent sampler — E10's recorded
+divergence now carries the `.58` cite `subagent/mod.rs` `reconcile_refreshed_reasoning_effort`).
 
 ## Wave 16 — Pager surfaces, first parallel worktree batch (2026-08-08)
 

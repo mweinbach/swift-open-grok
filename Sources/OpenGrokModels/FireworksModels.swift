@@ -63,6 +63,20 @@ public enum FireworksModels {
             description: "Moonshot's Kimi K2.7 coding model on Fireworks AI",
             fallbackContextWindow: 262_144
         ),
+        CuratedFireworksModel(
+            key: "fireworks:kimi-k3",
+            slug: "accounts/fireworks/models/kimi-k3",
+            name: "Kimi K3",
+            description: "Moonshot's Kimi K3 flagship model on Fireworks AI",
+            fallbackContextWindow: 1_040_000
+        ),
+        CuratedFireworksModel(
+            key: "fireworks:kimi-k3-fast",
+            slug: "accounts/fireworks/routers/kimi-k3-fast",
+            name: "Kimi K3 Fast",
+            description: "Kimi K3 on Fireworks AI's low-latency router",
+            fallbackContextWindow: 1_040_000
+        ),
     ]
 
     /// The effort menu every curated Fireworks entry offers: Low/Medium/High
