@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-08 (Wave 17 E21: `/timeline` rail live — chrome-reader trio complete: compact_mode, show_timestamps, show_timeline)
+**As of:** 2026-08-08 (Wave 17 E22: Detached loop-subagent fires, `[scheduler] background_loops` resolver, `monitor` tool live)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `70002584da34e4c37ea14a3bce35341b7d04f9a7` (re-pinned **2026-08-06** from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05`; +3 commits, release `v0.1.220-open-grok.57` — the Meta API provider delta: `0f8dc87b` provider, `666b2ceb` login/settings, `70002584` stored-key unlock fix. The prior 2026-08-05 re-pin moved from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`; before that the 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08); the pinned commit is reachable in `/Users/mweinbach/Projects/open-grok` history — read it via `git show 70002584:<path>` / `git grep <pat> 70002584 -- crates` (crates prefixed `crates/codegen/`), NOT that clone's working tree, which sits one substantive commit newer (`650c1db7`, release `.58`).
@@ -804,6 +804,73 @@ glyph fallbacks not ported (the `PagerGlyphs` table's standing policy).
 (`compact_mode`, `show_timestamps`, `show_timeline`) are now live; the hidden list
 retains only `page_flip_on_send`, `simple_mode`, `render_mermaid`, `max_thoughts_width`,
 `show_thinking_blocks`, `group_tool_verbs`, `collapsed_edit_blocks`.
+
+### E22 — Detached scheduler fires, `background_loops`, `monitor` (serial gate: exit 0, 5,023 tests, zero issues)
+
+Closes E18's recorded deferrals except persistence. **Detached fires**
+(`actor.rs:406-450` selection, `:511-733` mechanism): a due fire on a non-`foreground`
+task with `background_loops` resolved on runs as a real background loop-subagent through
+the SAME `LiveSubagentHost.spawn` the `spawn_subagent` tool uses (`subagent_type:
+"general-purpose"`, framed `format_loop_iteration_prompt` — byte-parity verified at
+`reminders/mod.rs:63-83` — and the `loop: … (schedule)` description), so an iteration is
+a real child in every observable way (`/tasks`, output/kill/resume). Chain semantics
+ported faithfully: probe the previous iteration against the real coordinator
+(running/unanswerable → skip with the interval consumed), fresh-restart every 10
+iterations with a 600-char summary, `chainResetPending` honored, anchor written BEFORE
+dispatch and restored in FULL (including a consumed pending reset) on a failed dispatch,
+which falls back to the E18 Cron inject; a failed iteration clears the anchor by
+spawned-subagent id. `foreground: true` keeps the Cron path — that is what the flag
+means. Fire-mode selection is byte-parity with `actor.rs:414-423` (verified).
+**Authorization design, reviewed by the lead:** a fire is not a tool call — no
+PreToolUse runs, matching upstream's actor-internal `SubagentEvent::Spawn`; the
+authorization surface is the child's own `LiveToolExecutor`, built by the pre-existing
+`LiveSubagentHost.runChild` from the parent session's security context/sandbox/
+permissions — the same surface a Cron turn's tool calls pass. **`background_loops`**
+(`toolset.rs:216-264`): full precedence chain (env `GROK_SCHEDULER_BACKGROUND_LOOPS` >
+requirement > user `[scheduler] background_loops` > managed/system-managed > remote
+flag > default TRUE) in `Sources/OpenGrokConfig/SchedulerConfiguration.swift`, consumed
+by two behavioral readers in the same slice (host fire-mode selection, `/loop`
+instruction mode) — the §3 rule E18 cited is satisfied. **`monitor`**
+(`monitor/{tool,event,rate_limiter,types}.rs`): upstream corrected the brief's sketch —
+it monitors a shell command's stdout lines, not subagent runs; backed by the session's
+real process execution with `kind: .monitor`, byte-pinned `<monitor-event>` line
+pipeline, token-bucket rate limiter with suppression and 30 s auto-kill (injected
+clock), mid-turn delivery via the interjection buffer and idle delivery as a
+`monitor-{task}-{uuid}` prompt turn; `/tasks` renders the `is_monitor` arm byte-exact.
+43 net-new tests, including the E2E: real `scheduler_create` → deterministic fire → a
+real child on the real coordinator with `lastSubagentId` recorded and the child's actual
+sampler request ending in the framed iteration prompt.
+
+**Lead ruling — monitor dispatch gate is deliberately STRICTER than upstream.** Upstream
+registers `monitor` with `requires_expr: Expr::True`, a generic `Other` permission kind,
+and no bash-rule evaluation against its `command` (verified at the pin: `tool.rs:40-42`,
+`tool_calls.rs:2402-2407`, and no monitor arm anywhere in the permission mapping). The
+port routes monitor dispatch through the full bash permission pipeline
+(`gateMonitorCommand`: fail-closed on no pipeline, `prepare(.bash(command))`,
+ask-without-prompter denies). Reason: the port's `run_terminal_cmd` and background-task
+tools all gate arbitrary commands through this pipeline; an arbitrary-command tool
+admitted hooks-only would be a second, weaker door to the same capability — the §5
+"next author copies whichever gate they open first" hazard. Cost, recorded: a
+`deny Bash(foo:*)` rule also blocks `monitor {command: "foo …"}` where upstream would
+run it, and unknown commands under a headless prompter are denied rather than monitored.
+Collapsing to upstream-exact is one edit if ever wanted.
+
+**Recorded divergences:** remote-settings tier fed `nil` at the interactive call site
+(no startup settings fetch there; the resolver carries the tier); `background_loops`
+construction-fixed per session (no mid-session rebuild seam); `LoopUnitActive`
+descendant guard vacuous (children cannot nest-spawn); monitor idle wakes ride the pager
+queue (visible in the `+n` count; model-facing text and prompt id are parity); mid-turn
+monitor events carry the interjection drain's envelope around the already-wrapped body;
+monitor advertised interactive-only (no delivery seam elsewhere — the E18 shape);
+rate-limit auto-kill stops the pipeline but not the process (upstream's own behavior at
+the pin); monitor output files under the port's session folder root; sorted JSON keys
+and v4 lowercase ids (shared cosmetics).
+
+**Still deferred, deliberately:** scheduler persistence / durable removal (`durable:
+true` parses and stores but dies with the session — the occurrence journal and
+durable-removal barriers are unported); headless/ACP scheduler + monitor surfaces;
+`TaskCompleted` auto-wake (pre-existing background-task deferral — a monitor's natural
+exit produces no completion wake; visible via `/tasks` and output reads only).
 
 ## Wave 16 — Pager surfaces, first parallel worktree batch (2026-08-08)
 

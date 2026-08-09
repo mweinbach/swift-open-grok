@@ -942,6 +942,27 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     public static let cronTaskIDMetadataKey = "schedulerCronTaskID"
     public static let cronHumanScheduleMetadataKey = "schedulerCronHumanSchedule"
 
+    /// Queue-entry kind for a monitor-event wake. RECORDED DIVERGENCE from
+    /// upstream, which never routes monitor events through the pager queue:
+    /// its bridge sends `SessionCommand::InjectNotification` into the
+    /// SESSION's own prompt machinery (`notification_bridge.rs:776-789`),
+    /// invisible to the queue pane. This port's controller queue is its only
+    /// idle-wake seam, so an idle monitor event rides it as its own entry
+    /// (briefly visible in the `+n` count — the named cost).
+    public static let monitorQueueEntryKind = "monitor"
+
+    /// Prompt-id prefix for a monitor-event turn — upstream's
+    /// `format!("monitor-{task_id}-{uuid}")` (notification_bridge.rs:776).
+    /// `PromptOrigin::from_prompt_id` has no `monitor-` arm upstream
+    /// (session/mod.rs:103-133), so these turns persist as plain user items
+    /// there and here.
+    public static let monitorPromptIDPrefix = "monitor-"
+
+    /// Metadata key stamped onto a monitor turn's request: the runtime
+    /// adapter sends the (already `<monitor-event>`-wrapped) text verbatim
+    /// under a `monitor-` prompt id instead of framing it as a cron prompt.
+    public static let monitorTaskIDMetadataKey = "monitorEventTaskID"
+
     /// Report what the render layer knows is in motion — visible running
     /// blocks, the welcome logo, background-task chips, and whether the
     /// terminal can animate at all. Callable at any time, including mid-run;
@@ -1777,6 +1798,28 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         return .enqueued
     }
 
+    /// Enqueue a monitor event as a notification prompt turn and, when the
+    /// controller is idle, wake the run loop to drain it — this port's
+    /// single-process seam for upstream's `SessionCommand::InjectNotification`
+    /// with `NotificationPriority::Next` (notification_bridge.rs:776-789).
+    /// `eventText` is the full `<monitor-event …>` wrap; the model receives
+    /// it verbatim, exactly as upstream's prompt blocks carry it. No de-dup
+    /// on purpose: each event is its own wake upstream too — the monitor's
+    /// rate limiter is what bounds the flow, not the queue.
+    public func enqueueMonitorPrompt(taskID: String, eventText: String) async {
+        await promptQueue.enqueue(QueueEntryMeta(
+            id: Self.monitorPromptIDPrefix + taskID + "-" + UUID().uuidString,
+            kind: Self.monitorQueueEntryKind,
+            text: eventText,
+            taskID: taskID,
+            humanSchedule: nil
+        ))
+        try? await emit(.queueChanged(queuedPromptCount: await promptQueue.count))
+        // The same idle-wake control the cron path uses: its meaning is
+        // "an out-of-band entry landed; drain if idle", not "cron".
+        await signalMailbox?.send(.control(.cronEnqueued))
+    }
+
     /// Convert an interjection with no running turn into a queued prompt
     /// turn at the FRONT of the queue — send-now semantics: the user asked
     /// for "now", queued rows asked for "later". The port of
@@ -1846,8 +1889,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // run it early. A Cron entry is exempt: its text is the stored
             // task prompt and is sent to the model even when it starts with
             // "/" (upstream's Cron drain arm never parses commands,
-            // app/dispatch/queue.rs:518-560).
+            // app/dispatch/queue.rs:518-560). A monitor entry is exempt for
+            // the same reason — its text is a wrapped event, never a command.
             if entry.kind != Self.cronQueueEntryKind,
+               entry.kind != Self.monitorQueueEntryKind,
                case .command = PagerCommandParser.parse(entry.text) {
                 await promptQueue.completeRunning()
                 switch try await runSlashCommand(entry.text) {
@@ -1870,13 +1915,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // combine gate admits only plain `Prompt` rows
             // (`agent.rs:1085-1098`), so the fold takes the plain-prompt
             // prefix and stops at the first Cron row, and a Cron front runs
-            // alone.
+            // alone. Monitor entries share the rule — upstream's notification
+            // prompts never enter the pager queue at all, so they can never
+            // have merged.
             var promptText = entry.text
             var foldedBacklog = false
-            if modes.combineQueuedPrompts, entry.kind != Self.cronQueueEntryKind {
+            if modes.combineQueuedPrompts,
+               entry.kind != Self.cronQueueEntryKind,
+               entry.kind != Self.monitorQueueEntryKind {
                 var rest: [String] = []
                 for waiting in await promptQueue.entries {
-                    if waiting.kind == Self.cronQueueEntryKind { break }
+                    if waiting.kind == Self.cronQueueEntryKind
+                        || waiting.kind == Self.monitorQueueEntryKind { break }
                     guard let removed = try? await promptQueue.remove(id: waiting.id) else {
                         continue
                     }
@@ -1911,6 +1961,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 turnMetadata[Self.cronTaskIDMetadataKey] = entry.taskID ?? "unknown"
                 turnMetadata[Self.cronHumanScheduleMetadataKey] =
                     entry.humanSchedule ?? "unknown"
+            }
+            // A monitor turn carries its task id in metadata: the runtime
+            // adapter sends the wrapped event verbatim under a `monitor-`
+            // prompt id instead of framing it as a cron prompt.
+            if entry.kind == Self.monitorQueueEntryKind {
+                turnMetadata[Self.monitorTaskIDMetadataKey] = entry.taskID ?? "unknown"
             }
             let turnRequest = OpenGrokPagerRequest(
                 prompt: promptText,

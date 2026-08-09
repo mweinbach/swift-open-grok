@@ -33,6 +33,7 @@ import OpenGrokSubagentResolution
 import OpenGrokTerminalCore
 import OpenGrokToolRegistry
 import OpenGrokToolTypes
+import OpenGrokToolsAPI
 import OpenGrokTTY
 import OpenGrokWebMediaTools
 import OpenGrokWorkspace
@@ -1329,9 +1330,18 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                 // `scheduler_create`) and the provisional
                                 // preview seeds the tasks pane before the
                                 // round-trip (`app/dispatch/prompt.rs:775-794`).
+                                // The fire mode is the session's resolved
+                                // `background_loops` — the same value the
+                                // scheduler host consults at fire time, so
+                                // the instruction describes the runtime the
+                                // fire will actually get (upstream reads its
+                                // seeded copy the same way, loop_cmd.rs:116-120).
                                 switch LiveLoopCommand.dispatch(
                                     rawArgumentTail: OpenGrokPagerInteractiveController
-                                        .rawArgumentTail(of: invocation)
+                                        .rawArgumentTail(of: invocation),
+                                    fireMode: foundation.schedulerBackgroundLoops
+                                        ? .detached
+                                        : .inSession
                                 ) {
                                 case .usage(let message):
                                     return .notice(message)
@@ -1464,6 +1474,102 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     // exists mid-turn — both drop fires exactly when the
                     // session is idle.
                     if let schedulerHost = toolExecutor.schedulerHost {
+                        // The Detached spawn seam, installed BEFORE the fire
+                        // sink: the sink install delivers fires held over
+                        // from startup, and a due Detached task must already
+                        // see its spawner then (the wiring-grace window,
+                        // actor.rs:224-253). The seam drives the SAME
+                        // subagent host `spawn_subagent` dispatches through,
+                        // so a loop iteration is a real child in every
+                        // observable way — `/tasks`, `get_task_output`,
+                        // `kill_task`, `resume_from`.
+                        if let subagentHost = toolExecutor.subagentHost {
+                            await schedulerHost.setLoopSpawner(LiveSchedulerLoopSpawner(
+                                probePrevious: { [weak subagentHost] subagentID in
+                                    // The actor's `SubagentEvent::Query` read
+                                    // (actor.rs:522-580) against the real
+                                    // coordinator. A torn-down host is
+                                    // upstream's closed channel: unknown,
+                                    // so the fire skips.
+                                    guard let subagentHost else { return .unknown }
+                                    let coordinator = subagentHost.coordinator
+                                    let active = await coordinator.listActive(
+                                        parentSessionID: subagentHost.context.sessionID
+                                    )
+                                    if active.contains(where: { $0.request.id == subagentID }) {
+                                        return .running
+                                    }
+                                    guard let completed = await coordinator.listCompleted()
+                                        .first(where: { $0.request.id == subagentID }),
+                                        completed.state == "completed",
+                                        let result = completed.result
+                                    else {
+                                        // Evicted, failed, or cancelled: the
+                                        // anchor is unusable and the next
+                                        // iteration starts fresh
+                                        // (actor.rs:620-632).
+                                        return .gone
+                                    }
+                                    // The RAW completion output — the
+                                    // 600-char restart summary's source
+                                    // (actor.rs:629-631), never the
+                                    // meta-footered task_output rendering.
+                                    return .completed(output: result.output)
+                                },
+                                spawn: { [weak subagentHost, weak schedulerHost] request in
+                                    guard let subagentHost else { return false }
+                                    var arguments: [String: JSONValue] = [
+                                        "prompt": .string(request.framedPrompt),
+                                        "description": .string(request.description),
+                                        // `subagent_type: "general-purpose"`,
+                                        // `run_in_background: true` — the
+                                        // actor's request verbatim
+                                        // (actor.rs:658-680).
+                                        "subagent_type": .string("general-purpose"),
+                                        "background": .bool(true),
+                                        "task_id": .string(request.subagentID),
+                                    ]
+                                    if let resumeFrom = request.resumeFrom {
+                                        arguments["resume_from"] = .string(resumeFrom)
+                                    }
+                                    // No PreToolUse gate here on purpose: a
+                                    // fire is not a tool call — upstream's
+                                    // actor sends `SubagentEvent::Spawn`
+                                    // straight to the coordinator
+                                    // (actor.rs:682-688). The spawned
+                                    // child's OWN tool calls pass through
+                                    // the child executor's full permission
+                                    // pipeline (LiveSubagentHost.runChild),
+                                    // built from this session's security
+                                    // context — that is the authorization
+                                    // surface, same as a Cron turn's.
+                                    switch await subagentHost.spawn(
+                                        args: .object(arguments),
+                                        toolCallID: "scheduler-fire-\(request.subagentID)"
+                                    ) {
+                                    case .success:
+                                        // The spawn-result watcher
+                                        // (actor.rs:707-730): a failed
+                                        // iteration clears the chain anchor
+                                        // so the next fire starts fresh
+                                        // instead of resuming a broken chain.
+                                        let coordinator = subagentHost.coordinator
+                                        let spawnedID = request.subagentID
+                                        Task { [weak schedulerHost] in
+                                            guard let result = try? await coordinator
+                                                .awaitResult(spawnedID) else { return }
+                                            guard result.error != nil else { return }
+                                            await schedulerHost?.clearChainAnchor(
+                                                spawnedSubagentID: spawnedID
+                                            )
+                                        }
+                                        return true
+                                    case .failure:
+                                        return false
+                                    }
+                                }
+                            ))
+                        }
                         await schedulerHost.setFireSink { [weak controller] fire in
                             guard let controller else { return }
                             switch await controller.enqueueCronPrompt(
@@ -1480,6 +1586,26 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                 // up. Both are by-design no-ops here.
                                 break
                             }
+                        }
+                    }
+                    // The monitor event seam: mid-turn events ride the
+                    // interjection buffer (the round-boundary drain,
+                    // upstream's `MonitorEventBuffer`, monitor/types.rs:139-155);
+                    // an idle session gets a notification prompt turn
+                    // through the controller's queue (upstream's
+                    // `SessionCommand::InjectNotification`,
+                    // notification_bridge.rs:776-789).
+                    if let monitorHost = toolExecutor.monitorHost {
+                        let monitorInterjections = stack.interjections
+                        await monitorHost.setEventSink { [weak controller] event in
+                            if await monitorInterjections.interject(event.eventText) {
+                                return
+                            }
+                            guard let controller else { return }
+                            await controller.enqueueMonitorPrompt(
+                                taskID: event.taskID,
+                                eventText: event.eventText
+                            )
                         }
                     }
                     // Typing `/model ` drops the dropdown into the catalog, as
@@ -1998,6 +2124,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let discoveredSkills: [SkillInfo]
         let skillCatalog: [LiveSkills.SkillCommand]
         let feedback: LiveFeedbackComposition
+        /// The session's resolved `[scheduler] background_loops` — the value
+        /// the scheduler host consults at fire time, re-read here by `/loop`
+        /// for its instruction mode (upstream's
+        /// `scheduler_background_loops_seed`, app/event_loop.rs:1333-1338).
+        let schedulerBackgroundLoops: Bool
     }
 
     /// The provider-facing half: tool surface, Code Mode, history, `/model`
@@ -2219,6 +2350,20 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // `open-grok < file` launches where no presenter could ever attach.
         let planApprovalCoordinator: PagerPlanApprovalCoordinator? =
             interactiveSurfaceAvailable ? PagerPlanApprovalCoordinator() : nil
+        // `[scheduler] background_loops`, resolved once at session build —
+        // upstream resolves the same value at session spawn and hands it to
+        // the scheduler as a resource (`resolve_scheduler_background_loops`,
+        // acp_session_impl/spawn.rs:1208-1212 → agent_rebuild.rs:540-545).
+        // Both readers — the host's fire-mode selection and `/loop`'s
+        // instruction mode — consume this one resolve, so they can never
+        // disagree. The remote tier is passed nil: the interactive
+        // composition performs no startup remote-settings fetch (recorded
+        // divergence; the resolver carries the tier for the composition
+        // that does).
+        let schedulerBackgroundLoops = loadResolvedSchedulerBackgroundLoops(
+            remote: nil,
+            environment: context.environment
+        ).value
         // The scheduler runtime, gated exactly like the question coordinator:
         // it exists precisely when the interactive controller (the only
         // in-session fire path) will be constructed. Headless (`-p`),
@@ -2227,7 +2372,28 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // worse than an absent tool (AGENTS.md §4). Headless/ACP scheduler
         // support is a deferred slice.
         let schedulerHost: LiveSchedulerHost? =
-            interactiveSurfaceAvailable ? LiveSchedulerHost() : nil
+            interactiveSurfaceAvailable
+                ? LiveSchedulerHost(backgroundLoopsEnabled: schedulerBackgroundLoops)
+                : nil
+        // The monitor runtime, same gate: its event sink's idle half is the
+        // interactive controller's queue, so a composition without the
+        // controller has no path to deliver events and must not advertise
+        // the tool (AGENTS.md §4). Upstream registers `monitor` in every
+        // preset — headless included — because its notification bridge
+        // reaches every session shape; this port's narrower advertisement
+        // is a recorded divergence, the E18 headless-scheduler precedent.
+        let monitorHost: LiveMonitorHost? = interactiveSurfaceAvailable
+            ? LiveMonitorHost(context: LiveMonitorHost.Context(
+                sessionID: sessionID,
+                // The port's analog of upstream's session_folder/terminal/
+                // (tool.rs:110-112): a per-session directory next to the
+                // session record.
+                outputDirectory: openGrokHome
+                    .appendingPathComponent("sessions", isDirectory: true)
+                    .appendingPathComponent(sessionID, isDirectory: true)
+                    .appendingPathComponent("terminal", isDirectory: true)
+            ))
+            : nil
         let toolExecutor = try await LiveToolExecutor(
             processBackend: processBackend,
             sessionID: sessionID,
@@ -2245,7 +2411,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             subagentHost: subagentHost,
             userQuestions: questionCoordinator.map { LiveUserQuestionBroker(coordinator: $0) },
             planApprovals: planApprovalCoordinator.map { LivePlanApprovalBroker(coordinator: $0) },
-            schedulerHost: schedulerHost
+            schedulerHost: schedulerHost,
+            monitorHost: monitorHost
         )
         conversationRecord.sandboxProfile = sandboxDecision.profileName
         try await conversationStore.save(conversationRecord)
@@ -2272,7 +2439,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             subagentHost: subagentHost,
             discoveredSkills: discoveredSkills,
             skillCatalog: skillCatalog,
-            feedback: feedback
+            feedback: feedback,
+            schedulerBackgroundLoops: schedulerBackgroundLoops
         )
     }
 
@@ -3904,6 +4072,16 @@ struct LiveToolExecutor: Sendable {
     /// The advertised scheduler-tool names (at most the trio). Same
     /// reachability rule: an unadvertised surface is undispatchable.
     private let schedulerToolNames: Set<String>
+    /// The session's monitor runtime: real background processes with
+    /// `kind: .monitor` plus the stdout pipelines that stream their lines
+    /// as model-facing events. `nil` when the composition has no delivery
+    /// seam (headless, ACP, children), which strips `monitor` from the
+    /// advertised list — a monitor whose events can never arrive is worse
+    /// than an absent tool (AGENTS.md §4).
+    let monitorHost: LiveMonitorHost?
+    /// The advertised monitor-tool name (at most `["monitor"]`). Same
+    /// reachability rule: an unadvertised surface is undispatchable.
+    private let monitorToolNames: Set<String>
     /// Session-local swarm-mode tracker, shared by the `/swarm` slash path,
     /// the `agent_swarm` tool trigger, and the turn loop's reminder
     /// injection — one tracker, so the three can never disagree (the port
@@ -4008,7 +4186,10 @@ struct LiveToolExecutor: Sendable {
         // without an in-session fire path (headless, ACP, workflow children,
         // subagent children) advertises no `scheduler_*` tools; only the
         // interactive TUI foundation passes one.
-        schedulerHost: LiveSchedulerHost? = nil
+        schedulerHost: LiveSchedulerHost? = nil,
+        // The monitor runtime, same defaulting rule: only the interactive
+        // TUI foundation has an event-delivery seam, so only it passes one.
+        monitorHost: LiveMonitorHost? = nil
     ) async throws {
         self.subagentHost = subagentHost
         let composition = OpenGrokShellToolRuntimeComposition(
@@ -4319,16 +4500,35 @@ struct LiveToolExecutor: Sendable {
         // (`xai-grok-tools/src/registry/types.rs:694-701`) for the same reason.
         let backgroundTaskTools: [ToolSpec]
         let terminalTools: [ToolSpec]
+        let monitorTools: [ToolSpec]
         if toolPolicy?.allows(liveToolName: Self.runTerminalTool.name) == false {
             backgroundTaskTools = []
             terminalTools = []
+            // The monitor rides the same process surface `run_terminal_cmd`
+            // does (upstream requires the `Terminal` resource, tool.rs:90);
+            // a profile that strips the terminal strips the monitor with it.
+            monitorTools = []
         } else {
             backgroundTaskTools = LiveBackgroundTaskTools
                 .toolSpecs(environment: environment, subagentsPresent: advertisesSubagents)
                 .filter { toolPolicy?.allows(liveToolName: $0.name) ?? true }
             terminalTools = [Self.runTerminalTool] + backgroundTaskTools
+            // `monitor` — enablement is the host's presence (only the
+            // interactive foundation constructs one; its event sink's idle
+            // half is the controller's queue), then the per-tool profile
+            // filter. Upstream's `requires_expr` is `Expr::True`
+            // (tool.rs:41-43); the host-presence gate is this port's
+            // narrower advertisement, recorded.
+            if monitorHost != nil,
+               toolPolicy?.allows(liveToolName: LiveMonitorTools.toolName) ?? true {
+                monitorTools = [LiveMonitorTools.toolSpec()]
+            } else {
+                monitorTools = []
+            }
         }
         self.backgroundTaskToolNames = Set(backgroundTaskTools.map(\.name))
+        self.monitorHost = monitorHost
+        self.monitorToolNames = Set(monitorTools.map(\.name))
         let spawnTools: [ToolSpec] = advertisesSubagents
             ? subagentHost.map { host in
                 [host.toolSpec] + (advertisesSwarm ? [LiveSubagentHost.swarmToolSpec] : [])
@@ -4397,6 +4597,7 @@ struct LiveToolExecutor: Sendable {
             .union(swarmToolNames)
             .union(collaborationToolNames)
             .union(schedulerToolNames)
+            .union(monitorToolNames)
             .union([Self.runTerminalTool.name])
         assert(
             Set(sessionTools.map(\.name)).isDisjoint(with: dispatchedToolNames),
@@ -4408,7 +4609,7 @@ struct LiveToolExecutor: Sendable {
             and background-task tools get.
             """
         )
-        self.tools = terminalTools + spawnTools + collaborationTools + schedulerTools + sessionTools + allowedFileToolDefinitions.map { definition in
+        self.tools = terminalTools + monitorTools + spawnTools + collaborationTools + schedulerTools + sessionTools + allowedFileToolDefinitions.map { definition in
             ToolSpec(
                 name: definition.name,
                 description: definition.description,
@@ -4755,6 +4956,35 @@ struct LiveToolExecutor: Sendable {
             )
         }
 
+        // The monitor. Its command is a REAL process, so the gate is the
+        // full permission pipeline with the command as the bash access —
+        // deliberately STRICTER than upstream, which starts the background
+        // process without bash-rule evaluation (tool.rs:113-138): this
+        // port's `run_terminal_cmd` evaluates `[permission]` bash segments,
+        // and a tool that runs the same commands hooks-only would be a
+        // second, open door to the surface that gate exists to guard
+        // (AGENTS.md §5). Recorded divergence, cost named in the report.
+        if monitorToolNames.contains(call.name),
+           let monitorHost {
+            if let denial = await gateMonitorCommand(args: args, call: call) {
+                return .failure(denial)
+            }
+            do {
+                let execution = try await composition.execution(
+                    for: sessionID,
+                    workingDirectory: workingDirectory
+                )
+                return await LiveMonitorTools.invoke(
+                    args: args,
+                    callID: call.callId,
+                    process: execution,
+                    host: monitorHost
+                )
+            } catch {
+                return .failure(.failed(String(describing: error)))
+            }
+        }
+
         guard call.name == Self.runTerminalTool.name
             || backgroundTaskToolNames.contains(call.name)
         else {
@@ -4969,6 +5199,52 @@ struct LiveToolExecutor: Sendable {
         }
     }
 
+    /// Run `monitor` through the permission pipeline, `gateTerminalCommand`'s
+    /// shape with the monitored command as the bash access: a rule that
+    /// denies `Bash(foo:*)` denies monitoring `foo` too, because the monitor
+    /// RUNS `foo`. Fails closed on no pipeline for the same reason the
+    /// terminal gate does — the tool spawns a real process, and "cannot
+    /// authorize" must read as deny, never as dispatch.
+    private func gateMonitorCommand(
+        args: JSONValue,
+        call: ToolCall
+    ) async -> OpenGrokShellToolRuntimeError? {
+        guard let permissionPipeline else {
+            return .failed(
+                "'\(call.name)' has no permission gate configured for this session"
+            )
+        }
+        guard case .object(let object) = args,
+              case .string(let command)? = object["command"],
+              !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return .invalidCall("\(LiveMonitorTools.toolName) requires a non-empty command")
+        }
+
+        let prepared = await permissionPipeline.prepare(PrepareToolAccessRequest(
+            access: .bash(command),
+            toolName: call.name,
+            toolCallId: call.callId,
+            permissionModeLabel: await sessionPermissionMode?.permissionModeLabel()
+        ))
+        if prepared.mayDispatch { return nil }
+
+        switch prepared.decision {
+        case .policyDeny(let reason), .reject(let reason):
+            firePermissionDenied(call: call, args: args, reason: reason)
+            return .denied(reason)
+        case .cancelled:
+            return .cancelled
+        case .followupMessage(let message):
+            return .failed(message)
+        case .ask:
+            // The engine asked and nothing answered — deny rather than run.
+            return .failed("'\(call.name)' requires approval, and no prompter is available.")
+        case .allow:
+            return nil
+        }
+    }
+
     /// Run `run_terminal_cmd` through the permission pipeline.
     ///
     /// Returns the error to fail the call with, or nil to proceed. Fails closed
@@ -5027,12 +5303,17 @@ struct LiveToolExecutor: Sendable {
             payload: ["reason": .string("shutdown")]
         )
         // The scheduler timer first: a fire delivered into a torn-down
-        // controller would enqueue a cron prompt nothing can ever drain.
+        // controller would enqueue a cron prompt nothing can ever drain —
+        // and a Detached fire would spawn a subagent into the teardown the
+        // next line performs.
         await schedulerHost?.shutdown()
         // Children first: a child holds its own MCP connections and shell
         // session, and its coordinator entry must not outlive the parent's
         // tool surface.
         await subagentHost?.shutdown()
+        // Monitor pipelines before the shell composition: a poll loop that
+        // outlives the backend would spin against a dead process table.
+        await monitorHost?.shutdown()
         await mcpConnections.shutdown()
         await composition.shutdown()
     }
@@ -5641,7 +5922,13 @@ struct LiveAgentToolPolicy: Sendable, Equatable {
         guard let capabilityMode else { return true }
         switch capabilityMode {
         case .readOnly, .readWrite:
+            // `monitor` is upstream's process-control class alongside bash:
+            // `kind_allowed` keeps `ToolKind::Monitor` only under Execute
+            // and All (`xai-grok-workspace/src/capability.rs:157-160`) — it
+            // starts an arbitrary command, so it is exactly as execute-
+            // shaped as `run_terminal_cmd`.
             return liveToolName != "run_terminal_cmd"
+                && liveToolName != LiveMonitorTools.toolName
         case .execute, .all:
             return true
         }
@@ -6432,6 +6719,21 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
                     taskID: cronTaskID,
                     humanSchedule: humanSchedule
                 )
+            )
+        } else if let monitorTaskID = request.metadata[
+            OpenGrokPagerInteractiveController.monitorTaskIDMetadataKey
+        ] {
+            // A monitor turn's text is already the full `<monitor-event …>`
+            // wrap — upstream's InjectNotification prompt blocks carry it
+            // verbatim (notification_bridge.rs:776-789) — so no framing
+            // here; only the `monitor-{task}-{uuid}` prompt-id shape.
+            // `from_prompt_id` has no `monitor-` arm upstream
+            // (session/mod.rs:103-133), so the turn persists as a plain
+            // user item, which is what the port's default mapping does too.
+            turnRequest = OpenGrokShellTurnRequest(
+                promptID: OpenGrokPagerInteractiveController.monitorPromptIDPrefix
+                    + monitorTaskID + "-" + UUID().uuidString,
+                text: request.prompt
             )
         } else {
             turnRequest = OpenGrokShellTurnRequest(text: request.prompt)

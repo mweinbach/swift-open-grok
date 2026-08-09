@@ -210,10 +210,15 @@ enum LivePagerTasksBlock {
             rows.append("  \(padded(status))\(label)  (\(formatDuration(elapsed)))")
         }
 
-        // ── Background tasks (`status_blocks.rs:116-148`) ──
+        // ── Background tasks / monitors (`status_blocks.rs:116-148`) ──
         //
-        // Every row is "Task": the port has no monitor tool, so upstream's
-        // `is_monitor` arm has no source. Status vocabulary: upstream's
+        // The kind label is upstream's `is_monitor` arm verbatim
+        // (`status_blocks.rs:128`): a `monitor`-kind task renders "Monitor",
+        // everything else "Task". The port's source for `is_monitor` is the
+        // snapshot's own `ShellTaskKind` — the same field the monitor tool
+        // stamps at `runBackground` — where upstream reconstructs it
+        // pager-side from the `monitor_description` notification field
+        // (`acp_handler/background.rs:139`). Status vocabulary: upstream's
         // running/done/failed where states correspond, plus the port's own
         // "cancelled" for an explicitly killed task (upstream folds those
         // into done/failed after its "stopping" interlude).
@@ -223,6 +228,7 @@ enum LivePagerTasksBlock {
             return a.taskID < b.taskID
         }
         for task in sortedTasks {
+            let kind = task.kind == .monitor ? "Monitor" : "Task"
             let oneLine = task.description
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .flatMap { $0.isEmpty ? nil : $0 }
@@ -235,7 +241,7 @@ enum LivePagerTasksBlock {
             default: status = "failed"
             }
             rows.append(
-                "  \(padded(status))Task · \(oneLine)  (\(formatDuration(task.duration(at: now))))"
+                "  \(padded(status))\(kind) · \(oneLine)  (\(formatDuration(task.duration(at: now))))"
             )
         }
 

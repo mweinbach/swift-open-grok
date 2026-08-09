@@ -14,13 +14,15 @@
 // same list the model is offered, the `/imagine` gate precedent: a session
 // that cannot act on the injection never lists the row (AGENTS.md §4).
 //
-// Fire mode is pinned to `.inSession`: this port's only fire path is the
-// in-session cron turn. Upstream resolves `[scheduler] background_loops`
-// (default true → Detached); the Detached loop-subagent mode is a deferred
-// slice, so the resolved value would be overridden either way and the
-// instruction must describe the runtime the user actually has. The
-// `background_loops` config reader lands with the Detached slice — wiring
-// the key now would give it a parse with no behavioral reader (AGENTS.md §3).
+// Fire mode comes from the session's resolved `[scheduler] background_loops`
+// (default true → Detached), the same resolved value the scheduler host
+// consults at fire time — one resolve feeds both, so the instruction
+// describes the runtime the fire will actually get. Upstream's `/loop` reads
+// the identical seed (`ctx.pager_state.scheduler_background_loops`,
+// loop_cmd.rs:116-120, seeded from `resolve_scheduler_background_loops`,
+// app/event_loop.rs:1333-1338). Per-task `foreground: true` still fires
+// in-session; the instruction describes the DEFAULT mode, exactly as
+// upstream's seed does.
 
 import Foundation
 import OpenGrokPager
