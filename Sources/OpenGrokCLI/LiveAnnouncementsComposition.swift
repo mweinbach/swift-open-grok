@@ -280,6 +280,20 @@ public actor LiveAnnouncementsComposition {
         return await refreshVisibleBanner(now: now)
     }
 
+    /// The upgrade CTA's target url, re-resolved through the SAME slot gate
+    /// at dispatch time — upstream's `AnnouncementsOpenCta` arm re-runs
+    /// `promo_cta_target` against the live announcements + hidden set
+    /// (`app/dispatch/router.rs:1006-1018` at pin 650c1db7), so a critical
+    /// preempting the promo, or a hide landing between paint and click,
+    /// makes the click a no-op instead of opening a stale target. Reuses
+    /// `promoCTATarget` — the library gate the projection's `ctaLabel`
+    /// already inherits — never a second show-logic.
+    public func promoCTATargetURL(now: Date = Date()) async -> String? {
+        let hidden = await service.stateStore.read()
+        let cached = service.cachedStartupAnnouncements(hiddenIDs: hidden, now: now)
+        return promoCTATarget(cached, hiddenIDs: hidden, now: now)?.url
+    }
+
     /// Synchronous refresh: await the real fetch (rather than the detached
     /// background spawn) and re-derive the banner. The composition's
     /// `spawnBackgroundRefresh` is the production path — fire-and-forget, the

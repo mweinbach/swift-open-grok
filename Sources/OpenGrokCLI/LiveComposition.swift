@@ -8123,6 +8123,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func refreshAnnouncementBanner() async {
         guard let announcements else { return }
         announcementBanner = await announcements.refreshVisibleBanner()
+        // The welcome hero shows the same slot selection in its info slot
+        // (`app_view.rs:4937-4964` at pin 650c1db7), so a hide/show that
+        // changed the slot must swap the OPEN welcome's arm in place —
+        // announcement to next-or-changelog — through the W2
+        // prefetch-completion seam (no visible change, no repaint).
+        refreshWelcomeInPlace()
     }
 
     /// Hydrate the privacy banner's gate state from what this session can
@@ -8610,7 +8616,24 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // the CTA and the row can never disagree about whether a click
             // has something to open.
             changelogBullets: changelogBullets,
-            changelogHasFullNotes: markdownAvailable
+            changelogHasFullNotes: markdownAvailable,
+            // The info slot's announcement arm: the SAME slot selection the
+            // chrome banner paints (the cached `firstSessionAnnouncement`
+            // projection, refreshed by `refreshAnnouncementBanner`) —
+            // upstream's hero picks `promo_cta(...)` owner, else
+            // `first_session_announcement(...)` (`app_view.rs:4937-4948`),
+            // which collapse to the one slot gate because the promo-CTA
+            // owner IS the slot selection. Present ⇒ the changelog arm is
+            // suppressed entirely by the painters. Upstream's third leg —
+            // the sticky random `self.announcement` pick over ALL severities
+            // (`:4949`, fed by `apply_announcements_update`,
+            // `acp_handler/settings.rs:485-492`) — is a deliberate omission:
+            // this port's pipeline has no per-launch random-pick seam (its
+            // upstream feeder is the ACP settings push), and inventing a
+            // nondeterministic surface here would be UX upstream's port
+            // ground doesn't carry. Cost: an info/warning-only feed shows
+            // the changelog where upstream would show a random announcement.
+            announcement: announcementBanner
         )
     }
 
@@ -8683,6 +8706,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 next.menu.firstIndex { $0.id == id }
             }
             next.changelogHovered = welcome.changelogHovered
+            // The expand toggle and hover flags are app-side state upstream
+            // keeps across frames (`welcome_announcement`, app_view.rs:1011;
+            // only a login transition resets `expanded`,
+            // `dispatch/ctx.rs:158`) — a refresh must not collapse an
+            // expanded announcement or drop a hover mid-pointer.
+            next.announcementExpanded = welcome.announcementExpanded
+            next.announcementHovered = welcome.announcementHovered
+            next.announcementCTAHovered = welcome.announcementCTAHovered
             if welcome != next {
                 welcome = next
                 changed = true
@@ -11419,6 +11450,26 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 // key event, `:3620-3621`); the round-trip is the same
                 // controller-owned `/quit` the command palette takes.
                 return "/quit"
+            case PagerWelcomeOverlay.announcementRowID:
+                // Click anywhere on the announcement block toggles inline
+                // expansion (`app_view.rs:4389-4395`). The painter publishes
+                // this row ONLY while `truncated || expanded` — upstream's
+                // gate at the click site — so arriving here IS the gate.
+                overlays.updateWelcome { welcome in
+                    welcome.announcementExpanded.toggle()
+                }
+            case PagerWelcomeOverlay.announcementCTARowID:
+                // `Action::AnnouncementsOpenCta(Welcome)` (`:4349-4355`) →
+                // the router re-resolves the target through the slot gate
+                // and opens it (`dispatch/router.rs:1006-1018`), so a
+                // critical preempting the promo between paint and click
+                // no-ops. The opener is the same seam `Action::OpenUrl`
+                // takes (`openExternalURL`). Upstream's
+                // `AnnouncementCtaClicked` telemetry is omitted with the
+                // rest of this port's dark telemetry.
+                if let url = await announcements?.promoCTATargetURL() {
+                    openExternalURL(url)
+                }
             default:
                 break
             }

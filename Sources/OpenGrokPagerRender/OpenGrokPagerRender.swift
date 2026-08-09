@@ -134,6 +134,20 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     // (flag off, or a squeezed slot below the banner's minimum height),
     // the announcement paints exactly as before and the banner arms no
     // rects (`render.rs:2130-2132`).
+    // While the welcome takeover is up, the chrome has no announcement
+    // surface: upstream's welcome and agent views are mutually exclusive
+    // draw arms (`app/app_view.rs:4914` vs `:5158` at pin 650c1db7) and only
+    // the agent arm sizes and paints the session banner (`:5221-5241`) — the
+    // welcome shows the same slot selection in its hero info slot instead
+    // (`:4937-4964`). Without this gate the full-screen welcome overpaints
+    // the banner cells but the promo button's OSC 8 link span stays armed
+    // over blank cells — a click target for a banner that is not on screen
+    // (the same reason upstream clears banner hit rects when the privacy
+    // banner owns the slot, `agent_view/render.rs:2134-2135`).
+    let welcomeOwnsChrome = state.overlays.overlays.contains { overlay in
+        if case .welcome = overlay.content { return true }
+        return false
+    }
     if state.privacyBanner,
        chrome.announcementBanner.height >= pagerPrivacyBannerMinHeight {
         layout.privacyBanner = renderPagerPrivacyBanner(
@@ -141,7 +155,7 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
             buffer: &buffer,
             theme: state.theme
         )
-    } else {
+    } else if !welcomeOwnsChrome {
         renderAnnouncementBanner(
             state.announcementBanner,
             in: chrome.announcementBanner,
@@ -1143,35 +1157,73 @@ private func renderPromoAnnouncementRow(
 
     // Caption only for a pinned promo whose `Ctrl+O` actually opens the CTA.
     let caption: String? = (!dismissible) ? banner.ctaCaption : nil
-    let button = "[\(label)]"
-    let buttonDisp = truncateToWidth(button, width: remaining)
-    let buttonW2 = min(UnicodeDisplayWidth.width(of: buttonDisp), remaining)
-    guard buttonW2 > 0 else { return }
-    buffer.setString(
+    guard let rect = drawAnnouncementCTAButton(
+        &buffer,
         x: area.x,
         y: row,
-        text: buttonDisp,
+        maxWidth: remaining,
+        label: label,
+        caption: caption,
+        hovered: false,
+        theme: theme
+    ) else { return }
+    if let url = banner.ctaURL, !url.isEmpty {
+        links.append(LinkSpan(row: row, colStart: rect.x, colEnd: rect.x + rect.width, url: url))
+    }
+}
+
+/// Paint the promo upgrade `[label]` button (semantic warning yellow; hovered
+/// → `bgHover` behind it), then the dim ` caption` one space after when it
+/// fits — dropped WHOLE when it does not (never a partial). Returns the
+/// clickable button rect (caption excluded), or `nil` when not even a clipped
+/// button fits. The ONE painter every surface shares — upstream's
+/// `render_cta_button` (`views/announcements.rs:71-118` at pin 650c1db7:
+/// "the ONE painter every surface (banner, hero, in-session header,
+/// dashboard) shares so the button/caption style, truncation, and clamping
+/// can't drift") — used by the chrome banner's promo row and the welcome
+/// hero/stacked announcement arm. The over-narrow label truncates WITH the
+/// `…` (upstream `truncate_str`, `line_utils.rs:83-104`).
+@discardableResult
+func drawAnnouncementCTAButton(
+    _ buffer: inout CellBuffer,
+    x: Int,
+    y: Int,
+    maxWidth: Int,
+    label: String,
+    caption: String?,
+    hovered: Bool,
+    theme: PagerRenderTheme
+) -> TerminalRect? {
+    guard maxWidth > 0 else { return nil }
+    let button = "[\(label)]"
+    let disp = truncateWithEllipsis(button, width: maxWidth)
+    let dispW = min(UnicodeDisplayWidth.width(of: disp), maxWidth)
+    guard dispW > 0 else { return nil }
+    buffer.setString(
+        x: x,
+        y: y,
+        text: disp,
         style: [],
         foreground: theme.warning,
-        background: theme.bgBase
+        background: hovered ? theme.bgHover : theme.bgBase
     )
-    if let url = banner.ctaURL, !url.isEmpty {
-        links.append(LinkSpan(row: row, colStart: area.x, colEnd: area.x + buttonW2, url: url))
-    }
+    // Reservation-first: the button is already painted; the dim caption
+    // follows one space later, whole-or-not (`announcements.rs:99-116`).
     if let caption, !caption.isEmpty {
         let cap = " \(caption)"
         let capW = UnicodeDisplayWidth.width(of: cap)
-        if buttonW2 + capW <= remaining {
+        if dispW + capW <= maxWidth {
             buffer.setString(
-                x: area.x + buttonW2,
-                y: row,
+                x: x + dispW,
+                y: y,
                 text: cap,
                 style: [.dim],
-                foreground: dimFG,
+                foreground: theme.gray,
                 background: theme.bgBase
             )
         }
     }
+    return TerminalRect(x: x, y: y, width: dispW, height: 1)
 }
 
 private func statusBarLeftSpans(

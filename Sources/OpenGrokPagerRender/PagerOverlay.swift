@@ -425,6 +425,19 @@ public struct PagerWelcomeOverlay: Sendable, Equatable, Hashable {
     /// `views/welcome/mod.rs:1608` at pin 650c1db7), carried through the
     /// same rows channel the menu uses so the one mouse router serves both.
     public static let changelogCTARowID = "changelog-cta"
+    /// Row id for the announcement text block — upstream's
+    /// `announcement_rect` (`views/welcome/hero_box.rs:366`, consumed at
+    /// `app/app_view.rs:4389-4395`). Published ONLY while there is something
+    /// to toggle (`truncated || expanded`, the gate upstream applies at the
+    /// click site) so the router's click-toggles semantics need no second
+    /// flag channel.
+    public static let announcementRowID = "announcement"
+    /// Row id for the promo upgrade CTA `[label]` button — upstream's
+    /// `upgrade_cta_rect` (`hero_box.rs:368`, consumed at
+    /// `app/app_view.rs:4349-4355`). Button cells only, caption excluded
+    /// (`render_cta_button` returns the button rect, `views/
+    /// announcements.rs:117`).
+    public static let announcementCTARowID = "announcement-upgrade-cta"
 
     public var productName: String
     public var version: String
@@ -452,6 +465,27 @@ public struct PagerWelcomeOverlay: Sendable, Equatable, Hashable {
     /// uses. Only ever true while a CTA rect is published (the block is
     /// clickable), so the painters can brighten on the flag alone.
     public var changelogHovered: Bool
+    /// The resolved announcement for the info slot, `nil` when the slot
+    /// falls to the changelog arm. The composition passes the SAME slot
+    /// selection the frame banner paints (`first_session_announcement` via
+    /// the banner projection) — upstream's hero selection
+    /// (`app/app_view.rs:4937-4949`); the painters never re-derive
+    /// critical-wins or hidden filtering. Present ⇒ the announcement owns
+    /// the slot and the changelog never paints (`hero_box.rs:349-378`).
+    public var announcement: PagerAnnouncementBanner?
+    /// Whether a long announcement is expanded inline vs collapsed to 2
+    /// wrapped lines — upstream's `welcome_announcement_expanded`
+    /// (`views/welcome/mod.rs:651-653`), toggled by clicking the block.
+    public var announcementExpanded: Bool
+    /// Pointer over the announcement block — upstream's
+    /// `welcome_announcement.on_cta` hover (`app/app_view.rs:4474-4479`).
+    /// Set only while the block's row is published (truncated or expanded),
+    /// so the painter brightens on the flag alone, the changelog-hover
+    /// convention above.
+    public var announcementHovered: Bool
+    /// Pointer over the upgrade CTA `[label]` button — upstream's
+    /// `welcome_on_upgrade_cta` (`app/app_view.rs:4453-4457`).
+    public var announcementCTAHovered: Bool
 
     public init(
         productName: String = "Open Grok Beta",
@@ -461,7 +495,11 @@ public struct PagerWelcomeOverlay: Sendable, Equatable, Hashable {
         selectedIndex: Int? = nil,
         changelogBullets: [String] = [],
         changelogHasFullNotes: Bool = false,
-        changelogHovered: Bool = false
+        changelogHovered: Bool = false,
+        announcement: PagerAnnouncementBanner? = nil,
+        announcementExpanded: Bool = false,
+        announcementHovered: Bool = false,
+        announcementCTAHovered: Bool = false
     ) {
         self.productName = productName
         self.version = version
@@ -471,6 +509,10 @@ public struct PagerWelcomeOverlay: Sendable, Equatable, Hashable {
         self.changelogBullets = changelogBullets
         self.changelogHasFullNotes = changelogHasFullNotes
         self.changelogHovered = changelogHovered
+        self.announcement = announcement
+        self.announcementExpanded = announcementExpanded
+        self.announcementHovered = announcementHovered
+        self.announcementCTAHovered = announcementCTAHovered
     }
 }
 

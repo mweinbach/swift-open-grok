@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-09 (Wave 18 B2-W2: changelog prefetch + hero info slot live; W3 announcement arbitration next)
+**As of:** 2026-08-09 (Wave 18 B2-W3: announcement arm + arbitration live; W4 privacy welcome slot closes the W program)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1476,6 +1476,49 @@ store; the command additionally AWAITS an in-flight prefetch so a racing invocat
 deterministic instead of double-fetching. Cost: a changelog republished to the CDN
 mid-session is not picked up that session — bounded to nil in practice because the
 artifact is version-keyed and the binary's version cannot change mid-session.
+
+### B2-W3 — the announcement arm + arbitration (serial gate: exit 0, 5,269 tests, zero issues)
+
+**Third delegate infrastructure death today** (ping-timeout mid-implementation, after
+the enumeration and most edits; no tests). Lead completed in-house per the W2 protocol:
+audited every hunk against the pin — **all kept** — and wrote the two missing test
+files. The two load-bearing claims lead-verified at the pin: (1) **the frame-banner
+interaction**: upstream's welcome and agent views are mutually exclusive draw arms of
+the same match (`app_view.rs:4914` vs `:5158`) and only the AGENT arm sizes/paints the
+session banner (`:5221-5241`) — the port's landed gate suppresses the chrome banner
+(paint AND the promo OSC 8 link span) while a welcome overlay is up, because the
+full-screen welcome overpaints the cells but an armed link over blank cells would be a
+click target for a banner not on screen (the B9-c3 rect-clearing precedent); (2) **the
+hero slot selection** is upstream's `promo_cta` owner → else `first_session_announcement`
+→ else the sticky random `self.announcement` pick (`app_view.rs:4937-4949`) — the port
+carries the first two legs (they collapse onto the same projection the chrome banner
+paints, so the hero and banner can never disagree) and DELIBERATELY OMITS the third:
+its upstream feeder is the ACP settings push (`acp_handler/settings.rs:485-492`), a
+seam the port lacks, and inventing a nondeterministic pick would be UX without a
+ground. Cost: an info/warning-only feed shows the changelog where upstream would show a
+random announcement. What's live: the announcement arm in both hero and stacked
+painters (announcement CLAMPS to fit while the changelog stays all-or-nothing — with
+an announcement the hero box can never be disabled, `mod.rs:3712-3732`);
+click-toggles-expansion with the row published only while `truncated || expanded`
+(upstream's click-site gate, so arriving at the dispatch IS the gate); the upgrade CTA
+through the ONE shared button painter (`render_cta_button`, `announcements.rs:71-118` —
+the chrome banner's promo row now uses the same fn, whole-or-not caption,
+ellipsis-truncated label, rect-matches-painted-cells so a click can never land in a
+blank margin); the CTA dispatch re-resolving the target through the live slot gate at
+click time (`router.rs:1006-1018` — a critical preempting the promo between paint and
+click no-ops); expand/hover state preserved across in-place welcome refreshes; a
+hide/show that changes the slot swaps the OPEN welcome's arm in place. 8 net-new tests
+(4 render-level: suppression, never-both arbitration, W2 fallback regression, CTA
+whole-or-not; 4 live-seam: real-pipeline arbitration, empty-feed fallback,
+expand round-trip asserted on the published frame HEIGHT, CTA click → captured browser
+URL).
+
+**Test-authoring note (the cumulative-sink trap bit the lead too):** the capturing sink
+accumulates bytes, so `!contains` on painted text fails on any HONEST earlier frame —
+the changelog arm legitimately paints before the announcements land (upstream does the
+same until its fetch fills), then swaps in place. Negative assertions belong on the
+CURRENT frame's published rows (or in single-frame render tests); the arbitration test
+was corrected accordingly during authoring.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

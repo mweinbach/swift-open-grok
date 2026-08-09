@@ -1292,24 +1292,34 @@ private func drawWelcomeHero(
     motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) -> [PagerOverlayBounds.Row] {
     let boxWidth = min(max(0, area.width - 6), 120)
+    // Column widths are height-independent, so derive them before the info
+    // slot is measured (`hero_box.rs:113-120`: measured == drawn). The
+    // right column starts one border + logo + 5 pad columns in, and ends
+    // one border column before the box's right edge.
+    let logoWidth = logo.map { UnicodeDisplayWidth.width(of: $0) }.max() ?? 0
+    let rightWidth = max(0, boxWidth - 7 - logoWidth)
     // The in-box info slot, changelog arm: `changelog_height = 2 + bullets`
     // (header + blank + one row per bullet, `views/welcome/mod.rs:1748-1752`
-    // at pin 650c1db7), collapsed to 0 when there are no bullets. The W3
-    // slice adds the announcement arm into this same slot (one at a time,
-    // announcement wins — `hero_box.rs:349-378`); the geometry below is the
-    // shared `hero_layout` shape both arms occupy.
-    let infoHeight = welcome.changelogBullets.isEmpty
+    // at pin 650c1db7), collapsed to 0 when there are no bullets.
+    let changelogHeight = welcome.changelogBullets.isEmpty
         ? 0
         : 2 + welcome.changelogBullets.count
-    // The subtitle hides while the info slot is shown, to keep the box
-    // compact (`subtitle_rows`, `hero_box.rs:35-39`).
-    let subtitleRows = (infoHeight > 0 || welcome.subtitle.isEmpty) ? 0 : 1
-    let infoGap = infoHeight > 0 ? 1 : 0
     // `right_col_height` (`hero_box.rs:41-47`): version(1) + subtitle +
-    // [info_gap + info] + gap-before-menu(1) + menu.
-    let rightRows = 1 + subtitleRows + infoGap + infoHeight + 1 + welcome.menu.count
-    let boxHeight = 4 + max(logo.count, rightRows)
-    guard boxWidth >= 20, boxHeight <= area.height else {
+    // [info_gap + info] + gap-before-menu(1) + menu. The subtitle hides
+    // while the info slot is shown, to keep the box compact
+    // (`subtitle_rows`, `hero_box.rs:35-39`).
+    func heroBoxHeight(infoHeight: Int) -> Int {
+        let subtitleRows = (infoHeight > 0 || welcome.subtitle.isEmpty) ? 0 : 1
+        let infoGap = infoHeight > 0 ? 1 : 0
+        let rightRows = 1 + subtitleRows + infoGap + infoHeight + 1 + welcome.menu.count
+        return 4 + max(logo.count, rightRows)
+    }
+    // Hero-vs-stacked gate (`mod.rs:254-267`): the changelog is not clamped
+    // so it must fit as-is, but an announcement clamps to fit, so with one
+    // present the box only needs to fit EMPTY (`gate_info = 0`) — a real
+    // announcement can never disable the hero box (`mod.rs:3712-3732`).
+    let gateInfo = welcome.announcement != nil ? 0 : changelogHeight
+    guard boxWidth >= 20, heroBoxHeight(infoHeight: gateInfo) <= area.height else {
         return drawWelcomeStacked(
             welcome,
             logo: logo,
@@ -1319,6 +1329,25 @@ private func drawWelcomeHero(
             motion: motion
         )
     }
+    // In-box info slot arbitration: the slot is sized by the announcement's
+    // desired rows when one is present — clamped to the tallest height that
+    // still fits the box (`clamp_info_height`, `hero_box.rs:70-81`; the
+    // renderer trails a `…` for whatever tail still doesn't fit) — else by
+    // the fixed changelog height (`hero_box.rs:121-130`). Never both.
+    let infoHeight: Int
+    if let announcement = welcome.announcement {
+        let desired = pagerAnnouncementDesiredRows(
+            announcement,
+            width: rightWidth,
+            expanded: welcome.announcementExpanded
+        )
+        infoHeight = (0...desired).reversed().first {
+            heroBoxHeight(infoHeight: $0) <= area.height
+        } ?? 0
+    } else {
+        infoHeight = changelogHeight
+    }
+    let boxHeight = heroBoxHeight(infoHeight: infoHeight)
 
     let x = area.x + (area.width - boxWidth) / 2
     let y = area.y + max(0, (area.height - boxHeight) / 3)
@@ -1356,7 +1385,6 @@ private func drawWelcomeHero(
     // Left column: the logo, padded two columns to optically center it
     // (`hero_box.rs:207`).
     let logoX = frame.x + 1 + 2
-    let logoWidth = logo.map { UnicodeDisplayWidth.width(of: $0) }.max() ?? 0
     for (index, line) in logo.enumerated() {
         let row = frame.y + 2 + index
         guard row < frame.bottom - 1 else { break }
@@ -1373,9 +1401,9 @@ private func drawWelcomeHero(
         )
     }
 
-    // Right column.
+    // Right column — `rightWidth` was derived with the column widths above,
+    // before the info slot was measured (measured == drawn).
     let rightX = frame.x + 1 + logoWidth + 5
-    let rightWidth = max(0, frame.right - 1 - rightX)
     var row = frame.y + 2
     func writeRight(_ spans: [PagerStyledSpan]) {
         guard row < frame.bottom - 1, rightWidth > 0 else { return }
@@ -1403,24 +1431,40 @@ private func drawWelcomeHero(
         // hidden per `subtitle_rows` above.
         row += 1
         let infoFrame = TerminalRect(x: rightX, y: row, width: rightWidth, height: infoHeight)
-        drawWelcomeChangelogBlock(
-            &buffer,
-            bullets: welcome.changelogBullets,
-            in: infoFrame,
-            clipBottom: frame.bottom - 1,
-            hovered: welcome.changelogHovered,
-            bulletPrefix: " \u{2022} ",
-            textInset: 4,
-            theme: theme
-        )
-        // The whole block is the click target, published only when full
-        // notes exist to open (`clickable.then_some(area)`,
-        // `hero_box.rs:587`) — a bullets-only slot paints but is inert.
-        if welcome.changelogHasFullNotes {
-            rows.append(PagerOverlayBounds.Row(
-                id: PagerWelcomeOverlay.changelogCTARowID,
-                frame: infoFrame
+        if let announcement = welcome.announcement {
+            // The announcement takes priority over the changelog, and only
+            // one is ever shown — always in this same position
+            // (`hero_box.rs:349-378`).
+            rows.append(contentsOf: drawWelcomeAnnouncementArm(
+                &buffer,
+                announcement: announcement,
+                in: infoFrame,
+                clipBottom: frame.bottom - 1,
+                expanded: welcome.announcementExpanded,
+                hovered: welcome.announcementHovered,
+                ctaHovered: welcome.announcementCTAHovered,
+                theme: theme
             ))
+        } else {
+            drawWelcomeChangelogBlock(
+                &buffer,
+                bullets: welcome.changelogBullets,
+                in: infoFrame,
+                clipBottom: frame.bottom - 1,
+                hovered: welcome.changelogHovered,
+                bulletPrefix: " \u{2022} ",
+                textInset: 4,
+                theme: theme
+            )
+            // The whole block is the click target, published only when full
+            // notes exist to open (`clickable.then_some(area)`,
+            // `hero_box.rs:587`) — a bullets-only slot paints but is inert.
+            if welcome.changelogHasFullNotes {
+                rows.append(PagerOverlayBounds.Row(
+                    id: PagerWelcomeOverlay.changelogCTARowID,
+                    frame: infoFrame
+                ))
+            }
         }
         row += infoHeight
     } else if !welcome.subtitle.isEmpty {
@@ -1552,14 +1596,42 @@ private func drawWelcomeStacked(
         row += 1
     }
 
-    // Stacked info slot BELOW the menu — upstream keeps the narrow layout's
-    // changelog too, centered to the menu width (`render_changelog_section`,
-    // `views/welcome/mod.rs:1544-1609` at pin 650c1db7, painted from the
-    // `layout.changelog` slot at `:1961-1993`). All-or-nothing: upstream's
-    // `effective_changelog` (`mod.rs:203-217`) allocates the gap + the full
-    // slot or collapses it to 0 — never a clipped header. Upstream also
-    // refuses a column narrower than 20 (`mod.rs:1569-1571`).
-    if !welcome.changelogBullets.isEmpty {
+    // Stacked info slot BELOW the menu — one slot, announcement over
+    // changelog, mirroring the hero box (`views/welcome/mod.rs:1961-1993`
+    // at pin 650c1db7: "show the announcement or the changelog
+    // (announcement takes priority)"). Both arms are centered to the menu
+    // width and refuse a column narrower than 20 (`mod.rs:1668-1670`).
+    if let announcement = welcome.announcement {
+        // The announcement CLAMPS to the remaining column budget
+        // (`mod.rs:283-301`: desired rows `.min(stacked_info_budget)`),
+        // unlike the all-or-nothing changelog arm below — the painter
+        // trails a `…` for the tail that doesn't fit.
+        let desired = pagerAnnouncementDesiredRows(
+            announcement,
+            width: menuWidth,
+            expanded: welcome.announcementExpanded
+        )
+        let budget = max(0, area.bottom - (row + 1))
+        let slotHeight = min(desired, budget)
+        if menuWidth >= 20, slotHeight > 0 {
+            row += 1
+            let slotFrame = TerminalRect(x: menuX, y: row, width: menuWidth, height: slotHeight)
+            rows.append(contentsOf: drawWelcomeAnnouncementArm(
+                &buffer,
+                announcement: announcement,
+                in: slotFrame,
+                clipBottom: area.bottom,
+                expanded: welcome.announcementExpanded,
+                hovered: welcome.announcementHovered,
+                ctaHovered: welcome.announcementCTAHovered,
+                theme: theme
+            ))
+            row += slotHeight
+        }
+    } else if !welcome.changelogBullets.isEmpty {
+        // All-or-nothing: upstream's `effective_changelog` (`mod.rs:203-217`)
+        // allocates the gap + the full slot or collapses it to 0 — never a
+        // clipped header.
         let slotHeight = 2 + welcome.changelogBullets.count
         if menuWidth >= 20, row + 1 + slotHeight <= area.bottom {
             row += 1
@@ -1639,13 +1711,238 @@ private func drawWelcomeChangelogBlock(
     }
 }
 
+// MARK: - Welcome announcement arm
+
+/// Rows the promo upgrade CTA reserves in the info slot: a spacer row above
+/// the `[label]` button row — upstream's `UPGRADE_CTA_ROWS`
+/// (`views/welcome/hero_box.rs:26-29` at pin 650c1db7). Reserved on top of
+/// the announcement text rows so the message never paints over the button.
+let pagerWelcomeUpgradeCTARows = 2
+
+/// Word-wrap `text` into lines no wider than `width` columns — upstream's
+/// `wrap_lines` (`hero_box.rs:592-616`): whitespace-split words re-joined
+/// with single spaces; a single word longer than `width` becomes its own
+/// (over-wide) line and the renderer clips it.
+func pagerAnnouncementWrapLines(_ text: String, width: Int) -> [String] {
+    guard width > 0 else { return [] }
+    var lines: [String] = []
+    var current = ""
+    for word in text.split(whereSeparator: \.isWhitespace) {
+        if current.isEmpty {
+            current = String(word)
+        } else if UnicodeDisplayWidth.width(of: current) + 1
+            + UnicodeDisplayWidth.width(of: String(word)) <= width {
+            current += " "
+            current += word
+        } else {
+            lines.append(current)
+            current = String(word)
+        }
+    }
+    if !current.isEmpty {
+        lines.append(current)
+    }
+    return lines
+}
+
+/// Rows the announcement TEXT wants at `width`: title + message, the message
+/// capped at 2 wrapped lines unless `expanded` — upstream's
+/// `announcement_text_rows` (`hero_box.rs:627-638`). Shared with the painter
+/// so the upgrade CTA lands right after the drawn text (reserved == drawn).
+func pagerAnnouncementTextRows(
+    _ announcement: PagerAnnouncementBanner,
+    width: Int,
+    expanded: Bool
+) -> Int {
+    let titleRows = announcement.title != nil ? 1 : 0
+    let messageRows: Int
+    if let message = announcement.message {
+        let wrapped = pagerAnnouncementWrapLines(message, width: width).count
+        messageRows = expanded ? wrapped : min(wrapped, 2)
+    } else {
+        messageRows = 0
+    }
+    return titleRows + messageRows
+}
+
+/// Rows the announcement info slot wants at `width`: the text rows plus,
+/// when a promo upgrade CTA is shown, a spacer row + the `[label]` button
+/// row — upstream's `announcement_desired_rows` (`hero_box.rs:643-651`).
+/// The CTA presence is the projection's `ctaLabel` (resolved once by the
+/// slot gate, never re-derived here).
+func pagerAnnouncementDesiredRows(
+    _ announcement: PagerAnnouncementBanner,
+    width: Int,
+    expanded: Bool
+) -> Int {
+    pagerAnnouncementTextRows(announcement, width: width, expanded: expanded)
+        + (announcement.ctaLabel != nil ? pagerWelcomeUpgradeCTARows : 0)
+}
+
+/// Draw the announcement text + (optional) upgrade CTA into `area` and
+/// publish the hit rows — upstream's `render_announcement_with_upgrade_cta`
+/// (`hero_box.rs:438-483`) + `render_announcement_block` (`:490-539`),
+/// shared by the hero box and the stacked layout exactly as upstream shares
+/// them.
+///
+/// Layout: title row (bold; critical → error red, else warning —
+/// `:501-511`), then the message word-wrapped to at most 2 lines collapsed /
+/// what fits expanded, the last visible line hard-cut with a `…` when the
+/// tail doesn't fit (`render_wrapped_text`, `:657-695`). When a CTA label is
+/// present the bottom `UPGRADE_CTA_ROWS` are reserved first so a
+/// long/expanded message never overpaints the button, and the `[label]`
+/// button lands one spacer row after the drawn text (`:447-463`). The
+/// caption is pinned-only: a dismissible promo keeps its caption off the
+/// welcome (`:471-476`).
+///
+/// Rows published: the button rect under `announcementCTARowID` when drawn,
+/// and the text block under `announcementRowID` ONLY while interactive
+/// (truncated or expanded) — the gate upstream applies to both the click
+/// (`app_view.rs:4389-4391`) and the hover (`:4474-4475`), applied here at
+/// publish time because the rows channel IS this port's hit-test. The
+/// button row precedes the block row, upstream's hit-test order
+/// (`:4349` before `:4389`); the rects never overlap (the text area
+/// excludes the reserved CTA rows).
+///
+/// `hovered` brightens the message to `textPrimary` (`hover_style`,
+/// `mod.rs:66-74`); the flag is only ever set while the block's row is
+/// published, so a short non-interactive message can never brighten — the
+/// W2 changelog-hover convention.
+private func drawWelcomeAnnouncementArm(
+    _ buffer: inout CellBuffer,
+    announcement: PagerAnnouncementBanner,
+    in area: TerminalRect,
+    clipBottom: Int,
+    expanded: Bool,
+    hovered: Bool,
+    ctaHovered: Bool,
+    theme: PagerRenderTheme
+) -> [PagerOverlayBounds.Row] {
+    guard area.width > 0, area.height > 0 else { return [] }
+    let ctaRows = announcement.ctaLabel != nil ? pagerWelcomeUpgradeCTARows : 0
+    let textArea = TerminalRect(
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: max(0, area.height - ctaRows)
+    )
+    let maxY = min(textArea.bottom, clipBottom)
+    var row = area.y
+    var truncated = false
+
+    if let title = announcement.title {
+        if row < maxY {
+            let titleColor = announcement.severity == .critical
+                ? theme.accentError
+                : theme.warning
+            _ = buffer.setString(
+                x: area.x,
+                y: row,
+                text: truncateWithEllipsis(title, width: area.width),
+                style: [.bold],
+                foreground: titleColor,
+                background: theme.bgBase
+            )
+        }
+        row += 1
+    }
+    if let message = announcement.message {
+        let remainingRows = max(0, maxY - row)
+        let maxLines = expanded ? remainingRows : min(remainingRows, 2)
+        let lines = pagerAnnouncementWrapLines(message, width: area.width)
+        truncated = lines.count > maxLines
+        let visible = min(maxLines, lines.count)
+        let messageColor = hovered ? theme.textPrimary : theme.gray
+        for (index, line) in lines.prefix(visible).enumerated() {
+            let y = row + index
+            guard y < maxY else { break }
+            if index + 1 == visible, truncated {
+                // Hard-cut the text and append our own styled `…`
+                // (`render_wrapped_text`, `hero_box.rs:677-693`). Dim
+                // affordance unless hovered (`:526-533`).
+                let lineWidth = UnicodeDisplayWidth.width(of: line)
+                let head = lineWidth < area.width
+                    ? line
+                    : truncateToWidth(line, width: max(0, area.width - 1))
+                let headWidth = UnicodeDisplayWidth.width(of: head)
+                if !head.isEmpty {
+                    _ = buffer.setString(
+                        x: area.x,
+                        y: y,
+                        text: head,
+                        style: [],
+                        foreground: messageColor,
+                        background: theme.bgBase
+                    )
+                }
+                _ = buffer.setString(
+                    x: area.x + headWidth,
+                    y: y,
+                    text: PagerGlyphs.ellipsis,
+                    style: hovered ? [] : [.dim],
+                    foreground: hovered ? theme.textPrimary : theme.grayBright,
+                    background: theme.bgBase
+                )
+            } else if !line.isEmpty {
+                _ = buffer.setString(
+                    x: area.x,
+                    y: y,
+                    text: line,
+                    style: [],
+                    foreground: messageColor,
+                    background: theme.bgBase
+                )
+            }
+        }
+    }
+
+    var rows: [PagerOverlayBounds.Row] = []
+    if let label = announcement.ctaLabel {
+        let textRows = min(
+            pagerAnnouncementTextRows(announcement, width: area.width, expanded: expanded),
+            textArea.height
+        )
+        let ctaY = area.y + textRows + 1
+        if ctaY < min(area.bottom, clipBottom) {
+            // Pinned (non-dismissible) promo shows its dim `cta.caption`; a
+            // dismissible one stays bare (`hero_box.rs:471-476`). No
+            // permission prompt exists on the welcome, so no chord gating.
+            let caption = announcement.dismissible ? nil : announcement.ctaCaption
+            if let buttonFrame = drawAnnouncementCTAButton(
+                &buffer,
+                x: area.x,
+                y: ctaY,
+                maxWidth: area.width,
+                label: label,
+                caption: caption,
+                hovered: ctaHovered,
+                theme: theme
+            ) {
+                rows.append(PagerOverlayBounds.Row(
+                    id: PagerWelcomeOverlay.announcementCTARowID,
+                    frame: buttonFrame
+                ))
+            }
+        }
+    }
+    if truncated || expanded {
+        rows.append(PagerOverlayBounds.Row(
+            id: PagerWelcomeOverlay.announcementRowID,
+            frame: textArea
+        ))
+    }
+    return rows
+}
+
 /// Upstream `truncate_str` (`xai-grok-pager-render/src/render/line_utils.rs:
 /// 83-104` at pin 650c1db7): clip to `width` display columns, ending with a
 /// `…` when content was dropped — unlike the port's plain `truncateToWidth`,
 /// which clips silently. Upstream backs up one *char* for the ellipsis; this
 /// backs up to `width - 1` *columns*, identical for the 1-column characters
 /// changelog bullets carry and never wider than budget for the rest.
-private func truncateWithEllipsis(_ text: String, width: Int) -> String {
+/// Module-internal: the shared announcement CTA button painter
+/// (`drawAnnouncementCTAButton`) is upstream's `truncate_str` consumer too.
+func truncateWithEllipsis(_ text: String, width: Int) -> String {
     guard width > 0 else { return "" }
     guard UnicodeDisplayWidth.width(of: text) > width else { return text }
     guard width > 1 else { return PagerGlyphs.ellipsis }
