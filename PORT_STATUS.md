@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-08 (Wave 17 E22: Detached loop-subagent fires, `[scheduler] background_loops` resolver, `monitor` tool live)
+**As of:** 2026-08-08 (Wave 17 E23: scheduler persistence + durable-removal barriers + occurrence journal — the scheduler program is complete except headless/ACP surfaces)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `70002584da34e4c37ea14a3bce35341b7d04f9a7` (re-pinned **2026-08-06** from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05`; +3 commits, release `v0.1.220-open-grok.57` — the Meta API provider delta: `0f8dc87b` provider, `666b2ceb` login/settings, `70002584` stored-key unlock fix. The prior 2026-08-05 re-pin moved from `80dff0a9dcb24121b976b9f920fbe442af40ea88`; +14 commits, release `v0.1.220-open-grok.54`; before that the 2026-08-04 re-pin moved from `9739c4a2ad23cfea14312a481169757f3da494f4` to `80dff0a9…`; +202 commits, releases `v0.1.220-open-grok.22` through `.53`). Local read-only clone: `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08); the pinned commit is reachable in `/Users/mweinbach/Projects/open-grok` history — read it via `git show 70002584:<path>` / `git grep <pat> 70002584 -- crates` (crates prefixed `crates/codegen/`), NOT that clone's working tree, which sits one substantive commit newer (`650c1db7`, release `.58`).
@@ -871,6 +871,54 @@ true` parses and stores but dies with the session — the occurrence journal and
 durable-removal barriers are unported); headless/ACP scheduler + monitor surfaces;
 `TaskCompleted` auto-wake (pre-existing background-task deferral — a monitor's natural
 exit produces no completion wake; visible via `/tasks` and output reads only).
+*(The persistence deferral closed in E23 below; the other two stand.)*
+
+### E23 — scheduler persistence, durable-removal barriers, occurrence journal (serial gate: exit 0, 5,041 tests, zero issues)
+
+Closes the last scheduler deferral. **Load-bearing finding, verified by the lead at the
+pin (it overrode the brief's sketch):** upstream persists ALL tasks, not only durable
+ones — `SchedulerState.tasks` has no serde filter (`types.rs:293-303`) and nothing
+filters at save/load (`types/resources.rs:303-366`, `persistence.rs:113-154`); the
+`durable` flag's only behavioral readers are the expiry barrier (`actor.rs:311-391`) and
+the occurrence journal's one-shot constraint. `durable` buys the REMOVAL BARRIERS —
+"persists across sessions" is realized as surviving `--resume` of the same session.
+State lives at `$OPENGROK_HOME/sessions/<sessionID>/resources_state.json` in upstream's
+exact shape (`{"state": {"grok_build.Scheduler": …}}`, `registry/types.rs:1134-1139`;
+the session-id path segment is safe by construction — every id passes
+`validateSessionID` `[A-Za-z0-9._-]`/≤128/not-dots, re-verified by the lead). Two write
+grades, exactly upstream's (`persistence.rs:297-347`): best-effort temp+rename saves at
+every scheduler mutation (a superset of upstream's debounced per-tool-call trigger,
+same at-rest content — recorded), and the durable barrier (temp → fsync file → rename →
+fsync parent dir, temp cleaned on failure, directory-squatter removed, parent dir never
+created by the writer). **Removal barrier** (`actor.rs:837-870,150-179`): a delete
+persists durably before acknowledging; while pending, fires are suspended, the timer
+parks, and every other mutation throws `RemovalPending` — only retrying the same delete
+makes progress, so a crash cannot resurrect a task the user watched disappear.
+**Durable expiry** removes → durable save → on failure re-inserts at the same slot and
+blocks the id from due-selection and timer computation (`blocked_expiries`).
+**Overdue-at-load**: one catch-up fire, never per-missed-interval — load leaves
+`lastFiredAt` untouched, the sink install runs `fireDue(now)`, `markFired` re-anchors;
+the E18 wiring-grace seam covers loaded tasks as designed. Corrupt/missing/foreign
+files load fresh, never crash (every upstream failure arm mapped). **Occurrence
+journal** ported whole (`occurrence_journal.rs`: v7-validated ids, quarantine/overflow
+caps 50/50/256, prepare/finish/reconcile, byte-exact error strings) with every upstream
+test; NO runtime reader was invented — upstream's own consumers are
+`#[expect(dead_code)]` at the pin, recorded in the file header. 18 net-new tests
+(journal pins; state-file/reload with cadence phase preserved; barrier crash-reload;
+corrupt/foreign files) — the hand-off's "30 new" counted re-run E17 suites; the gate's
+count is the ledger's.
+
+**Recorded divergences:** no acknowledged-tombstone leg on delete/expiry (upstream's
+tombstone cancels replayed pager rows; the port replays no scheduler rows — if a
+transcript-replay surface lands, deletes need the tombstone or rows resurrect
+visually); save timing mutation-driven vs. debounced per-tool-call (same rest state);
+binary barrier outcomes (no Timeout/Cancelled arms — the write is a direct bounded
+call); `sessions/<id>/` without upstream's `<encoded-cwd>` level (established port
+convention); single-resource file (a round-trip over an upstream file drops resource
+keys the port doesn't register — upstream's own behavior for unregistered types);
+`SchedulerClock`/reservation machinery unported (stamps a cross-process notification
+stream this one-process port lacks; the version VALUES are ported since they live in
+the file format); restored-row display stamps use millisecond-spaced load instants.
 
 ## Wave 16 — Pager surfaces, first parallel worktree batch (2026-08-08)
 

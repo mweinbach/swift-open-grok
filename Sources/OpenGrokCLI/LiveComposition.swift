@@ -2371,9 +2371,26 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // from the advertised list — a create whose fires can never run is
         // worse than an absent tool (AGENTS.md §4). Headless/ACP scheduler
         // support is a deferred slice.
+        //
+        // Persistence binds the host to the session directory's
+        // `resources_state.json` — upstream's `state_path.parent().join(
+        // "resources_state.json")` (registry/types.rs:1134-1140) under
+        // `sessions/<id>/` (spawn.rs:946-947) — so durable tasks survive a
+        // `--resume` of this session: the host loads the file at
+        // construction and every mutation writes it back. The same
+        // `sessions/<sessionID>` directory the monitor host uses; the id is
+        // path-safe because every id reaching this point passed
+        // `LiveConversationStore.validateSessionID`.
         let schedulerHost: LiveSchedulerHost? =
             interactiveSurfaceAvailable
-                ? LiveSchedulerHost(backgroundLoopsEnabled: schedulerBackgroundLoops)
+                ? LiveSchedulerHost(
+                    backgroundLoopsEnabled: schedulerBackgroundLoops,
+                    persistence: LiveSchedulerPersistence.forSessionDirectory(
+                        openGrokHome
+                            .appendingPathComponent("sessions", isDirectory: true)
+                            .appendingPathComponent(sessionID, isDirectory: true)
+                    )
+                )
                 : nil
         // The monitor runtime, same gate: its event sink's idle half is the
         // interactive controller's queue, so a composition without the

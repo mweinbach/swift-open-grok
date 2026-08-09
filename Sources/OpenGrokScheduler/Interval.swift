@@ -11,16 +11,22 @@
 
 import Foundation
 
-/// Pure scheduler errors, ported from `scheduler/types.rs:158-186`.
+/// Scheduler errors, ported from `scheduler/types.rs:158-186`.
 ///
-/// Only the cases the pure library can raise are ported. The runtime-only
-/// cases (`Persistence`, `Notification`, `NoDurableNotificationConsumer`,
-/// `RemovalPending`, `Cancelled`, `Timeout`) belong to the scheduler actor
-/// slice: they describe actor/persistence failures this library cannot reach.
+/// `persistence` and `removalPending` are the durable-barrier cases the
+/// runtime host raises (`SchedulerError::Persistence` / `RemovalPending`,
+/// `types.rs:169-170,178-179`). Still deliberately unported:
+/// `Notification`, `NoDurableNotificationConsumer`, `Cancelled`, and
+/// `Timeout` — they describe the acknowledged-notification consumer and the
+/// background persistence writer's timeout/cancel arms, and this port has
+/// neither surface (the state write is a direct call, so its outcome is
+/// never "unknown").
 public enum SchedulerError: Error, Equatable, Sendable {
     case invalidInterval(String)
     case taskLimitReached(Int)
     case taskNotFound(String)
+    case persistence(String)
+    case removalPending(String)
 }
 
 extension SchedulerError: CustomStringConvertible {
@@ -36,6 +42,10 @@ extension SchedulerError: CustomStringConvertible {
             return "maximum of \(limit) scheduled tasks reached"
         case .taskNotFound(let id):
             return "no scheduled task with id \(id); call scheduler_list to see active task ids"
+        case .persistence(let detail):
+            return "failed to persist scheduler resources: \(detail)"
+        case .removalPending(let id):
+            return "scheduler removal for \(id) is pending"
         }
     }
 }

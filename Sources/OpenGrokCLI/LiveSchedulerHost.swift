@@ -93,9 +93,44 @@ struct LiveSchedulerLoopSpawner: Sendable {
 
 /// Per-session scheduler runtime: task store, sleep-until-due timer, and the
 /// in-session fire delivery seam.
+///
+/// Persistence (E23): the store loads from the session's
+/// `resources_state.json` at construction — upstream's `persistence.load(
+/// &mut resources)` at toolset finalize (`registry/types.rs:1140`) — and is
+/// written back on every mutation. ALL tasks persist, durable and not: at
+/// the pin nothing filters `SchedulerState.tasks` at save or load (verified
+/// across `types/resources.rs`, `persistence.rs`, `registry/types.rs`; the
+/// `durable` flag's only behavioral readers are the expiry barrier,
+/// `actor.rs:311-391`, and the occurrence journal's one-shot constraint).
+/// What `durable` buys is the REMOVAL BARRIER: a delete or durable expiry
+/// must land on disk before it is acknowledged, so a crash cannot resurrect
+/// a task the user watched disappear.
 actor LiveSchedulerHost {
     private var state = SchedulerState()
     private let clock: @Sendable () -> Date
+
+    /// The session's `resources_state.json` writer, or `nil` when the
+    /// composition has no persistence (tests without a home, or a session
+    /// dir that could not be created — upstream's empty-`state_path`
+    /// "persistence disabled for session" arm, `tool_config.rs:369-377`).
+    /// `nil` behaves like upstream's `ResourcesPersistence::noop()`
+    /// (`persistence.rs:51-58`): barriers acknowledge immediately.
+    private let persistence: LiveSchedulerPersistence?
+
+    /// The durable-removal barrier's in-flight marker — upstream's
+    /// `pending_removal: Option<PendingDurableRemoval>` (`actor.rs:41-44,
+    /// 106`). While set: fires are suspended (the actor's sleep arm carries
+    /// `if self.pending_removal.is_none()`, `actor.rs:200`) and every other
+    /// mutation is refused with `RemovalPending` (`actor.rs:773-777,
+    /// 798-802, 846-850`). Only a retry of the SAME delete makes progress.
+    private var pendingRemovalTaskID: String?
+
+    /// Durable expiries whose barrier write failed — upstream's
+    /// `blocked_expiries` (`actor.rs:107`): the task stays in the store but
+    /// is excluded from due-selection (`actor.rs:283-285`) and from the
+    /// timer's next-fire computation (`actor.rs:262`), so one broken disk
+    /// cannot spin the fire loop.
+    private var blockedExpiries: Set<String> = []
 
     /// The resolved `[scheduler] background_loops` value, read at fire time —
     /// the port of the actor's `SchedulerBackgroundLoops` resource read
@@ -139,10 +174,32 @@ actor LiveSchedulerHost {
 
     init(
         clock: @escaping @Sendable () -> Date = { Date() },
-        backgroundLoopsEnabled: Bool = true
+        backgroundLoopsEnabled: Bool = true,
+        persistence: LiveSchedulerPersistence? = nil
     ) {
         self.clock = clock
         self.backgroundLoopsEnabled = backgroundLoopsEnabled
+        self.persistence = persistence
+        guard let persistence, let loaded = persistence.load() else { return }
+        state = loaded
+        // Display stamps for restored rows: upstream re-announces after
+        // restore and the pager gives each row a synthetic arrival instant
+        // (`announce_existing_tasks`, actor.rs:735-768; `Instant::now()`
+        // stamping, acp_handler/background.rs:347), so the display age
+        // never reads a backdated `createdAt`. Millisecond spacing keeps
+        // the store order under the formatter's created-at sort, standing
+        // in for the pager's strictly-increasing arrival instants.
+        let loadInstant = clock()
+        for (index, task) in state.tasks.enumerated() {
+            displayCreatedAt[task.id] = loadInstant
+                .addingTimeInterval(TimeInterval(index) / 1_000)
+        }
+        // No timer here: `rearmTimer` parks until the fire sink installs,
+        // and `setFireSink` runs `fireDue` — the moment a restored overdue
+        // task fires once (upstream's overdue-at-load semantics: the sleep
+        // computes a zero delay and `fire_next_task` re-anchors from `now`,
+        // actor.rs:266-271, 406-408 — one catch-up fire, never one per
+        // missed interval).
     }
 
     /// Stop the timer. Called from the executor's shutdown so a dying session
@@ -184,6 +241,7 @@ actor LiveSchedulerHost {
         }) else { return }
         state.tasks[index].lastSubagentId = nil
         state.tasks[index].iterationsSinceFresh = 0
+        persistence?.save(state)
     }
 
     /// Fire every task due at `now`, in store order, one at a time — the port
@@ -198,6 +256,24 @@ actor LiveSchedulerHost {
     func fireDue(now: Date) async -> [LiveSchedulerFire] {
         defer { rearmTimer() }
         guard fireSink != nil else { return [] }
+        // Fires are suspended while a removal barrier is in flight — the
+        // actor's sleep arm carries `if self.pending_removal.is_none()`
+        // (actor.rs:200); a fire that interleaved with a half-committed
+        // delete could resurrect the deleted task's cadence on disk.
+        guard pendingRemovalTaskID == nil else { return [] }
+        let stateAtEntry = state
+        defer {
+            // Upstream persists mutated resources after every tool call
+            // (`finalize_output`, registry/types.rs:1789-1792) — the port
+            // has no per-tool-call chokepoint, so the fire pass saves its
+            // own mutations (cadence re-anchors, chain anchors, non-durable
+            // expiries). A durable expiry was already committed by its
+            // barrier below; this re-writes the same bytes best-effort,
+            // redundant but harmless.
+            if state != stateAtEntry {
+                persistence?.save(state)
+            }
+        }
         var fires: [LiveSchedulerFire] = []
         // A task fires at most once per pass. Guards the decoded-legacy
         // corner where `intervalSecs == 0` (parseInterval clamps at 60 on
@@ -206,11 +282,32 @@ actor LiveSchedulerHost {
         var firedTaskIDs: Set<String> = []
         while let index = state.tasks.firstIndex(where: {
             $0.isDue(now: now) && !firedTaskIDs.contains($0.id)
+                && !blockedExpiries.contains($0.id)
         }) {
             var task = state.tasks[index]
             firedTaskIDs.insert(task.id)
             if task.recurring, task.isExpired(now: now) {
-                // Expiry removes without firing (`actor.rs:395-404`).
+                if task.durable, let persistence {
+                    // The durable-expiry barrier (actor.rs:311-391): remove,
+                    // persist durably, and only a committed write makes the
+                    // removal real. A failed write re-inserts the task at
+                    // its slot and blocks its expiry (actor.rs:355-368) —
+                    // the task neither fires nor silently vanishes, and
+                    // other due tasks keep firing past it.
+                    let expired = state.tasks.remove(at: index)
+                    do {
+                        try persistence.saveDurably(state)
+                    } catch {
+                        state.tasks.insert(expired, at: index)
+                        blockedExpiries.insert(task.id)
+                        continue
+                    }
+                    displayCreatedAt.removeValue(forKey: task.id)
+                    continue
+                }
+                // Non-durable expiry removes without firing and without a
+                // barrier (`actor.rs:395-404`); the pass-end save records it
+                // best-effort, like upstream's next debounced save.
                 state.tasks.remove(at: index)
                 displayCreatedAt.removeValue(forKey: task.id)
                 continue
@@ -415,6 +512,11 @@ actor LiveSchedulerHost {
         foreground: Bool,
         fireImmediately: Bool
     ) throws -> ScheduledTask {
+        // A pending removal barrier refuses every other mutation
+        // (`actor.rs:773-777`) until the stuck delete is retried.
+        if let pending = pendingRemovalTaskID {
+            throw SchedulerError.removalPending(pending)
+        }
         let now = clock()
         var task = ScheduledTask(
             intervalSecs: intervalSecs,
@@ -428,6 +530,7 @@ actor LiveSchedulerHost {
         try state.create(task)
         provisional.removeAll()
         displayCreatedAt[task.id] = now
+        persistence?.save(state)
         rearmTimer()
         return task
     }
@@ -439,25 +542,74 @@ actor LiveSchedulerHost {
         prompt: String?,
         intervalSecs: UInt64?
     ) throws -> ScheduledTask {
+        // `actor.rs:798-802`.
+        if let pending = pendingRemovalTaskID {
+            throw SchedulerError.removalPending(pending)
+        }
         let updated = try state.update(
             id: id,
             prompt: prompt,
             intervalSecs: intervalSecs,
             now: clock()
         )
+        persistence?.save(state)
         rearmTimer()
         return updated
     }
 
-    /// Remove a task; a missing id reports `false`, not an error
-    /// (`actor.rs:854-856`).
-    func deleteTask(id: String) -> Bool {
-        let removed = state.delete(id: id)
-        if removed {
-            displayCreatedAt.removeValue(forKey: id)
-            rearmTimer()
+    /// Remove a task behind the durable-removal barrier — the port of
+    /// `SchedulerCommand::Delete` (`actor.rs:837-870`) +
+    /// `complete_pending_removal` (`actor.rs:150-179`), minus the
+    /// acknowledged-tombstone leg (`publish_durable_removal`,
+    /// `actor.rs:138-148`): upstream also appends an acknowledged
+    /// `ScheduledTaskRemoved` to the session transcript so a REPLAYED
+    /// `ScheduledTaskCreated` row cannot resurrect in the pager
+    /// (`notification_bridge.rs:133-185`). This port renders `/tasks` from
+    /// this live store and replays no scheduler rows from any transcript,
+    /// so that consumer surface does not exist — recorded, not half-ported.
+    ///
+    /// Semantics, exactly upstream's:
+    ///  * missing id → `false`, not an error (`actor.rs:854-856`);
+    ///  * the task leaves the store FIRST (`actor.rs:863`), then the barrier
+    ///    write runs; a failed write throws `persistence` and RETAINS the
+    ///    pending marker, so fires stay suspended and other mutations get
+    ///    `removalPending` until a retry of the same id lands the write
+    ///    (pinned upstream by `durable_delete_retries_persistence_and_
+    ///    reuses_version`, actor.rs:2315-2368);
+    ///  * a delete of a DIFFERENT id while pending → `removalPending`
+    ///    (`actor.rs:846-850`); the same id retries the barrier
+    ///    (`actor.rs:838-845`).
+    func deleteTask(id: String) throws -> Bool {
+        if pendingRemovalTaskID == id {
+            return try completePendingRemoval()
         }
-        return removed
+        if let pending = pendingRemovalTaskID {
+            throw SchedulerError.removalPending(pending)
+        }
+        guard state.delete(id: id) else {
+            return false
+        }
+        displayCreatedAt.removeValue(forKey: id)
+        pendingRemovalTaskID = id
+        return try completePendingRemoval()
+    }
+
+    /// `complete_pending_removal` (`actor.rs:150-179`), reduced to the
+    /// persistence leg: the durable save is awaited, and only success clears
+    /// the pending marker and re-arms the timer. Without persistence this
+    /// acknowledges immediately — upstream's noop writer
+    /// (`persistence.rs:161-165`).
+    private func completePendingRemoval() throws -> Bool {
+        if let persistence {
+            do {
+                try persistence.saveDurably(state)
+            } catch {
+                throw SchedulerError.persistence(String(describing: error))
+            }
+        }
+        pendingRemovalTaskID = nil
+        rearmTimer()
+        return true
     }
 
     func list() -> [ScheduledTask] {
@@ -512,7 +664,18 @@ actor LiveSchedulerHost {
         timer?.cancel()
         timer = nil
         guard fireSink != nil else { return }
-        guard let next = state.tasks.map({ $0.nextFireAt() }).min() else { return }
+        // Parked while a removal barrier is pending — the actor's sleep arm
+        // condition (actor.rs:200); a due task would otherwise hot-loop
+        // timer → fireDue → suspended → re-arm at zero delay.
+        guard pendingRemovalTaskID == nil else { return }
+        // Blocked expiries do not drive the timer (actor.rs:262): a durable
+        // expiry whose barrier write keeps failing must not wake the loop
+        // every pass just to fail again.
+        guard let next = state.tasks
+            .filter({ !blockedExpiries.contains($0.id) })
+            .map({ $0.nextFireAt() })
+            .min()
+        else { return }
         let generation = timerGeneration
         // Cap one sleep at a day; an early wake finds nothing due and re-arms.
         // Guards the UInt64 conversion against a corrupt far-future date.

@@ -266,7 +266,18 @@ enum LiveSchedulerTools {
         guard let id = string(object["id"]) else {
             return .failure(.invalidCall("\(deleteToolName) requires an id"))
         }
-        let removed = await host.deleteTask(id: id)
+        let removed: Bool
+        do {
+            removed = try await host.deleteTask(id: id)
+        } catch let error as SchedulerError {
+            // The durable-removal barrier's failures — upstream maps them
+            // through `scheduler_tool_error` (`types.rs:188-201`) and the
+            // thrown display string is the model-facing text
+            // (`delete.rs` → `scheduler_tool_error(e)`).
+            return .failure(.failed(error.description))
+        } catch {
+            return .failure(.failed(String(describing: error)))
+        }
         let message = removed
             ? "Scheduled task \(id) cancelled."
             : "No scheduled task with ID \(id) found. Use scheduler_list to see active tasks."

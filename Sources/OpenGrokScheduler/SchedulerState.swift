@@ -9,10 +9,11 @@
 // barriers). This port keeps the mutations on the value type so they are
 // deterministic and directly testable; the runtime slice wraps this in its
 // actor and owns everything transactional. The occurrence journal
-// (`types.rs:297-302`) is deliberately not ported here — it exists to dedupe
-// replayed fires, which is actor territory. Decoding ignores the
-// `occurrenceJournal` key; encoding omits it, which matches upstream's
-// `skip_serializing_if = "is_empty"` for the empty journal.
+// (`types.rs:297-302`) is carried as persisted state (OccurrenceJournal.swift)
+// with upstream's serde shape: the `occurrenceJournal` key decodes leniently
+// (quarantine, never a decode error) and is omitted when empty
+// (`skip_serializing_if = "is_empty"`). Nothing in the runtime READS it —
+// upstream's own consumers are `#[expect(dead_code)]` at the pin.
 
 import Foundation
 
@@ -33,6 +34,11 @@ public struct SchedulerState: Codable, Equatable, Sendable {
     public static let maxScheduledTasks = 50
 
     public var tasks: [ScheduledTask]
+
+    /// Persisted one-shot removal receipts (`types.rs:297-302`). Mutable only
+    /// through the journal's own prepare/finish seam (OccurrenceJournal.swift),
+    /// matching upstream's `pub(crate)` field.
+    public internal(set) var occurrenceJournal = OccurrenceJournal()
 
     public init(tasks: [ScheduledTask] = []) {
         self.tasks = tasks
@@ -107,12 +113,34 @@ public struct SchedulerState: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case tasks
+        case occurrenceJournal
     }
 
     /// `tasks` carries `#[serde(default)]` upstream (`types.rs:295-296`), so
-    /// an empty or journal-only state document decodes to no tasks.
+    /// an empty or journal-only state document decodes to no tasks. The
+    /// journal decodes through `decodeLenient` for ANY present value —
+    /// including an explicit `null`, which upstream's `Value::deserialize`
+    /// routes to the malformed arm rather than treating as absent.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         tasks = try c.decodeIfPresent([ScheduledTask].self, forKey: .tasks) ?? []
+        if c.contains(.occurrenceJournal) {
+            let raw = (try? c.decode(JournalJSON.self, forKey: .occurrenceJournal)) ?? .null
+            occurrenceJournal = OccurrenceJournal.decodeLenient(raw)
+        } else {
+            occurrenceJournal = OccurrenceJournal()
+        }
+    }
+
+    /// The empty journal is omitted, matching upstream's
+    /// `skip_serializing_if = "OccurrenceJournal::is_empty"`
+    /// (`types.rs:297-302`) — pinned upstream by
+    /// `empty_journal_omits_legacy_field`.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(tasks, forKey: .tasks)
+        if !occurrenceJournal.isEmpty {
+            try c.encode(occurrenceJournal, forKey: .occurrenceJournal)
+        }
     }
 }

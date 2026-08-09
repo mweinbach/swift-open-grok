@@ -506,7 +506,7 @@ struct LiveSchedulerHostFireTests {
             foreground: true,
             fireImmediately: true
         )
-        #expect(await host.deleteTask(id: task.id))
+        #expect(try await host.deleteTask(id: task.id))
 
         let collector = FireCollector()
         await host.setFireSink { fire in await collector.record(fire) }
