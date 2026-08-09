@@ -980,6 +980,7 @@ public enum PagerOverlayContent: Sendable, Equatable {
     case workflows(PagerWorkflowsOverlay)
     case settings(PagerSettingsOverlay)
     case extensions(PagerExtensionsOverlay)
+    case agents(PagerAgentsOverlay)
 }
 
 public struct PagerOverlay: Sendable, Equatable {
@@ -1155,6 +1156,29 @@ extension PagerOverlay {
             content: .extensions(extensions),
             // Escape is routed into the modal, which decides whether it means
             // "clear the search" or "close" — see `PagerOverlayStack.handle`.
+            dismissOnEscape: false
+        )
+    }
+
+    /// `/config-agents` (alias `/agents`) and `/personas` — the read-only
+    /// agents/personas modal (Wave 18 B9-b1).
+    ///
+    /// The title is upstream's `"Agents"` (`agents_modal.rs:2010,1029`).
+    /// Footer hints are recomputed from the modal's own state at paint
+    /// time.
+    public static func agents(
+        _ agents: PagerAgentsOverlay,
+        id: String = "agents"
+    ) -> PagerOverlay {
+        PagerOverlay(
+            id: id,
+            title: "Agents",
+            presentation: .centeredModal(PagerAgentsMetrics.sizing),
+            hints: pagerAgentsHints(agents),
+            content: .agents(agents),
+            // Escape is routed into the modal, which decides whether it
+            // means "clear the search" or "close" — see
+            // `PagerOverlayStack.handle`.
             dismissOnEscape: false
         )
     }
@@ -1364,10 +1388,11 @@ public struct PagerOverlayStack: Sendable, Equatable {
         // *outcome* the coordinator must see (the tool is blocked on it),
         // never a dismissal.
         // The extensions modal owns it too: with search active, Esc clears
-        // the query instead of closing.
+        // the query instead of closing. The agents modal follows the same
+        // rule (search-Esc resets the query, `agents_modal.rs:1986-1990`).
         let ownsEscape: Bool
         switch overlay.content {
-        case .settings, .question, .planApproval, .extensions: ownsEscape = true
+        case .settings, .question, .planApproval, .extensions, .agents: ownsEscape = true
         default: ownsEscape = false
         }
 
@@ -1449,6 +1474,26 @@ public struct PagerOverlayStack: Sendable, Equatable {
                 // rebuilds the snapshot. Rides the row-selection channel the
                 // way the workflows overlay's p/r/x already do.
                 outcome = .selected(id: overlay.id, rowID: "reload:\(tab.rawValue)")
+            }
+        case .agents(var agents):
+            let result = agents.handle(event)
+            overlay.content = .agents(agents)
+            switch result {
+            case .redraw:
+                outcome = .redraw
+            case .consumed:
+                outcome = .consumed
+            case .close:
+                overlays.remove(at: index)
+                return .dismissed(id: overlay.id)
+            case .viewAgent(let entryIndex):
+                // The overlay cannot read files; the composition resolves
+                // the view payload from the (just-updated) snapshot and
+                // pushes the document overlay ON TOP — upstream's
+                // viewer-over-modal layering (`agent_view/modals.rs:27-47`).
+                outcome = .selected(id: overlay.id, rowID: "view:agent:\(entryIndex)")
+            case .viewPersona(let entryIndex):
+                outcome = .selected(id: overlay.id, rowID: "view:persona:\(entryIndex)")
             }
         }
 

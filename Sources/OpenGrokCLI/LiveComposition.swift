@@ -9412,12 +9412,41 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // fresh from the live loaders at open. Re-running the command
             // while open replaces the modal on the requested tab, exactly
             // what pushing the shared id does.
+            // Mutual exclusivity: opening extensions closes the agents
+            // modal (`dispatch/transcript.rs:463-464` at pin 650c1db7).
+            overlays.dismiss(id: LiveAgentsComposition.overlayID)
             overlays.push(.extensions(LiveExtensionsComposition.overlay(
                 tab: LiveExtensionsComposition.tab(for: tab),
                 workingDirectory: workingDirectory,
                 openGrokHome: openGrokHome,
                 sessionID: sessionID,
                 connections: mcpServers,
+                environment: environment
+            )))
+        case .agentsModal(let initialTab):
+            // `/config-agents` (alias `/agents`) and `/personas` — the
+            // read-only agents/personas modal (B9-b1), both tabs
+            // snapshotted fresh at open (`dispatch_open_config_agents_modal`,
+            // `dispatch/transcript.rs:486-531`). Mutual exclusivity runs
+            // the other way too: opening agents closes extensions
+            // (`transcript.rs:500-501`). Upstream additionally fires
+            // `Effect::FetchSessionAgentName` for the ` active` marker
+            // (`:525-530`) — the recorded B9 deferral: this port has no
+            // session-agent-name channel, so only the resolved default is
+            // shown.
+            overlays.dismiss(id: LiveExtensionsComposition.overlayID)
+            // The current model's `agentType`, from the SAME catalog the
+            // model switch resolves against — upstream's
+            // `model_agent_type_from_info` (`transcript.rs:534-543`),
+            // empty filtered out.
+            let modelAgentType = catalogStore
+                .flatMap { findModelByID($0.snapshot(), modelID: modelName)?.info.agentType }
+                .flatMap { $0.isEmpty ? nil : $0 }
+            overlays.push(.agents(LiveAgentsComposition.overlay(
+                initialTab: initialTab.map(LiveAgentsComposition.tab(for:)) ?? .agents,
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                modelAgentType: modelAgentType,
                 environment: environment
             )))
         case .reasoningEffort(let query):
@@ -10992,6 +11021,28 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // loaders and swap them in. The modal stays open and keeps its
             // navigation state — reload is a data refresh, not a reset.
             reloadExtensionsOverlay(rowID: rowID)
+            return nil
+        }
+        if overlayID == LiveAgentsComposition.overlayID {
+            // `Enter`/`o` view: resolve the payload from the OPEN modal's
+            // snapshot and push the document overlay ON TOP — the agents
+            // modal stays beneath, upstream's viewer-over-modal layering
+            // (Esc closes the viewer and the modal is still there,
+            // `agent_view/modals.rs:33-36`). A stale or unreadable target
+            // opens nothing, upstream's own silent `open_markdown` → None
+            // arm.
+            guard let existing = overlays.overlays.first(
+                      where: { $0.id == LiveAgentsComposition.overlayID }
+                  ),
+                  case .agents(let current) = existing.content,
+                  let payload = LiveAgentsComposition.viewPayload(
+                      rowID: rowID, overlay: current
+                  )
+            else { return nil }
+            overlays.push(LiveHowtoGuidesPicker.viewerOverlay(
+                title: payload.title,
+                content: payload.content
+            ))
             return nil
         }
         overlays.dismiss(id: overlayID)

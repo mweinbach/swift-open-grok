@@ -2651,6 +2651,24 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             aliases: ["tour", "onboarding"],
             summary: "Quick tips to get the most out of Open Grok"
         ),
+        // `/config-agents` and `/personas` follow `/tutorial`, upstream's
+        // registry order (`slash/commands/mod.rs:150-153`). Names, alias,
+        // descriptions and usage are verbatim (`config_agents.rs:10-24`,
+        // `personas.rs:11-25`) — including the mutation verbs in the
+        // `/personas` description, which are upstream's own copy; this
+        // port's b1 modal browses read-only (create/edit/delete are
+        // B9-b2/b3) and its FOOTER advertises only the keys it handles.
+        PagerCommandDefinition(
+            name: "config-agents",
+            aliases: ["agents"],
+            summary: "Manage agent definitions",
+            usage: "/config-agents"
+        ),
+        PagerCommandDefinition(
+            name: "personas",
+            summary: "Manage personas (create, edit, delete)",
+            usage: "/personas"
+        ),
         PagerCommandDefinition(
             name: "rewind",
             aliases: ["undo"],
@@ -3355,6 +3373,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case "tutorial":
                 try await emit(.overlay(.tutorial))
                 return .handled
+            case "config-agents":
+                // Arguments are ignored — upstream's `ConfigAgentsCommand::run`
+                // declares `_args` (`config_agents.rs:26-28`) and always
+                // opens with no initial tab (Agents).
+                try await emit(.overlay(.agentsModal(initialTab: nil)))
+                return .handled
+            case "personas":
+                // `personas.rs:27-29` — the same modal opened on the
+                // Personas tab.
+                try await emit(.overlay(.agentsModal(initialTab: .personas)))
+                return .handled
             case "rewind":
                 try await emit(.overlay(.rewind(
                     argument: invocation.arguments.joined(separator: " ")
@@ -3711,6 +3740,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /theme [name]  /t         Switch the color theme
       /release-notes /changelog View release notes for the current version
       /tutorial                 Quick tips
+      /config-agents  /agents   Manage agent definitions
+      /personas                 Manage personas (create, edit, delete)
       /workflows                Show workflow runs
       /timestamps               Toggle message timestamps on/off
       /timeline                 Toggle the timeline sidebar

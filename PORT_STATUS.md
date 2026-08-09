@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-09 (Wave 18 B9-b0: personas feed the live subagent seam; the agents/personas modal b1–b3 unblocked)
+**As of:** 2026-08-09 (Wave 18 B9-b1: agents/personas modal live read-only; b2 mutations and b3 personas CRUD remain)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1217,6 +1217,54 @@ upstream lacks. Consequence for the modal: b1–b3 are honest immediately for st
 resolution, and display; a persona alters a live spawn only through the internal
 overrides channel until upstream adds a naming surface — the modal ships without
 inventing one (§4).
+
+### B9-b1 — the agents/personas modal, read-only (serial gate: exit 0, 5,195 tests, zero issues on rerun; flake note below)
+
+`/config-agents` (alias `/agents`) and `/personas` (copy verbatim, verified at the pin;
+registered after `/tutorial` per `mod.rs:150-153`) open a new `.agents` overlay built on
+the E14 extensions-modal precedent: both tabs browsable read-only. Agents tab: the five
+user-visible builtins in upstream's order (verified `:275-283`), live
+`AgentDefinitionDiscovery` deduped Project>User>Bundled>BuiltIn with the
+builtin-at-Project-scope rule, a NEW read-only `[subagents.toggle]` reader over a fresh
+effective-config load, and the default marker from the full resolution chain
+(`resolve_default_agent_name` → the shell's `resolve_agent_definition`, incl. the
+strict-harness arms). Personas tab: the b0 loader's EFFECTIVE map — exactly what a
+spawn resolves against — with scope tags (plus a `config` tag for inline entries
+upstream has no label for), sniffed descriptions, capability tags. `Enter/o` routes
+through the existing document overlay pushed OVER the modal (upstream's
+viewer-over-modal layering). `i` is search on both tabs (verified `:2147,:2283` — the
+editor `i` lives only in b3's detail modal). Dispatch: initial-tab, agent-view only,
+mutual exclusivity with the extensions modal in BOTH directions (`transcript.rs:463-464,
+500-501`). **Footer honesty:** only the read-only key set is advertised; `t/s/n/d` are
+swallowed with tests pinning no-config-write and no notice — the b2/b3 deferral is
+recorded at the handler heads. The delegate caught its own click-invention before
+hand-off: upstream's mouse explicitly does NOT view on click (`agent_view/modals.rs:
+104-108`), so no row click targets are published (click-to-select deferred with the
+mouse surface). 29 net-new tests incl. live-seam proof that a real persona file and a
+real project agent definition appear painted from the same data the session resolves
+with.
+
+**Recorded divergences:** no bundle-catalog column (no `x.ai/bundle/status` client —
+the tab lists the effective map instead, which includes inline `[subagents.personas]`
+entries upstream's own modal misses; ordering precedence-grouped vs upstream's append
+order); project personas listed without a trust gate (upstream's own modal behavior —
+resolution stays trust-gated per b0); prompt-extension preview uses the live
+`spawn_subagent` tool naming (the port's definitions carry no per-tool kind);
+selection-derived scroll (the extensions convention); append/backspace search; the
+persona viewer shows raw file text pending b3's detail modal. Deferred (all cited
+in-source): `t`/`s` writers (b2), `n`/`d`/create/confirm/detail modal (b3),
+`EditInEditor` (b3 + the `$EDITOR` seam), the ` active` session-agent marker (no
+channel — the recorded B9 ruling), mouse row handling.
+
+**Suite flake, recorded:** the first gate run of this slice failed ONE unrelated test —
+`LiveInterjectionTests` "an interjection drains into the running turn's next sampler
+round and persists" — at 15.028 s (its delivery-retry deadline is 15 s), with the
+interjection landing before the tool round. It passed in all 14 prior serial gates
+tonight and on the immediate rerun; the b1 diff touches no interjection seam. Judged a
+load flake of the test's time-boxed delivery loop on a machine nine hours into
+continuous builds (the V5 telemetry-flake precedent). If it recurs, the fix is a
+deterministic turn-started signal instead of the retry deadline — noted here so the
+next red run starts with a diagnosis.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

@@ -252,16 +252,23 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     nonisolated static let advertisedToolName = "spawn_subagent"
     nonisolated static let dispatchNames: Set<String> = ["spawn_subagent", "task"]
 
+    /// The production tool names substituted into `${{ tools.by_kind.* }}`
+    /// placeholders. Shared with the agents modal's prompt-extension
+    /// preview (`LiveAgentsComposition`) so the modal renders the SAME
+    /// names the live `spawn_subagent` descriptors carry — one naming, no
+    /// drift.
+    nonisolated static let fragmentToolNaming = SubagentToolNaming(
+        execute: "run_terminal_cmd",
+        read: "read_file",
+        edit: "search_replace",
+        list: "list_dir",
+        search: "grep",
+        webSearch: "web_search",
+        plan: "todo_write"
+    )
+
     private static func makeToolSpec(context: Context) -> ToolSpec {
-        let fragmentNaming = SubagentToolNaming(
-            execute: "run_terminal_cmd",
-            read: "read_file",
-            edit: "search_replace",
-            list: "list_dir",
-            search: "grep",
-            webSearch: "web_search",
-            plan: "todo_write"
-        )
+        let fragmentNaming = Self.fragmentToolNaming
         // Upstream lists built-ins first in catalog order, then discovered
         // entries (`discovery.rs` `merge_subagents`); `availableAgentNames`
         // is alphabetical, so the built-in order is restored by hand.

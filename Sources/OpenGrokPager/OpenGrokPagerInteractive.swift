@@ -468,6 +468,18 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// discovery, the plugin install registry, and the session's MCP
     /// connections.
     case extensions(tab: OpenGrokPagerExtensionsTab)
+    /// `/config-agents` (alias `/agents`) and `/personas` (upstream
+    /// `Action::OpenConfigAgentsModal(Option<AgentsTab>)`,
+    /// `slash/commands/config_agents.rs:27`, `personas.rs:28`) — the
+    /// agents/personas modal, a READ-ONLY browser in this port (B9-b1;
+    /// the toggle/default-agent writers are b2, persona CRUD b3).
+    /// `initialTab` mirrors upstream's optional tab: `nil` opens on
+    /// Agents, `/personas` sends `.personas`
+    /// (`dispatch/transcript.rs:521-523`). The agent lists, persona
+    /// snapshots, toggle states, and the default-agent resolution all
+    /// live in the render layer, which owns discovery and the config
+    /// authority chain.
+    case agentsModal(initialTab: OpenGrokPagerAgentsTab?)
     /// `/effort [level]` — reasoning effort on the *current* model (upstream
     /// `slash/commands/effort.rs:57-92`, a thin wrapper over
     /// `Action::SwitchModel` with the session's model id). Same shape as
@@ -590,6 +602,16 @@ public enum OpenGrokPagerExtensionsTab: String, Sendable, Equatable, Hashable {
     case marketplace
     case skills
     case mcpServers
+}
+
+/// Which tab the agents modal opens on — upstream's `AgentsTab`
+/// (`views/agents_modal.rs:27-30`) carried on the intent the way the tab
+/// rides `Action::OpenConfigAgentsModal`. The controller cannot hold the
+/// render layer's modal type, so the tab travels as this mirror and the
+/// composition maps it onto `PagerAgentsTab`.
+public enum OpenGrokPagerAgentsTab: String, Sendable, Equatable, Hashable {
+    case agents
+    case personas
 }
 
 /// The parsed `/doctor` argument grammar — upstream's `DoctorRequest`

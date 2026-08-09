@@ -154,6 +154,10 @@ private func renderCenteredModal(
     if case .extensions(let extensions) = overlay.content {
         hints = pagerExtensionsHints(extensions)
     }
+    // The agents modal's footer follows its search mode too.
+    if case .agents(let agents) = overlay.content {
+        hints = pagerAgentsHints(agents)
+    }
 
     // Clear under the popup so the transcript does not bleed through. The
     // reference applies no backdrop dimming (`modal_window.rs:328`).
@@ -236,6 +240,8 @@ private func renderCenteredModal(
         rows = drawSettingsBody(settings, in: content, buffer: &buffer, theme: theme)
     case .extensions(let extensions):
         rows = drawExtensionsBody(extensions, in: content, buffer: &buffer, theme: theme)
+    case .agents(let agents):
+        rows = drawAgentsBody(agents, in: content, buffer: &buffer, theme: theme)
     }
 
     let hintBounds = drawModalFooter(hints, in: footer, buffer: &buffer, theme: theme)
@@ -626,6 +632,9 @@ func pagerBottomSheetHeight(
     case .extensions:
         // Same shape as settings: centered-modal only, full budget if sheeted.
         contentRows = screenHeight
+    case .agents:
+        // Same shape as settings: centered-modal only, full budget if sheeted.
+        contentRows = screenHeight
     }
     let ceiling = max(1, screenHeight * 80 / 100)
     let preferred = max(screenHeight / 2, 10)
@@ -733,6 +742,8 @@ private func renderBottomSheet(
         rows = drawSettingsBody(settings, in: content, buffer: &buffer, theme: theme)
     case .extensions(let extensions):
         rows = drawExtensionsBody(extensions, in: content, buffer: &buffer, theme: theme)
+    case .agents(let agents):
+        rows = drawAgentsBody(agents, in: content, buffer: &buffer, theme: theme)
     }
 
     return PagerOverlayBounds(
