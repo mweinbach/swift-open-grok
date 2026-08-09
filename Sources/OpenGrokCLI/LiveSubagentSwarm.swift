@@ -542,7 +542,15 @@ extension LiveSubagentHost {
                 allowNestedSubagents: false
             ),
             roles: [:],
-            personas: [:],
+            // The same per-spawn map the task path feeds: swarm members go
+            // through the identical shell resolution upstream
+            // (handle_request.rs:300-306 receives `ctx.subagent_personas`
+            // for every owner, swarm included). Swarm input carries no
+            // persona name at the pin (agent_swarm/mod.rs:731 —
+            // `persona: None`), so this map is consulted only if that ever
+            // changes; feeding `[:]` here would make that change silently
+            // resolve nothing.
+            personas: effectiveSpawnPersonas(),
             cwd: context.workingDirectory,
             definition: definition,
             parent: ParentRuntimeDefaults(
@@ -550,7 +558,9 @@ extension LiveSubagentHost {
                 capabilityMode: context.parentCapabilityCeiling
             )
         )
-        if runtime.personaResolutionFatal, let personaError = runtime.personaError {
+        // Any persona error aborts (handle_request.rs:308-315), same arm as
+        // the task path — not only the fatal file-I/O case.
+        if let personaError = runtime.personaError {
             return .failure(.invalidCall(personaError))
         }
         runtime.capabilityMode = intersectCapabilityModes(

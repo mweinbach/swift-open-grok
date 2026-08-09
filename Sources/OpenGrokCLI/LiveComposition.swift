@@ -2564,7 +2564,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 }
             },
             definitionContext: definitionContext,
-            modelSlugs: LiveModelCatalogResolver.catalog().map(\.id)
+            modelSlugs: LiveModelCatalogResolver.catalog().map(\.id),
+            // The trust-independent persona base: inline [subagents.personas]
+            // from the SAME trust-gated document the toggles read, plus the
+            // session home's `personas/` and `bundled/personas/` dirs
+            // (upstream resolve_subagents, agent/config.rs:2255-2263).
+            // Loaded once here; the trusted project overlay is per-spawn
+            // inside the host. The session's resolved home, never the
+            // process's — a `--cwd`/injected-env launch must read the same
+            // persona files the rest of the session resolved against.
+            basePersonas: SubagentPersonaLoader.basePersonas(
+                configDocument: securityContext.document,
+                openGrokHome: openGrokHome
+            )
         ))
     }
 

@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-09 (Wave 18 B9-c3: privacy banner live — the B9-c program is closed; B9-b personas next)
+**As of:** 2026-08-09 (Wave 18 B9-b0: personas feed the live subagent seam; the agents/personas modal b1–b3 unblocked)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1180,6 +1180,43 @@ treats welcome bounds as blocking); Optional rects vs `Rect::default()`
 (representation). `set_unless_dropdown` suppression not ported — the port's completions
 band cannot geometrically overlap the banner slot, so the click-through hazard it
 guards does not exist.
+
+### B9-b0 — personas feed the live seam (serial gate: exit 0, 5,166 tests, zero issues)
+
+The lead-ruled prerequisite for the agents/personas modal. `SubagentPersonaLoader`
+(housed in `OpenGrokSubagentResolution`, mirroring `AgentDefinitionDiscovery`'s
+conventions) loads the trust-independent base once at session build — inline
+`[subagents.personas]` from the trust-gated config document plus
+`$OPENGROK_HOME/personas/` and `bundled/personas/` (`agent/config.rs:2255-2263`) —
+and both spawn paths (task + swarm) recompute the trusted-project overlay
+(`{cwd}/.opengrok/personas/*.toml`) per spawn, feeding the merged map into
+`resolveRuntimeConfig` instead of `[:]`. Relative `instructions_file` references
+resolve against the PARENT session's cwd, not the task's `cwd` argument
+(`handle_request.rs:296-301`, verified at the pin). Malformed persona files skip
+without crashing. Resumes inherit the source's persona unconditionally before
+resolution (`handle_request.rs:255-258`, verified) with identity validation so a
+resume cannot silently swap SOULs; the recorded persona rides child bookkeeping. The
+flagship §3 test proves disk-to-wire reachability: a persona `.toml` in an isolated
+home lands its instructions on a real spawned child's captured sampler request through
+real executor dispatch. 17 net-new tests.
+
+**Delegate-found-and-fixed pre-existing §3 bug, lead-verified at the pin:** the port's
+abort arm checked `personaResolutionFatal` before refusing a spawn, but upstream
+aborts on ANY `persona_error` (`handle_request.rs:308-315` — "Persona resolution
+failed, aborting subagent spawn"); the fatal flag only governs whether the OTHER
+runtime fields still resolved. The old arm would have let a named-but-missing persona
+spawn silently without its instructions — harmless while the map was `[:]`, load-bearing
+the moment this slice fed it. Corrected on both paths.
+
+**Load-bearing enumeration finding (affects b1–b3, lead-verified):** at the pin the
+persona-NAME channel is dormant UPSTREAM too — the model-facing `task` input has no
+persona field and `TaskTool::run` hardcodes `persona: None` (`task/mod.rs:394`, swarm
+likewise `agent_swarm/mod.rs:731`); only internal spawners can name one. The feed is
+exact structural parity, and in-source comments warn against "fixing" the tool schema
+upstream lacks. Consequence for the modal: b1–b3 are honest immediately for storage,
+resolution, and display; a persona alters a live spawn only through the internal
+overrides channel until upstream adds a naming surface — the modal ships without
+inventing one (§4).
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

@@ -117,6 +117,12 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         var definitionContext: DefinitionResolutionContext
         /// Public catalog slugs the `model` parameter may name.
         var modelSlugs: [String]
+        /// Trust-independent personas — inline `[subagents.personas]` plus
+        /// the user and bundled persona directories — loaded once at session
+        /// build (upstream `resolve_subagents`, agent/config.rs:2255-2263).
+        /// The trusted project overlay is recomputed per spawn in
+        /// `effectiveSpawnPersonas()`, never cached here.
+        var basePersonas: [String: SubagentPersona] = [:]
         /// Matches the root turn loop's ceiling (`LiveComposition.swift`
         /// `runTurn`): a child that has not converged in this many tool
         /// rounds is looping.
@@ -148,6 +154,11 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         var subagentType: String
         var description: String
         var model: String
+        /// The persona the child resolved with, kept so a resume re-applies
+        /// it (upstream inherits the source's persona before resolution,
+        /// handle_request.rs:255-258, and records it per child,
+        /// task/coordinator_state.rs:639).
+        var persona: String? = nil
         var turns: UInt32 = 0
         var toolCalls: UInt32 = 0
         var toolsUsed: [String] = []
@@ -361,12 +372,37 @@ actor LiveSubagentHost: LiveSubagentQuerying {
 
     // MARK: - Spawn (the `task` tool path)
 
+    /// The map one spawn resolves personas against: the trusted project
+    /// overlay from `{parent_cwd}/.opengrok/personas/*.toml` merged over the
+    /// session's trust-independent base. Recomputed per spawn, exactly as
+    /// upstream recomputes `effective_definition_maps` in every spawn
+    /// context (subagent_coordinator.rs:459-474) — one directory scan, no
+    /// cache to go stale. The trust bit is the session's folder-trust
+    /// verdict (the same one that gated the config document); upstream
+    /// re-reads the trust store per spawn, but this port has no mid-session
+    /// trust transition surface, so the session verdict is the whole truth.
+    func effectiveSpawnPersonas() -> [String: SubagentPersona] {
+        SubagentPersonaLoader.effectivePersonas(
+            base: context.basePersonas,
+            cwd: context.workingDirectory,
+            projectTrusted: context.securityContext.projectTrusted
+        )
+    }
+
     /// Execute one `spawn_subagent` call. Validation order and error copy
     /// follow `TaskTool::run`: sanitize, cwd check, eager type validation,
     /// model check, then background fire-and-forget or a foreground await.
+    ///
+    /// `persona` is the port of `SubagentRequest.runtime_overrides.persona`
+    /// (task/types.rs:331-332): an internal-spawner channel. The model-facing
+    /// task input has NO persona parameter at the pin — `TaskTool::run`
+    /// hardcodes `persona: None` (task/mod.rs:394) — so tool dispatch always
+    /// leaves this nil and the schema advertises nothing. Do not "fix" that
+    /// by adding a persona property to the tool schema; upstream lacks it.
     func spawn(
         args: JSONValue,
-        toolCallID: String
+        toolCallID: String,
+        persona requestedPersona: String? = nil
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
         guard case .object(var object) = args else {
             return .failure(.invalidCall("\(Self.advertisedToolName) requires an object argument"))
@@ -434,24 +470,46 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             case .all: return .all
             }
         }
+        // A resume inherits the source's persona BEFORE resolution — the
+        // source's value wins over the caller's, including a nil that
+        // clears it (handle_request.rs:255-258 assigns unconditionally).
+        // The caller's explicit ask is still validated against the source
+        // in the resume arm below, so a mismatch errors rather than being
+        // silently replaced.
+        let sourcePersona = resumeID.flatMap { bookkeeping[$0]?.persona }
+        let effectivePersona = resumeID != nil ? sourcePersona : requestedPersona
         var runtime = resolveRuntimeConfig(
             subagentType: input.subagentType,
             overrides: SubagentRuntimeOverrides(
                 model: sanitizeOptionalArg(input.model),
+                persona: effectivePersona,
                 capabilityMode: requestedCapability,
                 isolation: input.isolation,
                 allowNestedSubagents: false
             ),
             roles: [:],
-            personas: [:],
-            cwd: childCWD,
+            // The per-spawn map: project overlay over the session base. The
+            // `cwd:` below is the PARENT session's cwd because that is what
+            // relative persona `instructions_file` references resolve
+            // against upstream (handle_request.rs:296-301 passes
+            // `parent_session_info.cwd`), not the task's own `cwd` argument.
+            personas: effectiveSpawnPersonas(),
+            cwd: context.workingDirectory,
             definition: definition,
             parent: ParentRuntimeDefaults(
                 model: context.parentModel,
                 capabilityMode: context.parentCapabilityCeiling
             )
         )
-        if runtime.personaResolutionFatal, let personaError = runtime.personaError {
+        // ANY persona error aborts the spawn — not just the fatal file-I/O
+        // arm. Upstream's shell returns a failure whenever `persona_error`
+        // is set (handle_request.rs:308-315: "Persona resolution failed,
+        // aborting subagent spawn"); the resolution crate's `fatal` flag
+        // only governs whether the OTHER runtime fields still resolved.
+        // Checking only `fatal` here would let a named-but-missing persona
+        // spawn silently without its instructions — the §3 arm this slice
+        // exists to close.
+        if let personaError = runtime.personaError {
             return .failure(.invalidCall(personaError))
         }
         // `run_shell_child` intersects once more with the definition's own
@@ -484,12 +542,17 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 return .failure(.invalidCall(Self.resumeNotFoundMessage(resumeID)))
             }
             do {
+                // The caller's explicit persona (internal channel; nil from
+                // tool dispatch) is checked against the source's recorded
+                // one — a resume must not silently swap SOULs
+                // (`validate_resume_identity`, resolution resume.rs:48+).
                 try validateResumeIdentity(
                     requestedType: input.subagentType,
-                    requestedPersona: nil,
+                    requestedPersona: requestedPersona,
                     source: ResumeSourceData(
                         subagentID: resumeID,
                         subagentType: source.subagentType,
+                        persona: source.persona,
                         childCWD: childCWD.path,
                         childSessionID: resumeID
                     )
@@ -540,7 +603,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             startedAt: Date(),
             subagentType: input.subagentType,
             description: input.description,
-            model: childModel
+            model: childModel,
+            persona: runtime.persona
         )
         let request = OpenGrokChildRequest(
             id: childID,
