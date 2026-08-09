@@ -348,6 +348,115 @@ public final class Terminal {
         try clear()
     }
 
+    // MARK: - Insert before (native scrollback injection)
+
+    /// Insert `height` rows of content before the current inline viewport,
+    /// scrolling them into the terminal's NATIVE scrollback. No effect on
+    /// fullscreen/fixed viewports. Port of xai-ratatui-inline's
+    /// `insert_before_no_scrolling_regions`
+    /// (`xai-ratatui-inline/src/terminal.rs:812-993` at pin 650c1db7) — the
+    /// pager builds WITHOUT the `scrolling-regions` feature (upstream's own
+    /// note at `terminal.rs:882-884`), so the scrolling-regions variant is
+    /// deliberately not ported.
+    ///
+    /// `drawFn` paints into a `height`-row buffer at the viewport's width.
+    /// While the viewport is above the screen bottom, inserted rows push it
+    /// down; once it reaches the bottom, the screen above it scrolls up (each
+    /// scrolled row lands in native scrollback). Content taller than the
+    /// screen is drawn in screen-sized chunks, scrolling between chunks.
+    ///
+    /// Errors PROPAGATE (never swallowed): the minimal-mode commit pipeline
+    /// is print-once, and it must not mark an entry committed when the write
+    /// failed — a marked-but-unprinted block can never be re-emitted
+    /// (upstream's bugbot note at `commit.rs:335-337`).
+    public func insertBefore(_ height: Int, draw drawFn: (inout CellBuffer) -> Void) throws {
+        guard case .inline = viewport else { return }
+        let width = viewportArea.width
+        var buffer = CellBuffer.empty(TerminalRect(x: 0, y: 0, width: width, height: max(0, height)))
+        drawFn(&buffer)
+
+        // Signed arithmetic like upstream's i32 walk (`terminal.rs:923-928`),
+        // so intermediate subtraction cannot trap.
+        var drawnHeight = viewportArea.top
+        var bufferHeight = max(0, height)
+        let viewportHeight = viewportArea.height
+        let screenHeight = lastKnownArea.height
+        var consumedRows = 0
+
+        // Chunked walk (`terminal.rs:930-956`): draw up to a screenful per
+        // iteration until the remainder plus the viewport fits on screen,
+        // scrolling just enough each round for the chunk being drawn.
+        while bufferHeight + viewportHeight > screenHeight {
+            let toDraw = min(bufferHeight, screenHeight)
+            let scroll = max(0, drawnHeight + toDraw - screenHeight)
+            try scrollUp(scroll)
+            consumedRows = try drawBufferRows(
+                buffer,
+                startRow: consumedRows,
+                rowCount: toDraw,
+                atY: drawnHeight - scroll
+            )
+            drawnHeight += toDraw - scroll
+            bufferHeight -= toDraw
+        }
+
+        // Final chunk: scroll exactly enough that content + viewport fill the
+        // screen bottom-aligned, never negative when the viewport was not at
+        // the bottom and the insert did not reach it (`terminal.rs:958-979`).
+        let scroll = max(0, drawnHeight + bufferHeight + viewportHeight - screenHeight)
+        try scrollUp(scroll)
+        _ = try drawBufferRows(
+            buffer,
+            startRow: consumedRows,
+            rowCount: bufferHeight,
+            atY: drawnHeight - scroll
+        )
+        drawnHeight += bufferHeight - scroll
+
+        setViewportArea(TerminalRect(
+            x: viewportArea.x,
+            y: drawnHeight,
+            width: viewportArea.width,
+            height: viewportArea.height
+        ))
+
+        // Clear the viewport off the screen LAST — deliberately deferred.
+        // Upstream's two reasons (`terminal.rs:986-989`): the inserted buffer
+        // is not sparse so it already overwrote what was on screen, and "there
+        // is a weird bug with tmux where a full screen clear plus immediate
+        // scrolling causes some garbage to go into the scrollback". Clearing
+        // before the scroll re-introduces that artifact — do not reorder.
+        try clear()
+    }
+
+    /// Draw `rowCount` rows of `buffer` starting at `startRow`, placed at
+    /// screen row `atY`. Every cell is emitted (the buffer is not sparse — the
+    /// draw itself overwrites stale screen content, which is what lets
+    /// `insertBefore` defer its clear). Returns the next unconsumed row.
+    /// Upstream's `draw_lines` (`terminal.rs:1077-1094`), which flushes per
+    /// chunk so a scroll can never overtake an undrawn chunk.
+    private func drawBufferRows(
+        _ buffer: CellBuffer,
+        startRow: Int,
+        rowCount: Int,
+        atY: Int
+    ) throws -> Int {
+        guard rowCount > 0 else { return startRow }
+        let width = buffer.area.width
+        var updates: [CellUpdate] = []
+        updates.reserveCapacity(rowCount * width)
+        for row in 0..<rowCount {
+            for x in 0..<width {
+                if let cell = buffer.cell(x: x, y: startRow + row) {
+                    updates.append(CellUpdate(x: x, y: atY + row, cell: cell))
+                }
+            }
+        }
+        try backend.draw(updates)
+        try backend.flush()
+        return startRow + rowCount
+    }
+
     private func scrollUp(_ lines: Int) throws {
         guard lines > 0 else { return }
         try setCursorPosition(TerminalPoint(x: 0, y: max(0, lastKnownArea.height - 1)))

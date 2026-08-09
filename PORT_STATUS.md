@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-09 (Wave 18 B2-S1: [ui] screen_mode reader live on both launch paths; N native scrollback next)
+**As of:** 2026-08-09 (Wave 18 B2-N: insertBefore native-scrollback injection landed, implemented-unwired; M1 minimal frontend next)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1578,6 +1578,79 @@ CLI-beats-config, off-TTY degrade, row-description pin).
 descriptors" (`prompt_complete` notification not yet arrived — a timing race over real
 descriptors under serial-suite load). Passed 4/4 in isolation and on the full rerun.
 Same family as the V5 telemetry flake; root-cause pass still owed.
+
+### B2-N — `insertBefore`, the native-scrollback injection primitive (serial gate: exit 0, 5,286 tests, zero issues)
+
+**Scope correction on enumeration:** the research line "no `insert_before` analog
+exists anywhere" was accurate for `insert_before` SPECIFICALLY — but the surrounding
+inline-terminal layer (the `xai-ratatui-inline` analog: double-buffered `Terminal`,
+OSC 8 link layer, `emitToScrollback`, `resizePurgeRerender`, `splitIntoLineSegments`,
+`withSynchronizedOutput`, `setViewportHeight`) has existed in `OpenGrokTerminalCore`
+since cycle 2, with thorough tests. N therefore landed as a gap-close, not a new
+target: (1) **`Terminal.insertBefore`** — the port of
+`insert_before_no_scrolling_regions` (`xai-ratatui-inline/src/terminal.rs:812-993` at
+pin 650c1db7): render into an off-screen buffer, chunked screen-sized draws with
+minimal scroll per round, final bottom-alignment scroll, viewport repositioned to sit
+directly below the content, and the viewport clear DEFERRED to last — upstream's two
+in-source reasons carried verbatim, including "there is a weird bug with tmux where a
+full screen clear plus immediate scrolling causes some garbage to go into the
+scrollback" (`:986-989`, the research's tmux artifact). Errors propagate, never
+swallowed — the print-once commit pipeline (M1) marks an entry committed only after a
+successful insert (`commit.rs:225-248`, `:335-337`). (2) **The missing upstream
+regression tests**: grow-after-out-of-band-shrink (the stored-height drift bug — the
+FIX was already in the cycle-2 port, which judges against `viewportArea.height`; the
+pin's in-source comment is `terminal.rs:851-861`, its test `tests.rs:251-300`), the
+full-height inline resize family (tracks the terminal both directions, repeatedly —
+the alt-screen-unavailable stance), and small-inline-not-forced-full. Lead-verified
+against the pin with no drift found: `emitToScrollback`'s byte sequence
+(move/clear/content/CRLF-reserve/move/clear/flush — `scrollback.rs:15-73`), the
+`diffLarge` u16-truncation-safe analog, and the `setViewportHeight` lockstep
+stored-height update. 10 net-new tests, including the deferred-clear ORDERING pin
+(every draw and scroll precedes the clear — do not reorder) and once-per-row chunk
+accounting on a taller-than-screen insert.
+
+**Deliberately not ported, with reasons:** the `scrolling-regions` `insert_before`
+variant (upstream's pager builds WITHOUT that feature; its own comment calls the
+variant "a separate (unused-by-the-pager) path left as a TODO", `terminal.rs:882-884`);
+the minimal-mode commit pipeline (`xai-grok-pager-minimal/src/commit.rs` — frontier
+walk, print-once display-mode stamping, capped commits with the `… N more lines`
+footer, Ctrl+E re-print) which is the M1 slice's subject and consumes this primitive.
+Status: **implemented-unwired** per ruling (b) — a tested terminal-core capability
+with no consumer until M1-M4.
+
+**Process note:** the fourth delegate-infrastructure failure today (the spawn itself
+timed out), so N went in-house like W3/W4. Delegation stays suspended for the rest of
+this session.
+
+### B2-N — native-scrollback injection: `insertBefore` lands (serial gate: exit 0, 5,286 tests, zero issues)
+
+Lead-implemented (the fourth delegate infrastructure failure today killed the spawn
+itself, before any work). **Enumeration correction to the B2 research:** the research's
+"no `insert_before` analog exists anywhere" was right about the FUNCTION but the layer
+around it already existed — `OpenGrokTerminalCore` has carried a cycle-2 port of
+upstream's `xai-ratatui-inline` crate (`Terminal`, `emitToScrollback`,
+`splitIntoLineSegments`, `resizePurgeRerender`, `withSynchronizedOutput`, the OSC 8
+link layer) all along, verified file-by-file against the pin this slice: the
+`set_viewport_height` stored-height drift FIX (`terminal.rs:851-861`) and the
+full-height-inline resize arm were already present in the Swift code — what was
+missing was `insert_before` itself, the drift REGRESSION TEST, and the full-height
+resize test family. N therefore landed as a gap-close, not a new target:
+`Terminal.insertBefore(_:draw:)` ports `insert_before_no_scrolling_regions`
+(`terminal.rs:812-993`) — chunked draw of taller-than-screen content, minimal-scroll
+placement, push-down-then-scroll-up viewport regimes, and the DEFERRED viewport clear
+carrying upstream's tmux comment verbatim ("a full screen clear plus immediate
+scrolling causes some garbage to go into the scrollback", `:986-989` — the §2 trap).
+Errors propagate un-swallowed because the M-side commit pipeline is print-once and
+marks an entry committed only after a successful insert (`commit.rs:225-248`,
+`:335-337`). **Deliberately not ported, recorded:** the `scrolling-regions`
+`insert_before` variant — upstream's pager builds without that feature (its own note
+at `terminal.rs:882-884`), so porting it would be dead code with no caller and no
+oracle. 10 net-new tests: 7 `insertBefore` pins (push-down, bottom-scroll amounts,
+tall-insert chunk walk with each row drawn exactly once, clear-after-draw ordering,
+error propagation, non-inline no-op, full-height viewport) + the out-of-band drift
+regression (`tests.rs:251-300`) + 2 full-height/small-inline resize pins
+(`terminal.rs:1350-1434`). The layer remains implemented-unwired per ruling (b) —
+M1–M4 are its consumer.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 
