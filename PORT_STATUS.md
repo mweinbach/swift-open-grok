@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-09 (Wave 18 B9-b1: agents/personas modal live read-only; b2 mutations and b3 personas CRUD remain)
+**As of:** 2026-08-09 (Wave 18 B9-b2: agents-tab mutations live with the spawn-gate proof; b3 personas CRUD is the wave's last slice)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1265,6 +1265,41 @@ load flake of the test's time-boxed delivery loop on a machine nine hours into
 continuous builds (the V5 telemetry-flake precedent). If it recurs, the fix is a
 deterministic turn-started signal instead of the retry deadline — noted here so the
 next red run starts with a diagnosis.
+
+### B9-b2 — Agents-tab mutations: `t` toggle, `s` default (serial gate: exit 0, 5,212 tests, zero issues)
+
+`PagerAgentsConfigStore` ports both writers faithfully (verified at the pin against
+`agents_modal.rs:730-778`): `[subagents.toggle]` and `[agent] name` surgery on the USER
+config.toml with upstream's `read_config_document_for_edit` guard (missing file →
+empty doc; unparseable non-empty → refused untouched), table-creation arms, the clear
+arm removing only `name` and leaving the emptied `[agent]` header (upstream's own
+`toml_edit` residue), write-even-on-noop-clear, and every error string byte-parity.
+Key semantics verified exact at `:2152-2196`: NO per-entry-kind guard (builtins toggle
+like file agents; disabled entries can be default), `s` set-vs-clear compares the fresh
+EXPLICIT `[agent] name` (so `s` on the resolved-fallback entry sets), both `s` success
+messages quote the RE-RESOLVED default after refresh, `t` succeeds silently (the
+flipped dot is the feedback), failures land as inline messages with nothing mutated —
+and the port has no in-memory mirror to roll back, so modal state always states disk
+(pinned by the unparseable-config failure test). Refresh parity: `t` →
+in-place list rebuild from disk, collapsed, selection clamped; `s` → default re-resolve
+only. Footer gains `t toggle`/`s default` on the Agents tab only. **Item-5 finding:
+CLOSED — the toggle was never pixels-only.** The live spawn path already consulted
+`[subagents.toggle]` (session-build read into `DefinitionResolutionContext`;
+advertisement filter + resolution gate in `OpenGrokSubagentResolution`; upstream clones
+the startup-resolved toggle per spawn, so takes-effect-for-new-sessions is parity).
+What b2 added is the proof against the WRITER's own output: `LiveAgentsToggleSpawnGateTests`
+drives the b2-written file through a real session foundation — a writer-toggled-off
+`explore` refuses at real executor dispatch with the config message, and toggling all
+three subagent builtins off strips `spawn_subagent` from a new session. 15 net-new
+tests (+2 in updated files).
+
+**Recorded divergences:** comments dropped on write (the port-wide config-writer
+divergence, now pinned by a test at this surface — a hand-commented config.toml loses
+comments on the first `t`/`s` press); `{e}` renders as Swift's error description
+(prefix pinned); Ctrl-modified `t`/`s` consumed (b1-inherited); message truncation by
+chars matching upstream's `chars().take(w)` rather than the port's display-width
+convention. Deferred to b3: `n`/`d`, the create form, delete confirm, the persona
+detail modal, `EditInEditor`.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

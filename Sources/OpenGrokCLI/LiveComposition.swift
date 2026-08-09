@@ -9435,18 +9435,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // session-agent-name channel, so only the resolved default is
             // shown.
             overlays.dismiss(id: LiveExtensionsComposition.overlayID)
-            // The current model's `agentType`, from the SAME catalog the
-            // model switch resolves against — upstream's
-            // `model_agent_type_from_info` (`transcript.rs:534-543`),
-            // empty filtered out.
-            let modelAgentType = catalogStore
-                .flatMap { findModelByID($0.snapshot(), modelID: modelName)?.info.agentType }
-                .flatMap { $0.isEmpty ? nil : $0 }
             overlays.push(.agents(LiveAgentsComposition.overlay(
                 initialTab: initialTab.map(LiveAgentsComposition.tab(for:)) ?? .agents,
                 workingDirectory: workingDirectory,
                 openGrokHome: openGrokHome,
-                modelAgentType: modelAgentType,
+                modelAgentType: agentsModalModelAgentType,
                 environment: environment
             )))
         case .reasoningEffort(let query):
@@ -10996,6 +10989,19 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         )))
     }
 
+    /// The current model's `agentType`, from the SAME catalog the model
+    /// switch resolves against — upstream's `model_agent_type_from_info`
+    /// (`dispatch/transcript.rs:534-543`), empty filtered out. Read at
+    /// modal open and again at each `s` re-resolution; upstream stows the
+    /// open-time value on the modal state (`model_agent_type`, `:262-264`)
+    /// but the model cannot change while the modal captures input, so the
+    /// two reads agree.
+    private var agentsModalModelAgentType: String? {
+        catalogStore
+            .flatMap { findModelByID($0.snapshot(), modelID: modelName)?.info.agentType }
+            .flatMap { $0.isEmpty ? nil : $0 }
+    }
+
     @discardableResult
     private func select(overlayID: String, rowID: String) async -> String? {
         if overlayID.hasPrefix("permission:") {
@@ -11024,6 +11030,29 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             return nil
         }
         if overlayID == LiveAgentsComposition.overlayID {
+            guard let existing = overlays.overlays.first(
+                      where: { $0.id == LiveAgentsComposition.overlayID }
+                  ),
+                  case .agents(let current) = existing.content
+            else { return nil }
+            // `t`/`s` (B9-b2): the writers run here, then the refreshed
+            // snapshot — rebuilt list after `t` (`rebuild_agents`,
+            // `agents_modal.rs:322-328`), re-resolved default + inline
+            // message after `s` (`:2161-2179`) — replaces the open modal
+            // in place; navigation state rides the snapshot. A failed
+            // write refreshes nothing, so the modal keeps stating what
+            // disk still holds, plus the error message.
+            if let updated = LiveAgentsComposition.applyingMutation(
+                rowID: rowID,
+                to: current,
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                modelAgentType: agentsModalModelAgentType,
+                environment: environment
+            ) {
+                overlays.push(.agents(updated))
+                return nil
+            }
             // `Enter`/`o` view: resolve the payload from the OPEN modal's
             // snapshot and push the document overlay ON TOP — the agents
             // modal stays beneath, upstream's viewer-over-modal layering
@@ -11031,14 +11060,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // `agent_view/modals.rs:33-36`). A stale or unreadable target
             // opens nothing, upstream's own silent `open_markdown` → None
             // arm.
-            guard let existing = overlays.overlays.first(
-                      where: { $0.id == LiveAgentsComposition.overlayID }
-                  ),
-                  case .agents(let current) = existing.content,
-                  let payload = LiveAgentsComposition.viewPayload(
-                      rowID: rowID, overlay: current
-                  )
-            else { return nil }
+            guard let payload = LiveAgentsComposition.viewPayload(
+                rowID: rowID, overlay: current
+            ) else { return nil }
             overlays.push(LiveHowtoGuidesPicker.viewerOverlay(
                 title: payload.title,
                 content: payload.content

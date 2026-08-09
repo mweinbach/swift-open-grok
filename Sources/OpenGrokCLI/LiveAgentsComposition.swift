@@ -41,6 +41,11 @@ enum LiveAgentsComposition {
     static let viewAgentRowPrefix = "view:agent:"
     static let viewPersonaRowPrefix = "view:persona:"
 
+    /// Row-id prefixes for the B9-b2 mutation round-trips (`t`/`s`,
+    /// `agents_modal.rs:2152-2196`), riding the same selection channel.
+    static let toggleRowPrefix = "toggle:"
+    static let defaultRowPrefix = "default:"
+
     /// Map the controller's intent tab onto the render layer's modal tab.
     static func tab(for intent: OpenGrokPagerAgentsTab) -> PagerAgentsTab {
         switch intent {
@@ -62,15 +67,7 @@ enum LiveAgentsComposition {
         environment: [String: String]
     ) -> PagerAgentsOverlay {
         let cwd = URL(fileURLWithPath: workingDirectory, isDirectory: true)
-        // A fresh effective-config load at open, like upstream's
-        // `load_effective_config()` inside `load_agent_toggle` (`:570`) and
-        // `load_agent_selection_config` (`:698-704`) — the modal shows what
-        // a NEW session would read, not this session's boot-time snapshot.
-        // The same authority chain `resolveUIConfig` reads.
-        let document = (try? loadAuthorityComposition(
-            cwd: cwd,
-            environment: environment
-        ).effective()) ?? .table(TOMLTable())
+        let document = effectiveDocument(cwd: cwd, environment: environment)
         let toggles = loadAgentToggle(document: document)
         return PagerAgentsOverlay(
             activeTab: initialTab,
@@ -85,11 +82,27 @@ enum LiveAgentsComposition {
         )
     }
 
+    /// A fresh effective-config load, like upstream's
+    /// `load_effective_config()` inside `load_agent_toggle` (`:570`) and
+    /// `load_agent_selection_config` (`:698-704`) — the modal shows what a
+    /// NEW session would read, not this session's boot-time snapshot. The
+    /// same authority chain `resolveUIConfig` reads. Called fresh at open,
+    /// at each mutation's compare, and again after each write.
+    static func effectiveDocument(
+        cwd: URL,
+        environment: [String: String]
+    ) -> TOMLValue {
+        (try? loadAuthorityComposition(
+            cwd: cwd,
+            environment: environment
+        ).effective()) ?? .table(TOMLTable())
+    }
+
     // MARK: - `[subagents.toggle]` reader
 
     /// `load_agent_toggle` (`agents_modal.rs:569-587`): the toggle map from
     /// the effective config, bool values only, everything else ignored.
-    /// Read-only — the `toggle_agent` writer (`:754-778`) is B9-b2.
+    /// The `toggle_agent` writer lives in `PagerAgentsConfigStore`.
     static func loadAgentToggle(document: TOMLValue) -> [String: Bool] {
         guard let table = document[path: ["subagents", "toggle"]]?.table else { return [:] }
         var toggles: [String: Bool] = [:]
@@ -288,8 +301,9 @@ enum LiveAgentsComposition {
     ///   5. the built-in default, `grok-build-plan`;
     ///   plus the trailing strict-harness re-check (`:3990-4009`).
     ///
-    /// Read-only: the `s` writer (`set_default_agent`, `:730-752`) is
-    /// B9-b2.
+    /// The `s` writer (`set_default_agent`, `:730-752`) lives in
+    /// `PagerAgentsConfigStore`; after a successful write this chain
+    /// re-runs against a fresh load (`refresh_default_agent`, `:723-726`).
     static func resolveDefaultAgentName(
         cwd: URL,
         modelAgentType: String?,
@@ -493,6 +507,141 @@ enum LiveAgentsComposition {
             lines.append("\"\"\"")
         }
         return lines.joined(separator: "\n")
+    }
+
+    // MARK: - Mutations (`t`/`s`, B9-b2)
+
+    /// `load_config_agent_name` (`agents_modal.rs:707-709`): the EXPLICIT
+    /// `[agent] name` from the effective config, empty-string filtered.
+    /// This — not the resolved default — is what `s` compares against
+    /// (`:2155`), so pressing `s` on the entry the chain merely FALLS BACK
+    /// to still sets the key rather than clearing it.
+    static func configAgentName(document: TOMLValue) -> String? {
+        document[path: ["agent", "name"]]?.stringValue
+            .flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// Resolve a `t`/`s` mutation row against the real config writers and
+    /// return the refreshed overlay to swap in, or nil when the row id is
+    /// not a mutation (the view rows fall through to `viewPayload`).
+    ///
+    /// Both writers target the USER config.toml
+    /// (`grok_home().join("config.toml")`, `agents_modal.rs:731`/`:755`),
+    /// never the project one — hence `openGrokHome`, not `cwd`.
+    static func applyingMutation(
+        rowID: String,
+        to current: PagerAgentsOverlay,
+        workingDirectory: String,
+        openGrokHome: URL,
+        modelAgentType: String?,
+        environment: [String: String]
+    ) -> PagerAgentsOverlay? {
+        let cwd = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        let store = PagerAgentsConfigStore(
+            configPath: openGrokHome.appendingPathComponent("config.toml")
+        )
+        if rowID.hasPrefix(toggleRowPrefix) {
+            guard let index = Int(rowID.dropFirst(toggleRowPrefix.count)),
+                  current.agents.indices.contains(index)
+            else { return nil }
+            return togglingAgent(
+                at: index, current: current, store: store,
+                cwd: cwd, environment: environment
+            )
+        }
+        if rowID.hasPrefix(defaultRowPrefix) {
+            guard let index = Int(rowID.dropFirst(defaultRowPrefix.count)),
+                  current.agents.indices.contains(index)
+            else { return nil }
+            return settingDefaultAgent(
+                at: index, current: current, store: store,
+                cwd: cwd, modelAgentType: modelAgentType, environment: environment
+            )
+        }
+        return nil
+    }
+
+    /// The `t` arm (`agents_modal.rs:2183-2196`): write `!entry.enabled`,
+    /// then `rebuild_agents` (`:322-328`) — a fresh effective-config
+    /// toggle read plus fresh discovery, selection clamped to the new
+    /// length, entries rebuilt collapsed (upstream constructs them with
+    /// `expanded: false`). Success paints NO message — the flipped dot
+    /// and ` [off]` marker are the feedback. A failed write rebuilds
+    /// nothing, so the list keeps showing what disk still says, and the
+    /// error surfaces as the inline message (`:2192`).
+    private static func togglingAgent(
+        at index: Int,
+        current: PagerAgentsOverlay,
+        store: PagerAgentsConfigStore,
+        cwd: URL,
+        environment: [String: String]
+    ) -> PagerAgentsOverlay {
+        var updated = current
+        let entry = current.agents[index]
+        do {
+            try store.toggleAgent(name: entry.name, enabled: !entry.enabled)
+            let document = effectiveDocument(cwd: cwd, environment: environment)
+            updated.agents = agentRows(
+                cwd: cwd,
+                toggles: loadAgentToggle(document: document),
+                environment: environment
+            )
+            if updated.selectedAgent >= updated.agents.count {
+                updated.selectedAgent = max(0, updated.agents.count - 1)
+            }
+            updated.expandedAgents = []
+        } catch {
+            updated.message = .error(writerMessage(error))
+        }
+        return updated
+    }
+
+    /// The `s` arm (`agents_modal.rs:2152-2181`): a fresh
+    /// `load_config_agent_name` read decides set vs clear — the selected
+    /// entry already being the explicit `[agent] name` means CLEAR the
+    /// key (`:2156-2160`); anything else (including a disabled entry —
+    /// upstream applies no enabled guard) sets it. On success the default
+    /// re-resolves through the full chain against a fresh post-write load
+    /// (`refresh_default_agent`, `:723-726`) and the info message quotes
+    /// the RE-RESOLVED name (`:2164-2174`) — after clearing, that is
+    /// whatever the chain falls back to, not the entry just cleared. The
+    /// list is NOT rebuilt (upstream's `s` never calls `rebuild_agents`);
+    /// only the marker moves. A failed write re-resolves nothing.
+    private static func settingDefaultAgent(
+        at index: Int,
+        current: PagerAgentsOverlay,
+        store: PagerAgentsConfigStore,
+        cwd: URL,
+        modelAgentType: String?,
+        environment: [String: String]
+    ) -> PagerAgentsOverlay {
+        var updated = current
+        let name = current.agents[index].name
+        let document = effectiveDocument(cwd: cwd, environment: environment)
+        let isAlreadyDefault = configAgentName(document: document) == name
+        do {
+            try store.setDefaultAgent(isAlreadyDefault ? nil : name)
+            let refreshed = effectiveDocument(cwd: cwd, environment: environment)
+            updated.defaultAgentName = resolveDefaultAgentName(
+                cwd: cwd,
+                modelAgentType: modelAgentType,
+                document: refreshed,
+                environment: environment
+            )
+            updated.message = .info(isAlreadyDefault
+                ? "Cleared \u{2014} new sessions use '\(updated.defaultAgentName)'"
+                : "New sessions will start with '\(updated.defaultAgentName)'")
+        } catch {
+            updated.message = .error(writerMessage(error))
+        }
+        return updated
+    }
+
+    /// The store's errors carry upstream's exact copy in `message`; any
+    /// other thrown error would be a programming surprise, surfaced
+    /// verbatim rather than swallowed.
+    private static func writerMessage(_ error: Error) -> String {
+        (error as? PagerAgentsConfigWriteError)?.message ?? "\(error)"
     }
 
     // MARK: - View resolution (`Enter`/`o`)

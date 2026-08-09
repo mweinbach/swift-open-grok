@@ -9,15 +9,22 @@
 // B9-b0 `SubagentPersonaLoader` (the same data a live spawn resolves
 // with), the `[subagents.toggle]` reader, the `[agent] name` default
 // marker, the `Enter` route into the document overlay, and the mutual
-// exclusivity with the extensions modal. The controller half (registry
-// pins, dispatch, initial tab) is in
+// exclusivity with the extensions modal. As of B9-b2, also the `t`/`s`
+// mutation round-trips: a keypress in the open modal landing on the USER
+// config.toml, the repainted state after the in-place refresh, upstream's
+// inline-message copy, the failed-write arm, and — the §3 stake — the
+// same `[subagents.toggle]` file the writer produces gating a REAL
+// session's spawn surface through real executor dispatch. The controller
+// half (registry pins, dispatch, initial tab) is in
 // `Tests/OpenGrokPagerTests/PagerAgentsCommandTests.swift`.
 
 import Foundation
 import OpenGrokHTTP
 import OpenGrokPager
 import OpenGrokPagerRender
+import OpenGrokSamplingTypes
 import OpenGrokTerminalCore
+import OpenGrokTestSupport
 import Testing
 @testable import OpenGrokCLI
 
@@ -228,6 +235,23 @@ private struct AgentsRendererFixture {
         )
     }
 
+    /// What the USER config.toml actually says right now — the disk truth
+    /// every mutation assertion compares against.
+    func readConfig() -> String? {
+        try? String(
+            contentsOf: home.appendingPathComponent("config.toml"),
+            encoding: .utf8
+        )
+    }
+
+    /// Press one key against the open modal through the real input route.
+    func press(_ key: Character) async throws {
+        let routing = try await renderer.handleInput(
+            .key(KeyEvent(key: .char(key), modifiers: []))
+        )
+        #expect(routing == .consumed, "key \(key) leaked past the open modal")
+    }
+
     /// The reconstructed screen with all whitespace removed, so a
     /// multi-word needle matches regardless of the column its row starts
     /// at.
@@ -338,10 +362,12 @@ struct LiveAgentsReachabilityTests {
         // `[agent] name = "grok-build"` resolves the default marker
         // (`resolve_default_agent_name`, `:712-722`).
         #expect(await fixture.waitForPaint(of: "grok-build default"))
-        // The read-only footer: none of the b2/b3 mutation verbs.
+        // The Agents-tab footer advertises the b2 verbs (`t toggle`
+        // `:1080-1083`, `s default` `:1084-1088`) — and still none of the
+        // b3 ones.
         let footer = fixture.paintedCompact()
-        #expect(!footer.contains("ttoggle"))
-        #expect(!footer.contains("sdefault"))
+        #expect(footer.contains("ttoggle"))
+        #expect(footer.contains("sdefault"))
         #expect(!footer.contains("nnew"))
         #expect(!footer.contains("ddelete"))
     }
@@ -368,6 +394,14 @@ struct LiveAgentsReachabilityTests {
         // (`persona_detail_from_local_file`, `:538-550`).
         #expect(await fixture.waitForPaint(of: "auditor project"))
         #expect(await fixture.waitForPaint(of: "Review everything twice."))
+        // The Personas footer carries neither the b2 Agents-tab verbs
+        // (upstream's personas footer has no `t`/`s` rows) nor the b3
+        // ones.
+        let footer = fixture.paintedCompact()
+        #expect(!footer.contains("ttoggle"))
+        #expect(!footer.contains("sdefault"))
+        #expect(!footer.contains("nnew"))
+        #expect(!footer.contains("ddelete"))
     }
 
     @Test("Enter routes the selected definition through the document overlay, layered over the modal")
@@ -452,31 +486,247 @@ struct LiveAgentsReachabilityTests {
         try await fixture.renderer.restoreTerminal()
     }
 
-    @Test("mutation keys are swallowed without a write or a notice")
-    func mutationKeysAreInert() async throws {
+    @Test("the b3 keys n and d stay swallowed without a write or a notice")
+    func unbackedKeysAreInert() async throws {
         let fixture = try AgentsRendererFixture()
         defer { fixture.dispose() }
         try await fixture.renderer.begin()
         try await fixture.renderer.render(.overlay(.agentsModal(initialTab: nil)))
         #expect(await fixture.waitForPaint(of: "\u{2500}\u{2500} Built-in \u{2500}\u{2500}"))
 
-        // The b2/b3 mutation keys: each is swallowed by the open modal
-        // (never leaks to the composer), changes nothing on screen, and —
-        // the real stake — writes nothing to config.toml.
-        for mutation in ["t", "s", "n", "d"] as [Character] {
-            let routing = try await fixture.renderer.handleInput(
-                .key(KeyEvent(key: .char(mutation), modifiers: []))
-            )
-            #expect(routing == .consumed, "mutation key \(mutation) leaked")
+        // The b3 persona keys: each is swallowed by the open modal (never
+        // leaks to the composer), changes nothing on screen, and — the
+        // real stake — writes nothing to config.toml. (`t`/`s` write as
+        // of b2 and are covered by the mutation tests below.)
+        for mutation in ["n", "d"] as [Character] {
+            try await fixture.press(mutation)
         }
         let configPath = fixture.home.appendingPathComponent("config.toml").path
         #expect(
             !FileManager.default.fileExists(atPath: configPath),
-            "a read-only modal must not create config.toml"
+            "an unbacked key must not create config.toml"
         )
-        let compact = fixture.paintedCompact()
-        #expect(!compact.contains("[off]"), "t must not toggle anything")
-        #expect(!compact.contains("Newsessionswillstart"), "s must not set a default")
         try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("t writes [subagents.toggle] to the user config and the repainted list states disk, both directions")
+    func toggleKeyRoundTrips() async throws {
+        let fixture = try AgentsRendererFixture()
+        defer { fixture.dispose() }
+        try await fixture.renderer.begin()
+        try await fixture.renderer.render(.overlay(.agentsModal(initialTab: nil)))
+        #expect(await fixture.waitForPaint(of: "\u{25CF} explore"))
+
+        // j j → explore (third builtin), then `t` (`toggle_agent`,
+        // `agents_modal.rs:754-778,:2183-2196`): the write lands in the
+        // USER config.toml and the rebuilt list (`rebuild_agents`,
+        // `:322-328` — a fresh effective-config read, not a snapshot
+        // patch) paints the hollow dot + ` [off]`. No success message —
+        // upstream's `t` arm sets none.
+        try await fixture.press("j")
+        try await fixture.press("j")
+        try await fixture.press("t")
+        #expect(await fixture.waitForPaint(of: "\u{25CB} explore"))
+        #expect(await fixture.waitForPaint(of: "explore [off]"))
+        var config = fixture.readConfig() ?? ""
+        #expect(config.contains("[subagents.toggle]"))
+        #expect(config.contains("explore = false"))
+
+        // `t` again re-enables: an explicit `true` on disk (upstream sets,
+        // never prunes) and the marker repaints away.
+        try await fixture.press("t")
+        #expect(await fixture.waitForErase(of: "explore [off]"))
+        #expect(await fixture.waitForPaint(of: "\u{25CF} explore"))
+        config = fixture.readConfig() ?? ""
+        #expect(config.contains("explore = true"))
+        #expect(!config.contains("explore = false"))
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("s sets [agent] name with upstream's message; s again clears the key and quotes the fallback")
+    func defaultKeyRoundTrips() async throws {
+        let fixture = try AgentsRendererFixture()
+        defer { fixture.dispose() }
+        try await fixture.renderer.begin()
+        try await fixture.renderer.render(.overlay(.agentsModal(initialTab: nil)))
+        #expect(await fixture.waitForPaint(of: "\u{25CF} grok-build"))
+
+        // `s` on grok-build (first row): `set_default_agent(Some)`
+        // (`agents_modal.rs:730-752,:2152-2181`) writes `[agent] name`,
+        // the default re-resolves through the full chain, the marker
+        // moves, and the info message carries upstream's exact copy.
+        try await fixture.press("s")
+        #expect(await fixture.waitForPaint(of: "New sessions will start with 'grok-build'"))
+        #expect(await fixture.waitForPaint(of: "grok-build default"))
+        var config = fixture.readConfig() ?? ""
+        #expect(config.contains("[agent]"))
+        #expect(config.contains("name = \"grok-build\""))
+
+        // `s` again on the SAME entry: it now IS the explicit config name
+        // (`load_config_agent_name`, `:707-709`), so the key CLEARS and
+        // the message quotes the RE-RESOLVED fallback — the chain default
+        // `grok-build-plan`, not the entry just cleared (`:2156-2168`).
+        try await fixture.press("s")
+        #expect(await fixture.waitForPaint(
+            of: "Cleared \u{2014} new sessions use 'grok-build-plan'"
+        ))
+        config = fixture.readConfig() ?? ""
+        #expect(!config.contains("name = \"grok-build\""))
+        #expect(await fixture.waitForErase(of: "grok-build default"))
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("a failed write surfaces upstream's copy and the modal keeps stating what disk holds")
+    func failedWriteSurfacesAndStaysConsistent() async throws {
+        let fixture = try AgentsRendererFixture()
+        defer { fixture.dispose() }
+        // A non-empty config.toml that does not parse: the writers refuse
+        // it rather than clobber (`read_config_document_for_edit`,
+        // `config_toml_edit.rs:7-27`) — the failed-write consistency arm.
+        let bad = "this is [not valid toml\n"
+        try fixture.writeConfig(bad)
+        try await fixture.renderer.begin()
+        try await fixture.renderer.render(.overlay(.agentsModal(initialTab: nil)))
+        #expect(await fixture.waitForPaint(of: "\u{2500}\u{2500} Built-in \u{2500}\u{2500}"))
+
+        try await fixture.press("t")
+        // The inline error, byte-parity (`agents_modal.rs:760` surfaced
+        // via `:2192`), and NO optimistic flip — the list still states
+        // what disk holds.
+        #expect(await fixture.waitForPaint(of: "Could not read or parse config.toml"))
+        #expect(!fixture.paintedCompact().contains("[off]"))
+        #expect(fixture.readConfig() == bad, "a refused write must leave the file untouched")
+
+        // `s` refuses identically (`:736` via `:2177`), and the next key
+        // clears the message (`:1978`).
+        try await fixture.press("s")
+        #expect(await fixture.waitForPaint(of: "Could not read or parse config.toml"))
+        #expect(fixture.readConfig() == bad)
+        try await fixture.press("j")
+        #expect(await fixture.waitForErase(of: "Could not read or parse config.toml"))
+        try await fixture.renderer.restoreTerminal()
+    }
+}
+
+// MARK: - The toggle writer at the spawn surface (§3, item 5)
+
+/// The B9-b2 stake beyond pixels: the SAME `[subagents.toggle]` table the
+/// `t` writer produces is what gates a real session's spawn surface — at
+/// session build (`LiveComposition.makeSubagentHost` feeds it into
+/// `DefinitionResolutionContext`, mirroring upstream's `resolve_subagents`
+/// → `ctx.subagent_toggle` → `resolve_agent_definition`,
+/// `agent/config.rs:2257-2271` / `agent/subagent/mod.rs:1729-1751`) and at
+/// every spawn validation. Upstream's running session snapshots the map at
+/// startup exactly the same way (`subagent_coordinator.rs:283-293`), so
+/// "the toggle takes effect for NEW sessions" is parity, not a shortcut.
+@Suite("agents toggle writer gates the live spawn surface", .serialized)
+struct LiveAgentsToggleSpawnGateTests {
+    private struct GateFixture {
+        let root: URL
+        let home: URL
+        let workspace: URL
+        let server: MockInferenceServer
+        let store: PagerAgentsConfigStore
+
+        init() throws {
+            root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("opengrok-agents-gate-\(UUID().uuidString)", isDirectory: true)
+            home = root.appendingPathComponent("home", isDirectory: true)
+            workspace = root.appendingPathComponent("workspace", isDirectory: true)
+            try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+            server = try MockInferenceServer()
+            try """
+            [endpoints]
+            xai_api_base_url = "\(server.url)"
+            """.write(
+                to: home.appendingPathComponent("config.toml"),
+                atomically: true,
+                encoding: .utf8
+            )
+            store = PagerAgentsConfigStore(
+                configPath: home.appendingPathComponent("config.toml")
+            )
+        }
+
+        func dispose() {
+            server.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        func makeFoundation() async throws
+            -> OpenGrokLiveApplicationLauncher.LiveSessionFoundation {
+            let command = try CLICommandParser.parseOrThrow([
+                "headless", "--prompt", "hello", "--cwd", workspace.path,
+                "--model", "grok-4.5",
+            ])
+            guard case .launch(let options) = command else {
+                throw CLIApplicationError.failed("fixture did not parse to a launch")
+            }
+            return try await OpenGrokLiveApplicationLauncher.makeSessionFoundation(
+                options: options,
+                context: CLIApplicationContext(
+                    environment: [
+                        "HOME": home.path,
+                        "OPENGROK_HOME": home.path,
+                        "XDG_STATE_HOME": home.appendingPathComponent("state").path,
+                        "XAI_API_KEY": "test-xai-key",
+                    ],
+                    streams: CLIStreams(out: { _ in }, err: { _ in }),
+                    control: .never
+                ),
+                dependencies: OpenGrokLiveCompositionDependencies(
+                    makeSampler: OpenGrokLiveSampler.production(configuration:)
+                )
+            )
+        }
+    }
+
+    @Test("a writer-toggled-off agent is refused by real executor dispatch, and preserved keys keep working")
+    func writerOutputGatesSpawn() async throws {
+        let fixture = try GateFixture()
+        defer { fixture.dispose() }
+        // The WRITER produces the config — not a hand-written fixture —
+        // so this proves the b2 file format is the one the session gate
+        // actually consumes, and that the write preserved the sibling
+        // `[endpoints]` table the session needs to reach the mock server.
+        try fixture.store.toggleAgent(name: "explore", enabled: false)
+
+        let foundation = try await fixture.makeFoundation()
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+        // The roster still has other built-ins, so the surface stays up…
+        #expect(foundation.toolExecutor.tools.map(\.name).contains("spawn_subagent"))
+        // …and the toggled-off type is refused at REAL dispatch with the
+        // config message (`validate_subagent_type` → `Disabled`,
+        // `agent/subagent/mod.rs:1782-1806`).
+        let result = await foundation.toolExecutor.invoke(
+            sessionID: foundation.sessionID,
+            workingDirectory: foundation.cwd,
+            call: ToolCall(
+                id: "call-spawn-toggled",
+                name: "spawn_subagent",
+                arguments: #"{"prompt":"p","description":"d","subagent_type":"explore"}"#
+            )
+        )
+        guard case .failure(let error) = result else {
+            Issue.record("a writer-disabled type unexpectedly spawned")
+            return
+        }
+        #expect(error.description.contains(
+            "Subagent 'explore' is disabled via [subagents.toggle] in config.toml"
+        ))
+    }
+
+    @Test("writer-toggling every builtin off strips the spawn surface of a new session")
+    func writerOutputStripsSurface() async throws {
+        let fixture = try GateFixture()
+        defer { fixture.dispose() }
+        for name in ["general-purpose", "explore", "plan"] {
+            try fixture.store.toggleAgent(name: name, enabled: false)
+        }
+        let foundation = try await fixture.makeFoundation()
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+        #expect(foundation.subagentHost == nil)
+        #expect(!foundation.toolExecutor.tools.map(\.name).contains("spawn_subagent"))
     }
 }

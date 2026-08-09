@@ -2,19 +2,23 @@
 //
 // The agents/personas modal's state and key handling — the tabbed viewer
 // behind `/config-agents` (alias `/agents`) and `/personas`.
-// Ports `xai-grok-pager/src/views/agents_modal.rs` at upstream 650c1db7,
-// restricted to the READ-ONLY surface (Wave 18 B9-b1): tabs (`:27-55`),
-// the entry shapes (`:57-66`, `PersonaDetail` consumption `:451-567`),
-// search filtering (`:892-905`, `:941-959`), selection (`:907-981`),
-// expand/collapse, and the per-tab key handlers (`:2082-2199`,
-// `:2202-2290`) minus every mutation arm. `t` (toggle) and `s` (default)
-// are B9-b2; `n` (new), `d` (delete), and the persona detail modal are
-// B9-b3 — none of those keys is handled or advertised here, because a
-// footer verb with no backing is exactly the no-op row AGENTS.md §4
-// forbids. `i` IS handled: at the pin it is search-focus on BOTH tabs
-// (`:2147`, `:2283` — `Char('/') | Char('i')` with empty modifiers), not
-// an editor key; `EditInEditor` is only ever produced by the b3 persona
-// detail modal (`views/persona_detail.rs:827`).
+// Ports `xai-grok-pager/src/views/agents_modal.rs` at upstream 650c1db7:
+// tabs (`:27-55`), the entry shapes (`:57-66`, `PersonaDetail`
+// consumption `:451-567`), search filtering (`:892-905`, `:941-959`),
+// selection (`:907-981`), expand/collapse, the inline-message machinery
+// (`:67-99`, cleared on every key at `:1978`), and the per-tab key
+// handlers (`:2082-2199`, `:2202-2290`). The Agents tab's mutation keys
+// `t` (toggle, `:2183-2196`) and `s` (default, `:2152-2181`) are live as
+// of B9-b2: the overlay owns no file IO, so each emits an outcome the
+// composition resolves against the real config writers
+// (`PagerAgentsConfigStore`) before refreshing this snapshot in place.
+// `n` (new), `d` (delete), and the persona detail modal are B9-b3 —
+// those keys stay unhandled and unadvertised, because a footer verb with
+// no backing is exactly the no-op row AGENTS.md §4 forbids. `i` IS
+// handled: at the pin it is search-focus on BOTH tabs (`:2147`, `:2283`
+// — `Char('/') | Char('i')` with empty modifiers), not an editor key;
+// `EditInEditor` is only ever produced by the b3 persona detail modal
+// (`views/persona_detail.rs:827`).
 //
 // Like `PagerExtensionsOverlay`, this is a value type that owns
 // navigation, search, and expansion, and never touches the data sources:
@@ -183,14 +187,50 @@ public struct PagerAgentsPersonaEntry: Sendable, Equatable {
     }
 }
 
+// MARK: - Messages
+
+/// `AgentsModalMessageKind` (`agents_modal.rs:67-73`). All three kinds
+/// exist at the pin; b2 produces only `.info` (the `s` success copy) and
+/// `.error` (writer failures) — `.success` arrives with b3's persona
+/// create/delete arms and is carried now so the style map
+/// (`message_line_style`, `:1938-1945`) ports whole.
+public enum PagerAgentsMessageKind: Sendable, Equatable {
+    case error
+    case success
+    case info
+}
+
+/// `AgentsModalMessage` (`:74-99`): the one inline status line, shown
+/// until the next keypress clears it (`handle_agents_key`, `:1978`).
+public struct PagerAgentsMessage: Sendable, Equatable {
+    public var kind: PagerAgentsMessageKind
+    public var text: String
+
+    public init(kind: PagerAgentsMessageKind, text: String) {
+        self.kind = kind
+        self.text = text
+    }
+
+    public static func error(_ text: String) -> PagerAgentsMessage {
+        PagerAgentsMessage(kind: .error, text: text)
+    }
+
+    public static func success(_ text: String) -> PagerAgentsMessage {
+        PagerAgentsMessage(kind: .success, text: text)
+    }
+
+    public static func info(_ text: String) -> PagerAgentsMessage {
+        PagerAgentsMessage(kind: .info, text: text)
+    }
+}
+
 // MARK: - Outcome
 
-/// What a keystroke decided. `.view` is the only outward-facing outcome in
-/// this read-only slice: the overlay cannot read files, so the composition
-/// resolves the payload and routes it through the `.showDocument` overlay.
-/// The stack maps it onto the row-selection channel by index
-/// (`"view:agent:{i}"` / `"view:persona:{i}"`), the extensions `.reload`
-/// pattern.
+/// What a keystroke decided. The outward-facing outcomes exist because
+/// the overlay cannot touch files: the composition resolves each against
+/// the real loaders/writers. The stack maps them onto the row-selection
+/// channel by index (`"view:agent:{i}"`, `"toggle:{i}"`, …), the
+/// extensions `.reload` pattern.
 public enum PagerAgentsOutcome: Sendable, Equatable {
     case redraw
     case consumed
@@ -201,6 +241,14 @@ public enum PagerAgentsOutcome: Sendable, Equatable {
     /// modal here (`:2244-2260`); that modal is B9-b3, so this slice
     /// routes the definition through the document overlay instead.
     case viewPersona(index: Int)
+    /// `t` on the Agents tab (`:2183-2196`): flip the selected entry's
+    /// `[subagents.toggle]` state. The composition writes and rebuilds
+    /// the list from disk (`rebuild_agents`, `:322-328`).
+    case toggleAgent(index: Int)
+    /// `s` on the Agents tab (`:2152-2181`): set the selected entry as
+    /// `[agent] name`, or clear the key when it already IS the explicit
+    /// config name. The composition writes and re-resolves the default.
+    case setDefaultAgent(index: Int)
 }
 
 // MARK: - Overlay state
@@ -233,6 +281,11 @@ public struct PagerAgentsOverlay: Sendable, Equatable {
     /// resolved by the CLI layer (`resolve_default_agent_name`, `:712-722`).
     public var defaultAgentName: String
 
+    /// Inline status line (`message`, `:251-252`), set by the composition
+    /// after a `t`/`s` write resolves and cleared here on the next key
+    /// (`:1978`).
+    public var message: PagerAgentsMessage?
+
     public init(
         activeTab: PagerAgentsTab = .agents,
         agents: [PagerAgentsListEntry] = [],
@@ -243,7 +296,8 @@ public struct PagerAgentsOverlay: Sendable, Equatable {
         searchActive: Bool = false,
         expandedAgents: Set<Int> = [],
         expandedPersonas: Set<Int> = [],
-        defaultAgentName: String = ""
+        defaultAgentName: String = "",
+        message: PagerAgentsMessage? = nil
     ) {
         self.activeTab = activeTab
         self.agents = agents
@@ -255,6 +309,7 @@ public struct PagerAgentsOverlay: Sendable, Equatable {
         self.expandedAgents = expandedAgents
         self.expandedPersonas = expandedPersonas
         self.defaultAgentName = defaultAgentName
+        self.message = message
     }
 
     // MARK: Filtering (`filtered_indices`, `:892-905`; personas `:941-959`)
@@ -342,6 +397,9 @@ public struct PagerAgentsOverlay: Sendable, Equatable {
     static let pageStep = 10
 
     public mutating func handle(_ event: KeyEvent) -> PagerAgentsOutcome {
+        // Every key clears the inline message first (`handle_agents_key`,
+        // `:1978`) — a status line lives exactly one keypress.
+        message = nil
         if searchActive { return handleSearch(event) }
 
         // Chrome keys shared by both tabs (`handle_agents_key`,
@@ -366,9 +424,11 @@ public struct PagerAgentsOverlay: Sendable, Equatable {
         }
     }
 
-    /// `handle_agents_tab_key` (`:2082-2199`), mutation arms excluded:
-    /// `t` toggle (`:2183-2196`) and `s` default (`:2152-2181`) are B9-b2
-    /// writers — unhandled keys are swallowed, never dispatched.
+    /// `handle_agents_tab_key` (`:2082-2199`). The mutation arms `t`
+    /// (`:2183-2196`) and `s` (`:2152-2181`) emit outcomes for the
+    /// composition's writers; upstream applies NO per-entry-kind guard on
+    /// either — a builtin toggles like a file agent, and a disabled entry
+    /// can still be set default — so neither does this handler.
     private mutating func handleAgentsTabKey(_ event: KeyEvent) -> PagerAgentsOutcome {
         if event.modifiers.contains(.control) {
             switch event.key {
@@ -418,6 +478,18 @@ public struct PagerAgentsOverlay: Sendable, Equatable {
             return .redraw
         case .char("q"):
             return .close
+        case .char("s"):
+            // `s` (`:2152-2181`): the whole set/clear decision — including
+            // the fresh `[agent] name` read it hinges on — runs in the
+            // composition, which owns config IO. An empty list is
+            // upstream's silent fall-through to `Changed` (`:2153,:2180`).
+            guard agents.indices.contains(selectedAgent) else { return .redraw }
+            return .setDefaultAgent(index: selectedAgent)
+        case .char("t"):
+            // `t` (`:2183-2196`): flip the selected entry. The composition
+            // writes `!entry.enabled` and rebuilds the list from disk.
+            guard agents.indices.contains(selectedAgent) else { return .redraw }
+            return .toggleAgent(index: selectedAgent)
         default:
             return .consumed
         }
@@ -425,6 +497,8 @@ public struct PagerAgentsOverlay: Sendable, Equatable {
 
     /// `handle_personas_tab_key` (`:2202-2290`), mutation arms excluded:
     /// `n` new (`:2261-2264`) and `d` delete (`:2265-2282`) are B9-b3.
+    /// `t`/`s` do NOT exist on this tab upstream — the Personas handler
+    /// has no such arms — so they fall to the swallow default here.
     private mutating func handlePersonasTabKey(_ event: KeyEvent) -> PagerAgentsOutcome {
         if event.modifiers.contains(.control) {
             switch event.key {

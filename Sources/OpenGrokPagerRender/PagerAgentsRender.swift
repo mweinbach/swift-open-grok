@@ -1,15 +1,17 @@
 // PagerAgentsRender.swift
 //
 // Painting the agents/personas modal.
-// Ports the read-only surface of `render_agents_modal`
+// Ports `render_agents_modal`
 // (`xai-grok-pager/src/views/agents_modal.rs:1011-1758` at upstream
-// 650c1db7): the tab bar, the `/ ` search row, the Agents tab's
-// scope-header/agent/description/detail flat rows (`:1278-1494`), and the
-// Personas tab's blurb + name/description/tags/hint rows (`:1496-1758`).
-// The footer hints carry only keys this slice actually handles — the
-// mutation verbs (`t toggle` `:1080-1083`, `s default` `:1084-1088`,
-// `n new` `:1163-1167`, `d delete` `:1168-1172`) are B9-b2/b3 and are
-// deliberately absent (AGENTS.md §4).
+// 650c1db7): the tab bar, the inline message line (`:1946-1959`, painted
+// first in each tab's content, `:1249-1251`/`:1519`), the `/ ` search
+// row, the Agents tab's scope-header/agent/description/detail flat rows
+// (`:1278-1494`), and the Personas tab's blurb + name/description/tags/
+// hint rows (`:1496-1758`). The footer hints carry only keys the overlay
+// actually handles: the Agents tab advertises `t toggle`/`s default`
+// (live as of B9-b2, labels verbatim from `:1080-1088`); the Personas
+// tab's mutation verbs (`n new` `:1163-1167`, `d delete` `:1168-1172`)
+// are B9-b3 and stay deliberately absent (AGENTS.md §4).
 
 import Foundation
 import OpenGrokTerminalCore
@@ -143,7 +145,12 @@ func drawAgentsBody(
         rows = personasFlatRows(overlay, width: width)
     }
 
-    // Personas blurbs come first (`:1521-1527`), then the search row.
+    // The inline message paints first in the tab content on BOTH tabs
+    // (`:1249-1251`, `:1519`), before the Personas blurbs (`:1521-1527`)
+    // and the search row.
+    if let message = overlay.message {
+        y = drawAgentsMessageLine(message, in: area, y: y, buffer: &buffer, theme: theme)
+    }
     if overlay.activeTab == .personas {
         y = drawPersonaBlurbs(in: area, y: y, buffer: &buffer, theme: theme)
     }
@@ -466,6 +473,34 @@ private func agentsScopeBadgeColor(
     }
 }
 
+/// `render_modal_message_line` (`:1946-1959`): one line, char-truncated
+/// to the content width, colored by kind (`message_line_style`,
+/// `:1938-1945`), followed by upstream's blank separator (`y + 1` then
+/// `+ 1` again).
+private func drawAgentsMessageLine(
+    _ message: PagerAgentsMessage,
+    in area: TerminalRect,
+    y: Int,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme
+) -> Int {
+    guard y < area.bottom else { return y }
+    let foreground: TerminalColor
+    switch message.kind {
+    case .error: foreground = theme.accentError
+    case .success: foreground = theme.accentSuccess
+    case .info: foreground = theme.textSecondary
+    }
+    _ = buffer.setString(
+        x: area.x, y: y,
+        // Upstream truncates by chars (`msg.text.chars().take(w)`), not
+        // display columns.
+        text: String(message.text.prefix(area.width)),
+        style: [], foreground: foreground, background: theme.bgBase
+    )
+    return min(y + 2, area.bottom)
+}
+
 /// The `/ ` search row (`render_agents_search`, `:1188-1239`), followed by
 /// upstream's blank spacer row (`y += 1; y += 1`, `:1260-1261`).
 private func drawAgentsSearchRow(
@@ -548,11 +583,14 @@ func agentsWordWrap(_ text: String, maxWidth: Int) -> [String] {
 
 // MARK: - Footer
 
-/// The footer lists exactly the keys `PagerAgentsOverlay.handle` acts on.
-/// Upstream's full sets are `build_agents_tab_shortcuts` (`:1052-1101`)
-/// and `build_personas_tab_shortcuts` (`:1104-1186`); the mutation verbs
-/// (`t toggle`, `s default`, `n new`, `d delete`) are B9-b2/b3 and
-/// deliberately absent until their writers land.
+/// The footer lists exactly the keys `PagerAgentsOverlay.handle` acts on,
+/// per tab. The Agents tab is upstream's full set
+/// (`build_agents_tab_shortcuts`, `:1052-1101`) including the b2 verbs
+/// `t toggle` (`:1080-1083`) and `s default` (`:1084-1088`). The
+/// Personas tab is the browse arm of `build_personas_tab_shortcuts`
+/// (`:1137-1183`) minus `n new`/`d delete`, whose B9-b3 backings do not
+/// exist yet — advertising them would be the no-op verb AGENTS.md §4
+/// forbids.
 func pagerAgentsHints(_ overlay: PagerAgentsOverlay) -> [PagerOverlayHint] {
     if overlay.searchActive {
         return [
@@ -562,15 +600,18 @@ func pagerAgentsHints(_ overlay: PagerAgentsOverlay) -> [PagerOverlayHint] {
             PagerOverlayHint(key: "Esc", label: "clear")
         ]
     }
-    // The shared read-only set, upstream's labels verbatim (`:1053-1098`,
-    // `:1137-1183`).
-    return [
+    var hints = [
         PagerOverlayHint(key: "j/k", label: "nav"),
         PagerOverlayHint(key: "e/\u{2192}", label: "expand"),
         PagerOverlayHint(key: "E/\u{2190}", label: "collapse"),
         PagerOverlayHint(key: "Enter", label: "view"),
-        PagerOverlayHint(key: "/", label: "search"),
-        PagerOverlayHint(key: "Tab", label: "switch tab"),
-        PagerOverlayHint(key: "Esc", label: "close")
+        PagerOverlayHint(key: "/", label: "search")
     ]
+    if overlay.activeTab == .agents {
+        hints.append(PagerOverlayHint(key: "t", label: "toggle"))
+        hints.append(PagerOverlayHint(key: "s", label: "default"))
+    }
+    hints.append(PagerOverlayHint(key: "Tab", label: "switch tab"))
+    hints.append(PagerOverlayHint(key: "Esc", label: "close"))
+    return hints
 }

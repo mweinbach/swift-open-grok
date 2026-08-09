@@ -1494,6 +1494,14 @@ public struct PagerOverlayStack: Sendable, Equatable {
                 outcome = .selected(id: overlay.id, rowID: "view:agent:\(entryIndex)")
             case .viewPersona(let entryIndex):
                 outcome = .selected(id: overlay.id, rowID: "view:persona:\(entryIndex)")
+            case .toggleAgent(let entryIndex):
+                // The B9-b2 mutation keys ride the same channel: the
+                // composition owns the config writers and the in-place
+                // snapshot refresh (`toggle_agent`/`set_default_agent`,
+                // `agents_modal.rs:730-778`).
+                outcome = .selected(id: overlay.id, rowID: "toggle:\(entryIndex)")
+            case .setDefaultAgent(let entryIndex):
+                outcome = .selected(id: overlay.id, rowID: "default:\(entryIndex)")
             }
         }
 

@@ -1,12 +1,14 @@
 // PagerAgentsOverlayTests.swift
 //
-// The agents/personas modal at the overlay seam (Wave 18 B9-b1): tab cycle
-// (`agents_modal.rs:27-55` at upstream 650c1db7), selection clamping and
-// filter recovery (`:907-981`), search filtering (`:892-905`, `:941-959`),
-// the painted row shapes for BOTH tabs (`:1278-1494`, `:1496-1758`), and —
-// the point of the read-only slice — that no mutation key (`t`, `s`, `n`,
-// `d`) is handled or advertised. Full frames are painted through
-// `renderPagerFrame` so the assertions see what a user sees.
+// The agents/personas modal at the overlay seam (Wave 18 B9-b1/b2): tab
+// cycle (`agents_modal.rs:27-55` at upstream 650c1db7), selection clamping
+// and filter recovery (`:907-981`), search filtering (`:892-905`,
+// `:941-959`), the painted row shapes for BOTH tabs (`:1278-1494`,
+// `:1496-1758`), the b2 mutation keys `t`/`s` on the Agents tab ONLY
+// (`:2152-2196`) with the inline-message machinery (`:67-99`, `:1978`,
+// `:1946-1959`), and that the b3 keys (`n`, `d`) stay unhandled and
+// unadvertised. Full frames are painted through `renderPagerFrame` so the
+// assertions see what a user sees.
 
 import Foundation
 @testable import OpenGrokPagerRender
@@ -255,27 +257,72 @@ struct PagerAgentsTabTests {
         #expect(overlay.handle(KeyEvent(key: .enter)) == .viewPersona(index: 2))
     }
 
-    @Test("no mutation key is handled: t, s, n, d are consumed no-ops on their tabs")
-    func mutationKeysAreInert() {
-        // `t` toggle (`:2183-2196`) and `s` default (`:2152-2181`) are
-        // B9-b2; `n` new (`:2261-2264`) and `d` delete (`:2265-2282`) are
-        // B9-b3. Each must swallow without an outcome and without a state
-        // change.
+    @Test("t and s emit mutation outcomes on the Agents tab, for every entry kind")
+    func mutationKeysEmitOutcomes() {
+        // `t` (`:2183-2196`) and `s` (`:2152-2181`): upstream applies NO
+        // per-entry-kind guard — a builtin toggles like a project agent,
+        // and a disabled entry can still be `s`-selected (the disabled/
+        // default interplay is unguarded at the pin). The write itself is
+        // the composition's; the overlay only names the entry.
+        var overlay = PagerAgentsOverlay(
+            agents: builtinEntries(toggledOff: ["explore"]) + [projectEntry()]
+        )
+        // Builtin (index 0).
+        #expect(overlay.handle(character("t")) == .toggleAgent(index: 0))
+        #expect(overlay.handle(character("s")) == .setDefaultAgent(index: 0))
+        // A DISABLED entry (explore, index 2) still takes both keys.
+        overlay.selectedAgent = 2
+        #expect(overlay.handle(character("t")) == .toggleAgent(index: 2))
+        #expect(overlay.handle(character("s")) == .setDefaultAgent(index: 2))
+        // A file-based project entry (index 5).
+        overlay.selectedAgent = 5
+        #expect(overlay.handle(character("t")) == .toggleAgent(index: 5))
+        #expect(overlay.handle(character("s")) == .setDefaultAgent(index: 5))
+        // An empty list is upstream's silent fall-through to `Changed`
+        // (`:2153`, `:2184` — the `if let` guard, then `:2180`/`:2196`).
+        var empty = PagerAgentsOverlay()
+        #expect(empty.handle(character("t")) == .redraw)
+        #expect(empty.handle(character("s")) == .redraw)
+    }
+
+    @Test("the b3 keys n and d stay consumed no-ops; t and s do nothing on the Personas tab")
+    func unbackedKeysStayInert() {
+        // `n` new (`:2261-2264`) and `d` delete (`:2265-2282`) are B9-b3.
+        // On the Personas tab upstream's handler has NO `t`/`s` arms
+        // (`:2202-2290`), so all four swallow there.
         var agents = PagerAgentsOverlay(agents: builtinEntries())
-        for mutation in ["t", "s", "n", "d"] as [Character] {
+        for mutation in ["n", "d"] as [Character] {
             let before = agents
             #expect(agents.handle(character(mutation)) == .consumed)
-            #expect(agents == before, "mutation key \(mutation) changed Agents-tab state")
+            #expect(agents == before, "b3 key \(mutation) changed Agents-tab state")
         }
         var personas = PagerAgentsOverlay(activeTab: .personas, personas: samplePersonas())
         for mutation in ["t", "s", "n", "d"] as [Character] {
             let before = personas
             #expect(personas.handle(character(mutation)) == .consumed)
-            #expect(personas == before, "mutation key \(mutation) changed Personas-tab state")
+            #expect(personas == before, "key \(mutation) changed Personas-tab state")
         }
     }
 
-    @Test("the stack maps view outcomes onto the row-selection channel by index")
+    @Test("the inline message clears on the next key, whatever it is")
+    func messageClearsOnNextKey() {
+        // `handle_agents_key` sets `state.message = None` before anything
+        // else (`:1978`) — a status line lives exactly one keypress.
+        var overlay = PagerAgentsOverlay(
+            agents: builtinEntries(),
+            message: .info("New sessions will start with 'grok-build'")
+        )
+        _ = overlay.handle(character("j"))
+        #expect(overlay.message == nil, "a nav key must clear the message")
+        overlay.message = .error("Could not read or parse config.toml")
+        _ = overlay.handle(KeyEvent(key: .tab))
+        #expect(overlay.message == nil, "a tab switch must clear the message")
+        overlay.message = .error("stale")
+        _ = overlay.handle(character("/"))
+        #expect(overlay.message == nil, "entering search must clear the message")
+    }
+
+    @Test("the stack maps view and mutation outcomes onto the row-selection channel by index")
     func stackViewPlumbing() {
         var stack = PagerOverlayStack([PagerOverlay.agents(PagerAgentsOverlay(
             agents: builtinEntries(),
@@ -283,6 +330,11 @@ struct PagerAgentsTabTests {
         ))])
         #expect(stack.handle(KeyEvent(key: .enter))
             == .selected(id: "agents", rowID: "view:agent:0"))
+        // The b2 mutation rows ride the same channel.
+        #expect(stack.handle(character("t"))
+            == .selected(id: "agents", rowID: "toggle:0"))
+        #expect(stack.handle(character("s"))
+            == .selected(id: "agents", rowID: "default:0"))
         // Switch to Personas and view the first persona.
         _ = stack.handle(KeyEvent(key: .tab))
         #expect(stack.handle(KeyEvent(key: .enter))
@@ -386,35 +438,81 @@ struct PagerAgentsRenderTests {
         #expect(painted(personas).contains("No matching personas"))
     }
 
-    @Test("the footer advertises only the read-only set — never t/s/n/d, never i")
+    @Test("the Agents footer advertises t toggle and s default in upstream's slot; Personas does not")
     func footerHonesty() {
-        // Upstream's full footers carry `t toggle`/`s default`
-        // (`:1080-1088`) and `n new`/`d delete` (`:1163-1172`); those
-        // writers are B9-b2/b3, so the b1 footer must not promise them.
-        // `i` stays un-advertised too (upstream only shows it under the
-        // vim hint, `push_vim_nav_search_hint`), though it works as
-        // search.
-        for tab in PagerAgentsTab.all {
-            let hints = pagerAgentsHints(PagerAgentsOverlay(activeTab: tab))
-            let keys = hints.map(\.key)
-            let labels = hints.map(\.label)
-            #expect(keys.contains("j/k"))
-            #expect(labels.contains("view"))
-            #expect(labels.contains("search"))
-            #expect(labels.contains("close"))
-            for verb in ["toggle", "default", "new", "delete", "edit"] {
-                #expect(!labels.contains(verb), "\(tab) footer advertises \(verb)")
-            }
-            for key in ["t", "s", "n", "d", "i"] {
-                #expect(!keys.contains(key), "\(tab) footer advertises key \(key)")
-            }
+        // The Agents tab carries upstream's `t toggle`/`s default`
+        // (`build_agents_tab_shortcuts`, `:1080-1088`) between `/ search`
+        // and `Tab switch tab`, live as of b2. The Personas tab's
+        // mutation verbs (`n new`/`d delete`, `:1163-1172`) are B9-b3 and
+        // stay absent, as does `t`/`s` there (upstream's personas footer
+        // has no such rows). `i` stays un-advertised on both (upstream
+        // only shows it under the vim hint, `push_vim_nav_search_hint`).
+        let agentsHints = pagerAgentsHints(PagerAgentsOverlay(activeTab: .agents))
+        #expect(agentsHints.map(\.key) == [
+            "j/k", "e/\u{2192}", "E/\u{2190}", "Enter", "/", "t", "s", "Tab", "Esc",
+        ])
+        #expect(agentsHints.map(\.label) == [
+            "nav", "expand", "collapse", "view", "search",
+            "toggle", "default", "switch tab", "close",
+        ])
+        let personasHints = pagerAgentsHints(PagerAgentsOverlay(activeTab: .personas))
+        let personasKeys = personasHints.map(\.key)
+        let personasLabels = personasHints.map(\.label)
+        #expect(personasKeys.contains("j/k"))
+        #expect(personasLabels.contains("view"))
+        for verb in ["toggle", "default", "new", "delete", "edit"] {
+            #expect(!personasLabels.contains(verb), "Personas footer advertises \(verb)")
         }
-        // The painted frame agrees with the hint list.
-        let frame = painted(PagerAgentsOverlay(agents: builtinEntries()))
-        #expect(!frame.contains("t toggle"))
-        #expect(!frame.contains("s default"))
-        #expect(!frame.contains("n new"))
-        #expect(!frame.contains("d delete"))
+        for key in ["t", "s", "n", "d", "i"] {
+            #expect(!personasKeys.contains(key), "Personas footer advertises key \(key)")
+        }
+        // The painted frames agree with the hint lists.
+        let agentsFrame = painted(PagerAgentsOverlay(agents: builtinEntries()))
+        #expect(agentsFrame.contains("t toggle"))
+        #expect(agentsFrame.contains("s default"))
+        #expect(!agentsFrame.contains("n new"))
+        #expect(!agentsFrame.contains("d delete"))
+        let personasFrame = painted(PagerAgentsOverlay(
+            activeTab: .personas, personas: samplePersonas()
+        ))
+        #expect(!personasFrame.contains("t toggle"))
+        #expect(!personasFrame.contains("s default"))
+        #expect(!personasFrame.contains("n new"))
+        #expect(!personasFrame.contains("d delete"))
+    }
+
+    @Test("the inline message paints one line above the tab content on both tabs")
+    func messagePaints() {
+        // `render_modal_message_line` (`:1946-1959`) at the top of each
+        // tab's content (`:1249-1251`, `:1519`), then a blank separator.
+        let info = painted(PagerAgentsOverlay(
+            agents: builtinEntries(),
+            message: .info("New sessions will start with 'grok-build'")
+        ))
+        #expect(info.contains("New sessions will start with 'grok-build'"))
+        let error = painted(PagerAgentsOverlay(
+            agents: builtinEntries(),
+            message: .error("Could not read or parse config.toml")
+        ))
+        #expect(error.contains("Could not read or parse config.toml"))
+        // The Personas tab paints it too, above the blurbs (`:1519-1521`).
+        let personas = painted(PagerAgentsOverlay(
+            activeTab: .personas,
+            personas: samplePersonas(),
+            message: .error("Cannot delete bundled personas")
+        ))
+        #expect(personas.contains("Cannot delete bundled personas"))
+        let messageRow = personas.split(separator: "\n").firstIndex {
+            $0.contains("Cannot delete bundled personas")
+        }
+        let blurbRow = personas.split(separator: "\n").firstIndex {
+            $0.contains("Personas shape subagent behavior")
+        }
+        if let messageRow, let blurbRow {
+            #expect(messageRow < blurbRow, "the message paints above the blurbs")
+        } else {
+            Issue.record("message or blurb row missing from the painted frame")
+        }
     }
 
     @Test("word wrap breaks at spaces and never hard-breaks a long word")
