@@ -1605,9 +1605,12 @@ the alt-screen-unavailable stance), and small-inline-not-forced-full. Lead-verif
 against the pin with no drift found: `emitToScrollback`'s byte sequence
 (move/clear/content/CRLF-reserve/move/clear/flush — `scrollback.rs:15-73`), the
 `diffLarge` u16-truncation-safe analog, and the `setViewportHeight` lockstep
-stored-height update. 10 net-new tests, including the deferred-clear ORDERING pin
-(every draw and scroll precedes the clear — do not reorder) and once-per-row chunk
-accounting on a taller-than-screen insert.
+stored-height update. 10 net-new tests: 7 `insertBefore` pins (push-down,
+bottom-scroll amounts, tall-insert chunk walk with each row drawn exactly once,
+clear-after-draw ORDERING — every draw and scroll precedes the deferred clear, do not
+reorder — error propagation, non-inline no-op, full-height viewport) + the
+out-of-band drift regression (`tests.rs:251-300`) + 2 full-height/small-inline resize
+pins (`terminal.rs:1350-1434`).
 
 **Deliberately not ported, with reasons:** the `scrolling-regions` `insert_before`
 variant (upstream's pager builds WITHOUT that feature; its own comment calls the
@@ -1618,39 +1621,24 @@ footer, Ctrl+E re-print) which is the M1 slice's subject and consumes this primi
 Status: **implemented-unwired** per ruling (b) — a tested terminal-core capability
 with no consumer until M1-M4.
 
-**Process note:** the fourth delegate-infrastructure failure today (the spawn itself
-timed out), so N went in-house like W3/W4. Delegation stays suspended for the rest of
-this session.
-
-### B2-N — native-scrollback injection: `insertBefore` lands (serial gate: exit 0, 5,286 tests, zero issues)
-
-Lead-implemented (the fourth delegate infrastructure failure today killed the spawn
-itself, before any work). **Enumeration correction to the B2 research:** the research's
-"no `insert_before` analog exists anywhere" was right about the FUNCTION but the layer
-around it already existed — `OpenGrokTerminalCore` has carried a cycle-2 port of
-upstream's `xai-ratatui-inline` crate (`Terminal`, `emitToScrollback`,
-`splitIntoLineSegments`, `resizePurgeRerender`, `withSynchronizedOutput`, the OSC 8
-link layer) all along, verified file-by-file against the pin this slice: the
-`set_viewport_height` stored-height drift FIX (`terminal.rs:851-861`) and the
-full-height-inline resize arm were already present in the Swift code — what was
-missing was `insert_before` itself, the drift REGRESSION TEST, and the full-height
-resize test family. N therefore landed as a gap-close, not a new target:
-`Terminal.insertBefore(_:draw:)` ports `insert_before_no_scrolling_regions`
-(`terminal.rs:812-993`) — chunked draw of taller-than-screen content, minimal-scroll
-placement, push-down-then-scroll-up viewport regimes, and the DEFERRED viewport clear
-carrying upstream's tmux comment verbatim ("a full screen clear plus immediate
-scrolling causes some garbage to go into the scrollback", `:986-989` — the §2 trap).
-Errors propagate un-swallowed because the M-side commit pipeline is print-once and
-marks an entry committed only after a successful insert (`commit.rs:225-248`,
-`:335-337`). **Deliberately not ported, recorded:** the `scrolling-regions`
-`insert_before` variant — upstream's pager builds without that feature (its own note
-at `terminal.rs:882-884`), so porting it would be dead code with no caller and no
-oracle. 10 net-new tests: 7 `insertBefore` pins (push-down, bottom-scroll amounts,
-tall-insert chunk walk with each row drawn exactly once, clear-after-draw ordering,
-error propagation, non-inline no-op, full-height viewport) + the out-of-band drift
-regression (`tests.rs:251-300`) + 2 full-height/small-inline resize pins
-(`terminal.rs:1350-1434`). The layer remains implemented-unwired per ruling (b) —
-M1–M4 are its consumer.
+**Process incident (recorded so the anomaly is auditable):** the B2-N delegation
+spawn REPORTED failure ("timeout waiting for bubble creation" — the day's fourth
+delegate-infrastructure fault), so the lead implemented N in-house. The delegate had
+in fact LAUNCHED despite the reported failure and worked the same tree in parallel,
+building a competing new-target implementation (`Sources/OpenGrokInlineTerminal/`,
+tests, `Package.swift` stanzas). It was stood down by interrupt, gave a clean
+inventory (no commits, no ledger edits, no builds in flight), and its uncommitted
+work was removed — audit copies kept at `/tmp/b2n-delegate-audit/`. Removal reason:
+it duplicates the landed gap-close on a NEW target where the layer already lives in
+`OpenGrokTerminalCore`; two inline terminals is a divergence with no upstream ground.
+Separately, an unattributed commit and a duplicate B2-N ledger section (both
+describing this same landed work, accurately) appeared during the same window —
+consistent with a duplicated twin of the lead session (the same window produced
+doubled system notifications and a doubled commit invocation on W4). The duplicate
+section was folded into this one; the accidental lead commit that swept the
+delegate's orphan file into history was dropped before push (audit copy kept).
+Delegation stays suspended for the rest of this session, and the next session should
+start by checking `git log` for unattributed commits.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 
