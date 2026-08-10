@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B2-M1: pure minimal-mode commit pipeline landed as OpenGrokMinimalScrollback, implemented-unwired; M2 committed-block paint path next)
+**As of:** 2026-08-10 (Wave 18 B2-M2: committed-block paint path landed in OpenGrokPagerRender, implemented-unwired; M3 live tail + overlay host next)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1723,6 +1723,74 @@ recorded at the 2026-08-08 re-pin) is gone; `~/Projects/grok-build` EXISTS AGAIN
 `~/Projects/xai-grok-build-reference`. All M1 reads went through
 `git -C ~/Projects/grok-build show 650c1db7:<path>`, which stays correct
 regardless of which clone's worktree moves.
+
+### B2-M2 — the committed-block paint path (serial gate: exit 0, 5,325 tests, 105 runs, zero issues, 2026-08-10)
+
+Lead-implemented. `Sources/OpenGrokPagerRender/PagerMinimalCommitRender.swift` —
+the renderer-facing half of `commit.rs` at the pin (`committed_appearance`
+:263-271, `minimal_renderer` :282-306, `insert_committed` :319-343, `insert_gap`
+:348-353, `paint_committed` :361-393), consuming B2-N's `Terminal.insertBefore`
+and M1's display-mode stamp.
+
+**The load-bearing architectural difference, endorsed:** upstream must PROVE
+`desired_height` equals what `render` paints (its height-fitting test family
+exists because the pair can drift). The port's layout is line-based — the same
+`appendMessage`/`appendToolCard` call produces both the lines and the height
+(`height == lines.count`), so K5 agreement is by construction; the M2 tests pin
+the PAINTER (footer, rail, flush-left, containment) instead. This is also why
+the paint path lives in `OpenGrokPagerRender` beside the strip's layout
+functions rather than in the minimal frontend target: committed blocks and the
+M3 live tail must wrap through the SAME functions or a block's height flips as
+it crosses the frontier and the prompt jumps (`commit.rs:276-280`). The
+`OpenGrokPagerRender → OpenGrokMinimalScrollback` edge is one-way, recorded in
+the manifest.
+
+What's live (implemented-unwired until M3/M4): the minimal committed stance
+(timestamps off, flush-left with pads zeroed, motion stilled — the
+`COMMITTED_TICK` analog — and the accent column reserved ONLY for non-collapsed
+reasoning, `commit.rs:289-296`); the display-mode structural mapping (collapsed
+reasoning = one header row + the fit-gated dim `(ctrl+e to expand)` affordance,
+`thinking.rs:21-50`; expanded reasoning = FULL body dim+italic,
+`body_dim_italic` `thinking.rs:52-71`; collapsed tool = header row; truncated
+tool = the strip's head/tail preview; expanded tool = whole output — the cap is
+the footer's job); the capped insert with the
+`… N more lines — /transcript to view` footer (hidden = full − (cap − 1),
+`commit.rs:378-391`) whose kept rows are byte-identical to an uncapped commit
+because one layout produced both; error PROPAGATION out of `insertCommitted`
+(print-once: the walk must leave a failed entry uncommitted); the flat `.reset`
+background with line-carried bands (user prompt) kept. Two defaulted escape
+hatches were added to the SHARED layout functions (`appendThinking
+bodyBudget: Int?` — nil = full body; `toolPreviewRows unbounded:`) — strip
+callers keep the defaults, and the full-suite gate pins that strip behavior is
+unchanged. Upstream's `minimal_max_commit_rows` default is 2000
+(`appearance/config.rs:1446`) — recorded here for M4's config wiring.
+
+12 net-new tests: 9 paint-path (cap footer `commit_tests.rs:709-747`, uncapped
+:749-778, K5 containment adapted from :498-538, accent-column rules :853-930,
+dim rail :932-994, one-row collapsed header + hint :1090-1140, full-body K9,
+tool mode mapping, native background) and 3 live-seam (committed text reaches
+the terminal through the real `insertBefore`; the cap bounds what lands and the
+footer is the last committed row; a failed backend draw THROWS out of
+`insertCommitted`).
+
+**Recorded divergences:** (1) the thinking rail covers BODY rows only — the
+port's landed strip stance puts a `◆` bullet on the header where upstream rails
+every row; adopting upstream's full-block rail would fork the port's own
+thinking look across modes. Cost: one fewer rail cell per committed reasoning
+block. (2) The expand hint renders `(ctrl+e to expand)` appended dim to the
+header (upstream's exact copy and fit-gate), but the port hard-codes the chord
+label exactly as upstream's TODO does (`thinking.rs:17-20`) — a remapped chord
+would advertise the wrong key there too. (3) Three upstream tests have NO port
+ground, deliberately not ported: `committed_block_uses_owning_session_cwd_for_tool_paths`
+(the port's tool-card `input` is preformatted by the live producer; no
+cwd-eliding at this layer), `terminal_native_lock_paints_only_native_colors`
+(the port has no terminal-native palette lock; color reduction happens at the
+encoder, `PagerTerminalRenderer.sixteenColorCode`), and
+`committed_edit_keeps_diff_line_backgrounds` (the port's cards render output as
+text — no per-line diff backgrounds exist anywhere in the strip; if diff-hunk
+rendering ever lands, that test lands with it). (4) `insert_gap` failures are
+swallowed as upstream's are (`let _ =`, `commit.rs:352`) — a lost cosmetic
+blank row must not strand a block that DID print.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

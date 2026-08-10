@@ -304,7 +304,14 @@ private func targets() -> [Target] {
     // W8-S2: MermaidLayout base; Mermaid -> MermaidLayout.
     t.append(.target(name: "OpenGrokMermaidLayout", dependencies: dep(w0s2, w0s4, w2s2, w2s5)))
     t.append(.target(name: "OpenGrokMermaid", dependencies: dep(w0s2, w0s4, w2s2, w2s5, ["OpenGrokMermaidLayout"])))
-    t.append(contentsOf: libs(w8s3, dep(w0s2, w0s4, w1s5, w2s5)))
+    // `OpenGrokMinimalScrollback` joined at B2-M2: the committed-block paint
+    // path (`PagerMinimalCommitRender`) stamps blocks with the pure
+    // pipeline's display modes and must live BESIDE the strip's layout
+    // functions — committed blocks and the live tail wrap through the same
+    // `appendMessage`/`appendToolCard` or a block's height flips as it
+    // crosses the commit frontier. The edge stays one-way; the pure target
+    // must never import back.
+    t.append(contentsOf: libs(w8s3, dep(w0s2, w0s4, w1s5, w2s5, ["OpenGrokMinimalScrollback"])))
     t.append(contentsOf: libs(w8s4, dep(w0s2, w0s4, w1s2, w1s3, w1s4, w1s5, w2s5, w7s5)))
     t.append(contentsOf: libs(w8s5, dep(w7s1, w7s2, w7s3, w7s4, w7s5)))
 
@@ -434,7 +441,13 @@ private func targets() -> [Target] {
     ))
     t.append(contentsOf: tests(["OpenGrokMarkdownCore", "OpenGrokMarkdown"]))
     t.append(contentsOf: tests(["OpenGrokMermaidLayout", "OpenGrokMermaid"]))
-    t.append(contentsOf: tests(w8s3))
+    // Declared explicitly: the render suite names `Terminal`/`CellBuffer`
+    // (w2s5) in the M2 committed-paint tests and stamps display modes from
+    // `OpenGrokMinimalScrollback` in its own assertions.
+    t.append(.testTarget(
+        name: "OpenGrokPagerRenderTests",
+        dependencies: dep(w8s3, w2s5, ["OpenGrokMinimalScrollback"])
+    ))
     t.append(contentsOf: tests(w8s4))
     t.append(contentsOf: tests(w8s5))
     t.append(contentsOf: tests(w9s1))

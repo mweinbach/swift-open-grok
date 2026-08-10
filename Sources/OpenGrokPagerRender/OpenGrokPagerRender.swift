@@ -521,12 +521,13 @@ func makeConversationLayout(
     return ConversationLayout(lines: lines, blockStartLines: blockStartLines)
 }
 
-private func appendMessage(
+func appendMessage(
     _ message: PagerMessage,
     width: Int,
     theme: PagerRenderTheme,
     compact: Bool = false,
     showTimestamps: Bool = false,
+    thinkingBodyBudget: Int? = PagerLayoutMetrics.thinkingTruncatedLines,
     into lines: inout [PaintLine]
 ) {
     // The timestamp role gate, `EntryRenderer::should_show_timestamp`
@@ -554,7 +555,7 @@ private func appendMessage(
             into: &lines
         )
     case .reasoning:
-        appendThinking(message, width: width, theme: theme, into: &lines)
+        appendThinking(message, width: width, theme: theme, bodyBudget: thinkingBodyBudget, into: &lines)
     case .system:
         appendPlain(message, width: width, foreground: theme.accentSystem, theme: theme, into: &lines)
     case .error:
@@ -731,10 +732,16 @@ private func overlayTimestamp(
 /// `Thinking…` while streaming, collapsing to `Thought for 1.4s` when the turn
 /// ends. Truncated mode shows a lone `…` and the last three lines
 /// (`blocks/thinking.rs`).
-private func appendThinking(
+///
+/// `bodyBudget` is the truncation escape hatch for minimal mode's committed
+/// blocks (upstream `DisplayMode::Expanded`, `thinking.rs`: "Expanded: full
+/// content" — K9 commits reasoning in full): `nil` renders the whole body.
+/// The strip's callers keep the default truncated budget.
+func appendThinking(
     _ message: PagerMessage,
     width: Int,
     theme: PagerRenderTheme,
+    bodyBudget: Int? = PagerLayoutMetrics.thinkingTruncatedLines,
     into lines: inout [PaintLine]
 ) {
     var header: [PagerStyledSpan] = [
@@ -764,8 +771,7 @@ private func appendThinking(
     for physical in message.text.split(separator: "\n", omittingEmptySubsequences: false) {
         body.append(contentsOf: wrapDisplayLines(String(physical), width: bodyWidth))
     }
-    let budget = PagerLayoutMetrics.thinkingTruncatedLines
-    if body.count > budget {
+    if let budget = bodyBudget, body.count > budget {
         lines.append(PaintLine(
             spans: [PagerStyledSpan(text: "  " + PagerGlyphs.ellipsis, foreground: theme.gray)],
             foreground: theme.gray,
@@ -813,11 +819,12 @@ func pagerToolAccent(_ tool: PagerToolCard, theme: PagerRenderTheme) -> Terminal
     }
 }
 
-private func appendToolCard(
+func appendToolCard(
     _ tool: PagerToolCard,
     width: Int,
     theme: PagerRenderTheme,
     motion: PagerMotionSnapshot,
+    unboundedPreview: Bool = false,
     into lines: inout [PaintLine]
 ) {
     let accent = pagerToolAccent(tool, theme: theme)
@@ -892,7 +899,7 @@ private func appendToolCard(
         accentColor: railAccent(row: lines.count)
     ))
     let previewColor = tool.state == .failed ? theme.accentError : theme.gray
-    for row in toolPreviewRows(output, width: max(1, width - 2), theme: theme) {
+    for row in toolPreviewRows(output, width: max(1, width - 2), theme: theme, unbounded: unboundedPreview) {
         lines.append(PaintLine(
             spans: [PagerStyledSpan(text: "  " + row.text, foreground: row.foreground ?? previewColor)],
             foreground: previewColor,
@@ -903,11 +910,15 @@ private func appendToolCard(
 }
 
 /// Head/tail preview with the reference's `… +{n} lines` marker
-/// (`execute.rs:551-620`).
+/// (`execute.rs:551-620`). `unbounded` is minimal mode's committed-Expanded
+/// escape (K9 "diffs always full", `commit.rs:128`): every wrapped row, no
+/// marker — the CAP on a committed block is applied downstream by the
+/// `… N more lines` footer, not here. The strip's callers keep the preview.
 private func toolPreviewRows(
     _ output: String,
     width: Int,
-    theme: PagerRenderTheme
+    theme: PagerRenderTheme,
+    unbounded: Bool = false
 ) -> [PagerStyledSpan] {
     var wrapped: [String] = []
     for physical in output.split(separator: "\n", omittingEmptySubsequences: false) {
@@ -915,7 +926,7 @@ private func toolPreviewRows(
     }
     let head = PagerLayoutMetrics.executePreviewFirstLines
     let tail = PagerLayoutMetrics.executePreviewLastLines
-    guard wrapped.count > head + tail + 1 else {
+    guard !unbounded, wrapped.count > head + tail + 1 else {
         return wrapped.map { PagerStyledSpan(text: $0) }
     }
     let hidden = wrapped.count - head - tail
