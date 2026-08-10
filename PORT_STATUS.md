@@ -1599,6 +1599,48 @@ the full filter grammar, overflow/fold boundaries, pin/reorder/gc, cwd
 compaction edges, key-grammar round-trips, caps, lenient-load and
 preserved-file guards, and the live↔persisted bridge.
 
+### B1-p — the dashboard peek band + the list row-verb table (batch serial gate: exit 0, 5,526 tests, 105 runs, zero issues, 2026-08-10)
+
+Agent-implemented peek (b1-peek-impl), lead-implemented row verbs;
+lead-integrated into the shared render files. Render-side only — the
+composition wiring is B1-w's; this tree is additive (the new
+`PagerListOverlay` members default inert, so an un-wired CLI still compiles
+and paints byte-identically, pinned).
+
+**The peek band** is the port of `peek.rs` + `peek_tail.rs` + the
+`layout.rs` allocation, selection-follows lifecycle (no open key — the peek
+is REBUILT from the selected row on every cursor move, `render.rs:212-283`):
+list-first allocation (12-row list floor, 8-row minimum live-tail box, 3/8
+max fraction, 28-row live-tail cap), `desiredContentRows` never over-tapping
+the tail cap, and the peek-tail densification rules — pin the last user
+line, top ellipsis under the pin when truncated, PURE tail below (newest
+rows win), a budget of 1 drops the omission marker rather than the content,
+and a fresh user send leaves the body EMPTY until the agent streams
+(`peek_tail.rs:286-318` — the rule that keeps a fresh send honest).
+`PagerListOverlay` gained `peek` (rendered as a band SPLIT from the list
+area in `renderCenteredModal`, list floor first) and `updateList(id:_:)` —
+the in-place mutation seam whose contract is cursor+filter preservation,
+because `push` resets both and would destroy the selection the peek follows.
+
+**The row-verb table** (`rowActions`, C-1's dispatch half): a bound bare key
+acts on the SELECTED row before the filter takes the character, dispatching
+`<prefix>:<rowID>` through the same `.selected` channel Enter uses — the
+workflows-overlay precedent generalized to lists. Guards pinned: never on a
+non-selectable selection (a verb on a header/placeholder would dispatch
+nowhere — the filter takes the key instead), never with modifiers, unbound
+characters still filter. Recorded cost: a bound key is unavailable to
+filter typing on that overlay.
+
+**Deferred with reasons (the peek report):** the reply row + question mode
+(peek-side input needs a second composer seam), subagent peek (lands with
+subagent attach), and the wide-layout side-panel variant (the port's modal
+is centered; the band form is the narrow-layout parity).
+
+27 net-new tests (19 peek + 8 overlay-seam): allocation/refusal boundaries
+incl. the height-20 list-first refusal, densification rules, the
+byte-identical nil-peek pin, band paint placement, updateList
+cursor+filter preservation, and the four row-verb dispatch guards.
+
 ### B6 closure — the context-bar hover widget (serial gate: exit 0, 5,395 tests, 105 runs, zero issues, 2026-08-10). **The B6 chrome-reader program is CLOSED.**
 
 Lead-implemented — the last B6 item (timeline rail, timestamps, and

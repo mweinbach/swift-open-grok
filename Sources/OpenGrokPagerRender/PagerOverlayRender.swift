@@ -205,7 +205,39 @@ private func renderCenteredModal(
     var rows: [PagerOverlayBounds.Row] = []
     switch overlay.content {
     case .list(let list):
-        rows = drawListBody(list, in: content, buffer: &buffer, theme: theme)
+        // The peek takes the BOTTOM of the content rect under list-first
+        // allocation (`allocate_peek`, layout.rs:120-167): the roster keeps
+        // its 12-row floor first, and a band that cannot reach its min box
+        // is refused outright rather than painted as a useless sliver.
+        var listArea = content
+        if let peek = list.peek {
+            let allocation = PagerDashboardPeekTail.band(
+                for: peek,
+                contentHeight: content.height,
+                width: content.width,
+                theme: theme
+            )
+            if allocation.showPeek {
+                listArea = TerminalRect(
+                    x: content.x,
+                    y: content.y,
+                    width: content.width,
+                    height: content.height - allocation.peekBoxHeight
+                )
+                drawDashboardPeekBand(
+                    peek,
+                    in: TerminalRect(
+                        x: content.x,
+                        y: content.y + content.height - allocation.peekBoxHeight,
+                        width: content.width,
+                        height: allocation.peekBoxHeight
+                    ),
+                    buffer: &buffer,
+                    theme: theme
+                )
+            }
+        }
+        rows = drawListBody(list, in: listArea, buffer: &buffer, theme: theme)
     case .text(let text):
         drawTextBody(text, in: content, buffer: &buffer, theme: theme)
     case .permission(let prompt):

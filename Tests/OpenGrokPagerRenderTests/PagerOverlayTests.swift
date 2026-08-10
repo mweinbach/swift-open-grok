@@ -625,3 +625,171 @@ struct PagerPermissionTests {
         #expect(await coordinator.pendingCount == 0)
     }
 }
+
+@Suite("Dashboard peek at the overlay seam")
+struct PagerOverlayPeekTests {
+    private func frame(_ overlay: PagerOverlay, height: Int = 36) -> PagerRenderResult {
+        renderPagerFrame(PagerRenderState(
+            size: TerminalSize(width: 100, height: height),
+            conversation: [.message(PagerMessage(role: .assistant, text: "behind"))],
+            input: PagerComposerState(text: ""),
+            showScrollbar: false,
+            overlays: PagerOverlayStack([overlay])
+        ))
+    }
+
+    private func roster(peek: PagerDashboardPeek?) -> PagerOverlay {
+        var overlay = PagerOverlay.list(
+            id: "dashboard",
+            title: "Agent Dashboard",
+            rows: (0..<6).map { PagerListRow(id: "r\($0)", label: "session \($0)") }
+        )
+        if case .list(var list) = overlay.content {
+            list.peek = peek
+            overlay.content = .list(list)
+        }
+        return overlay
+    }
+
+    /// Inertness: the field costs nothing to every list that has no peek.
+    @Test("a nil peek renders byte-identically to a list without the field")
+    func nilPeekIsInert() {
+        let withField = frame(roster(peek: nil)).snapshot()
+        let plain = frame(PagerOverlay.list(
+            id: "dashboard",
+            title: "Agent Dashboard",
+            rows: (0..<6).map { PagerListRow(id: "r\($0)", label: "session \($0)") }
+        )).snapshot()
+        #expect(withField == plain)
+    }
+
+    @Test("the band paints between the list and the footer")
+    func bandPaintsBelowTheList() {
+        let painted = frame(roster(peek: PagerDashboardPeek(
+            statusLabel: "Working",
+            timeAgo: "12s",
+            items: [
+                .message(PagerMessage(role: .user, text: "peekpin")),
+                .message(PagerMessage(role: .assistant, text: "peekbody")),
+            ]
+        ))).snapshot()
+        let rows = painted.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let listRow = rows.firstIndex(where: { $0.contains("session 0") }),
+              let pinRow = rows.firstIndex(where: { $0.contains("peekpin") })
+        else {
+            Issue.record("expected list and peek rows: \(painted)")
+            return
+        }
+        #expect(listRow < pinRow, "the band sits below the list rows")
+        #expect(painted.contains("peekbody"))
+    }
+
+    /// List-first refusal (`allocate_peek`, layout.rs:143-149): under the
+    /// floor the roster keeps the whole modal rather than sharing it with a
+    /// band too small to say anything.
+    @Test("no band under the list floor")
+    func listFirstRefusal() {
+        let painted = frame(roster(peek: PagerDashboardPeek(
+            statusLabel: "Working",
+            items: [.message(PagerMessage(role: .user, text: "peekpin"))]
+        )), height: 20).snapshot()
+        #expect(!painted.contains("peekpin"))
+    }
+
+    /// `push` would reset both; `updateList` must not.
+    @Test("updateList swaps the peek preserving selectedIndex and filterQuery")
+    func updateListPreservesCursorAndFilter() {
+        var stack = PagerOverlayStack([roster(peek: nil)])
+        stack.updateList(id: "dashboard") { list in
+            list.filterQuery = "session"
+            list.selectedIndex = 3
+        }
+        stack.updateList(id: "dashboard") { list in
+            list.peek = PagerDashboardPeek(statusLabel: "Idle")
+        }
+        guard case .list(let list) = stack.overlays[0].content else {
+            Issue.record("expected a list overlay")
+            return
+        }
+        #expect(list.selectedIndex == 3)
+        #expect(list.filterQuery == "session")
+        #expect(list.peek?.statusLabel == "Idle")
+        #expect(!stack.updateList(id: "not-open") { $0.peek = nil })
+    }
+}
+
+// MARK: - Row actions
+
+// The list's row-verb table (B1 C-1): a bound bare key acts on the SELECTED
+// row before the filter can take the character, dispatching
+// `<prefix>:<rowID>` through the same `.selected` channel Enter uses. The
+// recorded cost — the bound key no longer types into that overlay's filter —
+// is pinned here alongside the guards that keep the verb off headers,
+// placeholders, and modified keystrokes.
+@Suite("Pager list row actions")
+struct PagerListRowActionTests {
+    private func roster(rows rosterRows: [PagerListRow]) -> PagerOverlayStack {
+        var overlay = PagerOverlay.list(
+            id: "dashboard",
+            title: "Agent Dashboard",
+            rows: rosterRows,
+            isFilterable: true
+        )
+        if case .list(var list) = overlay.content {
+            list.rowActions = [PagerListRowAction(key: "x", rowIDPrefix: "close")]
+            overlay.content = .list(list)
+        }
+        return PagerOverlayStack([overlay])
+    }
+
+    @Test("a bound key dispatches prefix:rowID for the selected row, not the filter")
+    func boundKeyDispatchesThroughThePrefix() {
+        var stack = roster(rows: [
+            PagerListRow(id: "attach:one", label: "one"),
+            PagerListRow(id: "attach:two", label: "two"),
+        ])
+        #expect(stack.handle(character("x")) == .selected(id: "dashboard", rowID: "close:attach:one"))
+        guard case .list(let list) = stack.overlays[0].content else {
+            Issue.record("expected a list overlay")
+            return
+        }
+        #expect(list.filterQuery.isEmpty, "the bound key must never leak into the filter")
+    }
+
+    @Test("the verb never fires on a non-selectable selection; the filter takes the key")
+    func nonSelectableSelectionFallsThroughToTheFilter() {
+        var stack = roster(rows: [
+            PagerListRow(id: "subagent:sub-1", label: "child", isSelectable: false)
+        ])
+        #expect(stack.handle(character("x")) == .redraw)
+        guard case .list(let list) = stack.overlays[0].content else {
+            Issue.record("expected a list overlay")
+            return
+        }
+        #expect(list.filterQuery == "x", "a verb on a row that dispatches nowhere must not dispatch")
+    }
+
+    @Test("unbound characters still type into the filter on an action-bearing list")
+    func unboundCharactersStillFilter() {
+        var stack = roster(rows: [
+            PagerListRow(id: "attach:one", label: "one")
+        ])
+        #expect(stack.handle(character("a")) == .redraw)
+        guard case .list(let list) = stack.overlays[0].content else {
+            Issue.record("expected a list overlay")
+            return
+        }
+        #expect(list.filterQuery == "a")
+    }
+
+    @Test("a modified keystroke bypasses the verb table")
+    func modifiedKeystrokeBypassesTheVerb() {
+        var stack = roster(rows: [
+            PagerListRow(id: "attach:one", label: "one")
+        ])
+        let outcome = stack.handle(
+            KeyEvent(key: .char("x"), modifiers: [.control], character: "x")
+        )
+        #expect(outcome == .consumed, "ctrl+x is neither the verb nor filter input")
+    }
+}

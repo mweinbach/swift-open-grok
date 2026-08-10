@@ -148,6 +148,24 @@ public struct PagerListRow: Sendable, Equatable, Hashable {
 /// spec §13) rather than the picker's background-only selection
 /// (`picker.rs:944-947`); the selected row still gets the `bg_visual` band, so
 /// the two cues reinforce rather than replace each other.
+/// A per-overlay action key bound to the SELECTED row — the workflows
+/// convention (`handleWorkflows` dispatching `p`/`r`/`x` as
+/// `.selected(rowID: "<key>:<id>")`) generalized so list surfaces like the
+/// dashboard roster can bind row verbs (B1 close-row) without a dedicated
+/// content case. The key is consulted BEFORE the filter's char intake, so
+/// binding one deliberately removes that character from filter typing on
+/// that overlay — a recorded cost per binding.
+public struct PagerListRowAction: Sendable, Equatable, Hashable {
+    public var key: Character
+    /// The dispatched rowID is `"<prefix>:<row.id>"`.
+    public var rowIDPrefix: String
+
+    public init(key: Character, rowIDPrefix: String) {
+        self.key = key
+        self.rowIDPrefix = rowIDPrefix
+    }
+}
+
 public struct PagerListOverlay: Sendable, Equatable, Hashable {
     public var rows: [PagerListRow]
     public var isFilterable: Bool
@@ -157,6 +175,13 @@ public struct PagerListOverlay: Sendable, Equatable, Hashable {
     public var scrollOffset: Int
     /// `picker.rs:2039-2045`.
     public var emptyMessage: String
+    /// Row verbs (see `PagerListRowAction`); empty for ordinary pickers.
+    public var rowActions: [PagerListRowAction]
+    /// The dashboard peek band for the SELECTED row — nil for every list
+    /// that has no peek, which is every list but `/dashboard`. Rebuilt from
+    /// the cursor on each refresh, never toggled (`render.rs:212-283`); nil
+    /// renders byte-identically to a list that never had the field.
+    public var peek: PagerDashboardPeek?
 
     public init(
         rows: [PagerListRow],
@@ -164,7 +189,9 @@ public struct PagerListOverlay: Sendable, Equatable, Hashable {
         filterQuery: String = "",
         selectedIndex: Int = 0,
         scrollOffset: Int = 0,
-        emptyMessage: String = "No matches"
+        emptyMessage: String = "No matches",
+        rowActions: [PagerListRowAction] = [],
+        peek: PagerDashboardPeek? = nil
     ) {
         self.rows = rows
         self.isFilterable = isFilterable
@@ -172,6 +199,8 @@ public struct PagerListOverlay: Sendable, Equatable, Hashable {
         self.selectedIndex = selectedIndex
         self.scrollOffset = scrollOffset
         self.emptyMessage = emptyMessage
+        self.rowActions = rowActions
+        self.peek = peek
         clampSelection()
     }
 
@@ -1460,6 +1489,23 @@ public struct PagerOverlayStack: Sendable, Equatable {
     /// follow, without rebuilding the overlay (a rebuild would reset the
     /// cursor and any open sub-pane). Returns false when no settings
     /// overlay with that id is open — upstream's early exit.
+    /// Mutate a list overlay in place — the `updateSettings`/`updateWelcome`
+    /// convention. Re-`push`ing would remove and re-append the overlay,
+    /// resetting the cursor and the filter query; in-place mutation is what
+    /// keeps a selection-driven refresh (the dashboard peek, close-arming)
+    /// from yanking the user's position.
+    @discardableResult
+    public mutating func updateList(
+        id: String,
+        _ transform: (inout PagerListOverlay) -> Void
+    ) -> Bool {
+        guard let index = overlays.firstIndex(where: { $0.id == id }),
+              case .list(var list) = overlays[index].content else { return false }
+        transform(&list)
+        overlays[index].content = .list(list)
+        return true
+    }
+
     @discardableResult
     public mutating func updateSettings(
         id: String = "settings",
@@ -1700,6 +1746,16 @@ public struct PagerOverlayStack: Sendable, Equatable {
             list.clampSelection()
             return .redraw
         case .char(let character):
+            // Row verbs are consulted BEFORE the filter takes the character
+            // (the workflows precedent generalized): a bound key acts on the
+            // SELECTED row and is deliberately unavailable to filter typing
+            // on that overlay. Never fires without a selectable selection —
+            // a verb on a header or placeholder would dispatch nowhere.
+            if event.modifiers.isEmpty,
+               let action = list.rowActions.first(where: { $0.key == character }),
+               let row = list.selectedRow, row.isSelectable {
+                return .selected(id: overlay.id, rowID: "\(action.rowIDPrefix):\(row.id)")
+            }
             // `j`/`k` navigate only when there is no filter field competing for
             // the keystroke, matching the reference's vim gate (`picker.rs`).
             if !list.isFilterable, event.modifiers.isEmpty {
