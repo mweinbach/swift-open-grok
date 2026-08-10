@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B1-m + B1-d v1: the session tab registry and the /dashboard roster are live with Ctrl+G and Ctrl+backslash bound; B1-c /cd + the deferred dashboard bulk remain)
+**As of:** 2026-08-10 (Wave 18 B6 CLOSED with the context-bar hover widget; B1 core live [tasks pane, tab registry, /dashboard roster]; remaining: B1 deferred bulk + /cd, Wave 19 long tail)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1511,6 +1511,41 @@ first gate run FAILED on the pinned `/tasks → /release-notes` relative pair �
 the dashboard row was initially inserted there instead of upstream's slot —
 and the fix moved it to `/rename`'s side with its own pair pinned: the
 E20/E21 relative-order convention catching a real placement error.
+
+### B6 closure — the context-bar hover widget (serial gate: exit 0, 5,395 tests, 105 runs, zero issues, 2026-08-10). **The B6 chrome-reader program is CLOSED.**
+
+Lead-implemented — the last B6 item (timeline rail, timestamps, and
+compact_mode landed in earlier waves; the ledger's hidden-rows list was
+corrected in the same pass, and the remaining 13 hidden rows stay hidden
+honestly, readers still absent).
+
+What's live: hovering the status bar's context segment swaps
+`8.5K / 1.0M` for `█████ 50.0%` — the eighth-cell block progress bar plus
+`fmt_pct5` — at EXACTLY the default's width, so nothing shifts under the
+pointer (`context_bar.rs:182-260`: the default's ≥6-column right-pad is what
+makes the invariant hold for degenerate inputs like `0 / 9`; the bar width is
+the padded width minus gap+percentage). The urgency gradient colors both
+forms so high usage reads without hovering (`:236-238`). Plumbing: the
+segment's painted cells publish as `PagerFrameLayout.contextBar` (the
+privacy-banner hit-rects pattern), the mouse-move arm flips a hover flag on
+the last frame's rect with change-only repaint (a capturing overlay blocks it
+like every hover), and `PagerStyledSpan` gained a per-span `background`
+override (upstream spans carry their own bg; the bar's unfilled cells are the
+first consumer — `paintSpans` honors it over the run background).
+
+**Hardening past upstream, recorded:** upstream's `fmt_pct5` round-formats
+99.95–99.99 to `"100.0%"` — six characters through its own `<100` arm, a
+latent width-invariant break; the port clamps any over-wide result to the
+`MAX %` form, pinned by a test that documents the divergence. Found by the
+width-invariant test's 999,999,999/1,000,000,000 row on the first run.
+Remaining B6-adjacent deferral: mouse reporting must be ON for hover to
+arrive (the port's `/toggle-mouse-reporting` state), which is the existing
+mouse stance, not a new gap.
+
+4 net-new tests: the `fmt_pct5` table (upstream's rows + the ≥100 arm + the
+hardening pin), the width invariant across degenerate inputs asserted on the
+published rect, the in-place hover swap asserted on painted cells, and
+no-data-publishes-no-rect.
 
 ## Wave 18 B2 — native scrollback, pager-minimal, screen mode, welcome (research complete, queued)
 

@@ -7664,6 +7664,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// tick — recorded divergence, cost: states up to ~1s stale.
     private var tasksPaneRefresh: Task<Void, Never>?
 
+    /// B6: the context segment's painted cells from the LAST frame, for the
+    /// hover router (per-frame geometry, the rail's rule).
+    private var lastContextBarRect: TerminalRect?
+    /// Pointer-over state driving the width-matched bar swap.
+    private var contextBarHovered = false
+
     /// B1-m: the session tab registry — the in-process roster the dashboard
     /// lists. Upstream's `app.agents` map holds full agent tabs; this port's
     /// single runtime stack grounds a METADATA roster (id, title, activity)
@@ -12247,6 +12253,18 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         }
 
         if event.kind == .move {
+            // B6: the context-bar hover swap (`context_bar.rs:4-8`) — the
+            // pointer over the segment's last-frame cells flips the flag,
+            // change-only repaint. A capturing overlay blocks it like every
+            // hover.
+            let overContext = !overlays.isActive
+                && lastContextBarRect.map {
+                    event.y == $0.y && event.x >= $0.x && event.x < $0.right
+                } == true
+            if overContext != contextBarHovered {
+                contextBarHovered = overContext
+                try renderState()
+            }
             // Hover moves the welcome menu highlight — upstream's
             // `MouseEventKind::Moved` arm (`app/app_view.rs:4428-4443` at pin
             // 650c1db7): the selection becomes the row under the pointer, or
@@ -12819,6 +12837,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         lastOverlayBounds = result.overlays
         lastTimelineRail = result.layout.timelineRail
         lastPrivacyBannerHits = result.layout.privacyBanner
+        lastContextBarRect = result.layout.contextBar
         lastConversationHeight = max(1, result.layout.conversation.height)
         lastMaximumScrollOffset = max(
             0,
@@ -12966,7 +12985,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 workingDirectory: LivePagerChrome.collapseHome(workingDirectory),
                 contextUsedTokens: contextUsage.map { Int($0.usedTokens) },
                 contextTotalTokens: contextUsage.map { Int($0.contextWindow) },
-                queuedPromptCount: queuedPromptCount
+                queuedPromptCount: queuedPromptCount,
+                contextBarHovered: contextBarHovered
             ),
             announcementBanner: announcementBanner,
             conversation: blocks,

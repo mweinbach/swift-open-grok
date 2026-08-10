@@ -117,7 +117,7 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     var buffer = CellBuffer(area: bounds)
     var links: [LinkSpan] = []
     fill(&buffer, area: bounds, background: state.theme.bgBase, foreground: state.theme.textPrimary)
-    renderStatusBar(
+    layout.contextBar = renderStatusBar(
         state.statusBar,
         in: chrome.statusBar,
         buffer: &buffer,
@@ -964,32 +964,45 @@ private func singleLineSummary(_ value: String) -> String {
 
 // MARK: - Status bar
 
+@discardableResult
 private func renderStatusBar(
     _ status: PagerStatusBar?,
     in area: TerminalRect,
     buffer: inout CellBuffer,
     theme: PagerRenderTheme,
     motion: PagerMotionSnapshot = PagerMotionSnapshot()
-) {
-    guard let status, area.height > 0, area.width > 0 else { return }
+) -> TerminalRect? {
+    guard let status, area.height > 0, area.width > 0 else { return nil }
     paintBlank(&buffer, area: area, foreground: theme.gray, background: theme.bgBase)
 
-    let right = statusBarRightSpans(status, theme: theme, motion: motion)
+    let run = statusBarRightSpans(status, theme: theme, motion: motion)
+    let right = run.spans
     let rightWidth = right.reduce(0) { $0 + UnicodeDisplayWidth.width(of: $1.text) }
     let leftBudget = max(0, area.width - rightWidth - 1)
     let left = truncateSpans(statusBarLeftSpans(status, theme: theme), to: leftBudget)
 
     paintSpans(&buffer, spans: left, x: area.x, y: area.y, limit: area.right, background: theme.bgBase)
+    var contextBar: TerminalRect?
     if rightWidth > 0, rightWidth <= area.width {
+        let runX = area.right - rightWidth
         paintSpans(
             &buffer,
             spans: right,
-            x: area.right - rightWidth,
+            x: runX,
             y: area.y,
             limit: area.right,
             background: theme.bgBase
         )
+        if let range = run.contextRange {
+            contextBar = TerminalRect(
+                x: runX + range.lowerBound,
+                y: area.y,
+                width: range.count,
+                height: 1
+            )
+        }
     }
+    return contextBar
 }
 
 // MARK: - Announcement banner
@@ -1310,12 +1323,20 @@ private func statusBarLeftSpans(
     return spans
 }
 
+private struct StatusBarRightRun {
+    var spans: [PagerStyledSpan]
+    /// The context segment's display-column range within the run, for the
+    /// hover router's rect (B6).
+    var contextRange: Range<Int>?
+}
+
 private func statusBarRightSpans(
     _ status: PagerStatusBar,
     theme: PagerRenderTheme,
     motion: PagerMotionSnapshot = PagerMotionSnapshot()
-) -> [PagerStyledSpan] {
+) -> StatusBarRightRun {
     var groups: [[PagerStyledSpan]] = []
+    var contextGroupIndex: Int?
     if status.backgroundTaskCount > 0 {
         // The chip spins while background tasks run (`agent_status.rs:278,317`
         // draws `dot_spinner_frames()[tick / SPINNER_DIVISOR]`). With motion
@@ -1329,8 +1350,9 @@ private func statusBarRightSpans(
     if status.isPlanMode {
         groups.append([PagerStyledSpan(text: "plan", foreground: theme.accentPlan)])
     }
-    if let context = contextIndicatorSpan(status, theme: theme) {
-        groups.append([context])
+    if let context = contextIndicatorSpans(status, theme: theme) {
+        contextGroupIndex = groups.count
+        groups.append(context)
     }
     if status.queuedPromptCount > 0 {
         groups.append([PagerStyledSpan(
@@ -1338,26 +1360,79 @@ private func statusBarRightSpans(
             foreground: theme.accentUser
         )])
     }
-    guard !groups.isEmpty else { return [] }
+    guard !groups.isEmpty else { return StatusBarRightRun(spans: [], contextRange: nil) }
     var spans: [PagerStyledSpan] = []
+    var contextRange: Range<Int>?
+    var column = 0
     for (index, group) in groups.enumerated() {
         if index > 0 {
-            spans.append(PagerStyledSpan(
+            let separator = PagerStyledSpan(
                 text: " \(PagerGlyphs.statusSeparator) ",
                 foreground: theme.grayDim
-            ))
+            )
+            spans.append(separator)
+            column += UnicodeDisplayWidth.width(of: separator.text)
+        }
+        let width = group.reduce(0) { $0 + UnicodeDisplayWidth.width(of: $1.text) }
+        if index == contextGroupIndex {
+            contextRange = column..<(column + width)
         }
         spans.append(contentsOf: group)
+        column += width
     }
-    return spans
+    return StatusBarRightRun(spans: spans, contextRange: contextRange)
 }
 
 /// `"8.5K / 1.0M"`, right-padded to at least six columns, colored by the
 /// context ramp (`views/context_bar.rs`).
-private func contextIndicatorSpan(
+/// `fmt_pct5` (`context_bar.rs:25-33`): always five characters, so the
+/// hovered line's width never depends on the value. HARDENED past
+/// upstream: 99.95–99.99 round-formats to "100.0%" — six characters —
+/// through upstream's own arms (a latent width-invariant break there);
+/// the port clamps any over-wide result to the MAX form instead.
+func pagerFormatPct5(_ pct: Double) -> String {
+    if pct >= 100 { return "MAX %" }
+    let formatted = pct < 10
+        ? String(format: "%.2f%%", pct)
+        : String(format: "%.1f%%", pct)
+    return formatted.count > 5 ? "MAX %" : formatted
+}
+
+/// One span per cell of a `width`-cell progress bar at `value` fill —
+/// eighth-cell resolution via the LEFT-fractional blocks
+/// (`progress_bar.rs:36-58`; the port's `PagerGlyphs.progressBlocks` is the
+/// same 9-glyph table). Unfilled cells carry the highlight background so
+/// the bar's extent reads even at low fill.
+func pagerProgressBarSpans(
+    width: Int,
+    value: Double,
+    color: TerminalColor,
+    theme: PagerRenderTheme
+) -> [PagerStyledSpan] {
+    guard width > 0 else { return [] }
+    let clamped = min(1.0, max(0.0, value))
+    let totalEighths = Int((clamped * Double(width) * 8.0).rounded())
+    let full = min(totalEighths / 8, width)
+    let remainder = totalEighths % 8
+    return (0..<width).map { index in
+        if index < full {
+            return PagerStyledSpan(text: PagerGlyphs.progressBlocks[8], foreground: color)
+        }
+        if index == full, remainder > 0 {
+            return PagerStyledSpan(text: PagerGlyphs.progressBlocks[remainder], foreground: color)
+        }
+        return PagerStyledSpan(text: " ", background: theme.bgVisual)
+    }
+}
+
+/// The context segment: `8.5K / 1.0M` colored by the urgency gradient, or —
+/// hovered — `█████ 42.0%` at the SAME total width so nothing shifts under
+/// the pointer (`context_bar_line`, `context_bar.rs:182-260`: the default's
+/// ≥6-column pad is what makes the invariant hold for every input).
+private func contextIndicatorSpans(
     _ status: PagerStatusBar,
     theme: PagerRenderTheme
-) -> PagerStyledSpan? {
+) -> [PagerStyledSpan]? {
     guard let used = status.contextUsedTokens,
           let total = status.contextTotalTokens,
           total > 0
@@ -1365,7 +1440,19 @@ private func contextIndicatorSpan(
     var text = "\(pagerFormatTokens(used)) / \(pagerFormatTokens(total))"
     while UnicodeDisplayWidth.width(of: text) < 6 { text += " " }
     let fraction = min(1.0, Double(used) / Double(total))
-    return PagerStyledSpan(text: text, foreground: pagerContextColor(fraction: fraction, theme: theme))
+    let color = pagerContextColor(fraction: fraction, theme: theme)
+    guard status.contextBarHovered else {
+        return [PagerStyledSpan(text: text, foreground: color)]
+    }
+    let totalWidth = UnicodeDisplayWidth.width(of: text)
+    var spans = pagerProgressBarSpans(
+        width: totalWidth - 6, value: fraction, color: color, theme: theme
+    )
+    spans.append(PagerStyledSpan(text: " "))
+    spans.append(PagerStyledSpan(
+        text: pagerFormatPct5(fraction * 100), foreground: theme.textSecondary
+    ))
+    return spans
 }
 
 // MARK: - Turn status
@@ -2038,7 +2125,7 @@ func paintSpans(
             text: truncateToWidth(span.text, width: limit - column),
             style: inheritStyle.union(span.style),
             foreground: span.foreground ?? inheritForeground ?? .reset,
-            background: background
+            background: span.background ?? background
         )
         let next = min(column + written, limit)
         if let url = span.url, written > 0 {

@@ -14,17 +14,23 @@ public struct PagerStyledSpan: Sendable, Equatable, Hashable {
     /// Hyperlink target. Populated spans are emitted as `LinkSpan`s on the
     /// render result so terminals with OSC 8 support make them clickable.
     public var url: String?
+    /// Per-span background override; `nil` inherits the paint run's
+    /// background (upstream spans carry their own `Style` bg — the context
+    /// bar's unfilled cells are the first consumer, `context_bar.rs:245`).
+    public var background: TerminalColor?
 
     public init(
         text: String,
         foreground: TerminalColor? = nil,
         style: CellStyle = [],
-        url: String? = nil
+        url: String? = nil,
+        background: TerminalColor? = nil
     ) {
         self.text = text
         self.foreground = foreground
         self.style = style
         self.url = url
+        self.background = background
     }
 
     public var isEmpty: Bool { text.isEmpty }

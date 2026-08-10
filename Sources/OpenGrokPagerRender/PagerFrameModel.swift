@@ -204,6 +204,9 @@ public struct PagerStatusBar: Sendable, Equatable, Hashable {
     public var queuedPromptCount: Int
     public var isPlanMode: Bool
     public var backgroundTaskCount: Int
+    /// The pointer is over the context segment — swap the tokens for the
+    /// width-matched progress bar (`context_bar.rs:184-189`).
+    public var contextBarHovered: Bool
 
     public init(
         gitBranch: String? = nil,
@@ -216,7 +219,8 @@ public struct PagerStatusBar: Sendable, Equatable, Hashable {
         contextTotalTokens: Int? = nil,
         queuedPromptCount: Int = 0,
         isPlanMode: Bool = false,
-        backgroundTaskCount: Int = 0
+        backgroundTaskCount: Int = 0,
+        contextBarHovered: Bool = false
     ) {
         self.gitBranch = gitBranch
         self.isDetached = isDetached
@@ -229,6 +233,7 @@ public struct PagerStatusBar: Sendable, Equatable, Hashable {
         self.queuedPromptCount = queuedPromptCount
         self.isPlanMode = isPlanMode
         self.backgroundTaskCount = backgroundTaskCount
+        self.contextBarHovered = contextBarHovered
     }
 }
 
@@ -689,6 +694,10 @@ public struct PagerFrameLayout: Sendable, Equatable {
     /// `privacy_banner_owns_slot`, `render.rs:2128-2132`); inside, each
     /// button rect is `nil` when the row was too narrow to paint it whole.
     public var privacyBanner: PagerPrivacyBannerHitRects?
+    /// The context-usage segment's painted cells in the status bar, for the
+    /// hover router (B6: `context_bar.rs:4-8` — hover swaps tokens for a
+    /// progress bar at the SAME width). `nil` when no context data painted.
+    public var contextBar: TerminalRect?
 
     public init(
         bounds: TerminalRect,
@@ -705,7 +714,8 @@ public struct PagerFrameLayout: Sendable, Equatable {
         scrollOffset: Int,
         hasScrollbar: Bool,
         timelineRail: PagerTimelineRail? = nil,
-        privacyBanner: PagerPrivacyBannerHitRects? = nil
+        privacyBanner: PagerPrivacyBannerHitRects? = nil,
+        contextBar: TerminalRect? = nil
     ) {
         self.bounds = bounds
         self.statusBar = statusBar
@@ -722,6 +732,7 @@ public struct PagerFrameLayout: Sendable, Equatable {
         self.hasScrollbar = hasScrollbar
         self.timelineRail = timelineRail
         self.privacyBanner = privacyBanner
+        self.contextBar = contextBar
     }
 }
 
