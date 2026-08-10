@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B2-M3: live tail + viewport sizing landed in OpenGrokPagerRender, implemented-unwired; M4 minimal frontend wiring next)
+**As of:** 2026-08-10 (Wave 18 B2-M4: the minimal frontend is LIVE — --minimal / [ui] screen_mode reach the scrollback-native renderer; S2 /minimal + /fullscreen + exec relaunch next, closing B2)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1845,6 +1845,81 @@ composition, and several of their surfaces (the `/fullscreen` copy!) are
 S2-gated: advertising it before the command exists is exactly what ruling (a)
 forbids. (3) `MinimalTranscript.updateItem` on an id removed by rewind is an
 honest `false` no-op (upstream mutates through `get_by_id_mut`, same shape).
+
+### B2-M4 — the minimal frontend program, LIVE (serial gate: exit 0, 5,347 tests, 105 runs, zero issues, 2026-08-10)
+
+Lead-implemented. Minimal mode is now **live**: `resolveInteractivePagerMode`'s
+`.minimal` (the root `--minimal` flag and S1's `[ui] screen_mode` reader) reaches
+the real scrollback-native frontend instead of degrading to the ≤12-row inline
+strip. Three pieces:
+
+**`PagerMinimalFrameHost`** (`Sources/OpenGrokPagerRender/`) — the port of
+`lib.rs::draw` (:91-108) with upstream's exact frame order: synchronized update
++ size adoption FIRST (a block finalizing on a resize frame would otherwise
+print at the stale width and the shrink would hard-wrap the print-once copy
+forever, `lib.rs:71-90`), pending-mark + transcript sync once up front, the
+welcome card, the POST-commit viewport sizing, the commit pass, the live region
+(tail · completions · status · composer). Plus the `welcome.rs` card (:28-143 —
+border + title/version/cwd/model/hint; the pending flag clears only after the
+insert SUCCEEDS, upstream's bugbot; armed only for a fresh session — a resumed
+transcript replays into scrollback instead per `commit.rs:400-406`) and
+`MinimalSinkBackend`, the ANSI `TerminalBackend` over the pager sink that lets
+B2-N's `Terminal` drive the live byte stream (`appendLines` scrolls with
+newlines at the bottom row — the portable scroll that pushes rows into NATIVE
+scrollback, which is the mode's entire point; `\e[S` would discard them).
+
+**The composition wiring** (`LiveComposition.swift`) — the actor constructs the
+host when the session resolves `.minimal` and routes `renderState`//resize//
+restore//suspend//resume through it; `renderer` is never `start()`ed (no alt
+screen, no mouse capture — the `guard.rs` stance); the full-screen welcome
+overlay is not pushed (the card replaces it, `welcome.rs:3-8`); the mouse
+toggle refuses honestly instead of flipping a flag no capture sequence backs.
+
+**Overlay hosting** — overlays paint INSIDE the live viewport through the
+shared `renderOverlays` with a viewport-scoped synthetic layout, and the
+viewport grows to `appModalTarget` while one is open. This closed a §3-class
+hole caught during the slice: a `/resume` picker would have CAPTURED INPUT
+while painting nowhere (the invisible-modal "succeeds, does nothing" class) —
+now pinned by a visibility test.
+
+11 net-new live-seam tests, all asserted on the BYTES a capturing sink received
+(what actually lands on the user's terminal): print-once across repeated draws;
+streaming-stays-live then commits once (the diff-flush honest-still-frame
+lesson: a mutation reaching the terminal is the live/frozen discriminator, not
+repaint counts); the card once + above the first block + absent on resume; no
+alt-screen//mouse-capture bytes ever; the permission hold (mutations reach the
+terminal while held — a committed block could never change — and resolution
+releases exactly one commit); the app-modal commit hold + deferred flush;
+failed-write retry; rewind still commits what follows; picker visibility; and
+the K6 guard (`guard.rs:13-45`): minimal's sources never name
+`resizePurgeRerender`//`emitToScrollback`, `#filePath`-anchored.
+
+**Recorded divergences / deferrals:** (1) the live region keeps the port's
+themed painters (`renderComposer`//`renderTurnStatus`//`renderCompletions`,
+bgBase-filled rows) rather than upstream's flat terminal-native live stance —
+committed scrollback IS flat (`.reset`); cost: the pinned band reads visually
+distinct from committed history; reusing the landed painters beats forking flat
+variants of all three. (2) Frame coalescing is the renderer's; the host paints
+per event (the frontier makes the heavy rows print-once, and still frames
+diff to zero bytes); cost: more small writes per second than the coalesced
+path under streaming. (3) `turnRunning` is derived from
+`state.turnStatus != nil` (the frame model has no explicit turn flag); cost:
+a status row shown while idle would briefly hold the last entry live — the
+idle-commits relaxation covers the converse. (4) The pending mark targets the
+LAST running tool while a permission/question overlay is up (the frame model
+does not link prompts to tool entries); cost: a prompt for an EARLIER parallel
+tool would hold the wrong entry — single-tool-at-a-time turns make this
+unobservable today. (5) Deferred with their upstream modules: the todo panel
+(`todo.rs`), `/btw` (`live.rs` btw arms), the below-prompt list panels
+(`panel.rs`), plan commit (`plan.rs`), the transcript pump (`full_view.rs`),
+the pre-session auth arm (`auth.rs`), the Ctrl+E expand chord + `expand_pending`
+driver (the ring and re-print machinery are landed; the chord is an input-seam
+slice), rich idle-watcher status arms, and the status row's `/fullscreen to go
+back` copy — S2-gated by ruling (a). (6) `PagerConversationUI`'s
+`PagerConversationRow` model remains consumer-less (predates this wave;
+unchanged). (7) Bottom-sheet prompts size under `appModalTarget` rather than
+upstream's `modal_target` tail-reservation math; cost: a very tall held-tool
+diff can clip sooner — `drawTail` bottom-anchors what fits.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

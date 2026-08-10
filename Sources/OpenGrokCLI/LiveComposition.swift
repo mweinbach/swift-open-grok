@@ -36,6 +36,7 @@ import OpenGrokToolRegistry
 import OpenGrokToolTypes
 import OpenGrokToolsAPI
 import OpenGrokTTY
+import OpenGrokVersion
 import OpenGrokWebMediaTools
 import OpenGrokWorkspace
 
@@ -7575,6 +7576,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private let terminal: OpenGrokLiveTerminal
     private let sink: any PagerTerminalSink
     private let renderer: PagerTerminalRenderer
+    /// B2-M4: the scrollback-native frame program, constructed instead of
+    /// driving `renderer` when the session resolved `.minimal`. The
+    /// controller's frame states route to `minimalHost.draw` and the
+    /// finalized blocks print once into the terminal's own scrollback;
+    /// `renderer` stays idle (never `start()`ed — no alt screen, no mouse
+    /// capture, the guard.rs stance).
+    private let minimalHost: PagerMinimalFrameHost?
 
     private var conversation = LivePagerConversationState(markdown: PagerMarkdownRenderer())
     private var prompt = OpenGrokPagerInteractivePromptState()
@@ -8058,6 +8066,29 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 paintCadence: paintCadence
             )
         )
+        // B2-M4: `.minimal` gets the real scrollback-native frontend instead
+        // of the degraded inline strip it fell to before. The host owns its
+        // own inline `Terminal` over the same sink; a failed construction
+        // (a sink with no usable size is not one of them — the provider
+        // falls back) degrades to the strip rather than refusing the launch.
+        if mode == .minimal {
+            self.minimalHost = try? PagerMinimalFrameHost(
+                sink: sink,
+                sizeProvider: { [terminal] in
+                    let size = terminal.size() ?? OpenGrokLiveTerminalSize(width: 80, height: 24)
+                    return OpenGrokTerminalCore.TerminalSize(
+                        width: size.width, height: size.height
+                    )
+                },
+                welcome: MinimalWelcomeCardInfo(
+                    version: OpenGrokVersion.compiledVersion,
+                    workingDirectory: LivePagerChrome.collapseHome(workingDirectory),
+                    model: modelName
+                )
+            )
+        } else {
+            self.minimalHost = nil
+        }
     }
 
     /// Effective `[ui]` from the same config chain as `resolveDisplayRefreshPolicy`.
@@ -8772,7 +8803,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     }
 
     func begin() async throws {
-        try renderer.start()
+        if let minimalHost {
+            // Fresh sessions get the one-shot scrollback card; a resumed
+            // transcript replays into scrollback instead (welcome.rs:11-13).
+            minimalHost.setWelcomePending(conversation.items.isEmpty)
+            try minimalHost.begin()
+        } else {
+            try renderer.start()
+        }
         if let permissionCoordinator {
             await permissionCoordinator.setPresenter { [weak self] request in
                 await self?.showPermission(request)
@@ -8790,7 +8828,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         }
         // The welcome screen only makes sense on an empty session, and it must
         // not capture input: the reference paints a live composer beneath it.
-        if conversation.items.isEmpty {
+        // Minimal skips the full-screen welcome entirely — the scrollback
+        // card above stands in for it (welcome.rs:3-8), and a pushed overlay
+        // here would be an invisible input-routing surface.
+        if conversation.items.isEmpty, minimalHost == nil {
             overlays.push(.welcome(welcomeOverlay(), capturesInput: false))
         }
         // The changelog startup prefetch — upstream's one-shot post-auth
@@ -8816,8 +8857,39 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
 
     func resize(to size: OpenGrokTerminalCore.TerminalSize) async throws {
         terminalSize = size
-        try renderer.resize(to: size)
+        // The minimal host adopts the size at the top of every draw
+        // (lib.rs:71-80 — the stale-width commit hazard is why it happens
+        // there, inside the synchronized update, not here).
+        if minimalHost == nil {
+            try renderer.resize(to: size)
+        }
         try renderState()
+    }
+
+    /// Route frontend terminal-ownership transitions to whichever frontend
+    /// is live: the minimal frame host or the frame renderer.
+    private func frontendRestore() throws {
+        if let minimalHost {
+            try minimalHost.restore()
+        } else {
+            try renderer.restore()
+        }
+    }
+
+    private func frontendSuspendToChild() throws {
+        if let minimalHost {
+            try minimalHost.suspendToChild()
+        } else {
+            try renderer.suspendToChild()
+        }
+    }
+
+    private func frontendResumeFromChild() throws {
+        if let minimalHost {
+            try minimalHost.resumeFromChild()
+        } else {
+            try renderer.resumeFromChild()
+        }
     }
 
     func render(_ event: OpenGrokPagerInteractiveEvent) async throws {
@@ -9043,7 +9115,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         pendingQuestionRequest = nil
         currentPlanApprovalRequestID = nil
         pendingPlanApprovalRequest = nil
-        try renderer.restore()
+        try frontendRestore()
         if mode == .fullScreen {
             try sink.write(transcript)
             try sink.flush()
@@ -9248,6 +9320,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 currentModelID: modelName
             ))
         case .toggleMouseReporting:
+            // Minimal never captures the mouse (the guard.rs stance): the
+            // terminal's native selection and scrollback own it, which is
+            // the mode's point. Refuse honestly instead of toggling a flag
+            // no capture sequence would ever back.
+            if minimalHost != nil {
+                appendMessage(PagerMessage(
+                    role: .system,
+                    text: "Mouse capture stays off in minimal mode — the terminal's native selection and scrollback own the mouse."
+                ))
+                return
+            }
             mouseReportingEnabled.toggle()
             try renderer.setMouseReporting(mouseReportingEnabled)
             appendMessage(PagerMessage(
@@ -10908,7 +10991,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             return
         }
         do {
-            try renderer.suspendToChild()
+            try frontendSuspendToChild()
         } catch {
             try? await suspension.end()
             note("Could not suspend the terminal for $PAGER: \(error)")
@@ -10926,7 +11009,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             environment: suspendHost.environment
         )
         do {
-            try renderer.resumeFromChild()
+            try frontendResumeFromChild()
             try await suspension.end()
         } catch {
             // Either the tty rejected the re-entry writes or raw mode failed:
@@ -10934,7 +11017,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // paints into a screen we cannot own — the terminal ends fully
             // cooked, never half — and fail the run loudly instead of
             // wedging with a paused reader.
-            try? renderer.restore()
+            try? frontendRestore()
             try? FileManager.default.removeItem(at: file)
             throw error
         }
@@ -10979,7 +11062,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             return
         }
         do {
-            try renderer.suspendToChild()
+            try frontendSuspendToChild()
         } catch {
             try? await suspension.end()
             note("Could not suspend the terminal for $EDITOR: \(error)")
@@ -10991,13 +11074,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             environment: suspendHost.environment
         )
         do {
-            try renderer.resumeFromChild()
+            try frontendResumeFromChild()
             try await suspension.end()
         } catch {
             // The tty rejected re-entry: latch the renderer down so nothing
             // paints into a screen we cannot own and fail loudly — the
             // transcript pager's identical arm.
-            try? renderer.restore()
+            try? frontendRestore()
             throw error
         }
         if let launchError {
@@ -12384,6 +12467,18 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// other half of the animation ticker — 30 fps of ticks plus per-event
     /// repaints must not become 30+ paints per second.
     private func renderState() throws {
+        if let minimalHost {
+            // The minimal frame program consumes the STATE, not laid-out
+            // cells: commits and the live region are its own ordered walk
+            // (lib.rs:91-108). Mouse-geometry bookkeeping is skipped —
+            // minimal is keyboard-only by design (guard.rs stance). Frame
+            // coalescing is the renderer's; the host paints per event and
+            // relies on `insertBefore`'s print-once frontier for the heavy
+            // rows (recorded in the ledger with its cost).
+            minimalHost.draw(renderState(conversation: conversation.items))
+            publishMotionState()
+            return
+        }
         let result = layOutCurrentFrame()
         if try renderer.requestFrame(result, at: Self.monotonicNow()) == nil {
             armFlushTimerIfNeeded()

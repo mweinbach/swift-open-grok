@@ -1354,7 +1354,7 @@ private func contextIndicatorSpan(
 
 // MARK: - Turn status
 
-private func renderTurnStatus(
+func renderTurnStatus(
     _ status: PagerTurnStatus?,
     in area: TerminalRect,
     buffer: inout CellBuffer,
@@ -1438,7 +1438,7 @@ private func renderTurnStatus(
 
 // MARK: - Completion menu
 
-private func renderCompletions(
+func renderCompletions(
     _ menu: PagerCompletionMenu?,
     in area: TerminalRect,
     buffer: inout CellBuffer,
@@ -1504,7 +1504,7 @@ private func renderCompletions(
 
 // MARK: - Composer
 
-private func renderComposer(
+func renderComposer(
     _ input: PagerComposerState,
     in area: TerminalRect,
     buffer: inout CellBuffer,

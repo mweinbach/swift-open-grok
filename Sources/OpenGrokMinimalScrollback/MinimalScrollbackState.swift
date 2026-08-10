@@ -159,6 +159,16 @@ public final class MinimalScrollbackState {
         entries.firstIndex { $0.id == id }
     }
 
+    /// Flip an entry's running flag (`set_entry_running`,
+    /// `state/mod.rs:1184-1199`, minus the tool-timing and finish-flash
+    /// arms, which are renderer concerns). The M4 frame driver uses this to
+    /// mirror item lifecycle transitions and to finalize a stale-running
+    /// entry before the commit pass renders it (`commit.rs:451-456`).
+    public func setEntryRunning(_ id: MinimalEntryID, running: Bool) {
+        guard let index = indexOfID(id) else { return }
+        entries[index].isRunning = running
+    }
+
     /// Flag an entry as awaiting (or no longer awaiting) user input.
     /// Returns `true` only when the flag actually changed; `false` for an
     /// unknown id or a repeated value (`state/mod.rs:1491-1508`).
