@@ -2472,14 +2472,24 @@ the keystone.
 
 ### Still absent / deliberately deferred (the roadmap's remaining waves)
 
-Full ACP extension surface beyond the router (`open-grok/*/models/apply` + live-session
-credential rebind, `x.ai/mcp/*`), MCP OAuth + credential store, `agent_swarm` + collaboration
-tools, `ask_user_question` + a real plan-approval view, MCP OAuth, the multi-agent
-dashboard/AppView runtime and its dependents (`/cd`, tasks pane), native scrollback + the full
-minimal frontend, TUI suspend/restore (`$EDITOR`/`$PAGER`/screen-mode/in-pager `/login`),
-xAI browser-OAuth login, voice live seam, video/scheduler/monitor/LSP/search_tool tools,
-foreign sessions, memory embeddings + dream, auto-mode LLM classifier, Computer Hub MCP
-adapter. See `PARITY_ROADMAP.md` for the dependency-ordered plan.
+**Corrected 2026-08-10 with the Wave 18 B2 closure** (the prior list predated
+Waves 14-18 and had gone stale — native scrollback + the minimal frontend,
+TUI suspend/restore, in-pager `/login`, MCP OAuth + credential store, and the
+subagent/collaboration stack are LIVE per their wave records). Remaining open:
+the multi-agent dashboard/AppView runtime and its dependents (`/dashboard`,
+Ctrl+\, `/cd` + `SetWorkingDir`, the tasks pane — roadmap B1, the last Wave 18
+keystone); the context-bar hover widget (the B6 remainder — timeline rail,
+timestamps, and compact_mode landed); the hidden settings rows above that
+still lack renderer readers; xAI browser-OAuth in-TUI login (the recorded D1
+divergence); upstream's soft `x.ai/interject` seam (send-now is live; true
+mid-turn injection is not); voice live seam (B7); media overlays (B10);
+video tools; LSP; `search_tool`/`use_tool` meta-discovery; foreign-session
+scan/resume; memory embeddings + dream; auto-mode LLM permission classifier;
+Computer Hub MCP adapter wiring; the Wave 19 config/env long tail
+(`RemoteSettings` authority allowlist, `GROK_*` env-gate table, `features.*`
+resolver); and the standing platform gaps (Linux sandbox proof, Windows
+named-pipe leader IPC + the S2 exec emulation, Linux custom-CA, Linux/Windows
+CI). See `PARITY_ROADMAP.md` for the dependency-ordered plan.
 
 ## Wave 12 — Meta provider catch-up, re-pin to 70002584, and fundamentals closures (2026-08-06)
 
