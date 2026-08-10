@@ -550,6 +550,10 @@ public struct PagerRenderState: Sendable, Equatable {
     public var completions: PagerCompletionMenu?
     public var input: PagerComposerState
     public var shortcuts: PagerShortcutsBar?
+    /// The Ctrl+G tasks pane (B1-t) — a full-width band between the status
+    /// bar/banner and the transcript, upstream's `Constraint::Length(
+    /// tasks_height)` slot (`views/agent.rs:210-213`). `nil` = hidden.
+    public var tasksPane: PagerTasksPaneState?
     public var scrollPosition: PagerScrollPosition
     public var theme: PagerRenderTheme
     public var showScrollbar: Bool
@@ -620,6 +624,7 @@ public struct PagerRenderState: Sendable, Equatable {
         completions: PagerCompletionMenu? = nil,
         input: PagerComposerState = PagerComposerState(),
         shortcuts: PagerShortcutsBar? = nil,
+        tasksPane: PagerTasksPaneState? = nil,
         scrollPosition: PagerScrollPosition = .followTail,
         theme: PagerRenderTheme = .default,
         showScrollbar: Bool = true,
@@ -641,6 +646,7 @@ public struct PagerRenderState: Sendable, Equatable {
         self.completions = completions
         self.input = input
         self.shortcuts = shortcuts
+        self.tasksPane = tasksPane
         self.scrollPosition = scrollPosition
         self.theme = theme
         self.showScrollbar = showScrollbar

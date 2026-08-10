@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B2 closed + follow-up: /expand and the minimal Ctrl+E chord landed — the advertised expand affordance is real; next open keystone per PARITY_ROADMAP: Wave 18 B1 dashboard or B6 chrome readers)
+**As of:** 2026-08-10 (Wave 18 B1-t: the Ctrl+G tasks pane landed as a live chrome band with kill affordances; next per the B1 rulings: B1-m the multi-session tab map, then B1-d the dashboard)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1407,6 +1407,56 @@ SUPERSEDED by this. Live-refresh divergence pre-ruled: upstream rebuilds rows
 per frame off actor-free state; the port's feeds are actors, so the pane
 refreshes on open, on action, and on a bounded tick while open — staleness
 cost recorded when it lands.
+
+### B1-t — the Ctrl+G tasks pane (serial gate: exit 0, 5,382 tests, 105 runs, zero issues, 2026-08-10)
+
+Lead-implemented, the grounded first slice per the research ruling.
+
+**What's live:** Ctrl+G toggles a full-width tasks band between the chrome and
+the transcript — upstream's `ActionId::ToggleTasks` surface
+(`defaults.rs:44-55`) in upstream's slot (`views/agent.rs:210-213`,
+`Constraint::Length(tasks_height)`), COEXISTING with the composer: unfocused
+it stays visible while typing, focused it owns the keys
+(`AgentPane::Tasks` routing, `agent_view/input.rs:1152,1230-1231` — closed →
+open focused; unfocused → take focus; focused → close). The pane
+(`PagerTasksPane.swift` render-side, `LiveTasksPane.swift` live-side) carries
+upstream's four groups in fixed order (Workflows · Subagents · Tasks ·
+Watchers = monitors + `/loop`, `tasks_pane.rs:178-215`), collapsible headers,
+selection preserved by row id across refreshes, the `desired_height` rule
+verbatim (hidden under 12 rows; min(8, 15% of the view), `:1168-1190`), and
+the caller affordances (`panes.rs:312-455`): Enter//←//→ collapse and expand
+headers, `x` kills the selected entry through whichever backing owns it — a
+running bg task or monitor via the session execution's owner-scoped
+`killTask` (a new `LiveToolExecutor.killBackgroundTask` mirror of
+`backgroundTaskSnapshots`), a running subagent via the coordinator's
+`cancelSubagent`, a scheduled `/loop` via the scheduler host's `deleteTask`,
+a stoppable workflow via `.runCommand("/workflow stop <name>")` — upstream's
+own `SendSlashCommandPreservingDraft` shape — and Tab returns focus to the
+prompt. Entries share `LivePagerTasksBlock`'s sort orders, labels, and status
+vocabulary so the pane and the read-only `/tasks` block can never describe
+the same task differently. `/tasks` itself is UNCHANGED — upstream's command
+deliberately prints the block (`tasks.rs:1-7`).
+
+**Recorded divergences:** (1) the `y` stdout-copy affordance is NOT wired —
+this port has no clipboard channel (the OSC 52 divergence at
+`openExternalURL`); `copyAction` stays nil everywhere, pinned by a test, and
+lands with a clipboard seam. (2) Refresh cadence: upstream rebuilds rows
+every frame off actor-free state; the port's feeds are actors, so the pane
+refreshes on open, on action, and on a 1 s tick while visible — cost: states
+up to ~1 s stale, and no per-row spinner animation. (3) Enter on an ENTRY
+(upstream opens the bg task's block viewer) is deferred with the block-viewer
+surface; headers toggle as upstream. (4) The pane's `/` filter input (and its
+`desired_height` `+1` bar row) is deferred. (5) Minimal mode refuses the
+chord quietly (upstream's Ctrl+G means external editor there; toggling state
+nothing paints would be the dead-key class).
+
+12 net-new tests: 6 state (group order + empty-group headers, collapse
+toggles, kill mapping incl. the finished-entry refusal, Tab/Esc/Ctrl+G,
+refresh selection re-anchor, the desired-height table) + 2 frame (the band
+paints between chrome and transcript through the real renderer; a nil pane
+changes nothing) + 4 builder (kind→group incl. monitors-join-watchers, kill
+actions per kind with the no-copy pin, workflow sort order, block-vocabulary
+status).
 
 ## Wave 18 B2 — native scrollback, pager-minimal, screen mode, welcome (research complete, queued)
 

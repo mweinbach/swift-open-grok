@@ -164,6 +164,9 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
             links: &links
         )
     }
+    if let tasksPane = state.tasksPane, chrome.tasksPane.height > 0 {
+        drawTasksPane(tasksPane, in: chrome.tasksPane, buffer: &buffer, theme: state.theme)
+    }
     renderConversation(
         contentLines,
         visibleRange: visibleRange,
@@ -250,6 +253,7 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
 private struct ChromeLayout {
     var statusBar: TerminalRect
     var announcementBanner: TerminalRect
+    var tasksPane: TerminalRect
     var conversation: TerminalRect
     var completions: TerminalRect
     var turnStatus: TerminalRect
@@ -287,6 +291,7 @@ private func makeChromeLayout(
         return ChromeLayout(
             statusBar: empty,
             announcementBanner: empty,
+            tasksPane: empty,
             conversation: empty,
             completions: empty,
             turnStatus: empty,
@@ -331,6 +336,15 @@ private func makeChromeLayout(
     let announcementHeight = bannerRows > 0 ? take(bannerRows) : 0
     let announcementGap = announcementHeight > 0 ? take(1) : 0
 
+    // The Ctrl+G tasks pane (B1-t): a full-width band directly below the
+    // status bar/banner, upstream's `Constraint::Length(tasks_height)` slot
+    // between the status bar and the scrollback (`views/agent.rs:210-213`,
+    // gap row included via `pane_gap`). Sized by the pane's own
+    // `desired_height` rule so a short terminal hides it entirely.
+    let tasksPaneRows = state.tasksPane?.desiredHeight(viewHeight: bounds.height) ?? 0
+    let tasksPaneHeight = tasksPaneRows > 0 ? take(tasksPaneRows) : 0
+    let tasksPaneGap = tasksPaneHeight > 0 ? take(1) : 0
+
     let shortcutsHeight = state.shortcuts != nil ? take(1) : 0
     // The reference drops the bottom padding row on short terminals, and in
     // compact mode: `shortcuts_gap` is 0 whenever `bottom_vpad` is
@@ -367,6 +381,7 @@ private func makeChromeLayout(
 
     let statusBar = place(statusHeight, gapAfter: statusGap)
     let announcementBanner = place(announcementHeight, gapAfter: announcementGap)
+    let tasksPane = place(tasksPaneHeight, gapAfter: tasksPaneGap)
     let conversation = place(conversationHeight, gapAfter: completionsGap)
     let completions = place(completionsHeight, gapAfter: turnStatusGap)
     let turnStatus = place(turnStatusHeight, gapAfter: promptGap)
@@ -376,6 +391,7 @@ private func makeChromeLayout(
     return ChromeLayout(
         statusBar: statusBar,
         announcementBanner: announcementBanner,
+        tasksPane: tasksPane,
         conversation: conversation,
         completions: completions,
         turnStatus: turnStatus,

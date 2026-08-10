@@ -5496,6 +5496,24 @@ struct LiveToolExecutor: Sendable {
         return await execution.listTasks()
     }
 
+    /// Kill one owned background task — the tasks pane's `x` affordance
+    /// (B1-t), through the SAME owner-scoped execution `kill_task` uses, so
+    /// the pane can never signal a task the session does not own.
+    func killBackgroundTask(
+        sessionID: String,
+        workingDirectory: URL,
+        taskID: String
+    ) async -> Bool {
+        guard let execution = try? await composition.execution(
+            for: sessionID,
+            workingDirectory: workingDirectory
+        ) else { return false }
+        switch await execution.killTask(taskID) {
+        case .killed: return true
+        case .alreadyExited, .notFound: return false
+        }
+    }
+
     private static let runTerminalTool = ToolSpec(
         name: "run_terminal_cmd",
         description: "Run a validated shell command in the workspace with bounded output and cancellable process cleanup.",
@@ -7634,6 +7652,136 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func takePendingScreenModeRelaunch() -> (sessionID: String, minimal: Bool)? {
         defer { pendingScreenModeRelaunch = nil }
         return pendingScreenModeRelaunch
+    }
+
+    /// B1-t: the Ctrl+G tasks pane — nil = hidden. A full-width chrome band
+    /// (upstream's AgentPane::Tasks), coexisting with the composer; keys
+    /// route to it only while `focused`.
+    private var tasksPane: PagerTasksPaneState?
+    /// Bounded refresh while the pane is visible. Upstream rebuilds rows
+    /// every frame off actor-free state; this port's feeds are actors, so
+    /// the pane refreshes on open, on action, and on this once-a-second
+    /// tick — recorded divergence, cost: states up to ~1s stale.
+    private var tasksPaneRefresh: Task<Void, Never>?
+
+    private func isTasksPaneChord(_ key: KeyEvent) -> Bool {
+        guard key.modifiers.contains(.control) else { return false }
+        switch key.key {
+        case .char(let value): return String(value).lowercased() == "g"
+        default: return key.character.map { String($0).lowercased() } == "g"
+        }
+    }
+
+    /// Ctrl+G (`agent_view/input.rs:1230-1231`): closed → open focused;
+    /// open but unfocused → take focus; focused → close.
+    private func toggleTasksPane() async throws {
+        if tasksPane == nil {
+            tasksPane = PagerTasksPaneState(focused: true)
+            await refreshTasksPaneEntries()
+            armTasksPaneRefresh()
+        } else if tasksPane?.focused == false {
+            tasksPane?.focused = true
+        } else {
+            closeTasksPane()
+        }
+        try renderState()
+    }
+
+    private func closeTasksPane() {
+        tasksPane = nil
+        tasksPaneRefresh?.cancel()
+        tasksPaneRefresh = nil
+    }
+
+    private func armTasksPaneRefresh() {
+        tasksPaneRefresh?.cancel()
+        tasksPaneRefresh = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self else { return }
+                guard await self.tasksPaneIsVisible() else { return }
+                await self.refreshTasksPaneEntries()
+                await self.repaintForTasksPane()
+            }
+        }
+    }
+
+    private func tasksPaneIsVisible() -> Bool {
+        tasksPane != nil
+    }
+
+    private func repaintForTasksPane() {
+        try? renderState()
+    }
+
+    /// Rebuild the pane's entries from the same four feeds `/tasks` reads
+    /// (`presentTasksBlock`), preserving collapse and selection.
+    private func refreshTasksPaneEntries() async {
+        guard tasksPane != nil else { return }
+        var workflowViews: [RhaiWorkflowRunView] = []
+        if let workflowRegistry {
+            workflowViews = (try? await workflowRegistry.views()) ?? []
+        }
+        var subagents: [LiveSubagentSnapshot] = []
+        if let host = toolExecutor?.subagentHost {
+            for id in await host.knownSubagentIDs() {
+                if let snapshot = await host.subagentSnapshot(id: id) {
+                    subagents.append(snapshot)
+                }
+            }
+        }
+        let shellTasks = await toolExecutor?.backgroundTaskSnapshots(
+            sessionID: sessionID,
+            workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        ) ?? []
+        var scheduled: [ScheduledTaskInfo] = []
+        if let schedulerHost = toolExecutor?.schedulerHost {
+            scheduled = await schedulerHost.displayInfos()
+        }
+        tasksPane?.updateEntries(LiveTasksPane.entries(
+            workflows: workflowViews,
+            subagents: subagents,
+            tasks: shellTasks,
+            scheduled: scheduled
+        ))
+    }
+
+    /// The pane's `x` dispatch (`panes.rs:384-420`), each through its
+    /// backing; the workflow stop rides the slash dispatch exactly as
+    /// upstream's `SendSlashCommandPreservingDraft` does.
+    private func performTasksPaneAction(
+        _ action: PagerTaskPaneAction
+    ) async throws -> OpenGrokPagerInputRouting {
+        switch action {
+        case .killBgTask(let taskID):
+            let killed = await toolExecutor?.killBackgroundTask(
+                sessionID: sessionID,
+                workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
+                taskID: taskID
+            ) ?? false
+            if !killed {
+                note("Task \(taskID) had already exited.")
+            }
+        case .killSubagent(let subagentID):
+            if let host = toolExecutor?.subagentHost {
+                _ = await host.cancelSubagent(id: subagentID)
+            }
+        case .cancelScheduled(let taskID):
+            if let schedulerHost = toolExecutor?.schedulerHost {
+                _ = try? await schedulerHost.deleteTask(id: taskID)
+            }
+        case .stopWorkflow(let name):
+            // The command path owns confirmation and copy; preserve the
+            // user's draft exactly as upstream's dispatch does.
+            return .runCommand("/workflow stop \(name)")
+        case .copyBgTaskOutput:
+            // Unreachable until a clipboard seam exists — the builder never
+            // sets `copyAction` (recorded divergence, no OSC 52 channel).
+            break
+        }
+        await refreshTasksPaneEntries()
+        try renderState()
+        return .consumed
     }
 
     private var conversation = LivePagerConversationState(markdown: PagerMarkdownRenderer())
@@ -11871,6 +12019,36 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             if let welcomeRouting = try await handleWelcomeChord(key) {
                 return welcomeRouting
             }
+            // B1-t: Ctrl+G toggles the tasks pane (`ActionId::ToggleTasks`,
+            // `defaults.rs:44-55`) — a chrome band, so it must not fight an
+            // active modal, and minimal has no pane surface (upstream's
+            // Ctrl+G means external editor there; refusing quietly beats
+            // toggling state nothing paints).
+            if !overlays.isActive, minimalHost == nil, isTasksPaneChord(key) {
+                try await toggleTasksPane()
+                return .consumed
+            }
+            // A focused pane owns the keys the composer would otherwise get
+            // (`AgentPane::Tasks` routing, `agent_view/input.rs:1152`).
+            if var pane = tasksPane, pane.focused, !overlays.isActive {
+                let outcome = pane.handle(key)
+                tasksPane = pane
+                switch outcome {
+                case .redraw, .consumed:
+                    try renderState()
+                    return .consumed
+                case .close:
+                    closeTasksPane()
+                    try renderState()
+                    return .consumed
+                case .focusPrompt:
+                    tasksPane?.focused = false
+                    try renderState()
+                    return .consumed
+                case .action(let action):
+                    return try await performTasksPaneAction(action)
+                }
+            }
             guard overlays.isActive else { return .notHandled }
             switch overlays.handle(key, viewportHeight: overlayViewportHeight) {
             case .ignored:
@@ -12768,6 +12946,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 pendingKey: prompt.pendingConfirmationKey,
                 pendingLabel: prompt.pendingConfirmationLabel
             ),
+            tasksPane: tasksPane,
             scrollPosition: followsBottom ? .followTail : .offset(scrollOffset),
             theme: renderTheme,
             selectedBlockIndex: selection.index,
