@@ -1408,6 +1408,47 @@ per frame off actor-free state; the port's feeds are actors, so the pane
 refreshes on open, on action, and on a bounded tick while open — staleness
 cost recorded when it lands.
 
+**B1 finish-wave research (2026-08-10, three-agent Opus fan-out; reports at
+/tmp/b1-reports/{peek,state,actions}.md, consolidated rulings binding):**
+
+1. **CORRECTION — the B1-t "no clipboard channel" divergence was WRONG.** The
+   OSC 52 seam exists and is LIVE: `LivePagerClipboard.copy`
+   (`LiveScrollbackFocus.swift:386-394`) writes through the renderer sink, with
+   two live call sites (the scrollback selection copy and `/copy`//`/export`'s
+   deliver). The B1-t entry's divergence (1) is retired by this wave: the
+   pane's `y` copy is being wired. What remains true and recorded: OSC 52 is
+   the ONLY leg — no native pbcopy leg, no tmux-buffer leg, no
+   `last-copy.txt` backup, no CopyDelivery trust classification, so a
+   success toast over a terminal that ignores OSC 52 is upstream's
+   "Unverified" reported as success.
+2. **Dormant rows LAND.** Upstream's non-leader dashboard fills its roster
+   from the on-disk session list (`dashboard_local_sessions`, activity
+   `Dormant` → `Inactive` rows) — the port's `LiveSessionCatalog.list()` is
+   the same feed `/resume` uses, so on-disk sessions joining the roster is
+   PARITY, not invention. This grounds the `inactive` state and makes
+   `Grouping::Directory` real (per-session cwds). Dormant pins persist as
+   `top:<session_id>` keys — a recorded divergence from upstream's
+   roster-pins-are-ephemeral rule, correct here because the port's dormant
+   ids are local session ids `/resume` accepts.
+3. **Slices in flight (disjoint ownership, lead integrates/commits):** peek
+   band (selection-follows, no reply row/question mode/subagent peek —
+   deferred with reasons in the peek report), dashboard state machinery
+   (grouping/filter/pins/reorder/persistence in `[dashboard]` of
+   config.toml, closing the recorded `[dashboard].enabled` gap), tasks-pane
+   completions (`y` copy, Enter→viewer, `f` filter with `/` search
+   deferred — a `/` with hide semantics would teach upstream's `f` meaning
+   under upstream's `/` key), and close-row (`x`, lead-implemented).
+4. **Deferred with reasons (the actions report, verbatim rulings):**
+   dispatch-from-dashboard (requires the multi-agent map; a session-swapping
+   "dispatch" would destroy the live conversation); `/cd` + location picker
+   (blocked on dispatch — a landed `/cd` writes a value with zero readers,
+   the `ui.screen_mode` class; slots between `dashboard` and `theme` when it
+   lands); rename rows (needs an inline row editor the overlay layer lacks;
+   `/rename` covers the active session); row pins WITHOUT persistence are
+   the wrong half — they land WITH the persistence slice; the leader bridge
+   (honest NO: no roster wire types, no `x.ai/sessions/changed`, and leader
+   interactive builds a different renderer with no overlay stack).
+
 ### B1-t — the Ctrl+G tasks pane (serial gate: exit 0, 5,382 tests, 105 runs, zero issues, 2026-08-10)
 
 Lead-implemented, the grounded first slice per the research ruling.
