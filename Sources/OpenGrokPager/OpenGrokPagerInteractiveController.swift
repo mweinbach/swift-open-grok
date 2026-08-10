@@ -66,6 +66,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         /// submit uses, including the mid-turn deferral for history-rewriting
         /// commands.
         case command(String)
+        /// A dashboard dispatch/reply targeting a retained session tab.
+        case dispatch(sessionID: String, prompt: String)
+        /// A dashboard dispatch that creates a retained top-level session.
+        case dispatchNew(prompt: String, workingDirectory: String?)
         /// A scheduler fire enqueued a Cron prompt from outside the input
         /// loop. Idle, the loop must start the drain — the port of
         /// `maybe_drain_queue` after `enqueue_cron_prompt`
@@ -716,6 +720,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// the drain path is not a second, subtly different code path.
     private let promptQueue = PromptQueue(sessionId: "interactive")
     private var nextPromptSequence = 0
+    /// Cross-tab dashboard dispatches that arrived while a turn was active.
+    /// They run in arrival order after the active turn settles; the runtime
+    /// activates each retained session before its prompt is enqueued.
+    private enum DeferredDashboardDispatch: Sendable {
+        case existing(sessionID: String, prompt: String)
+        case new(prompt: String, workingDirectory: String?)
+    }
+
+    private var deferredSessionDispatches: [DeferredDashboardDispatch] = []
 
     /// Prompt history, oldest first. `historyIndex` is the browse cursor;
     /// `historySavedDraft` is the composer text stashed when browsing opened,
@@ -1065,6 +1078,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         guard !shutdownRequested else { throw OpenGrokPagerInteractiveError.shutdown }
 
         running = true
+        deferredSessionDispatches.removeAll(keepingCapacity: true)
         currentRequest = request
         activePagerMode = request.mode
         launchSessionID = request.sessionID
@@ -1108,6 +1122,21 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             // control signal resumes it, exactly as for an
                             // interrupt.
                             await mailbox.send(.control(.command(text)), priority: true)
+                            continue
+                        case .some(.dispatchPrompt(let sessionID, let prompt)):
+                            await mailbox.send(
+                                .control(.dispatch(sessionID: sessionID, prompt: prompt)),
+                                priority: true
+                            )
+                            continue
+                        case .some(.dispatchNew(let prompt, let workingDirectory)):
+                            await mailbox.send(
+                                .control(.dispatchNew(
+                                    prompt: prompt,
+                                    workingDirectory: workingDirectory
+                                )),
+                                priority: true
+                            )
                             continue
                         case .some(.notHandled), .none:
                             break
@@ -1260,6 +1289,26 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             // `SendSlashCommandPreservingDraft`.
                             try await emit(.promptChanged(promptState()))
                             await inputPumpGate.resume()
+                        }
+                    case .dispatch(let sessionID, let prompt):
+                        if let lifecycle = try await dispatchDashboardPrompt(
+                            sessionID: sessionID,
+                            prompt: prompt,
+                            request: request,
+                            mailbox: mailbox,
+                            inputPumpGate: inputPumpGate
+                        ) {
+                            outcome = lifecycle
+                        }
+                    case .dispatchNew(let prompt, let workingDirectory):
+                        if let lifecycle = try await dispatchNewDashboardPrompt(
+                            prompt: prompt,
+                            workingDirectory: workingDirectory,
+                            request: request,
+                            mailbox: mailbox,
+                            inputPumpGate: inputPumpGate
+                        ) {
+                            outcome = lifecycle
                         }
                     case .cronEnqueued:
                         // A scheduler fire queued a Cron prompt while idle;
@@ -1735,6 +1784,42 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             try await emit(.promptChanged(promptState()))
                             await inputPumpGate.resume()
                         }
+                    case .dispatch(let sessionID, let prompt):
+                        let target = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !target.isEmpty, !text.isEmpty else {
+                            try await emit(.notice("dashboard reply cannot be empty"))
+                            await inputPumpGate.resume()
+                            break
+                        }
+                        let current = activeSessionID ?? lastSessionID ?? request.sessionID
+                        if current == target {
+                            try await enqueue(text)
+                        } else {
+                            deferredSessionDispatches.append(.existing(
+                                sessionID: target,
+                                prompt: text
+                            ))
+                            try await emit(.notice(
+                                "Queued dashboard reply for \(target); it will run when this turn finishes."
+                            ))
+                        }
+                        await inputPumpGate.resume()
+                    case .dispatchNew(let prompt, let workingDirectory):
+                        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !text.isEmpty else {
+                            try await emit(.notice("dashboard dispatch cannot be empty"))
+                            await inputPumpGate.resume()
+                            break
+                        }
+                        deferredSessionDispatches.append(.new(
+                            prompt: text,
+                            workingDirectory: workingDirectory
+                        ))
+                        try await emit(.notice(
+                            "Queued dashboard dispatch; it will start when this turn finishes."
+                        ))
+                        await inputPumpGate.resume()
                     case .cronEnqueued:
                         // Mid-turn a cron entry just waits its turn in the
                         // queue; the completion arm's `.drainNext` starts it
@@ -1912,6 +1997,27 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         inputPumpGate: InputPumpGate
     ) async throws -> OpenGrokPagerInteractiveLifecycle? {
         while true {
+            if await promptQueue.count == 0,
+               let dispatch = deferredSessionDispatches.first {
+                deferredSessionDispatches.removeFirst()
+                switch dispatch {
+                case .existing(let sessionID, let prompt):
+                    let activated = try await activateStoredSession(
+                        sessionID: sessionID,
+                        clearQueue: false
+                    )
+                    guard activated else { continue }
+                    try await enqueue(prompt)
+                case .new(let prompt, let workingDirectory):
+                    let replaced = try await replaceSession(
+                        request: request,
+                        workingDirectory: workingDirectory,
+                        clearQueue: false
+                    )
+                    guard replaced else { continue }
+                    try await enqueue(prompt)
+                }
+            }
             let entry: QueueEntryMeta
             do {
                 entry = try await promptQueue.beginNext()
@@ -3761,6 +3867,38 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// need no clear here: the session-side buffer only holds entries while
     /// a turn runs, and both swaps happen from the idle loop.)
     private func resumeStoredSession(sessionID: String) async throws {
+        _ = try await activateStoredSession(sessionID: sessionID, clearQueue: true)
+    }
+
+    @discardableResult
+    private func replaceSession(
+        request: OpenGrokPagerRequest,
+        workingDirectory: String?,
+        clearQueue: Bool
+    ) async throws -> Bool {
+        let newSessionID: String
+        do {
+            newSessionID = try await runtime.replaceSession(
+                from: request,
+                workingDirectory: workingDirectory
+            )
+        } catch {
+            try await emit(.notice("Could not create dashboard session: \(error)"))
+            return false
+        }
+        lastSessionID = newSessionID
+        activeSessionID = nil
+        editor.reset()
+        if clearQueue { await promptQueue.removeAll() }
+        try await emit(.sessionReplaced(sessionID: newSessionID))
+        return true
+    }
+
+    @discardableResult
+    private func activateStoredSession(
+        sessionID: String,
+        clearQueue: Bool
+    ) async throws -> Bool {
         let resumedID: String
         do {
             resumedID = try await runtime.resumeSession(sessionID: sessionID)
@@ -3768,13 +3906,72 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             try await emit(.notice(
                 "Could not resume session \(sessionID): \(String(describing: error))"
             ))
-            return
+            return false
         }
         lastSessionID = resumedID
         activeSessionID = nil
         editor.reset()
-        await promptQueue.removeAll()
+        if clearQueue { await promptQueue.removeAll() }
         try await emit(.sessionResumed(sessionID: resumedID))
+        return true
+    }
+
+    private func dispatchDashboardPrompt(
+        sessionID: String,
+        prompt: String,
+        request: OpenGrokPagerRequest,
+        mailbox: SignalMailbox,
+        inputPumpGate: InputPumpGate
+    ) async throws -> OpenGrokPagerInteractiveLifecycle? {
+        let target = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty, !text.isEmpty else {
+            try await emit(.notice("dashboard reply cannot be empty"))
+            await inputPumpGate.resume()
+            return nil
+        }
+        let current = lastSessionID ?? request.sessionID
+        if current != target {
+            guard try await activateStoredSession(sessionID: target, clearQueue: true) else {
+                await inputPumpGate.resume()
+                return nil
+            }
+        }
+        try await enqueue(text)
+        return try await drainQueue(
+            request: request,
+            mailbox: mailbox,
+            inputPumpGate: inputPumpGate
+        )
+    }
+
+    private func dispatchNewDashboardPrompt(
+        prompt: String,
+        workingDirectory: String?,
+        request: OpenGrokPagerRequest,
+        mailbox: SignalMailbox,
+        inputPumpGate: InputPumpGate
+    ) async throws -> OpenGrokPagerInteractiveLifecycle? {
+        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            try await emit(.notice("dashboard dispatch cannot be empty"))
+            await inputPumpGate.resume()
+            return nil
+        }
+        guard try await replaceSession(
+            request: request,
+            workingDirectory: workingDirectory,
+            clearQueue: true
+        ) else {
+            await inputPumpGate.resume()
+            return nil
+        }
+        try await enqueue(text)
+        return try await drainQueue(
+            request: request,
+            mailbox: mailbox,
+            inputPumpGate: inputPumpGate
+        )
     }
 
     /// `/copy [N] [file]` — `N` is 1-based and counts back from the newest

@@ -32,6 +32,16 @@ enum LiveRecap {
     /// grow it without an upstream citation.
     static let automaticCodexAuxModel = "gpt-5.6-terra"
 
+    /// Recap budgeting is capped at the verified product-backend input window.
+    /// Smaller explicit windows still win (`session_recap.rs:93-107`).
+    static let contextWindowCap: UInt64 = 500_000
+    static let budgetThresholdPercent: UInt64 = 85
+    static let budgetHeadroomTokens: UInt64 = 4_000
+
+    private static let bytesPerToken: UInt64 = 4
+    private static let imageTokenEstimate: UInt64 = 765
+    private static let truncationMarkerReserve = 64
+
     // MARK: - Instruction
 
     /// The instruction turn appended to the conversation snapshot. BYTE-EXACT
@@ -67,7 +77,7 @@ enum LiveRecap {
     // MARK: - Snapshot construction
 
     /// Prepare the conversation snapshot for a recap request
-    /// (`build_recap_items`, `session_recap.rs:62-91`):
+    /// (`budget_recap_items`, `session_recap.rs:93-164`):
     ///
     /// 1. Optionally strip reasoning items (`stripReasoning`) — only needed on
     ///    the Anthropic Messages backend, which rejects thinking blocks sent
@@ -77,25 +87,302 @@ enum LiveRecap {
     /// 2. Truncate a trailing incomplete assistant/tool-result run — a recap
     ///    can fire mid-turn, and the appended instruction must never follow a
     ///    dangling tool call or output.
-    /// 3. Append the recap instruction as a final REAL user turn
+    /// 3. When the unmodified snapshot exceeds the recap budget, strip
+    ///    reasoning, normalize the trailing boundary, retain the newest items
+    ///    in their original order, and truncate one oversized retained item in
+    ///    place rather than returning an empty snapshot.
+    /// 4. Append the recap instruction as a final REAL user turn
     ///    (`ConversationItem::user`, synthetic reason nil — session_recap.rs:89).
-    ///
-    /// The over-budget front-trim of `budget_recap_items`
-    /// (`session_recap.rs:127-164`) is deliberately not ported: this port's
-    /// sessions auto-compact at the same 85% threshold before every sample, so
-    /// the snapshot a recap reads is already held under the wall; a degenerate
-    /// overflow fails the side-call and paints the failure copy instead.
     static func buildItems(
         conversation: [ConversationItem],
         tag: String,
+        stripReasoning: Bool,
+        contextWindow: UInt64 = contextWindowCap
+    ) -> [ConversationItem] {
+        let instructionItem = ConversationItem.user(instruction(tag: tag))
+        let snapshotBudget = snapshotBudget(
+            instruction: instructionItem,
+            contextWindow: contextWindow
+        )
+
+        // The unstripped estimate is an upper bound. Staying on this path keeps
+        // the provider prefix byte-for-byte identical when the snapshot fits.
+        if estimateConversationTokens(conversation) <= snapshotBudget {
+            return buildUnbudgetedItems(
+                conversation: conversation,
+                instruction: instructionItem,
+                stripReasoning: stripReasoning
+            )
+        }
+
+        // Once front-trimming loses prefix-cache identity, reasoning is always
+        // removed, including on providers that accept it (`session_recap.rs:120-123`).
+        var snapshot = conversation.filter {
+            if case .reasoning = $0 { return false }
+            return true
+        }
+        popTrailingToolRun(&snapshot)
+        var items = fitConversationToBudget(snapshot, maxTokens: snapshotBudget)
+        items.append(instructionItem)
+        return items
+    }
+
+    private static func buildUnbudgetedItems(
+        conversation: [ConversationItem],
+        instruction: ConversationItem,
         stripReasoning: Bool
     ) -> [ConversationItem] {
         var items = stripReasoning
             ? conversation.filter { if case .reasoning = $0 { return false } else { return true } }
             : conversation
         popTrailingToolRun(&items)
-        items.append(.user(instruction(tag: tag)))
+        items.append(instruction)
         return items
+    }
+
+    static func promptBudget(contextWindow: UInt64) -> UInt64 {
+        let effectiveWindow = min(contextWindow, contextWindowCap)
+        let threshold = effectiveWindow * budgetThresholdPercent / 100
+        return threshold >= budgetHeadroomTokens ? threshold - budgetHeadroomTokens : 0
+    }
+
+    static func snapshotBudget(tag: String, contextWindow: UInt64) -> UInt64 {
+        snapshotBudget(
+            instruction: .user(instruction(tag: tag)),
+            contextWindow: contextWindow
+        )
+    }
+
+    private static func snapshotBudget(
+        instruction: ConversationItem,
+        contextWindow: UInt64
+    ) -> UInt64 {
+        let promptBudget = promptBudget(contextWindow: contextWindow)
+        let instructionTokens = estimateItemTokens(instruction)
+        return promptBudget >= instructionTokens ? promptBudget - instructionTokens : 0
+    }
+
+    static func estimateConversationTokens(_ items: [ConversationItem]) -> UInt64 {
+        items.reduce(0) { $0 + estimateItemTokens($1) }
+    }
+
+    private static func estimateItemTokens(_ item: ConversationItem) -> UInt64 {
+        switch item {
+        case .system(let system):
+            return UInt64(system.content.utf8.count) / bytesPerToken
+        case .user(let user):
+            return estimateContentParts(user.content)
+        case .assistant(let assistant):
+            let bytes = assistant.content.utf8.count
+                + assistant.toolCalls.reduce(0) { $0 + $1.arguments.utf8.count }
+            return UInt64(bytes) / bytesPerToken
+        case .toolResult(let result):
+            if result.orderedContent.isEmpty {
+                return UInt64(result.content.utf8.count) / bytesPerToken
+            }
+            return estimateOrderedContent(result.orderedContent)
+        case .customToolOutput(let output):
+            return estimateOrderedContent(output.content)
+        case .backendToolCall(let call):
+            return UInt64(call.estimatedContentLen()) / bytesPerToken
+        case .reasoning(let reasoning):
+            let bytes = reasoningItemText(reasoning).utf8.count
+                + (reasoning.encryptedContent?.utf8.count ?? 0)
+            return UInt64(bytes) / bytesPerToken
+        }
+    }
+
+    private static func estimateContentParts(_ parts: [ContentPart]) -> UInt64 {
+        var bytes = 0
+        var images: UInt64 = 0
+        for part in parts {
+            switch part {
+            case .text(let text): bytes += text.utf8.count
+            case .image: images += 1
+            }
+        }
+        return UInt64(bytes) / bytesPerToken + images * imageTokenEstimate
+    }
+
+    private static func estimateOrderedContent(
+        _ content: [CustomToolOutputContent]
+    ) -> UInt64 {
+        var bytes = 0
+        var images: UInt64 = 0
+        for part in content {
+            switch part {
+            case .text(let text): bytes += text.utf8.count
+            case .image: images += 1
+            }
+        }
+        return UInt64(bytes) / bytesPerToken + images * imageTokenEstimate
+    }
+
+    private static func fitConversationToBudget(
+        _ conversation: [ConversationItem],
+        maxTokens: UInt64
+    ) -> [ConversationItem] {
+        guard estimateConversationTokens(conversation) > maxTokens else { return conversation }
+
+        var head: [ConversationItem] = []
+        var body = conversation
+        if let first = body.first, case .system = first {
+            head.append(body.removeFirst())
+        }
+
+        let headTokens = estimateConversationTokens(head)
+        let budget = maxTokens >= headTokens ? maxTokens - headTokens : 0
+        var remaining = budget
+        var start = body.count
+        if !body.isEmpty {
+            for index in stride(from: body.count - 1, through: 0, by: -1) {
+                let cost = estimateItemTokens(body[index])
+                guard cost <= remaining else { break }
+                remaining -= cost
+                start = index
+            }
+        }
+
+        while start < body.count, isToolOutput(body[start]) {
+            start += 1
+        }
+        if start < body.count {
+            head.append(contentsOf: body[start...])
+        } else {
+            head.append(contentsOf: recoverTruncatedTailUnit(body, budget: budget))
+        }
+        return head
+    }
+
+    private static func isToolOutput(_ item: ConversationItem) -> Bool {
+        switch item {
+        case .toolResult, .customToolOutput: true
+        default: false
+        }
+    }
+
+    private static func recoverTruncatedTailUnit(
+        _ input: [ConversationItem],
+        budget: UInt64
+    ) -> [ConversationItem] {
+        var body = input
+        var results: [ConversationItem] = []
+        while let last = body.last, isToolOutput(last) {
+            results.append(body.removeLast())
+        }
+        results.reverse()
+
+        guard !results.isEmpty else {
+            guard let item = body.popLast() else { return [] }
+            return [truncateItem(item, maxTokens: budget)]
+        }
+
+        let owner: ConversationItem?
+        if let last = body.last,
+           case .assistant(let assistant) = last,
+           !assistant.toolCalls.isEmpty {
+            owner = body.removeLast()
+        } else {
+            owner = nil
+        }
+        let ownerCost = owner.map(estimateItemTokens) ?? 0
+        let resultBudget = budget >= ownerCost ? budget - ownerCost : 0
+        let perResult = max(resultBudget / UInt64(results.count), 1)
+        var unit = owner.map { [$0] } ?? []
+        unit.append(contentsOf: results.map { truncateItem($0, maxTokens: perResult) })
+        return unit
+    }
+
+    private static func truncateItem(
+        _ item: ConversationItem,
+        maxTokens: UInt64
+    ) -> ConversationItem {
+        let maxBytes = Int(clamping: maxTokens * bytesPerToken)
+        switch item {
+        case .toolResult(var result):
+            if result.orderedContent.isEmpty {
+                if let truncated = truncateText(result.content, maxBytes: maxBytes) {
+                    result.content = truncated
+                }
+            } else {
+                result.orderedContent = truncateOrderedContent(
+                    result.orderedContent,
+                    maxTokens: maxTokens
+                )
+                result.content = result.orderedContent.compactMap { part in
+                    if case .text(let text) = part { return text }
+                    return nil
+                }.joined()
+            }
+            return .toolResult(result)
+        case .customToolOutput(var output):
+            output.content = truncateOrderedContent(output.content, maxTokens: maxTokens)
+            return .customToolOutput(output)
+        case .assistant(var assistant):
+            if let truncated = truncateText(assistant.content, maxBytes: maxBytes) {
+                assistant.content = truncated
+            }
+            return .assistant(assistant)
+        case .user(var user):
+            user.content = user.content.map { part in
+                guard case .text(let text) = part,
+                      let truncated = truncateText(text, maxBytes: maxBytes)
+                else { return part }
+                return .text(text: truncated)
+            }
+            return .user(user)
+        default:
+            return item
+        }
+    }
+
+    private static func truncateOrderedContent(
+        _ content: [CustomToolOutputContent],
+        maxTokens: UInt64
+    ) -> [CustomToolOutputContent] {
+        var remainingUnits = maxTokens * bytesPerToken
+        let imageUnits = imageTokenEstimate * bytesPerToken
+        var retained: [CustomToolOutputContent] = []
+
+        for part in content {
+            switch part {
+            case .text(let text):
+                let textUnits = UInt64(text.utf8.count)
+                if textUnits <= remainingUnits {
+                    remainingUnits -= textUnits
+                    retained.append(part)
+                    continue
+                }
+                let availableBytes = Int(clamping: remainingUnits)
+                if availableBytes > 0 {
+                    retained.append(.text(text: truncateText(
+                        text,
+                        maxBytes: availableBytes
+                    ) ?? text))
+                }
+                return retained
+            case .image:
+                guard imageUnits <= remainingUnits else { return retained }
+                remainingUnits -= imageUnits
+                retained.append(part)
+            }
+        }
+        return retained
+    }
+
+    private static func truncateText(_ text: String, maxBytes: Int) -> String? {
+        let bytes = Array(text.utf8)
+        guard bytes.count > maxBytes else { return nil }
+
+        let keep = max(0, maxBytes - truncationMarkerReserve)
+        let prefix = floorToScalarBoundary(text, maxBytes: keep)
+        let dropped = bytes.count - prefix.utf8.count
+        let withMarker = prefix
+            + "\n[... truncated \(dropped) bytes to fit the compaction window ...]"
+        if withMarker.utf8.count <= maxBytes {
+            return withMarker
+        }
+        return floorToScalarBoundary(text, maxBytes: maxBytes)
     }
 
     /// Pop a trailing tool run — trailing `toolResult`s, native

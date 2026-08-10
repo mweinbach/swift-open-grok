@@ -1,12 +1,98 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B1 cleanup hardening complete: deterministic live controller/renderer reachability now covers dashboard open/hydration, state mutations, search, peek, close/delete persistence, and dismissal; final serial gate exit 0, **5,544 tests across 105 runs, zero issues**. B1 and B6 remain CLOSED; Wave 19 is next.)
+**As of:** 2026-08-10 (Wave 19 deferred-parity batch complete: dashboard dispatch, working-directory/location flows, rename, subagent peek/completed attach, question/reply actions, worktree launch, search, and the typed leader roster bridge are live; seven broader audit slices also landed. The authoritative serial gate exited 0 with **4,982 Swift Testing cases across 73 nonempty summaries**, 105 XCTest harness launches with zero legacy XCTest cases, and zero issues.)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
 **Fixture pin:** `ProtocolFixtures/` was re-evaluated against `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` on 2026-08-08, with `70002584da34e4c37ea14a3bce35341b7d04f9a7` recorded as the immediate previous revision. The `.58` delta touched no fixture family's upstream source (every family's `referenceSources` diff across `70002584..650c1db7`, including `Cargo.lock` and the telemetry/tracing surfaces, verified empty by the lead), so the only recaptures are the two release-stamped artifacts (CLI version fixture and the GCRX sample, both restamped `0.1.220-open-grok.58` — the GCRX golden by same-length in-place substitution at offset 32); unchanged families carry explicit `70002584..650c1db7` diff evidence.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
+
+## Wave 19 — Deferred parity follow-ons (2026-08-10, complete)
+
+**Scope.** Re-audited the named Wave 18 deferrals against pinned Rust commit
+`650c1db7` and implemented every behavior that had a safe live seam, then used the
+same GPT-5.6 Sol batch to rank fifty additional gaps and land seven independent
+buildable-now slices. The audit artifact is
+`.opengrok/swarm-handoffs/deferred-audit.md`.
+
+### Dashboard dispatch and retained rows
+
+The dashboard now keeps live session handles instead of rebuilding tabs on every
+selection, so a selected session can accept a new prompt or a reply and can be left
+and restored without losing its active controller. This follows the upstream
+dispatch/new-session split (`app/dispatch/dashboard.rs:1130,1179,1191`). `/cd`, typed
+`SetWorkingDir`, and Ctrl+L location selection converge on the same validated
+working-directory mutation (`slash/commands/cd.rs:1,37,44` and
+`app/dispatch/dashboard.rs:779,888`); Ctrl+R provides inline rename
+(`app/dispatch/dashboard.rs:1852`); Ctrl+W routes through the real worktree launch
+path (`app/dispatch/dashboard.rs:594,682,972,1179`); and Ctrl+/ is the distinct
+dashboard search mode while literal `/` remains prompt editing
+(`views/dashboard/state.rs:442,1635,3527,3661`).
+
+Subagent rows now paint live status and output, support peek, and attach when the
+child has a persisted/resumable session; a still-running child refuses attach
+because the Swift child runner does not yet own a durable session record. Reply and
+single/freeform question resolution are live (`app/dispatch/dashboard.rs:1741,1764,
+1807,2519`); multiselect stays in the attached session view rather than fabricating
+dashboard semantics. The prior "wide-layout side-panel peek" deferral is retired:
+the pinned Rust dashboard uses vertical layout only (`views/dashboard/layout.rs:223`).
+
+### Typed leader bridge
+
+`OpenGrokACPRuntime` now defines the typed `x.ai/sessions/list` snapshot and
+`x.ai/sessions/changed` lifecycle delta, publishes input/working/idle state changes,
+fans them out only over leader IPC, and exposes a client stream. Interactive leader
+mode starts directly in the dashboard, preserves remote activity states, applies
+snapshot/delta repaint, and resumes the selected remote session in its recorded
+working directory. This ports the roster protocol and lifecycle shapes from
+`xai-grok-shell/src/agent/roster.rs:1,20,43,52,79,85,94` and the leader fanout from
+`xai-grok-shell/src/leader/server.rs:391,6277`. Windows named-pipe leader transport
+remains open; this wave does not weaken the Windows refusal.
+
+### Broader audited closures
+
+- **Settings/profile honesty:** live settings now hide or gate unsupported voice,
+  Antigravity, auto-permission, dream, and LSP choices; built-in agent profiles no
+  longer advertise absent `search_tool`, `use_tool`, `image_to_video`,
+  `reference_to_video`, or `lsp` handlers. The taxonomy remains reserved for future
+  implementations. Rust behavior anchors include `voice/mod.rs:10-16,30-33`,
+  `permission/auto_mode.rs:301-312`, `memory/src/dream.rs:32-40,114`,
+  `agent_ops.rs:4474-4504`, and `builder.rs:2243-2261`.
+- **MCP OAuth recovery/revoke:** the browser flow polls the owner-only credential
+  file inside the callback timeout, a recovered credential re-probes and registers
+  the live client, and delete performs best-effort RFC 7009 revoke followed by
+  authoritative local deletion and live teardown (`extensions/mcp/oauth.rs:27-37,
+  387-485`; `credentials.rs:291-300,392-406`). Scope-upgrade consent remains open.
+- **Recap budget:** over-budget recap input now deterministically applies the
+  500k-window, 85% threshold, and 4k headroom; strips reasoning/tool tails first;
+  preserves the newest suffix; and marks a truncated retained item
+  (`session/helpers/session_recap.rs:93-164`,
+  `xai-chat-state/src/compaction_utils.rs:206-390`). Remote-settings and automatic
+  watermark scheduling remain separate work.
+- **Windows command lookup:** production shell resolution now honors PATHEXT order
+  and executable suffixes (`xai-grok-config/src/shell.rs:230,239,521`). Windows host
+  execution and COMSPEC/CreateProcess quoting still need platform evidence.
+- **Packed Git phase 1:** pack index v2 lookup, bounded non-delta inflate, checksum,
+  OID, and object-size validation are live; OFS_DELTA/REF_DELTA objects refuse with a
+  typed error rather than misreading data. Upstream delegates the complete behavior
+  to gix (`xai-fast-worktree/src/git/status.rs:31,57-59`).
+- **Docs helpers:** how-to lookup and versioned atomic user-guide extraction now exist
+  (`xai-grok-pager/src/docs.rs:48,171,192,208,227,241`). Startup auto-extraction is
+  intentionally still open until the helper has a production lifecycle owner.
+
+### Verification snapshot
+
+| Command / proof | Outcome |
+|---|---|
+| Dashboard follow-on focused suites | Exit 0; 62 tests. |
+| Leader roster/protocol/composition focused suites | Exit 0; 31 tests, plus the post-integration stdio/wire/live-host regressions. |
+| MCP OAuth/revoke focused suites | Exit 0; 21 + 13 + 4 tests. |
+| Git pack / Windows PATHEXT / docs helper focused suites | Exit 0; 28 / 6 / 4 + 17 tests. |
+| `zsh workflows/swift-safe-verify.zsh build-tests` | Exit 0. |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | **Exit 0**; 4,982 Swift Testing cases across 73 nonempty summaries; 105 XCTest harness launches, zero legacy XCTest cases; zero issues. |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | Exit 0. |
+| `control-open-grok` baseline map | All version, paths, help, models, and empty-session entry points passed against `/tmp/open-grok-verify-20260810-161948-49821`; the unknown-help negative control exited 2 as expected, evidence was retained, and the isolated home was removed. |
 
 ## Wave 15 — Slash-command parity batch (2026-08-07, in progress)
 
@@ -674,12 +760,13 @@ instruction pins, byte-exact Scheduled rows, controller Cron semantics (idle dra
 metadata, mid-turn wait, both de-dup guards), and the end-to-end fire → drain → real
 shell turn → on-disk `.schedulerFired` persistence.
 
-**Deferred, deliberately (each cited in-source):** Detached loop-subagent fires and the
+**Deferred at this slice, deliberately (each cited in-source):** Detached loop-subagent fires and the
 `[scheduler] background_loops` config reader (wiring the key now would give it a parse
 with no behavioral reader — §3; `/loop` pins `.inSession` and the instruction describes
 the runtime the user actually has), the `monitor` tool (rows all render "Task"),
 scheduler persistence/durable removal (`durable: true` is stored but dies with the
-session — user-facing cost recorded), and headless/ACP/leader scheduler surfaces.
+session — user-facing cost recorded; closed later in E23), and headless/ACP/leader
+scheduler surfaces.
 
 **Recorded divergences:** single-process store (no `ScheduledTaskCreated/Fired/Removed`
 notification hop — nothing would consume it; a future ACP scheduler adds it); fires wait
@@ -872,7 +959,7 @@ rate-limit auto-kill stops the pipeline but not the process (upstream's own beha
 the pin); monitor output files under the port's session folder root; sorted JSON keys
 and v4 lowercase ids (shared cosmetics).
 
-**Still deferred, deliberately:** scheduler persistence / durable removal (`durable:
+**Still deferred at this slice, deliberately:** scheduler persistence / durable removal (`durable:
 true` parses and stores but dies with the session — the occurrence journal and
 durable-removal barriers are unported); headless/ACP scheduler + monitor surfaces;
 `TaskCompleted` auto-wake (pre-existing background-task deferral — a monitor's natural
@@ -1765,13 +1852,14 @@ initial cursor landing on a session row rather than its header. The old
 "no cheap harness" caveat is superseded by the cleanup suite below; the pure
 state/overlay tests remain useful as the narrower failure-localization layer.
 
-**The B1 program closes with these deferrals standing, each with its
-recorded reason (finish-wave rulings):** dispatch-from-dashboard (needs the
-multi-agent map), `/cd` + location picker (blocked on dispatch), rename
-rows (no inline row editor), subagent peek/attach, the peek reply
-row/question mode, the wide-layout side-panel peek, the worktree dialog,
-`/` Search as a separate key, and the leader bridge (honest NO — no roster
-wire types, no overlay stack in leader interactive).
+**Superseded by Wave 19:** the B1 finish-wave deferrals no longer stand. Retained
+dispatch/replies, `/cd` + `SetWorkingDir` + Ctrl+L location selection, Ctrl+R
+rename, subagent peek and completed/persisted attach, reply plus single/freeform
+question handling, Ctrl+W worktree launch, Ctrl+/ search, and the typed leader
+bridge are live. Remaining honest boundaries are running-subagent attach (no
+durable resumable child record) and dashboard multiselect question resolution
+(use the attached session view). The alleged wide side peek is not present in
+the pinned Rust layout and is retired rather than implemented.
 
 ### B1 cleanup hardening — live renderer reachability (serial gate: exit 0, 5,544 tests, 105 runs, zero issues, 2026-08-10)
 
@@ -2506,10 +2594,10 @@ research found advertising a hole, quoted from the landed tree):
 **B2 final state:** W1-W4 (welcome program), S1 (config reader), N
 (insertBefore), M1 (pure commit pipeline), M2 (paint path), M3 (live tail +
 viewport sizing), M4 (the live minimal frontend), S2 (switchers + relaunch).
-Deferred remainders, all recorded in their slices: the todo//btw//panel//
-plan//full_view//auth minimal modules, the Ctrl+E chord, the flat live-region
-stance, upstream's renderer-dependent tests with no port ground, and the
-Windows exec emulation.
+Deferred remainders at the B2 close, all recorded in their slices: the
+todo//btw//panel//plan//full_view//auth minimal modules, the Ctrl+E chord (closed
+immediately below), the flat live-region stance, upstream's renderer-dependent
+tests with no port ground, and the Windows exec emulation.
 
 ### B2 follow-up — `/expand` + the minimal Ctrl+E chord (serial gate: exit 0, 5,370 tests, 105 runs, zero issues, 2026-08-10)
 
@@ -2821,8 +2909,8 @@ with per-unit full-suite gates and lead review of every diff. Reference pin unch
   carry the owning turn's generation; stale ones are ignored.
 - **Ledger correction:** the Wave 13 line "queued prompts / steering … live since Wave 3"
   (L103-104) overclaimed for steering. The queue was live; mid-turn steering was
-  next-prompt-buffering until this wave, and true mid-turn injection into a RUNNING turn still
-  does not exist (upstream's soft `x.ai/interject` remains open).
+  next-prompt-buffering until this wave. E5 later closed the remaining true mid-turn
+  injection gap with the live `x.ai/interject` buffer/drain seam.
 
 ### `/always-approve` (commit 83d1e39)
 
@@ -2977,17 +3065,16 @@ this list when their readers landed — rows registered, audited 2026-08-10.)
 
 ### Still absent / deliberately deferred (the roadmap's remaining waves)
 
-**Corrected 2026-08-10 after the B1/B6 closure cleanup** (the prior list had
+**Corrected 2026-08-10 after the Wave 19 deferred batch** (the prior list had
 again gone stale). Native scrollback + the minimal frontend, TUI suspend/restore,
-in-pager `/login`, MCP OAuth + credential store, the subagent/collaboration stack,
-the tasks pane, in-pager `/dashboard` roster/navigation, and the context-bar hover
-widget are LIVE per their wave records. Remaining open: the deliberately deferred
-B1 follow-ons (dashboard dispatch/replies, `/cd` + `SetWorkingDir` + location
-picker, rename rows, subagent peek/attach, peek reply/question mode, wide side
-peek, worktree dialog, separate bare `/` search, leader bridge); hidden settings
-rows above that still lack renderer readers; xAI browser-OAuth in-TUI login;
-upstream's soft `x.ai/interject` seam (send-now is live; true mid-turn injection
-is not); voice live seam (B7); media overlays (B10); video tools; LSP;
+in-pager `/login`, MCP OAuth + credential store/recovery/revoke, the
+subagent/collaboration stack, the tasks pane, dashboard dispatch/navigation and
+working-directory/rename/worktree/search actions, the typed leader roster bridge,
+and the context-bar hover widget are LIVE per their wave records. Remaining B1
+limits are attach to a still-running subagent and dashboard-native multiselect
+question resolution; the former wide-side-peek item was not in pinned Rust.
+Other remaining work: hidden settings rows above that still lack renderer readers;
+voice live seam (B7); media overlays (B10); video tools; LSP;
 `search_tool`/`use_tool` meta-discovery; foreign-session scan/resume; memory
 embeddings + dream; auto-mode LLM permission classifier; Computer Hub MCP adapter
 wiring; Code Mode V8 hard-interrupt/module-loader debt; PTY-backed
@@ -2997,7 +3084,9 @@ allowlist, `GROK_*` env-gate table, `features.*` resolver); signed share
 upload/export clients; and the standing platform/evidence gaps (capable-Linux
 sandbox proof, Windows named-pipe leader IPC + S2 exec emulation, portable secure
 WebSockets, Linux custom-CA installation, and post-change Linux/Windows CI plus
-required-check evidence). See `PARITY_ROADMAP.md` for the current long-tail list.
+required-check evidence). Packed Git delta resolution, docs-helper startup wiring,
+recap remote/automatic policy, MCP OAuth scope-upgrade consent, and Windows COMSPEC
+launch semantics also remain. See `PARITY_ROADMAP.md` for the current long-tail list.
 
 ## Wave 12 — Meta provider catch-up, re-pin to 70002584, and fundamentals closures (2026-08-06)
 

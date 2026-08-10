@@ -149,11 +149,28 @@ enum LiveDashboardPeek {
         activeItems: [PagerConversationItem],
         activeLastActivity: Date? = nil,
         turnActivity: String?,
+        subagentStatuses: [String: String] = [:],
+        subagentHints: [String: String] = [:],
+        replyRowID: String? = nil,
+        replyDraft: String? = nil,
+        questionPrompt: String? = nil,
+        questionOptions: [String] = [],
+        questionSelectedIndex: Int? = nil,
+        questionFreeformText: String = "",
+        questionFreeformFocused: Bool = false,
+        questionRequiresAttach: Bool = false,
         now: Date = Date()
     ) -> PagerDashboardPeek? {
-        guard rowID.hasPrefix(LiveDashboardOverlay.attachPrefix) else { return nil }
-        let sessionID = String(rowID.dropFirst(LiveDashboardOverlay.attachPrefix.count))
+        let sessionID: String
+        if rowID.hasPrefix(LiveDashboardOverlay.attachPrefix) {
+            sessionID = String(rowID.dropFirst(LiveDashboardOverlay.attachPrefix.count))
+        } else if rowID.hasPrefix(LiveDashboardOverlay.subagentPrefix) {
+            sessionID = String(rowID.dropFirst(LiveDashboardOverlay.subagentPrefix.count))
+        } else {
+            return nil
+        }
         guard !sessionID.isEmpty else { return nil }
+        let draft = replyRowID == rowID ? replyDraft : nil
 
         if sessionID == activeSessionID {
             return PagerDashboardPeek(
@@ -162,14 +179,39 @@ enum LiveDashboardPeek {
                     from: activeLastActivity ?? cache.lastActivity[sessionID],
                     now: now
                 ),
-                items: activeItems
+                items: activeItems,
+                replyDraft: draft,
+                questionPrompt: questionPrompt,
+                questionOptions: questionOptions,
+                questionSelectedIndex: questionSelectedIndex,
+                questionFreeformText: questionFreeformText,
+                questionFreeformFocused: questionFreeformFocused,
+                questionRequiresAttach: questionRequiresAttach
             )
         }
-        guard let items = cache.items[sessionID] else { return nil }
+        let childStatus = subagentStatuses[sessionID].map { status in
+            switch status {
+            case "running": return "Working"
+            case "failed", "cancelled", "canceled", "error": return "Failed"
+            default: return "Completed"
+            }
+        }
+        guard let items = cache.items[sessionID] else {
+            guard let childStatus else { return nil }
+            return PagerDashboardPeek(
+                statusLabel: childStatus,
+                items: [],
+                emptyHint: subagentHints[sessionID].flatMap { $0.isEmpty ? nil : $0 }
+                    ?? (childStatus == "Working"
+                        ? "Subagent is still running; attach is available after it finishes."
+                        : "No persisted subagent transcript is available.")
+            )
+        }
         return PagerDashboardPeek(
-            statusLabel: idleStatus,
+            statusLabel: childStatus ?? idleStatus,
             timeAgo: timeAgo(from: cache.lastActivity[sessionID], now: now),
-            items: items
+            items: items,
+            replyDraft: draft
         )
     }
 

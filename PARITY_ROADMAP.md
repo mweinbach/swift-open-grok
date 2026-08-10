@@ -15,11 +15,27 @@ whichever wave lands first.
 **Wave 14 corrections (2026-08-07):** B3's "shared by in-pager `/login` … screen-mode
 relaunch" was wrong: upstream `/login` never suspends (in-TUI OAuth/device code) and
 screen-mode switch is a full-process exec relaunch (`screen_mode_relaunch.rs:222-247`).
-B3's real consumers are `$PAGER` (landed, Wave 14) and `$EDITOR` (open). Wave 16 items
+B3's real consumers are `$PAGER` (landed, Wave 14) and `$EDITOR` (landed later). Wave 16 items
 1 (question view + plan approval), 2 (plan tracker into `makeResources` — already landed
 in Wave 13), and 5 (always-approve toggle, Wave 13; slash command, Wave 14) are done;
-item 6's honest scope is send-now (landed) — true mid-turn injection needs the soft
-`x.ai/interject` seam, which remains open.
+item 6 first landed as send-now and was later completed by E5's true mid-turn
+`x.ai/interject` buffer/drain seam.
+
+**Wave 19 update (2026-08-10):** the deferred-dashboard batch is now landed rather
+than standing. Retained dashboard sessions can dispatch prompts and replies; `/cd`,
+typed `SetWorkingDir`, and the Ctrl+L location picker share one working-directory
+path; Ctrl+R renames rows; completed or persisted subagents can be peeked and
+attached; reply plus single/freeform question resolution are live; Ctrl+W launches
+the worktree flow; Ctrl+/ owns dashboard search while literal `/` remains prompt
+editing; and the leader publishes/consumes typed `x.ai/sessions/list` plus
+`x.ai/sessions/changed` roster traffic. Running-subagent attach remains honestly
+blocked until child sessions are durable/resumable, and dashboard multiselect
+questions still require the attached session view. The pinned Rust layout is
+vertical-only (`views/dashboard/layout.rs:223`), so the former "wide side peek"
+deferral was an audit invention, not upstream work. The same wave also hardened MCP
+OAuth credential recovery/revocation, recap over-budget trimming, Windows PATHEXT
+lookup, packed-Git non-delta reads, docs lookup/extraction helpers, and the live
+settings/profile honesty gates.
 
 ---
 
@@ -113,8 +129,8 @@ Order within the wave is forced:
    sessions).
 3. `x.ai/mcp/*` management methods + `sdk_call` reverse bridge + initialize meta
    advertisement.
-4. **MCP OAuth** (oauth.rs/credentials.rs against already-parsed config fields) +
-   `$OPENGROK_HOME/mcp_credentials.json`.
+4. **MCP OAuth — CLOSED 2026-08-08; recovery/revoke hardened 2026-08-10**
+   (`oauth.rs`/`credentials.rs`) + `$OPENGROK_HOME/mcp_credentials.json`.
 5. Inbound ext notifications (`yolo_mode_changed`, `swarm_mode_changed`,
    `permissions/reset`); outbound `session/prompt_complete`, MCP server notifications.
 6. ACP session-admin parity (`x.ai/session/*`) or record the typed `session/*`
@@ -137,9 +153,8 @@ Order within the wave is forced:
    steer/Ctrl+Enter real instead of next-prompt-only.
 
 ### Wave 17 — Auth, distribution, announcements (L)
-1. xAI browser OAuth / OIDC / device / external-auth in `LiveAuthComposition`
-   (the OIDC/DeviceCode/ExternalAuth libraries are implemented-unwired); post-login
-   managed-config sync (flow.rs:1027-1039).
+1. **In-TUI xAI browser OAuth — CLOSED 2026-08-08.** External/devbox/device variants
+   and post-login managed-config sync (`flow.rs:1027-1039`) remain separate work.
 2. B3 TUI suspend/restore host (park raw mode, run child, restore) — shared by
    in-pager `/login`, `$EDITOR` edit-prompt, `$PAGER` transcript, screen-mode relaunch.
 3. In-pager `/login` provider picker (8 providers incl. Meta, login.rs:12-100).
@@ -154,33 +169,41 @@ Order within the wave is forced:
    attach through `/resume`, bare `x` close for eligible rows, `Ctrl+T` pin,
    `Shift+Up`/`Shift+Down` reorder, `Ctrl+G` grouping, `Ctrl+/` search/filter,
    section collapse/navigation, and the stepped `Esc` behavior. The historical
-   AppView scope remains useful as a reference snapshot, but these B1 follow-ons
-   are deliberately deferred: dispatch/replies, `/cd`/`SetWorkingDir` and the
-   location picker,
-   rename, subagent peek/attach, question mode, the wide side peek, the worktree
-   dialog, separate bare `/` search, and the leader bridge. Cleanup hardening now
-   exercises the real controller/renderer actor, stores, overlay stack, and terminal
-   paint across six serialized dashboard scenarios; this retires the old
-   composition-harness caveat without overclaiming binary/PTY/raw-decoder proof.
+   AppView scope remains useful as a reference snapshot. Wave 19 closes the recorded
+   follow-ons: retained-session dispatch/replies, `/cd`/`SetWorkingDir` plus Ctrl+L
+   location selection, Ctrl+R rename, subagent peek and completed/persisted attach,
+   reply plus single/freeform question handling, Ctrl+W worktree launch, Ctrl+/
+   search, and the typed leader roster bridge. Running-subagent attach still refuses
+   until a durable resumable child-session record exists, and multiselect dashboard
+   questions stay in the attached session view. The pinned Rust dashboard is
+   vertical-only, so "wide side peek" is retired as a stale audit assumption.
+   Cleanup hardening exercises the real controller/renderer actor, stores, overlay
+   stack, and terminal paint without overclaiming binary/PTY/raw-decoder proof.
 2. **B2 — CLOSED 2026-08-10** (see the Wave 18 B2 ledger section: W1-W4 welcome,
    S1 screen_mode reader, N insertBefore, M1-M4 the live minimal frontend, S2
    `/minimal`//`/fullscreen` + exec relaunch; the B3 dependency turned out
    unnecessary — relaunch is a process exec, not the suspend seam). Recorded
-   remainders: the minimal todo//btw//panel//plan//full_view//auth modules, the
-   Ctrl+E expand chord, the flat live-region stance.
+   remainders: the minimal todo//btw//panel//plan//full_view//auth modules and the
+   flat live-region stance. Ctrl+E expansion closed in the recorded B2 follow-up.
 3. **B6 — CLOSED 2026-08-10** (timeline rail, per-block timestamps, compact-mode
    layout, and the context-bar hover widget are now live; unrelated settings
    that still lack renderer readers remain honestly hidden).
 4. **B9 — CLOSED 2026-08-08** (config-agents/personas modal; release-notes viewer;
    privacy banner — the Wave 18 B9 ledger section).
 
-### Wave 19 — Long tail (parallelizable, mostly XL each)
+### Wave 19 — Long tail (deferred batch landed; remaining work below)
+Completed 2026-08-10: the B1 follow-ons described above; typed leader roster
+snapshot/deltas and IPC fanout; settings/profile honesty for absent voice,
+Antigravity, auto-permission, dream, LSP, video, and MCP meta-tools; MCP OAuth
+credential-file recovery, live re-probe, and best-effort RFC 7009 revoke; deterministic
+recap budget trimming; Windows PATHEXT resolution; pack-index-v2 lookup plus bounded
+non-delta object inflate; and versioned atomic docs extraction/how-to lookup.
+
 Platform/evidence tail: capable-Linux sandbox proof · Windows named-pipe leader IPC +
 S2 exec emulation · portable secure WebSockets · Linux custom-CA installation · signed
 share upload/export clients · post-change Linux/Windows CI and required-check evidence ·
-B1 follow-ons: dashboard dispatch/replies, `/cd` + `SetWorkingDir` + location picker,
-rename rows, subagent peek/attach, peek reply/question mode, wide side peek, worktree
-dialog, separate bare `/` search, leader bridge ·
+B1 residuals: attach to a still-running subagent and dashboard-native multiselect
+question resolution ·
 Mouse block selection (click selects a transcript block; upstream's scrollback click
 handling — the live pipeline is proven and pinned, Wave 14.1, only the feature is absent) ·
 LSP tool (pull-diagnostics rewrite) · video tools
@@ -188,12 +211,13 @@ LSP tool (pull-diagnostics rewrite) · video tools
 voice live seam (B7: macOS capture + `__mic-capture` intercept + pipeline) · media
 overlays (B10: kitty/iTerm images, mermaid, real `/gboom`) · foreign-session
 scan/resume (Claude/Codex/Cursor) · auto-mode LLM permission classifier ·
-memory embeddings + dream (`/dream`) · xAI `x_search` replay into Responses input ·
+memory embeddings + dream (`/dream`) ·
 Code Mode V8 debt (hard interrupt, module loader) · Computer Hub MCP adapter wiring ·
 PTY-backed `run_terminal_cmd` · local-workspace/chat env+flag family ·
 `RemoteSettings` authority allowlist · env-gate table (`GROK_*` kill-switches) ·
 `features.*` resolver consumed by tools/compaction/MCP watchers ·
-relocation journal · antigravity runner.
+relocation journal · antigravity runner · packed Git OFS_DELTA/REF_DELTA resolution ·
+startup invocation of the landed docs extraction helper.
 
 ---
 

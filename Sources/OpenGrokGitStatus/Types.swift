@@ -129,14 +129,22 @@ public struct GitStatusOptions: Sendable, Equatable {
     }
 }
 
+public enum GitPackDeltaKind: String, Sendable, Equatable {
+    case offset
+    case reference
+}
+
 public enum GitStatusError: Error, Equatable, Sendable {
     case notARepository(String)
     case corruptIndex(String)
     case unsupportedIndexVersion(Int)
     case io(String)
     case cancelled
-    /// Object is not present as a loose object. Pack reading is not implemented;
-    /// callers must treat this as an explicit non-parity result rather than a
-    /// silent empty HEAD comparison.
+    case unsupportedPackIndexVersion(path: String, version: Int)
+    case corruptPackIndex(path: String, reason: String)
+    case corruptPack(path: String, reason: String)
+    case packedObjectTooLarge(oid: String, declaredSize: UInt64, limit: Int)
+    case packedDeltaUnsupported(oid: String, kind: GitPackDeltaKind)
+    /// Pack files exist, but no usable v2 index contains the requested object.
     case packedObjectUnsupported(oid: String)
 }

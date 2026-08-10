@@ -196,6 +196,102 @@ struct LiveRecapHelperTests {
         #expect(!items.contains { if case .toolResult = $0 { return true } else { return false } })
     }
 
+    @Test("budget boundary uses the fast path at equality and trims one token over")
+    func budgetBoundaryIsExact() {
+        // `pre_tokens <= snapshot_budget` is the pinned branch boundary
+        // (`session_recap.rs:140-145`, tests :875-917).
+        let tag = "system-reminder"
+        let snapshotBudget = LiveRecap.snapshotBudget(tag: tag, contextWindow: 8_000)
+        let reasoning = ConversationItem.reasoning(synthesizedReasoningItem("reasoning"))
+        let reasoningTokens = LiveRecap.estimateConversationTokens([reasoning])
+        let fillerTokens = snapshotBudget - reasoningTokens
+
+        let atBudget: [ConversationItem] = [
+            reasoning,
+            .user(String(repeating: "a", count: Int(fillerTokens * 4))),
+        ]
+        #expect(LiveRecap.estimateConversationTokens(atBudget) == snapshotBudget)
+        let atOutput = LiveRecap.buildItems(
+            conversation: atBudget,
+            tag: tag,
+            stripReasoning: false,
+            contextWindow: 8_000
+        )
+        #expect(atOutput.contains { if case .reasoning = $0 { return true } else { return false } })
+
+        let overBudget: [ConversationItem] = [
+            reasoning,
+            .user(String(repeating: "a", count: Int(fillerTokens * 4 + 4))),
+        ]
+        #expect(LiveRecap.estimateConversationTokens(overBudget) > snapshotBudget)
+        let overOutput = LiveRecap.buildItems(
+            conversation: overBudget,
+            tag: tag,
+            stripReasoning: false,
+            contextWindow: 8_000
+        )
+        #expect(!overOutput.contains { if case .reasoning = $0 { return true } else { return false } })
+    }
+
+    @Test("over-budget trim retains deterministic newest content in original order")
+    func budgetTrimRetainsDeterministicNewestContent() {
+        // Reverse-fit selects the newest suffix, then emits it in original
+        // order with the System prefix kept (`compaction_utils.rs:206-240`).
+        let conversation: [ConversationItem] = [
+            .system("sys"),
+            .user(String(repeating: "old", count: 20_000)),
+            .assistant("older answer"),
+            .user("recent question"),
+            .assistant("recent answer"),
+        ]
+        let output = LiveRecap.buildItems(
+            conversation: conversation,
+            tag: "system-reminder",
+            stripReasoning: false,
+            contextWindow: 8_000
+        )
+
+        #expect(Array(output.dropLast()) == [
+            .system("sys"),
+            .assistant("older answer"),
+            .user("recent question"),
+            .assistant("recent answer"),
+        ])
+        #expect(LiveRecap.estimateConversationTokens(output) <= LiveRecap.promptBudget(
+            contextWindow: 8_000
+        ))
+    }
+
+    @Test("one giant retained turn is truncated in place with exact content")
+    func giantTurnIsTruncatedInPlace() {
+        // A lone oversized tail is never dropped to an empty snapshot
+        // (`session_recap.rs:739-755`; `compaction_utils.rs:241-277`).
+        let original = String(repeating: "y", count: 200_000)
+        let output = LiveRecap.buildItems(
+            conversation: [.user(original)],
+            tag: "system-reminder",
+            stripReasoning: false,
+            contextWindow: 8_000
+        )
+        guard case .user(let retained)? = output.first,
+              case .text(let text)? = retained.content.first
+        else {
+            Issue.record("the giant user turn must remain as the first item")
+            return
+        }
+        let maxBytes = Int(LiveRecap.snapshotBudget(
+            tag: "system-reminder",
+            contextWindow: 8_000
+        ) * 4)
+        let keptBytes = maxBytes - 64
+        let expected = String(repeating: "y", count: keptBytes)
+            + "\n[... truncated \(original.utf8.count - keptBytes) bytes to fit the compaction window ...]"
+        #expect(text == expected)
+        #expect(LiveRecap.estimateConversationTokens(output) <= LiveRecap.promptBudget(
+            contextWindow: 8_000
+        ))
+    }
+
     @Test("pop trailing removes a tool run, keeps a clean tail")
     func popTrailingRemovesToolRunKeepsCleanTail() {
         // Upstream's pin (session_recap.rs:822-839).
@@ -672,6 +768,45 @@ struct LiveRecapLiveSeamTests {
         #expect(body?["service_tier"].stringValue == "priority")
         #expect(body?["tools"].isNull == true)
         #expect(await harness.history.items == recapSeedItems)
+    }
+
+    @Test("/recap trims an over-budget snapshot before the live request")
+    func recapTrimsBeforeLiveRequest() async throws {
+        // The existing live call uses the pinned 500k cap default. This input
+        // crosses that exact budget while leaving a small newest suffix whose
+        // order and content are observable on the mock server.
+        let giantOldTurn = String(repeating: "x", count: 1_700_000)
+        let items: [ConversationItem] = [
+            .system("sys"),
+            .user(giantOldTurn),
+            .assistant("older answer"),
+            .user("most recent question"),
+        ]
+        let fixture = try RecapFixture()
+        defer { fixture.dispose() }
+        fixture.server.setResponse("We trimmed the recap input.")
+        let harness = try await RecapRendererFixture(
+            fixture: fixture,
+            modelID: "glm-5.2",
+            sessionID: "recap-budget-live",
+            items: items
+        )
+        let before = fixture.inferenceBodies().count
+
+        try await harness.runController(submitting: ["/recap"])
+        #expect(await harness.waitForPaint(of: "Recap \u{2014} We trimmed the recap input."))
+        #expect(fixture.inferenceBodies().count == before + 1)
+
+        let messages = fixture.inferenceBodies().last?.body?["messages"].arrayValue ?? []
+        #expect(messages.count == 4)
+        #expect(messages[0]["content"].stringValue == "sys")
+        #expect(messages[1]["content"].stringValue == "older answer")
+        #expect(messages[2]["content"].stringValue == "most recent question")
+        #expect(messages[3]["content"].stringValue?.contains(
+            "Write ONE sentence recap body"
+        ) == true)
+        #expect(!messages.contains { $0["content"].stringValue == giantOldTurn })
+        #expect(await harness.history.items == items)
     }
 
     /// A failed side-call paints upstream's failure copy and the session

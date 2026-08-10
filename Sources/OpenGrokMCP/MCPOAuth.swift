@@ -17,8 +17,10 @@
 //     (auth.rs:1614-1651) and `Bearer` header attachment (auth.rs:1731-1737).
 //
 // Deliberately not ported (recorded): the 403 insufficient_scope upgrade
-// machinery, the client-credentials flow (SEP-1046), and token revocation —
-// upstream's interactive MCP flow reaches none of them.
+// machinery and the client-credentials flow (SEP-1046). RFC 7009 revocation
+// is implemented only when discovery advertises `revocation_endpoint`; local
+// credential deletion remains authoritative when remote revocation is absent
+// or fails.
 
 import Foundation
 import OpenGrokFileUtils
@@ -65,6 +67,26 @@ public enum MCPAuthError: Error, Sendable, Equatable, CustomStringConvertible {
         case .invalidScope(let detail):
             return "Invalid scope: \(detail)"
         }
+    }
+}
+
+public enum MCPRemoteRevocationStatus: Sendable, Equatable {
+    case notAttempted
+    case succeeded
+    case unsupported
+    case failed(String)
+}
+
+public struct MCPCredentialRevocationResult: Sendable, Equatable {
+    public var credentialsRemoved: Bool
+    public var remoteStatus: MCPRemoteRevocationStatus
+
+    public init(
+        credentialsRemoved: Bool,
+        remoteStatus: MCPRemoteRevocationStatus
+    ) {
+        self.credentialsRemoved = credentialsRemoved
+        self.remoteStatus = remoteStatus
     }
 }
 
@@ -162,6 +184,14 @@ public struct MCPAuthorizationMetadata: Sendable, Equatable, Codable {
             return nil
         }
         return names.contains("client_secret_post") && !names.contains("client_secret_basic")
+    }
+
+    var revocationEndpoint: String? {
+        guard case .string(let value)? = additionalFields["revocation_endpoint"],
+              !value.isEmpty else {
+            return nil
+        }
+        return value
     }
 }
 
@@ -1009,6 +1039,56 @@ public actor MCPAuthorizationManager {
         return token
     }
 
+    /// Best-effort RFC 7009 remote revocation followed by mandatory local
+    /// deletion. The returned status distinguishes "the authorization server
+    /// revoked it" from "only the local credential was removed"; a local
+    /// deletion failure throws instead of reporting a false logout.
+    public func revokeStoredCredentials(
+        clientSecret: String? = nil
+    ) async throws -> MCPCredentialRevocationResult {
+        guard let stored = try storage.load(), let token = stored.tokenResponse else {
+            return MCPCredentialRevocationResult(
+                credentialsRemoved: false,
+                remoteStatus: .notAttempted
+            )
+        }
+
+        var remoteStatus: MCPRemoteRevocationStatus
+        do {
+            if metadata == nil {
+                metadata = try await discoverMetadata()
+            }
+            guard let metadata,
+                  let endpoint = metadata.revocationEndpoint,
+                  let revocationURL = URL(string: endpoint) else {
+                remoteStatus = .unsupported
+                try storage.clear()
+                return MCPCredentialRevocationResult(
+                    credentialsRemoved: true,
+                    remoteStatus: remoteStatus
+                )
+            }
+            self.clientID = stored.clientId
+            self.clientSecret = clientSecret
+            try await revoke(
+                token: token.refreshToken ?? token.accessToken,
+                tokenTypeHint: token.refreshToken == nil ? "access_token" : "refresh_token",
+                clientID: stored.clientId,
+                metadata: metadata,
+                url: revocationURL
+            )
+            remoteStatus = .succeeded
+        } catch {
+            remoteStatus = .failed(String(describing: error))
+        }
+
+        try storage.clear()
+        return MCPCredentialRevocationResult(
+            credentialsRemoved: true,
+            remoteStatus: remoteStatus
+        )
+    }
+
     /// Access token for the next request (auth.rs:1618-1651): reads through
     /// the store (so tokens written by another process are picked up),
     /// refreshes when within 30 s of expiry, and returns expiry-less tokens
@@ -1093,6 +1173,48 @@ public actor MCPAuthorizationManager {
             throw wrapError("Failed to parse server response: \(error)")
         }
     }
+
+    private func revoke(
+        token: String,
+        tokenTypeHint: String,
+        clientID: String,
+        metadata: MCPAuthorizationMetadata,
+        url: URL
+    ) async throws {
+        var body: [(String, String)] = [
+            ("token", token),
+            ("token_type_hint", tokenTypeHint),
+        ]
+        var headers = [
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        ]
+        if let clientSecret {
+            if metadata.usesClientSecretPost {
+                body.append(("client_id", clientID))
+                body.append(("client_secret", clientSecret))
+            } else {
+                let raw = Data("\(clientID):\(clientSecret)".utf8)
+                headers["Authorization"] = "Basic \(raw.base64EncodedString())"
+            }
+        } else {
+            body.append(("client_id", clientID))
+        }
+
+        let response = try await transport.send(HTTPRequest(
+            method: .post,
+            url: url,
+            headers: headers,
+            body: Data(mcpFormEncode(body).utf8),
+            timeout: 30
+        ))
+        guard (200..<300).contains(response.metadata.statusCode) else {
+            let text = String(decoding: response.body, as: UTF8.self)
+            throw MCPAuthError.authorizationFailed(
+                "token revocation returned HTTP \(response.metadata.statusCode): \(text)"
+            )
+        }
+    }
 }
 
 // MARK: - Connect-time probe
@@ -1151,4 +1273,3 @@ extension MCPAuthorizationManager: MCPAuthorizationProviding {
         return (try? await refreshToken()) != nil
     }
 }
-

@@ -59,6 +59,22 @@ private func liveTool(_ name: String) -> PagerConversationItem {
 
 @Suite("Dashboard peek source")
 struct LiveDashboardPeekSourceTests {
+    @Test("a running subagent without a persisted transcript still has a truthful peek")
+    func runningSubagentPeek() throws {
+        let peek = try #require(LiveDashboardPeek.peek(
+            forRowID: LiveDashboardOverlay.subagentPrefix + "child-running",
+            cache: LiveDashboardPeekCache(),
+            activeSessionID: "active",
+            activeItems: [],
+            turnActivity: nil,
+            subagentStatuses: ["child-running": "running"],
+            subagentHints: ["child-running": "streaming child output"]
+        ))
+        #expect(peek.statusLabel == "Working")
+        #expect(peek.emptyHint == "streaming child output")
+        #expect(peek.items.isEmpty)
+    }
+
     @Test("the active row reads memory, a background row reads the cache, anything else is nil")
     func sourcePerRowKind() {
         let cache = LiveDashboardPeekCache.build(from: [
@@ -90,9 +106,8 @@ struct LiveDashboardPeekSourceTests {
             "a background row is served from the decoded record"
         )
 
-        // A subagent child row: peek-onto-a-subagent lands with subagent
-        // attach (B1 ruling §5.3), so it must resolve to nothing rather than
-        // silently showing the parent's transcript.
+        // A child with neither a persisted transcript nor a live status must
+        // resolve to nothing rather than silently showing the parent.
         #expect(LiveDashboardPeek.peek(
             forRowID: "subagent:sub-1",
             cache: cache,
@@ -220,8 +235,8 @@ struct LiveDashboardPeekStatusTests {
             turnActivity: "bash"
         ) == "Bash")
 
-        // A pending permission is not its own status here (question mode is
-        // deferred); it falls through the same way and the running tool wins.
+        // A pending permission is not a transcript status; the question
+        // surface carries the prompt separately, so the running tool wins.
         #expect(LiveDashboardPeek.status(
             items: [liveUser("ask"), liveTool("bash")],
             turnActivity: "Permission required: run ls"

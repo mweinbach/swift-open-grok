@@ -154,6 +154,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
     let makeHTTPTransport: @Sendable () -> any HTTPTransport
     let openBrowser: @Sendable (URL) -> Void
     let authTimeoutSeconds: TimeInterval
+    let authCredentialPollIntervalSeconds: TimeInterval
 
     init(
         gateway: ACPNotificationGateway,
@@ -164,7 +165,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         environment: [String: String],
         makeHTTPTransport: @escaping @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() },
         openBrowser: (@Sendable (URL) -> Void)? = nil,
-        authTimeoutSeconds: TimeInterval = mcpBrowserAuthTimeoutSeconds
+        authTimeoutSeconds: TimeInterval = mcpBrowserAuthTimeoutSeconds,
+        authCredentialPollIntervalSeconds: TimeInterval = mcpCredentialPollIntervalSeconds
     ) {
         self.gateway = gateway
         self.state = state
@@ -175,6 +177,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         self.makeHTTPTransport = makeHTTPTransport
         self.openBrowser = openBrowser ?? { LiveAuthComposition.openInSystemBrowser($0) }
         self.authTimeoutSeconds = authTimeoutSeconds
+        self.authCredentialPollIntervalSeconds = authCredentialPollIntervalSeconds
     }
 
     /// The production declaration source: re-resolve the config layers
@@ -612,7 +615,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
                 byoConfig: declaration.config.oauthConfig(environment: environment),
                 force: true,
                 openBrowser: openBrowser,
-                timeoutSeconds: authTimeoutSeconds
+                timeoutSeconds: authTimeoutSeconds,
+                credentialPollIntervalSeconds: authCredentialPollIntervalSeconds
             )
         } catch {
             // Upstream's generic flow failure, byte-copy
@@ -757,8 +761,11 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         }
 
         var existed = false
+        var deletedDeclaration: MCPServerDeclaration?
         if var root = LiveMCPComposition.loadForEdit(at: userConfigPath) {
             do {
+                deletedDeclaration = MCPConfigLoader.load(from: root)
+                    .servers.first { $0.name == serverName }
                 existed = try removeMCPServer(serverName, from: &root)
                 if existed { try writeConfigFile(root, to: userConfigPath) }
             } catch {
@@ -782,7 +789,51 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             await previous.close()
         }
         await state.removeOutcome(name: serverName)
-        return envelope(.object(["ok": .bool(true)]))
+
+        // Credential teardown is intentionally separate from config removal:
+        // remote RFC 7009 revocation is best-effort and reported honestly,
+        // while locked local deletion is mandatory. The pinned Rust store's
+        // durability contract is credentials.rs:291-300 and :392-406.
+        var credentialsRemoved = 0
+        var remoteStatus: MCPRemoteRevocationStatus = .notAttempted
+        if let declaration = deletedDeclaration,
+           let endpoint = declaration.oauthEligibleEndpoint(environment: environment) {
+            let manager = MCPAuthorizationManager(
+                baseURL: endpoint,
+                transport: makeHTTPTransport(),
+                storage: MCPFileCredentialStorage(
+                    home: openGrokHome,
+                    serverName: serverName,
+                    serverURL: endpoint
+                )
+            )
+            let revocation = try await manager.revokeStoredCredentials(
+                clientSecret: declaration.config.oauthConfig(environment: environment)?.clientSecret
+            )
+            if revocation.credentialsRemoved { credentialsRemoved += 1 }
+            remoteStatus = revocation.remoteStatus
+        }
+        credentialsRemoved += try MCPCredentialStore.removeByServerNameAndSave(
+            home: openGrokHome,
+            serverName: serverName
+        )
+
+        var result: [String: JSONValue] = [
+            "ok": .bool(true),
+            "credentials_removed": .bool(credentialsRemoved > 0),
+        ]
+        switch remoteStatus {
+        case .notAttempted:
+            result["remote_revocation"] = .string("not_attempted")
+        case .succeeded:
+            result["remote_revocation"] = .string("succeeded")
+        case .unsupported:
+            result["remote_revocation"] = .string("unsupported")
+        case .failed(let error):
+            result["remote_revocation"] = .string("failed")
+            result["revocation_error"] = .string(error)
+        }
+        return envelope(.object(result))
     }
 }
 

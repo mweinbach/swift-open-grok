@@ -390,6 +390,23 @@ public struct MCPCredentialStore: Sendable, Equatable {
             store.entries.removeValue(forKey: key)
         }
     }
+
+    /// Locked removal of every credential entry for one server name, across
+    /// URL changes. Returns the number removed and does not create an empty
+    /// credential file when no store exists.
+    @discardableResult
+    public static func removeByServerNameAndSave(
+        home: URL,
+        serverName: String
+    ) throws -> Int {
+        let path = defaultPath(home: home)
+        guard FileManager.default.fileExists(atPath: path.path) else { return 0 }
+        var removed = 0
+        _ = try lockedMutate(home: home) { store in
+            removed = store.removeByServerName(serverName)
+        }
+        return removed
+    }
 }
 
 // MARK: - Per-server storage adapter (credentials.rs:339-408)

@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokFastWorktree
 import OpenGrokPager
 import OpenGrokPagerRender
 import OpenGrokSamplingTypes
@@ -100,6 +101,15 @@ private func key(_ character: Character) -> InputEvent {
     .key(KeyEvent(key: .char(character), character: character))
 }
 
+private func typeDashboardText(
+    _ text: String,
+    into renderer: LiveInteractiveControllerRenderer
+) async throws {
+    for character in text {
+        #expect(try await renderer.handleInput(key(character)) == .consumed)
+    }
+}
+
 private func userItem(_ text: String) -> ConversationItem {
     .user(UserItem(content: [.text(text: text)]))
 }
@@ -128,16 +138,20 @@ private struct DashboardFixture {
     let home: URL
     let sink: DashboardCapturingSink
     let renderer: LiveInteractiveControllerRenderer
+    let workingDirectory: URL
     let activeID = "active-session"
     let dormantID = "dormant-session"
 
     init(
         config: String? = nil,
-        environment: [String: String] = [:]
+        environment: [String: String] = [:],
+        workingDirectory: URL? = nil,
+        questionCoordinator: PagerQuestionCoordinator? = nil
     ) throws {
         home = FileManager.default.temporaryDirectory
             .appendingPathComponent("opengrok-dashboard-live-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        self.workingDirectory = workingDirectory ?? home
         if let config {
             try config.write(
                 to: home.appendingPathComponent("config.toml"),
@@ -160,7 +174,8 @@ private struct DashboardFixture {
                 write: { _ in }
             ),
             sink: sink,
-            workingDirectory: home.path,
+            workingDirectory: self.workingDirectory.path,
+            questionCoordinator: questionCoordinator,
             sessionID: activeID,
             sessionCatalog: LiveSessionCatalog(openGrokHome: home),
             conversationStore: LiveConversationStore(openGrokHome: home),
@@ -194,6 +209,16 @@ private struct DashboardFixture {
         await renderer.lastOverlayBounds
             .last { $0.id == LiveDashboardOverlay.overlayID }?
             .rows ?? []
+    }
+
+    func selectDashboardRow(_ rowID: String) async throws {
+        let maximumMoves = await dashboardRows().count + 2
+        var selectedRowID = await renderer.dashboardSnapshotForTesting().selectedRowID
+        for _ in 0..<maximumMoves where selectedRowID != rowID {
+            #expect(try await renderer.handleInput(.key(KeyEvent(key: .down))) == .consumed)
+            selectedRowID = await renderer.dashboardSnapshotForTesting().selectedRowID
+        }
+        #expect(selectedRowID == rowID)
     }
 
     func waitForConfig(
@@ -242,13 +267,13 @@ private func seedRecords(for fixture: DashboardFixture) -> [LiveConversationReco
     return [
         record(
             fixture.activeID,
-            workingDirectory: fixture.home,
+            workingDirectory: fixture.workingDirectory,
             updatedAt: activeTime,
             items: [userItem("active prompt"), assistantItem("active response")]
         ),
         record(
             fixture.dormantID,
-            workingDirectory: fixture.home,
+            workingDirectory: fixture.workingDirectory,
             updatedAt: dormantTime,
             items: [
                 userItem("dormant prompt"),
@@ -256,6 +281,35 @@ private func seedRecords(for fixture: DashboardFixture) -> [LiveConversationReco
             ]
         ),
     ]
+}
+
+private func makeDashboardRepository() throws -> (root: URL, repository: URL) {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("opengrok-dashboard-worktree-\(UUID().uuidString)")
+    let repository = root.appendingPathComponent("repo", isDirectory: true)
+    try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+    func git(_ arguments: [String]) throws {
+        let result = try runGit(arguments, cwd: repository)
+        guard result.exitCode == 0 else {
+            throw NSError(
+                domain: "LiveDashboardReachabilityTests",
+                code: Int(result.exitCode),
+                userInfo: [NSLocalizedDescriptionKey: result.stderr]
+            )
+        }
+    }
+    try git(["init", "--quiet"])
+    try "dashboard\n".write(
+        to: repository.appendingPathComponent("README.md"),
+        atomically: true,
+        encoding: .utf8
+    )
+    try git(["add", "README.md"])
+    try git([
+        "-c", "user.email=test@example.com", "-c", "user.name=Test",
+        "commit", "--quiet", "-m", "initial",
+    ])
+    return (root, repository)
 }
 
 @Suite("Live dashboard orchestration", .serialized)
@@ -312,6 +366,7 @@ struct LiveDashboardReachabilityTests {
         #expect(await fixture.waitForPaint("Agent Dashboard"))
 
         let activeID = fixture.activeID
+        try await fixture.selectDashboardRow(LiveDashboardOverlay.attachPrefix + activeID)
         harness.continuation.yield(ctrlKey("t"))
         #expect(await fixture.waitForConfig { persisted in
             persisted?.pinned == [.topLevel(sessionID: activeID)]
@@ -365,13 +420,7 @@ struct LiveDashboardReachabilityTests {
         try await fixture.openDirect()
 
         let dormantRowID = LiveDashboardOverlay.attachPrefix + fixture.dormantID
-        let maximumMoves = await fixture.dashboardRows().count + 2
-        var selectedRowID = await fixture.renderer.dashboardSnapshotForTesting().selectedRowID
-        for _ in 0..<maximumMoves where selectedRowID != dormantRowID {
-            #expect(try await fixture.renderer.handleInput(.key(KeyEvent(key: .down))) == .consumed)
-            selectedRowID = await fixture.renderer.dashboardSnapshotForTesting().selectedRowID
-        }
-        #expect(selectedRowID == dormantRowID)
+        try await fixture.selectDashboardRow(dormantRowID)
         #expect(await fixture.waitForPaint("dormant cached transcript needle"))
         try await fixture.renderer.restoreTerminal()
     }
@@ -388,8 +437,11 @@ struct LiveDashboardReachabilityTests {
             .appendingPathComponent(activeFixture.activeID)
             .appendingPathExtension("json")
         #expect(FileManager.default.fileExists(atPath: activeURL.path))
-        #expect(try await activeFixture.renderer.handleInput(key("x")) == .consumed)
-        #expect(await activeFixture.waitForPaint("attached session can't be deleted"))
+        try await activeFixture.selectDashboardRow(
+            LiveDashboardOverlay.attachPrefix + activeFixture.activeID
+        )
+        #expect(try await activeFixture.renderer.handleInput(ctrlKey("x")) == .consumed)
+        #expect(await activeFixture.renderer.dashboardSnapshotForTesting().isOpen)
         #expect(FileManager.default.fileExists(atPath: activeURL.path))
         try await activeFixture.renderer.restoreTerminal()
 
@@ -408,10 +460,13 @@ struct LiveDashboardReachabilityTests {
             .appendingPathComponent(deletionFixture.dormantID)
             .appendingPathExtension("json")
         #expect(FileManager.default.fileExists(atPath: dormantURL.path))
+        try await deletionFixture.selectDashboardRow(
+            LiveDashboardOverlay.attachPrefix + deletionFixture.dormantID
+        )
 
-        #expect(try await deletionFixture.renderer.handleInput(key("x")) == .consumed)
+        #expect(try await deletionFixture.renderer.handleInput(ctrlKey("x")) == .consumed)
         #expect(FileManager.default.fileExists(atPath: dormantURL.path))
-        #expect(try await deletionFixture.renderer.handleInput(key("x")) == .consumed)
+        #expect(try await deletionFixture.renderer.handleInput(ctrlKey("x")) == .consumed)
         #expect(await deletionFixture.waitForConfig { persisted in
             persisted?.pinned.isEmpty == true && persisted?.reorder.isEmpty == true
         })
@@ -441,6 +496,204 @@ struct LiveDashboardReachabilityTests {
         #expect(dismissed.searchQuery == nil)
         #expect(dismissed.cachedSessionIDs.isEmpty)
         #expect(dismissed.dormantSessionIDs.isEmpty)
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("bare slash edits the dashboard prompt while Ctrl+/ remains search")
+    func bareSlashIsDispatchText() async throws {
+        let fixture = try DashboardFixture()
+        defer { fixture.dispose() }
+        try await fixture.seed(seedRecords(for: fixture))
+        try await fixture.openDirect()
+
+        #expect(try await fixture.renderer.handleInput(key("/")) == .consumed)
+        let composing = await fixture.renderer.dashboardSnapshotForTesting()
+        #expect(composing.searchQuery == nil)
+        #expect(composing.inputText == "/")
+
+        #expect(try await fixture.renderer.handleInput(.key(KeyEvent(key: .escape))) == .consumed)
+        #expect(try await fixture.renderer.handleInput(ctrlKey("/")) == .consumed)
+        let searching = await fixture.renderer.dashboardSnapshotForTesting()
+        #expect(searching.searchQuery == "")
+        #expect(searching.inputText.isEmpty)
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("typed text replies to an explicit retained row and the default row dispatches a new one")
+    func replyAndNewDispatchRouting() async throws {
+        let fixture = try DashboardFixture()
+        defer { fixture.dispose() }
+        try await fixture.seed(seedRecords(for: fixture))
+        try await fixture.openDirect()
+
+        try await fixture.selectDashboardRow(
+            LiveDashboardOverlay.attachPrefix + fixture.activeID
+        )
+        try await typeDashboardText("reply now", into: fixture.renderer)
+        #expect(
+            try await fixture.renderer.handleInput(.key(KeyEvent(key: .enter)))
+                == .dispatchPrompt(sessionID: fixture.activeID, prompt: "reply now")
+        )
+
+        try await fixture.renderer.render(.global(.openDashboard))
+        #expect(
+            await fixture.renderer.dashboardSnapshotForTesting().selectedRowID
+                == LiveDashboardOverlay.newAgentRowID
+        )
+        try await typeDashboardText("new task", into: fixture.renderer)
+        #expect(
+            try await fixture.renderer.handleInput(.key(KeyEvent(key: .enter)))
+                == .dispatchNew(prompt: "new task", workingDirectory: fixture.home.path)
+        )
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("Ctrl+R commits an inline persisted rename")
+    func inlineRename() async throws {
+        let fixture = try DashboardFixture()
+        defer { fixture.dispose() }
+        try await fixture.seed(seedRecords(for: fixture))
+        try await fixture.openDirect()
+
+        try await fixture.selectDashboardRow(
+            LiveDashboardOverlay.attachPrefix + fixture.activeID
+        )
+        #expect(try await fixture.renderer.handleInput(ctrlKey("r")) == .consumed)
+        try await typeDashboardText("renamed active", into: fixture.renderer)
+        #expect(try await fixture.renderer.handleInput(.key(KeyEvent(key: .enter))) == .consumed)
+        let stored = try await LiveConversationStore(openGrokHome: fixture.home)
+            .load(sessionID: fixture.activeID)
+        #expect(stored.title == "renamed active")
+        let renamedLabel = await fixture.renderer.dashboardSnapshotForTesting().rowLabels[
+            LiveDashboardOverlay.attachPrefix + fixture.activeID
+        ]
+        #expect(renamedLabel?.contains("renamed active") == true)
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("dashboard question mode resolves the real coordinator")
+    func questionMode() async throws {
+        let coordinator = PagerQuestionCoordinator()
+        let fixture = try DashboardFixture(questionCoordinator: coordinator)
+        defer { fixture.dispose() }
+        try await fixture.seed(seedRecords(for: fixture))
+        try await fixture.openDirect()
+        try await fixture.selectDashboardRow(
+            LiveDashboardOverlay.attachPrefix + fixture.activeID
+        )
+
+        let request = PagerQuestionRequest(
+            id: "dashboard-question",
+            toolCallID: "call-dashboard-question",
+            questions: [PagerQuestion(
+                text: "Choose release timing",
+                options: [
+                    PagerQuestionOption(label: "Ship now"),
+                    PagerQuestionOption(label: "Hold"),
+                ]
+            )]
+        )
+        let waiter = Task { await coordinator.answers(for: request) }
+        #expect(await fixture.waitForPaint("Choose release timing"))
+        #expect(try await fixture.renderer.handleInput(key("2")) == .consumed)
+        #expect(
+            await waiter.value == .answered([
+                PagerQuestionAnswer(question: "Choose release timing", label: "Hold")
+            ])
+        )
+        #expect(await fixture.renderer.dashboardSnapshotForTesting().isOpen)
+        #expect(await coordinator.pendingCount == 0)
+
+        let multiRequest = PagerQuestionRequest(
+            id: "dashboard-multi-question",
+            toolCallID: "call-dashboard-multi-question",
+            questions: [PagerQuestion(
+                text: "Choose several",
+                options: [
+                    PagerQuestionOption(label: "A"),
+                    PagerQuestionOption(label: "B"),
+                ],
+                isMultiSelect: true
+            )]
+        )
+        let multiWaiter = Task { await coordinator.answers(for: multiRequest) }
+        #expect(await fixture.waitForPaint("Choose several"))
+        #expect(try await fixture.renderer.handleInput(key("1")) == .consumed)
+        #expect(await coordinator.pendingCount == 1)
+        #expect(await fixture.renderer.dashboardSnapshotForTesting().isOpen)
+        await coordinator.resolveAll()
+        #expect(await multiWaiter.value == .cancelled)
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("dashboard worktree dialog dispatches through the shared registry")
+    func worktreeDispatch() async throws {
+        let repository = try makeDashboardRepository()
+        defer { try? FileManager.default.removeItem(at: repository.root) }
+        let fixture = try DashboardFixture(workingDirectory: repository.repository)
+        defer { fixture.dispose() }
+        let processDirectory = FileManager.default.currentDirectoryPath
+        try await fixture.openDirect()
+
+        #expect(try await fixture.renderer.handleInput(ctrlKey("w")) == .consumed)
+        #expect(
+            await fixture.renderer.dashboardSnapshotForTesting().rowLabels[
+                LiveDashboardOverlay.newAgentRowID
+            ] == "+ New worktree"
+        )
+        try await typeDashboardText("isolated task", into: fixture.renderer)
+        #expect(try await fixture.renderer.handleInput(.key(KeyEvent(key: .enter))) == .consumed)
+        try await typeDashboardText("dashboard-wt", into: fixture.renderer)
+        let routing = try await fixture.renderer.handleInput(.key(KeyEvent(key: .enter)))
+        guard case .dispatchNew(let prompt, let workingDirectory) = routing else {
+            Issue.record("expected dashboard worktree dispatch")
+            return
+        }
+        let worktreeDirectory = try #require(workingDirectory)
+        #expect(prompt == "isolated task")
+        #expect(worktreeDirectory != repository.repository.path)
+        #expect(FileManager.default.fileExists(atPath: worktreeDirectory))
+        #expect(FileManager.default.currentDirectoryPath == processDirectory)
+
+        var records = try WorktreeRegistry(openGrokHome: fixture.home).records()
+        #expect(records.count == 1)
+        #expect(records[0].label == "dashboard-wt")
+        #expect(records[0].sessionID == nil)
+        try await fixture.renderer.render(.sessionReplaced(sessionID: "dashboard-worktree-session"))
+        records = try WorktreeRegistry(openGrokHome: fixture.home).records()
+        #expect(records[0].sessionID == "dashboard-worktree-session")
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("/cd opens the location picker and a path updates dashboard dispatch cwd")
+    func locationPickerAndSetWorkingDir() async throws {
+        let fixture = try DashboardFixture()
+        defer { fixture.dispose() }
+        let processDirectory = FileManager.default.currentDirectoryPath
+        defer {
+            let restored = FileManager.default.changeCurrentDirectoryPath(processDirectory)
+            if !restored { Issue.record("could not restore process working directory") }
+        }
+        try await fixture.seed(seedRecords(for: fixture))
+        let destination = fixture.home.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try await fixture.openDirect()
+
+        #expect(try await fixture.renderer.handleInput(ctrlKey("l")) == .consumed)
+        #expect(await fixture.renderer.lastOverlayBounds.contains { $0.id == "dashboard-location" })
+        #expect(try await fixture.renderer.handleInput(.key(KeyEvent(key: .escape))) == .consumed)
+
+        try await typeDashboardText("/cd", into: fixture.renderer)
+        #expect(try await fixture.renderer.handleInput(.key(KeyEvent(key: .enter))) == .consumed)
+        #expect(await fixture.renderer.lastOverlayBounds.contains { $0.id == "dashboard-location" })
+        #expect(try await fixture.renderer.handleInput(.key(KeyEvent(key: .escape))) == .consumed)
+
+        try await typeDashboardText("/cd \(destination.path)", into: fixture.renderer)
+        #expect(try await fixture.renderer.handleInput(.key(KeyEvent(key: .enter))) == .consumed)
+        #expect(
+            await fixture.renderer.dashboardSnapshotForTesting().dispatchWorkingDirectory
+                == destination.standardizedFileURL.path
+        )
         try await fixture.renderer.restoreTerminal()
     }
 }

@@ -9,7 +9,10 @@ import OpenGrokACP
 import OpenGrokACPRuntime
 import OpenGrokAuth
 import OpenGrokHTTP
+import OpenGrokPager
+import OpenGrokPagerRender
 import OpenGrokShared
+import OpenGrokTerminalCore
 import Testing
 
 @testable import OpenGrokCLI
@@ -49,6 +52,76 @@ private final class LeaderStreamRecorder: @unchecked Sendable {
     func append(_ value: String) {
         lock.lock()
         lines.append(value)
+        lock.unlock()
+    }
+}
+
+private final class LeaderInteractiveTerminalFixture: PagerTerminalSink, @unchecked Sendable {
+    let capabilities = PagerTerminalCapabilities.standard
+
+    private let lock = NSLock()
+    private var storage = Data()
+
+    var terminal: OpenGrokLiveTerminal {
+        let fixture = self
+        return OpenGrokLiveTerminal(
+            isTTY: { true },
+            size: { OpenGrokLiveTerminalSize(width: 120, height: 32) },
+            write: { data in fixture.append(data) }
+        )
+    }
+
+    var paintedText: String {
+        var result = ""
+        var iterator = output[...]
+        while let escape = iterator.firstIndex(of: "\u{1B}") {
+            result += iterator[iterator.startIndex..<escape]
+            var cursor = iterator.index(after: escape)
+            guard cursor < iterator.endIndex else { break }
+            if iterator[cursor] == "[" || iterator[cursor] == "]" {
+                let isOSC = iterator[cursor] == "]"
+                cursor = iterator.index(after: cursor)
+                while cursor < iterator.endIndex {
+                    let scalar = iterator[cursor].unicodeScalars.first!.value
+                    let isFinal = isOSC
+                        ? (scalar == 0x07 || iterator[cursor] == "\\")
+                        : (scalar >= 0x40 && scalar <= 0x7E)
+                    cursor = iterator.index(after: cursor)
+                    if isFinal { break }
+                }
+            } else {
+                cursor = iterator.index(after: cursor)
+            }
+            iterator = iterator[cursor...]
+        }
+        result += iterator
+        return result
+    }
+
+    func write(bytes: [UInt8]) throws {
+        append(Data(bytes))
+    }
+
+    func flush() throws {}
+
+    func waitForPaintedText(_ marker: String, timeout: TimeInterval = 5) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if paintedText.contains(marker) { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return paintedText.contains(marker)
+    }
+
+    private var output: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(decoding: storage, as: UTF8.self)
+    }
+
+    private func append(_ data: Data) {
+        lock.lock()
+        storage.append(data)
         lock.unlock()
     }
 }
@@ -265,6 +338,185 @@ struct LiveLeaderMessageTests {
 // MARK: - Live
 
 #if !os(Windows)
+
+@Suite("Interactive leader dashboard bridge", .serialized)
+struct LiveLeaderInteractiveDashboardTests {
+    @Test(
+        "typed roster snapshot and delta render, then selection resumes the remote cwd",
+        .timeLimit(.minutes(1))
+    )
+    func snapshotDeltaAttachAndShutdown() async throws {
+        let home = try makeShortHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let pair = InMemoryWebSocketChannel.makePair()
+        let client = ACPLeaderClient(channel: pair.a, clientType: "grok-tui")
+        let terminal = LeaderInteractiveTerminalFixture()
+        let (releaseDelta, releaseDeltaContinuation) = AsyncStream<Void>.makeStream()
+
+        let server = Task { () throws -> ResumeSessionRequest in
+            let reader = ACPLeaderChannelReader(
+                channel: pair.b,
+                maximumMessageSize: ACPLeaderProtocolLimits.maximumMessageSize
+            )
+            guard case .register = try await reader.next(ACPLeaderClientMessage.self) else {
+                throw ACPLeaderProtocolError.connectionClosed
+            }
+            try await pair.b.write(try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.registered(
+                    clientID: 21,
+                    ready: true,
+                    protocolVersion: ACPLeaderProtocolLimits.protocolVersion,
+                    binaryVersion: "test",
+                    capabilities: .supported
+                )
+            ))
+
+            guard case .acp(let initializePayload) = try await reader.next(ACPLeaderClientMessage.self),
+                  let initialize = try? ACPMessage(data: Data(initializePayload.utf8)),
+                  case .request(let initializeID, let initializeMethod, _) = initialize,
+                  initializeMethod == AgentMethodNames.initialize
+            else {
+                throw ACPLeaderProtocolError.invalidJSON("expected initialize request")
+            }
+            try await pair.b.write(try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.acp(payload: String(decoding: try ACPMessage.response(
+                    id: initializeID,
+                    result: JSONValue.encode(InitializeResponse(protocolVersion: .v1)),
+                    error: nil
+                ).encodedData(), as: UTF8.self))
+            ))
+
+            guard case .acp(let rosterPayload) = try await reader.next(ACPLeaderClientMessage.self),
+                  let rosterRequest = try? ACPMessage(data: Data(rosterPayload.utf8)),
+                  case .request(let rosterID, let rosterMethod, _) = rosterRequest,
+                  rosterMethod == ACPLeaderRosterMethods.sessionsList
+            else {
+                throw ACPLeaderProtocolError.invalidJSON("expected roster snapshot request")
+            }
+            let idleEntry = ACPLeaderRosterEntry(
+                sessionId: "remote-session",
+                title: "Remote target",
+                cwd: "/remote/cwd",
+                isWorktree: false,
+                modelId: "grok-4",
+                yolo: false,
+                activity: .idle,
+                resident: true,
+                lastChangeUnixMs: 1,
+                origin: .remote(host: "other-process")
+            )
+            try await pair.b.write(try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.acp(payload: String(decoding: try ACPMessage.response(
+                    id: rosterID,
+                    result: JSONValue.encode(ACPLeaderRosterListResponse(sessions: [idleEntry])),
+                    error: nil
+                ).encodedData(), as: UTF8.self))
+            ))
+
+            var releaseIterator = releaseDelta.makeAsyncIterator()
+            _ = await releaseIterator.next()
+            var workingEntry = idleEntry
+            workingEntry.activity = .working
+            workingEntry.lastChangeUnixMs = 2
+            try await pair.b.write(try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.acp(payload: String(decoding: try ACPMessage.notification(
+                    method: ACPLeaderRosterMethods.sessionsChanged,
+                    params: JSONValue.encode(ACPLeaderRosterChanged(upserted: [workingEntry]))
+                ).encodedData(), as: UTF8.self))
+            ))
+
+            while let message = try await reader.next(ACPLeaderClientMessage.self) {
+                guard case .acp(let payload) = message,
+                      let request = try? ACPMessage(data: Data(payload.utf8)),
+                      case .request(let requestID, let method, let params) = request,
+                      method == AgentMethodNames.sessionResume
+                else { continue }
+                let resume = try params.decode(ResumeSessionRequest.self)
+                try await pair.b.write(try ACPLeaderCodec.encode(
+                    ACPLeaderServerMessage.acp(payload: String(decoding: try ACPMessage.response(
+                        id: requestID,
+                        result: JSONValue.encode(ResumeSessionResponse()),
+                        error: nil
+                    ).encodedData(), as: UTF8.self))
+                ))
+                return resume
+            }
+            throw ACPLeaderProtocolError.connectionClosed
+        }
+
+        let (input, inputContinuation) = AsyncThrowingStream<InputEvent, Error>.makeStream()
+        let inputDriver = Task { () -> (snapshot: Bool, delta: Bool, resumed: Bool, cwd: Bool) in
+            inputContinuation.yield(.key(KeyEvent(
+                key: .char("\\"), modifiers: .control, character: "\\"
+            )))
+            let paintedDashboard = await terminal.waitForPaintedText("Agent Dashboard")
+            let paintedCWD = await terminal.waitForPaintedText("/remote/cwd")
+            let paintedIdle = await terminal.waitForPaintedText("idle")
+            let snapshot = paintedDashboard && paintedCWD && paintedIdle
+            releaseDeltaContinuation.yield(())
+            let delta = await terminal.waitForPaintedText("working")
+            inputContinuation.yield(.key(KeyEvent(key: .down)))
+            inputContinuation.yield(.key(KeyEvent(key: .down)))
+            inputContinuation.yield(.key(KeyEvent(key: .enter)))
+            let resumed = await terminal.waitForPaintedText("Resumed session remote-s")
+            let cwd = await terminal.waitForPaintedText("/remote/cwd")
+            inputContinuation.yield(.key(KeyEvent(
+                key: .char("d"), modifiers: .control, character: "d"
+            )))
+            inputContinuation.finish()
+            return (snapshot, delta, resumed, cwd)
+        }
+
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in
+                throw CLIApplicationError.failed("leader bridge test must not create a local sampler")
+            },
+            terminal: terminal.terminal,
+            makeInteractiveInput: {
+                OpenGrokLiveInteractiveInput(events: input, close: {})
+            },
+            makeTerminalSink: { terminal },
+            makeLeaderClient: { _ in
+                _ = try await client.start()
+                return LiveLeaderClientLease(client: client)
+            }
+        )
+        let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
+        let (streams, _, _) = CLIStreams.buffered()
+        let code = await CLIRunner.run(
+            ["interactive", "--leader", "--fullscreen"],
+            environment: [
+                "HOME": home.path,
+                "OPENGROK_HOME": home.appendingPathComponent("state").path,
+                "TERM": "xterm-256color",
+            ],
+            streams: streams,
+            application: application
+        )
+
+        let observations = await inputDriver.value
+        let resume = try await server.value
+        releaseDeltaContinuation.finish()
+
+        #expect(code == CLIRunner.ExitCode.success.rawValue)
+        #expect(observations.snapshot)
+        #expect(observations.delta)
+        #expect(observations.resumed)
+        #expect(observations.cwd)
+        #expect(resume.sessionId.rawValue == "remote-session")
+        #expect(resume.cwd == nil)
+        #expect(terminal.paintedText.contains("Agent Dashboard"))
+        #expect(terminal.paintedText.contains("idle"))
+        #expect(terminal.paintedText.contains("working"))
+        do {
+            _ = try await client.events()
+            Issue.record("leader client should be closed after interactive session shutdown")
+        } catch {
+            // The client closes after the roster task is cancelled and joined.
+        }
+        await client.close()
+    }
+}
 
 @Suite("Live leader route", .serialized)
 struct LiveLeaderCompositionLiveTests {
@@ -557,6 +809,235 @@ struct LiveLeaderCompositionLiveTests {
                 continue
             }
         }
+    }
+}
+
+@Suite("Live leader pager runtime")
+struct LiveLeaderPagerRuntimeAdapterTests {
+    @Test("resume attaches the selected leader session without replacing its cwd", .timeLimit(.minutes(1)))
+    func resumeSelectedSession() async throws {
+        let pair = InMemoryWebSocketChannel.makePair()
+        let client = ACPLeaderClient(channel: pair.a, clientType: "roster-viewer")
+        let server = Task { () throws -> ResumeSessionRequest in
+            let reader = ACPLeaderChannelReader(
+                channel: pair.b,
+                maximumMessageSize: ACPLeaderProtocolLimits.maximumMessageSize
+            )
+            guard case .register = try await reader.next(ACPLeaderClientMessage.self) else {
+                throw ACPLeaderProtocolError.connectionClosed
+            }
+            try await pair.b.write(try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.registered(
+                    clientID: 11,
+                    ready: true,
+                    protocolVersion: ACPLeaderProtocolLimits.protocolVersion,
+                    binaryVersion: "test",
+                    capabilities: .supported
+                )
+            ))
+
+            guard case .acp(let initializePayload) = try await reader.next(ACPLeaderClientMessage.self),
+                  let initialize = try? ACPMessage(data: Data(initializePayload.utf8)),
+                  case .request(let initializeID, let initializeMethod, _) = initialize,
+                  initializeMethod == AgentMethodNames.initialize
+            else {
+                throw ACPLeaderProtocolError.invalidJSON("expected initialize request")
+            }
+            try await pair.b.write(try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.acp(payload: String(decoding: try ACPMessage.response(
+                    id: initializeID,
+                    result: JSONValue.encode(InitializeResponse(protocolVersion: .v1)),
+                    error: nil
+                ).encodedData(), as: UTF8.self))
+            ))
+
+            guard case .acp(let resumePayload) = try await reader.next(ACPLeaderClientMessage.self),
+                  let resume = try? ACPMessage(data: Data(resumePayload.utf8)),
+                  case .request(let resumeID, let resumeMethod, let params) = resume,
+                  resumeMethod == AgentMethodNames.sessionResume
+            else {
+                throw ACPLeaderProtocolError.invalidJSON("expected session/resume request")
+            }
+            let request = try params.decode(ResumeSessionRequest.self)
+            try await pair.b.write(try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.acp(payload: String(decoding: try ACPMessage.response(
+                    id: resumeID,
+                    result: JSONValue.encode(ResumeSessionResponse()),
+                    error: nil
+                ).encodedData(), as: UTF8.self))
+            ))
+            return request
+        }
+
+        _ = try await client.start()
+        let runtime = LiveLeaderPagerRuntimeAdapter(
+            client: client,
+            workingDirectory: URL(fileURLWithPath: "/viewer")
+        )
+        #expect(try await runtime.resumeSession(sessionID: "remote-session") == "remote-session")
+
+        let request = try await server.value
+        #expect(request.sessionId.rawValue == "remote-session")
+        #expect(request.cwd == nil)
+        #expect(request.additionalDirectories.isEmpty)
+        #expect(request.mcpServers.isEmpty)
+        await client.close()
+    }
+}
+
+@Suite("Live leader roster bridge")
+struct LiveLeaderRosterBridgeTests {
+    @Test("rejects a second subscriber while the snapshot is in flight", .timeLimit(.minutes(1)))
+    func concurrentStart() async throws {
+        let pair = InMemoryWebSocketChannel.makePair()
+        let client = ACPLeaderClient(channel: pair.a, clientType: "roster-viewer")
+        let (requestObserved, requestContinuation) = AsyncStream<Void>.makeStream()
+        let (releaseResponse, releaseContinuation) = AsyncStream<Void>.makeStream()
+        let server = Task { () throws -> Void in
+            let reader = ACPLeaderChannelReader(
+                channel: pair.b,
+                maximumMessageSize: ACPLeaderProtocolLimits.maximumMessageSize
+            )
+            guard case .register = try await reader.next(ACPLeaderClientMessage.self) else {
+                throw ACPLeaderProtocolError.connectionClosed
+            }
+            try await pair.b.write(try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.registered(
+                    clientID: 10,
+                    ready: true,
+                    protocolVersion: ACPLeaderProtocolLimits.protocolVersion,
+                    binaryVersion: "test",
+                    capabilities: .supported
+                )
+            ))
+
+            guard case .acp(let payload) = try await reader.next(ACPLeaderClientMessage.self),
+                  let request = try? ACPMessage(data: Data(payload.utf8)),
+                  case .request(let requestID, let method, _) = request,
+                  method == ACPLeaderRosterMethods.sessionsList
+            else {
+                throw ACPLeaderProtocolError.invalidJSON("expected roster snapshot request")
+            }
+            requestContinuation.yield(())
+            var releaseIterator = releaseResponse.makeAsyncIterator()
+            _ = await releaseIterator.next()
+            try await pair.b.write(try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.acp(payload: String(decoding: try ACPMessage.response(
+                    id: requestID,
+                    result: JSONValue.encode(ACPLeaderRosterListResponse(sessions: [])),
+                    error: nil
+                ).encodedData(), as: UTF8.self))
+            ))
+        }
+
+        _ = try await client.start()
+        let bridge = LiveLeaderRosterBridge(client: client)
+        let first = Task { try await bridge.events() }
+        var observedIterator = requestObserved.makeAsyncIterator()
+        _ = await observedIterator.next()
+
+        await #expect(throws: LiveLeaderRosterBridgeError.alreadyStarted) {
+            _ = try await bridge.events()
+        }
+
+        releaseContinuation.yield(())
+        _ = try await first.value
+        try await server.value
+        await bridge.stop()
+        await client.close()
+    }
+
+    @Test("subscribes before snapshot and reconciles an in-flight delta", .timeLimit(.minutes(1)))
+    func snapshotDeltaRace() async throws {
+        let pair = InMemoryWebSocketChannel.makePair()
+        let client = ACPLeaderClient(channel: pair.a, clientType: "roster-viewer")
+        let server = Task { () throws -> Void in
+            let reader = ACPLeaderChannelReader(
+                channel: pair.b,
+                maximumMessageSize: ACPLeaderProtocolLimits.maximumMessageSize
+            )
+            guard case .register = try await reader.next(ACPLeaderClientMessage.self) else {
+                throw ACPLeaderProtocolError.connectionClosed
+            }
+            try await pair.b.write(try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.registered(
+                    clientID: 9,
+                    ready: true,
+                    protocolVersion: ACPLeaderProtocolLimits.protocolVersion,
+                    binaryVersion: "test",
+                    capabilities: .supported
+                )
+            ))
+
+            guard case .acp(let payload) = try await reader.next(ACPLeaderClientMessage.self),
+                  let request = try? ACPMessage(data: Data(payload.utf8)),
+                  case .request(let requestID, let method, _) = request,
+                  method == ACPLeaderRosterMethods.sessionsList
+            else {
+                throw ACPLeaderProtocolError.invalidJSON("expected roster snapshot request")
+            }
+
+            let late = ACPLeaderRosterChanged(upserted: [
+                ACPLeaderRosterEntry(
+                    sessionId: "late",
+                    cwd: "/late",
+                    isWorktree: false,
+                    yolo: false,
+                    activity: .working,
+                    resident: true,
+                    lastChangeUnixMs: 2,
+                    origin: .local
+                )
+            ])
+            try await pair.b.write(try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.acp(payload: String(decoding: try ACPMessage.notification(
+                    method: ACPLeaderRosterMethods.sessionsChanged,
+                    params: JSONValue.encode(late)
+                ).encodedData(), as: UTF8.self))
+            ))
+
+            let initial = ACPLeaderRosterListResponse(sessions: [
+                ACPLeaderRosterEntry(
+                    sessionId: "initial",
+                    cwd: "/initial",
+                    isWorktree: false,
+                    yolo: false,
+                    activity: .idle,
+                    resident: true,
+                    lastChangeUnixMs: 1,
+                    origin: .local
+                )
+            ])
+            try await pair.b.write(try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.acp(payload: String(decoding: try ACPMessage.response(
+                    id: requestID,
+                    result: JSONValue.encode(initial),
+                    error: nil
+                ).encodedData(), as: UTF8.self))
+            ))
+        }
+
+        _ = try await client.start()
+        let bridge = LiveLeaderRosterBridge(client: client)
+        let events = try await bridge.events()
+        var iterator = events.makeAsyncIterator()
+
+        guard case .snapshot(let snapshot)? = try await iterator.next() else {
+            Issue.record("expected the initial roster snapshot")
+            return
+        }
+        #expect(snapshot.map(\.sessionId) == ["initial"])
+
+        guard case .changed(let sessions, let delta)? = try await iterator.next() else {
+            Issue.record("expected the queued roster delta")
+            return
+        }
+        #expect(delta.upserted.map(\.sessionId) == ["late"])
+        #expect(sessions.map(\.sessionId) == ["late", "initial"])
+
+        try await server.value
+        await bridge.stop()
+        await client.close()
     }
 }
 

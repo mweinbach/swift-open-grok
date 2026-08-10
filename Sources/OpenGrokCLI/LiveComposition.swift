@@ -9,6 +9,7 @@ import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokDiagnostics
 import OpenGrokFileTools
+import OpenGrokFastWorktree
 import OpenGrokHTTP
 import OpenGrokHooks
 import OpenGrokHooksPluginTypes
@@ -1002,14 +1003,26 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         )
                     )
                 )
-                return try await Self.makeLeaderLaunchSession(
-                    options: options,
-                    prompt: prompt,
-                    workingDirectory: cwd,
-                    lease: lease,
-                    context: context,
-                    terminal: dependencies.terminal
-                )
+                let interactiveInput = options.mode == .interactive
+                    && dependencies.terminal.isTTY()
+                    ? try await dependencies.makeInteractiveInput()
+                    : nil
+                do {
+                    return try await Self.makeLeaderLaunchSession(
+                        options: options,
+                        prompt: prompt,
+                        workingDirectory: cwd,
+                        lease: lease,
+                        context: context,
+                        terminal: dependencies.terminal,
+                        interactiveInput: interactiveInput,
+                        makeTerminalSink: dependencies.makeTerminalSink
+                    )
+                } catch {
+                    await interactiveInput?.close()
+                    await lease.close()
+                    throw error
+                }
             }
             // The interactive surface is created BEFORE the foundation so the
             // ask-user/plan-approval coordinators can be gated on what will
@@ -1866,7 +1879,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         workingDirectory: URL,
         lease: LiveLeaderClientLease,
         context: CLIApplicationContext,
-        terminal: OpenGrokLiveTerminal
+        terminal: OpenGrokLiveTerminal,
+        interactiveInput: OpenGrokLiveInteractiveInput?,
+        makeTerminalSink: @escaping @Sendable () -> (any PagerTerminalSink)?
     ) async throws -> CLIApplicationSession {
         let runtime = LiveLeaderPagerRuntimeAdapter(
             client: lease.client,
@@ -1874,24 +1889,131 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         )
 
         if options.mode == .interactive {
-            guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                await lease.close()
-                throw CLIApplicationError.failed(
-                    "interactive leader mode requires a prompt when no local input controller is attached"
-                )
-            }
+            let uiConfiguration = LiveInteractiveControllerRenderer.resolveUIConfig(
+                workingDirectory: workingDirectory,
+                environment: context.environment
+            )
             let pagerMode = try Self.resolveInteractivePagerMode(
                 options: options,
                 terminal: terminal,
                 // The leader launch reads the same effective `[ui]` document
                 // the local composition does — one screen-mode rule, both
                 // launch paths.
-                configScreenMode: LiveInteractiveControllerRenderer.resolveUIConfig(
-                    workingDirectory: workingDirectory,
-                    environment: context.environment
-                ).config.screenMode,
+                configScreenMode: uiConfiguration.config.screenMode,
                 screenModeEnvOverride: LiveScreenModeRelaunch.takeScreenModeEnvOverride()
             )
+            if let interactiveInput, let terminalSink = makeTerminalSink() {
+                let baseRequest = OpenGrokPagerRequest(
+                    prompt: prompt,
+                    mode: pagerMode,
+                    metadata: ["mode": options.mode.rawValue]
+                )
+                let initialSession: (any OpenGrokPagerSessionAdapter)?
+                if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    initialSession = nil
+                } else {
+                    initialSession = try await runtime.makeSession(for: baseRequest)
+                }
+                let request = OpenGrokPagerRequest(
+                    prompt: prompt,
+                    mode: pagerMode,
+                    sessionID: initialSession?.sessionID,
+                    metadata: baseRequest.metadata
+                )
+                let openGrokHome = Self.resolveOpenGrokHome(environment: context.environment)
+                let renderer = LiveInteractiveControllerRenderer(
+                    mode: pagerMode,
+                    terminal: terminal,
+                    sink: terminalSink,
+                    workingDirectory: workingDirectory.path,
+                    modelName: "leader",
+                    terminalProgram: context.environment["TERM_PROGRAM"],
+                    uiConfiguration: uiConfiguration,
+                    sessionID: initialSession?.sessionID ?? "",
+                    openGrokHome: openGrokHome,
+                    environment: context.environment
+                )
+                let controller = OpenGrokPagerInteractiveController(
+                    input: interactiveInput.events,
+                    runtime: runtime,
+                    renderer: renderer,
+                    output: SilentLiveInteractiveOutput()
+                )
+                await controller.setInputModes(uiConfiguration.inputModes)
+                await renderer.setInputModesSink { [weak controller] modes in
+                    await controller?.setInputModes(modes)
+                }
+                await renderer.setMotionStateSink { [weak controller] state in
+                    await controller?.setMotionState(state)
+                }
+                await renderer.setSuspendHost(LiveTUISuspendHost(
+                    beginInputSuspension: { await interactiveInput.beginSuspension() },
+                    environment: context.environment
+                ))
+                await controller.setSlashMru(PagerSlashMru(directory: openGrokHome))
+
+                let rosterEvents = try await runtime.rosterEvents()
+                let rosterTask = Task {
+                    do {
+                        for try await event in rosterEvents {
+                            guard !Task.isCancelled else { return }
+                            await renderer.applyLeaderRosterEvent(event)
+                        }
+                    } catch is CancellationError {
+                    } catch {
+                        await renderer.reportLeaderRosterFailure(String(describing: error))
+                    }
+                }
+                let task = Task {
+                    do {
+                        let result: OpenGrokPagerInteractiveResult
+                        if let initialSession {
+                            result = try await controller.run(
+                                initialSession: initialSession,
+                                request: request
+                            )
+                        } else {
+                            result = try await controller.run(request)
+                        }
+                        rosterTask.cancel()
+                        await runtime.stopRosterEvents()
+                        await rosterTask.value
+                        await interactiveInput.close()
+                        return result
+                    } catch {
+                        rosterTask.cancel()
+                        await runtime.stopRosterEvents()
+                        await rosterTask.value
+                        await interactiveInput.close()
+                        throw error
+                    }
+                }
+                return CLIApplicationSession(
+                    waitForExit: {
+                        _ = try await withTaskCancellationHandler {
+                            try await task.value
+                        } onCancel: {
+                            task.cancel()
+                        }
+                    },
+                    shutdown: {
+                        task.cancel()
+                        await controller.shutdown()
+                        rosterTask.cancel()
+                        await runtime.stopRosterEvents()
+                        await rosterTask.value
+                        await interactiveInput.close()
+                        await lease.close()
+                    }
+                )
+            }
+
+            await interactiveInput?.close()
+            guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw CLIApplicationError.failed(
+                    "interactive leader mode requires terminal input or a prompt"
+                )
+            }
             let pager = OpenGrokPager(
                 runtime: runtime,
                 frontendFactory: LiveInteractiveFrontendFactory(
@@ -4165,9 +4287,26 @@ actor LiveSessionPermissionMode {
     }
 }
 
+private actor LiveSessionDirectoryRegistry {
+    private var directories: [String: URL]
+
+    init(sessionID: String, workingDirectory: URL) {
+        directories = [sessionID: workingDirectory.standardizedFileURL]
+    }
+
+    func set(sessionID: String, workingDirectory: URL) {
+        directories[sessionID] = workingDirectory.standardizedFileURL
+    }
+
+    func directory(sessionID: String, fallback: URL) -> URL {
+        directories[sessionID] ?? fallback.standardizedFileURL
+    }
+}
+
 struct LiveToolExecutor: Sendable {
     let tools: [ToolSpec]
     let workingDirectory: URL
+    private let sessionDirectories: LiveSessionDirectoryRegistry
     private let composition: OpenGrokShellToolRuntimeComposition
     private let fileToolBridge: ToolBridge
     private let registryToolNames: Set<String>
@@ -4722,6 +4861,10 @@ struct LiveToolExecutor: Sendable {
         self.mcpServerConnections = mcpServerConnections
         self.registryToolNames = Set(allowedFileToolDefinitions.map(\.name))
         self.workingDirectory = standardizedWorkingDirectory
+        self.sessionDirectories = LiveSessionDirectoryRegistry(
+            sessionID: sessionID,
+            workingDirectory: standardizedWorkingDirectory
+        )
         self.sessionServices = sessionServices
         // Session-service tools run through the same agent-profile gate as
         // every other tool, so a read-only profile that denies `memory_search`
@@ -5477,6 +5620,17 @@ struct LiveToolExecutor: Sendable {
         try await composition.registerSession(
             sessionID: sessionID,
             workingDirectory: workingDirectory
+        )
+        await sessionDirectories.set(
+            sessionID: sessionID,
+            workingDirectory: workingDirectory
+        )
+    }
+
+    func workingDirectory(sessionID: String) async -> URL {
+        await sessionDirectories.directory(
+            sessionID: sessionID,
+            fallback: workingDirectory
         )
     }
 
@@ -6713,6 +6867,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             await emit(.status("running tool \(call.name)"))
         }
 
+        let workingDirectory = await toolExecutor.workingDirectory(sessionID: sessionID)
         return try await withThrowingTaskGroup(
             of: (Int, ToolResultItem).self,
             returning: [ConversationItem].self
@@ -6721,7 +6876,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 group.addTask {
                     let result = await toolExecutor.invoke(
                         sessionID: sessionID,
-                        workingDirectory: toolExecutorWorkingDirectory,
+                        workingDirectory: workingDirectory,
                         call: call
                     )
                     let content: String
@@ -6792,9 +6947,6 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         }
     }
 
-    private var toolExecutorWorkingDirectory: URL {
-        toolExecutor.workingDirectory
-    }
 }
 
 actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPagerRuntimeAdapter {
@@ -6815,6 +6967,8 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
     /// the shell would fail, but switching back to it must not.
     private var activeShellSessionID: SessionID?
     private var createdSessionIDs: Set<SessionID> = []
+    private var retainedRecords: [String: LiveConversationRecord] = [:]
+    private var activeWorkingDirectory: URL
 
     init(
         shell: OpenGrokShell,
@@ -6834,6 +6988,7 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         self.toolExecutor = toolExecutor
         self.compaction = compaction
         self.modelSwitch = modelSwitch
+        self.activeWorkingDirectory = cwd.standardizedFileURL
     }
 
     func makeSession(
@@ -6842,18 +6997,27 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         _ = try await shell.start()
         let shellEvents = await shell.events()
         let sessionID = SessionID(request.sessionID ?? providerConfiguration.sessionID)
-        if let activeShellSessionID {
-            guard activeShellSessionID == sessionID else {
-                throw CLIApplicationError.failed("interactive runtime cannot switch session IDs")
-            }
+        let record = await conversationHistory.snapshot()
+        guard record.sessionID == sessionID.rawValue else {
+            throw CLIApplicationError.failed(
+                "interactive runtime session mismatch: \(sessionID.rawValue)"
+            )
         }
+        let sessionDirectory = URL(
+            fileURLWithPath: record.workingDirectory,
+            isDirectory: true
+        ).standardizedFileURL
         if !createdSessionIDs.contains(sessionID) {
             _ = try await shell.createSession(OpenGrokShellSessionRequest(
                 sessionID: sessionID,
-                cwd: cwd,
+                cwd: sessionDirectory,
                 providerConfiguration: providerConfiguration,
                 restorePersistedState: false
             ))
+            try await toolExecutor?.registerSession(
+                sessionID: sessionID.rawValue,
+                workingDirectory: sessionDirectory
+            )
             createdSessionIDs.insert(sessionID)
             // The record is born carrying the boundary's CURRENT truth, not
             // the launch configuration's snapshot — upstream marks the store
@@ -6869,6 +7033,8 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
                 )
             }
         }
+        activeWorkingDirectory = sessionDirectory
+        retainedRecords[sessionID.rawValue] = record
         activeShellSessionID = sessionID
         // A Cron turn arrives with the RAW stored prompt plus scheduler
         // metadata; this seam frames the model text and stamps the
@@ -6945,12 +7111,29 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
     }
 
     func replaceSession(from request: OpenGrokPagerRequest) async throws -> String {
+        try await replaceSession(from: request, workingDirectory: nil)
+    }
+
+    func replaceSession(
+        from request: OpenGrokPagerRequest,
+        workingDirectory: String?
+    ) async throws -> String {
         _ = request
+        await retainActiveRecord()
         let newSessionID = UUID().uuidString
         try LiveConversationStore.validateSessionID(newSessionID)
+        let newWorkingDirectory: URL
+        if let workingDirectory {
+            newWorkingDirectory = URL(
+                fileURLWithPath: workingDirectory,
+                isDirectory: true
+            ).standardizedFileURL
+        } else {
+            newWorkingDirectory = activeWorkingDirectory
+        }
         let record = LiveConversationRecord.new(
             sessionID: newSessionID,
-            workingDirectory: cwd,
+            workingDirectory: newWorkingDirectory,
             sandboxProfile: toolExecutor?.sandbox.profileName
         )
         let configuration = ProviderSessionConfiguration(
@@ -6970,19 +7153,21 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         _ = try await shell.start()
         _ = try await shell.createSession(OpenGrokShellSessionRequest(
             sessionID: SessionID(newSessionID),
-            cwd: cwd,
+            cwd: newWorkingDirectory,
             providerConfiguration: configuration,
             restorePersistedState: false
         ))
         try await conversationStore.save(record)
         try await toolExecutor?.registerSession(
             sessionID: newSessionID,
-            workingDirectory: cwd
+            workingDirectory: newWorkingDirectory
         )
         try await conversationHistory.replace(with: record)
         await compaction?.replaceSessionID(newSessionID)
         providerConfiguration = configuration
         createdSessionIDs.insert(SessionID(newSessionID))
+        retainedRecords[newSessionID] = record
+        activeWorkingDirectory = newWorkingDirectory
         activeShellSessionID = SessionID(newSessionID)
         return newSessionID
     }
@@ -6999,12 +7184,15 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
     /// `/model` applies, because a resume across providers is the same seam.
     func resumeSession(sessionID: String) async throws -> String {
         try LiveConversationStore.validateSessionID(sessionID)
-        guard var record = try await conversationStore.loadIfPresent(sessionID: sessionID) else {
+        await retainActiveRecord()
+        let storedRecord = try await conversationStore.loadIfPresent(sessionID: sessionID)
+        guard let record = retainedRecords[sessionID] ?? storedRecord else {
             throw CLIApplicationError.failed("session not found: \(sessionID)")
         }
-        // The session continues in this process's working directory, exactly
-        // as a cold-start `--resume` rebinds it (`resolveConversationRecord`).
-        record.workingDirectory = cwd.standardizedFileURL.path
+        let sessionDirectory = URL(
+            fileURLWithPath: record.workingDirectory,
+            isDirectory: true
+        ).standardizedFileURL
         let configuration = ProviderSessionConfiguration(
             sessionID: sessionID,
             modelCatalog: providerConfiguration.modelCatalog,
@@ -7024,7 +7212,7 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         if !createdSessionIDs.contains(shellSessionID) {
             _ = try await shell.createSession(OpenGrokShellSessionRequest(
                 sessionID: shellSessionID,
-                cwd: cwd,
+                cwd: sessionDirectory,
                 providerConfiguration: configuration,
                 restorePersistedState: false
             ))
@@ -7033,7 +7221,7 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         try await conversationStore.save(record)
         try await toolExecutor?.registerSession(
             sessionID: sessionID,
-            workingDirectory: cwd
+            workingDirectory: sessionDirectory
         )
         try await conversationHistory.replace(with: record)
         if let modelSwitch {
@@ -7045,8 +7233,64 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         }
         await compaction?.replaceSessionID(sessionID)
         providerConfiguration = configuration
+        retainedRecords[sessionID] = await conversationHistory.snapshot()
+        activeWorkingDirectory = sessionDirectory
         activeShellSessionID = shellSessionID
         return sessionID
+    }
+
+    func renameRetainedSession(sessionID: String, title: String) async throws -> Bool {
+        let activeSessionID = await conversationHistory.sessionID
+        if sessionID == activeSessionID {
+            try await conversationHistory.rename(title: title)
+            retainedRecords[sessionID] = await conversationHistory.snapshot()
+            return true
+        }
+        guard try await conversationStore.renameStored(sessionID: sessionID, title: title) else {
+            retainedRecords.removeValue(forKey: sessionID)
+            return false
+        }
+        if var record = retainedRecords[sessionID] {
+            record.title = title
+            record.updatedAt = Date()
+            retainedRecords[sessionID] = record
+        }
+        return true
+    }
+
+    func retainedSessionIDs() -> Set<String> {
+        Set(retainedRecords.keys)
+    }
+
+    func workingDirectory(sessionID: String) async -> URL? {
+        let activeSessionID = await conversationHistory.sessionID
+        if sessionID == activeSessionID {
+            return activeWorkingDirectory
+        }
+        if let record = retainedRecords[sessionID] {
+            return URL(fileURLWithPath: record.workingDirectory, isDirectory: true)
+                .standardizedFileURL
+        }
+        let storedRecord: LiveConversationRecord?
+        do {
+            storedRecord = try await conversationStore.loadIfPresent(sessionID: sessionID)
+        } catch {
+            return nil
+        }
+        guard let storedRecord else { return nil }
+        return URL(
+            fileURLWithPath: storedRecord.workingDirectory,
+            isDirectory: true
+        ).standardizedFileURL
+    }
+
+    private func retainActiveRecord() async {
+        let record = await conversationHistory.snapshot()
+        retainedRecords[record.sessionID] = record
+        activeWorkingDirectory = URL(
+            fileURLWithPath: record.workingDirectory,
+            isDirectory: true
+        ).standardizedFileURL
     }
 }
 
@@ -7631,6 +7875,26 @@ struct LiveDashboardRendererSnapshot: Sendable, Equatable {
     let selectedRowID: String?
     let cachedSessionIDs: Set<String>
     let dormantSessionIDs: Set<String>
+    let inputText: String
+    let dispatchWorkingDirectory: String
+    let rowLabels: [String: String]
+}
+
+private enum LiveDashboardInputMode: Sendable, Equatable {
+    case compose(rowID: String)
+    case rename(rowID: String)
+    case worktree(prompt: String)
+}
+
+private struct LiveDashboardQuestionSnapshot: Sendable, Equatable {
+    let overlayID: String
+    let requestID: String
+    let prompt: String
+    let options: [String]
+    let selectedIndex: Int
+    let freeformText: String
+    let freeformFocused: Bool
+    let requiresAttach: Bool
 }
 
 actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
@@ -7668,8 +7932,20 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             searchQuery: dashboardSearchQuery,
             selectedRowID: selectedDashboardListRowID(),
             cachedSessionIDs: Set(dashboardPeekCache.items.keys),
-            dormantSessionIDs: Set(dashboardDormant.map(\.sessionID))
+            dormantSessionIDs: Set(dashboardDormant.map(\.sessionID)),
+            inputText: dashboardInputText,
+            dispatchWorkingDirectory: dashboardDispatchWorkingDirectory,
+            rowLabels: dashboardRowLabelsForTesting()
         )
+    }
+
+    private func dashboardRowLabelsForTesting() -> [String: String] {
+        guard let overlay = overlays.overlays.first(
+                  where: { $0.id == LiveDashboardOverlay.overlayID }
+              ),
+              case .list(let list) = overlay.content
+        else { return [:] }
+        return Dictionary(uniqueKeysWithValues: list.rows.map { ($0.id, $0.label) })
     }
 
     /// B1-t: the Ctrl+G tasks pane — nil = hidden. A full-width chrome band
@@ -7689,11 +7965,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private var contextBarHovered = false
 
     /// B1-m: the session tab registry — the in-process roster the dashboard
-    /// lists. Upstream's `app.agents` map holds full agent tabs; this port's
-    /// single runtime stack grounds a METADATA roster (id, title, activity)
-    /// with attach-via-`/resume` — the pre-ruled tab divergence (no parallel
-    /// top-level turns; a background tab is idle by construction).
+    /// lists. One turn is active at a time, while the runtime retains each
+    /// tab's history, shell state, and cwd for later dispatch or attachment.
     private var sessionTabs: [LiveSessionTab] = []
+    /// Typed leader FleetView state. Empty in the local composition; the
+    /// leader client replaces it from the initial snapshot and every delta.
+    private var leaderRoster: [ACPLeaderRosterEntry] = []
 
     /// The dashboard peek's transcript snapshot, built ONCE when the roster
     /// opens. Held only while the modal is up (see `handleOverlayDismissal`):
@@ -7720,6 +7997,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// while Ctrl+/ search is live; `dashboardState.searchActive` mirrors it
     /// for the line builder's fold suppression.
     private var dashboardSearchQuery: String?
+    private var dashboardInputMode: LiveDashboardInputMode?
+    private var dashboardInputText = ""
+    private var dashboardDispatchWorkingDirectory: String
+    private var dashboardWorktreeEnabled = false
+    /// The active-only divergence still keeps the dashboard visible for a
+    /// send-without-open: the session switch replaces the transcript but the
+    /// roster remains foregrounded and follows the new active tab.
+    private var preserveDashboardOnNextSessionSwitch = false
+    private var pendingDashboardWorktree: LiveWorktreePreparation?
     /// The ON-DISK `[dashboard].enabled`, threaded into every persist so a
     /// deliberate `enabled = false` is never overwritten by a pin
     /// (`dispatch_dashboard_persist`, dashboard.rs:2369-2384).
@@ -7736,10 +8022,56 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             touchSessionTab(id)
             return
         }
+        let rosterEntry = leaderRoster.first { $0.sessionId == id }
+        let rosterTitle = rosterEntry?.title.flatMap { title -> String? in
+            let line = LivePagerTasksBlock.firstNonEmptyLine(title)
+            return line.isEmpty ? nil : line
+        }
         sessionTabs.append(LiveSessionTab(
-            sessionID: id, title: "New session", lastActivity: Date(),
-            cwd: workingDirectory
+            sessionID: id,
+            title: rosterTitle ?? "New session",
+            lastActivity: rosterEntry.map {
+                Date(timeIntervalSince1970: TimeInterval($0.lastChangeUnixMs) / 1_000)
+            } ?? Date(),
+            cwd: rosterEntry?.cwd ?? workingDirectory
         ))
+    }
+
+    func applyLeaderRosterEvent(_ event: LiveLeaderRosterEvent) {
+        switch event {
+        case .snapshot(let sessions), .changed(let sessions, _):
+            leaderRoster = sessions
+        }
+        for entry in leaderRoster {
+            guard let index = sessionTabs.firstIndex(where: { $0.sessionID == entry.sessionId }) else {
+                continue
+            }
+            if let title = entry.title {
+                let line = LivePagerTasksBlock.firstNonEmptyLine(title)
+                if !line.isEmpty { sessionTabs[index].title = line }
+            }
+            sessionTabs[index].cwd = entry.cwd
+            sessionTabs[index].lastActivity = Date(
+                timeIntervalSince1970: TimeInterval(entry.lastChangeUnixMs) / 1_000
+            )
+            if entry.sessionId == sessionID, let modelID = entry.modelId {
+                modelName = modelID
+            }
+        }
+        guard overlays.contains(id: LiveDashboardOverlay.overlayID) else { return }
+        let candidates = dashboardCandidateRowIDs()
+        dashboardState.gcStaleRefs { candidates.contains($0) }
+        if let armedCloseSessionID,
+           !candidates.contains(where: { $0.owningSessionID == armedCloseSessionID }) {
+            self.armedCloseSessionID = nil
+        }
+        rebuildDashboardRows()
+        try? renderState()
+    }
+
+    func reportLeaderRosterFailure(_ message: String) {
+        note("Leader roster unavailable: \(message)")
+        try? renderState()
     }
 
     /// Stamp activity (and adopt the first user prompt as the roster title —
@@ -7778,10 +8110,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 }
             }
         }
-        // ONE catalog pass for the modal's whole lifetime: background tabs
-        // are idle by construction, so a snapshot taken at open cannot go
-        // stale while the roster is up — and a per-arrow read would be N JSON
-        // decodes per keystroke.
+        // ONE local-catalog pass for the modal's whole lifetime. Leader roster
+        // state is push-driven separately and rebuilds the open rows on every
+        // typed delta; there is no per-arrow file read or roster polling.
         let catalogRecords = (try? sessionCatalog?.records()) ?? nil
         dashboardPeekCache = LiveDashboardPeekCache.build(from: catalogRecords ?? [])
         dashboardSubagents = subagents
@@ -7795,14 +8126,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         dashboardState.home = environment["HOME"]
         let persisted = dashboardStore.load()
         dashboardPersistedEnabled = persisted?.enabled ?? true
-        let candidates = LiveDashboardOverlay.rowInputs(
-            tabs: sessionTabs,
-            activeSessionID: sessionID,
-            activeTurnRunning: turnActivity != nil,
-            activeNeedsInput: dashboardActiveNeedsInput,
-            subagents: subagents,
-            dormant: dashboardDormant
-        ).map(\.id)
+        let candidates = dashboardCandidateRowIDs()
         if let persisted {
             dashboardState.apply(persisted, resolvingAgainst: candidates)
         }
@@ -7824,7 +8148,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// collapse a focused header (Enter rides the select arm), and Esc with
     /// an active filter clears the filter FIRST instead of dismissing
     /// (`esc_clears_active_filter`, state.rs:7347).
-    private func handleDashboardChord(_ event: KeyEvent) throws -> OpenGrokPagerInputRouting? {
+    private func handleDashboardChord(_ event: KeyEvent) async throws -> OpenGrokPagerInputRouting? {
         guard overlays.focused?.id == LiveDashboardOverlay.overlayID else { return nil }
         if var query = dashboardSearchQuery {
             switch event.key {
@@ -7856,6 +8180,46 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             try renderState()
             return .consumed
         }
+        if let question = dashboardPeekQuestion,
+           selectedDashboardListRowID() == LiveDashboardOverlay.attachPrefix + sessionID,
+           let routing = try await handleDashboardQuestionChord(event, question: question) {
+            return routing
+        }
+        if let mode = dashboardInputMode {
+            if event.key == .char("w"), event.modifiers.contains(.control),
+               case .compose(let rowID) = mode,
+               rowID == LiveDashboardOverlay.newAgentRowID {
+                toggleDashboardWorktree()
+                rebuildDashboardRows()
+                try renderState()
+                return .consumed
+            }
+            switch event.key {
+            case .escape:
+                if case .worktree(let prompt) = mode {
+                    dashboardInputMode = .compose(rowID: LiveDashboardOverlay.newAgentRowID)
+                    dashboardInputText = prompt
+                } else {
+                    dashboardInputMode = nil
+                    dashboardInputText = ""
+                }
+                rebuildDashboardRows()
+                try renderState()
+                return .consumed
+            case .backspace:
+                if !dashboardInputText.isEmpty { dashboardInputText.removeLast() }
+            case .enter:
+                return try await commitDashboardInput(mode)
+            case .char(let character)
+                where event.modifiers.subtracting(.shift).isEmpty && !character.isNewline:
+                dashboardInputText.append(character)
+            default:
+                return .consumed
+            }
+            rebuildDashboardRows()
+            try renderState()
+            return .consumed
+        }
         switch event.key {
         case .char(let character) where event.modifiers.contains(.control):
             if Self.isSearchChordCharacter(character) {
@@ -7875,6 +8239,40 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                     persistDashboardState()
                     try renderState()
                 }
+                return .consumed
+            }
+            if String(character).lowercased() == "r" {
+                guard let rowID = selectedDashboardListRowID(),
+                      rowID.hasPrefix(LiveDashboardOverlay.attachPrefix)
+                else {
+                    note("Only top-level session rows can be renamed.")
+                    try renderState()
+                    return .consumed
+                }
+                dashboardInputMode = .rename(rowID: rowID)
+                dashboardInputText = ""
+                rebuildDashboardRows()
+                try renderState()
+                return .consumed
+            }
+            if String(character).lowercased() == "x" {
+                guard let rowID = selectedDashboardListRowID(),
+                      rowID.hasPrefix(LiveDashboardOverlay.attachPrefix)
+                else { return .consumed }
+                await handleDashboardClose(
+                    rowID: LiveDashboardOverlay.closePrefix + ":" + rowID
+                )
+                return .consumed
+            }
+            if String(character).lowercased() == "l" {
+                presentDashboardLocationPicker()
+                try renderState()
+                return .consumed
+            }
+            if String(character).lowercased() == "w" {
+                toggleDashboardWorktree()
+                rebuildDashboardRows()
+                try renderState()
                 return .consumed
             }
             return nil
@@ -7899,9 +8297,236 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             rebuildDashboardRows()
             try renderState()
             return .consumed
+        case .char(let character)
+            where event.modifiers.subtracting(.shift).isEmpty && !character.isNewline:
+            guard let rowID = selectedDashboardListRowID() else { return .consumed }
+            dashboardInputMode = .compose(rowID: rowID)
+            dashboardInputText = String(character)
+            rebuildDashboardRows()
+            try renderState()
+            return .consumed
         default:
             return nil
         }
+    }
+
+    private func commitDashboardInput(
+        _ mode: LiveDashboardInputMode
+    ) async throws -> OpenGrokPagerInputRouting {
+        let text = dashboardInputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch mode {
+        case .rename(let rowID):
+            dashboardInputMode = nil
+            dashboardInputText = ""
+            guard !text.isEmpty else {
+                rebuildDashboardRows()
+                try renderState()
+                return .consumed
+            }
+            let sessionID = String(rowID.dropFirst(LiveDashboardOverlay.attachPrefix.count))
+            let title = LivePagerTasksBlock.firstNonEmptyLine(text)
+            let renamed: Bool
+            if let pagerRuntime {
+                renamed = (try? await pagerRuntime.renameRetainedSession(
+                    sessionID: sessionID,
+                    title: title
+                )) == true
+            } else if sessionID == self.sessionID, let conversationHistory {
+                do {
+                    try await conversationHistory.rename(title: title)
+                    renamed = true
+                } catch {
+                    renamed = false
+                }
+            } else {
+                renamed = (try? await conversationStore?.renameStored(
+                    sessionID: sessionID,
+                    title: title
+                )) == true
+            }
+            if renamed {
+                if let index = sessionTabs.firstIndex(where: { $0.sessionID == sessionID }) {
+                    sessionTabs[index].title = title
+                }
+                if let index = dashboardDormant.firstIndex(where: { $0.sessionID == sessionID }) {
+                    dashboardDormant[index].title = title
+                }
+            } else {
+                note("Session no longer exists.")
+            }
+            rebuildDashboardRows()
+            try renderState()
+            return .consumed
+
+        case .worktree(let prompt):
+            do {
+                let preparation = try LiveWorktreeLaunch.prepare(
+                    options: CLIExecutionOptions(worktree: text),
+                    sourceDirectory: URL(
+                        fileURLWithPath: dashboardDispatchWorkingDirectory,
+                        isDirectory: true
+                    ).standardizedFileURL,
+                    openGrokHome: openGrokHome,
+                    isCancelled: { false }
+                )
+                guard let preparation else {
+                    throw CLIApplicationError.failed("dashboard worktree preparation was not requested")
+                }
+                pendingDashboardWorktree = preparation
+                dashboardInputMode = nil
+                dashboardInputText = ""
+                dashboardWorktreeEnabled = false
+                preserveDashboardOnNextSessionSwitch = true
+                return .dispatchNew(
+                    prompt: prompt,
+                    workingDirectory: preparation.effectiveDirectory.path
+                )
+            } catch {
+                note(String(describing: error))
+                dashboardInputMode = .compose(rowID: LiveDashboardOverlay.newAgentRowID)
+                dashboardInputText = prompt
+                dashboardWorktreeEnabled = true
+            }
+            rebuildDashboardRows()
+            try renderState()
+            return .consumed
+
+        case .compose(let rowID):
+            guard !text.isEmpty else {
+                dashboardInputMode = nil
+                dashboardInputText = ""
+                rebuildDashboardRows()
+                try renderState()
+                return .consumed
+            }
+            if text == "/cd" {
+                dashboardInputMode = nil
+                dashboardInputText = ""
+                presentDashboardLocationPicker()
+                try renderState()
+                return .consumed
+            }
+            if text.hasPrefix("/cd ") {
+                dashboardInputMode = nil
+                dashboardInputText = ""
+                changeDashboardDispatchLocation(String(text.dropFirst(4)))
+                rebuildDashboardRows()
+                try renderState()
+                return .consumed
+            }
+            dashboardInputMode = nil
+            dashboardInputText = ""
+            preserveDashboardOnNextSessionSwitch = true
+            if rowID == LiveDashboardOverlay.newAgentRowID {
+                if dashboardWorktreeEnabled {
+                    dashboardInputMode = .worktree(prompt: text)
+                    preserveDashboardOnNextSessionSwitch = false
+                    rebuildDashboardRows()
+                    try renderState()
+                    return .consumed
+                }
+                return .dispatchNew(
+                    prompt: text,
+                    workingDirectory: dashboardDispatchWorkingDirectory
+                )
+            }
+            if rowID.hasPrefix(LiveDashboardOverlay.subagentPrefix) {
+                note("Subagent peeks are read-only; attach before sending a prompt.")
+                preserveDashboardOnNextSessionSwitch = false
+                rebuildDashboardRows()
+                try renderState()
+                return .consumed
+            }
+            guard rowID.hasPrefix(LiveDashboardOverlay.attachPrefix) else {
+                preserveDashboardOnNextSessionSwitch = false
+                return .consumed
+            }
+            return .dispatchPrompt(
+                sessionID: String(rowID.dropFirst(LiveDashboardOverlay.attachPrefix.count)),
+                prompt: text
+            )
+        }
+    }
+
+    private func selectDashboardListRow(id: String) {
+        overlays.updateList(id: LiveDashboardOverlay.overlayID) { list in
+            guard let index = list.rows.firstIndex(where: { $0.id == id }) else { return }
+            list.selectedIndex = index
+        }
+    }
+
+    private func presentDashboardLocationPicker() {
+        var paths = [dashboardDispatchWorkingDirectory]
+        let current = URL(
+            fileURLWithPath: dashboardDispatchWorkingDirectory,
+            isDirectory: true
+        ).standardizedFileURL
+        paths.append(current.deletingLastPathComponent().path)
+        if let home = environment["HOME"] { paths.append(home) }
+        paths.append(contentsOf: sessionTabs.map(\.cwd))
+        paths.append(contentsOf: dashboardDormant.map(\.workingDirectory))
+        paths.append(contentsOf: leaderRoster.map(\.cwd))
+        var seen: Set<String> = []
+        let rows = paths.compactMap { path -> PagerListRow? in
+            let normalized = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+            guard !normalized.isEmpty, seen.insert(normalized).inserted else { return nil }
+            return PagerListRow(
+                id: "location:" + normalized,
+                label: LivePagerChrome.collapseHome(normalized)
+            )
+        }
+        overlays.push(.list(
+            id: "dashboard-location",
+            title: "Choose dashboard location",
+            rows: rows,
+            isFilterable: true,
+            hints: [
+                PagerOverlayHint(key: "enter", label: "select"),
+                PagerOverlayHint(key: "esc", label: "back"),
+            ]
+        ))
+    }
+
+    private func changeDashboardDispatchLocation(_ input: String) {
+        let expanded = (input as NSString).expandingTildeInPath
+        let candidate = URL(fileURLWithPath: expanded, relativeTo: URL(
+            fileURLWithPath: dashboardDispatchWorkingDirectory,
+            isDirectory: true
+        )).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(
+            atPath: candidate.path,
+            isDirectory: &isDirectory
+        ), isDirectory.boolValue else {
+            note("Directory not found: \(input)")
+            return
+        }
+        guard FileManager.default.changeCurrentDirectoryPath(candidate.path) else {
+            note("Could not set working directory: \(candidate.path)")
+            return
+        }
+        dashboardDispatchWorkingDirectory = candidate.path
+        note("\u{2192} \(LivePagerChrome.collapseHome(candidate.path))")
+    }
+
+    private func toggleDashboardWorktree() {
+        let sourceDirectory = URL(
+            fileURLWithPath: dashboardDispatchWorkingDirectory,
+            isDirectory: true
+        ).standardizedFileURL
+        do {
+            guard try discoverGitRepo(at: sourceDirectory).toplevel != nil else {
+                note("New worktrees require a git repository.")
+                dashboardWorktreeEnabled = false
+                return
+            }
+        } catch {
+            note("Could not inspect repository: \(error)")
+            dashboardWorktreeEnabled = false
+            return
+        }
+        dashboardWorktreeEnabled.toggle()
+        selectDashboardListRow(id: LiveDashboardOverlay.newAgentRowID)
     }
 
     /// Ctrl+/ reaches the decoder as the raw unit-separator byte; the
@@ -7947,17 +8572,42 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     }
 
     private func buildDashboardOverlay() -> PagerOverlay {
-        LiveDashboardOverlay.overlay(
+        let editingRowID: String?
+        switch dashboardInputMode {
+        case .compose(let rowID), .rename(let rowID): editingRowID = rowID
+        case .worktree: editingRowID = LiveDashboardOverlay.newAgentRowID
+        case nil: editingRowID = nil
+        }
+        return LiveDashboardOverlay.overlay(
             tabs: sessionTabs,
             activeSessionID: sessionID,
             activeTurnRunning: turnActivity != nil,
             activeNeedsInput: dashboardActiveNeedsInput,
             subagents: dashboardSubagents,
             dormant: dashboardDormant,
+            roster: leaderRoster,
             state: dashboardState,
             armedCloseSessionID: armedCloseSessionID,
-            searchQuery: dashboardSearchQuery
+            searchQuery: dashboardSearchQuery,
+            editingRowID: editingRowID,
+            editingText: dashboardInputText,
+            dispatchWorkingDirectory: LivePagerChrome.collapseHome(
+                dashboardDispatchWorkingDirectory
+            ),
+            worktreeEnabled: dashboardWorktreeEnabled
         )
+    }
+
+    private func dashboardCandidateRowIDs() -> [PagerDashboardRowID] {
+        LiveDashboardOverlay.rowInputs(
+            tabs: sessionTabs,
+            activeSessionID: sessionID,
+            activeTurnRunning: turnActivity != nil,
+            activeNeedsInput: dashboardActiveNeedsInput,
+            subagents: dashboardSubagents,
+            dormant: dashboardDormant,
+            roster: leaderRoster
+        ).map(\.id)
     }
 
     /// `dispatch_dashboard_persist` (`dashboard.rs:2369-2384`): thread the
@@ -8035,6 +8685,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// the filter query, i.e. destroy the selection the peek follows. A
     /// no-op when the roster is not the open list.
     private func refreshDashboardPeek() {
+        let replyState: (rowID: String, text: String?)?
+        if case .compose(let rowID) = dashboardInputMode,
+           rowID != LiveDashboardOverlay.newAgentRowID {
+            replyState = (rowID, dashboardInputText)
+        } else {
+            replyState = nil
+        }
+        let question = dashboardPeekQuestion
         overlays.updateList(id: LiveDashboardOverlay.overlayID) { list in
             list.peek = list.selectedRow.flatMap { row in
                 LiveDashboardPeek.peek(
@@ -8044,10 +8702,136 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                     activeItems: conversation.items,
                     activeLastActivity: sessionTabs
                         .first { $0.sessionID == sessionID }?.lastActivity,
-                    turnActivity: turnActivity
+                    turnActivity: turnActivity,
+                    subagentStatuses: Dictionary(
+                        uniqueKeysWithValues: dashboardSubagents.map {
+                            ($0.subagentID, $0.status)
+                        }
+                    ),
+                    subagentHints: Dictionary(
+                        uniqueKeysWithValues: dashboardSubagents.map {
+                            ($0.subagentID, $0.output)
+                        }
+                    ),
+                    replyRowID: replyState?.rowID,
+                    replyDraft: replyState?.text,
+                    questionPrompt: row.id == LiveDashboardOverlay.attachPrefix + sessionID
+                        ? question?.prompt
+                        : nil,
+                    questionOptions: row.id == LiveDashboardOverlay.attachPrefix + sessionID
+                        ? question?.options ?? []
+                        : [],
+                    questionSelectedIndex: row.id == LiveDashboardOverlay.attachPrefix + sessionID
+                        ? question?.selectedIndex
+                        : nil,
+                    questionFreeformText: row.id == LiveDashboardOverlay.attachPrefix + sessionID
+                        ? question?.freeformText ?? ""
+                        : "",
+                    questionFreeformFocused: row.id == LiveDashboardOverlay.attachPrefix + sessionID
+                        ? question?.freeformFocused ?? false
+                        : false,
+                    questionRequiresAttach: row.id == LiveDashboardOverlay.attachPrefix + sessionID
+                        ? question?.requiresAttach ?? false
+                        : false
                 )
             }
         }
+    }
+
+    private var dashboardPeekQuestion: LiveDashboardQuestionSnapshot? {
+        for overlay in overlays.overlays.reversed() {
+            guard case .question(let prompt) = overlay.content,
+                  let question = prompt.currentQuestion
+            else { continue }
+            return LiveDashboardQuestionSnapshot(
+                overlayID: overlay.id,
+                requestID: prompt.request.id,
+                prompt: question.text,
+                options: question.options.map(\.label) + ["Other"],
+                selectedIndex: prompt.cursor,
+                freeformText: prompt.freeformText,
+                freeformFocused: prompt.focus == .freeformInput,
+                requiresAttach: question.isMultiSelect
+            )
+        }
+        return nil
+    }
+
+    private func handleDashboardQuestionChord(
+        _ event: KeyEvent,
+        question snapshot: LiveDashboardQuestionSnapshot
+    ) async throws -> OpenGrokPagerInputRouting? {
+        if snapshot.requiresAttach {
+            if event.key == .escape { return nil }
+            switch event.key {
+            case .enter, .char(" "):
+                note("Open the session to answer multi-select questions.")
+                try renderState()
+            case .char(let character)
+                where character.wholeNumberValue != nil:
+                note("Open the session to answer multi-select questions.")
+                try renderState()
+            default:
+                break
+            }
+            return .consumed
+        }
+
+        if event.key == .escape, !snapshot.freeformFocused { return nil }
+        var confirmation: PagerQuestionPrompt.ConfirmResult?
+        let updated = overlays.updateQuestion(id: snapshot.overlayID) { prompt in
+            switch prompt.focus {
+            case .freeformInput:
+                switch event.key {
+                case .escape:
+                    prompt.leaveFreeformInput()
+                case .enter:
+                    confirmation = prompt.confirmFreeform()
+                case .backspace:
+                    prompt.deleteFreeformBackward()
+                case .char(let character)
+                    where event.modifiers.subtracting(.shift).isEmpty && !character.isNewline:
+                    prompt.appendFreeform(character)
+                default:
+                    break
+                }
+            case .navigation:
+                switch event.key {
+                case .up:
+                    prompt.moveCursor(by: -1)
+                case .down:
+                    prompt.moveCursor(by: 1)
+                case .enter:
+                    confirmation = prompt.confirmAtCursor()
+                case .char(" "):
+                    prompt.toggleAtCursor()
+                case .char(let character)
+                    where event.modifiers.subtracting(.shift).isEmpty && !character.isNewline:
+                    if let number = character.wholeNumberValue,
+                       number > 0,
+                       number <= prompt.rowCount {
+                        prompt.moveCursor(by: number - 1 - prompt.cursor)
+                        confirmation = prompt.confirmAtCursor()
+                    } else if prompt.isOnFreeformRow {
+                        prompt.enterFreeformInput()
+                        prompt.appendFreeform(character)
+                    }
+                default:
+                    break
+                }
+            }
+        }
+        guard updated else { return .consumed }
+        if case .submitted(let answers) = confirmation {
+            await resolveQuestion(
+                overlayID: snapshot.overlayID,
+                requestID: snapshot.requestID,
+                outcome: .answered(answers)
+            )
+        }
+        rebuildDashboardRows()
+        try renderState()
+        return .consumed
     }
 
     /// Ctrl+G (`agent_view/input.rs:1230-1231`): closed → open focused;
@@ -8258,7 +9042,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// Frame chrome. `turnActivity` is `nil` whenever no turn is in flight,
     /// which is what hides the turn-status row — the reference gives that row
     /// zero height when idle.
-    private let workingDirectory: String
+    private var workingDirectory: String
     private var modelName: String
     /// `(id, provider)` pairs the `/model` picker lists.
     private let modelCatalog: [LiveModelPickerEntry]
@@ -8416,6 +9200,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// predate the hook wiring (tests, non-interactive minimal sessions),
     /// in which case `/compact` compacts without firing hooks.
     private let toolExecutor: LiveToolExecutor?
+    private let pagerRuntime: LivePagerRuntimeAdapter?
     /// The session this renderer belongs to, and the three things the
     /// session-scoped commands act on.
     ///
@@ -8624,6 +9409,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         paintCadence: TimeInterval = PagerMotion.defaultPaintCadence,
         environment: [String: String]? = nil,
         toolExecutor: LiveToolExecutor? = nil,
+        pagerRuntime: LivePagerRuntimeAdapter? = nil,
         authServices: LivePagerAuthServices = .production
     ) {
         self.mode = mode
@@ -8656,6 +9442,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.workflowsEnabled = workflowsEnabled
         self.compaction = compaction
         self.toolExecutor = toolExecutor
+        self.pagerRuntime = pagerRuntime
+        self.dashboardDispatchWorkingDirectory = workingDirectory
         self.wheelTuning = MouseWheelTuning(
             eventsPerTick: MouseWheelTuning.eventsPerTick(forTerminalProgram: terminalProgram)
         )
@@ -9599,12 +10387,32 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // A swapped conversation invalidates an in-flight recap the same
             // way a new prompt does — it no longer describes this session.
             recapEpoch &+= 1
+            let preserveDashboard = preserveDashboardOnNextSessionSwitch
+            preserveDashboardOnNextSessionSwitch = false
             registerSessionTab(sessionID)
             resetForNewSession(sessionID: sessionID)
+            await synchronizeRendererWorkingDirectory(sessionID: sessionID)
+            if let preparation = pendingDashboardWorktree {
+                pendingDashboardWorktree = nil
+                do {
+                    try LiveWorktreeLaunch.attachSession(preparation, sessionID: sessionID)
+                } catch {
+                    note(String(describing: error))
+                }
+            }
+            if preserveDashboard {
+                restoreDashboardAfterSessionSwitch()
+            }
         case .sessionResumed(let sessionID):
             recapEpoch &+= 1
+            let preserveDashboard = preserveDashboardOnNextSessionSwitch
+            preserveDashboardOnNextSessionSwitch = false
             registerSessionTab(sessionID)
             await applyResumedSession(sessionID: sessionID)
+            await synchronizeRendererWorkingDirectory(sessionID: sessionID)
+            if preserveDashboard {
+                restoreDashboardAfterSessionSwitch()
+            }
         case .notice(let message):
             appendMessage(PagerMessage(role: .system, text: message))
         case .interjected(let text):
@@ -9706,6 +10514,29 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         endTurn()
         overlays.removeAll()
         overlays.push(.welcome(welcomeOverlay(), capturesInput: false))
+    }
+
+    private func synchronizeRendererWorkingDirectory(sessionID: String) async {
+        let directory: URL?
+        if let entry = leaderRoster.first(where: { $0.sessionId == sessionID }) {
+            directory = URL(fileURLWithPath: entry.cwd, isDirectory: true).standardizedFileURL
+            if let modelID = entry.modelId { modelName = modelID }
+        } else {
+            directory = await pagerRuntime?.workingDirectory(sessionID: sessionID)
+        }
+        guard let directory else { return }
+        workingDirectory = directory.path
+        if let index = sessionTabs.firstIndex(where: { $0.sessionID == sessionID }) {
+            sessionTabs[index].cwd = directory.path
+        }
+    }
+
+    private func restoreDashboardAfterSessionSwitch() {
+        dashboardInputMode = nil
+        dashboardInputText = ""
+        overlays.removeAll()
+        overlays.push(buildDashboardOverlay())
+        refreshDashboardPeek()
     }
 
     /// Move the transcript viewport.
@@ -11880,7 +12711,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // The approval the question was waiting behind is resolved;
             // surface the parked questionnaire now.
             pendingQuestionRequest = nil
-            overlays.push(.question(parked))
+            pushQuestionOverlay(parked)
             currentQuestionRequestID = parked.id
         }
         try? renderState()
@@ -11907,11 +12738,21 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             if currentPermissionRequestID != nil {
                 pendingQuestionRequest = request
             } else {
-                overlays.push(.question(request))
+                pushQuestionOverlay(request)
                 currentQuestionRequestID = request.id
             }
         }
         try? renderState()
+    }
+
+    private func pushQuestionOverlay(_ request: PagerQuestionRequest) {
+        guard let dashboard = overlays.dismiss(id: LiveDashboardOverlay.overlayID) else {
+            overlays.push(.question(request))
+            return
+        }
+        overlays.push(.question(request))
+        overlays.push(dashboard)
+        refreshDashboardPeek()
     }
 
     private func resolveOutstandingPermissions() async {
@@ -12166,8 +13007,24 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 rebuildDashboardRows()
                 return nil
             }
-            guard rowID.hasPrefix(LiveDashboardOverlay.attachPrefix) else { return nil }
-            let target = String(rowID.dropFirst(LiveDashboardOverlay.attachPrefix.count))
+            let target: String
+            if rowID.hasPrefix(LiveDashboardOverlay.attachPrefix) {
+                target = String(rowID.dropFirst(LiveDashboardOverlay.attachPrefix.count))
+            } else if rowID.hasPrefix(LiveDashboardOverlay.subagentPrefix) {
+                target = String(rowID.dropFirst(LiveDashboardOverlay.subagentPrefix.count))
+                guard dashboardPeekCache.items[target] != nil else {
+                    note("Subagent attach is available after its transcript is persisted.")
+                    rebuildDashboardRows()
+                    return nil
+                }
+            } else if rowID == LiveDashboardOverlay.newAgentRowID {
+                dashboardInputMode = .compose(rowID: rowID)
+                dashboardInputText = ""
+                rebuildDashboardRows()
+                return nil
+            } else {
+                return nil
+            }
             overlays.dismiss(id: LiveDashboardOverlay.overlayID)
             // Attaching to the ACTIVE session is just closing the roster;
             // any other row rides the same `/resume <id>` the sessions
@@ -12175,6 +13032,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // machinery's refusals.
             guard target != sessionID else { return nil }
             return "/resume \(target)"
+        }
+        if overlayID == "dashboard-location" {
+            guard rowID.hasPrefix("location:") else { return nil }
+            let path = String(rowID.dropFirst("location:".count))
+            overlays.dismiss(id: overlayID)
+            changeDashboardDispatchLocation(path)
+            rebuildDashboardRows()
+            return nil
         }
         if overlayID == "workflows" {
             // The dashboard stays open: a control key acts on a run and
@@ -12565,7 +13430,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // Dashboard-scoped chords run BEFORE the generic overlay
             // routing — upstream registers the dashboard's bindings over
             // the globals while it has focus (`defaults.rs:997-1017`).
-            if let dashboardRouting = try handleDashboardChord(key) {
+            if let dashboardRouting = try await handleDashboardChord(key) {
                 return dashboardRouting
             }
             switch overlays.handle(key, viewportHeight: overlayViewportHeight) {
@@ -13089,6 +13954,18 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 "opencode_go_models": (try? store.loadMultiSelect(key: "opencode_go_models")) ?? []
             ],
             locks: locks,
+            hiddenKeys: [
+                "voice_keybind_enabled",
+                "voice_capture_mode",
+                "voice_stt_language",
+                "antigravity_subagents",
+                "antigravity_skip_permissions",
+                "memory.dream.enabled",
+                "features.lsp_tools",
+            ],
+            gatedChoices: [
+                "permission_mode": ["auto"],
+            ],
             // Minimal mode hides the rows the reference marks `hidden_in_minimal`,
             // because none of them have a surface there to affect.
             minimalMode: mode != .fullScreen

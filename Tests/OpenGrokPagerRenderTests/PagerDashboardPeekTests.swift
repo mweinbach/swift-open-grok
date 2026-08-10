@@ -277,9 +277,9 @@ struct PagerDashboardPeekSizingTests {
     // layout.rs:57-108 — the measure the paint has to agree with.
     @Test("desired content shrinks to fit, and an empty body still reserves a hint row")
     func desiredContentRows() {
-        // layout.rs:1005-1011 minus the deferred reply row: status + blank +
-        // hint. The hint row is why an idle peek never collapses to a bare
-        // status line that reads as a rendering failure.
+        // A transcript-only sizing probe: status + blank + hint. The live
+        // dashboard passes one reply row; zero keeps this case focused on the
+        // empty-tail budget.
         let empty = PagerDashboardPeekTail.desiredContentRows(
             maxContent: 20, replyRows: 0, bodyMeasured: 0, pinUser: false
         )
@@ -287,7 +287,7 @@ struct PagerDashboardPeekSizingTests {
         #expect(empty.blankRow)
         #expect(empty.contentRows == 3, "status + blank + hint")
 
-        // layout.rs:1021-1033 minus the reply row.
+        // The corresponding transcript-only pinned-tail probe.
         let pinned = PagerDashboardPeekTail.desiredContentRows(
             maxContent: 20, replyRows: 0, bodyMeasured: 2, pinUser: true
         )
@@ -353,11 +353,33 @@ struct PagerDashboardPeekSizingTests {
 
 @Suite("Dashboard peek band paint")
 struct PagerDashboardPeekBandTests {
+    @Test("question mode paints the selected option and freeform cursor")
+    func questionModePaintsSelection() {
+        let area = TerminalRect(x: 0, y: 0, width: 80, height: 10)
+        var buffer = CellBuffer(area: area)
+        drawDashboardPeekBand(
+            PagerDashboardPeek(
+                statusLabel: "Waiting",
+                questionPrompt: "Choose timing",
+                questionOptions: ["Ship now", "Hold", "Other"],
+                questionSelectedIndex: 2,
+                questionFreeformText: "next week",
+                questionFreeformFocused: true
+            ),
+            in: area,
+            buffer: &buffer,
+            theme: .default
+        )
+        let content = bandRows(buffer, area: area).joined(separator: "\n")
+        #expect(content.contains("Choose timing"))
+        #expect(content.contains("❯ 3. Other: next week▏"))
+    }
+
     // peek.rs:1253-1298 — the paint must not steal the body row for a blank.
     @Test("a tight band still shows the current-turn body under the pin")
     func tightPinShowsCurrentTurnBody() {
-        // 2 chrome rows + 3 content rows (status + pin + body).
-        let area = TerminalRect(x: 0, y: 0, width: 80, height: 5)
+        // 2 chrome rows + 4 content rows (status + pin + body + live reply).
+        let area = TerminalRect(x: 0, y: 0, width: 80, height: 6)
         var buffer = CellBuffer(area: area)
         drawDashboardPeekBand(
             PagerDashboardPeek(

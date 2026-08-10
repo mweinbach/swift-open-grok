@@ -11,24 +11,23 @@
 // picker; `x` arms/deletes through the close verb (C-1).
 
 import Foundation
+import OpenGrokACPRuntime
 import OpenGrokPagerRender
 
-/// One in-process session tab — B1-m's registry entry. Metadata only: the
-/// pre-ruled divergence keeps background tabs idle, so a row needs no
-/// retained conversation to be truthful.
+/// One in-process session tab — B1-m's roster entry. The runtime retains the
+/// conversation; this value carries the render metadata used by the list.
 struct LiveSessionTab: Sendable, Equatable {
     var sessionID: String
     var title: String
     var lastActivity: Date
-    /// The tab's working directory — `Grouping::Directory`'s key. Every
-    /// in-process tab shares the launch cwd (single runtime stack); dormant
-    /// rows carry their own persisted cwds, which is what makes the
-    /// directory grouping real.
+    /// The tab's retained working directory — `Grouping::Directory`'s key.
+    /// Live and dormant rows both carry their session-specific cwd.
     var cwd: String = ""
 }
 
 enum LiveDashboardOverlay {
     static let overlayID = "dashboard"
+    static let newAgentRowID = "dispatch:new"
 
     /// Row id prefix for attachable sessions (live AND dormant); the select
     /// arm strips it and rides `/resume <id>`.
@@ -36,7 +35,8 @@ enum LiveDashboardOverlay {
     /// The `x` close verb's row-action prefix (B1 C-1): the dispatched rowID
     /// is `close:attach:<sessionID>`.
     static let closePrefix = "close"
-    /// Non-selectable child rows under the active session.
+    /// Child rows under the active session. The child id is also its durable
+    /// session id, so Enter can attach through the retained `/resume` seam.
     static let subagentPrefix = "subagent:"
     /// Focusable section headers; Enter/Left/Right toggle collapse.
     static let sectionPrefix = "section:"
@@ -54,11 +54,20 @@ enum LiveDashboardOverlay {
         activeNeedsInput: Bool = false,
         subagents: [LiveSubagentSnapshot],
         dormant: [LiveSessionListing] = [],
+        roster: [ACPLeaderRosterEntry] = [],
         state: PagerDashboardState = PagerDashboardState(),
         armedCloseSessionID: String? = nil,
         searchQuery: String? = nil,
+        editingRowID: String? = nil,
+        editingText: String = "",
+        dispatchWorkingDirectory: String? = nil,
+        worktreeEnabled: Bool = false,
         now: Date = Date()
     ) -> PagerOverlay {
+        let rosterByID = Dictionary(
+            roster.map { ($0.sessionId, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
         let lines = state.lines(
             from: state.rows(from: rowInputs(
                 tabs: tabs,
@@ -67,13 +76,23 @@ enum LiveDashboardOverlay {
                 activeNeedsInput: activeNeedsInput,
                 subagents: subagents,
                 dormant: dormant,
+                roster: roster,
                 now: now
             )),
             now: now
         )
 
-        var rows: [PagerListRow] = []
-        rows.reserveCapacity(lines.count)
+        var rows: [PagerListRow] = [PagerListRow(
+            id: newAgentRowID,
+            label: editingRowID == newAgentRowID
+                ? "\u{276F} \(editingText)"
+                : (worktreeEnabled ? "+ New worktree" : "+ New agent"),
+            detail: [
+                worktreeEnabled ? "worktree" : nil,
+                dispatchWorkingDirectory,
+            ].compactMap { $0 }.joined(separator: "  ")
+        )]
+        rows.reserveCapacity(lines.count + 1)
         for line in lines {
             switch line {
             case .pinnedHeader(let count):
@@ -95,7 +114,10 @@ enum LiveDashboardOverlay {
                     for: row,
                     activeSessionID: activeSessionID,
                     activeTurnRunning: activeTurnRunning,
-                    armedCloseSessionID: armedCloseSessionID
+                    armedCloseSessionID: armedCloseSessionID,
+                    editingRowID: editingRowID,
+                    editingText: editingText,
+                    rosterActivity: rosterByID[row.id.owningSessionID]?.activity
                 ))
             case .idleOverflow(let hidden, let expanded):
                 // Upstream's fold line (`render.rs:1424-1487`): a focusable
@@ -122,33 +144,34 @@ enum LiveDashboardOverlay {
             id: overlayID,
             title: title,
             rows: rows,
+            isFilterable: false,
+            sizing: PagerModalSizing(
+                widthFraction: 0.9,
+                maximumWidth: 140,
+                minimumWidth: 60,
+                verticalMargin: 2,
+                horizontalPadding: 2,
+                verticalPadding: 1,
+                footerLines: 2
+            ),
             // The state machinery owns filtering (Ctrl+/ search, the a:/s:
             // grammar); leaving the list's own fuzzy filter on would
             // double-filter the same keystrokes.
-            isFilterable: false,
             hints: [
                 PagerOverlayHint(key: "enter", label: "attach"),
-                PagerOverlayHint(key: "x", label: "delete"),
+                PagerOverlayHint(key: "type", label: "reply"),
+                PagerOverlayHint(key: "ctrl+r", label: "rename"),
+                PagerOverlayHint(key: "ctrl+x", label: "delete"),
                 PagerOverlayHint(key: "ctrl+t", label: "pin"),
                 PagerOverlayHint(key: "ctrl+g", label: "group"),
+                PagerOverlayHint(key: "ctrl+l", label: "location"),
+                PagerOverlayHint(key: "ctrl+w", label: "worktree"),
                 PagerOverlayHint(key: "ctrl+/", label: "search"),
                 PagerOverlayHint(key: "esc", label: "close"),
             ]
         )
         if case .list(var list) = overlay.content {
-            // `x` deletes the selected session row — upstream's Ctrl+X delete
-            // leg (`dispatch_dashboard_stop`, dispatch/dashboard.rs:1980-2062).
-            // Bare `x` is safe here because the list's own filter is off.
-            list.rowActions = [PagerListRowAction(key: "x", rowIDPrefix: closePrefix)]
-            // Open on the first SESSION row, not the section header above
-            // it — Enter's first meaning is attach, and the header is still
-            // one ↑ away. (Only the composition's in-place rebuild preserves
-            // a moved cursor; a fresh open always re-anchors here.)
-            if let first = rows.firstIndex(where: { row in
-                row.isSelectable && row.id.hasPrefix(attachPrefix)
-            }) {
-                list.selectedIndex = first
-            }
+            list.selectedIndex = 0
             overlay.content = .list(list)
         }
         return overlay
@@ -156,14 +179,10 @@ enum LiveDashboardOverlay {
 
     // MARK: Row building
 
-    /// Classification per `classify_top_level` (`row.rs:375-393`) reduced to
-    /// the signals this runtime grounds: the ACTIVE session is needs-input
-    /// (pending permission/question) or working (turn running) or idle;
-    /// background tabs are IDLE BY CONSTRUCTION (the pre-ruled divergence —
-    /// no parallel top-level turns in one process); dormant catalog rows are
-    /// INACTIVE (`roster_activity_to_state`, `row.rs:258-269`). No session
-    /// row is ever Completed/Failed/Blocked — upstream's classifier never
-    /// emits them for live rows either.
+    /// Classification per `classify_top_level` (`row.rs:375-393`) plus the
+    /// leader FleetView roster (`row.rs:255-334`). Local retained background
+    /// tabs remain idle by construction, while leader-backed tabs and
+    /// unattached roster rows keep the leader's typed lifecycle state.
     static func rowInputs(
         tabs: [LiveSessionTab],
         activeSessionID: String,
@@ -171,15 +190,24 @@ enum LiveDashboardOverlay {
         activeNeedsInput: Bool,
         subagents: [LiveSubagentSnapshot],
         dormant: [LiveSessionListing],
+        roster: [ACPLeaderRosterEntry] = [],
         now: Date = Date()
     ) -> [PagerDashboardRowInput] {
         var inputs: [PagerDashboardRowInput] = []
         let liveIDs = Set(tabs.map(\.sessionID))
+        let rosterByID = Dictionary(
+            roster.map { ($0.sessionId, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
         for tab in tabs {
             let isActive = tab.sessionID == activeSessionID
             let rowState: PagerDashboardRowState
-            if isActive {
-                rowState = activeNeedsInput ? .needsInput : (activeTurnRunning ? .working : .idle)
+            if isActive, activeNeedsInput {
+                rowState = .needsInput
+            } else if isActive, activeTurnRunning {
+                rowState = .working
+            } else if let activity = rosterByID[tab.sessionID]?.activity {
+                rowState = rosterState(activity)
             } else {
                 rowState = .idle
             }
@@ -223,7 +251,8 @@ enum LiveDashboardOverlay {
         // process (`append_roster_rows` skips local ids, `row.rs:145-167`).
         // Label chain: title, else cwd basename, else the id — sanitized to
         // one line.
-        for listing in dormant where !liveIDs.contains(listing.sessionID) {
+        for listing in dormant
+        where !liveIDs.contains(listing.sessionID) && rosterByID[listing.sessionID] == nil {
             let title = listing.title.flatMap { title -> String? in
                 let line = LivePagerTasksBlock.firstNonEmptyLine(title)
                 return line.isEmpty ? nil : line
@@ -238,7 +267,35 @@ enum LiveDashboardOverlay {
                 lastChangeAt: listing.lastActivityAt
             ))
         }
+        for entry in roster where !liveIDs.contains(entry.sessionId) {
+            let title = entry.title.flatMap { title -> String? in
+                let line = LivePagerTasksBlock.firstNonEmptyLine(title)
+                return line.isEmpty ? nil : line
+            }
+            let basename = (entry.cwd as NSString).lastPathComponent
+            inputs.append(PagerDashboardRowInput(
+                id: .dormant(entry.sessionId),
+                label: title ?? (basename.isEmpty ? entry.sessionId : basename),
+                detail: entry.modelId,
+                state: rosterState(entry.activity),
+                cwd: entry.cwd,
+                lastChangeAt: Date(
+                    timeIntervalSince1970: TimeInterval(entry.lastChangeUnixMs) / 1_000
+                )
+            ))
+        }
         return inputs
+    }
+
+    static func rosterState(_ activity: ACPLeaderRosterActivity) -> PagerDashboardRowState {
+        switch activity {
+        case .working: return .working
+        case .idle: return .idle
+        case .needsInput: return .needsInput
+        case .dormant: return .inactive
+        case .completed: return .completed
+        case .dead: return .failed
+        }
     }
 
     /// `classify_subagent` (`row.rs:430-442`).
@@ -265,7 +322,10 @@ enum LiveDashboardOverlay {
         for row: PagerDashboardRow,
         activeSessionID: String,
         activeTurnRunning: Bool,
-        armedCloseSessionID: String?
+        armedCloseSessionID: String?,
+        editingRowID: String?,
+        editingText: String,
+        rosterActivity: ACPLeaderRosterActivity?
     ) -> PagerListRow {
         switch row.id {
         case .subagent(_, let child):
@@ -280,19 +340,26 @@ enum LiveDashboardOverlay {
                 id: subagentPrefix + child,
                 label: "    \u{21B3} \(row.label)",
                 detail: row.detail,
-                // Peek/attach-to-subagent are deferred surfaces; a row that
-                // dispatches nowhere must not be selectable (§4).
-                isSelectable: false
+                isSelectable: true
             )
         case .session(let sessionID), .dormant(let sessionID):
             let isActive = sessionID == activeSessionID
             let stateWord: String
-            if isActive {
-                stateWord = activeTurnRunning ? "running" : "attached"
+            if isActive, activeTurnRunning {
+                stateWord = "running"
+            } else if let rosterActivity {
+                stateWord = rosterActivity.rawValue
+            } else if isActive {
+                stateWord = "attached"
             } else {
                 switch row.state {
+                case .needsInput: stateWord = "needs_input"
+                case .working: stateWord = "working"
+                case .idle: stateWord = "idle"
                 case .inactive: stateWord = "inactive"
-                default: stateWord = "idle"
+                case .completed: stateWord = "completed"
+                case .failed: stateWord = "failed"
+                case .blocked: stateWord = "blocked"
                 }
             }
             // An armed close shows its confirmation ON the row — the port's
@@ -309,9 +376,12 @@ enum LiveDashboardOverlay {
             }
             let marker = isActive ? "\u{25CF} " : "  "
             let pin = row.pinned ? "\u{2299} " : ""
+            let rowID = attachPrefix + sessionID
             return PagerListRow(
-                id: attachPrefix + sessionID,
-                label: marker + pin + row.label,
+                id: rowID,
+                label: editingRowID == rowID
+                    ? "\u{276F} \(editingText)"
+                    : marker + pin + row.label,
                 detail: detail
             )
         }

@@ -40,14 +40,23 @@ public actor ACPAgentRuntime {
     private let reverseRequests: ACPReverseRequestBroker
     private let makeSessionId: @Sendable () -> String
     private let timestamp: @Sendable () -> String
+    private let rosterTimestampMilliseconds: @Sendable () -> Int64
 
     private var state: ACPConnectionState = .connected
     private var authenticated = false
     private var activePrompts: [AcpSessionId: Task<PromptRunOutcome, Never>] = [:]
+    private var pendingRosterInteractions: [AcpSessionId: Int] = [:]
+    private var rosterMetadata: [AcpSessionId: RosterMetadata] = [:]
     private var requestIDs: Set<AcpRequestId> = []
     private var queuedNotifications: [ACPMessage] = []
     private var notificationSink: NotificationSink?
+    private var rosterNotificationSink: NotificationSink?
     private var reverseSender: (@Sendable (ACPMessage) async throws -> Void)?
+
+    private struct RosterMetadata: Sendable {
+        var title: String?
+        var yolo: Bool
+    }
 
     public init(
         configuration: ACPAgentConfiguration = ACPAgentConfiguration(),
@@ -59,7 +68,10 @@ public actor ACPAgentRuntime {
         extensionNotifications: ACPExtensionNotificationRouter? = nil,
         reverseRequests: ACPReverseRequestBroker = ACPReverseRequestBroker(),
         makeSessionId: @escaping @Sendable () -> String = { UUID().uuidString },
-        timestamp: @escaping @Sendable () -> String = { ISO8601DateFormatter().string(from: Date()) }
+        timestamp: @escaping @Sendable () -> String = { ISO8601DateFormatter().string(from: Date()) },
+        rosterTimestampMilliseconds: @escaping @Sendable () -> Int64 = {
+            Int64(Date().timeIntervalSince1970 * 1_000)
+        }
     ) {
         self.configuration = configuration
         self.store = store
@@ -78,6 +90,7 @@ public actor ACPAgentRuntime {
         self.reverseRequests = reverseRequests
         self.makeSessionId = makeSessionId
         self.timestamp = timestamp
+        self.rosterTimestampMilliseconds = rosterTimestampMilliseconds
     }
 
     public func connectionState() -> ACPConnectionState {
@@ -88,6 +101,10 @@ public actor ACPAgentRuntime {
         notificationSink = sink
     }
 
+    func setRosterNotificationSink(_ sink: NotificationSink?) {
+        rosterNotificationSink = sink
+    }
+
     public func setReverseSender(_ sender: (@Sendable (ACPMessage) async throws -> Void)?) {
         reverseSender = sender
     }
@@ -96,7 +113,27 @@ public actor ACPAgentRuntime {
         guard let reverseSender else {
             throw ACPRuntimeError.transport("no ACP client is connected")
         }
-        return try await reverseRequests.request(method: method, params: params, send: reverseSender)
+        let interactionSession = Self.rosterInteractionSession(method: method, params: params)
+        if let interactionSession {
+            pendingRosterInteractions[interactionSession, default: 0] += 1
+            await publishRosterUpsert(sessionId: interactionSession, activity: .needsInput)
+        }
+        do {
+            let response = try await reverseRequests.request(
+                method: method,
+                params: params,
+                send: reverseSender
+            )
+            if let interactionSession {
+                await endRosterInteraction(sessionId: interactionSession)
+            }
+            return response
+        } catch {
+            if let interactionSession {
+                await endRosterInteraction(sessionId: interactionSession)
+            }
+            throw error
+        }
     }
 
     public func readTextFile(
@@ -150,6 +187,7 @@ public actor ACPAgentRuntime {
         }
         activePrompts.removeAll()
         await reverseRequests.cancelAll()
+        rosterNotificationSink = nil
         reverseSender = nil
     }
 
@@ -316,6 +354,8 @@ public actor ACPAgentRuntime {
             return try await setModel(route.params)
         case AgentMethodNames.sessionSetConfigOption:
             return try await setConfigOption(route.params)
+        case ACPLeaderRosterMethods.sessionsList:
+            return try await listRoster()
         default:
             guard let extensionRouter else {
                 throw ACPRuntimeError.methodNotFound(route.method)
@@ -441,6 +481,11 @@ public actor ACPAgentRuntime {
             updatedAt: timestamp()
         )
         try await store.create(session)
+        rosterMetadata[session.sessionId] = RosterMetadata(
+            title: nil,
+            yolo: Self.metaBool(request.meta, key: "yoloMode") ?? false
+        )
+        await publishRosterUpsert(sessionId: session.sessionId)
         return try encode(NewSessionResponse(
             sessionId: session.sessionId,
             modes: configuration.modes,
@@ -460,7 +505,9 @@ public actor ACPAgentRuntime {
         session.closed = false
         session.updatedAt = timestamp()
         try await store.update(session)
+        updateRosterMetadata(sessionId: session.sessionId, meta: request.meta)
         await replay(session)
+        await publishRosterUpsert(sessionId: session.sessionId)
         return try encode(LoadSessionResponse(modes: configuration.modes, models: configuration.models))
     }
 
@@ -482,7 +529,9 @@ public actor ACPAgentRuntime {
         session.closed = false
         session.updatedAt = timestamp()
         try await store.update(session)
+        updateRosterMetadata(sessionId: session.sessionId, meta: request.meta)
         await replay(session)
+        await publishRosterUpsert(sessionId: session.sessionId)
         return try encode(ResumeSessionResponse(modes: configuration.modes, models: configuration.models))
     }
 
@@ -506,6 +555,9 @@ public actor ACPAgentRuntime {
             durableUpdates: source.durableUpdates
         )
         try await store.create(fork)
+        rosterMetadata[fork.sessionId] = rosterMetadata[source.sessionId]
+            ?? RosterMetadata(title: nil, yolo: false)
+        await publishRosterUpsert(sessionId: fork.sessionId)
         return try encode(ForkSessionResponse(
             sessionId: fork.sessionId,
             modes: configuration.modes,
@@ -523,6 +575,21 @@ public actor ACPAgentRuntime {
         return try encode(ListSessionsResponse(sessions: sessions))
     }
 
+    private func listRoster() async throws -> JSONValue {
+        try requireReady()
+        let stored = try await store.list(cwd: nil)
+        let sessions = stored
+            .filter { !$0.closed }
+            .map { rosterEntry(for: $0) }
+            .sorted {
+                if $0.lastChangeUnixMs == $1.lastChangeUnixMs {
+                    return $0.sessionId < $1.sessionId
+                }
+                return $0.lastChangeUnixMs > $1.lastChangeUnixMs
+            }
+        return try encode(ACPLeaderRosterListResponse(sessions: sessions))
+    }
+
     private func closeSession(_ params: JSONValue) async throws -> JSONValue {
         try requireReady()
         let request = try decode(CloseSessionRequest.self, from: params, method: AgentMethodNames.sessionClose)
@@ -534,6 +601,9 @@ public actor ACPAgentRuntime {
         session.closed = true
         session.updatedAt = timestamp()
         try await store.update(session)
+        await publishRosterRemoved(sessionId: request.sessionId)
+        rosterMetadata.removeValue(forKey: request.sessionId)
+        pendingRosterInteractions.removeValue(forKey: request.sessionId)
         return try encode(CloseSessionResponse())
     }
 
@@ -590,9 +660,11 @@ public actor ACPAgentRuntime {
             }
         }
         activePrompts[request.sessionId] = task
-        defer { activePrompts.removeValue(forKey: request.sessionId) }
+        await publishRosterUpsert(sessionId: request.sessionId, activity: .working)
         let outcome = await task.value
+        activePrompts.removeValue(forKey: request.sessionId)
         await emitPromptComplete(request: request, outcome: outcome)
+        await publishRosterUpsert(sessionId: request.sessionId)
         return try encode(outcome.response)
     }
 
@@ -725,6 +797,7 @@ public actor ACPAgentRuntime {
         session.modelId = request.modelId
         session.updatedAt = timestamp()
         try await store.update(session)
+        await publishRosterUpsert(sessionId: request.sessionId)
         return try encode(SetSessionModelResponse())
     }
 
@@ -773,6 +846,17 @@ public actor ACPAgentRuntime {
     }
 
     private func emit(_ notification: SessionNotification, disposition: ACPNotificationDisposition) async {
+        var rosterTitleChanged = false
+        if case .sessionInfoUpdate(let update) = notification.update,
+           let title = update.title {
+            var metadata = rosterMetadata[notification.sessionId]
+                ?? RosterMetadata(title: nil, yolo: false)
+            if metadata.title != title {
+                metadata.title = title
+                rosterMetadata[notification.sessionId] = metadata
+                rosterTitleChanged = true
+            }
+        }
         if disposition == .durable {
             do {
                 if var session = try await store.read(notification.sessionId) {
@@ -789,6 +873,105 @@ public actor ACPAgentRuntime {
         if let notificationSink {
             await notificationSink(message)
         }
+        if rosterTitleChanged {
+            await publishRosterUpsert(sessionId: notification.sessionId)
+        }
+    }
+
+    private func publishRosterUpsert(
+        sessionId: AcpSessionId,
+        activity: ACPLeaderRosterActivity? = nil
+    ) async {
+        let stored: ACPSessionSnapshot?
+        do {
+            stored = try await store.read(sessionId)
+        } catch {
+            return
+        }
+        guard let snapshot = stored, !snapshot.closed else { return }
+        await sendRosterChanged(
+            ACPLeaderRosterChanged(upserted: [rosterEntry(for: snapshot, activity: activity)])
+        )
+    }
+
+    private func publishRosterRemoved(sessionId: AcpSessionId) async {
+        await sendRosterChanged(ACPLeaderRosterChanged(removed: [sessionId.rawValue]))
+    }
+
+    private func sendRosterChanged(_ changed: ACPLeaderRosterChanged) async {
+        guard !changed.upserted.isEmpty || !changed.removed.isEmpty,
+               let params = try? JSONValue.encode(changed)
+        else { return }
+        let message = ACPMessage.notification(
+            method: ACPLeaderRosterMethods.sessionsChanged,
+            params: params
+        )
+        if let rosterNotificationSink {
+            await rosterNotificationSink(message)
+        }
+    }
+
+    private func rosterEntry(
+        for snapshot: ACPSessionSnapshot,
+        activity: ACPLeaderRosterActivity? = nil
+    ) -> ACPLeaderRosterEntry {
+        let metadata = rosterMetadata[snapshot.sessionId]
+            ?? RosterMetadata(title: nil, yolo: false)
+        return ACPLeaderRosterEntry(
+            sessionId: snapshot.sessionId.rawValue,
+            title: metadata.title,
+            cwd: snapshot.cwd,
+            isWorktree: false,
+            modelId: snapshot.modelId?.rawValue,
+            reasoningEffort: nil,
+            yolo: metadata.yolo,
+            activity: activity ?? rosterActivity(sessionId: snapshot.sessionId),
+            resident: true,
+            lastChangeUnixMs: rosterTimestampMilliseconds(),
+            origin: .local
+        )
+    }
+
+    private func rosterActivity(sessionId: AcpSessionId) -> ACPLeaderRosterActivity {
+        if pendingRosterInteractions[sessionId, default: 0] > 0 {
+            return .needsInput
+        }
+        if activePrompts[sessionId] != nil {
+            return .working
+        }
+        return .idle
+    }
+
+    private func endRosterInteraction(sessionId: AcpSessionId) async {
+        let remaining = max(0, pendingRosterInteractions[sessionId, default: 0] - 1)
+        if remaining == 0 {
+            pendingRosterInteractions.removeValue(forKey: sessionId)
+        } else {
+            pendingRosterInteractions[sessionId] = remaining
+        }
+        await publishRosterUpsert(sessionId: sessionId)
+    }
+
+    private func updateRosterMetadata(sessionId: AcpSessionId, meta: AcpMeta?) {
+        guard let yolo = Self.metaBool(meta, key: "yoloMode") else { return }
+        var metadata = rosterMetadata[sessionId] ?? RosterMetadata(title: nil, yolo: false)
+        metadata.yolo = yolo
+        rosterMetadata[sessionId] = metadata
+    }
+
+    private static func metaBool(_ meta: AcpMeta?, key: String) -> Bool? {
+        guard case .bool(let value)? = meta?[key] else { return nil }
+        return value
+    }
+
+    private static func rosterInteractionSession(method: String, params: JSONValue) -> AcpSessionId? {
+        let route = ACPMethodRoute.normalize(method: method, params: params)
+        guard route.method == ClientMethodNames.sessionRequestPermission
+                || route.method == OpenGrokACPExtMethods.askUserQuestion,
+              case .object(let object) = route.params,
+              case .string(let sessionId)? = object["sessionId"]
+        else { return nil }
+        return AcpSessionId(sessionId)
     }
 
     private func emitProtocolError(_ error: Error) async {

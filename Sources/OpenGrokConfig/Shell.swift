@@ -27,11 +27,10 @@
 // `chainSeparator` on Windows) is still defined here as pure data so callers
 // that know their shell kind can use it.
 //
-// `isCommandAvailable` uses FileManager file-existence checks rather than the
-// Rust `which::which` crate (which also resolves PATHEXT on Windows and App
-// Execution Aliases). The Swift port covers the Unix and Windows PATH cases
-// that the Rust tests exercise; PATHEXT resolution is deferred to the W2-S4
-// integration slice.
+// `isCommandAvailable` uses FileManager checks rather than the Rust
+// `which::which` crate. The production resolver covers PATH on Unix and
+// PATH/PATHEXT on Windows; Windows App Execution Aliases remain delegated to
+// the operating system when commands are spawned.
 
 import Foundation
 import OpenGrokConfigTypes
@@ -184,21 +183,75 @@ func isExecutable(_ path: URL) -> Bool {
     #endif
 }
 
+enum ExecutableSearchPlatform: Sendable, Equatable {
+    case posix
+    case windows
+
+    static var current: Self {
+        #if os(Windows)
+        return .windows
+        #else
+        return .posix
+        #endif
+    }
+
+    var pathSeparator: Character {
+        switch self {
+        case .posix: return ":"
+        case .windows: return ";"
+        }
+    }
+
+    func pathValue(environment: [String: String]) -> String? {
+        switch self {
+        case .posix:
+            return environment["PATH"]
+        case .windows:
+            return environment["PATH"] ?? environment["Path"]
+        }
+    }
+
+    func executableSuffixes(name: String, environment: [String: String]) -> [String] {
+        guard self == .windows else { return [""] }
+        let pathExt = environment["PATHEXT"] ?? ".EXE;.CMD;.BAT"
+        let suffixes = pathExt.split(separator: ";").map(String.init)
+        guard !suffixes.isEmpty else { return [""] }
+        if suffixes.contains(where: { name.lowercased().hasSuffix($0.lowercased()) }) {
+            return [""]
+        }
+        return suffixes
+    }
+
+    func appendingPathComponent(_ component: String, to directory: String) -> String {
+        switch self {
+        case .posix:
+            return URL(fileURLWithPath: directory).appendingPathComponent(component).path
+        case .windows:
+            if directory.hasSuffix("\\") || directory.hasSuffix("/") {
+                return directory + component
+            }
+            return directory + "\\" + component
+        }
+    }
+}
+
 /// Locate `name` on `$PATH`. Returns the first matching executable, or `nil`.
-/// Mirrors Rust `which::which(name)` for the Unix PATH case. PATHEXT and App
-/// Execution Aliases on Windows are deferred to the W2-S4 integration slice.
-func which(_ name: String, environment: [String: String]) -> String? {
-    guard let path = environment["PATH"] else { return nil }
-    #if os(Windows)
-    let sep = ";"
-    #else
-    let sep = ":"
-    #endif
-    for dir in path.components(separatedBy: sep) {
-        if dir.isEmpty { continue }
-        let candidate = URL(fileURLWithPath: dir).appendingPathComponent(name)
-        if isExecutable(candidate) {
-            return candidate.path
+/// Mirrors the Rust `which::which(name)` behavior used by the live command
+/// availability seam, including ordered PATHEXT lookup on Windows.
+func which(
+    _ name: String,
+    environment: [String: String],
+    platform: ExecutableSearchPlatform = .current,
+    isExecutableFile: (String) -> Bool = { isExecutable(URL(fileURLWithPath: $0)) }
+) -> String? {
+    guard let path = platform.pathValue(environment: environment) else { return nil }
+    let suffixes = platform.executableSuffixes(name: name, environment: environment)
+    for directory in path.split(separator: platform.pathSeparator, omittingEmptySubsequences: true) {
+        for suffix in suffixes {
+            let candidate = platform.appendingPathComponent(name + suffix, to: String(directory))
+            if isExecutableFile(candidate) {
+                return candidate
+            }
         }
     }
     return nil
@@ -351,19 +404,21 @@ public func isCommandAvailable(
     _ name: String,
     environment: [String: String] = ProcessInfo.processInfo.environment
 ) -> Bool {
-    #if os(Windows)
-    // The Rust reference uses `which::which` (PATHEXT + App Execution
-    // Aliases). The Swift port covers the plain PATH case here; PATHEXT
-    // resolution is deferred to W2-S4.
-    if let _ = which(name, environment: environment) { return true }
-    // Try common extensions on Windows.
-    for ext in [".exe", ".bat", ".cmd"] {
-        if let _ = which(name + ext, environment: environment) { return true }
-    }
-    return false
-    #else
     return which(name, environment: environment) != nil
-    #endif
+}
+
+func isCommandAvailable(
+    _ name: String,
+    environment: [String: String],
+    platform: ExecutableSearchPlatform,
+    isExecutableFile: (String) -> Bool
+) -> Bool {
+    which(
+        name,
+        environment: environment,
+        platform: platform,
+        isExecutableFile: isExecutableFile
+    ) != nil
 }
 
 /// How the active shell interprets a bare `&`. Unix shells are always

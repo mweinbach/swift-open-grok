@@ -1,12 +1,13 @@
 // ObjectStore.swift
 //
-// Pure Git object/tree reader (loose objects + commit/tree parse).
+// Pure Git object/tree reader (loose objects + non-delta pack entries).
 // Used to compare stage-0 index entries against HEAD without shelling out.
 //
 // Portability:
 // - SHA-1 via pure-Swift `PortableSHA1` (no CryptoKit).
 // - zlib via Apple Compression when available, else system zlib (`COpenGrokZlib`).
-// - Packed objects: explicit `packedObjectUnsupported` non-parity error.
+// - Pack index v2 lookup with bounded non-delta inflate.
+// - OFS_DELTA/REF_DELTA remain explicit typed refusals.
 
 import Foundation
 #if canImport(Compression)
@@ -33,12 +34,20 @@ public struct GitTreeEntry: Sendable, Equatable {
     public var isSymlink: Bool { mode == 0o120000 }
 }
 
-/// Pure object store over a `.git` directory (loose objects only; packs optional best-effort).
+/// Pure object store over a `.git` directory.
 public struct GitObjectStore: Sendable {
-    public let gitDir: String
+    public static let defaultMaximumPackedObjectSize = 64 * 1024 * 1024
 
-    public init(gitDir: String) {
+    public let gitDir: String
+    public let maximumPackedObjectSize: Int
+
+    public init(
+        gitDir: String,
+        maximumPackedObjectSize: Int = GitObjectStore.defaultMaximumPackedObjectSize
+    ) {
+        precondition(maximumPackedObjectSize >= 0)
         self.gitDir = gitDir
+        self.maximumPackedObjectSize = maximumPackedObjectSize
     }
 
     /// Resolve a 40-char hex OID string to 20 raw bytes.
@@ -79,9 +88,10 @@ public struct GitObjectStore: Sendable {
             return try parseObject(inflated)
         }
 
-        // Pack reading is not implemented. When pack files exist, report an
-        // explicit non-parity error so callers never treat a pack-only object
-        // as a soft "missing HEAD" success.
+        if let location = try locatePackedObject(oid: oid) {
+            return try readPackedObject(oid: oid, location: location)
+        }
+
         if Self.hasPackFiles(gitDir: gitDir) {
             throw GitStatusError.packedObjectUnsupported(oid: hex)
         }
@@ -171,6 +181,447 @@ public struct GitObjectStore: Sendable {
         let payloadStart = inflated.index(after: nul)
         return (type, Data(inflated[payloadStart...]))
     }
+
+    private func locatePackedObject(oid: Data) throws -> PackedObjectLocation? {
+        let packDirectory = URL(fileURLWithPath: gitDir)
+            .appendingPathComponent("objects/pack", isDirectory: true)
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: packDirectory.path) else {
+            return nil
+        }
+
+        var firstFailure: GitStatusError?
+        for name in names.filter({ $0.hasSuffix(".idx") }).sorted() {
+            let indexURL = packDirectory.appendingPathComponent(name)
+            do {
+                let index = try PackIndexV2(url: indexURL)
+                guard let entry = index.lookup(oid: oid) else { continue }
+                let packURL = indexURL.deletingPathExtension().appendingPathExtension("pack")
+                guard FileManager.default.fileExists(atPath: packURL.path) else {
+                    throw GitStatusError.corruptPackIndex(
+                        path: indexURL.path,
+                        reason: "matching pack file is missing"
+                    )
+                }
+                return PackedObjectLocation(
+                    packURL: packURL,
+                    objectOffset: entry.offset,
+                    nextObjectOffset: entry.nextOffset,
+                    objectCount: index.objectCount,
+                    packChecksum: index.packChecksum
+                )
+            } catch let error as GitStatusError {
+                if firstFailure == nil {
+                    firstFailure = error
+                }
+            } catch {
+                if firstFailure == nil {
+                    firstFailure = .corruptPackIndex(path: indexURL.path, reason: String(describing: error))
+                }
+            }
+        }
+        if let firstFailure {
+            throw firstFailure
+        }
+        return nil
+    }
+
+    private func readPackedObject(
+        oid: Data,
+        location: PackedObjectLocation
+    ) throws -> (type: String, payload: Data) {
+        let path = location.packURL.path
+        let attributes: [FileAttributeKey: Any]
+        do {
+            attributes = try FileManager.default.attributesOfItem(atPath: path)
+        } catch {
+            throw GitStatusError.corruptPack(path: path, reason: "cannot stat pack: \(error)")
+        }
+        guard let fileSize = (attributes[.size] as? NSNumber)?.uint64Value, fileSize >= 32 else {
+            throw GitStatusError.corruptPack(path: path, reason: "pack is too short")
+        }
+
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: location.packURL)
+        } catch {
+            throw GitStatusError.corruptPack(path: path, reason: "cannot open pack: \(error)")
+        }
+        defer { try? handle.close() }
+
+        let header = try readExactly(handle: handle, offset: 0, count: 12, packPath: path)
+        guard header.prefix(4) == Data("PACK".utf8) else {
+            throw GitStatusError.corruptPack(path: path, reason: "bad pack signature")
+        }
+        let version = header.readBigEndianUInt32(at: 4)
+        guard version == 2 || version == 3 else {
+            throw GitStatusError.corruptPack(path: path, reason: "unsupported pack version \(version)")
+        }
+        let objectCount = header.readBigEndianUInt32(at: 8)
+        guard objectCount == location.objectCount else {
+            throw GitStatusError.corruptPack(
+                path: path,
+                reason: "pack/index object counts differ"
+            )
+        }
+
+        let trailerOffset = fileSize - 20
+        let trailer = try readExactly(handle: handle, offset: trailerOffset, count: 20, packPath: path)
+        guard trailer == location.packChecksum else {
+            throw GitStatusError.corruptPack(path: path, reason: "pack checksum does not match index")
+        }
+
+        let entryEnd = location.nextObjectOffset ?? trailerOffset
+        guard location.objectOffset >= 12,
+              location.objectOffset < entryEnd,
+              entryEnd <= trailerOffset else {
+            throw GitStatusError.corruptPack(path: path, reason: "object offset is outside pack data")
+        }
+        let entryLength = entryEnd - location.objectOffset
+        let prefixCount = Int(min(entryLength, 16))
+        let entryPrefix = try readExactly(
+            handle: handle,
+            offset: location.objectOffset,
+            count: prefixCount,
+            packPath: path
+        )
+        let parsedHeader = try parsePackEntryHeader(entryPrefix, packPath: path)
+        let hex = Self.hexFromOID(oid)
+
+        switch parsedHeader.typeCode {
+        case 6:
+            throw GitStatusError.packedDeltaUnsupported(oid: hex, kind: .offset)
+        case 7:
+            throw GitStatusError.packedDeltaUnsupported(oid: hex, kind: .reference)
+        default:
+            break
+        }
+
+        let type: String
+        switch parsedHeader.typeCode {
+        case 1: type = "commit"
+        case 2: type = "tree"
+        case 3: type = "blob"
+        case 4: type = "tag"
+        default:
+            throw GitStatusError.corruptPack(
+                path: path,
+                reason: "invalid packed object type \(parsedHeader.typeCode)"
+            )
+        }
+
+        guard parsedHeader.declaredSize <= UInt64(maximumPackedObjectSize) else {
+            throw GitStatusError.packedObjectTooLarge(
+                oid: hex,
+                declaredSize: parsedHeader.declaredSize,
+                limit: maximumPackedObjectSize
+            )
+        }
+        let compressedOffset = location.objectOffset + UInt64(parsedHeader.headerLength)
+        guard compressedOffset < entryEnd else {
+            throw GitStatusError.corruptPack(path: path, reason: "packed object has no zlib payload")
+        }
+        let compressedLength = entryEnd - compressedOffset
+        let maximumCompressedLength = UInt64(maximumPackedObjectSize) + 1_048_576
+        guard compressedLength <= maximumCompressedLength,
+              compressedLength <= UInt64(Int.max) else {
+            throw GitStatusError.corruptPack(path: path, reason: "packed object input exceeds bound")
+        }
+        let compressed = try readExactly(
+            handle: handle,
+            offset: compressedOffset,
+            count: Int(compressedLength),
+            packPath: path
+        )
+        let payload = try inflatePackedZlib(
+            compressed,
+            expectedSize: Int(parsedHeader.declaredSize),
+            packPath: path
+        )
+
+        var canonical = Data("\(type) \(payload.count)".utf8)
+        canonical.append(0)
+        canonical.append(payload)
+        guard PortableSHA1.hash(canonical) == oid else {
+            throw GitStatusError.corruptPack(path: path, reason: "packed object id mismatch")
+        }
+        return (type, payload)
+    }
+}
+
+private struct PackedObjectLocation {
+    var packURL: URL
+    var objectOffset: UInt64
+    var nextObjectOffset: UInt64?
+    var objectCount: UInt32
+    var packChecksum: Data
+}
+
+private struct PackIndexV2 {
+    struct Entry {
+        var offset: UInt64
+        var nextOffset: UInt64?
+    }
+
+    let data: Data
+    let fanout: [UInt32]
+    let namesOffset: Int
+    let offsets: [UInt64]
+    let objectCount: UInt32
+    let packChecksum: Data
+
+    init(url: URL) throws {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            throw GitStatusError.corruptPackIndex(path: url.path, reason: "cannot read index: \(error)")
+        }
+        guard data.count >= 8 + 256 * 4 + 40 else {
+            throw GitStatusError.corruptPackIndex(path: url.path, reason: "index is too short")
+        }
+        guard data.prefix(4) == Data([0xFF, 0x74, 0x4F, 0x63]) else {
+            throw GitStatusError.unsupportedPackIndexVersion(path: url.path, version: 1)
+        }
+        let version = data.readBigEndianUInt32(at: 4)
+        guard version == 2 else {
+            throw GitStatusError.unsupportedPackIndexVersion(path: url.path, version: Int(version))
+        }
+
+        var fanout: [UInt32] = []
+        fanout.reserveCapacity(256)
+        var previous: UInt32 = 0
+        for bucket in 0..<256 {
+            let value = data.readBigEndianUInt32(at: 8 + bucket * 4)
+            guard value >= previous else {
+                throw GitStatusError.corruptPackIndex(path: url.path, reason: "fanout table is not monotonic")
+            }
+            fanout.append(value)
+            previous = value
+        }
+        let objectCount = fanout[255]
+        let namesOffset = 8 + 256 * 4
+        let fixedTablesEnd = UInt64(namesOffset) + UInt64(objectCount) * 28
+        guard fixedTablesEnd + 40 <= UInt64(data.count) else {
+            throw GitStatusError.corruptPackIndex(path: url.path, reason: "index tables are truncated")
+        }
+
+        let count = Int(objectCount)
+        let offsetsOffset = namesOffset + count * 24
+        var rawOffsets: [UInt32] = []
+        rawOffsets.reserveCapacity(count)
+        var largeOffsetCount = 0
+        for index in 0..<count {
+            let raw = data.readBigEndianUInt32(at: offsetsOffset + index * 4)
+            rawOffsets.append(raw)
+            if raw & 0x8000_0000 != 0 {
+                largeOffsetCount += 1
+            }
+        }
+        let largeOffsetsOffset = offsetsOffset + count * 4
+        let expectedSize = UInt64(largeOffsetsOffset) + UInt64(largeOffsetCount) * 8 + 40
+        guard expectedSize == UInt64(data.count) else {
+            throw GitStatusError.corruptPackIndex(path: url.path, reason: "index has invalid table length")
+        }
+
+        let contentEnd = data.count - 20
+        guard PortableSHA1.hash(Data(data[..<contentEnd])) == Data(data[contentEnd...]) else {
+            throw GitStatusError.corruptPackIndex(path: url.path, reason: "index checksum mismatch")
+        }
+
+        var offsets: [UInt64] = []
+        offsets.reserveCapacity(count)
+        for raw in rawOffsets {
+            if raw & 0x8000_0000 == 0 {
+                offsets.append(UInt64(raw))
+            } else {
+                let largeIndex = Int(raw & 0x7FFF_FFFF)
+                guard largeIndex < largeOffsetCount else {
+                    throw GitStatusError.corruptPackIndex(path: url.path, reason: "large offset index is out of range")
+                }
+                offsets.append(data.readBigEndianUInt64(at: largeOffsetsOffset + largeIndex * 8))
+            }
+        }
+
+        var bucketCounts = [UInt32](repeating: 0, count: 256)
+        var previousOID: Data?
+        for index in 0..<count {
+            let oidOffset = namesOffset + index * 20
+            let currentOID = Data(data[oidOffset..<(oidOffset + 20)])
+            if let previousOID, !previousOID.lexicographicallyPrecedes(currentOID) {
+                throw GitStatusError.corruptPackIndex(path: url.path, reason: "object ids are not strictly sorted")
+            }
+            bucketCounts[Int(currentOID[0])] += 1
+            previousOID = currentOID
+        }
+        var cumulative: UInt32 = 0
+        for bucket in 0..<256 {
+            cumulative += bucketCounts[bucket]
+            guard cumulative == fanout[bucket] else {
+                throw GitStatusError.corruptPackIndex(path: url.path, reason: "fanout table does not match object ids")
+            }
+        }
+
+        self.data = data
+        self.fanout = fanout
+        self.namesOffset = namesOffset
+        self.offsets = offsets
+        self.objectCount = objectCount
+        self.packChecksum = Data(data[(data.count - 40)..<(data.count - 20)])
+    }
+
+    func lookup(oid: Data) -> Entry? {
+        guard oid.count == 20 else { return nil }
+        let bucket = Int(oid[0])
+        var lower = bucket == 0 ? 0 : Int(fanout[bucket - 1])
+        var upper = Int(fanout[bucket])
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            let comparison = compare(oid: oid, at: middle)
+            if comparison == 0 {
+                let offset = offsets[middle]
+                return Entry(offset: offset, nextOffset: offsets.filter { $0 > offset }.min())
+            }
+            if comparison < 0 {
+                upper = middle
+            } else {
+                lower = middle + 1
+            }
+        }
+        return nil
+    }
+
+    private func compare(oid: Data, at index: Int) -> Int {
+        let offset = namesOffset + index * 20
+        for byteIndex in 0..<20 {
+            let left = oid[byteIndex]
+            let right = data[offset + byteIndex]
+            if left < right { return -1 }
+            if left > right { return 1 }
+        }
+        return 0
+    }
+}
+
+private func parsePackEntryHeader(
+    _ data: Data,
+    packPath: String
+) throws -> (typeCode: UInt8, declaredSize: UInt64, headerLength: Int) {
+    guard let first = data.first else {
+        throw GitStatusError.corruptPack(path: packPath, reason: "missing packed object header")
+    }
+    let typeCode = (first >> 4) & 0x07
+    var declaredSize = UInt64(first & 0x0F)
+    var current = first
+    var offset = 1
+    var shift: UInt64 = 4
+    while current & 0x80 != 0 {
+        guard offset < data.count else {
+            throw GitStatusError.corruptPack(path: packPath, reason: "unterminated packed object header")
+        }
+        current = data[offset]
+        let value = UInt64(current & 0x7F)
+        guard shift < 64, value <= (UInt64.max - declaredSize) >> shift else {
+            throw GitStatusError.corruptPack(path: packPath, reason: "packed object size overflows")
+        }
+        declaredSize |= value << shift
+        shift += 7
+        offset += 1
+    }
+    return (typeCode, declaredSize, offset)
+}
+
+private func readExactly(
+    handle: FileHandle,
+    offset: UInt64,
+    count: Int,
+    packPath: String
+) throws -> Data {
+    do {
+        try handle.seek(toOffset: offset)
+        guard let data = try handle.read(upToCount: count), data.count == count else {
+            throw GitStatusError.corruptPack(path: packPath, reason: "truncated pack read")
+        }
+        return data
+    } catch let error as GitStatusError {
+        throw error
+    } catch {
+        throw GitStatusError.corruptPack(path: packPath, reason: "pack read failed: \(error)")
+    }
+}
+
+private func inflatePackedZlib(
+    _ data: Data,
+    expectedSize: Int,
+    packPath: String
+) throws -> Data {
+    #if canImport(Compression)
+    let capacity = max(expectedSize + 1, 1)
+    return try data.withUnsafeBytes { (source: UnsafeRawBufferPointer) -> Data in
+        guard let sourceBase = source.baseAddress else {
+            throw GitStatusError.corruptPack(path: packPath, reason: "missing zlib input")
+        }
+        var output = Data(count: capacity)
+        let written = output.withUnsafeMutableBytes { destination -> Int in
+            guard let destinationBase = destination.baseAddress else { return 0 }
+            return compression_decode_buffer(
+                destinationBase.assumingMemoryBound(to: UInt8.self),
+                capacity,
+                sourceBase.assumingMemoryBound(to: UInt8.self),
+                data.count,
+                nil,
+                COMPRESSION_ZLIB
+            )
+        }
+        guard written == expectedSize else {
+            throw GitStatusError.corruptPack(path: packPath, reason: "invalid zlib stream or size mismatch")
+        }
+        output.count = written
+        return output
+    }
+    #elseif canImport(COpenGrokZlib)
+    var stream = z_stream()
+    var status = inflateInit_(&stream, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
+    guard status == Z_OK else {
+        throw GitStatusError.corruptPack(path: packPath, reason: "inflateInit failed")
+    }
+    defer { _ = inflateEnd(&stream) }
+
+    var output = Data()
+    output.reserveCapacity(expectedSize)
+    var input = data
+    try input.withUnsafeMutableBytes { (inputBuffer: UnsafeMutableRawBufferPointer) in
+        stream.next_in = inputBuffer.bindMemory(to: Bytef.self).baseAddress
+        stream.avail_in = uInt(data.count)
+        var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let written = chunk.withUnsafeMutableBufferPointer { outputBuffer -> Int in
+                stream.next_out = outputBuffer.baseAddress
+                stream.avail_out = uInt(outputBuffer.count)
+                status = inflate(&stream, Z_NO_FLUSH)
+                return outputBuffer.count - Int(stream.avail_out)
+            }
+            guard output.count + written <= expectedSize else {
+                throw GitStatusError.corruptPack(path: packPath, reason: "inflated object exceeds declared size")
+            }
+            if written > 0 {
+                output.append(contentsOf: chunk.prefix(written))
+            }
+            if status == Z_STREAM_END { break }
+            guard status == Z_OK, written > 0 || stream.avail_in > 0 else {
+                throw GitStatusError.corruptPack(path: packPath, reason: "invalid or truncated zlib stream")
+            }
+        }
+    }
+    guard stream.avail_in == 0 else {
+        throw GitStatusError.corruptPack(path: packPath, reason: "zlib stream ended before packed entry")
+    }
+    guard output.count == expectedSize else {
+        throw GitStatusError.corruptPack(path: packPath, reason: "inflated object size mismatch")
+    }
+    return output
+    #else
+    throw GitStatusError.corruptPack(path: packPath, reason: "zlib inflate unavailable")
+    #endif
 }
 
 // MARK: - zlib inflate (zlib-wrapped deflate, as used by Git objects)
@@ -410,6 +861,18 @@ public func encodeGitIndex(entries: [GitIndexEntry]) -> Data {
 }
 
 private extension Data {
+    func readBigEndianUInt32(at offset: Int) -> UInt32 {
+        (UInt32(self[offset]) << 24)
+            | (UInt32(self[offset + 1]) << 16)
+            | (UInt32(self[offset + 2]) << 8)
+            | UInt32(self[offset + 3])
+    }
+
+    func readBigEndianUInt64(at offset: Int) -> UInt64 {
+        (UInt64(readBigEndianUInt32(at: offset)) << 32)
+            | UInt64(readBigEndianUInt32(at: offset + 4))
+    }
+
     mutating func appendU32(_ v: UInt32) {
         append(UInt8((v >> 24) & 0xFF))
         append(UInt8((v >> 16) & 0xFF))

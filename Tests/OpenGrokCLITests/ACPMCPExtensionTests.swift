@@ -124,9 +124,26 @@ private final class PlainMCPHandler: HttpRequestHandler, @unchecked Sendable {
 private final class OAuthGatedMCPHandler: HttpRequestHandler, @unchecked Sendable {
     private let lock = NSLock()
     private var base = ""
+    private let revocationStatus: UInt16
+    private var tokenRequests = 0
+    private var revocationBodies: [String] = []
+
+    init(revocationStatus: UInt16 = 200) {
+        self.revocationStatus = revocationStatus
+    }
 
     func setBase(_ base: String) {
         lock.lock(); self.base = base; lock.unlock()
+    }
+
+    var tokenRequestCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return tokenRequests
+    }
+
+    var seenRevocationBodies: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return revocationBodies
     }
 
     func handle(_ request: HttpRequest) -> HttpResponse {
@@ -141,7 +158,8 @@ private final class OAuthGatedMCPHandler: HttpRequestHandler, @unchecked Sendabl
             let metadata = """
             {"authorization_endpoint":"http://127.0.0.1:9/authorize",\
             "token_endpoint":"\(currentBase)/token",\
-            "registration_endpoint":"\(currentBase)/register"}
+            "registration_endpoint":"\(currentBase)/register",\
+            "revocation_endpoint":"\(currentBase)/revoke"}
             """
             return HttpResponse(
                 status: 200,
@@ -155,6 +173,7 @@ private final class OAuthGatedMCPHandler: HttpRequestHandler, @unchecked Sendabl
                 body: .bytes(Data(#"{"client_id":"live-client","redirect_uris":[]}"#.utf8))
             )
         case ("POST", "/token"):
+            lock.lock(); tokenRequests += 1; lock.unlock()
             let token = """
             {"access_token":"at-live","token_type":"Bearer","expires_in":3600,\
             "refresh_token":"rt-live"}
@@ -163,6 +182,18 @@ private final class OAuthGatedMCPHandler: HttpRequestHandler, @unchecked Sendabl
                 status: 200,
                 headers: [("content-type", "application/json")],
                 body: .bytes(Data(token.utf8))
+            )
+        case ("POST", "/revoke"):
+            lock.lock()
+            revocationBodies.append(String(decoding: request.body, as: UTF8.self))
+            lock.unlock()
+            let body = revocationStatus == 200
+                ? Data()
+                : Data(#"{"error":"temporarily_unavailable"}"#.utf8)
+            return HttpResponse(
+                status: revocationStatus,
+                headers: [("content-type", "application/json")],
+                body: .bytes(body)
             )
         case ("POST", "/mcp"):
             guard request.header("Authorization") == "Bearer at-live" else {
@@ -191,6 +222,11 @@ private final class OAuthGatedMCPHandler: HttpRequestHandler, @unchecked Sendabl
                         "description": "Echo the supplied text.",
                         "inputSchema": ["type": "object"] as [String: Any],
                     ]],
+                ]
+            case "tools/call":
+                result = [
+                    "content": [["type": "text", "text": "recovered"]],
+                    "isError": false,
                 ]
             default:
                 result = [:]
@@ -298,10 +334,13 @@ private struct MCPFamilyHarness {
 
     static func start(
         configTOML: String,
+        home explicitHome: URL? = nil,
         openBrowser: (@Sendable (URL) -> Void)? = nil,
-        authTimeoutSeconds: TimeInterval = 30
+        authTimeoutSeconds: TimeInterval = 30,
+        authCredentialPollIntervalSeconds: TimeInterval = mcpCredentialPollIntervalSeconds
     ) async throws -> MCPFamilyHarness {
-        let home = try makeHome()
+        let home = try explicitHome ?? makeHome()
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         try configTOML.write(
             to: home.appendingPathComponent("config.toml"),
             atomically: true,
@@ -342,7 +381,8 @@ private struct MCPFamilyHarness {
             openGrokHome: home,
             environment: environment,
             openBrowser: openBrowser,
-            authTimeoutSeconds: authTimeoutSeconds
+            authTimeoutSeconds: authTimeoutSeconds,
+            authCredentialPollIntervalSeconds: authCredentialPollIntervalSeconds
         )
         let catalogStore = LiveModelCatalogStore(
             input: .default,
@@ -684,6 +724,73 @@ struct ACPMCPExtensionTests {
         #expect(after?["result"]?["servers"]?.arrayValue?.isEmpty == true)
     }
 
+    @Test("auth_trigger recovers from credentials written by another process and re-probes the live tools")
+    func authTriggerRecoversFromCredentialStorePoll() async throws {
+        let gated = OAuthGatedMCPHandler()
+        let server = HttpServer(handler: gated, basePath: "")
+        try server.start()
+        defer { server.stop() }
+        gated.setBase(server.baseURL)
+        let endpoint = try #require(URL(string: "\(server.baseURL)/mcp"))
+
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let storage = MCPFileCredentialStorage(
+            home: home,
+            serverName: "gated",
+            serverURL: endpoint
+        )
+        let browser: @Sendable (URL) -> Void = { _ in
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+                try? storage.save(MCPStoredCredentials(
+                    clientId: "external-client",
+                    tokenResponse: MCPOAuthTokenResponse(
+                        accessToken: "at-live",
+                        expiresIn: 3600,
+                        refreshToken: "rt-external"
+                    ),
+                    tokenReceivedAt: UInt64(Date().timeIntervalSince1970)
+                ))
+            }
+        }
+        let harness = try await MCPFamilyHarness.start(
+            configTOML: """
+            [mcpServers.gated]
+            url = "\(endpoint.absoluteString)"
+            """,
+            home: home,
+            openBrowser: browser,
+            authTimeoutSeconds: 5,
+            authCredentialPollIntervalSeconds: 0.01
+        )
+        defer { Task { await harness.shutdown() } }
+
+        let (triggered, triggerError) = await harness.call(
+            "x.ai/mcp/auth_trigger",
+            id: "poll-auth",
+            params: .object([
+                "session_id": .string(harness.sessionID),
+                "server_name": .string("gated"),
+            ])
+        )
+        #expect(triggerError == nil)
+        #expect(triggered?["result"]?["status"]?.stringValue == "authenticated")
+        #expect(gated.tokenRequestCount == 0)
+        #expect(harness.toolset.topLevelDefinitions().contains { $0.name == "gated__echo" })
+
+        let (called, callError) = await harness.call(
+            "x.ai/mcp/call",
+            id: "poll-call",
+            params: .object([
+                "server": .string("gated"),
+                "tool": .string("echo"),
+                "arguments": .object(["text": .string("recovered")]),
+            ])
+        )
+        #expect(callError == nil)
+        #expect(called?["result"]?["isError"]?.boolValue == false)
+    }
+
     @Test("auth_trigger refusal arms ride inside the payload with upstream's copy")
     func authTriggerRefusalArms() async throws {
         let harness = try await MCPFamilyHarness.start(configTOML: """
@@ -819,6 +926,128 @@ struct ACPMCPExtensionTests {
         #expect(missingError?.data == .string(
             "server 'added' not found in config.toml (only locally-configured servers can be deleted)"
         ))
+    }
+
+    @Test("delete revokes the refresh token and removes only that server's real credentials")
+    func deleteRevokesAndDeletesCredentials() async throws {
+        let gated = OAuthGatedMCPHandler()
+        let server = HttpServer(handler: gated, basePath: "")
+        try server.start()
+        defer { server.stop() }
+        gated.setBase(server.baseURL)
+        let endpoint = try #require(URL(string: "\(server.baseURL)/mcp"))
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        try MCPFileCredentialStorage(
+            home: home,
+            serverName: "gated",
+            serverURL: endpoint
+        ).save(MCPStoredCredentials(
+            clientId: "live-client",
+            tokenResponse: MCPOAuthTokenResponse(
+                accessToken: "at-live",
+                expiresIn: 3600,
+                refreshToken: "rt-live"
+            ),
+            tokenReceivedAt: 1
+        ))
+        let otherURL = try #require(URL(string: "https://other.example/mcp"))
+        try MCPFileCredentialStorage(
+            home: home,
+            serverName: "other",
+            serverURL: otherURL
+        ).save(MCPStoredCredentials(
+            clientId: "other-client",
+            tokenResponse: MCPOAuthTokenResponse(accessToken: "other-token")
+        ))
+
+        let harness = try await MCPFamilyHarness.start(
+            configTOML: """
+            [mcpServers.gated]
+            url = "\(endpoint.absoluteString)"
+            """,
+            home: home
+        )
+        defer { Task { await harness.shutdown() } }
+        #expect(harness.toolset.topLevelDefinitions().contains { $0.name == "gated__echo" })
+
+        let (deleted, deleteError) = await harness.call(
+            "x.ai/mcp/delete",
+            id: "revoke-success",
+            params: .object([
+                "session_id": .string(harness.sessionID),
+                "server_name": .string("gated"),
+            ])
+        )
+        #expect(deleteError == nil)
+        #expect(deleted?["result"]?["ok"]?.boolValue == true)
+        #expect(deleted?["result"]?["credentials_removed"]?.boolValue == true)
+        #expect(deleted?["result"]?["remote_revocation"]?.stringValue == "succeeded")
+        #expect(gated.seenRevocationBodies == [
+            "token=rt-live&token_type_hint=refresh_token&client_id=live-client"
+        ])
+        #expect(try MCPFileCredentialStorage(
+            home: home,
+            serverName: "gated",
+            serverURL: endpoint
+        ).load() == nil)
+        #expect(try MCPFileCredentialStorage(
+            home: home,
+            serverName: "other",
+            serverURL: otherURL
+        ).load()?.tokenResponse?.accessToken == "other-token")
+        #expect(!harness.toolset.topLevelDefinitions().contains { $0.name == "gated__echo" })
+        #expect(await harness.connections.names().isEmpty)
+    }
+
+    @Test("delete reports remote revocation failure but still deletes local credentials")
+    func deleteReportsRevocationFailureAfterLocalDeletion() async throws {
+        let gated = OAuthGatedMCPHandler(revocationStatus: 503)
+        let server = HttpServer(handler: gated, basePath: "")
+        try server.start()
+        defer { server.stop() }
+        gated.setBase(server.baseURL)
+        let endpoint = try #require(URL(string: "\(server.baseURL)/mcp"))
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let storage = MCPFileCredentialStorage(
+            home: home,
+            serverName: "gated",
+            serverURL: endpoint
+        )
+        try storage.save(MCPStoredCredentials(
+            clientId: "live-client",
+            tokenResponse: MCPOAuthTokenResponse(
+                accessToken: "at-live",
+                expiresIn: 3600,
+                refreshToken: "rt-live"
+            )
+        ))
+
+        let harness = try await MCPFamilyHarness.start(
+            configTOML: """
+            [mcpServers.gated]
+            url = "\(endpoint.absoluteString)"
+            """,
+            home: home
+        )
+        defer { Task { await harness.shutdown() } }
+
+        let (deleted, deleteError) = await harness.call(
+            "x.ai/mcp/delete",
+            id: "revoke-failed",
+            params: .object([
+                "session_id": .string(harness.sessionID),
+                "server_name": .string("gated"),
+            ])
+        )
+        #expect(deleteError == nil)
+        #expect(deleted?["result"]?["ok"]?.boolValue == true)
+        #expect(deleted?["result"]?["credentials_removed"]?.boolValue == true)
+        #expect(deleted?["result"]?["remote_revocation"]?.stringValue == "failed")
+        #expect(deleted?["result"]?["revocation_error"]?.stringValue?.contains("HTTP 503") == true)
+        #expect(try storage.load() == nil)
     }
 
     @Test("upsert refuses a blank transport and a disabled config before touching the session")

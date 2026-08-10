@@ -4,10 +4,11 @@
 // section headers with counts and collapse chevrons, state classification
 // (active working/needs-input, background idle BY CONSTRUCTION, dormant
 // inactive), dormant catalog rows joining as attachable rows, directory
-// grouping, filters, pins, the idle fold, the armed close row, and the
-// chord-side id mapping helpers.
+// grouping, filters, pins, the idle fold, the new-agent anchor, the armed
+// close row, and the chord-side id mapping helpers.
 
 import Foundation
+import OpenGrokACPRuntime
 import OpenGrokPagerRender
 import Testing
 @testable import OpenGrokCLI
@@ -68,15 +69,14 @@ struct LiveDashboardOverlayTests {
         // state word without jumping the sort (upstream sorts by
         // state + recency, never active-first).
         #expect(list.rows.map(\.id) == [
-            "section:idle", "attach:recent", "attach:old", "attach:active-1",
+            "dispatch:new", "section:idle", "attach:recent", "attach:old", "attach:active-1",
         ])
-        #expect(list.rows[0].label.contains("Idle (3)"))
-        #expect(!list.rows[0].label.contains("\u{25B8}"), "an uncollapsed header wears \u{25BE}")
-        #expect(list.rows[3].label.contains("\u{25CF} "), "the active row wears the marker")
-        #expect(list.rows[3].detail?.contains("attached") == true)
-        #expect(list.rows[1].detail?.contains("idle") == true)
-        // The cursor opens on the first session row, not the header.
-        #expect(list.selectedRow?.id == "attach:recent")
+        #expect(list.rows[1].label.contains("Idle (3)"))
+        #expect(!list.rows[1].label.contains("\u{25B8}"), "an uncollapsed header wears \u{25BE}")
+        #expect(list.rows[4].label.contains("\u{25CF} "), "the active row wears the marker")
+        #expect(list.rows[4].detail?.contains("attached") == true)
+        #expect(list.rows[2].detail?.contains("idle") == true)
+        #expect(list.selectedRow?.id == "dispatch:new", "a fresh dashboard starts on + New agent")
     }
 
     @Test("a running turn lifts the active row into Working; background stays idle by construction")
@@ -98,10 +98,56 @@ struct LiveDashboardOverlayTests {
         // no parallel top-level turns in one process (the pre-ruled
         // divergence, pinned here).
         #expect(list.rows.map(\.id) == [
-            "section:working", "attach:a", "section:idle", "attach:bg",
+            "dispatch:new", "section:working", "attach:a", "section:idle", "attach:bg",
         ])
-        #expect(list.rows[0].label.contains("Working (1)"))
-        #expect(list.rows[1].detail?.contains("running") == true)
+        #expect(list.rows[1].label.contains("Working (1)"))
+        #expect(list.rows[2].detail?.contains("running") == true)
+    }
+
+    @Test("leader roster rows preserve every typed lifecycle state")
+    func leaderRosterLifecycleStates() {
+        let activities: [ACPLeaderRosterActivity] = [
+            .working, .idle, .needsInput, .dormant, .completed, .dead,
+        ]
+        let roster = activities.enumerated().map { index, activity in
+            ACPLeaderRosterEntry(
+                sessionId: "remote-\(activity.rawValue)",
+                title: "Remote \(activity.rawValue)",
+                cwd: "/remote/\(activity.rawValue)",
+                isWorktree: false,
+                modelId: "grok-4",
+                yolo: false,
+                activity: activity,
+                resident: activity != .dormant,
+                lastChangeUnixMs: Int64(index + 1),
+                origin: .remote(host: "host-a")
+            )
+        }
+        let overlay = LiveDashboardOverlay.overlay(
+            tabs: [],
+            activeSessionID: "",
+            activeTurnRunning: false,
+            subagents: [],
+            roster: roster
+        )
+        guard let list = list(overlay) else {
+            Issue.record("expected a list overlay")
+            return
+        }
+        let rows = Dictionary(uniqueKeysWithValues: list.rows.map { ($0.id, $0) })
+        for activity in activities {
+            let row = rows[LiveDashboardOverlay.attachPrefix + "remote-\(activity.rawValue)"]
+            #expect(row != nil)
+            #expect(row?.label.contains("Remote \(activity.rawValue)") == true)
+            #expect(row?.detail?.contains("/remote/\(activity.rawValue)") == true)
+            #expect(row?.detail?.hasSuffix(activity.rawValue) == true)
+        }
+        #expect(LiveDashboardOverlay.rosterState(.working) == .working)
+        #expect(LiveDashboardOverlay.rosterState(.idle) == .idle)
+        #expect(LiveDashboardOverlay.rosterState(.needsInput) == .needsInput)
+        #expect(LiveDashboardOverlay.rosterState(.dormant) == .inactive)
+        #expect(LiveDashboardOverlay.rosterState(.completed) == .completed)
+        #expect(LiveDashboardOverlay.rosterState(.dead) == .failed)
     }
 
     @Test("a pending approval classifies the active session as Awaiting")
@@ -117,10 +163,10 @@ struct LiveDashboardOverlayTests {
             Issue.record("expected a list overlay")
             return
         }
-        #expect(list.rows[0].label.contains("Awaiting (1)"), "needs-input outranks working")
+        #expect(list.rows[1].label.contains("Awaiting (1)"), "needs-input outranks working")
     }
 
-    @Test("subagent children glue under the active row, non-selectable")
+    @Test("subagent children glue under the active row and stay selectable")
     func subagentChildrenUnderTheActiveRowOnly() {
         let overlay = LiveDashboardOverlay.overlay(
             tabs: [
@@ -145,14 +191,14 @@ struct LiveDashboardOverlayTests {
             return
         }
         #expect(list.rows.map(\.id) == [
-            "section:working", "attach:active-1", "subagent:sub-1",
+            "dispatch:new", "section:working", "attach:active-1", "subagent:sub-1",
             "section:idle", "attach:other",
         ])
-        #expect(list.rows[0].label.contains("Working (1)"), "the header counts top-level rows only")
-        #expect(list.rows[2].label.contains("Explore"))
+        #expect(list.rows[1].label.contains("Working (1)"), "the header counts top-level rows only")
+        #expect(list.rows[3].label.contains("Explore"))
         #expect(
-            !list.rows[2].isSelectable,
-            "peek/attach-to-subagent are deferred; a row that dispatches nowhere must not be selectable"
+            list.rows[3].isSelectable,
+            "subagent rows expose truthful peek and persisted-session attach behavior"
         )
     }
 
@@ -173,12 +219,12 @@ struct LiveDashboardOverlayTests {
             return
         }
         #expect(list.rows.map(\.id) == [
-            "section:idle", "attach:live-1", "section:inactive", "attach:cold-1",
+            "dispatch:new", "section:idle", "attach:live-1", "section:inactive", "attach:cold-1",
         ])
-        #expect(list.rows[2].label.contains("Inactive (1)"))
-        #expect(list.rows[3].label.contains("alpha"), "an untitled dormant row is labelled by cwd basename")
-        #expect(list.rows[3].detail?.contains("inactive") == true)
-        #expect(list.rows[3].isSelectable, "dormant rows attach through the same /resume machinery")
+        #expect(list.rows[3].label.contains("Inactive (1)"))
+        #expect(list.rows[4].label.contains("alpha"), "an untitled dormant row is labelled by cwd basename")
+        #expect(list.rows[4].detail?.contains("inactive") == true)
+        #expect(list.rows[4].isSelectable, "dormant rows attach through the same /resume machinery")
     }
 
     @Test("directory grouping suppresses state headers and orders by compacted cwd")
@@ -198,8 +244,8 @@ struct LiveDashboardOverlayTests {
             Issue.record("expected a list overlay")
             return
         }
-        #expect(list.rows.map(\.id) == ["attach:cold", "attach:a"], "cwd asc, no state headers")
-        #expect(list.rows[0].detail?.contains("~/alpha") == true, "the cwd column compacts against home")
+        #expect(list.rows.map(\.id) == ["dispatch:new", "attach:cold", "attach:a"], "cwd asc, no state headers")
+        #expect(list.rows[1].detail?.contains("~/alpha") == true, "the cwd column compacts against home")
     }
 
     @Test("a state filter keeps exactly its rows and drops the redundant header")
@@ -220,7 +266,7 @@ struct LiveDashboardOverlayTests {
             Issue.record("expected a list overlay")
             return
         }
-        #expect(list.rows.map(\.id) == ["attach:a"], "one state in view ⇒ no header chrome")
+        #expect(list.rows.map(\.id) == ["dispatch:new", "attach:a"], "one state in view ⇒ no header chrome")
     }
 
     @Test("a collapsed section keeps its header, wearing the collapsed chevron, and hides its rows")
@@ -241,9 +287,9 @@ struct LiveDashboardOverlayTests {
             Issue.record("expected a list overlay")
             return
         }
-        #expect(list.rows.map(\.id) == ["section:working", "attach:a", "section:idle"])
-        #expect(list.rows[2].label.contains("\u{25B8}"))
-        #expect(list.rows[2].label.contains("Idle (1)"), "the count stays true while collapsed")
+        #expect(list.rows.map(\.id) == ["dispatch:new", "section:working", "attach:a", "section:idle"])
+        #expect(list.rows[3].label.contains("\u{25B8}"))
+        #expect(list.rows[3].label.contains("Idle (1)"), "the count stays true while collapsed")
     }
 
     @Test("pinned rows float above every group under the Pinned header")
@@ -265,10 +311,10 @@ struct LiveDashboardOverlayTests {
             return
         }
         #expect(list.rows.map(\.id) == [
-            "section:pinned", "attach:bg", "section:working", "attach:a",
+            "dispatch:new", "section:pinned", "attach:bg", "section:working", "attach:a",
         ])
-        #expect(list.rows[0].label.contains("Pinned (1)"))
-        #expect(list.rows[1].label.contains("\u{2299}"), "the pinned row wears the pin marker")
+        #expect(list.rows[1].label.contains("Pinned (1)"))
+        #expect(list.rows[2].label.contains("\u{2299}"), "the pinned row wears the pin marker")
     }
 
     @Test("the idle fold lands at the group's end and expands through idleShowAll")
@@ -366,10 +412,9 @@ struct LiveDashboardOverlayTests {
 }
 
 extension LiveDashboardOverlayTests {
-    /// The roster's initial cursor must resolve a peek, and a non-selectable
-    /// subagent child must never request one (peek-onto-a-subagent lands with
-    /// subagent attach, the B1 peek ruling).
-    @Test func initialPeekAndSubagentRefusal() {
+    /// A fresh roster starts on the new-agent anchor; moving to either the
+    /// active session or its child resolves a truthful peek.
+    @Test func initialNewAgentAnchorAndSelectablePeeks() {
         let overlay = LiveDashboardOverlay.overlay(
             tabs: [tab("active-1", title: "current", activity: 100)],
             activeSessionID: "active-1",
@@ -386,9 +431,10 @@ extension LiveDashboardOverlayTests {
         }
         let cache = LiveDashboardPeekCache()
         let selected = list.selectedRow
-        #expect(selected?.id == "attach:active-1", "the cursor starts on the active row, not its header")
+        #expect(selected?.id == "dispatch:new", "the cursor starts on + New agent")
+        let activeRowID = list.rows.first { $0.id == "attach:active-1" }?.id ?? ""
         #expect(LiveDashboardPeek.peek(
-            forRowID: selected?.id ?? "",
+            forRowID: activeRowID,
             cache: cache,
             activeSessionID: "active-1",
             activeItems: [.message(PagerMessage(role: .user, text: "ask"))],
@@ -400,13 +446,15 @@ extension LiveDashboardOverlayTests {
             cache: cache,
             activeSessionID: "active-1",
             activeItems: [],
-            turnActivity: nil
-        ) == nil, "a row that dispatches nowhere gets no peek either")
+            turnActivity: nil,
+            subagentStatuses: ["sub-1": "running"],
+            subagentHints: ["sub-1": "mapping the tree"]
+        )?.statusLabel == "Working")
     }
 
-    /// The C-1 close verb's overlay half: the `x` action is registered with
-    /// the `close` prefix, and an ARMED session shows its confirmation ON the
-    /// row — the port's press-again analog of upstream's 2 s arm window
+    /// The C-1 close verb is a Ctrl+X dashboard chord, not a bare printable
+    /// list action. An ARMED session shows its confirmation ON the row — the
+    /// port's press-again analog of upstream's 2 s arm window
     /// (`arm_or_delete`, dispatch/dashboard.rs:2125-2140). Un-armed rows keep
     /// their meta detail; other rows never inherit the armed text.
     @Test func closeActionRegistrationAndArmedRowDetail() {
@@ -425,10 +473,10 @@ extension LiveDashboardOverlayTests {
             Issue.record("expected a list overlay")
             return
         }
-        #expect(list.rowActions == [PagerListRowAction(key: "x", rowIDPrefix: "close")])
+        #expect(list.rowActions.isEmpty, "bare x remains available to the reply/dispatch editor")
         let byID = Dictionary(uniqueKeysWithValues: list.rows.map { ($0.id, $0) })
         #expect(byID["attach:bg-1"]?.detail == "press x again to delete")
         #expect(byID["attach:bg-2"]?.detail?.contains("idle") == true, "only the armed row wears the confirmation")
-        #expect(armed.hints.contains { $0.key == "x" })
+        #expect(armed.hints.contains { $0.key == "ctrl+x" })
     }
 }

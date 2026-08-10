@@ -93,29 +93,6 @@ struct OpenGrokGitStatusTests {
         #expect(PortableSHA1.hash(Data("ab".utf8), Data("c".utf8)) == PortableSHA1.hash(a))
     }
 
-    @Test("pack-only missing loose object raises packedObjectUnsupported")
-    func packedObjectUnsupported() throws {
-        let root = try makeSeedRepo()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let gitDir = root.appendingPathComponent(".git").path
-        let packDir = URL(fileURLWithPath: gitDir)
-            .appendingPathComponent("objects/pack")
-        try FileManager.default.createDirectory(at: packDir, withIntermediateDirectories: true)
-        // Presence of a .pack file (even empty) marks the repo as pack-bearing.
-        try Data().write(to: packDir.appendingPathComponent("pack-deadbeef.pack"))
-        let oid = Data(repeating: 0xAB, count: 20)
-        let store = GitObjectStore(gitDir: gitDir)
-        do {
-            _ = try store.readObject(oid: oid)
-            Issue.record("expected packedObjectUnsupported")
-        } catch GitStatusError.packedObjectUnsupported(let hex) {
-            #expect(hex.count == 40)
-            #expect(hex.hasPrefix("ab"))
-        } catch {
-            Issue.record("unexpected \(error)")
-        }
-    }
-
     @Test("not a repository errors")
     func notARepo() {
         let temp = FileManager.default.temporaryDirectory
@@ -533,7 +510,373 @@ struct OpenGrokGitStatusTests {
     }
 }
 
+@Suite("Packed Git Objects")
+struct PackedGitObjectTests {
+    @Test("non-delta packed objects match loose objects through live status")
+    func nonDeltaPackedParity() throws {
+        let root = try makeRepoWithHead(files: ["hello.txt": "hello\n"])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gitDir = root.appendingPathComponent(".git").path
+
+        let blob = PackedFixtureObject.object(type: "blob", payload: Data("hello\n".utf8))
+        let treePayload = encodeGitTree([(0o100644, "hello.txt", blob.oid)])
+        let tree = PackedFixtureObject.object(type: "tree", payload: treePayload)
+        let commit = PackedFixtureObject.object(
+            type: "commit",
+            payload: encodeGitCommit(treeOID: tree.oid, message: "seed\n")
+        )
+        let objects = [blob, tree, commit]
+
+        let looseStore = GitObjectStore(gitDir: gitDir)
+        let looseObjects = try objects.map { try looseStore.readObject(oid: $0.oid) }
+        let looseStatus = try gitStatus(
+            path: root.path,
+            options: GitStatusOptions(includeUntracked: false)
+        )
+
+        let fixture = try writePackFixture(gitDir: gitDir, objects: objects)
+        #expect(FileManager.default.fileExists(atPath: fixture.packURL.path))
+        #expect(FileManager.default.fileExists(atPath: fixture.indexURL.path))
+        try removeLooseObjects(gitDir: gitDir, oids: objects.map(\.oid))
+
+        let packedStore = GitObjectStore(gitDir: gitDir)
+        let packedObjects = try objects.map { try packedStore.readObject(oid: $0.oid) }
+        for index in objects.indices {
+            #expect(packedObjects[index].type == looseObjects[index].type)
+            #expect(packedObjects[index].payload == looseObjects[index].payload)
+        }
+        let packedStatus = try gitStatus(
+            path: root.path,
+            options: GitStatusOptions(includeUntracked: false)
+        )
+        #expect(packedStatus == looseStatus)
+
+        try "dirty\n".write(
+            to: root.appendingPathComponent("hello.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let dirtyStatus = try gitStatus(
+            path: root.path,
+            options: GitStatusOptions(includeUntracked: false)
+        )
+        #expect(dirtyStatus.unstaged.contains { $0.path == "hello.txt" && $0.status == .modified })
+    }
+
+    @Test("pack index checksum corruption is typed")
+    func corruptPackIndex() throws {
+        let root = try makeSeedRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gitDir = root.appendingPathComponent(".git").path
+        let object = PackedFixtureObject.object(type: "blob", payload: Data("hello\n".utf8))
+        let fixture = try writePackFixture(gitDir: gitDir, objects: [object])
+        var indexData = try Data(contentsOf: fixture.indexURL)
+        indexData[indexData.count - 1] ^= 0xFF
+        try indexData.write(to: fixture.indexURL)
+
+        do {
+            _ = try GitObjectStore(gitDir: gitDir).readObject(oid: object.oid)
+            Issue.record("expected corruptPackIndex")
+        } catch GitStatusError.corruptPackIndex(let path, let reason) {
+            #expect(path == fixture.indexURL.path)
+            #expect(reason.contains("checksum"))
+        } catch {
+            Issue.record("unexpected \(error)")
+        }
+    }
+
+    @Test("packed object declared size is bounded before inflate")
+    func packedObjectSizeBound() throws {
+        let root = try makeSeedRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gitDir = root.appendingPathComponent(".git").path
+        let object = PackedFixtureObject.object(
+            type: "blob",
+            payload: Data("tiny".utf8),
+            declaredSize: 1_024
+        )
+        let fixture = try writePackFixture(gitDir: gitDir, objects: [object])
+        #expect(FileManager.default.fileExists(atPath: fixture.packURL.path))
+
+        do {
+            _ = try GitObjectStore(gitDir: gitDir, maximumPackedObjectSize: 8)
+                .readObject(oid: object.oid)
+            Issue.record("expected packedObjectTooLarge")
+        } catch GitStatusError.packedObjectTooLarge(let oid, let declaredSize, let limit) {
+            #expect(oid == GitObjectStore.hexFromOID(object.oid))
+            #expect(declaredSize == 1_024)
+            #expect(limit == 8)
+        } catch {
+            Issue.record("unexpected \(error)")
+        }
+    }
+
+    @Test("packed object corrupt zlib stream is typed")
+    func packedObjectCorruptInflate() throws {
+        let root = try makeSeedRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gitDir = root.appendingPathComponent(".git").path
+        let object = PackedFixtureObject.object(
+            type: "blob",
+            payload: Data("hello\n".utf8),
+            compressed: Data([0x78, 0x9C, 0x00])
+        )
+        let fixture = try writePackFixture(gitDir: gitDir, objects: [object])
+
+        do {
+            _ = try GitObjectStore(gitDir: gitDir).readObject(oid: object.oid)
+            Issue.record("expected corruptPack")
+        } catch GitStatusError.corruptPack(let path, let reason) {
+            #expect(path == fixture.packURL.path)
+            #expect(reason.contains("zlib"))
+        } catch {
+            Issue.record("unexpected \(error)")
+        }
+    }
+
+    @Test("OFS_DELTA and REF_DELTA are honest typed refusals")
+    func packedDeltaRefusal() throws {
+        let root = try makeSeedRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gitDir = root.appendingPathComponent(".git").path
+
+        let base = PackedFixtureObject.object(type: "blob", payload: Data("base\n".utf8))
+        let offsetResult = Data("offset\n".utf8)
+        let referenceResult = Data("reference\n".utf8)
+        let offsetDelta = PackedFixtureObject.delta(
+            resultType: "blob",
+            resultPayload: offsetResult,
+            deltaPayload: encodeInsertDelta(baseSize: base.payload.count, result: offsetResult),
+            storage: .offset(baseIndex: 0)
+        )
+        let referenceDelta = PackedFixtureObject.delta(
+            resultType: "blob",
+            resultPayload: referenceResult,
+            deltaPayload: encodeInsertDelta(baseSize: base.payload.count, result: referenceResult),
+            storage: .reference(baseOID: base.oid)
+        )
+        let fixture = try writePackFixture(
+            gitDir: gitDir,
+            objects: [base, offsetDelta, referenceDelta]
+        )
+        #expect(FileManager.default.fileExists(atPath: fixture.indexURL.path))
+
+        for (object, expectedKind) in [
+            (offsetDelta, GitPackDeltaKind.offset),
+            (referenceDelta, GitPackDeltaKind.reference),
+        ] {
+            do {
+                _ = try GitObjectStore(gitDir: gitDir).readObject(oid: object.oid)
+                Issue.record("expected packedDeltaUnsupported")
+            } catch GitStatusError.packedDeltaUnsupported(let oid, let kind) {
+                #expect(oid == GitObjectStore.hexFromOID(object.oid))
+                #expect(kind == expectedKind)
+            } catch {
+                Issue.record("unexpected \(error)")
+            }
+        }
+    }
+}
+
 // MARK: - Helpers
+
+private enum PackedFixtureStorage {
+    case object(typeCode: UInt8)
+    case offset(baseIndex: Int)
+    case reference(baseOID: Data)
+}
+
+private struct PackedFixtureObject {
+    var oid: Data
+    var payload: Data
+    var declaredSize: UInt64
+    var compressed: Data?
+    var storage: PackedFixtureStorage
+
+    static func object(
+        type: String,
+        payload: Data,
+        declaredSize: UInt64? = nil,
+        compressed: Data? = nil
+    ) -> PackedFixtureObject {
+        PackedFixtureObject(
+            oid: gitObjectOID(type: type, payload: payload),
+            payload: payload,
+            declaredSize: declaredSize ?? UInt64(payload.count),
+            compressed: compressed,
+            storage: .object(typeCode: packTypeCode(type))
+        )
+    }
+
+    static func delta(
+        resultType: String,
+        resultPayload: Data,
+        deltaPayload: Data,
+        storage: PackedFixtureStorage
+    ) -> PackedFixtureObject {
+        PackedFixtureObject(
+            oid: gitObjectOID(type: resultType, payload: resultPayload),
+            payload: deltaPayload,
+            declaredSize: UInt64(deltaPayload.count),
+            compressed: nil,
+            storage: storage
+        )
+    }
+}
+
+private struct PackFixtureURLs {
+    var packURL: URL
+    var indexURL: URL
+}
+
+private func writePackFixture(
+    gitDir: String,
+    objects: [PackedFixtureObject]
+) throws -> PackFixtureURLs {
+    var pack = Data("PACK".utf8)
+    pack.appendBigEndianUInt32(2)
+    pack.appendBigEndianUInt32(UInt32(objects.count))
+
+    var records: [(object: PackedFixtureObject, offset: UInt64, crc32: UInt32)] = []
+    records.reserveCapacity(objects.count)
+    for (index, object) in objects.enumerated() {
+        let offset = UInt64(pack.count)
+        let typeCode: UInt8
+        var baseReference = Data()
+        switch object.storage {
+        case .object(let code):
+            typeCode = code
+        case .offset(let baseIndex):
+            typeCode = 6
+            precondition(baseIndex >= 0 && baseIndex < index)
+            let distance = offset - records[baseIndex].offset
+            baseReference = encodeOffsetDeltaDistance(distance)
+        case .reference(let baseOID):
+            typeCode = 7
+            baseReference = baseOID
+        }
+
+        var entry = encodePackObjectHeader(typeCode: typeCode, size: object.declaredSize)
+        entry.append(baseReference)
+        let compressed = try object.compressed ?? deflateZlib(object.payload)
+        entry.append(compressed)
+        pack.append(entry)
+        records.append((object, offset, gitCRC32(entry)))
+    }
+
+    let packChecksum = PortableSHA1.hash(pack)
+    pack.append(packChecksum)
+    let stem = "pack-\(GitObjectStore.hexFromOID(packChecksum))"
+    let packDirectory = URL(fileURLWithPath: gitDir)
+        .appendingPathComponent("objects/pack", isDirectory: true)
+    try FileManager.default.createDirectory(at: packDirectory, withIntermediateDirectories: true)
+    let packURL = packDirectory.appendingPathComponent(stem).appendingPathExtension("pack")
+    try pack.write(to: packURL)
+
+    let sorted = records.sorted { $0.object.oid.lexicographicallyPrecedes($1.object.oid) }
+    var index = Data([0xFF, 0x74, 0x4F, 0x63])
+    index.appendBigEndianUInt32(2)
+    var counts = [UInt32](repeating: 0, count: 256)
+    for record in sorted {
+        counts[Int(record.object.oid[0])] += 1
+    }
+    var cumulative: UInt32 = 0
+    for count in counts {
+        cumulative += count
+        index.appendBigEndianUInt32(cumulative)
+    }
+    for record in sorted {
+        index.append(record.object.oid)
+    }
+    for record in sorted {
+        index.appendBigEndianUInt32(record.crc32)
+    }
+    for record in sorted {
+        precondition(record.offset < 0x8000_0000)
+        index.appendBigEndianUInt32(UInt32(record.offset))
+    }
+    index.append(packChecksum)
+    index.append(PortableSHA1.hash(index))
+    let indexURL = packDirectory.appendingPathComponent(stem).appendingPathExtension("idx")
+    try index.write(to: indexURL)
+    return PackFixtureURLs(packURL: packURL, indexURL: indexURL)
+}
+
+private func removeLooseObjects(gitDir: String, oids: [Data]) throws {
+    for oid in oids {
+        let hex = GitObjectStore.hexFromOID(oid)
+        let url = URL(fileURLWithPath: gitDir)
+            .appendingPathComponent("objects")
+            .appendingPathComponent(String(hex.prefix(2)))
+            .appendingPathComponent(String(hex.dropFirst(2)))
+        try FileManager.default.removeItem(at: url)
+    }
+}
+
+private func gitObjectOID(type: String, payload: Data) -> Data {
+    var canonical = Data("\(type) \(payload.count)".utf8)
+    canonical.append(0)
+    canonical.append(payload)
+    return PortableSHA1.hash(canonical)
+}
+
+private func packTypeCode(_ type: String) -> UInt8 {
+    switch type {
+    case "commit": return 1
+    case "tree": return 2
+    case "blob": return 3
+    case "tag": return 4
+    default: preconditionFailure("unsupported fixture object type")
+    }
+}
+
+private func encodePackObjectHeader(typeCode: UInt8, size: UInt64) -> Data {
+    var remaining = size >> 4
+    var first = UInt8(size & 0x0F) | (typeCode << 4)
+    if remaining != 0 {
+        first |= 0x80
+    }
+    var data = Data([first])
+    while remaining != 0 {
+        var byte = UInt8(remaining & 0x7F)
+        remaining >>= 7
+        if remaining != 0 {
+            byte |= 0x80
+        }
+        data.append(byte)
+    }
+    return data
+}
+
+private func encodeOffsetDeltaDistance(_ distance: UInt64) -> Data {
+    precondition(distance > 0)
+    var value = distance
+    var bytes = [UInt8(value & 0x7F)]
+    while value > 0x7F {
+        value = (value >> 7) - 1
+        bytes.append(UInt8(value & 0x7F) | 0x80)
+    }
+    return Data(bytes.reversed())
+}
+
+private func encodeInsertDelta(baseSize: Int, result: Data) -> Data {
+    precondition(baseSize < 0x80 && result.count > 0 && result.count < 0x80)
+    var data = Data([UInt8(baseSize), UInt8(result.count), UInt8(result.count)])
+    data.append(result)
+    return data
+}
+
+private func gitCRC32(_ data: Data) -> UInt32 {
+    var crc = UInt32.max
+    for byte in data {
+        crc ^= UInt32(byte)
+        for _ in 0..<8 {
+            let mask = UInt32(bitPattern: -Int32(crc & 1))
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask)
+        }
+    }
+    return ~crc
+}
 
 /// Minimal fake repo: `.git` + empty index + one untracked-ready worktree file.
 private func makeSeedRepo() throws -> URL {
@@ -605,4 +948,13 @@ private func makeRepoWithHead(files: [String: String]) throws -> URL {
         .write(to: URL(fileURLWithPath: gitDir).appendingPathComponent("index"))
 
     return root
+}
+
+private extension Data {
+    mutating func appendBigEndianUInt32(_ value: UInt32) {
+        append(UInt8((value >> 24) & 0xFF))
+        append(UInt8((value >> 16) & 0xFF))
+        append(UInt8((value >> 8) & 0xFF))
+        append(UInt8(value & 0xFF))
+    }
 }

@@ -150,6 +150,22 @@ private func leaderPrompt(id: Int64, sessionId: String) -> ACPMessage {
     )
 }
 
+private func leaderClose(id: Int64, sessionId: String) -> ACPMessage {
+    .request(
+        id: .number(id),
+        method: AgentMethodNames.sessionClose,
+        params: .object(["sessionId": .string(sessionId)])
+    )
+}
+
+private func rosterChanged(from message: ACPMessage) -> ACPLeaderRosterChanged? {
+    guard case .notification(let method, let params) = message,
+          ACPMethodRoute.normalize(method: method, params: params).method
+            == ACPLeaderRosterMethods.sessionsChanged
+    else { return nil }
+    return try? params.decode(ACPLeaderRosterChanged.self)
+}
+
 private func sessionID(from message: ACPMessage) throws -> String {
     guard case .response(_, let result, _) = message,
         case .object(let object)? = result,
@@ -468,6 +484,126 @@ struct ACPLeaderIPCRoutingTests {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         #expect(await host.connectedClientCount() == 0)
+    }
+}
+
+@Suite("Leader IPC roster", .serialized)
+struct ACPLeaderIPCRosterTests {
+    @Test("other-process sessions publish snapshot and honest activity deltas", .timeLimit(.minutes(1)))
+    func rosterLifecycleAcrossClients() async throws {
+        let runtime = ACPAgentRuntime(
+            promptDriver: LeaderEchoPromptDriver(),
+            makeSessionId: { "sess-roster" },
+            timestamp: { "2026-08-10T12:00:00Z" },
+            rosterTimestampMilliseconds: { 1_754_827_200_000 }
+        )
+        let host = ACPLeaderIPCHost(runtime: runtime)
+        let (driver, driverTask) = attach(to: host)
+        let (viewer, viewerTask) = attach(to: host)
+        defer {
+            driverTask.cancel()
+            viewerTask.cancel()
+        }
+
+        try await driver.send(.register(
+            clientType: "driver",
+            mode: .stdio,
+            capabilities: ACPLeaderClientCapabilities(yoloMode: true)
+        ))
+        try await viewer.send(.register(
+            clientType: "viewer",
+            mode: .stdio,
+            capabilities: ACPLeaderClientCapabilities()
+        ))
+        _ = try await driver.next { if case .registered = $0 { true } else { false } }
+        _ = try await viewer.next { if case .registered = $0 { true } else { false } }
+
+        try await driver.sendACP(leaderInitialize(id: 1))
+        _ = try await driver.nextACP {
+            if case .response(.number(1), _, _) = $0 { true } else { false }
+        }
+
+        try await driver.sendACP(leaderNewSession(id: 2))
+        let createdForDriver = try await driver.nextACP {
+            rosterChanged(from: $0)?.upserted.first?.sessionId == "sess-roster"
+        }
+        let createdForViewer = try await viewer.nextACP {
+            rosterChanged(from: $0)?.upserted.first?.sessionId == "sess-roster"
+        }
+        let createResponse = try await driver.nextACP {
+            if case .response(.number(2), _, _) = $0 { true } else { false }
+        }
+        #expect(try sessionID(from: createResponse) == "sess-roster")
+
+        for message in [createdForDriver, createdForViewer] {
+            let changed = try #require(rosterChanged(from: message))
+            let entry = try #require(changed.upserted.first)
+            #expect(entry.sessionId == "sess-roster")
+            #expect(entry.activity == .idle)
+            #expect(entry.resident)
+            #expect(entry.yolo)
+            #expect(entry.cwd == FileManager.default.currentDirectoryPath)
+            #expect(entry.lastChangeUnixMs == 1_754_827_200_000)
+            #expect(changed.removed.isEmpty)
+        }
+
+        try await viewer.sendACP(.request(
+            id: .number(3),
+            method: ACPLeaderRosterMethods.sessionsList,
+            params: .object([:])
+        ))
+        let listResponse = try await viewer.nextACP {
+            if case .response(.number(3), _, _) = $0 { true } else { false }
+        }
+        guard case .response(_, let listResult?, nil) = listResponse else {
+            Issue.record("expected a successful roster snapshot response")
+            return
+        }
+        let list = try listResult.decode(ACPLeaderRosterListResponse.self)
+        #expect(list.sessions.map(\.sessionId) == ["sess-roster"])
+        #expect(list.sessions.first?.activity == .idle)
+
+        try await driver.sendACP(leaderPrompt(id: 4, sessionId: "sess-roster"))
+        for client in [driver, viewer] {
+            let working = try await client.nextACP {
+                rosterChanged(from: $0)?.upserted.first?.activity == .working
+            }
+            #expect(rosterChanged(from: working)?.upserted.first?.sessionId == "sess-roster")
+        }
+        for client in [driver, viewer] {
+            let idle = try await client.nextACP {
+                rosterChanged(from: $0)?.upserted.first?.activity == .idle
+            }
+            #expect(rosterChanged(from: idle)?.upserted.first?.sessionId == "sess-roster")
+        }
+        _ = try await driver.nextACP {
+            if case .response(.number(4), _, _) = $0 { true } else { false }
+        }
+
+        try await driver.sendACP(leaderClose(id: 5, sessionId: "sess-roster"))
+        for client in [driver, viewer] {
+            let removed = try await client.nextACP {
+                rosterChanged(from: $0)?.removed == ["sess-roster"]
+            }
+            #expect(rosterChanged(from: removed)?.upserted.isEmpty == true)
+        }
+        _ = try await driver.nextACP {
+            if case .response(.number(5), _, _) = $0 { true } else { false }
+        }
+
+        try await viewer.sendACP(.request(
+            id: .number(6),
+            method: ACPLeaderRosterMethods.sessionsList,
+            params: .object([:])
+        ))
+        let emptyResponse = try await viewer.nextACP {
+            if case .response(.number(6), _, _) = $0 { true } else { false }
+        }
+        guard case .response(_, let emptyResult?, nil) = emptyResponse else {
+            Issue.record("expected a successful empty roster response")
+            return
+        }
+        #expect(try emptyResult.decode(ACPLeaderRosterListResponse.self).sessions.isEmpty)
     }
 }
 

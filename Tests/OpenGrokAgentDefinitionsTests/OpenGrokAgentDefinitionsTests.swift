@@ -96,6 +96,25 @@ struct OpenGrokAgentDefinitionsTests {
         #expect(BuiltinAgentName.subagentVariants == [.generalPurpose, .explore, .plan])
     }
 
+    @Test("built-in profile tools stay within the live registered surface")
+    func builtinProfileToolsAreLive() throws {
+        var profiles = Dictionary(uniqueKeysWithValues: BuiltinAgentName.allCases.map {
+            ($0.rawValue, Set($0.definition.toolConfig.toolNames))
+        })
+        for preset in [
+            "grok-build-plan-no-subagents", "grok-build-ask-user",
+            "grok-build-orchestrator", "grok-computer",
+        ] {
+            profiles[preset] = Set(try #require(toolsetForPreset(preset)).toolNames)
+        }
+        profiles["workspace-grok-build"] = Set(workspaceGrokBuildToolset().toolNames)
+
+        for (profile, toolNames) in profiles {
+            let unregistered = toolNames.subtracting(liveRegisteredToolNames)
+            #expect(unregistered.isEmpty, "\(profile) exposes unregistered tools: \(unregistered.sorted())")
+        }
+    }
+
     @Test("project definitions take precedence over user and bundled definitions")
     func discoveryPrecedence() throws {
         let root = try makeTemporaryDirectory()
@@ -163,3 +182,14 @@ struct OpenGrokAgentDefinitionsTests {
         try Data(content.utf8).write(to: directory.appendingPathComponent("\(name).md"))
     }
 }
+
+private let liveRegisteredToolNames: Set<String> = [
+    "agent_swarm", "apply_patch", "ask_user_question", "edit",
+    "enter_plan_mode", "exit_plan_mode", "get_command_or_subagent_output", "glob",
+    "grep", "image_gen", "kill_command_or_subagent", "list_dir",
+    "memory_get", "memory_search", "monitor", "read_file",
+    "run_terminal_command", "scheduler_create", "scheduler_delete", "scheduler_list",
+    "search_replace", "skill", "spawn_subagent", "todo_write",
+    "update_goal", "view_image", "wait_commands_or_subagents", "web_fetch",
+    "web_search", "workflow", "write",
+]

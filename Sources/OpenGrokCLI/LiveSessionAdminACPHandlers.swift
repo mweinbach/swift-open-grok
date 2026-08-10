@@ -25,11 +25,9 @@
 // error: `info`/`close`/`updates`/`state`/`import`/`load_history`/`search`/
 // `repair`/`usage` need live-session internals (SessionCommand plumbing,
 // updates journals, FTS index) this port does not have;
-// `x.ai/session/list`/`x.ai/sessions/list` merge a remote registry /
-// conversations lane that was deliberately not ported (the typed core
-// `session/list` this runtime already serves is the recorded divergence —
-// it lists the RUNTIME's ACP session store, not `$OPENGROK_HOME/sessions`;
-// peers listing persisted history use the CLI surface).
+// Singular `x.ai/session/list` still needs the persisted-history lane.
+// Plural `x.ai/sessions/list` is now the live typed leader roster snapshot;
+// peers listing persisted local history still use the CLI surface.
 //
 // Recorded divergences (beyond the refusals above):
 //   1. No remote writeback: upstream syncs renames/deletes to the backend

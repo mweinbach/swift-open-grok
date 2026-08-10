@@ -43,9 +43,9 @@
 //     admin/state/search/usage/repair (:4115-4155 — the item 6 remainder:
 //     info/close/updates/state/import/load_history/search/repair/usage need
 //     live-session command plumbing, updates journals or the FTS index;
-//     `x.ai/session/list`/`x.ai/sessions/list` merge the unported remote
-//     registry — the typed core `session/list` this runtime serves is the
-//     recorded divergence), `x.ai/memory/*` (:4156),
+//     singular `x.ai/session/list` still needs the persisted-history lane;
+//     plural `x.ai/sessions/list` is the live typed leader roster snapshot),
+//     `x.ai/memory/*` (:4156),
 //     `x.ai/skills/refresh-baseline` (:4159), `x.ai/interject` (:4165),
 //     `x.ai/feedback/dismiss` (:4166 — its `x.ai/btw` sibling left this
 //     list with item 7), `x.ai/cloud/*` (:4170-4370), `x.ai/billing` +

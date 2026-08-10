@@ -670,6 +670,15 @@ public enum OpenGrokPagerInputRouting: Sendable, Equatable, Hashable {
     /// routing value carries the command back up. Nothing here touches the
     /// composer, which is what "preserving draft" means.
     case runCommand(String)
+    /// The dashboard's dispatch/reply row targeted a specific retained
+    /// session. The controller switches to that tab before enqueuing the
+    /// prompt; when another turn is active it defers the switch until that
+    /// turn finishes, preserving both conversations.
+    case dispatchPrompt(sessionID: String, prompt: String)
+    /// The dashboard's unselected dispatch row starts a new retained session
+    /// in its selected directory, then submits the prompt through the normal
+    /// queue/turn lifecycle.
+    case dispatchNew(prompt: String, workingDirectory: String?)
 }
 
 public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {

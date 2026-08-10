@@ -41,6 +41,10 @@ public struct MCPOAuthFlowError: Error, Sendable, Equatable, CustomStringConvert
 /// dedup layers, so every other session blocks on the same server's auth.
 public let mcpBrowserAuthTimeoutSeconds: TimeInterval = 600
 
+/// Credential-store polling cadence while the browser callback is pending
+/// (oauth.rs:27-29, 420-435).
+public let mcpCredentialPollIntervalSeconds: TimeInterval = 2
+
 /// How long a follower waits for the cross-process auth lock before giving
 /// up on dedup and proceeding with its own flow (oauth.rs:39-45).
 let mcpAuthLockWaitSeconds: TimeInterval = mcpBrowserAuthTimeoutSeconds + 60
@@ -191,6 +195,35 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
         }
     }
 
+    /// Wait for either the loopback callback or a changed token in the real
+    /// credential store. One blocking poll loop owns both signals, so disk
+    /// recovery returns immediately instead of leaving a structured child
+    /// parked until the callback timeout.
+    fileprivate func awaitCallbackOrCredential(
+        timeoutSeconds: TimeInterval,
+        credentialPollIntervalSeconds: TimeInterval,
+        credentialsChanged: @escaping @Sendable () -> Bool
+    ) async throws -> MCPOAuthBrowserCompletion {
+        let sFd = serverFd
+        guard sFd >= 0 else {
+            throw MCPOAuthFlowError("Failed to bind loopback port 0: listener is closed")
+        }
+        let timeout = timeoutSeconds
+        let interval = max(0.001, credentialPollIntervalSeconds)
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(with: Result {
+                    try Self.serveUntilCallbackOrCredential(
+                        fd: sFd,
+                        timeoutSeconds: timeout,
+                        credentialPollIntervalSeconds: interval,
+                        credentialsChanged: credentialsChanged
+                    )
+                })
+            }
+        }
+    }
+
     private static func serveUntilCallback(
         fd: Int32,
         timeoutSeconds: TimeInterval
@@ -239,6 +272,65 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
                 }
             }
             // Non-callback path answered (404); keep waiting.
+        }
+    }
+
+    private static func serveUntilCallbackOrCredential(
+        fd: Int32,
+        timeoutSeconds: TimeInterval,
+        credentialPollIntervalSeconds: TimeInterval,
+        credentialsChanged: @escaping @Sendable () -> Bool
+    ) throws -> MCPOAuthBrowserCompletion {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        var nextCredentialPoll = Date().addingTimeInterval(credentialPollIntervalSeconds)
+        while true {
+            let now = Date()
+            guard now < deadline else {
+                throw MCPOAuthFlowError(
+                    "OAuth consent timed out after \(UInt64(timeoutSeconds))s; "
+                        + "re-run authentication to try again")
+            }
+            if now >= nextCredentialPoll {
+                if credentialsChanged() { return .credentialsStored }
+                nextCredentialPoll = now.addingTimeInterval(credentialPollIntervalSeconds)
+                continue
+            }
+
+            let untilDeadline = deadline.timeIntervalSince(now)
+            let untilCredentialPoll = nextCredentialPoll.timeIntervalSince(now)
+            let waitSeconds = min(untilDeadline, untilCredentialPoll)
+            let waitMs = Int32(max(1, (waitSeconds * 1000).rounded(.up)))
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let pollRes = poll(&pfd, 1, waitMs)
+            if pollRes == 0 { continue }
+            guard pollRes > 0 else {
+                if errno == EINTR { continue }
+                throw MCPOAuthFlowError("OAuth callback failed: poll failed: errno \(errno)")
+            }
+
+            var clientAddr = sockaddr_in()
+            var clientLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let clientFd = withUnsafeMutablePointer(to: &clientAddr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    accept(fd, $0, &clientLen)
+                }
+            }
+            guard clientFd >= 0 else { continue }
+            defer { close(clientFd) }
+
+            var buffer = [UInt8](repeating: 0, count: 8192)
+            let bytesRead = recv(clientFd, &buffer, buffer.count - 1, 0)
+            guard bytesRead > 0,
+                  let request = String(bytes: buffer[..<bytesRead], encoding: .utf8)
+            else { continue }
+
+            if let outcome = handle(request: request, clientFd: clientFd) {
+                switch outcome {
+                case .success(let payload): return .callback(payload)
+                case .failure(let error):
+                    throw MCPOAuthFlowError("OAuth callback failed: \(error.message)")
+                }
+            }
         }
     }
 
@@ -366,11 +458,6 @@ public actor MCPOAuthSingleFlight {
 ///   4. authorization URL → browser → callback (bounded wait);
 ///   5. code exchange (state + RFC 9207 `iss` validated) → persisted tokens.
 ///
-/// Not ported from upstream's wait arm (recorded): the 2-second credential
-/// store poll that detects a login completed by ANOTHER process while this
-/// flow waits for its own callback (oauth.rs:387-436). The cross-process
-/// flock + post-wait token-changed recheck below still dedups the common
-/// case; the poll only matters for a force-evicted parallel flow.
 public func mcpRunBrowserAuthFlow(
     serverName: String,
     serverURL: URL,
@@ -378,7 +465,8 @@ public func mcpRunBrowserAuthFlow(
     transport: any HTTPTransport,
     byoConfig: McpOAuthConfig?,
     openBrowser: @escaping @Sendable (URL) -> Void,
-    timeoutSeconds: TimeInterval = mcpBrowserAuthTimeoutSeconds
+    timeoutSeconds: TimeInterval = mcpBrowserAuthTimeoutSeconds,
+    credentialPollIntervalSeconds: TimeInterval = mcpCredentialPollIntervalSeconds
 ) async throws {
     let storage = MCPFileCredentialStorage(
         home: home, serverName: serverName, serverURL: serverURL)
@@ -441,22 +529,43 @@ public func mcpRunBrowserAuthFlow(
         throw MCPOAuthFlowError("Failed to get authorization URL: \(error)")
     }
 
+    // Snapshot after DCR/authorization URL generation, before opening the
+    // browser. A different non-nil token means another flow completed.
+    let tokenBeforeBrowser = (try? storage.load())?.tokenResponse?.accessToken
+
     // 4. Browser consent. Open failure is non-fatal upstream
     //    (oauth.rs:381-385); the caller has already surfaced the URL.
     openBrowser(authURL)
 
-    // 5. Bounded callback wait, then exchange with RFC 9207 `iss`
-    //    (oauth.rs:440-459).
-    let callback = try await listener.awaitCallback(timeoutSeconds: timeoutSeconds)
-    do {
-        _ = try await manager.exchangeCode(
-            code: callback.code,
-            state: callback.state,
-            issuer: callback.issuer
-        )
-    } catch {
-        throw MCPOAuthFlowError("Token exchange failed: \(error)")
+    // 5. Race the bounded callback wait against the REAL on-disk store
+    //    (oauth.rs:387-485). The callback's timeout bounds both arms.
+    let completion = try await listener.awaitCallbackOrCredential(
+        timeoutSeconds: timeoutSeconds,
+        credentialPollIntervalSeconds: credentialPollIntervalSeconds,
+        credentialsChanged: {
+            guard let tokenNow = (try? storage.load())?.tokenResponse?.accessToken else {
+                return false
+            }
+            return tokenNow != tokenBeforeBrowser
+        }
+    )
+
+    if case .callback(let callback) = completion {
+        do {
+            _ = try await manager.exchangeCode(
+                code: callback.code,
+                state: callback.state,
+                issuer: callback.issuer
+            )
+        } catch {
+            throw MCPOAuthFlowError("Token exchange failed: \(error)")
+        }
     }
+}
+
+private enum MCPOAuthBrowserCompletion: Sendable {
+    case callback(MCPOAuthCallbackPayload)
+    case credentialsStored
 }
 
 /// The dedup wrapper (`authenticate_mcp_server_dedup`, oauth.rs:81-160): the
@@ -472,6 +581,7 @@ public func mcpAuthenticateServer(
     force: Bool,
     openBrowser: @escaping @Sendable (URL) -> Void,
     timeoutSeconds: TimeInterval = mcpBrowserAuthTimeoutSeconds,
+    credentialPollIntervalSeconds: TimeInterval = mcpCredentialPollIntervalSeconds,
     singleFlight: MCPOAuthSingleFlight = .shared
 ) async throws {
     try await singleFlight.run(serverName: serverName, force: force) {
@@ -486,7 +596,8 @@ public func mcpAuthenticateServer(
                 transport: transport,
                 byoConfig: byoConfig,
                 openBrowser: openBrowser,
-                timeoutSeconds: timeoutSeconds
+                timeoutSeconds: timeoutSeconds,
+                credentialPollIntervalSeconds: credentialPollIntervalSeconds
             )
             return
         }
@@ -523,7 +634,8 @@ public func mcpAuthenticateServer(
             transport: transport,
             byoConfig: byoConfig,
             openBrowser: openBrowser,
-            timeoutSeconds: timeoutSeconds
+            timeoutSeconds: timeoutSeconds,
+            credentialPollIntervalSeconds: credentialPollIntervalSeconds
         )
     }
 }

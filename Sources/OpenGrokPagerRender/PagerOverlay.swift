@@ -1506,6 +1506,18 @@ public struct PagerOverlayStack: Sendable, Equatable {
         return true
     }
 
+    @discardableResult
+    public mutating func updateQuestion(
+        id: String,
+        _ transform: (inout PagerQuestionPrompt) -> Void
+    ) -> Bool {
+        guard let index = overlays.firstIndex(where: { $0.id == id }),
+              case .question(var prompt) = overlays[index].content else { return false }
+        transform(&prompt)
+        overlays[index].content = .question(prompt)
+        return true
+    }
+
     /// Retitle an open overlay in place — the `updateList` convention for
     /// the frame chrome. A search query or filter chip that lives in the
     /// modal title has to repaint without re-pushing (which would reset the

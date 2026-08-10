@@ -314,6 +314,9 @@ public actor ACPLeaderIPCHost {
         await runtime.setNotificationSink { [weak self] message in
             await self?.route(message)
         }
+        await runtime.setRosterNotificationSink { [weak self] message in
+            await self?.route(message)
+        }
         await runtime.setReverseSender { [weak self] message in
             await self?.route(message)
         }
@@ -386,6 +389,7 @@ public actor ACPLeaderIPCHost {
     public func stop() async {
         guard !stopped else { return }
         stopped = true
+        await runtime.setRosterNotificationSink(nil)
         // `server.rs:1228-1235` — a live workspace exposure drains with the
         // leader, before clients are told to leave.
         await controlPlane.finalize()
@@ -574,6 +578,14 @@ public actor ACPLeaderIPCHost {
                 return
             }
             await deliver(message, to: split.clientID)
+            return
+        }
+        if case .notification(let method, let params) = message,
+           ACPMethodRoute.normalize(method: method, params: params).method
+            == ACPLeaderRosterMethods.sessionsChanged {
+            for clientID in clients.keys.sorted() {
+                await deliver(message, to: clientID)
+            }
             return
         }
         // Session-scoped and driver-only routing. The sender id is the empty

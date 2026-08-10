@@ -14,22 +14,10 @@
 // selection cursor (`render.rs:212-283`), so there is no open key and no
 // peek state to keep in sync with the row list.
 //
-// DEFERRED with the B1 research ruling (§5), each for a grounded reason,
-// not for effort:
-//   1. the `❯ reply` PromptWidget row (`peek.rs:837-896`) — the port runs a
-//      single agent stack and background tabs are idle by construction, so
-//      dispatch-to-an-existing-agent has no second runtime to reach; on the
-//      ACTIVE row the composer live beneath the modal already is the reply.
-//   2. question/permission mode (`peek.rs:639-753`) — only the active
-//      session can hold a pending permission and that already raises its
-//      own capturing overlay.
-//   3. the subagent peek — lands with subagent attach, since a peek onto a
-//      row Enter cannot open is a dead end.
-//   4. the bottom-border config badge (`peek.rs:459-523`) — a background
-//      session's permission mode is not persisted, so the badge would be a
-//      guess.
-// `replyRows` survives as a PARAMETER on the measure so deferral 1 is a
-// wiring job, not a re-derivation.
+// The band carries the live reply row, single-select/freeform question mode,
+// and truthful subagent status/transcript peeks. The bottom-border config
+// badge remains absent because the retained record does not persist enough
+// per-session model/mode state to paint it without guessing.
 //
 // The measure and the paint must agree row for row: that is the entire
 // reason `desiredContentRows` and `liveTailMiddleBottom` exist as a pair
@@ -63,17 +51,43 @@ public struct PagerDashboardPeek: Sendable, Equatable, Hashable {
     /// Shown in the middle when there is nothing to tail
     /// (`peek.rs:812-821`, whose fallback is `"No activity yet"`).
     public var emptyHint: String
+    /// The live `❯ reply` draft painted at the bottom of the peek. `nil`
+    /// means the row is visible with its placeholder; a non-nil value is the
+    /// text currently owned by dashboard input.
+    public var replyDraft: String?
+    /// Pending question mode replaces the reply row with the question and
+    /// its answer choices, matching the dashboard peek's modal input mode.
+    public var questionPrompt: String?
+    public var questionOptions: [String]
+    public var questionSelectedIndex: Int?
+    public var questionFreeformText: String
+    public var questionFreeformFocused: Bool
+    public var questionRequiresAttach: Bool
 
     public init(
         statusLabel: String,
         timeAgo: String = "",
         items: [PagerConversationItem] = [],
-        emptyHint: String = PagerDashboardPeekTail.defaultEmptyHint
+        emptyHint: String = PagerDashboardPeekTail.defaultEmptyHint,
+        replyDraft: String? = nil,
+        questionPrompt: String? = nil,
+        questionOptions: [String] = [],
+        questionSelectedIndex: Int? = nil,
+        questionFreeformText: String = "",
+        questionFreeformFocused: Bool = false,
+        questionRequiresAttach: Bool = false
     ) {
         self.statusLabel = statusLabel
         self.timeAgo = timeAgo
         self.items = items
         self.emptyHint = emptyHint
+        self.replyDraft = replyDraft
+        self.questionPrompt = questionPrompt
+        self.questionOptions = questionOptions
+        self.questionSelectedIndex = questionSelectedIndex
+        self.questionFreeformText = questionFreeformText
+        self.questionFreeformFocused = questionFreeformFocused
+        self.questionRequiresAttach = questionRequiresAttach
     }
 }
 
@@ -113,6 +127,7 @@ public enum PagerDashboardPeekTail {
     /// (`PEEK_MIN_BOX_LIVE_TAIL`, `layout.rs:17`). Below this the band is
     /// refused outright rather than painted as a sliver.
     public static let peekMinBoxLiveTail = 8
+    public static let peekMinBoxQuestion = 10
     /// Band max = ⌊H × 3/8⌋ (`PEEK_MAX_FRAC_NUM/DEN`, `layout.rs:23-24`).
     public static let peekMaxFractionNumerator = 3
     public static let peekMaxFractionDenominator = 8
@@ -122,10 +137,6 @@ public enum PagerDashboardPeekTail {
 
     /// `peek.rs:814` — the fallback when a peeked row has no transcript.
     public static let defaultEmptyHint = "No activity yet"
-
-    // NOT ported: `PEEK_MIN_BOX_QUESTION` (`layout.rs:20`). Question mode is
-    // deferred (ruling 2); a constant with no caller is a promise the code
-    // does not keep.
 
     // MARK: Measure
 
@@ -143,11 +154,8 @@ public enum PagerDashboardPeekTail {
     /// bare status row that looks like a rendering failure.
     ///
     /// DIVERGENCE: upstream clamps `reply_rows.max(1)` because its `❯ reply`
-    /// input is unconditional. This port defers the reply row (ruling 1) and
-    /// passes 0, so the clamp is dropped — keeping it would reserve a
-    /// phantom row the band never paints, and `liveTailMiddleBottom` would
-    /// then hand the body one row fewer than the measure promised. Every
-    /// other arm is verbatim.
+    /// input is unconditional. This pure helper accepts an explicit 0 for
+    /// transcript-only sizing probes; the live dashboard path passes 1.
     public static func desiredContentRows(
         maxContent: Int,
         replyRows: Int,
@@ -264,10 +272,19 @@ public enum PagerDashboardPeekTail {
                 showPeek: false, peekBoxHeight: 0, maxContentRows: 0
             )
         }
+        if peek.questionPrompt != nil {
+            let contentRows = 2 + max(1, peek.questionOptions.count)
+                + (peek.questionRequiresAttach ? 1 : 0)
+            return allocate(
+                areaHeight: contentHeight,
+                fixedOverhead: 0,
+                desiredContentRows: min(contentRows, cap),
+                peekMinBox: peekMinBoxQuestion
+            )
+        }
         let budget = desiredContentRows(
             maxContent: cap,
-            // Ruling 1: no reply row in v1.
-            replyRows: 0,
+            replyRows: 1,
             bodyMeasured: densifiedBodyLineCount(items: peek.items, width: width, theme: theme),
             pinUser: hasLastUser(items: peek.items)
         )
@@ -287,9 +304,8 @@ public enum PagerDashboardPeekTail {
     /// current turn — the paint-side half of the `blank_row = false` arm in
     /// `desiredContentRows`.
     ///
-    /// `replyTopY` keeps its upstream name: with the reply deferred it is the
-    /// exclusive end of the content region, which is where the reply would
-    /// begin.
+    /// `replyTopY` is both the reply row and the exclusive end of the middle
+    /// content region.
     static func liveTailMiddleBottom(middleTop: Int, replyTopY: Int) -> Int {
         let withBlank = max(0, replyTopY - 1)
         let heightWithBlank = max(0, withBlank - middleTop)
@@ -477,13 +493,13 @@ public enum PagerDashboardPeekTail {
 
 // MARK: - Paint
 
-/// Paint the peek band: a rule, the status/time row, then the dense tail.
+/// Paint the peek band: a rule, status/time, dense tail, and reply/question.
 ///
 /// Band chrome is the two rows `allocate` charges for, standing in for the
-/// rounded box's top and bottom borders (`peek.rs:585-616`): the first row
-/// is a rule separating the band from the roster above it, the last is left
-/// blank — upstream fills it with the live config badge, which is deferred
-/// (ruling 4). A blank row there also keeps the tail off the modal footer.
+/// rounded box's top and bottom borders (`peek.rs:585-616`). The first row
+/// is a rule separating the band from the roster above it; the terminal row
+/// stays blank because the retained record cannot truthfully supply the
+/// upstream model/mode badge.
 ///
 /// The degenerate gate is upstream's (`peek.rs:577-579`): under 3 rows or 20
 /// columns nothing is painted at all, because a peek too small to carry both
@@ -548,12 +564,74 @@ func drawDashboardPeekBand(
         )
     }
 
+    if let question = peek.questionPrompt {
+        _ = paintSpans(
+            &buffer,
+            spans: [PagerStyledSpan(text: "\u{25B8} \(question)", foreground: theme.warning)],
+            x: area.x,
+            y: contentTop + 1,
+            limit: area.right,
+            background: theme.bgBase
+        )
+        for (offset, option) in peek.questionOptions.enumerated() {
+            let y = contentTop + 2 + offset
+            guard y < contentTop + contentRows else { break }
+            let isSelected = peek.questionSelectedIndex == offset
+            let isOther = offset + 1 == peek.questionOptions.count
+            let freeform = isOther && !peek.questionFreeformText.isEmpty
+                ? ": \(peek.questionFreeformText)"
+                : ""
+            let cursor = isOther && peek.questionFreeformFocused ? "\u{258F}" : ""
+            _ = paintSpans(
+                &buffer,
+                spans: [PagerStyledSpan(
+                    text: "\(isSelected ? "\u{276F}" : " ") \(offset + 1). \(option)\(freeform)\(cursor)",
+                    foreground: isSelected ? theme.accentUser : theme.textPrimary,
+                    style: isSelected ? [.bold] : []
+                )],
+                x: area.x,
+                y: y,
+                limit: area.right,
+                background: theme.bgBase
+            )
+        }
+        if peek.questionRequiresAttach {
+            let y = contentTop + 2 + peek.questionOptions.count
+            if y < contentTop + contentRows {
+                _ = paintSpans(
+                    &buffer,
+                    spans: [PagerStyledSpan(text: "Open the session to answer this question", foreground: theme.grayDim)],
+                    x: area.x,
+                    y: y,
+                    limit: area.right,
+                    background: theme.bgBase
+                )
+            }
+        }
+        return
+    }
+
+    let replyTop = contentTop + contentRows - 1
+    let reply = peek.replyDraft ?? ""
+    _ = paintSpans(
+        &buffer,
+        spans: [
+            PagerStyledSpan(text: "\u{276F} ", foreground: theme.accentUser),
+            PagerStyledSpan(
+                text: reply.isEmpty ? "reply\u{2026}" : reply,
+                foreground: reply.isEmpty ? theme.grayDim : theme.textPrimary
+            ),
+        ],
+        x: area.x,
+        y: replyTop,
+        limit: area.right,
+        background: theme.bgBase
+    )
+
     let middleTop = contentTop + 1
-    // No reply row (ruling 1), so the reply's would-be top is the exclusive
-    // end of the content region.
     let middleBottom = PagerDashboardPeekTail.liveTailMiddleBottom(
         middleTop: middleTop,
-        replyTopY: contentTop + contentRows
+        replyTopY: replyTop
     )
     let middleHeight = max(0, middleBottom - middleTop)
     guard middleHeight > 0 else { return }

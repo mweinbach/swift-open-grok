@@ -545,6 +545,79 @@ struct ShellTests {
         let sep = chainSeparator()
         #expect(sep == "&&" || sep == ";")
     }
+
+    @Test("Windows executable lookup follows PATH then PATHEXT order")
+    func windowsPathExtOrder() {
+        let executableFiles = Set([
+            "C:\\First\\npx.CMD",
+            "C:\\Second\\npx.COM",
+        ])
+        let environment = [
+            "PATH": "C:\\First;C:\\Second",
+            "PATHEXT": ".COM;.EXE;.CMD",
+        ]
+
+        let resolved = which(
+            "npx",
+            environment: environment,
+            platform: .windows,
+            isExecutableFile: executableFiles.contains
+        )
+
+        #expect(resolved == "C:\\First\\npx.CMD")
+        #expect(isCommandAvailable(
+            "npx",
+            environment: environment,
+            platform: .windows,
+            isExecutableFile: executableFiles.contains
+        ))
+    }
+
+    @Test("Windows executable lookup uses default PATHEXT and Path casing")
+    func windowsDefaultPathExt() {
+        let executableFiles = Set(["C:\\Windows\\System32\\cmd.EXE"])
+        let resolved = which(
+            "cmd",
+            environment: ["Path": "C:\\Windows\\System32"],
+            platform: .windows,
+            isExecutableFile: executableFiles.contains
+        )
+
+        #expect(resolved == "C:\\Windows\\System32\\cmd.EXE")
+    }
+
+    @Test("Windows executable lookup preserves an explicit PATHEXT suffix")
+    func windowsExplicitSuffix() {
+        let executableFiles = Set(["C:\\Tools\\script.CMD"])
+        let resolved = which(
+            "script.CMD",
+            environment: ["PATH": "C:\\Tools", "PATHEXT": ".EXE;.CMD"],
+            platform: .windows,
+            isExecutableFile: executableFiles.contains
+        )
+
+        #expect(resolved == "C:\\Tools\\script.CMD")
+    }
+
+    @Test("POSIX executable lookup does not apply PATHEXT")
+    func posixIgnoresPathExt() {
+        let executableFiles = Set(["/usr/local/bin/tool"])
+        let resolved = which(
+            "tool",
+            environment: ["PATH": "/missing:/usr/local/bin", "PATHEXT": ".EXE"],
+            platform: .posix,
+            isExecutableFile: executableFiles.contains
+        )
+
+        #expect(resolved == "/usr/local/bin/tool")
+    }
+
+    #if os(Windows)
+    @Test("live Windows command availability resolves cmd via PATHEXT")
+    func liveWindowsCommandAvailability() {
+        #expect(isCommandAvailable("cmd"))
+    }
+    #endif
 }
 
 // MARK: - Atomic write

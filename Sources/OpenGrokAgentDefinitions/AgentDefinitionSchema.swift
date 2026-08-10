@@ -845,7 +845,7 @@ extension AgentToolConfiguration {
         "run_terminal_command", "read_file", "view_image", "search_replace", "list_dir", "grep",
         "kill_command_or_subagent", "todo_write", "get_command_or_subagent_output", "wait_commands_or_subagents",
         "spawn_subagent", "agent_swarm", "scheduler_create", "scheduler_delete", "scheduler_list", "monitor",
-        "search_tool", "use_tool", "update_goal", "workflow"
+        "update_goal", "workflow"
     ].map { AgentToolDefinition(id: $0) })
 
     public static func preset(_ name: String) -> AgentToolConfiguration {
@@ -917,11 +917,11 @@ private enum ToolsetPresets {
         case "grok-build-plan": return list(AgentToolConfiguration.defaultGrokBuild.toolNames + ["enter_plan_mode", "exit_plan_mode", "ask_user_question"])
         case "grok-build-plan-no-subagents": return list(AgentToolConfiguration.defaultGrokBuild.toolNames.filter { !["spawn_subagent", "agent_swarm"].contains($0) } + ["enter_plan_mode", "exit_plan_mode", "ask_user_question"])
         case "grok-build-ask-user": return list(AgentToolConfiguration.defaultGrokBuild.toolNames + ["ask_user_question"])
-        case "codex": return list(["run_terminal_command", "read_file", "view_image", "apply_patch", "list_dir", "grep", "kill_command_or_subagent", "todo_write", "get_command_or_subagent_output", "wait_commands_or_subagents", "spawn_subagent", "agent_swarm", "workflow", "scheduler_create", "scheduler_delete", "scheduler_list", "monitor", "search_tool", "use_tool", "update_goal", "enter_plan_mode", "exit_plan_mode", "ask_user_question"])
+        case "codex": return list(["run_terminal_command", "read_file", "view_image", "apply_patch", "list_dir", "grep", "kill_command_or_subagent", "todo_write", "get_command_or_subagent_output", "wait_commands_or_subagents", "spawn_subagent", "agent_swarm", "workflow", "scheduler_create", "scheduler_delete", "scheduler_list", "monitor", "update_goal", "enter_plan_mode", "exit_plan_mode", "ask_user_question"])
         case "explore": return list(["read_file", "view_image", "list_dir", "grep"])
         case "plan": return list(["read_file", "view_image", "list_dir", "grep", "todo_write"])
         case "grok-computer": return list(["run_terminal_command", "read_file", "search_replace", "write", "list_dir", "grep", "kill_command_or_subagent", "get_command_or_subagent_output"])
-        case "grok-build-orchestrator": return list(["run_terminal_command", "read_file", "list_dir", "grep", "spawn_subagent", "agent_swarm", "get_command_or_subagent_output", "wait_commands_or_subagents", "kill_command_or_subagent", "search_tool", "use_tool", "todo_write", "enter_plan_mode", "exit_plan_mode", "ask_user_question", "update_goal", "workflow", "scheduler_create", "scheduler_delete", "scheduler_list", "monitor", "web_search", "web_fetch", "memory_search", "memory_get"])
+        case "grok-build-orchestrator": return list(["run_terminal_command", "read_file", "list_dir", "grep", "spawn_subagent", "agent_swarm", "get_command_or_subagent_output", "wait_commands_or_subagents", "kill_command_or_subagent", "todo_write", "enter_plan_mode", "exit_plan_mode", "ask_user_question", "update_goal", "workflow", "scheduler_create", "scheduler_delete", "scheduler_list", "monitor", "web_search", "web_fetch", "memory_search", "memory_get"])
         case "opencode": return list(["run_terminal_command", "read_file", "edit", "write", "grep", "glob", "todo_write", "skill", "kill_command_or_subagent", "get_command_or_subagent_output"])
         default:
             store.lock.lock(); defer { store.lock.unlock() }
@@ -953,8 +953,7 @@ public func toolsetForPreset(_ preset: String) -> AgentToolConfiguration? { Tool
 public func workspaceGrokBuildToolset() -> AgentToolConfiguration {
     let additions = [
         "write", "enter_plan_mode", "exit_plan_mode", "ask_user_question", "web_search",
-        "image_gen", "image_to_video", "reference_to_video", "web_fetch", "memory_search",
-        "memory_get", "lsp"
+        "image_gen", "web_fetch", "memory_search", "memory_get"
     ]
     return AgentToolConfiguration(tools: (AgentToolConfiguration.defaultGrokBuild.toolNames + additions).map { AgentToolDefinition(id: $0) })
 }

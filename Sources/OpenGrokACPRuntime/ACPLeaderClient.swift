@@ -80,6 +80,9 @@ public actor ACPLeaderClient {
     private var registrationValue: ACPLeaderClientRegistration?
     private let eventStream: AsyncThrowingStream<ACPMessage, Error>
     private var eventContinuation: AsyncThrowingStream<ACPMessage, Error>.Continuation?
+    private var rosterContinuations: [
+        UUID: AsyncThrowingStream<ACPLeaderRosterChanged, Error>.Continuation
+    ] = [:]
 
     public init(
         channel: any WebSocketByteChannel,
@@ -151,6 +154,22 @@ public actor ACPLeaderClient {
         return eventStream
     }
 
+    public func rosterSnapshot() async throws -> ACPLeaderRosterListResponse {
+        let response = try await request(method: ACPLeaderRosterMethods.sessionsList)
+        return try response.decode(ACPLeaderRosterListResponse.self)
+    }
+
+    public func rosterEvents() throws -> AsyncThrowingStream<ACPLeaderRosterChanged, Error> {
+        guard started, !closed else { throw ACPLeaderClientError.notStarted }
+        let id = UUID()
+        let (stream, continuation) = AsyncThrowingStream<ACPLeaderRosterChanged, Error>.makeStream()
+        rosterContinuations[id] = continuation
+        continuation.onTermination = { @Sendable [weak self] _ in
+            Task { await self?.removeRosterContinuation(id) }
+        }
+        return stream
+    }
+
     public func request(method: String, params: JSONValue = .object([:])) async throws -> JSONValue {
         guard started, !closed else { throw ACPLeaderClientError.notStarted }
         let id = AcpRequestId.number(nextRequestID)
@@ -206,6 +225,7 @@ public actor ACPLeaderClient {
         pendingControl.removeAll()
         eventContinuation?.finish(throwing: error)
         eventContinuation = nil
+        finishRosterContinuations(throwing: error)
         await writer.close()
         await channel.close()
     }
@@ -240,6 +260,7 @@ public actor ACPLeaderClient {
                         continuation.resume(returning: result ?? .object([:]))
                     }
                 } else {
+                    publishRosterEvent(from: message)
                     eventContinuation?.yield(message)
                 }
             } catch {
@@ -283,8 +304,32 @@ public actor ACPLeaderClient {
         pendingControl.removeAll()
         eventContinuation?.finish(throwing: error)
         eventContinuation = nil
+        finishRosterContinuations(throwing: error)
         await writer.close()
         await channel.close()
+    }
+
+    private func publishRosterEvent(from message: ACPMessage) {
+        guard case .notification(let method, let params) = message,
+              ACPMethodRoute.normalize(method: method, params: params).method
+                == ACPLeaderRosterMethods.sessionsChanged,
+              let changed = try? params.decode(ACPLeaderRosterChanged.self)
+        else { return }
+        for continuation in rosterContinuations.values {
+            continuation.yield(changed)
+        }
+    }
+
+    private func removeRosterContinuation(_ id: UUID) {
+        rosterContinuations.removeValue(forKey: id)
+    }
+
+    private func finishRosterContinuations(throwing error: Error) {
+        let continuations = rosterContinuations.values
+        rosterContinuations.removeAll()
+        for continuation in continuations {
+            continuation.finish(throwing: error)
+        }
     }
 
     private static func encode(_ message: ACPMessage) -> String {

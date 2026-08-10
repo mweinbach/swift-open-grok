@@ -155,10 +155,11 @@ private struct HermeticFamily {
 /// 410-420). Each must be refused with the terminal arm's error — never
 /// silently mis-routed, never accepted as a no-op.
 ///
-/// Count discipline: 76 entries when the pin landed with E10; 70 now —
+/// Count discipline: 76 entries when the pin landed with E10; 69 now —
 /// `x.ai/session/rename`/`delete`/`fork` left with the session-admin trio
 /// (ACPSessionAdminExtensionTests pins their routing), `x.ai/btw` left with
 /// the side-question slice (ACPBtwExtensionTests pins its routing), and the
+/// leader roster's `x.ai/sessions/list` left with the leader bridge slice;
 /// two `x.ai/mcp/` representatives left with the MCP family
 /// (ACPMCPExtensionTests pins the routed seven AND the family's two
 /// refusal shapes: terminal-with-data for the unported
@@ -173,7 +174,7 @@ private let refusedUpstreamMethods: [String] = [
     // :4115-4150. rename/delete/fork (:4146-4150) left this list with the
     // session-admin trio — see the header note.
     "x.ai/session/info", "x.ai/session/close", "x.ai/session/list",
-    "x.ai/sessions/list", "x.ai/workspaces/list", "x.ai/session/updates",
+    "x.ai/workspaces/list", "x.ai/session/updates",
     "x.ai/session/state", "x.ai/session/import", "x.ai/session/load_history",
     "x.ai/session/search", "x.ai/session/resolve_local_for_worktree_resume",
     "x.ai/session/rehydrate", "x.ai/session/add_local_workspace",
@@ -265,6 +266,16 @@ struct ACPExtensionMethodTableTests {
         #expect(error == nil)
         #expect(result?["status"]?.stringValue == "persisted_local_only")
         #expect(store.count == 1)
+    }
+
+    @Test("x.ai/sessions/list is the live leader roster snapshot")
+    func leaderRosterListRoutes() async throws {
+        let family = try HermeticFamily()
+        try await family.initialize()
+
+        let (result, error) = await family.call("x.ai/sessions/list", id: "roster-list")
+        #expect(error == nil)
+        #expect(result?["sessions"] == .array([]))
     }
 
     @Test("every unimplemented upstream method is refused with the terminal error, byte-exact")

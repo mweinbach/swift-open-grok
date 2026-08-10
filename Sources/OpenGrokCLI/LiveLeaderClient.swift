@@ -292,12 +292,14 @@ private final class LiveLeaderTerminationSignal: @unchecked Sendable {
 actor LiveLeaderPagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPagerRuntimeAdapter {
     private let client: ACPLeaderClient
     private let workingDirectory: URL
+    private let rosterBridge: LiveLeaderRosterBridge
     private var initialized = false
     private var sessionID: AcpSessionId?
 
     init(client: ACPLeaderClient, workingDirectory: URL) {
         self.client = client
         self.workingDirectory = workingDirectory
+        self.rosterBridge = LiveLeaderRosterBridge(client: client)
     }
 
     func makeSession(
@@ -350,6 +352,27 @@ actor LiveLeaderPagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGro
         sessionID = nil
         let session = try await makeSession(for: request)
         return session.sessionID ?? ""
+    }
+
+    func resumeSession(sessionID: String) async throws -> String {
+        try await ensureInitialized()
+        let remoteSessionID = AcpSessionId(sessionID)
+        let response = try await client.request(
+            method: AgentMethodNames.sessionResume,
+            params: try JSONValue.encode(ResumeSessionRequest(sessionId: remoteSessionID))
+        )
+        _ = try response.decode(ResumeSessionResponse.self)
+        self.sessionID = remoteSessionID
+        return remoteSessionID.rawValue
+    }
+
+    func rosterEvents() async throws -> AsyncThrowingStream<LiveLeaderRosterEvent, Error> {
+        try await ensureInitialized()
+        return try await rosterBridge.events()
+    }
+
+    func stopRosterEvents() async {
+        await rosterBridge.stop()
     }
 
     private func ensureInitialized() async throws {

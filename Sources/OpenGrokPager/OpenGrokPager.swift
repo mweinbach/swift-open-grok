@@ -67,6 +67,14 @@ public protocol OpenGrokPagerRuntimeAdapter: Sendable {
 
     func replaceSession(from request: OpenGrokPagerRequest) async throws -> String
 
+    /// Create the replacement session in the dashboard's selected dispatch
+    /// directory. Adapters that do not own per-session directories retain the
+    /// legacy behavior through the default implementation.
+    func replaceSession(
+        from request: OpenGrokPagerRequest,
+        workingDirectory: String?
+    ) async throws -> String
+
     /// Swap the live conversation to the stored session `sessionID` — the
     /// commit half of `/resume` (upstream `Action::ShowSessionPicker`,
     /// `slash/commands/resume.rs:21-23`, resolved by the picker's selection).
@@ -78,6 +86,14 @@ public extension OpenGrokPagerRuntimeAdapter {
     func replaceSession(from request: OpenGrokPagerRequest) async throws -> String {
         _ = request
         throw OpenGrokPagerError.sessionReplacementUnsupported
+    }
+
+    func replaceSession(
+        from request: OpenGrokPagerRequest,
+        workingDirectory: String?
+    ) async throws -> String {
+        _ = workingDirectory
+        return try await replaceSession(from: request)
     }
 
     // Defaulted so existing adapters keep compiling; the default fails loudly

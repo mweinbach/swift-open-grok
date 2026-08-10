@@ -249,6 +249,23 @@ struct ToolRegistryTests {
         #expect(meta.readOnly)
         #expect(meta.label == "Read")
     }
+
+    @Test("future tool kinds remain parseable without registering inert specs")
+    func taxonomyOnlyKindsAreNotRegistered() throws {
+        let taxonomyOnlyKinds: [ProductToolKind] = [
+            .lsp, .imageToVideo, .referenceToVideo, .searchTool, .useTool,
+        ]
+        for kind in taxonomyOnlyKinds {
+            let encoded = try JSONEncoder().encode(kind)
+            #expect(try JSONDecoder().decode(ProductToolKind.self, from: encoded) == kind)
+        }
+
+        let registeredNames = Set(BuiltinToolCatalog.builtinTools.map(\.id))
+        let taxonomyOnlyNames: Set<String> = [
+            "lsp", "image_to_video", "reference_to_video", "search_tool", "use_tool",
+        ]
+        #expect(registeredNames.isDisjoint(with: taxonomyOnlyNames))
+    }
 }
 
 private func unwrap(
