@@ -341,6 +341,13 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// after the loop ends to exec the relaunch; the controller returns
     /// `.quit` right after emitting it.
     case relaunchInScreenMode(minimal: Bool, sessionID: String)
+    /// Ctrl+E / `/expand` in minimal mode — re-print the most-recently
+    /// committed FOLDED block, fully expanded, below the conversation
+    /// (upstream `Action::MinimalExpandLast`, `app/actions.rs` →
+    /// `router.rs:645-648` → `minimal_expand_last`,
+    /// `app_view.rs:4697-4712`). The render side owns the expand ring, so
+    /// the intent carries no target id.
+    case minimalExpandLast
     /// `/workflows` — the background workflow-run overlay.
     case workflows
     /// `Ctrl+P` and `/help`'s upstream target (`OpenCommandPalette`) — every

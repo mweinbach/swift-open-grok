@@ -191,6 +191,10 @@ public final class PagerMinimalFrameHost {
     /// Entries this host marked pending, so a resolved prompt clears exactly
     /// the marks it set (the per-frame sync of `commit.rs:594-600`).
     private var pendingMarked: Set<MinimalEntryID> = []
+    /// Folded-commit ids queued by Ctrl+E / `/expand` for a full re-print
+    /// (`minimal_state.pending_expand`, drained by `expand_pending`,
+    /// `commit.rs:518-582`).
+    private var pendingExpand: [MinimalEntryID] = []
 
     /// `collapseThinking` is `[terminal] minimal_collapse_thinking` and
     /// `maxCommitRows` is `[terminal] minimal_max_commit_rows` (default 2000,
@@ -233,6 +237,18 @@ public final class PagerMinimalFrameHost {
     /// scrollback instead and must not get a second card.
     public func setWelcomePending(_ pending: Bool) {
         welcomePending = pending && welcome != nil
+    }
+
+    /// Queue the most-recently committed FOLDED block for a full re-print
+    /// (`minimal_expand_last`, `app_view.rs:4697-4712`): committed terminal
+    /// text cannot be mutated, so "expanding" is an honest re-print of the
+    /// same block, fully expanded, below the conversation (K10). Walks the
+    /// ring backwards on repeated presses; a no-op once nothing folded
+    /// remains.
+    public func expandMostRecentFolded() {
+        if let id = transcript.state.takeExpandableCommitted() {
+            pendingExpand.append(id)
+        }
     }
 
     /// Hand the screen to a child ($EDITOR / $PAGER): park the cursor below
@@ -383,6 +399,43 @@ public final class PagerMinimalFrameHost {
                 }
                 return true
             }
+        }
+
+        // Ctrl+E / `/expand` re-prints, after the commit pass exactly as
+        // upstream orders them (`lib.rs:105-106`). Held whole while a
+        // centered overlay owns the region — the user would not see the
+        // re-print and an insert would scroll the popup (`expand_pending`,
+        // `commit.rs:534-539`); a 0-width probe frame also leaves the queue
+        // intact rather than silently dropping the request (`:543-546`).
+        if !holdCommits, !pendingExpand.isEmpty {
+            let queued = pendingExpand
+            pendingExpand = []
+            var requeue: [MinimalEntryID] = []
+            for (position, id) in queued.enumerated() {
+                guard let index = transcript.state.indexOfID(id) else {
+                    continue // entry removed (rewind / clear) since the keypress
+                }
+                transcript.state.updateEntry(at: index) { $0.setDisplayMode(.expanded) }
+                guard let item = transcript.item(for: id) else { continue }
+                let block = MinimalCommitRender.committedLines(
+                    item: item, displayMode: .expanded, width: width, theme: theme
+                )
+                do {
+                    // UNCAPPED (`maxRows: 0`): the initial commit truncated
+                    // the block under the cap, and this is the explicit
+                    // "show me the whole thing" action — re-capping just
+                    // reprints the same footer (`commit.rs:513-517`).
+                    try MinimalCommitRender.insertCommitted(
+                        block, into: terminal, maxRows: 0, theme: theme
+                    )
+                } catch {
+                    // Terminal write failed: keep this id and the rest
+                    // queued so the request retries instead of vanishing.
+                    requeue.append(contentsOf: queued[position...])
+                    break
+                }
+            }
+            pendingExpand = requeue + pendingExpand
         }
 
         drawLiveRegion(state, turnRunning: turnRunning, completionsRows: completionsRows, theme: theme)

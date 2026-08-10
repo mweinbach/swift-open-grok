@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B2-S2: /minimal + /fullscreen + the exec relaunch landed — the B2 program is CLOSED; W1-W4, S1, N, M1-M4, S2 all live or recorded)
+**As of:** 2026-08-10 (Wave 18 B2 closed + follow-up: /expand and the minimal Ctrl+E chord landed — the advertised expand affordance is real; next open keystone per PARITY_ROADMAP: Wave 18 B1 dashboard or B6 chrome readers)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -2006,6 +2006,37 @@ Deferred remainders, all recorded in their slices: the todo//btw//panel//
 plan//full_view//auth minimal modules, the Ctrl+E chord, the flat live-region
 stance, upstream's renderer-dependent tests with no port ground, and the
 Windows exec emulation.
+
+### B2 follow-up — `/expand` + the minimal Ctrl+E chord (serial gate: exit 0, 5,370 tests, 105 runs, zero issues, 2026-08-10)
+
+Lead-implemented — the smallest recorded B2 remainder, closed first because the
+expand ring was landed machinery with no consumer (the "implemented-unwired"
+middle case §7 warns about, one notch from a dead affordance: the committed
+collapsed header ADVERTISES "(ctrl+e to expand)" since M2, and until this slice
+the chord did nothing).
+
+What's live: `/expand` registered with `expand.rs:19-33` copy verbatim in
+upstream's transcript→context neighborhood, dispatched with the
+`ModeSupport::MinimalOnly(UseInstead)` refusal byte-exact
+(`mode_support.rs:52-56` — outside minimal the fold is a live scrollback
+affordance, so the remedy names Tab + →, not the mode switch); the Ctrl+E
+chord intercepted in the input pump BEFORE the composer, gated on the
+session-fixed minimal mode (`minimal_key_intercept`, `app_view.rs:4750-4777` +
+the `:3261` is_minimal gate), riding the same `/expand` command signal so one
+dispatch owns the ring; `PagerMinimalFrameHost.expandMostRecentFolded`
+(`minimal_expand_last`, `app_view.rs:4697-4712`) popping the ring into a
+pending queue drained after the commit pass in upstream's frame order
+(`lib.rs:105-106`) — UNCAPPED re-prints (`commit.rs:513-517`: re-capping just
+reprints the same footer), held whole under a centered overlay
+(`:534-539`), requeued past a failed write, stale ids skipped.
+
+6 net-new tests: 5 controller-seam (registry copy + position, minimal
+dispatch, the UseInstead refusal verbatim, Ctrl+E-rides-the-dispatch, and
+Ctrl+E-stays-with-the-composer outside minimal — the chord is the editor's
+readline end-of-line there, `EditorKeys.swift:37`) and 1 host live-seam (a
+collapsed search commit hides its output; expand re-prints EVERY folded row
+once; the consumed ring re-prints nothing). Cost carried from upstream: the
+composer's Ctrl+E end-of-line is unavailable in minimal (Home/End remain).
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

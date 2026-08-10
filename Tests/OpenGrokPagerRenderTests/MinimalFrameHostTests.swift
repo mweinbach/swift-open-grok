@@ -292,6 +292,43 @@ struct MinimalFrameHostTests {
         #expect(sink.occurrences(of: "PICKERROW") >= 1, "the overlay's rows must land on screen")
     }
 
+    // Ctrl+E / /expand (K10): committed terminal text cannot be mutated, so
+    // expanding a folded block is an honest re-print of the same block in
+    // full below the conversation — UNCAPPED, because the explicit "show me
+    // the whole thing" action re-capped just reprints the same footer
+    // (expand_pending, commit.rs:513-582). The ring walks backwards and is
+    // consumed: a second expand with nothing folded re-prints nothing.
+    @Test("expand re-prints the folded block in full, once")
+    func expandRePrintsTheFoldedBlockInFullOnce() throws {
+        let sink = CaptureSink()
+        let host = try makeHost(sink: sink)
+        try host.begin()
+        // A successful search collapses on commit (the M1 policy) — its
+        // detail line is folded away.
+        let search = PagerConversationItem.tool(PagerToolCard(
+            name: "Search", kind: .search, input: "NEEDLEWORD",
+            output: "FOLDEDDETAIL line one\nFOLDEDDETAIL line two",
+            state: .succeeded
+        ))
+        host.draw(frame([search]))
+        #expect(
+            sink.occurrences(of: "FOLDEDDETAIL") == 0,
+            "a collapsed commit is its header row only"
+        )
+
+        host.expandMostRecentFolded()
+        host.draw(frame([search]))
+        #expect(
+            sink.occurrences(of: "FOLDEDDETAIL") == 2,
+            "the re-print carries the WHOLE output — every folded row"
+        )
+
+        // The ring is consumed: nothing folded remains, so nothing re-prints.
+        host.expandMostRecentFolded()
+        host.draw(frame([search]))
+        #expect(sink.occurrences(of: "FOLDEDDETAIL") == 2, "no second re-print")
+    }
+
     // insert_committed's error contract, end to end: a failed write leaves
     // the entry uncommitted and a later frame retries it.
     @Test("a failed terminal write retries the commit next frame")

@@ -1072,6 +1072,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         let inputPumpGate = InputPumpGate()
         self.inputPumpGate = inputPumpGate
         let renderer = self.renderer
+        // Session-fixed (a mode switch is a re-exec), so the pump captures
+        // the value instead of hopping the actor per keystroke.
+        let minimalInterceptsKeys = request.mode == .minimal
         inputPump = Task {
             while !Task.isCancelled {
                 guard await inputPumpGate.waitUntilAllowed() else { return }
@@ -1102,6 +1105,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         case .some(.notHandled), .none:
                             break
                         }
+                    }
+                    // Minimal-only Ctrl+E, intercepted BEFORE the composer —
+                    // upstream's `minimal_key_intercept`
+                    // (`app_view.rs:4758-4759`, gated on `is_minimal()` at
+                    // `:3261`). It rides the `/expand` command signal so the
+                    // dispatch (and its ring) stays in one place. Cost,
+                    // upstream's own: the composer's readline end-of-line
+                    // chord is unavailable in minimal (Home/End remain).
+                    // Overlays kept first refusal above, so a modal still
+                    // sees its own keys.
+                    if minimalInterceptsKeys,
+                       case .key(let keyEvent) = event,
+                       keyEvent.modifiers.contains(.control),
+                       Self.controlCharacter(of: keyEvent) == "e" {
+                        await mailbox.send(.control(.command("/expand")), priority: true)
+                        continue
                     }
                     switch Self.controlAction(for: event) {
                     case .some(.escape):
@@ -2442,6 +2461,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "View the full conversation transcript in your pager ($PAGER)",
             usage: "/transcript"
         ),
+        // `/expand` sits between `/transcript` and `/context`, upstream's
+        // registry order minus the absent `/edit-prompt`
+        // (`slash/commands/mod.rs:95-98`). Copy verbatim from
+        // `expand.rs:19-33`; no aliases upstream. Its
+        // `ModeSupport::MinimalOnly(UseInstead)` gate lives with the
+        // dispatch arm, the `/timeline` precedent.
+        PagerCommandDefinition(
+            name: "expand",
+            summary: "Re-print the last collapsed block, fully expanded (minimal mode)",
+            usage: "/expand"
+        ),
         PagerCommandDefinition(
             name: "context",
             summary: "View context usage"
@@ -3581,6 +3611,23 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     minimal: wantMinimal, sessionID: sessionID
                 )))
                 return .quit
+            case "expand":
+                // `expand.rs:35-46` + the `ModeSupport::MinimalOnly(
+                // UseInstead)` refusal (`mode_support.rs:52-56`): outside
+                // minimal the fold is a live scrollback affordance, so the
+                // remedy names it instead of the mode switch.
+                guard activePagerMode == .minimal else {
+                    try await emit(.notice(
+                        "/expand isn't available in fullscreen mode — press Tab to focus the scrollback, then → on the block."
+                    ))
+                    return .handled
+                }
+                guard (activeSessionID ?? lastSessionID ?? launchSessionID) != nil else {
+                    try await emit(.notice("No active session"))
+                    return .handled
+                }
+                try await emit(.overlay(.minimalExpandLast))
+                return .handled
             case "toggle-mouse-reporting":
                 try await emit(.overlay(.toggleMouseReporting))
                 return .handled
@@ -3776,6 +3823,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /queue                    Prompts queued behind the running turn
       /tasks                    List background tasks, subagents, and scheduled tasks
       /btw <question>           Ask a side question without interrupting
+      /expand                   Re-print the last collapsed block, fully expanded (minimal)
       /context                  View context usage
       /usage  /cost             View session token usage
       /minimal                  Reopen this session in minimal (scrollback-native) mode
@@ -3961,6 +4009,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case .lifecycle, .output, .status, .tool, .permissionRequested:
             return false
         }
+    }
+
+    /// The lowercase character of a Ctrl-chord key, whichever field the
+    /// terminal reported it in (the same two-field read the settings chord
+    /// dispatcher uses).
+    private static func controlCharacter(of key: KeyEvent) -> String? {
+        let character: Character?
+        switch key.key {
+        case .char(let value): character = value
+        default: character = key.character
+        }
+        return character.map { String($0).lowercased() }
     }
 
     private static func controlAction(for event: InputEvent) -> PromptAction? {

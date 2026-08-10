@@ -9469,6 +9469,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // terminal is restored (upstream's router.rs:199-209 stash +
             // `Effect::Quit` shape).
             pendingScreenModeRelaunch = (sessionID: sessionID, minimal: minimal)
+        case .minimalExpandLast:
+            // Ctrl+E / `/expand` — the controller already applied the
+            // minimal-only gate, so a nil host here is a routing bug worth a
+            // note rather than silence.
+            if let minimalHost {
+                minimalHost.expandMostRecentFolded()
+            } else {
+                note("/expand isn't available in fullscreen mode — press Tab to focus the scrollback, then → on the block.")
+            }
         case .toggleTimeline:
             // Upstream's `ModeSupport::FullscreenOnly` refusal, byte-parity
             // with `mode_support.rs:47-51` over `timeline.rs:21-25`'s
