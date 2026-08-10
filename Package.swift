@@ -169,6 +169,15 @@ private func targets() -> [Target] {
     // and the library's tests building with no pager/CLI import is the
     // disjointness guarantee.
     t.append(.target(name: "OpenGrokScheduler", dependencies: dep()))
+    // OpenGrokMinimalScrollback: the PURE minimal-mode commit pipeline
+    // (frontier walk, print-once display-mode policy, committed-frontier
+    // state) from `xai-grok-pager-minimal/src/commit.rs`. Dependency-free on
+    // purpose, mirroring upstream's design ("deliberately terminal-agnostic
+    // and unit-testable: the actual insert_before call is injected as a
+    // closure") — the paint path, live tail, and frame loop (B2 M2-M4) are
+    // separate slices that import this, and the library's tests building
+    // with no terminal/pager import is the disjointness guarantee.
+    t.append(.target(name: "OpenGrokMinimalScrollback", dependencies: dep()))
 
     // ---- Wave 1 ----
     // W1-S1: layered tool stack (types -> protocol -> runtime -> api).
@@ -375,6 +384,7 @@ private func targets() -> [Target] {
     t.append(contentsOf: tests(w0s4))
     t.append(contentsOf: tests(["OpenGrokDiagnostics"]))
     t.append(contentsOf: tests(["OpenGrokScheduler"]))
+    t.append(contentsOf: tests(["OpenGrokMinimalScrollback"]))
     t.append(contentsOf: tests(["OpenGrokToolTypes", "OpenGrokToolProtocol", "OpenGrokToolRuntime", "OpenGrokToolsAPI"]))
     t.append(contentsOf: tests(w1s2))
     t.append(contentsOf: tests(["OpenGrokSamplingTypes", "OpenGrokChatState", "OpenGrokTokenEstimation"]))

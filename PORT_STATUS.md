@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-09 (Wave 18 B2-N: insertBefore native-scrollback injection landed, implemented-unwired; M1 minimal frontend next)
+**As of:** 2026-08-10 (Wave 18 B2-M1: pure minimal-mode commit pipeline landed as OpenGrokMinimalScrollback, implemented-unwired; M2 committed-block paint path next)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1639,6 +1639,90 @@ section was folded into this one; the accidental lead commit that swept the
 delegate's orphan file into history was dropped before push (audit copy kept).
 Delegation stays suspended for the rest of this session, and the next session should
 start by checking `git log` for unattributed commits.
+
+### B2-M1 — the minimal-mode commit pipeline, pure (serial gate: exit 0, 5,313 tests, 105 runs, zero issues, 2026-08-10)
+
+Lead-implemented (delegation still suspended per the B2-N incident; the next-session
+`git log` audit passed clean — history matched the ledger chain and the tree was
+clean). New dependency-free library target `Sources/OpenGrokMinimalScrollback/`
+mirroring upstream's own design ("deliberately terminal-agnostic and unit-testable:
+the actual `insert_before` call is injected as a closure", `commit.rs:4-8`). The
+port of `xai-grok-pager-minimal/src/commit.rs` (604 lines) at pin 650c1db7, pure
+half only:
+
+- **`isCommittable`** (`commit.rs:92-115`): pending-user-input holds the frontier
+  in EVERY turn state; an idle turn commits everything else (a stale `is_running`
+  flag must not wedge — the missing-edit/stuck-spinner regression); mid-turn a
+  running BgTask lifecycle block commits anyway (the flag is animation-only, and an
+  async task can outlive its turn), a running agent message commits once a LATER
+  block exists (the tracker provably moved past it), a running TOOL always holds,
+  and the LAST entry always stays live.
+- **`commitLeadingRun`** (`commit.rs:225-248`), the ONE mutating frontier walk:
+  `onCommit` runs first and the entry is marked committed ONLY on `true` — a failed
+  emit stops the walk with the cursor holding, for retry (print-once means a
+  marked-but-unprinted block silently vanishes forever — upstream's bugbot
+  regression, ported at `commit_tests.rs:313-339`).
+- **`scanFrontier`** (`commit.rs:188-205`) mirrors the mutating walk through the
+  ONE shared `classify` step (`commit.rs:149-169`) — the M3 viewport sizing and
+  will-commit gate depend on exact agreement, and one classifier is what makes
+  drift impossible.
+- **Display-mode policy** (`commit.rs:122-141`): Edit → Expanded (even failed —
+  diffs always full, K9; the Edit arm precedes the success check); successful
+  Search/Read/ListDir/MemorySearch/IntegrationSearch → Collapsed; other/FAILED
+  tools → Truncated (`commit_tests.rs:1016-1061` ported); Thinking → Collapsed iff
+  the collapse-thinking toggle; else Expanded.
+- **The frontier state** (`MinimalScrollbackState`): per-entry committed flags
+  travel with the entry (the id-set is authoritative; the cursor only a
+  lower-bound hint, `state/mod.rs:88-100`); remove-below-cursor DECREMENTS the
+  cursor (clamping alone strands a shifted uncommitted entry beneath it — the
+  `/resume` placeholder regression, `state/mod.rs:726-731`), `removeFrom` clamps,
+  `clear` resets, `insertBlockBefore` pulls the cursor back to the insertion point
+  (`state/mod.rs:676`) and debug-asserts an uncommitted anchor. The Ctrl+E expand
+  ring (`state/mod.rs:1125-1149`: LIFO, stale-skip, bounded 256) rides along for
+  its M2/M4 consumers.
+
+27 net-new tests in 3 suites: 19 frontier tests ported from `commit_tests.rs`
+(:46-490, every non-renderer test, table values copied not re-derived), 4
+state-coherence tests (3 ported from `state/mod.rs:3228-3319`; 1 pins the
+otherwise-untested expand ring against its implementation), 4 policy tests
+(:996-1088 plus one covering the lookup kinds and failed-Edit arm the upstream
+trio leaves implicit).
+
+**Recorded divergences (all bookkeeping-shaped, no behavior change):** (1) the
+policy takes `collapseThinking: Bool` instead of upstream's `&AppearanceConfig` —
+the appearance struct is renderer territory; cost: M4 must thread the real
+`minimal_collapse_thinking` toggle to this parameter, one more seam to wire. (2)
+`MinimalBlock`/`MinimalScrollbackEntry` are a reduced stand-in model carrying only
+what the pipeline reads (kind, success, flags, text) — upstream runs the pipeline
+ON the production `ScrollbackState`; cost: M2 must define and maintain the mapping
+from the port's live transcript blocks onto `MinimalToolKind`/`MinimalBlock`, and
+a block kind mismapped there silently gets the wrong fold policy (the policy tests
+here cannot catch a bridge bug). (3) The upstream `should_panic` committed-anchor
+test (`state/mod.rs:3255-3261`) is not ported — the precondition is a debug-only
+assert Swift Testing cannot observe in-process; the guarded behavior (cursor
+pull-back) is pinned by the ported strand test instead. (4)
+`clear_all_pending_user_input`/`has_pending_user_input` and the
+`sync_pending_marks` frame hook (`commit.rs:594-600`) are NOT ported yet — their
+consumer is the per-frame AgentView mark sync, which is M3/M4 territory; landing
+them consumer-less now would be dead API pretending to be a seam.
+
+**Deliberately deferred to M2 (renderer-dependent tests in `commit_tests.rs`):**
+`committed_blocks_fit_desired_height` + `collapsed_thinking_commit_fits_desired_height`
+(K5 height-exactness), `large_commit_is_capped_with_footer` /
+`small_commit_is_not_capped` (§6.15 cap), `committed_block_uses_owning_session_cwd_for_tool_paths`,
+`terminal_native_lock_paints_only_native_colors`, `committed_edit_keeps_diff_line_backgrounds`,
+`only_thinking_spends_the_accent_column`, `committed_thinking_paints_a_dim_rail_in_column_zero`,
+`collapsed_thinking_commit_is_one_advertised_row`, plus the production emit path
+(`committed_appearance`, `minimal_renderer`, `insert_committed`/`paint_committed`,
+`commit_active`, `expand_pending` — `commit.rs:250-600`). Status:
+**implemented-unwired** — a tested library with no importer until M2-M4.
+
+**Reference-clone drift, observed 2026-08-10:** `~/Projects/open-grok` (the path
+recorded at the 2026-08-08 re-pin) is gone; `~/Projects/grok-build` EXISTS AGAIN
+(recorded gone 2026-08-08) and holds the pin, as does a new
+`~/Projects/xai-grok-build-reference`. All M1 reads went through
+`git -C ~/Projects/grok-build show 650c1db7:<path>`, which stays correct
+regardless of which clone's worktree moves.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 
