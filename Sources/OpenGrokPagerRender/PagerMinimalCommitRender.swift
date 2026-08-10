@@ -203,9 +203,14 @@ public enum MinimalCommitRender {
         }
     }
 
-    private static func paintRow(
+    /// Shared with the M3 live tail (`PagerMinimalLiveRender`), which paints
+    /// the same laid-out lines at a viewport offset — one painter on both
+    /// sides of the frontier, like one layout, is what keeps a block
+    /// pixel-identical as it crosses.
+    static func paintRow(
         _ line: PaintLine,
         at y: Int,
+        originX: Int = 0,
         chrome: Int,
         width: Int,
         into buffer: inout CellBuffer
@@ -213,14 +218,14 @@ public enum MinimalCommitRender {
         if let background = line.background {
             for x in 0..<width {
                 _ = buffer.setString(
-                    x: x, y: y, text: " ",
+                    x: originX + x, y: y, text: " ",
                     style: [], foreground: line.foreground, background: background
                 )
             }
         }
         if chrome > 0, let glyph = line.accentGlyph {
             _ = buffer.setString(
-                x: 0, y: y, text: glyph,
+                x: originX, y: y, text: glyph,
                 style: line.style.union([.dim]),
                 foreground: line.accentColor ?? .reset,
                 background: line.background ?? .reset
@@ -229,9 +234,9 @@ public enum MinimalCommitRender {
         _ = paintSpans(
             &buffer,
             spans: line.spans,
-            x: chrome,
+            x: originX + chrome,
             y: y,
-            limit: width,
+            limit: originX + width,
             background: line.background ?? .reset,
             inheritForeground: line.foreground,
             inheritStyle: line.style

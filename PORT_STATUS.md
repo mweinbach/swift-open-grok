@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B2-M2: committed-block paint path landed in OpenGrokPagerRender, implemented-unwired; M3 live tail + overlay host next)
+**As of:** 2026-08-10 (Wave 18 B2-M3: live tail + viewport sizing landed in OpenGrokPagerRender, implemented-unwired; M4 minimal frontend wiring next)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1791,6 +1791,60 @@ text — no per-line diff backgrounds exist anywhere in the strip; if diff-hunk
 rendering ever lands, that test lands with it). (4) `insert_gap` failures are
 swallowed as upstream's are (`let _ =`, `commit.rs:352`) — a lost cosmetic
 blank row must not strand a block that DID print.
+
+### B2-M3 — the live tail + the overlay host's viewport sizing (serial gate: exit 0, 5,336 tests, 105 runs, zero issues, 2026-08-10)
+
+Lead-implemented. `Sources/OpenGrokPagerRender/PagerMinimalLiveRender.swift` — the
+portable core of `live.rs` (`draw_tail` :422-493, `tail_height` :732-750) and
+`overlay.rs` (`sync_viewport` :143-191, `will_commit` :199-211, `content_target`
+:343-358, `modal_target` :125-132, `app_modal_target` :110-112) at the pin. The
+AppView-owned frame composition around them (status row via the turn-status
+widget, prompt widget, todo//btw panels, dropdown/modal rendering,
+`draw_live`'s layout walk) is M4's frame program; the sizing math takes those
+chrome heights as parameters.
+
+What's live (implemented-unwired): **`MinimalTranscript`** — the frontier state
+bound to renderable payloads (`PagerConversationItem` keyed by the state's
+entry ids), with the classification derivation the pure model needs
+(role→block, tool-kind→`MinimalToolKind` with `create` folded into the edit
+family, failed/cancelled→error) and a pinned explicit-block override for
+BgTask lifecycle cards (the item model cannot express them; without the
+override a started task gates on `isRunning` and wedges the frontier);
+**`tailHeight`** — the POST-commit tail measured with exactly the M2 committed
+constructor (sizing to the post-commit tail before the commit runs is the fix
+for upstream's "snaps to top" bug, `live.rs:725-731`); **`drawTail`** —
+bottom-anchored, top-clipped, starting at the shared `scanFrontier` stop;
+**`willCommit`** with the app-modal hold parameter; **`syncViewport`** with
+upstream's two resize paths (pre-commit: area-height-only, keep the top, no
+clear/scroll — `insertBefore` owns those; otherwise: `setViewportHeight`,
+top-fixed, growing downward, result discarded exactly as upstream discards it
+at `overlay.rs:189`); and the three sizing functions with upstream's floors
+and ceilings. Constants recorded for M4: `minimal_live_rows` default 10
+(`config.rs:1445`), `MINIMAL_APP_MODAL_ROWS` 18.
+
+11 net-new tests: classification mapping + pinned-override + payload sync (3,
+port-specific — upstream's state entries ARE its render blocks so it needs no
+mapping tests), frontier-mirroring tail height including the
+released-agent-message + held-tool interplay, measure/draw row-for-row
+agreement (the port's analog of upstream's
+`the_animation_tick_never_changes_a_blocks_height` — one constructor on both
+sides makes a tick parameter nonexistent rather than merely equal),
+bottom-anchor clipping, willCommit + hold, steady-state no-op, the
+pre-commit resize (top kept, zero scroll at the screen bottom), the overlay
+resize (grows in place, scrolls only on bottom overflow), and the three
+sizing tables.
+
+**Recorded divergences / deferrals:** (1)
+`tail_height_uses_owning_session_cwd_for_tool_paths` (live.rs:778-816) not
+ported — same no-ground as M2's cwd test (tool-card input is preformatted; no
+cwd eliding at this layer). (2) The status row
+(`render_minimal_status`/`render_idle_hint` with the `/fullscreen to go back`
+arms), `render_prompt_info`, `minimal_pending_hint`, the btw-geometry guards,
+and `compute_target`'s agent-state reads land with M4 — they are AppView
+composition, and several of their surfaces (the `/fullscreen` copy!) are
+S2-gated: advertising it before the command exists is exactly what ruling (a)
+forbids. (3) `MinimalTranscript.updateItem` on an id removed by rewind is an
+honest `false` no-op (upstream mutates through `get_by_id_mut`, same shape).
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 
