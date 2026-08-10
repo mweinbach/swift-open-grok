@@ -1387,11 +1387,26 @@ agents stream in background tabs via concurrent ACP sessions, but this port's
 single runtime stack grounds only idle background tabs — dispatching to a
 background tab switches to it first; the cost (no parallel top-level turns in
 one process) is recorded when B1-m lands, and the subagent stack remains the
-in-process parallelism story; (c) the tasks pane follows the B9 dedicated-
-overlay precedent (`PagerAgentsOverlay`), not a re-skinned `.list` overlay —
-the pane owns per-key affordances a generic list cannot honestly carry; (d)
-the leader bridge (other processes' sessions in the roster) is deferred past
-B1-d with its own entry.
+in-process parallelism story; (c) the leader bridge (other processes' sessions
+in the roster) is deferred past B1-d with its own entry.
+
+**B1-t enumeration corrections (2026-08-10, before implementation):** (1) the
+port's `/tasks` read-only block is ALREADY upstream parity — `tasks.rs:1-7` is
+explicit that the command "commits a read-only list; killing/attaching is out
+of scope here (use the tasks pane in the full TUI)", so the D3 landing needs
+no change and the pane is a separate surface. (2) The pane is a **side pane**,
+not a modal: `ActionId::ToggleTasks` = Ctrl+G ("A side pane; toggle off to
+reclaim width", `defaults.rs:44-55`), an `AgentPane::Tasks` focus target
+coexisting with the composer (`agent_view/input.rs:1152,1230-1231`) — its
+defining property is being glanceable WHILE typing. Porting it as a capturing
+modal would delete that property; the honest port therefore extends the frame
+model with an optional right-pane region (chrome layout width split, a third
+focus target beside composer/scrollback, Tab cycling) rather than reusing the
+overlay stack. The earlier ruling (c) naming the B9 modal precedent is
+SUPERSEDED by this. Live-refresh divergence pre-ruled: upstream rebuilds rows
+per frame off actor-free state; the port's feeds are actors, so the pane
+refreshes on open, on action, and on a bounded tick while open — staleness
+cost recorded when it lands.
 
 ## Wave 18 B2 — native scrollback, pager-minimal, screen mode, welcome (research complete, queued)
 
