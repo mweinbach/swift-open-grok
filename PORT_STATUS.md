@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B6 CLOSED with the context-bar hover widget; B1 core live [tasks pane, tab registry, /dashboard roster]; remaining: B1 deferred bulk + /cd, Wave 19 long tail)
+**As of:** 2026-08-10 (Wave 18 B1 finish in flight: B1-s state machinery landed; B1-p peek band + B1-w wiring next; then Wave 19 regroup)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1552,6 +1552,52 @@ first gate run FAILED on the pinned `/tasks → /release-notes` relative pair �
 the dashboard row was initially inserted there instead of upstream's slot —
 and the fix moved it to `/rename`'s side with its own pair pinned: the
 E20/E21 relative-order convention catching a real placement error.
+
+### B1-s — the dashboard state machinery + persistence store (batch serial gate: exit 0, 5,526 tests, 105 runs, zero issues, 2026-08-10)
+
+Agent-implemented (b1-state-impl), lead-integrated. The three finish-wave
+slices (B1-s, B1-p, B1-w below) were gated as ONE batch: the full serial
+suite ran green at the completed batch tree; this slice's own tree is purely
+additive (nothing references the new module yet — the wiring is B1-w's).
+
+`PagerDashboardState` is the full value model of `views/dashboard/state.rs` +
+`row.rs` at the pin: the row-state vocabulary
+(needs-input/working/idle/inactive/completed/failed/blocked with
+`allowsDelete`, group priority, and labels), `.state`/`.directory` grouping,
+row identity (`session`/`subagent(parent:child:)`/`dormant`), the filter
+grammar (`a:<agent>`, `s:<state>` with `s:unknown` falling back to substring,
+`#N`, bare substring), pins + manual reorder with the state-confined sort
+ladder, section collapse, the two overflow rules (8 visible subagents per
+cluster, idle fold ≥2 hidden with the 3600 s freshness window), stale-ref gc,
+and component-wise `~` cwd compaction (`Path::strip_prefix` parity — a
+`hasPrefix` port would render `/Users/mweinbach` as `~einbach` under a home
+of `/Users/mw`). `PagerDashboardStore` persists it as the `[dashboard]` table
+of config.toml with upstream's `top:<id>`/`sub:<parent>:<child>` key grammar,
+lenient loads, the unparseable-file-preserved guard on write, and the
+256-entry/1024-byte caps — closing the recorded `[dashboard].enabled` gap
+(the store's `loadEnabled()` returns `Bool?` so the composition can apply
+`GROK_AGENT_DASHBOARD=0` OVER the config, pinned lead-side when B1-w lands).
+
+**Recorded divergences (each also commented in place):** the `"… N more"`
+placeholder label follows `row.rs:228` over the research report's `"… N"`
+transcription slip; `toggleGrouping` drops the section cursor instead of
+parking it on upstream's `[+ New Agent]` button (no such button here);
+placeholder rows reuse the parent's `lastChangeAt` instead of `now()`
+(deterministic, and a child never sorts independently of its cluster); the
+writer THROWS `.unparseableConfig` where upstream warns-and-continues (the
+composition swallows it — same observable behavior, but testable); the
+`pinned` array is key-string-sorted for byte-deterministic files under
+Swift's per-process `Set` seeding; key length caps measure UTF-8 bytes
+(Rust `str::len`); the `[dashboard.onboarding]` cleanup is omitted (the port
+never wrote that key); a non-table `[dashboard]` no-ops the writer and
+defaults the loader, both pinned. Directory-grouping note carried from
+upstream's `sort_within_directory_groups`: cwd compares BEFORE the pin key,
+so pins float within a directory, never globally.
+
+80 net-new tests (57 state + 23 store): the sort ladder, both groupings,
+the full filter grammar, overflow/fold boundaries, pin/reorder/gc, cwd
+compaction edges, key-grammar round-trips, caps, lenient-load and
+preserved-file guards, and the live↔persisted bridge.
 
 ### B6 closure — the context-bar hover widget (serial gate: exit 0, 5,395 tests, 105 runs, zero issues, 2026-08-10). **The B6 chrome-reader program is CLOSED.**
 
