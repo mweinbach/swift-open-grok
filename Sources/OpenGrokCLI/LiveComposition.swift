@@ -1194,7 +1194,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 let pagerMode = try Self.resolveInteractivePagerMode(
                     options: options,
                     terminal: dependencies.terminal,
-                    configScreenMode: uiConfiguration.config.screenMode
+                    configScreenMode: uiConfiguration.config.screenMode,
+                    screenModeEnvOverride: LiveScreenModeRelaunch.takeScreenModeEnvOverride()
                 )
                 if let interactiveInput, let terminalSink = interactiveSink {
                     let initialInputModes = uiConfiguration.inputModes
@@ -1749,6 +1750,32 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             } onCancel: {
                                 task.cancel()
                             }
+                            // B2-S2: an accepted /minimal · /fullscreen switch
+                            // execs HERE — after the controller loop ended and
+                            // its teardown restored the terminal, upstream's
+                            // quit → restore → exec order (event loop drains,
+                            // then `exec_screen_mode_relaunch`). The session
+                            // stack is shut down first so stores flush; exec
+                            // then replaces the process image, which is why
+                            // this must be the last thing the run does. On
+                            // exec failure the pasteable resume hint is the
+                            // fallback (`screen_mode_relaunch.rs:206-214`).
+                            if let relaunch = await renderer.takePendingScreenModeRelaunch() {
+                                await controller.shutdown()
+                                await interactiveInput.close()
+                                _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                                await codeMode?.shutdown()
+                                await toolExecutor.shutdown()
+                                exportBoundaries.remove(sessionID: sessionID)
+                                let failure = LiveScreenModeRelaunch.exec(
+                                    sessionID: relaunch.sessionID,
+                                    wantMinimal: relaunch.minimal
+                                )
+                                FileHandle.standardError.write(Data((
+                                    "Could not reopen the session automatically (\(failure)).\n"
+                                    + "Run: \(LiveScreenModeRelaunch.resumeHint(sessionID: relaunch.sessionID, wantMinimal: relaunch.minimal))\n"
+                                ).utf8))
+                            }
                         },
                         shutdown: {
                             task.cancel()
@@ -1862,7 +1889,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 configScreenMode: LiveInteractiveControllerRenderer.resolveUIConfig(
                     workingDirectory: workingDirectory,
                     environment: context.environment
-                ).config.screenMode
+                ).config.screenMode,
+                screenModeEnvOverride: LiveScreenModeRelaunch.takeScreenModeEnvOverride()
             )
             let pager = OpenGrokPager(
                 runtime: runtime,
@@ -2044,8 +2072,21 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     static func resolveInteractivePagerMode(
         options: CLIExecutionOptions,
         terminal: OpenGrokLiveTerminal,
-        configScreenMode: String? = nil
+        configScreenMode: String? = nil,
+        screenModeEnvOverride: String? = nil
     ) throws -> OpenGrokPagerMode {
+        // B2-S2: the consume-once GROK_SCREEN_MODE override, set ONLY by the
+        // `/minimal`//`/fullscreen` re-exec. It WINS over CLI flags and
+        // config (`take_screen_mode_env_override`,
+        // `screen_mode_relaunch.rs:337-341`): a preserved `--no-alt-screen`
+        // or a config `screen_mode = "minimal"` must not keep a
+        // `/fullscreen` relaunch out of fullscreen. Same grammar as the
+        // config key; off a TTY it degrades to inline like the S1 arm — a
+        // relaunch always has a TTY in practice, and the degrade beats
+        // throwing from an env var no user typed.
+        if let forced = parseConfiguredScreenMode(screenModeEnvOverride) {
+            return terminal.isTTY() ? forced : .inline
+        }
         if options.noAltScreen {
             return .inline
         }
@@ -7583,6 +7624,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// `renderer` stays idle (never `start()`ed — no alt screen, no mouse
     /// capture, the guard.rs stance).
     private let minimalHost: PagerMinimalFrameHost?
+    /// B2-S2: the accepted `/minimal`//`/fullscreen` relaunch, recorded by
+    /// the event arm and read by the composition root AFTER the loop ends
+    /// and the terminal is restored (upstream's `app.relaunch` stash,
+    /// `router.rs:199-209`).
+    private var pendingScreenModeRelaunch: (sessionID: String, minimal: Bool)?
+
+    /// One-shot read of the recorded relaunch request.
+    func takePendingScreenModeRelaunch() -> (sessionID: String, minimal: Bool)? {
+        defer { pendingScreenModeRelaunch = nil }
+        return pendingScreenModeRelaunch
+    }
 
     private var conversation = LivePagerConversationState(markdown: PagerMarkdownRenderer())
     private var prompt = OpenGrokPagerInteractivePromptState()
@@ -9410,13 +9462,28 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // conditional arm, unlike compact's. Mapped onto a transcript
             // note like every toast in this port.
             note("\u{2713} Timestamps: \(userShowTimestamps ? "on" : "off")")
+        case .relaunchInScreenMode(let minimal, let sessionID):
+            // The accepted `/minimal`//`/fullscreen` switch — the controller
+            // gated and resolved it; this side only records the request for
+            // the composition root, which execs AFTER the loop ends and the
+            // terminal is restored (upstream's router.rs:199-209 stash +
+            // `Effect::Quit` shape).
+            pendingScreenModeRelaunch = (sessionID: sessionID, minimal: minimal)
         case .toggleTimeline:
             // Upstream's `ModeSupport::FullscreenOnly` refusal, byte-parity
             // with `mode_support.rs:47-51` over `timeline.rs:21-25`'s
-            // remedy: in minimal mode the command errors BEFORE any flip or
-            // persist, so the config never changes from a mode that cannot
-            // paint the rail. (`.inline` is this port's minimal-shaped
-            // surface — the `/jump` gate above draws the same line.)
+            // remedy: outside fullscreen the command errors BEFORE any flip
+            // or persist, so the config never changes from a mode that
+            // cannot paint the rail. B2-S2 ruling: upstream's line is
+            // NOT-minimal (its inline is the full layout), but THIS port's
+            // `.inline` is a ≤12-row strip whose render gate keeps the rail
+            // out (`showTimeline: mode == .fullScreen`) — flipping the key
+            // from inline would be a dead toggle, the S1 class. The gate
+            // stays capability-true, and the refusal's `/fullscreen` remedy
+            // is now REAL from both refused modes (recorded divergence:
+            // upstream refuses `/fullscreen` from inline as AlreadyInMode;
+            // this port relaunches, because its inline is not the full
+            // layout upstream's is).
             guard mode == .fullScreen else {
                 note("/timeline isn't available in minimal mode (the timeline rail needs the interactive scrollback pane). Run /fullscreen to switch this session.")
                 return

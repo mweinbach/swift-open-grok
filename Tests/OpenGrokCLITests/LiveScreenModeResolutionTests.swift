@@ -127,14 +127,15 @@ struct LiveScreenModeResolutionTests {
         ) == .inline)
     }
 
-    // MARK: The settings row stops advertising absent commands (ruling c)
+    // MARK: The settings row advertises the switchers again (ruling c, closed by S2)
 
-    @Test("the screen_mode row no longer names /minimal or /fullscreen until S2 lands them")
-    func rowDescriptionNamesNoAbsentCommands() throws {
+    @Test("the screen_mode row names /minimal and /fullscreen now that S2 landed them")
+    func rowDescriptionNamesTheLandedSwitchers() throws {
         let row = try #require(pagerDefaultSettings.first { $0.key == "screen_mode" })
-        #expect(!row.description.contains("/minimal"))
-        #expect(!row.description.contains("/fullscreen"))
-        // The truthful half stays.
+        // S1 trimmed this sentence while the commands were absent (never
+        // advertise an absent surface); S2 registered both, so the
+        // session-switch clause is restored and every claim has a backing.
+        #expect(row.description.contains("Switch this session only with /minimal or /fullscreen."))
         #expect(row.description.contains("How Open Grok opens next time"))
         #expect(row.restartRequired)
     }

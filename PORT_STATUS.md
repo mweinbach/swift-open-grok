@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B2-M4: the minimal frontend is LIVE — --minimal / [ui] screen_mode reach the scrollback-native renderer; S2 /minimal + /fullscreen + exec relaunch next, closing B2)
+**As of:** 2026-08-10 (Wave 18 B2-S2: /minimal + /fullscreen + the exec relaunch landed — the B2 program is CLOSED; W1-W4, S1, N, M1-M4, S2 all live or recorded)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1920,6 +1920,92 @@ back` copy — S2-gated by ruling (a). (6) `PagerConversationUI`'s
 unchanged). (7) Bottom-sheet prompts size under `appModalTarget` rather than
 upstream's `modal_target` tail-reservation math; cost: a very tall held-tool
 diff can clip sooner — `drawTail` bottom-anchors what fits.
+
+### B2-S2 — `/minimal`, `/fullscreen`, the exec relaunch (serial gate: exit 0, 5,364 tests, 105 runs, zero issues, 2026-08-10). **The Wave 18 B2 program is CLOSED.**
+
+Lead-implemented, the deliberately-last slice of ruling (a) — everything it
+advertises now exists.
+
+**The commands** (`OpenGrokPagerInteractiveController`): `/minimal` and
+`/fullscreen` (alias `/full`), registered in upstream's context→model
+neighborhood with `screen_mode_switch.rs:36-60` copy verbatim, dispatched at
+the controller seam with the ModeSupport gate (`mode_support.rs:30-57`):
+AlreadyInMode refusals byte-exact ("You're already in minimal mode."), the
+no-session error (`:76-80`), and on acceptance the
+`.relaunchInScreenMode(minimal:sessionID:)` event followed by `.quit` — the
+port of the router's stash + `Effect::Quit` (`router.rs:199-209`). Added to
+`helpText` in the same edit (the D1 registered-but-invisible lesson).
+
+**The relaunch** (`Sources/OpenGrokCLI/LiveScreenModeRelaunch.swift` + the
+`waitForExit` hook): after the loop ends and the terminal is restored, the
+composition shuts the session stack down and `execv`s the same binary —
+argv rebuilt per `build_screen_mode_relaunch_args` (`:85-194`: prior
+mode/session/one-shot flags stripped with their values, `=` forms included,
+the bare prompt and everything after `--` dropped, kept flags carrying their
+value tokens, then `--resume <sid>` + the mode flag), the banner
+"Reopening session in … (switch back with …)" on stderr, and the
+consume-once `GROK_SCREEN_MODE` env set for the child. On exec failure the
+pasteable resume hint prints (`:206-214`). The env override is read AND
+REMOVED at startup (`take_screen_mode_env_override`, `:330-354` — children
+must never inherit a forced mode) and WINS over CLI flags and config in
+`resolveInteractivePagerMode` — a preserved `--no-alt-screen` or an opposite
+config key cannot fight the relaunch; off a TTY it degrades to inline like
+the S1 config arm. Both launch paths (local + leader) consume it.
+
+**The rulings, recorded:** (1) inline-counts-as-fullscreen is upstream's
+line for its inline (the full layout); THIS port's `.inline` is a degraded
+≤12-row strip, so the switchers gate on mode IDENTITY — from inline, BOTH
+relaunch (upstream would refuse `/fullscreen` as AlreadyInMode there). Cost:
+an explicit `--no-alt-screen` user can `/fullscreen` into the alt screen
+they opted out of — by name, which is upstream's own env-override rationale
+(`screen_mode_relaunch.rs:337-341`). (2) `/timeline`'s gate stays
+capability-true (`mode == .fullScreen`): the port's inline render gate keeps
+the rail out of the strip (`showTimeline: mode == .fullScreen`), so an
+inline toggle would be the dead-key class — and its refusal's `/fullscreen`
+remedy is now REAL from both refused modes. (3) The registry rows list in
+every mode (no mode-visibility channel on `PagerCommandDefinition` — the
+`/timeline` precedent) where upstream hides each in its own mode; the
+dispatch refuses honestly instead. (4) The value-taking-flag classification
+is hand-maintained (the port's parser is a switch, no clap table to derive
+from) and pinned by the argv tests — upstream's drift warning carried as
+the test's reason. (5) Windows spawn-and-WAIT exec emulation
+(`:249-291`) not ported — macOS/Linux `execv` only, consistent with the
+port's standing Windows-IPC gaps.
+
+17 net-new tests: 7 controller-seam (registry copy/order verbatim, both
+relaunch directions, both AlreadyInMode refusals, the inline ruling both
+ways, no-session, help text) and 10 CLI-side (6 argv-rebuild table rows
+ported from `:400-914`'s shapes, consume-once env removal incl. the
+unparseable case, env-beats-flags/config + garbage-falls-through +
+off-TTY-degrade, the hint and banner strings). The S1 settings-row pin was
+updated from asserting the trimmed sentence to asserting the restored one.
+
+**The B2 program is closed. Three-surface re-audit** (the surfaces the B2
+research found advertising a hole, quoted from the landed tree):
+
+1. The settings row (`PagerSettingsRegistry.swift:507`): "How Open Grok
+   opens next time: Fullscreen (default when unset) or Minimal. Writes
+   [ui] screen_mode in config.toml. Restart required. Switch this session
+   only with /minimal or /fullscreen." — the key has its reader (S1), the
+   mode it names is real (M4), and both named commands are registered and
+   dispatch (this slice). Every clause backed.
+2. `/timeline`'s refusal (`LiveComposition.swift:9488`): "/timeline isn't
+   available in minimal mode (the timeline rail needs the interactive
+   scrollback pane). Run /fullscreen to switch this session." —
+   `/fullscreen` exists and, from minimal, relaunches. The remedy is
+   actionable.
+3. `[ui] screen_mode` — written by the settings row, read by
+   `resolveInteractivePagerMode` (S1), overridden only by the consume-once
+   relaunch env (this slice), and `.minimal` now reaches the real
+   scrollback-native frontend (M4). No dead key, no dead value.
+
+**B2 final state:** W1-W4 (welcome program), S1 (config reader), N
+(insertBefore), M1 (pure commit pipeline), M2 (paint path), M3 (live tail +
+viewport sizing), M4 (the live minimal frontend), S2 (switchers + relaunch).
+Deferred remainders, all recorded in their slices: the todo//btw//panel//
+plan//full_view//auth minimal modules, the Ctrl+E chord, the flat live-region
+stance, upstream's renderer-dependent tests with no port ground, and the
+Windows exec emulation.
 
 ### R4 + R4b + R5 — Fireworks pacing gate, curated Kimi entries, reconcile ruling (serial gate: exit 0, 5,057 tests, zero issues). **The `.58` re-pin wave is closed.**
 

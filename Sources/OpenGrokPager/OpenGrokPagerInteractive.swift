@@ -333,6 +333,14 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// `ModeSupport::FullscreenOnly` gate (`timeline.rs:21-25`) lives with
     /// the render layer, which is the side that knows the session's mode.
     case toggleTimeline
+    /// `/minimal` / `/fullscreen` — the accepted screen-mode switch
+    /// (upstream `Action::RelaunchInScreenMode`, `app/actions.rs:68` →
+    /// `router.rs:199-209`: stash the relaunch request, quit the loop). The
+    /// controller has already applied the ModeSupport gate and resolved the
+    /// session, so this event is the RECORD the composition root reads
+    /// after the loop ends to exec the relaunch; the controller returns
+    /// `.quit` right after emitting it.
+    case relaunchInScreenMode(minimal: Bool, sessionID: String)
     /// `/workflows` — the background workflow-run overlay.
     case workflows
     /// `Ctrl+P` and `/help`'s upstream target (`OpenCommandPalette`) — every

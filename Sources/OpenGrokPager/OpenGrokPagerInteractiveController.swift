@@ -680,6 +680,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private var currentRequest: OpenGrokPagerRequest?
     private var activeSessionID: String?
     private var lastSessionID: String?
+    /// The render mode this run launched under, for the `/minimal` /
+    /// `/fullscreen` ModeSupport gate (`mode_support.rs:30-36` at pin
+    /// 650c1db7: FullscreenOnly means NOT-minimal — inline counts as the
+    /// fullscreen family). Session-fixed: a mode switch is a re-exec, never
+    /// an in-process transition.
+    private var activePagerMode: OpenGrokPagerMode?
+    /// The launch request's session id — the relaunch fallback when no turn
+    /// has run yet (`activeSessionID`/`lastSessionID` are still nil on a
+    /// fresh interactive session that has typed only the switch command).
+    private var launchSessionID: String?
     private var terminalRestored = false
     private var running = false
     private var rendererBegan = false
@@ -1049,6 +1059,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
 
         running = true
         currentRequest = request
+        activePagerMode = request.mode
+        launchSessionID = request.sessionID
         rendererBegan = false
         terminalRestored = false
         // One epoch per run: every animation frame's tick and seconds are
@@ -2445,6 +2457,26 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "View session token usage",
             usage: "/usage"
         ),
+        // B2-S2: the screen-mode switchers, upstream's registry position —
+        // after `/context`, before `/model` (`slash/commands/mod.rs:99-101`).
+        // Name, alias, description, and usage verbatim
+        // (`screen_mode_switch.rs:36-60`). Upstream hides each in its own
+        // mode ("visible only in the opposite mode"); this port's
+        // `PagerCommandDefinition` has no mode-visibility channel — the
+        // `/timeline` precedent — so both rows list everywhere and the
+        // dispatch refuses with upstream's AlreadyInMode copy
+        // (`mode_support.rs:55`). Recorded divergence.
+        PagerCommandDefinition(
+            name: "minimal",
+            summary: "Reopen this session in minimal (scrollback-native) mode — switch back with /fullscreen",
+            usage: "/minimal"
+        ),
+        PagerCommandDefinition(
+            name: "fullscreen",
+            aliases: ["full"],
+            summary: "Reopen this session in fullscreen mode — switch back with /minimal",
+            usage: "/fullscreen"
+        ),
         PagerCommandDefinition(
             name: "model",
             aliases: ["m"],
@@ -3511,6 +3543,44 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 // the half that knows the session's mode.
                 try await emit(.overlay(.toggleTimeline))
                 return .handled
+            case "minimal", "fullscreen":
+                // B2-S2, the screen-mode switch (`screen_mode_switch.rs:73-84`
+                // + `mode_support.rs:30-57`) with the AlreadyInMode remedy
+                // copy verbatim (`mode_support.rs:55`). The inline ruling,
+                // deferred from the B2 research to this slice: upstream
+                // treats inline as the fullscreen family (its inline IS the
+                // full layout, so `/fullscreen` there refuses), but THIS
+                // port's `.inline` is a degraded ≤12-row strip — from it,
+                // BOTH switchers are real transitions, so the gate is mode
+                // identity, not family. Cost of the divergence: an explicit
+                // `--no-alt-screen` user can `/fullscreen` into the alt
+                // screen they opted out of — by name, which is upstream's
+                // own env-override rationale ("`/fullscreen` always reopens
+                // in alt-screen fullscreen … even under a preserved
+                // `--no-alt-screen`", screen_mode_relaunch.rs:337-341).
+                let wantMinimal = command.name == "minimal"
+                if wantMinimal, activePagerMode == .minimal {
+                    try await emit(.notice("You're already in minimal mode."))
+                    return .handled
+                }
+                if !wantMinimal, activePagerMode == .fullScreen {
+                    try await emit(.notice("You're already in fullscreen mode."))
+                    return .handled
+                }
+                guard let sessionID = activeSessionID ?? lastSessionID ?? launchSessionID else {
+                    try await emit(.notice(
+                        "No active session to reopen in \(command.name) mode"
+                    ))
+                    return .handled
+                }
+                // Record the accepted relaunch for the composition root,
+                // then quit the loop — upstream's router stashes the request
+                // on the app and pushes `Effect::Quit` (`router.rs:199-209`);
+                // the exec happens after the terminal is restored.
+                try await emit(.overlay(.relaunchInScreenMode(
+                    minimal: wantMinimal, sessionID: sessionID
+                )))
+                return .quit
             case "toggle-mouse-reporting":
                 try await emit(.overlay(.toggleMouseReporting))
                 return .handled
@@ -3708,6 +3778,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /btw <question>           Ask a side question without interrupting
       /context                  View context usage
       /usage  /cost             View session token usage
+      /minimal                  Reopen this session in minimal (scrollback-native) mode
+      /fullscreen  /full        Reopen this session in fullscreen mode
       /session-info             Show session info
       /mcps                     Show MCP server status
       /doctor [fix [FIX]]       Check this session and show available fixes
