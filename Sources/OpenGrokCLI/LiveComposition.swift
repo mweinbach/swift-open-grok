@@ -7690,6 +7690,28 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// upstream's 2 s arm window (`arm_or_delete`, dashboard.rs:2125-2140):
     /// pressing `x` on a DIFFERENT row re-arms instead of deleting.
     private var armedCloseSessionID: String?
+    /// B1-w2: the state machinery behind the open roster. Rebuilt FRESH at
+    /// every open — filter/search/collapse/idle-expand are per-open state by
+    /// upstream's persistence contract; grouping/pins/reorder re-enter
+    /// through the `[dashboard]` load.
+    private var dashboardState = PagerDashboardState()
+    /// The dormant catalog listings the open roster was built from — the
+    /// same one-pass-at-open rule as the peek cache.
+    private var dashboardDormant: [LiveSessionListing] = []
+    /// Search-mode text (`enter_search_mode`, state.rs:3533-3540). Non-nil
+    /// while Ctrl+/ search is live; `dashboardState.searchActive` mirrors it
+    /// for the line builder's fold suppression.
+    private var dashboardSearchQuery: String?
+    /// The ON-DISK `[dashboard].enabled`, threaded into every persist so a
+    /// deliberate `enabled = false` is never overwritten by a pin
+    /// (`dispatch_dashboard_persist`, dashboard.rs:2369-2384).
+    private var dashboardPersistedEnabled = true
+
+    private var dashboardStore: PagerDashboardStore {
+        PagerDashboardStore(
+            configPath: openGrokHome.appendingPathComponent("config.toml")
+        )
+    }
 
     private func registerSessionTab(_ id: String) {
         guard !id.isEmpty, !sessionTabs.contains(where: { $0.sessionID == id }) else {
@@ -7697,7 +7719,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             return
         }
         sessionTabs.append(LiveSessionTab(
-            sessionID: id, title: "New session", lastActivity: Date()
+            sessionID: id, title: "New session", lastActivity: Date(),
+            cwd: workingDirectory
         ))
     }
 
@@ -7713,14 +7736,18 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     }
 
     /// `/dashboard` / Ctrl+\ — the roster overlay. The feature gate is
-    /// upstream's env kill-switch (`dashboard_enabled`,
-    /// `dashboard/mod.rs:88-100`: `GROK_AGENT_DASHBOARD=0` → a friendly
-    /// toast and stay put; the persisted `[dashboard].enabled` half has no
-    /// port config section yet — recorded). The minimal refusal lives with
-    /// the controller's dispatch, the ModeSupport seam.
+    /// upstream's `dashboard_enabled` (`dashboard/mod.rs:88-100`): the
+    /// `GROK_AGENT_DASHBOARD=0` env kill-switch WINS, then the persisted
+    /// `[dashboard].enabled`, then the enabled default. The minimal refusal
+    /// lives with the controller's dispatch, the ModeSupport seam.
     private func presentDashboard() async throws {
         guard environment["GROK_AGENT_DASHBOARD"] != "0" else {
             note("The Agent Dashboard is disabled (GROK_AGENT_DASHBOARD=0).")
+            try renderState()
+            return
+        }
+        guard dashboardStore.loadEnabled() != false else {
+            note("The Agent Dashboard is disabled ([dashboard].enabled = false in config.toml).")
             try renderState()
             return
         }
@@ -7740,15 +7767,190 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         let catalogRecords = (try? sessionCatalog?.records()) ?? nil
         dashboardPeekCache = LiveDashboardPeekCache.build(from: catalogRecords ?? [])
         dashboardSubagents = subagents
+        dashboardDormant = (try? sessionCatalog?.list()) ?? []
         armedCloseSessionID = nil
-        overlays.push(LiveDashboardOverlay.overlay(
+        dashboardSearchQuery = nil
+        // Fresh per-open state, then the persisted grouping/pins/reorder
+        // resolved against what exists RIGHT NOW and gc'd — `gc_stale_refs`
+        // on open (state.rs:1736-1780).
+        dashboardState = PagerDashboardState()
+        dashboardState.home = environment["HOME"]
+        let persisted = dashboardStore.load()
+        dashboardPersistedEnabled = persisted?.enabled ?? true
+        let candidates = LiveDashboardOverlay.rowInputs(
             tabs: sessionTabs,
             activeSessionID: sessionID,
             activeTurnRunning: turnActivity != nil,
-            subagents: subagents
-        ))
+            activeNeedsInput: dashboardActiveNeedsInput,
+            subagents: subagents,
+            dormant: dashboardDormant
+        ).map(\.id)
+        if let persisted {
+            dashboardState.apply(persisted, resolvingAgainst: candidates)
+        }
+        dashboardState.gcStaleRefs { candidates.contains($0) }
+        overlays.push(buildDashboardOverlay())
         refreshDashboardPeek()
         try renderState()
+    }
+
+    /// The dashboard's scoped key table (`state.rs:3533-3540`,
+    /// `dispatch/dashboard.rs:2329-2367`, `defaults.rs:997-1017`), consulted
+    /// while the roster is the FOCUSED overlay. Returns nil to fall through
+    /// to the generic overlay routing (arrows, Enter, x, Esc-dismiss).
+    ///
+    /// Search mode (Ctrl+/, arriving as the raw 0x1F byte) owns every key
+    /// while live: chars/backspace live-reparse the filter grammar, Enter
+    /// confirms KEEPING the filter, Esc or a second Ctrl+/ cancels clearing
+    /// it. Outside search: Ctrl+T pins, Shift+↑/↓ reorder, Left/Right
+    /// collapse a focused header (Enter rides the select arm), and Esc with
+    /// an active filter clears the filter FIRST instead of dismissing
+    /// (`esc_clears_active_filter`, state.rs:7347).
+    private func handleDashboardChord(_ event: KeyEvent) throws -> OpenGrokPagerInputRouting? {
+        guard overlays.focused?.id == LiveDashboardOverlay.overlayID else { return nil }
+        if var query = dashboardSearchQuery {
+            switch event.key {
+            case .enter:
+                dashboardSearchQuery = nil
+                dashboardState.searchActive = false
+            case .escape:
+                dashboardSearchQuery = nil
+                dashboardState.searchActive = false
+                dashboardState.filter = .none
+            case .backspace:
+                if !query.isEmpty { query.removeLast() }
+                dashboardSearchQuery = query
+                dashboardState.filter = .from(PagerDashboardFilter.parse(query))
+            case .char(let character)
+                where event.modifiers.contains(.control) && Self.isSearchChordCharacter(character):
+                dashboardSearchQuery = nil
+                dashboardState.searchActive = false
+                dashboardState.filter = .none
+            case .char(let character)
+                where event.modifiers.subtracting(.shift).isEmpty && !character.isNewline:
+                query.append(character)
+                dashboardSearchQuery = query
+                dashboardState.filter = .from(PagerDashboardFilter.parse(query))
+            default:
+                break
+            }
+            rebuildDashboardRows()
+            try renderState()
+            return .consumed
+        }
+        switch event.key {
+        case .char(let character) where event.modifiers.contains(.control):
+            if Self.isSearchChordCharacter(character) {
+                // `enter_search_mode` clears the previous filter
+                // (state.rs:3533-3540).
+                dashboardSearchQuery = ""
+                dashboardState.searchActive = true
+                dashboardState.filter = .none
+                rebuildDashboardRows()
+                try renderState()
+                return .consumed
+            }
+            if String(character).lowercased() == "t" {
+                if let target = selectedDashboardRowID() {
+                    dashboardState.togglePin(target)
+                    rebuildDashboardRows()
+                    persistDashboardState()
+                    try renderState()
+                }
+                return .consumed
+            }
+            return nil
+        case .up where event.modifiers.contains(.shift),
+             .down where event.modifiers.contains(.shift):
+            if let target = selectedDashboardRowID() {
+                dashboardState.reorderRow(target, up: event.key == .up)
+                rebuildDashboardRows()
+                persistDashboardState()
+                try renderState()
+            }
+            return .consumed
+        case .left, .right:
+            guard let key = selectedDashboardSectionKey() else { return nil }
+            dashboardState.toggleSection(key)
+            rebuildDashboardRows()
+            try renderState()
+            return .consumed
+        case .escape:
+            guard dashboardState.filter.isActive else { return nil }
+            dashboardState.filter = .none
+            rebuildDashboardRows()
+            try renderState()
+            return .consumed
+        default:
+            return nil
+        }
+    }
+
+    /// Ctrl+/ reaches the decoder as the raw unit-separator byte; the
+    /// literal `/` spelling is kept for adapters that report the pair —
+    /// the Ctrl+\ dual-spelling precedent.
+    private static func isSearchChordCharacter(_ character: Character) -> Bool {
+        character == "/" || character == "\u{1f}"
+    }
+
+    private func selectedDashboardListRowID() -> String? {
+        guard let focused = overlays.focused,
+              focused.id == LiveDashboardOverlay.overlayID,
+              case .list(let list) = focused.content
+        else { return nil }
+        return list.selectedRow?.id
+    }
+
+    private func selectedDashboardRowID() -> PagerDashboardRowID? {
+        guard let rowID = selectedDashboardListRowID() else { return nil }
+        return LiveDashboardOverlay.dashboardRowID(
+            forListRowID: rowID,
+            activeSessionID: sessionID,
+            liveSessionIDs: Set(sessionTabs.map(\.sessionID))
+        )
+    }
+
+    private func selectedDashboardSectionKey() -> PagerDashboardSectionKey? {
+        guard let rowID = selectedDashboardListRowID() else { return nil }
+        return LiveDashboardOverlay.sectionKey(forListRowID: rowID)
+    }
+
+    /// The active session shows NEEDS INPUT exactly when an approval is
+    /// waiting under the roster — the port of `classify_top_level`'s
+    /// permission/question arm (`row.rs:375-380`) over the overlay stack,
+    /// the same signal the composer's focus follows.
+    private var dashboardActiveNeedsInput: Bool {
+        overlays.overlays.contains { overlay in
+            switch overlay.content {
+            case .permission, .question, .planApproval: return true
+            default: return false
+            }
+        }
+    }
+
+    private func buildDashboardOverlay() -> PagerOverlay {
+        LiveDashboardOverlay.overlay(
+            tabs: sessionTabs,
+            activeSessionID: sessionID,
+            activeTurnRunning: turnActivity != nil,
+            activeNeedsInput: dashboardActiveNeedsInput,
+            subagents: dashboardSubagents,
+            dormant: dashboardDormant,
+            state: dashboardState,
+            armedCloseSessionID: armedCloseSessionID,
+            searchQuery: dashboardSearchQuery
+        )
+    }
+
+    /// `dispatch_dashboard_persist` (`dashboard.rs:2369-2384`): thread the
+    /// ON-DISK enabled — never a hardcoded `true` — and swallow write
+    /// failures (warn-only upstream; the mutation already took effect in
+    /// memory, and failing the keystroke over a read-only config would be
+    /// worse than losing the persistence).
+    private func persistDashboardState() {
+        try? dashboardStore.write(
+            dashboardState.toPersisted(enabled: dashboardPersistedEnabled)
+        )
     }
 
     /// The `x` close verb (B1 C-1): the port of upstream's Ctrl+X DELETE leg
@@ -7778,12 +7980,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             return
         }
         // Second press on the same row: delete for real. The catalog file is
-        // the on-disk record; the tab entry is this process's metadata.
+        // the on-disk record; the tab/dormant entries are this process's
+        // metadata, and the state refs must not linger as phantoms.
         armedCloseSessionID = nil
-        _ = try? sessionCatalog?.delete(sessionID: target)
+        let deleted = (try? sessionCatalog?.delete(sessionID: target)) ?? false
         sessionTabs.removeAll { $0.sessionID == target }
+        dashboardDormant.removeAll { $0.sessionID == target }
+        dashboardState.gcStaleRefs { $0.owningSessionID != target }
         rebuildDashboardRows()
-        note("Deleting session\u{2026}")
+        note(deleted ? "Deleting session\u{2026}" : "Session file was already gone.")
         try? renderState()
     }
 
@@ -7793,18 +7998,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// `dashboard_neighbor_row` keeps the cursor "in place" as rows shift up
     /// (dashboard.rs:1924-1979).
     private func rebuildDashboardRows() {
-        guard case .list(let rebuilt) = LiveDashboardOverlay.overlay(
-            tabs: sessionTabs,
-            activeSessionID: sessionID,
-            activeTurnRunning: turnActivity != nil,
-            subagents: dashboardSubagents,
-            armedCloseSessionID: armedCloseSessionID
-        ).content else { return }
+        let fresh = buildDashboardOverlay()
+        guard case .list(let rebuilt) = fresh.content else { return }
         overlays.updateList(id: LiveDashboardOverlay.overlayID) { list in
             let previousIndex = list.selectedIndex
             list.rows = rebuilt.rows
             list.selectedIndex = min(previousIndex, max(0, list.filteredRows.count - 1))
         }
+        // The rebuilt title carries the live search text / filter chip.
+        overlays.retitle(id: LiveDashboardOverlay.overlayID, title: fresh.title)
         refreshDashboardPeek()
     }
 
@@ -9702,8 +9904,18 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // Ctrl+G (`defaults.rs:44-55`) — minimal has no pane surface
             // (upstream's Ctrl+G means external editor there; toggling state
             // nothing paints would be the dead-key class), and a modal owns
-            // the keys while active.
-            guard minimalHost == nil, !overlays.isActive else { return }
+            // the keys while active. EXCEPT the roster: in-dashboard Ctrl+G
+            // toggles GROUPING (`defaults.rs:997-1017` scopes the binding
+            // over the global while the dashboard has focus) and persists.
+            guard minimalHost == nil else { return }
+            if overlays.focused?.id == LiveDashboardOverlay.overlayID {
+                dashboardState.toggleGrouping()
+                rebuildDashboardRows()
+                persistDashboardState()
+                try renderState()
+                return
+            }
+            guard !overlays.isActive else { return }
             try await toggleTasksPane()
         case .openDashboard:
             try await presentDashboard()
@@ -11922,6 +12134,19 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 await handleDashboardClose(rowID: rowID)
                 return nil
             }
+            // Enter on a focused section header toggles its collapse
+            // (`render.rs:1490-1516` focusables); on the idle fold it flips
+            // `idle_show_all`. Neither dismisses the roster.
+            if let sectionKey = LiveDashboardOverlay.sectionKey(forListRowID: rowID) {
+                dashboardState.toggleSection(sectionKey)
+                rebuildDashboardRows()
+                return nil
+            }
+            if rowID == LiveDashboardOverlay.idleOverflowRowID {
+                dashboardState.idleShowAll.toggle()
+                rebuildDashboardRows()
+                return nil
+            }
             guard rowID.hasPrefix(LiveDashboardOverlay.attachPrefix) else { return nil }
             let target = String(rowID.dropFirst(LiveDashboardOverlay.attachPrefix.count))
             overlays.dismiss(id: LiveDashboardOverlay.overlayID)
@@ -12318,6 +12543,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 }
             }
             guard overlays.isActive else { return .notHandled }
+            // Dashboard-scoped chords run BEFORE the generic overlay
+            // routing — upstream registers the dashboard's bindings over
+            // the globals while it has focus (`defaults.rs:997-1017`).
+            if let dashboardRouting = try handleDashboardChord(key) {
+                return dashboardRouting
+            }
             switch overlays.handle(key, viewportHeight: overlayViewportHeight) {
             case .ignored:
                 return .notHandled
@@ -12617,8 +12848,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             refreshAgentsPersonasSnapshot()
         }
         if id == LiveDashboardOverlay.overlayID {
-            // The snapshot is only valid while the roster is up.
+            // The snapshots are only valid while the roster is up, and
+            // search text must never leak into the next open.
             dashboardPeekCache = LiveDashboardPeekCache()
+            dashboardDormant = []
+            dashboardSearchQuery = nil
         }
     }
 

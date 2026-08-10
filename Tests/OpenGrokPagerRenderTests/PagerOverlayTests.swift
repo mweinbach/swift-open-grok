@@ -793,3 +793,28 @@ struct PagerListRowActionTests {
         #expect(outcome == .consumed, "ctrl+x is neither the verb nor filter input")
     }
 }
+
+// The in-place retitle seam (B1-w2): a search query living in the modal
+// title must repaint without re-pushing — push would reset the cursor.
+@Suite("Pager overlay retitle")
+struct PagerOverlayRetitleTests {
+    @Test("retitle edits the open overlay in place and refuses unknown ids")
+    func retitleInPlace() {
+        var stack = PagerOverlayStack([
+            .list(id: "dashboard", title: "Agent Dashboard", rows: [
+                PagerListRow(id: "r0", label: "row"),
+            ])
+        ])
+        stack.updateList(id: "dashboard") { $0.selectedIndex = 0 }
+        let retitled = stack.retitle(id: "dashboard", title: "Agent Dashboard — /s:idle")
+        let unknown = stack.retitle(id: "not-open", title: "x")
+        #expect(retitled)
+        #expect(stack.overlays[0].title == "Agent Dashboard — /s:idle")
+        #expect(!unknown)
+        guard case .list(let list) = stack.overlays[0].content else {
+            Issue.record("expected a list overlay")
+            return
+        }
+        #expect(list.selectedIndex == 0, "retitle never touches the list state")
+    }
+}

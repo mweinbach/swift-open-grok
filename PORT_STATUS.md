@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B1 finish in flight: B1-s state machinery, B1-p peek band, B1-w1 wiring landed; B1-w2 roster-state integration next, then Wave 19 regroup)
+**As of:** 2026-08-10 (Wave 18 B1 dashboard program CLOSED: state machinery, peek band, pane completions, close verb, roster-state integration all live; recorded deferrals stand [dispatch//cd/rename/leader/subagent-attach]; next: Wave 19 regroup with the user)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1699,6 +1699,72 @@ cache/refusal rules — with the destructive path quoted above.
 
 24 net-new tests (9 CLI peek + 2 roster overlay + 9 pane state + 4 pane
 builder).
+
+### B1-w2 — the roster rides the state machinery (serial gate: exit 0, 5,536 tests, 105 runs, zero issues, 2026-08-10). **The Wave 18 B1 dashboard program is CLOSED.**
+
+Lead-implemented over B1-s. `LiveDashboardOverlay` now builds through
+`PagerDashboardState.rows → lines`: focusable section headers with true
+counts and collapse chevrons (Enter/Left/Right toggle; selectable on purpose
+— upstream's headers are focusables, and the port's `isHeader` forces
+non-selectable), the pinned prefix with its marker, the subagent `… N more`
+fold, the idle fold as a selectable toggle row, and DORMANT on-disk catalog
+sessions as attachable Inactive rows (the finish-wave ruling made real:
+`LiveSessionCatalog.list()` is the same feed `/resume` trusts; live ids are
+skipped; untitled rows are labelled by cwd basename). Classification pins:
+the ACTIVE session is Awaiting when an approval overlay is pending under
+the roster, Working when the turn runs, else Idle; background tabs are IDLE
+BY CONSTRUCTION — a fresher background tab still never outranks the active
+Working row. `LiveSessionTab` gained `cwd`, which is what makes
+`Grouping::Directory` real alongside the dormant rows' persisted cwds.
+
+**Chords** (`handleDashboardChord`, consulted BEFORE the generic overlay
+routing while the roster has focus): Ctrl+T pins the selected row, Shift+↑/↓
+reorder, Left/Right collapse a focused header, Ctrl+/ (arriving as the raw
+0x1F byte; the literal `/` spelling kept — the Ctrl+\ precedent) enters
+search mode which live-reparses the `a:`/`s:`/`#N` grammar per keystroke,
+Enter confirms KEEPING the filter, Esc/Ctrl+/ cancel clearing it, and Esc
+with a confirmed filter clears the filter FIRST instead of dismissing
+(`esc_clears_active_filter`, state.rs:7347). In-dashboard Ctrl+G toggles
+GROUPING at the `.toggleTasks` arm (the controller owns that chord;
+`defaults.rs:997-1017` scopes the dashboard binding over the global one).
+The search query paints in the modal title through a new
+`PagerOverlayStack.retitle` in-place seam — recorded divergence: upstream
+paints a dedicated search-bar row; the port's modal has no spare chrome row,
+and a live query the user cannot see would be the invisible-state class.
+Cost also recorded: the roster's old fuzzy type-to-filter is OFF
+(`isFilterable: false`) — the state grammar owns filtering, and
+double-filtering the same keystrokes was the hazard.
+
+**Persistence, quoted (the threading pins the store tests could not
+reach):** open runs env-first then config —
+`guard environment["GROK_AGENT_DASHBOARD"] != "0" else … ; guard
+dashboardStore.loadEnabled() != false else …` — so the env kill-switch
+beats `[dashboard].enabled` beats the default; every pin/grouping/reorder
+mutation persists via `try? dashboardStore.write(dashboardState.toPersisted(
+enabled: dashboardPersistedEnabled))` — the ON-DISK enabled threaded, never
+a hardcoded `true`, failures swallowed (upstream warns-only). Open-time:
+fresh per-open state (filter/search/collapse/idle-expand are never
+persisted), `apply(persisted, resolvingAgainst:)` then `gcStaleRefs`. The
+close verb now also gc's the deleted id from pins/reorder and drops the
+dormant listing, and the delete's Bool is consumed honestly (a vanished
+file notes "Session file was already gone." instead of pretending).
+
+10 net-new tests (9 roster + 1 retitle): headers/ordering, both classifier
+pins, dormant rows + live-id skip, directory grouping with `~` compaction,
+the `s:` filter view, collapse, pinned float, the idle fold + expand, the
+title's search/filter chip, the chord-side id mapping round-trips, and the
+initial cursor landing on a session row rather than its header. The
+chord handler itself is composition glue with no cheap harness (the
+recorded B1-w1 coverage stance) — its pure halves are pinned at the state
+and overlay seams above.
+
+**The B1 program closes with these deferrals standing, each with its
+recorded reason (finish-wave rulings):** dispatch-from-dashboard (needs the
+multi-agent map), `/cd` + location picker (blocked on dispatch), rename
+rows (no inline row editor), subagent peek/attach, the peek reply
+row/question mode, the wide-layout side-panel peek, the worktree dialog,
+`/` Search as a separate key, and the leader bridge (honest NO — no roster
+wire types, no overlay stack in leader interactive).
 
 ### B6 closure — the context-bar hover widget (serial gate: exit 0, 5,395 tests, 105 runs, zero issues, 2026-08-10). **The B6 chrome-reader program is CLOSED.**
 
