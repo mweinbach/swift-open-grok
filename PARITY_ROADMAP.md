@@ -148,12 +148,16 @@ Order within the wave is forced:
 1. **B1** multi-agent AppView/dashboard runtime (agent map, roster, peek/attach,
    leader bridge) → `/dashboard`, Ctrl+\, `/cd` + `SetWorkingDir`, tasks pane +
    Ctrl+G/`/tasks` (feeds from Wave 14), dashboard worktree dialog.
-2. **B2** native scrollback (`xai-ratatui-inline` insert_before) + the full
-   pager-minimal frontend (auth/welcome/commit/live/todo/overlay) → true `--minimal`,
-   `/minimal`/`/fullscreen` via screen-mode relaunch (needs B3 from Wave 17).
+2. **B2 — CLOSED 2026-08-10** (see the Wave 18 B2 ledger section: W1-W4 welcome,
+   S1 screen_mode reader, N insertBefore, M1-M4 the live minimal frontend, S2
+   `/minimal`//`/fullscreen` + exec relaunch; the B3 dependency turned out
+   unnecessary — relaunch is a process exec, not the suspend seam). Recorded
+   remainders: the minimal todo//btw//panel//plan//full_view//auth modules, the
+   Ctrl+E expand chord, the flat live-region stance.
 3. **B6** chrome readers: timeline rail, per-block timestamps, compact_mode layout,
    context-bar hover widget (un-hide the Wave 13 rows).
-4. **B9** config-agents/personas modal; release-notes viewer; privacy banner.
+4. **B9 — CLOSED 2026-08-08** (config-agents/personas modal; release-notes viewer;
+   privacy banner — the Wave 18 B9 ledger section).
 
 ### Wave 19 — Long tail (parallelizable, mostly XL each)
 Mouse block selection (click selects a transcript block; upstream's scrollback click
