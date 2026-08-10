@@ -11,11 +11,33 @@
 // monitor kills through the session execution's `killTask`, a running
 // subagent through the coordinator's cancel, a scheduled `/loop` through
 // the scheduler host's delete, and a stoppable workflow rides
-// `/workflow stop <name>` — upstream's own dispatch shape. The `y`
-// stdout-copy affordance is NOT wired: this port has no clipboard channel
-// (the OSC 52 divergence recorded at `openExternalURL`), and advertising a
-// copy that lands nowhere is the §4 class. `copyAction` stays nil until a
-// clipboard seam exists.
+// `/workflow stop <name>` — upstream's own dispatch shape.
+//
+// `y` copies a bg task's stdout (`panes.rs:422-430`) and IS wired. This
+// header used to claim the port had no clipboard channel and the tests
+// pinned `copyAction == nil` forever; both were wrong. The channel is
+// `LivePagerClipboard.copy` (`LiveScrollbackFocus.swift:386-394`), the same
+// OSC 52 write that already carries `/copy`, `/export`, and the scrollback
+// selection copy. `copyAction` is set ONLY when the snapshot holds output,
+// mirroring upstream's `!task.stdout.is_empty()` gate — a `y` that copies
+// an empty string is still a copy that lands nowhere.
+//
+// What the OSC 52 leg does not carry, recorded: no `pbcopy` fallback, no
+// tmux-buffer leg, no `~/.opengrok/last-copy.txt` backup, and no
+// CopyDelivery trust classification — the success note is upstream's
+// "Unverified" tier, the real cost of a terminal that may have OSC 52
+// switched off. A truncated snapshot copies what the snapshot holds.
+//
+// Enter opens the selected entry (`panes.rs:339-383`): a bg task or monitor
+// opens the block viewer over its stdout — unconditionally, upstream has no
+// running gate and a finished task's output is exactly what gets read back
+// — and a workflow opens its detail. Scheduled rows open nothing
+// (`panes.rs:371`), and the subagent fullscreen is not ported.
+//
+// The `f` filter matches an entry's `searchText`, which the entry
+// initializer defaults to the concatenated span text built here; upstream's
+// `search_text` is the same row label (`tasks_pane.rs:305-312`, where the
+// `Task ` prefix is baked into the label so it stays searchable).
 
 import Foundation
 import OpenGrokPagerRender
@@ -81,7 +103,11 @@ enum LiveTasksPane {
                 ],
                 elapsed: "(\(LivePagerTasksBlock.formatDuration(run.elapsedSeconds(now: now))))",
                 running: run.isActive,
-                killAction: run.isActive ? .stopWorkflow(name: run.name) : nil
+                killAction: run.isActive ? .stopWorkflow(name: run.name) : nil,
+                // Enter → the run's detail, by NAME because that is what
+                // upstream's `open_workflow_detail(&name)` takes
+                // (`panes.rs:373-377`); finished runs open too.
+                openAction: .openWorkflowDetail(name: run.name)
             ))
         }
 
@@ -159,7 +185,15 @@ enum LiveTasksPane {
                 ],
                 elapsed: "(\(LivePagerTasksBlock.formatDuration(task.duration(at: now))))",
                 running: running,
-                killAction: running ? .killBgTask(taskID: task.taskID) : nil
+                killAction: running ? .killBgTask(taskID: task.taskID) : nil,
+                // `y` only when there is something to put on the clipboard
+                // (`panes.rs:427`, `!task.stdout.is_empty()`). Monitors are
+                // bg tasks upstream too, so they get the same terms.
+                copyAction: task.output.isEmpty
+                    ? nil
+                    : .copyBgTaskOutput(taskID: task.taskID),
+                // Enter → the block viewer over stdout, running or not.
+                openAction: .openBgTaskOutput(taskID: task.taskID)
             ))
         }
 

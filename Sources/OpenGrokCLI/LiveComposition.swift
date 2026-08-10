@@ -7677,6 +7677,20 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// top-level turns; a background tab is idle by construction).
     private var sessionTabs: [LiveSessionTab] = []
 
+    /// The dashboard peek's transcript snapshot, built ONCE when the roster
+    /// opens. Held only while the modal is up (see `handleOverlayDismissal`):
+    /// retaining every session's items for the life of the process would be a
+    /// leak with no reader.
+    private var dashboardPeekCache = LiveDashboardPeekCache()
+    /// The subagent snapshot the open roster was built from, so armed-close
+    /// and post-delete rebuilds repaint the same child rows without another
+    /// actor round-trip.
+    private var dashboardSubagents: [LiveSubagentSnapshot] = []
+    /// The C-1 close arm's press-again state — the port's no-timer analog of
+    /// upstream's 2 s arm window (`arm_or_delete`, dashboard.rs:2125-2140):
+    /// pressing `x` on a DIFFERENT row re-arms instead of deleting.
+    private var armedCloseSessionID: String?
+
     private func registerSessionTab(_ id: String) {
         guard !id.isEmpty, !sessionTabs.contains(where: { $0.sessionID == id }) else {
             touchSessionTab(id)
@@ -7719,13 +7733,100 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 }
             }
         }
+        // ONE catalog pass for the modal's whole lifetime: background tabs
+        // are idle by construction, so a snapshot taken at open cannot go
+        // stale while the roster is up — and a per-arrow read would be N JSON
+        // decodes per keystroke.
+        let catalogRecords = (try? sessionCatalog?.records()) ?? nil
+        dashboardPeekCache = LiveDashboardPeekCache.build(from: catalogRecords ?? [])
+        dashboardSubagents = subagents
+        armedCloseSessionID = nil
         overlays.push(LiveDashboardOverlay.overlay(
             tabs: sessionTabs,
             activeSessionID: sessionID,
             activeTurnRunning: turnActivity != nil,
             subagents: subagents
         ))
+        refreshDashboardPeek()
         try renderState()
+    }
+
+    /// The `x` close verb (B1 C-1): the port of upstream's Ctrl+X DELETE leg
+    /// only (`dispatch_dashboard_stop` -> `arm_or_delete` -> `delete_dashboard_row`,
+    /// dispatch/dashboard.rs:1980-2242). The busy-stop leg has no analog —
+    /// background tabs are idle by construction, and the ACTIVE session
+    /// refuses with its real deletion route, the resident-delete rule
+    /// (`LiveSessionAdminACPHandlers.swift:38-43`: no live-actor teardown
+    /// seam — `/delete` owns that flow's confirmation).
+    private func handleDashboardClose(rowID: String) async {
+        let stripped = String(rowID.dropFirst(LiveDashboardOverlay.closePrefix.count + 1))
+        guard stripped.hasPrefix(LiveDashboardOverlay.attachPrefix) else { return }
+        let target = String(stripped.dropFirst(LiveDashboardOverlay.attachPrefix.count))
+        guard target != sessionID else {
+            note("The attached session can't be deleted from the roster — use /delete.")
+            armedCloseSessionID = nil
+            try? renderState()
+            return
+        }
+        guard armedCloseSessionID == target else {
+            // First press (or a press on a different row): arm, never delete —
+            // upstream re-checks the armed row is still the selected row for
+            // the same reason (dashboard.rs:2141-2161).
+            armedCloseSessionID = target
+            rebuildDashboardRows()
+            try? renderState()
+            return
+        }
+        // Second press on the same row: delete for real. The catalog file is
+        // the on-disk record; the tab entry is this process's metadata.
+        armedCloseSessionID = nil
+        _ = try? sessionCatalog?.delete(sessionID: target)
+        sessionTabs.removeAll { $0.sessionID == target }
+        rebuildDashboardRows()
+        note("Deleting session\u{2026}")
+        try? renderState()
+    }
+
+    /// Rebuild the open roster's rows IN PLACE (cursor and filter preserved —
+    /// the updateList contract), clamping the cursor so it lands on the
+    /// neighbor row after a deletion the way upstream's
+    /// `dashboard_neighbor_row` keeps the cursor "in place" as rows shift up
+    /// (dashboard.rs:1924-1979).
+    private func rebuildDashboardRows() {
+        guard case .list(let rebuilt) = LiveDashboardOverlay.overlay(
+            tabs: sessionTabs,
+            activeSessionID: sessionID,
+            activeTurnRunning: turnActivity != nil,
+            subagents: dashboardSubagents,
+            armedCloseSessionID: armedCloseSessionID
+        ).content else { return }
+        overlays.updateList(id: LiveDashboardOverlay.overlayID) { list in
+            let previousIndex = list.selectedIndex
+            list.rows = rebuilt.rows
+            list.selectedIndex = min(previousIndex, max(0, list.filteredRows.count - 1))
+        }
+        refreshDashboardPeek()
+    }
+
+    /// Follow the selection cursor: the peek is rebuilt from the selected row
+    /// on every refresh, never toggled (`render.rs:212-283`). Editing the open
+    /// overlay IN PLACE is load-bearing — `push` would reset the cursor and
+    /// the filter query, i.e. destroy the selection the peek follows. A
+    /// no-op when the roster is not the open list.
+    private func refreshDashboardPeek() {
+        overlays.updateList(id: LiveDashboardOverlay.overlayID) { list in
+            list.peek = list.selectedRow.flatMap { row in
+                LiveDashboardPeek.peek(
+                    forRowID: row.id,
+                    cache: dashboardPeekCache,
+                    activeSessionID: sessionID,
+                    activeItems: conversation.items,
+                    activeLastActivity: sessionTabs
+                        .first { $0.sessionID == sessionID }?.lastActivity,
+                    turnActivity: turnActivity
+                )
+            }
+        }
     }
 
     /// Ctrl+G (`agent_view/input.rs:1230-1231`): closed → open focused;
@@ -7830,10 +7931,98 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // The command path owns confirmation and copy; preserve the
             // user's draft exactly as upstream's dispatch does.
             return .runCommand("/workflow stop \(name)")
-        case .copyBgTaskOutput:
-            // Unreachable until a clipboard seam exists — the builder never
-            // sets `copyAction` (recorded divergence, no OSC 52 channel).
-            break
+        case .copyBgTaskOutput(let taskID):
+            // Re-read the feed instead of trusting the row the user was
+            // looking at: the pane refreshes on a one-second timer, so the
+            // snapshot that built the row can already be stale.
+            let snapshots = await toolExecutor?.backgroundTaskSnapshots(
+                sessionID: sessionID,
+                workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            ) ?? []
+            guard let snapshot = snapshots.first(where: { $0.taskID == taskID }) else {
+                note("Task \(taskID) is no longer in this session's task list.")
+                break
+            }
+            guard !snapshot.output.isEmpty else {
+                // The builder applies upstream's `!task.stdout.is_empty()`
+                // gate (`panes.rs:427`), so this only fires when the output
+                // went away between the row and the keypress.
+                note("Task \(taskID) has no output to copy.")
+                break
+            }
+            do {
+                // The OSC 52 seam `/copy` and `/export` already ride
+                // (`deliver`): one write into the sink in hand, which is
+                // what also works over SSH and inside tmux.
+                try LivePagerClipboard.copy(snapshot.output) { data in
+                    try sink.write(String(decoding: data, as: UTF8.self))
+                }
+                try sink.flush()
+                // Upstream classifies copy delivery and reports the tier; this
+                // leg has only OSC 52, so the note is upstream's "Unverified"
+                // by construction — a terminal with OSC 52 switched off
+                // swallows the write and nothing here can tell. A truncated
+                // snapshot copies what the snapshot holds.
+                note("Copied task output — \(snapshot.output.count) characters.")
+            } catch {
+                appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Could not reach the clipboard: \(error)"
+                ))
+            }
+        case .openBgTaskOutput(let taskID):
+            let snapshots = await toolExecutor?.backgroundTaskSnapshots(
+                sessionID: sessionID,
+                workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            ) ?? []
+            guard let snapshot = snapshots.first(where: { $0.taskID == taskID }) else {
+                note("Task \(taskID) is no longer in this session's task list.")
+                break
+            }
+            // Split on `Character.isNewline`, NOT on "\n": Swift clusters CRLF
+            // into ONE Character, so `split(separator: "\n")` finds no
+            // separator at all in CRLF output and paints the whole log as a
+            // single line (AGENTS.md §2).
+            let lines: [PagerStyledLine] = snapshot.output.isEmpty
+                ? [PagerStyledLine(text: "(no output yet)")]
+                : snapshot.output
+                    .split(omittingEmptySubsequences: false, whereSeparator: { $0.isNewline })
+                    .map { PagerStyledLine(text: String($0)) }
+            // A static snapshot modal, not upstream's BlockViewerPane: no
+            // tailing while the task runs, no in-viewer search, no visual
+            // select. Recorded divergence.
+            overlays.push(.sessionInfo(
+                id: "block-viewer",
+                title: LivePagerTasksBlock.firstNonEmptyLine(
+                    snapshot.displayCommand ?? snapshot.command
+                ),
+                lines: lines
+            ))
+        case .openWorkflowDetail(let name):
+            guard let workflowRegistry else {
+                note("No workflow runs in this session.")
+                break
+            }
+            let views = (try? await workflowRegistry.views()) ?? []
+            let rows = LiveWorkflowOverlayBuilder.rows(from: views)
+            // Rows are newest-first, so a name shared by several runs opens the
+            // newest — upstream's `open_workflow_detail(&name)` is name-keyed
+            // the same way.
+            guard let index = rows.firstIndex(where: { $0.name == name }) else {
+                note("Workflow \(name) is no longer in this session's run list.")
+                break
+            }
+            var overlay = PagerOverlay.workflows(rows: rows)
+            // Land ON the run's detail rather than on the dashboard listing it:
+            // the pane row the user pressed Enter on already named the run.
+            // The overlay id stays "workflows", so `p`/`r`/`x` keep routing
+            // through `handleWorkflowSelection`.
+            overlay.content = .workflows(PagerWorkflowsOverlay(
+                rows: rows,
+                selectedIndex: index,
+                isDetailOpen: true
+            ))
+            overlays.push(overlay)
         }
         await refreshTasksPaneEntries()
         try renderState()
@@ -11729,6 +11918,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             return nil
         }
         if overlayID == LiveDashboardOverlay.overlayID {
+            if rowID.hasPrefix(LiveDashboardOverlay.closePrefix + ":") {
+                await handleDashboardClose(rowID: rowID)
+                return nil
+            }
             guard rowID.hasPrefix(LiveDashboardOverlay.attachPrefix) else { return nil }
             let target = String(rowID.dropFirst(LiveDashboardOverlay.attachPrefix.count))
             overlays.dismiss(id: LiveDashboardOverlay.overlayID)
@@ -12129,6 +12322,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             case .ignored:
                 return .notHandled
             case .redraw, .consumed:
+                // Arrows and filter typing both land here; the peek has to
+                // follow the cursor before the frame paints.
+                refreshDashboardPeek()
                 try renderState()
                 return .consumed
             case .dismissed(let id):
@@ -12234,6 +12430,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 switch overlays.handle(key, viewportHeight: max(1, hit.content.height)) {
                 case .ignored: break
                 default:
+                    refreshDashboardPeek()
                     try renderState()
                     return nil
                 }
@@ -12418,6 +12615,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private func handleOverlayDismissal(_ id: String) {
         if id == LiveAgentsComposition.personaDetailOverlayID {
             refreshAgentsPersonasSnapshot()
+        }
+        if id == LiveDashboardOverlay.overlayID {
+            // The snapshot is only valid while the roster is up.
+            dashboardPeekCache = LiveDashboardPeekCache()
         }
     }
 

@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B1 finish in flight: B1-s state machinery landed; B1-p peek band + B1-w wiring next; then Wave 19 regroup)
+**As of:** 2026-08-10 (Wave 18 B1 finish in flight: B1-s state machinery, B1-p peek band, B1-w1 wiring landed; B1-w2 roster-state integration next, then Wave 19 regroup)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1478,16 +1478,20 @@ vocabulary so the pane and the read-only `/tasks` block can never describe
 the same task differently. `/tasks` itself is UNCHANGED — upstream's command
 deliberately prints the block (`tasks.rs:1-7`).
 
-**Recorded divergences:** (1) the `y` stdout-copy affordance is NOT wired —
-this port has no clipboard channel (the OSC 52 divergence at
-`openExternalURL`); `copyAction` stays nil everywhere, pinned by a test, and
-lands with a clipboard seam. (2) Refresh cadence: upstream rebuilds rows
+**Recorded divergences:** (1) ~~the `y` stdout-copy affordance is NOT wired —
+this port has no clipboard channel~~ **RETIRED by B1-w1 (2026-08-10): the
+claim was wrong** — the OSC 52 seam exists and was already live
+(`LivePagerClipboard.copy`, `LiveScrollbackFocus.swift:386-394`); the pane's
+`y` copy now writes through it. (2) Refresh cadence: upstream rebuilds rows
 every frame off actor-free state; the port's feeds are actors, so the pane
 refreshes on open, on action, and on a 1 s tick while visible — cost: states
 up to ~1 s stale, and no per-row spinner animation. (3) Enter on an ENTRY
-(upstream opens the bg task's block viewer) is deferred with the block-viewer
-surface; headers toggle as upstream. (4) The pane's `/` filter input (and its
-`desired_height` `+1` bar row) is deferred. (5) Minimal mode refuses the
+~~is deferred with the block-viewer surface~~ **landed in B1-w1**: Enter
+opens the bg task's output in the block viewer; headers toggle as upstream.
+(4) The pane's filter **landed in B1-w1 as `f`** (upstream's Filter mode);
+the separate `/` Search stays deferred by the finish-wave ruling — a `/`
+with hide semantics would teach upstream's `f` meaning under upstream's `/`
+key. (5) Minimal mode refuses the
 chord quietly (upstream's Ctrl+G means external editor there; toggling state
 nothing paints would be the dead-key class).
 
@@ -1640,6 +1644,61 @@ is centered; the band form is the narrow-layout parity).
 incl. the height-20 list-first refusal, densification rules, the
 byte-identical nil-peek pin, band paint placement, updateList
 cursor+filter preservation, and the four row-verb dispatch guards.
+
+### B1-w1 — pane completions, peek wiring, and the close verb (batch serial gate: exit 0, 5,526 tests, 105 runs, zero issues, 2026-08-10)
+
+Pane halves agent-implemented (b1-pane-impl + the actions research),
+peek cache agent-implemented (b1-peek-impl), close verb lead-implemented;
+lead-integrated in `LiveComposition`. Remaining after this slice: B1-w2,
+the roster riding B1-s's state machinery (rows/chords/persistence/dormant).
+
+**Tasks-pane completions** (retiring/landing B1-t divergences 1, 3, 4
+above): `y` copies the selected bg task's output through the live OSC 52
+seam (`LivePagerClipboard.copy` into the renderer sink + flush, noting
+"Copied task output — N characters."), gated `copyAction`-nil on empty
+output (upstream's guard); Enter on a bg task opens the block viewer
+(`.sessionInfo` push titled by the task's first non-empty command line,
+splitting on `Character.isNewline` — the AGENTS.md §2 CRLF trap, pinned);
+Enter on a workflow opens the workflows overlay pre-focused in detail;
+`f` enters upstream's Filter mode (the bar consumes every character;
+`filterQuery`/`acceptedFilter` gate all other pane arms EXCEPT Ctrl+G,
+which upstream checks first — `panes.rs:318-326` — so the pane can always
+be dismissed mid-filter).
+
+**Peek wiring:** the cache (`LiveDashboardPeekCache`) is built ONCE at
+`/dashboard` open from the same `LiveSessionCatalog.records()` feed
+`/resume` trusts, dropped at overlay dismissal (retaining every session's
+items process-long would be a leak with no reader); the selected row's peek
+is rebuilt through `updateList` on every consumed key and mouse-scroll —
+selection-follows, never toggled. The active row peeks the LIVE
+conversation + turn activity; catalog rows peek their persisted tail;
+subagent rows refuse (peek-onto-a-subagent lands with subagent attach).
+
+**The close verb (C-1):** `x` on a roster row dispatches
+`close:attach:<id>` through B1-p's verb table. The ACTIVE session refuses —
+"The attached session can't be deleted from the roster — use /delete." —
+because the resident-delete rule (`LiveSessionAdminACPHandlers.swift:38-43`)
+owns live-actor teardown. Otherwise first press ARMS (the row's detail
+becomes "press x again to delete", rebuilt in place); the port's
+press-again-no-timer arm is the recorded divergence from upstream's 2 s
+window (`arm_or_delete`, dispatch/dashboard.rs:2125-2140) — a different row
+re-arms instead of deleting, upstream's armed-row-still-selected re-check.
+The landed second-press block, quoted (destructive path, rule 5):
+`armedCloseSessionID = nil; _ = try? sessionCatalog?.delete(sessionID:
+target); sessionTabs.removeAll { $0.sessionID == target };
+rebuildDashboardRows(); note("Deleting session…")` — with the cursor
+clamped to the neighbor row by the in-place rebuild.
+
+**Coverage note (recorded, not hidden):** `LiveComposition` has no cheap
+test harness — it is reachable only through the full launcher (TTY). The
+composition glue (`performTasksPaneAction` arms, `handleDashboardClose`)
+is pinned at the deepest reachable seams instead: the verb-dispatch guards
+(B1-p), the armed-row overlay build, the pane's action/filter state
+machine, `LiveTasksPane`'s copy/open action gating, and the peek
+cache/refusal rules — with the destructive path quoted above.
+
+24 net-new tests (9 CLI peek + 2 roster overlay + 9 pane state + 4 pane
+builder).
 
 ### B6 closure — the context-bar hover widget (serial gate: exit 0, 5,395 tests, 105 runs, zero issues, 2026-08-10). **The B6 chrome-reader program is CLOSED.**
 

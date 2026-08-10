@@ -30,12 +30,16 @@ enum LiveDashboardOverlay {
     /// Row id prefix for attachable top-level sessions; the select arm
     /// strips it and rides `/resume <id>`.
     static let attachPrefix = "attach:"
+    /// The `x` close verb's row-action prefix (B1 C-1): the dispatched rowID
+    /// is `close:attach:<sessionID>`.
+    static let closePrefix = "close"
 
     static func overlay(
         tabs: [LiveSessionTab],
         activeSessionID: String,
         activeTurnRunning: Bool,
         subagents: [LiveSubagentSnapshot],
+        armedCloseSessionID: String? = nil,
         now: Date = Date()
     ) -> PagerOverlay {
         var rows: [PagerListRow] = []
@@ -57,10 +61,16 @@ enum LiveDashboardOverlay {
             } else {
                 state = "idle"
             }
+            // An armed close shows its confirmation ON the row — the port's
+            // press-again-no-timer analog of upstream's 2 s arm window
+            // (`arm_or_delete`, dispatch/dashboard.rs:2125-2140).
+            let detail = tab.sessionID == armedCloseSessionID
+                ? "press x again to delete"
+                : "\(shortID(tab.sessionID)) \u{00B7} \(state)"
             rows.append(PagerListRow(
                 id: attachPrefix + tab.sessionID,
                 label: (isActive ? "\u{25CF} " : "  ") + tab.title,
-                detail: "\(shortID(tab.sessionID)) \u{00B7} \(state)"
+                detail: detail
             ))
             guard isActive else { continue }
             // The active session's subagent children — the "agent map"
@@ -91,7 +101,7 @@ enum LiveDashboardOverlay {
             }
         }
 
-        return PagerOverlay.list(
+        var overlay = PagerOverlay.list(
             id: overlayID,
             title: "Agent Dashboard",
             rows: rows,
@@ -99,9 +109,23 @@ enum LiveDashboardOverlay {
             hints: [
                 PagerOverlayHint(key: "\u{2191}\u{2193}", label: "select"),
                 PagerOverlayHint(key: "enter", label: "attach"),
+                PagerOverlayHint(key: "x", label: "delete session"),
                 PagerOverlayHint(key: "esc", label: "close"),
             ]
         )
+        if case .list(var list) = overlay.content {
+            // `x` deletes the selected session row — the port of upstream's
+            // Ctrl+X delete leg (`dispatch_dashboard_stop`,
+            // dispatch/dashboard.rs:1980-2062). The chord is a bare `x`
+            // because the list's action table is consulted before the filter
+            // takes the character (recorded cost: `x` no longer types into
+            // this overlay's filter). The busy-stop leg has no port analog —
+            // background tabs are idle by construction, and the ACTIVE row
+            // refuses with the /delete route.
+            list.rowActions = [PagerListRowAction(key: "x", rowIDPrefix: closePrefix)]
+            overlay.content = .list(list)
+        }
+        return overlay
     }
 
     private static func shortID(_ id: String) -> String {
