@@ -348,6 +348,11 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// `app_view.rs:4697-4712`). The render side owns the expand ring, so
     /// the intent carries no target id.
     case minimalExpandLast
+    /// `/dashboard` (aliases `/agents-dashboard`, `/sessions`) and the
+    /// Ctrl+\ chord — open the Agent Dashboard roster (upstream
+    /// `Action::OpenDashboard`, `dashboard.rs:62-64`). The render side owns
+    /// the feature gate, the minimal refusal, and the roster feeds.
+    case showDashboard
     /// `/workflows` — the background workflow-run overlay.
     case workflows
     /// `Ctrl+P` and `/help`'s upstream target (`OpenCommandPalette`) — every

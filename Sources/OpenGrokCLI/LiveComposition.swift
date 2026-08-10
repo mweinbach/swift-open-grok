@@ -7664,12 +7664,62 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// tick — recorded divergence, cost: states up to ~1s stale.
     private var tasksPaneRefresh: Task<Void, Never>?
 
-    private func isTasksPaneChord(_ key: KeyEvent) -> Bool {
-        guard key.modifiers.contains(.control) else { return false }
-        switch key.key {
-        case .char(let value): return String(value).lowercased() == "g"
-        default: return key.character.map { String($0).lowercased() } == "g"
+    /// B1-m: the session tab registry — the in-process roster the dashboard
+    /// lists. Upstream's `app.agents` map holds full agent tabs; this port's
+    /// single runtime stack grounds a METADATA roster (id, title, activity)
+    /// with attach-via-`/resume` — the pre-ruled tab divergence (no parallel
+    /// top-level turns; a background tab is idle by construction).
+    private var sessionTabs: [LiveSessionTab] = []
+
+    private func registerSessionTab(_ id: String) {
+        guard !id.isEmpty, !sessionTabs.contains(where: { $0.sessionID == id }) else {
+            touchSessionTab(id)
+            return
         }
+        sessionTabs.append(LiveSessionTab(
+            sessionID: id, title: "New session", lastActivity: Date()
+        ))
+    }
+
+    /// Stamp activity (and adopt the first user prompt as the roster title —
+    /// upstream titles rows the same way, `dashboard/row.rs` first-prompt
+    /// labels).
+    private func touchSessionTab(_ id: String, title: String? = nil) {
+        guard let index = sessionTabs.firstIndex(where: { $0.sessionID == id }) else { return }
+        sessionTabs[index].lastActivity = Date()
+        if let title, sessionTabs[index].title == "New session" {
+            sessionTabs[index].title = LivePagerTasksBlock.firstNonEmptyLine(title)
+        }
+    }
+
+    /// `/dashboard` / Ctrl+\ — the roster overlay. The feature gate is
+    /// upstream's env kill-switch (`dashboard_enabled`,
+    /// `dashboard/mod.rs:88-100`: `GROK_AGENT_DASHBOARD=0` → a friendly
+    /// toast and stay put; the persisted `[dashboard].enabled` half has no
+    /// port config section yet — recorded). The minimal refusal lives with
+    /// the controller's dispatch, the ModeSupport seam.
+    private func presentDashboard() async throws {
+        guard environment["GROK_AGENT_DASHBOARD"] != "0" else {
+            note("The Agent Dashboard is disabled (GROK_AGENT_DASHBOARD=0).")
+            try renderState()
+            return
+        }
+        registerSessionTab(sessionID)
+        var subagents: [LiveSubagentSnapshot] = []
+        if let host = toolExecutor?.subagentHost {
+            for id in await host.knownSubagentIDs() {
+                if let snapshot = await host.subagentSnapshot(id: id) {
+                    subagents.append(snapshot)
+                }
+            }
+        }
+        overlays.push(LiveDashboardOverlay.overlay(
+            tabs: sessionTabs,
+            activeSessionID: sessionID,
+            activeTurnRunning: turnActivity != nil,
+            subagents: subagents
+        ))
+        try renderState()
     }
 
     /// Ctrl+G (`agent_view/input.rs:1230-1231`): closed → open focused;
@@ -9034,6 +9084,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         if conversation.items.isEmpty, minimalHost == nil {
             overlays.push(.welcome(welcomeOverlay(), capturesInput: false))
         }
+        registerSessionTab(sessionID)
         // The changelog startup prefetch — upstream's one-shot post-auth
         // effect, off the render path, "so the welcome screen can display
         // bullets and /release-notes uses the cached result"
@@ -9132,9 +9183,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // A swapped conversation invalidates an in-flight recap the same
             // way a new prompt does — it no longer describes this session.
             recapEpoch &+= 1
+            registerSessionTab(sessionID)
             resetForNewSession(sessionID: sessionID)
         case .sessionResumed(let sessionID):
             recapEpoch &+= 1
+            registerSessionTab(sessionID)
             await applyResumedSession(sessionID: sessionID)
         case .notice(let message):
             appendMessage(PagerMessage(role: .system, text: message))
@@ -9450,8 +9503,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // `Ctrl+L` — upstream opens the extensions modal on the Plugins
             // tab (`agent_view/input.rs:1266-1271`).
             try await present(.extensions(tab: .plugins))
-        case .toggleTodos, .toggleTasks, .sendToBackground, .newSession,
-             .openDashboard, .openSettings, .openSessions:
+        case .toggleTasks:
+            // Ctrl+G (`defaults.rs:44-55`) — minimal has no pane surface
+            // (upstream's Ctrl+G means external editor there; toggling state
+            // nothing paints would be the dead-key class), and a modal owns
+            // the keys while active.
+            guard minimalHost == nil, !overlays.isActive else { return }
+            try await toggleTasksPane()
+        case .openDashboard:
+            try await presentDashboard()
+        case .toggleTodos, .sendToBackground, .newSession,
+             .openSettings, .openSessions:
             // Unbound in the controller's key table until the backing surface
             // exists, so these arrive only from a caller that built them by
             // hand. Nothing to do beats a misleading approximation.
@@ -9925,6 +9987,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 note("Goal set. Send this to brief the model on it, or just keep going:")
                 note(text)
             }
+        case .showDashboard:
+            try await presentDashboard()
         case .sessionPicker:
             // `/resume` (upstream resume.rs:21-23). Row ids are session ids;
             // choosing one round-trips through the controller as
@@ -11166,6 +11230,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private func appendMessage(_ message: PagerMessage) {
         overlays.dismiss(id: "welcome")
         conversation.appendMessage(message)
+        if message.role == .user {
+            touchSessionTab(sessionID, title: message.text)
+        }
     }
 
     /// `/transcript` — write the transcript to a temp file and open `$PAGER`
@@ -11655,6 +11722,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             )
             return nil
         }
+        if overlayID == LiveDashboardOverlay.overlayID {
+            guard rowID.hasPrefix(LiveDashboardOverlay.attachPrefix) else { return nil }
+            let target = String(rowID.dropFirst(LiveDashboardOverlay.attachPrefix.count))
+            overlays.dismiss(id: LiveDashboardOverlay.overlayID)
+            // Attaching to the ACTIVE session is just closing the roster;
+            // any other row rides the same `/resume <id>` the sessions
+            // picker dispatches, so attach can never bypass the resume
+            // machinery's refusals.
+            guard target != sessionID else { return nil }
+            return "/resume \(target)"
+        }
         if overlayID == "workflows" {
             // The dashboard stays open: a control key acts on a run and
             // refreshes the rows, it does not close the surface the user is
@@ -12018,15 +12096,6 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         case .key(let key):
             if let welcomeRouting = try await handleWelcomeChord(key) {
                 return welcomeRouting
-            }
-            // B1-t: Ctrl+G toggles the tasks pane (`ActionId::ToggleTasks`,
-            // `defaults.rs:44-55`) — a chrome band, so it must not fight an
-            // active modal, and minimal has no pane surface (upstream's
-            // Ctrl+G means external editor there; refusing quietly beats
-            // toggling state nothing paints).
-            if !overlays.isActive, minimalHost == nil, isTasksPaneChord(key) {
-                try await toggleTasksPane()
-                return .consumed
             }
             // A focused pane owns the keys the composer would otherwise get
             // (`AgentPane::Tasks` routing, `agent_view/input.rs:1152`).

@@ -425,6 +425,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // this port has no per-family key table, so the chord is bound
             // unconditionally — recorded divergence.
             case "l": return .openExtensions
+            // `Ctrl+G` toggles the tasks pane (`defaults.rs:44-55`) — bound
+            // now that the B1-t pane exists.
+            case "g": return .toggleTasks
+            // `Ctrl+\` opens the Agent Dashboard (`defaults.rs:890`).
+            // Terminals report the chord as the raw FS byte; both spellings
+            // land here (the Ctrl+C `\u{3}` precedent in `controlAction`).
+            case "\\", "\u{1c}": return .openDashboard
             default: return nil
             }
         }
@@ -2771,6 +2778,19 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Rename the current session",
             usage: "/rename <title>"
         ),
+        // B1-d: `/dashboard` follows `/rename`, upstream's registry order
+        // (`slash/commands/mod.rs:117-118` — `/cd` sits between it and
+        // `/theme` upstream but is dashboard-only and lands with B1-c).
+        // Name, aliases, description, usage verbatim (`dashboard.rs:27-52`);
+        // `/sessions` survives the sessions-modal removal as an alias. The
+        // minimal ModeSupport refusal lives with the dispatch arm; the
+        // feature gate with the render layer, which owns the environment.
+        PagerCommandDefinition(
+            name: "dashboard",
+            aliases: ["agents-dashboard", "sessions"],
+            summary: "Open the Agent Dashboard — a fullscreen overview of every running session",
+            usage: "/dashboard"
+        ),
         PagerCommandDefinition(
             name: "remember",
             summary: "Save a memory note",
@@ -3333,6 +3353,19 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 // the only layer that owns a session id here.
                 try await emit(.overlay(.showTasks))
                 return .handled
+            case "dashboard":
+                // `ModeSupport::FullscreenOnly(SwitchMode)` with upstream's
+                // why-fragment verbatim (`dashboard.rs:55-59` over
+                // `mode_support.rs:47-51`). The inline strip keeps the
+                // command — the roster is a modal this port can paint there.
+                guard activePagerMode != .minimal else {
+                    try await emit(.notice(
+                        "/dashboard isn't available in minimal mode (minimal is single-session). Run /fullscreen to switch this session."
+                    ))
+                    return .handled
+                }
+                try await emit(.overlay(.showDashboard))
+                return .handled
             case "release-notes":
                 // Arguments are ignored — upstream's `ReleaseNotesCommand::run`
                 // declares `_args` (release_notes.rs:27). The fetch, the
@@ -3793,12 +3826,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             try await startNewSession()
         case .cyclePermissionMode, .toggleAlwaysApprove:
             try await emit(.global(command))
+        case .toggleTasks, .openDashboard:
+            // The render layer owns both surfaces (the B1-t pane state and
+            // the dashboard roster/feature gate), so the chords forward the
+            // way the permission-mode pair does.
+            try await emit(.global(command))
         case .openExtensions:
             // `Ctrl+L` — upstream opens the extensions modal on the Plugins
             // tab (`agent_view/input.rs:1266-1271`).
             try await emit(.overlay(.extensions(tab: .plugins)))
-        case .toggleTodos, .toggleTasks, .sendToBackground,
-             .openDashboard, .openSessions:
+        case .toggleTodos, .sendToBackground, .openSessions:
             // Unbound in `globalAction(for:)` until the backing surface exists.
             break
         }
@@ -3822,6 +3859,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /history                  Search prompt history
       /queue                    Prompts queued behind the running turn
       /tasks                    List background tasks, subagents, and scheduled tasks
+      /dashboard  /sessions     Open the Agent Dashboard session roster
       /btw <question>           Ask a side question without interrupting
       /expand                   Re-print the last collapsed block, fully expanded (minimal)
       /context                  View context usage

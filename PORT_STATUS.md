@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B1-t: the Ctrl+G tasks pane landed as a live chrome band with kill affordances; next per the B1 rulings: B1-m the multi-session tab map, then B1-d the dashboard)
+**As of:** 2026-08-10 (Wave 18 B1-m + B1-d v1: the session tab registry and the /dashboard roster are live with Ctrl+G and Ctrl+backslash bound; B1-c /cd + the deferred dashboard bulk remain)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -1458,6 +1458,60 @@ changes nothing) + 4 builder (kind→group incl. monitors-join-watchers, kill
 actions per kind with the no-copy pin, workflow sort order, block-vocabulary
 status).
 
+### B1-m + B1-d (v1) — the session tab registry and the dashboard roster (serial gate: exit 0, 5,391 tests, 105 runs, zero issues, 2026-08-10)
+
+Lead-implemented. Two halves in one slice because the registry alone would be
+dead code and the roster alone would have no rows.
+
+**B1-m, the tab registry:** `LiveSessionTab` (sessionID · title · lastActivity)
+maintained on the renderer actor at the three session boundaries — begin(),
+`.sessionReplaced`, `.sessionResumed` — with the first user prompt adopted as
+the roster title (upstream's first-prompt row labels) and activity stamped at
+the `appendMessage` choke point. This is the pre-ruled tab divergence made
+concrete: upstream's `app.agents` holds full agent tabs streaming in
+background; this port's single runtime stack grounds a METADATA roster whose
+background tabs are idle by construction, with attach riding `/resume`. Cost
+carried from the research ruling: no parallel top-level turns in one process.
+
+**B1-d v1, the roster:** `/dashboard` (aliases `/agents-dashboard`,
+`/sessions` — the sessions-modal replacement, `dashboard.rs:34-41`) registered
+at upstream's registry position (after `/rename`, `mod.rs:117-118`) with copy
+verbatim, plus the two predeclared-unbound chords finally bound to their
+now-existing backings: **Ctrl+G → `.toggleTasks`** and **Ctrl+\ →
+`.openDashboard`** (both spellings — the raw FS byte included, the Ctrl+C
+precedent), forwarded controller→renderer through the `.global` channel like
+the permission-mode pair. In the same corrective pass the B1-t renderer-side
+Ctrl+G intercept was REMOVED — it bypassed the predeclared controller
+channel; one chord table, one seam. The overlay (`LiveDashboardOverlay`)
+lists tabs active-first-then-activity with the active row's live state
+(running/attached) and the ACTIVE session's subagents as indented child rows
+(running-first, non-selectable — peek/attach-to-subagent are deferred
+surfaces and a row that dispatches nowhere must not be selectable); Enter on
+a session row rides `"/resume <id>"` — the sessions picker's exact dispatch,
+so attach can never bypass the resume machinery's refusals. Gates: minimal
+refuses with upstream's why-fragment verbatim ("minimal is single-session",
+`dashboard.rs:55-59` over `mode_support.rs:47-51`) at the controller;
+`GROK_AGENT_DASHBOARD=0` toasts and stays at the renderer
+(`dashboard_enabled`, `dashboard/mod.rs:88-95`; the persisted
+`[dashboard].enabled` half has no port config section yet — recorded).
+
+**Deferred, recorded (the bulk of upstream's ~26k dashboard lines):**
+grouping/filters/pins, the peek panel + peek tail, dispatch-from-dashboard,
+`DashboardState` persistence, the location picker + `/cd` (B1-c, dashboard-
+only), the worktree dialog, rename/close row actions, the leader bridge, and
+the session-switch hint banners. The roster is the load-bearing core
+(`dashboard/mod.rs:1-8`) and every affordance it shows is backed.
+
+9 net-new tests: 6 controller-seam (copy + aliases + the rename→dashboard
+relative pair, dispatch + the `/sessions` alias, the minimal refusal
+verbatim, both chords through the `.global` channel incl. the FS-byte
+spelling, help text) + 3 roster (ordering + attach ids + active markers,
+running state, children under the active row only + non-selectable). The
+first gate run FAILED on the pinned `/tasks → /release-notes` relative pair —
+the dashboard row was initially inserted there instead of upstream's slot —
+and the fix moved it to `/rename`'s side with its own pair pinned: the
+E20/E21 relative-order convention catching a real placement error.
+
 ## Wave 18 B2 — native scrollback, pager-minimal, screen mode, welcome (research complete, queued)
 
 Research at the pin, with the headline corrections and lead rulings:
@@ -2565,10 +2619,11 @@ the keystone.
 
 ### Hidden settings rows (no live reader; un-hide when the backing lands — roadmap B6)
 
-`compact_mode`, `show_timestamps`, `show_timeline`, `page_flip_on_send`, `simple_mode`,
-`render_mermaid`, `max_thoughts_width`, `show_thinking_blocks`, `group_tool_verbs`,
-`collapsed_edit_blocks`, `scroll_speed`, `scroll_mode`, `scroll_lines`, `invert_scroll`,
-`keep_text_selection`, `prompt_suggestions`.
+`page_flip_on_send`, `simple_mode`, `render_mermaid`, `max_thoughts_width`,
+`show_thinking_blocks`, `group_tool_verbs`, `collapsed_edit_blocks`, `scroll_speed`,
+`scroll_mode`, `scroll_lines`, `invert_scroll`, `keep_text_selection`,
+`prompt_suggestions`. (`compact_mode`, `show_timestamps`, and `show_timeline` left
+this list when their readers landed — rows registered, audited 2026-08-10.)
 
 ### Ledger corrections (stale rows every domain audit tripped over)
 
