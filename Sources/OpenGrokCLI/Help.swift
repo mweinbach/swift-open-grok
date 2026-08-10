@@ -79,7 +79,8 @@ public enum OpenGrokHelp {
       workspace start|pause|resume|stop|restart|status
       login, logout                         Manage credentials.
       inspect, doctor [fix]                 Diagnose config and terminal.
-      setup, update, export, trace, share, wrap, dashboard
+      setup, update, export, trace, share, wrap
+      dashboard                             Reserved; currently unavailable.
       release-validate --binary PATH --expected-version VERSION
                      [--expected-commit COMMIT] --isolated-root ROOT
       completions SHELL                     bash, zsh, fish, powershell, elvish.
@@ -294,8 +295,9 @@ public enum OpenGrokHelp {
             return """
             open-grok dashboard
 
-            Opens the Agent Dashboard at startup. Disabled by
-            `[dashboard] enabled = false` or GROK_AGENT_DASHBOARD=0.
+            The standalone dashboard utility route is reserved but unavailable in
+            this port. It remains fail-closed until a CLI dashboard host is wired.
+            Use `/dashboard` from a running pager session.
 
             """
         case "version":

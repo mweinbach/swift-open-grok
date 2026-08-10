@@ -506,4 +506,13 @@ struct OpenGrokExecutableTests {
         #expect(out.contents.isEmpty)
         #expect(err.contents.contains("unavailable"))
     }
+
+    @Test("standalone dashboard route fails closed until its utility host exists")
+    func standaloneDashboardRouteFailsClosed() {
+        let (streams, out, err) = CLIStreams.buffered()
+        let code = CLIRunner.main(["dashboard"], streams: streams)
+        #expect(code == CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(out.contents.isEmpty)
+        #expect(err.contents.contains("unavailable"))
+    }
 }

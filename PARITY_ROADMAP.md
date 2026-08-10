@@ -23,15 +23,19 @@ item 6's honest scope is send-now (landed) — true mid-turn injection needs the
 
 ---
 
-## The shape of the gap
+## Historical Wave 12 audit shape (superseded by later closures)
 
-The port's foundations are in good health: the permission gate order is live end-to-end,
+This section preserves the 2026-08-06 audit baseline. It is **not** the current
+capability list: closure labels in the wave plan below and `PORT_STATUS.md` govern
+current truth. At that baseline, the port's foundations were in good health: the
+permission gate order was live end-to-end,
 all three sampling backends stream with per-provider validation, compaction/memory/goals/
 sessions/worktrees/plugins/update/sandbox(macOS) run on the live path, ACP stdio/serve/
 leader work, Code Mode runs on JSC, and the Rhai workflow engine is live via `--workflow`.
 
-What is missing clusters into five structural seams, not dozens of scattered features.
-Every audit independently converged on the same first keystone:
+The missing work then clustered into five structural seams, not dozens of scattered
+features. Several of these keystones have since closed; the bullets remain as the
+historical audit input that shaped Waves 13-18:
 
 1. **The subagent stack is built and dead.** `OpenGrokAgentCoordinator` (mailboxes,
    waiters, cancel), `OpenGrokSubagentResolution`, `OpenGrokAgentControlTools`,
@@ -145,24 +149,41 @@ Order within the wave is forced:
 6. Announcements: spawn refresh → cache → pager banner + hide/CTA (+`/announcements`).
 
 ### Wave 18 — Pager surfaces (XL)
-1. **B1** multi-agent AppView/dashboard runtime (agent map, roster, peek/attach,
-   leader bridge) → `/dashboard`, Ctrl+\, `/cd` + `SetWorkingDir`, tasks pane +
-   Ctrl+G/`/tasks` (feeds from Wave 14), dashboard worktree dialog.
+1. **B1 — CLOSED 2026-08-10** (dashboard roster and navigation are live in the
+   pager): session/dormant roster, read-only selection-following peek, `Enter`
+   attach through `/resume`, bare `x` close for eligible rows, `Ctrl+T` pin,
+   `Shift+Up`/`Shift+Down` reorder, `Ctrl+G` grouping, `Ctrl+/` search/filter,
+   section collapse/navigation, and the stepped `Esc` behavior. The historical
+   AppView scope remains useful as a reference snapshot, but these B1 follow-ons
+   are deliberately deferred: dispatch/replies, `/cd`/`SetWorkingDir` and the
+   location picker,
+   rename, subagent peek/attach, question mode, the wide side peek, the worktree
+   dialog, separate bare `/` search, and the leader bridge. Cleanup hardening now
+   exercises the real controller/renderer actor, stores, overlay stack, and terminal
+   paint across six serialized dashboard scenarios; this retires the old
+   composition-harness caveat without overclaiming binary/PTY/raw-decoder proof.
 2. **B2 — CLOSED 2026-08-10** (see the Wave 18 B2 ledger section: W1-W4 welcome,
    S1 screen_mode reader, N insertBefore, M1-M4 the live minimal frontend, S2
    `/minimal`//`/fullscreen` + exec relaunch; the B3 dependency turned out
    unnecessary — relaunch is a process exec, not the suspend seam). Recorded
    remainders: the minimal todo//btw//panel//plan//full_view//auth modules, the
    Ctrl+E expand chord, the flat live-region stance.
-3. **B6** chrome readers: timeline rail, per-block timestamps, compact_mode layout,
-   context-bar hover widget (un-hide the Wave 13 rows).
+3. **B6 — CLOSED 2026-08-10** (timeline rail, per-block timestamps, compact-mode
+   layout, and the context-bar hover widget are now live; unrelated settings
+   that still lack renderer readers remain honestly hidden).
 4. **B9 — CLOSED 2026-08-08** (config-agents/personas modal; release-notes viewer;
    privacy banner — the Wave 18 B9 ledger section).
 
 ### Wave 19 — Long tail (parallelizable, mostly XL each)
+Platform/evidence tail: capable-Linux sandbox proof · Windows named-pipe leader IPC +
+S2 exec emulation · portable secure WebSockets · Linux custom-CA installation · signed
+share upload/export clients · post-change Linux/Windows CI and required-check evidence ·
+B1 follow-ons: dashboard dispatch/replies, `/cd` + `SetWorkingDir` + location picker,
+rename rows, subagent peek/attach, peek reply/question mode, wide side peek, worktree
+dialog, separate bare `/` search, leader bridge ·
 Mouse block selection (click selects a transcript block; upstream's scrollback click
 handling — the live pipeline is proven and pinned, Wave 14.1, only the feature is absent) ·
-LSP tool (pull-diagnostics rewrite) · scheduler trio + `monitor` · video tools
+LSP tool (pull-diagnostics rewrite) · video tools
 (`image_to_video`/`reference_to_video`) · `search_tool`/`use_tool` MCP meta-discovery ·
 voice live seam (B7: macOS capture + `__mic-capture` intercept + pipeline) · media
 overlays (B10: kitty/iTerm images, mermaid, real `/gboom`) · foreign-session

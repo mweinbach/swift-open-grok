@@ -7625,6 +7625,14 @@ private struct LivePagerConversationState {
 // Internal (not private) so the reachability suites can drive the real
 // adapter: a command's overlay/effect only exists here, and a test that
 // cannot construct the renderer can only test the registry.
+struct LiveDashboardRendererSnapshot: Sendable, Equatable {
+    let isOpen: Bool
+    let searchQuery: String?
+    let selectedRowID: String?
+    let cachedSessionIDs: Set<String>
+    let dormantSessionIDs: Set<String>
+}
+
 actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     struct ResolvedUIConfiguration: Sendable {
         let config: UiConfig
@@ -7652,6 +7660,16 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func takePendingScreenModeRelaunch() -> (sessionID: String, minimal: Bool)? {
         defer { pendingScreenModeRelaunch = nil }
         return pendingScreenModeRelaunch
+    }
+
+    func dashboardSnapshotForTesting() -> LiveDashboardRendererSnapshot {
+        LiveDashboardRendererSnapshot(
+            isOpen: overlays.contains(id: LiveDashboardOverlay.overlayID),
+            searchQuery: dashboardSearchQuery,
+            selectedRowID: selectedDashboardListRowID(),
+            cachedSessionIDs: Set(dashboardPeekCache.items.keys),
+            dormantSessionIDs: Set(dashboardDormant.map(\.sessionID))
+        )
     }
 
     /// B1-t: the Ctrl+G tasks pane — nil = hidden. A full-width chrome band
@@ -7987,6 +8005,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         sessionTabs.removeAll { $0.sessionID == target }
         dashboardDormant.removeAll { $0.sessionID == target }
         dashboardState.gcStaleRefs { $0.owningSessionID != target }
+        persistDashboardState()
         rebuildDashboardRows()
         note(deleted ? "Deleting session\u{2026}" : "Session file was already gone.")
         try? renderState()

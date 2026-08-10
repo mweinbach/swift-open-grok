@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 18 B1 dashboard program CLOSED: state machinery, peek band, pane completions, close verb, roster-state integration all live; recorded deferrals stand [dispatch//cd/rename/leader/subagent-attach]; next: Wave 19 regroup with the user)
+**As of:** 2026-08-10 (Wave 18 B1 cleanup hardening complete: deterministic live controller/renderer reachability now covers dashboard open/hydration, state mutations, search, peek, close/delete persistence, and dismissal; final serial gate exit 0, **5,544 tests across 105 runs, zero issues**. B1 and B6 remain CLOSED; Wave 19 is next.)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, share upload/export clients, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -154,11 +154,15 @@ or a how-to token opens the in-TUI guides browser, a web token opens
 `https://docs.x.ai/build/overview` through the same injected opener seam the codex login
 uses, a guide title opens that guide's markdown viewer, and unknown targets get the
 byte-exact error (including Rust's `{:?}` quoting for the ASCII range). The 26-guide
-corpus (24 user-guide files + 2 reference docs, 464,214 bytes) lives as generated Swift
-source — NOT SwiftPM resources, which silently break under `swiftpm-testing-helper`
-(AGENTS.md §2) — mechanically emitted from the reference clone; the lead independently
-re-hashed the literals against the upstream markdown (all matched) and the suite pins
-per-file byte counts. 25 new tests.
+corpus (24 user-guide files + 2 reference docs, **456,088 bytes**) lives as generated
+Swift source — NOT SwiftPM resources, which silently break under
+`swiftpm-testing-helper` (AGENTS.md §2). Most entries remain mechanically emitted from
+the reference clone; `03-keyboard-shortcuts.md` and `23-dashboard.md` are explicitly
+port-maintained so the shipped guides describe the controls that actually work instead
+of advertising deferred upstream surfaces. The suite pins every per-file byte count and
+semantically prevents deferred dashboard controls from leaking into the live table or
+example. Current coverage is **26 tests**: 17 controller/corpus tests + 9 live-renderer
+reachability tests.
 
 **Parity bug found during lead review — completion tie-break inverted.** The registry's
 final sort key compared CANONICAL command names where upstream compares the MATCHED
@@ -1344,7 +1348,7 @@ live-seam feed (`7477e0d`), read-only modal (`d50ade8`), mutations (`4914d60`), 
 detail (this entry). Every surface landed with working backings in dependency order;
 the docs corpus's descriptions of all three surfaces are now true.
 
-## Wave 18 B1 — multi-agent dashboard, tasks pane, /cd (research complete, in progress 2026-08-10)
+## Wave 18 B1 — dashboard and tasks surfaces (research + implementation record; CLOSED 2026-08-10)
 
 Research at the pin, with the headline findings and lead rulings:
 
@@ -1538,14 +1542,17 @@ refuses with upstream's why-fragment verbatim ("minimal is single-session",
 `dashboard.rs:55-59` over `mode_support.rs:47-51`) at the controller;
 `GROK_AGENT_DASHBOARD=0` toasts and stays at the renderer
 (`dashboard_enabled`, `dashboard/mod.rs:88-95`; the persisted
-`[dashboard].enabled` half has no port config section yet — recorded).
+`[dashboard].enabled` half had no port config section in this v1 slice and was
+closed later by B1-s/B1-w2).
 
-**Deferred, recorded (the bulk of upstream's ~26k dashboard lines):**
+**Historical v1 deferrals, superseded in part by the later B1-s/B1-p/B1-w
+slices below (the bulk of upstream's ~26k dashboard lines):**
 grouping/filters/pins, the peek panel + peek tail, dispatch-from-dashboard,
 `DashboardState` persistence, the location picker + `/cd` (B1-c, dashboard-
 only), the worktree dialog, rename/close row actions, the leader bridge, and
-the session-switch hint banners. The roster is the load-bearing core
-(`dashboard/mod.rs:1-8`) and every affordance it shows is backed.
+the session-switch hint banners. This paragraph records the v1 landing state;
+the later subsections are authoritative about what subsequently landed and
+what remains deferred.
 
 9 net-new tests: 6 controller-seam (copy + aliases + the rename→dashboard
 relative pair, dispatch + the `/sessions` alias, the minimal refusal
@@ -1689,13 +1696,14 @@ target); sessionTabs.removeAll { $0.sessionID == target };
 rebuildDashboardRows(); note("Deleting session…")` — with the cursor
 clamped to the neighbor row by the in-place rebuild.
 
-**Coverage note (recorded, not hidden):** `LiveComposition` has no cheap
-test harness — it is reachable only through the full launcher (TTY). The
-composition glue (`performTasksPaneAction` arms, `handleDashboardClose`)
-is pinned at the deepest reachable seams instead: the verb-dispatch guards
-(B1-p), the armed-row overlay build, the pane's action/filter state
-machine, `LiveTasksPane`'s copy/open action gating, and the peek
-cache/refusal rules — with the destructive path quoted above.
+**Historical coverage note, retired by the cleanup hardening below:** at the
+B1-w1 landing, `LiveComposition` had no deterministic renderer-construction
+harness, so the glue was pinned only at its deepest pure seams. The later
+`LiveDashboardReachabilityTests` constructs the real live renderer, catalog,
+conversation store, overlay stack, terminal sink, and controller input stream;
+the composition caveat is therefore closed at the actor/render boundary. This
+still is not a shipped-binary PTY/raw-key-decoder proof, which remains a
+separate evidence class.
 
 24 net-new tests (9 CLI peek + 2 roster overlay + 9 pane state + 4 pane
 builder).
@@ -1753,10 +1761,9 @@ file notes "Session file was already gone." instead of pretending).
 pins, dormant rows + live-id skip, directory grouping with `~` compaction,
 the `s:` filter view, collapse, pinned float, the idle fold + expand, the
 title's search/filter chip, the chord-side id mapping round-trips, and the
-initial cursor landing on a session row rather than its header. The
-chord handler itself is composition glue with no cheap harness (the
-recorded B1-w1 coverage stance) — its pure halves are pinned at the state
-and overlay seams above.
+initial cursor landing on a session row rather than its header. The old
+"no cheap harness" caveat is superseded by the cleanup suite below; the pure
+state/overlay tests remain useful as the narrower failure-localization layer.
 
 **The B1 program closes with these deferrals standing, each with its
 recorded reason (finish-wave rulings):** dispatch-from-dashboard (needs the
@@ -1765,6 +1772,46 @@ rows (no inline row editor), subagent peek/attach, the peek reply
 row/question mode, the wide-layout side-panel peek, the worktree dialog,
 `/` Search as a separate key, and the leader bridge (honest NO — no roster
 wire types, no overlay stack in leader interactive).
+
+### B1 cleanup hardening — live renderer reachability (serial gate: exit 0, 5,544 tests, 105 runs, zero issues, 2026-08-10)
+
+The technical caveat recorded in B1-w1/B1-w2 is now fixed at the strongest
+deterministic seam available without launching a PTY. `LiveDashboardReachabilityTests`
+constructs the production `LiveInteractiveControllerRenderer` with an isolated real
+`LiveSessionCatalog`, `LiveConversationStore`, `[dashboard]` store, overlay stack, and
+capturing terminal sink. Its six serialized cases prove: controller-entered
+`/dashboard` plus env/config gates and dormant hydration; Ctrl+T pin persistence and
+the live grouping arm; Ctrl+/ search/confirm/stepped-Esc routing; selection-following
+peek paint from the dormant transcript cache; active-row delete refusal plus dormant
+arm/delete; and dismissal cleanup of filter/cache/dormant state.
+
+The destructive-path case exposed and fixed a real persistence bug: delete-time
+`gcStaleRefs` removed a deleted session's pin/reorder references only in memory.
+`handleDashboardClose` now persists immediately after gc, and the regression seeds
+real `top:dormant-session` pin/reorder keys, deletes the real session file, and waits
+for both keys to disappear from `config.toml`. The test therefore cannot pass through
+an unresolvable phantom key or an in-memory-only cleanup.
+
+Evidence boundary: this retires the live-composition reachability caveat at the real
+controller/renderer actor and terminal-paint seam. It deliberately does **not** claim
+binary/PTY/raw-byte decoder coverage. Controller chord forwarding remains separately
+pinned by `PagerDashboardCommandTests`; the isolated real-CLI drive verifies that
+`help dashboard` points users to in-pager `/dashboard` while standalone
+`open-grok dashboard` continues to fail closed.
+
+| Verification | Result |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh build-tests` | exit 0 |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --filter LiveDashboardReachabilityTests` | exit 0; **6 tests / 1 suite** |
+| `... --filter PagerDocsCommandTests` | exit 0; **17 tests / 1 suite** |
+| `... --filter PagerDashboardCommandTests` | exit 0; **6 tests / 1 suite** |
+| `... --filter OpenGrokExecutableTests` | exit 0; **226 tests / 33 suites** |
+| `... --filter LivePagerDocsReachabilityTests` | exit 0; **9 tests / 1 suite** |
+| `... --filter SubcommandGrammarTests` | exit 0; **24 tests / 1 suite** |
+| `... --filter LiveDashboardOverlayTests` | exit 0; **14 tests / 1 suite** |
+| `... --filter LiveDashboardPeek` | exit 0; **9 tests / 3 suites** |
+| isolated `verify-open-grok` drive: `help`, `help dashboard`, standalone `dashboard` refusal | helper doctor exit 0; help live; refusal exact and nonzero |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | exit 0; **5,544 tests / 105 runs**, zero issues |
 
 ### B6 closure — the context-bar hover widget (serial gate: exit 0, 5,395 tests, 105 runs, zero issues, 2026-08-10). **The B6 chrome-reader program is CLOSED.**
 
@@ -2930,24 +2977,27 @@ this list when their readers landed — rows registered, audited 2026-08-10.)
 
 ### Still absent / deliberately deferred (the roadmap's remaining waves)
 
-**Corrected 2026-08-10 with the Wave 18 B2 closure** (the prior list predated
-Waves 14-18 and had gone stale — native scrollback + the minimal frontend,
-TUI suspend/restore, in-pager `/login`, MCP OAuth + credential store, and the
-subagent/collaboration stack are LIVE per their wave records). Remaining open:
-the multi-agent dashboard/AppView runtime and its dependents (`/dashboard`,
-Ctrl+\, `/cd` + `SetWorkingDir`, the tasks pane — roadmap B1, the last Wave 18
-keystone); the context-bar hover widget (the B6 remainder — timeline rail,
-timestamps, and compact_mode landed); the hidden settings rows above that
-still lack renderer readers; xAI browser-OAuth in-TUI login (the recorded D1
-divergence); upstream's soft `x.ai/interject` seam (send-now is live; true
-mid-turn injection is not); voice live seam (B7); media overlays (B10);
-video tools; LSP; `search_tool`/`use_tool` meta-discovery; foreign-session
-scan/resume; memory embeddings + dream; auto-mode LLM permission classifier;
-Computer Hub MCP adapter wiring; the Wave 19 config/env long tail
-(`RemoteSettings` authority allowlist, `GROK_*` env-gate table, `features.*`
-resolver); and the standing platform gaps (Linux sandbox proof, Windows
-named-pipe leader IPC + the S2 exec emulation, Linux custom-CA, Linux/Windows
-CI). See `PARITY_ROADMAP.md` for the dependency-ordered plan.
+**Corrected 2026-08-10 after the B1/B6 closure cleanup** (the prior list had
+again gone stale). Native scrollback + the minimal frontend, TUI suspend/restore,
+in-pager `/login`, MCP OAuth + credential store, the subagent/collaboration stack,
+the tasks pane, in-pager `/dashboard` roster/navigation, and the context-bar hover
+widget are LIVE per their wave records. Remaining open: the deliberately deferred
+B1 follow-ons (dashboard dispatch/replies, `/cd` + `SetWorkingDir` + location
+picker, rename rows, subagent peek/attach, peek reply/question mode, wide side
+peek, worktree dialog, separate bare `/` search, leader bridge); hidden settings
+rows above that still lack renderer readers; xAI browser-OAuth in-TUI login;
+upstream's soft `x.ai/interject` seam (send-now is live; true mid-turn injection
+is not); voice live seam (B7); media overlays (B10); video tools; LSP;
+`search_tool`/`use_tool` meta-discovery; foreign-session scan/resume; memory
+embeddings + dream; auto-mode LLM permission classifier; Computer Hub MCP adapter
+wiring; Code Mode V8 hard-interrupt/module-loader debt; PTY-backed
+`run_terminal_cmd`; the local-workspace/chat env+flag family; relocation journal;
+antigravity runner; the Wave 19 config/env long tail (`RemoteSettings` authority
+allowlist, `GROK_*` env-gate table, `features.*` resolver); signed share
+upload/export clients; and the standing platform/evidence gaps (capable-Linux
+sandbox proof, Windows named-pipe leader IPC + S2 exec emulation, portable secure
+WebSockets, Linux custom-CA installation, and post-change Linux/Windows CI plus
+required-check evidence). See `PARITY_ROADMAP.md` for the current long-tail list.
 
 ## Wave 12 — Meta provider catch-up, re-pin to 70002584, and fundamentals closures (2026-08-06)
 

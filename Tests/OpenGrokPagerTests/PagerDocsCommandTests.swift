@@ -222,15 +222,15 @@ struct PagerDocsCommandTests {
         ])
     }
 
-    @Test("the corpus content is the upstream bytes: per-file UTF-8 counts and first lines")
+    @Test("the corpus content pins per-file UTF-8 counts and first lines")
     func corpusContentPins() {
-        // UTF-8 byte counts of the reference markdown at commit 650c1db7,
-        // recorded when the corpus was generated. A regenerated or edited
-        // constant that drifts by even one byte fails here.
+        // Most counts are the reference markdown at commit 650c1db7. The
+        // dashboard is a deliberate port adaptation, so its count pins the
+        // current port text rather than falsely claiming upstream identity.
         let expectedByteCounts: [String: Int] = [
             "01-getting-started.md": 9267,
             "02-authentication.md": 16265,
-            "03-keyboard-shortcuts.md": 23136,
+            "03-keyboard-shortcuts.md": 23148,
             "04-slash-commands.md": 22014,
             "05-configuration.md": 49610,
             "06-theming.md": 14410,
@@ -250,7 +250,7 @@ struct PagerDocsCommandTests {
             "20-background-tasks.md": 10192,
             "21-terminal-support.md": 11664,
             "22-permissions-and-safety.md": 30024,
-            "23-dashboard.md": 13123,
+            "23-dashboard.md": 4985,
             "24-monitoring-usage.md": 13576,
             "hooks-and-plugins.md": 5181,
             "custom-hooks.md": 11861,
@@ -273,6 +273,89 @@ struct PagerDocsCommandTests {
         #expect(firstLine(PagerDocs.userGuide[23]) == "# Monitoring Usage (External OpenTelemetry)")
         #expect(firstLine(PagerDocs.referenceDocs[0]) == "# Hooks & Plugins Guide")
         #expect(firstLine(PagerDocs.referenceDocs[1]) == "# Custom Hooks Guide")
+    }
+
+    @Test("dashboard docs keep deferred controls out of the live table and example")
+    func dashboardDocsAdvertiseOnlyLiveBindings() throws {
+        func section(_ text: String, from start: String, to end: String) -> String {
+            guard let startRange = text.range(of: start) else { return "" }
+            let body = text[startRange.upperBound...]
+            guard let endRange = body.range(of: end) else { return String(body) }
+            return String(body[..<endRange.lowerBound])
+        }
+
+        let dashboard = try #require(PagerDocs.find(title: "Agent Dashboard")?.content)
+        let liveGuide = section(dashboard, from: "## What you see", to: "## Deferred controls")
+        let deferredSection = section(
+            dashboard,
+            from: "## Deferred controls",
+            to: "## Historical upstream/reference (not current behavior)"
+        )
+        let liveShortcuts = section(
+            try #require(PagerDocs.find(title: "Keyboard Shortcuts")?.content),
+            from: "## Agent Dashboard",
+            to: "---"
+        )
+        let live = liveGuide + liveShortcuts
+
+        for required in [
+            "read-only peek",
+            "Enter",
+            "/resume",
+            "`x`",
+            "Ctrl+T",
+            "Shift+↑",
+            "Ctrl+G",
+            "Ctrl+/",
+            "←",
+            "→",
+            "Esc"
+        ] {
+            #expect(live.contains(required), "missing live dashboard control: \(required)")
+        }
+
+        for deferred in [
+            "Ctrl+S",
+            "Ctrl+R",
+            "Ctrl+X",
+            "Ctrl+O",
+            "Tab",
+            "dispatch composer",
+            "reply box",
+            "rename",
+            "/cd",
+            "location picker",
+            "subagent",
+            "question mode",
+            "wide side peek",
+            "worktree dialog",
+            "leader bridge",
+            "| `/` |"
+        ] {
+            #expect(
+                !live.localizedCaseInsensitiveContains(deferred),
+                "deferred dashboard control leaked into live docs: \(deferred)"
+            )
+        }
+
+        for namedDeferred in [
+            "dispatch and replies",
+            "/cd",
+            "SetWorkingDir",
+            "location picker",
+            "rename",
+            "subagent peek/attach",
+            "question mode",
+            "wide side peek",
+            "worktree dialog",
+            "separate bare `/` search",
+            "leader bridge"
+        ] {
+            #expect(
+                deferredSection.localizedCaseInsensitiveContains(namedDeferred),
+                "missing deferred dashboard note: \(namedDeferred)"
+            )
+        }
     }
 
     @Test("every user-guide entry is non-empty and starts with a markdown header")
