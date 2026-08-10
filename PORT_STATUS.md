@@ -1344,6 +1344,55 @@ live-seam feed (`7477e0d`), read-only modal (`d50ade8`), mutations (`4914d60`), 
 detail (this entry). Every surface landed with working backings in dependency order;
 the docs corpus's descriptions of all three surfaces are now true.
 
+## Wave 18 B1 — multi-agent dashboard, tasks pane, /cd (research complete, in progress 2026-08-10)
+
+Research at the pin, with the headline findings and lead rulings:
+
+1. **The dashboard is the multi-agent AppView roster** (`views/dashboard/`, ~26k
+   lines: state 11,182 + render 9,022 + peek 2,347 + row 2,039 + layout 1,075 +
+   peek_tail 464 + mod 153): rows rebuilt every frame off `app.agents` — the
+   in-process map of top-level agent tabs plus their subagents — with grouping,
+   filters, pins, peek, attach, dispatch, a location picker, and the worktree
+   dialog. THE architectural gap: this port's interactive controller holds ONE
+   conversation; `/new`//`/resume` swap the live session in place rather than
+   opening tabs, and the runtime stack (shell, tool executor, stores) tracks one
+   current session.
+2. **`/cd` is dashboard-ONLY** (`cd.rs:38-43`: `dashboard_only`, hidden from
+   completion elsewhere; both its arms dispatch dashboard actions — the location
+   picker and `DashboardChangeLocation`). It has NO ground before the dashboard
+   lands and must not be registered earlier (the §4 rule).
+3. **The tasks pane is grounded TODAY**: `views/tasks_pane.rs` (3,538 lines) is
+   the interactive Ctrl+G overlay — four groups in fixed order (Workflows,
+   Subagents, Tasks, Watchers = monitors + `/loop`, `tasks_pane.rs:178-215`),
+   collapsible headers, selection, and the caller affordances in
+   `agent_view/panes.rs:312-455`: Enter opens the entry's viewer / toggles a
+   header, `x` kills (KillBgTask / KillSubagent / CancelScheduledTask /
+   `/workflow stop <name>` — ALL four backed live in this port via the tool
+   executor's bg-task store, the subagent host, the scheduler host, and the
+   workflow registry, exactly the feeds `presentTasksBlock` already assembles at
+   `LiveComposition.swift:10082-10116`), `y` copies a bg task's stdout, Tab
+   returns to the prompt. The port's `/tasks` currently prints a static block;
+   upstream's command opens the pane.
+4. **`dashboard_enabled()`** (`dashboard/mod.rs:88-100`): `GROK_AGENT_DASHBOARD=0`
+   env kill-switch over a persisted `[dashboard].enabled` (default true);
+   minimal mode refuses `/dashboard` and its session-switch hint points at
+   `/resume` instead (`:106-117`).
+
+**Lead rulings:** (a) the program lands as **B1-t (tasks pane, the grounded
+slice) → B1-m (the multi-session tab map: retained conversation states with
+ACTIVE-ONLY turns) → B1-d (dashboard state/rows/render + `/dashboard` + Ctrl+\
++ peek/attach) → B1-c (`/cd` + location picker + worktree dialog, LAST — they
+are dashboard affordances)**; (b) the tab-map divergence is pre-ruled: upstream
+agents stream in background tabs via concurrent ACP sessions, but this port's
+single runtime stack grounds only idle background tabs — dispatching to a
+background tab switches to it first; the cost (no parallel top-level turns in
+one process) is recorded when B1-m lands, and the subagent stack remains the
+in-process parallelism story; (c) the tasks pane follows the B9 dedicated-
+overlay precedent (`PagerAgentsOverlay`), not a re-skinned `.list` overlay —
+the pane owns per-key affordances a generic list cannot honestly carry; (d)
+the leader bridge (other processes' sessions in the roster) is deferred past
+B1-d with its own entry.
+
 ## Wave 18 B2 — native scrollback, pager-minimal, screen mode, welcome (research complete, queued)
 
 Research at the pin, with the headline corrections and lead rulings:
