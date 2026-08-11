@@ -36,7 +36,16 @@ jobs:
       # --no-parallel is the documented green gate (PORT_STATUS.md). Default
       # parallel is also green locally, but shared-runner load variance makes
       # serial the honest CI configuration.
+      # The wrapper's default ceiling is 600s, which is generous on a dev
+      # machine (~5 min) and too tight on a shared runner: the first macOS run
+      # that got this far was killed mid-suite at exactly 600s and read as a
+      # test failure. Cost: a genuine hang now takes 40 minutes to surface
+      # instead of 10, so treat a job that approaches this bound as a hang to
+      # investigate, not as "CI is just slow" — and do not raise it again
+      # without checking how long a healthy run actually takes.
       - name: Test (serial gate)
+        env:
+          SWIFT_SAFE_TIMEOUT_SECONDS: "2400"
         run: zsh workflows/swift-safe-verify.zsh test --no-parallel
       - name: Smoke (isolated home)
         run: |
@@ -107,7 +116,10 @@ jobs:
         run: zsh workflows/swift-safe-verify.zsh build --product open-grok
       - name: Build tests
         run: zsh workflows/swift-safe-verify.zsh build-tests
+      # Same reasoning as the macOS gate above.
       - name: Test (serial gate)
+        env:
+          SWIFT_SAFE_TIMEOUT_SECONDS: "2400"
         run: zsh workflows/swift-safe-verify.zsh test --no-parallel
 
   windows-compile:
