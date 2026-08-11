@@ -1,3 +1,7 @@
+// Depends on OIDCTestJWTFixture, which needs Apple CryptoKit + Security.
+// Compiled out on Linux; see PORT_STATUS.md for the coverage gap this leaves.
+#if canImport(CryptoKit) && canImport(Security)
+
 // LivePagerAuthReachabilityTests.swift
 //
 // The render-layer half of `/login` and `/logout`, through the LIVE adapter
@@ -734,3 +738,5 @@ struct LiveLogoutTests {
         try await fixture.renderer.restoreTerminal()
     }
 }
+
+#endif /* canImport(CryptoKit) && canImport(Security) */

@@ -1,3 +1,7 @@
+// Depends on OIDCTestJWTFixture, which needs Apple CryptoKit + Security.
+// Compiled out on Linux; see PORT_STATUS.md for the coverage gap this leaves.
+#if canImport(CryptoKit) && canImport(Security)
+
 // OIDCIdTokenValidatorTests.swift
 //
 // JWKS signature validation for OIDC id_tokens — ports the upstream
@@ -296,3 +300,5 @@ struct OIDCIdTokenValidatorTests {
         #expect(claims.sub == "user-42")
     }
 }
+
+#endif /* canImport(CryptoKit) && canImport(Security) */

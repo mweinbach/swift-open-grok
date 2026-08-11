@@ -4,6 +4,13 @@
 // pager login reachability). Lives in the auth module so CLI tests can
 // script a JWKS-backed IdP without duplicating SecKey/CryptoKit setup.
 // Uses Security + CryptoKit — no third-party JWT libraries.
+//
+// Both of those are Apple-only, so this fixture cannot exist on Linux without
+// taking a swift-crypto dependency. It is compiled out there rather than
+// ported, which is why the OIDC id_token suites below it do not run on Linux —
+// recorded as a platform coverage gap in PORT_STATUS.md. Do not "fix" a Linux
+// build failure here by loosening the validator it exercises.
+#if canImport(CryptoKit) && canImport(Security)
 
 import CryptoKit
 import Foundation
@@ -241,3 +248,5 @@ private struct ASN1Reader {
         return bytes
     }
 }
+
+#endif /* canImport(CryptoKit) && canImport(Security) */

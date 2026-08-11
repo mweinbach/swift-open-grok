@@ -1,3 +1,7 @@
+// Depends on OIDCTestJWTFixture, which needs Apple CryptoKit + Security.
+// Compiled out on Linux; see PORT_STATUS.md for the coverage gap this leaves.
+#if canImport(CryptoKit) && canImport(Security)
+
 // XAIBrowserLoginTests.swift
 //
 // The xAI browser OAuth flow against the REAL loopback listener and the REAL
@@ -632,3 +636,5 @@ private final class HeaderBox: @unchecked Sendable {
     func set(_ value: HTTPURLResponse) { lock.lock(); response = value; lock.unlock() }
     func get() -> HTTPURLResponse? { lock.lock(); defer { lock.unlock() }; return response }
 }
+
+#endif /* canImport(CryptoKit) && canImport(Security) */

@@ -11,6 +11,19 @@
 #define _GNU_SOURCE 1
 #endif
 
+/* POSIX-only (<sys/mman.h>, sigaction, termios). The Swift caller's every use
+   of these symbols is already `#if os(macOS) || os(Linux)` with a Windows arm
+   that reports the handler as uninstalled, so on Windows this file compiles to
+   a placeholder rather than failing the build. The header stays unguarded: it
+   declares only int/char* signatures, and declarations nothing calls are
+   harmless. */
+#if defined(_WIN32)
+
+int opengrok_crash_unavailable_on_windows(void);
+int opengrok_crash_unavailable_on_windows(void) { return 0; }
+
+#else
+
 #include "opengrok_crash_posix.h"
 
 #include <errno.h>
@@ -417,3 +430,5 @@ void opengrok_crash_disable_terminal_escape_restore(void) {
 int opengrok_crash_is_installed(void) {
     return g_installed ? 1 : 0;
 }
+
+#endif /* !_WIN32 */
