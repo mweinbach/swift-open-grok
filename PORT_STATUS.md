@@ -199,11 +199,38 @@ summaries** and zero issues.
   without the `agy --print` runner would register controls whose backing feature
   does not exist, which §4 forbids, so the rows stay hidden.
 
+### Platform state after the CI unbreak (2026-08-11, PR #1)
+
+Each platform now fails *later* than it ever has, which is what turned three
+opaque red jobs into a concrete queue of real defects:
+
+| Platform | Before | After |
+| --- | --- | --- |
+| macOS | died in `Build` (type-check budget) | builds, links, compiles tests, runs the suite |
+| Linux | died at the bubblewrap probe | clears the probe, builds product **and** all test targets, runs the suite |
+| Windows | died on the first C target | past the C targets and `OpenGrokPaths`, now in test support |
+
+Two findings from the first runs that actually executed:
+
+- **Linux dies on SIGPIPE (signal 13)** a moment into the suite. Linux
+  terminates on SIGPIPE by default where Apple platforms do not, so this is a
+  real runtime divergence in the port, not a CI artifact — nothing installs
+  `SIG_IGN` for it. Fixing it is the next Linux step; until then Linux has
+  compile evidence but no test evidence.
+- **Windows needs a BSD-sockets port in `OpenGrokTestSupport/CountingServer.swift`**
+  (`socket`, `AF_INET`, `setsockopt`, `sockaddr_in` are all absent without
+  WinSock), plus a `distance(to:)` use in `OpenGrokPaths`. That is a genuine
+  porting task, not a guard.
+
+Also raised: the CI serial-gate steps now run with
+`SWIFT_SAFE_TIMEOUT_SECONDS=2400`. The first macOS run to reach the suite was
+killed at exactly the wrapper's 600s default and read as a test failure. The
+cost is that a real hang now takes 40 minutes to surface.
+
 ### Still deferred from the audit
 
 Antigravity runner, durable subagent resume, relocation journal, portable
-WSS/custom CA, and the remaining Windows platform work (the C-target and zlib
-fixes unblock the compile; the job has not yet reached a passing build).
+WSS/custom CA, Linux SIGPIPE handling, and the Windows sockets port.
 
 ## Wave 19 — Deferred parity follow-ons (2026-08-10, complete)
 
