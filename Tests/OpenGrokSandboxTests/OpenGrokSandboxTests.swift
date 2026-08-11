@@ -579,6 +579,23 @@ struct OpenGrokSandboxTests {
     #endif
 
     #if os(Linux)
+    private final class LinuxReexecCapture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var path = ""
+        private var arguments: [String] = []
+
+        func record(path: String, arguments: [String]) {
+            lock.lock(); defer { lock.unlock() }
+            self.path = path
+            self.arguments = arguments
+        }
+
+        func snapshot() -> (String, [String]) {
+            lock.lock(); defer { lock.unlock() }
+            return (path, arguments)
+        }
+    }
+
     @Test("Linux reexec uses an injected absolute bwrap handoff")
     func linuxReexecHandoffIsInjectable() throws {
         let workspace = FileManager.default.temporaryDirectory
@@ -587,9 +604,10 @@ struct OpenGrokSandboxTests {
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: workspace) }
 
-        let lock = NSLock()
-        var capturedPath = ""
-        var capturedArguments: [String] = []
+        // A box rather than captured `var`s: the `exec` hook is `@Sendable`,
+        // and Swift 6 rejects mutating captured locals from it. This test is
+        // `#if os(Linux)`, so that rejection only ever appears on Linux.
+        let captured = LinuxReexecCapture()
         let hooks = LinuxBwrapReexecHooks(
             environment: { ["OPENGROK_HOME": home.path] },
             arguments: { ["--child-arg"] },
@@ -604,10 +622,7 @@ struct OpenGrokSandboxTests {
             discoverBubblewrap: { _ in "/usr/bin/bwrap" },
             probe: { _ in true },
             exec: { path, arguments, _ in
-                lock.lock()
-                capturedPath = path
-                capturedArguments = arguments
-                lock.unlock()
+                captured.record(path: path, arguments: arguments)
                 throw SandboxError.enforcementFailed("captured for test")
             }
         )
@@ -620,10 +635,7 @@ struct OpenGrokSandboxTests {
         #expect(throws: SandboxError.self) {
             try manager.apply(workspace: workspace)
         }
-        lock.lock()
-        let path = capturedPath
-        let arguments = capturedArguments
-        lock.unlock()
+        let (path, arguments) = captured.snapshot()
         #expect(path == "/usr/bin/bwrap")
         #expect(arguments.contains("--"))
         #expect(arguments.suffix(2).elementsEqual(["/bin/open-grok", "--child-arg"]))
