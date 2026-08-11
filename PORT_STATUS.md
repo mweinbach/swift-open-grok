@@ -466,6 +466,11 @@ too (a 92-second gap in the same place) but does not die there, so the Linux
 reproduction technique that cracked the LSP hang does not apply, and no macOS
 host was available to this pass. Recorded as open rather than guessed at.
 
+The new stop point is at least **reproducible**: runs 31524927247 and
+31527210106 both die on that same test, having both passed the proto tests
+that previously killed them. Whoever picks this up on a macOS host has a
+named test to attach to rather than a nine-minute silence to bisect.
+
 **Not acted on, surfaced instead:** the reviewer's request to remove
 `options: --privileged` from the Linux PR job, and its request to restore the
 600s suite ceiling. Both are `.github/workflows/ci.yml` changes whose current
