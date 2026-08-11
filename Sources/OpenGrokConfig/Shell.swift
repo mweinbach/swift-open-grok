@@ -407,6 +407,19 @@ public func isCommandAvailable(
     return which(name, environment: environment) != nil
 }
 
+/// The resolved absolute path of `name` on `$PATH`, or `nil`.
+///
+/// The public counterpart to `isCommandAvailable` for callers that must hand a
+/// concrete path to `Process.executableURL` — `/usr/bin/env` is not available
+/// on Windows, so a spawner that needs PATH resolution cannot delegate it to
+/// the OS the way a POSIX-only one can.
+public func resolveExecutablePath(
+    _ name: String,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> String? {
+    which(name, environment: environment)
+}
+
 func isCommandAvailable(
     _ name: String,
     environment: [String: String],

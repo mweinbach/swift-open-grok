@@ -600,4 +600,62 @@ struct LiveAntigravitySpawnTests {
             return
         }
     }
+
+    /// `task_id` is decoder-supported but not advertised, so nothing else
+    /// constrains it — and the Antigravity runner joins it straight into
+    /// `$OPENGROK_HOME/sessions/<session>/subagents/<childID>` before handing
+    /// that to `createDirectory` and `agy --log-file`.
+    @Test("traversal in task_id is refused before any filesystem use")
+    func traversalTaskIDRefused() async throws {
+        let ran = LockedBox(false)
+        let services = LiveAntigravityServices(
+            loadConfig: { _ in
+                LiveAntigravityConfig(enabled: true, binary: "agy", skipPermissions: true)
+            },
+            isCLIInstalled: { _, _ in true },
+            probeModels: { _ in
+                LiveAntigravityStatus(signedIn: true, models: ["gemini-3.6-flash"], detail: nil)
+            },
+            runPrint: { _ in
+                ran.set(true)
+                return .success(output: "ok")
+            }
+        )
+        let fixture = try AntigravityHostFixture(services: services)
+        defer { fixture.dispose() }
+
+        guard case .object(var args) = AntigravityHostFixture.spawnArgs() else {
+            Issue.record("unexpected spawn args shape")
+            return
+        }
+        args["task_id"] = .string("../../outside")
+
+        let result = await fixture.host.spawn(args: .object(args), toolCallID: "call-agy-traversal")
+        guard case .failure(let error) = result else {
+            Issue.record("expected traversal refusal, got \(result)")
+            return
+        }
+        #expect(error.description.contains("task_id"))
+        #expect(ran.get() == false)
+    }
+}
+
+/// Minimal `Sendable` flag for asserting a closure did or did not run.
+private final class LockedBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Bool
+
+    init(_ value: Bool) { self.value = value }
+
+    func set(_ newValue: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        value = newValue
+    }
+
+    func get() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
 }

@@ -2867,6 +2867,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             },
             definitionContext: definitionContext,
             modelSlugs: LiveModelCatalogResolver.catalog().map(\.id),
+            antigravitySelectable: LiveAntigravityComposition
+                .antigravitySelectable(environment: environment),
             // The trust-independent persona base: inline [subagents.personas]
             // from the SAME trust-gated document the toggles read, plus the
             // session home's `personas/` and `bundled/personas/` dirs
@@ -3294,7 +3296,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 permissionMode: foundation.toolExecutor.sessionPermissionMode,
                 permissions: await foundation.toolExecutor.permissionHandle(),
                 swarmMode: foundation.toolExecutor.swarmMode,
-                gateway: gateway
+                gateway: gateway,
+                permissionPrompter: acpPermissionPrompter
             )
             return LiveACPLaunchComponents(
                 promptDriver: promptDriver,

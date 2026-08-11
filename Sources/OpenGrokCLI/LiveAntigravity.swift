@@ -64,6 +64,20 @@ public enum LiveAntigravityComposition {
         stripModelPrefix(slug) != nil
     }
 
+    /// Whether a spawn could actually accept an `antigravity:<model>` slug —
+    /// the same two cheap checks the spawn gate applies first
+    /// (`antigravity_runner.rs:100-127`), so the advertised contract and the
+    /// refusal path agree. Deliberately does NOT probe `agy models`: this runs
+    /// during session construction and the roster costs a 15s-timeout
+    /// subprocess.
+    public static func antigravitySelectable(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        let config = LiveAntigravityConfig.load(environment: environment)
+        return config.enabled
+            && LiveAntigravityServices.productionIsCLIInstalled(config.binary, environment)
+    }
+
     /// Config binary name + PATH/file presence (`cli_installed`,
     /// antigravity.rs:79-81). Cheap and synchronous — settings visibility
     /// must not spawn `agy models`.
@@ -294,11 +308,24 @@ func classifyAntigravityOutput(
 /// (`DEFAULT_RUN_TIMEOUT`, antigravity_runner.rs:37-38).
 func antigravityRunTimeout(environment: [String: String]) -> TimeInterval {
     if let raw = environment["OPENGROK_SUBAGENT_TIMEOUT_MS"],
-       let millis = Double(raw), millis > 0 {
+       let millis = Double(raw), millis > 0, millis.isFinite,
+       // `Double("1e309")` is `.infinity` and `Double("1e30")` is finite but
+       // far past `Int.max`; both reach `Int(timeout.rounded(.down))` in
+       // `antigravityArguments`, which traps. A user typo in an env var must
+       // not be able to kill the process before the child is even launched.
+       millis / 1000.0 <= antigravityMaxRunTimeout {
         return millis / 1000.0
     }
     return 600
 }
+
+/// Upper bound on a configured run timeout. Chosen so the value stays exactly
+/// representable as the `Int` seconds `agy --print-timeout` takes, with room
+/// for the `+ 30` hard-kill grace added on top. Cost: a caller who genuinely
+/// wants a longer-than-a-day budget silently gets the 600s default instead of
+/// an error — the env var has no error channel, and defaulting is the same
+/// thing an unparseable value already does.
+let antigravityMaxRunTimeout: TimeInterval = 86_400
 
 // MARK: - Refusal copy (verbatim from antigravity_runner.rs:100-127)
 
@@ -356,15 +383,25 @@ private func productionRunPrint(_ run: LiveAntigravityRun) async -> LiveAntigrav
     let args = antigravityArguments(for: run)
     // Hard-kill grace past `--print-timeout` (`KILL_GRACE`, antigravity.rs:51).
     let hardDeadline = run.timeout + 30
-    let outcome = await Task.detached(priority: .userInitiated) {
-        runBoundedAntigravityProcess(
-            executable: run.binary,
-            arguments: args,
-            currentDirectory: run.workspaceDirectory,
-            environment: ProcessInfo.processInfo.environment,
-            timeout: hardDeadline
-        )
-    }.value
+    // `Task.detached(...).value` is not a cancellation point for a nonthrowing
+    // task, so the child has to be reachable from the cancellation handler.
+    // Without this the acknowledgement was a lie: the turn reported cancelled
+    // while `agy --dangerously-skip-permissions` kept running.
+    let canceller = AntigravityProcessCanceller()
+    let outcome = await withTaskCancellationHandler {
+        await Task.detached(priority: .userInitiated) {
+            runBoundedAntigravityProcess(
+                executable: run.binary,
+                arguments: args,
+                currentDirectory: run.workspaceDirectory,
+                environment: ProcessInfo.processInfo.environment,
+                timeout: hardDeadline,
+                canceller: canceller
+            )
+        }.value
+    } onCancel: {
+        canceller.cancel()
+    }
     if Task.isCancelled { return .cancelled }
     switch outcome {
     case .exited(let status, let stdout, let stderr):

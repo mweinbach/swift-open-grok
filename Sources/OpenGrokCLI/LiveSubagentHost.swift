@@ -89,6 +89,22 @@ protocol LiveSubagentQuerying: Sendable {
     func knownSubagentIDs() async -> [String]
 }
 
+/// Whether a subagent child id is safe to use as a single path component.
+///
+/// Same alphabet as `LiveConversationStore.validateSessionID` — the ids share a
+/// directory tree, so a value one accepts and the other rejects would be a
+/// silent inconsistency. `.` and `..` are rejected outright; every other
+/// traversal form is already excluded because `/`, `\` and `:` are not in the
+/// allowed set.
+func isSafeSubagentChildID(_ id: String) -> Bool {
+    let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    return !id.isEmpty
+        && id.count <= 128
+        && id != "."
+        && id != ".."
+        && id.allSatisfy(allowed.contains)
+}
+
 actor LiveSubagentHost: LiveSubagentQuerying {
     /// Everything a child inherits from the root session, gathered once so
     /// `spawn` does not grow a dozen loose parameters. The sampler carries the
@@ -120,6 +136,11 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         var definitionContext: DefinitionResolutionContext
         /// Public catalog slugs the `model` parameter may name.
         var modelSlugs: [String]
+        /// Whether the advertised `model` contract should also name the
+        /// `antigravity:<model>` form. Both halves of the gate are the cheap
+        /// synchronous checks the settings rows already use — the config
+        /// toggle and the CLI being installed — never an `agy models` probe.
+        var antigravitySelectable: Bool = false
         /// Trust-independent personas — inline `[subagents.personas]` plus
         /// the user and bundled persona directories — loaded once at session
         /// build (upstream `resolve_subagents`, agent/config.rs:2255-2263).
@@ -318,7 +339,10 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 isolationParam: "isolation"
             )
         )
-        description += modelGuidance(slugs: context.modelSlugs)
+        description += modelGuidance(
+            slugs: context.modelSlugs,
+            antigravitySelectable: context.antigravitySelectable
+        )
         return ToolSpec(
             name: advertisedToolName,
             description: description,
@@ -373,15 +397,38 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     /// `task_model_guidance` (builder.rs:1362-1383) with the `model` param
     /// name resolved — upstream renders `${{ params.task.model }}` at
     /// finalize time; this composition builds descriptions directly.
-    private static func modelGuidance(slugs: [String]) -> String {
+    /// Antigravity models are named, not enumerated.
+    ///
+    /// `spawn` accepts any `antigravity:<model>` slug and validates it against
+    /// the live `agy models` roster, but the roster costs a subprocess with a
+    /// 15s timeout and this description is built during session construction.
+    /// Enumerating here would put that probe on every startup. The cost of
+    /// naming the form instead: the model can propose an `antigravity:` slug
+    /// that does not exist and learns so from the spawn refusal
+    /// (`LiveAntigravityRefusal.unknownModel`, which lists the real roster)
+    /// rather than from this description. Saying nothing was worse — the
+    /// "MUST use only model slugs from this list" sentence made the accepted
+    /// slugs unreachable through the ordinary model-driven path, so the
+    /// feature existed and nothing could ask for it.
+    private static let antigravityModelGuidance =
+        "\n\nAntigravity subagents are enabled: you may also pass `model` as "
+        + "`antigravity:<model>` (for example `antigravity:gemini-3-pro`) to run "
+        + "the child through the Antigravity CLI instead of an in-process model. "
+        + "These slugs are not in the list above; an unavailable one is refused "
+        + "with the installed roster."
+
+    private static func modelGuidance(slugs: [String], antigravitySelectable: Bool) -> String {
+        let antigravity = antigravitySelectable ? antigravityModelGuidance : ""
         let sorted = Array(Set(slugs)).sorted()
         guard !sorted.isEmpty else {
             return "\n\nNo explicit model slugs are currently available. Omit `model` to inherit the parent model."
+                + antigravity
         }
         let list = sorted.map { "- \($0)" }.joined(separator: "\n")
         return "\n\nYou may choose a different model or provider for a subagent when it materially fits the delegated task better (for example, speed, cost, depth, or provider capabilities). You MUST use only model slugs from this list:\n"
             + list
             + "\n\nOmit `model` to inherit the parent model when no listed model is a better fit."
+            + antigravity
     }
 
     // MARK: - Spawn (the `task` tool path)
@@ -595,6 +642,16 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         // UUID costs the time-ordered id sort (cosmetic only — completion
         // order is tracked separately), noted in the slice report.
         let childID = sanitizeOptionalArg(input.taskId) ?? UUID().uuidString.lowercased()
+        // `task_id` is decoder-supported but not advertised in the schema, so
+        // nothing upstream of here constrains it. The Antigravity runner joins
+        // it into `$OPENGROK_HOME/sessions/<session>/subagents/<childID>` and
+        // hands that to `createDirectory` and `agy --log-file`, so a value like
+        // `../../outside` writes outside the session tree. Rejected rather than
+        // sanitized: silently rewriting the id would hand the caller a child it
+        // cannot address by the name it asked for.
+        guard isSafeSubagentChildID(childID) else {
+            return .failure(.invalidCall("subagent task_id \"\(childID)\" is not a valid identifier"))
+        }
 
         // Antigravity gates, eager and in this order
         // (antigravity_runner.rs:100-127), before coordinator.spawn so a
