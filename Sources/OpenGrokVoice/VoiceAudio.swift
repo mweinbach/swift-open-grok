@@ -58,6 +58,14 @@ public struct SystemVoiceAudioCapture: VoiceAudioCapture {
             name: recorder,
             detail: "system recorder; uses the audio server's default input"
         )
+        #elseif os(macOS)
+        guard capabilities.microphoneCapture else {
+            throw VoiceError.unsupported(
+                capability: .microphoneCapture,
+                reason: "microphone capture helper is unavailable for this executable"
+            )
+        }
+        return try await MicCaptureSubprocess.inputDeviceInfo()
         #else
         throw VoiceError.unsupported(
             capability: .microphoneCapture,
@@ -77,6 +85,14 @@ public struct SystemVoiceAudioCapture: VoiceAudioCapture {
             recorder: recorder,
             sampleRate: sampleRate
         )
+        #elseif os(macOS)
+        guard capabilities.microphoneCapture else {
+            throw VoiceError.unsupported(
+                capability: .microphoneCapture,
+                reason: "microphone capture helper is unavailable for this executable"
+            )
+        }
+        return try await MicCaptureSubprocess.startCapture(sampleRate: sampleRate)
         #else
         throw VoiceError.unsupported(
             capability: .microphoneCapture,

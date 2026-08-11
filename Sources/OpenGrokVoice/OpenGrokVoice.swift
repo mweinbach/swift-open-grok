@@ -47,6 +47,16 @@ public struct VoiceCapabilities: Codable, Equatable, Sendable {
             playback: false,
             microphoneRecorder: recorder
         )
+        #elseif os(macOS)
+        let helperAvailable = MicCaptureSubprocess.currentExecutableURL(
+            fileManager: fileManager
+        ) != nil
+        return VoiceCapabilities(
+            microphoneCapture: helperAvailable,
+            microphonePermission: helperAvailable,
+            transcription: true,
+            playback: false
+        )
         #else
         return VoiceCapabilities(
             microphoneCapture: false,
@@ -167,13 +177,23 @@ public struct VoicePipelineSnapshot: Equatable, Sendable {
     }
 }
 
+func isCaptureSubcommand(_ arguments: [String]) -> Bool {
+    arguments.dropFirst().first == MIC_CAPTURE_SUBCOMMAND
+}
+
 public func maybeRunCaptureSubprocess(
     arguments: [String] = CommandLine.arguments,
-    output: (String) -> Void = { _ in }
+    output: ((String) -> Void)? = nil
 ) -> Int? {
-    guard arguments.dropFirst().first == MIC_CAPTURE_SUBCOMMAND else { return nil }
-    output("ERR mic-capture helper unavailable in this build")
+    guard isCaptureSubcommand(arguments) else { return nil }
+    let write = output ?? VoiceCaptureProtocol.emitHeaderLine
+    let childArgs = Array(arguments.dropFirst(2))
+    #if os(macOS)
+    return MicCaptureChild.runCLI(args: childArgs, output: write)
+    #else
+    write(VoiceCaptureProtocol.errLine(message: "mic-capture helper unavailable in this build"))
     return 2
+    #endif
 }
 
 public func micFixHelp() -> String {

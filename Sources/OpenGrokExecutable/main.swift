@@ -1,6 +1,10 @@
 import Foundation
 import OpenGrokCLI
 
+if let captureExitCode = LiveVoiceMainIntercept.maybeRunCaptureSubprocess() {
+    exit(Int32(captureExitCode))
+}
+
 let args = Array(CommandLine.arguments.dropFirst())
 let exitCode = await CLIRunner.run(
     args,

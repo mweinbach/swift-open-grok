@@ -254,16 +254,81 @@ struct VoiceCapabilityTests {
         #expect(formatted.contains("(none — STT returned no text)"))
     }
 
-    @Test("hidden capture helper reports explicit unsupported status")
-    func hiddenCaptureHelperUnsupported() {
-        var output = ""
+    @Test("capture helper ignores normal argv")
+    func captureHelperIgnoresNormalArgv() {
         #expect(maybeRunCaptureSubprocess(arguments: ["open-grok"]) == nil)
+        #expect(!isCaptureSubcommand(["open-grok"]))
+        #expect(isCaptureSubcommand(["open-grok", MIC_CAPTURE_SUBCOMMAND]))
+    }
+
+    @Test("protocol headers round-trip")
+    func protocolHeadersRoundTrip() throws {
+        #expect(VoiceCaptureProtocol.readyLine(device: "Mic\nName") == "READY Mic Name")
+        #expect(VoiceCaptureProtocol.errLine(message: "boom\r") == "ERR boom ")
+        #expect(
+            VoiceCaptureProtocol.infoLine(name: "USB Mic", detail: "44100 Hz")
+                == "INFO USB Mic\t44100 Hz"
+        )
+        let ready = try VoiceCaptureProtocol.parseHeaderLine("READY Built-in Microphone")
+        #expect(ready == .ready(device: "Built-in Microphone"))
+        let info = try VoiceCaptureProtocol.parseHeaderLine("INFO Mic\t44100 Hz, 1 ch")
+        #expect(info == .info(name: "Mic", detail: "44100 Hz, 1 ch"))
+        let err = try VoiceCaptureProtocol.parseHeaderLine("ERR no default input audio device")
+        #expect(err == .error(message: "no default input audio device"))
+    }
+
+    #if !os(macOS)
+    @Test("hidden capture helper reports explicit unsupported status off macOS")
+    func hiddenCaptureHelperUnsupportedOffMacOS() {
+        var output = ""
         let exitCode = maybeRunCaptureSubprocess(
             arguments: ["open-grok", MIC_CAPTURE_SUBCOMMAND],
-            output: { output = $0 }
+            output: { line in output = line }
         )
         #expect(exitCode == 2)
-        #expect(output == "ERR mic-capture helper unavailable in this build")
+        #expect(output == VoiceCaptureProtocol.errLine(message: "mic-capture helper unavailable in this build"))
+    }
+    #endif
+
+    #if os(macOS)
+    @Test("capture child arg parser rejects unknown flags")
+    func captureChildArgParserRejectsUnknownFlags() {
+        let parsed = MicCaptureChildArgs.parse(["--bogus"])
+        guard case .failure(let error) = parsed else {
+            Issue.record("expected parse failure")
+            return
+        }
+        #expect(error.description.contains("unknown mic-capture arg"))
+    }
+
+    @Test("macOS capability detect follows helper availability")
+    func macOSCapabilityDetect() {
+        let capabilities = VoiceCapabilities.detect()
+        let helperAvailable = MicCaptureSubprocess.currentExecutableURL() != nil
+        #expect(capabilities.microphoneCapture == helperAvailable)
+        #expect(capabilities.transcription)
+        #expect(!capabilities.playback)
+    }
+    #endif
+
+    @Test("unsupported capture surfaces typed configuration errors")
+    func unsupportedCaptureStatus() async {
+        let capture = SystemVoiceAudioCapture(
+            capabilities: VoiceCapabilities(
+                microphoneCapture: false,
+                microphonePermission: false,
+                transcription: true,
+                playback: false
+            )
+        )
+        do {
+            _ = try await capture.inputDeviceInfo()
+            Issue.record("expected unsupported inputDeviceInfo")
+        } catch let VoiceError.unsupported(capability, _) {
+            #expect(capability == .microphoneCapture)
+        } catch {
+            Issue.record("expected unsupported microphoneCapture, got \(error)")
+        }
     }
 }
 
