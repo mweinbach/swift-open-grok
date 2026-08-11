@@ -254,19 +254,24 @@ Findings from the first runs that actually executed, and what was done:
   on the WinSock path `COpenGrokSockets` already implements — not done.
 - **macOS still fails its gate, and not on an assertion.** The run goes quiet
   for eight and a half minutes and then exits 1 with no recorded issue and no
-  signal name. Do not read the last-printed test as the culprit: two runs
-  stopped after *different* tests (`DefaultProtoCompiler`'s PATH-lookup case,
-  then `ProtoBuildError.absolutePathRejected`), and those tests are hermetic —
-  injected `pathLookup`, `validateCandidates: false`, no subprocess — so they
-  cannot hang. It is also not the wrapper ceiling: the gate now has 2400s and
-  the whole job finished in 19 minutes.
+  signal name. Two of three runs stopped the instant
+  `DefaultProtoCompiler falls back to PATH lookup` printed `started` and never
+  printed `passed`; the third stopped one test earlier. That test and its
+  neighbours are hermetic — injected `pathLookup`, `validateCandidates: false`,
+  no subprocess — so the test body itself cannot stall for minutes, and the
+  varying stop point argues against a single hanging assertion.
 
-  The shape that fits is memory pressure — a long stall with no output followed
-  by death, on a runner with a fraction of the dev machine's RAM. §1 already
-  records a stranded helper ballooning past 100 GB of RSS here, so a test that
-  grows unboundedly is a known hazard in this suite rather than a novel guess.
-  The next step is to run the gate on CI with RSS sampling and find what grows,
-  not to raise a limit.
+  It is not the wrapper ceiling either: the gate now has 2400s and the whole
+  job finished in 19 minutes. The shape that fits is resource exhaustion — a
+  long silence with no output followed by death, on a runner with a fraction of
+  the dev machine's RAM. §1 already records a stranded helper ballooning past
+  100 GB of RSS here, so unbounded growth is a known hazard in this suite
+  rather than a novel guess. One concrete thing to rule out first: the
+  `bin/protoc` parent walk in `discoverProtoc` loops on
+  `deletingLastPathComponent()` and exits only when the path stops changing,
+  which is a convergence assumption about Foundation URL behavior that has
+  never been exercised against a CI runner's `NSTemporaryDirectory()`. Sample
+  RSS during the gate before changing anything.
 
 Also raised: the CI serial-gate steps now run with
 `SWIFT_SAFE_TIMEOUT_SECONDS=2400`. The first macOS run to reach the suite was
