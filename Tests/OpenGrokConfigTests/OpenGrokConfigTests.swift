@@ -12,7 +12,11 @@ import OpenGrokConfigTypes
 import OpenGrokPaths
 import OpenGrokCLIChatProxyTypes
 #if canImport(CryptoKit)
+// Every use below is already `#if canImport(CryptoKit)`-guarded; the import
+// itself was not, which is enough to fail the Linux test build.
+#if canImport(CryptoKit)
 import CryptoKit
+#endif
 #endif
 
 // MARK: - BLAKE3 official vectors

@@ -12,9 +12,9 @@
 // reachable endpoint pinned at the mock, UTF-8 sink with a compact
 // customMirror, bounded polls.
 
-import CryptoKit
 import Foundation
 import Testing
+import OpenGrokFileUtils
 import OpenGrokHTTP
 import OpenGrokModels
 import OpenGrokPager
@@ -36,8 +36,9 @@ struct LiveRecapHelperTests {
     func instructionIsByteExact() {
         let instruction = LiveRecap.instruction(tag: "system-reminder")
         #expect(instruction.utf8.count == 1483)
-        let digest = SHA256.hash(data: Data(instruction.utf8))
-        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        // The port's own SHA256 rather than Apple-only CryptoKit, so this pin
+        // also runs on Linux.
+        let hex = FileChecksum.sha256Hex(instruction)
         #expect(hex == "444f088a31656fa196be682552887bdaae6d63b45a8fef1ddd59b9b8be736b17")
     }
 
