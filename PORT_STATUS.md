@@ -433,7 +433,19 @@ head `2eee3bd`, 2026-08-11):
 | --- | --- | --- |
 | Linux | exit **124** — 2130s silent, killed at the wrapper ceiling, no suite result at all | exit **1** — full suite runs, **5,832 tests in 935 suites in 333.8s, 28 issues** |
 | macOS | exit 1, died in `DefaultProtoCompiler falls back to PATH lookup` (3 of 3 runs) | exit 1, that test now **passes in 0.017s**; dies later, in `OpenGrok executable parity composition` |
-| Windows | 4 `cannot find … in scope` in `OpenGrokSystemPower` | fix landed after this run; unverified |
+| Windows | 4 `cannot find … in scope` in `OpenGrokSystemPower` | that module compiles; next module `OpenGrokPTY` fails (run [31526565339](https://github.com/mweinbach/swift-open-grok/actions/runs/31526565339)) |
+
+**The Windows tail regenerates, and this pass stops chasing it.** Removing the
+`powrprof.h` calls advanced the job by exactly one module: `OpenGrokPTY` now
+fails with ~10 `NSLock.lock()/unlock()` "unavailable from asynchronous
+contexts" errors plus a `Bool`/`Int` mismatch. That is the same class already
+fixed once in this PR for `OpenGrokTTY`, recurring in a module the compiler
+had never reached. None of it is caused by this PR's changes; it is a
+pre-existing backlog that only becomes visible one module at a time, and each
+attempt costs a full CI round trip because nothing local can type-check the
+Windows configuration. Fixing `OpenGrokPTY` is mechanical and probably worth
+doing — but expect the module after it, and do not treat "Windows compiles"
+as near.
 
 Linux going from *no signal* to *a complete suite result in five and a half
 minutes* is the single largest change here. Its 28 remaining issues are
