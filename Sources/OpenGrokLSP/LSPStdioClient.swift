@@ -101,6 +101,42 @@ public struct LSPStdioClientConfiguration: Sendable, Equatable {
     }
 }
 
+/// Exactly-once bridge from a `terminationHandler` callback to a continuation.
+///
+/// Both orderings have to work: the handler firing after the continuation is
+/// armed, and the child already being dead before we look. Resuming a checked
+/// continuation twice traps and resuming it zero times hangs, so the guard is
+/// the whole point.
+private final class TerminationOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var fired = false
+
+    func arm(_ continuation: CheckedContinuation<Void, Never>) {
+        lock.lock()
+        if fired {
+            lock.unlock()
+            continuation.resume()
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func fire() {
+        lock.lock()
+        if fired {
+            lock.unlock()
+            return
+        }
+        fired = true
+        let parked = continuation
+        continuation = nil
+        lock.unlock()
+        parked?.resume()
+    }
+}
+
 public actor LSPStdioClient {
     private let configuration: LSPStdioClientConfiguration
     private let process = Process()
@@ -180,27 +216,37 @@ public actor LSPStdioClient {
         let requestID = nextID()
         let body = try LSPJSONRPCRequest(id: requestID, method: method, params: params).encoded()
         let packet = LSPMessageFraming.encode(body)
-        do {
-            try stdinPipe.fileHandleForWriting.write(contentsOf: packet)
-        } catch {
-            throw LSPError.transport("LSP stdio write failed: \(error.localizedDescription)")
-        }
 
-        let response = try await withThrowingTaskGroup(of: LSPJSONRPCResponse.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { continuation in
-                    Task { await self.storeContinuation(continuation, for: requestID) }
+        // The timeout is a plain task, not a task-group sibling. A group does
+        // not return until every child finishes, and the child parked in
+        // `withCheckedThrowingContinuation` is not cancellable — so
+        // `cancelAll()` on timeout left the group waiting forever for a child
+        // nothing could resume. That converts a slow server into a permanent
+        // hang, which is strictly worse than the timeout it was implementing.
+        let timeout = configuration.requestTimeout
+        let timeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await self?.failPending(id: requestID, with: LSPError.timeout(method: method))
+        }
+        defer { timeoutTask.cancel() }
+
+        // Register the pending slot and write in the SAME actor-isolated step.
+        // Storing it through `Task { await self.storeContinuation(...) }` after
+        // the write let a fast server's response reach `deliver` while
+        // `pendingResponses` was still empty: the response was dropped, and the
+        // continuation stored a moment later had nothing left to resume it.
+        let response: LSPJSONRPCResponse = try await withCheckedThrowingContinuation { continuation in
+            pendingResponses[requestID] = continuation
+            do {
+                try stdinPipe.fileHandleForWriting.write(contentsOf: packet)
+            } catch {
+                if let pending = pendingResponses.removeValue(forKey: requestID) {
+                    pending.resume(throwing: LSPError.transport(
+                        "LSP stdio write failed: \(error.localizedDescription)"
+                    ))
                 }
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(self.configuration.requestTimeout * 1_000_000_000))
-                throw LSPError.timeout(method: method)
-            }
-            guard let first = try await group.next() else {
-                throw LSPError.transport("LSP request ended without a response")
-            }
-            group.cancelAll()
-            return first
         }
 
         switch response {
@@ -237,10 +283,39 @@ public actor LSPStdioClient {
         stderrPipe.fileHandleForReading.readabilityHandler = nil
         buffer.close()
         if process.isRunning {
-            process.terminate()
+            // This await used to be unbounded, and it hung the Linux CI suite
+            // until the wrapper's ceiling: `terminate()` returned, the child
+            // survived, and `terminationHandler` never fired, so nothing ever
+            // resumed the continuation.
+            //
+            // Three separate hazards, all closed here rather than reasoned
+            // away, because §2's rule is not to trust a death notification:
+            //   1. The handler was installed AFTER `terminate()`. If the child
+            //      dies in between, the notification is already spent and the
+            //      new handler never runs.
+            //   2. The child may already be dead when we look, so `isRunning`
+            //      is re-checked once the handler is in place.
+            //   3. SIGTERM may simply not land. The child is escalated to
+            //      SIGKILL, and the waiter is released unconditionally after
+            //      that.
+            //
+            // Cost: on a child that survives both signals, `close()` returns
+            // after ~4s without having reaped it, so a caller cannot treat
+            // return as proof the child is gone. That is the right trade — a
+            // leaked child is recoverable, a wedged suite is not. Do not
+            // "simplify" this back to awaiting the handler alone.
+            let once = TerminationOnce()
+            let pid = process.processIdentifier
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                process.terminationHandler = { _ in
-                    continuation.resume()
+                once.arm(continuation)
+                process.terminationHandler = { _ in once.fire() }
+                if !process.isRunning { once.fire() }
+                process.terminate()
+                DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                    kill(pid, SIGKILL)
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                        once.fire()
+                    }
                 }
             }
         }
@@ -271,11 +346,10 @@ public actor LSPStdioClient {
         }
     }
 
-    private func storeContinuation(
-        _ continuation: CheckedContinuation<LSPJSONRPCResponse, Error>,
-        for id: Int
-    ) {
-        pendingResponses[id] = continuation
+    private func failPending(id: Int, with error: Error) {
+        if let continuation = pendingResponses.removeValue(forKey: id) {
+            continuation.resume(throwing: error)
+        }
     }
 
     private func deliver(_ message: LSPJSONRPCResponse) {
