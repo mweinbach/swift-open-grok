@@ -46,14 +46,22 @@ struct LiveSettingsHonestyTests {
         let voiceHidden = LiveVoiceCapabilities.hiddenSettingsKeys(
             when: LiveVoiceComposition.resolveCapabilities()
         )
-        var unsupportedKeys: Set<String> = [
-            "antigravity_subagents",
-            "antigravity_skip_permissions",
-        ]
+        // CLI-presence gate (mirrors voice). Until the lead replaces the
+        // hard-coded hide in LiveComposition with
+        // `LiveAntigravityCapabilities.hiddenSettingsKeys`, a machine with
+        // `agy` on PATH still keeps the rows hidden — that is stricter than
+        // this assertion, not looser.
+        let antigravityHidden = LiveAntigravityCapabilities.hiddenSettingsKeys(
+            when: LiveAntigravityComposition.resolveCapabilities()
+        )
+        var unsupportedKeys = antigravityHidden
         unsupportedKeys.formUnion(voiceHidden)
 
         #expect(visibleKeys.isDisjoint(with: unsupportedKeys))
         #expect(unsupportedKeys.allSatisfy { overlay.registry.find($0) != nil })
+        #expect(Set(LiveAntigravityCapabilities.settingsKeys).allSatisfy {
+            overlay.registry.find($0) != nil
+        })
         // Dream and LSP are live; they must appear once their seams exist.
         #expect(visibleKeys.contains("memory.dream.enabled"))
         #expect(visibleKeys.contains("features.lsp_tools"))

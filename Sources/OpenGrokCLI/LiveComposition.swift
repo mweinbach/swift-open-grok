@@ -14698,10 +14698,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             ],
             locks: locks,
             hiddenKeys: LiveVoiceCapabilities.hiddenSettingsKeys(when: voiceState.capabilities)
-                .union([
-                    "antigravity_subagents",
-                    "antigravity_skip_permissions",
-                ]),
+                .union(LiveAntigravityCapabilities.hiddenSettingsKeys(
+                    when: LiveAntigravityComposition.resolveCapabilities(environment: environment)
+                )),
             // Auto-mode is live via HeuristicPermissionClassifier on every
             // PermissionHandle; dream and LSP rows are unhidden now that their
             // live seams exist. Voice rows stay capability-gated above.

@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-11 (Platform CI unbroken for the first time, `reference_to_video` and the ACP reverse permission bridge live. Serial gate exited 0 with **5,306 Swift Testing cases across 74 nonempty summaries**, zero failed summaries, and zero issues — but see the two known-flaky tests recorded below before treating repeat runs as green.)
+**As of:** 2026-08-11 (Platform CI unbroken for the first time; `reference_to_video`, the ACP reverse permission bridge, and a minimal Antigravity runner live. Serial gate exited 0 with **5,325 Swift Testing cases across 74 nonempty summaries**, zero failed summaries, and zero issues. macOS CI still fails on a runner-only hang in the proto tests, and one flaky test remains — both recorded below; do not read the local green as CI green.)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -193,11 +193,37 @@ summaries** and zero issues.
   `transport.closeCount == 1`. Each failed one serial run during this wave.
   A flaky suite cannot produce trustworthy CI evidence, so these block any
   claim that CI is reliably green.
-- **Antigravity was not started.** Scoped at ~1.5k lines of upstream runtime
-  (`agent/antigravity.rs`) plus `antigravity_runner.rs`, a CLI-presence gate,
-  model-slug advertisement, and resume metadata. Landing the settings rows
-  without the `agy --print` runner would register controls whose backing feature
-  does not exist, which §4 forbids, so the rows stay hidden.
+- **One of the two flaky tests is fixed.** `RhaiEngineTests.parallelIsABarrier`
+  yielded a fixed number of times and *hoped* its siblings had started, so an
+  exact `peakConcurrency` assertion failed whenever a loaded machine let one
+  call finish before the next began; callers pinning an exact peak now hold
+  every sibling at a rendezvous. The hub MCP `transport.closeCount == 1` flake
+  is **not** fixed and not explained: the only close path is
+  `disconnect → bridge.shutdown → transport.close`, all awaited, with no second
+  closer (`MCPToolBridge.unregister` only touches the toolset). It has not
+  reproduced since. Guessing a fix for a mechanism that reads as deterministic
+  would be worse than leaving it recorded.
+
+### Antigravity (2026-08-11) — minimal slice live
+
+`antigravity:<model>` now routes out of process to `agy --print` instead of
+spawning an in-process child session, matching upstream's dispatch
+(`antigravity.rs:35,41,67-81`, `antigravity_runner.rs:100-127`). The runner
+builds upstream's argv (`build_command`, `:549-578`), classifies stdout as text
+because `agy` exits 0 on errors (`classify_output`, `:483-526`), and bounds the
+child through `terminationHandler` — never `waitUntilExit`, per §2. Defaults
+match upstream: subagents off, `skip_permissions` on, with a caller-pinned
+read-only capability mode clamping it off (`antigravity_runner.rs:259-271`).
+
+The two settings rows are no longer hard-hidden; they are gated on `agy` being
+installed, the same shape voice uses and the same gate upstream applies
+(`settings_modal/state.rs:977-1000`). On a machine without the CLI they stay
+invisible, so no row advertises a feature that cannot run.
+
+**Deliberately not done:** log-tail phase heartbeats, the Language-Server HTTP
+quota/models probe, the `/usage` Antigravity section, `--conversation` resume
+(resuming an Antigravity child refuses), and effort-suffix retries — the bulk of
+`antigravity.rs` past the core `run_print` path.
 
 ### Platform state after the CI unbreak (2026-08-11, PR #1)
 
@@ -210,17 +236,29 @@ opaque red jobs into a concrete queue of real defects:
 | Linux | died at the bubblewrap probe | clears the probe, builds product **and** all test targets, runs the suite |
 | Windows | died on the first C target | past the C targets and `OpenGrokPaths`, now in test support |
 
-Two findings from the first runs that actually executed:
+Findings from the first runs that actually executed, and what was done:
 
-- **Linux dies on SIGPIPE (signal 13)** a moment into the suite. Linux
-  terminates on SIGPIPE by default where Apple platforms do not, so this is a
-  real runtime divergence in the port, not a CI artifact — nothing installs
-  `SIG_IGN` for it. Fixing it is the next Linux step; until then Linux has
-  compile evidence but no test evidence.
-- **Windows needs a BSD-sockets port in `OpenGrokTestSupport/CountingServer.swift`**
-  (`socket`, `AF_INET`, `setsockopt`, `sockaddr_in` are all absent without
-  WinSock), plus a `distance(to:)` use in `OpenGrokPaths`. That is a genuine
-  porting task, not a guard.
+- **Linux died on SIGPIPE (signal 13)** a moment into the suite — **fixed.** The
+  portable socket shim wrote with `write(2)`, which raises SIGPIPE once the peer
+  is gone; SIGPIPE is fatal by default on Linux, and Apple never reaches that
+  branch at all (the Swift layer prefers Network.framework whenever it can
+  import it), so no macOS run could have caught it. Writes now request `EPIPE`
+  via `MSG_NOSIGNAL`, `SO_NOSIGPIPE` is set at connect/accept where that is the
+  spelling, and the executable installs the process-wide ignore at startup
+  rather than leaving it to whichever subsystem initializes first.
+- **Windows** needed POSIX assumptions removed from `OpenGrokTestSupport`
+  (`CountingServer`, `HttpServer`, `EnvGuard`) and a `String.Index.distance(to:)`
+  call that does not exist. The two loopback servers now refuse on Windows with
+  a typed `HttpServerError.unsupportedPlatform` instead of pretending to bind;
+  `EnvGuard` routes through `_putenv_s`. A real Windows loopback server belongs
+  on the WinSock path `COpenGrokSockets` already implements — not done.
+- **macOS still fails its gate, and not on an assertion.** The run goes quiet
+  for eight and a half minutes inside the `OpenGrokBuildSupport` proto tests
+  (around `DefaultProtoCompiler`'s PATH-lookup case, which is also where an
+  earlier run stopped) and then exits 1 with no recorded issue. Those tests take
+  milliseconds locally, so this is a runner-specific hang rather than a slow
+  suite, and it is the next thing to chase — per §1, a run that stalls like this
+  is a hang to investigate, not a ceiling to raise again.
 
 Also raised: the CI serial-gate steps now run with
 `SWIFT_SAFE_TIMEOUT_SECONDS=2400`. The first macOS run to reach the suite was
@@ -229,8 +267,9 @@ cost is that a real hang now takes 40 minutes to surface.
 
 ### Still deferred from the audit
 
-Antigravity runner, durable subagent resume, relocation journal, portable
-WSS/custom CA, Linux SIGPIPE handling, and the Windows sockets port.
+Durable subagent resume, relocation journal, portable WSS/custom CA, the
+Windows WinSock loopback server, the macOS proto-test hang on CI, and the
+Antigravity follow-ons listed above.
 
 ## Wave 19 — Deferred parity follow-ons (2026-08-10, complete)
 

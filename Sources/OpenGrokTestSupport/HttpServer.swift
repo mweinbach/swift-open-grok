@@ -165,7 +165,7 @@ public final class HttpServer: @unchecked Sendable {
     #if canImport(Network)
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "opengrok-test-http-server")
-    #else
+    #elseif !os(Windows)
     private var listenFD: Int32 = -1
     private var acceptThread: Thread?
     #endif
@@ -184,6 +184,12 @@ public final class HttpServer: @unchecked Sendable {
     public func start() throws {
         #if canImport(Network)
         try startWithNetwork()
+        #elseif os(Windows)
+        // Same reasoning as CountingServer: the backend below is POSIX-only,
+        // and a Windows port belongs on the WinSock path COpenGrokSockets
+        // already implements. Refused by name so a Windows test fails saying
+        // so instead of timing out against a URL nothing ever served.
+        throw HttpServerError.unsupportedPlatform
         #else
         try startWithSockets()
         #endif
@@ -198,7 +204,7 @@ public final class HttpServer: @unchecked Sendable {
         #if canImport(Network)
         listener?.cancel()
         listener = nil
-        #else
+        #elseif !os(Windows)
         if listenFD >= 0 {
             close(listenFD)
             listenFD = -1
@@ -449,7 +455,7 @@ public final class HttpServer: @unchecked Sendable {
     }
     #endif // canImport(Network)
 
-    #if !canImport(Network)
+    #if !canImport(Network) && !os(Windows)
     private func startWithSockets() throws {
         // BSD socket implementation for Linux/Windows.
         listenFD = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
@@ -595,7 +601,7 @@ public final class HttpServer: @unchecked Sendable {
             }
         }
     }
-    #endif // !canImport(Network)
+    #endif // !canImport(Network) && !os(Windows)
 }
 
 /// Errors thrown by `HttpServer`.

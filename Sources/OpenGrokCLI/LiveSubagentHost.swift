@@ -29,9 +29,12 @@
 // hands each child a `LiveAgentCollaboration` with its team identity.
 //
 // Deliberately absent here (recorded in the slice report): worktree
-// isolation, the foreground await budget with auto-backgrounding, Antigravity
-// runners, and durable cross-process resume metadata. Resume works within the
-// session through the same conversation store the root session uses.
+// isolation, the foreground await budget with auto-backgrounding, and durable
+// cross-process resume metadata. Antigravity CLI runners live in
+// `LiveAntigravity.swift` / `LiveAntigravityRunner.swift` and branch from
+// `spawn` when the resolved model carries the `antigravity:` prefix. Resume
+// works within the session through the same conversation store the root
+// session uses (Antigravity `--conversation` resume is not wired this slice).
 
 import Foundation
 import OpenGrokAgentCoordinator
@@ -127,6 +130,10 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         /// `runTurn`): a child that has not converged in this many tool
         /// rounds is looping.
         var maxToolRounds: Int = 16
+        /// Injectable Antigravity CLI seam. Defaults to production so
+        /// `makeSubagentHost` needs no LiveComposition edit; tests swap a
+        /// fake that returns canned stdout/exit codes.
+        var antigravityServices: LiveAntigravityServices = .production
     }
 
     /// The one coordinator per root session (scope item 1). Exposed
@@ -463,8 +470,14 @@ actor LiveSubagentHost: LiveSubagentQuerying {
 
         // Explicit model slugs must resolve against the public catalog
         // (task/mod.rs step 2b); the error vocabulary is the resolution
-        // module's own (`ResolutionError.modelUnavailable`).
-        if let requestedModel = sanitizeOptionalArg(input.model),
+        // module's own (`ResolutionError.modelUnavailable`). Antigravity
+        // slugs bypass the catalog — spawn validation below is authoritative
+        // (antigravity.rs:333-337; antigravity_runner.rs:100-127).
+        let requestedModelSlug = sanitizeOptionalArg(input.model)
+        let requestedAntigravityModel = requestedModelSlug
+            .flatMap(LiveAntigravityComposition.stripModelPrefix)
+        if let requestedModel = requestedModelSlug,
+           requestedAntigravityModel == nil,
            !context.modelSlugs.contains(requestedModel) {
             return .failure(.invalidCall("subagent model \"\(requestedModel)\" is unavailable"))
         }
@@ -577,10 +590,51 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         }
 
         let childModel = runtime.model ?? context.parentModel
+        let antigravityModel = LiveAntigravityComposition.stripModelPrefix(childModel)
         // Upstream assigns `Uuid::now_v7()`. The port has no v7 helper; a v4
         // UUID costs the time-ordered id sort (cosmetic only — completion
         // order is tracked separately), noted in the slice report.
         let childID = sanitizeOptionalArg(input.taskId) ?? UUID().uuidString.lowercased()
+
+        // Antigravity gates, eager and in this order
+        // (antigravity_runner.rs:100-127), before coordinator.spawn so a
+        // background spawn cannot escape with a refusal.
+        if let antigravityModel {
+            if let resumeID {
+                return .failure(.invalidCall(
+                    LiveAntigravityRefusal.cannotResume(subagentID: resumeID)
+                ))
+            }
+            let config = context.antigravityServices.loadConfig(context.environment)
+            guard config.enabled else {
+                return .failure(.invalidCall(LiveAntigravityRefusal.featureDisabled))
+            }
+            guard context.antigravityServices.isCLIInstalled(
+                config.binary,
+                context.environment
+            ) else {
+                return .failure(.invalidCall(
+                    LiveAntigravityRefusal.cliNotInstalled(binary: config.binary)
+                ))
+            }
+            let status = await context.antigravityServices.probeModels(config.binary)
+            guard status.signedIn else {
+                return .failure(.invalidCall(
+                    LiveAntigravityRefusal.notSignedIn(
+                        binary: config.binary,
+                        detail: status.detail ?? "sign-in required"
+                    )
+                ))
+            }
+            if !status.models.isEmpty, !status.models.contains(antigravityModel) {
+                return .failure(.invalidCall(
+                    LiveAntigravityRefusal.unknownModel(
+                        antigravityModel,
+                        available: status.prefixedModels
+                    )
+                ))
+            }
+        }
 
         // The child's tool policy: the resolved definition after the nested
         // spawn/plan strip and the capability filter, so the child can never
@@ -616,7 +670,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         let request = OpenGrokChildRequest(
             id: childID,
             parentSessionID: context.sessionID,
-            owner: .task,
+            owner: antigravityModel == nil ? .task : .antigravity,
             runInBackground: input.runInBackground,
             capabilityMode: runtime.capabilityMode?.rawValue,
             reasoningEffort: runtime.reasoningEffort,
@@ -624,12 +678,21 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             surfaceCompletion: true
         )
         do {
-            try await coordinator.spawn(request) { [context, weak self] in
+            try await coordinator.spawn(request) { [weak self] in
                 guard let self else {
                     return OpenGrokChildResult(
                         id: childID,
                         success: false,
                         error: "subagent host was torn down before the child ran"
+                    )
+                }
+                if let antigravityModel {
+                    return await self.runAntigravityChild(
+                        childID: childID,
+                        prompt: input.prompt,
+                        model: antigravityModel,
+                        runtime: childRuntime,
+                        cwd: childCWD
                     )
                 }
                 return await self.runChild(

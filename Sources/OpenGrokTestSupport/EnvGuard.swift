@@ -19,6 +19,31 @@
 import Foundation
 import OpenGrokTestUtilities
 
+#if os(Windows)
+import ucrt
+#endif
+
+/// `setenv`/`unsetenv` are POSIX and absent from the Windows CRT, where
+/// `_putenv_s` with an empty value is the documented removal. Wrapped once so
+/// the four mutation sites below read identically on every platform; the cost
+/// is that a Windows caller cannot distinguish "set to empty" from "unset",
+/// which matches what the CRT itself offers.
+private func envSet(_ key: String, _ value: String) {
+    #if os(Windows)
+    _ = _putenv_s(key, value)
+    #else
+    setenv(key, value, 1)
+    #endif
+}
+
+private func envUnset(_ key: String) {
+    #if os(Windows)
+    _ = _putenv_s(key, "")
+    #else
+    unsetenv(key)
+    #endif
+}
+
 /// RAII guard for a single environment variable in serial tests: snapshots
 /// the prior value on construction, applies the change, then restores the
 /// prior value (or unsets it) on `dispose` — even if an assertion throws.
@@ -83,7 +108,7 @@ public final class EnvGuard {
         // readers of the global environ.
         EnvGuardCoordinator.shared.acquireGlobal()
         let prior = ProcessInfo.processInfo.environment[key]
-        setenv(key, value, 1)
+        envSet(key, value)
         return EnvGuard(key: key, prior: prior, isLiveProcessEnv: true)
     }
 
@@ -94,7 +119,7 @@ public final class EnvGuard {
     public static func unset(_ key: String) -> EnvGuard {
         EnvGuardCoordinator.shared.acquireGlobal()
         let prior = ProcessInfo.processInfo.environment[key]
-        unsetenv(key)
+        envUnset(key)
         return EnvGuard(key: key, prior: prior, isLiveProcessEnv: true)
     }
 
@@ -119,9 +144,9 @@ public final class EnvGuard {
         guard isLiveProcessEnv, !disposed else { return }
         disposed = true
         if let prior {
-            setenv(key, prior, 1)
+            envSet(key, prior)
         } else {
-            unsetenv(key)
+            envUnset(key)
         }
         EnvGuardCoordinator.shared.releaseGlobal()
     }
@@ -134,9 +159,9 @@ public final class EnvGuard {
         // (which would clobber a subsequent guard's value).
         if isLiveProcessEnv, !disposed {
             if let prior {
-                setenv(key, prior, 1)
+                envSet(key, prior)
             } else {
-                unsetenv(key)
+                envUnset(key)
             }
             EnvGuardCoordinator.shared.releaseGlobal()
         }
