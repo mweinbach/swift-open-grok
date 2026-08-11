@@ -602,6 +602,12 @@ public final class HttpServer: @unchecked Sendable {
 public enum HttpServerError: Error, Equatable {
     case startupTimeout
     case bindFailed
+    /// No loopback server backend for this platform. Distinct from
+    /// `bindFailed` on purpose: a test that hits this has not found a busy
+    /// port, it is running somewhere the harness was never ported to, and
+    /// reporting it as a bind failure would send the reader hunting a
+    /// nonexistent port conflict.
+    case unsupportedPlatform
 }
 
 /// Lock-protected box for the bound URL, so the `@Sendable` state handler can

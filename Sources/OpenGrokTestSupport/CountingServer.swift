@@ -134,7 +134,7 @@ private final class CountingServerImpl: @unchecked Sendable {
     #if canImport(Network)
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "opengrok-counting-server")
-    #else
+    #elseif !os(Windows)
     private var listenFD: Int32 = -1
     private var acceptThread: Thread?
     #endif
@@ -149,6 +149,13 @@ private final class CountingServerImpl: @unchecked Sendable {
     func start() throws {
         #if canImport(Network)
         try startWithNetwork()
+        #elseif os(Windows)
+        // The BSD backend below is POSIX-only; Windows would need the WinSock
+        // path that `COpenGrokSockets` already implements for the production
+        // transports. Refused explicitly rather than silently binding nothing,
+        // so a Windows test that needs a loopback server fails naming the
+        // reason instead of timing out on a URL that was never served.
+        throw HttpServerError.unsupportedPlatform
         #else
         try startWithSockets()
         #endif
@@ -162,7 +169,7 @@ private final class CountingServerImpl: @unchecked Sendable {
         #if canImport(Network)
         listener?.cancel()
         listener = nil
-        #else
+        #elseif !os(Windows)
         if listenFD >= 0 {
             close(listenFD)
             listenFD = -1
@@ -313,7 +320,7 @@ private final class CountingServerImpl: @unchecked Sendable {
     }
     #endif // canImport(Network)
 
-    #if !canImport(Network)
+    #if !canImport(Network) && !os(Windows)
     private func startWithSockets() throws {
         listenFD = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
         if listenFD < 0 { throw HttpServerError.bindFailed }
@@ -426,7 +433,7 @@ private final class CountingServerImpl: @unchecked Sendable {
         }
         close(fd)
     }
-    #endif // !canImport(Network)
+    #endif // !canImport(Network) && !os(Windows)
 }
 
 /// Write all `count` bytes from `ptr` to `fd`, retrying partial writes.
@@ -434,7 +441,7 @@ private final class CountingServerImpl: @unchecked Sendable {
 /// counting-server implementation to ensure the complete HTTP response is
 /// written exactly once, even if the kernel only accepts part of it per
 /// `write` syscall.
-#if !canImport(Network)
+#if !canImport(Network) && !os(Windows)
 @inline(__always)
 private func writeAll(fd: Int32, bytes: UnsafePointer<CChar>, count: Int) -> Bool {
     var sent = 0

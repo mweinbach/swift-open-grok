@@ -119,6 +119,27 @@ static int og_set_nonblocking(int socket_value, int enabled) {
 
 #endif
 
+/* Ask for EPIPE instead of SIGPIPE on a dead peer. Linux exposes this per-call
+   as MSG_NOSIGNAL; Apple exposes it per-socket as SO_NOSIGPIPE and has no send
+   flag. Exactly one of the two applies on any given platform, so both are
+   defined unconditionally and each collapses to a no-op where it is absent. */
+#if defined(MSG_NOSIGNAL)
+#define OG_SEND_NOSIGNAL_FLAGS MSG_NOSIGNAL
+#else
+#define OG_SEND_NOSIGNAL_FLAGS 0
+#endif
+
+static void og_disable_sigpipe(OGSocketHandle handle) {
+#if !defined(_WIN32) && defined(SO_NOSIGPIPE)
+    int on = 1;
+    (void)setsockopt(
+        og_socket_value(handle), SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on)
+    );
+#else
+    (void)handle;
+#endif
+}
+
 static int og_wait_connected(
     OGSocketHandle handle,
     double timeout_seconds
@@ -329,6 +350,7 @@ int og_socket_tcp_connect(
         OGSocketHandle candidate = og_socket_handle(socket_value);
 #endif
         if (og_connect_socket(candidate, entry->ai_addr, (og_socklen_t)entry->ai_addrlen, timeout_seconds) == 0) {
+            og_disable_sigpipe(candidate);
             *handle = candidate;
             result = 0;
             break;
@@ -407,6 +429,7 @@ int og_socket_unix_connect(
         close(socket_value);
         return -1;
     }
+    og_disable_sigpipe(candidate);
     *handle = candidate;
     return 0;
 }
@@ -456,6 +479,7 @@ int og_socket_accept(OGSocketHandle listener, OGSocketHandle *handle) {
         return -1;
     }
 #endif
+    og_disable_sigpipe(og_socket_handle(accepted));
     *handle = og_socket_handle(accepted);
     return 0;
 }
@@ -502,7 +526,20 @@ int64_t og_socket_write_all(
         og_set_error(code, NULL);
         return -1;
 #else
-        ssize_t count = write(og_socket_value(handle), (const char *)buffer + written, length - written);
+        /* `write()` on a socket raises SIGPIPE once the peer is gone, and
+           SIGPIPE is fatal by default — which killed the entire test process on
+           Linux a moment into the suite. Apple never reaches this branch (the
+           Swift layer takes the Network.framework path whenever it can import
+           it), so the failure was invisible to every macOS run. `send` with
+           MSG_NOSIGNAL asks the kernel for EPIPE instead of the signal;
+           platforms without the flag rely on SO_NOSIGPIPE, set at accept/
+           connect time by og_disable_sigpipe. */
+        ssize_t count = send(
+            og_socket_value(handle),
+            (const char *)buffer + written,
+            length - written,
+            OG_SEND_NOSIGNAL_FLAGS
+        );
         if (count > 0) {
             written += (size_t)count;
             continue;

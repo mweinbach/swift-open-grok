@@ -212,7 +212,10 @@ internal func windowsPrefix(_ path: String) -> WindowsPrefix? {
                     let prefixEnd = remainder.index(after: secondSep)
                     let prefixString = "\\\\?\\UNC\\" + String(remainder[..<prefixEnd])
                     // Convert dropFirst offset back to original index.
-                    let endInOriginal = path.index(path.startIndex, offsetBy: 8 + distance(from: remainder.startIndex, to: prefixEnd))
+                    let endInOriginal = path.index(
+                        path.startIndex,
+                        offsetBy: 8 + remainder.distance(from: remainder.startIndex, to: prefixEnd)
+                    )
                     return WindowsPrefix(string: prefixString, nextIndex: endInOriginal)
                 }
             }
@@ -236,7 +239,10 @@ internal func windowsPrefix(_ path: String) -> WindowsPrefix? {
     if path.hasPrefix("\\\\.\\") {
         let after = path.dropFirst(4)
         if let sep = after.firstIndex(where: { $0 == "\\" || $0 == "/" }) {
-            let prefixEnd = path.index(path.startIndex, offsetBy: 4 + distance(from: after.startIndex, to: sep))
+            let prefixEnd = path.index(
+                path.startIndex,
+                offsetBy: 4 + after.distance(from: after.startIndex, to: sep)
+            )
             return WindowsPrefix(string: String(path[path.startIndex..<prefixEnd]), nextIndex: prefixEnd)
         }
         return WindowsPrefix(string: String(path), nextIndex: path.endIndex)
@@ -250,7 +256,10 @@ internal func windowsPrefix(_ path: String) -> WindowsPrefix? {
             if let secondSep = after[afterServer...].firstIndex(where: { $0 == "\\" || $0 == "/" }) {
                 let shareEnd = after.index(after: secondSep)
                 let prefixString = leading + String(after[..<shareEnd])
-                let endInOriginal = path.index(path.startIndex, offsetBy: 2 + distance(from: after.startIndex, to: shareEnd))
+                let endInOriginal = path.index(
+                    path.startIndex,
+                    offsetBy: 2 + after.distance(from: after.startIndex, to: shareEnd)
+                )
                 return WindowsPrefix(string: prefixString, nextIndex: endInOriginal)
             }
         }
@@ -270,10 +279,6 @@ internal func windowsPrefix(_ path: String) -> WindowsPrefix? {
     return nil
 }
 
-@inlinable
-internal func distance(from start: String.Index, to end: String.Index) -> Int {
-    return start.distance(to: end)
-}
 #endif
 
 // MARK: - Lexical normalization
