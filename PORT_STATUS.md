@@ -393,6 +393,38 @@ no measurable RSS growth. The RSS sample §1 asked for was taken on Linux only;
 no macOS host was available to this pass. If the macOS gate still dies at the
 same test, this fix was not it.
 
+**Linux gate — the hang, found and fixed.** The Linux job did not fail, it
+stopped: 2130 seconds of silence, then the wrapper's ceiling (exit 124). It
+reproduces in isolation in about fifteen seconds under
+`--filter PullDiagnosticsTests`, so it was never load-dependent — Linux had
+simply never run far enough to reach these tests. `LSPStdioClient.close()`
+parked forever on the child's termination: `terminate()` returned, the child
+survived, and `terminationHandler` never fired. Two further hang paths in the
+same file were found while tracing it — a response race that dropped the reply
+(the pending continuation was stored *after* the write, by a separate task),
+and a timeout that could not fire because it was a task-group sibling and the
+group could not tear down around a non-cancellable child. All three are fixed;
+`--filter "PullDiagnosticsTests|SyncDiagnostics|LSPConfigTests"` reports 11
+tests in 3 suites passing in 8.1s. **Pre-existing on `main`**, exposed rather
+than caused by this PR.
+
+**Windows divergence (2026-08-11, deliberate): no suspend/resume
+notifications.** `OpenGrokSystemPower` called
+`PowerRegisterSuspendResumeNotification`,
+`PowerUnregisterSuspendResumeNotification`,
+`DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS` and `DEVICE_NOTIFY_CALLBACK`, which live
+in `powrprof.h` and are not re-exported by Swift's WinSDK overlay — so the
+module could not compile and the Windows job died there on every push. Since
+no Windows binary has ever existed, that code has never run. `startListener`
+now returns `nil` on Windows, which is what
+`SystemPowerNotifications.start` already documents as "no power notifications,
+degrade gracefully", so no caller needs a Windows branch. **Cost: Windows gets
+no willSleep/didWake callbacks and anything keyed to sleep transitions is inert
+there.** Power *leases* still work; `SetThreadExecutionState` is in
+`winbase.h` and compiles. Restoring the notifications needs a C shim target
+including `<powrprof.h>` and linking `PowrProf.lib`, the same shape as
+`OpenGrokPTYC`.
+
 **Not acted on, surfaced instead:** the reviewer's request to remove
 `options: --privileged` from the Linux PR job, and its request to restore the
 600s suite ceiling. Both are `.github/workflows/ci.yml` changes whose current

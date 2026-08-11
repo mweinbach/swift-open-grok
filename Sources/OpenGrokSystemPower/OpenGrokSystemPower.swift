@@ -9,7 +9,8 @@
 // Platform seams:
 //   - macOS: IOKit system-power notifications + IOPMAssertionCreateWithName
 //   - Linux: logind PrepareForSleep (best-effort busctl) + systemd-inhibit
-//   - Windows: PowerRegisterSuspendResumeNotification + SetThreadExecutionState
+//   - Windows: SetThreadExecutionState only. Suspend/resume notifications are
+//     absent — see `WindowsPower` for why and what restoring them costs.
 
 import Foundation
 
@@ -616,23 +617,30 @@ public struct WindowsPowerAdapter: PowerAdapter, Sendable {
 
 public typealias PlatformPowerAdapter = WindowsPowerAdapter
 
-/// Context for PowerRegisterSuspendResumeNotification.
-private final class WindowsPowerContext: @unchecked Sendable {
-    let callback: PowerCallback
-    init(callback: @escaping PowerCallback) { self.callback = callback }
-}
-
-/// Windows suspend/resume + execution-state helpers.
+/// Windows execution-state helpers.
+///
+/// Suspend/resume notifications are **absent on Windows**, deliberately.
+/// `PowerRegisterSuspendResumeNotification`,
+/// `PowerUnregisterSuspendResumeNotification`,
+/// `DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS` and `DEVICE_NOTIFY_CALLBACK` live in
+/// `powrprof.h`, which Swift's WinSDK overlay does not re-export, so the code
+/// that called them could not compile — it failed the Windows job on every
+/// push and no Windows binary has ever existed to test it against.
+///
+/// `startListener` returns `nil` here, which is the contract
+/// `SystemPowerNotifications.start` already documents as "no power
+/// notifications, degrade gracefully", so no caller needs a Windows branch.
+/// Cost: Windows gets no willSleep/didWake callbacks, so anything keyed to
+/// sleep transitions is inert there. Power *leases* still work —
+/// `SetThreadExecutionState` is in `winbase.h` and does compile. Restoring the
+/// notifications needs a C shim target including `<powrprof.h>` and linking
+/// `PowrProf.lib`, the same shape as `OpenGrokPTYC`; do not restore these
+/// calls in Swift without one.
 public enum WindowsPower {
     // ES flags (winbase.h)
     private static let esSystemRequired: UInt32 = 0x0000_0001
     private static let esDisplayRequired: UInt32 = 0x0000_0002
     private static let esContinuous: UInt32 = 0x8000_0000
-
-    // Power broadcast types
-    private static let pbtAPMSuspend: UInt32 = 0x0004
-    private static let pbtAPMResumeSuspend: UInt32 = 0x0007
-    private static let pbtAPMResumeAutomatic: UInt32 = 0x0012
 
     static func currentState() -> PowerState { .unknown }
 
@@ -658,43 +666,8 @@ public enum WindowsPower {
     }
 
     static func startListener(_ callback: @escaping PowerCallback) -> SystemPowerListener? {
-        #if canImport(WinSDK)
-        let ctx = WindowsPowerContext(callback: callback)
-        let ctxPtr = Unmanaged.passRetained(ctx)
-        var params = DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS(
-            Callback: { context, eventType, _ in
-                guard let context else { return 0 }
-                let c = Unmanaged<WindowsPowerContext>.fromOpaque(context).takeUnretainedValue()
-                switch eventType {
-                case WindowsPower.pbtAPMSuspend:
-                    c.callback(.willSleep)
-                case WindowsPower.pbtAPMResumeSuspend, WindowsPower.pbtAPMResumeAutomatic:
-                    c.callback(.didWake)
-                default:
-                    break
-                }
-                return 0
-            },
-            Context: ctxPtr.toOpaque()
-        )
-        var handle: HPOWERNOTIFY?
-        let status = PowerRegisterSuspendResumeNotification(
-            DWORD(DEVICE_NOTIFY_CALLBACK),
-            &params,
-            &handle
-        )
-        guard status == 0, let handle else {
-            ctxPtr.release()
-            return nil
-        }
-        return SystemPowerListener {
-            PowerUnregisterSuspendResumeNotification(handle)
-            ctxPtr.release()
-        }
-        #else
         _ = callback
         return nil
-        #endif
     }
 }
 
