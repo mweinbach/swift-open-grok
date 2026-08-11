@@ -273,6 +273,10 @@ private func targets() -> [Target] {
     // W5-S4: MCP base; ComputerHubMCPAdapter -> MCP.
     t.append(.target(name: "OpenGrokMCP", dependencies: dep(w0s2, w0s3, w1s1, w1s4, w1s5, w2s1, w2s2, w4s4, w4s1)))
     t.append(.target(name: "OpenGrokComputerHubMCPAdapter", dependencies: dep(w0s2, w0s3, w1s1, w1s4, w1s5, w2s1, w2s2, w4s4, ["OpenGrokMCP"])))
+    // OpenGrokLSP: stdio JSON-RPC client and pull-model diagnostics
+    // (`textDocument/diagnostic`). Consumed by OpenGrokCLI's LiveLspComposition;
+    // the edge stays one-way — this target must never import CLI/pager code.
+    t.append(.target(name: "OpenGrokLSP", dependencies: dep(w0s4)))
     // W5-S5: Hooks base; PluginMarketplace -> Hooks.
     t.append(.target(name: "OpenGrokHooks", dependencies: dep(w0s2, w0s3, w1s4, w1s5, w2s1, w2s2, w4s3, w4s1)))
     t.append(.target(name: "OpenGrokPluginMarketplace", dependencies: dep(w0s2, w0s3, w1s4, w1s5, w2s1, w2s2, w4s3, ["OpenGrokHooks"])))
@@ -348,7 +352,7 @@ private func targets() -> [Target] {
     // `scheduler_*` tool handlers, the session scheduler host, and `/loop`
     // consume the pure library; the edge stays one-way — the scheduler
     // target must never import back (see its declaration).
-    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s4, w2s5, w3s1, w3s2, w3s3, w4s2, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w6s5, w7s3, w7s4, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokToolTypes", "OpenGrokCodeMode", "OpenGrokReleaseValidation", "OpenGrokDiagnostics", "OpenGrokScheduler"])))
+    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s4, w2s5, w3s1, w3s2, w3s3, w4s2, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w6s5, w7s3, w7s4, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokToolTypes", "OpenGrokCodeMode", "OpenGrokReleaseValidation", "OpenGrokDiagnostics", "OpenGrokScheduler", "OpenGrokLSP"])))
 
     // ---- Wave 11 (libraries + executable) ----
     // Distribution support only imports build support, version, and update
@@ -417,6 +421,11 @@ private func targets() -> [Target] {
     t.append(contentsOf: tests(["OpenGrokWebMediaTools"]))
     t.append(contentsOf: tests(w5s3))
     t.append(contentsOf: tests(["OpenGrokMCP", "OpenGrokComputerHubMCPAdapter"]))
+    t.append(.testTarget(
+        name: "OpenGrokLSPTests",
+        dependencies: dep(["OpenGrokLSP"]),
+        exclude: ["Fixtures/mock_pull_lsp.py"]
+    ))
     t.append(contentsOf: tests(["OpenGrokHooks", "OpenGrokPluginMarketplace"]))
     t.append(contentsOf: tests(w5s6))
     t.append(contentsOf: tests(["OpenGrokJavaScriptRuntime", "OpenGrokCodeMode"]))
