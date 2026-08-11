@@ -425,6 +425,35 @@ there.** Power *leases* still work; `SetThreadExecutionState` is in
 including `<powrprof.h>` and linking `PowrProf.lib`, the same shape as
 `OpenGrokPTYC`.
 
+**Verified CI state after this pass** (run
+[31524927247](https://github.com/mweinbach/swift-open-grok/actions/runs/31524927247),
+head `2eee3bd`, 2026-08-11):
+
+| Job | Before this pass | After |
+| --- | --- | --- |
+| Linux | exit **124** — 2130s silent, killed at the wrapper ceiling, no suite result at all | exit **1** — full suite runs, **5,832 tests in 935 suites in 333.8s, 28 issues** |
+| macOS | exit 1, died in `DefaultProtoCompiler falls back to PATH lookup` (3 of 3 runs) | exit 1, that test now **passes in 0.017s**; dies later, in `OpenGrok executable parity composition` |
+| Windows | 4 `cannot find … in scope` in `OpenGrokSystemPower` | fix landed after this run; unverified |
+
+Linux going from *no signal* to *a complete suite result in five and a half
+minutes* is the single largest change here. Its 28 remaining issues are
+pre-existing and none are in code this PR touched: 14 are
+`OpenGrokSQLiteJournal` reporting "SQLite3 module not available" in the
+`swift:6.3.3-jammy` container, 4 are voice capability on a machine with no
+capture device, and the rest are the dashboard, auto-update, welcome-banner,
+agents-config, pager-docs and security-release-gate suites. They were
+invisible before only because the suite never finished.
+
+**macOS is NOT fixed, and the proto change is not confirmed as its cause.**
+The named suspect was real and its test now passes, but the job still exits 1
+— now inside `OpenGrok executable parity composition`, on
+`live composition applies agent profiles with CLI model precedence`, a test
+that stands up the whole live application. Same signature as before: silence,
+then exit 1, no assertion and no signal name. That suite is expensive on Linux
+too (a 92-second gap in the same place) but does not die there, so the Linux
+reproduction technique that cracked the LSP hang does not apply, and no macOS
+host was available to this pass. Recorded as open rather than guessed at.
+
 **Not acted on, surfaced instead:** the reviewer's request to remove
 `options: --privileged` from the Linux PR job, and its request to restore the
 600s suite ceiling. Both are `.github/workflows/ci.yml` changes whose current
