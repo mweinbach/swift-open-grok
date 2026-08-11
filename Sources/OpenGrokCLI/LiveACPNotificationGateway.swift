@@ -71,7 +71,8 @@ enum LiveACPInboundNotifications {
         permissionMode: LiveSessionPermissionMode?,
         permissions: PermissionHandle?,
         swarmMode: LiveSwarmModeState,
-        gateway: ACPNotificationGateway
+        gateway: ACPNotificationGateway,
+        permissionPrompter: LiveACPPermissionPrompter? = nil
     ) -> ACPExtensionNotificationRouter {
         ACPExtensionNotificationRouter()
             .register(
@@ -87,7 +88,10 @@ enum LiveACPInboundNotifications {
             )
             .register(
                 exact: LiveACPPermissionsResetHandler.method,
-                handler: LiveACPPermissionsResetHandler(permissions: permissions)
+                handler: LiveACPPermissionsResetHandler(
+                    permissions: permissions,
+                    prompter: permissionPrompter
+                )
             )
     }
 }
@@ -221,13 +225,27 @@ struct LiveACPSwarmModeHandler: ACPAgentExtensionNotificationHandler {
 /// disallows / pin / config — the same partition. Upstream also persists the
 /// cleared state to disk; this handle is in-memory only (divergence 3's
 /// sibling, recorded in the file header).
+///
+/// The ACP reverse prompter keeps its own allow-always answers (an ACP client
+/// grants over `session/request_permission`, not through the handle), so the
+/// reset has to clear BOTH. Resetting only the handle left
+/// `isSessionPreapproved` returning allow for edits, bash, web fetch and MCP
+/// tools the client had already granted — the advertised reset would not have
+/// revoked the permissions it just granted.
 struct LiveACPPermissionsResetHandler: ACPAgentExtensionNotificationHandler {
     static let method = "x.ai/permissions/reset"
 
     let permissions: PermissionHandle?
+    let prompter: LiveACPPermissionPrompter?
 
     func handle(method: String, params: JSONValue) async {
         await permissions?.resetState()
+        // A notification that names no session resets every session's grants:
+        // for a reset, over-clearing costs an extra prompt while
+        // under-clearing leaves an authorization standing.
+        let sessionId = params["sessionId"]?.stringValue
+            ?? params["session_id"]?.stringValue
+        await prompter?.resetGrants(for: sessionId.map { AcpSessionId($0) })
     }
 }
 

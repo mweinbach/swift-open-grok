@@ -152,12 +152,49 @@ public struct LiveACPPromptDriver: ACPPromptDriver {
         context: ACPPromptContext,
         emit: @escaping @Sendable (SessionNotification, ACPNotificationDisposition) async -> Void
     ) async throws -> PromptResponse {
-        // Bind before the turn so a tool that prompts mid-turn sees this
-        // session id. Single active prompt per process is the common ACP
-        // shape; overlapping prompts on distinct sessions would race this
-        // slot — cost of the additive seam vs. threading session through
-        // `PermissionPrompter`.
-        await permissionPrompter?.bindSession(context.request.sessionId)
+        // Scope the session to THIS turn, two ways.
+        //
+        // The task-local is the authoritative one: it rides structured
+        // concurrency into the tool call, so a mid-turn permission request
+        // carries its own session even while another session's turn is in
+        // flight. `PermissionPrompter.prompt` has no session parameter, and a
+        // single bound slot on the prompter actor gave the later of two
+        // overlapping turns' session id to both — the reverse request would
+        // then ask session B's user to authorize session A's tool call.
+        //
+        // The begin/end refcount is the fallback for any dispatch that loses
+        // the task-local (a detached task does not inherit one). It resolves
+        // when exactly one turn is live and fails closed when several are, so
+        // losing the task-local costs an extra prompt or a denial, never a
+        // misattributed approval.
+        // Decremented on both exits explicitly rather than in a `defer`: a
+        // `defer` cannot await, so it would have to spawn the decrement and
+        // leave the count high for a window after the turn ended.
+        if let permissionPrompter {
+            await permissionPrompter.beginTurn(context.request.sessionId)
+        }
+        do {
+            let response = try await LiveACPPermissionPrompter.$activeSession.withValue(
+                context.request.sessionId
+            ) {
+                try await runTurn(context: context, emit: emit)
+            }
+            if let permissionPrompter {
+                await permissionPrompter.endTurn(context.request.sessionId)
+            }
+            return response
+        } catch {
+            if let permissionPrompter {
+                await permissionPrompter.endTurn(context.request.sessionId)
+            }
+            throw error
+        }
+    }
+
+    private func runTurn(
+        context: ACPPromptContext,
+        emit: @escaping @Sendable (SessionNotification, ACPNotificationDisposition) async -> Void
+    ) async throws -> PromptResponse {
         if !availableCommands.isEmpty {
             await emit(
                 SessionNotification(

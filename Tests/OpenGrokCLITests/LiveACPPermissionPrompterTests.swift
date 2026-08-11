@@ -274,3 +274,187 @@ struct LiveACPPermissionPrompterTests {
         }
     }
 }
+
+// MARK: - Session-scoped grants
+
+/// Answers a scripted sequence and records what was actually asked, so a test
+/// can assert that a SECOND request was issued (or was not) rather than only
+/// inspecting the final decision — a preapproval bug is invisible from the
+/// decision alone, since both paths return allow.
+private actor ScriptedACPPermissionClient: ACPPermissionReverseClient {
+    private var responses: [RequestPermissionResponse]
+    private(set) var requests: [RequestPermissionRequest] = []
+
+    init(_ responses: [RequestPermissionResponse]) {
+        self.responses = responses
+    }
+
+    func requestClient(method: String, params: JSONValue) async throws -> JSONValue {
+        requests.append(try params.decode(RequestPermissionRequest.self))
+        guard !responses.isEmpty else {
+            throw ACPRuntimeError.transport("no scripted permission response left")
+        }
+        return try JSONValue.encode(responses.removeFirst())
+    }
+
+    func askedSessionIds() -> [String] { requests.map(\.sessionId.rawValue) }
+    func askCount() -> Int { requests.count }
+}
+
+@Suite("ACP reverse permission grant scoping")
+struct LiveACPPermissionGrantScopingTests {
+    @Test("allow-always for one session does not preapprove another session")
+    func grantsDoNotLeakAcrossSessions() async throws {
+        let client = ScriptedACPPermissionClient([
+            selected("allow-edits-session"),
+            selected("reject-once"),
+        ])
+        let prompter = LiveACPPermissionPrompter(client: client, timeoutSeconds: 5)
+
+        await prompter.bindSession(AcpSessionId("sess-a"))
+        let granted = await prompter.prompt(
+            access: .edit("/work/a.swift"), toolName: "search_replace", toolCallId: "tc-1"
+        )
+        #expect(granted == .allow)
+
+        // Same session: the grant answers without asking again.
+        let reused = await prompter.prompt(
+            access: .edit("/work/b.swift"), toolName: "search_replace", toolCallId: "tc-2"
+        )
+        #expect(reused == .allow)
+        #expect(await client.askCount() == 1)
+
+        // Different session: must reach the client on its own behalf.
+        await prompter.bindSession(AcpSessionId("sess-b"))
+        let otherSession = await prompter.prompt(
+            access: .edit("/work/c.swift"), toolName: "search_replace", toolCallId: "tc-3"
+        )
+        #expect(otherSession.isAllow == false)
+        #expect(await client.askCount() == 2)
+        #expect(await client.askedSessionIds() == ["sess-a", "sess-b"])
+    }
+
+    @Test("reject-always for bash denies later requests without re-asking")
+    func rejectAlwaysBashPersists() async throws {
+        let client = ScriptedACPPermissionClient([
+            selected("reject-always"),
+            selected("allow-once"),
+        ])
+        let prompter = LiveACPPermissionPrompter(
+            client: client,
+            sessionId: AcpSessionId("sess-bash"),
+            timeoutSeconds: 5
+        )
+
+        let first = await prompter.prompt(
+            access: .bash("rm -rf /"), toolName: "run_terminal_cmd", toolCallId: "tc-b1"
+        )
+        #expect(first.isAllow == false)
+
+        // The scripted allow-once below must NOT be reachable: a persisted
+        // reject-always means the second request is answered locally.
+        let second = await prompter.prompt(
+            access: .bash("ls"), toolName: "run_terminal_cmd", toolCallId: "tc-b2"
+        )
+        #expect(second.isAllow == false)
+        #expect(await client.askCount() == 1)
+    }
+
+    @Test("permissions reset clears the prompter's own session grant")
+    func resetClearsPrompterGrant() async throws {
+        let client = ScriptedACPPermissionClient([
+            selected("always-allow"),
+            selected("reject-once"),
+        ])
+        let prompter = LiveACPPermissionPrompter(
+            client: client,
+            sessionId: AcpSessionId("sess-reset"),
+            timeoutSeconds: 5
+        )
+
+        let granted = await prompter.prompt(
+            access: .bash("ls"), toolName: "run_terminal_cmd", toolCallId: "tc-r1"
+        )
+        #expect(granted == .allow)
+        #expect(await client.askCount() == 1)
+
+        // Drive the LIVE notification handler, not `resetGrants` directly:
+        // the bug was that this handler reset only `PermissionHandle`.
+        let handler = LiveACPPermissionsResetHandler(permissions: nil, prompter: prompter)
+        await handler.handle(method: LiveACPPermissionsResetHandler.method, params: .object([:]))
+
+        let afterReset = await prompter.prompt(
+            access: .bash("ls"), toolName: "run_terminal_cmd", toolCallId: "tc-r2"
+        )
+        #expect(afterReset.isAllow == false)
+        #expect(await client.askCount() == 2)
+    }
+
+    @Test("allow-all-edits does not authorize a protected path")
+    func protectedEditReprompts() async throws {
+        let client = ScriptedACPPermissionClient([
+            selected("allow-edits-session"),
+            selected("reject-once"),
+        ])
+        let prompter = LiveACPPermissionPrompter(
+            client: client,
+            sessionId: AcpSessionId("sess-protected"),
+            timeoutSeconds: 5
+        )
+
+        let granted = await prompter.prompt(
+            access: .edit("/work/a.swift"), toolName: "search_replace", toolCallId: "tc-p1"
+        )
+        #expect(granted == .allow)
+
+        let protectedEdit = await prompter.prompt(
+            access: .edit("/etc/hosts"), toolName: "search_replace", toolCallId: "tc-p2"
+        )
+        #expect(protectedEdit.isAllow == false)
+        #expect(await client.askCount() == 2)
+    }
+
+    @Test("read reaching the prompter is asked, not auto-allowed")
+    func safeAccessIsNotAutoAllowed() async throws {
+        let client = ScriptedACPPermissionClient([selected("reject-once")])
+        let prompter = LiveACPPermissionPrompter(
+            client: client,
+            sessionId: AcpSessionId("sess-read"),
+            timeoutSeconds: 5
+        )
+
+        // `PermissionHandle` allows safe access itself; anything that reaches
+        // the prompter got here because a policy forced the ask (or is a plan
+        // exit riding `.read(nil)`), so answering allow here defeated it.
+        let decision = await prompter.prompt(
+            access: .read("/work/a.swift"), toolName: "read_file", toolCallId: "tc-s1"
+        )
+        #expect(decision.isAllow == false)
+        #expect(await client.askCount() == 1)
+    }
+
+    @Test("overlapping turns on different sessions fail closed rather than guess")
+    func ambiguousSessionFailsClosed() async throws {
+        let client = ScriptedACPPermissionClient([selected("allow-once")])
+        let prompter = LiveACPPermissionPrompter(client: client, timeoutSeconds: 5)
+
+        await prompter.beginTurn(AcpSessionId("sess-x"))
+        await prompter.beginTurn(AcpSessionId("sess-y"))
+        let decision = await prompter.prompt(
+            access: .edit("/work/a.swift"), toolName: "search_replace", toolCallId: "tc-amb"
+        )
+        #expect(decision.isAllow == false)
+        #expect(await client.askCount() == 0)
+
+        // The task-local disambiguates even while both turns are live.
+        let resolved = await LiveACPPermissionPrompter.$activeSession.withValue(
+            AcpSessionId("sess-x")
+        ) {
+            await prompter.prompt(
+                access: .edit("/work/a.swift"), toolName: "search_replace", toolCallId: "tc-amb-2"
+            )
+        }
+        #expect(resolved == .allow)
+        #expect(await client.askedSessionIds() == ["sess-x"])
+    }
+}

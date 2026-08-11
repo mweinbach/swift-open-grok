@@ -18,6 +18,7 @@
 import Foundation
 import OpenGrokACP
 import OpenGrokACPRuntime
+import OpenGrokConfig
 import OpenGrokShared
 import OpenGrokWorkspace
 
@@ -56,12 +57,36 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
     /// deployment target compiling.
     public static let defaultTimeoutSeconds: TimeInterval = 600
 
+    /// The session whose turn is running on this task tree.
+    ///
+    /// Structured concurrency carries this into the tool call, so a prompt
+    /// raised mid-turn knows its own session even while another session's turn
+    /// runs concurrently. `bindSession` cannot: it is one actor slot, and the
+    /// later bind wins for both turns (`prompter.rs` threads the session
+    /// through the request instead).
+    @TaskLocal static var activeSession: AcpSessionId?
+
     private var client: (any ACPPermissionReverseClient)?
     private var sessionId: AcpSessionId?
     private let timeoutSeconds: TimeInterval
-    private var allowsEditsForSession = false
-    private var bashAlwaysAllowed = false
-    private var otherAlwaysAllowed: Set<String> = []
+    /// Per-session grants. A grant made by one ACP session must not authorize
+    /// another session's tool call, and `x.ai/permissions/reset` for one
+    /// session must not clear another's.
+    private var grants: [AcpSessionId: SessionGrants] = [:]
+    /// Sessions with a `session/prompt` turn in flight, refcounted because a
+    /// client may legitimately re-enter. Used only when the task-local is
+    /// unavailable — see `resolveSession`.
+    private var activeTurns: [AcpSessionId: Int] = [:]
+
+    /// What one ACP session has been granted for its lifetime.
+    private struct SessionGrants {
+        var allowsEdits = false
+        var bashAllowed = false
+        /// `reject-always` for bash. Denial outranks any later allow-always so
+        /// that "No, and don't run bash commands" is actually permanent.
+        var bashDenied = false
+        var alwaysAllowed: Set<String> = []
+    }
 
     public init(
         client: (any ACPPermissionReverseClient)? = nil,
@@ -78,9 +103,67 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
         self.client = client
     }
 
-    /// Bind the ACP wire session id the next prompt will advertise.
+    /// Bind the ACP wire session id used when no turn is in flight and no
+    /// task-local is set (single-session hosts and tests).
     public func bindSession(_ sessionId: AcpSessionId?) {
         self.sessionId = sessionId
+    }
+
+    /// Mark a `session/prompt` turn as started for `sessionId`.
+    public func beginTurn(_ sessionId: AcpSessionId) {
+        activeTurns[sessionId, default: 0] += 1
+    }
+
+    /// Mark a `session/prompt` turn as finished for `sessionId`.
+    public func endTurn(_ sessionId: AcpSessionId) {
+        guard let count = activeTurns[sessionId] else { return }
+        if count <= 1 {
+            activeTurns.removeValue(forKey: sessionId)
+        } else {
+            activeTurns[sessionId] = count - 1
+        }
+    }
+
+    /// Drop every grant this prompter is holding for `sessionId`.
+    ///
+    /// `x.ai/permissions/reset` resets `PermissionHandle`, but the allow-always
+    /// answers a client gave over the reverse channel live here, not there. A
+    /// reset that clears only the handle leaves `isSessionPreapproved`
+    /// returning allow, so the advertised reset does not revoke the
+    /// permissions the client just granted.
+    public func resetGrants(for sessionId: AcpSessionId?) {
+        if let sessionId {
+            grants.removeValue(forKey: sessionId)
+        } else {
+            grants.removeAll()
+        }
+    }
+
+    /// How the session behind this prompt was determined.
+    private enum SessionResolution {
+        case resolved(AcpSessionId)
+        /// Nothing to attribute the prompt to.
+        case unknown
+        /// Turns are in flight for more than one session and no task-local
+        /// says which is ours. Attributing the request to a guess would show
+        /// session B's user a prompt that authorizes session A's tool call.
+        case ambiguous
+    }
+
+    private func resolveSession() -> SessionResolution {
+        if let active = Self.activeSession {
+            return .resolved(active)
+        }
+        if activeTurns.count == 1, let only = activeTurns.keys.first {
+            return .resolved(only)
+        }
+        if activeTurns.count > 1 {
+            return .ambiguous
+        }
+        if let sessionId {
+            return .resolved(sessionId)
+        }
+        return .unknown
     }
 
     public func prompt(
@@ -88,17 +171,29 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
         toolName: String,
         toolCallId: String
     ) async -> PermissionDecision {
-        if isSessionPreapproved(access) {
-            return .allow
-        }
-
         // No reverse channel means *cannot authorize* — fail closed, same
         // posture as `LiveWriteDenialPrompter` when nothing can paint a modal.
         guard let client else {
             return .reject(Self.unavailableMessage(toolName: toolName, access: access))
         }
-        guard let sessionId else {
+        let sessionId: AcpSessionId
+        switch resolveSession() {
+        case .resolved(let resolved):
+            sessionId = resolved
+        case .unknown:
             return .reject(Self.unavailableMessage(toolName: toolName, access: access))
+        case .ambiguous:
+            return .reject(Self.failureMessage(
+                toolName: toolName,
+                detail: "the ACP session this request belongs to is ambiguous"
+            ))
+        }
+
+        // Preapproval is checked AFTER the session resolves: a grant is a
+        // property of one session, so an unattributable request has no grant
+        // to consult and must reach the client (or fail closed above).
+        if let decision = preapproved(access, session: sessionId) {
+            return decision
         }
 
         let options = Self.buildOptions(for: access)
@@ -133,7 +228,15 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
             )
         } catch is PermissionPromptTimeoutError {
             return .reject(Self.failureMessage(toolName: toolName, detail: "permission request timed out"))
+        } catch is CancellationError {
+            // `session/cancel` while the request is outstanding is a cancel,
+            // not a denial. Rejecting here made the pipeline record a
+            // PermissionDenied audit event and fire the deny hooks for an
+            // operation the user merely cancelled. Cancelled is still not
+            // allow, so this does not widen anything.
+            return .cancelled
         } catch {
+            if Task.isCancelled { return .cancelled }
             // Includes `ACPRuntimeError.transport("no ACP client is connected")`
             // when `setReverseSender` was never installed — still cannot authorize.
             return .reject(Self.failureMessage(toolName: toolName, detail: "failed to request permission"))
@@ -150,7 +253,8 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
             response.outcome,
             optionById: optionById,
             access: access,
-            toolName: toolName
+            toolName: toolName,
+            session: sessionId
         )
     }
 
@@ -162,7 +266,8 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
         _ outcome: RequestPermissionOutcome,
         optionById: [String: PermissionOption],
         access: AccessKind,
-        toolName: String
+        toolName: String,
+        session: AcpSessionId
     ) -> PermissionDecision {
         switch outcome {
         case .cancelled:
@@ -179,47 +284,89 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
             case .allowOnce:
                 return .allow
             case .allowAlways:
-                grantSession(access: access, optionId: selected.optionId.rawValue)
+                grantSession(access: access, optionId: selected.optionId.rawValue, session: session)
                 return .allow
-            case .rejectOnce, .rejectAlways:
+            case .rejectOnce:
+                return .reject("'\(toolName)' was denied.")
+            case .rejectAlways:
+                denySession(access: access, optionId: selected.optionId.rawValue, session: session)
                 return .reject("'\(toolName)' was denied.")
             }
         }
     }
 
-    private func grantSession(access: AccessKind, optionId: String) {
+    private func grantSession(access: AccessKind, optionId: String, session: AcpSessionId) {
+        var record = grants[session] ?? SessionGrants()
         switch access {
         case .edit:
             // `allow-edits-session` and generic `always-allow` for edits are
             // session-scoped in-memory only (`prompter.rs:967-969`).
             if optionId == Self.allowEditsSessionOptionId || optionId == Self.alwaysAllowOptionId {
-                allowsEditsForSession = true
+                record.allowsEdits = true
             }
         case .bash:
             if optionId == Self.alwaysAllowOptionId {
-                bashAlwaysAllowed = true
+                record.bashAllowed = true
             }
         case .webFetch(let url):
-            otherAlwaysAllowed.insert(url)
+            record.alwaysAllowed.insert(url)
         case .mcpTool(let name, _):
-            otherAlwaysAllowed.insert(name)
+            record.alwaysAllowed.insert(name)
         case .read, .grep, .webSearch:
             break
         }
+        grants[session] = record
     }
 
-    private func isSessionPreapproved(_ access: AccessKind) -> Bool {
+    /// Record a `reject-always` answer. Only bash offers the option today; the
+    /// switch is exhaustive so adding one elsewhere has to be handled here
+    /// rather than silently degrading to reject-once.
+    private func denySession(access: AccessKind, optionId: String, session: AcpSessionId) {
+        guard optionId == Self.rejectAlwaysOptionId else { return }
+        var record = grants[session] ?? SessionGrants()
         switch access {
-        case .edit:
-            return allowsEditsForSession
         case .bash:
-            return bashAlwaysAllowed
+            record.bashDenied = true
+        case .edit, .read, .grep, .webSearch, .webFetch, .mcpTool:
+            return
+        }
+        grants[session] = record
+    }
+
+    /// A stored answer for `access`, or `nil` when the client must be asked.
+    ///
+    /// Returns a *decision*, not a Bool, because `reject-always` has to be
+    /// answerable here too — a stored denial that only suppressed the allow
+    /// path would still re-prompt and could then be approved.
+    private func preapproved(_ access: AccessKind, session: AcpSessionId) -> PermissionDecision? {
+        let record = grants[session] ?? SessionGrants()
+        switch access {
+        case .edit(let path):
+            // `PermissionHandle` refuses to let a session grant authorize a
+            // protected target (PermissionManager.swift:337-352, :365) — hooks
+            // and config under `.opengrok`, SSH keys, shell startup files,
+            // `/etc`. Those requests are routed here precisely because the
+            // handle declined to answer them, so honoring our own session
+            // grant would reinstate exactly what it withheld.
+            if protectedEditPath(path, userGrokHome: userGrokHome()?.path) {
+                return nil
+            }
+            return record.allowsEdits ? .allow : nil
+        case .bash:
+            if record.bashDenied { return .reject("bash commands were denied for this session.") }
+            return record.bashAllowed ? .allow : nil
         case .webFetch(let url):
-            return otherAlwaysAllowed.contains(url)
+            return record.alwaysAllowed.contains(url) ? .allow : nil
         case .mcpTool(let name, _):
-            return otherAlwaysAllowed.contains(name)
+            return record.alwaysAllowed.contains(name) ? .allow : nil
         case .read, .grep, .webSearch:
-            return true
+            // NOT auto-allowed. `PermissionHandle` already allows safe access
+            // on its own (PermissionManager.swift:355-363); a request that
+            // reaches this prompter is one where it deliberately did not —
+            // an explicit policy forced the ask, or `requestExitPlanApproval`
+            // is asking for plan exit under a `.read(nil)` access. Answering
+            // allow here silently defeated both.
+            return nil
         }
     }
 
