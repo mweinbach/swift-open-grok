@@ -57,13 +57,15 @@ struct LiveMemoryConfiguration: Sendable, Equatable {
     /// without an embedding provider — and this port has no embedding
     /// provider, so 0 is what it always resolves to today.
     var embeddingDimensions: Int
+    var dream: MemoryDreamConfig
 
     static let disabled = LiveMemoryConfiguration(
         enabled: false,
         search: MemorySearchConfig(),
         initialInjection: MemoryInitialInjectionConfig(),
         index: MemoryIndexConfig(),
-        embeddingDimensions: 0
+        embeddingDimensions: 0,
+        dream: MemoryDreamConfig()
     )
 
     /// Read `[memory]` out of the resolved config document.
@@ -143,6 +145,22 @@ struct LiveMemoryConfiguration: Sendable, Equatable {
         // text-only rather than pretending to score against embeddings it
         // never computed.
         config.embeddingDimensions = 0
+
+        if let table = document[path: ["memory", "dream"]] {
+            var dream = MemoryDreamConfig()
+            if let enabled = table["enabled"]?.boolValue { dream.enabled = enabled }
+            if let minHours = table["min_hours"]?.int64Value { dream.minHours = UInt64(minHours) }
+            if let minSessions = table["min_sessions"]?.int64Value {
+                dream.minSessions = UInt64(minSessions)
+            }
+            if let staleLockSecs = table["stale_lock_secs"]?.int64Value {
+                dream.staleLockSecs = UInt64(staleLockSecs)
+            }
+            if let checkInterval = table["check_interval_secs"]?.int64Value {
+                dream.checkIntervalSecs = UInt64(checkInterval)
+            }
+            config.dream = dream
+        }
 
         return config
     }
@@ -302,6 +320,45 @@ actor LiveMemoryBackend {
     }
 
     var isEphemeralWorkspace: Bool { storage.isEphemeral }
+
+    /// Manual `/dream` — bypasses time/session gates, consolidates eligible logs.
+    func runDream(
+        sessionID: String,
+        dreamConfig: MemoryDreamConfig,
+        sample: @Sendable (_ systemPrompt: String, _ userMessage: String) async throws -> String
+    ) async -> DreamResult {
+        let lock = DreamLock(workspaceDirectory: storage.workspaceDir)
+        let sid8 = String(sessionID.prefix(8))
+        let sessions: [String]
+        do {
+            sessions = try sessionsSince(
+                sessionsDirectory: storage.sessionsDir,
+                since: Date(timeIntervalSince1970: 0),
+                excludingSessionSID8: sid8
+            )
+        } catch {
+            return DreamResult(
+                status: .failed("failed to list sessions: \(error.localizedDescription)"),
+                sessionsEligible: 0,
+                cleanedStems: []
+            )
+        }
+        guard !sessions.isEmpty else {
+            return DreamResult(
+                status: .skipped("no session logs found"),
+                sessionsEligible: 0,
+                cleanedStems: []
+            )
+        }
+        try? storage.ensureInitialized()
+        return await runDreamConsolidation(
+            storage: storage,
+            lock: lock,
+            config: dreamConfig,
+            sessions: sessions,
+            sample: sample
+        )
+    }
 }
 
 // MARK: - Formatting
@@ -591,9 +648,22 @@ enum LiveMemoryTools {
     }
 }
 
+// MARK: - Dream sampling
+
+/// Injectable auxiliary model call for dream consolidation tests and live wiring.
+struct LiveMemoryDreamSampler: Sendable {
+    let sample: @Sendable (_ systemPrompt: String, _ userMessage: String) async throws -> String
+
+    init(
+        sample: @escaping @Sendable (_ systemPrompt: String, _ userMessage: String) async throws -> String
+    ) {
+        self.sample = sample
+    }
+}
+
 // MARK: - Commands
 
-/// Handler bodies for `/remember`, `/recall` and `/flush`.
+/// Handler bodies for `/remember`, `/recall`, `/flush`, and `/dream`.
 ///
 /// They return plain strings rather than touching the pager, so the interactive
 /// controller only has to print what it gets back. That keeps the command
@@ -665,5 +735,35 @@ enum LiveMemoryCommands {
         } catch {
             return "Could not write session memory: \(error)"
         }
+    }
+
+    /// `/dream` — run memory consolidation now.
+    ///
+    /// Bypasses automatic gate checks (time and session count) but still requires
+    /// `[memory.dream] enabled = true` and an auxiliary sampler from the caller.
+    static func dream(
+        backend: LiveMemoryBackend?,
+        dreamConfig: MemoryDreamConfig,
+        sessionID: String,
+        sampler: LiveMemoryDreamSampler?
+    ) async -> String {
+        guard let backend else {
+            return "Memory is not enabled. Set `memory.enabled = true` in config.toml or OPENGROK_MEMORY=1."
+        }
+        guard dreamConfig.enabled else {
+            return "Dream consolidation is disabled. Set `memory.dream.enabled = true` in config.toml."
+        }
+        if await backend.isEphemeralWorkspace {
+            return "This workspace is a temporary directory, so dream consolidation is skipped."
+        }
+        guard let sampler else {
+            return "Dream consolidation is not wired for this session (no auxiliary sampler)."
+        }
+        let result = await backend.runDream(
+            sessionID: sessionID,
+            dreamConfig: dreamConfig,
+            sample: sampler.sample
+        )
+        return dreamStatusMessage(for: result)
     }
 }
