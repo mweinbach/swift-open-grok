@@ -36,6 +36,26 @@ public struct HeadlessPermissionPrompter: PermissionPrompter {
 /// Auto-mode classifier seam.
 public protocol PermissionClassifier: Sendable {
     func classify(access: AccessKind, toolName: String) async -> PermissionDecision
+
+    func classify(
+        access: AccessKind,
+        toolName: String,
+        accessDetail: String?,
+        transcript: String
+    ) async -> PermissionDecision
+}
+
+extension PermissionClassifier {
+    /// Default ignores detail/transcript so existing two-parameter classifiers compile.
+    public func classify(
+        access: AccessKind,
+        toolName: String,
+        accessDetail: String?,
+        transcript: String
+    ) async -> PermissionDecision {
+        _ = (accessDetail, transcript)
+        return await classify(access: access, toolName: toolName)
+    }
 }
 
 /// Always-ask classifier (safe default).
@@ -77,6 +97,9 @@ public actor PermissionHandle {
         allowAll: Bool = false,
         shellCwd: String = FileManager.default.currentDirectoryPath,
         prompter: any PermissionPrompter = HeadlessPermissionPrompter(),
+        /// Production default is the Rust heuristic classifier. Tests that need
+        /// a fixed or absent classifier pass one explicitly (or `nil`).
+        classifier: (any PermissionClassifier)? = HeuristicPermissionClassifier(),
         sandboxAutoAllowBash: @Sendable @escaping () -> Bool = { false }
     ) {
         var cfg = config
@@ -101,7 +124,7 @@ public actor PermissionHandle {
         self.editPolicy = .ask
         self.shellCwd = shellCwd
         self.prompter = prompter
-        self.classifier = nil
+        self.classifier = classifier
         self.sandboxAutoAllowBash = sandboxAutoAllowBash
         self.events = []
         self.lastMatchedRuleSource = nil
@@ -372,7 +395,12 @@ public actor PermissionHandle {
 
         // 6. Auto mode classifier (not when policy forced prompt).
         if autoMode, !policyForcedPrompt, let classifier {
-            let classified = await classifier.classify(access: access, toolName: toolName)
+            let classified = await classifier.classify(
+                access: access,
+                toolName: toolName,
+                accessDetail: access.detail,
+                transcript: ""
+            )
             if case .allow = classified {
                 record(
                     access: access, toolName: toolName, toolCallId: toolCallId,

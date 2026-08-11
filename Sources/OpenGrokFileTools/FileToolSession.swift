@@ -124,6 +124,7 @@ public enum FileToolSession {
             allowAll: blanketApproval && !hasPolicy,
             shellCwd: workspaceRoot,
             prompter: policy.prompter,
+            // Default `HeuristicPermissionClassifier` from PermissionHandle.init.
             sandboxAutoAllowBash: sandboxAutoAllowBash
         )
         return PermissionPipeline(
