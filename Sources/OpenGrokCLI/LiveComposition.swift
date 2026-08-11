@@ -5172,15 +5172,31 @@ struct LiveToolExecutor: Sendable {
             and background-task tools get.
             """
         )
-        self.tools = terminalTools + monitorTools + spawnTools + collaborationTools + schedulerTools + sessionTools + allowedFileToolDefinitions.map { definition in
-            ToolSpec(
+        // Built by appends, not by one `a + b + … + f.map { … }` chain. As a
+        // single expression this exceeded the type checker's budget and failed
+        // the macOS CI build outright ("unable to type-check this expression in
+        // reasonable time") while still compiling locally off a warm
+        // incremental cache — so the break was invisible to every local gate
+        // and red on every push. Cost: seven statements instead of one
+        // expression, and a new tool surface has to be appended here rather
+        // than added to the chain. Do not re-collapse this.
+        var advertisedTools: [ToolSpec] = []
+        advertisedTools.append(contentsOf: terminalTools)
+        advertisedTools.append(contentsOf: monitorTools)
+        advertisedTools.append(contentsOf: spawnTools)
+        advertisedTools.append(contentsOf: collaborationTools)
+        advertisedTools.append(contentsOf: schedulerTools)
+        advertisedTools.append(contentsOf: sessionTools)
+        for definition in allowedFileToolDefinitions {
+            let parameters: JSONValue = definition.argumentsSchema
+                ?? .object(["type": .string("object")])
+            advertisedTools.append(ToolSpec(
                 name: definition.name,
                 description: definition.description,
-                parameters: definition.argumentsSchema ?? .object([
-                    "type": .string("object")
-                ])
-            )
+                parameters: parameters
+            ))
         }
+        self.tools = advertisedTools
     }
 
     func runStop(

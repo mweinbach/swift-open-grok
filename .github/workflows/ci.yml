@@ -60,7 +60,20 @@ jobs:
     # Linux is a blocking platform gate. Unsupported runtime adapters must
     # report explicitly in the test output; they must not turn a failed build
     # into a successful workflow conclusion.
-    container: swift:6.3.3-jammy
+    container:
+      image: swift:6.3.3-jammy
+      # `--privileged` is what makes the sandbox gate real rather than
+      # theatre. Under Docker's default seccomp/AppArmor profile
+      # `unshare(CLONE_NEWUSER)` returns EPERM, so `bwrap` cannot create a
+      # namespace and the verification step below failed on every push since
+      # this job was added — taking the Linux build and the serial suite down
+      # with it, so the platform produced no signal at all. Cost: this job
+      # runs with full container capabilities, so it must keep building only
+      # this repository's own sources on an ephemeral runner; do not add steps
+      # here that execute third-party code. The alternative considered and
+      # rejected was demoting the bwrap probe to non-fatal, which would have
+      # kept the job green while quietly never exercising the sandbox.
+      options: --privileged
     env:
       CI: "1"
     defaults:

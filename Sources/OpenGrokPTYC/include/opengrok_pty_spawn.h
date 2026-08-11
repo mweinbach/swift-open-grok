@@ -4,6 +4,15 @@
 #ifndef OPENGROK_PTY_SPAWN_H
 #define OPENGROK_PTY_SPAWN_H
 
+/* POSIX-only. `pid_t` and <sys/ioctl.h> do not exist in the Windows SDK, so on
+ * Windows this target must present an empty module rather than fail to compile
+ * — the Swift caller's PTY path is already `#if os(macOS) || os(Linux)` and its
+ * `#elseif os(Windows)` arm never reaches these symbols. Cost: the module still
+ * imports on Windows and silently exports nothing, so a future Windows PTY
+ * implementation must add its own declarations here rather than assume these
+ * exist. Without this guard the whole Windows build dies in this header. */
+#if !defined(_WIN32)
+
 #include <stddef.h>
 #include <sys/types.h>
 
@@ -49,5 +58,7 @@ int opengrok_spawn_with_fds(
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* !_WIN32 */
 
 #endif /* OPENGROK_PTY_SPAWN_H */

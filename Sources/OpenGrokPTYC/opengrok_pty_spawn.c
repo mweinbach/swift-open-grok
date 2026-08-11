@@ -1,5 +1,17 @@
 // Portable PTY open + fork/exec with session / controlling-terminal / CWD setup.
 
+/* POSIX-only; see the guard rationale in opengrok_pty_spawn.h. On Windows this
+   file compiles to a single placeholder symbol so the target still produces an
+   object file. */
+#if defined(_WIN32)
+
+/* A translation unit with no external symbols is not portable C; give the
+   Windows build one so the archive is well-formed. */
+int opengrok_pty_unavailable_on_windows(void);
+int opengrok_pty_unavailable_on_windows(void) { return 0; }
+
+#else
+
 /* glibc hides posix_openpt/grantpt/unlockpt/ptsname behind __USE_XOPEN2K,
    which SwiftPM's default C dialect does not request; without this they
    compile as implicit int-returning functions and ptsname's char* result is
@@ -220,3 +232,5 @@ int opengrok_spawn_with_fds(
     *out_pid = pid;
     return 0;
 }
+
+#endif /* !_WIN32 */

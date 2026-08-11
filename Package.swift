@@ -215,18 +215,36 @@ private func targets() -> [Target] {
     // W2-S3: FSNotify / CodebaseGraph / HunkTracker share base deps; GitStatus
     // depends on a thin C zlib shim for portable inflate/deflate when Apple
     // Compression is unavailable (notably Linux). Apple hosts prefer Compression.
-    t.append(.target(
-        name: "COpenGrokZlib",
-        path: "Sources/COpenGrokZlib",
-        publicHeadersPath: "include",
-        linkerSettings: [
-            .linkedLibrary("z"),
-        ]
-    ))
+    //
+    // The shim is omitted on Windows, where the SDK ships no <zlib.h> and no
+    // `z` import library: declaring it there fails the whole build in the
+    // shim's header. `ObjectStore` already selects Compression, then
+    // COpenGrokZlib, then a typed `zlib … unavailable on this platform` throw,
+    // and that third arm is only reachable when this module is genuinely
+    // absent — so dropping the target here is what arms it. Cost: Windows Git
+    // loose-object inflate/deflate throws instead of working; that is the
+    // honest state until a Windows zlib is vendored, and it must not be
+    // "fixed" by re-adding the target without one.
+    let zlibShimAvailable: Bool
+    #if os(Windows)
+    zlibShimAvailable = false
+    #else
+    zlibShimAvailable = true
+    #endif
+    if zlibShimAvailable {
+        t.append(.target(
+            name: "COpenGrokZlib",
+            path: "Sources/COpenGrokZlib",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedLibrary("z"),
+            ]
+        ))
+    }
     t.append(.target(name: "OpenGrokFSNotify", dependencies: dep(w0s2, w0s3, w0s4)))
     t.append(.target(
         name: "OpenGrokGitStatus",
-        dependencies: dep(w0s2, w0s3, w0s4, ["COpenGrokZlib"])
+        dependencies: dep(w0s2, w0s3, w0s4, zlibShimAvailable ? ["COpenGrokZlib"] : [])
     ))
     t.append(.target(name: "OpenGrokCodebaseGraph", dependencies: dep(w0s2, w0s3, w0s4)))
     t.append(.target(name: "OpenGrokHunkTracker", dependencies: dep(w0s2, w0s3, w0s4)))
