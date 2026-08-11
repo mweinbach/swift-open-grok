@@ -28,6 +28,8 @@ actor FakeAgentHost: RhaiWorkflowHost {
     private(set) var scratchWrites: [String] = []
 
     private let concurrencyLimit: Int
+    private var rendezvousTarget: Int?
+    private var rendezvousWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(concurrencyLimit: Int = 8) {
         self.concurrencyLimit = concurrencyLimit
@@ -45,6 +47,32 @@ actor FakeAgentHost: RhaiWorkflowHost {
 
     func failReservations(with error: RhaiHostError) { reserveFailure = error }
 
+    /// Hold every caller until `count` of them are in flight at once.
+    ///
+    /// Without this, overlap is only *likely*: each call yielded a fixed number
+    /// of times and hoped its siblings had started, so a test asserting an
+    /// exact `peakConcurrency` failed whenever a loaded machine let one call
+    /// finish before the next began. Only tests that pin an exact peak need it;
+    /// set it to the batch size or the calls will wait for arrivals that never
+    /// come.
+    func setRendezvous(_ count: Int) { rendezvousTarget = count }
+
+    private func waitForSiblings() async {
+        guard let target = rendezvousTarget else {
+            for _ in 0..<10 { await Task.yield() }
+            return
+        }
+        guard outstanding < target else {
+            let waiters = rendezvousWaiters
+            rendezvousWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+            return
+        }
+        await withCheckedContinuation { continuation in
+            rendezvousWaiters.append(continuation)
+        }
+    }
+
     func reserveAgentCalls(_ count: UInt64) throws {
         if let reserveFailure { throw reserveFailure }
         reserved += count
@@ -56,9 +84,7 @@ actor FakeAgentHost: RhaiWorkflowHost {
         prompts.append(options.prompt)
         outstanding += 1
         peakConcurrency = max(peakConcurrency, outstanding)
-        // Give sibling tasks a chance to start, so a real barrier shows up as
-        // overlap and a sequential chain does not.
-        for _ in 0..<10 { await Task.yield() }
+        await waitForSiblings()
         outstanding -= 1
 
         let reply = replies[options.prompt] ?? defaultReply
@@ -243,6 +269,7 @@ struct RhaiEngineTests {
     @Test("parallel() is a barrier: siblings overlap, and the call returns only when all are done")
     func parallelIsABarrier() async {
         let host = FakeAgentHost(concurrencyLimit: 8)
+        await host.setRendezvous(3)
         let outcome = await run(
             header + """
             let results = parallel([
