@@ -369,6 +369,25 @@ struct OpenGrokBuildSupportTests {
         #expect(discovered?.path == pathProtoc.path)
     }
 
+    /// The parent walk's only exit used to be `deletingLastPathComponent()`
+    /// reaching a fixed point, which never happens for a RELATIVE URL — it
+    /// keeps prepending `..`, so the loop spins forever building longer paths
+    /// and stat-ing each one. `URL(fileURLWithPath: "")` is exactly that URL,
+    /// and it is what an empty `NSTemporaryDirectory()` produces.
+    ///
+    /// This is a termination test, not a discovery test: it asserts the call
+    /// returns at all. If this regresses it will hang rather than fail, which
+    /// is the whole point — a hang is what it looked like in CI.
+    @Test("DefaultProtoCompiler terminates on a relative working directory")
+    func defaultProtoCompilerRelativeWorkingDirectoryTerminates() throws {
+        let compiler = DefaultProtoCompiler(
+            workingDirectory: URL(fileURLWithPath: ""),
+            pathLookup: { _ in nil },
+            validateCandidates: false
+        )
+        #expect(compiler.discoverProtoc(environment: [:]) == nil)
+    }
+
     @Test("DefaultProtoCompiler returns nil when no protoc is available")
     func defaultProtoCompilerNilWhenAbsent() throws {
         let temp = isolatedWorkingDirectory()

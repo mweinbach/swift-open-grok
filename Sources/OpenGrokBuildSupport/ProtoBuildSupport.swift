@@ -203,8 +203,22 @@ public struct DefaultProtoCompiler: ProtoCompiler {
         //    wrapper). The reference returns a relative path
         //    (`../bin/protoc`) for determinism; SwiftPM/Swift consumers
         //    prefer absolute URLs, so we resolve against `workingDirectory`.
-        var dir = workingDirectory
-        while true {
+        //    `deletingLastPathComponent()` only reaches a fixed point for an
+        //    ABSOLUTE path. On a relative one it keeps prepending `..`
+        //    forever, so the loop would spin building ever-longer paths and
+        //    stat-ing each — a hang, not an error. `workingDirectory` is
+        //    caller-supplied and `URL(fileURLWithPath:)` yields a relative URL
+        //    for an empty or relative string (an empty `NSTemporaryDirectory()`
+        //    is enough), so standardize first and keep a hard iteration bound
+        //    as the backstop. Cost of the bound: a `bin/protoc` more than 256
+        //    levels up is missed. That is not a real tree, and silently
+        //    missing a candidate beats spinning forever.
+        var dir = URL(
+            fileURLWithPath: workingDirectory.path,
+            isDirectory: true,
+            relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        ).standardizedFileURL.absoluteURL
+        for _ in 0..<256 {
             let candidate = dir.appendingPathComponent("bin").appendingPathComponent("protoc")
             if FileManager.default.fileExists(atPath: candidate.path) {
                 if !validateCandidates || protocIsGood(candidate) {
