@@ -1127,7 +1127,14 @@ struct ParityCompositionTests {
         } == true)
         #expect(processRequests.count == 1)
         #expect(processRequests.first?.command == "printf tool-output")
-        #expect(processRequests.first?.workingDirectory == root.standardizedFileURL)
+        // Compare the directory identity, not the URL: Foundation keeps a
+        // trailing slash on Linux and drops it on Darwin, so a URL-to-URL
+        // comparison passes on one platform and fails on the other for two
+        // spellings of the same path.
+        #expect(
+            processRequests.first?.workingDirectory.standardizedFileURL.path
+                == root.standardizedFileURL.path
+        )
         #expect(processRequests.first?.toolCallID == "call-1")
         #expect(processRequests.first?.ownerSessionID != nil)
     }

@@ -5,6 +5,15 @@
 // not pin cite the Rust source they encode
 // (crates/codegen/xai-grok-code-mode).
 
+// Every suite here drives a real JavaScript cell, and the runtime refuses with
+// a typed "code mode requires JavaScriptCore, which is unavailable on this
+// platform" wherever JSC is absent. Running them there does not test the
+// refusal — it just reports the refusal as N failures — so they compile only
+// where a cell can actually run. Cost: Linux gets no Code Mode coverage at all
+// until a non-JSC engine exists; the refusal itself is the runtime's contract
+// and belongs in a platform-agnostic test if someone wants it pinned.
+#if canImport(JavaScriptCore)
+
 import Foundation
 import OpenGrokCodeModeProtocol
 import OpenGrokJavaScriptRuntime
@@ -709,3 +718,5 @@ struct CodeModeProtocolProjectionTests {
         #expect(snapshot.executeRequestTools.count == 2)
     }
 }
+
+#endif /* canImport(JavaScriptCore) */
