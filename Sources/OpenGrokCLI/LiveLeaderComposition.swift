@@ -250,15 +250,23 @@ public enum LiveLeaderComposition {
         }
         let hubAuth = LeaderComputerHubAuthProvider(manager: manager)
         let sharedPermissionPipeline = workspace.permissionPipeline
-        let hubConnector: ACPWorkspaceExposureConnector = { [hubAuth, sharedPermissionPipeline] hubURL, workspaceCwd in
+        let hubConnector: ACPWorkspaceExposureConnector = { [hubAuth, sharedPermissionPipeline, environment] hubURL, workspaceCwd in
             let mediation = HubMediation.mediated(
                 LivePermissionHubMediator(pipeline: sharedPermissionPipeline)
+            )
+            let mcpConnections = MCPSessionConnections()
+            let mcpClients = await LiveMCPComposition.connectConfiguredClientsForHub(
+                cwd: workspaceCwd,
+                environment: environment,
+                connections: mcpConnections
             )
             return try await ComputerHubWorkspaceExposure.connect(
                 hubURL: hubURL,
                 cwd: workspaceCwd,
                 auth: hubAuth,
-                mediation: mediation
+                mediation: mediation,
+                mcpClients: mcpClients,
+                mcpConnections: mcpClients.isEmpty ? nil : mcpConnections
             )
         }
 

@@ -46,6 +46,7 @@ import OpenGrokComputerHubSDK
 import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokHTTP
+import OpenGrokMCP
 import OpenGrokModels
 import OpenGrokSandbox
 import OpenGrokShared
@@ -621,6 +622,158 @@ public final class LeaderWorkspaceControlChannel: WorkspaceControlChannel, @unch
 
     public func close() async {
         await client.close()
+    }
+}
+
+// MARK: - Hub session MCP bridge (Rust direction)
+
+/// Result of bridging local MCP clients onto a hub session.
+public struct LiveHubSessionMCPStartResult: Sendable {
+    public var started: [String]
+    public var failed: [(name: String, error: String)]
+
+    public init(started: [String] = [], failed: [(name: String, error: String)] = []) {
+        self.started = started
+        self.failed = failed
+    }
+}
+
+/// Bridges local MCP clients onto the hub tool server for one session.
+///
+/// Rust reference: `handle.rs:start_session_mcp_servers` and
+/// `mcp.rs:McpClientTransportAdapter` / `QualifiedMcpToolHandler`.
+///
+/// This is the inverse of [`HubMCPBridgeCoordinator`], which registers hub
+/// tools into a local `FinalizedToolset` and is kept as a loopback harness.
+public enum LiveHubSessionMCP {
+    public final class Handle: @unchecked Sendable {
+        fileprivate var bridges: [McpBridge] = []
+        fileprivate var registeredToolIds: [ToolId] = []
+        private let lock = NSLock()
+
+        public var isEmpty: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return bridges.isEmpty && registeredToolIds.isEmpty
+        }
+
+        fileprivate func append(bridge: McpBridge, toolIds: [ToolId]) {
+            lock.lock()
+            bridges.append(bridge)
+            registeredToolIds.append(contentsOf: toolIds)
+            lock.unlock()
+        }
+
+        fileprivate func snapshot() -> (bridges: [McpBridge], toolIds: [ToolId]) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (bridges, registeredToolIds)
+        }
+    }
+
+    /// Connect each live MCP client, discover tools, and register qualified
+    /// handlers on `harness.local` for `sessionId`.
+    ///
+    /// With no clients, or when every bridge fails, returns an empty handle
+    /// and leaves the harness unchanged apart from successful registrations.
+    @discardableResult
+    public static func start(
+        sessionId: SessionId,
+        clients: [HubMCPClientEntry],
+        harness: ToolHarness,
+        mediation: HubMediation,
+        principal: Principal
+    ) async -> (handle: Handle, result: LiveHubSessionMCPStartResult) {
+        guard !clients.isEmpty else {
+            return (Handle(), LiveHubSessionMCPStartResult())
+        }
+
+        let handle = Handle()
+        var started: [String] = []
+        var failed: [(name: String, error: String)] = []
+
+        for entry in clients {
+            let transport = MCPClientTransportAdapter(client: entry.client)
+            let config = McpBridgeConfig(
+                sessionId: sessionId,
+                mediation: mediation,
+                namespace: entry.serverName
+            )
+            do {
+                let bridgeHandle = try await McpBridge.connect(transport, config)
+                let bridge = bridgeHandle.bridge
+                var toolIds: [ToolId] = []
+                for handler in bridge.handlers() {
+                    guard let qualifiedName = qualifiedMCPToolName(
+                        server: entry.serverName,
+                        tool: handler.definition.name
+                    ) else {
+                        continue
+                    }
+                    guard let qualifiedId = try? ToolId(qualifiedName) else { continue }
+
+                    let tool = QualifiedHubMcpTool(
+                        qualifiedId: qualifiedId,
+                        qualifiedName: qualifiedName,
+                        inner: handler
+                    )
+                    let descriptionText = handler.definition.description
+                        ?? "MCP tool '\(handler.definition.name)' on '\(entry.serverName)'"
+                    let registration = ToolRegistration(
+                        toolId: qualifiedId,
+                        sessions: [sessionId],
+                        userId: principal.userId,
+                        description: ToolDescription(name: qualifiedName, description: descriptionText),
+                        inputSchema: handler.definition.inputSchema,
+                        transportKind: .local
+                    )
+                    harness.local.registerDyn(tool, registration: registration)
+                    toolIds.append(qualifiedId)
+                }
+                handle.append(bridge: bridge, toolIds: toolIds)
+                started.append(entry.serverName)
+            } catch {
+                failed.append((name: entry.serverName, error: String(describing: error)))
+            }
+        }
+
+        return (handle, LiveHubSessionMCPStartResult(started: started, failed: failed))
+    }
+
+    /// Unregister every tool this session bridge contributed and shut down
+    /// retained transports. Safe when the handle is empty.
+    public static func stop(_ handle: Handle, harness: ToolHarness) async {
+        let snapshot = handle.snapshot()
+        for toolId in snapshot.toolIds {
+            harness.local.unregister(toolId)
+        }
+        for bridge in snapshot.bridges {
+            try? await bridge.shutdown()
+        }
+    }
+}
+
+/// Wraps an adapter [`McpToolHandler`] with a qualified `server__tool` id for
+/// hub registration.
+struct QualifiedHubMcpTool: ToolDyn {
+    let qualifiedId: ToolId
+    let qualifiedName: String
+    let inner: McpToolHandler
+
+    func id() -> ToolId { qualifiedId }
+
+    func description(ctx: ListToolsContext) -> ToolDescription {
+        var description = inner.description(ctx: ctx)
+        description.name = qualifiedName
+        return description
+    }
+
+    func capabilities() -> ToolCapabilities {
+        inner.capabilities()
+    }
+
+    func execute(ctx: ToolCallContext, args: JSONValue) async -> ToolStream<TypedToolOutput> {
+        await inner.execute(ctx: ctx, args: args)
     }
 }
 

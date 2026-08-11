@@ -44,17 +44,23 @@ public final class ComputerHubWorkspaceExposure: ACPWorkspaceExposureConnection,
     public let workspaceClient: WorkspaceClient
     public let sessionId: SessionId
     private let drainTimeoutNanoseconds: UInt64
+    private let hubSessionMCP: LiveHubSessionMCP.Handle?
+    private let mcpConnections: MCPSessionConnections?
 
     private init(
         transport: HubWebSocketConnectionClient,
         workspaceClient: WorkspaceClient,
         sessionId: SessionId,
-        drainTimeoutNanoseconds: UInt64
+        drainTimeoutNanoseconds: UInt64,
+        hubSessionMCP: LiveHubSessionMCP.Handle?,
+        mcpConnections: MCPSessionConnections?
     ) {
         self.transport = transport
         self.workspaceClient = workspaceClient
         self.sessionId = sessionId
         self.drainTimeoutNanoseconds = drainTimeoutNanoseconds
+        self.hubSessionMCP = hubSessionMCP
+        self.mcpConnections = mcpConnections
     }
 
     public static func connect(
@@ -62,6 +68,8 @@ public final class ComputerHubWorkspaceExposure: ACPWorkspaceExposureConnection,
         cwd: String,
         auth: any AuthProvider,
         mediation: HubMediation,
+        mcpClients: [HubMCPClientEntry] = [],
+        mcpConnections: MCPSessionConnections? = nil,
         drainTimeoutNanoseconds: UInt64 = 10_000_000_000
     ) async throws -> ComputerHubWorkspaceExposure {
         let identity = try await auth.identity()
@@ -89,11 +97,25 @@ public final class ComputerHubWorkspaceExposure: ACPWorkspaceExposureConnection,
             harness: harness,
             connection: transport.hub
         )
+
+        var hubSessionMCP: LiveHubSessionMCP.Handle?
+        if !mcpClients.isEmpty {
+            hubSessionMCP = await LiveHubSessionMCP.start(
+                sessionId: sessionId,
+                clients: mcpClients,
+                harness: harness,
+                mediation: mediation,
+                principal: principal
+            ).handle
+        }
+
         return ComputerHubWorkspaceExposure(
             transport: transport,
             workspaceClient: workspaceClient,
             sessionId: sessionId,
-            drainTimeoutNanoseconds: drainTimeoutNanoseconds
+            drainTimeoutNanoseconds: drainTimeoutNanoseconds,
+            hubSessionMCP: hubSessionMCP,
+            mcpConnections: mcpConnections
         )
     }
 
@@ -105,6 +127,12 @@ public final class ComputerHubWorkspaceExposure: ACPWorkspaceExposureConnection,
     }
 
     public func disconnect() async {
+        if let hubSessionMCP {
+            await LiveHubSessionMCP.stop(hubSessionMCP, harness: workspaceClient.harness)
+        }
+        if let mcpConnections {
+            await mcpConnections.shutdown()
+        }
         transport.activityTracker.stopAccepting()
         await transport.activityTracker.waitUntilDrained(
             timeoutNanoseconds: drainTimeoutNanoseconds

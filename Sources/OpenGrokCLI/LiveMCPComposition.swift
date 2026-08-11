@@ -15,10 +15,114 @@
 import Foundation
 import OpenGrokConfig
 import OpenGrokConfigTypes
+import OpenGrokComputerHubMCPAdapter
 import OpenGrokHTTP
 import OpenGrokMCP
 import OpenGrokShared
 import OpenGrokToolRegistry
+
+// MARK: - Hub bridge transport
+
+/// One live MCP client to bridge onto the hub tool server.
+///
+/// Rust reference: `handle.rs:start_session_mcp_servers` retains started
+/// clients per server name before wrapping them in `McpClientTransportAdapter`.
+public struct HubMCPClientEntry: Sendable {
+    public let serverName: String
+    public let client: MCPClient
+
+    public init(serverName: String, client: MCPClient) {
+        self.serverName = serverName
+        self.client = client
+    }
+}
+
+/// Adapts [`MCPClient`] to [`McpTransport`] for [`McpBridge`].
+///
+/// Rust reference: `crates/codegen/xai-grok-workspace/src/mcp.rs:21-136`.
+public struct MCPClientTransportAdapter: McpTransport {
+    private let client: MCPClient
+
+    public init(client: MCPClient) {
+        self.client = client
+    }
+
+    public func initialize() async throws -> McpServerInfo {
+        let result: MCPInitializeResult
+        if await client.state() == .initialized,
+           let existing = await client.initializeResultValue()
+        {
+            result = existing
+        } else {
+            result = try await client.initialize()
+        }
+        let capabilities = (try? JSONValue.encode(result.capabilities)) ?? .null
+        return McpServerInfo(
+            name: result.serverInfo.name,
+            version: result.serverInfo.version,
+            capabilities: capabilities
+        )
+    }
+
+    public func listTools() async throws -> [McpToolDefinition] {
+        var allTools: [McpToolDefinition] = []
+        var cursor: String?
+        repeat {
+            let page = try await client.listTools(MCPListToolsParams(cursor: cursor))
+            allTools.append(contentsOf: page.tools.map { tool in
+                McpToolDefinition(
+                    name: tool.name,
+                    description: tool.description ?? tool.title,
+                    inputSchema: tool.inputSchema
+                )
+            })
+            cursor = page.nextCursor
+        } while cursor != nil
+        return allTools
+    }
+
+    public func callTool(name: String, arguments: JSONValue) async throws -> McpCallResult {
+        let argsObject: JSONValue?
+        switch arguments {
+        case .object:
+            argsObject = arguments
+        case .null:
+            argsObject = nil
+        default:
+            argsObject = .object(["value": arguments])
+        }
+        let result = try await client.callTool(
+            MCPCallToolParams(name: name, arguments: argsObject)
+        )
+        return McpCallResult(
+            content: result.content.map(hubMcpContent(from:)),
+            isError: result.isError
+        )
+    }
+
+    public func close() async throws {
+        // No-op: the session owner retains and shuts down the client.
+    }
+}
+
+private func hubMcpContent(from block: MCPContent) -> McpContent {
+    switch block {
+    case .text(let text, _):
+        return .text(text: text)
+    case .image(let data, let mimeType, _):
+        return .image(mimeType: mimeType, data: data)
+    case .audio(let data, let mimeType, _):
+        return .text(text: "[audio: \(mimeType), \(data.count) bytes]")
+    case .resource(let embedded):
+        return .resource(
+            uri: embedded.resource.uri,
+            mimeType: embedded.resource.mimeType,
+            text: embedded.resource.text
+        )
+    case .resourceLink(let link):
+        return .text(text: "[resource: \(link.uri)]")
+    }
+}
 
 // MARK: - Client adapter
 
@@ -280,6 +384,99 @@ public enum LiveMCPComposition {
             ))
         }
         return results
+    }
+
+    /// Connect configured MCP servers for hub session bridging only.
+    ///
+    /// Unlike `connectConfiguredServers`, this does **not** register tools
+    /// into a session `FinalizedToolset`. Upstream's
+    /// `start_session_mcp_servers` bridges local MCP clients onto the hub
+    /// tool server instead.
+    public static func connectConfiguredClientsForHub(
+        cwd: String,
+        environment: [String: String],
+        connections: MCPSessionConnections,
+        makeHTTPTransport: @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() }
+    ) async -> [HubMCPClientEntry] {
+        let cwdURL = URL(fileURLWithPath: cwd)
+        let loaded: MCPConfigLoadResult
+        do {
+            loaded = try loadDeclarations(environment: environment, cwd: cwdURL)
+        } catch {
+            return []
+        }
+
+        var disabledServers = Set<String>()
+        if let layers = try? configLayers(environment: environment, cwd: cwdURL) {
+            for (_, document) in layers {
+                disabledServers.formUnion(disabledMCPServers(in: document))
+            }
+        }
+
+        var entries: [HubMCPClientEntry] = []
+        for declaration in loaded.enabledServers {
+            if disabledServers.contains(declaration.name) {
+                continue
+            }
+            if let entry = await connectClientForHub(
+                declaration: declaration,
+                connections: connections,
+                environment: environment,
+                makeHTTPTransport: makeHTTPTransport
+            ) {
+                entries.append(entry)
+            }
+        }
+        return entries
+    }
+
+    /// Connect one MCP server for hub bridging without touching a toolset.
+    static func connectClientForHub(
+        declaration: MCPServerDeclaration,
+        connections: MCPSessionConnections,
+        environment: [String: String],
+        makeHTTPTransport: @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() }
+    ) async -> HubMCPClientEntry? {
+        var authorization: (any MCPAuthorizationProviding)?
+        if let endpoint = declaration.oauthEligibleEndpoint(environment: environment),
+           let home = userGrokHome(environment: environment)
+        {
+            let storage = MCPFileCredentialStorage(
+                home: home, serverName: declaration.name, serverURL: endpoint)
+            if (try? storage.load())?.tokenResponse != nil {
+                authorization = MCPAuthorizationManager(
+                    baseURL: endpoint,
+                    transport: makeHTTPTransport(),
+                    storage: storage
+                )
+            } else if await MCPOAuthProbe.serverAdvertisesOAuth(
+                url: endpoint, transport: makeHTTPTransport()
+            ) {
+                return nil
+            }
+        }
+
+        let transport: any MCPTransport
+        do {
+            transport = try declaration.makeTransport(
+                httpTransport: makeHTTPTransport(),
+                environment: environment,
+                authorization: authorization
+            )
+        } catch {
+            return nil
+        }
+
+        let client = MCPClient(transport: transport)
+        do {
+            _ = try await client.initialize()
+        } catch {
+            await client.close()
+            return nil
+        }
+
+        await connections.retain(client, as: declaration.name)
+        return HubMCPClientEntry(serverName: declaration.name, client: client)
     }
 
     /// The `/mcps` row for an OAuth server with no usable stored token —

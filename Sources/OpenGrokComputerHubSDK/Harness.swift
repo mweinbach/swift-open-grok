@@ -30,6 +30,13 @@ public final class LocalRegistry: @unchecked Sendable {
         register(ErasedTool(tool), registration: registration)
     }
 
+    public func unregister(_ id: ToolId) {
+        lock.lock()
+        defer { lock.unlock() }
+        tools[id] = nil
+        registrations[id] = nil
+    }
+
     public func get(_ id: ToolId) -> (any ToolHandle)? {
         lock.lock(); defer { lock.unlock() }
         return tools[id]
