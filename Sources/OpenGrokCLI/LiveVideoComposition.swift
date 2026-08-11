@@ -129,10 +129,17 @@ enum LiveVideoToolComposition {
               )
         else { return }
 
+        // ONE writer for both tools. Each handler's default-constructed writer
+        // resumes its counter from the highest existing `videos/<n>.mp4` the
+        // first time it saves, so two independent writers racing their first
+        // save both pick the same index and one video silently overwrites the
+        // other while both calls report success.
+        let videoWriter = LiveImageSessionWriter(directoryName: "videos")
+
         if availability.imageToVideoEnabled {
             builder.setHandler(
                 qualifiedId: BuiltinToolCatalog.imageToVideoQualifiedId,
-                handler: LiveImageToVideoToolHandler(client: client)
+                handler: LiveImageToVideoToolHandler(client: client, writer: videoWriter)
             )
             toolConfig.tools.append(ToolConfig.fromId(
                 BuiltinToolCatalog.imageToVideoQualifiedId,
@@ -142,7 +149,7 @@ enum LiveVideoToolComposition {
         if availability.referenceToVideoEnabled {
             builder.setHandler(
                 qualifiedId: BuiltinToolCatalog.referenceToVideoQualifiedId,
-                handler: LiveReferenceToVideoToolHandler(client: client)
+                handler: LiveReferenceToVideoToolHandler(client: client, writer: videoWriter)
             )
             toolConfig.tools.append(ToolConfig.fromId(
                 BuiltinToolCatalog.referenceToVideoQualifiedId,
@@ -223,6 +230,55 @@ enum LiveVideoToolComposition {
     }
 }
 
+// MARK: - Duration argument
+
+/// A `duration` argument as it arrived from the model.
+///
+/// The three cases exist because collapsing `malformed` into `absent` is a
+/// silent-divergence bug: `validateImagineVideoDuration` accepts `nil`, so a
+/// negative, oversized, or nonnumeric `duration` used to fall through to the
+/// six-second default and launch a billable generation nobody asked for. The
+/// decoder path already rejects malformed strings
+/// (`VideoGeneration.swift:decodeDuration`); this keeps the direct tool-call
+/// path as strict.
+private enum VideoDurationArgument {
+    case absent
+    case seconds(UInt32)
+    case malformed
+}
+
+/// Parse `duration` without trapping. `UInt32(someInt64)` traps for anything
+/// above `UInt32.max`, so a `duration` of 4294967296 used to kill the agent
+/// process rather than return an invalid-arguments result.
+private func videoDurationArgument(_ args: JSONValue, _ key: String) -> VideoDurationArgument {
+    guard case .object(let obj) = args, let raw = obj[key] else { return .absent }
+    switch raw {
+    case .null:
+        return .absent
+    case .number(.int64(let value)):
+        guard let seconds = UInt32(exactly: value) else { return .malformed }
+        return .seconds(seconds)
+    case .number(.uint64(let value)):
+        guard let seconds = UInt32(exactly: value) else { return .malformed }
+        return .seconds(seconds)
+    case .number(.double(let value)):
+        guard let seconds = UInt32(exactly: value) else { return .malformed }
+        return .seconds(seconds)
+    case .string(let text):
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return .absent }
+        guard let seconds = UInt32(trimmed) else { return .malformed }
+        return .seconds(seconds)
+    default:
+        return .malformed
+    }
+}
+
+/// Shared rejection copy, matching `validateImagineVideoDuration`'s vocabulary
+/// so a malformed value and an out-of-range one read the same to the model.
+private let videoDurationMalformedMessage =
+    "`duration` must be either 6 or 10 seconds, given as a whole number."
+
 // MARK: - Handlers
 
 struct LiveImageToVideoToolHandler: ToolHandler {
@@ -259,7 +315,12 @@ struct LiveImageToVideoToolHandler: ToolHandler {
             return .failure(.invalidArguments("image_to_video requires an image reference"))
         }
 
-        let duration = uintField(args, "duration")
+        let duration: UInt32?
+        switch videoDurationArgument(args, "duration") {
+        case .absent: duration = nil
+        case .seconds(let value): duration = value
+        case .malformed: return .failure(.invalidArguments(videoDurationMalformedMessage))
+        }
         let resolution = stringField(args, "resolution_name") ?? DEFAULT_VIDEO_RESOLUTION
         do {
             try validateImagineVideoDuration(duration)
@@ -336,18 +397,6 @@ struct LiveImageToVideoToolHandler: ToolHandler {
         }
         return value
     }
-
-    private func uintField(_ args: JSONValue, _ key: String) -> UInt32? {
-        guard case .object(let obj) = args else { return nil }
-        switch obj[key] {
-        case .number(.int64(let value)) where value >= 0:
-            return UInt32(value)
-        case .string(let raw):
-            return UInt32(raw.trimmingCharacters(in: .whitespacesAndNewlines))
-        default:
-            return nil
-        }
-    }
 }
 
 /// `reference_to_video` handler. Validation order matches Rust
@@ -400,7 +449,12 @@ struct LiveReferenceToVideoToolHandler: ToolHandler {
             ))
         }
 
-        let duration = uintField(args, "duration")
+        let duration: UInt32?
+        switch videoDurationArgument(args, "duration") {
+        case .absent: duration = nil
+        case .seconds(let value): duration = value
+        case .malformed: return .failure(.invalidArguments(videoDurationMalformedMessage))
+        }
         let aspectRatio = stringField(args, "aspect_ratio") ?? ""
         let resolution = stringField(args, "resolution_name") ?? DEFAULT_VIDEO_RESOLUTION
         do {
@@ -501,17 +555,5 @@ struct LiveReferenceToVideoToolHandler: ToolHandler {
             out.append(s)
         }
         return out
-    }
-
-    private func uintField(_ args: JSONValue, _ key: String) -> UInt32? {
-        guard case .object(let obj) = args else { return nil }
-        switch obj[key] {
-        case .number(.int64(let value)) where value >= 0:
-            return UInt32(value)
-        case .string(let raw):
-            return UInt32(raw.trimmingCharacters(in: .whitespacesAndNewlines))
-        default:
-            return nil
-        }
     }
 }

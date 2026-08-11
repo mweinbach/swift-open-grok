@@ -572,3 +572,90 @@ private func dataImageURL() -> String {
     #expect(refs.count == 2)
     #expect((refs[0]["url"] as? String)?.hasPrefix("data:image/") == true)
 }
+
+// MARK: - duration argument (crash + silent-default regressions)
+
+/// `UInt32(someInt64)` traps above `UInt32.max`, so this input used to kill the
+/// agent process instead of returning a tool error.
+@Test func referenceToVideoRejectsOutOfRangeDuration() async throws {
+    let transport = MockHTTPTransport()
+    let client = try VideoGenClient(
+        config: .enabled(VideoGenSettings(apiKey: "k", baseURL: "https://api.x.ai/v1")),
+        transport: transport
+    )
+    let handler = LiveReferenceToVideoToolHandler(client: client)
+    let sessionFolder = temporaryDirectory().path
+    let result = await handler.invoke(
+        clientName: REFERENCE_TO_VIDEO_TOOL_NAME,
+        args: .object([
+            "prompt": .string("blend"),
+            "images": .array([.string(dataImageURL()), .string(dataImageURL())]),
+            "aspect_ratio": .string("16:9"),
+            "duration": .number(.int64(4_294_967_296)),
+        ]),
+        ctx: ToolCallContext(),
+        resources: ToolResources(cwd: sessionFolder, sessionFolder: sessionFolder)
+    )
+    guard case .failure(let error) = result else {
+        Issue.record("expected out-of-range duration failure")
+        return
+    }
+    #expect(error.description.contains("`duration`"))
+    #expect(transport.recordedRequests.isEmpty)
+}
+
+/// A malformed duration used to collapse into "absent" and silently generate at
+/// the six-second default — a billable request the caller never asked for.
+@Test func referenceToVideoRejectsMalformedDuration() async throws {
+    let transport = MockHTTPTransport()
+    let client = try VideoGenClient(
+        config: .enabled(VideoGenSettings(apiKey: "k", baseURL: "https://api.x.ai/v1")),
+        transport: transport
+    )
+    let handler = LiveReferenceToVideoToolHandler(client: client)
+    let sessionFolder = temporaryDirectory().path
+    for malformed in [JSONValue.string("soon"), .number(.int64(-1))] {
+        let result = await handler.invoke(
+            clientName: REFERENCE_TO_VIDEO_TOOL_NAME,
+            args: .object([
+                "prompt": .string("blend"),
+                "images": .array([.string(dataImageURL()), .string(dataImageURL())]),
+                "aspect_ratio": .string("16:9"),
+                "duration": malformed,
+            ]),
+            ctx: ToolCallContext(),
+            resources: ToolResources(cwd: sessionFolder, sessionFolder: sessionFolder)
+        )
+        guard case .failure(let error) = result else {
+            Issue.record("expected malformed duration failure for \(malformed)")
+            return
+        }
+        #expect(error.description.contains("`duration`"))
+    }
+    #expect(transport.recordedRequests.isEmpty)
+}
+
+@Test func imageToVideoRejectsOutOfRangeDuration() async throws {
+    let transport = MockHTTPTransport()
+    let client = try VideoGenClient(
+        config: .enabled(VideoGenSettings(apiKey: "k", baseURL: "https://api.x.ai/v1")),
+        transport: transport
+    )
+    let handler = LiveImageToVideoToolHandler(client: client)
+    let sessionFolder = temporaryDirectory().path
+    let result = await handler.invoke(
+        clientName: IMAGE_TO_VIDEO_TOOL_NAME,
+        args: .object([
+            "image": .string(dataImageURL()),
+            "duration": .number(.int64(4_294_967_296)),
+        ]),
+        ctx: ToolCallContext(),
+        resources: ToolResources(cwd: sessionFolder, sessionFolder: sessionFolder)
+    )
+    guard case .failure(let error) = result else {
+        Issue.record("expected out-of-range duration failure")
+        return
+    }
+    #expect(error.description.contains("`duration`"))
+    #expect(transport.recordedRequests.isEmpty)
+}
