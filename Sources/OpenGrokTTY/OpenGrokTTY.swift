@@ -321,6 +321,14 @@ public final class WindowsTTYAdapter: TTYAdapter, @unchecked Sendable {
     public func capabilities() -> TerminalCapability { TerminalCapability() }
 
     public func enterRawMode() async throws -> any RawModeLease {
+        // NSLock is sync-only under Swift 6; keep the critical section off the
+        // async function body, the same split the other lock-holding actors in
+        // this port use. This arm is `#if os(Windows)`, so the diagnostic could
+        // only ever appear on the platform that had never compiled.
+        try acquireRawMode()
+    }
+
+    private func acquireRawMode() throws -> any RawModeLease {
         lock.lock()
         defer { lock.unlock() }
         guard WindowsConsole.isAttached else {
