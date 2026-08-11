@@ -1041,6 +1041,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         editor.isMultiline = newModes.isMultiline
     }
 
+    /// Replace the composer draft (voice finals, paste helpers). Emits
+    /// `.promptChanged` so the renderer stays in sync with the editor.
+    public func replacePromptDraft(_ text: String) async {
+        editor.replace(with: text)
+        do {
+            try await emit(.promptChanged(promptState()))
+        } catch {
+            // A failed prompt publish must not kill the voice pipeline; the
+            // next keystroke will refresh from the editor anyway.
+        }
+    }
+
     public func run(_ request: OpenGrokPagerRequest) async throws -> OpenGrokPagerInteractiveResult {
         try await run(initialSession: nil, request: request)
     }
@@ -2938,6 +2950,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             usage: "/flush <notes>"
         ),
         PagerCommandDefinition(
+            name: "dream",
+            summary: "Consolidate session logs into durable memory",
+            usage: "/dream"
+        ),
+        PagerCommandDefinition(
+            name: "voice",
+            summary: "Toggle microphone dictation into the prompt",
+            usage: "/voice"
+        ),
+        PagerCommandDefinition(
             name: "goal",
             summary: "Set or inspect the session goal",
             usage: "/goal [objective|status|pause|resume|clear]"
@@ -3606,6 +3628,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 return .handled
             case "flush":
                 try await emit(.overlay(.flush(text: Self.rejoined(invocation.arguments))))
+                return .handled
+            case "dream":
+                try await emit(.overlay(.dream))
+                return .handled
+            case "voice":
+                try await emit(.overlay(.voice))
                 return .handled
             case "goal":
                 try await emit(.overlay(.goal(argument: Self.rejoined(invocation.arguments))))

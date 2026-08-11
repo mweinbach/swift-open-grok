@@ -1432,7 +1432,7 @@ Open a preview of the current saved plan. Aliases: `/show-plan`, `/plan-view`.
 
 ## Memory
 
-`/flush` and `/memory` require memory to be enabled (`--experimental-memory` or `GROK_MEMORY=1`); `/memory` also needs a configured memory backend. `/remember` is always available. Dream consolidation (`/dream` and automatic dreaming) is not available in this port yet.
+`/flush`, `/dream`, and `/memory` require memory to be enabled (`--experimental-memory` or `GROK_MEMORY=1`); `/memory` also needs a configured memory backend. `/remember` is always available.
 
 ### `/memory`
 
@@ -1446,6 +1446,10 @@ Browse, view, and manage saved memories. Pass `on` or `off` to enable or disable
 ### `/flush`
 
 Save the current session's knowledge to memory right now, triggering an LLM summary of the most important content. Reach for it before compaction, or any time you want to lock in context.
+
+### `/dream`
+
+Run memory consolidation — merge session logs into organized topics in `MEMORY.md`. Requires `[memory.dream] enabled = true`.
 
 ### `/remember`
 
@@ -5592,7 +5596,7 @@ Background saves — flush and session-end — run silently and do not post a sc
 
 ## Dream Consolidation
 
-Dream consolidation (manual `/dream` and automatic `[memory.dream]` runs) is not available in this port yet. The settings row stays hidden until a live consolidation path exists. Use `/remember` and `/flush` for durable notes in the meantime.
+Use `/dream` to consolidate recent session logs into durable workspace memory. Automatic dreaming also runs at session end when `[memory.dream] enabled = true` and the time/session gates pass. Manual `/dream` bypasses those gates but still requires the setting.
 
 ---
 

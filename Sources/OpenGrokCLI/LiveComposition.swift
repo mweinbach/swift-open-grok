@@ -15,6 +15,7 @@ import OpenGrokHooks
 import OpenGrokHooksPluginTypes
 import OpenGrokHunkTracker
 import OpenGrokInterjection
+import OpenGrokLSP
 import OpenGrokModels
 import OpenGrokPager
 import OpenGrokPagerCommandUI
@@ -38,6 +39,7 @@ import OpenGrokToolTypes
 import OpenGrokToolsAPI
 import OpenGrokTTY
 import OpenGrokVersion
+import OpenGrokVoice
 import OpenGrokWebMediaTools
 import OpenGrokWorkspace
 
@@ -1476,6 +1478,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     await renderer.setInputModesSink { [weak controller] modes in
                         await controller?.setInputModes(modes)
                     }
+                    await renderer.setVoicePromptSink { [weak controller] text in
+                        await controller?.replacePromptDraft(text)
+                    }
                     // The render side reports what is moving (welcome logo,
                     // visible streaming blocks, finish flashes) and the
                     // controller's ticker arms or parks on it — this is what
@@ -2615,6 +2620,17 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             ),
             transport: dependencies.makeImageTransport()
         )
+        let videoToolContext = LiveVideoToolContext(
+            availability: LiveVideoToolComposition.resolveAvailability(
+                workingDirectory: cwd,
+                openGrokHome: openGrokHome,
+                environment: context.environment,
+                samplingProvider: samplingConfiguration.provider,
+                samplingAPIKey: samplingConfiguration.apiKey,
+                samplingBaseURL: samplingConfiguration.baseURL
+            ),
+            transport: dependencies.makeImageTransport()
+        )
         let webToolContext = LiveWebToolContext(
             availability: LiveWebToolComposition.resolveAvailability(
                 workingDirectory: cwd,
@@ -2740,6 +2756,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             fileAccessPolicy: fileAccessPolicy,
             environment: context.environment,
             imageToolContext: imageToolContext,
+            videoToolContext: videoToolContext,
             webToolContext: webToolContext,
             sandboxDecision: sandboxDecision,
             securityContext: securityContext,
@@ -4523,6 +4540,8 @@ struct LiveToolExecutor: Sendable {
     /// tools; see `LiveSessionServices.swift`.
     let sessionServices: LiveSessionServices?
     let telemetryStatus: LiveTelemetryStatus
+    /// Live LSP pull session when `features.lsp_tools` registered a tool.
+    private let lspPullSession: LSPPullSession?
 
     init(
         processBackend: any ShellProcessBackend,
@@ -4542,6 +4561,9 @@ struct LiveToolExecutor: Sendable {
         // construction sites that predate the image tools keep compiling; a
         // session that passes nothing simply never advertises them.
         imageToolContext: LiveImageToolContext? = nil,
+        // Video tools share the image transport and the same xAI credential
+        // gate. Defaulted so older construction sites advertise nothing.
+        videoToolContext: LiveVideoToolContext? = nil,
         // Web-tool availability is likewise a credential decision — plus the
         // `--disable-web-search` switch. Defaulted so construction sites that
         // predate the web tools keep compiling and simply advertise nothing.
@@ -4736,6 +4758,13 @@ struct LiveToolExecutor: Sendable {
                 }
             }
         }
+        if let videoToolContext {
+            LiveVideoToolComposition.registerImageToVideo(
+                context: videoToolContext,
+                builder: &builder,
+                toolConfig: &toolConfig
+            )
+        }
         // `todo_write` needs no credentials and no configuration — its whole
         // backing state is this session's in-memory list — so unlike the image
         // and web tools it is registered unconditionally and gated only by the
@@ -4885,6 +4914,14 @@ struct LiveToolExecutor: Sendable {
             connections: mcpConnections,
             environment: environment
         )
+        // LSP `pull_diagnostics` — after MCP so both share one search index
+        // refresh, and before `toolDefinitions()` so the model list includes it.
+        let lspPullSession = LiveLspComposition.registerTools(
+            toolset: toolset,
+            workingDirectory: standardizedWorkingDirectory,
+            document: security.document,
+            environment: environment
+        )
         mcpSearchIndex.refresh(from: toolset)
         let fileToolDefinitions = fileToolBridge.toolDefinitions()
         let allowedFileToolDefinitions = fileToolDefinitions.filter {
@@ -5017,6 +5054,7 @@ struct LiveToolExecutor: Sendable {
         self.fileToolBridge = fileToolBridge
         self.mcpConnections = mcpConnections
         self.mcpServerConnections = mcpServerConnections
+        self.lspPullSession = lspPullSession
         self.registryToolNames = Set(allowedFileToolDefinitions.map(\.name))
         self.workingDirectory = standardizedWorkingDirectory
         self.sessionDirectories = LiveSessionDirectoryRegistry(
@@ -5781,6 +5819,7 @@ struct LiveToolExecutor: Sendable {
         // Monitor pipelines before the shell composition: a poll loop that
         // outlives the backend would spin against a dead process table.
         await monitorHost?.shutdown()
+        await lspPullSession?.shutdown()
         await mcpConnections.shutdown()
         await composition.shutdown()
     }
@@ -9323,6 +9362,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private var prompt = OpenGrokPagerInteractivePromptState()
     private var terminalSize: OpenGrokTerminalCore.TerminalSize
     private var restored = false
+    /// Voice dictation state for `/voice` and Ctrl+Space. Capabilities are
+    /// resolved once at construction from the audited environment.
+    private var voiceState = LiveVoiceSessionState()
+    /// Drains `VoicePipeline.events` into the composer while listening.
+    private var voiceEventTask: Task<Void, Never>?
+    /// Forwards voice finals into the controller's editor (not only the
+    /// renderer's copy), so Send sees the dictated text.
+    private var voicePromptSink: (@Sendable (String) async -> Void)?
 
     /// Frame chrome. `turnActivity` is `nil` whenever no turn is in flight,
     /// which is what hides the turn-status row — the reference gives that row
@@ -9756,6 +9803,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         let environment = environment ?? ProcessInfo.processInfo.environment
         self.environment = environment
         self.authServices = authServices
+        self.voiceState = LiveVoiceSessionState(
+            capabilities: LiveVoiceComposition.resolveCapabilities(environment: environment)
+        )
         let resolvedUIConfiguration = uiConfiguration ?? Self.resolveUIConfig(
             workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
             environment: environment
@@ -9951,6 +10001,103 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// trap, applied to env).
     func setSuspendHost(_ host: LiveTUISuspendHost?) {
         suspendHost = host
+    }
+
+    /// Install the voice→composer bridge so dictated finals land in the
+    /// controller's editor, not only this renderer's painted copy.
+    func setVoicePromptSink(_ sink: (@Sendable (String) async -> Void)?) {
+        voicePromptSink = sink
+    }
+
+    /// `/dream` — consolidate session logs through the auxiliary sampler route.
+    private func runDreamCommand() async {
+        let dreamConfig = sessionServices?.memory?.configuration.dream ?? MemoryDreamConfig()
+        let sampler: LiveMemoryDreamSampler?
+        if let modelSwitch {
+            let sessionID = self.sessionID
+            sampler = LiveMemoryDreamSampler { systemPrompt, userMessage in
+                let route = await modelSwitch.auxiliaryRecapRoute(explicitModelID: nil)
+                var items: [ConversationItem] = []
+                if !systemPrompt.isEmpty {
+                    items.append(.system(systemPrompt))
+                }
+                items.append(.user(userMessage))
+                let response = try await route.sampler.sample(
+                    OpenGrokLiveSamplingRequest(
+                        sessionID: sessionID,
+                        turnID: "xai-dream-\(UUID().uuidString)",
+                        model: route.configuration.model,
+                        prompt: userMessage,
+                        items: items,
+                        tools: []
+                    )
+                ) { _ in }
+                return response.output
+            }
+        } else {
+            sampler = nil
+        }
+        note(await LiveMemoryCommands.dream(
+            backend: sessionServices?.memory,
+            dreamConfig: dreamConfig,
+            sessionID: sessionID,
+            sampler: sampler
+        ))
+    }
+
+    /// `/voice` — toggle microphone dictation into the prompt (no auto-send).
+    private func runVoiceCommand() async {
+        // Copy out of actor isolation: `inout` across an async call is illegal
+        // on an isolated stored property.
+        var state = voiceState
+        let result = await LiveVoiceCommands.toggle(state: &state)
+        voiceState = state
+        if let message = result.message {
+            note(message)
+        } else {
+            switch result.action {
+            case .startedListening:
+                note("Listening… (/voice again to stop)")
+                startVoiceEventDrain()
+            case .stoppedListening:
+                note("Voice dictation stopped.")
+                voiceEventTask?.cancel()
+                voiceEventTask = nil
+            case .unavailable, .ignored:
+                break
+            }
+        }
+        try? renderState()
+    }
+
+    private func startVoiceEventDrain() {
+        voiceEventTask?.cancel()
+        guard let pipeline = voiceState.pipeline?.pipeline else { return }
+        voiceEventTask = Task { [weak self] in
+            for await event in pipeline.events {
+                guard let self else { return }
+                await self.applyVoiceEvent(event)
+            }
+        }
+    }
+
+    private func applyVoiceEvent(_ event: VoiceEvent) async {
+        var interim = ""
+        var draft = prompt.text
+        let redraw = LiveVoiceEventHandling.apply(event, interim: &interim, prompt: &draft)
+        guard redraw else { return }
+        if case .utteranceFinal = event {
+            prompt = OpenGrokPagerInteractivePromptState(
+                text: draft,
+                cursorOffset: draft.count
+            )
+            if let voicePromptSink {
+                await voicePromptSink(draft)
+            }
+        } else if case .error(let message, _) = event, !message.isEmpty {
+            note(message)
+        }
+        try? renderState()
     }
 
     /// Pull the current announcement banner from the live composition into
@@ -11555,6 +11702,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 sessionID: sessionID,
                 backend: sessionServices?.memory
             ))
+        case .dream:
+            await runDreamCommand()
+        case .voice:
+            await runVoiceCommand()
         case .goal(let argument):
             guard let coordinator = sessionServices?.goal else {
                 note("Goal tracking is not available in this session.")
@@ -14375,18 +14526,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 "opencode_go_models": (try? store.loadMultiSelect(key: "opencode_go_models")) ?? []
             ],
             locks: locks,
-            hiddenKeys: [
-                "voice_keybind_enabled",
-                "voice_capture_mode",
-                "voice_stt_language",
-                "antigravity_subagents",
-                "antigravity_skip_permissions",
-                "memory.dream.enabled",
-                "features.lsp_tools",
-            ],
-            gatedChoices: [
-                "permission_mode": ["auto"],
-            ],
+            hiddenKeys: LiveVoiceCapabilities.hiddenSettingsKeys(when: voiceState.capabilities)
+                .union([
+                    "antigravity_subagents",
+                    "antigravity_skip_permissions",
+                ]),
+            // Auto-mode is live via HeuristicPermissionClassifier on every
+            // PermissionHandle; dream and LSP rows are unhidden now that their
+            // live seams exist. Voice rows stay capability-gated above.
+            gatedChoices: [:],
             // Minimal mode hides the rows the reference marks `hidden_in_minimal`,
             // because none of them have a surface there to affect.
             minimalMode: mode != .fullScreen

@@ -29,10 +29,13 @@ clients on the headless `open-grok share` route. Follow-on closes ACP
 `x.ai/share_session`, CLI `--tools`/`--disallowed-tools`, child reasoning effort,
 `SetPlanMode(Off)` / settings `plan_mode`, and allowlisted remote `session_recap`.
 Follow-on batch 2 also lands JWKS id_token validation, `--max-turns`,
-`page_flip_on_send`, and dream docs honesty. Still open at the live seam: hub MCP
-session connect, voice/Antigravity/auto-mode/dream *runtime*/LSP/video, ACP SDK
-reverse bridge, and platform evidence (Linux sandbox, Windows relaunch, WSS/custom
-CA, CI required checks).
+`page_flip_on_send`, and dream docs honesty. The deferred runtime wave then lands
+auto-mode heuristic classification, hub MCP→harness session connect, `/dream`
+consolidation, macOS `__mic-capture` voice + `/voice`, LSP `pull_diagnostics`,
+and backend-gated `image_to_video`. Still open at the live seam: Antigravity,
+auto-mode LLM side-query, full LSP sync, `reference_to_video`, ACP SDK reverse
+bridge, and platform evidence (Linux sandbox, Windows relaunch, WSS/custom CA,
+CI required checks).
 
 **Wave 19 update (2026-08-10):** the deferred-dashboard batch is now landed rather
 than standing. Retained dashboard sessions can dispatch prompts and replies; `/cd`,

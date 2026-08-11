@@ -43,18 +43,20 @@ struct LiveSettingsHonestyTests {
     func unsupportedRowsAreAbsent() async {
         let overlay = await makeSettingsRenderer().settingsOverlay()
         let visibleKeys = Set(overlay.visibleRows.compactMap(\.settingKey))
-        let unsupportedKeys: Set<String> = [
-            "voice_keybind_enabled",
-            "voice_capture_mode",
-            "voice_stt_language",
+        let voiceHidden = LiveVoiceCapabilities.hiddenSettingsKeys(
+            when: LiveVoiceComposition.resolveCapabilities()
+        )
+        var unsupportedKeys: Set<String> = [
             "antigravity_subagents",
             "antigravity_skip_permissions",
-            "memory.dream.enabled",
-            "features.lsp_tools",
         ]
+        unsupportedKeys.formUnion(voiceHidden)
 
         #expect(visibleKeys.isDisjoint(with: unsupportedKeys))
         #expect(unsupportedKeys.allSatisfy { overlay.registry.find($0) != nil })
+        // Dream and LSP are live; they must appear once their seams exist.
+        #expect(visibleKeys.contains("memory.dream.enabled"))
+        #expect(visibleKeys.contains("features.lsp_tools"))
         #expect(visibleKeys.isSuperset(of: [
             "permission_mode",
             "memory.enabled",
@@ -62,14 +64,15 @@ struct LiveSettingsHonestyTests {
         ]))
     }
 
-    @Test("auto is absent while supported permission choices remain")
-    func unsupportedAutoChoiceIsAbsent() async throws {
+    @Test("auto permission mode is offered once the heuristic classifier is live")
+    func autoChoiceIsPresent() async throws {
         let overlay = await makeSettingsRenderer().settingsOverlay()
         let permissionMode = try #require(overlay.registry.find("permission_mode"))
 
         #expect(overlay.choices(for: permissionMode).map(\.canonical) == [
             "default",
             "ask",
+            "auto",
             "always-approve",
         ])
     }

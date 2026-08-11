@@ -1,7 +1,7 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 20 deferred follow-ons batch 2 complete. Serial gate exited 0 with **5,819 Swift Testing cases across 105 nonempty summaries**, zero failed summaries, and zero issues.)
-**Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, hub MCP session connect, and post-change Linux/Windows CI plus required-check evidence remain open.
+**As of:** 2026-08-10 (Deferred runtime wave complete. Serial gate exited 0 with **5,872 Swift Testing cases across 106 nonempty summaries**, zero failed summaries, and zero issues.)
+**Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
 **Fixture pin:** `ProtocolFixtures/` was re-evaluated against `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` on 2026-08-08, with `70002584da34e4c37ea14a3bce35341b7d04f9a7` recorded as the immediate previous revision. The `.58` delta touched no fixture family's upstream source (every family's `referenceSources` diff across `70002584..650c1db7`, including `Cargo.lock` and the telemetry/tracing surfaces, verified empty by the lead), so the only recaptures are the two release-stamped artifacts (CLI version fixture and the GCRX sample, both restamped `0.1.220-open-grok.58` — the GCRX golden by same-length in-place substitution at offset 32); unchanged families carry explicit `70002584..650c1db7` diff evidence.
@@ -79,12 +79,40 @@ share/ACP/launch/child-effort **32**, plan+child-effort **11**.
 exited 0 on 2026-08-10 with **5,819 Swift Testing cases across 105 nonempty
 summaries** and zero issues.
 
+### Deferred runtime wave (2026-08-10)
+
+Rust-parity recommended slices against pin `650c1db7`, lead-wired through
+`LiveComposition` / pager / settings honesty:
+
+- **Auto-mode heuristic:** `HeuristicPermissionClassifier` is the default
+  `PermissionHandle` classifier; settings `"auto"` is ungated
+  (`auto_mode.rs:339-447`). Deliberate gap: no tree-sitter shell parse — opaque
+  shell Blocks (Rust fail-closed when parse fails). LLM side-query still absent.
+- **Hub MCP session connect (Rust direction):** local MCP clients bridge onto the
+  hub `ToolHarness` via `MCPClientTransportAdapter` + `LiveHubSessionMCP`
+  (`handle.rs:start_session_mcp_servers`, `mcp.rs:21+`). S6
+  `HubMCPBridgeCoordinator` stays loopback/test-only.
+- **Dream runtime + `/dream`:** lock/gates + consolidation in `OpenGrokMemory`;
+  live command uses the auxiliary sampler route; `memory.dream.enabled` unhidden;
+  docs restored. Auto-dream at session-end remains a follow-on.
+- **Voice:** macOS `__mic-capture` child path (not in-process AVFoundation in the
+  TUI); `/voice` toggles dictation into the prompt; settings rows unhide only when
+  `VoiceCapabilities.detect()` reports capture support.
+- **LSP `pull_diagnostics`:** new `OpenGrokLSP` target; tool registers when
+  `features.lsp_tools` is on and `lsp.json` has servers; settings row unhidden.
+- **`image_to_video`:** backend-gated beside image tools; tier-restricted upsell;
+  no `reference_to_video` / `/imagine-video`.
+
+**Verification:** `zsh workflows/swift-safe-verify.zsh test --no-parallel`
+exited 0 on 2026-08-10 with **5,872 Swift Testing cases across 106 nonempty
+summaries** and zero issues.
+
 ### Still deferred from the audit
 
-Hub MCP session connect (interactive transport owner), voice, Antigravity,
-auto-mode classifier, dream *implementation*, LSP, video tools, ACP SDK reverse
-bridge, durable subagent resume, relocation journal, Linux/Windows CI evidence,
-portable WSS/custom CA, and capable-Linux sandbox proof.
+Antigravity runner, auto-mode **LLM** classifier, full LSP push/sync,
+`reference_to_video`, durable subagent resume, ACP SDK reverse bridge,
+relocation journal, Linux/Windows CI evidence, portable WSS/custom CA, and
+capable-Linux sandbox proof.
 
 ## Wave 19 — Deferred parity follow-ons (2026-08-10, complete)
 
@@ -130,13 +158,13 @@ remains open; this wave does not weaken the Windows refusal.
 
 ### Broader audited closures
 
-- **Settings/profile honesty:** live settings now hide or gate unsupported voice,
-  Antigravity, auto-permission, dream, and LSP choices; built-in agent profiles no
-  longer advertise absent `search_tool`, `use_tool`, `image_to_video`,
-  `reference_to_video`, or `lsp` handlers. The taxonomy remains reserved for future
-  implementations. Rust behavior anchors include `voice/mod.rs:10-16,30-33`,
-  `permission/auto_mode.rs:301-312`, `memory/src/dream.rs:32-40,114`,
-  `agent_ops.rs:4474-4504`, and `builder.rs:2243-2261`.
+- **Settings/profile honesty:** live settings hide Antigravity and capability-gated
+  voice rows; auto / dream / LSP / `image_to_video` are live as of the deferred
+  runtime wave (voice still capability-gated). Built-in profiles still omit
+  `reference_to_video` until reference artifacts exist. Rust anchors include
+  `voice/mod.rs:10-16,30-33`, `permission/auto_mode.rs:301-312`,
+  `memory/src/dream.rs:32-40,114`, `agent_ops.rs:4474-4504`, and
+  `builder.rs:2243-2261`.
 - **MCP OAuth recovery/revoke:** the browser flow polls the owner-only credential
   file inside the callback timeout, a recovered credential re-probes and registers
   the live client, and delete performs best-effort RFC 7009 revoke followed by
@@ -708,7 +736,8 @@ the file header — notifications have no error channel; silence matches upstrea
 unmatched arm). 9 new test suites over the real ws:// carrier.
 
 **Recorded divergences:** single-stack fan-out (`clientIdentifier` matching vacuous —
-one live stack per ACP process); auto-mode is flag-only pending the classifier seam;
+one live stack per ACP process); auto-mode uses the heuristic classifier (LLM
+side-query still absent); 
 broadcasts are not persisted to `updates.jsonl` (a reconnecting client cannot replay);
 recap lacks the watermark/idle gate and new-prompt epoch cancel (an `auto:true` recap
 runs unconditionally); no `cancelTrigger` on prompt_complete; permissions reset is

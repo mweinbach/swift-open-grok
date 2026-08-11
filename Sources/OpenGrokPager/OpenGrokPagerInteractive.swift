@@ -433,6 +433,10 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     case recall(query: String)
     /// `/flush <notes>` — append to today's session memory log.
     case flush(text: String)
+    /// `/dream` — consolidate session logs into durable MEMORY.md.
+    case dream
+    /// `/voice` — toggle microphone dictation into the prompt.
+    case voice
     /// `/goal [objective|status|pause|resume|clear]` — the goal tracker.
     case goal(argument: String)
     /// Bare `/plan` — arm plan mode (upstream `Action::SetPlanMode(On)`,
