@@ -313,6 +313,28 @@ public enum BuiltinToolCatalog {
         required: ["prompt", "image"]
     )
 
+    /// Model-facing text for `image_to_video`. Kept byte-identical to
+    /// `OpenGrokWebMediaTools.IMAGE_TO_VIDEO_DESCRIPTION`.
+    public static let imageToVideoDescription = "Generate a video from a single source image; returns the saved video's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `videos/1.mp4`) rather than the absolute path, so it renders as a clickable link that opens the video. Provide `image` for the image to animate and optionally a `prompt` to guide the animation. Use this tool when the user provides an image and wants it animated, turned into a video, or used as the first frame. Example: image_to_video(image=\"/Users/me/photo.jpg\", prompt=\"gentle camera push-in with wind moving the hair\", duration=6, resolution_name=\"480p\")"
+
+    public static let imageToVideoSchema = objectSchema(
+        properties: [
+            "prompt": stringProp(
+                "Optional prompt to guide the video generation model. If omitted, a natural animation applies automatically."
+            ),
+            "image": stringProp(
+                "Source image to animate. Provide an absolute filesystem path, HTTPS URL, or `data:image/...;base64,...` URL."
+            ),
+            "duration": stringProp(
+                "Duration of the video generation, either 6 or 10 seconds. Default to 6 unless the user requests longer."
+            ),
+            "resolution_name": stringProp(
+                "Resolution name of the video generation, only specify it when user asks for a specific resolution, either 480p or 720p. Defaults to 480p unless the user specifically requests for higher quality."
+            ),
+        ],
+        required: ["image"]
+    )
+
     /// Image generation / editing tools.
     ///
     /// Registered unconditionally, exactly as upstream's registry does
@@ -343,6 +365,23 @@ public enum BuiltinToolCatalog {
 
     public static let imageGenQualifiedId = "GrokBuild:image_gen"
     public static let imageEditQualifiedId = "GrokBuild:image_edit"
+
+    /// Video generation tools. Registered unconditionally in the catalog; whether
+    /// a session advertises them is decided at live composition time from
+    /// resolved xAI credentials — see `LiveVideoToolComposition`.
+    public static let videoTools: [RegisteredToolSpec] = [
+        RegisteredToolSpec(
+            namespace: .grokBuild, id: "image_to_video", kind: .imageToVideo,
+            description: imageToVideoDescription,
+            inputSchema: imageToVideoSchema
+        ),
+    ]
+
+    public static var videoToolKinds: [String: ProductToolKind] {
+        Dictionary(uniqueKeysWithValues: videoTools.map { ($0.qualifiedId, $0.kind) })
+    }
+
+    public static let imageToVideoQualifiedId = "GrokBuild:image_to_video"
 
     // MARK: Web tools
 
@@ -600,7 +639,7 @@ public enum BuiltinToolCatalog {
     /// `mcpMetaTools` are always-retained: a restrictive allowlist cannot
     /// strip MCP access (`builder.rs:2243-2261`).
     public static var builtinTools: [RegisteredToolSpec] {
-        fileTools + mediaTools + webTools + sessionStateTools + planModeTools
+        fileTools + mediaTools + videoTools + webTools + sessionStateTools + planModeTools
             + askUserQuestionTools + mcpMetaTools
     }
 

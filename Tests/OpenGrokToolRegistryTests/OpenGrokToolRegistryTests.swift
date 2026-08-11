@@ -262,9 +262,10 @@ struct ToolRegistryTests {
 
         let registeredNames = Set(BuiltinToolCatalog.builtinTools.map(\.id))
         let taxonomyOnlyNames: Set<String> = [
-            "lsp", "image_to_video", "reference_to_video",
+            "lsp", "reference_to_video",
         ]
         #expect(registeredNames.isDisjoint(with: taxonomyOnlyNames))
+        #expect(registeredNames.contains("image_to_video"))
     }
 }
 
