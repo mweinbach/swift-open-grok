@@ -634,8 +634,8 @@ struct PackedGitObjectTests {
         }
     }
 
-    @Test("OFS_DELTA and REF_DELTA are honest typed refusals")
-    func packedDeltaRefusal() throws {
+    @Test("OFS_DELTA and REF_DELTA resolve to expected content")
+    func packedDeltaResolution() throws {
         let root = try makeSeedRepo()
         defer { try? FileManager.default.removeItem(at: root) }
         let gitDir = root.appendingPathComponent(".git").path
@@ -661,20 +661,233 @@ struct PackedGitObjectTests {
         )
         #expect(FileManager.default.fileExists(atPath: fixture.indexURL.path))
 
-        for (object, expectedKind) in [
-            (offsetDelta, GitPackDeltaKind.offset),
-            (referenceDelta, GitPackDeltaKind.reference),
+        let store = GitObjectStore(gitDir: gitDir)
+        for (object, expectedPayload) in [
+            (offsetDelta, offsetResult),
+            (referenceDelta, referenceResult),
         ] {
-            do {
-                _ = try GitObjectStore(gitDir: gitDir).readObject(oid: object.oid)
-                Issue.record("expected packedDeltaUnsupported")
-            } catch GitStatusError.packedDeltaUnsupported(let oid, let kind) {
-                #expect(oid == GitObjectStore.hexFromOID(object.oid))
-                #expect(kind == expectedKind)
-            } catch {
-                Issue.record("unexpected \(error)")
-            }
+            let result = try store.readObject(oid: object.oid)
+            #expect(result.type == "blob")
+            #expect(result.payload == expectedPayload)
         }
+    }
+}
+
+@Suite("Packed Git Delta Resolution")
+struct PackedGitDeltaTests {
+
+    @Test("copy-from-base delta instruction produces correct result")
+    func copyFromBaseDelta() throws {
+        let root = try makeSeedRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gitDir = root.appendingPathComponent(".git").path
+
+        let baseContent = Data("Hello, World!\n".utf8)
+        let base = PackedFixtureObject.object(type: "blob", payload: baseContent)
+
+        let resultContent = Data("Hello, Swift!\n".utf8)
+        let deltaPayload = encodeCopyInsertDelta(
+            baseSize: baseContent.count,
+            copyOffset: 0, copySize: 7,
+            insert: Data("Swift!\n".utf8)
+        )
+        let delta = PackedFixtureObject.delta(
+            resultType: "blob",
+            resultPayload: resultContent,
+            deltaPayload: deltaPayload,
+            storage: .offset(baseIndex: 0)
+        )
+
+        _ = try writePackFixture(gitDir: gitDir, objects: [base, delta])
+        let result = try GitObjectStore(gitDir: gitDir).readObject(oid: delta.oid)
+        #expect(result.type == "blob")
+        #expect(result.payload == resultContent)
+    }
+
+    @Test("nested two-deep OFS_DELTA chain resolves correctly")
+    func nestedDeltaChain() throws {
+        let root = try makeSeedRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gitDir = root.appendingPathComponent(".git").path
+
+        let aContent = Data("aaa".utf8)
+        let bContent = Data("bbb\n".utf8)
+        let cContent = Data("ccc\n\n".utf8)
+        let a = PackedFixtureObject.object(type: "blob", payload: aContent)
+        let b = PackedFixtureObject.delta(
+            resultType: "blob", resultPayload: bContent,
+            deltaPayload: encodeInsertDelta(baseSize: aContent.count, result: bContent),
+            storage: .offset(baseIndex: 0)
+        )
+        let c = PackedFixtureObject.delta(
+            resultType: "blob", resultPayload: cContent,
+            deltaPayload: encodeInsertDelta(baseSize: bContent.count, result: cContent),
+            storage: .offset(baseIndex: 1)
+        )
+
+        _ = try writePackFixture(gitDir: gitDir, objects: [a, b, c])
+        let store = GitObjectStore(gitDir: gitDir)
+        let bResult = try store.readObject(oid: b.oid)
+        #expect(bResult.type == "blob")
+        #expect(bResult.payload == bContent)
+
+        let cResult = try store.readObject(oid: c.oid)
+        #expect(cResult.type == "blob")
+        #expect(cResult.payload == cContent)
+    }
+
+    @Test("delta chain exceeding depth limit refuses with typed error")
+    func deltaChainTooDeep() throws {
+        let root = try makeSeedRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gitDir = root.appendingPathComponent(".git").path
+
+        let aContent = Data("aaa".utf8)
+        let bContent = Data("bbb\n".utf8)
+        let cContent = Data("ccc\n\n".utf8)
+        let a = PackedFixtureObject.object(type: "blob", payload: aContent)
+        let b = PackedFixtureObject.delta(
+            resultType: "blob", resultPayload: bContent,
+            deltaPayload: encodeInsertDelta(baseSize: aContent.count, result: bContent),
+            storage: .offset(baseIndex: 0)
+        )
+        let c = PackedFixtureObject.delta(
+            resultType: "blob", resultPayload: cContent,
+            deltaPayload: encodeInsertDelta(baseSize: bContent.count, result: cContent),
+            storage: .offset(baseIndex: 1)
+        )
+
+        _ = try writePackFixture(gitDir: gitDir, objects: [a, b, c])
+
+        let shallow = GitObjectStore(gitDir: gitDir, maximumDeltaChainDepth: 1)
+        let bResult = try shallow.readObject(oid: b.oid)
+        #expect(bResult.type == "blob")
+        #expect(bResult.payload == bContent)
+
+        do {
+            _ = try shallow.readObject(oid: c.oid)
+            Issue.record("expected packedDeltaChainTooDeep")
+        } catch GitStatusError.packedDeltaChainTooDeep(_, let depth, let limit) {
+            #expect(depth == 2)
+            #expect(limit == 1)
+        } catch {
+            Issue.record("unexpected \(error)")
+        }
+    }
+
+    @Test("delta result exceeding size limit is refused")
+    func deltaResultTooLarge() throws {
+        let root = try makeSeedRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gitDir = root.appendingPathComponent(".git").path
+
+        let baseContent = Data("x".utf8)
+        let base = PackedFixtureObject.object(type: "blob", payload: baseContent)
+        let bigResult = Data(repeating: 0x41, count: 64)
+        let delta = PackedFixtureObject.delta(
+            resultType: "blob", resultPayload: bigResult,
+            deltaPayload: encodeInsertDelta(baseSize: baseContent.count, result: bigResult),
+            storage: .offset(baseIndex: 0)
+        )
+
+        _ = try writePackFixture(gitDir: gitDir, objects: [base, delta])
+        let tiny = GitObjectStore(gitDir: gitDir, maximumPackedObjectSize: 8)
+        do {
+            _ = try tiny.readObject(oid: delta.oid)
+            Issue.record("expected packedObjectTooLarge")
+        } catch GitStatusError.packedObjectTooLarge(_, _, let limit) {
+            #expect(limit == 8)
+        } catch {
+            Issue.record("unexpected \(error)")
+        }
+    }
+
+    @Test("corrupt OFS_DELTA base offset is refused")
+    func corruptDeltaBaseOffset() throws {
+        let root = try makeSeedRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gitDir = root.appendingPathComponent(".git").path
+
+        let baseContent = Data("base".utf8)
+        let resultContent = Data("result".utf8)
+        let base = PackedFixtureObject.object(type: "blob", payload: baseContent)
+        let badDelta = PackedFixtureObject.delta(
+            resultType: "blob", resultPayload: resultContent,
+            deltaPayload: encodeInsertDelta(baseSize: baseContent.count, result: resultContent),
+            storage: .offset(baseIndex: 0)
+        )
+
+        let packDir = URL(fileURLWithPath: gitDir)
+            .appendingPathComponent("objects/pack", isDirectory: true)
+        try FileManager.default.createDirectory(at: packDir, withIntermediateDirectories: true)
+
+        var pack = Data("PACK".utf8)
+        pack.appendBigEndianUInt32(2)
+        pack.appendBigEndianUInt32(2)
+
+        let baseOffset = UInt64(pack.count)
+        let baseEntry = encodePackObjectHeader(typeCode: 3, size: UInt64(baseContent.count))
+        let baseCompressed = try deflateZlib(baseContent)
+        pack.append(baseEntry)
+        pack.append(baseCompressed)
+
+        let deltaOffset = UInt64(pack.count)
+        let deltaInstructions = encodeInsertDelta(baseSize: baseContent.count, result: resultContent)
+        let deltaHeader = encodePackObjectHeader(typeCode: 6, size: UInt64(deltaInstructions.count))
+        let bogusDistance = deltaOffset + 100
+        let bogusRef = encodeOffsetDeltaDistance(bogusDistance)
+        let deltaCompressed = try deflateZlib(deltaInstructions)
+        pack.append(deltaHeader)
+        pack.append(bogusRef)
+        pack.append(deltaCompressed)
+
+        let packChecksum = PortableSHA1.hash(pack)
+        pack.append(packChecksum)
+
+        let stem = "pack-\(GitObjectStore.hexFromOID(packChecksum))"
+        let packURL = packDir.appendingPathComponent(stem).appendingPathExtension("pack")
+        try pack.write(to: packURL)
+
+        let sorted = [
+            (base, baseOffset, gitCRC32(Data(pack[Int(baseOffset)..<Int(deltaOffset)]))),
+            (badDelta, deltaOffset, gitCRC32(Data(pack[Int(deltaOffset)..<(pack.count - 20)])))
+        ].sorted { $0.0.oid.lexicographicallyPrecedes($1.0.oid) }
+
+        var index = Data([0xFF, 0x74, 0x4F, 0x63])
+        index.appendBigEndianUInt32(2)
+        var counts = [UInt32](repeating: 0, count: 256)
+        for s in sorted { counts[Int(s.0.oid[0])] += 1 }
+        var cumulative: UInt32 = 0
+        for c in counts { cumulative += c; index.appendBigEndianUInt32(cumulative) }
+        for s in sorted { index.append(s.0.oid) }
+        for s in sorted { index.appendBigEndianUInt32(s.2) }
+        for s in sorted { index.appendBigEndianUInt32(UInt32(s.1)) }
+        index.append(packChecksum)
+        index.append(PortableSHA1.hash(index))
+        let indexURL = packDir.appendingPathComponent(stem).appendingPathExtension("idx")
+        try index.write(to: indexURL)
+
+        do {
+            _ = try GitObjectStore(gitDir: gitDir).readObject(oid: badDelta.oid)
+            Issue.record("expected packedDeltaCorrupt")
+        } catch GitStatusError.packedDeltaCorrupt(_, let reason) {
+            #expect(reason.contains("offset"))
+        } catch {
+            Issue.record("unexpected \(error)")
+        }
+    }
+
+    @Test("non-delta packed objects still resolve after delta support")
+    func nonDeltaRegression() throws {
+        let root = try makeSeedRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gitDir = root.appendingPathComponent(".git").path
+
+        let blob = PackedFixtureObject.object(type: "blob", payload: Data("hello\n".utf8))
+        _ = try writePackFixture(gitDir: gitDir, objects: [blob])
+        let result = try GitObjectStore(gitDir: gitDir).readObject(oid: blob.oid)
+        #expect(result.type == "blob")
+        #expect(result.payload == Data("hello\n".utf8))
     }
 }
 
@@ -864,6 +1077,48 @@ private func encodeInsertDelta(baseSize: Int, result: Data) -> Data {
     var data = Data([UInt8(baseSize), UInt8(result.count), UInt8(result.count)])
     data.append(result)
     return data
+}
+
+private func encodeCopyInsertDelta(
+    baseSize: Int,
+    copyOffset: Int,
+    copySize: Int,
+    insert: Data
+) -> Data {
+    let resultSize = copySize + insert.count
+    var delta = encodeDeltaVarint(baseSize)
+    delta.append(contentsOf: encodeDeltaVarint(resultSize))
+    if copySize > 0 {
+        var cmd: UInt8 = 0x80
+        var params = Data()
+        if copyOffset != 0 {
+            cmd |= 0x01
+            params.append(UInt8(copyOffset & 0xFF))
+        }
+        cmd |= 0x10
+        params.append(UInt8(copySize & 0xFF))
+        delta.append(cmd)
+        delta.append(params)
+    }
+    if !insert.isEmpty {
+        precondition(insert.count < 0x80)
+        delta.append(UInt8(insert.count))
+        delta.append(insert)
+    }
+    return delta
+}
+
+private func encodeDeltaVarint(_ value: Int) -> Data {
+    precondition(value >= 0)
+    var remaining = value
+    var bytes = Data()
+    repeat {
+        var byte = UInt8(remaining & 0x7F)
+        remaining >>= 7
+        if remaining != 0 { byte |= 0x80 }
+        bytes.append(byte)
+    } while remaining != 0
+    return bytes
 }
 
 private func gitCRC32(_ data: Data) -> UInt32 {

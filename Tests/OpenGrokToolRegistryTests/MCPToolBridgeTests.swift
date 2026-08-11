@@ -341,6 +341,24 @@ struct MCPToolRegistrationTests {
         #expect(toolset.clientNames.isEmpty)
     }
 
+    @Test("user-disabled tool names are skipped at registration time")
+    func disabledToolNamesAreSkipped() async {
+        let toolset = makeToolset()
+        let provider = StubProvider(serverName: "linear", tools: [
+            MCPBridgedTool(name: "search", description: ""),
+            MCPBridgedTool(name: "create", description: ""),
+        ])
+
+        let registration = await MCPToolBridge.register(
+            provider: provider,
+            into: toolset,
+            disabledToolNames: ["search"]
+        )
+        #expect(registration.registeredNames == ["linear__create"])
+        #expect(registration.skipped["search"] == "disabled by user")
+        #expect(toolset.clientNames == ["linear__create"])
+    }
+
     @Test("MCP tools are not exposed in read-only capability mode")
     func readOnlyModeExposesNothing() async {
         let toolset = makeToolset(capabilityMode: .readOnly)

@@ -26,6 +26,39 @@ public struct FinalizedTool: Sendable {
     public var visibility: ToolListVisibility
     public var exposure: ToolExposureFlags
     public var handler: (any ToolHandler)?
+
+    /// Public memberwise constructor — the synthesized one is internal to
+    /// `OpenGrokToolRegistry`, so live CLI bridges (Computer Hub MCP, etc.)
+    /// need this to call `FinalizedToolset.registerDynamic`.
+    public init(
+        qualifiedId: String,
+        namespace: ProductToolNamespace,
+        id: String,
+        clientName: String,
+        kind: ProductToolKind,
+        description: String,
+        definition: ToolDescription,
+        inputSchema: JSONValue,
+        reverseParams: [String: String],
+        contractVersion: String? = nil,
+        visibility: ToolListVisibility,
+        exposure: ToolExposureFlags,
+        handler: (any ToolHandler)? = nil
+    ) {
+        self.qualifiedId = qualifiedId
+        self.namespace = namespace
+        self.id = id
+        self.clientName = clientName
+        self.kind = kind
+        self.description = description
+        self.definition = definition
+        self.inputSchema = inputSchema
+        self.reverseParams = reverseParams
+        self.contractVersion = contractVersion
+        self.visibility = visibility
+        self.exposure = exposure
+        self.handler = handler
+    }
 }
 
 // MARK: - Toolset
@@ -181,6 +214,22 @@ public final class FinalizedToolset: @unchecked Sendable {
         toolsOrdered.removeAll { $0.clientName == tool.clientName }
         toolsOrdered.append(tool)
         toolsOrdered.sort { $0.clientName < $1.clientName }
+    }
+
+    /// Replace the handler for an already-finalized tool.
+    ///
+    /// Used when a handler needs the `FinalizedToolset` itself (e.g.
+    /// `UseToolHandler`) and therefore cannot be installed on the builder
+    /// before `finalize`. No-op when `clientName` is absent.
+    public func setHandler(clientName: String, handler: any ToolHandler) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var tool = toolsByClientName[clientName] else { return }
+        tool.handler = handler
+        toolsByClientName[clientName] = tool
+        if let index = toolsOrdered.firstIndex(where: { $0.clientName == clientName }) {
+            toolsOrdered[index] = tool
+        }
     }
 
     public func unregister(prefix: String) {

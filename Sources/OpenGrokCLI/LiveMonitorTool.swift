@@ -305,6 +305,12 @@ actor LiveMonitorHost {
     private var pendingEvents: [LiveMonitorEvent] = []
     private var pipelines: [String: Pipeline] = [:]
     private var pollLoops: [String: Task<Void, Never>] = [:]
+    /// The TaskCompleted auto-wake: fires exactly once per completed task
+    /// through the interjection seam. Wired by the composition; `nil`
+    /// until then (events before wiring are dropped — the wake has no
+    /// buffering analog because the monitor host only exists inside a
+    /// session that already owns an interjection buffer).
+    private var completionWake: LiveTaskCompletionWake?
 
     init(context: Context) {
         self.context = context
@@ -324,6 +330,10 @@ actor LiveMonitorHost {
         for event in held {
             await sink(event)
         }
+    }
+
+    func setCompletionWake(_ wake: LiveTaskCompletionWake) {
+        self.completionWake = wake
     }
 
     /// Register a monitor's pipeline. `startOffset` 0 for fresh pipelines
@@ -362,11 +372,9 @@ actor LiveMonitorHost {
     ///
     /// On completion the remaining partial line flushes, and deliberately NO
     /// terminal `[monitor ended]` event is emitted — upstream reserves the
-    /// completion wake for `TaskCompleted` (tool.rs:312-318). This port has
-    /// no TaskCompleted auto-wake (the recorded background-task deferral),
-    /// so a monitor's natural exit is visible in `/tasks` and via
-    /// `get_command_or_subagent_output`, not as a chat event — re-recorded
-    /// in the slice report.
+    /// completion wake for `TaskCompleted` (tool.rs:312-318). The wake fires
+    /// through `LiveTaskCompletionWake.reportIfNew`, routed into the
+    /// interjection seam exactly once.
     @discardableResult
     func tick(
         taskID: String,
@@ -405,6 +413,11 @@ actor LiveMonitorHost {
         pipelines[taskID] = pipeline
         for event in events {
             await deliver(event)
+        }
+        if finished, completed, let completionWake {
+            if let snapshot = await process.taskSnapshot(taskID) {
+                await completionWake.reportIfNew(snapshot)
+            }
         }
         return finished
     }
@@ -469,12 +482,16 @@ actor LiveMonitorHost {
     /// intent of upstream's Weak-handle pipeline exit (tool.rs:235-241);
     /// this port pins nothing across sessions because the loops are
     /// cancelled here, in the same shutdown that releases the executor.
-    func shutdown() {
+    func shutdown() async {
         for loop_ in pollLoops.values {
             loop_.cancel()
         }
         pollLoops.removeAll()
         pipelines.removeAll()
+        if let completionWake {
+            await completionWake.shutdown()
+        }
+        completionWake = nil
     }
 }
 

@@ -34,6 +34,11 @@ struct LiveModelPickerEntry: Sendable, Equatable {
     var description: String?
     var contextWindow: UInt64?
     var supportsReasoningEffort: Bool
+    /// The catalog entry's scalar reasoning-effort default. This is the value
+    /// `reasoning_effort_for_model(entry, None)` returns in upstream when no
+    /// override is given (acp/model_state.rs:14-23). Populated from
+    /// `ModelInfo.reasoningEffort` after `deriveReasoningEffortFields`.
+    var defaultReasoningEffort: ReasoningEffort?
     /// The model's declared effort menu; empty falls back to the built-in
     /// legacy menu when `supportsReasoningEffort` is set.
     var reasoningEfforts: [ReasoningEffortOption]
@@ -47,6 +52,7 @@ struct LiveModelPickerEntry: Sendable, Equatable {
         description: String? = nil,
         contextWindow: UInt64? = nil,
         supportsReasoningEffort: Bool = false,
+        defaultReasoningEffort: ReasoningEffort? = nil,
         reasoningEfforts: [ReasoningEffortOption] = [],
         serviceTiers: [ModelServiceTier] = []
     ) {
@@ -56,6 +62,7 @@ struct LiveModelPickerEntry: Sendable, Equatable {
         self.description = description
         self.contextWindow = contextWindow
         self.supportsReasoningEffort = supportsReasoningEffort
+        self.defaultReasoningEffort = defaultReasoningEffort
         self.reasoningEfforts = reasoningEfforts
         self.serviceTiers = serviceTiers
     }

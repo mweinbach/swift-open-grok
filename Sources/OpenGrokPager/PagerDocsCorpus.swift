@@ -514,9 +514,9 @@ refreshes access tokens automatically, and stores the resulting tokens in
 separate from `~/.opengrok/auth.json` prevents a Codex refresh, logout, or usage
 failure from changing xAI authentication or paywall state.
 
-Run `/usage` to view xAI billing and OpenAI Codex quota windows together. If
-Codex is not connected, the OpenAI section says so and points to
-`open-grok login --codex`; xAI usage still loads independently.
+Run `/usage` (alias `/cost`) to view session token usage for the current
+conversation. Provider account billing and quota surfaces are not available in
+this port; arguments such as `/usage manage` are refused.
 
 ---
 
@@ -1691,13 +1691,13 @@ the independent OpenAI Codex account and keep the xAI session active.
 
 ### `/usage`
 
-View xAI billing and OpenAI Codex quota usage together in one labeled summary.
-The two providers load independently, so one provider's error does not hide or
-alter the other. `/usage manage` opens xAI billing management. Alias: `/cost`.
+View session token usage for the current conversation in a text modal. Alias:
+`/cost`. Arguments are not supported; upstream billing arms such as `/usage
+manage` are not ported in this build.
 
 ```
 /usage
-/usage manage
+/cost
 ```
 
 ### `/privacy`

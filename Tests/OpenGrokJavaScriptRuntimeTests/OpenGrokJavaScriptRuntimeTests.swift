@@ -504,6 +504,184 @@ struct JavaScriptJSONBridgeTests {
     }
 }
 
+// MARK: - Module loader
+
+@Suite("JavaScript module loader")
+struct JavaScriptModuleLoaderTests {
+    // MARK: Specifier resolution
+
+    /// module_loader.rs:164: the referrer's directory is the resolution base.
+    @Test("bare specifiers pass through unchanged")
+    func bareSpecifier() {
+        let loader = JavaScriptModuleLoader()
+        let spec = loader.resolve(specifier: "lodash")
+        #expect(spec.raw == "lodash")
+        #expect(spec.resolved == "lodash")
+    }
+
+    @Test("node: protocol specifiers pass through unchanged")
+    func nodeProtocol() {
+        let loader = JavaScriptModuleLoader()
+        let spec = loader.resolve(specifier: "node:fs")
+        #expect(spec.resolved == "node:fs")
+    }
+
+    @Test("relative specifier resolves against the referrer directory")
+    func relativeToReferrer() {
+        let loader = JavaScriptModuleLoader()
+        let spec = loader.resolve(specifier: "./utils", referrer: "lib/main.mjs")
+        #expect(spec.resolved == "lib/utils")
+    }
+
+    @Test("parent-traversal resolves against the referrer directory")
+    func parentTraversal() {
+        let loader = JavaScriptModuleLoader()
+        let spec = loader.resolve(specifier: "../shared/helpers", referrer: "lib/sub/entry.mjs")
+        #expect(spec.resolved == "lib/shared/helpers")
+    }
+
+    @Test("relative specifier against a bare referrer normalizes to the filename")
+    func relativeAgainstBareReferrer() {
+        let loader = JavaScriptModuleLoader()
+        let spec = loader.resolve(
+            specifier: "./utils",
+            referrer: JavaScriptModuleLoader.mainModuleReferrer
+        )
+        #expect(spec.resolved == "utils")
+    }
+
+    @Test("dot segments are collapsed")
+    func dotCollapsing() {
+        let spec = JavaScriptModuleLoader.resolveSpecifier(
+            "./a/./b/../c", relativeTo: "root/main.mjs"
+        )
+        #expect(spec == "root/a/c")
+    }
+
+    @Test("parent beyond root is dropped, not escaped")
+    func parentBeyondRoot() {
+        let spec = JavaScriptModuleLoader.resolveSpecifier(
+            "../../escape", relativeTo: "single.mjs"
+        )
+        #expect(spec == "escape")
+    }
+
+    // MARK: Cache semantics
+
+    /// V8's module map deduplicates by identity: the resolve callback fires
+    /// at most once per specifier per instantiation. The loader mirrors this
+    /// with a cache keyed by canonical specifier.
+    @Test("repeated imports of the same specifier hit the cache")
+    func cacheHit() {
+        let loader = JavaScriptModuleLoader()
+        let spec1 = loader.resolve(specifier: "lodash")
+        let result1 = loader.load(spec1)
+        #expect(loader.resolvedCount == 1)
+
+        let spec2 = loader.resolve(specifier: "lodash")
+        let result2 = loader.load(spec2)
+        #expect(loader.resolvedCount == 1)
+        #expect(result1 == result2)
+    }
+
+    @Test("different specifiers get separate cache entries")
+    func cacheSeparation() {
+        let loader = JavaScriptModuleLoader()
+        _ = loader.load(loader.resolve(specifier: "a"))
+        _ = loader.load(loader.resolve(specifier: "b"))
+        #expect(loader.resolvedCount == 2)
+    }
+
+    @Test("relative and bare forms of the same canonical path share the cache")
+    func cacheCanonical() {
+        let loader = JavaScriptModuleLoader()
+        _ = loader.load(loader.resolve(specifier: "./utils", referrer: "main.mjs"))
+        #expect(loader.hasResolved("utils"))
+        _ = loader.load(loader.resolve(specifier: "./utils", referrer: "main.mjs"))
+        #expect(loader.resolvedCount == 1)
+    }
+
+    // MARK: Rejection
+
+    /// module_loader.rs:223: every specifier is rejected with the Rust
+    /// message format.
+    @Test("all specifiers are rejected with the Rust error message")
+    func rejectionMessage() {
+        let loader = JavaScriptModuleLoader()
+        let spec = loader.resolve(specifier: "node:fs")
+        let result = loader.load(spec)
+        #expect(result == .rejected(error: "Unsupported import in exec: node:fs"))
+    }
+
+    @Test("relative specifier rejection uses the raw specifier in the message")
+    func relativeRejectionMessage() {
+        let loader = JavaScriptModuleLoader()
+        let spec = loader.resolve(specifier: "./helpers", referrer: "lib/main.mjs")
+        let result = loader.load(spec)
+        #expect(result == .rejected(error: "Unsupported import in exec: ./helpers"))
+    }
+}
+
+// MARK: - Module loader integration
+
+@Suite("JavaScript module loader integration")
+struct JavaScriptModuleLoaderIntegrationTests {
+    /// The existing static import test verifies the scanner → loader →
+    /// rejection pipeline end to end. This test adds the relative-path
+    /// case: the specifier is resolved and the error message uses the raw
+    /// specifier text, matching Rust's resolve_module output.
+    @Test("relative import specifiers are rejected with the raw specifier")
+    func relativeImportRejected() async throws {
+        let (_, events) = try JavaScriptCellRuntime.start(
+            configuration: configuration(
+                source: "import utils from './helpers';\ntext('nope');"
+            ),
+            pendingMode: .continueImmediately
+        )
+        let collected = await EventCollector(events).drainToResult()
+
+        let outer = try #require(resultError(collected))
+        let error = try #require(outer)
+        #expect(error == "Unsupported import in exec: ./helpers")
+    }
+
+    @Test("export statements are rejected before evaluation")
+    func exportRejected() async throws {
+        let (_, events) = try JavaScriptCellRuntime.start(
+            configuration: configuration(
+                source: "export const x = 1;"
+            ),
+            pendingMode: .continueImmediately
+        )
+        let collected = await EventCollector(events).drainToResult()
+
+        let outer = try #require(resultError(collected))
+        let error = try #require(outer)
+        #expect(error.contains("Unsupported import in exec"))
+    }
+
+    @Test("import() expression is not treated as a static import declaration")
+    func dynamicImportNotStaticRejection() async throws {
+        let (_, events) = try JavaScriptCellRuntime.start(
+            configuration: configuration(
+                source: """
+                    try {
+                      await import('./dynamic');
+                    } catch (error) {
+                      text('caught: ' + String(error));
+                    }
+                    """
+            ),
+            pendingMode: .continueImmediately
+        )
+        let collected = await EventCollector(events).drainToResult()
+
+        let texts = textItems(collected)
+        #expect(!texts.isEmpty, "dynamic import() should produce some output (caught error or native failure)")
+        #expect(resultError(collected) == .some(nil), "the cell should settle cleanly via the catch")
+    }
+}
+
 @Suite("JavaScript runtime capability")
 struct JavaScriptRuntimeCapabilityTests {
     @Test("JavaScriptCore hosts report an available runtime")

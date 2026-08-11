@@ -263,13 +263,20 @@ public enum LiveMCPComposition {
             MCPServerConnection(name: $0.server, failure: $0.message)
         }
 
+        let disabledServers = disabledMCPServers(in: document)
+        let disabledToolsByServer = allDisabledMCPTools(in: document)
+
         for declaration in loaded.enabledServers {
+            if disabledServers.contains(declaration.name) {
+                continue
+            }
             results.append(await connect(
                 declaration: declaration,
                 toolset: toolset,
                 connections: connections,
                 environment: environment,
-                makeHTTPTransport: makeHTTPTransport
+                makeHTTPTransport: makeHTTPTransport,
+                disabledToolNames: disabledToolsByServer[declaration.name] ?? []
             ))
         }
         return results
@@ -300,7 +307,8 @@ public enum LiveMCPComposition {
         toolset: FinalizedToolset,
         connections: MCPSessionConnections,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        makeHTTPTransport: @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() }
+        makeHTTPTransport: @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() },
+        disabledToolNames: Set<String> = []
     ) async -> MCPServerConnection {
         var authorization: (any MCPAuthorizationProviding)?
         if let endpoint = declaration.oauthEligibleEndpoint(environment: environment),
@@ -347,7 +355,8 @@ public enum LiveMCPComposition {
 
         let registration = await MCPToolBridge.register(
             provider: MCPClientToolProvider(serverName: declaration.name, client: client),
-            into: toolset
+            into: toolset,
+            disabledToolNames: disabledToolNames
         )
         if let failure = registration.failure {
             await client.close()

@@ -197,6 +197,14 @@ public struct WorkflowBudgetState: Codable, Sendable, Hashable {
     }
 }
 
+// Legacy JavaScript workflow runtime (`WorkflowHost` / `WorkflowEngine` below).
+// The live executable runs workflows through `RhaiWorkflowEngine` instead
+// (`RhaiEngine.swift`, wired from `RhaiWorkflowRunRegistry`). A repo-wide
+// inventory (2026-08-10, wave 20 C1) found no `WorkflowEngine.run` or
+// `OpenGrokSessionRuntime(` call sites under `Sources/` outside this file;
+// `OpenGrokSessionRuntime` still type-checks against `WorkflowHost` but is
+// itself unwired. Kept compiling for library tests and until that actor is
+// retired in a follow-on slice — do not wire new production paths here.
 public enum WorkflowHostError: Error, Sendable, Hashable, CustomStringConvertible {
     case agentCallQuotaExceeded(requested: UInt64, maximum: UInt64)
     case budgetExceeded

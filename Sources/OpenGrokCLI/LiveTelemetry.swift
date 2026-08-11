@@ -113,10 +113,27 @@ public enum LiveTelemetry {
         TelemetryResolutionInputs(
             effectiveConfig: document,
             requirements: mergedRequirements(requirements),
-            remoteSettings: remoteSettings,
+            // TelemetryModeResolver / ExternalOtelRemotePolicy still take
+            // RemoteSettings; project through the allowlist so only reviewed
+            // remote fields can influence resolution.
+            remoteSettings: allowlistedRemoteSettingsProjection(remoteSettings),
             managedSettingsEnv: managedSettingsEnv,
             environment: environment
         )
+    }
+
+    /// Narrow `RemoteSettings` to allowlisted telemetry / OTEL fields.
+    private static func allowlistedRemoteSettingsProjection(
+        _ remote: RemoteSettings?
+    ) -> RemoteSettings? {
+        guard let remote else { return nil }
+        let allowed = AllowlistedRemoteSettings(projecting: remote)
+        var projected = RemoteSettings()
+        projected.telemetryMode = allowed.telemetryMode
+        projected.telemetryEnabled = allowed.telemetryEnabled
+        projected.externalOtelDisabled = allowed.externalOtelDisabled
+        projected.externalOtelContentGatesLocked = allowed.externalOtelContentGatesLocked
+        return projected
     }
 
     // MARK: - Bootstrap

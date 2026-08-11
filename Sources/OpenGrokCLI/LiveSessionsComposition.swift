@@ -49,6 +49,10 @@ public struct LiveSessionListing: Sendable, Equatable {
     public var messageCount: Int
     public var userMessageCount: Int
     public var assistantMessageCount: Int
+    /// Non-nil for foreign sessions (Claude Code, Codex). Local OpenGrok
+    /// sessions leave this nil. The badge is surfaced in both text and JSON
+    /// output so the caller always knows the provenance.
+    public var foreignSource: ForeignSessionSource?
 
     public init(
         sessionID: String,
@@ -60,7 +64,8 @@ public struct LiveSessionListing: Sendable, Equatable {
         lastActivityAt: Date,
         messageCount: Int,
         userMessageCount: Int,
-        assistantMessageCount: Int
+        assistantMessageCount: Int,
+        foreignSource: ForeignSessionSource? = nil
     ) {
         self.sessionID = sessionID
         self.workingDirectory = workingDirectory
@@ -72,6 +77,7 @@ public struct LiveSessionListing: Sendable, Equatable {
         self.messageCount = messageCount
         self.userMessageCount = userMessageCount
         self.assistantMessageCount = assistantMessageCount
+        self.foreignSource = foreignSource
     }
 }
 
@@ -268,6 +274,10 @@ public enum LiveSessionsComposition {
 
     /// Launcher entry point. Runs to completion and hands back a finished
     /// session, matching `LiveAuthComposition` and `LiveMCPComposition`.
+    ///
+    /// Wave 20 S10: `sessions list` merges Claude/Codex foreign sessions via
+    /// `LiveForeignSessionScanner` with every source enabled. Import/writeback
+    /// remain absent by architecture (§4).
     public static func session(
         for command: CLICommand,
         context: CLIApplicationContext
@@ -275,14 +285,22 @@ public enum LiveSessionsComposition {
         guard case .sessions(let options) = command else {
             throw CLIApplicationError.unsupported(route: command.routeName)
         }
-        try run(options: options, environment: context.environment, streams: context.streams)
+        try run(
+            options: options,
+            environment: context.environment,
+            streams: context.streams,
+            foreignScanner: LiveForeignSessionScanner(environment: context.environment),
+            foreignSources: .all
+        )
         return CLIApplicationSession(waitForExit: {}, shutdown: {})
     }
 
     public static func run(
         options: CLISessionOptions,
         environment: [String: String],
-        streams: CLIStreams
+        streams: CLIStreams,
+        foreignScanner: (any ForeignSessionScanning)? = nil,
+        foreignSources: EnabledForeignSources = .none
     ) throws {
         let home = OpenGrokHomeResolver.resolve(environment: environment)
         let catalog = LiveSessionCatalog(openGrokHome: home)
@@ -292,7 +310,10 @@ public enum LiveSessionsComposition {
                 catalog: catalog,
                 json: options.json,
                 limit: options.limit,
-                streams: streams
+                streams: streams,
+                foreignScanner: foreignScanner,
+                foreignSources: foreignSources,
+                environment: environment
             )
         case .search:
             try runSearch(options: options, catalog: catalog, streams: streams)
@@ -319,15 +340,30 @@ public enum LiveSessionsComposition {
         catalog: LiveSessionCatalog,
         json: Bool,
         limit: Int,
-        streams: CLIStreams
+        streams: CLIStreams,
+        foreignScanner: (any ForeignSessionScanning)? = nil,
+        foreignSources: EnabledForeignSources = .none,
+        environment: [String: String] = [:]
     ) throws {
-        let sessions = Array(try catalog.list().prefix(max(0, limit)))
+        var sessions = try catalog.list()
+        if let scanner = foreignScanner,
+           (foreignSources.claude || foreignSources.codex) {
+            let cwd = FileManager.default.currentDirectoryPath
+            let foreign = scanner.scan(cwd: cwd, enabled: foreignSources)
+            sessions.append(contentsOf: foreign.map(listing(fromForeign:)))
+        }
+        sessions.sort { lhs, rhs in
+            if lhs.lastActivityAt == rhs.lastActivityAt {
+                return lhs.sessionID < rhs.sessionID
+            }
+            return lhs.lastActivityAt > rhs.lastActivityAt
+        }
+        sessions = Array(sessions.prefix(max(0, limit)))
         if json {
             streams.out(try encodeJSON(sessions.map(payload(for:))) + "\n")
             return
         }
         guard !sessions.isEmpty else {
-            // Rust: `println!("No sessions found.")` (sessions_cmd.rs:204).
             streams.out("No sessions found.\n")
             return
         }
@@ -341,13 +377,14 @@ public enum LiveSessionsComposition {
             )
         ]
         for session in sessions {
+            let badge = session.foreignSource.map { "[\($0.badge)] " } ?? ""
             lines.append(
                 row(
                     id: session.sessionID,
                     created: day(session.createdAt),
                     updated: day(session.lastActivityAt),
-                    model: session.model ?? "-",
-                    title: session.title ?? "(no title)"
+                    model: session.model ?? (session.foreignSource != nil ? "-" : "-"),
+                    title: badge + (session.title ?? "(no title)")
                 )
             )
         }
@@ -516,7 +553,31 @@ public enum LiveSessionsComposition {
         if let title = session.title { payload["title"] = title }
         if let model = session.model { payload["model"] = model }
         if let parent = session.parentSessionID { payload["parent_session_id"] = parent }
+        if let foreign = session.foreignSource {
+            payload["foreign_source"] = foreign.rawValue
+            payload["foreign_tool"] = (foreign == .claudeCode) ? "claude" : "codex"
+        }
         return payload
+    }
+
+    /// Convert a `ForeignSessionSummary` into the unified listing type.
+    /// Foreign sessions carry no transcript, so message counts are zero and
+    /// `createdAt` equals `updatedAt` — we have only the file modification
+    /// time, which is the closest proxy.
+    static func listing(
+        fromForeign summary: ForeignSessionSummary
+    ) -> LiveSessionListing {
+        LiveSessionListing(
+            sessionID: summary.nativeID,
+            workingDirectory: summary.cwd,
+            title: summary.title,
+            createdAt: summary.updatedAt,
+            lastActivityAt: summary.updatedAt,
+            messageCount: 0,
+            userMessageCount: 0,
+            assistantMessageCount: 0,
+            foreignSource: summary.source
+        )
     }
 
     private static func encodeJSON(_ value: Any) throws -> String {

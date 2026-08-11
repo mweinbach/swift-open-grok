@@ -308,9 +308,9 @@ struct LiveMonitorPipelineTests {
         try #require(events.count == 1)
         #expect(events[0].eventText.contains("no trailing newline"))
         // NO `[monitor ended]` terminal event (tool.rs:312-318): upstream
-        // reserves the completion wake for TaskCompleted; this port's
-        // TaskCompleted auto-wake is a recorded deferral, so completion is
-        // visible via /tasks and get_command_or_subagent_output only.
+        // reserves the completion wake for TaskCompleted, which fires
+        // through LiveTaskCompletionWake.reportIfNew — never as a
+        // monitor-event in the stdout pipeline.
         #expect(!events[0].eventText.contains("monitor ended"))
         // A finished pipeline stays finished.
         #expect(await host.tick(taskID: "t2", process: execution) == true)

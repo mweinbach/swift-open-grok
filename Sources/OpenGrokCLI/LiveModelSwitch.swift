@@ -164,6 +164,7 @@ struct LiveModelCatalogResolver: Sendable {
                 description: entry.info.description,
                 contextWindow: entry.info.contextWindow,
                 supportsReasoningEffort: entry.info.supportsReasoningEffort,
+                defaultReasoningEffort: entry.info.reasoningEffort,
                 reasoningEfforts: entry.info.reasoningEfforts,
                 serviceTiers: entry.info.serviceTiers
             )
@@ -525,6 +526,80 @@ actor LiveModelSwitchCoordinator {
                 modelID: modelID,
                 effort: effort,
                 serviceTier: requestedTier
+            )
+        } catch let error as LiveModelSwitchError {
+            return .failed(modelID: modelID, message: error.description)
+        } catch {
+            return .failed(modelID: modelID, message: String(describing: error))
+        }
+        guard resolution.sampling.model != previous.model
+            || resolution.sampling.reasoningEffort != previous.reasoningEffort
+            || resolution.sampling.serviceTier != previous.serviceTier
+        else {
+            return .unchanged(modelID: modelID)
+        }
+        let rebuilt: OpenGrokLiveSampler
+        do {
+            rebuilt = try makeSampler(resolution.sampling)
+        } catch {
+            return .failed(modelID: modelID, message: String(describing: error))
+        }
+
+        var dropped = 0
+        if let history {
+            do {
+                dropped = try await history.reconcileRoute(
+                    modelID: resolution.sampling.model,
+                    provider: resolution.sampling.provider
+                )
+            } catch {
+                return .failed(
+                    modelID: modelID,
+                    message: "provider isolation failed: \(String(describing: error))"
+                )
+            }
+        }
+        sampling = resolution.sampling
+        sampler = rebuilt
+        await codeMode?.noteModelSwitch(
+            from: previous.provider,
+            to: resolution.sampling.provider
+        )
+        return .switched(LiveModelSwitchSummary(
+            modelID: resolution.sampling.model,
+            requestedID: modelID,
+            provider: resolution.sampling.provider,
+            previousModelID: previous.model,
+            previousProvider: previous.provider,
+            droppedOpaqueItems: dropped,
+            reasoningEffort: resolution.sampling.reasoningEffort,
+            previousReasoningEffort: previous.reasoningEffort,
+            serviceTier: resolution.sampling.serviceTier,
+            previousServiceTier: previous.serviceTier,
+            fastModeEnabled: liveFastModeEnabled(
+                serviceTier: resolution.sampling.serviceTier,
+                supportsFast: resolvedEntrySupportsFast(resolution.sampling)
+            )
+        ))
+    }
+
+    /// Apply a `reconcileModelState` result as an exact (model, effort, tier)
+    /// tuple. Unlike `apply`, this path does not treat `effort == nil` as
+    /// "no effort change" — that would short-circuit the lost-support clear
+    /// branch (`model_state.rs:178-188`) and leave a 400-bound effort live.
+    /// Callers must only invoke this when `samplerNeedsRebuild` is true.
+    func applyReconciled(
+        modelID: String,
+        effort: ReasoningEffort?,
+        serviceTier: String?
+    ) async -> LiveModelSwitchOutcome {
+        let previous = sampling
+        let resolution: LiveModelResolution
+        do {
+            resolution = try await resolver.resolve(
+                modelID: modelID,
+                effort: effort,
+                serviceTier: serviceTier
             )
         } catch let error as LiveModelSwitchError {
             return .failed(modelID: modelID, message: error.description)

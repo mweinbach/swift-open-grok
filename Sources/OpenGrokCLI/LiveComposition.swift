@@ -508,6 +508,7 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
     /// without reaching the network.
     public let makeImageTransport: @Sendable () -> any HTTPTransport
     public let workspaceRoute: LiveWorkspaceRouteDependencies
+    public let shareRoute: LiveShareRouteDependencies
     public let makeLeaderClient: @Sendable (
         LiveLeaderClientLaunchConfiguration
     ) async throws -> LiveLeaderClientLease
@@ -527,6 +528,7 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
             URLSessionHTTPTransport()
         },
         workspaceRoute: LiveWorkspaceRouteDependencies = .production(),
+        shareRoute: LiveShareRouteDependencies = .production(),
         makeLeaderClient: @escaping @Sendable (
             LiveLeaderClientLaunchConfiguration
         ) async throws -> LiveLeaderClientLease = { configuration in
@@ -541,6 +543,7 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
         self.makeTerminalSink = makeTerminalSink
         self.makeImageTransport = makeImageTransport
         self.workspaceRoute = workspaceRoute
+        self.shareRoute = shareRoute
         self.makeLeaderClient = makeLeaderClient
     }
 
@@ -553,6 +556,7 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
             makeTerminalSink: { FileHandlePagerTerminalSink() },
         makeImageTransport: { URLSessionHTTPTransport() },
         workspaceRoute: .production(),
+        shareRoute: .production(),
         makeLeaderClient: { configuration in
             try await LiveLeaderClientAcquisition.production.connectOrSpawn(configuration)
         }
@@ -915,7 +919,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     context: context,
                     liveBoundaries: { sessionID in
                         exportBoundaries.boundary(for: sessionID)
-                    }
+                    },
+                    routeDependencies: dependencies.shareRoute
                 )
             }
             if LiveWorkspaceComposition.handles(command) {
@@ -1658,6 +1663,31 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                 taskID: event.taskID,
                                 eventText: event.eventText
                             )
+                        }
+                        // Wave 20 S5 — TaskCompleted auto-wake: exactly-once
+                        // completion messages for monitors (via tick) and
+                        // bash background tasks (via the 1s poll). Same
+                        // interjection / idle-prompt delivery as monitor
+                        // events (task_completion.rs:164-195).
+                        let completionWake = LiveTaskCompletionWake(
+                            ownerSessionID: foundation.sessionID
+                        )
+                        await monitorHost.setCompletionWake(completionWake)
+                        await completionWake.setWakeSink { [weak controller] message in
+                            if await monitorInterjections.interject(message) {
+                                return
+                            }
+                            guard let controller else { return }
+                            await controller.enqueueMonitorPrompt(
+                                taskID: "task-completed",
+                                eventText: message
+                            )
+                        }
+                        if let process = await toolExecutor.processExecution(
+                            sessionID: foundation.sessionID,
+                            workingDirectory: cwd
+                        ) {
+                            await completionWake.startWatching(process: process)
                         }
                     }
                     // Typing `/model ` drops the dropdown into the catalog, as
@@ -2907,6 +2937,18 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // A provider change invalidates the cells and stored values the
         // old runtime holds (model_switch.rs:249).
         await modelSwitch.attachCodeMode(codeMode)
+        // After the fire-and-forget background catalog refresh publishes,
+        // reconcile the session's effort/tier against the new catalog
+        // (`ModelState::update_catalog`, acp/model_state.rs:155-192). The
+        // refresh must not delay first prompt, so this awaits on a side
+        // task — same shape as upstream's models_changed subscription.
+        Task {
+            await catalogStore.backgroundRefreshTask?.value
+            await applyLiveModelCatalogReconcile(
+                catalogStore: catalogStore,
+                modelSwitch: modelSwitch
+            )
+        }
         let compaction = LiveCompactionCoordinator(
             history: conversationHistory,
             modelSwitch: modelSwitch,
@@ -3075,12 +3117,36 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             // The session-admin trio operates on the SAME on-disk store the
             // launch path resumes from; the resident session's rename goes
             // through the live history actor so the next turn commit cannot
-            // clobber the title (Wave 15 item 6).
+            // clobber the title (Wave 15 item 6). Wave 20 S4 adds info/state/
+            // close over the same spine; close is latched so a second call
+            // reports notResident (session_lifecycle.rs:26-39).
+            let sessionCloseLatch = LiveSessionCloseLatch()
             let sessionAdmin = LiveSessionAdminACPHandler(
                 openGrokHome: foundation.openGrokHome,
                 gateway: gateway,
                 liveSessionID: foundation.sessionID,
-                renameLive: { title in try await history.rename(title: title) }
+                renameLive: { title in try await history.rename(title: title) },
+                sessionInfoSnapshot: {
+                    let snapshot = await history.snapshot()
+                    let route = await modelSwitch.snapshot()
+                    let userTurns = snapshot.items.reduce(into: 0) { count, item in
+                        if case .user = item { count += 1 }
+                    }
+                    return LiveSessionInfoSnapshot(
+                        modelID: route.modelID,
+                        modelDisplayName: nil,
+                        resolvedModelID: route.modelID,
+                        cwd: snapshot.workingDirectory,
+                        conversationID: foundation.sessionID,
+                        turns: userTurns,
+                        turnIndex: snapshot.items.count,
+                        context: LiveSessionContextInfo(
+                            maxContextTokens: Int(route.configuration.tuning.contextWindow ?? 0),
+                            currentTokens: 0
+                        )
+                    )
+                },
+                closeLive: { sessionCloseLatch.close() }
             )
             let extensionRouter = LiveACPExtensionRouter.build(
                 feedback: LiveFeedbackACPHandler(composition: foundation.feedback),
@@ -4709,6 +4775,25 @@ struct LiveToolExecutor: Sendable {
                 }
             }
         }
+        // MCP meta-tools (`search_tool` / `use_tool`). Always retained in the
+        // catalog; listed here so they survive finalize for this session.
+        // `use_tool`'s handler needs the finalized toolset and is installed
+        // immediately after finalize (see below).
+        let mcpSearchIndex = LiveMCPToolSearchIndex()
+        fileToolResources.extras.insert(ToolSearchIndexResource(mcpSearchIndex))
+        builder.setHandler(
+            qualifiedId: BuiltinToolCatalog.searchToolQualifiedId,
+            handler: SearchToolHandler()
+        )
+        let mcpMetaKinds = BuiltinToolCatalog.mcpMetaToolKinds
+        toolConfig.tools.append(ToolConfig.fromId(
+            BuiltinToolCatalog.searchToolQualifiedId,
+            kind: mcpMetaKinds[BuiltinToolCatalog.searchToolQualifiedId]
+        ))
+        toolConfig.tools.append(ToolConfig.fromId(
+            BuiltinToolCatalog.useToolQualifiedId,
+            kind: mcpMetaKinds[BuiltinToolCatalog.useToolQualifiedId]
+        ))
         let fileToolBridge = try ToolBridge.finalize(
             builder: builder,
             config: toolConfig,
@@ -4717,6 +4802,20 @@ struct LiveToolExecutor: Sendable {
                 capabilityMode: Self.capabilityMode(for: toolPolicy)
             )
         )
+        let toolset = fileToolBridge.toolset
+        // `UseToolHandler` dispatches through the same toolset — install after
+        // finalize so the circular dependency is a stored reference, not a
+        // builder-time value that does not exist yet.
+        toolset.setHandler(
+            clientName: "use_tool",
+            handler: UseToolHandler(toolset: toolset)
+        )
+        let nativeNames = Set(
+            toolset.clientNames.filter { name in
+                toolset.tool(named: name)?.namespace != .mcp
+            }
+        )
+        toolset.resources.extras.insert(EnabledNativeToolNames(nativeNames))
         let mcpConnections = MCPSessionConnections()
         // `security.document` already excludes the project tier when the folder
         // is untrusted, so a hostile repo's `.opengrok/config.toml` servers are
@@ -4724,10 +4823,11 @@ struct LiveToolExecutor: Sendable {
         // what spawns the process.
         let mcpServerConnections = await LiveMCPComposition.connectConfiguredServers(
             document: security.document,
-            toolset: fileToolBridge.toolset,
+            toolset: toolset,
             connections: mcpConnections,
             environment: environment
         )
+        mcpSearchIndex.refresh(from: toolset)
         let fileToolDefinitions = fileToolBridge.toolDefinitions()
         let allowedFileToolDefinitions = fileToolDefinitions.filter {
             toolPolicy?.allows(liveToolName: $0.name) ?? true
@@ -5634,6 +5734,19 @@ struct LiveToolExecutor: Sendable {
         )
     }
 
+    /// The session's registered process execution, for TaskCompleted watching
+    /// and other seams that need the live task table. `nil` when the session
+    /// was never registered (no tools can have run).
+    func processExecution(
+        sessionID: String,
+        workingDirectory: URL
+    ) async -> (any OpenGrokShellProcessExecution)? {
+        try? await composition.execution(
+            for: sessionID,
+            workingDirectory: workingDirectory
+        )
+    }
+
     /// The session's live background tasks, for `/tasks` — the same
     /// owner-scoped `listTasks()` the background-task tools consult, read
     /// through the session's registered execution. An unregistered session
@@ -5643,8 +5756,8 @@ struct LiveToolExecutor: Sendable {
         sessionID: String,
         workingDirectory: URL
     ) async -> [ShellTaskSnapshot] {
-        guard let execution = try? await composition.execution(
-            for: sessionID,
+        guard let execution = await processExecution(
+            sessionID: sessionID,
             workingDirectory: workingDirectory
         ) else { return [] }
         return await execution.listTasks()
@@ -9705,23 +9818,31 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         let acked = PagerPrivacyBannerAckStore(
             configPath: openGrokHome.appendingPathComponent("config.toml")
         ).read()
+        // Privacy / access fields reach the banner only through the
+        // allowlisted projection (RemoteSettingsAllowlist).
+        let allowed = remoteSettings.map { AllowlistedRemoteSettings(projecting: $0) }
+        var projectedRemote = RemoteSettings()
+        if let allowed {
+            projectedRemote.privacyNoticeRollout = allowed.privacyNoticeRollout
+            projectedRemote.privacyBannerReshowDays = allowed.privacyBannerReshowDays
+        }
 
         var state = PagerPrivacyBannerState(
             minimalMode: mode == .minimal,
             privacyNoticeRollout: resolvePrivacyNoticeRollout(
-                remoteSettings: remoteSettings,
+                remoteSettings: remoteSettings == nil ? nil : projectedRemote,
                 environment: env
             ),
             privacyBannerReshowDays: resolvePrivacyBannerReshowDays(
-                remoteSettings: remoteSettings,
+                remoteSettings: remoteSettings == nil ? nil : projectedRemote,
                 environment: env
             ),
             privacyBannerAcked: acked,
-            zdrAccessEnabled: remoteSettings?.zdrAccessEnabled ?? false,
+            zdrAccessEnabled: allowed?.zdrAccessEnabled ?? false,
             // `has_access()` is "no gate": a gate exists only when remote
             // settings carry a non-empty `gate_message`
             // (`gate_from_settings`, app_view.rs:1739-1746).
-            hasAccess: remoteSettings?.gateMessage?.isEmpty ?? true,
+            hasAccess: allowed?.gateMessage?.isEmpty ?? true,
             trustDone: true
         )
         if let auth {
@@ -11589,12 +11710,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// `/doctor` — the render-layer half. Upstream's TUI dispatch
     /// (`dispatch_doctor`, `app/dispatch/prompt.rs:87-117`) folds LIVE TUI
     /// evidence (fullscreen state, pushed kitty flags, xtversion, runtime
-    /// notification findings) into the report before formatting; the port's
-    /// diagnostics library exposes only the standalone collectors, so the
-    /// in-session report carries env-only evidence and the runtime probes
-    /// surface honestly as "not run" notes (recorded divergence; cost: the
-    /// in-session report cannot confirm kitty-keyboard or fullscreen
-    /// behavior the way upstream's can, and never pretends to).
+    /// notification findings) into the report before formatting. Wave 20 S12
+    /// wires the injectable XTVERSION collector here; the other TUI-only
+    /// collectors (kitty/fullscreen/notification) stay honestly Unavailable
+    /// until their OnceLock feeds exist.
     private func presentDoctor(_ request: OpenGrokPagerDoctorRequest) {
         let terminal = standaloneTerminalContext(environment: environment)
         switch request {
@@ -11604,7 +11723,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // belongs in the transcript, not a toast (the `/tasks` shape).
             let snapshot = collectStandalone(terminal: terminal, environment: environment)
             note(formatDoctor(DiagnosticsEngine.report(
-                snapshot: DiagnosticSnapshot(standalone: snapshot)
+                snapshot: doctorDiagnosticSnapshot(
+                    standalone: snapshot,
+                    terminal: terminal
+                )
             )))
         case .listFixes:
             // `DoctorRequest::ListFixes` → `format_applicable_automatic_fixes`
@@ -11613,7 +11735,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // probe runs only when the terminal is tmux-backed, exactly as
             // the CLI list path does.
             let snapshot = collectStandaloneFix(terminal: terminal, id: nil, environment: environment)
-            let report = DiagnosticsEngine.report(snapshot: DiagnosticSnapshot(standalone: snapshot))
+            let report = DiagnosticsEngine.report(snapshot: doctorDiagnosticSnapshot(
+                standalone: snapshot,
+                terminal: terminal
+            ))
             note(formatApplicableAutomaticFixes(
                 report: report, terminal: terminal, environment: environment
             ))
@@ -11644,6 +11769,28 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                     + "Preview and apply from your shell instead: open-grok doctor fix \(handle) --yes"
             )
         }
+    }
+
+    /// Fold the injectable XTVERSION collector into an otherwise-standalone
+    /// diagnostic snapshot. Other TUI-only runtime probes stay Unavailable.
+    private func doctorDiagnosticSnapshot(
+        standalone: StandaloneDiagnosticSnapshot,
+        terminal: TerminalContext
+    ) -> DiagnosticSnapshot {
+        let xtversion = LiveXtversionCollector().collect(context: terminal)
+        return DiagnosticSnapshot(
+            common: standalone.common,
+            clipboard: standalone.clipboard,
+            hostOs: standalone.hostOs,
+            displayServer: standalone.displayServer,
+            containerNoDisplay: standalone.containerNoDisplay,
+            colorLevel: standalone.colorLevel,
+            runtime: DiagnosticRuntimeEvidence(
+                fullscreenActive: .unavailable,
+                kittyFlagsPushed: .unavailable,
+                xtversion: xtversion
+            )
+        )
     }
 
     // MARK: - /login, /logout
@@ -11706,6 +11853,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // still offers no Codex rows.
             catalogStore?.refreshCredentialSnapshot()
             catalogStore?.spawnBackgroundRefresh()
+            Task { await self.reconcileModelStateAfterCatalogRefresh() }
         case .failure(let error):
             appendMessage(PagerMessage(
                 role: .error,
@@ -11789,6 +11937,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // fresh from disk immediately.
             catalogStore?.refreshCredentialSnapshot()
             catalogStore?.spawnBackgroundRefresh()
+            Task { await self.reconcileModelStateAfterCatalogRefresh() }
         case .failure(let error):
             appendMessage(PagerMessage(
                 role: .error,
@@ -12168,6 +12317,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 // stop resolving Codex before the republish.
                 self.catalogStore?.refreshCredentialSnapshot()
                 self.catalogStore?.spawnBackgroundRefresh()
+                Task { await self.reconcileModelStateAfterCatalogRefresh() }
             }
             try? self.renderState()
         }
@@ -13297,6 +13447,33 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         return nil
     }
 
+    /// Await the in-flight background catalog refresh, then reconcile the
+    /// session's effort/tier against the published catalog
+    /// (`ModelState::update_catalog`, acp/model_state.rs:155-192). Quiet:
+    /// composer labels update on rebuild, but no "Switched to…" row — a
+    /// catalog broadcast is not a user `/model` action.
+    private func reconcileModelStateAfterCatalogRefresh() async {
+        guard let catalogStore, let modelSwitch else { return }
+        await catalogStore.backgroundRefreshTask?.value
+        let before = await modelSwitch.snapshot()
+        guard let result = await applyLiveModelCatalogReconcile(
+            catalogStore: catalogStore,
+            modelSwitch: modelSwitch
+        ), result.samplerNeedsRebuild else {
+            return
+        }
+        let after = await modelSwitch.snapshot()
+        modelName = after.modelID
+        reasoningEffort = after.configuration.reasoningEffort?.asString
+        // Only repaint when the wire-visible route actually moved; a no-op
+        // rebuild is not expected here because samplerNeedsRebuild gated it.
+        if before.modelID != after.modelID
+            || before.configuration.reasoningEffort != after.configuration.reasoningEffort
+            || before.configuration.serviceTier != after.configuration.serviceTier {
+            try? renderState()
+        }
+    }
+
     /// Rebuild the live sampling stack for `modelID` and record what happened.
     ///
     /// A refused switch is reported as an error row and leaves `modelName` — and
@@ -14120,9 +14297,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // `apply_meta_models` (effects/mod.rs:844-861). KNOWN DEFERRAL: the
         // upstream rebind of LIVE sessions after a credential change
         // (task_result.rs:1087-1300) is not ported — the new key reaches new
-        // sessions and `/model` switches only.
+        // sessions and `/model` switches only. Effort/tier reconcile against
+        // the refreshed catalog still runs (model_state.rs:155-192).
         catalogStore?.refreshCredentialSnapshot()
         catalogStore?.spawnBackgroundRefresh()
+        Task { await self.reconcileModelStateAfterCatalogRefresh() }
     }
 
     private func reloadCatalogInput() {

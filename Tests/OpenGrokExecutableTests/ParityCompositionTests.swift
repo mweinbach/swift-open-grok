@@ -1496,6 +1496,7 @@ struct ParityCompositionTests {
             "list_agents", "send_message", "followup_task", "wait_agent",
             "enter_plan_mode", "exit_plan_mode",
             "web_search", "web_fetch", "x_search",
+            "search_tool", "use_tool",
             "todo_write"
         ]))
         // The `.build` file-tool pack proper is exactly these eight; the rest

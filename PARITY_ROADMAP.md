@@ -21,6 +21,15 @@ in Wave 13), and 5 (always-approve toggle, Wave 13; slash command, Wave 14) are 
 item 6 first landed as send-now and was later completed by E5's true mid-turn
 `x.ai/interject` buffer/drain seam.
 
+**Wave 20 update (2026-08-10):** Batch 2 closes the named deferred-audit buildable
+slices: live `search_tool`/`use_tool`, remote-settings allowlist authority,
+foreign-session listing, JSC module loader, git pack OFS/REF deltas, XTVERSION in
+`/doctor`, MCP connect-time disabled-tool filtering, and production share HTTP
+clients on the headless `open-grok share` route. Still open at the live seam: ACP
+`x.ai/share_session`, hub MCP session connect, voice/Antigravity/auto-mode/dream/LSP/
+video honesty gaps beyond profile restore, ACP SDK reverse bridge, and platform
+evidence (Linux sandbox, Windows relaunch, WSS/custom CA, CI required checks).
+
 **Wave 19 update (2026-08-10):** the deferred-dashboard batch is now landed rather
 than standing. Retained dashboard sessions can dispatch prompts and replies; `/cd`,
 typed `SetWorkingDir`, and the Ctrl+L location picker share one working-directory

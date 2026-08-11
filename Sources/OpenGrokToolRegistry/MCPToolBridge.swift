@@ -305,7 +305,8 @@ public enum MCPToolBridge {
     @discardableResult
     public static func register(
         provider: any MCPToolProviding,
-        into toolset: FinalizedToolset
+        into toolset: FinalizedToolset,
+        disabledToolNames: Set<String> = []
     ) async -> MCPBridgeRegistration {
         let server = provider.serverName
         // A server name that is not provider-safe is hex-encoded rather than
@@ -336,6 +337,10 @@ public enum MCPToolBridge {
         for tool in discovered {
             guard tool.modelVisible else {
                 skipped[tool.name] = "hidden by the server"
+                continue
+            }
+            if disabledToolNames.contains(tool.name) {
+                skipped[tool.name] = "disabled by user"
                 continue
             }
             guard let clientName = qualifiedMCPToolName(server: server, tool: tool.name),

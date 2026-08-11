@@ -13,11 +13,16 @@ import Testing
 @testable import OpenGrokCLI
 import OpenGrokACPRuntime
 import OpenGrokComputerHubCore
+import OpenGrokComputerHubMCPAdapter
 import OpenGrokConfigTypes
 import OpenGrokHTTP
 import OpenGrokShared
 import OpenGrokToolProtocol
+import OpenGrokToolRegistry
+import OpenGrokToolRuntime
+import OpenGrokToolTypes
 import OpenGrokWorkspace
+import OpenGrokWorkspaceClient
 
 // MARK: - Fakes
 
@@ -782,5 +787,267 @@ struct LiveHubMediationTests {
             return
         }
         #expect(name == "vendor_tool")
+    }
+}
+
+// MARK: - Hub MCP bridge coordinator
+
+/// Mock transport for the hub MCP bridge tests. Returns canned responses
+/// and records calls so assertions can verify the request actually
+/// crossed the bridge rather than being fabricated locally.
+private final class HubMockMcpTransport: McpTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private let serverInfo: McpServerInfo
+    private let tools: [McpToolDefinition]
+    private let callResult: McpCallResult
+    private var recordedCalls: [(String, JSONValue)] = []
+    private var closedCount = 0
+
+    init(
+        serverInfo: McpServerInfo = McpServerInfo(name: "hub-test-server", version: "1.0"),
+        tools: [McpToolDefinition] = [],
+        callResult: McpCallResult = McpCallResult(content: [.text(text: "ok")])
+    ) {
+        self.serverInfo = serverInfo
+        self.tools = tools
+        self.callResult = callResult
+    }
+
+    func initialize() async throws -> McpServerInfo { serverInfo }
+    func listTools() async throws -> [McpToolDefinition] { tools }
+    func close() async throws {
+        // NSLock is sync-only under Swift 6 / macOS 27 SDK.
+        markClosed()
+    }
+
+    func callTool(name: String, arguments: JSONValue) async throws -> McpCallResult {
+        recordCall(name: name, arguments: arguments)
+        return callResult
+    }
+
+    var calls: [(String, JSONValue)] {
+        snapshotCalls()
+    }
+
+    var closeCount: Int {
+        snapshotCloseCount()
+    }
+
+    private func markClosed() {
+        lock.lock(); closedCount += 1; lock.unlock()
+    }
+
+    private func recordCall(name: String, arguments: JSONValue) {
+        lock.lock()
+        recordedCalls.append((name, arguments))
+        lock.unlock()
+    }
+
+    private func snapshotCalls() -> [(String, JSONValue)] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedCalls
+    }
+
+    private func snapshotCloseCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return closedCount
+    }
+}
+
+private func makeTestToolset() -> FinalizedToolset {
+    FinalizedToolset(
+        tools: [],
+        resources: ToolResources(cwd: NSTemporaryDirectory()),
+        codeModeNamespaces: [:],
+        options: .unrestricted
+    )
+}
+
+@Suite("Hub MCP bridge coordinator")
+struct HubMCPBridgeCoordinatorTests {
+    @Test("no-hub coordinator exposes nothing")
+    func noHubExposesNothing() {
+        let coordinator = HubMCPBridgeCoordinator()
+        let toolset = makeTestToolset()
+        #expect(!coordinator.isConnected)
+        #expect(coordinator.serverName == nil)
+        #expect(coordinator.registeredNames(in: toolset).isEmpty)
+    }
+
+    @Test("connect registers tools; disconnect removes them")
+    func connectRegistersDisconnectRemoves() async throws {
+        let transport = HubMockMcpTransport(
+            tools: [
+                McpToolDefinition(name: "workspace_read", description: "Read workspace"),
+                McpToolDefinition(name: "workspace_write", description: "Write workspace"),
+            ]
+        )
+        let config = McpBridgeConfig(
+            sessionId: try SessionId("test-session"),
+            mediation: .mediated(AllowAllHubMediator()),
+            namespace: "hub"
+        )
+        let toolset = makeTestToolset()
+        let coordinator = HubMCPBridgeCoordinator()
+
+        let registered = try await coordinator.connect(
+            transport: transport,
+            config: config,
+            toolset: toolset
+        )
+        #expect(coordinator.isConnected)
+        #expect(registered.count == 2)
+        #expect(toolset.clientNames.contains(where: { $0.contains("workspace_read") }))
+        #expect(toolset.clientNames.contains(where: { $0.contains("workspace_write") }))
+        #expect(coordinator.registeredNames(in: toolset).count == 2)
+
+        await coordinator.disconnect(toolset: toolset)
+        #expect(!coordinator.isConnected)
+        #expect(coordinator.serverName == nil)
+        #expect(coordinator.registeredNames(in: toolset).isEmpty)
+        #expect(toolset.clientNames.isEmpty)
+        #expect(transport.closeCount == 1)
+    }
+
+    @Test("loopback workspace read through the live toolset seam")
+    func loopbackWorkspaceRead() async throws {
+        let readResult = McpCallResult(content: [
+            .text(text: "{\"files\":[\"README.md\",\"Package.swift\"]}")
+        ])
+        let transport = HubMockMcpTransport(
+            tools: [
+                McpToolDefinition(
+                    name: "workspace_read",
+                    description: "Read workspace files",
+                    inputSchema: .object([
+                        "type": .string("object"),
+                        "properties": .object([
+                            "path": .object(["type": .string("string")])
+                        ])
+                    ])
+                )
+            ],
+            callResult: readResult
+        )
+        let config = McpBridgeConfig(
+            sessionId: try SessionId("loopback-session"),
+            mediation: .mediated(AllowAllHubMediator()),
+            namespace: "hub"
+        )
+        let toolset = makeTestToolset()
+        let coordinator = HubMCPBridgeCoordinator()
+
+        let registered = try await coordinator.connect(
+            transport: transport,
+            config: config,
+            toolset: toolset
+        )
+        #expect(registered.count == 1)
+
+        let clientName = try #require(registered.first)
+        let tool = try #require(toolset.tool(named: clientName))
+        let handler = try #require(tool.handler)
+
+        let args: JSONValue = .object(["path": .string("/")])
+        let result = await handler.invoke(
+            clientName: clientName,
+            args: args,
+            ctx: ToolCallContext(),
+            resources: ToolResources(cwd: "/tmp")
+        )
+
+        switch result {
+        case .success(let output):
+            let wire = try output.value.decode(ToolOutputWire.self)
+            guard case .text(let text) = wire else {
+                Issue.record("expected text output, got \(wire)")
+                return
+            }
+            #expect(text.contains("README.md"))
+            #expect(text.contains("Package.swift"))
+        case .failure(let error):
+            Issue.record("loopback read failed: \(error.detail)")
+        }
+
+        #expect(transport.calls.count == 1)
+        #expect(transport.calls[0].0 == "workspace_read")
+        #expect(transport.calls[0].1 == args)
+
+        await coordinator.disconnect(toolset: toolset)
+    }
+
+    @Test("mediation gate denies a bridged call before it reaches the transport")
+    func mediationDeniesBeforeTransport() async throws {
+        let transport = HubMockMcpTransport(
+            tools: [McpToolDefinition(name: "dangerous_tool", description: "Dangerous")]
+        )
+        let config = McpBridgeConfig(
+            sessionId: try SessionId("mediation-session"),
+            mediation: .mediated(DenyAllHubMediator(reason: "hub tools blocked by policy")),
+            namespace: "hub"
+        )
+        let toolset = makeTestToolset()
+        let coordinator = HubMCPBridgeCoordinator()
+
+        let registered = try await coordinator.connect(
+            transport: transport,
+            config: config,
+            toolset: toolset
+        )
+        #expect(registered.count == 1)
+
+        let clientName = try #require(registered.first)
+        let tool = try #require(toolset.tool(named: clientName))
+        let handler = try #require(tool.handler)
+
+        let result = await handler.invoke(
+            clientName: clientName,
+            args: .null,
+            ctx: ToolCallContext(),
+            resources: ToolResources(cwd: "/tmp")
+        )
+
+        guard case .failure(let error) = result else {
+            Issue.record("expected denial, got success")
+            return
+        }
+        #expect(error.detail.contains("hub tools blocked by policy"))
+        #expect(transport.calls.isEmpty)
+
+        await coordinator.disconnect(toolset: toolset)
+    }
+
+    @Test("repeated connect replaces the previous bridge cleanly")
+    func repeatedConnectReplaces() async throws {
+        let transport1 = HubMockMcpTransport(
+            serverInfo: McpServerInfo(name: "server-v1", version: "1"),
+            tools: [McpToolDefinition(name: "tool_a")]
+        )
+        let transport2 = HubMockMcpTransport(
+            serverInfo: McpServerInfo(name: "server-v2", version: "2"),
+            tools: [McpToolDefinition(name: "tool_b")]
+        )
+        let toolset = makeTestToolset()
+        let coordinator = HubMCPBridgeCoordinator()
+        let config = McpBridgeConfig(
+            sessionId: try SessionId("replace-session"),
+            mediation: .mediated(AllowAllHubMediator())
+        )
+
+        try await coordinator.connect(
+            transport: transport1, config: config, toolset: toolset
+        )
+        #expect(coordinator.serverName == "server-v1")
+
+        try await coordinator.connect(
+            transport: transport2, config: config, toolset: toolset
+        )
+        #expect(coordinator.serverName == "server-v2")
+        #expect(transport1.closeCount >= 1)
+        let names = toolset.clientNames
+        #expect(!names.contains(where: { $0.contains("tool_a") }))
+        #expect(names.contains(where: { $0.contains("tool_b") }))
+
+        await coordinator.disconnect(toolset: toolset)
     }
 }

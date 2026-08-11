@@ -596,8 +596,12 @@ public enum BuiltinToolCatalog {
     /// it only reaches an advertised toolset when the live composition appends
     /// it — which it does exclusively when an interactive question surface
     /// exists (see `LiveComposition.swift`).
+    ///
+    /// `mcpMetaTools` are always-retained: a restrictive allowlist cannot
+    /// strip MCP access (`builder.rs:2243-2261`).
     public static var builtinTools: [RegisteredToolSpec] {
-        fileTools + mediaTools + webTools + sessionStateTools + planModeTools + askUserQuestionTools
+        fileTools + mediaTools + webTools + sessionStateTools + planModeTools
+            + askUserQuestionTools + mcpMetaTools
     }
 
     public static var allQualifiedIds: Set<String> {

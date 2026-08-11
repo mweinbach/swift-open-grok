@@ -7,7 +7,7 @@
 // forward routes at the pin are list / call / read_resource / auth_status /
 // auth_trigger / setup / toggle / toggle_tool / upsert / delete
 // (`mcp_methods`, mcp.rs:33-50; `route_mcp_method`, mcp.rs:358-372). This
-// port routes the seven with real backings and refuses the rest:
+// port routes the nine with real backings and refuses the rest:
 //
 //   * `list` (mcp.rs:899-1185) — the local server catalog (trust-gated
 //     config layers) annotated with the live session's connection state.
@@ -37,19 +37,23 @@
 //     (`upsertMCPServer` + `writeConfigFile`, the same write `mcp add`
 //     performs), then live-swap the server in the running session.
 //   * `delete` (mcp.rs:1910-1941) — remove from the user `config.toml`,
-//     then live teardown (tools unregistered, client shut down). Upstream's
-//     trailing `save_user_mcp_server_enabled` cleanup has no port
-//     equivalent (no `disabled_mcp_servers` list) — recorded.
+//     then live teardown (tools unregistered, client shut down).
+//   * `toggle` (mcp.rs:1714-1820) — persist to `disabled_mcp_servers` in
+//     the user `config.toml`, then live-swap (connect or teardown). Emits
+//     `x.ai/mcp/tools_changed` only after successful swap. Managed
+//     connectors, gateway prefix routing, and plugin registry are out of
+//     scope — those branches are absent.
+//   * `toggle_tool` (mcp.rs:1833-1870) — persist per-tool disable to
+//     `disabled_mcp_tools` in `config.toml`, then live remove/restore the
+//     qualified tool in the running toolset. Emits `tools_changed` after.
 //
 // Refused, with the shape upstream itself uses for the prefix:
 //
-//   * `setup` / `toggle` / `toggle_tool` — upstream serves these; this port
-//     has no `mcp_preferences.json` surface and no persisted
-//     `disabled_mcp_servers` layer, so a toggle here would either lie about
-//     surviving a restart or silently drop the persistence half. They are
-//     refused with the port's terminal ext-method error (data naming the
-//     method) so a peer can tell "not ported" from upstream's bare
-//     unknown-name refusal below.
+//   * `setup` — upstream serves this; this port has no
+//     `mcp_preferences.json` setup-values surface and no setup-schema
+//     resolution, so the schema cannot be driven. Refused with the
+//     port's terminal ext-method error (data naming the method) so a peer
+//     can tell "not ported" from upstream's bare unknown-name refusal below.
 //   * Anything else under the prefix — including an inbound copy of the
 //     emit-only reverse method `x.ai/mcp/sdk_call` — gets upstream's OWN
 //     refusal for unknown `x.ai/mcp/*` names: bare `method_not_found`, NO
@@ -223,12 +227,17 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             return try await handleUpsert(params)
         case "x.ai/mcp/delete":
             return try await handleDelete(params)
-        case "x.ai/mcp/setup", "x.ai/mcp/toggle", "x.ai/mcp/toggle_tool":
-            // Upstream serves these three; this port has no preferences /
-            // disabled-list persistence to back them (file header). The
-            // data-carrying terminal error distinguishes "not ported" from
-            // the bare unknown-name refusal below.
+        case "x.ai/mcp/setup":
+            // Upstream serves setup; this port has no setup-schema surface or
+            // `mcp_preferences.json` setup-values layer — the schema cannot
+            // resolve and the preference cannot persist. Refused with the
+            // data-carrying terminal error (distinguishes "not ported" from
+            // the bare unknown-name refusal below).
             throw ACPExtensionMethodRouter.unknownExtensionMethodError(method)
+        case "x.ai/mcp/toggle":
+            return try await handleToggle(params)
+        case "x.ai/mcp/toggle_tool":
+            return try await handleToggleTool(params)
         default:
             // Upstream's own arm for an unknown name under the prefix —
             // including an inbound copy of the emit-only reverse method
@@ -651,6 +660,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             makeHTTPTransport: { makeHTTPTransport() }
         )
         await state.record(outcome)
+        LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
         if let failure = outcome.failure {
             // Upstream's post-auth registration failure copy
             // (acp_session_impl/mcp.rs:420-423).
@@ -733,6 +743,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             makeHTTPTransport: { makeHTTPTransport() }
         )
         await state.record(outcome)
+        LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
         if let failure = outcome.failure {
             // Deferred OAuth is upstream's ok arm: the spawn succeeds with
             // auth pending and the session marks auth_required. Any other
@@ -748,12 +759,172 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         return envelope(.object(["ok": .bool(true)]))
     }
 
+    // MARK: x.ai/mcp/toggle
+
+    /// `handle_toggle` (mcp.rs:1714-1820): persist-then-swap, with a
+    /// `tools_changed` notification ONLY after a successful live swap.
+    ///
+    /// This port carries no managed connectors, no gateway prefix routing, and
+    /// no plugin registry — those subsystems are explicitly out of scope and
+    /// their conditional branches are absent rather than stubbed.
+    private func handleToggle(_ params: JSONValue) async throws -> JSONValue {
+        guard let sessionID = params["session_id"]?.stringValue
+                ?? params["sessionId"]?.stringValue,
+              let serverName = params["server_name"]?.stringValue
+                ?? params["serverName"]?.stringValue else {
+            throw invalidParams("invalid params: missing field `session_id` or `server_name`")
+        }
+        let enabled: Bool
+        if let e = params["enabled"]?.boolValue {
+            enabled = e
+        } else {
+            throw invalidParams("invalid params: missing field `enabled`")
+        }
+
+        try await requireSession(sessionID)
+
+        // 1. Persist the enable/disable to config.toml FIRST (fail-closed).
+        var root = LiveMCPComposition.loadForEdit(at: userConfigPath) ?? .table(TOMLTable())
+        do {
+            try applyMCPServerEnabled(serverName, enabled: enabled, in: &root)
+            try writeConfigFile(root, to: userConfigPath)
+        } catch {
+            throw internalError("failed to persist toggle: \(error)")
+        }
+
+        // 2. Live swap: connect or teardown depending on direction.
+        if enabled {
+            guard let declaration = declarations().servers.first(where: { $0.name == serverName })
+            else {
+                throw invalidParams("server '\(serverName)' not found in config")
+            }
+            let connections = state.connections
+            let toolset = state.toolset
+            MCPToolBridge.unregister(server: serverName, from: toolset)
+            if let previous = await connections.release(named: serverName) {
+                try? await previous.shutdown()
+                await previous.close()
+            }
+            let makeHTTPTransport = self.makeHTTPTransport
+            let disabledTools = allDisabledMCPTools(in: root)
+            let outcome = await LiveMCPComposition.connect(
+                declaration: declaration,
+                toolset: toolset,
+                connections: connections,
+                environment: environment,
+                makeHTTPTransport: { makeHTTPTransport() },
+                disabledToolNames: disabledTools[serverName] ?? []
+            )
+            await state.record(outcome)
+            if let failure = outcome.failure,
+               failure != LiveMCPComposition.authorizationRequiredNotice(serverName: serverName) {
+                throw internalError(failure)
+            }
+            // Notification ONLY after successful swap.
+            await emitToolsChanged(sessionID: sessionID, serverName: serverName)
+        } else {
+            let toolset = state.toolset
+            MCPToolBridge.unregister(server: serverName, from: toolset)
+            if let previous = await state.connections.release(named: serverName) {
+                try? await previous.shutdown()
+                await previous.close()
+            }
+            await state.removeOutcome(name: serverName)
+            await emitToolsChanged(sessionID: sessionID, serverName: serverName)
+        }
+        return envelope(.object(["ok": .bool(true)]))
+    }
+
+    // MARK: x.ai/mcp/toggle_tool
+
+    /// `handle_toggle_tool` (mcp.rs:1833-1870): persist per-tool disable,
+    /// then live unregister/re-register the single qualified tool.
+    private func handleToggleTool(_ params: JSONValue) async throws -> JSONValue {
+        guard let sessionID = params["session_id"]?.stringValue
+                ?? params["sessionId"]?.stringValue,
+              let serverName = params["server_name"]?.stringValue
+                ?? params["serverName"]?.stringValue,
+              let toolName = params["tool_name"]?.stringValue
+                ?? params["toolName"]?.stringValue else {
+            throw invalidParams(
+                "invalid params: missing field `session_id`, `server_name`, or `tool_name`"
+            )
+        }
+        let enabled: Bool
+        if let e = params["enabled"]?.boolValue {
+            enabled = e
+        } else {
+            throw invalidParams("invalid params: missing field `enabled`")
+        }
+
+        try await requireSession(sessionID)
+
+        // 1. Persist the per-tool disable/enable to config.toml FIRST.
+        var root = LiveMCPComposition.loadForEdit(at: userConfigPath) ?? .table(TOMLTable())
+        do {
+            try applyMCPToolEnabled(server: serverName, tool: toolName, enabled: enabled, in: &root)
+            try writeConfigFile(root, to: userConfigPath)
+        } catch {
+            throw internalError("failed to persist tool toggle: \(error)")
+        }
+
+        // 2. Live swap: remove or restore the single qualified tool.
+        let toolset = state.toolset
+        if enabled {
+            // Re-register the full server's tool set to pick up the re-enabled
+            // tool. Unregister first so the bridge can re-register cleanly.
+            MCPToolBridge.unregister(server: serverName, from: toolset)
+            if let client = await state.connections.client(named: serverName) {
+                let provider = MCPClientToolProvider(serverName: serverName, client: client)
+                let disabledTools = allDisabledMCPTools(in: root)
+                let registration = await MCPToolBridge.register(
+                    provider: provider,
+                    into: toolset,
+                    disabledToolNames: disabledTools[serverName] ?? []
+                )
+                await state.record(MCPServerConnection(
+                    name: serverName,
+                    toolNames: registration.registeredNames,
+                    skipped: registration.skipped
+                ))
+            }
+        } else {
+            // Unregister just the one qualified name.
+            if let qualified = qualifiedMCPToolName(server: serverName, tool: toolName) {
+                toolset.unregister(prefix: qualified)
+            }
+        }
+
+        // Notification after swap.
+        await emitToolsChanged(sessionID: sessionID, serverName: serverName)
+        return envelope(.object(["ok": .bool(true)]))
+    }
+
+    // MARK: Notifications
+
+    /// Emit `x.ai/mcp/tools_changed` — the per-server push that tells the
+    /// pager to schedule a debounced `mcp/list` refetch (mcp.rs:248-270).
+    /// The `sessionId` routes the push to the owning agent on multi-agent
+    /// runtimes; `serverName` and `tools` are currently unread by the pager
+    /// (mcp.rs:262-270) and left minimal for forward-compat.
+    private func emitToolsChanged(sessionID: String, serverName: String) async {
+        // Keep `search_tool`'s index aligned with the live MCP toolset after
+        // every tools-changed mutation (toggle / reconnect / delete).
+        LiveMCPToolSearchIndex.refreshIfPresent(in: state.toolset)
+        let params = JSONValue.object([
+            "sessionId": .string(sessionID),
+            "serverName": .string(serverName),
+        ])
+        await gateway.send(method: "x.ai/mcp/tools_changed", params: params)
+    }
+
     // MARK: x.ai/mcp/delete
 
     /// `handle_delete` (mcp.rs:1910-1941): config removal first — refusing
     /// names that were never locally configured with the byte-exact copy —
-    /// then the live teardown. Upstream's trailing user-disabled-list
-    /// cleanup (mcp.rs:1936-1938) has no port equivalent — recorded.
+    /// then the live teardown. Also clears `disabled_mcp_servers` for the
+    /// deleted name (mcp.rs:1936-1938) so a recreate does not inherit a
+    /// stale disable.
     private func handleDelete(_ params: JSONValue) async throws -> JSONValue {
         guard let sessionID = params["session_id"]?.stringValue,
               let serverName = params["server_name"]?.stringValue else {
@@ -767,7 +938,13 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
                 deletedDeclaration = MCPConfigLoader.load(from: root)
                     .servers.first { $0.name == serverName }
                 existed = try removeMCPServer(serverName, from: &root)
-                if existed { try writeConfigFile(root, to: userConfigPath) }
+                if existed {
+                    // Upstream's trailing cleanup (mcp.rs:1936-1938): a
+                    // deleted server must leave `disabled_mcp_servers` too,
+                    // or a recreate would inherit a stale disable.
+                    try? applyMCPServerEnabled(serverName, enabled: true, in: &root)
+                    try writeConfigFile(root, to: userConfigPath)
+                }
             } catch {
                 throw internalError("\(error)")
             }
@@ -789,6 +966,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             await previous.close()
         }
         await state.removeOutcome(name: serverName)
+        LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
 
         // Credential teardown is intentionally separate from config removal:
         // remote RFC 7009 revocation is best-effort and reported honestly,

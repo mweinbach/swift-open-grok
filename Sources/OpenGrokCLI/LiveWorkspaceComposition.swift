@@ -41,12 +41,18 @@ import Foundation
 import OpenGrokACPRuntime
 import OpenGrokAuth
 import OpenGrokComputerHubCore
+import OpenGrokComputerHubMCPAdapter
 import OpenGrokComputerHubSDK
+import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokHTTP
 import OpenGrokModels
 import OpenGrokSandbox
 import OpenGrokShared
+import OpenGrokToolProtocol
+import OpenGrokToolRegistry
+import OpenGrokToolRuntime
+import OpenGrokToolTypes
 import OpenGrokWorkspaceClient
 
 // MARK: - Errors
@@ -100,8 +106,12 @@ public func workspaceCommandGate(
     if let environmentOverride {
         return environmentOverride ? .enabled : .disabled
     }
+    // Absent settings stay `.unknown` (main.rs:266-282). Only the
+    // allowlisted projection may decide once settings are loaded — other
+    // RemoteSettings fields must not reach this gate.
     guard let remoteSettings else { return .unknown }
-    return (remoteSettings.workspaceCommandEnabled ?? false) ? .enabled : .disabled
+    let allowed = AllowlistedRemoteSettings(projecting: remoteSettings)
+    return (allowed.workspaceCommandEnabled ?? false) ? .enabled : .disabled
 }
 
 // MARK: - Status payload
@@ -611,5 +621,177 @@ public final class LeaderWorkspaceControlChannel: WorkspaceControlChannel, @unch
 
     public func close() async {
         await client.close()
+    }
+}
+
+// MARK: - Hub MCP bridge coordinator
+
+/// Manages the lifecycle of MCP tools bridged from a Computer Hub session.
+///
+/// Tools are registered into the retained toolset only when a live hub
+/// connection exists; `disconnect` removes them. The bridge's
+/// `McpBridgeConfig.mediation` gates every call before it leaves the
+/// process, so a `disconnect` racing an in-flight call still denies
+/// rather than dispatching against a torn-down transport.
+///
+/// Rust reference: `crates/codegen/xai-grok-workspace/src/mcp.rs:3-22`
+/// (transport adapter) and `:33` onward (bridge lifecycle).
+public final class HubMCPBridgeCoordinator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeBridge: McpBridge?
+    private var activeServerName: String?
+
+    public init() {}
+
+    /// The server name tools are registered under, or `nil` when no hub is
+    /// connected.
+    public var serverName: String? {
+        lock.lock(); defer { lock.unlock() }
+        return activeServerName
+    }
+
+    public var isConnected: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return activeBridge != nil
+    }
+
+    /// Connect to a hub's MCP transport, discover tools, and register them
+    /// into `toolset`. Returns the qualified names that were registered, or
+    /// an empty array when no usable tools were discovered.
+    ///
+    /// Calling `connect` while already connected is a programming error on
+    /// the caller's side; the previous bridge is shut down first so the
+    /// toolset never accumulates stale entries.
+    @discardableResult
+    public func connect(
+        transport: any McpTransport,
+        config: McpBridgeConfig,
+        toolset: FinalizedToolset
+    ) async throws -> [String] {
+        if isConnected {
+            await disconnect(toolset: toolset)
+        }
+
+        let handle = try await McpBridge.connect(transport, config)
+        let bridge = handle.bridge
+        let name = handle.serverInfo.name
+
+        let registered = Self.registerHandlers(
+            bridge: bridge,
+            serverName: name,
+            toolset: toolset
+        )
+
+        // NSLock is sync-only under Swift 6; keep the critical section off
+        // the async function body.
+        installActive(bridge: bridge, serverName: name)
+        return registered
+    }
+
+    /// Unregister every tool this bridge contributed and shut down the
+    /// transport. Safe to call when already disconnected.
+    public func disconnect(toolset: FinalizedToolset) async {
+        let snapshot = takeActive()
+        if let name = snapshot.serverName {
+            MCPToolBridge.unregister(server: name, from: toolset)
+        }
+        if let bridge = snapshot.bridge {
+            try? await bridge.shutdown()
+        }
+    }
+
+    /// Names currently registered by this bridge in `toolset`.
+    public func registeredNames(in toolset: FinalizedToolset) -> [String] {
+        guard let name = serverName else { return [] }
+        return MCPToolBridge.registeredNames(for: name, in: toolset)
+    }
+
+    private func installActive(bridge: McpBridge, serverName: String) {
+        lock.lock()
+        activeBridge = bridge
+        activeServerName = serverName
+        lock.unlock()
+    }
+
+    private func takeActive() -> (bridge: McpBridge?, serverName: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        let bridge = activeBridge
+        let name = activeServerName
+        activeBridge = nil
+        activeServerName = nil
+        return (bridge, name)
+    }
+
+    // MARK: - Registration
+
+    /// Create `FinalizedTool` entries from the bridge's handlers and
+    /// register them into the toolset. Each handler already carries the
+    /// `McpBridgeConfig.mediation` gate; the `HubBridgedMcpHandler`
+    /// wrapper routes through `McpToolHandler.execute`, so every call is
+    /// mediated.
+    static func registerHandlers(
+        bridge: McpBridge,
+        serverName: String,
+        toolset: FinalizedToolset
+    ) -> [String] {
+        var registered: [String] = []
+        for handler in bridge.handlers() {
+            let tool = handler.definition
+            guard let clientName = qualifiedMCPToolName(
+                server: serverName, tool: tool.name
+            ) else {
+                continue
+            }
+            guard (try? ToolId(clientName)) != nil else { continue }
+
+            let desc = tool.description ?? "Hub MCP tool '\(tool.name)' on '\(serverName)'"
+            var definition = ToolDescription(name: clientName, description: desc)
+                .withKind(ProductToolKind.other.rawValue)
+                .withNamespace(ProductToolNamespace.mcp.rawValue)
+            if let schema = tool.inputSchema {
+                definition = definition.withArgumentsSchema(schema)
+            }
+
+            toolset.registerDynamic(FinalizedTool(
+                qualifiedId: "\(ProductToolNamespace.mcp.displayName):\(clientName)",
+                namespace: .mcp,
+                id: clientName,
+                clientName: clientName,
+                kind: .other,
+                description: desc,
+                definition: definition,
+                inputSchema: tool.inputSchema ?? .object(["type": .string("object")]),
+                reverseParams: [:],
+                contractVersion: nil,
+                visibility: .topLevel,
+                exposure: .ordinary,
+                handler: HubBridgedMcpHandler(inner: handler)
+            ))
+            registered.append(clientName)
+        }
+        return registered
+    }
+}
+
+/// Adapts the hub adapter's `McpToolHandler` to the registry's
+/// `ToolHandler` protocol, preserving the built-in mediation gate.
+///
+/// The call chain: `FinalizedToolset` dispatches → `invoke` here →
+/// `McpToolHandler.execute` (which runs `mediation.admit` before
+/// touching the transport) → terminal stream result.
+struct HubBridgedMcpHandler: ToolHandler {
+    let inner: McpToolHandler
+
+    func invoke(
+        clientName: String,
+        args: JSONValue,
+        ctx: ToolCallContext,
+        resources: ToolResources
+    ) async -> Result<TypedToolOutput, ToolError> {
+        _ = (clientName, resources)
+        return await consumeStreamTerminal(
+            await inner.execute(ctx: ctx, args: args)
+        )
     }
 }

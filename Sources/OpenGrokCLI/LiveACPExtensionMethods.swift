@@ -40,9 +40,9 @@
 //     no per-session web-search reload command channel), `x.ai/getApiKey`/
 //     `x.ai/setApiKey` and `x.ai/auth/*` (:4112, :4387 — the xAI auth
 //     family, Wave 17), the rest of `x.ai/session*`
-//     admin/state/search/usage/repair (:4115-4155 — the item 6 remainder:
-//     info/close/updates/state/import/load_history/search/repair/usage need
-//     live-session command plumbing, updates journals or the FTS index;
+//     search/usage/repair (:4115-4155 — the item 6 remainder:
+//     updates/import/load_history/search/repair/usage need updates journals
+//     or the FTS index; info/state/close are routed (Wave 20 S4);
 //     singular `x.ai/session/list` still needs the persisted-history lane;
 //     plural `x.ai/sessions/list` is the live typed leader roster snapshot),
 //     `x.ai/memory/*` (:4156),

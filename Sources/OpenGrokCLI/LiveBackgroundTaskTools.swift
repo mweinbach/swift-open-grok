@@ -778,3 +778,146 @@ enum LiveBackgroundTaskTools {
         }
     }
 }
+
+// MARK: - TaskCompleted auto-wake
+
+/// Exactly-once completion wake for background tasks. Upstream fires
+/// `TaskCompleted(snapshot)` from the terminal backend on exit
+/// (terminal.rs:1588-1592) and the notification bridge formats it as an
+/// immediate prompt. This port cannot push from the shell backend (not
+/// owned), so it pulls: the monitor host fires on pipeline completion,
+/// and a registry watcher catches non-monitor bash tasks.
+///
+/// The wake routes through the session's interjection seam (mid-turn
+/// injection or idle-fallback prompt), matching the Rust notification
+/// bridge's immediate-prompt delivery
+/// (task_completion.rs:164-195, notification_bridge.rs:776-789).
+actor LiveTaskCompletionWake {
+    private var reportedIDs: Set<String> = []
+    private var wakeSink: (@Sendable (String) async -> Void)?
+    private let ownerSessionID: String?
+    private var watchTask: Task<Void, Never>?
+
+    init(ownerSessionID: String?) {
+        self.ownerSessionID = ownerSessionID
+    }
+
+    func setWakeSink(_ sink: (@Sendable (String) async -> Void)?) {
+        self.wakeSink = sink
+    }
+
+    /// Report a completed task. Returns `true` when the wake fires
+    /// (first report); `false` when already reported (exactly-once).
+    /// Suppresses wakes for tasks the model actively waited on
+    /// (`blockWaited`), matching Rust's bridge suppression
+    /// (terminal.rs:1520-1524).
+    @discardableResult
+    func reportIfNew(_ snapshot: ShellTaskSnapshot) async -> Bool {
+        guard snapshot.completed else { return false }
+        guard !reportedIDs.contains(snapshot.taskID) else { return false }
+        guard !snapshot.blockWaited else {
+            reportedIDs.insert(snapshot.taskID)
+            return false
+        }
+        reportedIDs.insert(snapshot.taskID)
+        let message: String
+        if snapshot.kind == .monitor {
+            message = LiveTaskCompletionFormatting.formatMonitorCompletion(snapshot)
+        } else {
+            message = LiveTaskCompletionFormatting.formatBashCompletion(snapshot)
+        }
+        await wakeSink?(message)
+        return true
+    }
+
+    /// Mark a task as already consumed (e.g. the model read it via
+    /// `get_task_output`), suppressing any future wake for this ID.
+    func suppress(_ taskID: String) {
+        reportedIDs.insert(taskID)
+    }
+
+    /// Start a background poll loop that watches the registry for
+    /// newly-completed tasks and fires wakes. Polls at 1s intervals —
+    /// coarser than the 200ms monitor debounce because bash tasks are
+    /// not latency-sensitive (the model is idle or mid-turn; a 1s
+    /// ceiling is well within user perception).
+    func startWatching(process: any OpenGrokShellProcessExecution) {
+        watchTask?.cancel()
+        watchTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let tasks = await process.listTasks()
+                for task in tasks where task.completed {
+                    if let owner = self.ownerSessionID,
+                       let taskOwner = task.ownerSessionID,
+                       taskOwner != owner {
+                        continue
+                    }
+                    await self.reportIfNew(task)
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    func shutdown() {
+        watchTask?.cancel()
+        watchTask = nil
+    }
+
+    /// Test observability.
+    var reported: Set<String> { reportedIDs }
+}
+
+// MARK: - Formatting (task_completion.rs:164-195)
+
+enum LiveTaskCompletionFormatting {
+    /// `format_monitor_completion` (task_completion.rs:171-195): the
+    /// model-facing wake message for a completed monitor.
+    static func formatMonitorCompletion(_ task: ShellTaskSnapshot) -> String {
+        let reason: String
+        if let signal = task.signal {
+            reason = "killed by signal \(signal)"
+        } else if let exitCode = task.exitCode {
+            reason = "exited (code \(exitCode))"
+        } else {
+            reason = "ended"
+        }
+        let description = task.displayCommand
+            .flatMap { $0.hasPrefix("[monitor] ") ? String($0.dropFirst("[monitor] ".count)) : nil }
+            ?? "monitor"
+        let tool = LiveBackgroundTaskTools.getTaskOutputName
+        let duration = task.duration()
+        return "Monitor \"\(task.taskID)\" ended: [monitor ended: \(reason)].\n"
+            + "Description: \(description)\n"
+            + "Command: \(task.command)\n"
+            + "Duration: \(String(format: "%.1f", duration))s\n"
+            + "Use \(tool)(\"\(task.taskID)\") for full output."
+    }
+
+    /// `format_bash_completion` (task_completion.rs:117-163): the
+    /// model-facing wake message for a completed bash task.
+    static func formatBashCompletion(_ task: ShellTaskSnapshot) -> String {
+        let command = task.displayCommand ?? task.command
+        let duration = task.duration()
+        let statusStr: String
+        if let signal = task.signal {
+            statusStr = "terminated by signal \(signal)"
+        } else {
+            let exitCodeStr = task.exitCode.map(String.init) ?? "unknown"
+            statusStr = "exit code: \(exitCodeStr)"
+        }
+        var msg = "Background task \"\(task.taskID)\" completed (\(statusStr)).\n"
+            + "Command: \(command) | Duration: \(String(format: "%.1f", duration))s\n"
+        if task.signal != nil, duration < 1.0 {
+            msg += "Note: this is much shorter than expected for a backgrounded command. "
+                + "The wrapper bash may have been killed by signal (e.g. `pkill -f <pat>` "
+                + "matching its own argv) before the inner command ran. Re-check the "
+                + "command for self-matching kill patterns, signals sent by the script "
+                + "itself, or upstream sources of SIGTERM/SIGHUP.\n"
+        }
+        let tool = LiveBackgroundTaskTools.getTaskOutputName
+        msg += "Use \(tool)(\"\(task.taskID)\") for full output."
+        return msg
+    }
+}

@@ -7,7 +7,7 @@
 // - SHA-1 via pure-Swift `PortableSHA1` (no CryptoKit).
 // - zlib via Apple Compression when available, else system zlib (`COpenGrokZlib`).
 // - Pack index v2 lookup with bounded non-delta inflate.
-// - OFS_DELTA/REF_DELTA remain explicit typed refusals.
+// - OFS_DELTA/REF_DELTA resolution with bounded depth/size ceilings.
 
 import Foundation
 #if canImport(Compression)
@@ -37,17 +37,22 @@ public struct GitTreeEntry: Sendable, Equatable {
 /// Pure object store over a `.git` directory.
 public struct GitObjectStore: Sendable {
     public static let defaultMaximumPackedObjectSize = 64 * 1024 * 1024
+    public static let defaultMaximumDeltaChainDepth = 50
 
     public let gitDir: String
     public let maximumPackedObjectSize: Int
+    public let maximumDeltaChainDepth: Int
 
     public init(
         gitDir: String,
-        maximumPackedObjectSize: Int = GitObjectStore.defaultMaximumPackedObjectSize
+        maximumPackedObjectSize: Int = GitObjectStore.defaultMaximumPackedObjectSize,
+        maximumDeltaChainDepth: Int = GitObjectStore.defaultMaximumDeltaChainDepth
     ) {
         precondition(maximumPackedObjectSize >= 0)
+        precondition(maximumDeltaChainDepth >= 0)
         self.gitDir = gitDir
         self.maximumPackedObjectSize = maximumPackedObjectSize
+        self.maximumDeltaChainDepth = maximumDeltaChainDepth
     }
 
     /// Resolve a 40-char hex OID string to 20 raw bytes.
@@ -207,7 +212,8 @@ public struct GitObjectStore: Sendable {
                     objectOffset: entry.offset,
                     nextObjectOffset: entry.nextOffset,
                     objectCount: index.objectCount,
-                    packChecksum: index.packChecksum
+                    packChecksum: index.packChecksum,
+                    sortedOffsets: index.offsets.sorted()
                 )
             } catch let error as GitStatusError {
                 if firstFailure == nil {
@@ -277,7 +283,7 @@ public struct GitObjectStore: Sendable {
             throw GitStatusError.corruptPack(path: path, reason: "object offset is outside pack data")
         }
         let entryLength = entryEnd - location.objectOffset
-        let prefixCount = Int(min(entryLength, 16))
+        let prefixCount = Int(min(entryLength, 48))
         let entryPrefix = try readExactly(
             handle: handle,
             offset: location.objectOffset,
@@ -287,13 +293,25 @@ public struct GitObjectStore: Sendable {
         let parsedHeader = try parsePackEntryHeader(entryPrefix, packPath: path)
         let hex = Self.hexFromOID(oid)
 
-        switch parsedHeader.typeCode {
-        case 6:
-            throw GitStatusError.packedDeltaUnsupported(oid: hex, kind: .offset)
-        case 7:
-            throw GitStatusError.packedDeltaUnsupported(oid: hex, kind: .reference)
-        default:
-            break
+        if parsedHeader.typeCode == 6 || parsedHeader.typeCode == 7 {
+            let resolved = try resolvePackEntryAt(
+                handle: handle,
+                packPath: path,
+                targetOID: oid,
+                entryOffset: location.objectOffset,
+                trailerOffset: trailerOffset,
+                sortedOffsets: location.sortedOffsets,
+                depth: 0
+            )
+            var canonical = Data("\(resolved.type) \(resolved.payload.count)".utf8)
+            canonical.append(0)
+            canonical.append(resolved.payload)
+            guard PortableSHA1.hash(canonical) == oid else {
+                throw GitStatusError.corruptPack(
+                    path: path, reason: "packed object id mismatch"
+                )
+            }
+            return resolved
         }
 
         let type: String
@@ -346,6 +364,199 @@ public struct GitObjectStore: Sendable {
         }
         return (type, payload)
     }
+
+    private func resolvePackEntryAt(
+        handle: FileHandle,
+        packPath: String,
+        targetOID: Data,
+        entryOffset: UInt64,
+        trailerOffset: UInt64,
+        sortedOffsets: [UInt64],
+        depth: Int
+    ) throws -> (type: String, payload: Data) {
+        let hex = Self.hexFromOID(targetOID)
+        guard depth <= maximumDeltaChainDepth else {
+            throw GitStatusError.packedDeltaChainTooDeep(
+                oid: hex, depth: depth, limit: maximumDeltaChainDepth
+            )
+        }
+        let entryEnd = nextOffsetAfter(
+            entryOffset, in: sortedOffsets, fallback: trailerOffset
+        )
+        guard entryOffset >= 12, entryOffset < entryEnd,
+              entryEnd <= trailerOffset else {
+            throw GitStatusError.packedDeltaCorrupt(
+                oid: hex, reason: "delta base offset outside pack data"
+            )
+        }
+        let entryLength = entryEnd - entryOffset
+        let prefixCount = Int(min(entryLength, 48))
+        let prefix = try readExactly(
+            handle: handle, offset: entryOffset,
+            count: prefixCount, packPath: packPath
+        )
+        let header = try parsePackEntryHeader(prefix, packPath: packPath)
+
+        switch header.typeCode {
+        case 1, 2, 3, 4:
+            let typeName: String
+            switch header.typeCode {
+            case 1: typeName = "commit"
+            case 2: typeName = "tree"
+            case 3: typeName = "blob"
+            case 4: typeName = "tag"
+            default: preconditionFailure("unreachable")
+            }
+            guard header.declaredSize <= UInt64(maximumPackedObjectSize) else {
+                throw GitStatusError.packedObjectTooLarge(
+                    oid: hex, declaredSize: header.declaredSize,
+                    limit: maximumPackedObjectSize
+                )
+            }
+            let compStart = entryOffset + UInt64(header.headerLength)
+            guard compStart < entryEnd else {
+                throw GitStatusError.corruptPack(
+                    path: packPath, reason: "packed object has no zlib payload"
+                )
+            }
+            let compLen = entryEnd - compStart
+            let maxComp = UInt64(maximumPackedObjectSize) + 1_048_576
+            guard compLen <= maxComp, compLen <= UInt64(Int.max) else {
+                throw GitStatusError.corruptPack(
+                    path: packPath, reason: "packed object input exceeds bound"
+                )
+            }
+            let compressed = try readExactly(
+                handle: handle, offset: compStart,
+                count: Int(compLen), packPath: packPath
+            )
+            let payload = try inflatePackedZlib(
+                compressed, expectedSize: Int(header.declaredSize),
+                packPath: packPath
+            )
+            return (typeName, payload)
+
+        case 6:
+            let afterHeader = header.headerLength
+            guard afterHeader < prefix.count else {
+                throw GitStatusError.packedDeltaCorrupt(
+                    oid: hex, reason: "OFS_DELTA header extends beyond entry"
+                )
+            }
+            let (distance, distLen) = try parseOfsDeltaOffset(
+                Data(prefix[afterHeader...]), oid: hex
+            )
+            guard distance > 0, distance <= entryOffset else {
+                throw GitStatusError.packedDeltaCorrupt(
+                    oid: hex, reason: "OFS_DELTA offset exceeds entry position"
+                )
+            }
+            let baseOffset = entryOffset - distance
+            guard baseOffset >= 12 else {
+                throw GitStatusError.packedDeltaCorrupt(
+                    oid: hex, reason: "OFS_DELTA base in pack header"
+                )
+            }
+            guard header.declaredSize <= UInt64(maximumPackedObjectSize) else {
+                throw GitStatusError.packedObjectTooLarge(
+                    oid: hex, declaredSize: header.declaredSize,
+                    limit: maximumPackedObjectSize
+                )
+            }
+            let compStart = entryOffset + UInt64(afterHeader + distLen)
+            guard compStart < entryEnd else {
+                throw GitStatusError.packedDeltaCorrupt(
+                    oid: hex, reason: "OFS_DELTA has no zlib payload"
+                )
+            }
+            let compLen = entryEnd - compStart
+            guard compLen <= UInt64(Int.max) else {
+                throw GitStatusError.packedDeltaCorrupt(
+                    oid: hex, reason: "delta compressed data too large"
+                )
+            }
+            let compressed = try readExactly(
+                handle: handle, offset: compStart,
+                count: Int(compLen), packPath: packPath
+            )
+            let deltaPayload = try inflatePackedZlib(
+                compressed, expectedSize: Int(header.declaredSize),
+                packPath: packPath
+            )
+            let base = try resolvePackEntryAt(
+                handle: handle, packPath: packPath,
+                targetOID: targetOID, entryOffset: baseOffset,
+                trailerOffset: trailerOffset,
+                sortedOffsets: sortedOffsets, depth: depth + 1
+            )
+            return (
+                base.type,
+                try applyGitDelta(
+                    base: base.payload, delta: deltaPayload,
+                    oid: hex, sizeLimit: maximumPackedObjectSize
+                )
+            )
+
+        case 7:
+            let afterHeader = header.headerLength
+            let neededForOID = afterHeader + 20
+            let fullPrefix: Data
+            if neededForOID <= prefix.count {
+                fullPrefix = prefix
+            } else {
+                guard UInt64(neededForOID) <= entryLength else {
+                    throw GitStatusError.packedDeltaCorrupt(
+                        oid: hex, reason: "REF_DELTA entry is truncated"
+                    )
+                }
+                fullPrefix = try readExactly(
+                    handle: handle, offset: entryOffset,
+                    count: neededForOID, packPath: packPath
+                )
+            }
+            let baseOID = Data(fullPrefix[afterHeader..<(afterHeader + 20)])
+            guard header.declaredSize <= UInt64(maximumPackedObjectSize) else {
+                throw GitStatusError.packedObjectTooLarge(
+                    oid: hex, declaredSize: header.declaredSize,
+                    limit: maximumPackedObjectSize
+                )
+            }
+            let compStart = entryOffset + UInt64(neededForOID)
+            guard compStart < entryEnd else {
+                throw GitStatusError.packedDeltaCorrupt(
+                    oid: hex, reason: "REF_DELTA has no zlib payload"
+                )
+            }
+            let compLen = entryEnd - compStart
+            guard compLen <= UInt64(Int.max) else {
+                throw GitStatusError.packedDeltaCorrupt(
+                    oid: hex, reason: "delta compressed data too large"
+                )
+            }
+            let compressed = try readExactly(
+                handle: handle, offset: compStart,
+                count: Int(compLen), packPath: packPath
+            )
+            let deltaPayload = try inflatePackedZlib(
+                compressed, expectedSize: Int(header.declaredSize),
+                packPath: packPath
+            )
+            let base = try readObject(oid: baseOID)
+            return (
+                base.type,
+                try applyGitDelta(
+                    base: base.payload, delta: deltaPayload,
+                    oid: hex, sizeLimit: maximumPackedObjectSize
+                )
+            )
+
+        default:
+            throw GitStatusError.corruptPack(
+                path: packPath,
+                reason: "invalid packed object type \(header.typeCode)"
+            )
+        }
+    }
 }
 
 private struct PackedObjectLocation {
@@ -354,6 +565,7 @@ private struct PackedObjectLocation {
     var nextObjectOffset: UInt64?
     var objectCount: UInt32
     var packChecksum: Data
+    var sortedOffsets: [UInt64]
 }
 
 private struct PackIndexV2 {
@@ -528,6 +740,185 @@ private func parsePackEntryHeader(
         offset += 1
     }
     return (typeCode, declaredSize, offset)
+}
+
+private func parseOfsDeltaOffset(
+    _ data: Data,
+    oid: String
+) throws -> (UInt64, Int) {
+    guard !data.isEmpty else {
+        throw GitStatusError.packedDeltaCorrupt(
+            oid: oid, reason: "missing OFS_DELTA offset"
+        )
+    }
+    var pos = data.startIndex
+    var c = data[pos]
+    var result = UInt64(c & 0x7F)
+    pos += 1
+    while c & 0x80 != 0 {
+        guard pos < data.endIndex else {
+            throw GitStatusError.packedDeltaCorrupt(
+                oid: oid, reason: "truncated OFS_DELTA offset"
+            )
+        }
+        result += 1
+        c = data[pos]
+        result = (result << 7) + UInt64(c & 0x7F)
+        pos += 1
+    }
+    return (result, pos - data.startIndex)
+}
+
+private func applyGitDelta(
+    base: Data,
+    delta: Data,
+    oid: String,
+    sizeLimit: Int
+) throws -> Data {
+    guard delta.count >= 2 else {
+        throw GitStatusError.packedDeltaCorrupt(
+            oid: oid, reason: "delta is too short"
+        )
+    }
+    var pos = 0
+
+    let (declaredBaseSize, afterBase) = try readDeltaVarint(
+        delta, at: pos, oid: oid
+    )
+    pos = afterBase
+    guard declaredBaseSize == base.count else {
+        throw GitStatusError.packedDeltaCorrupt(
+            oid: oid,
+            reason: "delta base size mismatch: declared \(declaredBaseSize), actual \(base.count)"
+        )
+    }
+
+    let (resultSize, afterResult) = try readDeltaVarint(
+        delta, at: pos, oid: oid
+    )
+    pos = afterResult
+    guard resultSize <= sizeLimit else {
+        throw GitStatusError.packedObjectTooLarge(
+            oid: oid, declaredSize: UInt64(resultSize), limit: sizeLimit
+        )
+    }
+
+    var result = Data()
+    result.reserveCapacity(resultSize)
+
+    while pos < delta.count {
+        let cmd = delta[pos]
+        pos += 1
+
+        if cmd & 0x80 != 0 {
+            var copyOffset = 0
+            var copySize = 0
+            if cmd & 0x01 != 0 {
+                guard pos < delta.count else { throw GitStatusError.packedDeltaCorrupt(oid: oid, reason: "truncated copy offset") }
+                copyOffset |= Int(delta[pos]); pos += 1
+            }
+            if cmd & 0x02 != 0 {
+                guard pos < delta.count else { throw GitStatusError.packedDeltaCorrupt(oid: oid, reason: "truncated copy offset") }
+                copyOffset |= Int(delta[pos]) << 8; pos += 1
+            }
+            if cmd & 0x04 != 0 {
+                guard pos < delta.count else { throw GitStatusError.packedDeltaCorrupt(oid: oid, reason: "truncated copy offset") }
+                copyOffset |= Int(delta[pos]) << 16; pos += 1
+            }
+            if cmd & 0x08 != 0 {
+                guard pos < delta.count else { throw GitStatusError.packedDeltaCorrupt(oid: oid, reason: "truncated copy offset") }
+                copyOffset |= Int(delta[pos]) << 24; pos += 1
+            }
+            if cmd & 0x10 != 0 {
+                guard pos < delta.count else { throw GitStatusError.packedDeltaCorrupt(oid: oid, reason: "truncated copy size") }
+                copySize |= Int(delta[pos]); pos += 1
+            }
+            if cmd & 0x20 != 0 {
+                guard pos < delta.count else { throw GitStatusError.packedDeltaCorrupt(oid: oid, reason: "truncated copy size") }
+                copySize |= Int(delta[pos]) << 8; pos += 1
+            }
+            if cmd & 0x40 != 0 {
+                guard pos < delta.count else { throw GitStatusError.packedDeltaCorrupt(oid: oid, reason: "truncated copy size") }
+                copySize |= Int(delta[pos]) << 16; pos += 1
+            }
+            if copySize == 0 { copySize = 0x10000 }
+            guard copyOffset >= 0,
+                  copyOffset + copySize <= base.count else {
+                throw GitStatusError.packedDeltaCorrupt(
+                    oid: oid,
+                    reason: "copy instruction out of base bounds"
+                )
+            }
+            result.append(base[copyOffset..<(copyOffset + copySize)])
+        } else if cmd != 0 {
+            let count = Int(cmd)
+            guard pos + count <= delta.count else {
+                throw GitStatusError.packedDeltaCorrupt(
+                    oid: oid, reason: "insert instruction truncated"
+                )
+            }
+            result.append(delta[pos..<(pos + count)])
+            pos += count
+        } else {
+            throw GitStatusError.packedDeltaCorrupt(
+                oid: oid, reason: "reserved delta instruction 0x00"
+            )
+        }
+    }
+
+    guard result.count == resultSize else {
+        throw GitStatusError.packedDeltaCorrupt(
+            oid: oid,
+            reason: "delta result size mismatch: declared \(resultSize), actual \(result.count)"
+        )
+    }
+    return result
+}
+
+private func readDeltaVarint(
+    _ data: Data,
+    at start: Int,
+    oid: String
+) throws -> (Int, Int) {
+    var pos = start
+    var result = 0
+    var shift = 0
+    repeat {
+        guard pos < data.count else {
+            throw GitStatusError.packedDeltaCorrupt(
+                oid: oid, reason: "truncated delta varint"
+            )
+        }
+        let byte = data[pos]
+        result |= Int(byte & 0x7F) << shift
+        shift += 7
+        pos += 1
+        if byte & 0x80 == 0 { break }
+        guard shift < 64 else {
+            throw GitStatusError.packedDeltaCorrupt(
+                oid: oid, reason: "delta varint overflows"
+            )
+        }
+    } while true
+    return (result, pos)
+}
+
+private func nextOffsetAfter(
+    _ target: UInt64,
+    in sortedOffsets: [UInt64],
+    fallback: UInt64
+) -> UInt64 {
+    var lo = 0
+    var hi = sortedOffsets.count
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if sortedOffsets[mid] <= target {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo < sortedOffsets.count ? sortedOffsets[lo] : fallback
 }
 
 private func readExactly(

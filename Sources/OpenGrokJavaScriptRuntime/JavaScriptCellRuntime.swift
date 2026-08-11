@@ -377,6 +377,11 @@ private final class JavaScriptCellEngine {
     /// re-arm its execution ceiling on its own.
     var watchdog: JavaScriptExecutionWatchdog?
     private var cancelledTimeouts: Set<UInt64> = []
+    /// Per-cell module loader mirroring V8's resolve/cache pipeline
+    /// (runtime/module_loader.rs). Specifiers discovered by the source
+    /// scanner are resolved and loaded (currently: rejected) through this
+    /// loader so the rejection message and cache semantics match Rust.
+    private let moduleLoader = JavaScriptModuleLoader()
 
     init(
         context: JSContext,
@@ -490,10 +495,14 @@ private final class JavaScriptCellEngine {
     ///
     /// Mirrors `evaluate_main_module` (runtime/module_loader.rs:9).
     func evaluateSource() -> String? {
-        if let specifier = JavaScriptSourceScanner.firstStaticImportSpecifier(
+        if let rawSpecifier = JavaScriptSourceScanner.firstStaticImportSpecifier(
             in: configuration.source
         ) {
-            return "Unsupported import in exec: \(specifier)"
+            let resolved = moduleLoader.resolve(specifier: rawSpecifier)
+            switch moduleLoader.load(resolved) {
+            case .rejected(let error):
+                return error
+            }
         }
 
         // JavaScriptCore's public API cannot compile ES modules, so the cell
@@ -910,11 +919,12 @@ private final class JavaScriptCellEngine {
 
 /// Static `import` / `export` detection.
 ///
-/// The Rust runtime compiles the cell as a real module and lets its
-/// resolver reject every specifier with `Unsupported import in exec:
-/// {specifier}` (runtime/module_loader.rs:223). This port has no module
-/// pipeline, so the same rejection is produced by scanning for a
-/// statement-position `import` / `export` before evaluation.
+/// The Rust runtime compiles the cell as a real module and lets V8's
+/// `resolve_module_callback` (module_loader.rs:164) reject every
+/// specifier. JavaScriptCore's public API has no module compilation, so
+/// the same rejection is produced by scanning for a statement-position
+/// `import` / `export` before evaluation and routing the specifier
+/// through `JavaScriptModuleLoader` for resolution and rejection.
 enum JavaScriptSourceScanner {
     static func firstStaticImportSpecifier(in source: String) -> String? {
         var inBlockComment = false

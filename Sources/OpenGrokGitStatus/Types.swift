@@ -145,6 +145,8 @@ public enum GitStatusError: Error, Equatable, Sendable {
     case corruptPack(path: String, reason: String)
     case packedObjectTooLarge(oid: String, declaredSize: UInt64, limit: Int)
     case packedDeltaUnsupported(oid: String, kind: GitPackDeltaKind)
+    case packedDeltaChainTooDeep(oid: String, depth: Int, limit: Int)
+    case packedDeltaCorrupt(oid: String, reason: String)
     /// Pack files exist, but no usable v2 index contains the requested object.
     case packedObjectUnsupported(oid: String)
 }

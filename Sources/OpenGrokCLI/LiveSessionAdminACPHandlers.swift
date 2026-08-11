@@ -1,10 +1,11 @@
 // LiveSessionAdminACPHandlers.swift
 //
-// The routed slice of upstream's session-admin ext family — Wave 15 item 6.
+// The routed slice of upstream's session-admin ext family — Wave 15 item 6,
+// extended with `info`/`state`/`close` in Wave 20 (session.rs:37-175,
+// extensions/session_state.rs:44-63).
 //
 // Upstream's `x.ai/session/*` dispatch (acp_agent.rs:4115-4155) spans four
-// modules; the arms with real port backings are the three
-// `extensions/session_admin.rs` methods that operate on PERSISTED sessions:
+// modules; the arms with real port backings are:
 //
 //   * `x.ai/session/rename` (session_admin.rs:80-219) — non-blank title into
 //     local storage, then a `SessionSummaryGenerated` broadcast. Backing:
@@ -20,12 +21,22 @@
 //     copy a saved session under a new id/cwd with parent tracking
 //     (`LiveConversationStore.fork`, the same coupled transcript+rewind
 //     transaction `--fork-session` uses).
+//   * `x.ai/session/info` (session.rs:73-144) — returns the resident
+//     session's display info (model, cwd, turn count, context metadata).
+//     This port derives the same shape from the live record + composition
+//     snapshot.
+//   * `x.ai/session/state` (session_state.rs:44-63) — returns metadata
+//     columns for a persisted session (plan, signals, goal, etc.). This
+//     port has no per-column files; returns a reduced set derivable from
+//     the conversation record (equivalent truth, narrower surface).
+//   * `x.ai/session/close` (session.rs:146-175) — graceful shutdown of a
+//     resident session. Returns `{success, outcome}` where outcome is
+//     `closed` / `notResident` / `superseded`. Idempotent.
 //
 // Everything else in the family stays refused with the router's terminal
-// error: `info`/`close`/`updates`/`state`/`import`/`load_history`/`search`/
-// `repair`/`usage` need live-session internals (SessionCommand plumbing,
-// updates journals, FTS index) this port does not have;
-// Singular `x.ai/session/list` still needs the persisted-history lane.
+// error: `updates`/`import`/`load_history`/`search`/`repair`/`usage` need
+// live-session internals (updates journals, FTS index) this port does not
+// have; Singular `x.ai/session/list` still needs the persisted-history lane.
 // Plural `x.ai/sessions/list` is now the live typed leader roster snapshot;
 // peers listing persisted local history still use the CLI surface.
 //
@@ -56,6 +67,17 @@
 //      UUIDv7 (fork.rs:60-62); `chatMessagesCopied` counts the copied
 //      transcript items, and `updatesCopied: 0` / `planStateCopied: false`
 //      are literal truth — this store has no updates journal or plan file.
+//   7. `info` omits the `modelFingerprint`, `showModelFingerprint`,
+//      `apiBackend`, and `context.autoCompactThresholdPercent` fields —
+//      this port has no fingerprint tracking or auto-compact threshold.
+//      Present fields match upstream's shape (session.rs:108-138).
+//   8. `state` returns `summary` (record JSON) and omits the per-column
+//      plan/planMode/signals/goal/announcement files upstream stores
+//      separately (session_state.rs:20-27): this port's plan/signal state
+//      is not persisted to a per-session directory. Documented, not hidden.
+//   9. `close` is honest about the resident-only scope: only the session
+//      matching `liveSessionID` is closeable; anything else reports
+//      `notResident`. `superseded` cannot occur here (no multi-attach).
 
 import Foundation
 import OpenGrokACP
@@ -64,11 +86,14 @@ import OpenGrokShared
 
 struct LiveSessionAdminACPHandler: ACPAgentExtensionHandler, Sendable {
     /// Exact names from the upstream dispatch arm this handler serves
-    /// (acp_agent.rs:4146-4150).
+    /// (acp_agent.rs:4146-4150, session.rs:37-38, session_state.rs:47).
     static let methods: [String] = [
         "x.ai/session/rename",
         "x.ai/session/delete",
         "x.ai/session/fork",
+        "x.ai/session/info",
+        "x.ai/session/state",
+        "x.ai/session/close",
     ]
 
     let openGrokHome: URL
@@ -80,17 +105,28 @@ struct LiveSessionAdminACPHandler: ACPAgentExtensionHandler, Sendable {
     /// .rename`) for the resident session; see the file header for why the
     /// store write is not enough there.
     let renameLive: (@Sendable (String) async throws -> Void)?
+    /// Returns a snapshot of the live session's info data: model id,
+    /// working directory, item count. Called from `x.ai/session/info`.
+    let sessionInfoSnapshot: (@Sendable () async -> LiveSessionInfoSnapshot)?
+    /// Graceful close of the resident session. Returns the close outcome.
+    /// Called from `x.ai/session/close`. A nil value means no live session
+    /// is available (compositions without a spine).
+    let closeLive: (@Sendable () async -> LiveSessionCloseOutcome)?
 
     init(
         openGrokHome: URL,
         gateway: ACPNotificationGateway,
         liveSessionID: String? = nil,
-        renameLive: (@Sendable (String) async throws -> Void)? = nil
+        renameLive: (@Sendable (String) async throws -> Void)? = nil,
+        sessionInfoSnapshot: (@Sendable () async -> LiveSessionInfoSnapshot)? = nil,
+        closeLive: (@Sendable () async -> LiveSessionCloseOutcome)? = nil
     ) {
         self.openGrokHome = openGrokHome
         self.gateway = gateway
         self.liveSessionID = liveSessionID
         self.renameLive = renameLive
+        self.sessionInfoSnapshot = sessionInfoSnapshot
+        self.closeLive = closeLive
     }
 
     func handle(method: String, params: JSONValue) async throws -> JSONValue {
@@ -101,10 +137,13 @@ struct LiveSessionAdminACPHandler: ACPAgentExtensionHandler, Sendable {
             return try await handleDelete(params)
         case "x.ai/session/fork":
             return try await handleFork(params)
+        case "x.ai/session/info":
+            return try await handleInfo(params)
+        case "x.ai/session/state":
+            return try await handleState(params)
+        case "x.ai/session/close":
+            return try await handleClose(params)
         default:
-            // Registration and dispatch are generated from the same list;
-            // refusing keeps a direct caller honest (the models-family
-            // handler's same terminal arm).
             throw ACPExtensionMethodRouter.unknownExtensionMethodError(method)
         }
     }
@@ -340,5 +379,225 @@ struct LiveSessionAdminACPHandler: ACPAgentExtensionHandler, Sendable {
             "newCwd": .string(newCwd),
             "parentSessionId": .string(sourceSessionID),
         ])
+    }
+
+    // MARK: x.ai/session/info
+
+    /// `handle_session_info` (session.rs:73-144): return the resident
+    /// session's display data wrapped in `ExtMethodResult::success`.
+    /// An absent or unknown `sessionId` returns `{"result": {}}` (the
+    /// upstream empty-object fallback, session.rs:88-92, :96-99).
+    private func handleInfo(_ params: JSONValue) async throws -> JSONValue {
+        let requestedID = params["sessionId"]?.stringValue
+        let sessionID = requestedID ?? liveSessionID
+
+        guard let sessionID, sessionID == liveSessionID else {
+            return envelope(.object([:]))
+        }
+
+        guard let snapshot = sessionInfoSnapshot else {
+            return envelope(.object([:]))
+        }
+
+        let info = await snapshot()
+        var data: [String: JSONValue] = [:]
+        if let model = info.modelID {
+            data["model"] = .string(model)
+        }
+        if let modelDisplayName = info.modelDisplayName {
+            data["modelDisplayName"] = .string(modelDisplayName)
+        }
+        if let resolvedModelId = info.resolvedModelID {
+            data["resolvedModelId"] = .string(resolvedModelId)
+        }
+        data["turns"] = .number(.int64(Int64(info.turns)))
+        data["turnIndex"] = .number(.int64(Int64(info.turnIndex)))
+        if let conversationId = info.conversationID {
+            data["conversationId"] = .string(conversationId)
+        }
+
+        var contextData: [String: JSONValue] = [:]
+        contextData["maxContextTokens"] = .number(.int64(Int64(info.context.maxContextTokens)))
+        contextData["currentTokens"] = .number(.int64(Int64(info.context.currentTokens)))
+        data["context"] = .object(contextData)
+
+        var response: [String: JSONValue] = [
+            "sessionId": .string(sessionID),
+            "data": .object(data),
+        ]
+        if let cwd = info.cwd {
+            response["cwd"] = .string(cwd)
+        }
+
+        return envelope(.object(response))
+    }
+
+    // MARK: x.ai/session/state
+
+    /// `handle_state` (session_state.rs:44-63): return metadata columns for a
+    /// persisted session. Upstream reads per-column files; this port derives
+    /// equivalent metadata from the `LiveConversationRecord` (divergence 8).
+    /// Errors when the session is not found (session_state.rs:52-53).
+    private func handleState(_ params: JSONValue) async throws -> JSONValue {
+        guard let sessionID = params["sessionId"]?.stringValue else {
+            throw invalidParams("invalid params: missing field `sessionId`")
+        }
+        guard let cwd = params["cwd"]?.stringValue else {
+            throw invalidParams("invalid params: missing field `cwd`")
+        }
+        guard let record = await lookupRecord(sessionID: sessionID, cwd: cwd) else {
+            throw invalidParams("session not found")
+        }
+
+        var state: [String: JSONValue] = [:]
+
+        // The summary column (session_state.rs:15, :26): a JSON object with
+        // session metadata. This port builds the equivalent from the record.
+        var summary: [String: JSONValue] = [
+            "sessionId": .string(record.sessionID),
+            "workingDirectory": .string(record.workingDirectory),
+            "createdAt": .string(ISO8601DateFormatter().string(from: record.createdAt)),
+            "updatedAt": .string(ISO8601DateFormatter().string(from: record.updatedAt)),
+            "messageCount": .number(.int64(Int64(record.items.count))),
+        ]
+        if let title = record.title {
+            summary["title"] = .string(title)
+        }
+        if let parentSessionID = record.parentSessionID {
+            summary["parentSessionId"] = .string(parentSessionID)
+        }
+        if let modelID = record.currentModelID {
+            summary["modelId"] = .string(modelID)
+        }
+        if let provider = record.currentProvider {
+            summary["provider"] = .string(provider.rawValue)
+        }
+        state["summary"] = .object(summary)
+
+        return envelope(.object(state))
+    }
+
+    // MARK: x.ai/session/close
+
+    /// `handle_session_close` (session.rs:146-175): graceful shutdown of a
+    /// resident session. The close is idempotent: calling it on an already-
+    /// closed or non-resident session reports `notResident` without error.
+    /// Wrapped in `ExtMethodResult::success` (session.rs:169-174).
+    private func handleClose(_ params: JSONValue) async throws -> JSONValue {
+        guard let sessionID = params["sessionId"]?.stringValue else {
+            throw invalidParams("invalid params: missing field `sessionId`")
+        }
+
+        guard let liveSessionID, sessionID == liveSessionID else {
+            return envelope(.object([
+                "success": .bool(true),
+                "outcome": .string(LiveSessionCloseOutcome.notResident.wireString),
+            ]))
+        }
+
+        guard let closeLive else {
+            return envelope(.object([
+                "success": .bool(true),
+                "outcome": .string(LiveSessionCloseOutcome.notResident.wireString),
+            ]))
+        }
+
+        let outcome = await closeLive()
+        return envelope(.object([
+            "success": .bool(true),
+            "outcome": .string(outcome.wireString),
+        ]))
+    }
+
+    // MARK: Envelope
+
+    /// `ExtMethodResult::success` envelope (`session/result.rs:38-44`):
+    /// `{"result": payload}`. Used by `info`, `state`, and `close` — the
+    /// admin trio (rename/delete/fork) answers RAW (`to_raw_response`).
+    private func envelope(_ payload: JSONValue) -> JSONValue {
+        .object(["result": payload])
+    }
+}
+
+// MARK: - Session info snapshot
+
+/// Snapshot data for `x.ai/session/info` — the subset of upstream's
+/// `SessionInfoResponse` (session.rs:134-138) this port can supply from
+/// its live composition state.
+struct LiveSessionInfoSnapshot: Sendable {
+    var modelID: String?
+    var modelDisplayName: String?
+    var resolvedModelID: String?
+    var cwd: String?
+    var conversationID: String?
+    var turns: Int
+    var turnIndex: Int
+    var context: LiveSessionContextInfo
+
+    init(
+        modelID: String? = nil,
+        modelDisplayName: String? = nil,
+        resolvedModelID: String? = nil,
+        cwd: String? = nil,
+        conversationID: String? = nil,
+        turns: Int = 0,
+        turnIndex: Int = 0,
+        context: LiveSessionContextInfo = LiveSessionContextInfo()
+    ) {
+        self.modelID = modelID
+        self.modelDisplayName = modelDisplayName
+        self.resolvedModelID = resolvedModelID
+        self.cwd = cwd
+        self.conversationID = conversationID
+        self.turns = turns
+        self.turnIndex = turnIndex
+        self.context = context
+    }
+}
+
+/// Context metadata for the info payload — the port of upstream's
+/// `ContextInfo` (session.rs:119-123).
+struct LiveSessionContextInfo: Sendable {
+    var maxContextTokens: Int
+    var currentTokens: Int
+
+    init(maxContextTokens: Int = 0, currentTokens: Int = 0) {
+        self.maxContextTokens = maxContextTokens
+        self.currentTokens = currentTokens
+    }
+}
+
+// MARK: - Close outcome
+
+/// The result of closing a session (session_lifecycle.rs:26-39).
+enum LiveSessionCloseOutcome: Sendable {
+    case closed
+    case notResident
+    case superseded
+
+    /// The camelCase wire string clients see in the response
+    /// (session_lifecycle.rs:33-38).
+    var wireString: String {
+        switch self {
+        case .closed: return "closed"
+        case .notResident: return "notResident"
+        case .superseded: return "superseded"
+        }
+    }
+}
+
+/// Exactly-once close latch for the resident ACP session. A second close
+/// reports `notResident` without tearing anything down twice
+/// (session_lifecycle.rs:26-39).
+final class LiveSessionCloseLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var closed = false
+
+    func close() -> LiveSessionCloseOutcome {
+        lock.lock()
+        defer { lock.unlock() }
+        if closed { return .notResident }
+        closed = true
+        return .closed
     }
 }

@@ -610,23 +610,19 @@ struct ACPMCPExtensionTests {
         #expect(result["_meta"]?["x.ai/mcp/sdk"] == nil)
     }
 
-    @Test("setup/toggle/toggle_tool are refused with the terminal error; unknown prefix names (incl. inbound sdk_call) get upstream's bare method_not_found")
+    @Test("setup is refused with the terminal error; toggle/toggle_tool are live; unknown prefix names (incl. inbound sdk_call) get upstream's bare method_not_found")
     func prefixRefusals() async throws {
         let harness = try await MCPFamilyHarness.start(configTOML: "")
         defer { Task { await harness.shutdown() } }
 
-        // Upstream serves these; the port refuses with the data-carrying
-        // terminal error so "not ported" is distinguishable.
-        for (index, method) in ["x.ai/mcp/setup", "x.ai/mcp/toggle", "x.ai/mcp/toggle_tool"]
-            .enumerated() {
-            let (result, error) = await harness.call(method, id: "ref-\(index)")
-            #expect(result == nil, "\(method)")
-            #expect(error?.code == .methodNotFound, "\(method)")
-            #expect(
-                error?.data == .string("unknown ACP extension method: \(method)"),
-                "\(method)"
-            )
-        }
+        // Setup is not ported (no setup-schema surface): refused with the
+        // data-carrying terminal error so "not ported" is distinguishable.
+        let (setupResult, setupError) = await harness.call("x.ai/mcp/setup", id: "ref-setup")
+        #expect(setupResult == nil)
+        #expect(setupError?.code == .methodNotFound)
+        #expect(
+            setupError?.data == .string("unknown ACP extension method: x.ai/mcp/setup")
+        )
 
         // Upstream's OWN refusal for unknown names under the prefix — bare
         // method_not_found, NO data (mcp.rs:387; the sdk_call regression
@@ -1048,6 +1044,151 @@ struct ACPMCPExtensionTests {
         #expect(deleted?["result"]?["remote_revocation"]?.stringValue == "failed")
         #expect(deleted?["result"]?["revocation_error"]?.stringValue?.contains("HTTP 503") == true)
         #expect(try storage.load() == nil)
+    }
+
+    // MARK: toggle / toggle_tool
+
+    @Test("toggle disable persists to config.toml and removes the server's tools from the live toolset; toggle enable reconnects")
+    func toggleDisableAndEnable() async throws {
+        let mcp = PlainMCPHandler()
+        let server = HttpServer(handler: mcp, basePath: "")
+        try server.start()
+        defer { server.stop() }
+        let harness = try await MCPFamilyHarness.start(configTOML: """
+        [mcpServers.plain]
+        url = "\(server.baseURL)/mcp"
+        """)
+        defer { Task { await harness.shutdown() } }
+        let configPath = harness.home.appendingPathComponent("config.toml")
+
+        // Precondition: server is connected and tools are registered.
+        #expect(harness.toolset.topLevelDefinitions().contains { $0.name == "plain__echo" })
+
+        // Disable: persists to config.toml AND removes tools live.
+        let (disabled, disableError) = await harness.call(
+            "x.ai/mcp/toggle",
+            id: "t-off",
+            params: .object([
+                "session_id": .string(harness.sessionID),
+                "server_name": .string("plain"),
+                "enabled": .bool(false),
+            ])
+        )
+        #expect(disableError == nil)
+        #expect(disabled?["result"]?["ok"]?.boolValue == true)
+        #expect(!harness.toolset.topLevelDefinitions().contains { $0.name == "plain__echo" })
+
+        // The file on disk records the disable — survives restart.
+        let afterDisable = try String(contentsOf: configPath, encoding: .utf8)
+        #expect(afterDisable.contains("disabled_mcp_servers"))
+        #expect(afterDisable.contains("plain"))
+
+        // Enable: reconnects and re-registers tools.
+        let (enabled, enableError) = await harness.call(
+            "x.ai/mcp/toggle",
+            id: "t-on",
+            params: .object([
+                "session_id": .string(harness.sessionID),
+                "server_name": .string("plain"),
+                "enabled": .bool(true),
+            ])
+        )
+        #expect(enableError == nil)
+        #expect(enabled?["result"]?["ok"]?.boolValue == true)
+        #expect(harness.toolset.topLevelDefinitions().contains { $0.name == "plain__echo" })
+
+        // disabled_mcp_servers is gone from the file.
+        let afterEnable = try String(contentsOf: configPath, encoding: .utf8)
+        #expect(!afterEnable.contains("disabled_mcp_servers"))
+    }
+
+    @Test("toggle_tool disable removes only the qualified tool; enable re-registers it")
+    func toggleToolDisableAndEnable() async throws {
+        let mcp = PlainMCPHandler()
+        let server = HttpServer(handler: mcp, basePath: "")
+        try server.start()
+        defer { server.stop() }
+        let harness = try await MCPFamilyHarness.start(configTOML: """
+        [mcpServers.plain]
+        url = "\(server.baseURL)/mcp"
+        """)
+        defer { Task { await harness.shutdown() } }
+        let configPath = harness.home.appendingPathComponent("config.toml")
+
+        #expect(harness.toolset.topLevelDefinitions().contains { $0.name == "plain__echo" })
+
+        // Disable one tool.
+        let (disabled, disableError) = await harness.call(
+            "x.ai/mcp/toggle_tool",
+            id: "tt-off",
+            params: .object([
+                "session_id": .string(harness.sessionID),
+                "server_name": .string("plain"),
+                "tool_name": .string("echo"),
+                "enabled": .bool(false),
+            ])
+        )
+        #expect(disableError == nil)
+        #expect(disabled?["result"]?["ok"]?.boolValue == true)
+        #expect(!harness.toolset.topLevelDefinitions().contains { $0.name == "plain__echo" })
+
+        // Persisted: disabled_mcp_tools.plain = ["echo"]
+        let afterDisable = try String(contentsOf: configPath, encoding: .utf8)
+        #expect(afterDisable.contains("disabled_mcp_tools"))
+        #expect(afterDisable.contains("echo"))
+
+        // Enable the tool back.
+        let (enabled, enableError) = await harness.call(
+            "x.ai/mcp/toggle_tool",
+            id: "tt-on",
+            params: .object([
+                "session_id": .string(harness.sessionID),
+                "server_name": .string("plain"),
+                "tool_name": .string("echo"),
+                "enabled": .bool(true),
+            ])
+        )
+        #expect(enableError == nil)
+        #expect(enabled?["result"]?["ok"]?.boolValue == true)
+        #expect(harness.toolset.topLevelDefinitions().contains { $0.name == "plain__echo" })
+
+        // disabled_mcp_tools is cleaned up.
+        let afterEnable = try String(contentsOf: configPath, encoding: .utf8)
+        #expect(!afterEnable.contains("disabled_mcp_tools"))
+    }
+
+    @Test("toggle refuses with invalid_params when the session is unknown")
+    func toggleSessionGate() async throws {
+        let harness = try await MCPFamilyHarness.start(configTOML: "")
+        defer { Task { await harness.shutdown() } }
+
+        let (_, error) = await harness.call(
+            "x.ai/mcp/toggle",
+            id: "tg-nosess",
+            params: .object([
+                "session_id": .string("nonexistent"),
+                "server_name": .string("x"),
+                "enabled": .bool(false),
+            ])
+        )
+        #expect(error?.code == .invalidParams)
+        #expect(error?.data == .string("session not found"))
+    }
+
+    @Test("toggle_tool refuses with invalid_params when required fields are missing")
+    func toggleToolMissingParams() async throws {
+        let harness = try await MCPFamilyHarness.start(configTOML: "")
+        defer { Task { await harness.shutdown() } }
+
+        let (_, error) = await harness.call(
+            "x.ai/mcp/toggle_tool",
+            id: "tt-missing",
+            params: .object([
+                "session_id": .string(harness.sessionID),
+                "server_name": .string("x"),
+            ])
+        )
+        #expect(error?.code == .invalidParams)
     }
 
     @Test("upsert refuses a blank transport and a disabled config before touching the session")

@@ -229,9 +229,9 @@ struct PagerDocsCommandTests {
         // current port text rather than falsely claiming upstream identity.
         let expectedByteCounts: [String: Int] = [
             "01-getting-started.md": 9267,
-            "02-authentication.md": 16265,
+            "02-authentication.md": 16269,
             "03-keyboard-shortcuts.md": 23148,
-            "04-slash-commands.md": 22014,
+            "04-slash-commands.md": 21961,
             "05-configuration.md": 49610,
             "06-theming.md": 14410,
             "07-mcp-servers.md": 16370,

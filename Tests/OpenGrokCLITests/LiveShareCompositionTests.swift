@@ -21,6 +21,78 @@ import OpenGrokConfigTypes
 import OpenGrokSamplingTypes
 import OpenGrokShellSessionSupport
 
+// MARK: - Mock clients
+
+/// Records whether `uploadShareData` was called, and with what arguments.
+private final class MockShareSignedUploadClient: ShareSignedUploadClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _calls: [(sessionID: String, itemCount: Int)] = []
+
+    var calls: [(sessionID: String, itemCount: Int)] {
+        snapshotCalls()
+    }
+
+    func uploadShareData(
+        sessionID: String,
+        items: [ConversationItem],
+        boundary: ExportBoundary?
+    ) async {
+        // NSLock is sync-only under Swift 6 / macOS 27 SDK.
+        recordCall(sessionID: sessionID, itemCount: items.count)
+    }
+
+    private func snapshotCalls() -> [(sessionID: String, itemCount: Int)] {
+        lock.lock(); defer { lock.unlock() }
+        return _calls
+    }
+
+    private func recordCall(sessionID: String, itemCount: Int) {
+        lock.lock()
+        _calls.append((sessionID: sessionID, itemCount: itemCount))
+        lock.unlock()
+    }
+}
+
+/// Returns a canned share URL, or throws a canned error.
+private final class MockShareBackendClient: ShareBackendClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _calls: [(sessionID: String, itemCount: Int)] = []
+    let result: Result<String, ShareBackendError>
+
+    var calls: [(sessionID: String, itemCount: Int)] {
+        snapshotCalls()
+    }
+
+    init(url: String) {
+        self.result = .success(url)
+    }
+
+    init(error: ShareBackendError) {
+        self.result = .failure(error)
+    }
+
+    func shareSession(
+        sessionID: String,
+        items: [ConversationItem],
+        title: String?,
+        cwd: String
+    ) async throws -> String {
+        recordCall(sessionID: sessionID, itemCount: items.count)
+        return try result.get()
+    }
+
+    private func snapshotCalls() -> [(sessionID: String, itemCount: Int)] {
+        lock.lock(); defer { lock.unlock() }
+        return _calls
+    }
+
+    private func recordCall(sessionID: String, itemCount: Int) {
+        lock.lock()
+        _calls.append((sessionID: sessionID, itemCount: itemCount))
+        lock.unlock()
+    }
+}
+
 @Suite("Live share composition")
 struct LiveShareCompositionTests {
     // MARK: Fixtures
@@ -339,9 +411,9 @@ struct LiveShareCompositionTests {
         }
     }
 
-    // MARK: The upload blocker
+    // MARK: No backend client (fail-closed)
 
-    @Test("a fully authorized session still stops at the absent upload path, and says nothing left the process")
+    @Test("a fully authorized session still stops when no backend client is configured")
     func uploadBlocker() async throws {
         let (home, cleanup) = try makeHome()
         defer { cleanup() }
@@ -362,7 +434,7 @@ struct LiveShareCompositionTests {
             Issue.record("the route succeeded, which means something claims to have uploaded")
         } catch let error as CLIApplicationError {
             #expect(error.description.contains("passed every share authorization check"))
-            #expect(error.description.contains("upload path is not ported"))
+            #expect(error.description.contains("no session-sharing backend client"))
             #expect(error.description.contains("No transcript bytes left this process"))
         }
         #expect(!out.contents.contains("http"))
@@ -387,5 +459,165 @@ struct LiveShareCompositionTests {
                 liveBoundaries: { _ in ExportBoundary() }
             )
         }
+    }
+
+    // MARK: Successful share (share.rs:108-141)
+
+    @Test("a fully authorized session with backend client returns the share URL")
+    func successfulShare() async throws {
+        let (home, cleanup) = try makeHome()
+        defer { cleanup() }
+        try await saveRecord(
+            sessionID: "sess-1",
+            items: [.user("hello")],
+            home: home,
+            everUsedNonXAI: false
+        )
+        let (streams, out, _) = CLIStreams.buffered()
+        let upload = MockShareSignedUploadClient()
+        let backend = MockShareBackendClient(url: "https://grok.com/build/share/perm-123")
+
+        try await LiveShareComposition.run(
+            options: shareOptions(["share", "sess-1"]),
+            environment: environment(home: home, auth: xaiAuth()),
+            streams: streams,
+            remoteSettings: sharingSettings(true),
+            signedUploadClient: upload,
+            backendClient: backend
+        )
+
+        #expect(out.contents.contains("https://grok.com/build/share/perm-123"))
+        #expect(upload.calls.count == 1)
+        #expect(upload.calls.first?.sessionID == "sess-1")
+        #expect(upload.calls.first?.itemCount == 1)
+        #expect(backend.calls.count == 1)
+        #expect(backend.calls.first?.sessionID == "sess-1")
+    }
+
+    @Test("share works without a signed-upload client — backend-only path")
+    func shareWithoutSignedUpload() async throws {
+        let (home, cleanup) = try makeHome()
+        defer { cleanup() }
+        try await saveRecord(
+            sessionID: "sess-1",
+            items: [.user("hello")],
+            home: home,
+            everUsedNonXAI: false
+        )
+        let (streams, out, _) = CLIStreams.buffered()
+        let backend = MockShareBackendClient(url: "https://grok.com/build/share/perm-456")
+
+        try await LiveShareComposition.run(
+            options: shareOptions(["share", "sess-1"]),
+            environment: environment(home: home, auth: xaiAuth()),
+            streams: streams,
+            remoteSettings: sharingSettings(true),
+            backendClient: backend
+        )
+
+        #expect(out.contents.contains("https://grok.com/build/share/perm-456"))
+        #expect(backend.calls.count == 1)
+    }
+
+    // MARK: Backend failure (share.rs:130-137)
+
+    @Test("backend failure produces no share URL")
+    func backendFailure() async throws {
+        let (home, cleanup) = try makeHome()
+        defer { cleanup() }
+        try await saveRecord(
+            sessionID: "sess-1",
+            items: [.user("hello")],
+            home: home,
+            everUsedNonXAI: false
+        )
+        let (streams, out, _) = CLIStreams.buffered()
+        let backend = MockShareBackendClient(error: .network("connection refused"))
+
+        await expectFailure("Failed to share session") {
+            try await LiveShareComposition.run(
+                options: shareOptions(["share", "sess-1"]),
+                environment: environment(home: home, auth: xaiAuth()),
+                streams: streams,
+                remoteSettings: sharingSettings(true),
+                backendClient: backend
+            )
+        }
+        #expect(!out.contents.contains("http"))
+        #expect(backend.calls.count == 1)
+    }
+
+    // MARK: Mid-flight boundary recheck (share.rs:117-123)
+
+    @Test("mid-share boundary closure refuses after upload, before backend call")
+    func midShareBoundaryClosure() async throws {
+        let (home, cleanup) = try makeHome()
+        defer { cleanup() }
+        try await saveRecord(
+            sessionID: "sess-1",
+            items: [.user("hello")],
+            home: home,
+            everUsedNonXAI: false
+        )
+        let boundary = ExportBoundary()
+        let (streams, out, _) = CLIStreams.buffered()
+
+        // The upload client closes the boundary during upload, simulating
+        // a provider switch that arrives while data is in flight.
+        let closingUpload = ClosingShareSignedUploadClient(boundary: boundary)
+        let backend = MockShareBackendClient(url: "https://grok.com/build/share/should-not-reach")
+
+        await expectFailure("Session crossed the Codex provider boundary while sharing.") {
+            try await LiveShareComposition.run(
+                options: shareOptions(["share", "sess-1"]),
+                environment: environment(home: home, auth: xaiAuth()),
+                streams: streams,
+                remoteSettings: sharingSettings(true),
+                liveBoundaries: { _ in boundary },
+                signedUploadClient: closingUpload,
+                backendClient: backend
+            )
+        }
+
+        #expect(!out.contents.contains("http"))
+        // The upload was called (it's best-effort), but the backend was NOT.
+        #expect(closingUpload.called)
+        #expect(backend.calls.isEmpty)
+    }
+}
+
+/// An upload client that closes the boundary during upload, simulating a
+/// provider switch mid-share (share.rs:117-123).
+private final class ClosingShareSignedUploadClient: ShareSignedUploadClient, @unchecked Sendable {
+    let boundary: ExportBoundary
+    private let lock = NSLock()
+    private var _called = false
+
+    var called: Bool {
+        snapshotCalled()
+    }
+
+    init(boundary: ExportBoundary) {
+        self.boundary = boundary
+    }
+
+    func uploadShareData(
+        sessionID: String,
+        items: [ConversationItem],
+        boundary: ExportBoundary?
+    ) async {
+        self.boundary.observe(.codex)
+        markCalled()
+    }
+
+    private func snapshotCalled() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _called
+    }
+
+    private func markCalled() {
+        lock.lock()
+        _called = true
+        lock.unlock()
     }
 }
