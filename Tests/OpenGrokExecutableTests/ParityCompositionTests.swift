@@ -1464,12 +1464,14 @@ struct ParityCompositionTests {
         // The mutating tools are only *offered* here; the permission gate still
         // decides at dispatch, which `liveFileToolsDenyMutationsByDefault` pins.
         //
-        // `image_gen` / `image_edit` / `image_to_video` join the list because
-        // this session carries an `XAI_API_KEY`, which is exactly the
-        // advertisement rule upstream uses (`xai-grok-agent/src/builder.rs:771`
-        // for images; video shares the same xAI media credential gate via
-        // `LiveVideoToolComposition`). `ImageToolCompositionTests` and
-        // `LiveVideoCompositionTests` pin both directions.
+        // `image_gen` / `image_edit` / `image_to_video` / `reference_to_video`
+        // join the list because this session carries an `XAI_API_KEY`, which is
+        // exactly the advertisement rule upstream uses
+        // (`xai-grok-agent/src/builder.rs:771` for images; video shares the
+        // same xAI media credential gate via `LiveVideoToolComposition` and
+        // advertises the pair together — `builder.rs:781-788`).
+        // `ImageToolCompositionTests` and `LiveVideoCompositionTests` pin both
+        // directions.
         //
         // `get_command_or_subagent_output` / `wait_commands_or_subagents` /
         // `kill_command_or_subagent` ride along with `run_terminal_cmd`: it can
@@ -1491,7 +1493,7 @@ struct ParityCompositionTests {
         #expect(advertised == Set([
             "run_terminal_cmd", "read_file", "list_dir", "grep",
             "glob", "view_image", "search_replace", "write", "apply_patch",
-            "image_gen", "image_edit", "image_to_video",
+            "image_gen", "image_edit", "image_to_video", "reference_to_video",
             "get_command_or_subagent_output", "wait_commands_or_subagents", "kill_command_or_subagent",
             "spawn_subagent", "agent_swarm",
             "list_agents", "send_message", "followup_task", "wait_agent",

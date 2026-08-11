@@ -34,17 +34,16 @@ struct SyncDiagnosticsTests {
                 extensions: [".swift": "swift"]
             ),
         ]
-        let session = LSPSession(workspaceRoot: workspace.path, servers: servers)
-        defer { await session.shutdown() }
-
-        await session.notifyFileChanged(path: "Sample.swift", content: content)
-        let summary = await session.drainDiagnostics(timeout: 2.0)
-        #expect(summary != nil)
-        let text = try #require(summary)
-        #expect(text.contains("<lsp-diagnostics>"))
-        #expect(text.contains("</lsp-diagnostics>"))
-        #expect(text.contains("pushed diagnostic"))
-        #expect(text.contains("Sample.swift"))
+        try await withLSPSession(workspaceRoot: workspace.path, servers: servers) { session in
+            await session.notifyFileChanged(path: "Sample.swift", content: content)
+            let summary = await session.drainDiagnostics(timeout: 2.0)
+            #expect(summary != nil)
+            let text = try #require(summary)
+            #expect(text.contains("<lsp-diagnostics>"))
+            #expect(text.contains("</lsp-diagnostics>"))
+            #expect(text.contains("pushed diagnostic"))
+            #expect(text.contains("Sample.swift"))
+        }
     }
 
     @Test("pull_diagnostics still works against pull mock")
@@ -62,12 +61,11 @@ struct SyncDiagnosticsTests {
                 extensions: [".swift": "swift"]
             ),
         ]
-        let session = LSPSession(workspaceRoot: workspace.path, servers: servers)
-        defer { await session.shutdown() }
-
-        let text = await session.pullDiagnostics(path: "Sample.swift")
-        #expect(text.contains("mock diagnostic"))
-        #expect(text.contains("Sample.swift"))
+        try await withLSPSession(workspaceRoot: workspace.path, servers: servers) { session in
+            let text = await session.pullDiagnostics(path: "Sample.swift")
+            #expect(text.contains("mock diagnostic"))
+            #expect(text.contains("Sample.swift"))
+        }
     }
 
     @Test("inbound notification without id decodes and does not require response id")

@@ -33,12 +33,11 @@ struct PullDiagnosticsTests {
                 extensions: [".swift": "swift"]
             ),
         ]
-        let session = LSPSession(workspaceRoot: workspace.path, servers: servers)
-        defer { await session.shutdown() }
-
-        let text = await session.pullDiagnostics(path: "Sample.swift")
-        #expect(text.contains("mock diagnostic"))
-        #expect(text.contains("Sample.swift"))
+        try await withLSPSession(workspaceRoot: workspace.path, servers: servers) { session in
+            let text = await session.pullDiagnostics(path: "Sample.swift")
+            #expect(text.contains("mock diagnostic"))
+            #expect(text.contains("Sample.swift"))
+        }
     }
 
     @Test("MethodNotFound marks server rejected")
@@ -56,15 +55,14 @@ struct PullDiagnosticsTests {
                 extensions: [".swift": "swift"]
             ),
         ]
-        let session = LSPSession(workspaceRoot: workspace.path, servers: servers)
-        defer { await session.shutdown() }
+        try await withLSPSession(workspaceRoot: workspace.path, servers: servers) { session in
+            let first = await session.pullDiagnostics(path: "Sample.swift")
+            #expect(first.contains("does not support pull diagnostics"))
+            #expect(await session.support(for: "swift") == .rejected)
 
-        let first = await session.pullDiagnostics(path: "Sample.swift")
-        #expect(first.contains("does not support pull diagnostics"))
-        #expect(await session.support(for: "swift") == .rejected)
-
-        let second = await session.pullDiagnostics(path: "Sample.swift")
-        #expect(second.contains("does not support pull diagnostics"))
+            let second = await session.pullDiagnostics(path: "Sample.swift")
+            #expect(second.contains("does not support pull diagnostics"))
+        }
     }
 
     @Test("PullSupportFlag rejects only on writeOff")

@@ -1,9 +1,12 @@
 // LiveVideoCompositionTests.swift
 //
-// Availability, registration, and handler contracts for `image_to_video`.
+// Availability, registration, and handler contracts for `image_to_video`
+// and `reference_to_video`.
 //
-// Upstream references:
-//   * `video_gen/mod.rs:1030-1075` — handler validation, tier upsell, save path
+// Upstream references (pin 650c1db7):
+//   * `video_gen/mod.rs:1030-1075` — image_to_video handler
+//   * `video_gen/mod.rs:1136-1189` — reference_to_video validation + payload
+//   * `builder.rs:781-788` — both tools under one VideoGenConfig gate
 //   * `agent_ops.rs:2272-2314` — xAI-only config from `xai_media_api_key`
 
 import Foundation
@@ -76,6 +79,10 @@ private func minimalPNGData() -> Data {
     ])
 }
 
+private func dataImageURL() -> String {
+    "data:image/png;base64,\(minimalPNGData().base64EncodedString())"
+}
+
 // MARK: - Availability
 
 @Test func videoGenDisabledByFeatureFlag() {
@@ -92,18 +99,21 @@ private func minimalPNGData() -> Data {
         samplingBaseURL: "https://api.x.ai/v1"
     )
     #expect(!resolved.imageToVideoEnabled)
+    #expect(!resolved.referenceToVideoEnabled)
     #expect(resolved.config.isEnabled == false)
 }
 
 @Test func missingBackendAdvertisesNothing() {
     let resolved = availability(provider: .xai, apiKey: "")
     #expect(!resolved.imageToVideoEnabled)
+    #expect(!resolved.referenceToVideoEnabled)
     #expect(resolved.config.isEnabled == false)
 }
 
-@Test func xaiSessionWithBearerGetsVideoTool() {
+@Test func xaiSessionWithBearerGetsBothVideoTools() {
     let resolved = availability(provider: .xai, apiKey: "xai-key")
     #expect(resolved.imageToVideoEnabled)
+    #expect(resolved.referenceToVideoEnabled)
     #expect(resolved.config.isEnabled)
 }
 
@@ -112,18 +122,19 @@ private func minimalPNGData() -> Data {
     environment["XAI_API_KEY"] = "stored-xai-key"
     let resolved = availability(provider: .kimi, apiKey: "kimi-key", environment: environment)
     #expect(resolved.imageToVideoEnabled)
+    #expect(resolved.referenceToVideoEnabled)
 }
 
 // MARK: - Registration gate
 
-@Test func registerImageToVideoSkipsWhenClientCannotBeBuilt() {
+@Test func registerVideoToolsSkipsWhenClientCannotBeBuilt() {
     var builder = ToolRegistryBuilder()
     var toolConfig = ToolServerConfig(tools: [])
     let context = LiveVideoToolContext(
         availability: .unavailable,
         transport: MockHTTPTransport()
     )
-    LiveVideoToolComposition.registerImageToVideo(
+    LiveVideoToolComposition.registerVideoTools(
         context: context,
         builder: &builder,
         toolConfig: &toolConfig
@@ -131,52 +142,67 @@ private func minimalPNGData() -> Data {
     #expect(toolConfig.tools.isEmpty)
 }
 
-@Test func registerImageToVideoAppendsWhenClientConstructible() throws {
+@Test func registerVideoToolsAppendsBothWhenClientConstructible() throws {
     var builder = ToolRegistryBuilder()
     var toolConfig = ToolServerConfig(tools: [])
-    let client = try VideoGenClient(
-        config: .enabled(VideoGenSettings(
-            apiKey: "k",
-            baseURL: "https://api.x.ai/v1"
-        )),
-        transport: MockHTTPTransport()
-    )
     let context = LiveVideoToolContext(
         availability: LiveVideoToolAvailability(
             config: .enabled(VideoGenSettings(apiKey: "k", baseURL: "https://api.x.ai/v1")),
-            imageToVideoEnabled: true
+            imageToVideoEnabled: true,
+            referenceToVideoEnabled: true
         ),
         transport: MockHTTPTransport()
     )
-    _ = client
+    LiveVideoToolComposition.registerVideoTools(
+        context: context,
+        builder: &builder,
+        toolConfig: &toolConfig
+    )
+    #expect(toolConfig.tools.count == 2)
+    let ids = Set(toolConfig.tools.map(\.id))
+    #expect(ids.contains(BuiltinToolCatalog.imageToVideoQualifiedId))
+    #expect(ids.contains(BuiltinToolCatalog.referenceToVideoQualifiedId))
+    #expect(builder.hasToolId(BuiltinToolCatalog.imageToVideoQualifiedId))
+    #expect(builder.hasToolId(BuiltinToolCatalog.referenceToVideoQualifiedId))
+}
+
+@Test func registerImageToVideoAliasRegistersBoth() throws {
+    var builder = ToolRegistryBuilder()
+    var toolConfig = ToolServerConfig(tools: [])
+    let context = LiveVideoToolContext(
+        availability: LiveVideoToolAvailability(
+            config: .enabled(VideoGenSettings(apiKey: "k", baseURL: "https://api.x.ai/v1")),
+            imageToVideoEnabled: true,
+            referenceToVideoEnabled: true
+        ),
+        transport: MockHTTPTransport()
+    )
     LiveVideoToolComposition.registerImageToVideo(
         context: context,
         builder: &builder,
         toolConfig: &toolConfig
     )
-    #expect(toolConfig.tools.count == 1)
-    #expect(toolConfig.tools[0].id == BuiltinToolCatalog.imageToVideoQualifiedId)
+    #expect(toolConfig.tools.count == 2)
 }
 
-// MARK: - Handler
+// MARK: - image_to_video handler
 
 @Test func tierRestrictedReturnsUpsellWithoutHTTP() async throws {
+    let transport = MockHTTPTransport(responses: videoFlowResponses())
     let client = try VideoGenClient(
         config: .enabled(VideoGenSettings(
             apiKey: "k",
             baseURL: "https://api.x.ai/v1",
             tierRestricted: true
         )),
-        transport: MockHTTPTransport(responses: videoFlowResponses())
+        transport: transport
     )
     let handler = LiveImageToVideoToolHandler(client: client)
-    let transport = MockHTTPTransport(responses: videoFlowResponses())
-    _ = transport
     let sessionFolder = temporaryDirectory().path
     let result = await handler.invoke(
         clientName: IMAGE_TO_VIDEO_TOOL_NAME,
         args: .object([
-            "image": .string("data:image/png;base64,\(minimalPNGData().base64EncodedString())"),
+            "image": .string(dataImageURL()),
             "prompt": .string("gentle motion"),
         ]),
         ctx: ToolCallContext(),
@@ -193,6 +219,7 @@ private func minimalPNGData() -> Data {
         return
     }
     #expect(text == VIDEO_TIER_RESTRICTED_UPSELL)
+    #expect(transport.recordedRequests.isEmpty)
 }
 
 @Test func mockHTTPGeneratesAndSavesVideo() async throws {
@@ -286,4 +313,262 @@ private func minimalPNGData() -> Data {
         return
     }
     #expect(error.description.contains("resolution_name"))
+}
+
+// MARK: - reference_to_video handler
+
+@Test func referenceToVideoRejectsEmptyPrompt() async throws {
+    let transport = MockHTTPTransport()
+    let client = try VideoGenClient(
+        config: .enabled(VideoGenSettings(apiKey: "k", baseURL: "https://api.x.ai/v1")),
+        transport: transport
+    )
+    let handler = LiveReferenceToVideoToolHandler(client: client)
+    let sessionFolder = temporaryDirectory().path
+    let result = await handler.invoke(
+        clientName: REFERENCE_TO_VIDEO_TOOL_NAME,
+        args: .object([
+            "prompt": .string("   "),
+            "images": .array([.string(dataImageURL()), .string(dataImageURL())]),
+            "aspect_ratio": .string("16:9"),
+        ]),
+        ctx: ToolCallContext(),
+        resources: ToolResources(cwd: sessionFolder, sessionFolder: sessionFolder)
+    )
+    guard case .failure(let error) = result else {
+        Issue.record("expected empty prompt failure")
+        return
+    }
+    #expect(error.description.contains("`prompt` must not be empty."))
+    #expect(transport.recordedRequests.isEmpty)
+}
+
+@Test func referenceToVideoRejectsTooFewImages() async throws {
+    let transport = MockHTTPTransport()
+    let client = try VideoGenClient(
+        config: .enabled(VideoGenSettings(apiKey: "k", baseURL: "https://api.x.ai/v1")),
+        transport: transport
+    )
+    let handler = LiveReferenceToVideoToolHandler(client: client)
+    let sessionFolder = temporaryDirectory().path
+    let result = await handler.invoke(
+        clientName: REFERENCE_TO_VIDEO_TOOL_NAME,
+        args: .object([
+            "prompt": .string("blend"),
+            "images": .array([.string(dataImageURL())]),
+            "aspect_ratio": .string("16:9"),
+        ]),
+        ctx: ToolCallContext(),
+        resources: ToolResources(cwd: sessionFolder, sessionFolder: sessionFolder)
+    )
+    guard case .failure(let error) = result else {
+        Issue.record("expected too-few-images failure")
+        return
+    }
+    #expect(error.description.contains("at least two image references"))
+    #expect(transport.recordedRequests.isEmpty)
+}
+
+@Test func referenceToVideoRejectsTooManyImages() async throws {
+    let transport = MockHTTPTransport()
+    let client = try VideoGenClient(
+        config: .enabled(VideoGenSettings(apiKey: "k", baseURL: "https://api.x.ai/v1")),
+        transport: transport
+    )
+    let handler = LiveReferenceToVideoToolHandler(client: client)
+    let sessionFolder = temporaryDirectory().path
+    let images = (0..<8).map { _ in JSONValue.string(dataImageURL()) }
+    let result = await handler.invoke(
+        clientName: REFERENCE_TO_VIDEO_TOOL_NAME,
+        args: .object([
+            "prompt": .string("blend"),
+            "images": .array(images),
+            "aspect_ratio": .string("16:9"),
+        ]),
+        ctx: ToolCallContext(),
+        resources: ToolResources(cwd: sessionFolder, sessionFolder: sessionFolder)
+    )
+    guard case .failure(let error) = result else {
+        Issue.record("expected too-many-images failure")
+        return
+    }
+    #expect(error.description.contains("at most 7 image references"))
+    #expect(transport.recordedRequests.isEmpty)
+}
+
+@Test func referenceToVideoRejectsInvalidAspectRatio() async throws {
+    let transport = MockHTTPTransport()
+    let client = try VideoGenClient(
+        config: .enabled(VideoGenSettings(apiKey: "k", baseURL: "https://api.x.ai/v1")),
+        transport: transport
+    )
+    let handler = LiveReferenceToVideoToolHandler(client: client)
+    let sessionFolder = temporaryDirectory().path
+    let result = await handler.invoke(
+        clientName: REFERENCE_TO_VIDEO_TOOL_NAME,
+        args: .object([
+            "prompt": .string("blend"),
+            "images": .array([.string(dataImageURL()), .string(dataImageURL())]),
+            "aspect_ratio": .string("4:3"),
+        ]),
+        ctx: ToolCallContext(),
+        resources: ToolResources(cwd: sessionFolder, sessionFolder: sessionFolder)
+    )
+    guard case .failure(let error) = result else {
+        Issue.record("expected invalid aspect ratio failure")
+        return
+    }
+    #expect(error.description.contains("`aspect_ratio` must be one of:"))
+    #expect(error.description.contains("Got 4:3."))
+    #expect(transport.recordedRequests.isEmpty)
+}
+
+@Test func referenceToVideoRejectsInvalidDuration() async throws {
+    let transport = MockHTTPTransport()
+    let client = try VideoGenClient(
+        config: .enabled(VideoGenSettings(apiKey: "k", baseURL: "https://api.x.ai/v1")),
+        transport: transport
+    )
+    let handler = LiveReferenceToVideoToolHandler(client: client)
+    let sessionFolder = temporaryDirectory().path
+    let result = await handler.invoke(
+        clientName: REFERENCE_TO_VIDEO_TOOL_NAME,
+        args: .object([
+            "prompt": .string("blend"),
+            "images": .array([.string(dataImageURL()), .string(dataImageURL())]),
+            "aspect_ratio": .string("16:9"),
+            "duration": .number(.int64(8)),
+        ]),
+        ctx: ToolCallContext(),
+        resources: ToolResources(cwd: sessionFolder, sessionFolder: sessionFolder)
+    )
+    guard case .failure(let error) = result else {
+        Issue.record("expected invalid duration failure")
+        return
+    }
+    #expect(error.description.contains("`duration` must be either 6 or 10 seconds. Got 8."))
+    #expect(transport.recordedRequests.isEmpty)
+}
+
+@Test func referenceToVideoRejectsInvalidResolution() async throws {
+    let transport = MockHTTPTransport()
+    let client = try VideoGenClient(
+        config: .enabled(VideoGenSettings(apiKey: "k", baseURL: "https://api.x.ai/v1")),
+        transport: transport
+    )
+    let handler = LiveReferenceToVideoToolHandler(client: client)
+    let sessionFolder = temporaryDirectory().path
+    let result = await handler.invoke(
+        clientName: REFERENCE_TO_VIDEO_TOOL_NAME,
+        args: .object([
+            "prompt": .string("blend"),
+            "images": .array([.string(dataImageURL()), .string(dataImageURL())]),
+            "aspect_ratio": .string("16:9"),
+            "resolution_name": .string("1080p"),
+        ]),
+        ctx: ToolCallContext(),
+        resources: ToolResources(cwd: sessionFolder, sessionFolder: sessionFolder)
+    )
+    guard case .failure(let error) = result else {
+        Issue.record("expected invalid resolution failure")
+        return
+    }
+    #expect(error.description.contains("`resolution_name` must be one of:"))
+    #expect(error.description.contains("Got 1080p."))
+    #expect(transport.recordedRequests.isEmpty)
+}
+
+@Test func referenceToVideoTierRestrictedReturnsUpsellWithoutHTTP() async throws {
+    let transport = MockHTTPTransport(responses: videoFlowResponses())
+    let client = try VideoGenClient(
+        config: .enabled(VideoGenSettings(
+            apiKey: "k",
+            baseURL: "https://api.x.ai/v1",
+            tierRestricted: true
+        )),
+        transport: transport
+    )
+    let handler = LiveReferenceToVideoToolHandler(client: client)
+    let sessionFolder = temporaryDirectory().path
+    let result = await handler.invoke(
+        clientName: REFERENCE_TO_VIDEO_TOOL_NAME,
+        args: .object([
+            "prompt": .string("blend these into a cinematic shot"),
+            "images": .array([.string(dataImageURL()), .string(dataImageURL())]),
+            "aspect_ratio": .string("16:9"),
+            "duration": .number(.int64(6)),
+            "resolution_name": .string("480p"),
+        ]),
+        ctx: ToolCallContext(),
+        resources: ToolResources(cwd: sessionFolder, sessionFolder: sessionFolder)
+    )
+    guard case .success(let output) = result else {
+        Issue.record("expected tier upsell success, got \(String(describing: result))")
+        return
+    }
+    guard case .object(let obj) = output.value,
+          case .string(let text)? = obj["content"]
+    else {
+        Issue.record("expected text output")
+        return
+    }
+    #expect(text == VIDEO_TIER_RESTRICTED_UPSELL)
+    #expect(transport.recordedRequests.isEmpty)
+}
+
+@Test func referenceToVideoHappyPathUsesBaseModelAndReferenceImages() async throws {
+    let transport = MockHTTPTransport(responses: videoFlowResponses())
+    let client = try VideoGenClient(
+        config: .enabled(VideoGenSettings(
+            apiKey: "k",
+            baseURL: "https://api.x.ai/v1"
+        )),
+        transport: transport
+    )
+    let sessionFolder = temporaryDirectory()
+    let refA = sessionFolder.appendingPathComponent("ref-a.png")
+    let refB = sessionFolder.appendingPathComponent("ref-b.png")
+    try minimalPNGData().write(to: refA)
+    try minimalPNGData().write(to: refB)
+
+    let handler = LiveReferenceToVideoToolHandler(client: client)
+    let result = await handler.invoke(
+        clientName: REFERENCE_TO_VIDEO_TOOL_NAME,
+        args: .object([
+            "prompt": .string("blend these into a cinematic fashion shot"),
+            "images": .array([.string(refA.path), .string(refB.path)]),
+            "aspect_ratio": .string("16:9"),
+            "duration": .number(.int64(6)),
+            "resolution_name": .string("480p"),
+        ]),
+        ctx: ToolCallContext(),
+        resources: ToolResources(
+            cwd: sessionFolder.path,
+            sessionFolder: sessionFolder.path
+        )
+    )
+    guard case .success(let output) = result else {
+        Issue.record("expected successful reference_to_video, got \(String(describing: result))")
+        return
+    }
+    guard case .object(let obj) = output.value,
+          case .string(let text)? = obj["content"]
+    else {
+        Issue.record("expected structured output")
+        return
+    }
+    #expect(text.contains("Saved video to"))
+    let videosDirectory = sessionFolder.appendingPathComponent("videos")
+    let saved = try FileManager.default.contentsOfDirectory(atPath: videosDirectory.path)
+    #expect(saved.contains("1.mp4"))
+    #expect(transport.recordedRequests.count == 3)
+
+    let startBody = try #require(transport.recordedRequests.first?.body)
+    let root = try #require(try JSONSerialization.jsonObject(with: startBody) as? [String: Any])
+    #expect(root["model"] as? String == XAI_VIDEO_BASE_MODEL)
+    #expect(root["aspect_ratio"] as? String == "16:9")
+    #expect(root["image"] == nil)
+    let refs = try #require(root["reference_images"] as? [[String: Any]])
+    #expect(refs.count == 2)
+    #expect((refs[0]["url"] as? String)?.hasPrefix("data:image/") == true)
 }

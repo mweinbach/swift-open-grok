@@ -5,6 +5,7 @@
 
 import Foundation
 import OpenGrokHTTP
+import OpenGrokShared
 import Testing
 @testable import OpenGrokWebMediaTools
 
@@ -62,6 +63,16 @@ struct VideoGenerationValidationTests {
         }
     }
 
+    @Test("aspect ratio validation accepts Imagine toolbox values only")
+    func aspectRatioValidation() throws {
+        for ratio in VALID_IMAGINE_VIDEO_ASPECT_RATIOS {
+            try validateImagineVideoAspectRatio(ratio)
+        }
+        #expect(throws: VideoGenError.self) {
+            try validateImagineVideoAspectRatio("4:3")
+        }
+    }
+
     @Test("image_to_video input defaults match upstream")
     func inputDefaults() throws {
         let input = try JSONDecoder().decode(
@@ -73,10 +84,39 @@ struct VideoGenerationValidationTests {
         #expect(input.resolutionName == DEFAULT_VIDEO_RESOLUTION)
     }
 
+    @Test("reference_to_video input deserializes with defaults")
+    func referenceToVideoInputDefaults() throws {
+        let input = try JSONDecoder().decode(
+            ReferenceToVideoInput.self,
+            from: Data(#"""
+            {
+              "prompt": "blend these",
+              "images": ["/tmp/a.jpg", "/tmp/b.jpg"],
+              "aspect_ratio": "16:9",
+              "duration": 10
+            }
+            """#.utf8)
+        )
+        #expect(input.prompt == "blend these")
+        #expect(input.images.count == 2)
+        #expect(input.aspectRatio == "16:9")
+        #expect(input.duration == 10)
+        #expect(input.resolutionName == DEFAULT_VIDEO_RESOLUTION)
+    }
+
     @Test("resolveVideoImageReference accepts https URLs verbatim")
     func httpsPassthrough() throws {
         let url = "https://cdn.example.com/frame.png"
         #expect(try resolveVideoImageReference(url) == url)
+    }
+
+    @Test("constants match Rust pin 650c1db7")
+    func constantsMatchPin() {
+        #expect(XAI_VIDEO_BASE_MODEL == "grok-imagine-video")
+        #expect(XAI_VIDEO_QUALITY_MODEL == "grok-imagine-video-1.5-preview")
+        #expect(MAX_R2V_REFERENCE_IMAGES == 7)
+        #expect(REFERENCE_TO_VIDEO_TOOL_NAME == "reference_to_video")
+        #expect(REFERENCE_TO_VIDEO_DESCRIPTION.contains("2 to 7 image references"))
     }
 }
 
@@ -108,6 +148,47 @@ struct VideoGenerationClientTests {
         )
         #expect(bytes == sampleVideoBytes)
         #expect(transport.recordedRequests.count == 3)
+
+        let startBody = try #require(transport.recordedRequests.first?.body)
+        let root = try JSONSerialization.jsonObject(with: startBody) as? [String: Any]
+        #expect(root?["model"] as? String == XAI_VIDEO_QUALITY_MODEL)
+        #expect(root?["image"] != nil)
+        #expect(root?["reference_images"] == nil)
+        #expect(root?["aspect_ratio"] == nil)
+    }
+
+    @Test("reference_to_video payload uses base model and omits image")
+    func referenceToVideoPayload() async throws {
+        let transport = MockHTTPTransport(responses: videoFlowResponses())
+        let client = try VideoGenClient(
+            config: .enabled(VideoGenSettings(
+                apiKey: "k",
+                baseURL: "https://api.x.ai/v1"
+            )),
+            transport: transport
+        )
+        let a = "data:image/png;base64,\(minimalPNGData().base64EncodedString())"
+        let b = a
+        let bytes = try await client.generateWithImages(
+            model: XAI_VIDEO_BASE_MODEL,
+            prompt: "blend",
+            duration: 6,
+            aspectRatio: "16:9",
+            resolution: "480p",
+            image: nil,
+            referenceImages: [a, b]
+        )
+        #expect(bytes == sampleVideoBytes)
+        #expect(transport.recordedRequests.count == 3)
+
+        let startBody = try #require(transport.recordedRequests.first?.body)
+        let root = try #require(try JSONSerialization.jsonObject(with: startBody) as? [String: Any])
+        #expect(root["model"] as? String == XAI_VIDEO_BASE_MODEL)
+        #expect(root["aspect_ratio"] as? String == "16:9")
+        #expect(root["image"] == nil)
+        let refs = try #require(root["reference_images"] as? [[String: Any]])
+        #expect(refs.count == 2)
+        #expect(refs[0]["url"] as? String == a)
     }
 
     @Test("tier restriction is surfaced on the client")

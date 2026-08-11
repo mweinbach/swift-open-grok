@@ -152,6 +152,14 @@ public enum LiveServeComposition {
                 if let gateway = launchComponents.notificationGateway {
                     await gateway.attach(runtime)
                 }
+                // Re-point the reverse permission prompter at THIS connection's
+                // runtime so `session/request_permission` rides the live socket
+                // after reconnect (same attach discipline as the gateway).
+                if let permissionPrompter = launchComponents.permissionPrompter {
+                    await permissionPrompter.attach(
+                        client: ACPRuntimePermissionClient(runtime)
+                    )
+                }
                 return runtime
             },
             log: { message in context.streams.err("open-grok: \(message)\n") }

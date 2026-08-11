@@ -335,6 +335,32 @@ public enum BuiltinToolCatalog {
         required: ["image"]
     )
 
+    /// Model-facing text for `reference_to_video`. Kept byte-identical to
+    /// `OpenGrokWebMediaTools.REFERENCE_TO_VIDEO_DESCRIPTION`
+    /// (`video_gen/mod.rs:1090-1092` at pin 650c1db7).
+    public static let referenceToVideoDescription = "Generate a video from multiple reference images guided by a text prompt; returns the saved video's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `videos/1.mp4`) rather than the absolute path, so it renders as a clickable link that opens the video. Provide `images` with 2 to 7 image references and a required `prompt` describing the desired video. Use this tool when the user wants a video using multiple images as style/content references. Example: reference_to_video(prompt=\"blend these into a cinematic fashion shot with slow dolly movement\", images=[\"/Users/me/ref1.jpg\", \"/Users/me/ref2.jpg\"], aspect_ratio=\"16:9\", duration=6, resolution_name=\"480p\")"
+
+    public static let referenceToVideoSchema = objectSchema(
+        properties: [
+            "prompt": stringProp(
+                "Prompt to guide the video generation model. Describe the desired video."
+            ),
+            "images": stringArrayProp(
+                "Reference images. Provide 2 to 7 entries; the images are used as style/content references for the generated video. Each entry may be an absolute filesystem path, HTTPS URL, or `data:image/...;base64,...` URL."
+            ),
+            "aspect_ratio": stringProp(
+                "Aspect ratio of the generated video, decide it based on the user's request. 1:1 for square (icons, profiles), 16:9 for wide (landscapes, cinematic), 9:16 for tall (phone wallpapers, stories), 3:2 for horizontal photos, 2:3 for vertical (portraits, posters)."
+            ),
+            "duration": stringProp(
+                "Duration of the video generation, either 6 or 10 seconds. Defaults to 6."
+            ),
+            "resolution_name": stringProp(
+                "Resolution name of the video generation, only specify it when user asks for a specific resolution, either 480p or 720p. Defaults to 480p."
+            ),
+        ],
+        required: ["prompt", "images", "aspect_ratio"]
+    )
+
     /// Image generation / editing tools.
     ///
     /// Registered unconditionally, exactly as upstream's registry does
@@ -368,12 +394,19 @@ public enum BuiltinToolCatalog {
 
     /// Video generation tools. Registered unconditionally in the catalog; whether
     /// a session advertises them is decided at live composition time from
-    /// resolved xAI credentials — see `LiveVideoToolComposition`.
+    /// resolved xAI credentials — see `LiveVideoToolComposition`. Upstream
+    /// advertises the pair together whenever `VideoGenConfig::is_enabled()`
+    /// (`xai-grok-agent/src/builder.rs:781-788` at pin 650c1db7).
     public static let videoTools: [RegisteredToolSpec] = [
         RegisteredToolSpec(
             namespace: .grokBuild, id: "image_to_video", kind: .imageToVideo,
             description: imageToVideoDescription,
             inputSchema: imageToVideoSchema
+        ),
+        RegisteredToolSpec(
+            namespace: .grokBuild, id: "reference_to_video", kind: .referenceToVideo,
+            description: referenceToVideoDescription,
+            inputSchema: referenceToVideoSchema
         ),
     ]
 
@@ -382,6 +415,7 @@ public enum BuiltinToolCatalog {
     }
 
     public static let imageToVideoQualifiedId = "GrokBuild:image_to_video"
+    public static let referenceToVideoQualifiedId = "GrokBuild:reference_to_video"
 
     // MARK: Web tools
 

@@ -729,13 +729,24 @@ private func replaceProcess(
     }
     var argv = argumentPointers + [nil]
     var envp = environmentPointers + [nil]
-    let result: Int32 = argv.withUnsafeMutableBufferPointer { argvBuffer in
-        envp.withUnsafeMutableBufferPointer { envBuffer in
-            executable.withCString { path in
+    // `baseAddress` is optional, and Glibc's `execve` takes it non-optional
+    // while Darwin's is implicitly unwrapped — so passing the optional through
+    // compiles on macOS and fails only on Linux, which is why this never
+    // surfaced in a local gate. Unwrap once here so both platforms take the
+    // same code path.
+    let result: Int32 = argv.withUnsafeMutableBufferPointer { argvBuffer -> Int32 in
+        envp.withUnsafeMutableBufferPointer { envBuffer -> Int32 in
+            guard let argvBase = argvBuffer.baseAddress,
+                  let envBase = envBuffer.baseAddress
+            else {
+                errno = EINVAL
+                return -1
+            }
+            return executable.withCString { path in
                 #if os(Linux)
-                Glibc.execve(path, argvBuffer.baseAddress, envBuffer.baseAddress)
+                Glibc.execve(path, argvBase, envBase)
                 #else
-                Darwin.execve(path, argvBuffer.baseAddress, envBuffer.baseAddress)
+                Darwin.execve(path, argvBase, envBase)
                 #endif
             }
         }

@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-11 (Auto-mode LLM classifier + full LSP post-edit sync live. Serial gate exited 0 with **5,285 Swift Testing cases across 74 nonempty summaries**, zero failed summaries, and zero issues. Prior deferred-runtime green: 5,872 / 106 on 2026-08-10.)
+**As of:** 2026-08-11 (Platform CI unbroken for the first time, `reference_to_video` and the ACP reverse permission bridge live. Serial gate exited 0 with **5,306 Swift Testing cases across 74 nonempty summaries**, zero failed summaries, and zero issues — but see the two known-flaky tests recorded below before treating repeat runs as green.)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -128,11 +128,82 @@ exited 0 on 2026-08-11 with **5,285 Swift Testing cases across 74 nonempty
 summaries** and zero issues (one prior serial attempt hit an unrelated flaky
 `RhaiEngine` peakConcurrency assertion; re-run was clean).
 
+### Platform CI, `reference_to_video`, ACP reverse permissions (2026-08-11)
+
+**CI had never been green.** Every push since the platform jobs were added
+failed, on all three platforms, for three independent reasons — so no platform
+except the author's laptop had ever produced signal, and every "green gate"
+claim above this line was macOS-local only:
+
+- **macOS** built the advertised-tool list as one seven-term `+` chain with a
+  trailing closure and blew the type checker's budget on a cold runner
+  (`LiveComposition.swift`). It compiled locally only off a warm incremental
+  cache — the break was invisible to every local gate and red on every push.
+  Now built by appends.
+- **Linux** ran `bwrap` under Docker's default seccomp/AppArmor profile, where
+  `unshare(CLONE_NEWUSER)` is `EPERM`; the sandbox probe failed and took the
+  build and the serial suite with it. The container now runs `--privileged`.
+  Behind it sat a second, never-compiled break: `Sources/OpenGrokSandbox/Platform.swift`
+  passed an optional `baseAddress` to `Glibc.execve`, which is non-optional on
+  Linux and implicitly unwrapped on Darwin — i.e. the sandbox exec path had
+  never compiled on the platform whose sandbox it implements.
+- **Windows** compiled the POSIX-only PTY C shim unconditionally (`pid_t`,
+  `<sys/ioctl.h>`) and declared a zlib shim against an SDK with no `<zlib.h>`.
+  The C shim is now `#if !defined(_WIN32)`-guarded and the zlib target is
+  dropped on Windows, which arms `ObjectStore`'s existing typed
+  "zlib … unavailable on this platform" arm.
+
+Also fixed: the LSP tests landed in the previous wave used `await` in a `defer`
+body, which this toolchain accepts and CI's rejects. They now route through
+`withLSPSession`, which shuts the session down on the throwing path too — the
+naive rewrite (shutdown after the last assertion) strands a language-server
+child process whenever a `try #require` fires first.
+
+**Live closures:**
+
+- **`reference_to_video`:** registered as a pair with `image_to_video` under the
+  one video-gen gate, exactly as upstream advertises them
+  (`builder.rs:781-788`). Base model `grok-imagine-video`, 2–7 reference images,
+  required `aspect_ratio`, Rust's validation order and verbatim refusal strings
+  (`video_gen/mod.rs:1136-1189`), and the SuperGrok upsell returned as success
+  text with no HTTP (`mod.rs:713`, `:1170-1173`). The advertised-tool parity pin
+  was extended rather than loosened.
+- **ACP reverse permission bridge:** `LiveACPPermissionPrompter` issues
+  `session/request_permission` to the ACP client, upstream's always-ask posture
+  (`permission/prompter.rs:775-781`). Every unavailable path — no reverse
+  sender, transport error, encode/decode failure, unknown option id, timeout —
+  denies; `cancelled` maps to cancelled, never allow. `PermissionHandle` gained
+  `setPrompter` because `prompter` is actor-isolated state.
+
+**Verification:** `zsh workflows/swift-safe-verify.zsh test --no-parallel`
+exited 0 on 2026-08-11 with **5,306 Swift Testing cases across 74 nonempty
+summaries** and zero issues.
+
+**Recorded honestly, not fixed:**
+
+- The prompter's *install* line in `liveACPServices` has no reachability test.
+  Its behavior is covered through a real `PermissionHandle`/`PermissionPipeline`
+  with a fake reverse client, but nothing asserts the live ACP composition
+  actually installs it — no test harness constructs `liveACPServices` today.
+  This is the exact implemented-but-unwired shape §3 warns about; treat the
+  bridge as live-unproven until that harness exists.
+- **Two tests are flaky under full-suite load** and pass in isolation:
+  `RhaiEngineTests.parallelIsABarrier` (`peakConcurrency == 3`, which hopes
+  three tasks overlap rather than forcing a rendezvous) and the hub MCP bridge's
+  `transport.closeCount == 1`. Each failed one serial run during this wave.
+  A flaky suite cannot produce trustworthy CI evidence, so these block any
+  claim that CI is reliably green.
+- **Antigravity was not started.** Scoped at ~1.5k lines of upstream runtime
+  (`agent/antigravity.rs`) plus `antigravity_runner.rs`, a CLI-presence gate,
+  model-slug advertisement, and resume metadata. Landing the settings rows
+  without the `agy --print` runner would register controls whose backing feature
+  does not exist, which §4 forbids, so the rows stay hidden.
+
 ### Still deferred from the audit
 
-Antigravity runner, `reference_to_video`, durable subagent resume, ACP SDK
-reverse bridge, relocation journal, Linux/Windows CI evidence, portable
-WSS/custom CA, and capable-Linux sandbox proof.
+Antigravity runner, durable subagent resume, relocation journal, portable
+WSS/custom CA, and the remaining Windows platform work (the C-target and zlib
+fixes unblock the compile; the job has not yet reached a passing build).
 
 ## Wave 19 — Deferred parity follow-ons (2026-08-10, complete)
 

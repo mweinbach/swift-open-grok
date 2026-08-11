@@ -1,7 +1,7 @@
 // VideoGeneration.swift
 //
-// `image_to_video` tool — generate a video from a source image via the xAI
-// Video Generation API.
+// `image_to_video` and `reference_to_video` tools — generate videos via the
+// xAI Video Generation API.
 // Port of `crates/codegen/xai-grok-tools/src/implementations/grok_build/video_gen/mod.rs`
 // (650c1db7).
 
@@ -11,6 +11,9 @@ import OpenGrokShared
 
 // MARK: - Constants
 
+/// Base Imagine video model used by `reference_to_video` (`mod.rs:36`).
+public let XAI_VIDEO_BASE_MODEL = "grok-imagine-video"
+/// Quality model used by `image_to_video` (`mod.rs:37`).
 public let XAI_VIDEO_QUALITY_MODEL = "grok-imagine-video-1.5-preview"
 public let VIDEO_START_TIMEOUT_SECONDS: TimeInterval = 60
 public let VIDEO_GEN_TIMEOUT_SECONDS: TimeInterval = 300
@@ -19,6 +22,8 @@ public let VIDEO_POLL_REQUEST_TIMEOUT_SECONDS: TimeInterval = 30
 public let VIDEO_DOWNLOAD_TIMEOUT_SECONDS: TimeInterval = 120
 public let DEFAULT_VIDEO_RESOLUTION = "480p"
 public let DEFAULT_IMAGINE_VIDEO_DURATION_SECS: UInt32 = 6
+public let MAX_R2V_REFERENCE_IMAGES = 7
+public let VALID_IMAGINE_VIDEO_ASPECT_RATIOS = ["1:1", "16:9", "9:16", "3:2", "2:3"]
 public let VALID_VIDEO_RESOLUTIONS = ["480p", "720p"]
 public let IMAGINE_VIDEO_DURATIONS_SECS: [UInt32] = [6, 10]
 
@@ -142,19 +147,27 @@ public struct VideoGenClient: Sendable {
     }
 
     /// Start generation and poll until the video bytes are available.
+    ///
+    /// Empty optional fields are omitted from the wire payload, matching Rust
+    /// `GenerateVideoPayload` (`mod.rs:724-740`): `image` / `aspect_ratio` /
+    /// `reference_images` are skip-serialized when absent or empty.
     public func generateWithImages(
         model: String = XAI_VIDEO_QUALITY_MODEL,
         prompt: String,
         duration: UInt32,
+        aspectRatio: String? = nil,
         resolution: String,
-        image: String
+        image: String? = nil,
+        referenceImages: [String] = []
     ) async throws -> Data {
         let requestID = try await startGeneration(
             model: model,
             prompt: prompt,
             duration: duration,
+            aspectRatio: aspectRatio,
             resolution: resolution,
-            image: image
+            image: image,
+            referenceImages: referenceImages
         )
         let downloadURL = try await pollUntilDone(requestID: requestID)
         return try await downloadVideo(url: downloadURL)
@@ -164,21 +177,33 @@ public struct VideoGenClient: Sendable {
         model: String,
         prompt: String,
         duration: UInt32,
+        aspectRatio: String?,
         resolution: String,
-        image: String
+        image: String?,
+        referenceImages: [String]
     ) async throws -> String {
         let trimmedBase = trimTrailingSlash(baseURL)
         guard let url = URL(string: "\(trimmedBase)/videos/generations") else {
             throw VideoGenError.invalidArguments("Invalid video base URL: \(baseURL)")
         }
 
-        let payload: [String: JSONValue] = [
+        var payload: [String: JSONValue] = [
             "model": .string(model),
             "prompt": .string(prompt),
             "duration": .number(.int64(Int64(duration))),
             "resolution": .string(resolution),
-            "image": .object(["url": .string(image)]),
         ]
+        if let image {
+            payload["image"] = .object(["url": .string(image)])
+        }
+        if let aspectRatio {
+            payload["aspect_ratio"] = .string(aspectRatio)
+        }
+        if !referenceImages.isEmpty {
+            payload["reference_images"] = .array(
+                referenceImages.map { .object(["url": .string($0)]) }
+            )
+        }
 
         let sentBearer = await currentBearer()
         var headers = defaultHeaders
@@ -351,6 +376,70 @@ public struct ImageToVideoInput: Codable, Sendable, Equatable, Hashable {
 public let IMAGE_TO_VIDEO_TOOL_NAME = "image_to_video"
 public let IMAGE_TO_VIDEO_DESCRIPTION = "Generate a video from a single source image; returns the saved video's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `videos/1.mp4`) rather than the absolute path, so it renders as a clickable link that opens the video. Provide `image` for the image to animate and optionally a `prompt` to guide the animation. Use this tool when the user provides an image and wants it animated, turned into a video, or used as the first frame. Example: image_to_video(image=\"/Users/me/photo.jpg\", prompt=\"gentle camera push-in with wind moving the hair\", duration=6, resolution_name=\"480p\")"
 
+/// `reference_to_video` arguments. Mirrors the Rust `ReferenceToVideoInput` schema
+/// (`mod.rs:898-930`).
+public struct ReferenceToVideoInput: Codable, Sendable, Equatable, Hashable {
+    public var prompt: String
+    public var images: [String]
+    public var aspectRatio: String
+    public var duration: UInt32?
+    public var resolutionName: String
+
+    public init(
+        prompt: String,
+        images: [String],
+        aspectRatio: String,
+        duration: UInt32? = nil,
+        resolutionName: String = DEFAULT_VIDEO_RESOLUTION
+    ) {
+        self.prompt = prompt
+        self.images = images
+        self.aspectRatio = aspectRatio
+        self.duration = duration
+        self.resolutionName = resolutionName
+    }
+
+    public enum CodingKeys: String, CodingKey {
+        case prompt
+        case images
+        case aspectRatio = "aspect_ratio"
+        case duration
+        case resolutionName = "resolution_name"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.prompt = try container.decode(String.self, forKey: .prompt)
+        self.images = try container.decode([String].self, forKey: .images)
+        self.aspectRatio = try container.decode(String.self, forKey: .aspectRatio)
+        self.duration = try Self.decodeDuration(from: container)
+        self.resolutionName = try container.decodeIfPresent(String.self, forKey: .resolutionName)
+            ?? DEFAULT_VIDEO_RESOLUTION
+    }
+
+    private static func decodeDuration(from container: KeyedDecodingContainer<CodingKeys>) throws -> UInt32? {
+        if let intValue = try container.decodeIfPresent(UInt32.self, forKey: .duration) {
+            return intValue
+        }
+        if let stringValue = try container.decodeIfPresent(String.self, forKey: .duration)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !stringValue.isEmpty {
+            guard let parsed = UInt32(stringValue) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .duration,
+                    in: container,
+                    debugDescription: "duration must be 6 or 10"
+                )
+            }
+            return parsed
+        }
+        return nil
+    }
+}
+
+public let REFERENCE_TO_VIDEO_TOOL_NAME = "reference_to_video"
+public let REFERENCE_TO_VIDEO_DESCRIPTION = "Generate a video from multiple reference images guided by a text prompt; returns the saved video's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `videos/1.mp4`) rather than the absolute path, so it renders as a clickable link that opens the video. Provide `images` with 2 to 7 image references and a required `prompt` describing the desired video. Use this tool when the user wants a video using multiple images as style/content references. Example: reference_to_video(prompt=\"blend these into a cinematic fashion shot with slow dolly movement\", images=[\"/Users/me/ref1.jpg\", \"/Users/me/ref2.jpg\"], aspect_ratio=\"16:9\", duration=6, resolution_name=\"480p\")"
+
 // MARK: - Validation
 
 public func validateImagineVideoDuration(_ duration: UInt32?) throws {
@@ -358,6 +447,14 @@ public func validateImagineVideoDuration(_ duration: UInt32?) throws {
     guard IMAGINE_VIDEO_DURATIONS_SECS.contains(duration) else {
         throw VideoGenError.invalidArguments(
             "`duration` must be either 6 or 10 seconds. Got \(duration)."
+        )
+    }
+}
+
+public func validateImagineVideoAspectRatio(_ aspectRatio: String) throws {
+    guard VALID_IMAGINE_VIDEO_ASPECT_RATIOS.contains(aspectRatio) else {
+        throw VideoGenError.invalidArguments(
+            "`aspect_ratio` must be one of: \(VALID_IMAGINE_VIDEO_ASPECT_RATIOS.joined(separator: ", ")). Got \(aspectRatio)."
         )
     }
 }

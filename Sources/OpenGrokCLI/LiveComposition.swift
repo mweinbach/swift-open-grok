@@ -3123,6 +3123,16 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     providerConfiguration: foundation.providerConfiguration
                 )
             )
+            // The ACP reverse permission bridge. Upstream's agent ALWAYS asks
+            // the client (`AcpPrompter::request`, permission/prompter.rs:775-781);
+            // this port answered ACP sessions from the local pager or refused
+            // outright, so a connected client could not approve anything. The
+            // prompter denies whenever the reverse channel cannot answer, so
+            // installing it never widens what a silent client authorizes.
+            let acpPermissionPrompter = LiveACPPermissionPrompter()
+            if let permissions = await foundation.toolExecutor.permissionHandle() {
+                await permissions.setPrompter(acpPermissionPrompter)
+            }
             let promptDriver = LiveACPPromptDriver(
                 driver: ProviderBackedACPPromptDriver(
                     providerSession: providerSession,
@@ -3133,6 +3143,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     skills: foundation.skillCatalog
                 ),
                 skillCatalog: foundation.skillCatalog,
+                permissionPrompter: acpPermissionPrompter,
                 shutdown: {
                     await stack.codeMode?.shutdown()
                     await foundation.toolExecutor.shutdown()
@@ -3289,7 +3300,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 promptDriver: promptDriver,
                 extensionHandler: extensionRouter,
                 extensionNotifications: extensionNotifications,
-                notificationGateway: gateway
+                notificationGateway: gateway,
+                permissionPrompter: acpPermissionPrompter
             )
         })
     }

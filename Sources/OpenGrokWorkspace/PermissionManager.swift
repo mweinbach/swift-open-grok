@@ -159,6 +159,14 @@ public actor PermissionHandle {
         self.hasLLMSideQuery = Self.sideQueryEnabled(classifier)
     }
 
+    /// Swap the interactive prompter after construction. `prompter` is
+    /// actor-isolated state, so a caller outside the actor cannot assign it
+    /// directly; the ACP carrier needs this to replace the fail-closed default
+    /// with the reverse-request prompter once a client is connected.
+    public func setPrompter(_ prompter: any PermissionPrompter) {
+        self.prompter = prompter
+    }
+
     public func setClassifierTranscript(_ transcript: String) {
         classifierTranscript = transcript
     }

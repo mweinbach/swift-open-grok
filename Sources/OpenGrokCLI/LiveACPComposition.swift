@@ -99,17 +99,23 @@ public struct LiveACPLaunchComponents: Sendable {
     /// emits into the void, which is why both carrier compositions attach
     /// immediately after construction.
     public let notificationGateway: ACPNotificationGateway?
+    /// Reverse-permission prompter installed on the session's
+    /// `PermissionHandle`. Carriers attach the live runtime as its reverse
+    /// client; `nil` keeps today's fail-closed denial prompter.
+    public let permissionPrompter: LiveACPPermissionPrompter?
 
     public init(
         promptDriver: LiveACPPromptDriver,
         extensionHandler: (any ACPAgentExtensionHandler)? = nil,
         extensionNotifications: ACPExtensionNotificationRouter? = nil,
-        notificationGateway: ACPNotificationGateway? = nil
+        notificationGateway: ACPNotificationGateway? = nil,
+        permissionPrompter: LiveACPPermissionPrompter? = nil
     ) {
         self.promptDriver = promptDriver
         self.extensionHandler = extensionHandler
         self.extensionNotifications = extensionNotifications
         self.notificationGateway = notificationGateway
+        self.permissionPrompter = permissionPrompter
     }
 }
 
@@ -123,17 +129,22 @@ public struct LiveACPPromptDriver: ACPPromptDriver {
     private let driver: any ACPPromptDriver
     private let availableCommands: [AvailableCommand]
     private let skillCatalog: [LiveSkills.SkillCommand]
+    /// When set, each `session/prompt` binds this session id onto the reverse
+    /// permission prompter so a gated tool call advertises the wire session.
+    private let permissionPrompter: LiveACPPermissionPrompter?
     public let shutdown: @Sendable () async -> Void
 
     public init(
         driver: any ACPPromptDriver,
         availableCommands: [AvailableCommand] = [],
         skillCatalog: [LiveSkills.SkillCommand] = [],
+        permissionPrompter: LiveACPPermissionPrompter? = nil,
         shutdown: @escaping @Sendable () async -> Void = {}
     ) {
         self.driver = driver
         self.availableCommands = availableCommands
         self.skillCatalog = skillCatalog
+        self.permissionPrompter = permissionPrompter
         self.shutdown = shutdown
     }
 
@@ -141,6 +152,12 @@ public struct LiveACPPromptDriver: ACPPromptDriver {
         context: ACPPromptContext,
         emit: @escaping @Sendable (SessionNotification, ACPNotificationDisposition) async -> Void
     ) async throws -> PromptResponse {
+        // Bind before the turn so a tool that prompts mid-turn sees this
+        // session id. Single active prompt per process is the common ACP
+        // shape; overlapping prompts on distinct sessions would race this
+        // slot — cost of the additive seam vs. threading session through
+        // `PermissionPrompter`.
+        await permissionPrompter?.bindSession(context.request.sessionId)
         if !availableCommands.isEmpty {
             await emit(
                 SessionNotification(
@@ -291,6 +308,14 @@ public enum LiveACPComposition {
         // serves it.
         if let gateway = launchComponents.notificationGateway {
             await gateway.attach(runtimeComponents.runtime)
+        }
+        // Reverse permission channel: the prompter issues
+        // `session/request_permission` through this runtime's reverse sender
+        // (installed when `serve`/`run` binds the transport).
+        if let permissionPrompter = launchComponents.permissionPrompter {
+            await permissionPrompter.attach(
+                client: ACPRuntimePermissionClient(runtimeComponents.runtime)
+            )
         }
         let host = ACPStdioHost(
             runtime: runtimeComponents.runtime,

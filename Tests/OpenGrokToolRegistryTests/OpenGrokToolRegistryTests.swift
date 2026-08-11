@@ -252,8 +252,10 @@ struct ToolRegistryTests {
 
     @Test("future tool kinds remain parseable without registering inert specs")
     func taxonomyOnlyKindsAreNotRegistered() throws {
+        // `image_to_video` / `reference_to_video` are real catalog entries now;
+        // keep only kinds that still have no RegisteredToolSpec.
         let taxonomyOnlyKinds: [ProductToolKind] = [
-            .lsp, .imageToVideo, .referenceToVideo, .searchTool, .useTool,
+            .lsp, .searchTool, .useTool,
         ]
         for kind in taxonomyOnlyKinds {
             let encoded = try JSONEncoder().encode(kind)
@@ -262,10 +264,21 @@ struct ToolRegistryTests {
 
         let registeredNames = Set(BuiltinToolCatalog.builtinTools.map(\.id))
         let taxonomyOnlyNames: Set<String> = [
-            "lsp", "reference_to_video",
+            "lsp",
         ]
         #expect(registeredNames.isDisjoint(with: taxonomyOnlyNames))
         #expect(registeredNames.contains("image_to_video"))
+        #expect(registeredNames.contains("reference_to_video"))
+        #expect(
+            BuiltinToolCatalog.videoToolKinds[BuiltinToolCatalog.referenceToVideoQualifiedId]
+                == .referenceToVideo
+        )
+        #expect(
+            BuiltinToolCatalog.referenceToVideoDescription
+                == BuiltinToolCatalog.videoTools
+                .first(where: { $0.id == "reference_to_video" })?
+                .description
+        )
     }
 }
 

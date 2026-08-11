@@ -33,9 +33,12 @@ Follow-on batch 2 also lands JWKS id_token validation, `--max-turns`,
 auto-mode heuristic classification, hub MCP→harness session connect, `/dream`
 consolidation, macOS `__mic-capture` voice + `/voice`, LSP `pull_diagnostics`,
 and backend-gated `image_to_video`. Auto-mode LLM side-query and full LSP
-post-edit sync landed 2026-08-11. Still open at the live seam: Antigravity,
-`reference_to_video`, ACP SDK reverse bridge, and platform evidence (Linux
-sandbox, Windows relaunch, WSS/custom CA, CI required checks).
+post-edit sync landed 2026-08-11, followed the same day by `reference_to_video`,
+the ACP reverse permission bridge (`session/request_permission`), and the first
+non-red platform CI — macOS/Linux/Windows had each failed on every push for
+three independent reasons, so every prior green claim was macOS-local only.
+Still open at the live seam: Antigravity, WSS/custom CA, Windows relaunch, and
+a reliably green CI (two known-flaky tests remain, recorded in `PORT_STATUS.md`).
 
 **Wave 19 update (2026-08-10):** the deferred-dashboard batch is now landed rather
 than standing. Retained dashboard sessions can dispatch prompts and replies; `/cd`,
