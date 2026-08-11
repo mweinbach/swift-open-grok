@@ -853,6 +853,11 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             // loop's "safe model boundary" (the root loop's identical drain
             // point sits at LiveShellSamplingDriver.runTurn's round top).
             items.append(contentsOf: takeChildFollowups(childID))
+            // Child sampling effort (Rust handle_request.rs:705-714): parse
+            // the resolved runtime token when present. A non-nil but unknown
+            // token is treated as no override so the parent sampler default
+            // still applies — fail-open on the string, not fail-closed.
+            let childEffort = runtime.reasoningEffort.flatMap(parseCanonicalEffortToken)
             let response: OpenGrokLiveSamplingResponse
             do {
                 response = try await context.sampler.sample(OpenGrokLiveSamplingRequest(
@@ -861,7 +866,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                     model: model,
                     prompt: prompt,
                     items: items,
-                    tools: executor.tools
+                    tools: executor.tools,
+                    reasoningEffort: childEffort
                 )) { _ in
                     // A child's tokens stream to no pane; the parent reads the
                     // finished result, same as a workflow child.

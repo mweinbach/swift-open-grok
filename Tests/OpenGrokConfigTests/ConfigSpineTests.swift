@@ -85,7 +85,6 @@ struct RemoteSettingsAllowlistTests {
         rs.folderTrustEnabled = false
         rs.writeFileEnabled = false
         rs.fileToolset = "restricted"
-        rs.sessionRecap = false
         rs.webFetchEnabled = false
         rs.imageGenEnabled = false
         rs.videoGenEnabled = false
@@ -111,11 +110,12 @@ struct RemoteSettingsAllowlistTests {
         #expect(projected.workspaceCommandEnabled == nil)
         #expect(projected.zdrAccessEnabled == nil)
         #expect(projected.gateMessage == nil)
+        #expect(projected.sessionRecap == nil)
     }
 
     @Test("allowlisted wire name set is complete")
     func wireNameSetComplete() {
-        #expect(remoteSettingsAllowlistedWireNames.count == 11)
+        #expect(remoteSettingsAllowlistedWireNames.count == 12)
         #expect(remoteSettingsAllowlistedWireNames.contains("telemetry_mode"))
         #expect(remoteSettingsAllowlistedWireNames.contains("telemetry_enabled"))
         #expect(remoteSettingsAllowlistedWireNames.contains("external_otel_disabled"))
@@ -127,6 +127,7 @@ struct RemoteSettingsAllowlistTests {
         #expect(remoteSettingsAllowlistedWireNames.contains("workspace_command_enabled"))
         #expect(remoteSettingsAllowlistedWireNames.contains("zdr_access_enabled"))
         #expect(remoteSettingsAllowlistedWireNames.contains("gate_message"))
+        #expect(remoteSettingsAllowlistedWireNames.contains("session_recap"))
     }
 
     @Test("non-allowlisted wire names are not in the set")
@@ -134,7 +135,7 @@ struct RemoteSettingsAllowlistTests {
         let shouldNotBeAllowlisted: [String] = [
             "leader_mode", "max_upload_file_bytes",
             "memory_enabled", "lsp_tools_enabled", "folder_trust_enabled",
-            "write_file_enabled", "file_toolset", "session_recap",
+            "write_file_enabled", "file_toolset",
             "web_fetch_enabled", "image_gen_enabled", "video_gen_enabled",
             "feedback_enabled", "compaction_mode", "two_pass_compaction_enabled",
             "default_model", "subscription_tier", "permission_mode",
@@ -374,8 +375,8 @@ struct EffectiveFeaturesPrecedenceTests {
 @Suite("Remote fields inertness")
 struct RemoteFieldsInertnessTests {
 
-    @Test("non-allowlisted remote sessionRecap cannot override EffectiveFeatures")
-    func sessionRecapInert() {
+    @Test("allowlisted remote sessionRecap reaches EffectiveFeatures")
+    func sessionRecapAllowlisted() {
         var rs = RemoteSettings()
         rs.sessionRecap = false
         let projected = AllowlistedRemoteSettings(projecting: rs)
@@ -383,8 +384,9 @@ struct RemoteFieldsInertnessTests {
         let inputs = FeatureResolutionInputs(remote: projected)
         let features = EffectiveFeatures.resolve(inputs)
 
-        #expect(features.sessionRecap.value == true)
-        #expect(features.sessionRecap.source == .default)
+        #expect(features.sessionRecap.value == false)
+        #expect(features.sessionRecap.source == .remote)
+        #expect(projected.sessionRecap == false)
     }
 
     @Test("non-allowlisted remote webFetchEnabled cannot override EffectiveFeatures")

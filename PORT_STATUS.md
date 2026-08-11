@@ -1,7 +1,7 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 20 deferred batch complete. Serial gate re-run exited 0 with **5,786 Swift Testing cases across 105 nonempty summaries**, zero failed summaries, and zero issues.)
-**Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, ACP `x.ai/share_session`, hub MCP session connect, and post-change Linux/Windows CI plus required-check evidence remain open.
+**As of:** 2026-08-10 (Wave 20 follow-on deferred slices complete. Serial gate exited 0 with **5,801 Swift Testing cases across 105 nonempty summaries**, zero failed summaries, and zero issues.)
+**Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, hub MCP session connect, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
 **Fixture pin:** `ProtocolFixtures/` was re-evaluated against `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` on 2026-08-08, with `70002584da34e4c37ea14a3bce35341b7d04f9a7` recorded as the immediate previous revision. The `.58` delta touched no fixture family's upstream source (every family's `referenceSources` diff across `70002584..650c1db7`, including `Cargo.lock` and the telemetry/tracing surfaces, verified empty by the lead), so the only recaptures are the two release-stamped artifacts (CLI version fixture and the GCRX sample, both restamped `0.1.220-open-grok.58` — the GCRX golden by same-length in-place substitution at offset 32); unchanged families carry explicit `70002584..650c1db7` diff evidence.
@@ -35,19 +35,40 @@ zero issues.
   `LiveShareBackendHTTPClient` reach the launcher through
   `LiveShareRouteDependencies`; headless `open-grok share` can upload via signed
   URL (best-effort) and complete the backend upsert/save/share flow
-  (`share.rs:150-199`, `client.rs:360-388`). ACP `x.ai/share_session` remains
-  unwired.
+  (`share.rs:150-199`, `client.rs:360-388`).
 - **Foreign sessions:** `LiveForeignSessionScanner` feeds `sessions list` with
   Claude/Codex summaries (read-only; import/writeback deferred).
 - **XTVERSION / doctor:** `LiveXtversionCollector` folds into `/doctor` when a TTY
   is available (`xtversion.rs:38-65`).
 
+### Wave 20 follow-on (2026-08-10)
+
+Landed after the Wave 20 serial gate; focused proof before the commit gate:
+
+- **ACP `x.ai/share_session`:** `LiveShareACPHandler` returns the raw `share_url`
+  object (no ExtMethodResult envelope) through the live ACP extension router;
+  export-boundary registration covers resident ACP sessions (`share.rs:31-56`).
+- **CLI `--tools` / `--disallowed-tools`:** unrefused; `resolveLaunchPolicy` merges
+  into `LiveAgentToolPolicy` at tool-executor construction (`config.rs:1733-1768`).
+- **Child reasoning effort:** `OpenGrokLiveSamplingRequest.reasoningEffort` reaches
+  the production sampler; `LiveSubagentHost.runChild` parses persona effort tokens
+  (`handle_request.rs:705-714`).
+- **`SetPlanMode(Off)` / settings `plan_mode`:** `disarmPlanMode` → `exitPlanMode()`;
+  settings apply accepts a bool like swarm (`exit_plan_mode` path).
+- **`session_recap` remote gate:** allowlisted through `AllowlistedRemoteSettings` →
+  `EffectiveFeatures` → `LiveRecap.enabled` (`config.rs:2657-2667`).
+
+**Verification:** `zsh workflows/swift-safe-verify.zsh test --no-parallel`
+exited 0 on 2026-08-10 with **5,801 Swift Testing cases across 105 nonempty
+summaries** and zero issues. Focused pre-gate: ConfigSpine **34**,
+share/ACP/launch/child-effort **32**, plan+child-effort **11**.
+
 ### Still deferred from the audit
 
-Hub MCP session connect (interactive transport owner), ACP share handler, voice,
-Antigravity, auto-mode classifier, dream, LSP, video tools, ACP SDK reverse
-bridge, durable subagent resume, relocation journal, Linux/Windows CI evidence,
-portable WSS/custom CA, and capable-Linux sandbox proof.
+Hub MCP session connect (interactive transport owner), voice, Antigravity,
+auto-mode classifier, dream, LSP, video tools, ACP SDK reverse bridge, durable
+subagent resume, relocation journal, Linux/Windows CI evidence, portable
+WSS/custom CA, and capable-Linux sandbox proof.
 
 ## Wave 19 — Deferred parity follow-ons (2026-08-10, complete)
 

@@ -24,11 +24,15 @@
 //     mcp.rs:387), and the session-admin trio `x.ai/session/rename` /
 //     `x.ai/session/delete` / `x.ai/session/fork`
 //     (`LiveSessionAdminACPHandler`, LiveSessionAdminACPHandlers.swift —
-//     the real `$OPENGROK_HOME/sessions` store). Every routed method's
-//     payload mirrors the upstream payload builders byte-for-byte in copy
-//     (`acp_agent.rs:32-181`) inside upstream's `ExtMethodResult` envelope
-//     `{"result": <payload>}` (`session/result.rs:29-72`) — except the
-//     session-admin trio, whose upstream handlers answer RAW
+//     the real `$OPENGROK_HOME/sessions` store), and `x.ai/share_session`
+//     (`LiveShareACPHandler`, LiveShareACPHandler.swift — authorize +
+//     upload through `LiveShareComposition.shareURL`, RAW
+//     `{"share_url":…}` via `to_raw_response`, share.rs:145-146). Every
+//     routed method's payload mirrors the upstream payload builders
+//     byte-for-byte in copy (`acp_agent.rs:32-181`) inside upstream's
+//     `ExtMethodResult` envelope `{"result": <payload>}`
+//     (`session/result.rs:29-72`) — except the session-admin trio and
+//     share_session, whose upstream handlers answer RAW
 //     (`to_raw_response`, extensions/mod.rs:69-73), mirrored here.
 //   * Everything else at the upstream pin falls through to the router's
 //     terminal arm and gets upstream's unknown-method error byte-exact
@@ -49,7 +53,8 @@
 //     `x.ai/skills/refresh-baseline` (:4159), `x.ai/interject` (:4165),
 //     `x.ai/feedback/dismiss` (:4166 — its `x.ai/btw` sibling left this
 //     list with item 7), `x.ai/cloud/*` (:4170-4370), `x.ai/billing` +
-//     `x.ai/auto-topup-rule` (:4371-4374), `x.ai/share_session` (:4375),
+//     `x.ai/auto-topup-rule` (:4371-4374; `x.ai/share_session` at :4375
+//     left this list when `LiveShareACPHandler` registered),
 //     `x.ai/privacy/*` (:4376), `x.ai/rollout/survey` (:4379),
 //     `x.ai/prompt_history` (:4382), `x.ai/suggest`/`x.ai/suggestPrompt`
 //     (:4385-4386), the prefix families `x.ai/session_summaries/`,
@@ -84,7 +89,8 @@ enum LiveACPExtensionRouter {
         recap: LiveRecapACPHandler? = nil,
         btw: LiveBtwACPHandler? = nil,
         mcp: LiveMCPACPHandler? = nil,
-        sessionAdmin: LiveSessionAdminACPHandler? = nil
+        sessionAdmin: LiveSessionAdminACPHandler? = nil,
+        share: LiveShareACPHandler? = nil
     ) -> ACPExtensionMethodRouter {
         var router = ACPExtensionMethodRouter()
         if let feedback {
@@ -116,6 +122,12 @@ enum LiveACPExtensionRouter {
             for method in LiveSessionAdminACPHandler.methods {
                 router = router.register(exact: method, handler: sessionAdmin)
             }
+        }
+        if let share {
+            // `x.ai/share_session` (acp_agent.rs:4375 → share.rs:31-146).
+            // `nil` keeps the method on the refused table rather than
+            // answering without auth/upload clients.
+            router = router.register(exact: LiveShareACPHandler.method, handler: share)
         }
         return router
     }

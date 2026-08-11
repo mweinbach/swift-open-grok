@@ -80,8 +80,7 @@ public enum LiveShareComposition {
     ///   - liveBoundaries: the live session's `ExportBoundary` when the
     ///     session is resident in this process (upstream consults the live
     ///     session table, share.rs:69-76). The headless share route never
-    ///     has one; the seam exists for the future ACP
-    ///     `x.ai/share_session` handler, which does.
+    ///     has one; the ACP `x.ai/share_session` handler does.
     ///   - signedUploadClient: the GCS signed-URL upload client
     ///     (share.rs:150-199). `nil` skips the upload — the backend API
     ///     path is the primary, with GCS as the large-payload fallback.
@@ -105,6 +104,46 @@ public enum LiveShareComposition {
                 "share requires a session id: open-grok share <session-id>"
             )
         }
+        let shareURL: String
+        do {
+            shareURL = try await self.shareURL(
+                sessionID: sessionID,
+                environment: environment,
+                remoteSettings: remoteSettings,
+                persistedBoundaryMarkers: persistedBoundaryMarkers,
+                liveBoundaries: liveBoundaries,
+                signedUploadClient: signedUploadClient,
+                backendClient: backendClient
+            )
+        } catch let refusal as ShareRefusal {
+            // CLI surface keeps the refusal string; ACP maps the typed case.
+            throw CLIApplicationError.failed(refusal.message)
+        }
+        // share_cmd.rs:49: upstream prints exactly the share URL.
+        streams.out(shareURL + "\n")
+    }
+
+    /// Authorize and upload a share, returning the public URL.
+    ///
+    /// Same gate order and clients as `run`, but returns the URL for the ACP
+    /// `x.ai/share_session` handler (`to_raw_response`, share.rs:145-146)
+    /// instead of printing it. Throws `ShareRefusal` for upstream refusal
+    /// kinds so the ACP arm can map them to `auth_required` /
+    /// `invalid_params` / `resource_not_found` without string matching.
+    public static func shareURL(
+        sessionID: String,
+        environment: [String: String],
+        remoteSettings: RemoteSettings? = nil,
+        persistedBoundaryMarkers: (@Sendable (String) -> Bool?)? = nil,
+        liveBoundaries: (@Sendable (String) -> ExportBoundary?)? = nil,
+        signedUploadClient: (any ShareSignedUploadClient)? = nil,
+        backendClient: (any ShareBackendClient)? = nil
+    ) async throws -> String {
+        guard !sessionID.isEmpty else {
+            throw CLIApplicationError.failed(
+                "share requires a session id: open-grok share <session-id>"
+            )
+        }
 
         let home = OpenGrokHomeResolver.resolve(environment: environment)
         let manager = AuthManager(grokHome: home, environment: environment)
@@ -117,19 +156,15 @@ public enum LiveShareComposition {
                 AllowlistedRemoteSettings(projecting: $0).sharingEnabled ?? false
             } ?? false
 
-        do {
-            // share.rs:34-57: auth, sharing_enabled, ZDR — before any I/O.
-            try ShareExportGate.authorizeAccount(auth: auth, sharingEnabled: sharingEnabled)
-        } catch let refusal as ShareRefusal {
-            throw CLIApplicationError.failed(refusal.message)
-        }
+        // share.rs:34-57: auth, sharing_enabled, ZDR — before any I/O.
+        try ShareExportGate.authorizeAccount(auth: auth, sharingEnabled: sharingEnabled)
 
         // share.rs:59-67: the session lookup sits between the account checks
         // and the boundary check upstream, so "Session not found" outranks
         // a boundary refusal but never an auth refusal.
         let store = LiveConversationStore(openGrokHome: home)
         guard let record = try await store.loadIfPresent(sessionID: sessionID) else {
-            throw CLIApplicationError.failed(ShareRefusal.sessionNotFound.message)
+            throw ShareRefusal.sessionNotFound
         }
 
         let liveBoundary = liveBoundaries?(sessionID) ?? nil
@@ -148,15 +183,11 @@ public enum LiveShareComposition {
             )
         }
 
-        do {
-            try ShareExportGate.authorizeExport(
-                persistedEverUsedNonXAI: persistedMarker ?? false,
-                liveBoundary: liveBoundary,
-                messageCount: record.items.count
-            )
-        } catch let refusal as ShareRefusal {
-            throw CLIApplicationError.failed(refusal.message)
-        }
+        try ShareExportGate.authorizeExport(
+            persistedEverUsedNonXAI: persistedMarker ?? false,
+            liveBoundary: liveBoundary,
+            messageCount: record.items.count
+        )
 
         // Fail-closed when no backend client is configured: every gate
         // passed, but there is no path to deliver the share to the backend.
@@ -184,16 +215,11 @@ public enum LiveShareComposition {
 
         // share.rs:117-123: mid-share boundary recheck. A session that
         // crossed the boundary while data was uploading is refused here.
-        do {
-            try ShareExportGate.authorizePostExport(liveBoundary: liveBoundary)
-        } catch let refusal as ShareRefusal {
-            throw CLIApplicationError.failed(refusal.message)
-        }
+        try ShareExportGate.authorizePostExport(liveBoundary: liveBoundary)
 
         // share.rs:126-138: upload to backend and get share URL.
-        let shareURL: String
         do {
-            shareURL = try await backendClient.shareSession(
+            return try await backendClient.shareSession(
                 sessionID: sessionID,
                 items: record.items,
                 title: record.title,
@@ -204,8 +230,5 @@ public enum LiveShareComposition {
                 "Failed to share session: \(error)"
             )
         }
-
-        // share_cmd.rs:49: upstream prints exactly the share URL.
-        streams.out(shareURL + "\n")
     }
 }

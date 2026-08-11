@@ -275,6 +275,21 @@ struct LivePagerPlanCommandReachabilityTests {
         try await session.renderer.restoreTerminal()
     }
 
+    @Test("disarmPlanMode clears the same live gate armPlanMode armed")
+    func disarmPlanModeClearsTheGate() async throws {
+        let workspace = PlanWorkspace()
+        defer { workspace.cleanup() }
+        let session = try await PlanCommandSession.start(workspace)
+        #expect(await session.executor.armPlanMode())
+        #expect(await session.executor.planModeActive())
+        #expect(await session.planGateArmed(workspace: workspace, probe: "armed"))
+
+        #expect(await session.executor.disarmPlanMode())
+        #expect(await !session.executor.planModeActive())
+        #expect(await !session.planGateArmed(workspace: workspace, probe: "disarmed"))
+        try await session.renderer.restoreTerminal()
+    }
+
     @Test("/plan after the enter_plan_mode tool is idempotent: toast only, gate stays armed")
     func planIsIdempotentWithToolArm() async throws {
         let workspace = PlanWorkspace()

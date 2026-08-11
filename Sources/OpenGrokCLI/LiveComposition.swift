@@ -234,6 +234,11 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
     /// (`ConversationExtensions.swift:224`); on the other backends it is
     /// carried but ignored, and the runner falls back to parsing the text.
     public let jsonSchema: JSONValue?
+    /// Per-request reasoning effort override. When set, wins over the
+    /// sampler config default in `SamplingClient.applyConversationDefaults`
+    /// (nil request field → config fills in). Child subagent turns use this
+    /// for `runtime.reasoningEffort` (Rust handle_request.rs:705-714).
+    public let reasoningEffort: ReasoningEffort?
 
     public init(
         sessionID: String,
@@ -242,7 +247,8 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         prompt: String,
         items: [ConversationItem]? = nil,
         tools: [ToolSpec] = [],
-        jsonSchema: JSONValue? = nil
+        jsonSchema: JSONValue? = nil,
+        reasoningEffort: ReasoningEffort? = nil
     ) {
         self.sessionID = sessionID
         self.turnID = turnID
@@ -251,6 +257,7 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         self.items = items ?? [.user(prompt)]
         self.tools = tools
         self.jsonSchema = jsonSchema
+        self.reasoningEffort = reasoningEffort
     }
 }
 
@@ -369,6 +376,7 @@ public struct OpenGrokLiveSampler: Sendable {
                 model: request.model,
                 xGrokReqId: request.turnID,
                 xGrokSessionId: request.sessionID,
+                reasoningEffort: request.reasoningEffort,
                 jsonSchema: request.jsonSchema
             )) { delta in
                 await emit(.output(delta))
@@ -943,21 +951,45 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 return try await LiveLeaderComposition.session(
                     for: command,
                     context: context,
-                    services: Self.liveACPServices(dependencies: dependencies)
+                    services: Self.liveACPServices(
+                        dependencies: dependencies,
+                        liveBoundaries: { sessionID in
+                            exportBoundaries.boundary(for: sessionID)
+                        },
+                        registerExportBoundary: { sessionID, boundary in
+                            exportBoundaries.register(sessionID: sessionID, boundary: boundary)
+                        }
+                    )
                 )
             }
             if LiveServeComposition.handles(command) {
                 return try await LiveServeComposition.session(
                     for: command,
                     context: context,
-                    services: Self.liveACPServices(dependencies: dependencies)
+                    services: Self.liveACPServices(
+                        dependencies: dependencies,
+                        liveBoundaries: { sessionID in
+                            exportBoundaries.boundary(for: sessionID)
+                        },
+                        registerExportBoundary: { sessionID, boundary in
+                            exportBoundaries.register(sessionID: sessionID, boundary: boundary)
+                        }
+                    )
                 )
             }
             if LiveACPComposition.handles(command) {
                 return try await LiveACPComposition.session(
                     for: command,
                     context: context,
-                    services: Self.liveACPServices(dependencies: dependencies)
+                    services: Self.liveACPServices(
+                        dependencies: dependencies,
+                        liveBoundaries: { sessionID in
+                            exportBoundaries.boundary(for: sessionID)
+                        },
+                        registerExportBoundary: { sessionID, boundary in
+                            exportBoundaries.register(sessionID: sessionID, boundary: boundary)
+                        }
+                    )
                 )
             }
             if LivePluginComposition.handles(command) {
@@ -1114,7 +1146,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             return value
                         }
                         .joined(separator: "\n\n"),
-                        toolPolicy: agentProfile?.toolPolicy,
+                        toolPolicy: LiveAgentToolPolicy.resolveLaunchPolicy(
+                            tools: options.agentOptions.tools,
+                            disallowedTools: options.agentOptions.disallowedTools,
+                            profile: agentProfile?.toolPolicy
+                        ),
                         fileAccessPolicy: Self.resolveFileAccessPolicy(
                             environment: context.environment,
                             coordinator: permissionCoordinator
@@ -2123,8 +2159,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     /// started validating and applying it to the initial session.
 
     private static func unhonoredLaunchFlag(_ options: CLIExecutionOptions) -> String? {
-        if options.agentOptions.tools != nil { return "--tools" }
-        if options.agentOptions.disallowedTools != nil { return "--disallowed-tools" }
+        // `--tools` / `--disallowed-tools` are honored by
+        // `LiveAgentToolPolicy.resolveLaunchPolicy` at tool-executor
+        // construction — not refused here.
         if options.agentOptions.agent != nil { return "--agent" }
         if options.agentOptions.agentsJSON != nil { return "--agents" }
         if options.agentOptions.maxTurns != nil { return "--max-turns" }
@@ -2693,7 +2730,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             processBackend: processBackend,
             sessionID: sessionID,
             workingDirectory: cwd,
-            toolPolicy: agentProfile?.toolPolicy,
+            toolPolicy: LiveAgentToolPolicy.resolveLaunchPolicy(
+                tools: options.agentOptions.tools,
+                disallowedTools: options.agentOptions.disallowedTools,
+                profile: agentProfile?.toolPolicy
+            ),
             telemetryBootstrapContext: telemetryBootstrapContext,
             fileAccessPolicy: fileAccessPolicy,
             environment: context.environment,
@@ -3016,7 +3057,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     /// fail-closed write permissions, hooks and MCP tools. Nothing about the
     /// stack is ACP-specific; only the thing consuming it differs.
     static func liveACPServices(
-        dependencies: OpenGrokLiveCompositionDependencies
+        dependencies: OpenGrokLiveCompositionDependencies,
+        liveBoundaries: (@Sendable (String) -> ExportBoundary?)? = nil,
+        registerExportBoundary: (@Sendable (String, ExportBoundary) -> Void)? = nil
     ) -> LiveACPServices {
         LiveACPServices(makeComponents: { launch in
             let context = CLIApplicationContext(
@@ -3148,6 +3191,18 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 },
                 closeLive: { sessionCloseLatch.close() }
             )
+            // Same registry the headless `share` route consults: register
+            // the resident ACP session's boundary so `x.ai/share_session`
+            // and a concurrent CLI share see the live gate (share.rs:69-76).
+            let sharedExportBoundary = await history.sharedExportBoundary
+            registerExportBoundary?(foundation.sessionID, sharedExportBoundary)
+            let shareHandler = LiveShareACPHandler(
+                environment: launch.environment,
+                liveBoundaries: liveBoundaries ?? { sessionID in
+                    sessionID == foundation.sessionID ? sharedExportBoundary : nil
+                },
+                routeDependencies: dependencies.shareRoute
+            )
             let extensionRouter = LiveACPExtensionRouter.build(
                 feedback: LiveFeedbackACPHandler(composition: foundation.feedback),
                 models: LiveModelsACPHandler(
@@ -3178,7 +3233,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     history: LiveBtwHistoryStore(openGrokHome: launch.openGrokHome)
                 ),
                 mcp: mcpHandler,
-                sessionAdmin: sessionAdmin
+                sessionAdmin: sessionAdmin,
+                share: shareHandler
             )
             // Inbound ext notifications land on the LIVE state, never a
             // mirror: yolo on the session permission-mode handle, swarm on
@@ -5232,6 +5288,17 @@ struct LiveToolExecutor: Sendable {
         return true
     }
 
+    /// Disarm the plan gate for settings `plan_mode = false` through the same
+    /// `PermissionPipeline.exitPlanMode` seam `ExitPlanModeToolHandler`
+    /// calls after approval. Status-returning like `armPlanMode`: a nil
+    /// pipeline means the gate cannot disarm, and the caller must not claim
+    /// an exit that did not happen.
+    func disarmPlanMode() async -> Bool {
+        guard let permissionPipeline else { return false }
+        await permissionPipeline.exitPlanMode()
+        return true
+    }
+
     /// The absolute plan-file path `/view-plan` reads — the live tracker's
     /// resolved path, i.e. exactly the file the plan-file auto-approval gate
     /// compares edits against — not a second, recomputed location. `nil`
@@ -6316,6 +6383,91 @@ struct LiveAgentToolPolicy: Sendable, Equatable {
         self.sessionAllowlist = sessionAllowlist
         self.sessionDenylist = sessionDenylist
         self.capabilityMode = capabilityMode
+    }
+
+    /// Merge CLI `--tools` / `--disallowed-tools` with an optional agent-profile
+    /// policy.
+    ///
+    /// Merge rules (CLI wins on allowlist, unions on denylist):
+    /// - `--tools` set: `configuredTools` and `allowlist` become those names
+    ///   (replacing any profile allowlist — membership in `configuredTools` is
+    ///   required by `allows()`, so no wildcard).
+    /// - only `--disallowed-tools`: `configuredTools = ["*"]`, denylist = those
+    ///   names.
+    /// - both: allowlist/`configuredTools` from `--tools`, denylist from
+    ///   `--disallowed-tools`.
+    /// - with a profile: CLI `--tools` replaces the profile allowlist when set;
+    ///   CLI disallowed unions with the profile denylist. Session lists and
+    ///   capability mode stay on the profile.
+    /// - neither CLI flag nor profile: `nil` (unrestricted surface).
+    static func resolveLaunchPolicy(
+        tools: String?,
+        disallowedTools: String?,
+        profile: LiveAgentToolPolicy?
+    ) -> LiveAgentToolPolicy? {
+        let cliTools = parseCommaSeparatedToolNames(tools)
+        let cliDenied = parseCommaSeparatedToolNames(disallowedTools)
+        if cliTools == nil, cliDenied == nil {
+            return profile
+        }
+
+        if let profile {
+            let configured: [String]
+            let allow: [String]
+            if let cliTools {
+                configured = cliTools
+                allow = cliTools
+            } else {
+                configured = profile.configuredTools
+                allow = profile.allowlist
+            }
+            let denied = uniquingPreserveOrder(profile.denylist + (cliDenied ?? []))
+            return LiveAgentToolPolicy(
+                configuredTools: configured,
+                allowlist: allow,
+                denylist: denied,
+                sessionAllowlist: profile.sessionAllowlist,
+                sessionDenylist: profile.sessionDenylist,
+                capabilityMode: profile.capabilityMode
+            )
+        }
+
+        if let cliTools {
+            return LiveAgentToolPolicy(
+                configuredTools: cliTools,
+                allowlist: cliTools,
+                denylist: cliDenied ?? [],
+                sessionAllowlist: nil,
+                sessionDenylist: [],
+                capabilityMode: nil
+            )
+        }
+        return LiveAgentToolPolicy(
+            configuredTools: [wildcard],
+            allowlist: [],
+            denylist: cliDenied ?? [],
+            sessionAllowlist: nil,
+            sessionDenylist: [],
+            capabilityMode: nil
+        )
+    }
+
+    /// Comma-separated tool names: trim whitespace, drop empties. `nil` input
+    /// stays `nil` (flag absent); an empty/whitespace-only string yields `[]`.
+    static func parseCommaSeparatedToolNames(_ raw: String?) -> [String]? {
+        guard let raw else { return nil }
+        return raw.split(separator: ",", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func uniquingPreserveOrder(_ names: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for name in names where seen.insert(name).inserted {
+            result.append(name)
+        }
+        return result
     }
 
     /// A policy that constrains nothing except the capability mode.
@@ -14012,6 +14164,34 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                         await toolExecutor.swarmMode.enter(.manual)
                     } else {
                         await toolExecutor.swarmMode.exit()
+                    }
+                }
+                await applySettingsEvent(event)
+                return
+            }
+            if key == "plan_mode" {
+                // Same live-then-persist shape as `swarm_mode`: the settings
+                // row arms/disarms the session plan gate immediately
+                // (upstream `Action::SetPlanMode`), then the shared store
+                // write persists `ui.plan_mode`. No toast here — the modal
+                // commit path for swarm likewise stays silent; `/plan` owns
+                // the slash toast. There is no `/plan off` slash path in
+                // this port (only `.planModeOn` / `.enterPlanMode`).
+                if let toolExecutor {
+                    if flag {
+                        if await !toolExecutor.planModeActive() {
+                            guard await toolExecutor.armPlanMode() else {
+                                // No pipeline — preference still persists so
+                                // the next full session can honor it.
+                                await applySettingsEvent(event)
+                                return
+                            }
+                        }
+                    } else if await toolExecutor.planModeActive() {
+                        guard await toolExecutor.disarmPlanMode() else {
+                            await applySettingsEvent(event)
+                            return
+                        }
                     }
                 }
                 await applySettingsEvent(event)

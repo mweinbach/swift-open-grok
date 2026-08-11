@@ -71,6 +71,12 @@ public struct AllowlistedRemoteSettings: Sendable, Equatable {
     /// `gate_message` — consumed by `refreshPrivacyBannerState()`.
     public var gateMessage: String?
 
+    // -- Session recap (LiveRecap / EffectiveFeatures) --
+
+    /// `session_recap` — consumed by `EffectiveFeatures.resolve` →
+    /// `LiveRecap.enabled` (`resolve_session_recap`, config.rs:2657-2667).
+    public var sessionRecap: Bool?
+
     public init() {}
 }
 
@@ -93,6 +99,7 @@ extension AllowlistedRemoteSettings {
         self.workspaceCommandEnabled = remote.workspaceCommandEnabled
         self.zdrAccessEnabled = remote.zdrAccessEnabled
         self.gateMessage = remote.gateMessage
+        self.sessionRecap = remote.sessionRecap
     }
 }
 
@@ -113,4 +120,5 @@ public let remoteSettingsAllowlistedWireNames: Set<String> = [
     "workspace_command_enabled",
     "zdr_access_enabled",
     "gate_message",
+    "session_recap",
 ]

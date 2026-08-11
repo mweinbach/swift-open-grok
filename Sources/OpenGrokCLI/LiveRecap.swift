@@ -548,28 +548,41 @@ enum LiveRecap {
     }
 
     /// Session recap gate. Default ON — disable via the `GROK_SESSION_RECAP`
-    /// env or the `[features] session_recap` config key
-    /// (`resolve_session_recap`, `agent/config.rs:2657-2667`). The remote
-    /// settings leg is not ported: this composition has no live
-    /// remote-settings surface at this seam (recorded divergence).
+    /// env, the `[features] session_recap` config key, or allowlisted remote
+    /// `session_recap` (`resolve_session_recap`, `agent/config.rs:2657-2667`).
+    /// Precedence matches `EffectiveFeatures`: env > config > remote > default.
     static func enabled(
         workingDirectory: URL,
         openGrokHome: URL,
-        environment: [String: String]
+        environment: [String: String],
+        remoteSessionRecap: Bool? = nil
     ) -> Bool {
-        if let fromEnv = boolFromEnv(environment["GROK_SESSION_RECAP"]) {
-            return fromEnv
-        }
-        for table in configTables(
+        var remote = AllowlistedRemoteSettings()
+        remote.sessionRecap = remoteSessionRecap
+        let tables = configTables(
             workingDirectory: workingDirectory,
             openGrokHome: openGrokHome,
             environment: environment
-        ) {
+        )
+        // Project-then-user tables: first hit wins for the TOML tier, matching
+        // the prior local-only resolver. Fold them into one features table for
+        // EffectiveFeatures (which reads a single effective root).
+        var features = TOMLTable()
+        for table in tables.reversed() {
             if case .boolean(let value)? = table[path: ["features", "session_recap"]] {
-                return value
+                features.insert(.boolean(value), forKey: "session_recap")
             }
         }
-        return true
+        var rootTable = TOMLTable()
+        if !features.isEmpty {
+            rootTable.insert(.table(features), forKey: "features")
+        }
+        let inputs = FeatureResolutionInputs(
+            effectiveConfig: .table(rootTable),
+            remote: remote,
+            environment: environment
+        )
+        return EffectiveFeatures.resolve(inputs).sessionRecap.value
     }
 
     private static func configTables(

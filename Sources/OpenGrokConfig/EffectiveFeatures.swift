@@ -131,7 +131,7 @@ extension EffectiveFeatures {
             sessionRecap: resolveFlag(
                 key: "session_recap",
                 envVar: "GROK_SESSION_RECAP",
-                remoteValue: nil,
+                remoteValue: inputs.remote.sessionRecap,
                 defaultValue: true,
                 inputs: inputs
             ),
