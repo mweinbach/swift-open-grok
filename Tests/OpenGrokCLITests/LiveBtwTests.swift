@@ -19,9 +19,9 @@
 // pins, UTF-8 sink, bounded polls) and `LiveInterjectionTests.swift` (canned
 // sampler over the real stack for the mid-turn probe).
 
-import CryptoKit
 import Foundation
 import Testing
+import OpenGrokFileUtils
 import OpenGrokHTTP
 import OpenGrokModels
 import OpenGrokPager
@@ -48,8 +48,9 @@ struct LiveBtwHelperTests {
     func instructionIsByteExact() {
         let text = LiveBtw.instruction(tag: "system-reminder", question: "why")
         #expect(text.utf8.count == 1099)
-        let digest = SHA256.hash(data: Data(text.utf8))
-        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        // The port's own SHA256 rather than CryptoKit, which is Apple-only and
+        // took the whole Linux test build down with it.
+        let hex = FileChecksum.sha256Hex(text)
         #expect(hex == "b3c49c89275a329dcd02d26b66f7a161586ff59ba4fe2931de91606f17a5d547")
     }
 
