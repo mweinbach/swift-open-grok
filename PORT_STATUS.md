@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Deferred runtime wave complete. Serial gate exited 0 with **5,872 Swift Testing cases across 106 nonempty summaries**, zero failed summaries, and zero issues.)
+**As of:** 2026-08-11 (Auto-mode LLM classifier + full LSP post-edit sync live. Serial gate exited 0 with **5,285 Swift Testing cases across 74 nonempty summaries**, zero failed summaries, and zero issues. Prior deferred-runtime green: 5,872 / 106 on 2026-08-10.)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -84,10 +84,12 @@ summaries** and zero issues.
 Rust-parity recommended slices against pin `650c1db7`, lead-wired through
 `LiveComposition` / pager / settings honesty:
 
-- **Auto-mode heuristic:** `HeuristicPermissionClassifier` is the default
-  `PermissionHandle` classifier; settings `"auto"` is ungated
-  (`auto_mode.rs:339-447`). Deliberate gap: no tree-sitter shell parse — opaque
-  shell Blocks (Rust fail-closed when parse fails). LLM side-query still absent.
+- **Auto-mode heuristic + LLM classifier:** `HeuristicPermissionClassifier` is
+  the default; entering `.auto` (Shift+Tab / settings / ACP) installs
+  `LlmPermissionClassifier` via `LiveAutoModeComposition` (aux sampler + JSON
+  schema, 30s timeout → ask; unparseable → heuristic). Deliberate gap: no
+  tree-sitter shell parse — opaque shell Blocks (Rust fail-closed when parse
+  fails).
 - **Hub MCP session connect (Rust direction):** local MCP clients bridge onto the
   hub `ToolHarness` via `MCPClientTransportAdapter` + `LiveHubSessionMCP`
   (`handle.rs:start_session_mcp_servers`, `mcp.rs:21+`). S6
@@ -98,8 +100,11 @@ Rust-parity recommended slices against pin `650c1db7`, lead-wired through
 - **Voice:** macOS `__mic-capture` child path (not in-process AVFoundation in the
   TUI); `/voice` toggles dictation into the prompt; settings rows unhide only when
   `VoiceCapabilities.detect()` reports capture support.
-- **LSP `pull_diagnostics`:** new `OpenGrokLSP` target; tool registers when
-  `features.lsp_tools` is on and `lsp.json` has servers; settings row unhidden.
+- **LSP `pull_diagnostics` + post-edit sync:** `OpenGrokLSP` registers the tool
+  when `features.lsp_tools` is on and `lsp.json` has servers; after
+  `search_replace` / `edit`, live `LiveToolExecutor` re-reads disk, notifies
+  the session, drains diagnostics into a `<system-reminder>` (Rust
+  `LspDiagnosticsReminder`).
 - **`image_to_video`:** backend-gated beside image tools; tier-restricted upsell;
   no `reference_to_video` / `/imagine-video`.
 
@@ -107,12 +112,27 @@ Rust-parity recommended slices against pin `650c1db7`, lead-wired through
 exited 0 on 2026-08-10 with **5,872 Swift Testing cases across 106 nonempty
 summaries** and zero issues.
 
+### Auto-mode LLM + full LSP sync (2026-08-11)
+
+Lead-wired the two remaining deferred-runtime library seams:
+
+- **LLM auto classifier:** `LlmPermissionClassifier` +
+  `LiveAutoModeComposition.installLLMClassifier` on `.auto`; transcript refresh
+  before each tool batch; settings `permission_mode` and ACP
+  `x.ai/yolo_mode_changed` route through `LiveSessionPermissionMode`.
+- **Full LSP sync:** document tracking + `publishDiagnostics` +
+  `notifyFileChanged` / `drainDiagnostics` on the live edit path (above).
+
+**Verification:** `zsh workflows/swift-safe-verify.zsh test --no-parallel`
+exited 0 on 2026-08-11 with **5,285 Swift Testing cases across 74 nonempty
+summaries** and zero issues (one prior serial attempt hit an unrelated flaky
+`RhaiEngine` peakConcurrency assertion; re-run was clean).
+
 ### Still deferred from the audit
 
-Antigravity runner, auto-mode **LLM** classifier, full LSP push/sync,
-`reference_to_video`, durable subagent resume, ACP SDK reverse bridge,
-relocation journal, Linux/Windows CI evidence, portable WSS/custom CA, and
-capable-Linux sandbox proof.
+Antigravity runner, `reference_to_video`, durable subagent resume, ACP SDK
+reverse bridge, relocation journal, Linux/Windows CI evidence, portable
+WSS/custom CA, and capable-Linux sandbox proof.
 
 ## Wave 19 — Deferred parity follow-ons (2026-08-10, complete)
 

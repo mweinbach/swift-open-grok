@@ -112,9 +112,17 @@ public actor LSPStdioClient {
     private var closed = false
     private var nextRequestID = 1
     private var pendingResponses: [Int: CheckedContinuation<LSPJSONRPCResponse, Error>] = [:]
+    private var notificationHandler: (@Sendable (String, JSONValue?) async -> Void)?
 
     public init(configuration: LSPStdioClientConfiguration) {
         self.configuration = configuration
+    }
+
+    /// Route server notifications (e.g. `textDocument/publishDiagnostics`).
+    public func setNotificationHandler(
+        _ handler: (@Sendable (String, JSONValue?) async -> Void)?
+    ) {
+        notificationHandler = handler
     }
 
     public func start() async throws {
@@ -249,8 +257,14 @@ public actor LSPStdioClient {
                 continue
             }
             do {
-                let message = try LSPJSONRPCResponse.decode(from: data)
-                await deliver(message)
+                switch try LSPInboundMessage.decode(from: data) {
+                case .response(let message):
+                    deliver(message)
+                case .notification(let method, let params):
+                    if let notificationHandler {
+                        await notificationHandler(method, params)
+                    }
+                }
             } catch {
                 continue
             }
@@ -287,11 +301,40 @@ public actor LSPStdioClient {
 }
 
 extension LSPStdioClient {
+    /// Client capabilities advertised at initialize.
+    ///
+    /// Rust reference: `client.rs` `client_capabilities` — sync, publish,
+    /// and pull diagnostic support. Hover/goto omitted in this slice.
+    public static var clientCapabilities: JSONValue {
+        .object([
+            "textDocument": .object([
+                "synchronization": .object([
+                    "dynamicRegistration": .bool(false),
+                    "willSave": .bool(false),
+                    "willSaveWaitUntil": .bool(false),
+                    "didSave": .bool(true),
+                ]),
+                "publishDiagnostics": .object([
+                    "relatedInformation": .bool(true),
+                ]),
+                "diagnostic": .object([
+                    "dynamicRegistration": .bool(false),
+                    "relatedDocumentSupport": .bool(false),
+                ]),
+            ]),
+            "workspace": .object([
+                "diagnostic": .object([
+                    "refreshSupport": .bool(true),
+                ]),
+            ]),
+        ])
+    }
+
     public func initialize(rootURI: String) async throws {
         let params: JSONValue = .object([
             "processId": .null,
             "rootUri": .string(rootURI),
-            "capabilities": .object([:]),
+            "capabilities": Self.clientCapabilities,
             "clientInfo": .object([
                 "name": .string("open-grok"),
                 "version": .string("0.0.0"),

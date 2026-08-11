@@ -55,6 +55,10 @@ public enum LSPJSONRPCResponse: Sendable {
         guard case .object(let object) = value else {
             throw LSPError.parse("LSP message is not a JSON object")
         }
+        return try decode(object: object)
+    }
+
+    static func decode(object: [String: JSONValue]) throws -> LSPJSONRPCResponse {
         if let errorValue = object["error"], case .object(let errorObject) = errorValue {
             let codeValue = errorObject["code"]
             let code = Int(codeValue?.int64Value ?? Int64(codeValue?.doubleValue ?? 0))
@@ -81,6 +85,35 @@ public enum LSPJSONRPCResponse: Sendable {
             throw LSPError.parse("LSP response missing result")
         }
         return .result(id: idNumber, value: result)
+    }
+}
+
+/// Inbound JSON-RPC from an LSP server: a response to our request, or a
+/// server-originated notification (method + params, no id).
+///
+/// Notifications must not go through `LSPJSONRPCResponse.decode` — that path
+/// requires `id` and would drop every `publishDiagnostics` push.
+public enum LSPInboundMessage: Sendable {
+    case response(LSPJSONRPCResponse)
+    case notification(method: String, params: JSONValue?)
+
+    public static func decode(from data: Data) throws -> LSPInboundMessage {
+        let value = try JSONDecoder().decode(JSONValue.self, from: data)
+        guard case .object(let object) = value else {
+            throw LSPError.parse("LSP message is not a JSON object")
+        }
+
+        let method = object["method"]?.stringValue
+        let hasID = object["id"] != nil
+
+        if let method, !hasID {
+            return .notification(method: method, params: object["params"])
+        }
+        if hasID, method == nil {
+            return .response(try LSPJSONRPCResponse.decode(object: object))
+        }
+        // Server request (id + method) or malformed — not handled in this slice.
+        throw LSPError.parse("unsupported LSP inbound message shape")
     }
 }
 

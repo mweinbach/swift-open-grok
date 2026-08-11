@@ -122,15 +122,27 @@ struct LiveACPYoloModeHandler: ACPAgentExtensionNotificationHandler {
         let clearAuto = autoExplicit == false
             || (["always-approve", "ask", "default"].contains(modeString) && !wantAuto)
         let enableAuto = wantAuto && yoloSignal != true
-        if enableAuto || clearAuto {
-            // `setAutoMode(true)` also clears yolo, the same coupling
-            // upstream spells as `if enabled { h.yolo_mode = false }`
-            // (:4535-4537) — but routed through the display-mode handle
-            // first so the composer flag cannot drift from the pipeline.
-            if enableAuto {
-                await permissionMode?.applyInboundAlwaysApprove(false)
+        if enableAuto {
+            // Install the LLM classifier through the same display-mode handle
+            // Shift+Tab / settings use — bare `setAutoMode` would leave the
+            // composer flag and the heuristic default in place.
+            _ = await permissionMode?.applyPermissionMode(.auto)
+            if permissionMode == nil {
+                await permissions?.setAutoMode(true)
             }
-            await permissions?.setAutoMode(enableAuto)
+        } else if clearAuto {
+            // Do not clobber an always-approve the yolo arm just applied.
+            let leavingForYolo = yoloSignal == true || modeString == "always-approve"
+            if !leavingForYolo {
+                if let permissionMode {
+                    let label = await permissionMode.permissionModeLabel()
+                    if label == LiveSessionPermissionMode.DisplayMode.auto.rawValue {
+                        _ = await permissionMode.applyPermissionMode(.ask)
+                    }
+                } else {
+                    await permissions?.setAutoMode(false)
+                }
+            }
         }
     }
 }

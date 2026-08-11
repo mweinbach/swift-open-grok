@@ -88,6 +88,12 @@ public actor PermissionHandle {
     public private(set) var events: [PermissionEvent]
     /// Last matched rule source for auditing (deny/ask/allow).
     public private(set) var lastMatchedRuleSource: PermissionRuleSource?
+    /// Flat transcript fed to the auto-mode classifier (hostile-intent scan + LLM context).
+    public private(set) var classifierTranscript: String
+    /// Optional AGENTS.md / project instructions for the LLM classifier prompt.
+    public private(set) var classifierProjectInstructions: String?
+    /// True when the installed classifier is an `LlmPermissionClassifier` with a live side-query.
+    public private(set) var hasLLMSideQuery: Bool
 
     public init(
         config: PermissionConfig = PermissionConfig(),
@@ -128,6 +134,9 @@ public actor PermissionHandle {
         self.sandboxAutoAllowBash = sandboxAutoAllowBash
         self.events = []
         self.lastMatchedRuleSource = nil
+        self.classifierTranscript = ""
+        self.classifierProjectInstructions = nil
+        self.hasLLMSideQuery = Self.sideQueryEnabled(classifier)
     }
 
     public func setYoloMode(_ enabled: Bool) {
@@ -147,6 +156,20 @@ public actor PermissionHandle {
 
     public func setClassifier(_ classifier: (any PermissionClassifier)?) {
         self.classifier = classifier
+        self.hasLLMSideQuery = Self.sideQueryEnabled(classifier)
+    }
+
+    public func setClassifierTranscript(_ transcript: String) {
+        classifierTranscript = transcript
+    }
+
+    public func setClassifierProjectInstructions(_ instructions: String?) {
+        classifierProjectInstructions = instructions
+    }
+
+    private static func sideQueryEnabled(_ classifier: (any PermissionClassifier)?) -> Bool {
+        guard let llm = classifier as? LlmPermissionClassifier else { return false }
+        return llm.hasSideQuery
     }
 
     public func setAllowEditsForSession(_ enabled: Bool) {
@@ -395,12 +418,37 @@ public actor PermissionHandle {
 
         // 6. Auto mode classifier (not when policy forced prompt).
         if autoMode, !policyForcedPrompt, let classifier {
-            let classified = await classifier.classify(
-                access: access,
-                toolName: toolName,
-                accessDetail: access.detail,
-                transcript: ""
-            )
+            let classified: PermissionDecision
+            if let llm = classifier as? LlmPermissionClassifier {
+                // Prefer the outcome API so Unavailable (timeout/transport)
+                // forces a prompt rather than a silent deny.
+                let outcome = await llm.classifyOutcome(
+                    toolName: toolName,
+                    access: access,
+                    accessDetail: access.detail,
+                    context: ClassifierContext(
+                        transcript: classifierTranscript,
+                        projectInstructions: classifierProjectInstructions
+                    )
+                )
+                switch outcome.verdict {
+                case .allow:
+                    classified = .allow
+                case .block:
+                    classified = .policyDeny(
+                        outcome.reason ?? "auto mode: classifier blocked"
+                    )
+                case .unavailable:
+                    classified = .ask
+                }
+            } else {
+                classified = await classifier.classify(
+                    access: access,
+                    toolName: toolName,
+                    accessDetail: access.detail,
+                    transcript: classifierTranscript
+                )
+            }
             if case .allow = classified {
                 record(
                     access: access, toolName: toolName, toolCallId: toolCallId,

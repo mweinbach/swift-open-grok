@@ -33,7 +33,7 @@ struct PullDiagnosticsTests {
                 extensions: [".swift": "swift"]
             ),
         ]
-        let session = LSPPullSession(workspaceRoot: workspace.path, servers: servers)
+        let session = LSPSession(workspaceRoot: workspace.path, servers: servers)
         defer { await session.shutdown() }
 
         let text = await session.pullDiagnostics(path: "Sample.swift")
@@ -56,7 +56,7 @@ struct PullDiagnosticsTests {
                 extensions: [".swift": "swift"]
             ),
         ]
-        let session = LSPPullSession(workspaceRoot: workspace.path, servers: servers)
+        let session = LSPSession(workspaceRoot: workspace.path, servers: servers)
         defer { await session.shutdown() }
 
         let first = await session.pullDiagnostics(path: "Sample.swift")

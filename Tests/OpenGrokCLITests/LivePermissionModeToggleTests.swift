@@ -212,10 +212,15 @@ struct LivePermissionModeToggleTests {
         try await fixture.renderer.restoreTerminal()
     }
 
-    @Test("Shift+Tab cycles ask and always-approve")
+    @Test("Shift+Tab cycles ask → auto → always-approve → ask")
     func cyclePermissionModeRepaintsFlag() async throws {
         let fixture = PermissionRendererFixture(rules: [])
         try await fixture.renderer.begin()
+        try await fixture.renderer.render(.global(.cyclePermissionMode))
+        #expect(await fixture.waitForFrame(containing: "auto"))
+        #expect(await fixture.mode.composerFlags().map(\.label) == ["auto"])
+        #expect(await fixture.pipeline.permissions.autoMode)
+
         try await fixture.renderer.render(.global(.cyclePermissionMode))
         #expect(await fixture.waitForFrame(containing: "always-approve"))
         #expect(await fixture.mode.composerFlags().map(\.label) == ["always-approve"])
@@ -223,6 +228,34 @@ struct LivePermissionModeToggleTests {
         try await fixture.renderer.render(.global(.cyclePermissionMode))
         #expect(await fixture.mode.composerFlags().isEmpty)
         try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("settings permission_mode=auto installs LLM classifier hooks when wired")
+    func applyPermissionModeAutoEnablesAutoMode() async throws {
+        let stack = makeLivePermissionStack(rules: [])
+        let gate = InstallGate()
+        let permissions = await stack.pipeline.permissions
+        await stack.mode.setAutoModeHooks(
+            install: {
+                await gate.mark()
+                await permissions.setClassifier(
+                    LlmPermissionClassifier.withFixedModelText(
+                        #"{"verdict":"allow","reason":"test"}"#
+                    )
+                )
+                await permissions.setAutoMode(true)
+            },
+            uninstall: {
+                await permissions.setAutoMode(false)
+                await permissions.setClassifier(HeuristicPermissionClassifier())
+            }
+        )
+        #expect(await stack.mode.applyPermissionMode(.auto) == nil)
+        #expect(await gate.wasInstalled)
+        #expect(await stack.pipeline.permissions.autoMode)
+        #expect(await stack.pipeline.permissions.hasLLMSideQuery)
+        #expect(await stack.mode.applyPermissionMode(.ask) == nil)
+        #expect(await stack.pipeline.permissions.autoMode == false)
     }
 
     @Test("deny rules still win over always-approve")
@@ -330,4 +363,9 @@ struct LivePermissionModeToggleTests {
         #expect(autoPrepared.mayDispatch)
         #expect(await stack.prompter.recorded().isEmpty)
     }
+}
+
+private actor InstallGate {
+    private(set) var wasInstalled = false
+    func mark() { wasInstalled = true }
 }

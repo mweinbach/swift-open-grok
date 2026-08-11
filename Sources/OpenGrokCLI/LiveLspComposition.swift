@@ -1,14 +1,12 @@
 // LiveLspComposition.swift
 //
-// Live wiring for the `pull_diagnostics` tool — the first LSP slice.
+// Live wiring for LSP tools + the session handle used for post-edit sync.
 //
-// Registers one read-only tool when `features.lsp_tools` is enabled and at
-// least one language server is configured in `lsp.json`. The heavy LSP
-// transport lives in `OpenGrokLSP`; this file is the only place that sees
-// both that library and `OpenGrokToolRegistry`.
-//
-// The launcher hook that registers these tools belongs in
-// `LiveComposition.swift`, which the integration slice owns.
+// Registers `pull_diagnostics` when `features.lsp_tools` is enabled and at
+// least one language server is configured in `lsp.json`. The returned
+// `LSPSession` is also what `LiveToolExecutor` uses after `search_replace`
+// (notify + drain → `<system-reminder>`), matching Rust's
+// `LspDiagnosticsReminder`. The heavy transport lives in `OpenGrokLSP`.
 
 import Foundation
 import OpenGrokConfig
@@ -95,7 +93,7 @@ public enum LiveLspComposition {
         document: TOMLValue?,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         servers: [String: LspServerConfig]? = nil
-    ) -> LSPPullSession? {
+    ) -> LSPSession? {
         let enabled = resolveEnabled(document: document, environment: environment)
         let resolvedServers = servers ?? loadServers(
             workingDirectory: workingDirectory,
@@ -103,7 +101,7 @@ public enum LiveLspComposition {
         )
         guard enabled, !resolvedServers.isEmpty else { return nil }
 
-        let session = LSPPullSession(
+        let session = LSPSession(
             workspaceRoot: workingDirectory.standardizedFileURL.path,
             servers: resolvedServers
         )
@@ -132,7 +130,7 @@ public enum LiveLspComposition {
 }
 
 struct PullDiagnosticsToolHandler: ToolHandler {
-    let session: LSPPullSession
+    let session: LSPSession
 
     func invoke(
         clientName: String,

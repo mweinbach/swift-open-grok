@@ -2993,6 +2993,26 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             makeSampler: dependencies.makeSampler,
             history: conversationHistory
         )
+        // Auto-mode LLM side-query: install when the pager/ACP/settings enter
+        // `.auto`. Heuristic remains the PermissionHandle default until then.
+        if let permissionMode = foundation.toolExecutor.sessionPermissionMode {
+            let permissions = await foundation.toolExecutor.permissionHandle()
+            let sessionID = foundation.sessionID
+            await permissionMode.setAutoModeHooks(
+                install: {
+                    guard let permissions else { return }
+                    await LiveAutoModeComposition.installLLMClassifier(
+                        on: permissions,
+                        sessionID: sessionID,
+                        modelSwitch: modelSwitch
+                    )
+                },
+                uninstall: {
+                    guard let permissions else { return }
+                    await LiveAutoModeComposition.uninstallLLMClassifier(on: permissions)
+                }
+            )
+        }
         // A provider change invalidates the cells and stored values the
         // old runtime holds (model_switch.rs:249).
         await modelSwitch.attachCodeMode(codeMode)
@@ -4357,12 +4377,16 @@ struct LiveSecurityContext: Sendable {
 actor LiveSessionPermissionMode {
     enum DisplayMode: String, Sendable, Equatable {
         case ask
+        case auto
         case alwaysApprove = "always-approve"
     }
 
     private let pipeline: PermissionPipeline
     private let yoloPinReason: String?
     private(set) var displayMode: DisplayMode
+    /// Optional installer for the LLM side-query when entering `.auto`.
+    private var autoModeInstaller: (@Sendable () async -> Void)?
+    private var autoModeUninstaller: (@Sendable () async -> Void)?
 
     init(pipeline: PermissionPipeline, resolved: ResolvedPermissions) {
         self.pipeline = pipeline
@@ -4374,11 +4398,19 @@ actor LiveSessionPermissionMode {
         }
     }
 
+    func setAutoModeHooks(
+        install: @escaping @Sendable () async -> Void,
+        uninstall: @escaping @Sendable () async -> Void
+    ) {
+        autoModeInstaller = install
+        autoModeUninstaller = uninstall
+    }
+
     func permissionModeLabel() -> String { displayMode.rawValue }
 
     func composerFlags() -> [PagerComposerFlag] {
         switch displayMode {
-        case .alwaysApprove:
+        case .alwaysApprove, .auto:
             return [PagerComposerFlag(label: displayMode.rawValue)]
         case .ask:
             return []
@@ -4387,21 +4419,24 @@ actor LiveSessionPermissionMode {
 
     /// Toggle always-approve (`Ctrl+O`, upstream `dispatch_toggle_yolo`).
     func toggleAlwaysApprove() async -> String? {
-        if displayMode == .ask, let yoloPinReason {
+        if displayMode != .alwaysApprove, let yoloPinReason {
             return yoloPinReason
         }
-        let enabling = displayMode == .ask
+        let enabling = displayMode != .alwaysApprove
         await apply(enabling ? .alwaysApprove : .ask)
         return enabling
             ? "\u{26A0} Always-approve ON: all tool actions auto-run"
             : "\u{2713} Always-approve off"
     }
 
-    /// Shift+Tab cycle without plan/auto arms (upstream legacy path when auto
-    /// is gated off: ask ↔ always-approve, `modes.rs:693-695`).
+    /// Shift+Tab cycle: ask → auto → always-approve → ask (`modes.rs` when
+    /// auto is available).
     func cyclePermissionMode() async -> String? {
         switch displayMode {
         case .ask:
+            await apply(.auto)
+            return "Mode: Auto"
+        case .auto:
             if let yoloPinReason { return yoloPinReason }
             await apply(.alwaysApprove)
             return "Mode: Always-Approve"
@@ -4409,6 +4444,15 @@ actor LiveSessionPermissionMode {
             await apply(.ask)
             return "Mode: Normal"
         }
+    }
+
+    /// Settings / ACP explicit permission_mode set.
+    func applyPermissionMode(_ mode: DisplayMode) async -> String? {
+        if mode == .alwaysApprove, yoloPinReason != nil {
+            return yoloPinReason
+        }
+        await apply(mode)
+        return nil
     }
 
     /// The inbound `x.ai/yolo_mode_changed` arm (acp_agent.rs:4486-4513):
@@ -4423,8 +4467,33 @@ actor LiveSessionPermissionMode {
     }
 
     private func apply(_ newMode: DisplayMode) async {
+        let previous = displayMode
         displayMode = newMode
-        await pipeline.permissions.setYoloMode(newMode == .alwaysApprove)
+        switch newMode {
+        case .ask:
+            // Leaving `.auto` without an uninstall hook must still clear the
+            // pipeline flag — ACP/tests install no hooks and would otherwise
+            // leave `autoMode` stuck true (silent ask UI, live auto gate).
+            if previous == .auto, let autoModeUninstaller {
+                await autoModeUninstaller()
+            } else {
+                await pipeline.permissions.setYoloMode(false)
+                await pipeline.permissions.setAutoMode(false)
+            }
+        case .auto:
+            await pipeline.permissions.setYoloMode(false)
+            if let autoModeInstaller {
+                await autoModeInstaller()
+            } else {
+                await pipeline.permissions.setAutoMode(true)
+            }
+        case .alwaysApprove:
+            if previous == .auto, let autoModeUninstaller {
+                await autoModeUninstaller()
+            }
+            await pipeline.permissions.setAutoMode(false)
+            await pipeline.permissions.setYoloMode(true)
+        }
     }
 }
 
@@ -5391,9 +5460,15 @@ struct LiveToolExecutor: Sendable {
                 callId: call.callId
             ) {
             case .success(let result):
+                let promptText = await appendLspDiagnostics(
+                    toolName: call.name,
+                    args: args,
+                    workingDirectory: workingDirectory,
+                    promptText: result.promptText
+                )
                 return .success(OpenGrokShellToolCallResult(
                     value: result.output.value,
-                    promptText: result.promptText
+                    promptText: promptText
                 ))
             case .failure(let error):
                 return .failure(.failed(error.description))
@@ -5794,6 +5869,48 @@ struct LiveToolExecutor: Sendable {
         case .allow:
             return nil
         }
+    }
+
+    /// After registry tools: notify LSP of search_replace edits (disk re-read)
+    /// and drain pending diagnostics into a system-reminder, matching Rust
+    /// `LspDiagnosticsReminder` (`reminders/lsp_diagnostics.rs:14-47`).
+    private func appendLspDiagnostics(
+        toolName: String,
+        args: JSONValue,
+        workingDirectory: URL,
+        promptText: String
+    ) async -> String {
+        guard let session = lspPullSession else { return promptText }
+
+        // Notify only SearchReplace EditsApplied — Rust does not notify write
+        // or apply_patch from this reminder.
+        if toolName == "search_replace" || toolName == "edit",
+           case .object(let fields) = args
+        {
+            let path =
+                fields["file_path"]?.stringValue
+                ?? fields["filePath"]?.stringValue
+                ?? fields["path"]?.stringValue
+            if let path, !path.isEmpty {
+                let absolute: String
+                if (path as NSString).isAbsolutePath {
+                    absolute = path
+                } else {
+                    absolute = workingDirectory.appendingPathComponent(path).path
+                }
+                if let content = try? String(contentsOfFile: absolute, encoding: .utf8) {
+                    await session.notifyFileChanged(path: absolute, content: content)
+                }
+            }
+        }
+
+        // Drain pending diagnostics from this or earlier edits (even when
+        // this tool did not notify — same as the Rust reminder).
+        guard let summary = await session.drainDiagnostics() else {
+            return promptText
+        }
+        let wrapped = "<system-reminder>\n\(summary)\n</system-reminder>"
+        return promptText.isEmpty ? wrapped : "\(promptText)\n\n\(wrapped)"
     }
 
     func shutdown() async {
@@ -7145,6 +7262,14 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         sessionID: String,
         emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
     ) async throws -> [ConversationItem] {
+        // Feed the auto-mode classifier the recent conversation (Rust refreshes
+        // classifier turns before tool batches — tool_calls.rs:1618-1622).
+        if let permissions = await toolExecutor.permissionHandle() {
+            let transcript = LiveAutoModeComposition.transcript(
+                from: await conversationHistory.items
+            )
+            await permissions.setClassifierTranscript(transcript)
+        }
         // `agent_swarm` must be the only call in its batch
         // (tool_calls.rs:456-468): every call in a violating batch gets the
         // fixed refusal as its tool result and nothing executes.
@@ -14299,6 +14424,24 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// the full input-mode snapshot shared with the controller, and then the
     /// write to disk and the live theme swap.
     private func applySetting(_ event: PagerSettingsEvent) async {
+        if case .commit(let key, .string(let choice)) = event,
+           key == "permission_mode" {
+            // Session-local row: apply the live classifier/yolo seam and skip
+            // the config store (`.sessionLocal` → notPersistable).
+            let mode: LiveSessionPermissionMode.DisplayMode?
+            switch choice {
+            case "auto": mode = .auto
+            case "always-approve": mode = .alwaysApprove
+            case "ask", "default": mode = .ask
+            default: mode = nil
+            }
+            if let mode, let permissionMode {
+                if let notice = await permissionMode.applyPermissionMode(mode) {
+                    appendMessage(PagerMessage(role: .error, text: notice))
+                }
+            }
+            return
+        }
         if case .commit(let key, .string(let choice)) = event,
            key == Self.codingDataSharingKey {
             // The consent row persists to the xAI service through the

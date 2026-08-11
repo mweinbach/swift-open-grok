@@ -273,9 +273,10 @@ private func targets() -> [Target] {
     // W5-S4: MCP base; ComputerHubMCPAdapter -> MCP.
     t.append(.target(name: "OpenGrokMCP", dependencies: dep(w0s2, w0s3, w1s1, w1s4, w1s5, w2s1, w2s2, w4s4, w4s1)))
     t.append(.target(name: "OpenGrokComputerHubMCPAdapter", dependencies: dep(w0s2, w0s3, w1s1, w1s4, w1s5, w2s1, w2s2, w4s4, ["OpenGrokMCP"])))
-    // OpenGrokLSP: stdio JSON-RPC client and pull-model diagnostics
-    // (`textDocument/diagnostic`). Consumed by OpenGrokCLI's LiveLspComposition;
-    // the edge stays one-way — this target must never import CLI/pager code.
+    // OpenGrokLSP: stdio JSON-RPC client, document sync (didOpen/didChange),
+    // publishDiagnostics push + pull diagnostics, and drain for after-edit
+    // reminders. Consumed by OpenGrokCLI's LiveLspComposition; the edge stays
+    // one-way — this target must never import CLI/pager code.
     t.append(.target(name: "OpenGrokLSP", dependencies: dep(w0s4)))
     // W5-S5: Hooks base; PluginMarketplace -> Hooks.
     t.append(.target(name: "OpenGrokHooks", dependencies: dep(w0s2, w0s3, w1s4, w1s5, w2s1, w2s2, w4s3, w4s1)))
@@ -424,7 +425,7 @@ private func targets() -> [Target] {
     t.append(.testTarget(
         name: "OpenGrokLSPTests",
         dependencies: dep(["OpenGrokLSP"]),
-        exclude: ["Fixtures/mock_pull_lsp.py"]
+        exclude: ["Fixtures/mock_pull_lsp.py", "Fixtures/mock_push_lsp.py"]
     ))
     t.append(contentsOf: tests(["OpenGrokHooks", "OpenGrokPluginMarketplace"]))
     t.append(contentsOf: tests(w5s6))

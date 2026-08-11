@@ -32,10 +32,10 @@ Follow-on batch 2 also lands JWKS id_token validation, `--max-turns`,
 `page_flip_on_send`, and dream docs honesty. The deferred runtime wave then lands
 auto-mode heuristic classification, hub MCP→harness session connect, `/dream`
 consolidation, macOS `__mic-capture` voice + `/voice`, LSP `pull_diagnostics`,
-and backend-gated `image_to_video`. Still open at the live seam: Antigravity,
-auto-mode LLM side-query, full LSP sync, `reference_to_video`, ACP SDK reverse
-bridge, and platform evidence (Linux sandbox, Windows relaunch, WSS/custom CA,
-CI required checks).
+and backend-gated `image_to_video`. Auto-mode LLM side-query and full LSP
+post-edit sync landed 2026-08-11. Still open at the live seam: Antigravity,
+`reference_to_video`, ACP SDK reverse bridge, and platform evidence (Linux
+sandbox, Windows relaunch, WSS/custom CA, CI required checks).
 
 **Wave 19 update (2026-08-10):** the deferred-dashboard batch is now landed rather
 than standing. Retained dashboard sessions can dispatch prompts and replies; `/cd`,
@@ -222,12 +222,9 @@ B1 residuals: attach to a still-running subagent and dashboard-native multiselec
 question resolution ·
 Mouse block selection (click selects a transcript block; upstream's scrollback click
 handling — the live pipeline is proven and pinned, Wave 14.1, only the feature is absent) ·
-LSP tool (pull-diagnostics rewrite) · video tools
-(`image_to_video`/`reference_to_video`) · `search_tool`/`use_tool` MCP meta-discovery ·
-voice live seam (B7: macOS capture + `__mic-capture` intercept + pipeline) · media
-overlays (B10: kitty/iTerm images, mermaid, real `/gboom`) · foreign-session
-scan/resume (Claude/Codex/Cursor) · auto-mode LLM permission classifier ·
-memory embeddings + dream (`/dream`) ·
+video tools (`reference_to_video`) · `search_tool`/`use_tool` MCP meta-discovery ·
+media overlays (B10: kitty/iTerm images, mermaid, real `/gboom`) · foreign-session
+scan/resume (Claude/Codex/Cursor) ·
 Code Mode V8 debt (hard interrupt, module loader) · Computer Hub MCP adapter wiring ·
 PTY-backed `run_terminal_cmd` · local-workspace/chat env+flag family ·
 `RemoteSettings` authority allowlist · env-gate table (`GROK_*` kill-switches) ·
