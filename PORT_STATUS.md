@@ -253,12 +253,20 @@ Findings from the first runs that actually executed, and what was done:
   `EnvGuard` routes through `_putenv_s`. A real Windows loopback server belongs
   on the WinSock path `COpenGrokSockets` already implements — not done.
 - **macOS still fails its gate, and not on an assertion.** The run goes quiet
-  for eight and a half minutes inside the `OpenGrokBuildSupport` proto tests
-  (around `DefaultProtoCompiler`'s PATH-lookup case, which is also where an
-  earlier run stopped) and then exits 1 with no recorded issue. Those tests take
-  milliseconds locally, so this is a runner-specific hang rather than a slow
-  suite, and it is the next thing to chase — per §1, a run that stalls like this
-  is a hang to investigate, not a ceiling to raise again.
+  for eight and a half minutes and then exits 1 with no recorded issue and no
+  signal name. Do not read the last-printed test as the culprit: two runs
+  stopped after *different* tests (`DefaultProtoCompiler`'s PATH-lookup case,
+  then `ProtoBuildError.absolutePathRejected`), and those tests are hermetic —
+  injected `pathLookup`, `validateCandidates: false`, no subprocess — so they
+  cannot hang. It is also not the wrapper ceiling: the gate now has 2400s and
+  the whole job finished in 19 minutes.
+
+  The shape that fits is memory pressure — a long stall with no output followed
+  by death, on a runner with a fraction of the dev machine's RAM. §1 already
+  records a stranded helper ballooning past 100 GB of RSS here, so a test that
+  grows unboundedly is a known hazard in this suite rather than a novel guess.
+  The next step is to run the gate on CI with RSS sampling and find what grows,
+  not to raise a limit.
 
 Also raised: the CI serial-gate steps now run with
 `SWIFT_SAFE_TIMEOUT_SECONDS=2400`. The first macOS run to reach the suite was
