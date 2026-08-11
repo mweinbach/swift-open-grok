@@ -70,7 +70,12 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     case .followTail:
         scrollOffset = maximumOffset
     case .offset(let requested):
-        scrollOffset = min(max(requested, 0), maximumOffset)
+        // Page-flip on send may pin a prompt near the transcript tail with
+        // fewer lines below it than the viewport height — upstream keeps that
+        // offset (`follow_preserve_scroll`, nav.rs:1176-1205) instead of
+        // clamping to `maximumOffset`, which would leave the viewport at the
+        // tail and defeat the flip. Manual scroll paths clamp before storing.
+        scrollOffset = max(requested, 0)
     }
     let visibleEnd = min(contentLines.count, scrollOffset + visibleHeight)
     let visibleRange = scrollOffset..<visibleEnd

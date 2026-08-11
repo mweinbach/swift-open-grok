@@ -14,19 +14,22 @@ public struct OIDCDiscovery: Sendable, Equatable {
     public var tokenEndpoint: String
     public var deviceAuthorizationEndpoint: String?
     public var jwksURI: String?
+    public var idTokenSigningAlgValuesSupported: [String]?
 
     public init(
         issuer: String,
         authorizationEndpoint: String,
         tokenEndpoint: String,
         deviceAuthorizationEndpoint: String? = nil,
-        jwksURI: String? = nil
+        jwksURI: String? = nil,
+        idTokenSigningAlgValuesSupported: [String]? = nil
     ) {
         self.issuer = issuer
         self.authorizationEndpoint = authorizationEndpoint
         self.tokenEndpoint = tokenEndpoint
         self.deviceAuthorizationEndpoint = deviceAuthorizationEndpoint
         self.jwksURI = jwksURI
+        self.idTokenSigningAlgValuesSupported = idTokenSigningAlgValuesSupported
     }
 
     public static func fromJSON(_ json: [String: Any]) -> OIDCDiscovery? {
@@ -39,7 +42,8 @@ public struct OIDCDiscovery: Sendable, Equatable {
             authorizationEndpoint: auth,
             tokenEndpoint: token,
             deviceAuthorizationEndpoint: json["device_authorization_endpoint"] as? String,
-            jwksURI: json["jwks_uri"] as? String
+            jwksURI: json["jwks_uri"] as? String,
+            idTokenSigningAlgValuesSupported: json["id_token_signing_alg_values_supported"] as? [String]
         )
     }
 }

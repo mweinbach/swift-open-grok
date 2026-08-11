@@ -186,12 +186,19 @@ private let xaiPinnedEnvironment: [String: String] = [
     "GROK_OAUTH2_CLIENT_ID": "pager-client",
 ]
 
-/// Scripted xAI IdP: discovery + token exchange. The id_token's nonce claim
-/// must be the one the flow minted, which the fake browser reads off the
-/// authorize URL and stashes here before the exchange runs.
+/// Scripted xAI IdP: discovery + JWKS + token exchange. The id_token is
+/// RS256-signed against the JWKS this transport serves — browser login now
+/// requires JWKS validation before persist (`protocol.rs:639-715`).
 private final class PagerXAIIdPTransport: HTTPTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var nonce: String?
+    private let rsa: OIDCTestJWTFixture.RSAFixture
+    private let issuer = "http://127.0.0.1:9"
+    private let clientID = "pager-client"
+
+    init() throws {
+        rsa = try OIDCTestJWTFixture.rsa()
+    }
 
     func setNonce(_ value: String?) {
         lock.lock(); nonce = value; lock.unlock()
@@ -200,11 +207,18 @@ private final class PagerXAIIdPTransport: HTTPTransport, @unchecked Sendable {
     func send(_ request: HTTPRequest) async throws -> HTTPResponse {
         let path = request.url.path
         if path.hasSuffix("/.well-known/openid-configuration") {
-            let body = """
-            {"issuer":"http://127.0.0.1:9",\
-            "authorization_endpoint":"http://127.0.0.1:9/authorize",\
-            "token_endpoint":"http://127.0.0.1:9/token"}
-            """
+            let body = OIDCTestJWTFixture.discoveryJSON(
+                issuer: issuer,
+                jwksURI: "\(issuer)/jwks",
+                supportedAlgs: ["RS256"]
+            )
+            return HTTPResponse(
+                metadata: HTTPResponseMetadata(statusCode: 200),
+                body: Data(body.utf8)
+            )
+        }
+        if path.hasSuffix("/jwks") {
+            let body = OIDCTestJWTFixture.rsaJWKSJSON(n: rsa.jwkN, e: rsa.jwkE)
             return HTTPResponse(
                 metadata: HTTPResponseMetadata(statusCode: 200),
                 body: Data(body.utf8)
@@ -212,11 +226,17 @@ private final class PagerXAIIdPTransport: HTTPTransport, @unchecked Sendable {
         }
         if path.hasSuffix("/token") {
             let currentNonce = lock.withLock { nonce ?? "" }
-            let idToken = makeTestJWT(payload: [
-                "sub": "user-7",
-                "email": "tui@x.ai",
-                "nonce": currentNonce,
-            ])
+            var claims = OIDCTestJWTFixture.personalClaims(
+                nonce: currentNonce,
+                issuer: issuer,
+                clientID: clientID
+            )
+            claims["sub"] = "user-7"
+            claims["email"] = "tui@x.ai"
+            let idToken = try OIDCTestJWTFixture.signRS256(
+                payload: claims,
+                privateKey: rsa.privateKey
+            )
             let body = """
             {"access_token":"pager-xai-access","refresh_token":"pager-xai-refresh",\
             "expires_in":3600,"id_token":"\(idToken)"}
@@ -396,7 +416,7 @@ struct LiveLoginPickerTests {
 struct LiveXAILoginFlowTests {
     @Test("the xai flow runs against the real listener and lands in the real auth.json")
     func xaiFlowLandsCredentials() async throws {
-        let transport = PagerXAIIdPTransport()
+        let transport = try PagerXAIIdPTransport()
         // A catalog store so the post-login refresh pair is observable at its
         // own seam. Hermetic: no provider key env, so every background
         // partition skips before any network I/O.

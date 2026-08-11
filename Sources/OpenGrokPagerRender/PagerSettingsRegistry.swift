@@ -472,11 +472,10 @@ private let contextualHintsChildren = [
 public let pagerDefaultSettings: [PagerSettingMeta] = {
     var rows: [PagerSettingMeta] = []
 
-    // MARK: Appearance (10 — upstream 17 minus 7 without live readers)
+    // MARK: Appearance (11 — upstream 17 minus 6 without live readers)
 
     rows += [
         // Hidden until the renderer reads them (config round-trips; modal omits):
-        // `page_flip_on_send`,
         // `simple_mode`, `render_mermaid`, `max_thoughts_width`, `show_thinking_blocks`,
         // `group_tool_verbs`, `collapsed_edit_blocks`.
         //
@@ -545,6 +544,22 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             keywords: ["timeline", "sidebar", "ticks", "turns", "navigator", "rail"],
             kind: .bool(default: false),
             storage: .config(path: "ui.show_timeline"),
+            hiddenInMinimal: true
+        ),
+        // `page_flip_on_send` follows `show_timeline`, upstream's Appearance
+        // order (`defs.rs:687-703`); label, description, and keywords are
+        // upstream's verbatim. The default is `true` — absent means on
+        // (`defs.rs:698-699`: `ui_default.page_flip_on_send_enabled()`).
+        // The renderer reads it in `turnStarted` (`queue.rs:420-421` via
+        // `follow_new_turn`), so it is a live row, not a registered no-op.
+        PagerSettingMeta(
+            key: "page_flip_on_send",
+            category: .appearance,
+            label: "Snap prompt to top on send",
+            description: "When you send a prompt, scroll it to the top of the screen so the response starts on a fresh page (default). Turn off to leave the scroll position unchanged when you send.",
+            keywords: ["page", "flip", "send", "prompt", "scroll", "top", "jump", "auto", "snap"],
+            kind: .bool(default: true),
+            storage: .config(path: "ui.page_flip_on_send"),
             hiddenInMinimal: true
         ),
         PagerSettingMeta(
@@ -1053,7 +1068,7 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             key: "memory.enabled",
             category: .advanced,
             label: "Memory tools",
-            description: "Turn on cross-session memory so the agent can store and recall notes with /memory, /remember, and /dream. Off by default; restart after enabling so new sessions load the memory tools.",
+            description: "Turn on cross-session memory so the agent can store and recall notes with /memory and /remember. Off by default; restart after enabling so new sessions load the memory tools.",
             keywords: ["memory", "remember"],
             kind: .bool(default: false),
             storage: .featureFlag(path: "memory.enabled"),
@@ -1063,7 +1078,7 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             key: "memory.dream.enabled",
             category: .advanced,
             label: "Automatic memory dreaming",
-            description: "When Memory tools are on, periodically consolidate recent sessions into durable MEMORY.md notes in the background. Disable if you only want manual /remember and /dream.",
+            description: "When Memory tools are on, periodically consolidate recent sessions into durable MEMORY.md notes in the background. Not available in this port yet; the live settings overlay hides this row until consolidation ships.",
             keywords: ["memory", "dream"],
             kind: .bool(default: true),
             storage: .featureFlag(path: "memory.dream.enabled"),

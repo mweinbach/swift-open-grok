@@ -28,9 +28,11 @@ foreign-session listing, JSC module loader, git pack OFS/REF deltas, XTVERSION i
 clients on the headless `open-grok share` route. Follow-on closes ACP
 `x.ai/share_session`, CLI `--tools`/`--disallowed-tools`, child reasoning effort,
 `SetPlanMode(Off)` / settings `plan_mode`, and allowlisted remote `session_recap`.
-Still open at the live seam: hub MCP session connect, voice/Antigravity/auto-mode/
-dream/LSP/video honesty gaps beyond profile restore, ACP SDK reverse bridge, and
-platform evidence (Linux sandbox, Windows relaunch, WSS/custom CA, CI required checks).
+Follow-on batch 2 also lands JWKS id_token validation, `--max-turns`,
+`page_flip_on_send`, and dream docs honesty. Still open at the live seam: hub MCP
+session connect, voice/Antigravity/auto-mode/dream *runtime*/LSP/video, ACP SDK
+reverse bridge, and platform evidence (Linux sandbox, Windows relaunch, WSS/custom
+CA, CI required checks).
 
 **Wave 19 update (2026-08-10):** the deferred-dashboard batch is now landed rather
 than standing. Retained dashboard sessions can dispatch prompts and replies; `/cd`,

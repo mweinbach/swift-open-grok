@@ -454,10 +454,10 @@ public func xaiLoginRedirectURI(port: UInt16) -> String {
 /// devbox pre-flight arms (flow.rs:640-686), the opt-in device-flow transport
 /// (flow.rs:699-724), the manual paste channel (upstream's TUI paste box,
 /// login.rs:246-298), and post-exchange `/user` profile enrichment
-/// (`enrich_auth_inline`, login.rs:535). The id_token is decoded WITHOUT
-/// JWKS signature validation (the port has no JWK verifier); the nonce claim
-/// is still checked, and the server re-validates the signed access token on
-/// every API call (upstream's own stated security boundary,
+/// (`enrich_auth_inline`, login.rs:535). Personal id_tokens ARE validated
+/// via JWKS (`validateOIDCIdToken`, protocol.rs:639-715); external/devbox/
+/// device arms remain deferred. The server still re-validates the signed
+/// access token on every API call (upstream's stated security boundary,
 /// protocol.rs:164-172).
 public func loginXAIBrowser(
     manager: AuthManager,
@@ -537,17 +537,25 @@ public func loginXAIBrowser(
         actual: peekAccessTokenPrincipalID(tokens.accessToken)
     )
 
-    // Personal logins require a nonce-bound id_token; team-principal tokens
+    // Personal logins require a JWKS-validated id_token; team-principal tokens
     // don't carry one (`extract_user_info`, protocol.rs:716-747).
     let principal = peekAccessTokenPrincipal(tokens.accessToken)
+    var validatedSubject: String?
     if principal?.principalType != teamPrincipalType {
         guard let idToken = tokens.idToken else {
             throw XAILoginFlowError.missingIDToken
         }
-        let nonceClaim = decodeJWTPayload(idToken)?["nonce"] as? String
-        guard nonceClaim == nonce else {
-            throw XAILoginFlowError.nonceMismatch
-        }
+        // Prefer the JWKS-validated subject over an unverified payload decode
+        // inside `buildGrokAuthFromOIDCTokens` (protocol.rs:695-715).
+        let validatedClaims = try await validateOIDCIdToken(
+            token: idToken,
+            discovery: discovery,
+            expectedIssuer: oidc.issuer,
+            expectedClientID: oidc.clientID,
+            expectedNonce: nonce,
+            transport: transport
+        )
+        validatedSubject = validatedClaims.sub
     }
 
     var auth = buildGrokAuthFromOIDCTokens(
@@ -561,6 +569,9 @@ public func loginXAIBrowser(
     if let principal, principal.principalType == teamPrincipalType {
         // Team arm: the principal id IS the user id (protocol.rs:726-729).
         auth.userID = principal.principalID
+    } else if auth.userID.isEmpty,
+              let validatedSubject {
+        auth.userID = validatedSubject
     }
 
     // The one store write: AuthManager.update under the auth.json file lock.

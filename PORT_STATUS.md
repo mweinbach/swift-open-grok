@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-10 (Wave 20 follow-on deferred slices complete. Serial gate exited 0 with **5,801 Swift Testing cases across 105 nonempty summaries**, zero failed summaries, and zero issues.)
+**As of:** 2026-08-10 (Wave 20 deferred follow-ons batch 2 complete. Serial gate exited 0 with **5,819 Swift Testing cases across 105 nonempty summaries**, zero failed summaries, and zero issues.)
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, hub MCP session connect, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -63,12 +63,28 @@ exited 0 on 2026-08-10 with **5,801 Swift Testing cases across 105 nonempty
 summaries** and zero issues. Focused pre-gate: ConfigSpine **34**,
 share/ACP/launch/child-effort **32**, plan+child-effort **11**.
 
+### Wave 20 follow-on batch 2 (2026-08-10)
+
+- **Dream honesty:** `/dream` and auto-dream claims removed from live docs and
+  memory setting copy; settings row already hidden until consolidation exists.
+- **OIDC JWKS id_token validation:** browser login verifies signature + claims
+  via discovery `jwks_uri` before persist (`protocol.rs:639-715`).
+- **CLI `--max-turns`:** unrefused; `LiveShellSamplingDriver` stops before the
+  next sampler round when `toolTurnCount + 1 > limit` (`turn.rs:3130-3140`),
+  returning `stopReason: "max_turns_reached"`.
+- **`page_flip_on_send`:** live on `turnStarted` via `revealBlock` + per-frame
+  re-pin; Appearance settings row restored (`queue.rs:420-421`, `nav.rs:608-619`).
+
+**Verification:** `zsh workflows/swift-safe-verify.zsh test --no-parallel`
+exited 0 on 2026-08-10 with **5,819 Swift Testing cases across 105 nonempty
+summaries** and zero issues.
+
 ### Still deferred from the audit
 
 Hub MCP session connect (interactive transport owner), voice, Antigravity,
-auto-mode classifier, dream, LSP, video tools, ACP SDK reverse bridge, durable
-subagent resume, relocation journal, Linux/Windows CI evidence, portable
-WSS/custom CA, and capable-Linux sandbox proof.
+auto-mode classifier, dream *implementation*, LSP, video tools, ACP SDK reverse
+bridge, durable subagent resume, relocation journal, Linux/Windows CI evidence,
+portable WSS/custom CA, and capable-Linux sandbox proof.
 
 ## Wave 19 — Deferred parity follow-ons (2026-08-10, complete)
 

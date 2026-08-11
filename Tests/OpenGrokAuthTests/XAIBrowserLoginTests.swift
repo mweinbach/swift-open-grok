@@ -38,10 +38,12 @@ private func makeXAIHome() throws -> URL {
 /// Scripted IdP for the flow's two HTTP legs. The exchange's id_token must
 /// carry the nonce the flow minted, which only exists once the authorize URL
 /// is built — the fake browser stashes it here before the token leg runs.
+/// JWKS + RS256 signing mirror upstream's mock IdP (test_helpers.rs:49-130).
 private final class XAIFlowTransport: HTTPTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var nonce: String?
     private var recordedRequests: [HTTPRequest] = []
+    private let rsaFixture: OIDCTestJWTFixture.RSAFixture
 
     /// The access token the token endpoint returns (a JWT for principal arms).
     var accessToken = "xai-access-token"
@@ -49,6 +51,10 @@ private final class XAIFlowTransport: HTTPTransport, @unchecked Sendable {
     var includeIDToken = true
     /// Overrides the id_token's nonce claim (the mismatch arm).
     var idTokenNonceOverride: String?
+
+    init() throws {
+        rsaFixture = try OIDCTestJWTFixture.rsa()
+    }
 
     func setNonce(_ value: String?) {
         lock.lock(); nonce = value; lock.unlock()
@@ -67,11 +73,17 @@ private final class XAIFlowTransport: HTTPTransport, @unchecked Sendable {
 
         let path = request.url.path
         if path.hasSuffix("/.well-known/openid-configuration") {
-            let body = """
-            {"issuer":"http://127.0.0.1:9",\
-            "authorization_endpoint":"http://127.0.0.1:9/authorize",\
-            "token_endpoint":"http://127.0.0.1:9/token"}
-            """
+            let body = OIDCTestJWTFixture.discoveryJSON()
+            return HTTPResponse(
+                metadata: HTTPResponseMetadata(statusCode: 200),
+                body: Data(body.utf8)
+            )
+        }
+        if path.hasSuffix("/jwks") {
+            let body = OIDCTestJWTFixture.rsaJWKSJSON(
+                n: rsaFixture.jwkN,
+                e: rsaFixture.jwkE
+            )
             return HTTPResponse(
                 metadata: HTTPResponseMetadata(statusCode: 200),
                 body: Data(body.utf8)
@@ -84,11 +96,15 @@ private final class XAIFlowTransport: HTTPTransport, @unchecked Sendable {
                 "expires_in": 3600,
             ]
             if includeIDToken {
-                fields["id_token"] = buildTestJWT(payload: [
-                    "sub": "user-42",
-                    "email": "browser@x.ai",
-                    "nonce": idTokenNonceOverride ?? currentNonce ?? "",
-                ])
+                let nonceValue = idTokenNonceOverride ?? currentNonce ?? ""
+                let idToken = try OIDCTestJWTFixture.signRS256(
+                    payload: OIDCTestJWTFixture.personalClaims(
+                        nonce: nonceValue,
+                        clientID: "client-under-test"
+                    ),
+                    privateKey: rsaFixture.privateKey
+                )
+                fields["id_token"] = idToken
             }
             let body = try JSONSerialization.data(withJSONObject: fields)
             return HTTPResponse(
@@ -245,7 +261,7 @@ struct XAIBrowserLoginFlowTests {
         let home = try makeXAIHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let env = xaiTestEnvironment(home: home)
-        let transport = XAIFlowTransport()
+        let transport = try XAIFlowTransport()
         let manager = AuthManager(
             grokHome: home,
             config: GrokComConfig.default(environment: env),
@@ -320,7 +336,7 @@ struct XAIBrowserLoginFlowTests {
         let home = try makeXAIHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let env = xaiTestEnvironment(home: home)
-        let transport = XAIFlowTransport()
+        let transport = try XAIFlowTransport()
         let manager = AuthManager(
             grokHome: home,
             config: GrokComConfig.default(environment: env),
@@ -374,7 +390,7 @@ struct XAIBrowserLoginFlowTests {
         let home = try makeXAIHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let env = xaiTestEnvironment(home: home)
-        let transport = XAIFlowTransport()
+        let transport = try XAIFlowTransport()
         let manager = AuthManager(
             grokHome: home,
             config: GrokComConfig.default(environment: env),
@@ -397,7 +413,7 @@ struct XAIBrowserLoginFlowTests {
         let home = try makeXAIHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let env = xaiTestEnvironment(home: home)
-        let transport = XAIFlowTransport()
+        let transport = try XAIFlowTransport()
         let manager = AuthManager(
             grokHome: home,
             config: GrokComConfig.default(environment: env),
@@ -435,7 +451,7 @@ struct XAIBrowserLoginFlowTests {
         let home = try makeXAIHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let env = xaiTestEnvironment(home: home)
-        let transport = XAIFlowTransport()
+        let transport = try XAIFlowTransport()
         let manager = AuthManager(
             grokHome: home,
             config: GrokComConfig.default(environment: env),
@@ -464,7 +480,7 @@ struct XAIBrowserLoginFlowTests {
         let home = try makeXAIHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let env = xaiTestEnvironment(home: home)
-        let transport = XAIFlowTransport()
+        let transport = try XAIFlowTransport()
         transport.accessToken = buildTestJWT(payload: [
             "sub": "user-1",
             "principal_id": "team-wrong",
@@ -493,7 +509,7 @@ struct XAIBrowserLoginFlowTests {
         let home = try makeXAIHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let env = xaiTestEnvironment(home: home)
-        let transport = XAIFlowTransport()
+        let transport = try XAIFlowTransport()
         transport.accessToken = buildTestJWT(payload: [
             "sub": "user-1",
             "principal_type": "Team",
@@ -522,7 +538,7 @@ struct XAIBrowserLoginFlowTests {
         let home = try makeXAIHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let env = xaiTestEnvironment(home: home)
-        let transport = XAIFlowTransport()
+        let transport = try XAIFlowTransport()
         transport.includeIDToken = false
         let manager = AuthManager(
             grokHome: home,
@@ -545,7 +561,7 @@ struct XAIBrowserLoginFlowTests {
         let home = try makeXAIHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let env = xaiTestEnvironment(home: home)
-        let transport = XAIFlowTransport()
+        let transport = try XAIFlowTransport()
         transport.idTokenNonceOverride = "replayed-nonce"
         let manager = AuthManager(
             grokHome: home,
@@ -593,7 +609,7 @@ struct XAIBrowserLoginFlowTests {
         #expect(samplerSeam.snapshot().token == "pre-login-session-token")
 
         // `/login xai` mid-session: the flow's own fresh manager, same file.
-        let transport = XAIFlowTransport()
+        let transport = try XAIFlowTransport()
         let flowManager = AuthManager(grokHome: home, config: config, environment: env)
         _ = try await loginXAIBrowser(
             manager: flowManager,

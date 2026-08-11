@@ -90,19 +90,20 @@ struct PagerSettingsRegistryTests {
         // `compact_mode` came back exactly that way once `renderPagerFrame`
         // grew its reads (gap rows, user-prompt vpad and prefix),
         // `show_timestamps` with the stamp overlay, and `show_timeline` with
-        // the tick rail.
-        #expect(registry.entries.count == 77)
+        // the tick rail, and `page_flip_on_send` with the send/viewport pin.
+        #expect(registry.entries.count == 78)
         #expect(PagerSettingCategory.ordered.count == 8)
         #expect(!registry.entries.contains { $0.key == "show_tips" })
         #expect(registry.entries.contains { $0.key == "compact_mode" })
         #expect(registry.entries.contains { $0.key == "show_timestamps" })
         #expect(registry.entries.contains { $0.key == "show_timeline" })
+        #expect(registry.entries.contains { $0.key == "page_flip_on_send" })
     }
 
     @Test("per-category counts match the reference's registry")
     func categoryCounts() {
         let registry = PagerSettingsRegistry.default
-        #expect(registry.rows(in: .appearance).count == 10)
+        #expect(registry.rows(in: .appearance).count == 11)
         #expect(registry.rows(in: .mouse).count == 0)
         #expect(registry.rows(in: .editor).count == 6)
         #expect(registry.rows(in: .agent).count == 9)

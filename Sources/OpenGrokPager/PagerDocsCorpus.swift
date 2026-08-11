@@ -1432,7 +1432,7 @@ Open a preview of the current saved plan. Aliases: `/show-plan`, `/plan-view`.
 
 ## Memory
 
-`/flush`, `/dream`, and `/memory` require memory to be enabled (`--experimental-memory` or `GROK_MEMORY=1`); `/memory` also needs a configured memory backend. `/remember` is always available.
+`/flush` and `/memory` require memory to be enabled (`--experimental-memory` or `GROK_MEMORY=1`); `/memory` also needs a configured memory backend. `/remember` is always available. Dream consolidation (`/dream` and automatic dreaming) is not available in this port yet.
 
 ### `/memory`
 
@@ -1446,10 +1446,6 @@ Browse, view, and manage saved memories. Pass `on` or `off` to enable or disable
 ### `/flush`
 
 Save the current session's knowledge to memory right now, triggering an LLM summary of the most important content. Reach for it before compaction, or any time you want to lock in context.
-
-### `/dream`
-
-Run memory consolidation — merge session logs into organized topics.
 
 ### `/remember`
 
@@ -5542,7 +5538,7 @@ Grok searches across all memory files and summarizes what it knows, grouped by s
 
 ### Direct Editing
 
-You can edit memory files directly under `~/.opengrok/memory/`. The file watcher reindexes your changes on the next memory search. Use `/flush` to save the current session now, and `/dream` to consolidate session logs into organized topics.
+You can edit memory files directly under `~/.opengrok/memory/`. The file watcher reindexes your changes on the next memory search. Use `/flush` to save the current session now.
 
 ---
 
@@ -5590,32 +5586,13 @@ When you save a note with `/remember`, Grok confirms in the scrollback:
 Memory saved to ~/.opengrok/memory/MEMORY.md
 ```
 
-Background saves — flush, dream, and session-end — run silently and do not post a scrollback message. Use `/memory` at any time to browse what Grok has stored.
+Background saves — flush and session-end — run silently and do not post a scrollback message. Use `/memory` at any time to browse what Grok has stored.
 
 ---
 
-## Dream Consolidation with /dream
+## Dream Consolidation
 
-The `/dream` command consolidates scattered memory fragments into organized topics:
-
-```
-/dream
-```
-
-Dream reorganizes individual session logs and memory entries into a coherent, deduplicated knowledge base, which reduces noise and improves search quality over time. `/dream` requires memory to be enabled.
-
-### Auto-Dream
-
-Dream also runs automatically. By default, Grok checks the consolidation gates when a session ends and runs Dream once enough time has passed and enough sessions have accumulated:
-
-```toml
-[memory.dream]
-enabled = true     # Run automatic consolidation (default: true)
-min_hours = 4      # Minimum hours between consolidations
-min_sessions = 3   # Minimum sessions since the last consolidation
-# check_interval_secs is unset by default, so Dream runs only at session end.
-# Set it to a positive number of seconds to also check on a periodic interval.
-```
+Dream consolidation (manual `/dream` and automatic `[memory.dream]` runs) is not available in this port yet. The settings row stays hidden until a live consolidation path exists. Use `/remember` and `/flush` for durable notes in the meantime.
 
 ---
 

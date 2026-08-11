@@ -2155,6 +2155,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     ///   subagent host, so it is a real control, not an ignored flag.
     /// - Everything under `common.permissions`, which the permission and
     ///   sandbox layer consumes.
+    /// `--max-turns` is honored by `LiveShellSamplingDriver.runTurn` at turn-
+    /// driver construction — not refused here.
     /// `--reasoning-effort` left this list when `resolveSamplingConfiguration`
     /// started validating and applying it to the initial session.
 
@@ -2164,7 +2166,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // construction — not refused here.
         if options.agentOptions.agent != nil { return "--agent" }
         if options.agentOptions.agentsJSON != nil { return "--agents" }
-        if options.agentOptions.maxTurns != nil { return "--max-turns" }
         if options.agentOptions.noPlan { return "--no-plan" }
         if options.agentOptions.noAskUser { return "--no-ask-user" }
         if options.agentOptions.rules != nil { return "--rules" }
@@ -3015,7 +3016,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 toolSurface: toolSurface,
                 codeMode: codeMode,
                 compaction: compaction,
-                interjections: interjections
+                interjections: interjections,
+                maxTurns: foundation.options.agentOptions.maxTurns
             )
         )
         let shell = OpenGrokShell(configuration: OpenGrokShellConfiguration(
@@ -6710,6 +6712,11 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     /// root-delivery path); `/btw` stopped producing here when it became a
     /// real side question.
     let interjections: LiveSessionInterjections
+    /// Headless `--max-turns` cap. `nil` means unlimited sampler rounds
+    /// (subject only to the 16-round safety cap). When set, the first model
+    /// call counts as turn 1; after tool results, the next sampler round is
+    /// allowed only while `toolTurnCount + 1 <= limit` (turn.rs:2347,3130-3140).
+    let maxTurns: UInt32?
 
     func sample(
         context: OpenGrokShellProviderTurnContext,
@@ -6848,6 +6855,7 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             payload: ["prompt": .string(request.text)]
         )
 
+        var toolTurnCount = 1
         var toolRoundCount = 0
         var stopHookContinuations = 0
         var stopHookActive = false
@@ -6970,6 +6978,18 @@ private struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                     sessionID: context.sessionID,
                     emit: emit
                 ))
+                let nextTurn = toolTurnCount + 1
+                if let limit = maxTurns, nextTurn > limit {
+                    try await conversationHistory.commit(
+                        sessionID: context.sessionID,
+                        items: items
+                    )
+                    return OpenGrokShellSamplingResult(
+                        output: response.output,
+                        stopReason: "max_turns_reached"
+                    )
+                }
+                toolTurnCount = nextTurn
             }
         } catch is CancellationError {
             throw CancellationError()
@@ -9535,6 +9555,20 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// in the fullscreen agent view (`agent_view/render.rs:1157`; minimal
     /// mode has no interactive scrollback pane for it).
     private var userShowTimeline = false
+    /// `[ui] page_flip_on_send` — upstream's `current_ui.page_flip_on_send`
+    /// (`ui_config.rs:118`), hydrated from the effective config at
+    /// construction (`event_loop.rs:1541-1542` via `load_page_flip_on_send`,
+    /// `appearance/cache.rs:149-163`) and flipped by the settings modal
+    /// (`set_page_flip_on_send_inner`, `setters.rs:1594-1596`). No derivation
+    /// — the render seam reads this var on each send in `turnStarted`.
+    private var userPageFlipOnSend = true
+    /// While set, every frame re-pins this user block to the viewport top —
+    /// upstream's `follow_preserve_scroll` after `follow_new_turn`
+    /// (`nav.rs:608-613`, `layout.rs:1637`). A one-shot pin at send is not
+    /// enough when the new turn's tail is shorter than the viewport: the
+    /// maximum scroll offset grows as the assistant block streams, so the
+    /// target offset becomes reachable only after a few frames.
+    private var pageFlipUserBlockIndex: Int?
 
     /// Mouse. `linesPerEvent` folds the terminal's reports-per-notch into a
     /// per-report line count, which is the whole of the port's wheel handling —
@@ -9746,6 +9780,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // rail is opt-in, `SHOW_TIMELINE_DEFAULT = false` (`ui_config.rs:392`,
         // the single source `show_timeline_enabled()` resolves through).
         userShowTimeline = uiConfig.showTimeline ?? false
+        // `[ui] page_flip_on_send` hydrates the same way (`event_loop.rs:1541-1542`
+        // via `load_page_flip_on_send`, `appearance/cache.rs:149-163`). The key
+        // is `Option<bool>` (`ui_config.rs:118`) and ABSENT MEANS ON —
+        // `PAGE_FLIP_ON_SEND_DEFAULT = true` (`appearance/cache.rs:145`), the
+        // same default `page_flip_on_send_enabled()` resolves through.
+        userPageFlipOnSend = uiConfig.pageFlipOnSendEnabled()
         let autoDark = Self.themeKind(from: uiConfig.autoDarkTheme)
         let autoLight = Self.themeKind(from: uiConfig.autoLightTheme)
         self.autoDarkThemeKind = autoDark
@@ -10636,14 +10676,27 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 hasStartedFirstTurn = true
                 overlays.dismiss(id: "welcome")
             }
+            let paintUserBlock = request.metadata[
+                OpenGrokPagerInteractiveController.interjectionFallbackMetadataKey
+            ] == nil
             conversation.startTurn(
                 prompt: request.prompt,
                 // An interjection-fallback turn's text was already painted at
                 // dispatch; a second user block here would duplicate it.
-                paintUserBlock: request.metadata[
-                    OpenGrokPagerInteractiveController.interjectionFallbackMetadataKey
-                ] == nil
+                paintUserBlock: paintUserBlock
             )
+            // Pin the just-sent prompt at the viewport top when page-flip is
+            // on — upstream's `follow_new_turn(Some(prompt_idx), flip)`
+            // (`queue.rs:420-421`, `nav.rs:608-619`). Interjection-fallback
+            // turns have no fresh user block to snap (`paintUserBlock:
+            // false`).
+            if userPageFlipOnSend, paintUserBlock {
+                let userIndex = conversation.items.count - 2
+                pageFlipUserBlockIndex = userIndex
+                try revealBlock(at: userIndex)
+            } else {
+                pageFlipUserBlockIndex = nil
+            }
             turnActivity = "Thinking\u{2026}"
             turnStartedAt = Date()
             turnStartedAtSeconds = motion.seconds
@@ -10767,6 +10820,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         turnStartedAtSeconds = nil
         turnOutputUTF8Count = 0
         isCancelling = false
+        pageFlipUserBlockIndex = nil
     }
 
     private func resetForNewSession(sessionID: String) {
@@ -14152,6 +14206,16 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 await applySettingsEvent(event)
                 return
             }
+            if key == "page_flip_on_send" {
+                // Same routing for page-flip — upstream's modal commit maps
+                // `("page_flip_on_send", Bool) → Action::SetPageFlipOnSend`
+                // (`ui.rs:1210`) into `set_page_flip_on_send_inner`
+                // (`setters.rs:1594-1596`), so the very next send reads the
+                // new value. The persist half is the shared store write below.
+                userPageFlipOnSend = flag
+                await applySettingsEvent(event)
+                return
+            }
             if key == "swarm_mode" {
                 // The settings row applies live, exactly like `/swarm on|off`
                 // — the row's own promise ("Active sessions update
@@ -14416,6 +14480,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 // `show_timeline_enabled()`, the row default's single source
                 // `defs.rs:680-681`).
                 if key == "show_timeline" { userShowTimeline = false }
+                // Same path for page-flip (`ui.rs:1510`: `set_page_flip_on_send_inner`);
+                // the default is `true` — absent means on (`ui_config.rs:407-411`,
+                // `defs.rs:698-699` `page_flip_on_send_enabled()`).
+                if key == "page_flip_on_send" { userPageFlipOnSend = true }
                 reloadCatalogInput()
             } catch PagerSettingsStoreError.notPersistable {
                 return
@@ -14522,6 +14590,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// re-lays-out at flush time — a folded frame must paint the *latest*
     /// state, not the one that was folded.
     private func layOutCurrentFrame() -> PagerRenderResult {
+        if let index = pageFlipUserBlockIndex {
+            try? revealBlock(at: index)
+        }
         let result = renderPagerFrame(renderState(conversation: conversation.items))
         // Fresh every frame: a modal that no longer fits publishes no bounds.
         lastOverlayBounds = result.overlays
