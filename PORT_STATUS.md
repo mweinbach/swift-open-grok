@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-11 (Platform CI unbroken for the first time; `reference_to_video`, the ACP reverse permission bridge, and a minimal Antigravity runner live. Serial gate exited 0 with **5,325 Swift Testing cases across 74 nonempty summaries**, zero failed summaries, and zero issues. macOS CI still fails on a runner-only hang in the proto tests, and one flaky test remains — both recorded below; do not read the local green as CI green.)
+**As of:** 2026-08-11. **No platform CI job is green yet.** Platform CI now *runs* — for the first time it builds, links, and reaches the suite on macOS and Linux instead of failing at setup — but macOS still dies mid-suite, Windows still does not compile, and Linux's post-fix result is unconfirmed. `reference_to_video`, the ACP reverse permission bridge, and a minimal Antigravity runner are implemented and unit-tested; the bridge is **live-unproven** (its installation is not asserted through the running executable — see the ACP section). The local serial gate exited 0 with **5,325 Swift Testing cases across 74 nonempty summaries**, zero failed summaries, and zero issues; one flaky test remains. **Do not read the local green as CI green** — that is exactly the substitution this ledger exists to prevent.
 **Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, and post-change Linux/Windows CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -273,10 +273,133 @@ Findings from the first runs that actually executed, and what was done:
   never been exercised against a CI runner's `NSTemporaryDirectory()`. Sample
   RSS during the gate before changing anything.
 
+  **Update (PR #1 review pass, below):** that parent walk was in fact
+  non-terminating for a relative `workingDirectory` and has been bounded. That
+  is a real defect, but it is not confirmed to be *this* failure — see the
+  macOS entry in the review-pass section.
+
 Also raised: the CI serial-gate steps now run with
 `SWIFT_SAFE_TIMEOUT_SECONDS=2400`. The first macOS run to reach the suite was
 killed at exactly the wrapper's 600s default and read as a test failure. The
 cost is that a real hang now takes 40 minutes to surface.
+
+### PR #1 review pass (2026-08-11) — automated-review findings
+
+Sixteen findings from the PR's automated reviewer were worked. Everything below
+landed with a regression test asserting through the seam the defect actually
+used, not against composition types.
+
+**Crash-on-input (both were process death, not tool errors):**
+
+- `reference_to_video` / `image_to_video` `duration`: `UInt32(someInt64)` traps
+  above `UInt32.max`, so `duration: 4294967296` killed the agent. Parsing now
+  goes through a three-case `VideoDurationArgument` (`absent` / `seconds` /
+  `malformed`) using `UInt32(exactly:)`.
+- `OPENGROK_SUBAGENT_TIMEOUT_MS`: `Double("1e309")` is `.infinity` and passed
+  the `> 0` check, then trapped in `Int(timeout.rounded(.down))` before the
+  child launched. Now requires finite and `<= 86_400s`, else the default.
+
+**Silent-default (the §3 shape):** a malformed `duration` — negative,
+nonnumeric, or a `Double`/`UInt64` the old parser did not match — returned
+`nil`, which validation reads as *omitted*, so a billable generation ran at the
+six-second default. Malformed and absent are now distinct.
+
+**Path traversal:** `task_id` is decoder-supported but not advertised, so
+nothing constrained it, and the Antigravity runner joined it into
+`$OPENGROK_HOME/sessions/<session>/subagents/<childID>` before
+`createDirectory` and `agy --log-file`. `spawn` now rejects any id that is not
+a safe single path component (`isSafeSubagentChildID`, same alphabet as
+`LiveConversationStore.validateSessionID`). Rejected, not sanitized.
+
+**ACP reverse permission bridge — five fail-open holes, all closed by
+tightening:**
+
+- `.read` / `.grep` / `.webSearch` returned an unconditional `.allow` from the
+  prompter. `PermissionHandle` already allows safe access itself
+  (`PermissionManager.swift:355-363`); anything reaching the prompter got there
+  because a policy *forced* the ask, or because `requestExitPlanApproval` asks
+  under `.read(nil)`. Both were silently auto-approved. Now they prompt.
+- `allow-always` grants lived on the shared prompter, so a grant by one ACP
+  session authorized every later session. Grants are now keyed by
+  `AcpSessionId`.
+- `x.ai/permissions/reset` reset only `PermissionHandle`. The prompter's own
+  grants survived, so the advertised reset did not revoke what the client had
+  just granted. The handler now clears both.
+- `reject-always` for bash ("No, and don't run bash commands") behaved as
+  `reject-once`; the next bash request re-prompted and could be approved. It is
+  now recorded and outranks a later allow.
+- `allow all edits during this session` authorized *protected* targets —
+  `.opengrok` hooks/config, SSH keys, shell startup files, `/etc` — which
+  `PermissionHandle` deliberately withholds from session grants
+  (`PermissionManager.swift:337-352, :365`). The prompter now applies
+  `protectedEditPath` before honoring its own grant.
+
+**Cancellation, two places:**
+
+- A `session/cancel` during an outstanding permission request was caught by a
+  generic `catch` and converted to `.reject`, recording a false PermissionDenied
+  audit event and firing deny hooks for an operation the user merely cancelled.
+  Cancellation now returns `.cancelled`, which is still not allow.
+- An Antigravity child did not inherit cancellation: `Task.detached(…).value`
+  is not a cancellation point for a nonthrowing task, so `kill_task` and
+  session teardown reported cancelled while `agy
+  --dangerously-skip-permissions` kept mutating the workspace until it exited
+  on its own. `AntigravityProcessCanceller` now bridges
+  `withTaskCancellationHandler` to `terminate()` with a 2s SIGKILL escalation.
+
+**Concurrency (ACP session attribution).** `bindSession` was one actor slot set
+per turn, so with overlapping `session/prompt` requests the later bind won for
+both and a permission request could be shown under the wrong session — user
+action displayed for session B authorizing session A. The turn's session now
+rides a `@TaskLocal` through structured concurrency into the tool call, with a
+begin/end refcount as the fallback for any dispatch that loses the task-local.
+**Deliberate divergence:** when the task-local is absent *and* several sessions
+have turns in flight, the request is refused as ambiguous rather than
+attributed by guess. Upstream threads the session through the request instead;
+`PermissionPrompter.prompt` here carries no session parameter. Cost: a client
+running genuinely concurrent prompts on a dispatch path that loses the
+task-local gets denials instead of prompts. That is the fail-closed direction,
+and it is testable (`ambiguousSessionFailsClosed`).
+
+**Reachability:** `spawn_subagent`'s description enumerated only
+`LiveModelCatalogResolver.catalog()` and told the model it **MUST** use only
+those slugs, while `spawn` accepted `antigravity:*` — so the Antigravity
+bypass this PR added was unreachable through the ordinary model-driven path.
+The description now names the `antigravity:<model>` form when the feature is
+enabled and the CLI is installed. **Deliberately not** enumerating the roster:
+that needs `agy models`, a 15s-timeout subprocess, and this description is
+built during session construction.
+
+**Windows:** the Antigravity runner sent every bare name and every
+backslash-only path to `/usr/bin/env`, which does not exist on Windows, so the
+feature could not launch there even with `agy.exe` on `PATH`. Launch now
+resolves through `resolveExecutablePath` (PATH + `PATHEXT`) first and keeps
+`/usr/bin/env` as the POSIX fallback only. Untested on a real Windows runner —
+that job still does not compile.
+
+**macOS gate — changed, NOT diagnosed.** `discoverProtoc`'s parent walk exited
+only when `deletingLastPathComponent()` reached a fixed point, which never
+happens for a *relative* URL: it keeps prepending `..`, so the loop spins
+building longer paths and stat-ing each. `URL(fileURLWithPath: "")` is exactly
+that URL, and an empty `NSTemporaryDirectory()` produces it. The walk now
+standardizes to an absolute path first and carries a 256-iteration bound, with
+a termination test (`defaultProtoCompilerRelativeWorkingDirectoryTerminates`).
+
+This fits the evidence — three of three runs died in
+`DefaultProtoCompiler falls back to PATH lookup`, the first test in that file to
+exhaust the walk instead of breaking early — but it is **not confirmed as the
+cause**. It did not reproduce on Linux: that suite runs 56 tests in 0.043s with
+no measurable RSS growth. The RSS sample §1 asked for was taken on Linux only;
+no macOS host was available to this pass. If the macOS gate still dies at the
+same test, this fix was not it.
+
+**Not acted on, surfaced instead:** the reviewer's request to remove
+`options: --privileged` from the Linux PR job, and its request to restore the
+600s suite ceiling. Both are `.github/workflows/ci.yml` changes whose current
+values were chosen deliberately in this PR with their costs recorded in-file;
+changing CI config to satisfy a review comment is out of scope for this pass.
+The `--privileged` point is a real supply-chain observation about
+`pull_request` builds and belongs to whoever owns the runner policy.
 
 ### Still deferred from the audit
 
@@ -3780,7 +3903,8 @@ This is the port's largest honesty gap and the reason "91 non-placeholder target
 - Licensing: Apache-2.0 first-party; preserve all derived-source revisions and third-party notices in source, distribution, and notices UI.
 - **C shims:** platform C helpers live in pure-C targets (`OpenGrokPTYC`, `OpenGrokCrashHandlerC`); SwiftPM does not allow mixed-language source trees in one target.
 - **OTLP:** export bodies are real protobuf (`ExportTraceServiceRequest`), never JSON labeled `application/x-protobuf`.
-- **Git status:** portable pure-Swift SHA-1; zlib via Compression (Apple) or linked `COpenGrokZlib`/libz; pack-only objects are explicit non-parity.
+- **Git status:** portable pure-Swift SHA-1; zlib via Compression (Apple) or linked `COpenGrokZlib`/libz **on Apple platforms and Linux only**; pack-only objects are explicit non-parity.
+  - **Windows divergence (2026-08-11, deliberate):** `COpenGrokZlib` is not declared on Windows (`Package.swift`, `zlibShimAvailable`) because the Swift Windows SDK ships no `<zlib.h>` and no `z` import library, so declaring the target failed the entire Windows build inside the shim's header. `ObjectStore` selects Compression → `COpenGrokZlib` → a typed `zlib … unavailable on this platform` throw, and dropping the target is what arms that third arm. **Cost: Git loose-object and pack inflation do not work on Windows** — they return the typed unavailable error rather than a result. This is the honest state until a Windows zlib is vendored, and it must not be "fixed" by re-adding the target without one.
 
 ## Upstream drift since re-pin baseline
 
