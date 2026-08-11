@@ -117,8 +117,8 @@ internal func windowsHasDriveRoot(_ path: String) -> Bool {
     let scalars = Array(path.unicodeScalars)
     guard scalars.count >= 3 else { return false }
     let first = scalars[0]
-    let isLetter = (first >= Unicode.Scalar("a")! && first <= Unicode.Scalar("z")!)
-        || (first >= Unicode.Scalar("A")! && first <= Unicode.Scalar("Z")!)
+    let isLetter = (first >= Unicode.Scalar("a") && first <= Unicode.Scalar("z"))
+        || (first >= Unicode.Scalar("A") && first <= Unicode.Scalar("Z"))
     let second = scalars[1]
     let third = scalars[2]
     return isLetter && second == ":" && (third == "\\" || third == "/")
@@ -223,8 +223,8 @@ internal func windowsPrefix(_ path: String) -> WindowsPrefix? {
         let scalars = Array(after.unicodeScalars)
         if scalars.count >= 2 {
             let first = scalars[0]
-            let isLetter = (first >= Unicode.Scalar("a")! && first <= Unicode.Scalar("z")!)
-                || (first >= Unicode.Scalar("A")! && first <= Unicode.Scalar("Z")!)
+            let isLetter = (first >= Unicode.Scalar("a") && first <= Unicode.Scalar("z"))
+                || (first >= Unicode.Scalar("A") && first <= Unicode.Scalar("Z"))
             if isLetter && scalars[1] == ":" {
                 let prefixEnd = path.index(path.startIndex, offsetBy: 6) // "\\\\?\C:"
                 return WindowsPrefix(string: String(path[path.startIndex..<prefixEnd]), nextIndex: prefixEnd)
@@ -260,8 +260,8 @@ internal func windowsPrefix(_ path: String) -> WindowsPrefix? {
     let scalars = Array(path.unicodeScalars)
     if scalars.count >= 2 {
         let first = scalars[0]
-        let isLetter = (first >= Unicode.Scalar("a")! && first <= Unicode.Scalar("z")!)
-            || (first >= Unicode.Scalar("A")! && first <= Unicode.Scalar("Z")!)
+        let isLetter = (first >= Unicode.Scalar("a") && first <= Unicode.Scalar("z"))
+            || (first >= Unicode.Scalar("A") && first <= Unicode.Scalar("Z"))
         if isLetter && scalars[1] == ":" {
             let prefixEnd = path.index(path.startIndex, offsetBy: 2)
             return WindowsPrefix(string: String(path[path.startIndex..<prefixEnd]), nextIndex: prefixEnd)
