@@ -7,6 +7,12 @@
 //   * `foreign_sessions/mod.rs` `scan_foreign_sessions` — gated dispatch to
 //     per-tool scanners with cwd canonicalization and cross-tool sort.
 //
+// Compat + resume-skill gating happens *before* this type is called
+// (`LiveSessionsComposition.resolveProductionForeignSources`). Callers must
+// pass an `EnabledForeignSources` that is already skill-gated; this scanner
+// only honors the per-tool bools and never performs vendor I/O for a disabled
+// tool.
+//
 // This is the composition seam: tests inject a stub scanner, and the live
 // binary gets this one. The scanner is intentionally synchronous — the Rust
 // reference is synchronous too, and the bounded I/O keeps it fast.

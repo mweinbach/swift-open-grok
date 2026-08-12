@@ -749,6 +749,13 @@ extension LiveSubagentHost {
 
         var childModel = runtime.model ?? context.parentModel
         var resumeItems: [ConversationItem]?
+        // Swarm input carries no per-member cwd (agent_swarm/mod.rs:742
+        // `cwd: None`); fresh members run under the parent workspace. Resume
+        // still inherits the SOURCE child's effective cwd/worktree through
+        // the same helpers as `spawn` — upstream's SubagentRequest leaves
+        // cwd unset and `handle_request` selects via `select_override_cwd`.
+        var childCWD = context.workingDirectory
+        var resumedWorktree: URL? = nil
         if let resumeID = member.resumeFrom {
             let activeIDs = await coordinator.listActive(parentSessionID: context.sessionID)
                 .map { $0.request.id }
@@ -767,7 +774,10 @@ extension LiveSubagentHost {
                     source: ResumeSourceData(
                         subagentID: resumeID,
                         subagentType: source.subagentType,
-                        childCWD: context.workingDirectory.path,
+                        persona: source.persona,
+                        modelID: source.model,
+                        childCWD: source.childCWD?.path ?? "",
+                        worktreePath: source.worktreePath,
                         childSessionID: resumeID
                     )
                 )
@@ -781,13 +791,29 @@ extension LiveSubagentHost {
             // Resumed members keep their prior model; the override applies
             // to new members only (agent_swarm/mod.rs:721-728).
             childModel = source.model
+            // Same split as spawn: reusable URL vs recorded presence so a
+            // missing worktree is Shared/parent, not stale `childCWD`
+            // (`resume_inherited_cwd` / `worktree_path.is_some()`,
+            // subagent/mod.rs:1621).
+            resumedWorktree = Self.resumeWorktreePath(source.worktreePath)
+            let overrideCWD = Self.resumeInheritedCWD(
+                sourceCWD: source.childCWD,
+                recordedWorktreePath: source.worktreePath
+            )
+            childCWD = Self.resolveChildCWD(
+                worktreePath: resumedWorktree,
+                overrideCWD: overrideCWD,
+                parentCWD: context.workingDirectory
+            )
         }
 
         bookkeeping[agentID] = Bookkeeping(
             startedAt: Date(),
             subagentType: input.subagentType,
             description: input.description,
-            model: childModel
+            model: childModel,
+            childCWD: childCWD,
+            worktreePath: resumedWorktree
         )
         let request = OpenGrokChildRequest(
             id: agentID,
@@ -805,8 +831,9 @@ extension LiveSubagentHost {
         let inheritedItems = resumeItems
         let memberPrompt = member.prompt
         let memberModel = childModel
+        let memberCWD = childCWD
         do {
-            try await coordinator.spawn(request) { [context, weak self] in
+            try await coordinator.spawn(request) { [weak self] in
                 guard let self else {
                     return OpenGrokChildResult(
                         id: agentID,
@@ -820,7 +847,7 @@ extension LiveSubagentHost {
                     definition: definition,
                     runtime: runtime,
                     model: memberModel,
-                    cwd: context.workingDirectory,
+                    cwd: memberCWD,
                     resumeItems: inheritedItems
                 )
             }

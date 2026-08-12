@@ -177,6 +177,12 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     /// type is a wire-frozen Codable): spawn wall-clock, the model-facing
     /// type/description, live progress, terminal stats, and the in-session
     /// resume index.
+    ///
+    /// `childCWD` / `worktreePath` are the same-process half of upstream's
+    /// `SubagentMeta.child_cwd` / `worktree_path` (handle_request.rs:830-832):
+    /// a resume reads them here before selecting the new child's cwd. They are
+    /// not durable across process restarts — that needs the meta.json path
+    /// upstream writes under the parent session's `subagents/<id>/`.
     struct Bookkeeping {
         var startedAt: Date
         var subagentType: String
@@ -187,6 +193,22 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         /// handle_request.rs:255-258, and records it per child,
         /// task/coordinator_state.rs:639).
         var persona: String? = nil
+        /// Effective working directory the child actually ran with (after
+        /// worktree / override / parent precedence). Resume inherits this
+        /// when the source was not worktree-backed (`resume_inherited_cwd`,
+        /// subagent/mod.rs:1605-1620). `nil` means "not recorded" (older
+        /// in-session entries / swarm path that has not yet adopted the
+        /// field) — resume then falls back to the parent workspace.
+        var childCWD: URL? = nil
+        /// Isolated worktree path when one was recorded for the child.
+        /// Resume reuses it when still on disk; recorded *presence*
+        /// (`is_some`) also suppresses `childCWD` inheritance when the
+        /// directory is gone — Shared/parent, not a stale sibling cwd
+        /// (`resume_inherited_cwd`, subagent/mod.rs:1619-1622;
+        /// `ResumeWorktreeAction::Shared`, handle_request.rs:462-468).
+        /// Worktree *creation* is still absent from this host; the field
+        /// only preserves a path already represented in bookkeeping.
+        var worktreePath: URL? = nil
         var turns: UInt32 = 0
         var toolCalls: UInt32 = 0
         var toolsUsed: [String] = []
@@ -480,12 +502,15 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             return .failure(.invalidCall("\(Self.advertisedToolName) arguments are invalid: \(error)"))
         }
 
-        // cwd: sanitize, then validate it names a real directory (skipped on
-        // resume, where the source's cwd wins anyway).
+        // cwd: sanitize; validate it names a real directory only for a fresh
+        // spawn. On resume the schema ignores caller cwd — source
+        // cwd/worktree wins (`select_override_cwd`, subagent/mod.rs:1623-1632).
+        // Final child CWD is chosen after resume bookkeeping loads so a
+        // resumed child cannot inherit the parent path by accident.
         let sanitizedCwd = sanitizeOptionalArg(input.cwd)
         let resumeID = sanitizeOptionalArg(input.resumeFrom)
-        let childCWD: URL
-        if let sanitizedCwd, resumeID == nil {
+        let requestCWD: URL?
+        if resumeID == nil, let sanitizedCwd {
             let path = (sanitizedCwd as NSString).isAbsolutePath
                 ? sanitizedCwd
                 : context.workingDirectory.appendingPathComponent(sanitizedCwd).standardizedFileURL.path
@@ -496,9 +521,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             guard isDirectory.boolValue else {
                 return .failure(.invalidCall("cwd \"\(sanitizedCwd)\" exists but is not a directory"))
             }
-            childCWD = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+            requestCWD = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
         } else {
-            childCWD = context.workingDirectory
+            requestCWD = nil
         }
 
         // Eager type validation, before any background spawn can escape with
@@ -595,8 +620,11 @@ actor LiveSubagentHost: LiveSubagentQuerying {
 
         // Resume: the source must be a completed child of this session with a
         // persisted transcript; identity validation is the resolution
-        // module's own (`validate_resume_identity`).
+        // module's own (`validate_resume_identity`). Load bookkeeping BEFORE
+        // final child-CWD selection so resume inherits the source path
+        // (handle_request.rs:327-351 → select_override_cwd at :737).
         var resumeItems: [ConversationItem]? = nil
+        var resumeSource: Bookkeeping? = nil
         if let resumeID {
             let activeIDs = await coordinator.listActive(parentSessionID: context.sessionID)
                 .map { $0.request.id }
@@ -608,11 +636,14 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             guard let source = bookkeeping[resumeID] else {
                 return .failure(.invalidCall(Self.resumeNotFoundMessage(resumeID)))
             }
+            resumeSource = source
             do {
                 // The caller's explicit persona (internal channel; nil from
                 // tool dispatch) is checked against the source's recorded
                 // one — a resume must not silently swap SOULs
                 // (`validate_resume_identity`, resolution resume.rs:48+).
+                // `childCWD` here is the SOURCE identity, not the (not yet
+                // selected) resumed child's path.
                 try validateResumeIdentity(
                     requestedType: input.subagentType,
                     requestedPersona: requestedPersona,
@@ -620,7 +651,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                         subagentID: resumeID,
                         subagentType: source.subagentType,
                         persona: source.persona,
-                        childCWD: childCWD.path,
+                        modelID: source.model,
+                        childCWD: source.childCWD?.path ?? "",
+                        worktreePath: source.worktreePath,
                         childSessionID: resumeID
                     )
                 )
@@ -635,6 +668,27 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             // ignored, mirroring `run_shell_child`'s resume arm.
             runtime.model = source.model
         }
+
+        // Final child CWD: reusable worktree > resume-inherited/request cwd >
+        // parent (`resolve_child_cwd` / `select_override_cwd`,
+        // subagent/mod.rs:1590-1632). Caller cwd was already dropped above
+        // when `resume_from` is set. Recorded worktree *presence* is threaded
+        // separately from the reusable URL so a missing worktree falls
+        // through to Shared/parent instead of stale `childCWD`
+        // (`resume_inherited_cwd` checks `worktree_path.is_some()`,
+        // subagent/mod.rs:1621).
+        let resumedWorktree = Self.resumeWorktreePath(resumeSource?.worktreePath)
+        let overrideCWD: URL? = resumeID != nil
+            ? Self.resumeInheritedCWD(
+                sourceCWD: resumeSource?.childCWD,
+                recordedWorktreePath: resumeSource?.worktreePath
+            )
+            : requestCWD
+        let childCWD = Self.resolveChildCWD(
+            worktreePath: resumedWorktree,
+            overrideCWD: overrideCWD,
+            parentCWD: context.workingDirectory
+        )
 
         let childModel = runtime.model ?? context.parentModel
         let antigravityModel = LiveAntigravityComposition.stripModelPrefix(childModel)
@@ -722,7 +776,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             subagentType: input.subagentType,
             description: input.description,
             model: childModel,
-            persona: runtime.persona
+            persona: runtime.persona,
+            childCWD: childCWD,
+            worktreePath: resumedWorktree
         )
         let request = OpenGrokChildRequest(
             id: childID,
@@ -855,6 +911,65 @@ actor LiveSubagentHost: LiveSubagentQuerying {
 
     static func resumeNotFoundMessage(_ resumeID: String) -> String {
         "Cannot resume from subagent '\(resumeID)': not found. The subagent may have been evicted or the ID is invalid."
+    }
+
+    /// Precedence: worktree path > non-empty override > parent cwd
+    /// (`resolve_child_cwd`, subagent/mod.rs:1590-1599).
+    static func resolveChildCWD(
+        worktreePath: URL?,
+        overrideCWD: URL?,
+        parentCWD: URL
+    ) -> URL {
+        if let worktreePath {
+            return worktreePath.standardizedFileURL
+        }
+        if let overrideCWD {
+            return overrideCWD.standardizedFileURL
+        }
+        return parentCWD.standardizedFileURL
+    }
+
+    /// Reuse a recorded worktree when it still exists on disk. Missing paths
+    /// yield `nil` here (no reusable URL) but do **not** clear recorded
+    /// presence — callers must still pass the original `worktreePath` into
+    /// `resumeInheritedCWD` so Shared/parent wins over stale `childCWD`
+    /// (`ResumeWorktreeAction::Shared` — this host has no snapshot rehydrate).
+    static func resumeWorktreePath(_ recorded: URL?) -> URL? {
+        guard let recorded else { return nil }
+        let path = recorded.standardizedFileURL.path
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            return nil
+        }
+        return recorded.standardizedFileURL
+    }
+
+    /// The cwd a resumed child inherits from its source, or `nil` so
+    /// `resolveChildCWD` falls back to the parent workspace
+    /// (`resume_inherited_cwd`, subagent/mod.rs:1619-1632).
+    ///
+    /// `recordedWorktreePath` is the bookkeeping value's *presence*
+    /// (`worktree_path.is_some()`), not the existence-filtered reusable URL.
+    /// A worktree-backed source never inherits `childCWD` here — reuse goes
+    /// through `resumeWorktreePath`, and a missing worktree is Shared/parent.
+    /// A missing source directory is the explicit safe fallback to parent.
+    static func resumeInheritedCWD(
+        sourceCWD: URL?,
+        recordedWorktreePath: URL?
+    ) -> URL? {
+        if recordedWorktreePath != nil { return nil }
+        guard let sourceCWD else { return nil }
+        let path = sourceCWD.standardizedFileURL.path
+        guard !path.isEmpty else { return nil }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            return nil
+        }
+        return sourceCWD.standardizedFileURL
     }
 
     // MARK: - Child runner

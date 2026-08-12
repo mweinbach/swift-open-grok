@@ -97,6 +97,10 @@ public struct ForeignSessionSummary: Sendable, Equatable {
 
 /// Which foreign sources to scan. Defaults to all-off so the feature is
 /// opt-in, matching Rust's `EnabledForeignSessionSources`.
+///
+/// Cursor is intentionally absent: at pin `650c1db7` the Rust Cursor scan
+/// path is a no-op (`scan_cursor = |_| Vec::new()`), so this port never
+/// enables Cursor vendor I/O.
 public struct EnabledForeignSources: Sendable, Equatable {
     public var claude: Bool
     public var codex: Bool
@@ -108,6 +112,91 @@ public struct EnabledForeignSources: Sendable, Equatable {
 
     public static let all = EnabledForeignSources(claude: true, codex: true)
     public static let none = EnabledForeignSources()
+
+    public var anyEnabled: Bool { claude || codex }
+}
+
+/// Resolved `[compat.*.sessions]` cells before the resume-skill gate.
+///
+/// Defaults ON, matching Rust `CompatConfig` session cells
+/// (`xai-grok-tools/src/types/compat.rs`). Cursor is tracked for fail-closed
+/// resolution parity but never opens a scanner (upstream Cursor scan is empty).
+public struct ForeignSessionCompatSessions: Sendable, Equatable {
+    public var claude: Bool
+    public var codex: Bool
+    public var cursor: Bool
+
+    public init(claude: Bool = true, codex: Bool = true, cursor: Bool = true) {
+        self.claude = claude
+        self.codex = codex
+        self.cursor = cursor
+    }
+
+    public static let all = ForeignSessionCompatSessions()
+    public static let none = ForeignSessionCompatSessions(
+        claude: false,
+        codex: false,
+        cursor: false
+    )
+}
+
+/// Resume skills that authorize foreign-session filesystem I/O.
+///
+/// Mirrors Rust `ForeignPickerSource::skill_name`
+/// (`xai-grok-pager/src/app/foreign_sessions.rs`). `resume-cursor` is listed
+/// for path/parity tests but never enables a scan at this pin.
+public enum ForeignSessionResumeSkill: String, Sendable, CaseIterable {
+    case claude = "resume-claude"
+    case codex = "resume-codex"
+    case cursor = "resume-cursor"
+}
+
+/// Skill paths Rust probes before any vendor store I/O:
+/// `$OPENGROK_HOME/bundled/skills/<skill>/SKILL.md` then
+/// `$OPENGROK_HOME/skills/<skill>/SKILL.md`.
+public func foreignSessionResumeSkillPaths(
+    skill: ForeignSessionResumeSkill,
+    openGrokHome: URL
+) -> [URL] {
+    [
+        openGrokHome
+            .appendingPathComponent("bundled", isDirectory: true)
+            .appendingPathComponent("skills", isDirectory: true)
+            .appendingPathComponent(skill.rawValue, isDirectory: true)
+            .appendingPathComponent("SKILL.md"),
+        openGrokHome
+            .appendingPathComponent("skills", isDirectory: true)
+            .appendingPathComponent(skill.rawValue, isDirectory: true)
+            .appendingPathComponent("SKILL.md"),
+    ]
+}
+
+/// Pure source gate: `compat.<vendor>.sessions` AND a matching resume skill
+/// file. Skill paths are not probed when the compat cell is off
+/// (`async_gate_checks_compat_before_skill_metadata` at
+/// `xai-grok-pager/src/app/foreign_sessions.rs`).
+///
+/// Cursor is omitted: the pin's Cursor scanner is a no-op, so neither skill
+/// probes nor vendor I/O run for Cursor from this route.
+public func gatedForeignSessionSources(
+    compat: ForeignSessionCompatSessions,
+    openGrokHome: URL,
+    skillExists: (URL) -> Bool
+) -> EnabledForeignSources {
+    var enabled = EnabledForeignSources.none
+    if compat.claude {
+        let paths = foreignSessionResumeSkillPaths(skill: .claude, openGrokHome: openGrokHome)
+        if paths.contains(where: skillExists) {
+            enabled.claude = true
+        }
+    }
+    if compat.codex {
+        let paths = foreignSessionResumeSkillPaths(skill: .codex, openGrokHome: openGrokHome)
+        if paths.contains(where: skillExists) {
+            enabled.codex = true
+        }
+    }
+    return enabled
 }
 
 // MARK: - Scanner protocol

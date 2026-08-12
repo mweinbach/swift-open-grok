@@ -29,6 +29,8 @@
 // `LiveComposition.swift`, which the integration slice owns.
 
 import Foundation
+import OpenGrokConfig
+import OpenGrokConfigTypes
 import OpenGrokSamplingTypes
 
 // MARK: - Catalog
@@ -275,9 +277,15 @@ public enum LiveSessionsComposition {
     /// Launcher entry point. Runs to completion and hands back a finished
     /// session, matching `LiveAuthComposition` and `LiveMCPComposition`.
     ///
-    /// Wave 20 S10: `sessions list` merges Claude/Codex foreign sessions via
-    /// `LiveForeignSessionScanner` with every source enabled. Import/writeback
-    /// remain absent by architecture (§4).
+    /// `sessions list` merges Claude/Codex foreign sessions only when the
+    /// matching `[compat.*.sessions]` cell is on *and* the resume skill exists
+    /// (`gated_sources_async` / `foreign_sessions.rs` at pin `650c1db7`).
+    /// Import/writeback and Cursor scanning remain absent by architecture (§4).
+    ///
+    /// Project compat and the foreign scanner both key off the same resolved
+    /// launch cwd (`options.common.cwd` / `--cwd`), not the process cwd. The
+    /// process cwd is only the fallback when `--cwd` is absent — the AGENTS.md
+    /// process-cwd trap is that library helpers must not invent their own.
     public static func session(
         for command: CLICommand,
         context: CLIApplicationContext
@@ -285,20 +293,184 @@ public enum LiveSessionsComposition {
         guard case .sessions(let options) = command else {
             throw CLIApplicationError.unsupported(route: command.routeName)
         }
+        let home = OpenGrokHomeResolver.resolve(environment: context.environment)
+        let cwd = try resolveWorkingDirectory(options.common.cwd)
+        let foreignSources = resolveProductionForeignSources(
+            environment: context.environment,
+            cwd: cwd,
+            openGrokHome: home
+        )
         try run(
             options: options,
             environment: context.environment,
             streams: context.streams,
+            cwd: cwd,
             foreignScanner: LiveForeignSessionScanner(environment: context.environment),
-            foreignSources: .all
+            foreignSources: foreignSources
         )
         return CLIApplicationSession(waitForExit: {}, shutdown: {})
+    }
+
+    /// Production gate for `sessions list`: resolve session-compat cells from
+    /// the authoritative config composition, then require the matching
+    /// `resume-*` skill under `$OPENGROK_HOME`.
+    ///
+    /// Remote `*_sessions_enabled` fields are intentionally not read here —
+    /// they are not on `AllowlistedRemoteSettings`, and the LiveComposition
+    /// remote path is outside this route's ownership.
+    ///
+    /// `cwd` is required: project `[compat.*.sessions]` cells live under the
+    /// launch working directory, which is not necessarily the process cwd.
+    public static func resolveProductionForeignSources(
+        environment: [String: String],
+        cwd: URL,
+        openGrokHome: URL? = nil,
+        skillExists: ((URL) -> Bool)? = nil
+    ) -> EnabledForeignSources {
+        let home = openGrokHome ?? OpenGrokHomeResolver.resolve(environment: environment)
+        let compat = resolveForeignSessionCompatSessions(
+            environment: environment,
+            cwd: cwd
+        )
+        let exists = skillExists ?? { FileManager.default.fileExists(atPath: $0.path) }
+        return gatedForeignSessionSources(
+            compat: compat,
+            openGrokHome: home,
+            skillExists: exists
+        )
+    }
+
+    /// Resolve picker-facing session cells through
+    /// `loadAuthorityComposition(...).effective()`, then apply env overrides.
+    ///
+    /// Precedence matches `resolve_compat_sessions_from_raw` +
+    /// `resolve_compat_cell` at pin `650c1db7` (`config.rs:880` /
+    /// `resolve_compat_cell_with_env`):
+    /// 1. `GROK_{CLAUDE,CODEX,CURSOR}_SESSIONS_ENABLED` env
+    /// 2. `[compat.<vendor>] sessions` on the effective merged document
+    ///    (system managed → user managed → user → project chain →
+    ///    requirements; see `AuthorityComposition.effective`)
+    /// 3. default `true` when the cell is absent after a successful load
+    ///
+    /// Entire authority-load failure fails closed (`false`) per vendor, as
+    /// Rust does when `load_effective_config` returns `None`. A malformed
+    /// sessions cell fails closed for that vendor only.
+    ///
+    /// `cwd` is required so project `.opengrok/config.toml` is read from the
+    /// launch directory (`--cwd`), never silently from the process cwd.
+    public static func resolveForeignSessionCompatSessions(
+        environment: [String: String],
+        cwd: URL
+    ) -> ForeignSessionCompatSessions {
+        let document: ForeignSessionCompatDocument
+        do {
+            document = .loaded(
+                try loadAuthorityComposition(
+                    cwd: cwd,
+                    environment: environment
+                ).effective()
+            )
+        } catch {
+            document = .unavailable
+        }
+        return ForeignSessionCompatSessions(
+            claude: resolveCompatSessionsCell(
+                envName: "GROK_CLAUDE_SESSIONS_ENABLED",
+                vendor: "claude",
+                document: document,
+                environment: environment
+            ),
+            codex: resolveCompatSessionsCell(
+                envName: "GROK_CODEX_SESSIONS_ENABLED",
+                vendor: "codex",
+                document: document,
+                environment: environment
+            ),
+            cursor: resolveCompatSessionsCell(
+                envName: "GROK_CURSOR_SESSIONS_ENABLED",
+                vendor: "cursor",
+                document: document,
+                environment: environment
+            )
+        )
+    }
+
+    private enum ForeignSessionCompatDocument {
+        case loaded(TOMLValue)
+        case unavailable
+    }
+
+    private enum ForeignSessionCompatCell {
+        case value(Bool)
+        case absent
+        case malformed
+    }
+
+    private static func resolveCompatSessionsCell(
+        envName: String,
+        vendor: String,
+        document: ForeignSessionCompatDocument,
+        environment: [String: String]
+    ) -> Bool {
+        if let env = OpenGrokConfig.envBool(envName, environment: environment) {
+            return env
+        }
+        switch document {
+        case .unavailable:
+            return false
+        case .loaded(let effective):
+            switch readCompatSessionsCell(effective, vendor: vendor) {
+            case .value(let value):
+                return value
+            case .absent:
+                return true
+            case .malformed:
+                return false
+            }
+        }
+    }
+
+    private static func readCompatSessionsCell(
+        _ document: TOMLValue,
+        vendor: String
+    ) -> ForeignSessionCompatCell {
+        guard let compat = document["compat"] else { return .absent }
+        guard let compatTable = compat.table else { return .malformed }
+        guard let vendorValue = compatTable[vendor] else { return .absent }
+        guard let vendorTable = vendorValue.table else { return .malformed }
+        guard let sessions = vendorTable["sessions"] else { return .absent }
+        guard let bool = sessions.boolValue else { return .malformed }
+        return .value(bool)
+    }
+
+    /// Compatibility overload for unowned call sites that omit `cwd`.
+    ///
+    /// Resolves `options.common.cwd` through the same
+    /// `resolveWorkingDirectory` seam production `session()` uses — so a test
+    /// that builds options with `--cwd` still gets the launch directory, and
+    /// there is still only one place that falls back to the process cwd.
+    public static func run(
+        options: CLISessionOptions,
+        environment: [String: String],
+        streams: CLIStreams,
+        foreignScanner: (any ForeignSessionScanning)? = nil,
+        foreignSources: EnabledForeignSources = .none
+    ) throws {
+        try run(
+            options: options,
+            environment: environment,
+            streams: streams,
+            cwd: try resolveWorkingDirectory(options.common.cwd),
+            foreignScanner: foreignScanner,
+            foreignSources: foreignSources
+        )
     }
 
     public static func run(
         options: CLISessionOptions,
         environment: [String: String],
         streams: CLIStreams,
+        cwd: URL,
         foreignScanner: (any ForeignSessionScanning)? = nil,
         foreignSources: EnabledForeignSources = .none
     ) throws {
@@ -311,9 +483,9 @@ public enum LiveSessionsComposition {
                 json: options.json,
                 limit: options.limit,
                 streams: streams,
+                cwd: cwd,
                 foreignScanner: foreignScanner,
-                foreignSources: foreignSources,
-                environment: environment
+                foreignSources: foreignSources
             )
         case .search:
             try runSearch(options: options, catalog: catalog, streams: streams)
@@ -341,15 +513,15 @@ public enum LiveSessionsComposition {
         json: Bool,
         limit: Int,
         streams: CLIStreams,
+        cwd: URL,
         foreignScanner: (any ForeignSessionScanning)? = nil,
-        foreignSources: EnabledForeignSources = .none,
-        environment: [String: String] = [:]
+        foreignSources: EnabledForeignSources = .none
     ) throws {
         var sessions = try catalog.list()
-        if let scanner = foreignScanner,
-           (foreignSources.claude || foreignSources.codex) {
-            let cwd = FileManager.default.currentDirectoryPath
-            let foreign = scanner.scan(cwd: cwd, enabled: foreignSources)
+        // Zero scanner calls (and therefore zero vendor I/O) when every source
+        // is gated off — missing/disabled resume skill or compat.sessions=false.
+        if let scanner = foreignScanner, foreignSources.anyEnabled {
+            let foreign = scanner.scan(cwd: cwd.path, enabled: foreignSources)
             sessions.append(contentsOf: foreign.map(listing(fromForeign:)))
         }
         sessions.sort { lhs, rhs in
@@ -614,5 +786,31 @@ public enum LiveSessionsComposition {
 
     private static func truncate(_ value: String, _ limit: Int) -> String {
         value.count <= limit ? value : String(value.prefix(limit))
+    }
+
+    /// Same seam as `LiveComposition.resolveWorkingDirectory`: honor `--cwd`
+    /// when present, otherwise the process cwd, and reject a missing path.
+    /// Kept private so call sites cannot invent a second process-cwd default.
+    private static func resolveWorkingDirectory(_ path: String?) throws -> URL {
+        let processCwd = FileManager.default.currentDirectoryPath
+        let url: URL
+        if let path, !path.isEmpty {
+            if path.hasPrefix("/") {
+                url = URL(fileURLWithPath: path).standardizedFileURL
+            } else {
+                url = URL(fileURLWithPath: processCwd, isDirectory: true)
+                    .appendingPathComponent(path)
+                    .standardizedFileURL
+            }
+        } else {
+            url = URL(fileURLWithPath: processCwd, isDirectory: true).standardizedFileURL
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            throw CLIApplicationError.failed("working directory does not exist: \(url.path)")
+        }
+        return url
     }
 }

@@ -3132,6 +3132,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             // prompter denies whenever the reverse channel cannot answer, so
             // installing it never widens what a silent client authorizes.
             let acpPermissionPrompter = LiveACPPermissionPrompter()
+            let permissionPipeline = foundation.toolExecutor.toolPermissionPipeline()
             if let permissions = await foundation.toolExecutor.permissionHandle() {
                 await permissions.setPrompter(acpPermissionPrompter)
             }
@@ -3304,7 +3305,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 extensionHandler: extensionRouter,
                 extensionNotifications: extensionNotifications,
                 notificationGateway: gateway,
-                permissionPrompter: acpPermissionPrompter
+                permissionPrompter: acpPermissionPrompter,
+                permissionPipeline: permissionPipeline
             )
         })
     }
@@ -4551,6 +4553,14 @@ struct LiveToolExecutor: Sendable {
     func permissionHandle() async -> PermissionHandle? {
         guard let permissionPipeline else { return nil }
         return await permissionPipeline.permissions
+    }
+
+    /// The same pipeline tools prepare through. ACP composition proofs need
+    /// this actor (not a reconstructed one) after `liveACPServices` installs
+    /// the reverse prompter — otherwise the suite can only cover the prompter
+    /// in isolation and miss a deleted `setPrompter` line.
+    func toolPermissionPipeline() -> PermissionPipeline? {
+        permissionPipeline
     }
     private let hookPermissionGate: HookPermissionGate?
     /// The OS sandbox this session runs under. `profileName` is what a session

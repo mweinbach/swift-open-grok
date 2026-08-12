@@ -26,6 +26,7 @@ import OpenGrokACPRuntime
 import OpenGrokShared
 import OpenGrokShell
 import OpenGrokShellSessionSupport
+import OpenGrokWorkspace
 
 // MARK: - Injected services
 
@@ -103,7 +104,14 @@ public struct LiveACPLaunchComponents: Sendable {
     /// `PermissionHandle`. Carriers attach the live runtime as its reverse
     /// client; `nil` keeps today's fail-closed denial prompter.
     public let permissionPrompter: LiveACPPermissionPrompter?
+    /// Tool-gate pipeline that received `setPrompter` for `permissionPrompter`.
+    /// Internal on purpose: only `liveACPServices` fills it, and composition
+    /// tests reach it via `@testable import`. Not a carrier/public API.
+    let permissionPipeline: PermissionPipeline?
 
+    /// Public construction surface — unchanged from the pre-proof signature.
+    /// `permissionPipeline` stays nil here; same-module composition uses the
+    /// internal initializer below.
     public init(
         promptDriver: LiveACPPromptDriver,
         extensionHandler: (any ACPAgentExtensionHandler)? = nil,
@@ -116,6 +124,23 @@ public struct LiveACPLaunchComponents: Sendable {
         self.extensionNotifications = extensionNotifications
         self.notificationGateway = notificationGateway
         self.permissionPrompter = permissionPrompter
+        self.permissionPipeline = nil
+    }
+
+    init(
+        promptDriver: LiveACPPromptDriver,
+        extensionHandler: (any ACPAgentExtensionHandler)? = nil,
+        extensionNotifications: ACPExtensionNotificationRouter? = nil,
+        notificationGateway: ACPNotificationGateway? = nil,
+        permissionPrompter: LiveACPPermissionPrompter? = nil,
+        permissionPipeline: PermissionPipeline?
+    ) {
+        self.promptDriver = promptDriver
+        self.extensionHandler = extensionHandler
+        self.extensionNotifications = extensionNotifications
+        self.notificationGateway = notificationGateway
+        self.permissionPrompter = permissionPrompter
+        self.permissionPipeline = permissionPipeline
     }
 }
 

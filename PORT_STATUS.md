@@ -1,12 +1,81 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-11. **No platform CI job is green yet.** Platform CI now *runs* — for the first time it builds, links, and reaches the suite on macOS and Linux instead of failing at setup — but macOS still dies mid-suite, Windows still does not compile, and Linux's post-fix result is unconfirmed. `reference_to_video`, the ACP reverse permission bridge, and a minimal Antigravity runner are implemented and unit-tested; the bridge is **live-unproven** (its installation is not asserted through the running executable — see the ACP section). The local serial gate exited 0 with **5,325 Swift Testing cases across 74 nonempty summaries**, zero failed summaries, and zero issues; one flaky test remains. **Do not read the local green as CI green** — that is exactly the substitution this ledger exists to prevent.
-**Overall state:** The package builds and tests green on macOS, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, and post-change Linux/Windows CI plus required-check evidence remain open.
+**As of:** 2026-08-11 (local correctness wave). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green: macOS still dies mid-suite at the reproducible live-composition stop, Windows still does not compile through the remaining modules, and Linux's completed suite result is known later in this file (**5,832 tests / 935 suites / 28 issues**, exit 1) — not unconfirmed. The ACP reverse permission bridge is **live-proven** through `OpenGrokLiveApplicationLauncher.liveACPServices` (see Local correctness wave). Local serial gate (lead, 2026-08-11): `build-tests` exit 0; focused filter exit 0 (**60 tests / 13 suites**); `test --no-parallel` exit 0 twice — count-only second run reports exactly **5,366 Swift Testing cases, 926 suites, 74 nonempty test-run summaries**, elapsed 314.694s, zero failed summaries/issues. No known remaining local flaky tests from the recorded Rhai + Hub MCP `closeCount` pair; CI reliability remains unproven. **Do not read the local green as CI green** — that is exactly the substitution this ledger exists to prevent.
+**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, Antigravity follow-ons, durable cross-process subagent resume, and post-change platform CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
 **Fixture pin:** `ProtocolFixtures/` was re-evaluated against `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` on 2026-08-08, with `70002584da34e4c37ea14a3bce35341b7d04f9a7` recorded as the immediate previous revision. The `.58` delta touched no fixture family's upstream source (every family's `referenceSources` diff across `70002584..650c1db7`, including `Cargo.lock` and the telemetry/tracing surfaces, verified empty by the lead), so the only recaptures are the two release-stamped artifacts (CLI version fixture and the GCRX sample, both restamped `0.1.220-open-grok.58` — the GCRX golden by same-length in-place substitution at offset 32); unchanged families carry explicit `70002584..650c1db7` diff evidence.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
+
+## Local correctness wave (2026-08-11, complete)
+
+Current truth for the same-day local correctness closures. Historical sections below
+keep their contemporaneous wording; where they conflict, **this section wins**.
+
+**Verification (lead, 2026-08-11; no platform CI rerun):**
+
+- `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
+- Focused filter (ACP composition, foreign gating, subagent tool/swarm, Hub
+  adapter/coordinator) — exit 0, **60 tests in 13 suites**.
+- `zsh workflows/swift-safe-verify.zsh test --no-parallel` — exit 0 twice; count-only
+  second run: exactly **5,366** Swift Testing cases, **926** suites, **74** nonempty
+  test-run summaries, elapsed **314.694s**, zero failed summaries/issues.
+- Real-CLI smoke (`verify-open-grok`, separate from Swift totals): isolated run
+  `20260811-181209-36619` under `/tmp/open-grok-verify-…`; helper `doctor` exit 0 /
+  version `0.1.220-open-grok.58`; `sessions list` evidence exit 0 with fresh-home
+  `No sessions found.`; `help sessions` evidence exit 0; cleanup succeeded; artifacts
+  retained under `.cursor/skills/verify-open-grok/artifacts/`. Does **not** claim
+  foreign-fixture `sessions list` behavior.
+
+**Live closures:**
+
+1. **ACP reverse permission bridge — LIVE-PROVEN.** Tests attach a fake reverse
+   client to composed `liveACPServices` components and assert
+   `session/request_permission`; rejection, no channel, and transport error all leave
+   `mayDispatch` false. Security install lines (quote required):
+
+   ```
+   let acpPermissionPrompter = LiveACPPermissionPrompter()
+   let permissionPipeline = foundation.toolExecutor.toolPermissionPipeline()
+   if let permissions = await foundation.toolExecutor.permissionHandle() {
+       await permissions.setPrompter(acpPermissionPrompter)
+   }
+   ```
+
+   Landed at `Sources/OpenGrokCLI/LiveComposition.swift:3134-3138`. The earlier
+   "live-unproven / no harness constructs `liveACPServices`" record below is
+   **superseded**.
+
+2. **Hub MCP `closeCount` flake — root cause fixed.** Explicit `McpBridge.shutdown`
+   and `deinit` independently closed the same transport. `McpTransportCloseOnce`
+   now single-flights explicit close, shares sticky success/failure, never retries
+   success, and permits one bounded deinit best-effort retry only after failure.
+   Tests cover the adapter and `HubMCPBridgeCoordinator`. Do **not** overclaim a
+   direct `LiveHubSessionMCP.stop` close proof — its adapter close is a no-op. The
+   Rhai flake was already fixed; there are **no known remaining local flaky tests
+   from that pair**. CI reliability remains unproven.
+
+3. **Same-process `resume_from` / `agent_swarm resume_agent_ids`.** Record/inherit
+   source `childCWD` / worktree identity; caller cwd is ignored; missing non-worktree
+   cwd and missing recorded worktree fall back to parent per pinned Rust
+   `subagent/mod.rs:1590-1632`. Cross-process durable subagent metadata/resume
+   remains deferred.
+
+4. **Foreign `sessions list` gating.** No longer scans Claude/Codex unconditionally.
+   Uses authoritative effective config + env and the matching resume skill gate
+   before vendor I/O, with zero scanner calls when disabled; `--cwd` controls
+   project config and scanner matching (pinned Rust `foreign_sessions.rs:281-365`).
+   Import/writeback and Cursor scan are **not** required parity at this pin — do not
+   advertise them as active deferred parity.
+
+### Still deferred from the audit
+
+Durable cross-process subagent resume, relocation journal, portable WSS/custom CA,
+Windows WinSock loopback server, the reproducible macOS live-composition CI stop
+(`OpenGrok executable parity composition` /
+`live composition applies agent profiles with CLI model precedence`), and the
+Antigravity follow-ons listed in the Antigravity section below.
 
 ## Wave 20 — Deferred parity Batch 2 (2026-08-10, complete)
 
@@ -37,7 +106,10 @@ zero issues.
   URL (best-effort) and complete the backend upsert/save/share flow
   (`share.rs:150-199`, `client.rs:360-388`).
 - **Foreign sessions:** `LiveForeignSessionScanner` feeds `sessions list` with
-  Claude/Codex summaries (read-only; import/writeback deferred).
+  Claude/Codex summaries (read-only). **Later the same day (Local correctness
+  wave):** gated on authoritative effective config + env and the matching resume
+  skill before vendor I/O (`foreign_sessions.rs:281-365`); import/writeback and
+  Cursor scan are not required parity at this pin.
 - **XTVERSION / doctor:** `LiveXtversionCollector` folds into `/doctor` when a TTY
   is available (`xtversion.rs:38-65`).
 
@@ -179,30 +251,19 @@ child process whenever a `try #require` fires first.
 exited 0 on 2026-08-11 with **5,306 Swift Testing cases across 74 nonempty
 summaries** and zero issues.
 
-**Recorded honestly, not fixed:**
+**Recorded honestly, not fixed (contemporaneous 2026-08-11 morning; superseded
+by Local correctness wave above):**
 
-- The prompter's *install* line in `liveACPServices` has no reachability test.
-  Its behavior is covered through a real `PermissionHandle`/`PermissionPipeline`
-  with a fake reverse client, but nothing asserts the live ACP composition
-  actually installs it — no test harness constructs `liveACPServices` today.
-  This is the exact implemented-but-unwired shape §3 warns about; treat the
-  bridge as live-unproven until that harness exists.
-- **Two tests are flaky under full-suite load** and pass in isolation:
-  `RhaiEngineTests.parallelIsABarrier` (`peakConcurrency == 3`, which hopes
-  three tasks overlap rather than forcing a rendezvous) and the hub MCP bridge's
-  `transport.closeCount == 1`. Each failed one serial run during this wave.
-  A flaky suite cannot produce trustworthy CI evidence, so these block any
-  claim that CI is reliably green.
-- **One of the two flaky tests is fixed.** `RhaiEngineTests.parallelIsABarrier`
-  yielded a fixed number of times and *hoped* its siblings had started, so an
-  exact `peakConcurrency` assertion failed whenever a loaded machine let one
-  call finish before the next began; callers pinning an exact peak now hold
-  every sibling at a rendezvous. The hub MCP `transport.closeCount == 1` flake
-  is **not** fixed and not explained: the only close path is
-  `disconnect → bridge.shutdown → transport.close`, all awaited, with no second
-  closer (`MCPToolBridge.unregister` only touches the toolset). It has not
-  reproduced since. Guessing a fix for a mechanism that reads as deterministic
-  would be worse than leaving it recorded.
+- ~~The prompter's *install* line in `liveACPServices` has no reachability test.~~
+  **Superseded:** composition tests now attach a fake reverse client through
+  `liveACPServices` and prove install + fail-closed outcomes; see Local
+  correctness wave §1 and `LiveComposition.swift:3134-3138`.
+- ~~**Two tests are flaky under full-suite load**~~ / ~~hub MCP
+  `transport.closeCount == 1` flake is **not** fixed~~ — **superseded:** Rhai
+  rendezvous fix already landed; Hub MCP double-close root cause fixed via
+  `McpTransportCloseOnce` (Local correctness wave §2). No known remaining local
+  flaky tests from that pair; **CI reliability remains unproven** (do not treat
+  local green as platform-CI green).
 
 ### Antigravity (2026-08-11) — minimal slice live
 
@@ -481,8 +542,13 @@ The `--privileged` point is a real supply-chain observation about
 
 ### Still deferred from the audit
 
-Durable subagent resume, relocation journal, portable WSS/custom CA, the
-Windows WinSock loopback server, the macOS proto-test hang on CI, and the
+**Superseded wording note (2026-08-11 local correctness wave):** current deferred
+list lives under **Local correctness wave → Still deferred from the audit**.
+Updated from the obsolete "macOS proto-test hang" phrasing: durable
+cross-process subagent resume, relocation journal, portable WSS/custom CA, the
+Windows WinSock loopback server, the reproducible macOS live-composition CI stop
+(`OpenGrok executable parity composition` /
+`live composition applies agent profiles with CLI model precedence`), and the
 Antigravity follow-ons listed above.
 
 ## Wave 19 — Deferred parity follow-ons (2026-08-10, complete)

@@ -413,5 +413,335 @@ struct ComputerHubMCPAdapterTests {
             Issue.record("unexpected error: \(error)")
         }
         #expect(transport.closeCount == 1)
+        #expect(handle.bridge.closeOnceForTesting.isCompletedForTesting)
+    }
+
+    @Test("successful explicit shutdown then release closes the transport exactly once")
+    func successfulShutdownThenReleaseClosesOnce() async throws {
+        let transport = MockMcpTransport(
+            initializeResponse: .success(sampleServerInfo())
+        )
+        var handle: McpBridgeHandle? = try await McpBridge.connect(transport, try sampleConfig())
+        var bridge: McpBridge? = handle!.bridge
+        let gate = bridge!.closeOnceForTesting
+        handle = nil
+
+        try await bridge!.shutdown()
+        #expect(transport.closeCount == 1)
+        #expect(gate.performStartCountForTesting == 1)
+        #expect(gate.isCompletedForTesting)
+        #expect(!gate.failureRetryStartedForTesting)
+
+        // Success is terminal: deinit must not start a second close.
+        bridge = nil
+        #expect(gate.performStartCountForTesting == 1)
+        #expect(transport.closeCount == 1)
+        #expect(!gate.failureRetryStartedForTesting)
+
+        gate.startBestEffortClose {
+            try await transport.close()
+        }
+        #expect(gate.performStartCountForTesting == 1)
+        #expect(transport.closeCount == 1)
+    }
+
+    @Test("explicit close failure is shared once without a second flight")
+    func explicitCloseFailureSharedOnce() async throws {
+        let transport = ControllableCloseTransport(closeError: .transport("pipe closed"))
+        let handle = try await McpBridge.connect(transport, try sampleConfig())
+        let bridge = handle.bridge
+        let gate = bridge.closeOnceForTesting
+
+        let first = Task { () -> Result<Void, McpError> in
+            await shutdownResult(bridge)
+        }
+        let second = Task { () -> Result<Void, McpError> in
+            await shutdownResult(bridge)
+        }
+
+        await transport.waitUntilCloseStarted()
+        #expect(transport.closeCount == 1)
+        #expect(gate.performStartCountForTesting == 1)
+
+        transport.releaseClose()
+        let results = [await first.value, await second.value]
+        for result in results {
+            switch result {
+            case .success:
+                Issue.record("expected both shutdown callers to observe the close error")
+            case .failure(let error):
+                #expect(error == .transport("pipe closed"))
+            }
+        }
+        #expect(transport.closeCount == 1)
+        #expect(gate.performStartCountForTesting == 1)
+        #expect(gate.isCompletedForTesting)
+        #expect(!gate.failureRetryStartedForTesting)
+
+        // A later explicit shutdown re-observes the sticky failure; no new flight.
+        do {
+            try await bridge.shutdown()
+            Issue.record("expected stored close failure to be rethrown")
+        } catch let error as McpError {
+            #expect(error == .transport("pipe closed"))
+        }
+        #expect(transport.closeCount == 1)
+        #expect(gate.performStartCountForTesting == 1)
+        #expect(!gate.failureRetryStartedForTesting)
+    }
+
+    @Test("release after failed explicit shutdown starts one best-effort retry")
+    func releaseAfterFailedShutdownRetriesOnce() async throws {
+        let transport = MockMcpTransport(
+            initializeResponse: .success(sampleServerInfo()),
+            closeError: .transport("pipe closed")
+        )
+        var handle: McpBridgeHandle? = try await McpBridge.connect(transport, try sampleConfig())
+        var bridge: McpBridge? = handle!.bridge
+        let gate = bridge!.closeOnceForTesting
+        handle = nil
+
+        do {
+            try await bridge!.shutdown()
+            Issue.record("expected shutdown to fail")
+        } catch let error as McpError {
+            #expect(error == .transport("pipe closed"))
+        }
+        #expect(transport.closeCount == 1)
+        #expect(gate.performStartCountForTesting == 1)
+        #expect(gate.isCompletedForTesting)
+        #expect(!gate.failureRetryStartedForTesting)
+
+        // Sticky explicit failure: still one flight until release.
+        do {
+            try await bridge!.shutdown()
+            Issue.record("expected stored close failure to be rethrown")
+        } catch let error as McpError {
+            #expect(error == .transport("pipe closed"))
+        }
+        #expect(transport.closeCount == 1)
+        #expect(gate.performStartCountForTesting == 1)
+
+        // Deinit may start exactly one best-effort retry after that failure.
+        bridge = nil
+        #expect(gate.failureRetryStartedForTesting)
+        #expect(gate.performStartCountForTesting == 2)
+        #expect(await waitForCloseCount(transport, expected: 2))
+        #expect(transport.closeCount == 2)
+
+        // Sticky first failure: a later shared join must not start/join another close.
+        let sticky = await gate.runSharedClose {
+            try await transport.close()
+        }
+        guard case .failure(let stickyError) = sticky else {
+            Issue.record("expected sticky first failure after retry, got \(sticky)")
+            return
+        }
+        #expect(stickyError == .transport("pipe closed"))
+        #expect(gate.performStartCountForTesting == 2)
+        #expect(transport.closeCount == 2)
+
+        // Bound: a further best-effort kick must not start a third flight.
+        gate.startBestEffortClose {
+            try await transport.close()
+        }
+        #expect(gate.performStartCountForTesting == 2)
+        #expect(transport.closeCount == 2)
+    }
+
+    @Test("release without explicit shutdown still closes the transport once")
+    func releaseWithoutShutdownClosesOnce() async throws {
+        let transport = MockMcpTransport(
+            initializeResponse: .success(sampleServerInfo())
+        )
+        var handle: McpBridgeHandle? = try await McpBridge.connect(transport, try sampleConfig())
+        var bridge: McpBridge? = handle!.bridge
+        let gate = bridge!.closeOnceForTesting
+        handle = nil
+        #expect(transport.closeCount == 0)
+        #expect(gate.performStartCountForTesting == 0)
+
+        bridge = nil
+        #expect(gate.performStartCountForTesting == 1)
+        #expect(await waitForCloseCount(transport, expected: 1))
+        #expect(gate.isCompletedForTesting)
+        #expect(transport.closeCount == 1)
+        #expect(!gate.failureRetryStartedForTesting)
+    }
+
+    @Test("concurrent shutdown callers await one delayed close")
+    func concurrentShutdownSharesDelayedClose() async throws {
+        let transport = ControllableCloseTransport()
+        let handle = try await McpBridge.connect(transport, try sampleConfig())
+        let bridge = handle.bridge
+        let gate = bridge.closeOnceForTesting
+
+        let first = Task { () -> Result<Void, McpError> in
+            await shutdownResult(bridge)
+        }
+        let second = Task { () -> Result<Void, McpError> in
+            await shutdownResult(bridge)
+        }
+
+        await transport.waitUntilCloseStarted()
+        #expect(transport.closeCount == 1)
+        #expect(gate.performStartCountForTesting == 1)
+        #expect(!gate.isCompletedForTesting)
+
+        transport.releaseClose()
+        let firstResult = await first.value
+        let secondResult = await second.value
+        guard case .success = firstResult else {
+            Issue.record("expected first shutdown to succeed, got \(firstResult)")
+            return
+        }
+        guard case .success = secondResult else {
+            Issue.record("expected second shutdown to succeed, got \(secondResult)")
+            return
+        }
+        #expect(transport.closeCount == 1)
+        #expect(gate.performStartCountForTesting == 1)
+        #expect(gate.isCompletedForTesting)
+    }
+}
+
+private func shutdownResult(_ bridge: McpBridge) async -> Result<Void, McpError> {
+    do {
+        try await bridge.shutdown()
+        return .success(())
+    } catch let error as McpError {
+        return .failure(error)
+    } catch {
+        return .failure(.transport(String(describing: error)))
+    }
+}
+
+/// Bounded poll for the deinit-scheduled shared close Task.
+private func waitForCloseCount(
+    _ transport: MockMcpTransport,
+    expected: Int,
+    seconds: TimeInterval = 2
+) async -> Bool {
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline {
+        if transport.closeCount == expected { return true }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    return transport.closeCount == expected
+}
+
+// MARK: - Controllable close (single-flight proofs)
+
+private final class OnceSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var fired = false
+
+    func wait() async {
+        await withCheckedContinuation { cont in
+            lock.lock()
+            if fired {
+                lock.unlock()
+                cont.resume()
+            } else {
+                continuation = cont
+                lock.unlock()
+            }
+        }
+    }
+
+    func signal() {
+        lock.lock()
+        fired = true
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume()
+    }
+}
+
+private final class Latch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var isOpen = false
+
+    func wait() async {
+        await withCheckedContinuation { cont in
+            lock.lock()
+            if isOpen {
+                lock.unlock()
+                cont.resume()
+            } else {
+                waiters.append(cont)
+                lock.unlock()
+            }
+        }
+    }
+
+    func open() {
+        lock.lock()
+        isOpen = true
+        let pending = waiters
+        waiters = []
+        lock.unlock()
+        for waiter in pending {
+            waiter.resume()
+        }
+    }
+}
+
+/// Transport whose `close` blocks until `releaseClose()`, so concurrent
+/// `shutdown` callers can be observed sharing one in-flight operation.
+private final class ControllableCloseTransport: McpTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private let closeError: McpError?
+    private let closeStarted = OnceSignal()
+    private let closeHold = Latch()
+    private var closeCountValue = 0
+
+    init(closeError: McpError? = nil) {
+        self.closeError = closeError
+    }
+
+    func initialize() async throws -> McpServerInfo {
+        sampleServerInfo()
+    }
+
+    func listTools() async throws -> [McpToolDefinition] {
+        []
+    }
+
+    func callTool(name: String, arguments: JSONValue) async throws -> McpCallResult {
+        _ = (name, arguments)
+        return McpCallResult()
+    }
+
+    func close() async throws {
+        recordClose()
+        closeStarted.signal()
+        await closeHold.wait()
+        if let closeError {
+            throw closeError
+        }
+    }
+
+    private func recordClose() {
+        lock.lock()
+        defer { lock.unlock() }
+        closeCountValue += 1
+    }
+
+    func waitUntilCloseStarted() async {
+        await closeStarted.wait()
+    }
+
+    func releaseClose() {
+        closeHold.open()
+    }
+
+    var closeCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return closeCountValue
     }
 }

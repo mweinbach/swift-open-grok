@@ -34,11 +34,24 @@ auto-mode heuristic classification, hub MCP→harness session connect, `/dream`
 consolidation, macOS `__mic-capture` voice + `/voice`, LSP `pull_diagnostics`,
 and backend-gated `image_to_video`. Auto-mode LLM side-query and full LSP
 post-edit sync landed 2026-08-11, followed the same day by `reference_to_video`,
-the ACP reverse permission bridge (`session/request_permission`), and the first
-non-red platform CI — macOS/Linux/Windows had each failed on every push for
-three independent reasons, so every prior green claim was macOS-local only.
-Still open at the live seam: Antigravity, WSS/custom CA, Windows relaunch, and
-a reliably green CI (two known-flaky tests remain, recorded in `PORT_STATUS.md`).
+the ACP reverse permission bridge (`session/request_permission`), a minimal
+Antigravity runner, and the first non-red platform CI — macOS/Linux/Windows had
+each failed on every push for three independent reasons, so every prior green
+claim was macOS-local only.
+
+**Local correctness wave (2026-08-11):** ACP reverse permission install is now
+live-proven through `liveACPServices`; Hub MCP `closeCount` double-close flake
+is fixed (`McpTransportCloseOnce`); same-process `resume_from` /
+`resume_agent_ids` inherit source childCWD/worktree identity; foreign
+`sessions list` gates Claude/Codex scans on effective config + resume skill
+(`foreign_sessions.rs:281-365`). Local serial gate: **5,366** cases / **926**
+suites / **74** nonempty summaries, exit 0 twice; no known remaining local
+flakes from the recorded Rhai + Hub MCP pair. Still open at the live seam:
+**Antigravity follow-ons**, durable cross-process subagent resume, relocation
+journal, portable WSS/custom CA, Windows WinSock loopback / relaunch, and
+**platform CI reliability** (no platform job green; macOS live-composition CI
+stop remains). Details and quoted security install lines:
+`PORT_STATUS.md` → Local correctness wave.
 
 **Wave 19 update (2026-08-10):** the deferred-dashboard batch is now landed rather
 than standing. Retained dashboard sessions can dispatch prompts and replies; `/cd`,

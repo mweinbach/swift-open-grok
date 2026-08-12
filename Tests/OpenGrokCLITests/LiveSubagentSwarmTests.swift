@@ -21,10 +21,16 @@
 //     and a cancelled swarm kills every member at the host;
 //   * `resume_agent_ids`: a completed member's transcript seeds the resumed
 //     member, `mode="resume"` lands in the XML;
+//   * resume cwd: `resume_agent_ids` inherits a custom-cwd source child's
+//     effective directory (same-process bookkeeping; swarm schema has no
+//     per-member cwd of its own); recorded-but-missing worktree selects
+//     Shared/parent over a still-existing childCWD (pure pin — same helpers
+//     as spawn);
 //   * fail-fast validation copy through the live dispatch.
 
 import Foundation
 import Testing
+import OpenGrokFileUtils
 import OpenGrokSamplingTypes
 import OpenGrokShared
 import OpenGrokShell
@@ -117,11 +123,128 @@ private func toolNames(in entry: LogEntry) -> [String] {
     entry.body?["tools"].arrayValue?.compactMap { $0["name"].stringValue } ?? []
 }
 
+/// `pwd`-equivalent absolute path. Foundation's `resolvingSymlinksInPath` leaves
+/// the macOS firmlink `/var` → `/private/var` alone; shell `pwd` and
+/// `PathSecurity.canonicalize` (`realpath`) physicalize it.
+private func physicalPath(_ url: URL) throws -> String {
+    try PathSecurity.canonicalize(url).path
+}
+
+/// Await `toolExecutor.shutdown` after `operation` succeeds or throws.
+/// Scoped to the resumed-CWD test — historical suites keep their fire-and-forget
+/// `defer { Task { … } }` so this change stays local.
+private func withAwaitedToolExecutorShutdown(
+    _ foundation: OpenGrokLiveApplicationLauncher.LiveSessionFoundation,
+    operation: () async throws -> Void
+) async rethrows {
+    do {
+        try await operation()
+    } catch {
+        await foundation.toolExecutor.shutdown()
+        throw error
+    }
+    await foundation.toolExecutor.shutdown()
+}
+
+/// Decoded string leaves from a logged Responses body.
+///
+/// `SwarmFixture.bodyText` re-encodes via `JSONSerialization`, which escapes
+/// `/` as `\/`. Searching that raw text for absolute paths therefore fails even
+/// when production emitted the correct physical path; path-identity checks must
+/// run against these decoded values instead.
+private func decodedBodyStrings(_ entry: LogEntry) -> [String] {
+    // Encode through Data + JSONSerialization rather than naming the
+    // OpenGrokTestSupport JSONValue type: that qualifier is ambiguous
+    // (module enum `OpenGrokTestSupport` vs module-qualified type) once
+    // OpenGrokShared's JSONValue is also in scope.
+    guard let body = entry.body,
+          let data = try? body.encode(),
+          let root = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    else { return [] }
+    var out: [String] = []
+    appendDecodedStrings(from: root, into: &out)
+    return out
+}
+
+private func appendDecodedStrings(from value: Any, into out: inout [String]) {
+    if let string = value as? String {
+        out.append(string)
+        return
+    }
+    if let items = value as? [Any] {
+        for item in items {
+            appendDecodedStrings(from: item, into: &out)
+        }
+        return
+    }
+    if let object = value as? [String: Any] {
+        for child in object.values {
+            appendDecodedStrings(from: child, into: &out)
+        }
+    }
+}
+
+/// `RESUME_CWD=` value from a decoded `function_call_output` / content string.
+/// Only absolute shell output lines (`RESUME_CWD=/…`) count — the tool-call
+/// arguments leaf also contains `RESUME_CWD=$(pwd)` and must be ignored.
+private func resumeCWD(listedIn entry: LogEntry) -> String? {
+    let prefix = "RESUME_CWD="
+    for text in decodedBodyStrings(entry) {
+        for line in text.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("RESUME_CWD=/") else { continue }
+            return String(trimmed.dropFirst(prefix.count))
+        }
+    }
+    return nil
+}
+
+private func decodedBodyContains(_ entry: LogEntry, _ needle: String) -> Bool {
+    decodedBodyStrings(entry).contains { $0.contains(needle) }
+}
+
 /// Every `agent_id="…"` attribute value in an `agent_swarm_result` payload,
 /// in document order.
 private func agentIDs(in xml: String) -> [String] {
     xml.components(separatedBy: "agent_id=\"").dropFirst().compactMap {
         $0.components(separatedBy: "\"").first
+    }
+}
+
+// MARK: - Resume cwd precedence (shared with spawn)
+
+@Suite("agent_swarm resume cwd precedence")
+struct AgentSwarmResumeCWDPrecedenceTests {
+    /// Swarm resume selection uses the same helpers as spawn. A recorded
+    /// worktree that is gone must not fall through to a still-existing
+    /// `childCWD` (`resume_inherited_cwd` / `worktree_path.is_some()`,
+    /// subagent/mod.rs:1621; `ResumeWorktreeAction::Shared`).
+    @Test("missing recorded worktree selects parent over existing source childCWD")
+    func missingRecordedWorktreeSelectsParent() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opengrok-swarm-resume-cwd-\(UUID().uuidString)", isDirectory: true)
+        let parent = root.appendingPathComponent("parent", isDirectory: true)
+        let childCWD = root.appendingPathComponent("child", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: childCWD, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let recordedWorktree = root.appendingPathComponent("missing-wt", isDirectory: true)
+        #expect(!FileManager.default.fileExists(atPath: recordedWorktree.path))
+
+        let reusable = LiveSubagentHost.resumeWorktreePath(recordedWorktree)
+        #expect(reusable == nil)
+        let override = LiveSubagentHost.resumeInheritedCWD(
+            sourceCWD: childCWD,
+            recordedWorktreePath: recordedWorktree
+        )
+        #expect(override == nil)
+        let selected = LiveSubagentHost.resolveChildCWD(
+            worktreePath: reusable,
+            overrideCWD: override,
+            parentCWD: parent
+        )
+        #expect(selected.standardizedFileURL == parent.standardizedFileURL)
     }
 }
 
@@ -499,6 +622,92 @@ struct LiveAgentSwarmEndToEndTests {
         let resumedBody = SwarmFixture.bodyText(requests[2])
         #expect(resumedBody.contains("probe one \(marker)") || resumedBody.contains("probe two \(marker)"))
         #expect(resumedBody.contains("continue \(marker)"))
+    }
+
+    /// `resume_agent_ids` can resume a completed `spawn_subagent` child that
+    /// ran under a custom cwd (Rust sets swarm `cwd: None` and lets
+    /// `handle_request` inherit via `select_override_cwd`). Proves the
+    /// resumed member's shell tool sees the source directory — not a silent
+    /// parent-workspace fallback from missing bookkeeping.
+    @Test("resume_agent_ids inherits a custom-cwd source child's directory")
+    func resumeInheritsCustomSourceCWD() async throws {
+        let fixture = try SwarmFixture()
+        defer { fixture.dispose() }
+
+        let sourceDir = fixture.home.deletingLastPathComponent()
+            .appendingPathComponent("swarm-source-cwd-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceDir, withIntermediateDirectories: true)
+
+        let firstPrompt = "swarm cwd source \(UUID().uuidString)"
+        let resumePrompt = "swarm cwd resume \(UUID().uuidString)"
+        try fixture.server.enqueueResponse(
+            path: "/v1/responses",
+            response: .sse(SseEvents.responsesApiEventsExact(text: "source child answer", model: "grok-4.5"))
+        )
+        try fixture.server.enqueueResponse(
+            path: "/v1/responses",
+            response: .sse(SseEvents.responsesApiReasoningThenToolCallEvents(
+                reasoning: "Checking cwd.",
+                callId: "call-swarm-pwd-1",
+                name: "run_terminal_cmd",
+                arguments: #"{"command":"echo RESUME_CWD=$(pwd)","timeout_ms":5000}"#,
+                model: "grok-4.5"
+            ))
+        )
+        try fixture.server.enqueueResponse(
+            path: "/v1/responses",
+            response: .sse(SseEvents.responsesApiEventsExact(text: "resumed swarm answer", model: "grok-4.5"))
+        )
+
+        let foundation = try await fixture.makeFoundation(["--model", "grok-4.5", "--yolo"])
+        try await withAwaitedToolExecutorShutdown(foundation) {
+            let first = await foundation.toolExecutor.invoke(
+                sessionID: foundation.sessionID,
+                workingDirectory: foundation.cwd,
+                call: ToolCall(
+                    id: "call-spawn-1",
+                    name: "spawn_subagent",
+                    arguments: #"{"prompt":"\#(firstPrompt)","description":"cwd source","subagent_type":"general-purpose","background":false,"cwd":"\#(sourceDir.path)"}"#
+                )
+            )
+            guard case .success(let firstResult) = first else {
+                Issue.record("source spawn failed: \(first)")
+                return
+            }
+            guard let sourceID = firstResult.value["subagent_id"]?.stringValue else {
+                Issue.record("source spawn carried no subagent_id: \(firstResult.value)")
+                return
+            }
+
+            let resumed = await foundation.toolExecutor.invoke(
+                sessionID: foundation.sessionID,
+                workingDirectory: foundation.cwd,
+                call: ToolCall(
+                    id: "call-swarm-resume-1",
+                    name: "agent_swarm",
+                    arguments: #"{"description":"cwd resume","resume_agent_ids":{"\#(sourceID)":"\#(resumePrompt)"}}"#
+                )
+            )
+            guard case .success(let resumedOutput) = resumed else {
+                Issue.record("swarm resume failed: \(resumed)")
+                return
+            }
+            #expect(resumedOutput.promptText.contains("mode=\"resume\""))
+            #expect(resumedOutput.promptText.contains("resumed swarm answer"))
+
+            let requests = fixture.responsesRequests()
+            #expect(requests.count == 3)
+            // Decode string leaves first — raw `bodyText` escapes `/` as `\/`.
+            // Physicalize expected dirs: macOS `pwd` prints `/private/var/...`
+            // while temp URLs often stay at `/var/...`.
+            let resumePath = try #require(resumeCWD(listedIn: requests[2]))
+            let sourcePath = try physicalPath(sourceDir)
+            let parentPath = try physicalPath(foundation.cwd)
+            #expect(resumePath == sourcePath)
+            #expect(resumePath != parentPath)
+            #expect(!decodedBodyContains(requests[2], "RESUME_CWD=\(parentPath)"))
+            #expect(decodedBodyContains(requests[2], resumePrompt))
+        }
     }
 
     @Test("an unknown resume id fails that member, not the whole swarm")

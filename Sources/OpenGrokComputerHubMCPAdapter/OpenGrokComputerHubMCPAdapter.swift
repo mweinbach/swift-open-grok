@@ -200,12 +200,162 @@ public struct McpBridgeHandle: Sendable {
     }
 }
 
+/// Single-flight transport close shared by explicit `shutdown` and `deinit`.
+///
+/// Every `shutdown()` joins the same first in-flight (or already completed)
+/// operation and observes its normalized success/failure — a second caller must
+/// not return success while the first close is still running, and must not hide
+/// a failure. That first result is sticky for every later explicit caller, even
+/// if `deinit` later starts a post-failure retry. The lock is never held across
+/// `await`.
+///
+/// Cost: production teardown (`HubMCPBridgeCoordinator.disconnect` /
+/// `LiveHubSessionMCP.stop`) uses `try?`, so a failed explicit close would
+/// otherwise leave the transport open forever once `deinit` refused to touch a
+/// completed flight. `deinit` may start exactly one best-effort retry after a
+/// completed *failure*. Retrying after success, starting a second close while
+/// one is in flight, or unbounded retries after repeated failures would
+/// reintroduce double-close (or close storms).
+final class McpTransportCloseOnce: @unchecked Sendable {
+    private enum State {
+        case idle
+        case inFlight(Task<Result<Void, McpError>, Never>)
+        case completed(Result<Void, McpError>)
+    }
+
+    private let lock = NSLock()
+    private var state: State = .idle
+    /// First completed close result; every explicit `runSharedClose` re-observes
+    /// this and never joins a later best-effort retry.
+    private var firstResult: Result<Void, McpError>?
+    /// Bounds post-failure `deinit` retry to one start.
+    private var failureRetryStarted = false
+    private var performStartCount = 0
+
+    /// How many times a close `perform` Task was started (0–2: first flight plus
+    /// at most one post-failure best-effort retry).
+    var performStartCountForTesting: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return performStartCount
+    }
+
+    var isCompletedForTesting: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if case .completed = state { return true }
+        return false
+    }
+
+    var failureRetryStartedForTesting: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return failureRetryStarted
+    }
+
+    private enum SharedCloseJoin: Sendable {
+        case completed(Result<Void, McpError>)
+        case inFlight(Task<Result<Void, McpError>, Never>)
+    }
+
+    /// Join the first shared close, starting it when still idle.
+    ///
+    /// NSLock is sync-only under Swift 6; lock acquisition lives in
+    /// `beginOrJoinSharedClose` so this async body only awaits. After the first
+    /// flight completes, every caller re-observes that sticky result — including
+    /// while a post-failure best-effort retry is in flight.
+    func runSharedClose(
+        perform: @escaping @Sendable () async throws -> Void
+    ) async -> Result<Void, McpError> {
+        switch beginOrJoinSharedClose(perform: perform) {
+        case .completed(let result):
+            return result
+        case .inFlight(let task):
+            return await task.value
+        }
+    }
+
+    /// Start a best-effort close from `.idle`, or exactly one retry after a
+    /// completed failure. No-op while a close is in flight, after success, or
+    /// after the single failure retry has already been started.
+    func startBestEffortClose(
+        perform: @escaping @Sendable () async throws -> Void
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        switch state {
+        case .idle:
+            _ = startCloseTask_locked(perform: perform)
+        case .completed(.failure(_)):
+            guard !failureRetryStarted else { return }
+            failureRetryStarted = true
+            _ = startCloseTask_locked(perform: perform)
+        case .inFlight, .completed(.success):
+            return
+        }
+    }
+
+    /// Synchronous critical section: return the sticky first result, the shared
+    /// first in-flight Task, or start that first flight from `.idle`. Never
+    /// called with a lock held across an await.
+    private func beginOrJoinSharedClose(
+        perform: @escaping @Sendable () async throws -> Void
+    ) -> SharedCloseJoin {
+        lock.lock()
+        defer { lock.unlock() }
+        // Sticky first result wins even when a deinit retry is in flight or has
+        // completed with a different outcome.
+        if let firstResult {
+            return .completed(firstResult)
+        }
+        switch state {
+        case .completed(let result):
+            return .completed(result)
+        case .inFlight(let existing):
+            return .inFlight(existing)
+        case .idle:
+            return .inFlight(startCloseTask_locked(perform: perform))
+        }
+    }
+
+    /// Caller must hold `lock` and `state` must be `.idle` or a completed
+    /// failure about to retry (already flipped `failureRetryStarted`).
+    private func startCloseTask_locked(
+        perform: @escaping @Sendable () async throws -> Void
+    ) -> Task<Result<Void, McpError>, Never> {
+        performStartCount += 1
+        let task = Task<Result<Void, McpError>, Never> {
+            let result: Result<Void, McpError>
+            do {
+                try await perform()
+                result = .success(())
+            } catch {
+                result = .failure(normalizedMcpError(error))
+            }
+            self.markCompleted(result)
+            return result
+        }
+        state = .inFlight(task)
+        return task
+    }
+
+    private func markCompleted(_ result: Result<Void, McpError>) {
+        lock.lock()
+        if firstResult == nil {
+            firstResult = result
+        }
+        state = .completed(result)
+        lock.unlock()
+    }
+}
+
 public final class McpBridge: Sendable {
     public let sessionId: SessionId
 
     private let transport: any McpTransport
     private let bridgedHandlers: [McpToolHandler]
     private let info: McpServerInfo
+    private let closeOnce = McpTransportCloseOnce()
 
     private init(
         transport: any McpTransport,
@@ -218,6 +368,9 @@ public final class McpBridge: Sendable {
         self.bridgedHandlers = handlers
         self.info = serverInfo
     }
+
+    /// Retained by tests across bridge release so close-once state stays observable.
+    var closeOnceForTesting: McpTransportCloseOnce { closeOnce }
 
     public static func connect(
         _ transport: any McpTransport,
@@ -279,17 +432,20 @@ public final class McpBridge: Sendable {
     }
 
     public func shutdown() async throws {
-        do {
+        let transport = self.transport
+        let result = await closeOnce.runSharedClose {
             try await transport.close()
-        } catch {
-            throw normalizedMcpError(error)
         }
+        try result.get()
     }
 
     deinit {
+        // From idle: first close. After a completed explicit failure: exactly
+        // one best-effort retry (production teardown swallows that failure with
+        // `try?`). Never duplicates an in-flight close or retries after success.
         let transport = self.transport
-        Task {
-            try? await transport.close()
+        closeOnce.startBestEffortClose {
+            try await transport.close()
         }
     }
 }
