@@ -48,6 +48,28 @@ struct LiveTUISuspendHost: Sendable {
     /// composition never audited, the same trap as process-cwd defaults
     /// (AGENTS.md §2).
     let environment: [String: String]
+    /// Cancel+await the controller's motion ticker before tty teardown.
+    /// Composition wires a weak controller capture; the default is a no-op
+    /// so reachability fixtures keep compiling before that wiring lands.
+    let suspendMotion: @Sendable () async -> Void
+    /// Re-arm the controller's motion ticker after terminal+input restore.
+    /// Same weak-capture / no-op-default shape as `suspendMotion`.
+    let resumeMotion: @Sendable () async -> Void
+
+    /// Source-compatible with the two-argument call sites: motion callbacks
+    /// default to no-ops so production/tests compile before composition
+    /// wires `suspendMotionTicker` / `resumeMotionTicker`.
+    init(
+        beginInputSuspension: @escaping @Sendable () async -> LiveInputSuspension?,
+        environment: [String: String],
+        suspendMotion: @escaping @Sendable () async -> Void = {},
+        resumeMotion: @escaping @Sendable () async -> Void = {}
+    ) {
+        self.beginInputSuspension = beginInputSuspension
+        self.environment = environment
+        self.suspendMotion = suspendMotion
+        self.resumeMotion = resumeMotion
+    }
 
     /// `$PAGER`, trimmed, whitespace-split into program + arguments so values
     /// like `less -R` work; default `less` (event_loop.rs:741-756). No

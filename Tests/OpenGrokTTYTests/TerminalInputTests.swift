@@ -76,6 +76,121 @@ struct TerminalInputTests {
         #expect(try decoder.feed(0x78) == [.text("x")])
     }
 
+    /// `ESC [ M Cb Cx Cy` — each payload byte is `value + 32`.
+    private func x10Report(button: Int, column: Int, row: Int) -> [UInt8] {
+        [
+            0x1b, 0x5b, 0x4d,
+            UInt8(button + 32),
+            UInt8(column + 32),
+            UInt8(row + 32),
+        ]
+    }
+
+    private func feedAll(
+        _ bytes: [UInt8],
+        into decoder: inout TerminalInputDecoder
+    ) throws -> [TerminalInputEvent] {
+        var events: [TerminalInputEvent] = []
+        for byte in bytes {
+            let produced = try decoder.feed(byte)
+            events.append(contentsOf: produced)
+        }
+        return events
+    }
+
+    @Test("X10 click becomes one intact unknown event with zero text")
+    func x10ClickEmitsIntactUnknown() throws {
+        var decoder = TerminalInputDecoder()
+        let report = x10Report(button: 0, column: 3, row: 7)
+        let events = try feedAll(report, into: &decoder)
+
+        #expect(events == [.unknown(Data(report))])
+        #expect(events.filter { if case .text = $0 { true } else { false } }.isEmpty)
+        #expect(!decoder.hasPendingEscapeSequence)
+
+        // Following text must not be swallowed by a stuck X10 state.
+        #expect(try decoder.feed(0x41) == [.text("A")])
+    }
+
+    @Test("X10 wheel becomes one intact unknown event with zero text")
+    func x10WheelEmitsIntactUnknown() throws {
+        var decoder = TerminalInputDecoder()
+        let report = x10Report(button: 64, column: 10, row: 5)
+        let events = try feedAll(report, into: &decoder)
+
+        #expect(events == [.unknown(Data(report))])
+        #expect(events.filter { if case .text = $0 { true } else { false } }.isEmpty)
+    }
+
+    @Test("X10 reports survive byte-by-byte split feeds")
+    func x10SplitFeedStaysIntact() throws {
+        var decoder = TerminalInputDecoder()
+        let report = x10Report(button: 0, column: 10, row: 5)
+        var events: [TerminalInputEvent] = []
+        for byte in report {
+            let produced = try decoder.feed(byte)
+            #expect(produced.filter { if case .text = $0 { true } else { false } }.isEmpty)
+            events.append(contentsOf: produced)
+            if events.isEmpty {
+                #expect(decoder.hasPendingEscapeSequence)
+            }
+        }
+        #expect(events == [.unknown(Data(report))])
+        #expect(!decoder.hasPendingEscapeSequence)
+    }
+
+    @Test("truncated X10 finish returns buffered bytes without hanging")
+    func x10FinishReturnsPartialHonestly() throws {
+        var decoder = TerminalInputDecoder()
+        // ESC [ M and one payload byte — two short of a full report.
+        let partial: [UInt8] = [0x1b, 0x5b, 0x4d, 0x20]
+        #expect(try feedAll(partial, into: &decoder).isEmpty)
+        #expect(decoder.hasPendingEscapeSequence)
+
+        let finished = try decoder.finish()
+        #expect(finished == [.unknown(Data(partial))])
+        #expect(!decoder.hasPendingEscapeSequence)
+
+        // Decoder is usable again; unrelated text is not swallowed.
+        #expect(try decoder.feed(0x7a) == [.text("z")])
+    }
+
+    @Test("X10 payload bytes are not re-scanned as escapes or UTF-8")
+    func x10PayloadBytesConsumedVerbatim() throws {
+        var decoder = TerminalInputDecoder()
+        // Column 0x1B would otherwise open a new escape; 0xC3 would start UTF-8.
+        let report: [UInt8] = [0x1b, 0x5b, 0x4d, 0x20, 0x1b, 0xc3]
+        let events = try feedAll(report, into: &decoder)
+        #expect(events == [.unknown(Data(report))])
+        #expect(events.filter { if case .text = $0 { true } else { false } }.isEmpty)
+        #expect(try decoder.finish().isEmpty)
+    }
+
+    @Test("SGR mouse final M is unchanged and still one unknown")
+    func sgrMouseStillUnknown() throws {
+        var decoder = TerminalInputDecoder()
+        let sgr = Array("\u{1B}[<0;3;7M".utf8)
+        let events = try feedAll(sgr, into: &decoder)
+        #expect(events == [.unknown(Data(sgr))])
+    }
+
+    @Test("X10 ignores maxSequenceLength < 6 and never leaks payload as text")
+    func x10MaxSequenceBound() throws {
+        // A generic CSI ceiling of 4 is below the fixed 6-byte X10 length.
+        // The `.x10` arm must still buffer the full report — flushing mid-
+        // payload would emit Cx/Cy as `.text` / composer keys.
+        var decoder = TerminalInputDecoder(maxSequenceLength: 4)
+        let report = x10Report(button: 0, column: 3, row: 7)
+        let events = try feedAll(report, into: &decoder)
+
+        #expect(events == [.unknown(Data(report))])
+        #expect(events.filter { if case .text = $0 { true } else { false } }.isEmpty)
+        #expect(events.filter { if case .key = $0 { true } else { false } }.isEmpty)
+        #expect(!decoder.hasPendingEscapeSequence)
+        // Ordinary text after a complete report must still decode normally.
+        #expect(try decoder.feed(0x42) == [.text("B")])
+    }
+
     #if os(macOS) || os(Linux)
     @Test("POSIX input reads decoded events from a pipe")
     func posixReadsEvents() async throws {

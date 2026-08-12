@@ -37,6 +37,19 @@ struct LiveScrollbackSelection: Sendable {
         index = min(index ?? itemCount - 1, itemCount - 1)
     }
 
+    /// Click-to-select: focus a specific block, clamped into the conversation.
+    /// Unlike `focus`, this always lands on `index` (when the transcript is
+    /// non-empty) rather than preserving a prior cursor — the mouse hit is
+    /// authoritative. Empty transcripts still park at 0 so the focus flag
+    /// stays meaningful for the composer unfocus paint path.
+    mutating func select(at index: Int, itemCount: Int) {
+        guard itemCount > 0 else {
+            self.index = 0
+            return
+        }
+        self.index = min(max(0, index), itemCount - 1)
+    }
+
     mutating func unfocus() {
         index = nil
     }

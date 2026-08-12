@@ -124,6 +124,10 @@ public struct TerminalInputDecoder: Sendable {
         case utf8(bytes: [UInt8], expectedLength: Int)
         case escape(bytes: [UInt8])
         case altText(bytes: [UInt8])
+        /// Saw `ESC [ M` (legacy X10 mouse). Waiting for exactly `remaining`
+        /// payload bytes (`Cb Cx Cy`), which are raw and must not be re-scanned
+        /// as UTF-8, ESC, or CSI — otherwise they leak as `.text` / composer keys.
+        case x10(bytes: [UInt8], remaining: Int)
     }
 
     private var state: State = .normal
@@ -136,7 +140,7 @@ public struct TerminalInputDecoder: Sendable {
 
     public var hasPendingEscapeSequence: Bool {
         switch state {
-        case .escape, .altText:
+        case .escape, .altText, .x10:
             return true
         case .normal, .utf8:
             return false
@@ -153,6 +157,8 @@ public struct TerminalInputDecoder: Sendable {
             return try feedEscapeByte(byte, bytes: bytes)
         case .altText(let bytes):
             return try feedAltText(byte, bytes: bytes)
+        case .x10(let bytes, let remaining):
+            return feedX10Byte(byte, bytes: bytes, remaining: remaining)
         }
     }
 
@@ -170,6 +176,11 @@ public struct TerminalInputDecoder: Sendable {
             }
             return [.unknown(Data(bytes))]
         case .altText(let bytes):
+            state = .normal
+            return [.unknown(Data(bytes))]
+        case .x10(let bytes, _):
+            // Truncated X10: return what we buffered so the host can pass it
+            // through rather than hanging waiting for three payload bytes.
             state = .normal
             return [.unknown(Data(bytes))]
         }
@@ -329,11 +340,39 @@ public struct TerminalInputDecoder: Sendable {
         let introducer = nextBytes[1]
         let isFinalByte = byte >= 0x40 && byte <= 0x7e
         if (introducer == 0x5b || introducer == 0x4f) && isFinalByte {
+            // Bare `ESC [ M` starts a 6-byte X10 mouse report. Finalizing here
+            // (M ∈ CSI finals) used to emit `.unknown(ESC[M)` and then leak
+            // Cb/Cx/Cy as `.text`. Parameterized CSI ending in M (including
+            // SGR `ESC [ < … M`) keeps the normal unknown path — count > 3.
+            if introducer == 0x5b && byte == 0x4d && nextBytes.count == 3 {
+                state = .x10(bytes: nextBytes, remaining: 3)
+                return []
+            }
             state = .normal
             return parseEscape(nextBytes)
         }
         state = .escape(bytes: nextBytes)
         return []
+    }
+
+    private mutating func feedX10Byte(
+        _ byte: UInt8,
+        bytes: [UInt8],
+        remaining: Int
+    ) -> [TerminalInputEvent] {
+        // Payload bytes are consumed unconditionally — they may be ESC, DEL,
+        // or a UTF-8 lead byte and must not re-enter the escape/UTF-8 scanners.
+        // Bypass `maxSequenceLength` here: X10 is exactly six bytes and
+        // `remaining` (at most 3) already bounds the buffer. Flushing mid-
+        // payload against a ceiling < 6 would leak Cx/Cy as `.text`.
+        var nextBytes = bytes
+        nextBytes.append(byte)
+        if remaining > 1 {
+            state = .x10(bytes: nextBytes, remaining: remaining - 1)
+            return []
+        }
+        state = .normal
+        return [.unknown(Data(nextBytes))]
     }
 
     private mutating func parseEscape(_ bytes: [UInt8]) -> [TerminalInputEvent] {

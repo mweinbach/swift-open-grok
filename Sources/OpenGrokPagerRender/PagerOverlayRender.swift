@@ -1287,14 +1287,22 @@ private func drawWelcomeLogoLine(
         )
         return
     }
-    // Diagonal runs 0 at the bottom-left glyph to 1 at the top-right, so the
-    // band sweeps corner to corner (`welcome/logo.rs:126-152`).
-    let diagonalSpan = Double(max(1, (logoWidth - 1) + (rowCount - 1)))
+    // Diagonal runs 0 at the bottom-left glyph toward the top-right via
+    // `PagerMotion.shimmerDiagonal` (`welcome/logo.rs` `render_into`). The
+    // column is the display-column offset inside the line (so wide graphemes
+    // advance the field correctly), and `columns`/`rows` are the full logo
+    // bounding box — not the max-span `(cols-1)+(rows-1)` this used to divide
+    // by, which never quite reached the reference's top-right value.
     var column = x
     for grapheme in line {
         let glyph = String(grapheme)
         let width = max(0, UnicodeDisplayWidth.width(ofGrapheme: glyph))
-        let diagonal = Double((column - x) + (rowCount - 1 - rowIndex)) / diagonalSpan
+        let diagonal = PagerMotion.shimmerDiagonal(
+            column: column - x,
+            row: rowIndex,
+            columns: logoWidth,
+            rows: rowCount
+        )
         _ = buffer.setString(
             x: column,
             y: y,

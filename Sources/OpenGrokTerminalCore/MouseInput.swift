@@ -525,7 +525,11 @@ public struct MouseStreamParser: Sendable {
 /// Terminal wheel reports carry direction only, never magnitude, so the number
 /// of lines a notch scrolls is a policy decision. Terminals differ in how many
 /// SGR reports they emit per physical notch (`eventsPerTick`); dividing by it
-/// keeps one notch worth the same distance everywhere.
+/// keeps one notch worth the same distance everywhere. `linesPerTick` is the
+/// notch distance itself and is *not* independent of `eventsPerTick` for every
+/// brand: iTerm2/WezTerm set both to 1 so one report scrolls one line
+/// (`input/mouse.rs:363-369`). Changing only `eventsPerTick` leaves a 3-line
+/// notch on those terminals.
 public struct MouseWheelTuning: Sendable, Equatable {
     /// Lines scrolled per physical wheel notch (`DEFAULT_WHEEL_LINES_PER_TICK`,
     /// `input/mouse.rs:70`).
@@ -545,21 +549,43 @@ public struct MouseWheelTuning: Sendable, Equatable {
         self.eventsPerTick = max(1, eventsPerTick)
     }
 
-    /// Lines a single wheel report is worth, rounded up so one report always
+    /// Lines a single wheel report is worth, rounded so one report always
     /// moves at least one line (`MIN_LINES_PER_WHEEL_STREAM`,
     /// `input/mouse.rs:98`).
     public var linesPerEvent: Int {
         max(1, Int((Double(linesPerTick) / Double(eventsPerTick)).rounded()))
     }
 
-    /// Per-terminal reports-per-notch, from `ScrollConfig::from_terminal_context`
-    /// (`input/mouse.rs:330-353`). Terminals not listed use the default of 3.
-    public static func eventsPerTick(forTerminalProgram program: String?) -> Int {
+    /// Authoritative per-terminal wheel profile from
+    /// `ScrollConfig::from_terminal_context` (`input/mouse.rs:324-373`).
+    ///
+    /// `program` is a `TERM_PROGRAM` value (or nil). Only iTerm2 and WezTerm
+    /// lower `linesPerTick` with `eventsPerTick`; VS Code-family / Zed keep
+    /// the default 3-line notch with `eventsPerTick == 1` — do not broaden
+    /// that shape. Unknown / unlisted programs use the 3/3 defaults.
+    public static func forTerminalProgram(_ program: String?) -> MouseWheelTuning {
         switch program?.lowercased() {
-        case "iterm.app", "wezterm", "vscode", "cursor", "windsurf", "zed":
-            return 1
+        case "iterm.app", "iterm2", "iterm", "wezterm":
+            // Rust: Iterm2 | WezTerm → ept=1 and wheel_lines_per_tick=1.
+            return MouseWheelTuning(linesPerTick: 1, eventsPerTick: 1)
+        case "vscode", "cursor", "windsurf", "zed":
+            // Rust: VsCode | Cursor | Windsurf | Zed → ept=1, default LPT.
+            return MouseWheelTuning(
+                linesPerTick: defaultLinesPerTick,
+                eventsPerTick: 1
+            )
         default:
-            return defaultEventsPerTick
+            // Apple_Terminal, WarpTerminal, Ghostty, Kitty, Alacritty, Rio,
+            // Foot, and every other / unknown brand: DEFAULT_EVENTS_PER_TICK
+            // and DEFAULT_WHEEL_LINES_PER_TICK (both 3).
+            return MouseWheelTuning()
         }
+    }
+
+    /// Per-terminal reports-per-notch. Prefer `forTerminalProgram(_:)` when
+    /// constructing tuning — this helper only exposes one field and cannot
+    /// express the iTerm/WezTerm 1/1 pair.
+    public static func eventsPerTick(forTerminalProgram program: String?) -> Int {
+        forTerminalProgram(program).eventsPerTick
     }
 }

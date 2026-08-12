@@ -756,6 +756,21 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// `nil` exactly when no tick is armed, which is the idle case and the
     /// reason a still screen costs no wakeups.
     private var motionTicker: Task<Void, Never>?
+    /// Explicit hold for `/transcript` / `$EDITOR` suspend: forces demand to
+    /// `.none` and blocks `armMotionTickerIfNeeded` so a mid-suspend
+    /// `setMotionState(.fast)` cannot re-arm wakeups into a torn-down tty.
+    /// Cleared by `resumeMotionTicker`. Distinct from `PagerMotionState.motionEnabled`
+    /// (terminal capability) and from `motionShutdownLatched` (run teardown).
+    private var motionSuspended = false
+    /// Permanent-for-run latch set at teardown so a racing
+    /// `resumeMotionTicker` from a suspended child cannot clear the ordinary
+    /// suspend hold and re-arm while `running` is still true. Cleared only at
+    /// the next `run` start — never by resume.
+    private var motionShutdownLatched = false
+    /// Bumped each time a ticker Task is armed. Suspend/teardown await the
+    /// cancelled generation and only nil `motionTicker` when it still matches,
+    /// so a reentrant resume that armed a newer task is not erased.
+    private var motionTickerGeneration: UInt64 = 0
 
     /// Slash-command recency. Defaults to the in-memory store, exactly like
     /// upstream's default controllers (`mru.rs:9-10`); the live composition
@@ -997,6 +1012,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// blocks, the welcome logo, background-task chips, and whether the
     /// terminal can animate at all. Callable at any time, including mid-run;
     /// a rising demand arms the ticker, a falling one lets it park itself.
+    /// While `suspendMotionTicker` holds, the state is recorded but the
+    /// ticker stays dark — resume re-arms from whatever demand is current.
     public func setMotionState(_ state: PagerMotionState) {
         externalMotionState = state
         armMotionTickerIfNeeded()
@@ -1007,6 +1024,39 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// would make the tick counter jump.
     public func setMotionFPS(_ fps: Int) {
         motionFPS = min(max(fps, PagerMotion.minimumFPS), PagerMotion.maximumFPS)
+    }
+
+    /// Park the wall-clock ticker for a suspended-TUI child (`/transcript`,
+    /// `$EDITOR`). Cancel+await the in-flight task so no further
+    /// `renderAnimationTick` can race terminal teardown; keep the motion
+    /// epoch and `externalMotionState` so resume continues the same clock.
+    /// Idempotent: a second suspend while held is a no-op once the ticker
+    /// is already nil. Safe after shutdown — `running` is already false and
+    /// the ticker is gone. Does not touch `motionShutdownLatched`.
+    public func suspendMotionTicker() async {
+        motionSuspended = true
+        let generation = motionTickerGeneration
+        let cancelled = motionTicker
+        cancelled?.cancel()
+        if let cancelled {
+            _ = await cancelled.value
+        }
+        // A reentrant `resumeMotionTicker` may have armed a newer task while
+        // we awaited; only clear when this suspend still owns the slot.
+        if motionTickerGeneration == generation {
+            motionTicker = nil
+        }
+    }
+
+    /// Lift the ordinary suspend hold and re-arm from current demand.
+    /// Idempotent when already resumed. A no-op when teardown has latched
+    /// `motionShutdownLatched` — must not clear that latch or re-arm into a
+    /// run that is restoring the terminal. After a clean shutdown,
+    /// `armMotionTickerIfNeeded` also requires `running`.
+    public func resumeMotionTicker() {
+        guard !motionShutdownLatched else { return }
+        motionSuspended = false
+        armMotionTickerIfNeeded()
     }
 
     /// Install the slash-command MRU store. Call before `run`. Without this
@@ -1090,6 +1140,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         guard !shutdownRequested else { throw OpenGrokPagerInteractiveError.shutdown }
 
         running = true
+        // A prior run's teardown sets `motionShutdownLatched` (and may leave
+        // `motionSuspended`) so a racing resume cannot re-arm into restore;
+        // clear both for this run before anything can demand frames.
+        motionShutdownLatched = false
+        motionSuspended = false
         deferredSessionDispatches.removeAll(keepingCapacity: true)
         currentRequest = request
         activePagerMode = request.mode
@@ -1125,23 +1180,60 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     default: isEscapeHatch = false
                     }
                     if !isEscapeHatch {
-                        switch try? await renderer.handleInput(event) {
-                        case .some(.consumed):
+                        // Do not `try?` here: a swallowed restore/terminal
+                        // failure would leave local and controller motion
+                        // holds latched while the run continues. Surface the
+                        // error like other pump I/O failures and stop.
+                        let routing: OpenGrokPagerInputRouting
+                        do {
+                            routing = try await renderer.handleInput(event)
+                        } catch {
+                            await mailbox.send(
+                                .input(.failure(String(describing: error))),
+                                priority: true
+                            )
+                            return
+                        }
+                        switch routing {
+                        case .consumed:
                             await inputPumpGate.resume()
                             continue
-                        case .some(.runCommand(let text)):
+                        case .focusScrollback:
+                            // Click-to-select (and any other render-side focus
+                            // claim) must move the controller's focus region
+                            // so Tab/j/k agree with the painted selection.
+                            // `setFocus` emits `.focusChanged`, which is what
+                            // keeps the renderer's selection state in sync;
+                            // when focus is already on the scrollback it is
+                            // a no-op and the index the renderer just set
+                            // stays. Propagate emit failures through the
+                            // mailbox like other pump I/O errors — a silent
+                            // `try?` would leave composer focus with a
+                            // painted scrollback selection (Tab/j/k disagree).
+                            do {
+                                try await self.setFocus(.scrollback)
+                            } catch {
+                                await mailbox.send(
+                                    .input(.failure(String(describing: error))),
+                                    priority: true
+                                )
+                                return
+                            }
+                            await inputPumpGate.resume()
+                            continue
+                        case .runCommand(let text):
                             // The gate stays paused: whichever loop services the
                             // control signal resumes it, exactly as for an
                             // interrupt.
                             await mailbox.send(.control(.command(text)), priority: true)
                             continue
-                        case .some(.dispatchPrompt(let sessionID, let prompt)):
+                        case .dispatchPrompt(let sessionID, let prompt):
                             await mailbox.send(
                                 .control(.dispatch(sessionID: sessionID, prompt: prompt)),
                                 priority: true
                             )
                             continue
-                        case .some(.dispatchNew(let prompt, let workingDirectory)):
+                        case .dispatchNew(let prompt, let workingDirectory):
                             await mailbox.send(
                                 .control(.dispatchNew(
                                     prompt: prompt,
@@ -1150,7 +1242,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 priority: true
                             )
                             continue
-                        case .some(.notHandled), .none:
+                        case .notHandled:
                             break
                         }
                     }
@@ -1474,12 +1566,21 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         // Stop the motion ticker and wait for it to land before touching the
         // terminal: a tick racing `restoreTerminal` could paint into a
         // restored screen. Awaiting is safe — the ticker's sleeps are actor
-        // suspensions, so it observes the cancellation promptly.
-        motionTicker?.cancel()
-        if let motionTicker {
-            _ = await motionTicker.value
+        // suspensions, so it observes the cancellation promptly. The shutdown
+        // latch is permanent for this run so a late `resumeMotionTicker` from
+        // a racing child-restore path cannot clear an ordinary suspend hold
+        // and re-arm while `running` is still true.
+        motionShutdownLatched = true
+        motionSuspended = true
+        let teardownGeneration = motionTickerGeneration
+        let teardownTicker = motionTicker
+        teardownTicker?.cancel()
+        if let teardownTicker {
+            _ = await teardownTicker.value
         }
-        motionTicker = nil
+        if motionTickerGeneration == teardownGeneration {
+            motionTicker = nil
+        }
 
         await closeActiveSession()
         inputPump?.cancel()
@@ -4183,8 +4284,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
 
     /// The demand right now: the render layer's report, plus what only the
     /// controller knows — that a turn is running (`tick_demand`,
-    /// `app_view.rs:6078-6120` folds the same two kinds of source).
+    /// `app_view.rs:6078-6120` folds the same two kinds of source). Ordinary
+    /// suspend and the teardown latch both force `.none` without touching
+    /// `externalMotionState`, so a successful resume sees the same demand
+    /// the render layer last reported.
     private func currentMotionDemand() -> PagerTickDemand {
+        guard !motionSuspended, !motionShutdownLatched else { return .none }
         var state = externalMotionState
         state.hasRunningTurn = state.hasRunningTurn || lifecycle == .running
         return state.demand
@@ -4192,17 +4297,36 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
 
     /// Arm the ticker when demanded and none is pending — `schedule_tick`
     /// (`event_loop.rs:3172-3189`). Idempotent; called from every place the
-    /// demand can rise (run start, lifecycle transitions, `setMotionState`).
+    /// demand can rise (run start, lifecycle transitions, `setMotionState`,
+    /// `resumeMotionTicker`). Ordinary suspend and the teardown latch both
+    /// block arming even when the recorded external state would otherwise
+    /// demand frames.
     private func armMotionTickerIfNeeded() {
-        guard running, motionTicker == nil, currentMotionDemand() != .none else { return }
+        guard running,
+              !motionSuspended,
+              !motionShutdownLatched,
+              motionTicker == nil,
+              currentMotionDemand() != .none
+        else {
+            return
+        }
         // The unstructured Task inherits the actor's isolation, so the loop
         // body runs on the controller and `Task.sleep` suspends without
         // holding it.
-        motionTicker = Task { await self.runMotionTicker() }
+        motionTickerGeneration &+= 1
+        let generation = motionTickerGeneration
+        motionTicker = Task { await self.runMotionTicker(generation: generation) }
     }
 
-    private func runMotionTicker() async {
-        defer { motionTicker = nil }
+    private func runMotionTicker(generation: UInt64) async {
+        defer {
+            // Only the generation that still owns the slot may clear it —
+            // otherwise a reentrant resume's newer task is erased when this
+            // cancelled loop exits.
+            if motionTickerGeneration == generation {
+                motionTicker = nil
+            }
+        }
         while !Task.isCancelled, running {
             let demand = currentMotionDemand()
             // Demand fell to none: park. The next `armMotionTickerIfNeeded`

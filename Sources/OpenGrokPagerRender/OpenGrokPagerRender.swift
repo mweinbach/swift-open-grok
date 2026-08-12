@@ -116,7 +116,18 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         visibleContentLines: visibleRange,
         scrollOffset: scrollOffset,
         hasScrollbar: hasScrollbar,
-        timelineRail: timelineRail
+        timelineRail: timelineRail,
+        // Click-to-select geometry from the same layout the frame paints —
+        // content heights exclude the inter-block gap rows so a hit on a
+        // gap returns nil, matching upstream's `entry_at_content_y`
+        // (`scrollback/state/layout.rs:100-124`).
+        conversationHit: PagerConversationHitModel(
+            conversation: chrome.conversation,
+            scrollOffset: scrollOffset,
+            contentWidth: contentWidth,
+            blockStartLines: conversationLayout.blockStartLines,
+            blockHeights: conversationLayout.blockHeights
+        )
     )
 
     var buffer = CellBuffer(area: bounds)
@@ -474,14 +485,18 @@ func makeConversationLines(
     ).lines
 }
 
-/// The laid-out transcript plus each block's first line index — the port's
-/// counterpart of upstream's layout cache `virtual_y` rows
-/// (`scrollback/state/layout.rs`), which the timeline rail partitions to
-/// find the viewport-top turn. One entry per item, recorded as the lines
-/// are appended so it can never drift from what paints.
+/// The laid-out transcript plus each block's first line index and content-only
+/// height — the port's counterpart of upstream's layout cache `virtual_y`
+/// rows and per-entry heights (`scrollback/state/layout.rs`), which the
+/// timeline rail partitions to find the viewport-top turn and click-to-select
+/// uses to reject gap rows. One entry per item; starts and heights are
+/// recorded as the lines are appended so they can never drift from what paints.
 struct ConversationLayout {
     var lines: [PaintLine]
     var blockStartLines: [Int]
+    /// Content rows only — recorded before each inter-block gap so a hit on
+    /// the gap returns nil (`entry_at_content_y`, layout.rs:118-123).
+    var blockHeights: [Int]
 }
 
 func makeConversationLayout(
@@ -493,10 +508,14 @@ func makeConversationLayout(
     compact: Bool = false,
     showTimestamps: Bool = false
 ) -> ConversationLayout {
-    guard width > 0 else { return ConversationLayout(lines: [], blockStartLines: []) }
+    guard width > 0 else {
+        return ConversationLayout(lines: [], blockStartLines: [], blockHeights: [])
+    }
     var lines: [PaintLine] = []
     var blockStartLines: [Int] = []
+    var blockHeights: [Int] = []
     blockStartLines.reserveCapacity(items.count)
+    blockHeights.reserveCapacity(items.count)
     for (index, item) in items.enumerated() {
         let blockStart = lines.count
         blockStartLines.append(blockStart)
@@ -516,6 +535,10 @@ func makeConversationLayout(
             let separator = text.isEmpty ? String(repeating: "─", count: width) : text
             lines.append(PaintLine(separator, foreground: theme.grayDim))
         }
+        // Content-only height: capture before the gap row so packed tools
+        // abut (height reaches the next start) and gapped neighbors leave a
+        // nil-hit row between them.
+        blockHeights.append(lines.count - blockStart)
         // The selected block wears the accent rail and the visual band, which
         // is how the reference marks it under `When::ScrollbackFocused`. Rows
         // that already carry a band — a user prompt's `bg_light` — keep theirs,
@@ -539,7 +562,59 @@ func makeConversationLayout(
             lines.append(PaintLine("", foreground: theme.textPrimary))
         }
     }
-    return ConversationLayout(lines: lines, blockStartLines: blockStartLines)
+    return ConversationLayout(
+        lines: lines,
+        blockStartLines: blockStartLines,
+        blockHeights: blockHeights
+    )
+}
+
+/// Map a screen Y into a conversation block index using the last-frame hit
+/// geometry. Pure: no mutable state. Gap rows, empty/malformed arrays, and
+/// positions outside the conversation area return `nil` without trapping —
+/// the Swift counterpart of upstream's `entry_at_content_y`
+/// (`scrollback/state/layout.rs:100-124`) plus the screen-row reject in
+/// `entry_index_at_screen_row` (`layout.rs:285-288`).
+public func pagerConversationBlockIndex(
+    screenY: Int,
+    conversation: TerminalRect,
+    scrollOffset: Int,
+    blockStartLines: [Int],
+    blockHeights: [Int]
+) -> Int? {
+    // Vertical reject only — click-to-select is a row hit, not a text drag.
+    guard conversation.height > 0,
+          screenY >= conversation.y,
+          screenY < conversation.y + conversation.height
+    else { return nil }
+
+    let count = min(blockStartLines.count, blockHeights.count)
+    guard count > 0 else { return nil }
+
+    let viewportY = screenY - conversation.y
+    // Clamp a negative offset the same way paint does (`max(requested, 0)`);
+    // a malformed producer must not underflow content Y into traps.
+    let contentY = viewportY + max(scrollOffset, 0)
+
+    // partition_point: first index with start > contentY → prior start.
+    var lo = 0
+    var hi = count
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if blockStartLines[mid] <= contentY {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    guard lo > 0 else { return nil }
+    let idx = lo - 1
+    let start = blockStartLines[idx]
+    let height = blockHeights[idx]
+    // Non-positive / nonsense heights never contain a row. Subtract rather
+    // than `start + height` so a pathological height cannot overflow.
+    guard height > 0, contentY >= start, contentY - start < height else { return nil }
+    return idx
 }
 
 func appendMessage(

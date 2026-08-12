@@ -208,6 +208,89 @@ struct PagerMotionRenderSiteTests {
         #expect(earlyColors != logoColors(late))
     }
 
+    /// Logo braille cells with their buffer coordinates, in paint order.
+    private func logoCells(
+        _ result: PagerRenderResult
+    ) -> [(x: Int, y: Int, color: TerminalColor)] {
+        var cells: [(x: Int, y: Int, color: TerminalColor)] = []
+        for y in result.buffer.area.top..<result.buffer.area.bottom {
+            for x in result.buffer.area.left..<result.buffer.area.right {
+                guard let cell = result.buffer.cell(x: x, y: y) else { continue }
+                if let scalar = cell.grapheme.unicodeScalars.first,
+                   (0x2800...0x28FF).contains(scalar.value) {
+                    cells.append((x, y, cell.foreground))
+                }
+            }
+        }
+        return cells
+    }
+
+    @Test("welcome logo corner colors come from shimmerDiagonal, not the old max-span")
+    func welcomeLogoCornersUseShimmerDiagonal() {
+        // The pure-function suite already pins `shimmerDiagonal`'s formula;
+        // this asserts the paint path calls it. Bottom-left and top-right are
+        // the extremes of the diagonal field — if the renderer still divides
+        // by `(cols-1)+(rows-1)`, the top-right color diverges from the helper.
+        let theme = PagerRenderTheme.default
+        let seconds: TimeInterval = 1.0
+        let painted = renderPagerFrame(welcomeState(seconds: seconds, enabled: true))
+        let cells = logoCells(painted)
+        #expect(!cells.isEmpty)
+
+        let minX = cells.map(\.x).min()!
+        let maxX = cells.map(\.x).max()!
+        let minY = cells.map(\.y).min()!
+        let maxY = cells.map(\.y).max()!
+        let columns = maxX - minX + 1
+        let rows = maxY - minY + 1
+        // Full logo art (height tier clears `fullMinimumHeight` at size 32).
+        #expect(columns == (PagerWelcomeLogo.full.map {
+            UnicodeDisplayWidth.width(of: $0)
+        }.max() ?? 0))
+        #expect(rows == PagerWelcomeLogo.full.count)
+
+        func color(atX x: Int, y: Int) -> TerminalColor? {
+            cells.first { $0.x == x && $0.y == y }?.color
+        }
+        let bottomLeft = color(atX: minX, y: maxY)
+        let topRight = color(atX: maxX, y: minY)
+        #expect(bottomLeft != nil)
+        #expect(topRight != nil)
+
+        let expectedBottomLeft = PagerMotion.shimmerColor(
+            theme: theme,
+            diagonal: PagerMotion.shimmerDiagonal(
+                column: 0, row: rows - 1, columns: columns, rows: rows
+            ),
+            seconds: seconds
+        )
+        let expectedTopRight = PagerMotion.shimmerColor(
+            theme: theme,
+            diagonal: PagerMotion.shimmerDiagonal(
+                column: columns - 1, row: 0, columns: columns, rows: rows
+            ),
+            seconds: seconds
+        )
+        #expect(bottomLeft == expectedBottomLeft)
+        #expect(topRight == expectedTopRight)
+
+        // Discriminator: the retired max-span formula puts the top-right at
+        // diagonal 1.0; `shimmerDiagonal` does not. If these ever coincide at
+        // this timestamp the assertion above would stop catching an unwired
+        // helper — fail loud rather than silently lose coverage.
+        let oldMaxSpan = Double(max(1, (columns - 1) + (rows - 1)))
+        let oldTopRight = PagerMotion.shimmerColor(
+            theme: theme,
+            diagonal: Double((columns - 1) + (rows - 1)) / oldMaxSpan,
+            seconds: seconds
+        )
+        #expect(expectedTopRight != oldTopRight)
+
+        // Reduced motion still paints every logo cell in one still color.
+        let still = renderPagerFrame(welcomeState(seconds: seconds, enabled: false))
+        #expect(Set(logoColors(still)) == [theme.textPrimary])
+    }
+
     @Test("the dropdown window follows the selection so every row is reachable")
     func completionMenuAutoScrolls() {
         let rows = (0..<10).map {

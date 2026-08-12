@@ -761,14 +761,12 @@ extension OpenGrokLiveInteractiveInput {
                 height: size.height
             ))]
         case .unknown(let data):
-            // `TerminalInputDecoder` has no mouse handling: an SGR report
-            // (`ESC [ < b ; x ; y M|m`) terminates on its final byte, falls
-            // through the CSI switch and arrives here intact, so decoding it
-            // recovers the event without a new module dependency. Legacy X10
-            // is *not* recoverable this way — that parser treats `ESC [ M` as a
-            // complete CSI and the three coordinate bytes leak as text — which
-            // is why the driver enables `?1006h` last, making SGR the mode any
-            // terminal that understands it will use.
+            // `TerminalInputDecoder` has no mouse handling of its own: it
+            // preserves full SGR (`ESC [ < b ; x ; y M|m`) and X10
+            // (`ESC [ M` + three coordinate bytes) reports as `.unknown`
+            // Data. `MouseReportDecoder` recovers both shapes here without a
+            // new module dependency. The driver still enables `?1006h` last so
+            // terminals that understand SGR prefer that mode.
             guard case .event(let mouse) = MouseReportDecoder.decode(Array(data)) else {
                 return []
             }
@@ -1504,7 +1502,18 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     // process-default trap, applied to env).
                     await renderer.setSuspendHost(LiveTUISuspendHost(
                         beginInputSuspension: { await interactiveInput.beginSuspension() },
-                        environment: context.environment
+                        environment: context.environment,
+                        // Weak like the motion sink: the controller owns the
+                        // renderer, and a cycle here would keep both alive
+                        // past shutdown. Pause the ticker before tty
+                        // teardown; re-arm only after restore — never via
+                        // lying about `motionEnabled`.
+                        suspendMotion: { [weak controller] in
+                            await controller?.suspendMotionTicker()
+                        },
+                        resumeMotion: { [weak controller] in
+                            await controller?.resumeMotionTicker()
+                        }
                     ))
                     // Slash-command recency persists at
                     // `<opengrok home>/slash-mru.json`, upstream's grok_home
@@ -2019,7 +2028,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 }
                 await renderer.setSuspendHost(LiveTUISuspendHost(
                     beginInputSuspension: { await interactiveInput.beginSuspension() },
-                    environment: context.environment
+                    environment: context.environment,
+                    suspendMotion: { [weak controller] in
+                        await controller?.suspendMotionTicker()
+                    },
+                    resumeMotion: { [weak controller] in
+                        await controller?.resumeMotionTicker()
+                    }
                 ))
                 await controller.setSlashMru(PagerSlashMru(directory: openGrokHome))
 
@@ -8106,6 +8121,13 @@ private struct LivePagerConversationState {
         items.append(.message(message))
     }
 
+    /// Append any conversation item (including separators). Live-seam tests
+    /// use this to inject non-selectable blocks; production paths prefer the
+    /// typed appenders above so streaming indices stay coherent.
+    mutating func appendItem(_ item: PagerConversationItem) {
+        items.append(item)
+    }
+
     /// Drop everything from `index` on — what `/rewind` does to the visible
     /// transcript once the persisted history has been truncated.
     ///
@@ -8295,6 +8317,15 @@ private struct LivePagerConversationState {
     var transcript: String {
         let lines = items.flatMap(Self.transcriptLines(for:))
         return lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Narrow test probe: the motion-clock stamp on a tool card, when known.
+    func testingFinishedAt(callID: String) -> TimeInterval? {
+        guard let index = toolIndicesByCallID[callID],
+              items.indices.contains(index),
+              case .tool(let tool) = items[index]
+        else { return nil }
+        return tool.finishedAt
     }
 
     static func transcript(for tool: OpenGrokPagerToolUpdate) -> String {
@@ -9561,6 +9592,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// gone on purpose: an event-count "tick" froze the spinner on a silent
     /// turn and raced ahead on a chatty one.
     private var motion = PagerMotionSnapshot()
+    /// Last painted motion-clock seconds paired with the monotonic instant
+    /// they were sampled. Between ticks `motion.seconds` freezes; turn-start
+    /// / tool-finish stamps and flash/elapsed reads extrapolate from this
+    /// pair so an idle gap cannot inflate elapsed or erase a finish flash
+    /// before the ticker resumes. Same epoch as `PagerMotionSnapshot.seconds`
+    /// (controller `DispatchTime` uptime minus motion epoch).
+    private var motionClockAnchorSeconds: TimeInterval = 0
+    private var motionClockAnchorMonotonic: TimeInterval?
     /// Whether this terminal can animate at all, resolved once — a non-TTY or
     /// `TERM=dumb` renders still frames forever.
     private let motionEnabled: Bool
@@ -9575,6 +9614,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// Installed by the composition after the controller exists; `nil` (tests,
     /// headless) simply never arms the ticker from render-side changes.
     private var motionSink: (@Sendable (PagerMotionState) async -> Void)?
+    /// Latest motion state waiting for the ordered publisher. Always the
+    /// newest value — a late `.none` must not be overwritten by a stale
+    /// high-demand delivery that was already in flight.
+    private var pendingMotionDelivery: PagerMotionState?
+    /// Single in-flight delivery loop for `motionSink`. Replaces the old
+    /// per-update `Task { await sink(...) }` fire-and-forget, which could
+    /// reorder and re-arm a parked ticker from a stale `.fast`.
+    private var motionDeliveryTask: Task<Void, Never>?
+    /// Bumped on sink install/removal so an in-flight delivery stops talking
+    /// to a replaced or cleared sink.
+    private var motionSinkEpoch: UInt64 = 0
     /// Carries settings-modal commits into the controller's actor-isolated mode
     /// snapshot. Controller-originated mode events never invoke it, which keeps
     /// slash-command updates from bouncing back through this bridge.
@@ -9668,6 +9718,29 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// private) so the live-seam tests can pin what the REAL frame
     /// published, per AGENTS.md §3.
     private(set) var lastPrivacyBannerHits: PagerPrivacyBannerHitRects?
+    /// Conversation click-to-select geometry from the last painted frame,
+    /// replaced wholesale with the rail/banner caches so a click never acts
+    /// on a previous frame's block starts. Updated only when
+    /// `requestFrame` / `flushPendingFrame` actually paints — never on a
+    /// coalesced layout pass. Internal for live-seam tests.
+    private(set) var lastConversationHit: PagerConversationHitModel?
+    /// Pending left-button down for click-to-select: screen cell plus the
+    /// exact hit model visible at down. Up remaps through this snapshot
+    /// (not live `scrollOffset` / layout). Cleared on real drag,
+    /// overlay/rail/banner hits, and non-left buttons — upstream's
+    /// `pending_scrollback_click` (`mouse.rs:742`, `:830`), without the
+    /// same-cell-up gate Rust dropped for selection (jitter still selects
+    /// the down cell when no drag committed).
+    private var pendingScrollbackClick: (
+        x: Int,
+        y: Int,
+        hit: PagerConversationHitModel
+    )?
+    /// Local gate that makes `renderAnimationTick` a no-op while a suspended
+    /// child owns the tty. Set before `host.suspendMotion` and cleared only
+    /// after resume on every path — distinct from `motionEnabled`, which is
+    /// a terminal capability, not a lifecycle flag.
+    private var localMotionHold = false
     private let permissionCoordinator: PagerPermissionCoordinator?
     /// The `ask_user_question` surface, presenter-installed in `begin()`
     /// exactly like the permission coordinator. `nil` in compositions with
@@ -9956,9 +10029,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.toolExecutor = toolExecutor
         self.pagerRuntime = pagerRuntime
         self.dashboardDispatchWorkingDirectory = workingDirectory
-        self.wheelTuning = MouseWheelTuning(
-            eventsPerTick: MouseWheelTuning.eventsPerTick(forTerminalProgram: terminalProgram)
-        )
+        // Authoritative per-terminal profile (linesPerTick + eventsPerTick).
+        // Constructing with only `eventsPerTick` would leave iTerm/WezTerm on
+        // a 3-line notch — `forTerminalProgram` pairs both fields.
+        self.wheelTuning = MouseWheelTuning.forTerminalProgram(terminalProgram)
         self.mouseReportingEnabled = enableMouseReporting
         self.reasoningEffort = reasoningEffort
 
@@ -10144,11 +10218,30 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// after the controller exists (the renderer is constructed first), and
     /// immediately publishes the current state so a welcome logo that is
     /// already on screen arms the shimmer ticker without waiting for input.
+    ///
+    /// Single-flight teardown: cancel and *await* the prior delivery so an
+    /// already-entered sink await cannot publish into a replaced controller.
+    /// Cancellation alone cannot interrupt that await. The install epoch
+    /// guards concurrent replacements that hop in while this method awaits —
+    /// an older setter must not overwrite a newer one after its await.
     func setMotionStateSink(
         _ sink: (@Sendable (PagerMotionState) async -> Void)?
-    ) {
-        motionSink = sink
+    ) async {
+        motionSinkEpoch &+= 1
+        let installEpoch = motionSinkEpoch
+        let priorDelivery = motionDeliveryTask
+        motionDeliveryTask = nil
+        pendingMotionDelivery = nil
+        motionSink = nil
         lastPublishedMotionState = nil
+        priorDelivery?.cancel()
+        // Actor is free while awaiting: the delivery task is typically parked
+        // inside the old sink. Sinks must not re-enter `setMotionStateSink`
+        // or they deadlock against this await.
+        await priorDelivery?.value
+        guard installEpoch == motionSinkEpoch else { return }
+        motionSink = sink
+        guard sink != nil else { return }
         publishMotionState()
     }
 
@@ -10906,6 +10999,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 await self?.showPlanApproval(request)
             }
         }
+        // Seed the motion-clock anchor before any painted tick. A resumed
+        // session with no welcome shimmer never receives `renderAnimationTick`
+        // until the first turn arms the ticker; without this, idle before that
+        // turn leaves `currentMotionSeconds()` at 0 and the first controller
+        // frame (run age) inflates elapsed.
+        if motionEnabled {
+            motion = PagerMotionSnapshot(tick: 0, seconds: 0, enabled: true)
+            noteMotionClockAnchor(seconds: 0)
+        }
         // The welcome screen only makes sense on an empty session, and it must
         // not capture input: the reference paints a live composer beneath it.
         // Minimal skips the full-screen welcome entirely — the scrollback
@@ -11012,7 +11114,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             }
             turnActivity = "Thinking\u{2026}"
             turnStartedAt = Date()
-            turnStartedAtSeconds = motion.seconds
+            // Extrapolated motion clock, not the last painted tick: after an
+            // idle gap `motion.seconds` is stale and would bake the gap into
+            // the status-row elapsed readout.
+            turnStartedAtSeconds = motionEnabled ? currentMotionSeconds() : nil
             turnOutputUTF8Count = 0
             isCancelling = false
             await refreshContextUsage()
@@ -11231,10 +11336,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         guard !restored else { return }
         restored = true
         // A flush firing after restore would paint into a torn-down screen;
-        // `flushPendingFrameNow` also re-checks `restored` for the task that
-        // is already past its sleep.
-        pendingFlushTask?.cancel()
-        pendingFlushTask = nil
+        // cancel+await the inherited-actor task (releasing this actor while
+        // awaiting) and let `flushPendingFrameNow` re-check `restored`.
+        await cancelPendingFlushTask()
+        // Retire motion delivery before tearing the screen down — same
+        // single-flight await as sink replacement, so a blocked sink cannot
+        // publish into a controller after restore.
+        await setMotionStateSink(nil)
         // Detach the presenter first, so a tool that asks after this point
         // fails closed instead of suspending on a sheet nobody will paint.
         await permissionCoordinator?.setPresenter(nil)
@@ -11299,12 +11407,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     }
 
     private func apply(_ tool: OpenGrokPagerToolUpdate) {
-        // Terminal states are stamped with the motion clock so the block gets
-        // its 400 ms finish flash. `motion.seconds` is at most one tick stale
-        // (~33 ms at 30 fps), well inside the flash window; with motion
-        // disabled the stamp is 0 and the flash renderer treats it as
-        // already-static.
-        conversation.apply(tool, atSeconds: motionEnabled ? motion.seconds : nil)
+        // Terminal states are stamped with the extrapolated motion clock so
+        // the 400 ms finish flash survives an idle gap: stamping the last
+        // painted tick makes the flash already expired when the ticker
+        // resumes. Motion-disabled terminals leave the stamp nil so the
+        // block renders already-static.
+        conversation.apply(
+            tool,
+            atSeconds: motionEnabled ? currentMotionSeconds() : nil
+        )
         // While a tool runs, the turn-status row shows the tool's own title —
         // the reference has no separate "tool running" phrasing.
         if tool.state == .running {
@@ -13199,59 +13310,36 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         }
         let pager = LiveTUISuspendHost.resolvePager(environment: suspendHost.environment)
 
-        // Park the reader and drop raw mode (event_loop.rs:365-371, :399; the
-        // port releases the lease with the park so the input resource stays
-        // the single owner of termios — escape output is unaffected by the
-        // cooked/raw order swap). On timeout, upstream's error text, nothing
-        // torn down, and the suspend aborts; see
-        // `LiveInteractiveInputResource.beginSuspension` for what the
-        // single-attempt divergence costs.
-        guard let suspension = await suspendHost.beginInputSuspension() else {
+        // Blocking this path is correct — upstream blocks its event loop in
+        // `run_child` (event_loop.rs:400). Local motion hold + host
+        // `suspendMotion` keep interleaved ticks from painting; see
+        // `runSuspendedChild`.
+        let outcome = try await runSuspendedChild(
+            host: suspendHost,
+            program: pager.program,
+            arguments: pager.arguments + [file.path],
+            suspendFailPrefix: "Could not suspend the terminal for $PAGER"
+        )
+        switch outcome {
+        case .parkTimedOut:
             note("terminal input reader did not park before suspend")
             try? FileManager.default.removeItem(at: file)
             return
-        }
-        do {
-            try frontendSuspendToChild()
-        } catch {
-            try? await suspension.end()
-            note("Could not suspend the terminal for $PAGER: \(error)")
+        case .suspendFailed:
             try? FileManager.default.removeItem(at: file)
             return
+        case .completed(let launchError):
+            if let launchError {
+                // Deliberate divergence: upstream discards the pager's status
+                // entirely (event_loop.rs:783-786). A launch failure here says
+                // why the screen flickered and showed nothing.
+                note("Could not run pager \(pager.program): \(launchError)")
+            }
+            try? FileManager.default.removeItem(at: file) // event_loop.rs:807
+            // `resumeFromChild` dropped the previous frame, so the repaint at the
+            // end of `render(_:)` is the full-viewport redraw upstream requests
+            // after a child (event_loop.rs:811-812, :717-721).
         }
-        // Blocking this path is correct — upstream blocks its event loop in
-        // `run_child` (event_loop.rs:400). The await suspends this actor, so
-        // the motion ticker's queued ticks DO run during the child; the
-        // renderer's suspended gate is what keeps them from painting into
-        // its screen.
-        let launchError = await LiveTUISuspendHost.runChild(
-            program: pager.program,
-            arguments: pager.arguments + [file.path],
-            environment: suspendHost.environment
-        )
-        do {
-            try frontendResumeFromChild()
-            try await suspension.end()
-        } catch {
-            // Either the tty rejected the re-entry writes or raw mode failed:
-            // a genuinely broken terminal. Latch the renderer down so nothing
-            // paints into a screen we cannot own — the terminal ends fully
-            // cooked, never half — and fail the run loudly instead of
-            // wedging with a paused reader.
-            try? frontendRestore()
-            try? FileManager.default.removeItem(at: file)
-            throw error
-        }
-        if let launchError {
-            // Deliberate divergence: upstream discards the pager's status
-            // entirely (event_loop.rs:783-786). A launch failure here says
-            // why the screen flickered and showed nothing.
-            note("Could not run pager \(pager.program): \(launchError)")
-        }
-        try? FileManager.default.removeItem(at: file) // event_loop.rs:807
-        // `resumeFromChild` dropped the previous frame, so the repaint at the
-        // end of `render(_:)` is the full-viewport redraw upstream requests
-        // after a child (event_loop.rs:811-812, :717-721).
     }
 
     /// The persona detail's `i` — open a config file in `$VISUAL`/`$EDITOR`
@@ -13278,38 +13366,108 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             note("could not parse $VISUAL or $EDITOR")
             return
         }
-        guard let suspension = await suspendHost.beginInputSuspension() else {
+        let outcome = try await runSuspendedChild(
+            host: suspendHost,
+            program: editor.program,
+            arguments: editor.arguments + [path],
+            suspendFailPrefix: "Could not suspend the terminal for $EDITOR"
+        )
+        switch outcome {
+        case .parkTimedOut:
             note("terminal input reader did not park before suspend")
-            return
+        case .suspendFailed:
+            break
+        case .completed(let launchError):
+            if let launchError {
+                // Deliberate divergence, matching the pager arm: upstream only
+                // logs a child failure (`external_editor.rs:274-276`); a
+                // launch failure here says why the screen flickered and the
+                // file never changed.
+                note("Could not run editor \(editor.program): \(launchError)")
+            }
+        }
+    }
+
+    private enum SuspendedChildOutcome: Sendable {
+        case parkTimedOut
+        case suspendFailed
+        case completed(launchError: (any Error)?)
+    }
+
+    /// Shared `/transcript` + `$EDITOR` suspend order: local motion hold →
+    /// cancel+await pending flush → await `host.suspendMotion` → park input →
+    /// tear down the tty → run the child → restore tty/input →
+    /// `host.resumeMotion` → clear the hold. Park / pre-ownership suspend
+    /// failures resume motion and clear the hold (`motionEnabled` is never
+    /// lied about). A terminal/input restore failure keeps the hold,
+    /// best-effort `frontendRestore`, and does **not** call `resumeMotion` —
+    /// re-arming into a broken restore races teardown.
+    private func runSuspendedChild(
+        host: LiveTUISuspendHost,
+        program: String,
+        arguments: [String],
+        suspendFailPrefix: String
+    ) async throws -> SuspendedChildOutcome {
+        localMotionHold = true
+        await cancelPendingFlushTask()
+        await host.suspendMotion()
+
+        // Park the reader and drop raw mode (event_loop.rs:365-371, :399; the
+        // port releases the lease with the park so the input resource stays
+        // the single owner of termios — escape output is unaffected by the
+        // cooked/raw order swap). On timeout, upstream's error text, nothing
+        // torn down, and the suspend aborts; see
+        // `LiveInteractiveInputResource.beginSuspension` for what the
+        // single-attempt divergence costs.
+        guard let suspension = await host.beginInputSuspension() else {
+            // Ownership never moved — safe to resume the controller ticker.
+            await host.resumeMotion()
+            localMotionHold = false
+            return .parkTimedOut
         }
         do {
             try frontendSuspendToChild()
         } catch {
+            // Suspend-to-child failed before the child owned the tty; park is
+            // rolled back and motion may resume.
             try? await suspension.end()
-            note("Could not suspend the terminal for $EDITOR: \(error)")
-            return
+            await host.resumeMotion()
+            localMotionHold = false
+            note("\(suspendFailPrefix): \(error)")
+            return .suspendFailed
         }
+
         let launchError = await LiveTUISuspendHost.runChild(
-            program: editor.program,
-            arguments: editor.arguments + [path],
-            environment: suspendHost.environment
+            program: program,
+            arguments: arguments,
+            environment: host.environment
         )
         do {
             try frontendResumeFromChild()
             try await suspension.end()
         } catch {
-            // The tty rejected re-entry: latch the renderer down so nothing
-            // paints into a screen we cannot own and fail loudly — the
-            // transcript pager's identical arm.
+            // Either the tty rejected the re-entry writes or raw mode failed:
+            // a genuinely broken terminal. Keep `localMotionHold` so ticks and
+            // pending flushes stay dark, best-effort restore the frontend, and
+            // do not `resumeMotion` into a restore failure (controller shutdown
+            // latch / hold must stay shutdown-safe).
             try? frontendRestore()
             throw error
         }
-        if let launchError {
-            // Deliberate divergence, matching the pager arm: upstream only
-            // logs a child failure (`external_editor.rs:274-276`); a
-            // launch failure here says why the screen flickered and the
-            // file never changed.
-            note("Could not run editor \(editor.program): \(launchError)")
+        await host.resumeMotion()
+        localMotionHold = false
+        return .completed(launchError: launchError)
+    }
+
+    /// Cancel the coalesced paint timer and await it without actor deadlock:
+    /// clear the slot, cancel, then `await` (releasing this actor) so the
+    /// inherited-isolation task can exit on cancellation.
+    private func cancelPendingFlushTask() async {
+        let flush = pendingFlushTask
+        pendingFlushTask = nil
+        flush?.cancel()
+        if let flush {
+            _ = await flush.value
         }
     }
 
@@ -14172,8 +14330,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             }
         case .mouse(let mouse):
             guard mouseReportingEnabled else { return .notHandled }
-            let command = try await handleMouse(mouse)
-            return command.map { .runCommand($0) } ?? .consumed
+            return try await handleMouse(mouse)
         case .paste:
             // A modal swallows pasted text for the same reason it swallows
             // keys: nothing typed while it is up belongs to the composer.
@@ -14231,24 +14388,47 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         return max(1, bounds.content.height)
     }
 
-    /// Returns a slash command when the click landed on a command-palette row,
-    /// exactly as the keyboard path does — a click and an Enter must resolve the
-    /// same row the same way.
-    private func handleMouse(_ event: MouseEvent) async throws -> String? {
+    /// Mouse routing against last-painted geometry. Overlay/banner/rail keep
+    /// priority; a left down+up on a conversation content cell (no drag)
+    /// selects that block and returns `.focusScrollback` so controller Tab
+    /// focus matches. Returns a slash command routing when an overlay row is
+    /// a command, exactly as the keyboard path does.
+    private func handleMouse(_ event: MouseEvent) async throws -> OpenGrokPagerInputRouting {
         let hit = lastOverlayBounds.last { $0.hitTest(x: event.x, y: event.y) }
         if event.isScroll {
-            // One notch moves an overlay's selection by exactly one row, but
-            // moves the transcript by the terminal's lines-per-report — the
-            // reference's split between dropdown navigation and scrollback.
-            if let hit, overlays.isActive, hit.id == overlays.focused?.id {
-                let key = KeyEvent(key: event.kind == .scrollUp ? .up : .down)
-                switch overlays.handle(key, viewportHeight: max(1, hit.content.height)) {
-                case .ignored: break
-                default:
-                    refreshDashboardPeek()
-                    try renderState()
-                    return nil
+            // Capturing overlays are scroll-blocking (`is_scroll_blocking_modal_open`,
+            // app_view.rs:3016-3033 / :5619-5638): wheel never reaches the
+            // transcript while any modal captures input. Over the focused
+            // overlay, one vertical notch still moves selection by one row —
+            // the reference's split between dropdown navigation and scrollback.
+            // Horizontal scroll (`scrollLeft`/`scrollRight`) is also in
+            // `isScroll`; map only up→up and down→down so left/right are
+            // consumed without shifting selection or the transcript.
+            pendingScrollbackClick = nil
+            if overlays.isActive {
+                if let hit, hit.id == overlays.focused?.id {
+                    let key: KeyEvent?
+                    switch event.kind {
+                    case .scrollUp:
+                        key = KeyEvent(key: .up)
+                    case .scrollDown:
+                        key = KeyEvent(key: .down)
+                    case .scrollLeft, .scrollRight:
+                        key = nil
+                    default:
+                        key = nil
+                    }
+                    if let key {
+                        switch overlays.handle(key, viewportHeight: max(1, hit.content.height)) {
+                        case .ignored:
+                            break
+                        default:
+                            refreshDashboardPeek()
+                            try renderState()
+                        }
+                    }
                 }
+                return .consumed
             }
             switch event.kind {
             case .scrollUp:
@@ -14256,12 +14436,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             case .scrollDown:
                 scrollDown(by: wheelTuning.linesPerEvent)
             case .scrollLeft, .scrollRight:
-                return nil
+                return .consumed
             default:
-                return nil
+                return .consumed
             }
             try renderState()
-            return nil
+            return .consumed
         }
 
         if event.kind == .move {
@@ -14288,7 +14468,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                   let welcomeBounds = lastOverlayBounds.last(
                       where: { $0.id == Self.welcomeOverlayID }
                   )
-            else { return nil }
+            else { return .consumed }
             let hoveredRowID = welcomeBounds.row(atX: event.x, y: event.y)?.id
             var changed = false
             overlays.updateWelcome { welcome in
@@ -14311,10 +14491,25 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 }
             }
             if changed { try renderState() }
-            return nil
+            return .consumed
         }
 
-        guard event.kind == .down, event.resolvedButton == .left else { return nil }
+        if event.kind == .drag {
+            // Text/block drag is out of scope for this slice; any drag clears
+            // the pending click so a release after motion cannot select.
+            pendingScrollbackClick = nil
+            return .consumed
+        }
+
+        if event.kind == .up {
+            return try await completeScrollbackClick(event)
+        }
+
+        guard event.kind == .down else { return .consumed }
+        guard event.resolvedButton == .left else {
+            pendingScrollbackClick = nil
+            return .consumed
+        }
         // The privacy banner's four click targets, resolved against the
         // rects the LAST frame published (the rail's per-frame-geometry
         // rule below) — upstream's banner-slot hit handling
@@ -14342,22 +14537,26 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         if hit == nil || hit?.id == Self.welcomeOverlayID,
            !overlays.isActive, let banner = lastPrivacyBannerHits {
             if let rect = banner.optIn, rect.contains(x: event.x, y: event.y) {
+                pendingScrollbackClick = nil
                 dispatchPrivacyBannerOptIn()
-                return nil
+                return .consumed
             }
             if let rect = banner.optOut, rect.contains(x: event.x, y: event.y) {
+                pendingScrollbackClick = nil
                 dispatchPrivacyBannerOptOut()
-                return nil
+                return .consumed
             }
             if let rect = banner.terms, rect.contains(x: event.x, y: event.y) {
+                pendingScrollbackClick = nil
                 openExternalURL(pagerPrivacyBannerTermsURL)
                 try renderState()
-                return nil
+                return .consumed
             }
             if let rect = banner.policy, rect.contains(x: event.x, y: event.y) {
+                pendingScrollbackClick = nil
                 openExternalURL(pagerPrivacyBannerPolicyURL)
                 try renderState()
-                return nil
+                return .consumed
             }
         }
         // The timeline rail's click-to-jump (`mouse.rs:415-427`): resolve the
@@ -14372,6 +14571,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         if hit == nil, !overlays.isActive, let rail = lastTimelineRail,
            rail.rect.contains(x: event.x, y: event.y)
         {
+            pendingScrollbackClick = nil
             if let railHit = rail.hit(x: event.x, y: event.y),
                let turnIndex = pagerTimelineChevronTarget(rail, railHit)
             {
@@ -14381,9 +14581,22 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                     try renderState()
                 }
             }
-            return nil
+            return .consumed
         }
-        guard let hit else { return nil }
+        // Click-to-select pending arm: only when no overlay owns the cell,
+        // no capturing modal is up, and the point is inside the last painted
+        // content/chrome band — strictly before the scrollbar/rail gutter
+        // (composer/status/gutter do not arm). Freeze the painted hit model
+        // with the down cell so up cannot remap against a later scroll.
+        if hit == nil, !overlays.isActive,
+           let model = lastConversationHit,
+           model.containsSelectablePoint(x: event.x, y: event.y)
+        {
+            pendingScrollbackClick = (event.x, event.y, model)
+            return .consumed
+        }
+        pendingScrollbackClick = nil
+        guard let hit else { return .consumed }
         if let close = hit.closeButton, close.contains(x: event.x, y: event.y) {
             overlays.dismiss(id: hit.id)
             if currentPermissionRequestID.map({ "permission:\($0)" }) == hit.id {
@@ -14391,12 +14604,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             }
             handleOverlayDismissal(hit.id)
             try renderState()
-            return nil
+            return .consumed
         }
         if let row = hit.row(atX: event.x, y: event.y) {
             let command = try await select(overlayID: hit.id, rowID: row.id)
             try renderState()
-            return command
+            return command.map { .runCommand($0) } ?? .consumed
         }
         var command: String?
         if let hint = hit.hints.first(where: { $0.frame.contains(x: event.x, y: event.y) }),
@@ -14420,7 +14633,44 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             }
             try renderState()
         }
-        return command
+        return command.map { .runCommand($0) } ?? .consumed
+    }
+
+    /// Left-button up half of click-to-select: pending down cell + frozen
+    /// hit model, no drag committed → select + `.focusScrollback`. Up may
+    /// jitter off the down cell; remapping always uses the down snapshot
+    /// (`mouse.rs:830-947` — selection reads `click_row`, not the up row).
+    ///
+    /// X10 releases decode as `.up` with `resolvedButton == .none` (wire
+    /// code 3, no button attribution). Complete against the frozen left-down
+    /// pending snapshot for `.left` or `.none`; middle/right still clear
+    /// pending and refuse.
+    private func completeScrollbackClick(
+        _ event: MouseEvent
+    ) async throws -> OpenGrokPagerInputRouting {
+        switch event.resolvedButton {
+        case .left, .none:
+            break
+        case .middle, .right, .other:
+            pendingScrollbackClick = nil
+            return .consumed
+        }
+        guard let pending = pendingScrollbackClick else { return .consumed }
+        pendingScrollbackClick = nil
+        // Real drag already cleared pending; a jittered up without a drag
+        // event still completes against the down cell (up coordinates are
+        // intentionally ignored for the hit remap).
+        guard !overlays.isActive else { return .consumed }
+        guard let index = pending.hit.blockIndex(atScreenY: pending.y),
+              conversation.items.indices.contains(index),
+              conversation.items[index].isMouseSelectable
+        else { return .consumed }
+        selection.select(at: index, itemCount: conversation.items.count)
+        // Following the tail while a selection cursor exists would yank the
+        // viewport away from the block the user just picked.
+        followsBottom = false
+        try renderState()
+        return .focusScrollback
     }
 
     /// Per-overlay dismissal side effects. Closing the persona detail
@@ -14910,26 +15160,29 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             return
         }
         let result = layOutCurrentFrame()
-        if try renderer.requestFrame(result, at: Self.monotonicNow()) == nil {
+        if try renderer.requestFrame(result, at: Self.monotonicNow()) != nil {
+            // Only a real paint may refresh mouse hit caches — a coalesced
+            // request must not claim unpainted geometry.
+            recordPaintedGeometry(result)
+        } else {
             armFlushTimerIfNeeded()
         }
         publishMotionState()
     }
 
-    /// Run the frame function and refresh the geometry bookkeeping mouse
-    /// routing reads. Split out of `renderState` because the flush timer
-    /// re-lays-out at flush time — a folded frame must paint the *latest*
-    /// state, not the one that was folded.
+    /// Run the frame function and refresh scroll-state bookkeeping. Split
+    /// out of `renderState` because the flush timer re-lays-out at flush
+    /// time — a folded frame must paint the *latest* state, not the one
+    /// that was folded. Does **not** update last-painted mouse geometry;
+    /// that waits for `recordPaintedGeometry` after a non-nil paint.
     private func layOutCurrentFrame() -> PagerRenderResult {
         if let index = pageFlipUserBlockIndex {
             try? revealBlock(at: index)
         }
         let result = renderPagerFrame(renderState(conversation: conversation.items))
-        // Fresh every frame: a modal that no longer fits publishes no bounds.
-        lastOverlayBounds = result.overlays
-        lastTimelineRail = result.layout.timelineRail
-        lastPrivacyBannerHits = result.layout.privacyBanner
-        lastContextBarRect = result.layout.contextBar
+        // Max-scroll / follow-tail are scroll *state*, not hit geometry —
+        // they must track the latest layout even when the paint coalesces,
+        // or the viewport drifts from content growth.
         lastConversationHeight = max(1, result.layout.conversation.height)
         lastMaximumScrollOffset = max(
             0,
@@ -14939,31 +15192,55 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         return result
     }
 
+    /// Replace-wholesale the last-painted mouse caches (overlay / rail /
+    /// banner / context bar / conversation hit). Call only when
+    /// `requestFrame` or `flushPendingFrame` returned a report — never on a
+    /// coalesced nil, or clicks map against geometry the user has not seen.
+    private func recordPaintedGeometry(_ result: PagerRenderResult) {
+        lastOverlayBounds = result.overlays
+        lastTimelineRail = result.layout.timelineRail
+        lastPrivacyBannerHits = result.layout.privacyBanner
+        lastContextBarRect = result.layout.contextBar
+        lastConversationHit = result.layout.conversationHit
+    }
+
     /// Arm a one-shot timer for `renderer.scheduledFrameAt`. Idempotent: at
     /// most one flush is ever pending, and a fresh request folded while one
-    /// is armed rides the same flush.
+    /// is armed rides the same flush. Suspend hold and restore both block
+    /// arming — a cancelled timer must not be replaced while the child owns
+    /// the tty or after teardown.
     private func armFlushTimerIfNeeded() {
-        guard pendingFlushTask == nil,
+        guard !restored,
+              !localMotionHold,
+              pendingFlushTask == nil,
               let scheduled = renderer.scheduledFrameAt
         else { return }
         let delay = max(0, scheduled - Self.monotonicNow())
         // Inherits this actor's isolation; the sleep suspends without
-        // holding it.
+        // holding it. Exit on cancellation so `cancelPendingFlushTask`'s
+        // await cannot deadlock waiting for a post-sleep paint hop.
         pendingFlushTask = Task {
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000) + 1_000_000)
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000) + 1_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
             self.flushPendingFrameNow()
         }
     }
 
     private func flushPendingFrameNow() {
         pendingFlushTask = nil
-        guard !restored, renderer.scheduledFrameAt != nil else { return }
+        guard !restored, !localMotionHold, renderer.scheduledFrameAt != nil else { return }
         let result = layOutCurrentFrame()
         // A throw here has the same recovery as the next event's repaint;
         // surfacing it has no channel that would not kill the run.
-        _ = try? renderer.flushPendingFrame(result, at: Self.monotonicNow())
+        if (try? renderer.flushPendingFrame(result, at: Self.monotonicNow())) != nil {
+            recordPaintedGeometry(result)
+        }
         // Not yet due (the timer raced a fresher fold): re-arm rather than
-        // drop the frame.
+        // drop the frame — but never while held/restored.
         armFlushTimerIfNeeded()
     }
 
@@ -14978,11 +15255,18 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// One wall-clock tick from the controller's motion ticker: sample the
     /// clock into the frame state and repaint through the coalesced path.
     func renderAnimationTick(_ frame: OpenGrokPagerAnimationFrame) async throws {
+        // Suspended child or post-restore teardown: ticks that interleave at
+        // an await must not mutate the motion clock or paint. Distinct from
+        // `motionEnabled` — that is capability, this is lifecycle.
+        guard !localMotionHold, !restored else { return }
         motion = PagerMotionSnapshot(
             tick: frame.tick,
             seconds: frame.seconds,
             enabled: motionEnabled
         )
+        // Re-anchor every painted tick so idle extrapolation stays on the
+        // same epoch as `PagerMotionSnapshot.seconds`.
+        noteMotionClockAnchor(seconds: frame.seconds)
         if frame.demand == .slow {
             // The welcome shimmer advances at 12 fps of *frames*; a slow tick
             // that lands inside the same shimmer frame would repaint an
@@ -14992,6 +15276,34 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             lastShimmerFrame = shimmerFrame
         }
         try renderState()
+    }
+
+    /// Motion-clock "now": last anchored seconds plus monotonic time since
+    /// that anchor. `begin()` seeds the anchor at seconds 0 so idle before
+    /// the first painted tick still advances; each `renderAnimationTick`
+    /// re-anchors to the controller frame's seconds.
+    private func currentMotionSeconds() -> TimeInterval {
+        guard motionEnabled, let anchorMonotonic = motionClockAnchorMonotonic else {
+            return motion.seconds
+        }
+        let delta = Self.monotonicNow() - anchorMonotonic
+        return motionClockAnchorSeconds + max(0, delta)
+    }
+
+    private func noteMotionClockAnchor(seconds: TimeInterval) {
+        motionClockAnchorSeconds = seconds
+        motionClockAnchorMonotonic = Self.monotonicNow()
+    }
+
+    /// Snapshot for paints: tick stays at the last painted frame (spinner
+    /// cadence), but `seconds` extrapolates so finish-flash and elapsed stay
+    /// honest between ticks and across idle gaps.
+    private var paintMotion: PagerMotionSnapshot {
+        PagerMotionSnapshot(
+            tick: motion.tick,
+            seconds: motionEnabled ? currentMotionSeconds() : motion.seconds,
+            enabled: motion.enabled
+        )
     }
 
     /// Report what is moving on screen to the controller's ticker whenever it
@@ -15005,6 +15317,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // viewport misses the reference's finer visibility test and stays
             // animated; the cost is spare frames, never a frozen spinner.
             hasVisibleRunningBlock: followsBottom && hasStreamingBlock,
+            // No actor-local background-task count is maintained here; `/tasks`
+            // re-fetches through `toolExecutor` on demand. Feeding this from
+            // that async path would require a push/cache seam owned elsewhere.
             hasBackgroundTasks: false,
             showsWelcomeLogo: overlays.contains(id: "welcome"),
             hasPendingFlash: hasPendingFlash,
@@ -15012,8 +15327,48 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         )
         guard state != lastPublishedMotionState else { return }
         lastPublishedMotionState = state
-        guard let motionSink else { return }
-        Task { await motionSink(state) }
+        guard motionSink != nil else { return }
+        pendingMotionDelivery = state
+        guard motionDeliveryTask == nil else { return }
+        let epoch = motionSinkEpoch
+        motionDeliveryTask = Task {
+            await self.deliverMotionStates(epoch: epoch)
+        }
+    }
+
+    /// Ordered, coalescing delivery: at most one await on the sink at a time,
+    /// always forwarding the newest pending state. Never awaited from the
+    /// event-mutation path that called `publishMotionState`.
+    private func deliverMotionStates(epoch: UInt64) async {
+        while !Task.isCancelled {
+            guard let packet = takePendingMotionDelivery(epoch: epoch) else { break }
+            await packet.sink(packet.state)
+        }
+        finishMotionDelivery(epoch: epoch)
+    }
+
+    private func takePendingMotionDelivery(
+        epoch: UInt64
+    ) -> (state: PagerMotionState, sink: @Sendable (PagerMotionState) async -> Void)? {
+        // Stale loops must not clear a newer epoch's pending coalesce slot.
+        guard epoch == motionSinkEpoch, let sink = motionSink else {
+            return nil
+        }
+        guard let state = pendingMotionDelivery else { return nil }
+        pendingMotionDelivery = nil
+        return (state, sink)
+    }
+
+    private func finishMotionDelivery(epoch: UInt64) {
+        guard epoch == motionSinkEpoch else { return }
+        motionDeliveryTask = nil
+        // A publish may have landed after the last take returned nil and
+        // before this clear — re-arm so the newest state is not stranded.
+        guard pendingMotionDelivery != nil, motionSink != nil else { return }
+        let nextEpoch = motionSinkEpoch
+        motionDeliveryTask = Task {
+            await self.deliverMotionStates(epoch: nextEpoch)
+        }
     }
 
     private var hasStreamingBlock: Bool {
@@ -15028,11 +15383,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
 
     private var hasPendingFlash: Bool {
         guard motionEnabled else { return false }
+        let now = currentMotionSeconds()
         return conversation.items.contains { item in
             guard case .tool(let tool) = item, let finishedAt = tool.finishedAt else {
                 return false
             }
-            return PagerMotion.isFlashing(finishedAt: finishedAt, now: motion.seconds)
+            return PagerMotion.isFlashing(finishedAt: finishedAt, now: now)
         }
     }
 
@@ -15064,11 +15420,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 },
                 selectedIndex: prompt.selectedCompletion
             )
-        // Elapsed rides the motion clock so the readout and the spinner agree
-        // frame-for-frame; the wall-clock fallback only serves motion-disabled
-        // terminals, where no animation frame ever advances `motion.seconds`.
+        // Elapsed rides the extrapolated motion clock so the readout and the
+        // spinner agree without baking an idle gap into the first paint after
+        // resume; the wall-clock fallback only serves motion-disabled
+        // terminals, where no animation frame ever advances the motion clock.
+        let paintClock = paintMotion
         let elapsed: TimeInterval? = motionEnabled
-            ? turnStartedAtSeconds.map { max(0, motion.seconds - $0) }
+            ? turnStartedAtSeconds.map { max(0, paintClock.seconds - $0) }
             : turnStartedAt.map { Date().timeIntervalSince($0) }
         let streamedTokens = Int(estimateTokens(bytes: turnOutputUTF8Count))
         return PagerRenderState(
@@ -15086,7 +15444,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 PagerTurnStatus(
                     label: isCancelling ? "Cancelling\u{2026}" : label,
                     isCancelling: isCancelling,
-                    tick: motion.tick,
+                    tick: paintClock.tick,
                     elapsed: elapsed,
                     tokenCount: streamedTokens > 0 ? streamedTokens : nil,
                     queuedPromptCount: queuedPromptCount,
@@ -15132,7 +15490,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             theme: renderTheme,
             selectedBlockIndex: selection.index,
             overlays: overlays,
-            motion: motion,
+            motion: paintClock,
             // Derived per frame from the user value and the live terminal
             // height — the port of `AppView::apply_effective_compact`
             // (`app_view.rs:2676-2690`), collapsed to a pure read because this
@@ -15162,6 +15520,92 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     }
 
     private var transcript: String { conversation.transcript }
+
+    // MARK: - Narrow live-seam test probes
+
+    /// Extrapolated motion-clock seconds (same epoch as painted ticks).
+    func testingMotionSeconds() -> TimeInterval { currentMotionSeconds() }
+
+    /// Last painted motion tick (not extrapolated) — for proving
+    /// `renderAnimationTick` no-ops under the local suspend hold.
+    func testingPaintedMotionTick() -> Int { motion.tick }
+
+    /// Turn elapsed on the motion clock, or `nil` when no turn is running.
+    func testingTurnElapsed() -> TimeInterval? {
+        guard motionEnabled else {
+            return turnStartedAt.map { Date().timeIntervalSince($0) }
+        }
+        return turnStartedAtSeconds.map { max(0, currentMotionSeconds() - $0) }
+    }
+
+    /// `PagerToolCard.finishedAt` for a call id, when present.
+    func testingToolFinishedAt(callID: String) -> TimeInterval? {
+        conversation.testingFinishedAt(callID: callID)
+    }
+
+    /// Whether any tool card is still inside its finish-flash window.
+    func testingHasPendingFlash() -> Bool { hasPendingFlash }
+
+    /// Transcript scroll offset (0 at top). Follow-tail reports the last
+    /// painted maximum so tests can assert wheel quarantine without parsing
+    /// paint bytes.
+    func testingTranscriptScrollOffset() -> Int {
+        followsBottom ? lastMaximumScrollOffset : scrollOffset
+    }
+
+    func testingFollowsBottom() -> Bool { followsBottom }
+
+    /// Scrollback selection index after click-to-select / Tab focus.
+    func testingScrollbackSelectedIndex() -> Int? { selection.index }
+
+    /// Whether the local suspend motion hold is latched (ticks no-op).
+    func testingLocalMotionHold() -> Bool { localMotionHold }
+
+    /// Whether `restoreTerminal` has latched this renderer down.
+    func testingRestored() -> Bool { restored }
+
+    /// Whether a coalesced flush Task is currently armed.
+    func testingHasPendingFlushTask() -> Bool { pendingFlushTask != nil }
+
+    /// Invoke the pending-flush path directly — live-seam probe for hold /
+    /// restored gates on paint and re-arm (AGENTS.md §3).
+    func testingFlushPendingFrameNow() {
+        flushPendingFrameNow()
+    }
+
+    /// Selected row index of the focused capturing overlay, when it exposes one.
+    func testingFocusedOverlaySelectedIndex() -> Int? {
+        guard let focused = overlays.focused else { return nil }
+        switch focused.content {
+        case .list(let list):
+            return list.selectedIndex
+        case .workflows(let runs):
+            return runs.selectedIndex
+        case .permission(let prompt):
+            return prompt.selectedIndex
+        case .question(let prompt):
+            return prompt.cursor
+        case .text, .welcome, .planApproval, .settings, .extensions, .agents,
+             .personaDetail:
+            return nil
+        }
+    }
+
+    /// Focused capturing overlay id, for live mouse hit-tests in tests.
+    func testingFocusedOverlayID() -> String? { overlays.focused?.id }
+
+    /// Append a transcript block and request a repaint — live-seam injection
+    /// for system/separator click-to-select gates (AGENTS.md §3).
+    func testingAppendConversationItem(_ item: PagerConversationItem) throws {
+        conversation.appendItem(item)
+        try renderState()
+    }
+
+    /// Conversation item count after live appends / turns.
+    func testingConversationItemCount() -> Int { conversation.items.count }
+
+    /// Whether a coalesced frame is waiting on the paint-cadence flush timer.
+    func testingHasScheduledFrame() -> Bool { renderer.scheduledFrameAt != nil }
 }
 
 private struct SilentLiveInteractiveOutput: OpenGrokPagerInteractiveOutputAdapter, Sendable {

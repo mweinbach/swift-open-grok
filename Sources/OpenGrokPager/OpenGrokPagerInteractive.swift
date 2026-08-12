@@ -683,6 +683,12 @@ public enum OpenGrokPagerInputRouting: Sendable, Equatable, Hashable {
     /// in its selected directory, then submits the prompt through the normal
     /// queue/turn lifecycle.
     case dispatchNew(prompt: String, workingDirectory: String?)
+    /// The renderer selected a scrollback block (click-to-select) and needs
+    /// the controller's keyboard focus to match. The input pump calls
+    /// `setFocus(.scrollback)`, which emits the existing `.focusChanged`
+    /// event so the renderer's selection state stays in sync with Tab focus.
+    /// Idempotent when focus is already on the scrollback.
+    case focusScrollback
 }
 
 public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {

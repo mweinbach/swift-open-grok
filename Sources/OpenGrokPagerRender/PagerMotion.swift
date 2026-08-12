@@ -202,26 +202,53 @@ extension PagerMotion {
     /// Brightness for a glyph at diagonal position `diagonal` (0...1 across the
     /// logo, bottom-left to top-right) at wall time `seconds`.
     ///
-    /// A raised-cosine band sweeps the diagonal, plus a slow global breath. The
-    /// band parks off-screen for most of the cycle, so the logo is still most
-    /// of the time and glints briefly — the effect the reference is after.
+    /// Exact port of `shine_opacity` in
+    /// `crates/codegen/xai-grok-pager/src/views/welcome/logo.rs` at pin
+    /// `650c1db7`. A raised-cosine band sweeps the diagonal, plus a slow global
+    /// breath. The band parks off-screen for most of the cycle, so the logo is
+    /// still most of the time and glints briefly.
+    ///
+    /// The breath uses `PULSE * (0.5 - 0.5 * cos(...))` — minimum at t=0 — not
+    /// the phase-inverted `0.5 * (1 + cos(...))` form.
     public static func shimmerOpacity(diagonal: Double, seconds: Double) -> Double {
         let phase = seconds.truncatingRemainder(dividingBy: Shimmer.cycle) / Shimmer.cycle
-        // Sweep the band from just off one edge to just off the other, then
-        // leave it parked past the end for the rest of the cycle.
-        let sweep = phase / Shimmer.sweepFraction
+        // Sweep from just off one edge to just off the other, then clamp so the
+        // band stays parked past the end for the rest of the cycle
+        // (`q = (p / SWEEP_FRAC).min(1.0)` in the reference).
+        let sweep = min(phase / Shimmer.sweepFraction, 1.0)
         let center = -Shimmer.band + sweep * (1 + 2 * Shimmer.band)
-        var shine = 0.0
-        if phase <= Shimmer.sweepFraction {
-            let distance = abs(diagonal - center)
-            if distance < Shimmer.band {
-                // Raised cosine: 1 at the centre, 0 at the edges, smooth at both.
-                shine = Shimmer.shine * 0.5 * (1 + cos(Double.pi * distance / Shimmer.band))
-            }
+        let distance = abs(diagonal - center)
+        let shine: Double
+        if distance < Shimmer.band {
+            // Raised cosine: 1 at the centre, 0 at the edges, smooth at both.
+            shine = Shimmer.shine * 0.5 * (1 + cos(Double.pi * distance / Shimmer.band))
+        } else {
+            shine = 0
         }
-        let breath = Shimmer.pulse * 0.5
-            * (1 + cos(2 * Double.pi * seconds / Shimmer.pulseSeconds))
+        // `PULSE * (0.5 - 0.5 * cos(TAU * secs / PULSE_SECS))` — logo.rs.
+        let breath = Shimmer.pulse
+            * (0.5 - 0.5 * cos(2 * Double.pi * seconds / Shimmer.pulseSeconds))
         return min(1, max(0, shine + breath))
+    }
+
+    /// Normalized diagonal for one logo glyph — `render_into` in
+    /// `welcome/logo.rs` at pin `650c1db7`:
+    /// `(col + (rows - 1 - row)) / (cols + rows)`.
+    ///
+    /// Bottom-left is 0; the coordinate grows as column increases and row
+    /// decreases (toward the top-right). The denominator is `cols + rows`, not
+    /// the max span `(cols - 1) + (rows - 1)`. Zero-size inputs clamp to 1×1 so
+    /// a single cell / empty logo never divides by zero (same `.max(1)` the
+    /// reference applies before the division).
+    public static func shimmerDiagonal(
+        column: Int,
+        row: Int,
+        columns: Int,
+        rows: Int
+    ) -> Double {
+        let cols = Double(max(1, columns))
+        let rowCount = Double(max(1, rows))
+        return (Double(column) + (rowCount - 1 - Double(row))) / (cols + rowCount)
     }
 
     /// The shimmer color for one logo glyph — `gray` at rest, blended toward

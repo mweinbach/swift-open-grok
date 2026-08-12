@@ -44,14 +44,28 @@ live-proven through `liveACPServices`; Hub MCP `closeCount` double-close flake
 is fixed (`McpTransportCloseOnce`); same-process `resume_from` /
 `resume_agent_ids` inherit source childCWD/worktree identity; foreign
 `sessions list` gates Claude/Codex scans on effective config + resume skill
-(`foreign_sessions.rs:281-365`). Local serial gate: **5,366** cases / **926**
-suites / **74** nonempty summaries, exit 0 twice; no known remaining local
-flakes from the recorded Rhai + Hub MCP pair. Still open at the live seam:
+(`foreign_sessions.rs:281-365`). Prior same-day serial gate: **5,366** cases /
+**926** suites / **74** nonempty summaries, exit 0 twice; no known remaining
+local flakes from the recorded Rhai + Hub MCP pair. Still open at the live seam:
 **Antigravity follow-ons**, durable cross-process subagent resume, relocation
 journal, portable WSS/custom CA, Windows WinSock loopback / relaunch, and
 **platform CI reliability** (no platform job green; macOS live-composition CI
 stop remains). Details and quoted security install lines:
 `PORT_STATUS.md` → Local correctness wave.
+
+**Local TUI interaction wave (2026-08-11):** motion clock / finish-flash /
+ordered delivery / welcome shimmer / suspend pause-restore; full X10
+preservation; iTerm/WezTerm wheel 1/1 + modal wheel quarantine; transcript
+left-click visible-block selection via last-painted hit geometry +
+`focusScrollback`. Local serial gate (no platform CI rerun): `build-tests`
+exit 0; focused TUI matrix **154 tests / 25 suites**; real PTY filters
+**5 tests / 2 suites**; full `test --no-parallel` count-only **5,423** cases /
+**932** suites / **74** nonempty summaries, elapsed 303.118s, exit 0. Still
+absent (do not claim fixed): background-task count/spinner push seam; Rust
+scroll-stream normalizer/acceleration + hidden scroll settings readers; text
+drag/multi-click, composer mouse, link click, scrollbar drag, sticky headers,
+opt-in mouse-toggle/Ctrl+R; display-refresh probing (probe-skip cadence
+honest). Details: `PORT_STATUS.md` → Local TUI interaction wave.
 
 **Wave 19 update (2026-08-10):** the deferred-dashboard batch is now landed rather
 than standing. Retained dashboard sessions can dispatch prompts and replies; `/cd`,
@@ -236,8 +250,11 @@ S2 exec emulation · portable secure WebSockets · Linux custom-CA installation 
 share upload/export clients · post-change Linux/Windows CI and required-check evidence ·
 B1 residuals: attach to a still-running subagent and dashboard-native multiselect
 question resolution ·
-Mouse block selection (click selects a transcript block; upstream's scrollback click
-handling — the live pipeline is proven and pinned, Wave 14.1, only the feature is absent) ·
+Mouse long-tail (Local TUI interaction wave closed visible-block left-click
+selection + X10 preservation): scroll-stream normalizer/acceleration + hidden
+scroll settings readers; text drag/multi-click; composer mouse; link click;
+scrollbar drag; sticky headers; opt-in mouse-toggle/Ctrl+R; background-task
+count/spinner push seam; display-refresh probe ·
 video tools (`reference_to_video`) · `search_tool`/`use_tool` MCP meta-discovery ·
 media overlays (B10: kitty/iTerm images, mermaid, real `/gboom`) · foreign-session
 scan/resume (Claude/Codex/Cursor) ·

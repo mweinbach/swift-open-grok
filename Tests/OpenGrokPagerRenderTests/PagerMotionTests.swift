@@ -210,6 +210,59 @@ struct PagerShimmerTests {
             theme: theme, diagonal: 0.4, seconds: 1.2, motionEnabled: false
         ) == theme.textPrimary)
     }
+
+    @Test("breath matches Rust PULSE*(0.5-0.5*cos) at t=0, quarter, and half period")
+    func shimmerBreathMatchesPinnedRustSamples() {
+        // Pulse period is 5 s. At these times the sweep is either off-screen or
+        // the chosen diagonal is far from the band, so opacity == breath alone.
+        // Values from `shine_opacity` at pin 650c1db7 (logo.rs).
+        assertNear(PagerMotion.shimmerOpacity(diagonal: 0.5, seconds: 0.0), 0.0)
+        assertNear(PagerMotion.shimmerOpacity(diagonal: 0.5, seconds: 1.25), 0.03)
+        assertNear(PagerMotion.shimmerOpacity(diagonal: 0.5, seconds: 2.5), 0.06)
+        assertNear(PagerMotion.shimmerOpacity(diagonal: 0.5, seconds: 3.75), 0.03)
+        assertNear(PagerMotion.shimmerOpacity(diagonal: 0.5, seconds: 5.0), 0.0)
+        // Rest-window sample where breath is neither peak nor trough.
+        assertNear(
+            PagerMotion.shimmerOpacity(diagonal: 0.5, seconds: 2.0),
+            0.054270509831248419
+        )
+    }
+
+    @Test("sweep samples at early/mid times match pinned Rust shine_opacity")
+    func shimmerSweepMatchesPinnedRustSamples() {
+        // Computed from logo.rs `shine_opacity` at 650c1db7.
+        assertNear(PagerMotion.shimmerOpacity(diagonal: 0.0, seconds: 0.1), 0.095848147647018919)
+        assertNear(PagerMotion.shimmerOpacity(diagonal: 0.5, seconds: 0.1), 0.00023655896056566371)
+        assertNear(PagerMotion.shimmerOpacity(diagonal: 0.0, seconds: 0.4), 0.19586890699500517)
+        assertNear(PagerMotion.shimmerOpacity(diagonal: 0.5, seconds: 0.7), 0.30396316495388931)
+        assertNear(PagerMotion.shimmerOpacity(diagonal: 1.0, seconds: 0.7), 0.010877280307539308)
+    }
+
+    @Test("diagonal uses cols+rows, not max span, with zero/single-cell safety")
+    func shimmerDiagonalMatchesPinnedRust() {
+        // `(col + (rows - 1 - row)) / (cols + rows)` — logo.rs `render_into`.
+        // 4×3: bottom-left = 0, top-right = (3+2)/7 = 5/7 (never 1.0).
+        assertNear(PagerMotion.shimmerDiagonal(column: 0, row: 2, columns: 4, rows: 3), 0.0)
+        assertNear(
+            PagerMotion.shimmerDiagonal(column: 3, row: 0, columns: 4, rows: 3),
+            5.0 / 7.0
+        )
+        assertNear(
+            PagerMotion.shimmerDiagonal(column: 1, row: 1, columns: 4, rows: 3),
+            2.0 / 7.0
+        )
+        // Single cell and empty (clamped to 1×1): (0+0)/(1+1) = 0.
+        assertNear(PagerMotion.shimmerDiagonal(column: 0, row: 0, columns: 1, rows: 1), 0.0)
+        assertNear(PagerMotion.shimmerDiagonal(column: 0, row: 0, columns: 0, rows: 0), 0.0)
+        // Column-only / row-only strips.
+        assertNear(PagerMotion.shimmerDiagonal(column: 2, row: 0, columns: 3, rows: 1), 0.5)
+        assertNear(PagerMotion.shimmerDiagonal(column: 0, row: 0, columns: 1, rows: 3), 0.5)
+        assertNear(PagerMotion.shimmerDiagonal(column: 0, row: 2, columns: 1, rows: 3), 0.0)
+    }
+
+    private func assertNear(_ actual: Double, _ expected: Double) {
+        #expect(abs(actual - expected) < 1e-12)
+    }
 }
 
 // MARK: - Finish flash

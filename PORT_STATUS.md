@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-11 (local correctness wave). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green: macOS still dies mid-suite at the reproducible live-composition stop, Windows still does not compile through the remaining modules, and Linux's completed suite result is known later in this file (**5,832 tests / 935 suites / 28 issues**, exit 1) — not unconfirmed. The ACP reverse permission bridge is **live-proven** through `OpenGrokLiveApplicationLauncher.liveACPServices` (see Local correctness wave). Local serial gate (lead, 2026-08-11): `build-tests` exit 0; focused filter exit 0 (**60 tests / 13 suites**); `test --no-parallel` exit 0 twice — count-only second run reports exactly **5,366 Swift Testing cases, 926 suites, 74 nonempty test-run summaries**, elapsed 314.694s, zero failed summaries/issues. No known remaining local flaky tests from the recorded Rhai + Hub MCP `closeCount` pair; CI reliability remains unproven. **Do not read the local green as CI green** — that is exactly the substitution this ledger exists to prevent.
+**As of:** 2026-08-11 (local TUI interaction wave). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green: macOS still dies mid-suite at the reproducible live-composition stop, Windows still does not compile through the remaining modules, and Linux's completed suite result is known later in this file (**5,832 tests / 935 suites / 28 issues**, exit 1) — not unconfirmed. Same-day prior local correctness (ACP reverse permission live-proven, Hub MCP `closeCount`, same-process resume cwd, foreign `sessions list` gating) still stands. Local serial gate for this TUI wave (lead, 2026-08-11; no platform CI rerun): `build-tests` exit 0; focused final TUI matrix exit 0 (**exactly 154 tests in 25 suites**); real PTY filters `PagerPTYSessionTests|InferencePTYScenarioTests` exit 0 (**5 tests in 2 suites**); full `test --no-parallel` count-only exit 0 — exactly **5,423 Swift Testing cases, 932 suites, 74 nonempty test-run summaries**, elapsed **303.118s**, zero failed summaries/issues. No known remaining local flaky tests from the recorded Rhai + Hub MCP `closeCount` pair; CI reliability remains unproven. **Do not read the local green as CI green** — that is exactly the substitution this ledger exists to prevent.
 **Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, Antigravity follow-ons, durable cross-process subagent resume, and post-change platform CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -8,10 +8,73 @@
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
+## Local TUI interaction wave (2026-08-11, complete)
+
+Current truth for the verified local TUI animation + mouse interaction closures against
+pin `650c1db7`. Historical sections below keep their contemporaneous wording; where they
+conflict on motion/suspend/mouse interaction, **this section wins**.
+
+**Verification (lead, local macOS, 2026-08-11; no platform CI rerun):**
+
+- `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
+- Focused final TUI matrix — exit 0, **exactly 154 tests in 25 suites** (sum of five
+  test-run summaries: 28/4, 15/1, 14/3, 67/12, 30/5).
+- Real PTY filters `PagerPTYSessionTests|InferencePTYScenarioTests` — exit 0,
+  **5 tests in 2 suites**.
+- `zsh workflows/swift-safe-verify.zsh test --no-parallel` count-only — exit 0:
+  exactly **5,423** Swift Testing cases, **932** suites, **74** nonempty test-run
+  summaries, elapsed **303.118s**, zero failed summaries/issues.
+- Real-CLI smoke (`verify-open-grok`, separate from Swift totals): isolated run
+  `20260811-212555-45552`; helper `doctor` exit 0 / version `0.1.220-open-grok.58`;
+  `sessions list` exit 0 with fresh-home `No sessions found.`; `help sessions`
+  exit 0; cleanup succeeded; artifacts retained. Does **not** claim TUI mouse or
+  animation behavior.
+
+### Animations (live)
+
+1. **Live elapsed / finish-flash stamps** use a monotonic extrapolated motion clock
+   seeded at begin, so idle gaps and pre-first-tick sessions do not jump or skip flash.
+2. **Motion state delivery** is ordered/coalesced; sink replacement awaits old delivery;
+   stale fast demand cannot re-arm after `.none`.
+3. **Welcome shimmer** breath and diagonal match pinned Rust; the renderer uses the
+   helper.
+4. **TUI suspend** explicitly pauses/cancel-awaits the controller ticker and pending
+   flush, paints nothing during child ownership, restores then re-arms; a shutdown latch
+   prevents child return from rearming into teardown; renderer errors now propagate
+   rather than being swallowed.
+
+### Mouse (live)
+
+5. **`TerminalInputDecoder` preserves full legacy X10 reports**, including split
+   reads/releases/wheel, so coordinate bytes no longer become composer keys; SGR remains
+   live. The earlier build-out-wave-2 "Legacy X10 mouse reports still leak" claim is
+   **superseded**.
+6. **iTerm/WezTerm wheel tuning is 1/1**; capturing modals quarantine outside wheel;
+   horizontal wheel is a no-op.
+7. **Transcript left down/up** selects visible blocks through exact last-painted hit
+   geometry, excludes gaps/system/separators/scrollbar/rail/modal/composer, freezes
+   down-frame geometry, handles X10 up-none, and returns `focusScrollback` so keyboard
+   focus matches paint. The Wave 14.1 "mouse block selection is a feature gap" claim is
+   **superseded** for this left-click visible-block path.
+
+### Honest remaining gaps (not claimed fixed)
+
+- **Background-task count/spinner** remains render-only — the renderer lacks a
+  push/cache seam to feed live counts.
+- **Full Rust mouse scroll stream normalizer/acceleration** and the hidden scroll
+  settings readers (`scroll_speed` / `scroll_mode` / `scroll_lines` / `invert_scroll`
+  and related Appearance/Mouse rows still without live readers) remain absent.
+- **Text drag/multi-click, composer mouse, link click, scrollbar drag, sticky
+  headers**, and **opt-in mouse-toggle / Ctrl+R** parity remain absent/deferred.
+- **Display refresh probing** remains absent; default / probe-skip cadence is honest.
+
 ## Local correctness wave (2026-08-11, complete)
 
-Current truth for the same-day local correctness closures. Historical sections below
-keep their contemporaneous wording; where they conflict, **this section wins**.
+Current truth for the same-day local correctness closures (ACP / Hub MCP / same-process
+resume / foreign `sessions list`). For TUI animation and mouse interaction, see
+**Local TUI interaction wave** above. Historical sections below keep their
+contemporaneous wording; where they conflict with this section's closures,
+**this section wins**.
 
 **Verification (lead, 2026-08-11; no platform CI rerun):**
 
@@ -3366,6 +3429,8 @@ between the Wave 14 record and this section's verification snapshot.
   transcript blocks by click; this port's non-overlay clicks do nothing — and wheel scroll
   has nothing to move on a non-overflowing transcript. The gap belongs to the roadmap's
   pager-surface work.
+  *Superseded 2026-08-11 by Local TUI interaction wave for left-click visible-block
+  selection + X10 preservation; remaining mouse backlog is listed there.*
 - **Codex request parity + boundary ordering** (commit 4167a7f): Responses bodies now send
   upstream's unconditional `store: false` + encrypted-reasoning include
   (`client.rs:2453-2462`, applied before the adapter patch so the DeepSeek/Meta strippers
@@ -3592,6 +3657,10 @@ the keystone.
 `scroll_mode`, `scroll_lines`, `invert_scroll`, `keep_text_selection`,
 `prompt_suggestions`. (`compact_mode`, `show_timestamps`, and `show_timeline` left
 this list when their readers landed — rows registered, audited 2026-08-10.)
+*2026-08-11 note:* `page_flip_on_send` later gained a live reader (Wave 20 follow-on
+batch 2); the **scroll_*** / `invert_scroll` / `keep_text_selection` mouse-scroll
+settings remain hidden — Local TUI interaction wave did **not** land those readers or
+the Rust scroll-stream normalizer/acceleration.
 
 ### Ledger corrections (stale rows every domain audit tripped over)
 
@@ -4732,6 +4801,8 @@ overlay/permission/mouse subset 8/8.
   the prefilter described in `INTEGRATION-mouse.md` §2 — run `MouseStreamParser`
   ahead of `TerminalInputDecoder` on the raw byte stream — which needs a change
   inside `OpenGrokTTY`. Mitigated, not fixed, by enabling `?1006h` last.
+  *Superseded 2026-08-11 by Local TUI interaction wave: `TerminalInputDecoder`
+  preserves full legacy X10 reports (including split reads/releases/wheel).*
 
 **Deferred.**
 
@@ -4740,6 +4811,8 @@ overlay/permission/mouse subset 8/8.
   opening a link. The reference also requires mouse-up on the same cell as
   mouse-down, which needs down-cell tracking that does not exist yet. No
   selection, drag, double/triple-click, or hover either.
+  *2026-08-11:* visible-block left-click selection is now live (Local TUI
+  interaction wave); link click / text drag / multi-click remain absent.
 - **Live model switch.** `/model` posts `Model set to X` and relabels the
   composer. The sampler's model is fixed at session construction and nothing
   downstream can change it mid-session, so the picker is honest about being

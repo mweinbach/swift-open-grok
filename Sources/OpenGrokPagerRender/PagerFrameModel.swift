@@ -185,6 +185,22 @@ public enum PagerConversationItem: Sendable, Equatable, Hashable {
         case .separator: return true
         }
     }
+
+    /// Whether a mouse click may select this block. Mirrors upstream
+    /// `BlockContent::is_selectable` for the cases this port paints:
+    /// system messages are never navigable (`system.rs:88-90`), and
+    /// separators are chrome, not entries. Tools / user / assistant /
+    /// reasoning / error remain selectable.
+    public var isMouseSelectable: Bool {
+        switch self {
+        case .separator:
+            return false
+        case .message(let message):
+            return message.role != .system
+        case .tool:
+            return true
+        }
+    }
 }
 
 // MARK: - Status bar (top row)
@@ -663,6 +679,65 @@ public struct PagerRenderState: Sendable, Equatable {
     }
 }
 
+/// Last-frame conversation click-to-select geometry — area, scroll offset,
+/// painted content width, and per-block content starts/heights from the
+/// exact layout that painted. Gap rows are deliberately outside every
+/// `start..<start+height` so a click there selects nothing (upstream
+/// `entry_at_content_y`, `scrollback/state/layout.rs:100-124`). Not
+/// text-drag geometry.
+public struct PagerConversationHitModel: Sendable, Equatable {
+    public var conversation: TerminalRect
+    public var scrollOffset: Int
+    /// Painted text-column width (excludes accent/pad chrome and the
+    /// scrollbar/rail gutter). Same value `renderConversation` / the rail
+    /// use for `scrollbarX` / `railX` —
+    /// `conversation.x + chromeWidth + contentWidth` is the first gutter
+    /// column and must not arm click-to-select.
+    public var contentWidth: Int
+    public var blockStartLines: [Int]
+    public var blockHeights: [Int]
+
+    public init(
+        conversation: TerminalRect,
+        scrollOffset: Int,
+        contentWidth: Int,
+        blockStartLines: [Int],
+        blockHeights: [Int]
+    ) {
+        self.conversation = conversation
+        self.scrollOffset = scrollOffset
+        self.contentWidth = contentWidth
+        self.blockStartLines = blockStartLines
+        self.blockHeights = blockHeights
+    }
+
+    /// Exclusive screen X of the content/chrome band — first scrollbar or
+    /// rail-gutter column. Clicks at or past this X are not transcript
+    /// selection targets (upstream clears/handles `hit_scrollbar` before
+    /// arming `pending_scrollback_click`, `mouse.rs:408-414`).
+    public var selectableEndX: Int {
+        conversation.x + PagerLayoutMetrics.chromeWidth + max(0, contentWidth)
+    }
+
+    /// True when `(x, y)` sits inside the conversation pane's content/chrome
+    /// band and strictly before the scrollbar/rail gutter.
+    public func containsSelectablePoint(x: Int, y: Int) -> Bool {
+        guard conversation.contains(x: x, y: y) else { return false }
+        return x < selectableEndX
+    }
+
+    /// Block index under `screenY`, or `nil` for gaps / outside / malformed.
+    public func blockIndex(atScreenY screenY: Int) -> Int? {
+        pagerConversationBlockIndex(
+            screenY: screenY,
+            conversation: conversation,
+            scrollOffset: scrollOffset,
+            blockStartLines: blockStartLines,
+            blockHeights: blockHeights
+        )
+    }
+}
+
 public struct PagerFrameLayout: Sendable, Equatable {
     public var bounds: TerminalRect
     public var statusBar: TerminalRect
@@ -698,6 +773,11 @@ public struct PagerFrameLayout: Sendable, Equatable {
     /// hover router (B6: `context_bar.rs:4-8` — hover swaps tokens for a
     /// progress bar at the SAME width). `nil` when no context data painted.
     public var contextBar: TerminalRect?
+    /// Conversation click-to-select geometry from the layout THIS frame
+    /// painted. `nil` only for synthetic layouts that never laid out a
+    /// transcript (e.g. minimal host overlay scoping); a live frame always
+    /// publishes it so a router never acts on a previous frame's starts.
+    public var conversationHit: PagerConversationHitModel?
 
     public init(
         bounds: TerminalRect,
@@ -715,7 +795,8 @@ public struct PagerFrameLayout: Sendable, Equatable {
         hasScrollbar: Bool,
         timelineRail: PagerTimelineRail? = nil,
         privacyBanner: PagerPrivacyBannerHitRects? = nil,
-        contextBar: TerminalRect? = nil
+        contextBar: TerminalRect? = nil,
+        conversationHit: PagerConversationHitModel? = nil
     ) {
         self.bounds = bounds
         self.statusBar = statusBar
@@ -733,6 +814,7 @@ public struct PagerFrameLayout: Sendable, Equatable {
         self.timelineRail = timelineRail
         self.privacyBanner = privacyBanner
         self.contextBar = contextBar
+        self.conversationHit = conversationHit
     }
 }
 

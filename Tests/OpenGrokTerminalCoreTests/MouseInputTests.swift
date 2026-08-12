@@ -451,10 +451,15 @@ struct MouseWheelTuningTests {
         #expect(MouseWheelTuning.defaultLinesPerTick == 3)
         #expect(MouseWheelTuning.defaultEventsPerTick == 3)
         #expect(MouseWheelTuning().linesPerEvent == 1)
+        let fromNil = MouseWheelTuning.forTerminalProgram(nil)
+        #expect(fromNil.linesPerTick == 3)
+        #expect(fromNil.eventsPerTick == 3)
+        #expect(fromNil.linesPerEvent == 1)
     }
 
     @Test("One-report-per-notch terminals get the full notch distance")
     func singleEventTerminals() {
+        // VS Code-family shape: ept=1 with default LPT → 3 lines/report.
         let tuning = MouseWheelTuning(linesPerTick: 3, eventsPerTick: 1)
         #expect(tuning.linesPerEvent == 3)
     }
@@ -464,8 +469,37 @@ struct MouseWheelTuningTests {
         #expect(MouseWheelTuning(linesPerTick: 1, eventsPerTick: 8).linesPerEvent == 1)
     }
 
-    @Test("Terminal lookup mirrors ScrollConfig::from_terminal_context")
+    @Test("iTerm.app and WezTerm are 1/1 → one line per report")
+    func itermAndWezTermOneLinePerReport() {
+        for program in ["iTerm.app", "WezTerm", "iterm2", "iTerm"] {
+            let tuning = MouseWheelTuning.forTerminalProgram(program)
+            #expect(tuning.linesPerTick == 1, "\(program)")
+            #expect(tuning.eventsPerTick == 1, "\(program)")
+            #expect(tuning.linesPerEvent == 1, "\(program)")
+        }
+    }
+
+    @Test("forTerminalProgram covers every named terminal explicitly")
     func terminalLookup() {
+        // iTerm / WezTerm: both fields drop to 1 (Rust mouse.rs:340,337 + 367).
+        assertTuning("iTerm.app", lines: 1, events: 1, perEvent: 1)
+        assertTuning("WezTerm", lines: 1, events: 1, perEvent: 1)
+
+        // VS Code family + Zed: ept=1, default LPT (Rust:341-344; LPT stays 3).
+        assertTuning("vscode", lines: 3, events: 1, perEvent: 3)
+        assertTuning("cursor", lines: 3, events: 1, perEvent: 3)
+        assertTuning("windsurf", lines: 3, events: 1, perEvent: 3)
+        assertTuning("zed", lines: 3, events: 1, perEvent: 3)
+
+        // Default 3/3 brands / unknown (Rust AppleTerminal/Warp/Ghostty/Kitty/…).
+        assertTuning("Apple_Terminal", lines: 3, events: 3, perEvent: 1)
+        assertTuning("WarpTerminal", lines: 3, events: 3, perEvent: 1)
+        assertTuning("Ghostty", lines: 3, events: 3, perEvent: 1)
+        assertTuning("kitty", lines: 3, events: 3, perEvent: 1)
+        assertTuning("Alacritty", lines: 3, events: 3, perEvent: 1)
+        assertTuning(nil, lines: 3, events: 3, perEvent: 1)
+
+        // Compatibility helper delegates to the factory's events field.
         #expect(MouseWheelTuning.eventsPerTick(forTerminalProgram: "iTerm.app") == 1)
         #expect(MouseWheelTuning.eventsPerTick(forTerminalProgram: "WezTerm") == 1)
         #expect(MouseWheelTuning.eventsPerTick(forTerminalProgram: "vscode") == 1)
@@ -478,5 +512,18 @@ struct MouseWheelTuningTests {
         let tuning = MouseWheelTuning(linesPerTick: 0, eventsPerTick: -4)
         #expect(tuning.linesPerTick == 1)
         #expect(tuning.eventsPerTick == 1)
+    }
+
+    private func assertTuning(
+        _ program: String?,
+        lines: Int,
+        events: Int,
+        perEvent: Int
+    ) {
+        let tuning = MouseWheelTuning.forTerminalProgram(program)
+        let label = program ?? "nil"
+        #expect(tuning.linesPerTick == lines, "\(label) linesPerTick")
+        #expect(tuning.eventsPerTick == events, "\(label) eventsPerTick")
+        #expect(tuning.linesPerEvent == perEvent, "\(label) linesPerEvent")
     }
 }
