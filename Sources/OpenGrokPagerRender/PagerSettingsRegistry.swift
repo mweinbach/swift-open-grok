@@ -312,18 +312,34 @@ public enum PagerSettingChoices {
         PagerSettingChoice(canonical: "off", display: "Off")
     ]
 
-    /// `SCROLL_MODE_CHOICES` (`defs.rs:284`).
+    /// `SCROLL_MODE_CHOICES` (`defs.rs:300-316` at `650c1db7`).
     public static let scrollMode: [PagerSettingChoice] = [
-        PagerSettingChoice(canonical: "auto", display: "Auto-detect"),
-        PagerSettingChoice(canonical: "wheel", display: "Mouse wheel"),
-        PagerSettingChoice(canonical: "trackpad", display: "Trackpad")
+        PagerSettingChoice(canonical: "auto", display: "Auto-detect",
+                           summary: "Detect wheel vs trackpad per gesture from event timing. Default."),
+        PagerSettingChoice(canonical: "wheel", display: "Mouse wheel",
+                           summary: "Always treat scrolling as wheel notches (fixed lines per tick)."),
+        PagerSettingChoice(canonical: "trackpad", display: "Trackpad",
+                           summary: "Always treat scrolling as a trackpad (fractional accumulation).")
     ]
 
-    /// `TEXT_SELECTION_CHOICES` (`defs.rs:302`).
+    /// `TEXT_SELECTION_CHOICES` (`defs.rs:318-334` at `650c1db7`).
+    /// Canonical values are `flash` | `hold` | `word_select` (underscore).
     public static let textSelection: [PagerSettingChoice] = [
-        PagerSettingChoice(canonical: "flash", display: "Flash after copy"),
-        PagerSettingChoice(canonical: "hold", display: "Hold until dismissed"),
-        PagerSettingChoice(canonical: "word-select", display: "Word select (terminal-like)")
+        PagerSettingChoice(
+            canonical: "flash",
+            display: "Flash after copy",
+            summary: "Brief highlight on mouse-up, then clear. Double-click toggles fold. Default."
+        ),
+        PagerSettingChoice(
+            canonical: "hold",
+            display: "Hold until dismissed",
+            summary: "Keep the selection visible until Esc, click, or scroll. Double-click toggles fold."
+        ),
+        PagerSettingChoice(
+            canonical: "word_select",
+            display: "Word select (terminal-like)",
+            summary: "Double-click selects & copies a word, triple-click a line; selection stays until dismissed."
+        )
     ]
 
     /// `HUNK_TRACKER_MODE_CHOICES` (`defs.rs:322`). `disabled` parses as an
@@ -479,6 +495,11 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
         // `simple_mode`, `render_mermaid`, `max_thoughts_width`, `show_thinking_blocks`,
         // `group_tool_verbs`, `collapsed_edit_blocks`.
         //
+        // `sticky_headers` is parsed from `$OPENGROK_HOME/pager.toml`
+        // `[scrollback.display]` (default true) but has **no** settings row
+        // at pin 650c1db7 (`defs.rs` — do not invent one). File edits are
+        // restart-only (`ConfigWatcher::start` → `start_static`).
+        //
         // `compact_mode` is upstream's FIRST Appearance row (`defs.rs:614-629`)
         // and the settings modal's default selection (`settings_e2e.rs:1905`);
         // label, description, and keywords are upstream's verbatim. The
@@ -623,10 +644,78 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
         )
     ]
 
-    // MARK: Mouse (0 — upstream 5; scroll/selection rows have no live reader)
+    // MARK: Mouse (5 — matches upstream at `650c1db7`)
 
-    // Hidden: `scroll_speed`, `scroll_mode`, `scroll_lines`, `invert_scroll`,
-    // `keep_text_selection` — the port's wheel handler does not read them yet.
+    // Scroll normalizer rows plus live `keep_text_selection` for transcript
+    // text drag / multi-click (`defs.rs:1615-1744` at `650c1db7`).
+    rows += [
+        // SHELL-owned, persisted to `[ui].scroll_speed` (`defs.rs:1615-1632`).
+        PagerSettingMeta(
+            key: "scroll_speed",
+            category: .mouse,
+            label: "Scroll speed",
+            description: "Mouse-wheel and trackpad scroll speed multiplier (1-100). Higher = faster.",
+            keywords: ["scroll", "speed", "mouse", "wheel", "trackpad", "fast", "slow"],
+            kind: .integer(default: 50, minimum: 1, maximum: 100),
+            storage: .config(path: "ui.scroll_speed")
+        ),
+        // SHELL-owned `auto` | `wheel` | `trackpad` on `[ui].scroll_mode`
+        // (`defs.rs:1633-1656`). Default is ScrollMode::Auto → `"auto"`.
+        PagerSettingMeta(
+            key: "scroll_mode",
+            category: .mouse,
+            label: "Scroll input",
+            description: "Force wheel or trackpad scroll behavior when auto-detection misreads your device.",
+            keywords: ["scroll", "mode", "wheel", "trackpad", "mouse", "detect", "force", "input"],
+            kind: .enumeration(default: "auto", choices: PagerSettingChoices.scrollMode, supportsPreview: false),
+            storage: .config(path: "ui.scroll_mode")
+        ),
+        // SHELL-owned, persisted to `[ui].scroll_lines` (`defs.rs:1657-1678`).
+        // Registered display default is 3; until the user first commits a
+        // value the per-terminal profile stays in charge (unset → no override).
+        PagerSettingMeta(
+            key: "scroll_lines",
+            category: .mouse,
+            label: "Scroll lines",
+            description: "Lines per scroll tick for both wheel and trackpad (1-10). "
+                + "Until set, each terminal's own profile applies.",
+            keywords: ["scroll", "lines", "tick", "notch", "wheel", "trackpad", "mouse"],
+            kind: .integer(default: 3, minimum: 1, maximum: 10),
+            storage: .config(path: "ui.scroll_lines")
+        ),
+        // SHELL-owned: `[ui].invert_scroll` (`defs.rs:1679-1700`). Default OFF.
+        // `restart_required: false` — live-apply like upstream.
+        PagerSettingMeta(
+            key: "invert_scroll",
+            category: .mouse,
+            label: "Invert scroll",
+            description: "Reverse vertical scroll direction (natural scrolling).",
+            keywords: ["invert", "scroll", "natural", "direction", "reverse", "mouse", "trackpad"],
+            kind: .bool(default: false),
+            storage: .config(path: "ui.invert_scroll")
+        ),
+        // SHELL-owned `flash` | `hold` | `word_select` on `[ui].keep_text_selection`
+        // (`defs.rs:1715-1744` at `650c1db7`). Live-apply; no restart.
+        PagerSettingMeta(
+            key: "keep_text_selection",
+            category: .mouse,
+            label: "Text selection",
+            description: "How long in-app selection stays on screen and what double-click does "
+                + "(fold vs. select & copy a word). For your terminal or multiplexer's own "
+                + "selection, hold Shift while dragging (native copy).",
+            keywords: [
+                "selection", "drag", "copy", "flash", "hold", "shift", "native",
+                "mouse", "tmux", "double", "double-click", "word", "terminal",
+            ],
+            kind: .enumeration(
+                default: "flash",
+                choices: PagerSettingChoices.textSelection,
+                supportsPreview: false
+            ),
+            storage: .config(path: "ui.keep_text_selection"),
+            restartRequired: false
+        )
+    ]
 
     // MARK: Editor & Input (6 — upstream 7 minus `prompt_suggestions`)
 
@@ -1188,7 +1277,16 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             category: .advanced,
             label: "Mouse reporting toggle",
             description: "Register Ctrl+R (scrollback focused) and /toggle-mouse-reporting so you can turn terminal mouse capture off for native click-drag copy/paste, then turn TUI mouse features back on. Restart required.",
-            keywords: ["mouse", "reporting"],
+            keywords: [
+                "mouse",
+                "reporting",
+                "toggle",
+                "ctrl+r",
+                "capture",
+                "copy",
+                "paste",
+                "flag"
+            ],
             kind: .bool(default: false),
             storage: .featureFlag(path: "ui.mouse_reporting_toggle"),
             restartRequired: true

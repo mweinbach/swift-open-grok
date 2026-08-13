@@ -203,6 +203,19 @@ public struct RhaiWorkflowRunView: Sendable, Hashable {
     }
 }
 
+/// Process-local active-membership push for workflow runs.
+///
+/// CLI maps these onto `LiveActiveBackgroundWorkEvent` with kind `.workflow`
+/// (`LiveWorkflowActiveBackgroundWork`). The registry cannot import OpenGrokCLI.
+public enum RhaiWorkflowActiveBackgroundWorkEvent: Sendable, Hashable {
+    case upsert(runID: String)
+    case remove(runID: String)
+}
+
+/// Optional async sink the interactive session installs for the status chip.
+public typealias RhaiWorkflowActiveBackgroundWorkSink =
+    @Sendable (RhaiWorkflowActiveBackgroundWorkEvent) async -> Void
+
 public actor RhaiWorkflowRunRegistry {
     private struct Live {
         let context: RhaiWorkflowRunContext
@@ -219,6 +232,15 @@ public actor RhaiWorkflowRunRegistry {
     /// retained runs" dashboard rather than an active-only list.
     private var boards: [String: RhaiWorkflowProgressBoard] = [:]
     private let makeRunID: @Sendable () -> String
+
+    /// Optional status-chip feed. Generation invalidates in-flight publishes
+    /// after replace/clear so a slow await cannot start a *new* publish against
+    /// a retired sink.
+    private var activeBackgroundWorkSink: RhaiWorkflowActiveBackgroundWorkSink?
+    private var activeBackgroundWorkSinkGeneration: UInt64 = 0
+    /// Run ids we have upserted and not yet removed. Membership is the
+    /// single-remove / repeated-status latch.
+    private var publishedActiveWorkflowIDs: Set<String> = []
 
     public init(
         store: WorkflowSessionStore,
@@ -239,12 +261,88 @@ public actor RhaiWorkflowRunRegistry {
     /// Mark runs that were active when the process died as interrupted, so a
     /// restarted session never shows a run as still progressing when no task
     /// is behind it.
+    ///
+    /// When a status-chip sink is installed, membership is reconciled from the
+    /// restored records in the same transaction — active→interrupted drops
+    /// leave the chip, and any still-active id is published (none after a
+    /// normal restore).
     @discardableResult
     public func restore() async throws -> [WorkflowRunRecord] {
+        let records: [WorkflowRunRecord]
         do {
-            return try await store.restore()
+            records = try await store.restore()
         } catch {
             throw RhaiWorkflowRegistryError.persistence(String(describing: error))
+        }
+        await reconcileActiveBackgroundWork(with: records)
+        return records
+    }
+
+    // MARK: - Active background work (status chip)
+
+    /// Install (or clear) the status-chip sink. A non-nil install publishes an
+    /// upsert for every currently `.active` run id so a renderer that attaches
+    /// after start/restore still seeds its cache. Replacing or clearing bumps
+    /// the generation so in-flight publishes against the previous sink are
+    /// dropped at the next await boundary.
+    public func setActiveBackgroundWorkSink(
+        _ sink: RhaiWorkflowActiveBackgroundWorkSink?
+    ) async {
+        activeBackgroundWorkSinkGeneration &+= 1
+        let generation = activeBackgroundWorkSinkGeneration
+        activeBackgroundWorkSink = sink
+        guard sink != nil else {
+            publishedActiveWorkflowIDs.removeAll()
+            return
+        }
+        let snapshotIDs: [String]
+        do {
+            snapshotIDs = try await list()
+                .filter { $0.status == .active }
+                .map(\.runID)
+        } catch {
+            snapshotIDs = []
+        }
+        // Drop latch entries the snapshot no longer considers active, then
+        // publish each still-active id to the *new* sink. Re-check status
+        // per id so a finish that interleaved after `list()` cannot
+        // resurrect a terminal run on the chip.
+        let snapshotSet = Set(snapshotIDs)
+        for id in publishedActiveWorkflowIDs where !snapshotSet.contains(id) {
+            guard generation == activeBackgroundWorkSinkGeneration else { return }
+            await noteActiveBackgroundWork(runID: id, isActive: false, generation: generation)
+        }
+        for id in snapshotIDs {
+            guard generation == activeBackgroundWorkSinkGeneration else { return }
+            guard let record = try? await store.record(id), record.status == .active else {
+                await noteActiveBackgroundWork(runID: id, isActive: false, generation: generation)
+                continue
+            }
+            // Already-latched ids still need an upsert on sink *replacement*
+            // so a late-attached renderer seeds its cache.
+            if publishedActiveWorkflowIDs.contains(id) {
+                guard let sink = activeBackgroundWorkSink,
+                      generation == activeBackgroundWorkSinkGeneration
+                else { return }
+                await sink(.upsert(runID: id))
+            } else {
+                await noteActiveBackgroundWork(runID: id, isActive: true, generation: generation)
+            }
+        }
+    }
+
+    /// Remove every still-published active workflow id from the chip and clear
+    /// the sink. Session teardown calls this so a lost terminal update cannot
+    /// leave the chip armed after the registry is abandoned.
+    public func shutdownActiveBackgroundWork() async {
+        let ids = Array(publishedActiveWorkflowIDs)
+        let sink = activeBackgroundWorkSink
+        activeBackgroundWorkSinkGeneration &+= 1
+        activeBackgroundWorkSink = nil
+        publishedActiveWorkflowIDs.removeAll()
+        guard let sink else { return }
+        for id in ids {
+            await sink(.remove(runID: id))
         }
     }
 
@@ -286,6 +384,9 @@ public actor RhaiWorkflowRunRegistry {
         } catch {
             throw RhaiWorkflowRegistryError.persistence(String(describing: error))
         }
+        // Status is `.active` in the same transaction as insert — emit before
+        // the detached task starts so `/tasks` and the chip never disagree.
+        await noteActiveBackgroundWork(runID: runID, isActive: true)
         launch(
             record: record,
             script: script,
@@ -345,6 +446,7 @@ public actor RhaiWorkflowRunRegistry {
         } catch {
             throw RhaiWorkflowRegistryError.persistence(String(describing: error))
         }
+        await noteActiveBackgroundWork(runID: runID, isActive: true)
         launch(
             record: record,
             script: script,
@@ -402,7 +504,12 @@ public actor RhaiWorkflowRunRegistry {
 
     private func finish(runID: String, outcome: RhaiWorkflowOutcome, journal: RhaiJournal) async {
         live[runID] = nil
-        guard var record = try? await store.record(runID) else { return }
+        guard var record = try? await store.record(runID) else {
+            // Persistence lost the row; still drop the chip membership if we
+            // published an upsert for this id.
+            await noteActiveBackgroundWork(runID: runID, isActive: false)
+            return
+        }
         switch outcome {
         case .completed(let result):
             record.status = .completed
@@ -429,6 +536,9 @@ public actor RhaiWorkflowRunRegistry {
         record.revision = record.revision.saturatingAdd(1)
         record.completionDelivered = false
         try? await store.update(record)
+        // Rust `WorkflowRunSnapshot::is_active` is status == "active" only —
+        // paused / budget_exceeded / terminal all leave the chip.
+        await noteActiveBackgroundWork(runID: runID, isActive: record.status == .active)
     }
 
     // MARK: - Control
@@ -526,6 +636,59 @@ public actor RhaiWorkflowRunRegistry {
             ))
         }
         return out
+    }
+
+    // MARK: - Active background work helpers
+
+    /// Align published chip membership with `records` after restore/reconcile.
+    private func reconcileActiveBackgroundWork(with records: [WorkflowRunRecord]) async {
+        guard activeBackgroundWorkSink != nil else { return }
+        let active = Set(records.filter { $0.status == .active }.map(\.runID))
+        let published = publishedActiveWorkflowIDs
+        for id in published where !active.contains(id) {
+            await noteActiveBackgroundWork(runID: id, isActive: false)
+        }
+        for id in active where !published.contains(id) {
+            await noteActiveBackgroundWork(runID: id, isActive: true)
+        }
+    }
+
+    /// Emit upsert/remove from a status-mutation transaction. Idempotent on
+    /// repeated `.active` / non-active notes for the same id.
+    private func noteActiveBackgroundWork(
+        runID: String,
+        isActive: Bool,
+        generation: UInt64? = nil
+    ) async {
+        guard !runID.isEmpty else { return }
+        let generation = generation ?? activeBackgroundWorkSinkGeneration
+        guard generation == activeBackgroundWorkSinkGeneration else { return }
+        guard activeBackgroundWorkSink != nil else { return }
+
+        if isActive {
+            guard publishedActiveWorkflowIDs.insert(runID).inserted else { return }
+        } else {
+            guard publishedActiveWorkflowIDs.remove(runID) != nil else { return }
+        }
+
+        guard generation == activeBackgroundWorkSinkGeneration,
+              let sink = activeBackgroundWorkSink
+        else {
+            // Sink replaced/cleared between the latch and capture — roll the
+            // latch back so a later install can republish from store truth.
+            if isActive {
+                publishedActiveWorkflowIDs.remove(runID)
+            } else {
+                publishedActiveWorkflowIDs.insert(runID)
+            }
+            return
+        }
+
+        if isActive {
+            await sink(.upsert(runID: runID))
+        } else {
+            await sink(.remove(runID: runID))
+        }
     }
 
     // MARK: - Naming

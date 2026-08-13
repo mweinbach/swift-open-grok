@@ -172,6 +172,13 @@ actor LiveSchedulerHost {
     /// (`app/dispatch/prompt.rs:779-794`).
     private var provisional: [ScheduledTaskInfo] = []
 
+    /// Optional status-chip feed. Composition installs a weak renderer
+    /// apply; absent (headless / early tests) every emit is a no-op.
+    /// Generation invalidates in-flight publishes after replace/clear so a
+    /// slow await cannot leak into a retired sink.
+    private var activeBackgroundWorkSink: LiveActiveBackgroundWorkSink?
+    private var activeBackgroundWorkSinkGeneration: UInt64 = 0
+
     init(
         clock: @escaping @Sendable () -> Date = { Date() },
         backgroundLoopsEnabled: Bool = true,
@@ -200,14 +207,67 @@ actor LiveSchedulerHost {
         // computes a zero delay and `fire_next_task` re-anchors from `now`,
         // actor.rs:266-271, 406-408 — one catch-up fire, never one per
         // missed interval).
+        //
+        // Active-background-work upserts for restored rows wait for
+        // `setActiveBackgroundWorkSink`: the chip cache is initialized from
+        // the live set at install time (no polling), matching upstream's
+        // post-restore announce of every still-scheduled entry.
     }
 
-    /// Stop the timer. Called from the executor's shutdown so a dying session
-    /// cannot fire into a torn-down controller.
-    func shutdown() {
+    /// Stop the timer and clear every still-visible scheduled id from the
+    /// status-chip cache. Called from the executor's shutdown so a dying
+    /// session cannot fire into a torn-down controller or leave the chip
+    /// armed after teardown.
+    func shutdown() async {
         timerGeneration &+= 1
         timer?.cancel()
         timer = nil
+        for id in visibleScheduledIDs() {
+            await emitActiveBackgroundWork(.remove(kind: .scheduled, id: id))
+        }
+    }
+
+    // MARK: - Active background work (status chip)
+
+    /// Install (or clear) the status-chip sink. A non-nil install publishes
+    /// one atomic `.replace` of the currently visible scheduled id set —
+    /// provisional previews plus every live store row — so a renderer that
+    /// attaches after load/create seeds its cache without a burst of
+    /// upserts. Replacing or clearing bumps the generation so in-flight
+    /// publishes against the previous sink are dropped at the next await
+    /// boundary.
+    func setActiveBackgroundWorkSink(_ sink: LiveActiveBackgroundWorkSink?) async {
+        activeBackgroundWorkSinkGeneration &+= 1
+        let generation = activeBackgroundWorkSinkGeneration
+        activeBackgroundWorkSink = sink
+        guard let sink else { return }
+        guard generation == activeBackgroundWorkSinkGeneration else { return }
+        let event = LiveActiveBackgroundWorkEvent.replacing(
+            kind: .scheduled,
+            ids: Set(visibleScheduledIDs())
+        )
+        await sink(event)
+    }
+
+    /// Rust `TasksPane::running_count` counts `scheduled.len()` — every
+    /// entry in the display map, not only a currently firing Cron. Visible
+    /// here means provisional previews plus every live store row.
+    private func visibleScheduledIDs() -> [String] {
+        provisional.map(\.taskId) + state.tasks.map(\.id)
+    }
+
+    /// Await the current sink under this actor's sequencing. Captures the
+    /// generation before the await so a replace/clear that interleaves
+    /// cannot start a *new* publish against a retired sink (an already-
+    /// entered `await sink(event)` may still complete — that is one
+    /// in-flight delivery, not a leak of later lifecycle edges).
+    private func emitActiveBackgroundWork(_ event: LiveActiveBackgroundWorkEvent?) async {
+        guard let event else { return }
+        let generation = activeBackgroundWorkSinkGeneration
+        guard let sink = activeBackgroundWorkSink,
+              generation == activeBackgroundWorkSinkGeneration
+        else { return }
+        await sink(event)
     }
 
     // MARK: - Fire delivery
@@ -303,6 +363,7 @@ actor LiveSchedulerHost {
                         continue
                     }
                     displayCreatedAt.removeValue(forKey: task.id)
+                    await emitActiveBackgroundWork(.remove(kind: .scheduled, id: task.id))
                     continue
                 }
                 // Non-durable expiry removes without firing and without a
@@ -310,6 +371,7 @@ actor LiveSchedulerHost {
                 // best-effort, like upstream's next debounced save.
                 state.tasks.remove(at: index)
                 displayCreatedAt.removeValue(forKey: task.id)
+                await emitActiveBackgroundWork(.remove(kind: .scheduled, id: task.id))
                 continue
             }
             // Advance the cadence before delivering, so a re-entrant look at
@@ -326,6 +388,7 @@ actor LiveSchedulerHost {
                 // arm only serves decoded legacy state.
                 state.tasks.remove(at: index)
                 displayCreatedAt.removeValue(forKey: task.id)
+                await emitActiveBackgroundWork(.remove(kind: .scheduled, id: task.id))
                 nextFireAt = nil
             }
             // Fire-mode selection, upstream's `spawn_deps` decision
@@ -511,7 +574,7 @@ actor LiveSchedulerHost {
         durable: Bool,
         foreground: Bool,
         fireImmediately: Bool
-    ) throws -> ScheduledTask {
+    ) async throws -> ScheduledTask {
         // A pending removal barrier refuses every other mutation
         // (`actor.rs:773-777`) until the stuck delete is retried.
         if let pending = pendingRemovalTaskID {
@@ -528,10 +591,26 @@ actor LiveSchedulerHost {
         )
         task.foreground = foreground
         try state.create(task)
+        // Rust's map retain+insert is one sync (`acp_handler/background.rs:
+        // 329-353`). When provisional rows were visible, emit one atomic
+        // `.replace` of the full post-mutation scheduled set so the chip
+        // never paints a transient 0 or 2. Independent creates (no
+        // provisional) stay a single `.upsert`.
+        let replacedProvisional = !provisional.isEmpty
         provisional.removeAll()
         displayCreatedAt[task.id] = now
         persistence?.save(state)
         rearmTimer()
+        if replacedProvisional {
+            await emitActiveBackgroundWork(
+                LiveActiveBackgroundWorkEvent.replacing(
+                    kind: .scheduled,
+                    ids: Set(visibleScheduledIDs())
+                )
+            )
+        } else {
+            await emitActiveBackgroundWork(.upsert(kind: .scheduled, id: task.id))
+        }
         return task
     }
 
@@ -579,7 +658,7 @@ actor LiveSchedulerHost {
     ///  * a delete of a DIFFERENT id while pending → `removalPending`
     ///    (`actor.rs:846-850`); the same id retries the barrier
     ///    (`actor.rs:838-845`).
-    func deleteTask(id: String) throws -> Bool {
+    func deleteTask(id: String) async throws -> Bool {
         if pendingRemovalTaskID == id {
             return try completePendingRemoval()
         }
@@ -590,6 +669,9 @@ actor LiveSchedulerHost {
             return false
         }
         displayCreatedAt.removeValue(forKey: id)
+        // Leave the store first (actor.rs:863), then drop the chip key —
+        // the row is already invisible to `displayInfos` / `/tasks`.
+        await emitActiveBackgroundWork(.remove(kind: .scheduled, id: id))
         pendingRemovalTaskID = id
         return try completePendingRemoval()
     }
@@ -620,7 +702,9 @@ actor LiveSchedulerHost {
 
     /// Insert a provisional `/loop` preview row, keyed `provisional-…` so the
     /// next real create replaces it (`app/dispatch/prompt.rs:779-794`).
-    func insertProvisional(prompt: String, humanSchedule: String) {
+    /// Counts toward the status chip immediately — Rust `running_count` uses
+    /// `scheduled.len()`, and the provisional is already in that map.
+    func insertProvisional(prompt: String, humanSchedule: String) async {
         let id = "provisional-\(UUID().uuidString)"
         provisional.append(ScheduledTaskInfo(
             taskId: id,
@@ -631,6 +715,7 @@ actor LiveSchedulerHost {
             tag: "loop",
             lastSubagentId: nil
         ))
+        await emitActiveBackgroundWork(.upsert(kind: .scheduled, id: id))
     }
 
     /// The rows `/tasks` renders: provisional previews plus every live task,

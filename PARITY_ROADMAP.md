@@ -57,15 +57,119 @@ stop remains). Details and quoted security install lines:
 ordered delivery / welcome shimmer / suspend pause-restore; full X10
 preservation; iTerm/WezTerm wheel 1/1 + modal wheel quarantine; transcript
 left-click visible-block selection via last-painted hit geometry +
-`focusScrollback`. Local serial gate (no platform CI rerun): `build-tests`
-exit 0; focused TUI matrix **154 tests / 25 suites**; real PTY filters
-**5 tests / 2 suites**; full `test --no-parallel` count-only **5,423** cases /
-**932** suites / **74** nonempty summaries, elapsed 303.118s, exit 0. Still
-absent (do not claim fixed): background-task count/spinner push seam; Rust
-scroll-stream normalizer/acceleration + hidden scroll settings readers; text
-drag/multi-click, composer mouse, link click, scrollbar drag, sticky headers,
-opt-in mouse-toggle/Ctrl+R; display-refresh probing (probe-skip cadence
-honest). Details: `PORT_STATUS.md` → Local TUI interaction wave.
+`focusScrollback`. Local serial gate that day (no platform CI rerun):
+`build-tests` exit 0; focused TUI matrix **154 tests / 25 suites**; real PTY
+filters **5 tests / 2 suites**; full `test --no-parallel` count-only
+**5,423** cases / **932** suites / **74** nonempty summaries, elapsed
+303.118s, exit 0. Details: `PORT_STATUS.md` → Local TUI interaction wave.
+
+**Local remaining-TUI-gap follow-on (2026-08-12):** full Rust-style mouse
+scroll stream normalizer (80ms stream, 16ms dedicated clock, residual/coast,
+acceleration, remux/terminal profiles) + live `scroll_speed` / `scroll_mode` /
+`scroll_lines` / `invert_scroll` readers (settings reset re-resolves project
+layer); active background chip/motion via idempotent push cache (shell/monitor,
+running non-workflow subagents, all scheduled, active workflows; atomic
+scheduler provisional replacement; chip appears/spins/disappears and demand
+parks); direct mouse scrollbar click/drag, safe same-cell transcript links,
+composer focus/cursor via `PromptEditor` (block click remains; priorities/
+modal/X10); macOS CoreGraphics refresh-rate probe → auto cadence (Linux honest
+skip; Windows unsupported); `$OPENGROK_HOME/pager.toml` animation `fps` /
+`wave_rows` live (`show_fps` HUD absent); mouse-reporting toggle gate
+(env > effective ui > default false; command hidden/refused off; scrollback
+Ctrl+R on; prompt inert; terminal-write rollback); Standard URL schemes only
+`http`/`https`/`mailto` before LinkSpan / OSC8 / opener. Local serial gate
+(**no platform CI rerun**): `build-tests` exit 0; comprehensive remaining-gap
+filter **223 tests / 41 suites** (27/9 + 32/6 + 54/7 + 6/1 + 104/18);
+background lifecycle+spinner **50 tests / 9 suites**; real PTY filters
+**5 tests / 2 suites**; full `test --no-parallel` count-only **5,599** cases /
+**965** suites / **74** nonempty summaries, elapsed 329.038s, exit 0;
+verify-open-grok isolated CLI smoke `20260812-remaining-tui` (doctor/version
+`.58`, sessions list empty exit0, help sessions exit0, cleanup
+succeeded/artifacts retained). Contemporaneous “still absent” sticky-headers /
+text-drag / native-hover notes are **superseded** by the sticky-header +
+transcript text-selection follow-on below. Contemporaneous `show_fps` HUD
+absent / mouse-off / composer-drag notes are **superseded** by the final TUI
+divergence closure below. Do **not** keep background spinner,
+scroll normalizer, composer focus/cursor, safe link click, scrollbar
+click/drag, mouse-reporting toggle, or macOS display probe in current deferred
+lists. Details + security quotes: `PORT_STATUS.md` → Local remaining-TUI-gap
+follow-on.
+
+**Local sticky-header + transcript text-selection follow-on (2026-08-12,
+deep-tui):** sticky headers default-live when `!compact` (pinned user-prompt
+collapse/push/clip/fade, reduced content band, sticky-aware mouse hits/gaps,
+action-time PageUp/PageDown header recompute, compact old behavior,
+scrollbar/timeline logical offsets; no settings toggle reader — default true
+forced; cosmetic min-height/ellipsis/indexed-fade divergence may remain where
+comments retain it); linear transcript text drag/multi-click (last-painted
+selectable geometry, Unicode/offscreen reflow-safe OSC 52 copy, drag threshold,
+chrome→text conversion, X10, URL/word double + line triple in `word_select`,
+flash/hold/`word_select` live settings + legacy-key transaction/reset,
+autoscroll dedicated clock/action-time reclamp, resize-safe frozen width,
+Esc/new-down clear, suspend deadline); Appearance/Mouse `keep_text_selection`
+live; link native/modifier gate aligned; timeline test interaction update is
+**test-only proof**, not a product feature. Local serial gate (**no platform CI
+rerun**): `build-tests` exit 0; expanded deep TUI filter **310 tests / 47
+suites** (27/9 + 32/6 + 99/10 + 6/1 + 146/21); real PTY filters **5 tests / 2
+suites**; full `test --no-parallel` count-only **5,682** cases / **970** suites
+/ **74** nonempty summaries, elapsed 345.286s, exit 0; verify-open-grok
+isolated CLI smoke `20260812-deep-tui` (doctor/version `.58`, sessions list
+empty exit0, help sessions exit0, cleanup succeeded/artifacts retained).
+Contemporaneous “still honest divergences” (table cell/grid→linear; sticky
+header rows not text-drag selectable; composer `PromptEditor` drag/multi-click
+/ `OpenGrokTextArea` not adopted; `sticky_headers` config/settings toggle;
+FPS HUD/`show_fps` and mouse-off sticky hint/banner; Windows display probe)
+are **superseded** by the final TUI divergence closure below. Do **not** keep
+broad “sticky headers absent” or “text drag/multi-click absent” claims
+current; do **not** keep `keep_text_selection` or the native-hover/Cmd-modifier
+link gate in current deferred lists. Details: `PORT_STATUS.md` → Local
+sticky-header + transcript text-selection follow-on.
+
+**Local final TUI divergence closure (2026-08-12):** table box-grid selection
+live (paint-text geometry detection; fail-closed linear on malformed/border-start;
+cell/grid drag hysteresis; cell partial copy and TSV grid; triple cell / whole
+table; keyed sidecar frozen; stale/reflow paint none; empty valid cell no linear
+fallback; table-shaped assistant paint no soft-wrap). Sticky header text not
+drag-selectable is **pin parity, not a divergence** (header band never publishes
+selectable geometry). `$OPENGROK_HOME/pager.toml [scrollback.display].sticky_headers`
+one-shot config live, default true, compact override; no env / no settings row is
+**upstream parity, not a gap**; wrong-type parse diagnostic visible; project
+`pager.toml` not authority. Composer `PromptEditor` uses one `OpenGrokTextArea`
+as the sole mutable buffer (live click/drag/double word/triple line/wheel/
+edge-autoscroll/selection highlight+OSC52; same wrap for paint/hit; UTF-8
+internals at `Character` boundary; selection replacement; X10 up-none;
+overlay/resize/suspend cancel; readline fallthrough with host policy intercept).
+FPS HUD live via raw `GROK_FPS` nonempty `!= 0` and `/debug fps` (120 samples,
+250ms cache, full frame layout+writer timing, 2×32 top-right);
+`[animation].show_fps` remains parse-only because the pin also never reads it
+(no settings row/motion gate); `/debug` only advertises `fps` because scroll/log
+HUDs are absent. Mouse-off sticky toast live (successful off ⇒ focus-swapped
+sticky `Ctrl+r…` scrollback / `/toggle…` prompt; transient wins; on clears +
+`Mouse reporting on`; idle scroll-clock expiry; rollback/minimal; occluder);
+invented transcript-note claim retired. Windows refresh probe remains
+unsupported; Linux skip matches the pin. Local serial gate (**no platform CI
+rerun**): `build-tests` exit 0; focused real `PagerPTYSessionTests` **exactly 3
+tests in 1 suite**, 2.894s, exit 0; first full verbose serial exit 0, 367.631s
+(terminal body truncated — do **not** use its partial count); authoritative
+count-filtered second full `test --no-parallel` **6,470** cases / **1,017**
+suites / **106** nonempty summaries (one summary is 10 tests in 0 suites),
+elapsed 354.149s, exit 0; verify-open-grok isolated CLI smoke
+`20260812-divergence-close` (doctor/version `.58` exit0; paths isolated `/tmp`
+home; models json nonempty default `grok-4.5`; sessions fresh empty exit0; help
+exit0; cleanup succeeded/artifacts retained — does **not** by itself prove
+interactive TUI). Honest leftovers only (do not claim fixed): wrapped-fragment
+table-cell parity (`OpenGrokMarkdown` still fits/truncates cells instead of
+upstream wrapped cell fragments/`maxTableWidth` — synthetic/pure only);
+composer prompt-widget extras (paste chips/image elements, `@` file-ref
+search/view, predicted prompt/Ghostty extras; Ctrl-V internal clipboard and
+prompt paging/per-family key-table divergences as applicable — do **not** claim
+full prompt-widget parity); parse-only `[animation].show_fps`; narrower `/debug
+fps` command surface; auth welcome raw-url mouse-disable/clear; Windows display
+probe. Do **not** keep table cell/grid→linear, sticky-header-not-selectable as a
+divergence, composer `PromptEditor`/`OpenGrokTextArea` adoption, `sticky_headers`
+config/settings toggle as a gap, FPS HUD absent, or mouse-off sticky banner
+absent in current deferred lists. Details: `PORT_STATUS.md` → Local final TUI
+divergence closure.
 
 **Wave 19 update (2026-08-10):** the deferred-dashboard batch is now landed rather
 than standing. Retained dashboard sessions can dispatch prompts and replies; `/cd`,
@@ -250,11 +354,24 @@ S2 exec emulation · portable secure WebSockets · Linux custom-CA installation 
 share upload/export clients · post-change Linux/Windows CI and required-check evidence ·
 B1 residuals: attach to a still-running subagent and dashboard-native multiselect
 question resolution ·
-Mouse long-tail (Local TUI interaction wave closed visible-block left-click
-selection + X10 preservation): scroll-stream normalizer/acceleration + hidden
-scroll settings readers; text drag/multi-click; composer mouse; link click;
-scrollbar drag; sticky headers; opt-in mouse-toggle/Ctrl+R; background-task
-count/spinner push seam; display-refresh probe ·
+Mouse long-tail (closed by Local TUI interaction wave + 2026-08-12 remaining-TUI-gap
+follow-on + sticky-header/text-selection deep-tui + final TUI divergence
+closure: scroll-stream normalizer/acceleration, live scroll settings,
+background chip/spinner push, scrollbar click/drag, safe same-cell links,
+composer focus/cursor, mouse-reporting toggle, macOS display probe, sticky
+headers default-live when `!compact`, linear transcript text drag/multi-click
++ live `keep_text_selection`, native/modifier link gate, table box-grid
+selection, `sticky_headers` one-shot `pager.toml` config, composer
+`PromptEditor`/`OpenGrokTextArea` buffer, FPS HUD via `GROK_FPS`/`/debug fps`,
+mouse-off sticky toast). Remaining: wrapped-fragment table-cell parity
+(`OpenGrokMarkdown` fits/truncates vs upstream wrapped cell fragments/`maxTableWidth`
+— synthetic/pure only); composer prompt-widget leftovers (paste chips/image
+elements, `@` file-ref search/view, predicted prompt/Ghostty extras; Ctrl-V
+internal clipboard; prompt paging/per-family key-table — do **not** claim full
+prompt-widget parity); `[animation].show_fps` parse-only (pin also never reads
+it; no settings row/motion gate); `/debug` advertises only `fps` (scroll/log
+HUDs absent); auth welcome raw-url mouse-disable/clear; Windows display probe
+(Linux skip matches pin) ·
 video tools (`reference_to_video`) · `search_tool`/`use_tool` MCP meta-discovery ·
 media overlays (B10: kitty/iTerm images, mermaid, real `/gboom`) · foreign-session
 scan/resume (Claude/Codex/Cursor) ·

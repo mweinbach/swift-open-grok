@@ -160,6 +160,8 @@ struct PagerFocusAndCommandTests {
 
     @Test("scrolling still reaches the viewport from the scrollback")
     func scrollbackViewportBindings() async throws {
+        // Ctrl-K/U are `When::ScrollbackFocused` (`defaults.rs:192-226`).
+        // Prompt-focused they are readline (Stage 3); after Tab they still page.
         let harness = try await Harness.run([
             .key(KeyEvent(key: .tab)),
             .key(KeyEvent(key: .pageUp)),

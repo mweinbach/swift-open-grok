@@ -1,5 +1,6 @@
 import Foundation
 import OpenGrokTerminalCore
+import OpenGrokTextArea
 
 /// Paint one full-screen frame.
 ///
@@ -41,6 +42,7 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         theme: state.theme,
         selectedIndex: state.selectedBlockIndex,
         motion: state.motion,
+        waveRows: state.waveRows,
         compact: compact,
         showTimestamps: state.showTimestamps
     )
@@ -56,6 +58,7 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
             theme: state.theme,
             selectedIndex: state.selectedBlockIndex,
             motion: state.motion,
+            waveRows: state.waveRows,
             compact: compact,
             showTimestamps: state.showTimestamps
         )
@@ -77,14 +80,66 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         // tail and defeat the flip. Manual scroll paths clamp before storing.
         scrollOffset = max(requested, 0)
     }
-    let visibleEnd = min(contentLines.count, scrollOffset + visibleHeight)
-    let visibleRange = scrollOffset..<visibleEnd
+
+    // Sticky headers: `use_sticky = sticky_headers && !compact`
+    // (`scrollback_pane.rs:395-401` at pin 650c1db7). Default true when the
+    // producer never wires the pager.toml reader. Compact still wins.
+    // No settings-modal row — config is `$OPENGROK_HOME/pager.toml` only.
+    let useSticky = state.stickyHeadersEnabled && !compact
+    let prompts = pagerPromptDescriptors(
+        conversation: state.conversation,
+        blockStartLines: conversationLayout.blockStartLines,
+        blockHeights: conversationLayout.blockHeights,
+        compact: compact
+    )
+    let sticky = useSticky
+        ? computePagerStickyLayout(
+            scrollOffset: scrollOffset,
+            viewportHeight: visibleHeight,
+            prompts: prompts
+        )
+        : .empty
+    let headerRows = sticky.headerScreenRows
+    let contentPaintHeight = sticky.contentHeight(viewportHeight: visibleHeight)
+    let scrollForContent = sticky.scrollForContent(scrollOffset)
+    // Preserve sticky layout math (headerScreenRows may be viewport+1) and
+    // clamp only the paint range — `scrollForContent..<min(count, …)` traps
+    // when start > count on tiny viewports / follow-tail.
+    let visibleRange = pagerStickyVisibleContentRange(
+        scrollForContent: scrollForContent,
+        contentPaintHeight: contentPaintHeight,
+        lineCount: contentLines.count
+    )
+
+    // Content rect below the sticky band (`render_with_sticky_headers`,
+    // scrollback_pane.rs:407-426). Scrollbar / timeline keep the full
+    // conversation rect and the logical `scrollOffset` (virtual offsets
+    // unchanged).
+    let contentPaintArea: TerminalRect
+    if headerRows > 0, headerRows < visibleHeight {
+        contentPaintArea = TerminalRect(
+            x: chrome.conversation.x,
+            y: chrome.conversation.y + headerRows,
+            width: chrome.conversation.width,
+            height: contentPaintHeight
+        )
+    } else if headerRows >= visibleHeight, visibleHeight > 0 {
+        contentPaintArea = TerminalRect(
+            x: chrome.conversation.x,
+            y: chrome.conversation.y + max(0, visibleHeight - 1),
+            width: chrome.conversation.width,
+            height: 0
+        )
+    } else {
+        contentPaintArea = chrome.conversation
+    }
 
     // Rail geometry, derived AFTER the scroll offset resolves because the
     // active turn is a viewport-top read. The prompt rows come from the same
     // laid-out lines the frame paints, so the partition can never disagree
     // with what is on screen (upstream partitions the layout cache's
     // `virtual_y` the same way, `scrollback/state/timeline.rs:120-137`).
+    // Virtual scroll offset is the logical one — sticky does not shift it.
     var timelineRail: PagerTimelineRail?
     if hasTimelineRail {
         let promptLineIndices = turnBlockIndices.map {
@@ -102,6 +157,48 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         )
     }
 
+    // Scrollbar hit geometry only when the gutter will actually paint
+    // (rail absent + overflow + room for the track column) — same gate as
+    // `renderConversation`'s paint and upstream's `hit_scrollbar.set`
+    // (`agent_view/render.rs:1917-1926`). Track uses full conversation height
+    // and logical scrollOffset (sticky band does not rescale the thumb).
+    var scrollbarHit: PagerScrollbarHitModel?
+    if hasScrollbar, chrome.conversation.height > 0 {
+        let scrollbarX = chrome.conversation.x + PagerLayoutMetrics.chromeWidth + contentWidth
+        if scrollbarX < chrome.conversation.right {
+            let thumbHeight = pagerScrollbarThumbHeight(
+                total: contentLines.count,
+                viewport: visibleHeight
+            )
+            let thumbStart = pagerScrollbarThumbStart(
+                scrollOffset: scrollOffset,
+                total: contentLines.count,
+                viewport: visibleHeight,
+                trackHeight: visibleHeight
+            )
+            scrollbarHit = PagerScrollbarHitModel(
+                rect: TerminalRect(
+                    x: scrollbarX,
+                    y: chrome.conversation.y,
+                    width: 1,
+                    height: visibleHeight
+                ),
+                totalContentLines: contentLines.count,
+                viewportHeight: visibleHeight,
+                thumbHeight: thumbHeight,
+                thumbStart: thumbStart
+            )
+        }
+    }
+
+    // Toast geometry is known before paint (fit + conversation rect) so the
+    // occluder publishes on the same layout the mouse router will read.
+    // Transient wins; focus-specific copy is already resolved by the producer.
+    let toastPlan = pagerToastPaintPlan(
+        message: state.activeToastMessage,
+        conversation: chrome.conversation
+    )
+
     var layout = PagerFrameLayout(
         bounds: bounds,
         statusBar: chrome.statusBar,
@@ -116,18 +213,25 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         visibleContentLines: visibleRange,
         scrollOffset: scrollOffset,
         hasScrollbar: hasScrollbar,
+        sticky: sticky,
+        headerScreenRows: headerRows,
         timelineRail: timelineRail,
         // Click-to-select geometry from the same layout the frame paints —
         // content heights exclude the inter-block gap rows so a hit on a
         // gap returns nil, matching upstream's `entry_at_content_y`
-        // (`scrollback/state/layout.rs:100-124`).
+        // (`scrollback/state/layout.rs:100-124`). Sticky header rows route
+        // through `sticky` first (`entry_index_at_screen_row`).
         conversationHit: PagerConversationHitModel(
             conversation: chrome.conversation,
             scrollOffset: scrollOffset,
             contentWidth: contentWidth,
             blockStartLines: conversationLayout.blockStartLines,
-            blockHeights: conversationLayout.blockHeights
-        )
+            blockHeights: conversationLayout.blockHeights,
+            sticky: sticky,
+            toastOccluder: toastPlan?.rect
+        ),
+        scrollbarHit: scrollbarHit,
+        toastOccluder: toastPlan?.rect
     )
 
     var buffer = CellBuffer(area: bounds)
@@ -183,19 +287,31 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     if let tasksPane = state.tasksPane, chrome.tasksPane.height > 0 {
         drawTasksPane(tasksPane, in: chrome.tasksPane, buffer: &buffer, theme: state.theme)
     }
-    renderConversation(
+    let textSelectionModel = renderConversation(
         contentLines,
+        items: state.conversation,
         visibleRange: visibleRange,
         in: chrome.conversation,
+        contentArea: contentPaintArea,
         contentWidth: contentWidth,
         hasScrollbar: hasScrollbar,
         scrollOffset: scrollOffset,
+        sticky: sticky,
+        conversationLayout: conversationLayout,
         buffer: &buffer,
         theme: state.theme,
-        links: &links
+        links: &links,
+        textSelectionHighlight: state.textSelectionHighlight,
+        tableSelectionGeometry: state.tableSelectionGeometry
     )
+    layout.textSelection = textSelectionModel
     if let timelineRail {
         renderTimelineRail(timelineRail, buffer: &buffer, theme: state.theme)
+    }
+    // After conversation + rail so the toast wins the bottom-right cells
+    // (including the gutter) and before overlays so a modal still covers it.
+    if let toastPlan {
+        renderPagerToast(toastPlan, buffer: &buffer, theme: state.theme)
     }
     renderTurnStatus(state.turnStatus, in: chrome.turnStatus, buffer: &buffer, theme: state.theme)
     // An active overlay owns input focus, so the composer paints unfocused and
@@ -211,6 +327,10 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         buffer: &buffer,
         theme: state.theme
     )
+    // Hit geometry from the same composer state / input rect the paint just
+    // used (including the overlay-unfocused copy), so scroll/cursor mapping
+    // cannot drift from what the user sees.
+    layout.composerHit = makePagerComposerHitModel(composer, in: chrome.input)
     renderShortcutsBar(state.shortcuts, in: chrome.shortcuts, buffer: &buffer, theme: state.theme)
 
     let overlayBounds = renderOverlays(
@@ -255,6 +375,13 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     // non-capturing welcome coexists with a focused composer.
     renderCompletions(state.completions, in: chrome.completions, buffer: &buffer, theme: state.theme)
 
+    // FPS HUD last on the full terminal, every pager surface this function
+    // paints (welcome / agent / overlay stack). Matches `fps.render(full_area)`
+    // after each draw arm (`app_view.rs:5173, 5351, 5487, 5505`).
+    if let fpsHud = state.fpsHud {
+        renderPagerFpsHudOverlay(fpsHud, area: bounds, buffer: &buffer)
+    }
+
     return PagerRenderResult(
         buffer: buffer,
         layout: layout,
@@ -283,8 +410,8 @@ private struct ChromeLayout {
 func pagerComposerHeight(_ input: PagerComposerState, width: Int) -> Int {
     let borderRows = input.showBorders ? 2 : 0
     let textWidth = max(1, pagerComposerTextWidth(input, width: width))
-    let rendered = wrapDisplayLines(input.text, width: textWidth)
-    let textRows = max(1, rendered.count)
+    let rows = wrapRanges(input.text, options: composerWrapOptions(width: textWidth))
+    let textRows = max(1, rows.count)
     let total = borderRows + textRows
     let minimum = borderRows + 1
     return max(min(total, input.maximumHeight), min(minimum, input.maximumHeight))
@@ -418,6 +545,18 @@ private func makeChromeLayout(
 
 // MARK: - Transcript lines
 
+/// Selection seed attached at layout time so the frame can publish a
+/// `PagerTextSelectionModel` from the exact painted lines (range id, stable
+/// block-line index, selectable text, content-column start, joiner).
+struct PaintLineSelectionSeed: Equatable {
+    var rangeID: UInt16
+    var blockLineIndex: Int
+    var text: String
+    /// Display columns of chrome (prefix / indent) before selectable text.
+    var selectableColStart: Int
+    var joinerToPrevious: String?
+}
+
 /// One painted transcript row: an optional accent-rail glyph, an optional
 /// full-row background band, and the styled content spans.
 struct PaintLine {
@@ -427,6 +566,7 @@ struct PaintLine {
     var foreground: TerminalColor
     var style: CellStyle
     var spans: [PagerStyledSpan]
+    var selection: PaintLineSelectionSeed?
 
     init(
         _ text: String,
@@ -434,7 +574,8 @@ struct PaintLine {
         style: CellStyle = [],
         accentGlyph: String? = nil,
         accentColor: TerminalColor? = nil,
-        background: TerminalColor? = nil
+        background: TerminalColor? = nil,
+        selection: PaintLineSelectionSeed? = nil
     ) {
         self.init(
             spans: [PagerStyledSpan(text: text)],
@@ -442,7 +583,8 @@ struct PaintLine {
             style: style,
             accentGlyph: accentGlyph,
             accentColor: accentColor,
-            background: background
+            background: background,
+            selection: selection
         )
     }
 
@@ -452,7 +594,8 @@ struct PaintLine {
         style: CellStyle = [],
         accentGlyph: String? = nil,
         accentColor: TerminalColor? = nil,
-        background: TerminalColor? = nil
+        background: TerminalColor? = nil,
+        selection: PaintLineSelectionSeed? = nil
     ) {
         self.spans = spans
         self.foreground = foreground
@@ -460,6 +603,7 @@ struct PaintLine {
         self.accentGlyph = accentGlyph
         self.accentColor = accentColor
         self.background = background
+        self.selection = selection
     }
 
     var text: String { spans.map(\.text).joined() }
@@ -471,6 +615,7 @@ func makeConversationLines(
     theme: PagerRenderTheme,
     selectedIndex: Int? = nil,
     motion: PagerMotionSnapshot = PagerMotionSnapshot(),
+    waveRows: Int = PagerMotion.defaultWaveRows,
     compact: Bool = false,
     showTimestamps: Bool = false
 ) -> [PaintLine] {
@@ -480,6 +625,7 @@ func makeConversationLines(
         theme: theme,
         selectedIndex: selectedIndex,
         motion: motion,
+        waveRows: waveRows,
         compact: compact,
         showTimestamps: showTimestamps
     ).lines
@@ -505,6 +651,7 @@ func makeConversationLayout(
     theme: PagerRenderTheme,
     selectedIndex: Int? = nil,
     motion: PagerMotionSnapshot = PagerMotionSnapshot(),
+    waveRows: Int = PagerMotion.defaultWaveRows,
     compact: Bool = false,
     showTimestamps: Bool = false
 ) -> ConversationLayout {
@@ -530,7 +677,14 @@ func makeConversationLayout(
                 into: &lines
             )
         case .tool(let tool):
-            appendToolCard(tool, width: width, theme: theme, motion: motion, into: &lines)
+            appendToolCard(
+                tool,
+                width: width,
+                theme: theme,
+                motion: motion,
+                waveRows: waveRows,
+                into: &lines
+            )
         case .separator(let text):
             let separator = text.isEmpty ? String(repeating: "─", count: width) : text
             lines.append(PaintLine(separator, foreground: theme.grayDim))
@@ -675,7 +829,9 @@ private func appendUserPrompt(
     into lines: inout [PaintLine]
 ) {
     let band = theme.bgLight
+    let blockOrigin = lines.count
     if !compact {
+        // Vpad — not text-selectable (empty selectable span upstream).
         lines.append(PaintLine("", foreground: theme.textPrimary, background: band))
     }
     // The timestamp column is reserved out of the wrap width whenever the
@@ -691,8 +847,10 @@ private func appendUserPrompt(
     // vpad_top_visible { 1 } else { 0 }`, entry_renderer.rs:941-942).
     let firstContentIndex = lines.count
     var isFirstRow = true
+    var isFirstPhysical = true
     for physical in message.text.split(separator: "\n", omittingEmptySubsequences: false) {
         let wrapped = wrapDisplayLines(String(physical), width: bodyWidth)
+        var wrapIndex = 0
         for row in (wrapped.isEmpty ? [""] : wrapped) {
             var spans: [PagerStyledSpan] = []
             if isFirstRow, !compact {
@@ -705,12 +863,31 @@ private func appendUserPrompt(
             }
             isFirstRow = false
             spans.append(contentsOf: userBodySpans(row, theme: theme))
+            // Soft-wrap continuation joins with a space; hard breaks have no
+            // joiner (`blocks/user.rs` wrap_joiner / logical-line rules).
+            let joiner: String?
+            if isFirstPhysical && wrapIndex == 0 {
+                joiner = nil
+            } else if wrapIndex == 0 {
+                joiner = nil
+            } else {
+                joiner = " "
+            }
             lines.append(PaintLine(
                 spans: spans,
                 foreground: theme.textPrimary,
-                background: band
+                background: band,
+                selection: PaintLineSelectionSeed(
+                    rangeID: 0,
+                    blockLineIndex: lines.count - blockOrigin,
+                    text: row,
+                    selectableColStart: prefixWidth,
+                    joinerToPrevious: joiner
+                )
             ))
+            wrapIndex += 1
         }
+        isFirstPhysical = false
     }
     if isFirstRow {
         lines.append(PaintLine(
@@ -718,7 +895,14 @@ private func appendUserPrompt(
                 ? []
                 : [PagerStyledSpan(text: PagerGlyphs.promptArrow, foreground: theme.accentUser)],
             foreground: theme.textPrimary,
-            background: band
+            background: band,
+            selection: PaintLineSelectionSeed(
+                rangeID: 0,
+                blockLineIndex: lines.count - blockOrigin,
+                text: "",
+                selectableColStart: prefixWidth,
+                joinerToPrevious: nil
+            )
         ))
     }
     if showTimestamps, firstContentIndex < lines.count {
@@ -779,10 +963,43 @@ private func appendAssistantMessage(
     // first appended line is the first content line.
     let tsReserved = showTimestamps ? PagerLayoutMetrics.timestampReservedColumns : 0
     let firstContentIndex = lines.count
+    let blockOrigin = lines.count
+    var isFirstPhysical = true
     for styledLine in styledLines {
-        for row in wrapStyledSpans(styledLine.spans, width: max(1, width - tsReserved)) {
-            lines.append(PaintLine(spans: row, foreground: theme.textPrimary))
+        let wrapWidth = max(1, width - tsReserved)
+        // Table-shaped box lines never soft-wrap (wrapping.rs `is_table_line`):
+        // clip overflow so one physical line stays one selectable line. Markdown
+        // may still wrap/truncate cells when producing `styledLines`; this skip
+        // is paint-only.
+        let wrapped: [[PagerStyledSpan]]
+        if pagerLineLooksLikeTable(styledLine.text) {
+            wrapped = [truncateSpans(styledLine.spans, to: wrapWidth)]
+        } else {
+            wrapped = wrapStyledSpans(styledLine.spans, width: wrapWidth)
         }
+        for (wrapIndex, row) in wrapped.enumerated() {
+            let selectionText = pagerTrimEndDisplay(row.map(\.text).joined())
+            let joiner: String?
+            if isFirstPhysical && wrapIndex == 0 {
+                joiner = nil
+            } else if wrapIndex == 0 {
+                joiner = nil
+            } else {
+                joiner = " "
+            }
+            lines.append(PaintLine(
+                spans: row,
+                foreground: theme.textPrimary,
+                selection: PaintLineSelectionSeed(
+                    rangeID: 0,
+                    blockLineIndex: lines.count - blockOrigin,
+                    text: selectionText,
+                    selectableColStart: 0,
+                    joinerToPrevious: joiner
+                )
+            ))
+        }
+        isFirstPhysical = false
     }
     if showTimestamps, firstContentIndex < lines.count {
         overlayTimestamp(
@@ -858,14 +1075,31 @@ func appendThinking(
             ))
         }
     }
+    let blockOrigin = lines.count
+    // Header has no selection_range upstream (thinking.rs) — chrome only.
     lines.append(PaintLine(spans: header, foreground: theme.gray))
     guard !message.isCollapsed, !message.text.isEmpty else { return }
 
     let accent = message.isStreaming ? theme.accentThinking : theme.grayDim
     let bodyWidth = max(1, width - 2)
     var body: [String] = []
+    var bodyJoiners: [String?] = []
+    var isFirstPhysical = true
     for physical in message.text.split(separator: "\n", omittingEmptySubsequences: false) {
-        body.append(contentsOf: wrapDisplayLines(String(physical), width: bodyWidth))
+        let wrapped = wrapDisplayLines(String(physical), width: bodyWidth)
+        for (wrapIndex, row) in (wrapped.isEmpty ? [""] : wrapped).enumerated() {
+            let joiner: String?
+            if isFirstPhysical && wrapIndex == 0 {
+                joiner = nil
+            } else if wrapIndex == 0 {
+                joiner = nil
+            } else {
+                joiner = " "
+            }
+            body.append(row)
+            bodyJoiners.append(joiner)
+        }
+        isFirstPhysical = false
     }
     if let budget = bodyBudget, body.count > budget {
         lines.append(PaintLine(
@@ -874,14 +1108,26 @@ func appendThinking(
             accentGlyph: PagerGlyphs.accentBar,
             accentColor: accent
         ))
+        let drop = body.count - budget
         body = Array(body.suffix(budget))
+        bodyJoiners = Array(bodyJoiners.suffix(budget))
+        if drop > 0, !bodyJoiners.isEmpty {
+            bodyJoiners[0] = nil
+        }
     }
-    for row in body {
+    for (index, row) in body.enumerated() {
         lines.append(PaintLine(
             spans: [PagerStyledSpan(text: "  " + row, foreground: theme.grayDim)],
             foreground: theme.grayDim,
             accentGlyph: PagerGlyphs.accentBar,
-            accentColor: accent
+            accentColor: accent,
+            selection: PaintLineSelectionSeed(
+                rangeID: 0,
+                blockLineIndex: lines.count - blockOrigin,
+                text: row,
+                selectableColStart: 2,
+                joinerToPrevious: bodyJoiners[index]
+            )
         ))
     }
 }
@@ -920,6 +1166,7 @@ func appendToolCard(
     width: Int,
     theme: PagerRenderTheme,
     motion: PagerMotionSnapshot,
+    waveRows: Int = PagerMotion.defaultWaveRows,
     unboundedPreview: Bool = false,
     into lines: inout [PaintLine]
 ) {
@@ -945,6 +1192,7 @@ func appendToolCard(
     // block instead of blinking. The paint-line index is the phase input —
     // stable while the transcript is still, advancing as content scrolls,
     // which is the same thing the reference's per-row phase does.
+    // `waveRows` is `[animation].wave_rows` (`appearance/config.rs:377`).
     func railAccent(row: Int) -> TerminalColor {
         guard tool.state == .running else { return accent }
         return PagerMotion.runningAccentColor(
@@ -952,6 +1200,7 @@ func appendToolCard(
             accent: accent,
             tick: motion.tick,
             row: row,
+            waveRows: waveRows,
             motionEnabled: motion.enabled
         )
     }
@@ -977,13 +1226,22 @@ func appendToolCard(
         header.append(PagerStyledSpan(text: " " + detail, foreground: theme.grayDim))
     }
 
+    let blockOrigin = lines.count
     let accentGlyph = muted ? nil : PagerGlyphs.accentBar
     for (index, row) in wrapStyledSpans(header, width: width).enumerated() {
+        let selectionText = pagerTrimEndDisplay(row.map(\.text).joined())
         lines.append(PaintLine(
             spans: row,
             foreground: labelColor,
             accentGlyph: index == 0 || accentGlyph != nil ? accentGlyph : nil,
-            accentColor: railAccent(row: lines.count)
+            accentColor: railAccent(row: lines.count),
+            selection: PaintLineSelectionSeed(
+                rangeID: 0,
+                blockLineIndex: lines.count - blockOrigin,
+                text: selectionText,
+                selectableColStart: 0,
+                joinerToPrevious: index == 0 ? nil : " "
+            )
         ))
     }
 
@@ -995,12 +1253,20 @@ func appendToolCard(
         accentColor: railAccent(row: lines.count)
     ))
     let previewColor = tool.state == .failed ? theme.accentError : theme.gray
-    for row in toolPreviewRows(output, width: max(1, width - 2), theme: theme, unbounded: unboundedPreview) {
+    let preview = toolPreviewRows(output, width: max(1, width - 2), theme: theme, unbounded: unboundedPreview)
+    for (index, row) in preview.enumerated() {
         lines.append(PaintLine(
             spans: [PagerStyledSpan(text: "  " + row.text, foreground: row.foreground ?? previewColor)],
             foreground: previewColor,
             accentGlyph: PagerGlyphs.accentBar,
-            accentColor: railAccent(row: lines.count)
+            accentColor: railAccent(row: lines.count),
+            selection: PaintLineSelectionSeed(
+                rangeID: 1,
+                blockLineIndex: lines.count - blockOrigin,
+                text: row.text,
+                selectableColStart: 2,
+                joinerToPrevious: index == 0 ? nil : "\n"
+            )
         ))
     }
 }
@@ -1315,7 +1581,11 @@ private func renderPromoAnnouncementRow(
         hovered: false,
         theme: theme
     ) else { return }
-    if let url = banner.ctaURL, !url.isEmpty {
+    // Scheme gate before publishing — same Standard filter OSC 8 / open use
+    // (`scrollback/render.rs:949-962`, `link_opener.rs:261-278` at pin
+    // 650c1db7). Promo CTAs are already https via announcements, but the
+    // paint path must not trust the slot blindly.
+    if let url = banner.ctaURL, !url.isEmpty, pagerURLIsSafeToOpen(url) {
         links.append(LinkSpan(row: row, colStart: rect.x, colEnd: rect.x + rect.width, url: url))
     }
 }
@@ -1790,9 +2060,25 @@ func renderComposer(
         return TerminalPoint(x: textX + PagerGlyphs.promptArrowWidth, y: textTop)
     }
 
-    let rows = wrapDisplayLines(input.text, width: textWidth)
-    let cursor = composerCursorRowColumn(input, width: textWidth)
-    let firstVisibleRow = max(0, min(cursor.row, rows.count - visibleRows))
+    let contentRect = TextAreaRect(
+        x: textX + PagerGlyphs.promptArrowWidth,
+        y: textTop,
+        width: textWidth,
+        height: visibleRows
+    )
+    let snapshot = projectComposerGeometry(
+        text: input.text,
+        cursorUTF8: pagerComposerCursorUTF8(input),
+        selectionUTF8: input.selectionUTF8,
+        selectedText: input.selectedText,
+        state: input.textAreaState,
+        scrollOverride: input.scrollOverride,
+        area: contentRect,
+        showScrollbar: false,
+        tabWidth: 0
+    )
+    let rows = snapshot.wrappedRows
+    let firstVisibleRow = snapshot.state.scroll
 
     for offset in 0..<visibleRows {
         let index = firstVisibleRow + offset
@@ -1808,26 +2094,50 @@ func renderComposer(
             )
         }
         guard rows.indices.contains(index) else { continue }
+        let lineText = snapshot.text(ofWrappedRow: index)
         _ = buffer.setString(
             x: textX + PagerGlyphs.promptArrowWidth,
             y: y,
-            text: truncateToWidth(rows[index], width: textWidth),
+            text: truncateToWidth(lineText, width: textWidth),
             style: [],
             foreground: input.isFocused ? theme.textPrimary : theme.grayDim,
             background: theme.bgBase
         )
     }
 
+    if input.isFocused, let selection = input.selectionUTF8, !selection.isEmpty {
+        for span in snapshot.selectionScreenSpans {
+            for dx in 0..<span.width {
+                let x = span.x + dx
+                guard let existing = buffer.cell(x: x, y: span.y) else { continue }
+                var cell = existing
+                pagerApplyTextSelectionHighlight(theme: theme, to: &cell)
+                buffer.setCell(cell, x: x, y: span.y)
+            }
+        }
+    }
+
     guard input.isFocused, input.cursorVisible else { return nil }
-    let cursorRow = cursor.row - firstVisibleRow
-    guard cursorRow >= 0, cursorRow < visibleRows else { return nil }
-    return TerminalPoint(
-        x: min(textRight - 1, textX + PagerGlyphs.promptArrowWidth + cursor.column),
-        y: textTop + cursorRow
-    )
+    if let pos = snapshot.cursorScreenPosition {
+        return TerminalPoint(x: pos.x, y: pos.y)
+    }
+    return nil
+}
+
+/// UTF-8 caret for composer paint/hit. Prefers the published UTF-8 field;
+/// falls back to the Character offset so existing `PagerComposerState`
+/// call sites keep compiling.
+func pagerComposerCursorUTF8(_ input: PagerComposerState) -> Int {
+    if let utf8 = input.cursorUTF8 {
+        return min(max(0, utf8), input.text.utf8.count)
+    }
+    let characters = input.text.count
+    let offset = min(max(input.cursorCharacterOffset ?? characters, 0), characters)
+    return utf8Offset(fromCharacter: offset, in: input.text)
 }
 
 /// Map the composer's character offset onto a wrapped (row, column) position.
+/// Kept for non-composer callers; composer paint uses `projectComposerGeometry`.
 func composerCursorRowColumn(_ input: PagerComposerState, width: Int) -> (row: Int, column: Int) {
     let characters = Array(input.text)
     let offset = min(max(input.cursorCharacterOffset ?? characters.count, 0), characters.count)
@@ -1840,6 +2150,68 @@ func composerCursorRowColumn(_ input: PagerComposerState, width: Int) -> (row: I
         return (row + 1, 0)
     }
     return (row, column)
+}
+
+/// Last-painted composer hit model for `area`, or `nil` when the slot is too
+/// small to paint (same gate as `renderComposer`).
+func makePagerComposerHitModel(
+    _ input: PagerComposerState,
+    in area: TerminalRect
+) -> PagerComposerHitModel? {
+    guard area.height > 0, area.width >= 4 else { return nil }
+    let hasBorders = input.showBorders && area.height >= 3
+    let textTop = hasBorders ? area.y + 1 : area.y
+    let textBottom = hasBorders ? area.bottom - 1 : area.bottom
+    let textX = area.x + (hasBorders ? 2 : 0)
+    let textRight = area.right - (hasBorders ? 2 : 0)
+    let prefixWidth = PagerGlyphs.promptArrowWidth
+    let textWidth = max(1, textRight - textX - prefixWidth)
+    let visibleRows = max(0, textBottom - textTop)
+    guard visibleRows > 0, textRight > textX else { return nil }
+
+    let contentRect = TextAreaRect(
+        x: textX + prefixWidth,
+        y: textTop,
+        width: textWidth,
+        height: visibleRows
+    )
+    let snapshot = projectComposerGeometry(
+        text: input.text,
+        cursorUTF8: pagerComposerCursorUTF8(input),
+        selectionUTF8: input.selectionUTF8,
+        selectedText: input.selectedText,
+        state: input.textAreaState,
+        scrollOverride: input.scrollOverride,
+        area: contentRect,
+        showScrollbar: false,
+        tabWidth: 0
+    )
+    var lines: [PagerComposerWrappedLine] = []
+    if snapshot.wrappedRows.isEmpty {
+        lines = [PagerComposerWrappedLine(startOffset: 0, endOffset: 0, text: "")]
+    } else {
+        lines = snapshot.wrappedRows.enumerated().map { index, range in
+            PagerComposerWrappedLine(
+                startOffset: range.lowerBound,
+                endOffset: range.upperBound,
+                text: snapshot.text(ofWrappedRow: index)
+            )
+        }
+    }
+    return PagerComposerHitModel(
+        pane: area,
+        textArea: TerminalRect(
+            x: textX,
+            y: textTop,
+            width: max(0, textRight - textX),
+            height: visibleRows
+        ),
+        prefixWidth: prefixWidth,
+        textWidth: textWidth,
+        firstVisibleRow: snapshot.state.scroll,
+        lines: lines,
+        isFocused: input.isFocused
+    )
 }
 
 private func renderComposerInfoLine(
@@ -2005,18 +2377,29 @@ private func renderShortcutsBar(
 
 // MARK: - Conversation painting
 
+@discardableResult
 private func renderConversation(
     _ lines: [PaintLine],
+    items: [PagerConversationItem],
     visibleRange: Range<Int>,
     in area: TerminalRect,
+    contentArea: TerminalRect,
     contentWidth: Int,
     hasScrollbar: Bool,
     scrollOffset: Int,
+    sticky: PagerStickyHeaderLayout,
+    conversationLayout: ConversationLayout,
     buffer: inout CellBuffer,
     theme: PagerRenderTheme,
-    links: inout [LinkSpan]
-) {
-    guard area.height > 0, area.width > 0 else { return }
+    links: inout [LinkSpan],
+    textSelectionHighlight: PagerTextSelectionHighlight?,
+    tableSelectionGeometry: PagerTableSelectionGeometry?
+) -> PagerTextSelectionModel {
+    var model = PagerTextSelectionModel(
+        contentArea: contentArea,
+        conversationArea: area
+    )
+    guard area.height > 0, area.width > 0 else { return model }
     for row in 0..<area.height {
         paintBlank(
             &buffer,
@@ -2026,64 +2409,387 @@ private func renderConversation(
         )
     }
 
-    let contentX = area.x + PagerLayoutMetrics.accentWidth + PagerLayoutMetrics.blockPadLeft
-    for (row, lineIndex) in visibleRange.enumerated() {
-        guard row < area.height, lines.indices.contains(lineIndex) else { continue }
-        let line = lines[lineIndex]
-        let y = area.y + row
+    // Sticky pushed / pinned prompts occupy the top band
+    // (`render_with_sticky_headers`, scrollback_pane.rs:428-521).
+    // Sticky rows are painted but NOT published as selectable text this phase
+    // (deferred sticky drag) — screenY stays nil for those lines.
+    renderStickyHeaders(
+        sticky,
+        in: area,
+        contentWidth: contentWidth,
+        conversationLayout: conversationLayout,
+        buffer: &buffer,
+        theme: theme,
+        links: &links
+    )
 
-        if let background = line.background {
-            let bandWidth = PagerLayoutMetrics.chromeWidth + contentWidth
-            paintBlank(
-                &buffer,
-                area: TerminalRect(x: area.x, y: y, width: min(bandWidth, area.width), height: 1),
-                foreground: line.foreground,
-                background: background
-            )
-        }
-        if let glyph = line.accentGlyph {
-            _ = buffer.setString(
+    let contentX = area.x + PagerLayoutMetrics.accentWidth + PagerLayoutMetrics.blockPadLeft
+    var screenYByLineIndex: [Int: Int] = [:]
+    if contentArea.height > 0 {
+        for (row, lineIndex) in visibleRange.enumerated() {
+            guard row < contentArea.height, lines.indices.contains(lineIndex) else { continue }
+            // Rust passes `pinned_entry_idx` to suppress a *duplicate selection
+            // box* when the header already owns selection
+            // (`scrollback_pane.rs:1013`, `:1187-1194`) — it still paints the
+            // pinned entry's body rows that fall into the content window
+            // (scrollForContent bottom-line continuity). Never leave those
+            // rows blank.
+            let line = lines[lineIndex]
+            let y = contentArea.y + row
+            screenYByLineIndex[lineIndex] = y
+            paintConversationLine(
+                line,
                 x: area.x,
                 y: y,
-                text: glyph,
-                style: [],
-                foreground: line.accentColor ?? theme.grayDim,
-                background: line.background ?? theme.bgBase
+                contentX: contentX,
+                contentWidth: contentWidth,
+                areaWidth: area.width,
+                buffer: &buffer,
+                theme: theme,
+                links: &links
             )
         }
-        let rowLinks = paintSpans(
-            &buffer,
-            spans: line.spans,
-            x: contentX,
-            y: y,
-            limit: contentX + contentWidth,
-            background: line.background ?? theme.bgBase,
-            inheritForeground: line.foreground,
-            inheritStyle: line.style
-        )
-        links.append(contentsOf: rowLinks)
     }
 
-    guard hasScrollbar, area.height > 0 else { return }
-    let scrollbarX = area.x + PagerLayoutMetrics.chromeWidth + contentWidth
-    guard scrollbarX < area.right else { return }
-    let total = max(lines.count, 1)
-    let thumbHeight = max(1, (area.height * area.height) / total)
-    let maximumOffset = max(0, lines.count - area.height)
-    let trackTravel = max(0, area.height - thumbHeight)
-    let thumbStart = maximumOffset == 0
-        ? 0
-        : min(trackTravel, (scrollOffset * trackTravel) / maximumOffset)
-    for row in 0..<area.height {
-        let isThumb = row >= thumbStart && row < thumbStart + thumbHeight
-        _ = buffer.setString(
-            x: scrollbarX,
-            y: area.y + row,
-            text: isThumb ? "█" : "│",
-            style: [],
-            foreground: isThumb ? theme.scrollbarForeground : theme.bgLight,
-            background: theme.bgBase
+    // Rust `pinned_entry_idx` only skips a duplicate content *selection box*
+    // when the sticky header already owns it (`scrollback_pane.rs:1187-1194`)
+    // — this port has no separate selection-box overlay yet; accent/highlight
+    // stay on painted content rows. Never blank pinned-entry body paint.
+    model = makePagerTextSelectionModel(
+        items: items,
+        lines: lines,
+        conversationLayout: conversationLayout,
+        contentArea: contentArea,
+        conversationArea: area,
+        contentWidth: contentWidth,
+        contentX: contentX,
+        screenYByLineIndex: screenYByLineIndex
+    )
+
+    // Text highlight after base conversation paint — selected cells win;
+    // block selection band may remain on non-selected cells.
+    if let highlight = textSelectionHighlight {
+        pagerPaintTextSelectionHighlight(
+            model: model,
+            highlight: highlight,
+            theme: theme,
+            clipArea: contentArea,
+            buffer: &buffer,
+            tableSidecar: tableSelectionGeometry
         )
+    }
+
+    // Scrollbar uses the full conversation track + logical scrollOffset —
+    // sticky header rows do not rescale virtual thumb geometry.
+    if hasScrollbar, area.height > 0 {
+        let scrollbarX = area.x + PagerLayoutMetrics.chromeWidth + contentWidth
+        if scrollbarX < area.right {
+            let thumbHeight = pagerScrollbarThumbHeight(total: lines.count, viewport: area.height)
+            let thumbStart = pagerScrollbarThumbStart(
+                scrollOffset: scrollOffset,
+                total: lines.count,
+                viewport: area.height,
+                trackHeight: area.height
+            )
+            for row in 0..<area.height {
+                let isThumb = row >= thumbStart && row < thumbStart + thumbHeight
+                _ = buffer.setString(
+                    x: scrollbarX,
+                    y: area.y + row,
+                    text: isThumb ? "█" : "│",
+                    style: [],
+                    foreground: isThumb ? theme.scrollbarForeground : theme.bgLight,
+                    background: theme.bgBase
+                )
+            }
+        }
+    }
+    return model
+}
+
+/// Build the replace-wholesale text-selection model from the exact laid-out /
+/// painted transcript. System/separator/error never contribute selectable
+/// lines. Sticky header band rows are absent from `screenYByLineIndex`
+/// (painted separately; deferred sticky text-drag). Pinned-entry body rows
+/// that fall into the content window *are* on-screen and publish screenY.
+func makePagerTextSelectionModel(
+    items: [PagerConversationItem],
+    lines: [PaintLine],
+    conversationLayout: ConversationLayout,
+    contentArea: TerminalRect,
+    conversationArea: TerminalRect,
+    contentWidth: Int,
+    contentX: Int,
+    screenYByLineIndex: [Int: Int]
+) -> PagerTextSelectionModel {
+    var model = PagerTextSelectionModel(
+        contentArea: contentArea,
+        conversationArea: conversationArea
+    )
+    let count = min(
+        items.count,
+        min(conversationLayout.blockStartLines.count, conversationLayout.blockHeights.count)
+    )
+    guard count > 0 else { return model }
+
+    for entryIndex in 0..<count {
+        let start = conversationLayout.blockStartLines[entryIndex]
+        let height = conversationLayout.blockHeights[entryIndex]
+        guard height > 0, start >= 0, start < lines.count else { continue }
+        let end = min(lines.count, start + height)
+
+        let dragStartable: Bool
+        switch items[entryIndex] {
+        case .separator:
+            dragStartable = false
+        case .message(let message):
+            // System never; error is block-selectable but not text-eligible.
+            dragStartable = message.role != .system && message.role != .error
+        case .tool:
+            dragStartable = true
+        }
+
+        var publishedAny = false
+
+        for lineIndex in start..<end {
+            let line = lines[lineIndex]
+            guard let seed = line.selection else { continue }
+            // System / separator / error: layout never seeds; belt-and-suspenders.
+            if case .separator = items[entryIndex] { continue }
+            if case .message(let message) = items[entryIndex],
+               message.role == .system || message.role == .error
+            {
+                continue
+            }
+
+            let textWidth = pagerSelectionDisplayWidth(seed.text)
+            // Zero-width empty seeds are non-hittable; skip publish.
+            guard textWidth > 0 else { continue }
+            let selectableCols = seed.selectableColStart..<(seed.selectableColStart + textWidth)
+            // Content-window rows only — sticky band lines never enter the map.
+            let onScreen = screenYByLineIndex[lineIndex]
+            model.pushLine(PagerSelectableLine(
+                entryIndex: entryIndex,
+                rangeID: seed.rangeID,
+                blockLineIndex: seed.blockLineIndex,
+                screenY: onScreen,
+                screenX: contentX,
+                selectableCols: selectableCols,
+                text: seed.text,
+                joinerToPrevious: seed.joinerToPrevious
+            ))
+            publishedAny = true
+        }
+
+        // Visible block geometry for viewport-intersecting entries.
+        var minY: Int?
+        var maxY: Int?
+        for lineIndex in start..<end {
+            if let y = screenYByLineIndex[lineIndex] {
+                minY = minY.map { min($0, y) } ?? y
+                maxY = maxY.map { max($0, y) } ?? y
+            }
+        }
+        if let minY, let maxY {
+            let blockHeight = maxY - minY + 1
+            let topClipped = screenYByLineIndex[start] == nil
+            let bottomClipped = screenYByLineIndex[end - 1] == nil
+            model.visibleBlocks.append(PagerVisibleBlockGeometry(
+                entryIndex: entryIndex,
+                area: TerminalRect(
+                    x: conversationArea.x,
+                    y: minY,
+                    width: conversationArea.width,
+                    height: blockHeight
+                ),
+                contentArea: TerminalRect(
+                    x: contentX,
+                    y: minY,
+                    width: contentWidth,
+                    height: blockHeight
+                ),
+                selectionArea: TerminalRect(
+                    x: conversationArea.x,
+                    y: minY,
+                    width: min(conversationArea.width, PagerLayoutMetrics.chromeWidth + contentWidth),
+                    height: blockHeight
+                ),
+                contentWidth: contentWidth,
+                topClipped: topClipped,
+                bottomClipped: bottomClipped,
+                dragStartable: dragStartable && publishedAny
+            ))
+        }
+    }
+    return model
+}
+
+/// Trim trailing whitespace the way `Selectable::All` copy does
+/// (`derive_selection_text`, types.rs:301-312).
+func pagerTrimEndDisplay(_ text: String) -> String {
+    var end = text.endIndex
+    while end > text.startIndex {
+        let prev = text.index(before: end)
+        if text[prev].isWhitespace {
+            end = prev
+        } else {
+            break
+        }
+    }
+    return String(text[..<end])
+}
+
+/// Paint pushed then pinned sticky headers into the conversation top band.
+private func renderStickyHeaders(
+    _ sticky: PagerStickyHeaderLayout,
+    in area: TerminalRect,
+    contentWidth: Int,
+    conversationLayout: ConversationLayout,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme,
+    links: inout [LinkSpan]
+) {
+    guard sticky.hasHeader, area.height > 0 else { return }
+    let contentX = area.x + PagerLayoutMetrics.accentWidth + PagerLayoutMetrics.blockPadLeft
+
+    if let pushed = sticky.pushed {
+        let visible = pushed.visibleHeight
+        if visible > 0 {
+            let screenRow = sticky.pushedScreenRow ?? 0
+            let headerArea = TerminalRect(
+                x: area.x,
+                y: area.y + screenRow,
+                width: area.width,
+                height: min(visible, max(0, area.height - screenRow))
+            )
+            let paintLines = pagerStickyHeaderLines(
+                from: conversationLayout,
+                entryIdx: pushed.entryIdx,
+                renderHeight: pushed.renderHeight,
+                clipTop: pushed.clipTop
+            )
+            for (row, line) in paintLines.enumerated() {
+                guard row < headerArea.height else { break }
+                paintConversationLine(
+                    line,
+                    x: area.x,
+                    y: headerArea.y + row,
+                    contentX: contentX,
+                    contentWidth: contentWidth,
+                    areaWidth: area.width,
+                    buffer: &buffer,
+                    theme: theme,
+                    links: &links
+                )
+            }
+            // Fade pushed header: opacity = visible / (renderHeight + 1)
+            // (`scrollback_pane.rs:462-464`). Cosmetic divergence: non-RGB
+            // theme channels skip blend (blendPagerColors falls back to
+            // nearer endpoint); row/clip semantics still match.
+            let opacity = Double(visible) / Double(max(1, pushed.renderHeight + 1))
+            fadePagerRegion(&buffer, area: headerArea, base: theme.bgBase, opacity: opacity)
+        }
+    }
+
+    if let pinned = sticky.pinned {
+        let visible = pinned.visibleHeight
+        if visible > 0 {
+            let screenRow = sticky.pinnedScreenRow ?? 0
+            let headerArea = TerminalRect(
+                x: area.x,
+                y: area.y + screenRow,
+                width: area.width,
+                height: min(visible, max(0, area.height - screenRow))
+            )
+            let paintLines = pagerStickyHeaderLines(
+                from: conversationLayout,
+                entryIdx: pinned.entryIdx,
+                renderHeight: pinned.renderHeight,
+                clipTop: pinned.clipTop
+            )
+            for (row, line) in paintLines.enumerated() {
+                guard row < headerArea.height else { break }
+                paintConversationLine(
+                    line,
+                    x: area.x,
+                    y: headerArea.y + row,
+                    contentX: contentX,
+                    contentWidth: contentWidth,
+                    areaWidth: area.width,
+                    buffer: &buffer,
+                    theme: theme,
+                    links: &links
+                )
+            }
+        }
+    }
+}
+
+private func paintConversationLine(
+    _ line: PaintLine,
+    x: Int,
+    y: Int,
+    contentX: Int,
+    contentWidth: Int,
+    areaWidth: Int,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme,
+    links: inout [LinkSpan]
+) {
+    if let background = line.background {
+        let bandWidth = PagerLayoutMetrics.chromeWidth + contentWidth
+        paintBlank(
+            &buffer,
+            area: TerminalRect(x: x, y: y, width: min(bandWidth, areaWidth), height: 1),
+            foreground: line.foreground,
+            background: background
+        )
+    }
+    if let glyph = line.accentGlyph {
+        _ = buffer.setString(
+            x: x,
+            y: y,
+            text: glyph,
+            style: [],
+            foreground: line.accentColor ?? theme.grayDim,
+            background: line.background ?? theme.bgBase
+        )
+    }
+    let rowLinks = paintSpans(
+        &buffer,
+        spans: line.spans,
+        x: contentX,
+        y: y,
+        limit: contentX + contentWidth,
+        background: line.background ?? theme.bgBase,
+        inheritForeground: line.foreground,
+        inheritStyle: line.style
+    )
+    links.append(contentsOf: rowLinks)
+}
+
+/// Blend every cell in `area` toward `base` at `opacity` (Rust `fade_region`:
+/// opacity 1.0 keeps original, 0.0 fully base). Non-RGB colors are left as
+/// the nearer endpoint of `blendPagerColors` — documented cosmetic divergence.
+private func fadePagerRegion(
+    _ buffer: inout CellBuffer,
+    area: TerminalRect,
+    base: TerminalColor,
+    opacity: Double
+) {
+    let amount = min(max(opacity, 0), 1)
+    guard area.width > 0, area.height > 0 else { return }
+    for y in area.y..<area.bottom {
+        for x in area.x..<area.right {
+            guard var cell = buffer.cell(x: x, y: y) else { continue }
+            // Rust: blend_color(target=base, cell, opacity) — keep * opacity
+            // of the cell and (1-opacity) of base. Our blendPagerColors(from,
+            // to, amount) mixes from→to by amount, so from=base, to=cell,
+            // amount=opacity.
+            cell.foreground = blendPagerColors(base, cell.foreground, amount)
+            cell.background = blendPagerColors(base, cell.background, amount)
+            buffer.setCell(cell, x: x, y: y)
+        }
     }
 }
 
@@ -2139,6 +2845,32 @@ private func renderTimelineRail(
 }
 
 // MARK: - Painting primitives
+
+/// One-row toast: `accent_user` + bold on `bg_base`, character-per-cell
+/// matching `render.rs:2014-2021` (`for (i, ch) in toast_text.chars()`).
+func renderPagerToast(
+    _ plan: PagerToastPaintPlan,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme
+) {
+    let rect = plan.rect
+    guard rect.height > 0, rect.width > 0 else { return }
+    for (index, character) in plan.text.enumerated() {
+        let x = rect.x + index
+        guard x < rect.right else { break }
+        buffer.setCell(
+            Cell(
+                grapheme: String(character),
+                style: .bold,
+                foreground: theme.accentUser,
+                background: theme.bgBase,
+                displayWidth: 1
+            ),
+            x: x,
+            y: rect.y
+        )
+    }
+}
 
 private func fill(
     _ buffer: inout CellBuffer,
@@ -2208,7 +2940,11 @@ func paintSpans(
             background: span.background ?? background
         )
         let next = min(column + written, limit)
-        if let url = span.url, written > 0 {
+        // Drop unsafe schemes before they become clickable LinkSpans or OSC 8
+        // targets (`scrollback/render.rs:949-962` at pin 650c1db7). Text still
+        // paints; only the hyperlink region is omitted. Relative / schemeless
+        // paths fail `pagerURLIsSafeToOpen` and must not be treated as file://.
+        if let url = span.url, written > 0, pagerURLIsSafeToOpen(url) {
             links.append(LinkSpan(row: y, colStart: column, colEnd: next, url: url))
         }
         column = next
@@ -2252,34 +2988,91 @@ func truncateToWidth(_ text: String, width: Int) -> String {
 }
 
 func wrapDisplayLines(_ text: String, width: Int) -> [String] {
+    wrapDisplayLinesWithRanges(text, width: width).map(\.text)
+}
+
+/// Same wrap math as `wrapDisplayLines`, with Character offsets into `text`.
+/// Transcript / markdown wrapping still uses this path. Composer paint and
+/// hit-testing use `projectComposerGeometry` / `composerWrapOptions` instead.
+func wrapDisplayLinesWithRanges(_ text: String, width: Int) -> [PagerComposerWrappedLine] {
     guard width > 0 else { return [] }
-    let physicalLines = text.split(separator: "\n", omittingEmptySubsequences: false)
-    let physical = physicalLines.isEmpty ? [""] : physicalLines.map(String.init)
-    var result: [String] = []
-    for line in physical {
-        if line.isEmpty {
-            result.append("")
-            continue
+    let characters = Array(text)
+    if characters.isEmpty {
+        return [PagerComposerWrappedLine(startOffset: 0, endOffset: 0, text: "")]
+    }
+
+    var result: [PagerComposerWrappedLine] = []
+    var index = 0
+    while index <= characters.count {
+        let physicalStart = index
+        while index < characters.count, characters[index] != "\n" {
+            index += 1
         }
-        var current = ""
-        var currentWidth = 0
-        for grapheme in line {
-            let string = String(grapheme)
-            let graphemeWidth = max(0, UnicodeDisplayWidth.width(ofGrapheme: string))
-            if graphemeWidth > 0 && !current.isEmpty && currentWidth + graphemeWidth > width {
-                result.append(current)
-                current = ""
-                currentWidth = 0
+        let physicalEnd = index
+        if physicalStart == physicalEnd {
+            result.append(PagerComposerWrappedLine(
+                startOffset: physicalStart,
+                endOffset: physicalEnd,
+                text: ""
+            ))
+        } else {
+            var current = ""
+            var currentWidth = 0
+            var segStart = physicalStart
+            var j = physicalStart
+            while j < physicalEnd {
+                let grapheme = characters[j]
+                let string = String(grapheme)
+                let graphemeWidth = max(0, UnicodeDisplayWidth.width(ofGrapheme: string))
+                if graphemeWidth > 0 && !current.isEmpty && currentWidth + graphemeWidth > width {
+                    result.append(PagerComposerWrappedLine(
+                        startOffset: segStart,
+                        endOffset: j,
+                        text: current
+                    ))
+                    current = ""
+                    currentWidth = 0
+                    segStart = j
+                }
+                current += string
+                currentWidth += graphemeWidth
+                j += 1
+                if graphemeWidth > width {
+                    result.append(PagerComposerWrappedLine(
+                        startOffset: segStart,
+                        endOffset: j,
+                        text: current
+                    ))
+                    current = ""
+                    currentWidth = 0
+                    segStart = j
+                }
             }
-            current += string
-            currentWidth += graphemeWidth
-            if graphemeWidth > width {
-                result.append(current)
-                current = ""
-                currentWidth = 0
+            // Same flush as the historical `wrapDisplayLines` body: keep a
+            // trailing empty segment only when the overall result is still
+            // empty (defensive; the empty-draft path returns above).
+            if !current.isEmpty || result.isEmpty {
+                result.append(PagerComposerWrappedLine(
+                    startOffset: segStart,
+                    endOffset: physicalEnd,
+                    text: current
+                ))
             }
         }
-        if !current.isEmpty || result.isEmpty { result.append(current) }
+
+        if index >= characters.count {
+            break
+        }
+        // Consume the hard newline; a trailing newline yields one more empty row.
+        index += 1
+        if index >= characters.count {
+            result.append(PagerComposerWrappedLine(
+                startOffset: index,
+                endOffset: index,
+                text: ""
+            ))
+            break
+        }
     }
     return result
 }

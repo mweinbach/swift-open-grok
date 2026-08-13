@@ -230,10 +230,90 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     /// recipient takes the message at the round boundary, never mid-round.
     private var pendingChildFollowups: [String: [AgentMailboxMessage]] = [:]
 
+    /// Optional status-chip sink. Composition installs a weak renderer hop;
+    /// tests install a recorder. Cleared with `nil`.
+    private var activeBackgroundWorkSink: LiveActiveBackgroundWorkSink?
+    /// Child ids we have upserted and not yet removed. Membership is the
+    /// single-remove latch: cancel cleanup and `shutdown` race without
+    /// double-emitting.
+    private var countedActiveBackgroundWorkIDs: Set<String> = []
+
     init(context: Context) {
         self.context = context
         self.coordinator = OpenGrokAgentCoordinator()
         self.toolSpec = Self.makeToolSpec(context: context)
+    }
+
+    // MARK: - Active background work (status-chip push)
+
+    /// Install or replace the optional active-background-work sink.
+    ///
+    /// Passing `nil` clears the sink without emitting removes — still-running
+    /// children remove through structured cleanup / `shutdown` if a sink is
+    /// reinstalled later (late remove is idempotent on the cache side).
+    func setActiveBackgroundWorkSink(_ sink: LiveActiveBackgroundWorkSink?) {
+        activeBackgroundWorkSink = sink
+    }
+
+    /// Whether a registered child contributes to Rust
+    /// `TasksPane::running_count` subagent half (`tasks_pane.rs:1143-1146`):
+    /// running and `workflow_run_id.is_none()`.
+    ///
+    /// Port markers on `OpenGrokChildRequest`: non-nil `workflowRunID`, or
+    /// `owner == .workflow`. `LiveSubagentHost.spawn` and the swarm path
+    /// never set either today — workflow children are not registered through
+    /// this host — so the filter is latent. Do not invent a separate
+    /// bookkeeping flag; if a future workflow registration omits the marker,
+    /// it would incorrectly count (recorded port limitation).
+    static func countsTowardActiveBackgroundWork(
+        _ request: OpenGrokChildRequest
+    ) -> Bool {
+        if request.workflowRunID != nil { return false }
+        if request.owner == .workflow { return false }
+        return true
+    }
+
+    /// Upsert after coordinator registration, then await exactly one remove
+    /// when `body` returns — success, failure, or cancel. Not
+    /// `defer { Task { … } }`: that is fire-and-forget and can lose the
+    /// remove under teardown.
+    func withActiveBackgroundWorkCounting(
+        for request: OpenGrokChildRequest,
+        body: () async -> OpenGrokChildResult
+    ) async -> OpenGrokChildResult {
+        let counts = Self.countsTowardActiveBackgroundWork(request)
+        if counts {
+            await emitActiveBackgroundWorkUpsert(id: request.id)
+        }
+        let result = await body()
+        if counts {
+            await emitActiveBackgroundWorkRemove(id: request.id)
+        }
+        return result
+    }
+
+    /// Internal so the swarm extension (separate file) can roll back on
+    /// failed registration. Latch makes a no-op when upsert never ran.
+    func emitActiveBackgroundWorkUpsert(id: String) async {
+        guard countedActiveBackgroundWorkIDs.insert(id).inserted else { return }
+        guard let event = LiveActiveBackgroundWorkEvent.upsert(
+            kind: .subagent,
+            id: id
+        ) else {
+            countedActiveBackgroundWorkIDs.remove(id)
+            return
+        }
+        await activeBackgroundWorkSink?(event)
+    }
+
+    /// Internal so the swarm extension can share the single-remove latch.
+    func emitActiveBackgroundWorkRemove(id: String) async {
+        guard countedActiveBackgroundWorkIDs.remove(id) != nil else { return }
+        guard let event = LiveActiveBackgroundWorkEvent.remove(
+            kind: .subagent,
+            id: id
+        ) else { return }
+        await activeBackgroundWorkSink?(event)
     }
 
     // MARK: - Collaboration routing (the followup_task live-delivery seam)
@@ -799,30 +879,39 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                         error: "subagent host was torn down before the child ran"
                     )
                 }
-                if let antigravityModel {
-                    return await self.runAntigravityChild(
+                // Operation body runs only after coordinator registration.
+                // Upsert/remove bracket the child so background, foreground,
+                // antigravity, and resume share one counting seam.
+                return await self.withActiveBackgroundWorkCounting(for: request) {
+                    if let antigravityModel {
+                        return await self.runAntigravityChild(
+                            childID: childID,
+                            prompt: input.prompt,
+                            model: antigravityModel,
+                            runtime: childRuntime,
+                            cwd: childCWD
+                        )
+                    }
+                    return await self.runChild(
                         childID: childID,
                         prompt: input.prompt,
-                        model: antigravityModel,
+                        definition: childDefinition,
                         runtime: childRuntime,
-                        cwd: childCWD
+                        model: childModel,
+                        cwd: childCWD,
+                        resumeItems: inheritedItems
                     )
                 }
-                return await self.runChild(
-                    childID: childID,
-                    prompt: input.prompt,
-                    definition: childDefinition,
-                    runtime: childRuntime,
-                    model: childModel,
-                    cwd: childCWD,
-                    resumeItems: inheritedItems
-                )
             }
         } catch let error as OpenGrokCoordinatorError {
             bookkeeping.removeValue(forKey: childID)
+            // Spawn never reached the operation body — remove is a no-op
+            // unless a future path upserts before this catch.
+            await emitActiveBackgroundWorkRemove(id: childID)
             return .failure(.failed(error.description))
         } catch {
             bookkeeping.removeValue(forKey: childID)
+            await emitActiveBackgroundWorkRemove(id: childID)
             return .failure(.failed("subagent \(childID) could not be registered: \(error)"))
         }
 
@@ -1273,8 +1362,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     // MARK: - LiveSubagentQuerying
 
     func subagentSnapshot(id: String) async -> LiveSubagentSnapshot? {
-        if let active = await coordinator.listActive(parentSessionID: context.sessionID)
-            .first(where: { $0.request.id == id }) {
+        let isActive = await coordinator.listActive(parentSessionID: context.sessionID)
+            .contains { $0.request.id == id }
+        if isActive {
             let meta = bookkeeping[id]
             let started = meta?.startedAt ?? Date()
             return LiveSubagentSnapshot(
@@ -1379,6 +1469,12 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     /// tool surfaces they built (MCP connections, shell sessions).
     func shutdown() async {
         await coordinator.teardown(sessionID: context.sessionID)
+        // Chip must clear immediately on host death. Child tasks may still
+        // be unwinding; their later removes hit the latch and stay silent.
+        let outstanding = countedActiveBackgroundWorkIDs
+        for id in outstanding {
+            await emitActiveBackgroundWorkRemove(id: id)
+        }
         let executors = Array(childExecutors.values)
         childExecutors.removeAll()
         for executor in executors {

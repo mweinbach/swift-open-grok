@@ -152,6 +152,52 @@ public struct PagerSettingsStore: Sendable {
         return path
     }
 
+    // MARK: keep_text_selection (atomic + legacy clear)
+
+    /// Legacy `[ui]` keys superseded by `keep_text_selection`
+    /// (`settings_writes.rs` `set_keep_text_selection` at pin `650c1db7`).
+    private static let keepTextSelectionLegacyPaths: [[String]] = [
+        ["ui", "double_click_action"],
+        ["ui", "selection_highlight_duration_ms"],
+    ]
+
+    /// Persist `keep_text_selection` and clear superseded legacy keys in **one**
+    /// read-modify-write — no partial writes if the file write fails.
+    @discardableResult
+    public func writeKeepTextSelection(_ canonical: String) throws -> String {
+        guard registry.find("keep_text_selection") != nil else {
+            throw PagerSettingsStoreError.unknownKey("keep_text_selection")
+        }
+        var root = (try? readRoot()) ?? .table(TOMLTable())
+        try setValue(
+            .string(canonical),
+            at: ["ui", "keep_text_selection"],
+            in: &root
+        )
+        for path in Self.keepTextSelectionLegacyPaths {
+            removeValue(at: path, in: &root)
+        }
+        try writeConfigFile(root, to: configPath)
+        return "ui.keep_text_selection"
+    }
+
+    /// Unset `keep_text_selection` and clear legacy keys in one write so a
+    /// reset cannot resurrect `word_select` / hold via
+    /// `double_click_action` or `selection_highlight_duration_ms == 0`.
+    @discardableResult
+    public func resetKeepTextSelection() throws -> String {
+        guard registry.find("keep_text_selection") != nil else {
+            throw PagerSettingsStoreError.unknownKey("keep_text_selection")
+        }
+        var root = (try? readRoot()) ?? .table(TOMLTable())
+        removeValue(at: ["ui", "keep_text_selection"], in: &root)
+        for path in Self.keepTextSelectionLegacyPaths {
+            removeValue(at: path, in: &root)
+        }
+        try writeConfigFile(root, to: configPath)
+        return "ui.keep_text_selection"
+    }
+
     private func encode(
         _ value: PagerSettingValue,
         for meta: PagerSettingMeta

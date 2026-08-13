@@ -163,20 +163,56 @@ private struct BlockSelectFixture {
     }
 }
 
+/// First on-screen selectable text cell + a same-row drag X that exceeds the
+/// ≥1 drag threshold without leaving the line's selectable span.
+private func firstVisibleSelectablePoint(
+    in text: PagerTextSelectionModel
+) -> (x: Int, y: Int, entryIndex: Int, dragX: Int)? {
+    for range in text.ranges {
+        for line in range.lines {
+            guard let screenY = line.screenY else { continue }
+            let width = line.selectableCols.upperBound - line.selectableCols.lowerBound
+            // Need at least two selectable columns so dx ≥ 1 promotes the drag.
+            guard width > 1 else { continue }
+            let x = line.screenX + line.selectableCols.lowerBound
+            let dragCol = min(2, width - 1)
+            let dragX = line.screenX + line.selectableCols.lowerBound + dragCol
+            return (x, screenY, range.entryIndex, dragX)
+        }
+    }
+    return nil
+}
+
 private func contentPoint(
     in model: PagerConversationHitModel,
     blockIndex: Int
 ) -> (x: Int, y: Int)? {
+    let x = model.conversation.x + PagerLayoutMetrics.chromeWidth + 2
+    // Sticky header band: pinned/pushed user prompts hit via header rows
+    // (logical contentY - scrollOffset often lands above the viewport).
+    if model.sticky.hasHeader {
+        for row in 0..<model.sticky.headerScreenRows {
+            if model.sticky.entryAtHeaderRow(row) == blockIndex {
+                let screenY = model.conversation.y + row
+                guard model.blockIndex(atScreenY: screenY) == blockIndex else { continue }
+                return (x, screenY)
+            }
+        }
+    }
     guard model.blockStartLines.indices.contains(blockIndex),
           model.blockHeights.indices.contains(blockIndex),
           model.blockHeights[blockIndex] > 0
     else { return nil }
     let contentY = model.blockStartLines[blockIndex]
-    let screenY = model.conversation.y + contentY - model.scrollOffset
-    guard screenY >= model.conversation.y,
-          screenY < model.conversation.y + model.conversation.height
+    let viewportY = contentY - model.scrollOffset
+    let headerRows = model.sticky.hasHeader ? model.sticky.headerScreenRows : 0
+    // Content paints below the sticky band; a row inside the header zone is
+    // not this block's content (Rust content_y still uses logical scroll).
+    guard viewportY >= headerRows,
+          viewportY < model.conversation.height
     else { return nil }
-    let x = model.conversation.x + PagerLayoutMetrics.chromeWidth + 2
+    let screenY = model.conversation.y + viewportY
+    guard model.blockIndex(atScreenY: screenY) == blockIndex else { return nil }
     return (x, screenY)
 }
 
@@ -191,12 +227,16 @@ private func gapPoint(in model: PagerConversationHitModel) -> (x: Int, y: Int)? 
     let area = model.conversation
     guard area.height > 0 else { return nil }
     let x = area.x + PagerLayoutMetrics.chromeWidth + 2
+    let headerRows = model.sticky.hasHeader ? model.sticky.headerScreenRows : 0
     for index in 0..<(count - 1) {
         let gapContentY = model.blockStartLines[index] + model.blockHeights[index]
         // Packed neighbors abut; only a real inter-block gap is a nil hit.
         guard gapContentY < model.blockStartLines[index + 1] else { continue }
-        let screenY = area.y + gapContentY - model.scrollOffset
-        guard screenY >= area.y, screenY < area.y + area.height else { continue }
+        let viewportY = gapContentY - model.scrollOffset
+        // Content-area gaps only — sticky header/gap rows are covered by
+        // LiveStickyHeaderTests, not this inter-block fixture.
+        guard viewportY >= headerRows, viewportY < area.height else { continue }
+        let screenY = area.y + viewportY
         // Refuse any candidate the hit model still treats as content.
         guard model.blockIndex(atScreenY: screenY) == nil else { continue }
         return (x, screenY)
@@ -559,27 +599,91 @@ struct LiveMouseBlockSelectionTests {
         try await fixture.renderer.restoreTerminal()
     }
 
-    @Test("real drag clears pending so release does not select")
-    func dragClearsPendingClick() async throws {
+    @Test("drag on selectable text promotes text drag over pending block click")
+    func selectableTextDragPromotesOverBlockClick() async throws {
         let fixture = try BlockSelectFixture()
         defer { fixture.dispose() }
         try await fixture.seedTwoBlocks()
+        await fixture.renderer.testingSetKeepTextSelectionMode(.hold)
 
-        let model = try #require(await fixture.renderer.lastConversationHit)
-        let target = min(2, model.blockStartLines.count - 1)
-        let point = try #require(contentPoint(in: model, blockIndex: target))
+        let conversation = try #require(await fixture.renderer.lastConversationHit)
+        let textModel = try #require(await fixture.renderer.testingLastTextSelection())
+        // Block-start contentPoint often lands on vpad/chrome with no text hit —
+        // arm from the first on-screen selectable line cell.
+        let point = try #require(firstVisibleSelectablePoint(in: textModel))
+        let blockAtY = try #require(conversation.blockIndex(atScreenY: point.y))
+        #expect(blockAtY == point.entryIndex)
+        // Published selectable lines only come from mouse-selectable entries
+        // (system never contributes). Threshold drag must promote text.
+        #expect(textModel.hitTestSelectableRange(col: point.x, row: point.y) != nil)
 
         _ = try await fixture.renderer.handleInput(.mouse(MouseEvent(
             kind: .down, x: point.x, y: point.y, button: .left
         )))
+        #expect(await fixture.renderer.testingPendingScrollbackClick() != nil)
+        #expect(await fixture.renderer.testingPendingTextDrag() != nil)
+        #expect(await fixture.renderer.testingScrollbackSelectedIndex() == nil)
+
+        let dragX = point.dragX
+        _ = try await fixture.renderer.handleInput(.mouse(MouseEvent(
+            kind: .drag, x: dragX, y: point.y, button: .left
+        )))
+        // Text drag wins: pending block click cleared, active drag armed.
+        #expect(await fixture.renderer.testingPendingScrollbackClick() == nil)
+        #expect(await fixture.renderer.testingActiveTextDrag() != nil)
+        #expect(await fixture.renderer.testingScrollbackSelectedIndex() == nil)
+
+        let up = try await fixture.renderer.handleInput(.mouse(MouseEvent(
+            kind: .up, x: dragX, y: point.y, button: .left
+        )))
+        #expect(up == .focusScrollback)
+        #expect(await fixture.renderer.testingActiveTextDrag() == nil)
+        let persistent = try #require(await fixture.renderer.testingPersistentTextSelection())
+        #expect(persistent.origin == .drag)
+        #expect(persistent.entryIndex == point.entryIndex)
+        // Finish focuses the text entry (not a lingering pending-click select).
+        #expect(await fixture.renderer.testingScrollbackSelectedIndex() == point.entryIndex)
+
+        await fixture.renderer.testingAwaitTextSelectionFlashCleanup()
+        try await fixture.renderer.restoreTerminal()
+    }
+
+    @Test("drag on nonselectable system clears pending without block select")
+    func nonselectableDragClearsPendingNoBlockSelect() async throws {
+        let fixture = try BlockSelectFixture()
+        defer { fixture.dispose() }
+        try await fixture.seedTwoBlocks()
+        try await fixture.renderer.testingAppendConversationItem(
+            .message(PagerMessage(role: .system, text: "system-drag-no-select-unique-token"))
+        )
+        #expect(await fixture.waitForPaint(containing: "system-drag-no-select-unique-token"))
+
+        let model = try #require(await fixture.renderer.lastConversationHit)
+        let systemIndex = await fixture.renderer.testingConversationItemCount() - 1
+        let point = try #require(contentPoint(in: model, blockIndex: systemIndex))
+        // System publishes no selectable text — drag cannot promote text selection.
+        let textModel = await fixture.renderer.testingLastTextSelection()
+        #expect(textModel?.hitTestSelectableRange(col: point.x, row: point.y) == nil)
+
+        _ = try await fixture.renderer.handleInput(.mouse(MouseEvent(
+            kind: .down, x: point.x, y: point.y, button: .left
+        )))
+        // Chrome/system miss arms deferred_text_press; that owns the gesture
+        // so pending block click may remain until up (Rust deferred press).
         _ = try await fixture.renderer.handleInput(.mouse(MouseEvent(
             kind: .drag, x: point.x + 2, y: point.y, button: .left
         )))
+        #expect(await fixture.renderer.testingActiveTextDrag() == nil)
+
         let up = try await fixture.renderer.handleInput(.mouse(MouseEvent(
             kind: .up, x: point.x + 2, y: point.y, button: .left
         )))
         #expect(up == .consumed)
+        #expect(await fixture.renderer.testingPendingScrollbackClick() == nil)
+        #expect(await fixture.renderer.testingDeferredTextPress() == nil)
         #expect(await fixture.renderer.testingScrollbackSelectedIndex() == nil)
+        #expect(await fixture.renderer.testingPersistentTextSelection() == nil)
+
         try await fixture.renderer.restoreTerminal()
     }
 

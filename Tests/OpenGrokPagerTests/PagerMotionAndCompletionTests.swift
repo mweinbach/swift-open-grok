@@ -86,6 +86,44 @@ struct PagerMotionTickerTests {
         #expect(await renderer.frames.isEmpty)
     }
 
+    @Test("non-default setMotionFPS changes ticker cadence before run")
+    func configuredFPSChangesCadence() async throws {
+        // Through the controller seam only: lower fps must advance the
+        // derived tick counter more slowly for the same wall seconds
+        // (`makeAnimationFrame` divides by tickInterval(fps)).
+        func lastTick(fps: Int, afterSeconds: Double) async throws -> (tick: Int, seconds: Double) {
+            let renderer = MotionRecordingRenderer()
+            let controller = OpenGrokPagerInteractiveController(
+                input: openStream([]),
+                runtime: InertRuntime(),
+                renderer: renderer,
+                output: SilentMotionOutput()
+            )
+            await controller.setMotionFPS(fps)
+            await controller.setMotionState(PagerMotionState(hasBackgroundTasks: true))
+            let task = Task { try await controller.run(.init(prompt: "", mode: .inline)) }
+            let reached = await renderer.waitForSeconds(
+                atLeast: afterSeconds,
+                timeoutNanos: 10_000_000_000
+            )
+            #expect(reached)
+            let frame = await renderer.frames.last
+            await controller.shutdown()
+            _ = try await task.value
+            return (frame?.tick ?? -1, frame?.seconds ?? -1)
+        }
+
+        let slow = try await lastTick(fps: 10, afterSeconds: 0.35)
+        let fast = try await lastTick(fps: 60, afterSeconds: 0.35)
+        #expect(slow.seconds >= 0.35)
+        #expect(fast.seconds >= 0.35)
+        // At equal wall time, 60 fps must report a higher tick than 10 fps.
+        #expect(fast.tick > slow.tick)
+        // And the slow cadence must stay near seconds*fps (not the default 30).
+        #expect(slow.tick <= Int(slow.seconds * 10) + 2)
+        #expect(fast.tick >= Int(fast.seconds * 40))
+    }
+
     @Test("suspend holds the ticker; setMotionState while held cannot re-arm; resume continues the clock")
     func suspendHoldsAndResumeContinues() async throws {
         let renderer = MotionRecordingRenderer()
@@ -574,6 +612,12 @@ private actor MotionRecordingRenderer: OpenGrokPagerInteractiveRenderAdapter {
 
     func waitForFrameCount(atLeast count: Int, timeoutNanos: UInt64) async -> Bool {
         await wait(timeoutNanos: timeoutNanos) { $0.count >= count }
+    }
+
+    func waitForSeconds(atLeast seconds: Double, timeoutNanos: UInt64) async -> Bool {
+        await wait(timeoutNanos: timeoutNanos) { frames in
+            (frames.last?.seconds ?? 0) >= seconds
+        }
     }
 
     private func wait(

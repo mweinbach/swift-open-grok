@@ -101,6 +101,14 @@ public enum GrokEnvGates {
         envBool("GROK_WORKFLOWS", environment: environment)
     }
 
+    /// Opt-in mouse-reporting toggle (`Ctrl+R` scrollback + `/toggle-mouse-reporting`).
+    /// Consumer: `MouseReportingToggleConfiguration` / live pager startup gate.
+    public static func mouseReportingToggle(
+        environment: [String: String]
+    ) -> Bool? {
+        envBool("GROK_MOUSE_REPORTING_TOGGLE", environment: environment)
+    }
+
     /// Campaign application disable.
     /// Consumer: `Loader.campaignsApplicationDisabled`.
     public static func campaigns(

@@ -658,6 +658,135 @@ struct TextAreaMouseTests {
         #expect((area.scrollOverrideValue ?? 0) > 0)
     }
 
+    @Test("X10 up-none finishes a left drag and copies; middle/right up do not")
+    func x10UpFinishesLeftGesture() throws {
+        let area = TextArea()
+        area.setText("abcdef")
+        let rect = TextAreaRect(x: 0, y: 0, width: 40, height: 5)
+        let state = TextAreaState()
+        let down = area.handleMouse(
+            MouseEvent(kind: .down, x: 0, y: 0, button: 0),
+            area: rect,
+            state: state
+        )
+        #expect(down == .cursorPlaced)
+        let drag = area.handleMouse(
+            MouseEvent(kind: .drag, x: 4, y: 0, button: 0),
+            area: rect,
+            state: state
+        )
+        #expect(drag == .selectionUpdated)
+        #expect(area.dragActive)
+        let middle = area.handleMouse(
+            MouseEvent(kind: .up, x: 4, y: 0, button: 1),
+            area: rect,
+            state: state
+        )
+        #expect(middle == .nothing)
+        #expect(area.dragActive)
+        #expect(area.pendingDragScroll == nil)
+        let right = area.handleMouse(
+            MouseEvent(kind: .up, x: 4, y: 0, button: 2),
+            area: rect,
+            state: state
+        )
+        #expect(right == .nothing)
+        #expect(area.dragActive)
+        let x10 = area.handleMouse(
+            MouseEvent(kind: .up, x: 4, y: 0, button: MouseEvent.noButton),
+            area: rect,
+            state: state
+        )
+        #expect(x10 == .selectionFinished)
+        #expect(!area.dragActive)
+        #expect(area.pendingDragScroll == nil)
+        let selected = try #require(area.selectedText())
+        #expect(!selected.isEmpty)
+        #expect(area.clipboard() == selected)
+    }
+
+    @Test("X10 up-none ends a scrollbar drag; middle up does not")
+    func x10UpEndsScrollbarDrag() {
+        let area = TextArea()
+        var text = ""
+        for i in 0..<30 { text += "line \(i)\n" }
+        area.setText(text)
+        area.showScrollbar = true
+        let rect = TextAreaRect(x: 0, y: 0, width: 20, height: 5)
+        let state = TextAreaState()
+        let sbX = rect.x + rect.width - 1
+        let down = area.handleMouse(
+            MouseEvent(kind: .down, x: sbX, y: rect.y, button: 0),
+            area: rect,
+            state: state
+        )
+        #expect(down == .scrolled)
+        #expect(area.scrollbarDragging)
+        let middle = area.handleMouse(
+            MouseEvent(kind: .up, x: sbX, y: rect.y, button: 1),
+            area: rect,
+            state: state
+        )
+        #expect(middle == .nothing)
+        #expect(area.scrollbarDragging)
+        let x10 = area.handleMouse(
+            MouseEvent(kind: .up, x: sbX, y: rect.y, button: MouseEvent.noButton),
+            area: rect,
+            state: state
+        )
+        #expect(x10 == .scrolled)
+        #expect(!area.scrollbarDragging)
+    }
+
+    @Test("cancelMouseGesture drops drag without copying; next down starts fresh")
+    func cancelMouseGestureStartsFresh() {
+        let area = TextArea()
+        area.setText("abcdef")
+        let rect = TextAreaRect(x: 0, y: 0, width: 40, height: 5)
+        let state = TextAreaState()
+        _ = area.handleMouse(
+            MouseEvent(kind: .down, x: 0, y: 0, button: 0),
+            area: rect,
+            state: state
+        )
+        _ = area.handleMouse(
+            MouseEvent(kind: .drag, x: 4, y: 0, button: 0),
+            area: rect,
+            state: state
+        )
+        #expect(area.dragActive)
+        let beforeClipboard = area.clipboard()
+        area.cancelMouseGesture()
+        #expect(!area.dragActive)
+        #expect(area.pendingDragScroll == nil)
+        #expect(area.pollTimeoutMs() == nil)
+        #expect(area.clipboard() == beforeClipboard)
+        let next = area.handleMouse(
+            MouseEvent(kind: .down, x: 5, y: 0, button: 0),
+            area: rect,
+            state: state
+        )
+        #expect(next == .cursorPlaced)
+        #expect(!area.dragActive)
+        #expect(area.cursor == 5)
+    }
+
+    @Test("Ctrl+J replaces an active selection with a newline; Ctrl+H deletes it")
+    func ctrlJAndHReplaceOrDeleteSelection() {
+        let area = TextArea()
+        area.setText("hello")
+        area.setSelection(anchor: 0, head: 5)
+        area.input(KeyEvent(key: .char("j"), modifiers: [.control], character: "j"))
+        #expect(area.text == "\n")
+        #expect(area.selectionRange == nil)
+
+        area.setText("hello")
+        area.setSelection(anchor: 0, head: 5)
+        area.input(KeyEvent(key: .char("h"), modifiers: [.control], character: "h"))
+        #expect(area.text == "")
+        #expect(area.selectionRange == nil)
+    }
+
     @Test("InputEvent.mouse is consumed")
     func inputEventMouse() {
         let area = TextArea()

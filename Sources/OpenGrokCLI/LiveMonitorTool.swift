@@ -604,6 +604,10 @@ enum LiveMonitorTools {
         )
         let handle: ShellBackgroundHandle
         do {
+            // Chip upsert/remove for this task id is owned by
+            // `OpenGrokShellOwnedProcessExecution` (`.shell`). Do not emit a
+            // second upsert here — monitors share the shell ownership map and
+            // would double-count under a separate kind or a second emit.
             handle = try await process.runBackground(request)
         } catch {
             // Upstream: `ToolError::custom("process_manager", e)` (tool.rs:138).

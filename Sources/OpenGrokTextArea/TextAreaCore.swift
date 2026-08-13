@@ -80,9 +80,72 @@ public enum MouseAction: Sendable, Equatable {
     case scrolled
 }
 
-public struct TextAreaState: Sendable, Equatable {
+public struct TextAreaState: Sendable, Equatable, Hashable {
     public var scroll: Int
     public init(scroll: Int = 0) { self.scroll = scroll }
+}
+
+// MARK: - Character ↔ UTF-8 converters
+
+/// Convert a Swift `Character` (extended grapheme cluster) index into a UTF-8
+/// byte offset in `text`.
+///
+/// **Clamping:** `characterOffset` is clamped to `0...text.count`. Negative
+/// values become `0`; values past the last grapheme become `text.utf8Count`.
+///
+/// **Snap:** none. Character indices are already grapheme-aligned. Swift treats
+/// CRLF (`\r\n`) as one `Character`, so that index maps to the UTF-8 start of
+/// the CR (never the LF). Combining marks, ZWJ sequences, and flags occupy one
+/// index and map to the cluster's first byte.
+///
+/// These converters exist so pager/render can talk UTF-8 without a parallel
+/// Character-indexed selection. The live buffer remains UTF-8.
+public func utf8Offset(fromCharacter characterOffset: Int, in text: String) -> Int {
+    let graphemeCount = text.count
+    let clamped = min(max(0, characterOffset), graphemeCount)
+    if clamped == 0 { return 0 }
+    if clamped == graphemeCount { return text.utf8Count }
+    return text.graphemeBoundaries()[clamped]
+}
+
+/// Convert a UTF-8 byte offset into a Swift `Character` (extended grapheme
+/// cluster) index in `text`.
+///
+/// **Clamping:** `utf8Offset` is clamped to `0...text.utf8Count`.
+///
+/// **Snap:** offsets that are not extended-grapheme boundaries snap to the
+/// nearest boundary; ties go left — the same rule as
+/// `String.normalizeExternalCursor` / `EditBuffer` cursor placement. The
+/// Character index is the grapheme count up to that boundary. Mid-CRLF,
+/// mid-emoji, mid-ZWJ, and mid-combining offsets therefore round-trip to the
+/// cluster start (or the nearer end when that end is strictly closer).
+///
+/// Round-trip: `characterOffset(fromUTF8: utf8Offset(fromCharacter:i, in: t), in: t) == i`
+/// for every clamped Character index `i`. The inverse holds only when the UTF-8
+/// offset is already a grapheme boundary.
+public func characterOffset(fromUTF8 utf8Offset: Int, in text: String) -> Int {
+    let snapped = text.normalizeExternalCursor(byte: utf8Offset)
+    let bounds = text.graphemeBoundaries()
+    return bounds.firstIndex(of: snapped) ?? 0
+}
+
+// MARK: - Composer wrap options
+
+/// Wrap options used by `TextArea.ensureWrapCache` — the sole composer wrap
+/// geometry. Matches pin `650c1db7` `xai-ratatui-textarea` `wrapped_lines`
+/// (`textarea.rs:2925-2946`): `Options::new(width).wrap_algorithm(FirstFit)`
+/// with textwrap defaults `break_words = true`, `WordSeparator::new()`
+/// (unicode-linebreak), `HyphenSplitter`.
+///
+/// Width is floored at 1, matching `ensureWrapCache` / Rust `width.max(1)`.
+public func composerWrapOptions(width: Int) -> WrapOptions {
+    WrapOptions(
+        width: max(width, 1),
+        breakWords: true,
+        wrapAlgorithm: .firstFit,
+        wordSeparator: .unicodeBreakProperties,
+        wordSplitter: .hyphenSplitter
+    )
 }
 
 // MARK: - Undo
@@ -284,7 +347,20 @@ public final class TextArea {
                 insertStr("\n")
                 endUndoGroup()
                 return
+            // Ctrl+J is readline newline (`textarea.rs:1918-1935`). Host-owned
+            // Ctrl+M (multiline) never reaches this intercept.
+            case .char(let ch) where ch == "j" && event.modifiers == [.control]:
+                beginUndoGroup()
+                if !deleteSelection() { clearSelection() }
+                insertStr("\n")
+                endUndoGroup()
+                return
             case .backspace, .delete:
+                if deleteSelection() { return }
+                clearSelection()
+            // Ctrl+H is backward-delete (`textarea.rs:1941-1959`). Host-owned
+            // Ctrl+D (EOF) / Ctrl+X (shortcuts) never reach this intercept.
+            case .char(let ch) where ch == "h" && event.modifiers == [.control]:
                 if deleteSelection() { return }
                 clearSelection()
             case .char(let ch) where ch == "x" && event.modifiers == [.control]:
@@ -554,16 +630,9 @@ public final class TextArea {
     // MARK: Wrap / viewport
 
     public func ensureWrapCache(width: Int) {
-        let w = max(width, 1)
+        let opts = composerWrapOptions(width: width)
+        let w = opts.width
         if let cache = wrapCache, cache.width == w { return }
-        // Match Rust textarea wrap cache: FirstFit (not OptimalFit).
-        let opts = WrapOptions(
-            width: w,
-            breakWords: true,
-            wrapAlgorithm: .firstFit,
-            wordSeparator: .unicodeBreakProperties,
-            wordSplitter: .hyphenSplitter
-        )
         wrapCache = (w, wrapRanges(buffer.text, options: opts))
     }
 
@@ -775,6 +844,57 @@ public final class TextArea {
         }
         // Fallback: last line starting at or before pos
         return lines.lastIndex(where: { $0.lowerBound <= pos })
+    }
+
+    /// Last wrapped row whose start byte is `<= pos`. Matches Rust
+    /// `wrapped_line_index_by_start` (`textarea.rs:1749-1754`). Used by
+    /// cursor/span geometry; vertical motion keeps `wrappedLineIndex`.
+    func wrappedLineIndexByStart(_ lines: [Range<Int>], _ pos: Int) -> Int? {
+        lines.lastIndex(where: { $0.lowerBound <= pos })
+    }
+
+    /// Display width of UTF-8 range `[from, to)`, honoring element display
+    /// text. Port of `display_width_of_range` (`textarea.rs:1687-1747`).
+    public func displayWidth(ofUTF8Range range: Range<Int>) -> Int {
+        let from = range.lowerBound
+        let to = range.upperBound
+        if from >= to { return 0 }
+        var width = 0
+        var pos = from
+        let elems = elements.sorted { $0.range.lowerBound < $1.range.lowerBound }
+        for elem in elems {
+            if elem.range.lowerBound >= to { break }
+            if elem.range.upperBound <= pos { continue }
+            if pos < elem.range.lowerBound {
+                let plainEnd = min(elem.range.lowerBound, to)
+                width += plainDisplayWidth(
+                    buffer.text.substring(utf8Range: pos..<plainEnd),
+                    tabWidth: tabWidth
+                )
+                pos = plainEnd
+            }
+            if pos >= to { break }
+            let elemStartInRange = max(elem.range.lowerBound, pos)
+            let elemEndInRange = min(elem.range.upperBound, to)
+            if elemStartInRange < elemEndInRange {
+                if let display = elem.displayText, elemStartInRange == elem.range.lowerBound {
+                    width += UnicodeDisplayWidth.width(of: display)
+                } else {
+                    width += plainDisplayWidth(
+                        buffer.text.substring(utf8Range: elemStartInRange..<elemEndInRange),
+                        tabWidth: tabWidth
+                    )
+                }
+                pos = elemEndInRange
+            }
+        }
+        if pos < to {
+            width += plainDisplayWidth(
+                buffer.text.substring(utf8Range: pos..<to),
+                tabWidth: tabWidth
+            )
+        }
+        return width
     }
 
     private func snapshot() -> UndoEntry {

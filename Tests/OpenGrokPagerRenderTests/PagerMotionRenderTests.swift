@@ -78,6 +78,51 @@ struct PagerMotionRenderSiteTests {
         #expect(frame.buffer.cell(x: 0, y: 0)?.foreground == theme.accentRunning)
     }
 
+    @Test("non-default waveRows changes the painted rail brightness span")
+    func waveRowsChangesPaintedSpan() {
+        let theme = PagerRenderTheme.default
+        func state(waveRows: Int) -> PagerRenderState {
+            PagerRenderState(
+                size: TerminalSize(width: 44, height: 12),
+                conversation: [
+                    .tool(PagerToolCard(
+                        name: "bash",
+                        input: "swift build",
+                        output: "compiling\nline2\nline3",
+                        state: .running,
+                        isExpanded: true
+                    ))
+                ],
+                motion: PagerMotionSnapshot(tick: 5, seconds: 0, enabled: true),
+                waveRows: waveRows
+            )
+        }
+
+        let defaultFrame = renderPagerFrame(state(waveRows: PagerMotion.defaultWaveRows))
+        let tightFrame = renderPagerFrame(state(waveRows: 4))
+
+        // Row 1 (body) is the phase that diverges first when wavelength shortens.
+        let defaultRow = defaultFrame.buffer.cell(x: 0, y: 1)?.foreground
+        let tightRow = tightFrame.buffer.cell(x: 0, y: 1)?.foreground
+        #expect(defaultRow != nil)
+        #expect(tightRow != nil)
+        #expect(defaultRow != tightRow)
+        #expect(tightRow == PagerMotion.runningAccentColor(
+            theme: theme,
+            accent: theme.accentRunning,
+            tick: 5,
+            row: 1,
+            waveRows: 4
+        ))
+        #expect(defaultRow == PagerMotion.runningAccentColor(
+            theme: theme,
+            accent: theme.accentRunning,
+            tick: 5,
+            row: 1,
+            waveRows: PagerMotion.defaultWaveRows
+        ))
+    }
+
     private func finishedToolState(now: TimeInterval) -> PagerRenderState {
         PagerRenderState(
             size: TerminalSize(width: 44, height: 12),

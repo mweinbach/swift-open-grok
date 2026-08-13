@@ -9,7 +9,7 @@ import OpenGrokTerminalCore
 // MARK: - Layout types
 
 /// Rectangular area occupied by a text area (absolute screen coordinates).
-public struct TextAreaRect: Sendable, Equatable {
+public struct TextAreaRect: Sendable, Equatable, Hashable {
     public var x: Int
     public var y: Int
     public var width: Int
@@ -56,6 +56,388 @@ public struct TextAreaLayout: Sendable, Equatable {
         let end = min(wrappedLines.count, scroll + max(area.height, 0))
         self.visibleRange = min(scroll, wrappedLines.count)..<end
     }
+}
+
+/// Absolute screen cell of a buffer offset inside a `TextAreaRect`.
+public struct TextAreaScreenPosition: Sendable, Equatable {
+    public var x: Int
+    public var y: Int
+    public init(x: Int, y: Int) {
+        self.x = x
+        self.y = y
+    }
+}
+
+/// One visible row of a UTF-8 selection (or any byte range) after wrap/scroll.
+///
+/// `utf8Range` is the wrapped-row segment (may include trailing wrap spaces
+/// whose display is clipped). `displayCols` is 0-based within the content
+/// origin, already clamped to `textWidth` so it never covers the scrollbar.
+public struct TextAreaSelectionSpan: Sendable, Equatable {
+    public var x: Int
+    public var y: Int
+    public var width: Int
+    public var utf8Range: Range<Int>
+    public var displayCols: Range<Int>
+
+    public init(x: Int, y: Int, width: Int, utf8Range: Range<Int>, displayCols: Range<Int>) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.utf8Range = utf8Range
+        self.displayCols = displayCols
+    }
+
+    public var rect: TextAreaRect {
+        TextAreaRect(x: x, y: y, width: width, height: 1)
+    }
+}
+
+/// Hit-test result for a screen cell. `utf8Offset` is grapheme-snapped via
+/// `displayColToBufferPos` (wide glyphs land on the cluster start).
+public struct TextAreaScreenHit: Sendable, Equatable {
+    public var utf8Offset: Int
+    public var hitElement: Bool
+    /// Wrapped-row index in the wrap cache (not screen-relative).
+    public var wrappedRow: Int
+    /// Display column relative to the content origin (`col - area.x`).
+    public var displayCol: Int
+
+    public init(utf8Offset: Int, hitElement: Bool, wrappedRow: Int, displayCol: Int) {
+        self.utf8Offset = utf8Offset
+        self.hitElement = hitElement
+        self.wrappedRow = wrappedRow
+        self.displayCol = displayCol
+    }
+}
+
+/// Sendable read-only copy of composer buffer + wrap geometry for pager
+/// actor/render. Does not retain the `TextArea` object. Wrap rows are the
+/// `ensureWrapCache` / `wrappedLines` cache, not an independent wrap.
+public struct TextAreaComposerSnapshot: Sendable, Equatable {
+    public var text: String
+    public var cursorUTF8: Int
+    public var selectionUTF8: Range<Int>?
+    public var selectedText: String?
+    public var state: TextAreaState
+    public var scrollOverride: Int?
+    public var wrapWidth: Int
+    public var wrapOptions: WrapOptions
+    public var wrappedRows: [Range<Int>]
+    public var cursorScreenPosition: TextAreaScreenPosition?
+    public var selectionScreenSpans: [TextAreaSelectionSpan]
+
+    public init(
+        text: String,
+        cursorUTF8: Int,
+        selectionUTF8: Range<Int>?,
+        selectedText: String?,
+        state: TextAreaState,
+        scrollOverride: Int?,
+        wrapWidth: Int,
+        wrapOptions: WrapOptions,
+        wrappedRows: [Range<Int>],
+        cursorScreenPosition: TextAreaScreenPosition? = nil,
+        selectionScreenSpans: [TextAreaSelectionSpan] = []
+    ) {
+        self.text = text
+        self.cursorUTF8 = cursorUTF8
+        self.selectionUTF8 = selectionUTF8
+        self.selectedText = selectedText
+        self.state = state
+        self.scrollOverride = scrollOverride
+        self.wrapWidth = wrapWidth
+        self.wrapOptions = wrapOptions
+        self.wrappedRows = wrappedRows
+        self.cursorScreenPosition = cursorScreenPosition
+        self.selectionScreenSpans = selectionScreenSpans
+    }
+
+    /// UTF-8 slice of one wrap row. Empty when `index` is out of range.
+    public func text(ofWrappedRow index: Int) -> String {
+        guard wrappedRows.indices.contains(index) else { return "" }
+        return text.substring(utf8Range: wrappedRows[index])
+    }
+}
+
+// MARK: - Pure composer projection (no TextArea instance)
+
+/// Wrap / caret / selection / hit geometry from text + UTF-8 state.
+///
+/// This is the render-side seam: pager paint and hit-testing must not
+/// construct a second mutable `TextArea`. Matches `TextArea.composerSnapshot`
+/// for a buffer with no elements, `tabWidth` 0 by default, and the same
+/// `composerWrapOptions` wrap cache.
+public func projectComposerGeometry(
+    text: String,
+    cursorUTF8: Int,
+    selectionUTF8: Range<Int>?,
+    selectedText: String? = nil,
+    state: TextAreaState = TextAreaState(),
+    scrollOverride: Int? = nil,
+    area: TextAreaRect,
+    showScrollbar: Bool = false,
+    scrollbarPadding: Int = 0,
+    tabWidth: UInt8 = 0
+) -> TextAreaComposerSnapshot {
+    let (textWidth, _) = projectComposerContentWidth(
+        text: text,
+        areaWidth: area.width,
+        areaHeight: area.height,
+        showScrollbar: showScrollbar,
+        scrollbarPadding: scrollbarPadding,
+        tabWidth: tabWidth
+    )
+    let opts = composerWrapOptions(width: max(textWidth, 1))
+    var rows = wrapRanges(text, options: opts)
+    if rows.isEmpty { rows = [0..<0] }
+    let cursor = min(max(0, cursorUTF8), text.utf8Count)
+    let scroll = projectComposerEffectiveScroll(
+        areaHeight: area.height,
+        lines: rows,
+        currentScroll: state.scroll,
+        cursorUTF8: cursor,
+        scrollOverride: scrollOverride
+    )
+    let cursorPos = projectComposerCursorPosition(
+        text: text,
+        cursorUTF8: cursor,
+        lines: rows,
+        area: area,
+        textWidth: max(textWidth, 1),
+        scroll: scroll,
+        tabWidth: tabWidth
+    )
+    let spans: [TextAreaSelectionSpan]
+    if let selectionUTF8 {
+        spans = projectComposerScreenSpans(
+            ofUTF8: selectionUTF8,
+            text: text,
+            lines: rows,
+            area: area,
+            textWidth: max(textWidth, 1),
+            scroll: scroll,
+            tabWidth: tabWidth
+        )
+    } else {
+        spans = []
+    }
+    return TextAreaComposerSnapshot(
+        text: text,
+        cursorUTF8: cursor,
+        selectionUTF8: selectionUTF8,
+        selectedText: selectedText,
+        state: TextAreaState(scroll: scroll),
+        scrollOverride: scrollOverride,
+        wrapWidth: opts.width,
+        wrapOptions: opts,
+        wrappedRows: rows == [0..<0] && text.isEmpty ? [] : rows,
+        cursorScreenPosition: cursorPos,
+        selectionScreenSpans: spans
+    )
+}
+
+/// Hit-test a screen cell against a pure projection. `nil` outside `area`.
+public func projectComposerScreenHit(
+    col: Int,
+    row: Int,
+    snapshot: TextAreaComposerSnapshot,
+    area: TextAreaRect,
+    tabWidth: UInt8 = 0
+) -> TextAreaScreenHit? {
+    guard area.contains(col: col, row: row) else { return nil }
+    var lines = snapshot.wrappedRows
+    if lines.isEmpty { lines = [0..<0] }
+    let scroll = snapshot.state.scroll
+    let visualRow = (row - area.y) + scroll
+    let displayCol = max(0, col - area.x)
+    let utf8Count = snapshot.text.utf8Count
+    let pos: Int
+    if visualRow >= lines.count {
+        pos = utf8Count
+    } else if visualRow < 0 {
+        pos = 0
+    } else {
+        let line = lines[visualRow]
+        let lineEnd = min(line.upperBound, utf8Count)
+        pos = projectComposerDisplayColToBufferPos(
+            text: snapshot.text,
+            lineStart: line.lowerBound,
+            lineEnd: lineEnd,
+            targetCol: displayCol,
+            tabWidth: tabWidth
+        )
+    }
+    return TextAreaScreenHit(
+        utf8Offset: pos,
+        hitElement: false,
+        wrappedRow: max(0, visualRow),
+        displayCol: displayCol
+    )
+}
+
+func projectComposerContentWidth(
+    text: String,
+    areaWidth: Int,
+    areaHeight: Int,
+    showScrollbar: Bool,
+    scrollbarPadding: Int,
+    tabWidth: UInt8
+) -> (Int, Bool) {
+    _ = tabWidth
+    if !showScrollbar || areaWidth <= 1 {
+        return (areaWidth, false)
+    }
+    let lines = wrapRanges(text, options: composerWrapOptions(width: max(areaWidth, 1)))
+    let needs = lines.count > areaHeight
+    if needs {
+        let reserved = 1 + scrollbarPadding
+        return (max(0, areaWidth - reserved), true)
+    }
+    return (areaWidth, false)
+}
+
+func projectComposerEffectiveScroll(
+    areaHeight: Int,
+    lines: [Range<Int>],
+    currentScroll: Int,
+    cursorUTF8: Int,
+    scrollOverride: Int?
+) -> Int {
+    let total = lines.count
+    if areaHeight >= total { return 0 }
+    let maxScroll = max(0, total - areaHeight)
+    if let ovr = scrollOverride {
+        return min(max(0, ovr), maxScroll)
+    }
+    let cursorLine = projectComposerWrappedLineIndexByStart(lines, cursorUTF8) ?? 0
+    var scroll = min(max(0, currentScroll), maxScroll)
+    if cursorLine < scroll {
+        scroll = cursorLine
+    } else if cursorLine >= scroll + areaHeight {
+        scroll = cursorLine + 1 - areaHeight
+    }
+    return scroll
+}
+
+func projectComposerCursorPosition(
+    text: String,
+    cursorUTF8: Int,
+    lines: [Range<Int>],
+    area: TextAreaRect,
+    textWidth: Int,
+    scroll: Int,
+    tabWidth: UInt8
+) -> TextAreaScreenPosition? {
+    var rows = lines
+    if rows.isEmpty { rows = [0..<0] }
+    guard var i = projectComposerWrappedLineIndexByStart(rows, cursorUTF8) else { return nil }
+    let ls = rows[i]
+    var col = projectComposerDisplayWidth(
+        ofUTF8Range: ls.lowerBound..<cursorUTF8,
+        text: text,
+        tabWidth: tabWidth
+    )
+    if col >= textWidth {
+        i += 1
+        col = 0
+    }
+    if i < scroll || i >= scroll + area.height {
+        return nil
+    }
+    return TextAreaScreenPosition(x: area.x + col, y: area.y + (i - scroll))
+}
+
+func projectComposerScreenSpans(
+    ofUTF8 range: Range<Int>,
+    text: String,
+    lines: [Range<Int>],
+    area: TextAreaRect,
+    textWidth: Int,
+    scroll: Int,
+    tabWidth: UInt8
+) -> [TextAreaSelectionSpan] {
+    var spans: [TextAreaSelectionSpan] = []
+    if range.lowerBound >= range.upperBound
+        || range.upperBound > text.utf8Count
+        || !isUTF8ScalarBoundary(range.lowerBound, in: text)
+        || !isUTF8ScalarBoundary(range.upperBound, in: text)
+    {
+        return spans
+    }
+    var rows = lines
+    if rows.isEmpty { rows = [0..<0] }
+    let first = projectComposerWrappedLineIndexByStart(rows, range.lowerBound) ?? 0
+    let rightEdge = area.x + textWidth
+    if first < rows.count {
+        for i in first..<rows.count {
+            let ls = rows[i]
+            if ls.lowerBound >= range.upperBound { break }
+            if i < scroll { continue }
+            if i >= scroll + area.height { break }
+            let segStart = max(range.lowerBound, ls.lowerBound)
+            let segEnd = min(range.upperBound, ls.upperBound)
+            if segStart >= segEnd { continue }
+            let startX = min(
+                area.x + projectComposerDisplayWidth(
+                    ofUTF8Range: ls.lowerBound..<segStart,
+                    text: text,
+                    tabWidth: tabWidth
+                ),
+                rightEdge
+            )
+            let endX = min(
+                area.x + projectComposerDisplayWidth(
+                    ofUTF8Range: ls.lowerBound..<segEnd,
+                    text: text,
+                    tabWidth: tabWidth
+                ),
+                rightEdge
+            )
+            if startX < endX {
+                spans.append(TextAreaSelectionSpan(
+                    x: startX,
+                    y: area.y + (i - scroll),
+                    width: endX - startX,
+                    utf8Range: segStart..<segEnd,
+                    displayCols: (startX - area.x)..<(endX - area.x)
+                ))
+            }
+        }
+    }
+    return spans
+}
+
+func projectComposerWrappedLineIndexByStart(_ lines: [Range<Int>], _ pos: Int) -> Int? {
+    lines.lastIndex(where: { $0.lowerBound <= pos })
+}
+
+func projectComposerDisplayWidth(ofUTF8Range range: Range<Int>, text: String, tabWidth: UInt8) -> Int {
+    if range.lowerBound >= range.upperBound { return 0 }
+    return plainDisplayWidth(text.substring(utf8Range: range), tabWidth: tabWidth)
+}
+
+func projectComposerDisplayColToBufferPos(
+    text: String,
+    lineStart: Int,
+    lineEnd: Int,
+    targetCol: Int,
+    tabWidth: UInt8
+) -> Int {
+    var widthSoFar = 0
+    var pos = lineStart
+    while pos < lineEnd {
+        let next = text.nextGraphemeBoundary(byte: pos)
+        if next <= pos { break }
+        let g = text.substring(utf8Range: pos..<min(next, lineEnd))
+        let gw = graphemeDisplayWidth(g, tabWidth: tabWidth)
+        widthSoFar += gw
+        if widthSoFar > targetCol {
+            return text.normalizeExternalCursor(byte: pos)
+        }
+        pos = next
+    }
+    return text.normalizeExternalCursor(byte: lineEnd)
 }
 
 // MARK: - Interaction extension
@@ -127,9 +509,167 @@ extension TextArea {
         )
     }
 
+    /// Buffer + wrap-cache snapshot. Screen cursor/spans stay empty; use
+    /// `composerSnapshot(area:state:)` when the pager has a painted rect.
+    public func composerSnapshot(wrapWidth: Int) -> TextAreaComposerSnapshot {
+        let opts = composerWrapOptions(width: wrapWidth)
+        let rows = wrappedLines(width: opts.width)
+        return TextAreaComposerSnapshot(
+            text: text,
+            cursorUTF8: cursor,
+            selectionUTF8: selectionRange,
+            selectedText: selectedText(),
+            state: TextAreaState(scroll: scrollOverrideStorage ?? 0),
+            scrollOverride: scrollOverrideValue,
+            wrapWidth: opts.width,
+            wrapOptions: opts,
+            wrappedRows: rows
+        )
+    }
+
+    /// Snapshot including effective scroll and screen geometry for `area`.
+    public func composerSnapshot(area: TextAreaRect, state: TextAreaState) -> TextAreaComposerSnapshot {
+        let layout = layout(area: area, state: state)
+        var snap = composerSnapshot(wrapWidth: max(layout.textWidth, 1))
+        snap.wrappedRows = layout.wrappedLines
+        snap.state = TextAreaState(scroll: layout.scroll)
+        snap.cursorScreenPosition = cursorPosition(area: area, state: state)
+        snap.selectionScreenSpans = selectionScreenSpans(area: area, state: state)
+        return snap
+    }
+
+    /// On-screen cursor with wrap-boundary adjustment. `nil` when the cursor
+    /// row is scrolled out of the viewport.
+    ///
+    /// Port of `cursor_pos` / `cursor_pos_with_state` (`textarea.rs:720-759`).
+    public func cursorPosition(area: TextAreaRect, state: TextAreaState = TextAreaState()) -> TextAreaScreenPosition? {
+        let tw = textWidth(area: area)
+        var lines = wrappedLines(width: max(tw, 1))
+        // `desiredHeight` floors at 1; empty wrap cache still has a cursor cell.
+        if lines.isEmpty { lines = [0..<0] }
+        let effectiveScroll = effectiveScroll(areaHeight: area.height, lines: lines, currentScroll: state.scroll)
+        guard var i = wrappedLineIndexByStart(lines, cursor) else { return nil }
+        let ls = lines[i]
+        var col = displayWidth(ofUTF8Range: ls.lowerBound..<cursor)
+        // Cursor at the exact wrap boundary sits on the next visual line
+        // (`textarea.rs:741-749`), including a virtual row when the last
+        // line is exactly full.
+        if col >= tw {
+            i += 1
+            col = 0
+        }
+        let scroll = effectiveScroll
+        if i < scroll || i >= scroll + area.height {
+            return nil
+        }
+        let screenRow = i - scroll
+        return TextAreaScreenPosition(x: area.x + col, y: area.y + screenRow)
+    }
+
+    /// On-screen cell of an arbitrary UTF-8 offset. No wrap-boundary bump —
+    /// see `cursorPosition` for the cursor. Port of `screen_position_of`
+    /// (`textarea.rs:766-786`).
+    public func screenPosition(
+        ofUTF8 pos: Int,
+        area: TextAreaRect,
+        state: TextAreaState
+    ) -> TextAreaScreenPosition? {
+        let tw = textWidth(area: area)
+        var lines = wrappedLines(width: max(tw, 1))
+        if lines.isEmpty { lines = [0..<0] }
+        let effectiveScroll = effectiveScroll(areaHeight: area.height, lines: lines, currentScroll: state.scroll)
+        guard let i = wrappedLineIndexByStart(lines, pos) else { return nil }
+        let ls = lines[i]
+        let col = displayWidth(ofUTF8Range: ls.lowerBound..<pos)
+        let scroll = effectiveScroll
+        if i < scroll || i >= scroll + area.height {
+            return nil
+        }
+        let screenRow = i - scroll
+        return TextAreaScreenPosition(x: area.x + col, y: area.y + screenRow)
+    }
+
+    /// Visible selection (or any UTF-8 range) as height-1 spans. Empty when
+    /// the range is empty, past the text, or not on UTF-8 scalar boundaries.
+    /// Port of `screen_spans_of_range` (`textarea.rs:799-856`).
+    public func screenSpans(
+        ofUTF8 range: Range<Int>,
+        area: TextAreaRect,
+        state: TextAreaState
+    ) -> [TextAreaSelectionSpan] {
+        var spans: [TextAreaSelectionSpan] = []
+        if range.lowerBound >= range.upperBound
+            || range.upperBound > text.utf8Count
+            || !isUTF8ScalarBoundary(range.lowerBound, in: text)
+            || !isUTF8ScalarBoundary(range.upperBound, in: text)
+        {
+            return spans
+        }
+        let tw = textWidth(area: area)
+        let lines = wrappedLines(width: max(tw, 1))
+        let scroll = effectiveScroll(areaHeight: area.height, lines: lines, currentScroll: state.scroll)
+        let first = wrappedLineIndexByStart(lines, range.lowerBound) ?? 0
+        let rightEdge = area.x + tw
+        if first < lines.count {
+            for i in first..<lines.count {
+                let ls = lines[i]
+                if ls.lowerBound >= range.upperBound { break }
+                if i < scroll { continue }
+                if i >= scroll + area.height { break }
+                let segStart = max(range.lowerBound, ls.lowerBound)
+                let segEnd = min(range.upperBound, ls.upperBound)
+                if segStart >= segEnd { continue }
+                let startX = min(area.x + displayWidth(ofUTF8Range: ls.lowerBound..<segStart), rightEdge)
+                let endX = min(area.x + displayWidth(ofUTF8Range: ls.lowerBound..<segEnd), rightEdge)
+                if startX < endX {
+                    let displayStart = startX - area.x
+                    let displayEnd = endX - area.x
+                    spans.append(TextAreaSelectionSpan(
+                        x: startX,
+                        y: area.y + (i - scroll),
+                        width: endX - startX,
+                        utf8Range: segStart..<segEnd,
+                        displayCols: displayStart..<displayEnd
+                    ))
+                }
+            }
+        }
+        return spans
+    }
+
+    public func selectionScreenSpans(area: TextAreaRect, state: TextAreaState) -> [TextAreaSelectionSpan] {
+        guard let range = selectionRange else { return [] }
+        return screenSpans(ofUTF8: range, area: area, state: state)
+    }
+
     public func bufferPosAtScreen(col: Int, row: Int, area: TextAreaRect, state: TextAreaState) -> Int? {
         guard area.contains(col: col, row: row) else { return nil }
         return bufferPosAtScreenEx(col: col, row: row, area: area, state: state)?.0
+    }
+
+    /// Strict-bounds hit mapping (same containment as `bufferPosAtScreen`)
+    /// with wrap-row / display-col / element flags `handleMouse` already uses.
+    public func screenHit(
+        col: Int,
+        row: Int,
+        area: TextAreaRect,
+        state: TextAreaState
+    ) -> TextAreaScreenHit? {
+        guard area.contains(col: col, row: row) else { return nil }
+        guard let (pos, hitElement) = bufferPosAtScreenEx(col: col, row: row, area: area, state: state) else {
+            return nil
+        }
+        let tw = textWidth(area: area)
+        let lines = wrappedLines(width: max(tw, 1))
+        let scroll = effectiveScroll(areaHeight: area.height, lines: lines, currentScroll: state.scroll)
+        let visualRow = (row - area.y) + scroll
+        let displayCol = max(0, col - area.x)
+        return TextAreaScreenHit(
+            utf8Offset: pos,
+            hitElement: hitElement,
+            wrappedRow: visualRow,
+            displayCol: displayCol
+        )
     }
 
     public func elementAtScreen(col: Int, row: Int, area: TextAreaRect, state: TextAreaState) -> TextElement? {
@@ -157,6 +697,21 @@ extension TextArea {
 
     // MARK: Mouse
 
+    /// Drop an in-flight left gesture without copying. Overlay / nil-hit /
+    /// resize / suspend / restore must call this so `dragActive` and
+    /// `pendingDragScroll` cannot strand the host clock. The next left-down
+    /// starts fresh. Cost: a mid-drag cancel leaves the highlight as-is
+    /// (no OSC 52); that is the point — do not synthesize a copy.
+    public func cancelMouseGesture() {
+        mouseDownPos = nil
+        dragActive = false
+        scrollbarDragging = false
+        pendingDragScroll = nil
+        dragAnchor = nil
+        lastDragScrollMs = nil
+        dragScrollSteps = 0
+    }
+
     public func handleMouse(_ event: MouseEvent, area: TextAreaRect, state: TextAreaState) -> MouseAction {
         let tw = textWidth(area: area)
         let hasScrollbar = showScrollbar && tw < area.width
@@ -164,17 +719,23 @@ extension TextArea {
 
         if scrollbarDragging {
             switch event.kind {
-            case .drag, .down where event.button == 0:
-                return handleScrollbarClick(row: event.y, area: area, textWidth: tw)
-            case .up where event.button == 0:
-                scrollbarDragging = false
-                return .scrolled
+            case .drag, .down:
+                // Explicit gate: a comma-list `where` only binds the last
+                // pattern, so middle/right drag would keep the thumb moving.
+                if isLeftButton(event) {
+                    return handleScrollbarClick(row: event.y, area: area, textWidth: tw)
+                }
+            case .up:
+                if isLeftRelease(event) {
+                    scrollbarDragging = false
+                    return .scrolled
+                }
             default:
                 break
             }
         }
 
-        if onScrollbar, event.kind == .down, event.button == 0 {
+        if onScrollbar, event.kind == .down, isLeftButton(event) {
             scrollbarDragging = true
             if isScrollbarThumbAt(row: event.y, area: area, textWidth: tw, state: state) {
                 return .scrolled
@@ -183,7 +744,8 @@ extension TextArea {
         }
 
         switch event.kind {
-        case .down where event.button == 0:
+        case .down:
+            guard isLeftButton(event) else { return .nothing }
             if dragActive {
                 let dragEvent = MouseEvent(kind: .drag, x: event.x, y: event.y, button: event.button, modifiers: event.modifiers)
                 return handleMouse(dragEvent, area: area, state: state)
@@ -255,7 +817,8 @@ extension TextArea {
                 return .cursorPlaced
             }
 
-        case .drag where event.button == 0:
+        case .drag:
+            guard isLeftButton(event) else { return .nothing }
             guard let anchor = dragAnchor else { return .nothing }
             let outside = event.y < area.y || event.y >= area.bottom
             if outside {
@@ -327,7 +890,11 @@ extension TextArea {
             preferredColStorage = nil
             return selectionRange == nil ? .cursorPlaced : .selectionUpdated
 
-        case .up where event.button == 0:
+        case .up:
+            // X10 release is `.up` + `noButton`; finish/copy/cancel the
+            // active LEFT gesture exactly like button 0. Middle/right up
+            // never do (`isLeftRelease`).
+            guard isLeftRelease(event) else { return .nothing }
             mouseDownPos = nil
             let wasDrag = dragActive
             dragActive = false
@@ -387,6 +954,17 @@ extension TextArea {
     }
 
     // MARK: - Private interaction helpers
+
+    /// SGR/X10 left down and drag. X10 release is `noButton`, not 0.
+    fileprivate func isLeftButton(_ event: MouseEvent) -> Bool {
+        event.button == 0
+    }
+
+    /// Left release: SGR button 0, or X10/legacy up with no button
+    /// attribution. Middle/right up must never finish a left gesture.
+    fileprivate func isLeftRelease(_ event: MouseEvent) -> Bool {
+        event.button == 0 || event.button == MouseEvent.noButton
+    }
 
     fileprivate func handleScroll(delta: Int, area: TextAreaRect, state: TextAreaState) -> MouseAction {
         let tw = textWidth(area: area)
@@ -665,6 +1243,16 @@ extension TextArea {
     fileprivate func monotonicMs() -> Int {
         Int(Date().timeIntervalSince1970 * 1000)
     }
+}
+
+/// UTF-8 scalar (Rust `is_char_boundary`) — not grapheme — so a combining
+/// mark start is valid while a continuation byte inside `é` is not.
+fileprivate func isUTF8ScalarBoundary(_ byte: Int, in text: String) -> Bool {
+    let n = text.utf8Count
+    if byte < 0 || byte > n { return false }
+    if byte == 0 || byte == n { return true }
+    let idx = text.utf8.index(text.utf8.startIndex, offsetBy: byte)
+    return text.utf8[idx] & 0xC0 != 0x80
 }
 
 // MARK: - Click tracker

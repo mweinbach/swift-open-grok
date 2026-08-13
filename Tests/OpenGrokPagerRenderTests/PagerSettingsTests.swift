@@ -81,7 +81,7 @@ private let stepperTestRegistry = PagerSettingsRegistry(entries: [
 
 @Suite("Settings registry")
 struct PagerSettingsRegistryTests {
-    @Test("the catalog carries 77 rows across 8 categories")
+    @Test("the catalog carries 82 rows across 8 categories")
     func catalogSize() {
         let registry = PagerSettingsRegistry.default
         // Upstream registers 91; this port hides `show_tips` plus every `[ui]`
@@ -91,20 +91,27 @@ struct PagerSettingsRegistryTests {
         // grew its reads (gap rows, user-prompt vpad and prefix),
         // `show_timestamps` with the stamp overlay, and `show_timeline` with
         // the tick rail, and `page_flip_on_send` with the send/viewport pin.
-        #expect(registry.entries.count == 78)
+        // The five Mouse rows (`scroll_*` / `invert_scroll` /
+        // `keep_text_selection`) are live with the text-selection reader.
+        #expect(registry.entries.count == 83)
         #expect(PagerSettingCategory.ordered.count == 8)
         #expect(!registry.entries.contains { $0.key == "show_tips" })
+        #expect(registry.entries.contains { $0.key == "keep_text_selection" })
         #expect(registry.entries.contains { $0.key == "compact_mode" })
         #expect(registry.entries.contains { $0.key == "show_timestamps" })
         #expect(registry.entries.contains { $0.key == "show_timeline" })
         #expect(registry.entries.contains { $0.key == "page_flip_on_send" })
+        #expect(registry.entries.contains { $0.key == "scroll_speed" })
+        // Parsed from pager.toml; upstream has no settings row (`defs.rs`).
+        #expect(registry.find("sticky_headers") == nil)
     }
 
     @Test("per-category counts match the reference's registry")
     func categoryCounts() {
         let registry = PagerSettingsRegistry.default
         #expect(registry.rows(in: .appearance).count == 11)
-        #expect(registry.rows(in: .mouse).count == 0)
+        // Upstream Mouse is 5 including `keep_text_selection`.
+        #expect(registry.rows(in: .mouse).count == 5)
         #expect(registry.rows(in: .editor).count == 6)
         #expect(registry.rows(in: .agent).count == 9)
         #expect(registry.rows(in: .privacy).count == 1)
@@ -155,8 +162,24 @@ struct PagerSettingsRegistryTests {
         #expect(registry.find("screen_mode")?.restartRequired == true)
         #expect(registry.find("auto_update")?.restartRequired == true)
         #expect(registry.find("diagnostics.crash_handler")?.restartRequired == true)
+        #expect(registry.find("ui.mouse_reporting_toggle")?.restartRequired == true)
         #expect(registry.find("theme")?.restartRequired == false)
         #expect(registry.find("vim_mode")?.restartRequired == false)
+    }
+
+    @Test("ui.mouse_reporting_toggle is the restart-required Advanced feature-flag row")
+    func mouseReportingToggleSettingRow() throws {
+        // defs.rs:2346-2366 at pin 650c1db7 — gate only; live mouse_reporting
+        // enable/disable is a separate runtime flag.
+        let meta = try #require(PagerSettingsRegistry.default.find("ui.mouse_reporting_toggle"))
+        #expect(meta.category == .advanced)
+        #expect(meta.label == "Mouse reporting toggle")
+        #expect(meta.storage == .featureFlag(path: "ui.mouse_reporting_toggle"))
+        #expect(meta.restartRequired == true)
+        #expect(meta.defaultValue == .bool(false))
+        #expect(meta.keywords == [
+            "mouse", "reporting", "toggle", "ctrl+r", "capture", "copy", "paste", "flag"
+        ])
     }
 
     @Test("group children never surface as top-level rows")
@@ -733,6 +756,48 @@ struct PagerSettingsStoreTests {
         // Absent means "follow the default", which is what `value(for:)` returns.
         let overlay = PagerSettingsOverlay(values: try store.load())
         #expect(overlay.stringValue(for: "theme") == "groknight")
+    }
+
+    @Test("writeKeepTextSelection clears legacy keys in one atomic write")
+    func writeKeepTextSelectionClearsLegacy() throws {
+        let path = temporaryConfig()
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try """
+        [ui]
+        double_click_action = "word_select"
+        selection_highlight_duration_ms = 0
+        """.write(to: path, atomically: true, encoding: .utf8)
+
+        let store = PagerSettingsStore(configPath: path)
+        try store.writeKeepTextSelection("flash")
+        let text = try String(contentsOf: path, encoding: .utf8)
+        #expect(text.contains("keep_text_selection = \"flash\""))
+        #expect(!text.contains("double_click_action"))
+        #expect(!text.contains("selection_highlight_duration_ms"))
+        #expect(try store.load()["keep_text_selection"] == .string("flash"))
+    }
+
+    @Test("resetKeepTextSelection clears canonical and legacy together")
+    func resetKeepTextSelectionClearsLegacy() throws {
+        let path = temporaryConfig()
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try """
+        [ui]
+        keep_text_selection = "hold"
+        double_click_action = "word_select"
+        selection_highlight_duration_ms = 0
+        """.write(to: path, atomically: true, encoding: .utf8)
+
+        let store = PagerSettingsStore(configPath: path)
+        try store.resetKeepTextSelection()
+        let text = try String(contentsOf: path, encoding: .utf8)
+        #expect(!text.contains("keep_text_selection"))
+        #expect(!text.contains("double_click_action"))
+        #expect(!text.contains("selection_highlight_duration_ms"))
     }
 
     @Test("reset prunes a table it empties")

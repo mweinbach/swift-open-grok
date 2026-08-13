@@ -559,27 +559,19 @@ public struct MouseWheelTuning: Sendable, Equatable {
     /// Authoritative per-terminal wheel profile from
     /// `ScrollConfig::from_terminal_context` (`input/mouse.rs:324-373`).
     ///
-    /// `program` is a `TERM_PROGRAM` value (or nil). Only iTerm2 and WezTerm
-    /// lower `linesPerTick` with `eventsPerTick`; VS Code-family / Zed keep
-    /// the default 3-line notch with `eventsPerTick == 1` — do not broaden
-    /// that shape. Unknown / unlisted programs use the 3/3 defaults.
+    /// Delegates to `ScrollConfig.from(brand:multiplexer:overrides:)` so the
+    /// brand table cannot drift from the scroll-stream normalizer. `program`
+    /// is a `TERM_PROGRAM` value (or nil). Only iTerm2 and WezTerm lower
+    /// `linesPerTick` with `eventsPerTick`; VS Code-family / Zed keep the
+    /// default 3-line notch with `eventsPerTick == 1`. Unknown / unlisted
+    /// programs use the 3/3 defaults.
     public static func forTerminalProgram(_ program: String?) -> MouseWheelTuning {
-        switch program?.lowercased() {
-        case "iterm.app", "iterm2", "iterm", "wezterm":
-            // Rust: Iterm2 | WezTerm → ept=1 and wheel_lines_per_tick=1.
-            return MouseWheelTuning(linesPerTick: 1, eventsPerTick: 1)
-        case "vscode", "cursor", "windsurf", "zed":
-            // Rust: VsCode | Cursor | Windsurf | Zed → ept=1, default LPT.
-            return MouseWheelTuning(
-                linesPerTick: defaultLinesPerTick,
-                eventsPerTick: 1
-            )
-        default:
-            // Apple_Terminal, WarpTerminal, Ghostty, Kitty, Alacritty, Rio,
-            // Foot, and every other / unknown brand: DEFAULT_EVENTS_PER_TICK
-            // and DEFAULT_WHEEL_LINES_PER_TICK (both 3).
-            return MouseWheelTuning()
-        }
+        let brand = MouseScrollTerminalBrand.from(termProgram: program)
+        let config = ScrollConfig.from(brand: brand, multiplexer: .undetected)
+        return MouseWheelTuning(
+            linesPerTick: Int(config.wheelLinesPerTick),
+            eventsPerTick: Int(config.eventsPerTick)
+        )
     }
 
     /// Per-terminal reports-per-notch. Prefer `forTerminalProgram(_:)` when

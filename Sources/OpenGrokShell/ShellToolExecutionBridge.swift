@@ -34,6 +34,17 @@ public enum OpenGrokShellToolBridgeError: Error, Sendable, Equatable, CustomStri
     }
 }
 
+/// Session-owned background-task chip events. CLI installs a translator to
+/// `LiveActiveBackgroundWorkEvent` (`.shell`); monitors share that kind because
+/// they register through the same owned execution (one upsert per task id).
+public enum OpenGrokShellBackgroundWorkEvent: Sendable, Hashable, Equatable {
+    case upsert(taskID: String)
+    case remove(taskID: String)
+}
+
+public typealias OpenGrokShellBackgroundWorkEventSink =
+    @Sendable (OpenGrokShellBackgroundWorkEvent) async -> Void
+
 public protocol OpenGrokShellProcessExecution: Sendable {
     var sessionID: String { get }
     var workingDirectory: URL { get }
@@ -46,6 +57,12 @@ public protocol OpenGrokShellProcessExecution: Sendable {
     func taskSnapshot(_ taskID: String) async -> ShellTaskSnapshot?
     func waitForCompletion(_ taskID: String, timeout: ShellDuration?) async -> ShellTaskSnapshot?
     func listTasks() async -> [ShellTaskSnapshot]
+    /// Optional status-chip sink. Default is a no-op for fakes/stubs.
+    func setBackgroundWorkEventSink(_ sink: OpenGrokShellBackgroundWorkEventSink?) async
+}
+
+extension OpenGrokShellProcessExecution {
+    public func setBackgroundWorkEventSink(_ sink: OpenGrokShellBackgroundWorkEventSink?) async {}
 }
 
 public actor OpenGrokShellOwnedProcessExecution: OpenGrokShellProcessExecution {
@@ -56,10 +73,19 @@ public actor OpenGrokShellOwnedProcessExecution: OpenGrokShellProcessExecution {
     private var foregroundCallIDs: Set<String> = []
     private var backgroundTaskOwners: [String: String] = [:]
 
+    /// Optional chip sink. Cleared with `nil`; replacement drops the old
+    /// closure so late events cannot reach a retired renderer hop.
+    private var backgroundWorkEventSink: OpenGrokShellBackgroundWorkEventSink?
+    /// Task ids we have upserted and not yet removed — the single-remove latch.
+    private var countedBackgroundWorkIDs: Set<String> = []
+    /// One structured completion waiter per counted id (not `Task.detached`).
+    private var backgroundWorkWatchTasks: [String: Task<Void, Never>] = [:]
+
     public init(
         sessionID: String,
         workingDirectory: URL,
-        backend: any ShellProcessBackend
+        backend: any ShellProcessBackend,
+        backgroundWorkEventSink: OpenGrokShellBackgroundWorkEventSink? = nil
     ) throws {
         let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedSessionID.isEmpty else {
@@ -68,6 +94,11 @@ public actor OpenGrokShellOwnedProcessExecution: OpenGrokShellProcessExecution {
         self.sessionID = normalizedSessionID
         self.workingDirectory = workingDirectory.standardizedFileURL
         self.backend = backend
+        self.backgroundWorkEventSink = backgroundWorkEventSink
+    }
+
+    public func setBackgroundWorkEventSink(_ sink: OpenGrokShellBackgroundWorkEventSink?) async {
+        backgroundWorkEventSink = sink
     }
 
     public func run(_ request: ShellCommandRequest) async throws -> ShellCommandResult {
@@ -95,6 +126,7 @@ public actor OpenGrokShellOwnedProcessExecution: OpenGrokShellProcessExecution {
         // the model has no way to reach a task it did not choose to background.
         if result.backgrounded, let taskID = result.taskID, !taskID.isEmpty {
             backgroundTaskOwners[taskID] = callID
+            await noteBackgroundWorkRegistered(taskID)
         }
         return result
     }
@@ -111,6 +143,7 @@ public actor OpenGrokShellOwnedProcessExecution: OpenGrokShellProcessExecution {
             throw OpenGrokShellToolBridgeError.invalidBackgroundHandle
         }
         backgroundTaskOwners[handle.taskID] = callID
+        await noteBackgroundWorkRegistered(handle.taskID)
         return handle
     }
 
@@ -126,11 +159,17 @@ public actor OpenGrokShellOwnedProcessExecution: OpenGrokShellProcessExecution {
         for taskID in taskIDs {
             _ = await backend.killTask(taskID)
         }
+        // Removes arrive through per-task watches when the backend reaches a
+        // terminal state; do not flush here — a kill of one call must not
+        // clear unrelated still-running owned tasks from the chip.
     }
 
     public func cancelAll() async {
         await backend.killForegroundCommands(ownerSessionID: sessionID)
         await backend.killAllBackgroundTasks(ownerSessionID: sessionID)
+        // Session/host teardown: watches may lose the race with actor drop, so
+        // flush still-counted ids after the kill storm. Idempotent vs watchers.
+        await flushBackgroundWorkRemoves()
     }
 
     public func killTask(_ taskID: String) async -> ShellKillOutcome {
@@ -155,6 +194,59 @@ public actor OpenGrokShellOwnedProcessExecution: OpenGrokShellProcessExecution {
         return await backend.listTasks().filter {
             knownTaskIDs.contains($0.taskID) && $0.ownerSessionID == sessionID
         }
+    }
+
+    // MARK: - Active background work (status-chip push)
+
+    /// Upsert exactly after successful ownership registration, then attach one
+    /// completion waiter. Duplicate register of the same id is a no-op.
+    private func noteBackgroundWorkRegistered(_ taskID: String) async {
+        guard countedBackgroundWorkIDs.insert(taskID).inserted else { return }
+        await backgroundWorkEventSink?(.upsert(taskID: taskID))
+        backgroundWorkWatchTasks[taskID]?.cancel()
+        backgroundWorkWatchTasks[taskID] = Task { [weak self] in
+            guard let self else { return }
+            await self.awaitBackgroundWorkTerminal(taskID: taskID)
+            await self.emitBackgroundWorkRemove(taskID: taskID)
+        }
+    }
+
+    private func emitBackgroundWorkRemove(taskID: String) async {
+        guard countedBackgroundWorkIDs.remove(taskID) != nil else { return }
+        backgroundWorkWatchTasks.removeValue(forKey: taskID)?.cancel()
+        await backgroundWorkEventSink?(.remove(taskID: taskID))
+    }
+
+    private func flushBackgroundWorkRemoves() async {
+        let remaining = countedBackgroundWorkIDs
+        countedBackgroundWorkIDs.removeAll()
+        for task in backgroundWorkWatchTasks.values {
+            task.cancel()
+        }
+        backgroundWorkWatchTasks.removeAll()
+        for taskID in remaining {
+            await backgroundWorkEventSink?(.remove(taskID: taskID))
+        }
+    }
+
+    /// Await terminal without `waitForCompletion`'s `blockWaited` stamp (that
+    /// would suppress TaskCompleted wakes). Prefer the registry output stream's
+    /// `.completed` event when the backend is `LocalShellProcessBackend`; other
+    /// backends fall back to `waitForCompletion` (fakes / non-local).
+    private func awaitBackgroundWorkTerminal(taskID: String) async {
+        if let local = backend as? LocalShellProcessBackend {
+            if let stream = await local.outputStream(for: taskID) {
+                do {
+                    for try await event in stream {
+                        if case .completed = event { return }
+                    }
+                } catch {
+                    return
+                }
+                return
+            }
+        }
+        _ = await backend.waitForCompletion(taskID, timeout: nil)
     }
 
     private func ownedSnapshot(for taskID: String) async -> ShellTaskSnapshot? {
@@ -281,6 +373,9 @@ public actor OpenGrokShellToolRuntimeComposition {
     private var workingDirectories: [String: URL] = [:]
     private var activeCalls: [String: OpenGrokShellToolCall] = [:]
     private var cancelledCallKeys: Set<String> = []
+    /// Applied to every registered session execution (and retained for later
+    /// `registerSession` calls). CLI translates to `LiveActiveBackgroundWorkSink`.
+    private var backgroundWorkEventSink: OpenGrokShellBackgroundWorkEventSink?
 
     public init(
         processBackend: any ShellProcessBackend,
@@ -288,6 +383,15 @@ public actor OpenGrokShellToolRuntimeComposition {
     ) {
         self.backend = processBackend
         self.runtime = runtime
+    }
+
+    /// Install or replace the optional background-work chip sink on every
+    /// registered session execution. `nil` clears without emitting removes.
+    public func setBackgroundWorkEventSink(_ sink: OpenGrokShellBackgroundWorkEventSink?) async {
+        backgroundWorkEventSink = sink
+        for execution in executions.values {
+            await execution.setBackgroundWorkEventSink(sink)
+        }
     }
 
     public func registerSession(sessionID: String, workingDirectory: URL) throws {
@@ -309,7 +413,8 @@ public actor OpenGrokShellToolRuntimeComposition {
         executions[normalizedSessionID] = try OpenGrokShellOwnedProcessExecution(
             sessionID: normalizedSessionID,
             workingDirectory: normalizedDirectory,
-            backend: backend
+            backend: backend,
+            backgroundWorkEventSink: backgroundWorkEventSink
         )
         workingDirectories[normalizedSessionID] = normalizedDirectory
     }
@@ -424,10 +529,12 @@ public actor OpenGrokShellToolRuntimeComposition {
         }
         let activeExecutions = Array(executions.values)
         for process in activeExecutions {
+            // cancelAll kills then flushes still-counted chip ids.
             await process.cancelAll()
         }
         executions.removeAll()
         workingDirectories.removeAll()
+        backgroundWorkEventSink = nil
     }
 
     private func cancel(_ call: OpenGrokShellToolCall) async throws {

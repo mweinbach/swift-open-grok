@@ -246,13 +246,20 @@ struct OpenGrokPagerInteractiveControllerTests {
         #expect(texts.last == "")
     }
 
-    @Test("Up with a draft scrolls the transcript instead of recalling history")
-    func upScrollsWithDraft() async throws {
+    @Test("nonempty Up moves inside a multiline draft; PageUp/PageDown still page the viewport")
+    func upMovesInsideDraft() async throws {
+        // Pin 650c1db7: empty Up is history (`prompt.rs:465-486`); nonempty
+        // Up/Down are textarea vertical motion. PageUp/PageDown stay host
+        // viewport chords. The prior test pinned the opposite (draft Up =
+        // lineUp) and is rewritten to the pin.
         let renderer = RecordingInteractiveRenderer()
         let controller = OpenGrokPagerInteractiveController(
             input: makeInputStream([
-                .paste("draft"),
+                .paste("first"),
+                .key(KeyEvent(key: .enter, modifiers: [.shift])),
+                .paste("second"),
                 .key(KeyEvent(key: .up)),
+                .key(KeyEvent(key: .char("X"), character: "X")),
                 .key(KeyEvent(key: .pageUp)),
                 .key(KeyEvent(key: .pageDown)),
             ]),
@@ -263,17 +270,25 @@ struct OpenGrokPagerInteractiveControllerTests {
 
         _ = try await controller.run(.init(prompt: "", mode: .inline))
 
-        let commands = await renderer.viewportCommands
-        #expect(commands == [.lineUp, .pageUp, .pageDown])
+        #expect(await renderer.promptStates.last?.text == "firstX\nsecond")
+        #expect(await renderer.viewportCommands == [.pageUp, .pageDown])
     }
 
-    @Test("Home and End jump the transcript when the composer is empty")
-    func homeEndJumpTranscript() async throws {
+    @Test("empty Home/End are textarea no-ops; nonempty Home/End move in the draft")
+    func homeEndEditDraftNotTranscript() async throws {
+        // Pin: Home/End are not GotoTop/GotoBottom (those are g/G,
+        // `When::ScrollbackFocused`). Empty Home/End fall through to
+        // TextArea.input and do nothing; they must not jump the transcript.
         let renderer = RecordingInteractiveRenderer()
         let controller = OpenGrokPagerInteractiveController(
             input: makeInputStream([
                 .key(KeyEvent(key: .home)),
                 .key(KeyEvent(key: .end)),
+                .paste("ab"),
+                .key(KeyEvent(key: .home)),
+                .key(KeyEvent(key: .char("X"), character: "X")),
+                .key(KeyEvent(key: .end)),
+                .key(KeyEvent(key: .char("Y"), character: "Y")),
             ]),
             runtime: TestInteractiveRuntime(sessions: []),
             renderer: renderer,
@@ -282,7 +297,8 @@ struct OpenGrokPagerInteractiveControllerTests {
 
         _ = try await controller.run(.init(prompt: "", mode: .inline))
 
-        #expect(await renderer.viewportCommands == [.top, .bottom])
+        #expect(await renderer.viewportCommands.isEmpty)
+        #expect(await renderer.promptStates.last?.text == "XabY")
     }
 
     @Test("typing a slash opens a completion menu that Tab accepts")

@@ -409,6 +409,24 @@ public struct UiConfig: Hashable, Sendable, Codable, Equatable {
         return selectionHighlightDurationMs == 0
     }
 
+    /// Resolve `flash` | `hold` | `word_select` with the pin's precedence
+    /// (`appearance/cache.rs` `text_selection_from_ui` at `650c1db7`):
+    /// 1. Explicit canonical `[ui].keep_text_selection` always wins.
+    /// 2. Else retired `double_click_action = "word_select"` → `word_select`.
+    /// 3. Else `keepTextSelectionEnabled()` → `hold`, otherwise `flash`.
+    /// Default when nothing is set: `flash`.
+    public func resolvedKeepTextSelection() -> String {
+        if let s = keepTextSelection,
+           s == "flash" || s == "hold" || s == "word_select"
+        {
+            return s
+        }
+        if doubleClickAction == "word_select" {
+            return "word_select"
+        }
+        return keepTextSelectionEnabled() ? "hold" : "flash"
+    }
+
     // MARK: CodingKeys
 
     private enum CodingKeys: String, CodingKey {

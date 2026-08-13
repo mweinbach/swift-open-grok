@@ -1,5 +1,6 @@
 import Foundation
 import OpenGrokTerminalCore
+import OpenGrokTextArea
 
 // MARK: - Conversation content
 
@@ -327,6 +328,12 @@ public struct PagerComposerFlag: Sendable, Equatable, Hashable {
 public struct PagerComposerState: Sendable, Equatable, Hashable {
     public var text: String
     public var cursorCharacterOffset: Int?
+    /// UTF-8 caret. When `nil`, derived from `cursorCharacterOffset`.
+    public var cursorUTF8: Int?
+    public var selectionUTF8: Range<Int>?
+    public var selectedText: String?
+    public var textAreaState: TextAreaState
+    public var scrollOverride: Int?
     public var isFocused: Bool
     public var cursorVisible: Bool
     /// Two columns wide by contract — `"❯ "`, `"! "`, `"● "`, `"? "`.
@@ -351,6 +358,11 @@ public struct PagerComposerState: Sendable, Equatable, Hashable {
     public init(
         text: String = "",
         cursorCharacterOffset: Int? = nil,
+        cursorUTF8: Int? = nil,
+        selectionUTF8: Range<Int>? = nil,
+        selectedText: String? = nil,
+        textAreaState: TextAreaState = TextAreaState(),
+        scrollOverride: Int? = nil,
         isFocused: Bool = true,
         cursorVisible: Bool = true,
         prefix: String = PagerGlyphs.promptArrow,
@@ -365,6 +377,11 @@ public struct PagerComposerState: Sendable, Equatable, Hashable {
     ) {
         self.text = text
         self.cursorCharacterOffset = cursorCharacterOffset
+        self.cursorUTF8 = cursorUTF8
+        self.selectionUTF8 = selectionUTF8
+        self.selectedText = selectedText
+        self.textAreaState = textAreaState
+        self.scrollOverride = scrollOverride
         self.isFocused = isFocused
         self.cursorVisible = cursorVisible
         self.prefix = prefix
@@ -592,6 +609,12 @@ public struct PagerRenderState: Sendable, Equatable {
     /// producer that never wires the tick loop renders the same still frame
     /// as before — see `PagerMotionSnapshot`.
     public var motion: PagerMotionSnapshot
+    /// `[animation].wave_rows` — rows per accent-wave cycle
+    /// (`appearance/config.rs:377`, clamped `max(1)` at
+    /// `config.rs:1456`). Default matches `PagerMotion.defaultWaveRows` so
+    /// producers that never wire the pager.toml reader paint the same wave
+    /// span as before this field existed.
+    public var waveRows: Int
     /// The DERIVED render-value compact flag — upstream's
     /// `AppearanceConfig.prompt.compact` (`appearance/config.rs:91-95`), which
     /// every compact paint site reads and which is never the user setting
@@ -603,6 +626,13 @@ public struct PagerRenderState: Sendable, Equatable {
     /// terminals — the live composition's pass-through is pinned by the
     /// auto-compact toast test for exactly that reason.
     public var compactMode: Bool
+    /// `[scrollback.display].sticky_headers` from `$OPENGROK_HOME/pager.toml`
+    /// (`appearance/config.rs:158-160, 1429` at pin 650c1db7). Default
+    /// **true** — absent key / absent file / producers that never wire the
+    /// reader keep the forced-on behavior this field replaced. Compact
+    /// still suppresses sticky regardless (`scrollback_pane.rs:395-401`).
+    /// No env, no settings-modal row (`defs.rs` has none).
+    public var stickyHeadersEnabled: Bool
     /// `[ui] show_timestamps` — upstream's `appearance.show_timestamps`
     /// (`appearance/config.rs:35`), which IS the user value: unlike
     /// `compactMode` there is no derivation, `set_timestamps_inner` copies the
@@ -635,6 +665,30 @@ public struct PagerRenderState: Sendable, Equatable {
     /// Default `false`: a producer that never wires the gate paints exactly
     /// the frames it painted before this field existed.
     public var privacyBanner: Bool
+    /// Active or persistent text-selection highlight to paint after the
+    /// conversation base pass (`render_active_selection_overlay` /
+    /// `render_persistent_selection_overlay`). `nil` = no text highlight.
+    /// Sticky header rows are not drag-startable/selectable in this phase.
+    public var textSelectionHighlight: PagerTextSelectionHighlight?
+    /// Keyed table-selection sidecar for this frame. Table kinds paint only
+    /// from a matching sidecar (plus live structural equality when the
+    /// model still detects a grid); mismatch paints nothing — never a
+    /// re-detected replacement grid or a linear sweep. `nil` = no table
+    /// claim. Copy uses the same frozen sidecar; this field is how paint
+    /// sees it (pin 650c1db7).
+    public var tableSelectionGeometry: PagerTableSelectionGeometry?
+    /// Preformatted FPS HUD snapshot for this frame (`FpsOverlay`). `nil` =
+    /// HUD off / not painted. Carry the formatted body here, never
+    /// `PagerFpsHud` itself (that type is mutable session state).
+    public var fpsHud: PagerFpsHudOverlay?
+    /// Transient toast (Copied!, etc.). Wins over `stickyToast` while set.
+    /// Tick/expiry and focus-specific copy (mouse-off hint swap) are
+    /// live-layer concerns — pass the already-chosen strings.
+    public var toast: String?
+    /// Sticky status banner (mouse-off hint, reconnecting). Shown when
+    /// `toast` is nil. Default nil: producers that never wire a banner
+    /// paint the frames they painted before this field existed.
+    public var stickyToast: String?
 
     public init(
         size: TerminalSize,
@@ -652,10 +706,17 @@ public struct PagerRenderState: Sendable, Equatable {
         selectedBlockIndex: Int? = nil,
         overlays: PagerOverlayStack = PagerOverlayStack(),
         motion: PagerMotionSnapshot = PagerMotionSnapshot(),
+        waveRows: Int = PagerMotion.defaultWaveRows,
         compactMode: Bool = false,
+        stickyHeadersEnabled: Bool = true,
         showTimestamps: Bool = false,
         showTimeline: Bool = false,
-        privacyBanner: Bool = false
+        privacyBanner: Bool = false,
+        textSelectionHighlight: PagerTextSelectionHighlight? = nil,
+        tableSelectionGeometry: PagerTableSelectionGeometry? = nil,
+        fpsHud: PagerFpsHudOverlay? = nil,
+        toast: String? = nil,
+        stickyToast: String? = nil
     ) {
         self.overlays = overlays
         self.selectedBlockIndex = selectedBlockIndex
@@ -672,19 +733,88 @@ public struct PagerRenderState: Sendable, Equatable {
         self.theme = theme
         self.showScrollbar = showScrollbar
         self.motion = motion
+        self.waveRows = max(1, waveRows)
         self.compactMode = compactMode
+        self.stickyHeadersEnabled = stickyHeadersEnabled
         self.showTimestamps = showTimestamps
         self.showTimeline = showTimeline
         self.privacyBanner = privacyBanner
+        self.textSelectionHighlight = textSelectionHighlight
+        self.tableSelectionGeometry = tableSelectionGeometry
+        self.fpsHud = fpsHud
+        self.toast = toast
+        self.stickyToast = stickyToast
     }
+
+    /// Message currently drawn in the toast slot: transient wins while
+    /// set, otherwise sticky (`active_toast_message` without the
+    /// focus-specific mouse-off copy swap — that swap is live-layer).
+    public var activeToastMessage: String? {
+        pagerActiveToastMessage(transient: toast, sticky: stickyToast)
+    }
+}
+
+/// Transient wins while set; otherwise sticky. Focus-specific copy
+/// selection (mouse-off scrollback vs prompt hint) is a live-layer
+/// concern — pass the already-chosen sticky string.
+public func pagerActiveToastMessage(transient: String?, sticky: String?) -> String? {
+    if let transient { return transient }
+    return sticky
+}
+
+/// Pad `message` for the toast slot, truncating with a trailing ellipsis
+/// when it cannot fit (`fit_toast_text`, `agent_view/render.rs:4515-4526`
+/// at pin 650c1db7). ` {msg} `; available width `< 5` yields `nil`.
+public func pagerFitToastText(_ message: String, availableWidth: Int) -> String? {
+    let maxMsgChars = max(0, availableWidth - 4)
+    if maxMsgChars == 0 { return nil }
+    if message.count <= maxMsgChars {
+        return " \(message) "
+    }
+    var truncated = String(message.prefix(max(0, maxMsgChars - 1)))
+    while let last = truncated.last, last.isWhitespace {
+        truncated.removeLast()
+    }
+    return " \(truncated)… "
+}
+
+/// Fitted toast text plus the one-row bottom-right rect inside
+/// `conversation`, or `nil` when the slot is too narrow / empty / zero
+/// height (`render.rs:2007-2028`).
+public struct PagerToastPaintPlan: Sendable, Equatable {
+    public var text: String
+    public var rect: TerminalRect
+
+    public init(text: String, rect: TerminalRect) {
+        self.text = text
+        self.rect = rect
+    }
+}
+
+public func pagerToastPaintPlan(
+    message: String?,
+    conversation: TerminalRect
+) -> PagerToastPaintPlan? {
+    guard conversation.height > 0, conversation.width > 0 else { return nil }
+    guard let message, let text = pagerFitToastText(message, availableWidth: conversation.width)
+    else { return nil }
+    let width = text.count
+    // `sb.right().saturating_sub(w + 1)` / `sb.bottom().saturating_sub(1)`.
+    let x = max(0, conversation.right - (width + 1))
+    let y = max(0, conversation.bottom - 1)
+    return PagerToastPaintPlan(
+        text: text,
+        rect: TerminalRect(x: x, y: y, width: width, height: 1)
+    )
 }
 
 /// Last-frame conversation click-to-select geometry — area, scroll offset,
 /// painted content width, and per-block content starts/heights from the
 /// exact layout that painted. Gap rows are deliberately outside every
 /// `start..<start+height` so a click there selects nothing (upstream
-/// `entry_at_content_y`, `scrollback/state/layout.rs:100-124`). Not
-/// text-drag geometry.
+/// `entry_at_content_y`, `scrollback/state/layout.rs:100-124`). Sticky
+/// header rows route through `sticky.entryAtHeaderRow` first
+/// (`entry_index_at_screen_row`, layout.rs:280-311). Not text-drag geometry.
 public struct PagerConversationHitModel: Sendable, Equatable {
     public var conversation: TerminalRect
     public var scrollOffset: Int
@@ -696,19 +826,30 @@ public struct PagerConversationHitModel: Sendable, Equatable {
     public var contentWidth: Int
     public var blockStartLines: [Int]
     public var blockHeights: [Int]
+    /// Sticky header layout from THIS frame — header hits map via
+    /// `entryAtHeaderRow`; empty when sticky is gated off or inactive.
+    public var sticky: PagerStickyHeaderLayout
+    /// Toast slot painted this frame (`frame_occluder_rects` push at
+    /// `render.rs:2022-2027`). `nil` when no toast fitted. Mouse must not
+    /// fall through these cells onto transcript selection.
+    public var toastOccluder: TerminalRect?
 
     public init(
         conversation: TerminalRect,
         scrollOffset: Int,
         contentWidth: Int,
         blockStartLines: [Int],
-        blockHeights: [Int]
+        blockHeights: [Int],
+        sticky: PagerStickyHeaderLayout = .empty,
+        toastOccluder: TerminalRect? = nil
     ) {
         self.conversation = conversation
         self.scrollOffset = scrollOffset
         self.contentWidth = contentWidth
         self.blockStartLines = blockStartLines
         self.blockHeights = blockHeights
+        self.sticky = sticky
+        self.toastOccluder = toastOccluder
     }
 
     /// Exclusive screen X of the content/chrome band — first scrollbar or
@@ -720,15 +861,36 @@ public struct PagerConversationHitModel: Sendable, Equatable {
     }
 
     /// True when `(x, y)` sits inside the conversation pane's content/chrome
-    /// band and strictly before the scrollbar/rail gutter.
+    /// band and strictly before the scrollbar/rail gutter. Toast cells are
+    /// excluded so a click there does not fall through to block select.
     public func containsSelectablePoint(x: Int, y: Int) -> Bool {
         guard conversation.contains(x: x, y: y) else { return false }
+        if toastOccluder?.contains(x: x, y: y) == true { return false }
         return x < selectableEndX
     }
 
+    /// True when `(x, y)` is the painted toast slot this frame.
+    public func containsToastOccluder(x: Int, y: Int) -> Bool {
+        toastOccluder?.contains(x: x, y: y) ?? false
+    }
+
     /// Block index under `screenY`, or `nil` for gaps / outside / malformed.
+    /// Header rows (including the post-pinned gap) use sticky mapping; content
+    /// identity matches Rust: `contentY = viewportY + scrollOffset` after the
+    /// header short-circuit (layout.rs:301-310).
     public func blockIndex(atScreenY screenY: Int) -> Int? {
-        pagerConversationBlockIndex(
+        guard conversation.height > 0,
+              screenY >= conversation.y,
+              screenY < conversation.y + conversation.height
+        else { return nil }
+
+        let viewportY = screenY - conversation.y
+        let headerRows = sticky.headerScreenRows
+        if sticky.hasHeader, viewportY >= 0, viewportY < headerRows {
+            return sticky.entryAtHeaderRow(viewportY)
+        }
+
+        return pagerConversationBlockIndex(
             screenY: screenY,
             conversation: conversation,
             scrollOffset: scrollOffset,
@@ -736,6 +898,252 @@ public struct PagerConversationHitModel: Sendable, Equatable {
             blockHeights: blockHeights
         )
     }
+}
+
+/// One soft-wrapped (or empty) visual row of the composer, with UTF-8
+/// offsets into the full draft. Soft wraps split mid-physical-line; hard
+/// `\n` boundaries produce a new row. Ranges come from `composerWrapOptions`
+/// / `wrapRanges`, not `wrapDisplayLinesWithRanges`.
+public struct PagerComposerWrappedLine: Sendable, Equatable {
+    /// Inclusive UTF-8 offset of this row's first byte in the draft.
+    public var startOffset: Int
+    /// Exclusive UTF-8 offset — past EOL / soft-wrap boundary.
+    public var endOffset: Int
+    public var text: String
+
+    public init(startOffset: Int, endOffset: Int, text: String) {
+        self.startOffset = max(0, startOffset)
+        self.endOffset = max(self.startOffset, endOffset)
+        self.text = text
+    }
+
+    public var utf8Range: Range<Int> { startOffset..<endOffset }
+}
+
+/// Result of hit-testing a screen cell against a painted composer.
+public enum PagerComposerHitResult: Sendable, Equatable {
+    /// Inside the pane but on border / prefix / gutter chrome — focus only.
+    case focusOnly
+    /// Inside the text content columns. The controller forwards the mouse
+    /// event to `TextArea.handleMouse`; this case does not carry an offset.
+    case content
+}
+
+/// Last-painted composer click geometry — full input pane, the inner text
+/// box `renderComposer` paints into, and wrap rows from the same
+/// `projectComposerGeometry` snapshot the paint used. Published
+/// replace-wholesale with the other mouse caches so a click never maps
+/// against an unpainted layout.
+///
+/// Prefix/chrome sit outside the content rect. Collapsed-unfocused clicks
+/// are focus-only at the router (see `isFocused`).
+public struct PagerComposerHitModel: Sendable, Equatable {
+    /// Full composer chrome rect (`PagerFrameLayout.input`).
+    public var pane: TerminalRect
+    /// Inner text box (excludes top/bottom border rows and left/right border
+    /// + gutter columns). Prefix cells live at the leading edge of this rect.
+    public var textArea: TerminalRect
+    /// Columns reserved for the prompt prefix (`PagerGlyphs.promptArrowWidth`).
+    public var prefixWidth: Int
+    /// Wrap width passed to `composerWrapOptions`.
+    public var textWidth: Int
+    /// First wrapped-line index painted at `textArea.y` — TextArea effective
+    /// scroll from the same projection the paint used.
+    public var firstVisibleRow: Int
+    public var lines: [PagerComposerWrappedLine]
+    /// Last-painted focus. Unfocused (collapsed) pane clicks are focus-only.
+    public var isFocused: Bool
+
+    public init(
+        pane: TerminalRect,
+        textArea: TerminalRect,
+        prefixWidth: Int,
+        textWidth: Int,
+        firstVisibleRow: Int,
+        lines: [PagerComposerWrappedLine],
+        isFocused: Bool = true
+    ) {
+        self.pane = pane
+        self.textArea = textArea
+        self.prefixWidth = max(0, prefixWidth)
+        self.textWidth = max(1, textWidth)
+        self.firstVisibleRow = max(0, firstVisibleRow)
+        self.lines = lines
+        self.isFocused = isFocused
+    }
+
+    /// Content rect passed to `TextArea.handleMouse` — prefix excluded.
+    public var contentRect: TextAreaRect {
+        TextAreaRect(
+            x: textArea.x + prefixWidth,
+            y: textArea.y,
+            width: textWidth,
+            height: textArea.height
+        )
+    }
+
+    public func containsPane(x: Int, y: Int) -> Bool {
+        pane.contains(x: x, y: y)
+    }
+
+    /// `nil` outside the pane; `.focusOnly` on border/prefix/gutter; `.content`
+    /// for a cell inside the wrap/hit projection. Trap-free under empty
+    /// models, zero-height text areas, and out-of-range rows.
+    public func hit(x: Int, y: Int) -> PagerComposerHitResult? {
+        guard pane.width > 0, pane.height > 0, pane.contains(x: x, y: y) else {
+            return nil
+        }
+        guard textArea.width > 0, textArea.height > 0, textArea.contains(x: x, y: y) else {
+            return .focusOnly
+        }
+        let contentX = textArea.x + prefixWidth
+        guard x >= contentX else { return .focusOnly }
+        let contentRight = contentX + textWidth
+        guard x < contentRight else { return .focusOnly }
+
+        let visualRow = y - textArea.y
+        guard visualRow >= 0, visualRow < textArea.height else { return .focusOnly }
+        return .content
+    }
+}
+
+/// Map a display column onto a Character offset within one wrapped line.
+/// Wide graphemes snap to their start (no mid-glyph offset); columns past
+/// the line's display width clamp to `line.endOffset`.
+public func pagerComposerCursorOffset(
+    atDisplayColumn column: Int,
+    line: PagerComposerWrappedLine
+) -> Int {
+    let target = max(0, column)
+    var widthSoFar = 0
+    var offset = line.startOffset
+    for grapheme in line.text {
+        let graphemeWidth = max(0, UnicodeDisplayWidth.width(ofGrapheme: String(grapheme)))
+        if widthSoFar + graphemeWidth > target {
+            return offset
+        }
+        widthSoFar += graphemeWidth
+        offset += 1
+    }
+    return line.endOffset
+}
+
+/// Last-painted transcript scrollbar geometry — published only when the
+/// scrollbar actually paints and the timeline rail is absent (upstream
+/// `hit_scrollbar.set` / `.clear`, `agent_view/render.rs:1917-1926` at pin
+/// 650c1db7). Routers consume this replace-wholesale cache so a click never
+/// maps against a previous frame's gutter or against layout that has not
+/// painted yet.
+public struct PagerScrollbarHitModel: Sendable, Equatable {
+    public var rect: TerminalRect
+    public var totalContentLines: Int
+    public var viewportHeight: Int
+    /// Thumb height / start from the same paint math as
+    /// `renderConversation` — useful for tests and drag diagnostics; the
+    /// inverse helper does not need them at the call site.
+    public var thumbHeight: Int
+    public var thumbStart: Int
+
+    public init(
+        rect: TerminalRect,
+        totalContentLines: Int,
+        viewportHeight: Int,
+        thumbHeight: Int,
+        thumbStart: Int
+    ) {
+        self.rect = rect
+        self.totalContentLines = totalContentLines
+        self.viewportHeight = viewportHeight
+        self.thumbHeight = thumbHeight
+        self.thumbStart = thumbStart
+    }
+
+    public func contains(x: Int, y: Int) -> Bool {
+        rect.contains(x: x, y: y)
+    }
+
+    /// Content scroll offset for a screen row — inverse of this frame's
+    /// thumb paint (`pagerScrollbarOffset`).
+    public func offset(atScreenY screenY: Int) -> Int {
+        let cellIndex = screenY - rect.y
+        return pagerScrollbarOffset(
+            cellIndex: cellIndex,
+            trackHeight: rect.height,
+            total: totalContentLines,
+            viewport: viewportHeight
+        )
+    }
+
+    /// True when `screenY` is the bottom track cell that Rust's
+    /// `ScrollbarClickResult::Bottom` / `goto_bottom` re-engages follow on
+    /// (`scrollbar.rs:188-189`, `nav.rs:540-546`). A one-row track is Top
+    /// only (`cell_index == 0` wins), so it never reports bottom.
+    public func isBottomCell(atScreenY screenY: Int) -> Bool {
+        let height = rect.height
+        guard height > 1 else { return false }
+        let cellIndex = screenY - rect.y
+        return cellIndex > 0 && cellIndex >= height - 1
+    }
+}
+
+/// Thumb height matching `renderConversation`'s paint
+/// (`max(1, (viewport * viewport) / max(total, 1))`). Trap-free: empty /
+/// non-positive inputs collapse to a 1-cell thumb.
+public func pagerScrollbarThumbHeight(total: Int, viewport: Int) -> Int {
+    let content = max(total, 1)
+    let view = max(viewport, 0)
+    guard view > 0 else { return 1 }
+    return max(1, (view * view) / content)
+}
+
+/// Thumb start row matching `renderConversation`'s paint, clamped to the
+/// track travel. Trap-free under zero travel / zero max offset.
+public func pagerScrollbarThumbStart(
+    scrollOffset: Int,
+    total: Int,
+    viewport: Int,
+    trackHeight: Int
+) -> Int {
+    let thumbHeight = pagerScrollbarThumbHeight(total: total, viewport: viewport)
+    let maximumOffset = max(0, total - max(0, viewport))
+    let travel = max(0, trackHeight - thumbHeight)
+    guard maximumOffset > 0, travel > 0 else { return 0 }
+    return min(travel, (max(0, scrollOffset) * travel) / maximumOffset)
+}
+
+/// Map a scrollbar-track cell to a content scroll offset — exact inverse of
+/// `renderConversation`'s thumb placement, with Rust's top/bottom edge
+/// shortcuts (`scrollbar_click_to_offset`, `scrollbar.rs:173-207` at pin
+/// 650c1db7: first cell → 0, last cell → max). Mid-track centers the thumb
+/// on the clicked cell (JumpToClick) then inverts
+/// `thumbStart = (offset * travel) / maxOffset`. Clamped / trap-free for
+/// malformed inputs (`total <= viewport`, one-row track, negative cells,
+/// zero track).
+public func pagerScrollbarOffset(
+    cellIndex: Int,
+    trackHeight: Int,
+    total: Int,
+    viewport: Int
+) -> Int {
+    let track = max(0, trackHeight)
+    guard track > 0 else { return 0 }
+    let view = max(0, viewport)
+    let content = max(0, total)
+    let maximumOffset = max(0, content - view)
+    guard maximumOffset > 0 else { return 0 }
+
+    // First row → top (also wins a one-row track over the bottom arm).
+    if cellIndex <= 0 { return 0 }
+    // Last row → bottom.
+    if cellIndex >= track - 1 { return maximumOffset }
+
+    let thumbHeight = pagerScrollbarThumbHeight(total: content, viewport: view)
+    let travel = max(0, track - thumbHeight)
+    guard travel > 0 else { return 0 }
+
+    let halfThumb = thumbHeight / 2
+    let thumbStart = min(travel, max(0, cellIndex - halfThumb))
+    return min(maximumOffset, (thumbStart * maximumOffset) / travel)
 }
 
 public struct PagerFrameLayout: Sendable, Equatable {
@@ -752,6 +1160,12 @@ public struct PagerFrameLayout: Sendable, Equatable {
     public var visibleContentLines: Range<Int>
     public var scrollOffset: Int
     public var hasScrollbar: Bool
+    /// Sticky header layout for THIS frame (`StickyHeaderLayout` from
+    /// `compute_sticky_layout`). Empty when compact / gated off / scroll 0.
+    public var sticky: PagerStickyHeaderLayout
+    /// `sticky.headerScreenRows` — content paints below this band. Published
+    /// so live page-scroll can call `pagerPageScrollRows` without recompute.
+    public var headerScreenRows: Int
     /// The timeline rail this frame painted, exposed for mouse hit-testing
     /// the same way `overlays` is — upstream computes the geometry once per
     /// frame and both the renderer and `mouse.rs` consume that one value so
@@ -778,6 +1192,25 @@ public struct PagerFrameLayout: Sendable, Equatable {
     /// transcript (e.g. minimal host overlay scoping); a live frame always
     /// publishes it so a router never acts on a previous frame's starts.
     public var conversationHit: PagerConversationHitModel?
+    /// Transcript scrollbar hit geometry from THIS frame's paint, or `nil`
+    /// when the rail owns the gutter / the scrollbar did not paint
+    /// (`hit_scrollbar` clear arm, `agent_view/render.rs:1924-1926`).
+    public var scrollbarHit: PagerScrollbarHitModel?
+    /// Composer click-to-focus / cursor-place geometry from THIS frame's
+    /// paint. `nil` when the input slot is too small to paint (same gate as
+    /// `renderComposer`).
+    public var composerHit: PagerComposerHitModel?
+    /// Linear transcript text-selection model from THIS frame's paint —
+    /// replace-wholesale each frame so hits/copy never act on stale geometry
+    /// (`RenderOutput.selection_model`, selection.rs / scrollback/render.rs).
+    /// Includes off-screen line text/joiners for reconstruction; sticky header
+    /// rows are not published as selectable (deferred sticky drag).
+    public var textSelection: PagerTextSelectionModel?
+    /// Toast occluder from THIS frame's paint (`frame_occluder_rects`).
+    /// `nil` when no toast fitted. Same rect as
+    /// `conversationHit?.toastOccluder` so mouse routers that only hold
+    /// layout still see it.
+    public var toastOccluder: TerminalRect?
 
     public init(
         bounds: TerminalRect,
@@ -793,10 +1226,16 @@ public struct PagerFrameLayout: Sendable, Equatable {
         visibleContentLines: Range<Int>,
         scrollOffset: Int,
         hasScrollbar: Bool,
+        sticky: PagerStickyHeaderLayout = .empty,
+        headerScreenRows: Int = 0,
         timelineRail: PagerTimelineRail? = nil,
         privacyBanner: PagerPrivacyBannerHitRects? = nil,
         contextBar: TerminalRect? = nil,
-        conversationHit: PagerConversationHitModel? = nil
+        conversationHit: PagerConversationHitModel? = nil,
+        scrollbarHit: PagerScrollbarHitModel? = nil,
+        composerHit: PagerComposerHitModel? = nil,
+        textSelection: PagerTextSelectionModel? = nil,
+        toastOccluder: TerminalRect? = nil
     ) {
         self.bounds = bounds
         self.statusBar = statusBar
@@ -811,10 +1250,16 @@ public struct PagerFrameLayout: Sendable, Equatable {
         self.visibleContentLines = visibleContentLines
         self.scrollOffset = scrollOffset
         self.hasScrollbar = hasScrollbar
+        self.sticky = sticky
+        self.headerScreenRows = max(0, headerScreenRows)
         self.timelineRail = timelineRail
         self.privacyBanner = privacyBanner
         self.contextBar = contextBar
         self.conversationHit = conversationHit
+        self.scrollbarHit = scrollbarHit
+        self.composerHit = composerHit
+        self.textSelection = textSelection
+        self.toastOccluder = toastOccluder
     }
 }
 

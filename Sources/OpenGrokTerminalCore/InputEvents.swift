@@ -84,7 +84,7 @@ public struct KeyModifiers: Sendable, Equatable, Codable, OptionSet, Hashable {
 
 /// A mouse event.
 public struct MouseEvent: Sendable, Equatable {
-    public enum Kind: Sendable, Equatable {
+    public enum Kind: Sendable, Equatable, Hashable {
         case down, up, drag, move, scrollUp, scrollDown, scrollLeft, scrollRight
     }
     public var kind: Kind

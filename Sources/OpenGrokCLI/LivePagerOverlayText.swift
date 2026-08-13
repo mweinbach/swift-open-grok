@@ -20,8 +20,14 @@ enum LivePagerOverlayText {
 
     /// The command palette's fallback rows, parsed out of the controller's own
     /// help text so the palette cannot drift from `/help`.
-    static func commandRows(workflowsEnabled: Bool = true) -> [PagerListRow] {
-        OpenGrokPagerInteractiveController.helpText(workflowsEnabled: workflowsEnabled)
+    static func commandRows(
+        workflowsEnabled: Bool = true,
+        mouseReportingToggleEnabled: Bool = false
+    ) -> [PagerListRow] {
+        OpenGrokPagerInteractiveController.helpText(
+            workflowsEnabled: workflowsEnabled,
+            mouseReportingToggleEnabled: mouseReportingToggleEnabled
+        )
             .split(separator: "\n", omittingEmptySubsequences: false)
             .compactMap { line in
                 let trimmed = line.trimmingCharacters(in: .whitespaces)

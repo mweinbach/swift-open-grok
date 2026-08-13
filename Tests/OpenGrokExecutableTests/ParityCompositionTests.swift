@@ -1918,13 +1918,28 @@ struct ParityCompositionTests {
 
     @Test("mouse reporting is bracketed with the alternate screen and toggleable")
     func liveInteractiveMouseReporting() async {
-        let outcome = await runInteractiveOverlaySession { terminal, continuation in
+        // `/toggle-mouse-reporting` is opt-in (`GROK_MOUSE_REPORTING_TOGGLE` /
+        // `[ui].mouse_reporting_toggle`); enable the gate for this live seam.
+        let outcome = await runInteractiveOverlaySession(
+            environmentOverrides: ["GROK_MOUSE_REPORTING_TOGGLE": "1"]
+        ) { terminal, continuation in
+            await Self.waitForPaintedText("Build anything", terminal: terminal)
+            // Welcome covers the toast slot; Esc is a no-op on the
+            // non-capturing welcome, then `/history` notes on an empty
+            // session and dismisses it via appendMessage.
+            continuation.yield(.key(KeyEvent(key: .escape)))
+            continuation.yield(.paste("/history"))
+            continuation.yield(.key(KeyEvent(key: .enter)))
+            await Self.waitForPaintedText("No prompt history", terminal: terminal)
             // A wheel report over the transcript scrolls it rather than
             // reaching the composer.
             continuation.yield(.mouse(MouseEvent(kind: .scrollUp, x: 10, y: 5)))
             continuation.yield(.paste("/toggle-mouse-reporting"))
             continuation.yield(.key(KeyEvent(key: .enter)))
-            await Self.waitForPaintedText("Mouse reporting off", terminal: terminal)
+            await Self.waitForPaintedText(
+                "/toggle-mouse-reporting to enable mouse reporting and restore TUI features",
+                terminal: terminal
+            )
         }
         let output = outcome.output
         let enable = output.range(of: "\u{1B}[?1006h")
@@ -1945,7 +1960,11 @@ struct ParityCompositionTests {
             #expect(disable.lowerBound < alternateExit.lowerBound)
         }
         _ = disable
-        #expect(output.contains("Mouse reporting off"))
+        #expect(outcome.painted.contains(
+            "/toggle-mouse-reporting to enable mouse reporting and restore TUI features"
+        ))
+        #expect(!outcome.painted.contains("Mouse reporting off. Click and drag"))
+        #expect(!output.contains("Mouse reporting off. Click and drag"))
     }
 
     @Test("live file tools reject paths outside the working directory")

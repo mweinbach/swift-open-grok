@@ -1,6 +1,6 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-11 (local TUI interaction wave). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green: macOS still dies mid-suite at the reproducible live-composition stop, Windows still does not compile through the remaining modules, and Linux's completed suite result is known later in this file (**5,832 tests / 935 suites / 28 issues**, exit 1) — not unconfirmed. Same-day prior local correctness (ACP reverse permission live-proven, Hub MCP `closeCount`, same-process resume cwd, foreign `sessions list` gating) still stands. Local serial gate for this TUI wave (lead, 2026-08-11; no platform CI rerun): `build-tests` exit 0; focused final TUI matrix exit 0 (**exactly 154 tests in 25 suites**); real PTY filters `PagerPTYSessionTests|InferencePTYScenarioTests` exit 0 (**5 tests in 2 suites**); full `test --no-parallel` count-only exit 0 — exactly **5,423 Swift Testing cases, 932 suites, 74 nonempty test-run summaries**, elapsed **303.118s**, zero failed summaries/issues. No known remaining local flaky tests from the recorded Rhai + Hub MCP `closeCount` pair; CI reliability remains unproven. **Do not read the local green as CI green** — that is exactly the substitution this ledger exists to prevent.
+**As of:** 2026-08-12 (local final TUI divergence closure). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green: macOS still dies mid-suite at the reproducible live-composition stop, Windows still does not compile through the remaining modules, and Linux's completed suite result is known later in this file (**5,832 tests / 935 suites / 28 issues**, exit 1) — not unconfirmed. Prior local correctness (ACP reverse permission live-proven, Hub MCP `closeCount`, same-process resume cwd, foreign `sessions list` gating), the 2026-08-11 TUI interaction wave (motion/X10/block-select), the same-day remaining-TUI-gap follow-on (scroll stream / background chip / direct mouse / display probe / animation `pager.toml` / mouse-reporting toggle / link-scheme safety), and the sticky-header + transcript text-selection follow-on still stand where this closure does not supersede them. Local serial gate for this final TUI divergence closure (lead, 2026-08-12; **no platform CI rerun**): `build-tests` exit 0; focused real `PagerPTYSessionTests` exit 0 (**exactly 3 tests in 1 suite**, 2.894s); first full verbose serial exit 0, **367.631s** (terminal body truncated — do **not** use its partial count); authoritative count-filtered second full `test --no-parallel` exit 0 — exactly **6,470 Swift Testing cases, 1,017 suites, 106 nonempty summaries** (one summary is 10 tests in 0 suites), elapsed **354.149s** (authoritative final-tree serial). No known remaining local flaky tests from the recorded Rhai + Hub MCP `closeCount` pair; CI reliability remains unproven. **Do not read the local green as CI green** — that is exactly the substitution this ledger exists to prevent.
 **Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. Wave 11 closed 50 audited gaps, retained one duplicate as skipped, and landed partial implementations for five platform-constrained findings. This remains an incomplete source port rather than a full Rust-parity release: capable-Linux sandbox proof, Windows named-pipe leader IPC and portable secure WebSockets, Linux custom-CA installation, Antigravity follow-ons, durable cross-process subagent resume, and post-change platform CI plus required-check evidence remain open.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`; +2 commits, release `v0.1.220-open-grok.58` — one substantive commit, `f0a5a29f` "Harden provider reasoning and fast routing": service-tier wire field, provider strips, Fireworks effort restore/pacing, Meta reasoning-item drop, effort-support gating, plus the release stamp. The E24 audit found the port had already forward-ported roughly half of this delta in Wave 16/E3 with citations that only resolve at `.58`; the re-pin legitimizes them. Prior re-pins: 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` (+3 commits, `.57`, the Meta API provider delta); 2026-08-05 from `80dff0a9dcb24121b976b9f920fbe442af40ea88` (+14, `.54`); 2026-08-04 from `9739c4a2ad23cfea14312a481169757f3da494f4` (+202, `.22`–`.53`). Local read-only clone: `/Users/mweinbach/Projects/open-grok`, whose working tree IS the pin (`650c1db7`) as of this re-pin — still prefer `git show 650c1db7:<path>` / `git grep <pat> 650c1db7 -- crates` (crates prefixed `crates/codegen/`) so reads stay correct if that clone moves again. The former clone at `/Users/mweinbach/Projects/grok-build` no longer exists (observed gone 2026-08-08).
@@ -8,11 +8,388 @@
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 **Base commit before R10 edits:** `93584585eb038c155fbc773ad287f6ee2b043ff4`.
 
+## Local final TUI divergence closure (2026-08-12, complete)
+
+Current truth for the verified 2026-08-12 final TUI divergence closures against
+pin `650c1db7` (verify-open-grok run `20260812-divergence-close`). Historical
+sections below (including **Local sticky-header + transcript text-selection
+follow-on**, **Local remaining-TUI-gap follow-on**, and **Local TUI interaction
+wave**) keep their contemporaneous wording; where they conflict on table
+box-grid selection, sticky-header drag-selectability, `sticky_headers` config,
+composer `PromptEditor` / `OpenGrokTextArea`, FPS HUD / `GROK_FPS` / `/debug fps`,
+mouse-off sticky toast, or the invented mouse-off transcript-note claim,
+**this section wins**. Prior 2026-08-12 honest lists that still name table
+cell/grid→linear degradation, sticky header rows not text-drag selectable as a
+divergence, composer `PromptEditor` drag/multi-click / `OpenGrokTextArea` not
+adopted, `sticky_headers` config/settings toggle as a gap, FPS HUD / `show_fps`
+absent, or mouse-off sticky hint/banner absent (including the invented
+transcript-note claim) are **superseded** by the closures and honest leftovers
+below.
+
+**Verification (lead, local macOS, 2026-08-12; no platform CI rerun):**
+
+- `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
+- Focused real `PagerPTYSessionTests` — exit 0, **exactly 3 tests in 1 suite**,
+  2.894s.
+- First full verbose serial — exit 0, **367.631s**; terminal body truncated, so
+  do **not** use its partial count.
+- Authoritative count-filtered second full
+  `zsh workflows/swift-safe-verify.zsh test --no-parallel` — exit 0: exactly
+  **6,470** Swift Testing cases, **1,017** suites, **106** nonempty summaries
+  (one summary is 10 tests in 0 suites), elapsed **354.149s**. This is
+  final-tree serial.
+- Real-CLI smoke (`verify-open-grok`, separate from Swift totals): isolated run
+  `20260812-divergence-close`; helper `doctor` / version `0.1.220-open-grok.58`
+  exit 0; paths isolated `/tmp` home; models json nonempty default `grok-4.5`;
+  `sessions` fresh empty exit 0; `help` exit 0; cleanup succeeded; artifacts
+  retained. Does **not** by itself prove interactive TUI.
+- **No platform CI run** for this closure — keep the standing warning above.
+
+### Closures (live)
+
+1. **Table box-grid selection** — paint-text geometry detection; fail-closed
+   linear on malformed/border-start; cell/grid drag hysteresis; cell partial
+   copy and TSV grid; triple cell / whole table; keyed sidecar frozen;
+   stale/reflow paint none; empty valid cell no linear fallback; table-shaped
+   assistant paint no soft-wrap. The prior “table cell/grid selection degrades
+   to linear” claim is **superseded** except the honest leftover below.
+2. **Sticky header text not drag-selectable is PIN PARITY, not a divergence** —
+   the header band never publishes selectable geometry. Reclassify/remove the
+   prior “sticky header rows are not text-drag selectable” divergence claim.
+   `$OPENGROK_HOME/pager.toml [scrollback.display].sticky_headers` one-shot
+   config is now live, default **true**, compact override. No env / no settings
+   row is **upstream parity, not a gap**. Wrong-type parse diagnostic is
+   visible; project `pager.toml` is not authority. The prior
+   “`sticky_headers` config/settings toggle absent” gap is **superseded**.
+3. **Composer `PromptEditor` uses one `OpenGrokTextArea` as the sole mutable
+   buffer.** Live click / drag / double word / triple line / wheel /
+   edge-autoscroll / selection highlight + OSC 52; same wrap for paint/hit;
+   UTF-8 internals at `Character` boundary; selection replacement; X10
+   up-none; overlay / resize / suspend cancel; readline fallthrough with host
+   policy intercept. The prior “composer `PromptEditor` drag/multi-click still
+   absent; full `OpenGrokTextArea` not adopted” claim is **superseded**. Do
+   **not** claim full prompt-widget parity (honest leftovers below).
+4. **FPS HUD** live via raw `GROK_FPS` nonempty `!= 0` and `/debug fps`; 120
+   samples, 250ms cache, full frame layout+writer timing, 2×32 top-right.
+   `[animation].show_fps` remains parse-only because the pin also never reads
+   it; no settings row / motion gate. `/debug` only advertises `fps` because
+   scroll/log HUDs are absent — narrower command surface, recorded below. The
+   prior “FPS HUD / `show_fps` absent” gap is **superseded** for the live HUD
+   path.
+5. **Mouse-off sticky toast** live: successful off ⇒ focus-swapped sticky
+   (`Ctrl+r…` scrollback, `/toggle…` prompt); transient wins; on clears +
+   `Mouse reporting on`; idle scroll-clock expiry; rollback/minimal; occluder.
+   The old invented transcript-note behavior is removed:
+   `/toggle-mouse-reporting` no longer appends a system transcript note. Auth welcome raw-url
+   mouse-disable/clear remains an honest existing auth divergence.
+
+### Honest leftovers (not claimed fixed)
+
+- **Wrapped-fragment table-cell parity:** `OpenGrokMarkdown` still fits /
+  truncates cells instead of upstream wrapped cell fragments / `maxTableWidth`,
+  so wrapped-fragment parity is only synthetic/pure and must remain explicit.
+- **Composer prompt-widget leftovers:** paste chips / image elements; `@`
+  file-ref search/view; predicted prompt / Ghostty extras; Ctrl-V internal
+  clipboard and prompt paging / per-family key-table divergences as applicable.
+  Do **not** claim full prompt-widget parity.
+- **`[animation].show_fps`** remains parse-only (pin also never reads it); no
+  settings row / motion gate.
+- **`/debug` advertises only `fps`** because scroll/log HUDs are absent
+  (narrower command surface than a full debug-HUD family).
+- **Auth welcome raw-url mouse-disable/clear** (`auth_show_raw_url` /
+  `auth_mouse_disabled`) remains an existing auth divergence: this port has no
+  welcome raw-url mouse-capture state, so it does **not** couple sticky-toast
+  clear to an invented auth path.
+- **Windows display-refresh probe** remains unsupported; Linux skip matches the
+  pin.
+
+Do **not** keep table cell/grid→linear degradation, sticky-header-not-selectable
+as a divergence, composer `PromptEditor` / `OpenGrokTextArea` adoption,
+`sticky_headers` config/settings toggle as a gap, FPS HUD absent, or mouse-off
+sticky banner absent (including the invented transcript-note claim) in current
+deferred lists.
+
+## Local sticky-header + transcript text-selection follow-on (2026-08-12, complete)
+
+Contemporaneous record of the verified sticky-header + linear transcript
+text-selection closures against pin `650c1db7` (verify-open-grok run
+`20260812-deep-tui`). **Superseded as current truth** by **Local final TUI
+divergence closure** above for table box-grid selection, sticky-header
+drag-selectability (now pin parity), `sticky_headers` config, composer
+`PromptEditor` / `OpenGrokTextArea`, FPS HUD, mouse-off sticky toast, and the
+invented mouse-off transcript-note claim. Historical sections below (including
+**Local remaining-TUI-gap follow-on** and **Local TUI interaction wave**) keep
+their contemporaneous wording; where they conflict on sticky headers, transcript
+text drag/multi-click, `keep_text_selection`, or the native/modifier link gate,
+**this section still wins over those older sections**, but not over the final
+TUI divergence closure. Prior remaining-gap lists that still name broad “sticky
+headers absent” or “text drag/multi-click absent” remain **superseded** by the
+closures below.
+
+**Verification (lead, local macOS, 2026-08-12; no platform CI rerun):**
+
+- `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
+- Expanded deep TUI filter — exit 0, **exactly 310 tests in 47 suites**
+  (sum of five test-run summaries: 27/9 + 32/6 + 99/10 + 6/1 + 146/21).
+- Real PTY filters `PagerPTYSessionTests|InferencePTYScenarioTests` — exit 0,
+  **5 tests in 2 suites**.
+- `zsh workflows/swift-safe-verify.zsh test --no-parallel` count-only — exit 0:
+  exactly **5,682** Swift Testing cases, **970** suites, **74** nonempty test-run
+  summaries, elapsed **345.286s**, zero failed summaries/issues. Authoritative
+  final-tree serial.
+- Real-CLI smoke (`verify-open-grok`, separate from Swift totals): isolated run
+  `20260812-deep-tui`; helper `doctor` exit 0 / version `0.1.220-open-grok.58`;
+  `sessions list` exit 0 with fresh-home empty listing; `help sessions` exit 0;
+  cleanup succeeded; artifacts retained. Does **not** claim TUI sticky-header or
+  text-selection behavior.
+- **No platform CI run** for this follow-on — keep the standing warning above.
+
+### Closures (live)
+
+1. **Sticky headers default-live when `!compact`** — pinned user-prompt
+   collapse/push/clip/fade, reduced content band, sticky-aware mouse hits/gaps,
+   action-time PageUp/PageDown header recompute, compact keeps the old
+   (non-sticky) behavior, scrollbar/timeline logical offsets honor the sticky
+   band. No settings-toggle reader yet; default **true** is forced. Cosmetic
+   min-height / ellipsis / indexed-fade divergence may remain where code comments
+   retain it — not claimed closed.
+2. **Linear transcript text drag / multi-click** — last-painted selectable
+   geometry; Unicode / offscreen reflow-safe copy via OSC 52; drag threshold;
+   chrome→text conversion; X10; URL/word double-click + line triple-click in
+   `word_select`; flash / hold / `word_select` live settings + legacy-key
+   transaction/reset; autoscroll dedicated clock + action-time reclamp;
+   resize-safe frozen width; Esc / new-down clear; suspend deadline.
+   Appearance/Mouse **`keep_text_selection`** is live (leaves the hidden-rows
+   list). Link native/modifier gate is aligned (prior bare left-click same-cell
+   divergence note is **superseded** for that gate).
+3. **Timeline test interaction update** is **test-only proof**, not a product
+   feature claim — do not read suite coverage of timeline interaction as a new
+   live timeline capability beyond what prior waves already recorded.
+
+### Honest remaining divergences (contemporaneous deep-tui; superseded)
+
+*Superseded later 2026-08-12 by Local final TUI divergence closure.*
+Contemporaneous wording kept:
+
+- **Table cell/grid selection** degrades to linear selection.
+- **Sticky header rows are not text-drag selectable.**
+- **Composer `PromptEditor` drag/multi-click** still absent; full
+  `OpenGrokTextArea` not adopted.
+- **`sticky_headers` config/settings toggle** absent even though default sticky
+  behavior is live (forced default true; no reader/row).
+- **FPS HUD / `show_fps`** and **mouse-off sticky hint/banner** (port still has
+  no sticky-toast surface for mouse-off; slash toggle note remains).
+- **Windows display-refresh probe** (unsupported); Linux remains an honest skip
+  (unsupported by Rust at this pin too).
+- **Auth welcome raw-url mouse-disable** (`auth_show_raw_url` /
+  `auth_mouse_disabled` at `app_view.rs:4872-4892`) is an existing auth
+  divergence: this port has no welcome raw-url mouse-capture state, so it does
+  **not** couple sticky-toast clear to an invented auth path. Upstream clears
+  sticky toast when re-enabling capture after the auth URL is hidden; keep that
+  as a recorded auth gap, not a sticky-toast feature.
+
+Do **not** keep broad “sticky headers absent” or “transcript text drag /
+multi-click absent” claims in current deferred lists — those paths are closed
+above. Do **not** keep `keep_text_selection` or the Rust native-hover /
+Cmd-modifier link gate in current deferred lists either. For current leftovers
+(wrapped-fragment table cells, composer prompt-widget extras, parse-only
+`show_fps`, narrower `/debug fps`, auth welcome raw-url, Windows probe), see
+**Local final TUI divergence closure**.
+
+## Local remaining-TUI-gap follow-on (2026-08-12, complete)
+
+Verified remaining-TUI-gap closures against pin `650c1db7` (scroll stream,
+background chip, direct mouse, display probe, animation `pager.toml`,
+mouse-reporting toggle, link-scheme safety). For table box-grid selection,
+sticky-header drag-selectability / `sticky_headers` config, composer
+`PromptEditor` / `OpenGrokTextArea`, FPS HUD, and mouse-off sticky toast, see
+**Local final TUI divergence closure** above — **that section wins**. For sticky
+headers, transcript text drag/multi-click, `keep_text_selection`, and the
+native/modifier link gate, see **Local sticky-header + transcript text-selection
+follow-on** above — **that section wins over this one**. Historical sections
+below (including **Local TUI interaction wave**) keep their contemporaneous
+wording; where they conflict on scroll stream, background chip, direct mouse
+(scrollbar/link/composer), display-refresh probe, pager animation config,
+mouse-reporting toggle, or link-scheme safety, **this section wins**.
+
+**Verification (lead, local macOS, 2026-08-12; no platform CI rerun):**
+
+- `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
+- Comprehensive remaining-gap filter — exit 0, **exactly 223 tests in 41 suites**
+  (sum of five test-run summaries: 27/9 + 32/6 + 54/7 + 6/1 + 104/18).
+- Background lifecycle+spinner focused — exit 0, **50 tests in 9 suites**.
+- Real PTY filters `PagerPTYSessionTests|InferencePTYScenarioTests` — exit 0,
+  **5 tests in 2 suites**.
+- `zsh workflows/swift-safe-verify.zsh test --no-parallel` count-only — exit 0:
+  exactly **5,599** Swift Testing cases, **965** suites, **74** nonempty test-run
+  summaries, elapsed **333.910s**, zero failed summaries/issues. Authoritative
+  final-tree serial rerun after link-scheme filtering + mouse terminal-write
+  rollback.
+- Real-CLI smoke (`verify-open-grok`, separate from Swift totals): isolated run
+  `20260812-remaining-tui`; helper `doctor` exit 0 / version `0.1.220-open-grok.58`;
+  `sessions list` exit 0 with fresh-home empty listing; `help sessions` exit 0;
+  cleanup succeeded; artifacts retained. Does **not** claim TUI mouse or animation
+  behavior.
+- **No platform CI run** for this follow-on — keep the standing warning above.
+
+### Closures (live)
+
+1. **Full Rust-style mouse scroll stream normalizer** — 80ms stream window, 16ms
+   dedicated scroll clock, residual/coast, acceleration, remux/terminal profiles;
+   live `scroll_speed` / `scroll_mode` / `scroll_lines` / `invert_scroll` readers and
+   Appearance/Mouse rows; settings reset re-resolves the project layer. The prior
+   "wheel acceleration is not ported" / hidden-scroll-settings notes are
+   **superseded**.
+2. **Active background chip/motion feed** via an idempotent push cache — shell/
+   monitor, running non-workflow subagents, all scheduled work, and active
+   workflows; atomic scheduler provisional replacement. Chip appears/spins/
+   disappears and demand parks. The prior "background-task count/spinner remains
+   render-only" gap is **superseded**.
+3. **Direct mouse** — scrollbar click/drag; safe same-cell transcript links;
+   composer focus/cursor via `PromptEditor`; block click remains. Hit priorities,
+   capturing modal quarantine, and X10 up-none are honored. Prior deferred link-
+   click / scrollbar-drag / composer-mouse claims for these paths are
+   **superseded**.
+4. **macOS CoreGraphics refresh-rate probe** feeds auto cadence; Linux is an
+   honest skip (Rust also unsupported there); Windows remains unsupported. The
+   Wave 12 "Display-refresh probe: `probedRefreshHz` is nil" deferral is
+   **superseded** for macOS.
+5. **`$OPENGROK_HOME/pager.toml` animation** `fps` / `wave_rows` are live readers.
+   `show_fps` HUD remains absent (recorded gap below).
+   *Superseded later 2026-08-12 by Local final TUI divergence closure: FPS HUD
+   live via raw `GROK_FPS` nonempty `!= 0` and `/debug fps`; `[animation].show_fps`
+   remains parse-only because the pin also never reads it.*
+6. **Mouse-reporting toggle feature gate** — env > effective `[ui]` > default
+   `false`; command hidden/refused when off; scrollback `Ctrl+R` when on; prompt
+   focus inert for the chord; in-memory rollback on failed terminal write.
+7. **Security — Standard URL schemes only** (`http` / `https` / `mailto`) before
+   `LinkSpan` publish, OSC 8 emission, and the opener; `file` / `javascript` /
+   custom / relative rejected. Quoted landed lines (re-read 2026-08-12; AGENTS §5):
+
+   `Sources/OpenGrokPagerRender/PagerLinkSchemeSafety.swift:28-46` (allows table):
+
+   ```
+   public func allows(scheme: String) -> Bool {
+       let normalized = scheme.lowercased()
+       switch self {
+       case .standard:
+           switch normalized {
+           case "http", "https", "mailto":
+               return true
+           default:
+               return false
+           }
+       case .editorExtended:
+           switch normalized {
+           case "http", "https", "mailto", "file", "vscode", "cursor", "idea", "zed":
+               return true
+           default:
+               return false
+           }
+       }
+   }
+   ```
+
+   `Sources/OpenGrokPagerRender/PagerLinkSchemeSafety.swift:56-87` (safe parser):
+
+   ```
+   public func pagerURLIsSafeToOpen(
+       _ url: String,
+       filter: PagerLinkSchemeFilter = .standard
+   ) -> Bool {
+       let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+       guard !trimmed.isEmpty else { return false }
+
+       if let parsed = URL(string: trimmed),
+          let scheme = parsed.scheme,
+          !scheme.isEmpty
+       {
+           return filter.allows(scheme: scheme)
+       }
+
+       // Fallback: scheme via "://" when Foundation rejects the string
+       // (`link_opener.rs:266-269`). Lowercase before matching the filter.
+       if let separator = trimmed.range(of: "://") {
+           let scheme = String(trimmed[..<separator.lowerBound])
+           return filter.allows(scheme: scheme)
+       }
+
+       // mailto may lack "//"; only that scheme gets the bare-colon fallback
+       // (`link_opener.rs:271-277`). Other colon forms (tel:, javascript:) stay
+       // rejected unless Foundation already classified them above.
+       if let colon = trimmed.firstIndex(of: ":") {
+           let scheme = String(trimmed[..<colon])
+           if scheme.lowercased() == "mailto" {
+               return filter.allows(scheme: scheme)
+           }
+       }
+
+       return false
+   }
+   ```
+
+   `Sources/OpenGrokCLI/LiveComposition.swift:12693-12701` (guard/open):
+
+   ```
+   private func openExternalURL(_ url: String) {
+       guard pagerURLIsSafeToOpen(url) else { return }
+       let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+       guard let openBrowser = urlOpener,
+             let parsed = URL(string: trimmed) else {
+           note("Could not open a browser. Open this URL manually:\n\(trimmed)")
+           return
+       }
+       openBrowser(parsed)
+   }
+   ```
+
+   `Sources/OpenGrokPagerRender/PagerTerminalRenderer.swift:749-756`
+   (defense-in-depth):
+
+   ```
+       for span in spans {
+           // Defense in depth: never emit OSC 8 for a scheme Standard rejects,
+           // even if a stale LinkSpan slipped past paint-time filtering
+           // (`link_opener.rs:261-278` / `hyperlinks.rs:28-46` at pin 650c1db7).
+           guard pagerURLIsSafeToOpen(span.url) else { continue }
+           let start = max(area.left, span.colStart)
+           let end = min(area.right, span.colEnd)
+           guard span.row >= area.top, span.row < area.bottom, start < end else { continue }
+   ```
+
+### Honest remaining gaps (contemporaneous remaining-TUI-gap; superseded in part)
+
+*Superseded later 2026-08-12 by Local sticky-header + transcript text-selection
+follow-on for:* sticky headers (default-live when `!compact`); linear transcript
+text drag/multi-click + live `keep_text_selection`; Rust native-hover /
+Cmd-modifier link gate alignment. *Superseded later 2026-08-12 by Local final
+TUI divergence closure for:* table box-grid selection; sticky-header
+drag-selectability (pin parity, not a divergence); `sticky_headers` one-shot
+`pager.toml` config; composer `PromptEditor` / `OpenGrokTextArea`; FPS HUD /
+`GROK_FPS` / `/debug fps`; mouse-off sticky toast (invented transcript-note
+claim retired). Contemporaneous “still open” wording kept: table
+cell/grid→linear degradation; sticky header rows not text-drag selectable;
+composer `PromptEditor` drag/multi-click / full `OpenGrokTextArea`;
+`sticky_headers` config/settings toggle; mouse-off sticky hint/banner; FPS HUD /
+`show_fps`; Windows display probe. For current leftovers see **Local final TUI
+divergence closure**.
+
+Do **not** keep background spinner, scroll normalizer/acceleration, composer
+focus/cursor, safe link click, scrollbar click/drag, mouse-reporting toggle, or
+macOS display probe in current deferred lists — those are closed above.
+
 ## Local TUI interaction wave (2026-08-11, complete)
 
-Current truth for the verified local TUI animation + mouse interaction closures against
-pin `650c1db7`. Historical sections below keep their contemporaneous wording; where they
-conflict on motion/suspend/mouse interaction, **this section wins**.
+Verified local TUI animation + mouse interaction closures against pin `650c1db7`
+as of 2026-08-11. For table box-grid selection, sticky-header drag-selectability /
+`sticky_headers` config, composer `PromptEditor` / `OpenGrokTextArea`, FPS HUD,
+and mouse-off sticky toast, see **Local final TUI divergence closure** above. For
+sticky headers / transcript text selection / `keep_text_selection` /
+native-modifier link gate, see **Local sticky-header + transcript text-selection
+follow-on** above. For scroll stream, background chip, scrollbar/link/composer
+mouse, display probe, animation `pager.toml`, mouse-reporting toggle, and
+link-scheme safety, see **Local remaining-TUI-gap follow-on** above. Historical
+wording below is preserved.
 
 **Verification (lead, local macOS, 2026-08-11; no platform CI rerun):**
 
@@ -57,24 +434,34 @@ conflict on motion/suspend/mouse interaction, **this section wins**.
    focus matches paint. The Wave 14.1 "mouse block selection is a feature gap" claim is
    **superseded** for this left-click visible-block path.
 
-### Honest remaining gaps (not claimed fixed)
+### Honest remaining gaps (contemporaneous 2026-08-11; superseded in part)
 
-- **Background-task count/spinner** remains render-only — the renderer lacks a
-  push/cache seam to feed live counts.
-- **Full Rust mouse scroll stream normalizer/acceleration** and the hidden scroll
-  settings readers (`scroll_speed` / `scroll_mode` / `scroll_lines` / `invert_scroll`
-  and related Appearance/Mouse rows still without live readers) remain absent.
-- **Text drag/multi-click, composer mouse, link click, scrollbar drag, sticky
-  headers**, and **opt-in mouse-toggle / Ctrl+R** parity remain absent/deferred.
-- **Display refresh probing** remains absent; default / probe-skip cadence is honest.
+*Superseded 2026-08-12 by Local remaining-TUI-gap follow-on for:* background-task
+count/spinner push seam; full Rust scroll-stream normalizer/acceleration + live
+`scroll_*` / `invert_scroll` readers; link click (safe same-cell); scrollbar
+click/drag; composer focus/cursor via `PromptEditor`; opt-in mouse-toggle /
+scrollback `Ctrl+R`; macOS display-refresh probing. *Superseded later 2026-08-12
+by Local sticky-header + transcript text-selection follow-on for:* sticky headers
+(default-live when `!compact`); linear transcript text drag/multi-click + live
+`keep_text_selection`; Rust native-hover/Cmd-modifier link gate. *Superseded
+later 2026-08-12 by Local final TUI divergence closure for:* table box-grid
+selection; sticky-header drag-selectability (pin parity); `sticky_headers`
+one-shot config; composer `PromptEditor` / `OpenGrokTextArea`; FPS HUD; mouse-off
+sticky toast. Contemporaneous “still open” wording kept: table cell/grid→linear
+degradation; sticky header rows not text-drag selectable; composer drag/select /
+full `OpenGrokTextArea`; `sticky_headers` config/settings toggle; mouse-off
+sticky hint/banner; FPS HUD/`show_fps`; Windows display probe. For current
+leftovers see **Local final TUI divergence closure**.
 
 ## Local correctness wave (2026-08-11, complete)
 
 Current truth for the same-day local correctness closures (ACP / Hub MCP / same-process
-resume / foreign `sessions list`). For TUI animation and mouse interaction, see
-**Local TUI interaction wave** above. Historical sections below keep their
-contemporaneous wording; where they conflict with this section's closures,
-**this section wins**.
+resume / foreign `sessions list`). For TUI table/composer/FPS/mouse-off toast,
+sticky/text-selection, remaining TUI gaps, animation / mouse, see **Local final TUI
+divergence closure**, **Local sticky-header + transcript text-selection follow-on**,
+**Local remaining-TUI-gap follow-on**, and **Local TUI interaction wave** above.
+Historical sections below keep their contemporaneous wording; where they conflict
+with this section's closures, **this section wins**.
 
 **Verification (lead, 2026-08-11; no platform CI rerun):**
 
@@ -3658,9 +4045,24 @@ the keystone.
 `prompt_suggestions`. (`compact_mode`, `show_timestamps`, and `show_timeline` left
 this list when their readers landed — rows registered, audited 2026-08-10.)
 *2026-08-11 note:* `page_flip_on_send` later gained a live reader (Wave 20 follow-on
-batch 2); the **scroll_*** / `invert_scroll` / `keep_text_selection` mouse-scroll
-settings remain hidden — Local TUI interaction wave did **not** land those readers or
-the Rust scroll-stream normalizer/acceleration.
+batch 2); at that date the **scroll_*** / `invert_scroll` / `keep_text_selection`
+mouse-scroll settings remained hidden.
+*2026-08-12 note:* `scroll_speed` / `scroll_mode` / `scroll_lines` / `invert_scroll`
+left this list when Local remaining-TUI-gap follow-on landed live readers + the
+Rust-style scroll-stream normalizer/acceleration.
+*2026-08-12 note (sticky-header + transcript text-selection / deep-tui):*
+`keep_text_selection` (`flash` | `hold` | `word_select`) left this list when live
+readers + linear transcript text drag/multi-click landed. Appearance/Mouse catalog
+now exposes scroll_* / `invert_scroll` / `keep_text_selection` (Mouse hidden-row
+count updated accordingly). `prompt_suggestions` remains hidden until its backing
+lands. Sticky-header **behavior** is default-live without a settings row —
+`sticky_headers` config/settings toggle is still absent (recorded under the
+sticky/text-selection honest-divergence list, not as a hidden lying row).
+*2026-08-12 note (final TUI divergence closure):* `$OPENGROK_HOME/pager.toml
+[scrollback.display].sticky_headers` one-shot config is now live (default true,
+compact override). No env / no settings row is **upstream parity, not a gap** —
+do not add a hidden lying row. Wrong-type parse diagnostic is visible; project
+`pager.toml` is not authority. See **Local final TUI divergence closure**.
 
 ### Ledger corrections (stale rows every domain audit tripped over)
 
@@ -3760,7 +4162,10 @@ launch semantics also remain. See `PARITY_ROADMAP.md` for the current long-tail 
 - **`.idleMonitor` turn indicator**: render side exists; deliberately unproduced — this composition has no idle-watcher feed, and a guessed glyph would claim watchers that don't exist.
 - **xAI/Codex halves of `spawn_background_refresh`**: not fired — the CLI catalog store has no live xAI/Codex list transport, so the call would be a refresh-shaped no-op. Meta/DeepSeek/Kimi/Fireworks/OpenCodeGo/Wafer partitions refresh post-readiness (reachability-tested).
 - **`/usage` billing arms** (`show`/`manage`): absent with upstream's non-consumer error copy — no billing surface exists in the port.
-- **Display-refresh probe**: `probedRefreshHz` is nil (no probe FFI); auto-cadence resolves to upstream's `probe_skip` default, matching the settings row's restart-required caption.
+- **Display-refresh probe**: *Superseded 2026-08-12 by Local remaining-TUI-gap
+  follow-on:* macOS CoreGraphics probe feeds auto cadence; Linux honest skip;
+  Windows unsupported. (Contemporaneous Wave 12 wording had `probedRefreshHz` nil
+  / `probe_skip` default.)
 - **Matcher scope**: fzf atom operators (`^ $ ! '`), diacritic folding, and highlight indices not ported (no consumer); ranked sort skips the builtin-over-plugin tiebreak (definitions carry no source tag).
 
 ### Pre-existing gaps found by this wave's audits, recorded but NOT fixed here
@@ -3768,7 +4173,8 @@ launch semantics also remain. See `PARITY_ROADMAP.md` for the current long-tail 
 - **xAI `x_search` replay**: upstream replays `XSearch` history into xAI-dialect Responses requests as `x_search_call` items (conversation.rs:1627-1629, 1978-1997); the Swift builder has never done this — `.xSearch` backend items are captured from streams but never re-sent. Needs its own slice and tests.
 - **Stale ledger corrections**: the wave-8 deferral line listing `/rewind` `/jump` `/delete` as unregistered (formerly at line ~621) predates their registration and is superseded by this section. `/recall`, `/flush`, and `/goal` are Swift-only rows with no upstream command-file counterpart (they map onto ported memory/goal features); recorded here as a deliberate divergence pending an upstream-parity decision.
 - **Orphaned pager targets**: `OpenGrokPagerModel`/`PagerConversationUI`/`PagerOperationsUI`/`PagerRuntime` remain importer-less from `Sources/` (first recorded 2026-08-04); the animation work consumed `PagerRuntime`'s design but landed the ticker at the controller seam, so the orphan status is unchanged.
-- Inline (`--no-alt-screen`) remains a 12-row bottom viewport without native scrollback; interactive `--minimal` still renders as inline; the scrollbar widget, tips banner, `/context` bar renderer consumers, and FPS HUD remain absent (all L/M-sized, listed in the TUI audit).
+- Inline (`--no-alt-screen`) remains a 12-row bottom viewport without native scrollback; interactive `--minimal` still renders as inline; tips banner and `/context` bar renderer consumers remain absent. *2026-08-12:* scrollbar click/drag is live (Local remaining-TUI-gap follow-on); **FPS HUD / `show_fps` remains absent**.
+  *Superseded later 2026-08-12 by Local final TUI divergence closure: FPS HUD live via raw `GROK_FPS` nonempty `!= 0` and `/debug fps`; `[animation].show_fps` remains parse-only because the pin also never reads it.*
 
 ## Current integration verification snapshot (2026-08-06)
 
@@ -4783,18 +5189,34 @@ overlay/permission/mouse subset 8/8.
   because `PermissionPrompter` receives an `AccessKind`, not the hunks.
 - `Enter` submits and `Tab` accepts a completion; the reference lets `Enter`
   accept the highlighted row.
-- **No `Ctrl+R` mouse-reporting binding.** The reference registers it under
-  `When::ScrollbackFocused` only. This port has a single focus region, so there
-  is no way to distinguish it from the prompt's `Ctrl+R` history search;
-  `/toggle-mouse-reporting` is the only entry point.
-- `/toggle-mouse-reporting` is **always available**. The reference hides both it
-  and its keybinding behind an opt-in feature flag
-  (`[ui] mouse_reporting_toggle` / `GROK_MOUSE_REPORTING_TOGGLE`, default off,
-  cached at startup); that flag is not ported. Reporting itself starts on in
-  both.
+- **Mouse-reporting toggle gate is live** (`[ui] mouse_reporting_toggle` /
+  `GROK_MOUSE_REPORTING_TOGGLE`, default off, env > effective TOML / `UiConfig`
+  field > default). When off, `/toggle-mouse-reporting` is hidden from the
+  dropdown / ACP catalog and returns the upstream unavailable hint on direct
+  invoke; scrollback `Ctrl+R` is unbound. When on, scrollback-focused `Ctrl+R`
+  and the slash command share the live `setMouseReporting` seam; prompt focus
+  does not bind the chord (prompt history stays Up/Down + `/history` — this
+  port never had prompt `Ctrl+R` history search). The settings row remains
+  restart-required (`ui.mouse_reporting_toggle`); live capture state is
+  separate.
+- **No sticky mouse-off banner.** Upstream keeps a focus-aware sticky toast
+  (`MOUSE_OFF_HINT_SCROLLBACK` / `MOUSE_OFF_HINT_PROMPT` via
+  `AgentView::active_toast_message`). This port has no sticky-toast surface for
+  mouse-off — `/toggle-mouse-reporting` still appends a system transcript note
+  (on/off copy) and restores wire sequences mid-session. Deliberate omission:
+  do not invent a banner.
+  *Superseded later 2026-08-12 by Local final TUI divergence closure: mouse-off
+  sticky toast is live (successful off ⇒ focus-swapped sticky; transient wins;
+  on clears + `Mouse reporting on`; idle scroll-clock expiry; rollback/minimal;
+  occluder). The invented transcript-note claim is retired. Auth welcome raw-url
+  mouse-disable/clear remains an existing auth divergence.*
 - Wheel acceleration is not ported — one report is worth `linesPerEvent` lines
   with no rolling-window multiplier. The constants are recorded in
   `INTEGRATION-mouse.md`.
+  *Superseded 2026-08-12 by Local remaining-TUI-gap follow-on: full Rust-style
+  scroll stream normalizer (80ms stream, 16ms dedicated clock, residual/coast,
+  acceleration, remux/terminal profiles) plus live `scroll_*` / `invert_scroll`
+  readers.*
 - **Legacy X10 mouse reports still leak.** SGR is recovered from
   `.unknown(Data)`, but `TerminalInputDecoder` treats `ESC [ M` as a complete CSI
   and its three coordinate bytes reach the text stream as ghost input. The fix is
@@ -4813,6 +5235,21 @@ overlay/permission/mouse subset 8/8.
   selection, drag, double/triple-click, or hover either.
   *2026-08-11:* visible-block left-click selection is now live (Local TUI
   interaction wave); link click / text drag / multi-click remain absent.
+  *2026-08-12:* safe same-cell transcript link open is live (Standard schemes
+  only; see Local remaining-TUI-gap follow-on security quotes).
+  *2026-08-12 (deep-tui):* linear transcript text drag/multi-click + live
+  `keep_text_selection`, sticky headers default-live when `!compact`, and
+  native/modifier link-gate alignment are live (see Local sticky-header +
+  transcript text-selection follow-on). Still open: table cell/grid→linear
+  degradation; sticky header rows not text-drag selectable; composer
+  `PromptEditor` drag/multi-click / full `OpenGrokTextArea`; `sticky_headers`
+  config/settings toggle.
+  *Superseded later 2026-08-12 by Local final TUI divergence closure:* table
+  box-grid selection live (fail-closed linear only on malformed/border-start;
+  wrapped-fragment leftover remains); sticky-header-not-selectable is pin
+  parity; composer `PromptEditor` uses one `OpenGrokTextArea`; `sticky_headers`
+  one-shot `pager.toml` config live (no env/no settings row is upstream
+  parity). For current leftovers see that section.
 - **Live model switch.** `/model` posts `Model set to X` and relabels the
   composer. The sampler's model is fixed at session construction and nothing
   downstream can change it mid-session, so the picker is honest about being

@@ -481,6 +481,7 @@ struct MouseWheelTuningTests {
 
     @Test("forTerminalProgram covers every named terminal explicitly")
     func terminalLookup() {
+        // Delegates to ScrollConfig.from(brand:) — brand table must stay aligned.
         // iTerm / WezTerm: both fields drop to 1 (Rust mouse.rs:340,337 + 367).
         assertTuning("iTerm.app", lines: 1, events: 1, perEvent: 1)
         assertTuning("WezTerm", lines: 1, events: 1, perEvent: 1)
@@ -505,6 +506,16 @@ struct MouseWheelTuningTests {
         #expect(MouseWheelTuning.eventsPerTick(forTerminalProgram: "vscode") == 1)
         #expect(MouseWheelTuning.eventsPerTick(forTerminalProgram: "Apple_Terminal") == 3)
         #expect(MouseWheelTuning.eventsPerTick(forTerminalProgram: nil) == 3)
+
+        // ScrollConfig brand builder agrees with the TERM_PROGRAM factory.
+        for program in ["iTerm.app", "WezTerm", "vscode", "Apple_Terminal", nil] as [String?] {
+            let tuning = MouseWheelTuning.forTerminalProgram(program)
+            let config = ScrollConfig.from(
+                brand: MouseScrollTerminalBrand.from(termProgram: program)
+            )
+            #expect(tuning.linesPerTick == Int(config.wheelLinesPerTick), "\(program ?? "nil")")
+            #expect(tuning.eventsPerTick == Int(config.eventsPerTick), "\(program ?? "nil")")
+        }
     }
 
     @Test("Zero or negative inputs are clamped to one")

@@ -779,6 +779,70 @@ enum LiveBackgroundTaskTools {
     }
 }
 
+// MARK: - Active background work (status-chip push)
+
+/// Installs the same-module `LiveActiveBackgroundWorkSink` onto a shell-owned
+/// process execution (or composition). Shell and monitor tasks both emit
+/// `.shell` — monitors ride `runBackground` on the same ownership map, so the
+/// host must not upsert again from `LiveMonitorHost.track`.
+enum LiveShellActiveBackgroundWork {
+    /// Translate shell ownership events into `.shell` upsert/remove for the
+    /// renderer cache. Passing `nil` clears the sink without emitting removes.
+    static func setActiveBackgroundWorkSink(
+        _ sink: LiveActiveBackgroundWorkSink?,
+        on process: any OpenGrokShellProcessExecution
+    ) async {
+        guard let sink else {
+            await process.setBackgroundWorkEventSink(nil)
+            return
+        }
+        await process.setBackgroundWorkEventSink { event in
+            switch event {
+            case .upsert(let taskID):
+                guard let translated = LiveActiveBackgroundWorkEvent.upsert(
+                    kind: .shell,
+                    id: taskID
+                ) else { return }
+                await sink(translated)
+            case .remove(let taskID):
+                guard let translated = LiveActiveBackgroundWorkEvent.remove(
+                    kind: .shell,
+                    id: taskID
+                ) else { return }
+                await sink(translated)
+            }
+        }
+    }
+
+    /// Composition-wide install: every registered session execution (and later
+    /// `registerSession` calls) receive the translator.
+    static func setActiveBackgroundWorkSink(
+        _ sink: LiveActiveBackgroundWorkSink?,
+        on composition: OpenGrokShellToolRuntimeComposition
+    ) async {
+        guard let sink else {
+            await composition.setBackgroundWorkEventSink(nil)
+            return
+        }
+        await composition.setBackgroundWorkEventSink { event in
+            switch event {
+            case .upsert(let taskID):
+                guard let translated = LiveActiveBackgroundWorkEvent.upsert(
+                    kind: .shell,
+                    id: taskID
+                ) else { return }
+                await sink(translated)
+            case .remove(let taskID):
+                guard let translated = LiveActiveBackgroundWorkEvent.remove(
+                    kind: .shell,
+                    id: taskID
+                ) else { return }
+                await sink(translated)
+            }
+        }
+    }
+}
+
 // MARK: - TaskCompleted auto-wake
 
 /// Exactly-once completion wake for background tasks. Upstream fires

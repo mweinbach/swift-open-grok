@@ -85,9 +85,12 @@ public final class PagerTerminalRenderer {
             return false
         }
         guard enabled != mouseReportingActive else { return false }
-        mouseReportingActive = enabled
+        // Write before flipping the latch: a thrown sink write must leave
+        // `mouseReportingActive` matching the wire so a later toggle and
+        // `restore()` still emit the correct enable/disable sequence.
         try sink.write(enabled ? ANSIMouse.enableReporting : ANSIMouse.disableReporting)
         try sink.flush()
+        mouseReportingActive = enabled
         return true
     }
 
@@ -744,6 +747,10 @@ public final class PagerTerminalRenderer {
         var ids = Array(repeating: UInt32(0), count: area.width * area.height)
         var table: [LinkRef] = []
         for span in spans {
+            // Defense in depth: never emit OSC 8 for a scheme Standard rejects,
+            // even if a stale LinkSpan slipped past paint-time filtering
+            // (`link_opener.rs:261-278` / `hyperlinks.rs:28-46` at pin 650c1db7).
+            guard pagerURLIsSafeToOpen(span.url) else { continue }
             let start = max(area.left, span.colStart)
             let end = min(area.right, span.colEnd)
             guard span.row >= area.top, span.row < area.bottom, start < end else { continue }

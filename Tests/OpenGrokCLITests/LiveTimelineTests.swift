@@ -4,7 +4,8 @@
 // `LiveInteractiveControllerRenderer` painting into a captured sink, with
 // the effects asserted where they land — the config file in an isolated
 // OPENGROK_HOME, the painted toast, the rail glyphs in the frame bytes, and
-// the viewport jump a rail click causes. The controller half (dispatch →
+// the logical scroll-offset jump a rail click causes (sticky may already
+// pin the target prompt at follow-tail). The controller half (dispatch →
 // `.overlay(.toggleTimeline)`) is pinned in
 // `Tests/OpenGrokPagerTests/PagerTimelineCommandTests.swift`; the exact
 // rail geometry and paint are pinned against `renderPagerFrame` in
@@ -147,12 +148,10 @@ private struct TimelineFixture {
 }
 
 /// A two-turn persisted session whose replies are BOTH tall enough that on a
-/// 30-row viewport the second turn's prompt sits in the middle of the
-/// transcript: not in the first screenful, not in the last. The frames a
-/// resume paints (top-of-transcript and tail) can therefore never contain
-/// its "zebra" token — only a jump that anchors that prompt to the viewport
-/// top can paint it, which is what makes the rail click observable in an
-/// accumulate-only byte sink.
+/// 30-row viewport the transcript overflows: resume follow-tail sits at max
+/// scroll with headroom above the second turn. Sticky headers may pin the
+/// latest user prompt ("zebra") at the tail, so visibility alone is not a
+/// jump signal — rail-click proofs use logical scroll offset instead.
 private func makeTwoTurnSession(
     home: URL,
     sessionID: String
@@ -338,10 +337,18 @@ struct LiveTimelineTests {
         try await fixture.renderer.begin()
         try await fixture.renderer.render(.sessionResumed(sessionID: "tl-click"))
         #expect(await fixture.waitForFrame(containing: "restored."))
-        // The second turn's prompt sits mid-transcript (line ~47 of ~90):
-        // neither the top-of-transcript frames nor the tail frames can have
-        // painted its token yet.
-        #expect(!fixture.sink.strippedText.contains("zebra"))
+        if await fixture.renderer.testingHasPendingFlushTask() {
+            await fixture.renderer.testingFlushPendingFrameNow()
+        }
+
+        // Follow-tail at max. Sticky may already pin the latest user prompt
+        // ("zebra") in the header band — so absence of that token is not a
+        // valid pre-click signal. Prove the jump via logical scroll offset.
+        let before = await fixture.renderer.testingTranscriptScrollOffset()
+        let maximum = await fixture.renderer.testingMaximumScrollOffset()
+        #expect(await fixture.renderer.testingFollowsBottom())
+        #expect(before == maximum)
+        #expect(maximum > 0)
 
         // The tick for turn 1, from the same geometry the frame published:
         // 100×30 chrome puts the transcript at y=2, height 22; chromeWidth 5
@@ -355,9 +362,27 @@ struct LiveTimelineTests {
             y: 13
         )))
         #expect(routing == .consumed)
-        // The jump anchored turn 1's prompt to the viewport top — the same
-        // `revealBlock` seam `/jump` scrolls through, so a tick click and a
-        // picker row cannot land differently.
+        if await fixture.renderer.testingHasPendingFlushTask() {
+            await fixture.renderer.testingFlushPendingFrameNow()
+        }
+
+        // revealBlock for turn 1 (zebra user at conversation index 2) leaves
+        // follow-tail and lands near that prompt's logical start — below max.
+        // Exact equality with blockStartLines can land one row early: non-compact
+        // user prompts wear a top vpad row, and sticky reveal/continuity can
+        // align the visible anchor on that pad (blockStart-1) rather than the
+        // first content line. Accept the top-padding/start window only.
+        let after = await fixture.renderer.testingTranscriptScrollOffset()
+        #expect(await !fixture.renderer.testingFollowsBottom())
+        #expect(after < before)
+        let hit = try #require(await fixture.renderer.lastConversationHit)
+        #expect(hit.blockStartLines.indices.contains(2))
+        let blockStart = hit.blockStartLines[2]
+        let anchorLo = max(0, blockStart - 1)
+        #expect(after >= anchorLo && after <= blockStart)
+        // Logical scrollOffset (sticky must not double-count header rows).
+        #expect(hit.scrollOffset == after)
+        // Target turn stays visible (sticky pin and/or anchored content).
         #expect(await fixture.waitForFrame(containing: "zebra"))
         try await fixture.renderer.restoreTerminal()
     }

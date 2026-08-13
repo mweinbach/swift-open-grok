@@ -5,6 +5,7 @@ import OpenGrokPagerMinimal
 import OpenGrokPagerRender
 import OpenGrokPromptQueue
 import OpenGrokTerminalCore
+import OpenGrokTextArea
 
 /// What a host-backed ("local") slash command resolved to.
 ///
@@ -167,9 +168,19 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case control(Control)
     }
 
-    private struct PromptEditor: Sendable {
-        private var characters: [Character]
-        private(set) var cursor: Int
+    /// Composer draft. Not `Sendable`: the sole store is a `TextArea` class,
+    /// and the controller actor owns this object so it never crosses actors.
+    ///
+    /// Stage 3 host-policy order matches `handle_prompt_key`
+    /// (`app/agent_view/prompt.rs` at pin 650c1db7): slash/menu keys, empty
+    /// Up history, Enter send/newline, Tab, Esc, Ctrl+C/D, and app-global /
+    /// viewport / tasks / plan / queue chords never reach `TextArea.input`.
+    /// Remaining editor keys (Ctrl-A/E/W/U/K/Y, undo/redo, Alt-word, Home/End,
+    /// arrows, backspace/delete, printable) go through that API once.
+    private final class PromptEditor {
+        /// The only text / cursor / selection / undo buffer. UTF-8 internally;
+        /// Character offsets exist only at `state()` / `placeCursor(at:)`.
+        private let area: TextArea
         /// Open slash-command dropdown. When non-empty, `↑`/`↓` move the
         /// selection instead of recalling history, matching the reference's
         /// dropdown intercept ahead of the history step.
@@ -188,20 +199,34 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         var isMultiline = false
 
         init(text: String) {
-            characters = Array(text)
-            cursor = characters.count
+            let area = TextArea()
+            // Default tabWidth is 4 and would expand pasted tabs; Stage 1
+            // keyboard paste must keep the bytes the user handed us.
+            area.tabWidth = 0
+            // Composer chrome owns the prefix; the TextArea content rect
+            // has no inner scrollbar (transcript gutter is separate).
+            area.showScrollbar = false
+            area.keepSelectionAfterMouseUp = true
+            self.area = area
+            loadBuffer(text)
         }
 
-        var text: String { String(characters) }
-        var isEmpty: Bool { characters.isEmpty }
+        var text: String { area.text }
+        var isEmpty: Bool { area.isEmpty }
 
         func state(
             pendingKey: String? = nil,
             pendingLabel: String? = nil
         ) -> OpenGrokPagerInteractivePromptState {
-            OpenGrokPagerInteractivePromptState(
-                text: text,
-                cursorOffset: cursor,
+            let contents = area.text
+            return OpenGrokPagerInteractivePromptState(
+                text: contents,
+                cursorOffset: characterOffset(fromUTF8: area.cursor, in: contents),
+                cursorUTF8: area.cursor,
+                selectionUTF8: area.selectionRange,
+                selectedText: area.selectedText(),
+                textAreaState: TextAreaState(scroll: area.scrollOverrideValue ?? 0),
+                scrollOverride: area.scrollOverrideValue,
                 completions: completions,
                 selectedCompletion: selectedCompletion,
                 pendingConfirmationKey: pendingKey,
@@ -209,10 +234,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             )
         }
 
-        mutating func apply(_ event: InputEvent) -> PromptAction {
+        func apply(_ event: InputEvent) -> PromptAction {
             switch event {
             case .paste(let value):
-                insert(Array(value))
+                insert(value)
                 return value.isEmpty ? .ignored : .changed
             case .key(let key):
                 return apply(key)
@@ -223,24 +248,54 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             }
         }
 
-        mutating func reset() {
-            characters.removeAll(keepingCapacity: true)
-            cursor = 0
+        func reset() {
+            loadBuffer("")
             completions = []
             selectedCompletion = nil
-            completionsDismissed = false
         }
 
-        mutating func replace(with value: String) {
-            characters = Array(value)
-            cursor = characters.count
-            completionsDismissed = false
+        func replace(with value: String) {
+            loadBuffer(value)
+        }
+
+        /// Place the cursor at a Character / grapheme offset from composer
+        /// mouse hit mapping. Clamped — never traps past the draft ends.
+        func placeCursor(at offset: Int) {
+            area.setCursor(utf8Offset(fromCharacter: offset, in: area.text))
+        }
+
+        /// Apply `TextArea.handleMouse` against the last-painted content rect.
+        /// Returns the mouse action plus any clipboard payload the TextArea
+        /// staged (double-click / drag-up copy).
+        func handleMouse(_ event: MouseEvent, content: TextAreaRect) -> MouseAction {
+            let state = TextAreaState(scroll: area.scrollOverrideValue ?? 0)
+            return area.handleMouse(event, area: content, state: state)
+        }
+
+        func tick(content: TextAreaRect) -> MouseAction {
+            let state = TextAreaState(scroll: area.scrollOverrideValue ?? 0)
+            return area.tick(area: content, state: state)
+        }
+
+        func pollTimeoutMs() -> UInt64? {
+            area.pollTimeoutMs()
+        }
+
+        /// Drop an in-flight TextArea gesture without copying. Overlay /
+        /// suspend / restore / a non-composer routing must call this so
+        /// `pendingDragScroll` cannot keep the scroll clock armed.
+        func cancelMouseGesture() {
+            area.cancelMouseGesture()
+        }
+
+        func takeClipboard() -> String? {
+            area.takeClipboard()
         }
 
         /// Close the dropdown, latching it shut until the text changes.
         /// Returns whether there was anything to close, so the Esc handler
         /// can fall through to the cancel/clear ladder when there was not.
-        mutating func dismissCompletions() -> Bool {
+        func dismissCompletions() -> Bool {
             guard !completions.isEmpty else { return false }
             completions = []
             selectedCompletion = nil
@@ -248,7 +303,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             return true
         }
 
-        private mutating func apply(_ event: KeyEvent) -> PromptAction {
+        private func apply(_ event: KeyEvent) -> PromptAction {
             if let control = controlAction(for: event) {
                 return control
             }
@@ -281,12 +336,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case .up:
                 if !completions.isEmpty { return .completionMove(-1) }
                 // `Up` recalls history only on an empty composer
-                // (`app/agent_view/prompt.rs:465-486`); with a draft it is a
-                // scrollback movement instead.
-                return isEmpty || isBrowsingHistory ? .historyPrevious : .viewport(.lineUp)
+                // (`app/agent_view/prompt.rs:465-486`). A nonempty draft
+                // falls through to textarea vertical motion — not viewport
+                // line-up (`When::ScrollbackFocused` only, `defaults.rs:192`).
+                if isEmpty || isBrowsingHistory { return .historyPrevious }
+                return routeEditorKey(event)
             case .down:
                 if !completions.isEmpty { return .completionMove(1) }
-                return isEmpty || isBrowsingHistory ? .historyNext : .viewport(.lineDown)
+                // Down never opens history (`prompt.rs`: "Down never opens
+                // the panel"); once browsing it steps toward the newest.
+                if isBrowsingHistory { return .historyNext }
+                return routeEditorKey(event)
             case .pageUp:
                 // With the dropdown open the paging keys page the menu
                 // (`prompt.rs:187-198`), one visible window per press.
@@ -299,37 +359,6 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     return .completionMove(PagerLayoutMetrics.maxDropdownRows)
                 }
                 return .viewport(.pageDown)
-            case .backspace:
-                guard cursor > 0 else { return .ignored }
-                characters.remove(at: cursor - 1)
-                cursor -= 1
-                completionsDismissed = false
-                return .changed
-            case .delete:
-                guard cursor < characters.count else { return .ignored }
-                characters.remove(at: cursor)
-                completionsDismissed = false
-                return .changed
-            case .left:
-                guard cursor > 0 else { return .ignored }
-                cursor -= 1
-                return .changed
-            case .right:
-                guard cursor < characters.count else { return .ignored }
-                cursor += 1
-                return .changed
-            case .home:
-                // With a draft, Home is a line-editing key; on an empty
-                // composer it jumps the transcript to the top.
-                guard !isEmpty else { return .viewport(.top) }
-                guard cursor != 0 else { return .ignored }
-                cursor = 0
-                return .changed
-            case .end:
-                guard !isEmpty else { return .viewport(.bottom) }
-                guard cursor != characters.count else { return .ignored }
-                cursor = characters.count
-                return .changed
             case .char(let character):
                 if character == "\r" || character == "\n" {
                     return resolveEnter(modifiers: event.modifiers)
@@ -340,15 +369,31 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 if character == "\u{4}" {
                     return .eof
                 }
-                guard !event.modifiers.contains(.control),
-                      !event.modifiers.contains(.meta),
-                      !event.modifiers.contains(.alt)
-                else { return .ignored }
-                insert([event.character ?? character])
-                return .changed
-            case .insert, .f, .null:
-                return .ignored
+                return routeEditorKey(event)
+            default:
+                return routeEditorKey(event)
             }
+        }
+
+        /// Snapshot → `TextArea.input` → `.changed` only when text, cursor, or
+        /// selection actually moved. Matches `prompt_widget/mod.rs:1787-1802`
+        /// (text/cursor) plus this port's published `selectionUTF8`.
+        private func routeEditorKey(_ event: KeyEvent) -> PromptAction {
+            let beforeText = area.text
+            let beforeCursor = area.cursor
+            let beforeSelection = area.selectionRange
+            area.input(event)
+            let textChanged = area.text != beforeText
+            if textChanged {
+                completionsDismissed = false
+            }
+            if textChanged
+                || area.cursor != beforeCursor
+                || area.selectionRange != beforeSelection
+            {
+                return .changed
+            }
+            return .ignored
         }
 
         /// What `Enter` means right now.
@@ -359,10 +404,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         /// distinguish `Shift+Enter` from `Enter` at all
         /// (`views/prompt_widget/mod.rs:2137-2142`) — it eats the backslash and
         /// continues the line, so multiline stays reachable everywhere.
-        private mutating func resolveEnter(modifiers: KeyModifiers) -> PromptAction {
+        private func resolveEnter(modifiers: KeyModifiers) -> PromptAction {
             let wantsNewline = modifiers.contains(.shift) || modifiers.contains(.alt)
             if isMultiline != wantsNewline {
-                insert(["\n"])
+                insert("\n")
                 return .changed
             }
             // The dropdown owns a sending Enter in the COMMAND phase: accept
@@ -372,17 +417,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // Enter as plain send: a typed argument must pass through as
             // typed ("/theme tokyonight" stays tokyonight), and Tab remains
             // the explicit accept for a suggestion.
-            if !completions.isEmpty, !characters.contains(where: \.isWhitespace) {
+            if !completions.isEmpty, !area.text.contains(where: \.isWhitespace) {
                 return .completionCommit
             }
             // This press would have sent. A line ending in a backslash says
             // "not yet" — the rescue only applies here, on the send path, and
             // only with the cursor at the end, which is where it is when
             // someone types a line and reaches for Enter.
-            guard characters.last == "\\", cursor == characters.count else { return .submit }
-            characters.removeLast()
-            cursor = characters.count
-            insert(["\n"])
+            let contents = area.text
+            let end = contents.utf8.count
+            guard contents.last == "\\", area.cursor == end else { return .submit }
+            area.replaceRange((end - 1)..<end, with: "")
+            insert("\n")
             return .changed
         }
 
@@ -452,9 +498,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             switch character?.lowercased() {
             case "c": return .interrupt
             case "d": return .eof
-            case "u": return .viewport(.halfPageUp)
-            case "j": return .viewport(.lineDown)
-            case "k": return .viewport(.lineUp)
+            // Ctrl-U/J/K are `When::ScrollbackFocused` only (`defaults.rs:192-
+            // 226`). Prompt-focused they are readline (kill / newline) via
+            // `TextArea.input` — do not intercept them here.
             // Not a mis-assignment against the reference, as it first looks:
             // upstream hard-codes the same dropdown intercept ahead of the
             // action registry (`app/agent_view/prompt.rs:212-221`), so
@@ -466,16 +512,40 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // `Ctrl+M` toggles multiline in the prompt and opens the model
             // picker outside it. Upstream registers both in different `When`
             // contexts and resolves by focus (`defaults.rs:702` and `:824`);
-            // this branch is the prompt half.
+            // this branch is the prompt half. Must stay ahead of
+            // `TextArea.input`, which would otherwise insert a newline.
             case "m": return .toggleMultiline
             default: return nil
             }
         }
 
-        private mutating func insert(_ values: [Character]) {
-            guard !values.isEmpty else { return }
-            characters.insert(contentsOf: values, at: cursor)
-            cursor += values.count
+        /// Replace the whole buffer. `setText` leaves the caret at the
+        /// previous UTF-8 offset (0 on a fresh area), so this always parks
+        /// it at the end — matching the old `[Character]` replace.
+        /// Selection and undo are dropped so history / slash / submit cannot
+        /// resurrect a prior draft. Mouse gestures go through `handleMouse`
+        /// on this same `TextArea`; load must not leave a stale drag/selection.
+        private func loadBuffer(_ value: String) {
+            area.setText(value)
+            area.setCursor(utf8Offset(fromCharacter: value.count, in: area.text))
+            area.clearSelection()
+            area.clearHistory()
+            completionsDismissed = false
+        }
+
+        private func insert(_ value: String) {
+            guard !value.isEmpty else { return }
+            // Host-owned mutations (bracketed paste, Enter-as-newline) do not
+            // go through `TextArea.input`, which is what replaces a selection
+            // before inserting. Mirror that here so paste/newline still
+            // overwrite a highlighted range.
+            if let range = area.selectionRange, !range.isEmpty {
+                let deleted = area.deleteSelection()
+                if !deleted {
+                    area.clearSelection()
+                }
+            }
+            area.insertStr(value)
             // New text lifts the Esc dismissal: typing after closing the
             // dropdown is a fresh query.
             completionsDismissed = false
@@ -686,6 +756,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
 
     private var lifecycle: OpenGrokPagerInteractiveLifecycle = .idle
     private var editor = PromptEditor(text: "")
+    /// Last content rect applied via `.composerMouse` or queried from the
+    /// renderer on a drag-autoscroll tick. Never a second TextArea.
+    private var lastComposerContentRect: TextAreaRect?
     private var submittedPrompts: [String] = []
     private var completedTurnCount = 0
     private var currentRequest: OpenGrokPagerRequest?
@@ -772,6 +845,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// so a reentrant resume that armed a newer task is not erased.
     private var motionTickerGeneration: UInt64 = 0
 
+    /// Dedicated mouse-scroll flush clock. Never shares the motion ticker:
+    /// scroll coalescing must keep waking while motion demand is `.none`.
+    /// `nil` exactly when no scroll deadline is armed.
+    private var scrollTicker: Task<Void, Never>?
+    /// Same generation discipline as `motionTickerGeneration`: suspend /
+    /// teardown / re-arm cancel the prior task and only nil the slot when the
+    /// cancelled generation still owns it.
+    private var scrollTickerGeneration: UInt64 = 0
+
     /// Slash-command recency. Defaults to the in-memory store, exactly like
     /// upstream's default controllers (`mru.rs:9-10`); the live composition
     /// injects the disk-backed store via `setSlashMru`.
@@ -802,6 +884,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private let customCommandHandler: CustomCommandHandler?
     private let localCommandNames: Set<String>
     private let localCommandHandler: LocalCommandHandler?
+    /// Startup-cached `[ui] mouse_reporting_toggle` / `GROK_MOUSE_REPORTING_TOGGLE`
+    /// gate. Seeds command visibility and the scrollback-only `Ctrl+R`
+    /// binding; live `mouse_reporting` enable/disable is a separate flag on
+    /// the render layer.
+    private let mouseReportingToggleEnabled: Bool
 
     /// Completions for the *arguments* of a command whose name is already
     /// typed, as `(command, argumentQuery) -> rows`.
@@ -850,12 +937,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         customCommandHandler: CustomCommandHandler? = nil,
         localCommands: [OpenGrokPagerCommandRegistration] = [],
         localCommandHandler: LocalCommandHandler? = nil,
-        workflowsEnabled: Bool = true
+        workflowsEnabled: Bool = true,
+        mouseReportingToggleEnabled: Bool = false
     ) {
         self.input = input
         self.runtime = runtime
         self.renderer = renderer
         self.output = output
+        self.mouseReportingToggleEnabled = mouseReportingToggleEnabled
         let definitions = customCommands.map { registration in
             PagerCommandDefinition(
                 name: registration.name,
@@ -864,7 +953,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 usage: registration.usage
             )
         }
-        let builtinCommands = Self.builtinCommands.filter { workflowsEnabled || $0.name != "workflows" }
+        let builtinCommands = Self.sessionBuiltinCommands(
+            workflowsEnabled: workflowsEnabled,
+            mouseReportingToggleEnabled: mouseReportingToggleEnabled
+        )
         self.commands = PagerCommandRegistry(
             commands: builtinCommands + definitions + localCommands.map { registration in
                 PagerCommandDefinition(
@@ -899,7 +991,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         customCommandHandler: CustomCommandHandler? = nil,
         localCommands: [OpenGrokPagerCommandRegistration] = [],
         localCommandHandler: LocalCommandHandler? = nil,
-        workflowsEnabled: Bool = true
+        workflowsEnabled: Bool = true,
+        mouseReportingToggleEnabled: Bool = false
     ) {
         self.init(
             input: Self.makeThrowingStream(from: input),
@@ -910,7 +1003,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             customCommandHandler: customCommandHandler,
             localCommands: localCommands,
             localCommandHandler: localCommandHandler,
-            workflowsEnabled: workflowsEnabled
+            workflowsEnabled: workflowsEnabled,
+            mouseReportingToggleEnabled: mouseReportingToggleEnabled
         )
     }
 
@@ -1026,37 +1120,51 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         motionFPS = min(max(fps, PagerMotion.minimumFPS), PagerMotion.maximumFPS)
     }
 
-    /// Park the wall-clock ticker for a suspended-TUI child (`/transcript`,
-    /// `$EDITOR`). Cancel+await the in-flight task so no further
-    /// `renderAnimationTick` can race terminal teardown; keep the motion
-    /// epoch and `externalMotionState` so resume continues the same clock.
-    /// Idempotent: a second suspend while held is a no-op once the ticker
-    /// is already nil. Safe after shutdown — `running` is already false and
-    /// the ticker is gone. Does not touch `motionShutdownLatched`.
+    /// Park the wall-clock motion ticker and the dedicated scroll ticker for
+    /// a suspended-TUI child (`/transcript`, `$EDITOR`). Cancel+await both
+    /// in-flight tasks so no further `renderAnimationTick` /
+    /// `handleScrollClockTick` can race terminal teardown; keep the motion
+    /// epoch, `externalMotionState`, and the renderer's `MouseScrollState`
+    /// so resume continues the same clocks. Idempotent: a second suspend
+    /// while held is a no-op once both tickers are already nil. Safe after
+    /// shutdown — `running` is already false and the tickers are gone. Does
+    /// not touch `motionShutdownLatched`.
     public func suspendMotionTicker() async {
         motionSuspended = true
-        let generation = motionTickerGeneration
-        let cancelled = motionTicker
-        cancelled?.cancel()
-        if let cancelled {
-            _ = await cancelled.value
+        cancelComposerMouseGesture()
+        let motionGeneration = motionTickerGeneration
+        let cancelledMotion = motionTicker
+        cancelledMotion?.cancel()
+        let scrollGeneration = scrollTickerGeneration
+        let cancelledScroll = scrollTicker
+        cancelledScroll?.cancel()
+        if let cancelledMotion {
+            _ = await cancelledMotion.value
+        }
+        if let cancelledScroll {
+            _ = await cancelledScroll.value
         }
         // A reentrant `resumeMotionTicker` may have armed a newer task while
         // we awaited; only clear when this suspend still owns the slot.
-        if motionTickerGeneration == generation {
+        if motionTickerGeneration == motionGeneration {
             motionTicker = nil
+        }
+        if scrollTickerGeneration == scrollGeneration {
+            scrollTicker = nil
         }
     }
 
-    /// Lift the ordinary suspend hold and re-arm from current demand.
-    /// Idempotent when already resumed. A no-op when teardown has latched
-    /// `motionShutdownLatched` — must not clear that latch or re-arm into a
-    /// run that is restoring the terminal. After a clean shutdown,
-    /// `armMotionTickerIfNeeded` also requires `running`.
-    public func resumeMotionTicker() {
+    /// Lift the ordinary suspend hold, re-arm motion from current demand, and
+    /// re-query the renderer's scroll deadline (tty is restored; an active
+    /// scroll stream must keep flushing). Idempotent when already resumed.
+    /// A no-op when teardown has latched `motionShutdownLatched` — must not
+    /// clear that latch or re-arm into a run that is restoring the terminal.
+    /// After a clean shutdown, arm helpers also require `running`.
+    public func resumeMotionTicker() async {
         guard !motionShutdownLatched else { return }
         motionSuspended = false
         armMotionTickerIfNeeded()
+        await refreshScrollClockFromRenderer()
     }
 
     /// Install the slash-command MRU store. Call before `run`. Without this
@@ -1196,9 +1304,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         }
                         switch routing {
                         case .consumed:
+                            self.cancelComposerMouseGesture()
+                            // Scroll coalescing lives in the renderer
+                            // (`MouseScrollState`). Re-query after cancel so
+                            // a dropped composer pollTimeout parks the ticker.
+                            await self.refreshScrollClockFromRenderer()
                             await inputPumpGate.resume()
                             continue
                         case .focusScrollback:
+                            self.cancelComposerMouseGesture()
+                            await self.refreshScrollClockFromRenderer()
                             // Click-to-select (and any other render-side focus
                             // claim) must move the controller's focus region
                             // so Tab/j/k agree with the painted selection.
@@ -1221,19 +1336,57 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             }
                             await inputPumpGate.resume()
                             continue
+                        case .focusComposer:
+                            self.cancelComposerMouseGesture()
+                            await self.refreshScrollClockFromRenderer()
+                            // Chrome / prefix / collapsed-unfocused: focus
+                            // the prompt without moving the caret.
+                            do {
+                                try await self.applyFocusComposer()
+                            } catch {
+                                await mailbox.send(
+                                    .input(.failure(String(describing: error))),
+                                    priority: true
+                                )
+                                return
+                            }
+                            await inputPumpGate.resume()
+                            continue
+                        case .composerMouse(let claim):
+                            do {
+                                try await self.applyComposerMouse(claim)
+                            } catch {
+                                await mailbox.send(
+                                    .input(.failure(String(describing: error))),
+                                    priority: true
+                                )
+                                return
+                            }
+                            // Re-arm AFTER apply: TextArea may have just set
+                            // `pendingDragScroll` / `pollTimeoutMs`. Querying
+                            // before apply misses a newly armed edge autoscroll.
+                            await self.refreshScrollClockFromRenderer()
+                            await inputPumpGate.resume()
+                            continue
                         case .runCommand(let text):
+                            self.cancelComposerMouseGesture()
+                            await self.refreshScrollClockFromRenderer()
                             // The gate stays paused: whichever loop services the
                             // control signal resumes it, exactly as for an
                             // interrupt.
                             await mailbox.send(.control(.command(text)), priority: true)
                             continue
                         case .dispatchPrompt(let sessionID, let prompt):
+                            self.cancelComposerMouseGesture()
+                            await self.refreshScrollClockFromRenderer()
                             await mailbox.send(
                                 .control(.dispatch(sessionID: sessionID, prompt: prompt)),
                                 priority: true
                             )
                             continue
                         case .dispatchNew(let prompt, let workingDirectory):
+                            self.cancelComposerMouseGesture()
+                            await self.refreshScrollClockFromRenderer()
                             await mailbox.send(
                                 .control(.dispatchNew(
                                     prompt: prompt,
@@ -1243,6 +1396,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             )
                             continue
                         case .notHandled:
+                            self.cancelComposerMouseGesture()
+                            await self.refreshScrollClockFromRenderer()
                             break
                         }
                     }
@@ -1563,23 +1718,34 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             try? await emit(.failed(String(describing: error)))
         }
 
-        // Stop the motion ticker and wait for it to land before touching the
-        // terminal: a tick racing `restoreTerminal` could paint into a
-        // restored screen. Awaiting is safe — the ticker's sleeps are actor
-        // suspensions, so it observes the cancellation promptly. The shutdown
-        // latch is permanent for this run so a late `resumeMotionTicker` from
-        // a racing child-restore path cannot clear an ordinary suspend hold
-        // and re-arm while `running` is still true.
+        // Stop the motion ticker and the dedicated scroll ticker and wait for
+        // both to land before touching the terminal: a tick racing
+        // `restoreTerminal` could paint into a restored screen. Awaiting is
+        // safe — the tickers' sleeps are actor suspensions, so they observe
+        // cancellation promptly. The shutdown latch is permanent for this
+        // run so a late `resumeMotionTicker` from a racing child-restore
+        // path cannot clear an ordinary suspend hold and re-arm either
+        // ticker while `running` is still true.
         motionShutdownLatched = true
         motionSuspended = true
-        let teardownGeneration = motionTickerGeneration
-        let teardownTicker = motionTicker
-        teardownTicker?.cancel()
-        if let teardownTicker {
-            _ = await teardownTicker.value
+        cancelComposerMouseGesture()
+        let teardownMotionGeneration = motionTickerGeneration
+        let teardownMotion = motionTicker
+        teardownMotion?.cancel()
+        let teardownScrollGeneration = scrollTickerGeneration
+        let teardownScroll = scrollTicker
+        teardownScroll?.cancel()
+        if let teardownMotion {
+            _ = await teardownMotion.value
         }
-        if motionTickerGeneration == teardownGeneration {
+        if let teardownScroll {
+            _ = await teardownScroll.value
+        }
+        if motionTickerGeneration == teardownMotionGeneration {
             motionTicker = nil
+        }
+        if scrollTickerGeneration == teardownScrollGeneration {
+            scrollTicker = nil
         }
 
         await closeActiveSession()
@@ -2344,6 +2510,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case focusPrompt
         case command(OpenGrokPagerScrollbackCommand)
         case viewport(OpenGrokPagerViewportCommand)
+        /// Opt-in mouse-reporting toggle — same overlay seam as
+        /// `/toggle-mouse-reporting` (`Action::ToggleMouseCapture`).
+        case toggleMouseReporting
         /// The scrollback has focus and declines to act, but a focused region
         /// never leaks a keystroke to the composer — upstream's rule for
         /// modals, applied to the focus split for the same reason.
@@ -2371,6 +2540,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case "j": return .viewport(.lineDown)
             case "u": return .viewport(.halfPageUp)
             case "e": return .command(.expandAllThinking)
+            // `Ctrl+R` toggles mouse capture only while scrollback is
+            // focused and only when the opt-in gate is on
+            // (`defaults.rs:854-877`, `When::ScrollbackFocused`). Prompt
+            // focus must not steal this chord — history search / parity
+            // stay on the prompt path.
+            case "r" where mouseReportingToggleEnabled:
+                return .toggleMouseReporting
             default: return .swallowed
             }
         }
@@ -2454,6 +2630,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             try await emit(.scrollback(command))
         case .viewport(let command):
             try await emit(.viewport(command))
+        case .toggleMouseReporting:
+            try await emit(.overlay(.toggleMouseReporting))
         case .swallowed:
             break
         }
@@ -2468,6 +2646,47 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         pendingConfirmation = nil
         try await emit(.focusChanged(region))
         try await emit(.promptChanged(promptState()))
+    }
+
+    /// Apply a renderer `.focusComposer` claim: focus the prompt without
+    /// moving the caret, and emit `.promptChanged` so a chrome click that
+    /// only changes focus still syncs the paint.
+    private func applyFocusComposer() async throws {
+        let wasPrompt = focus == .prompt
+        try await setFocus(.prompt)
+        if wasPrompt {
+            try await emit(.promptChanged(promptState()))
+        }
+    }
+
+    /// Apply `.composerMouse`: TextArea.handleMouse on the last-painted
+    /// content rect. Down/drag/up focus the prompt and OSC 52 copy when
+    /// the TextArea staged a clipboard payload. Wheel may scroll the
+    /// TextArea but must not `setFocus(.prompt)` — pin `panes.rs:669-685`
+    /// calls `prompt.handle_mouse` without `set_active_pane`.
+    private func applyComposerMouse(_ claim: OpenGrokPagerComposerMouse) async throws {
+        lastComposerContentRect = claim.content
+        let action = editor.handleMouse(claim.event, content: claim.content)
+        if claim.event.isScroll {
+            if action != .nothing {
+                try await emit(.promptChanged(promptState()))
+            }
+            return
+        }
+        let wasPrompt = focus == .prompt
+        try await setFocus(.prompt)
+        if wasPrompt {
+            try await emit(.promptChanged(promptState()))
+        }
+        let copied = editor.takeClipboard()
+        if action == .selectionFinished, let copied, !copied.isEmpty {
+            try await renderer.copyToClipboard(copied)
+        }
+    }
+
+    /// Drop TextArea drag/scrollbar state without copying. Idempotent.
+    private func cancelComposerMouseGesture() {
+        editor.cancelMouseGesture()
     }
 
     private func setMultiline(_ isOn: Bool) async throws {
@@ -2592,6 +2811,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     ///
     /// Summaries are upstream's verbatim (`src/slash/commands/*.rs`) so the
     /// dropdown reads identically for every command both sides have.
+    ///
+    /// `/debug` listing tracks Swift `DEBUG` the way upstream's
+    /// `LISTED_IN_COMPLETIONS = cfg!(debug_assertions)` tracks the binary
+    /// profile (`debug.rs:24-29`). Always registered; hidden in release.
+    public static let debugCommandListedInCompletions: Bool = {
+        #if DEBUG
+        true
+        #else
+        false
+        #endif
+    }()
+
     static let builtinCommands: [PagerCommandDefinition] = [
         // Registration order is display order: a bare `/` lists exactly this
         // sequence, mirroring upstream's `builtin_commands()` ("in display
@@ -2849,6 +3080,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Toggle the timeline sidebar",
             usage: "/timeline"
         ),
+        // Gated at session construction on `[ui] mouse_reporting_toggle` /
+        // `GROK_MOUSE_REPORTING_TOGGLE` (`toggle_mouse_reporting.rs:32-46`):
+        // hidden + unavailable when the opt-in flag is off; the static row
+        // stays here so registry order pins keep the adjacent triple.
         PagerCommandDefinition(
             name: "toggle-mouse-reporting",
             summary: "Toggle terminal mouse reporting (native click-drag copy/paste)"
@@ -3065,6 +3300,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Set or inspect the session goal",
             usage: "/goal [objective|status|pause|resume|clear]"
         ),
+        // `/debug [fps]` — always registered and routable; listed only on
+        // debug binaries (`debug.rs:24-29` `LISTED_IN_COMPLETIONS =
+        // cfg!(debug_assertions)`). Scroll/log HUD surfaces are absent, so
+        // usage is `[fps]` only — no no-op subcommand rows.
+        PagerCommandDefinition(
+            name: "debug",
+            summary: "Toggle debug overlays",
+            usage: "/debug [fps]",
+            isHidden: {
+                #if DEBUG
+                false
+                #else
+                true
+                #endif
+            }()
+        ),
         PagerCommandDefinition(
             name: "gboom",
             summary: "Hidden easter egg",
@@ -3083,8 +3334,63 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         }
     }
 
+    /// Builtin rows advertised to the model / ACP client after applying the
+    /// same startup gates the interactive controller uses for the slash
+    /// dropdown (`workflows` kill-switch + mouse-reporting toggle opt-in).
+    public static func visibleBuiltinCommandCatalog(
+        workflowsEnabled: Bool = true,
+        mouseReportingToggleEnabled: Bool = false
+    ) -> [OpenGrokPagerCommandRegistration] {
+        sessionBuiltinCommands(
+            workflowsEnabled: workflowsEnabled,
+            mouseReportingToggleEnabled: mouseReportingToggleEnabled
+        )
+        .filter { !$0.isHidden && $0.availability.isAvailable }
+        .map { command in
+            OpenGrokPagerCommandRegistration(
+                name: command.name,
+                aliases: command.aliases,
+                summary: command.summary,
+                usage: command.usage
+            )
+        }
+    }
+
     public static var builtinCommandNames: Set<String> {
         Set(builtinCommands.flatMap(\.allNames))
+    }
+
+    /// Hint returned when `/toggle-mouse-reporting` is invoked while the
+    /// opt-in gate is off — byte-identical to upstream
+    /// `toggle_mouse_reporting.rs:42-44`.
+    public static let mouseReportingToggleUnavailableMessage =
+        "Mouse reporting toggle is off. Set `[ui] mouse_reporting_toggle = true` "
+        + "in ~/.opengrok/config.toml to enable it."
+
+    /// Apply the session-scoped feature gates to the static builtin table.
+    /// `/workflows` is dropped when disabled; `/toggle-mouse-reporting` stays
+    /// resolvable but hidden and unavailable so a direct invoke is honest.
+    static func sessionBuiltinCommands(
+        workflowsEnabled: Bool,
+        mouseReportingToggleEnabled: Bool
+    ) -> [PagerCommandDefinition] {
+        builtinCommands.compactMap { command in
+            if command.name == "workflows", !workflowsEnabled {
+                return nil
+            }
+            if command.name == "toggle-mouse-reporting", !mouseReportingToggleEnabled {
+                return PagerCommandDefinition(
+                    name: command.name,
+                    summary: command.summary,
+                    usage: command.usage,
+                    availability: .unavailable(
+                        reason: mouseReportingToggleUnavailableMessage
+                    ),
+                    isHidden: true
+                )
+            }
+            return command
+        }
     }
 
     /// The settings row `/privacy` deep-links to
@@ -3221,6 +3527,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case "logout":
             // `LogoutCommand::suggest_args` (`logout.rs:29-36`).
             return PagerLoginProviders.logoutSuggestions(query: query)
+        case "debug":
+            // Only `fps` — scroll/log HUD surfaces are absent, so those
+            // subcommands are not offered (no no-op entries).
+            let rows = [
+                OpenGrokPagerCommandSuggestion(
+                    name: "fps",
+                    summary: "Toggle the FPS overlay",
+                    insertText: "/debug fps"
+                )
+            ]
+            let trimmed = query.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return rows }
+            let matcher = PagerFuzzyMatcher()
+            return matcher
+                .rank(rows, query: trimmed, limit: rows.count) { $0.name }
+                .map { rows[$0.index] }
         default:
             return []
         }
@@ -3899,6 +4221,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case "toggle-mouse-reporting":
                 try await emit(.overlay(.toggleMouseReporting))
                 return .handled
+            case "debug":
+                try await emit(.overlay(.debug(argument: Self.rejoined(invocation.arguments))))
+                return .handled
             case "login":
                 // Bare `/login` opens the provider picker
                 // (`login.rs:129-131`); a typed provider resolves through the
@@ -4264,12 +4589,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       Click            choose a row in an overlay
     """
 
-    public static func helpText(workflowsEnabled: Bool) -> String {
-        guard !workflowsEnabled else { return helpText }
-        return helpText
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("/workflows") }
-            .joined(separator: "\n")
+    public static func helpText(
+        workflowsEnabled: Bool = true,
+        mouseReportingToggleEnabled: Bool = false
+    ) -> String {
+        var lines = helpText.split(separator: "\n", omittingEmptySubsequences: false)
+        if !workflowsEnabled {
+            lines = lines.filter {
+                !$0.trimmingCharacters(in: .whitespaces).hasPrefix("/workflows")
+            }
+        }
+        if !mouseReportingToggleEnabled {
+            lines = lines.filter {
+                !$0.trimmingCharacters(in: .whitespaces).hasPrefix("/toggle-mouse-reporting")
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 
     private func transition(to newLifecycle: OpenGrokPagerInteractiveLifecycle) async throws {
@@ -4370,9 +4705,153 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         return OpenGrokPagerAnimationFrame(tick: tick, seconds: seconds, demand: demand)
     }
 
+    // MARK: - Scroll clock
+
+    /// Floor for an overdue scroll deadline (`0`). A bare `Task.yield`
+    /// still lets a renderer that keeps returning `0` burn the core; one
+    /// millisecond is the cost of not spinning. Matches the spirit of
+    /// `MouseScrollState`'s 16 ms redraw cadence without inventing a second
+    /// poll loop.
+    private static let scrollClockOverdueSleepNanos: UInt64 = 1_000_000
+
+    /// Monotonic uptime seconds for scroll-clock queries. Same clock family
+    /// as motion ticks (`DispatchTime`); the renderer maps it onto
+    /// `MouseScrollState`'s injected `now`.
+    private func scrollClockNow() -> TimeInterval {
+        Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+    }
+
+    /// Re-query the renderer's relative scroll deadline, min'd with the
+    /// TextArea drag-autoscroll poll, and arm, reschedule, or disarm the
+    /// dedicated scroll ticker. Called after every successful `handleInput`
+    /// and from `resumeMotionTicker`. Ordinary suspend and the shutdown latch
+    /// both block arming; a `nil` deadline cancels any armed ticker without
+    /// awaiting (the cancelled generation exits itself).
+    private func refreshScrollClockFromRenderer() async {
+        guard running, !motionSuspended, !motionShutdownLatched else { return }
+        let delay = await combinedScrollClockDelay()
+        guard let delay else {
+            cancelScrollTicker()
+            return
+        }
+        armScrollTicker(delay: delay)
+    }
+
+    private func combinedScrollClockDelay() async -> TimeInterval? {
+        let rendererDelay = await renderer.scrollClockDeadline(at: scrollClockNow())
+        let composerDelay = editor.pollTimeoutMs().map { TimeInterval($0) / 1_000 }
+        switch (rendererDelay, composerDelay) {
+        case (let r?, let c?): return min(r, c)
+        case (let r?, nil): return r
+        case (nil, let c?): return c
+        case (nil, nil): return nil
+        }
+    }
+
+    /// TextArea drag-edge autoscroll. Re-reads the last-painted content rect
+    /// so a resize mid-drag cannot keep applying the down-time wrap.
+    private func tickComposerDragScroll() async throws {
+        guard editor.pollTimeoutMs() != nil else { return }
+        let rect = await renderer.lastComposerContentRect() ?? lastComposerContentRect
+        guard let rect else { return }
+        lastComposerContentRect = rect
+        let action = editor.tick(content: rect)
+        if action != .nothing {
+            try await emit(.promptChanged(promptState()))
+        }
+        let copied = editor.takeClipboard()
+        if action == .selectionFinished, let copied, !copied.isEmpty {
+            try await renderer.copyToClipboard(copied)
+        }
+    }
+
+    /// Cancel the armed scroll ticker without awaiting. Bumps generation so
+    /// a racing loop body cannot tick after disarm, and so a later arm is
+    /// not erased when the cancelled task's `defer` runs.
+    private func cancelScrollTicker() {
+        scrollTickerGeneration &+= 1
+        scrollTicker?.cancel()
+        scrollTicker = nil
+    }
+
+    /// Arm (or replace) the dedicated scroll ticker for `delay` relative
+    /// seconds. Always bumps generation and cancels any prior task so two
+    /// scroll events cannot leave duplicate wakeups. Suspend / shutdown
+    /// latch / not-running all no-op.
+    private func armScrollTicker(delay: TimeInterval) {
+        guard running, !motionSuspended, !motionShutdownLatched else { return }
+        scrollTickerGeneration &+= 1
+        let generation = scrollTickerGeneration
+        scrollTicker?.cancel()
+        scrollTicker = Task {
+            await self.runScrollTicker(generation: generation, initialDelay: delay)
+        }
+    }
+
+    private func runScrollTicker(generation: UInt64, initialDelay: TimeInterval) async {
+        defer {
+            if scrollTickerGeneration == generation {
+                scrollTicker = nil
+            }
+        }
+        var delay = initialDelay
+        while !Task.isCancelled, running {
+            guard !motionSuspended, !motionShutdownLatched else { return }
+            guard scrollTickerGeneration == generation else { return }
+            let sleepNanos: UInt64
+            if delay <= 0 {
+                sleepNanos = Self.scrollClockOverdueSleepNanos
+            } else {
+                let requested = delay * 1_000_000_000
+                if requested >= Double(UInt64.max) {
+                    sleepNanos = UInt64.max
+                } else {
+                    sleepNanos = UInt64(requested)
+                }
+            }
+            do {
+                try await Task.sleep(nanoseconds: sleepNanos)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, running else { return }
+            guard !motionSuspended, !motionShutdownLatched else { return }
+            guard scrollTickerGeneration == generation else { return }
+            do {
+                try await tickComposerDragScroll()
+                try await renderer.handleScrollClockTick(at: scrollClockNow())
+                guard !Task.isCancelled, running else { return }
+                guard !motionSuspended, !motionShutdownLatched else { return }
+                guard scrollTickerGeneration == generation else { return }
+                guard let next = await combinedScrollClockDelay() else {
+                    return
+                }
+                delay = next
+            } catch {
+                // Surface like `handleInput` failures — a swallowed tick
+                // error would leave scroll state armed with no wakeups, or
+                // worse keep the run green after a restore failure inside
+                // the renderer's tick path.
+                await signalMailbox?.send(
+                    .input(.failure(String(describing: error))),
+                    priority: true
+                )
+                return
+            }
+        }
+    }
+
     private func emit(_ event: OpenGrokPagerInteractiveEvent) async throws {
+        if case .overlay = event {
+            // Capturing overlay activation must drop a TextArea gesture
+            // without synthesizing a copy (`cancelMouseGesture`).
+            cancelComposerMouseGesture()
+        }
         try await renderer.render(event)
         try await output.forward(event)
+        if case .overlay = event {
+            await refreshScrollClockFromRenderer()
+        }
     }
 
     private func cancelActiveSession() async {

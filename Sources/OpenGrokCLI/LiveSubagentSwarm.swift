@@ -833,6 +833,10 @@ extension LiveSubagentHost {
         let memberModel = childModel
         let memberCWD = childCWD
         do {
+            // Swarm members are real coordinator children (`owner: .swarm`).
+            // Rust `running_count` includes them when `workflow_run_id` is
+            // absent; count each member once through the host helper so this
+            // path cannot double-emit with `spawn`.
             try await coordinator.spawn(request) { [weak self] in
                 guard let self else {
                     return OpenGrokChildResult(
@@ -841,21 +845,25 @@ extension LiveSubagentHost {
                         error: "subagent host was torn down before the child ran"
                     )
                 }
-                return await self.runChild(
-                    childID: agentID,
-                    prompt: memberPrompt,
-                    definition: definition,
-                    runtime: runtime,
-                    model: memberModel,
-                    cwd: memberCWD,
-                    resumeItems: inheritedItems
-                )
+                return await self.withActiveBackgroundWorkCounting(for: request) {
+                    await self.runChild(
+                        childID: agentID,
+                        prompt: memberPrompt,
+                        definition: definition,
+                        runtime: runtime,
+                        model: memberModel,
+                        cwd: memberCWD,
+                        resumeItems: inheritedItems
+                    )
+                }
             }
         } catch let error as OpenGrokCoordinatorError {
             bookkeeping.removeValue(forKey: agentID)
+            await emitActiveBackgroundWorkRemove(id: agentID)
             return failed(error.description)
         } catch {
             bookkeeping.removeValue(forKey: agentID)
+            await emitActiveBackgroundWorkRemove(id: agentID)
             return failed("subagent \(agentID) could not be registered: \(error)")
         }
 

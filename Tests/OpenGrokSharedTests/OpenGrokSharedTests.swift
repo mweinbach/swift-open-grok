@@ -502,6 +502,37 @@ struct UIConfigTests {
         #expect(fromHold.keepTextSelection == "hold")
     }
 
+    @Test("resolvedKeepTextSelection precedence matches pin cache.rs")
+    func resolvedKeepTextSelectionPrecedence() {
+        // appearance/cache.rs text_selection_from_ui at 650c1db7.
+        var config = UiConfig()
+        #expect(config.resolvedKeepTextSelection() == "flash")
+
+        config.selectionHighlightDurationMs = 0
+        #expect(config.resolvedKeepTextSelection() == "hold")
+
+        config.selectionHighlightDurationMs = nil
+        config.doubleClickAction = "word_select"
+        #expect(config.resolvedKeepTextSelection() == "word_select")
+
+        // Explicit keep_text_selection always wins over legacy keys.
+        config.keepTextSelection = "flash"
+        config.doubleClickAction = "word_select"
+        config.selectionHighlightDurationMs = 0
+        #expect(config.resolvedKeepTextSelection() == "flash")
+
+        config.keepTextSelection = "hold"
+        #expect(config.resolvedKeepTextSelection() == "hold")
+
+        config.keepTextSelection = "word_select"
+        #expect(config.resolvedKeepTextSelection() == "word_select")
+
+        // Non-canonical keep_text_selection falls through to legacy.
+        config.keepTextSelection = "yes"
+        config.doubleClickAction = "word_select"
+        #expect(config.resolvedKeepTextSelection() == "word_select")
+    }
+
     @Test("displayRefresh nested deserialize")
     func displayRefreshNested() throws {
         let json = #"{"display_refresh": {"auto_cadence_enabled": true, "floor_ms": 7, "probe_enabled": false}}"#.data(using: .utf8)!

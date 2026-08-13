@@ -1,6 +1,7 @@
 import Foundation
 import OpenGrokPagerRender
 import OpenGrokTerminalCore
+@_exported import OpenGrokTextArea
 
 public typealias OpenGrokPagerInputEventStream = AsyncThrowingStream<InputEvent, Error>
 
@@ -175,7 +176,20 @@ public struct OpenGrokPagerCommandSuggestion: Sendable, Equatable, Hashable {
 
 public struct OpenGrokPagerInteractivePromptState: Sendable, Equatable {
     public let text: String
+    /// Character / grapheme caret. Kept for Stage 1 compatibility; UTF-8
+    /// `cursorUTF8` is the live TextArea offset.
     public let cursorOffset: Int
+    /// UTF-8 byte caret into `text`. Snapped to a grapheme boundary.
+    public let cursorUTF8: Int
+    /// UTF-8 selection range, or `nil` when nothing is selected.
+    public let selectionUTF8: Range<Int>?
+    /// Exact selected slice, matching `TextArea.selectedText()`.
+    public let selectedText: String?
+    /// Last published TextArea scroll (override or 0). Render recomputes
+    /// effective scroll from this plus wrap geometry.
+    public let textAreaState: TextAreaState
+    /// Mouse-wheel / drag-scroll override. `nil` means follow the caret.
+    public let scrollOverride: Int?
     /// Slash-command completions for the current text. Empty when the dropdown
     /// is closed.
     public let completions: [OpenGrokPagerCommandSuggestion]
@@ -188,6 +202,11 @@ public struct OpenGrokPagerInteractivePromptState: Sendable, Equatable {
     public init(
         text: String = "",
         cursorOffset: Int = 0,
+        cursorUTF8: Int? = nil,
+        selectionUTF8: Range<Int>? = nil,
+        selectedText: String? = nil,
+        textAreaState: TextAreaState = TextAreaState(),
+        scrollOverride: Int? = nil,
         completions: [OpenGrokPagerCommandSuggestion] = [],
         selectedCompletion: Int? = nil,
         pendingConfirmationKey: String? = nil,
@@ -195,6 +214,16 @@ public struct OpenGrokPagerInteractivePromptState: Sendable, Equatable {
     ) {
         self.text = text
         self.cursorOffset = max(0, min(cursorOffset, text.count))
+        let utf8End = text.utf8.count
+        if let cursorUTF8 {
+            self.cursorUTF8 = min(max(0, cursorUTF8), utf8End)
+        } else {
+            self.cursorUTF8 = utf8Offset(fromCharacter: self.cursorOffset, in: text)
+        }
+        self.selectionUTF8 = selectionUTF8
+        self.selectedText = selectedText
+        self.textAreaState = textAreaState
+        self.scrollOverride = scrollOverride
         self.completions = completions
         self.selectedCompletion = selectedCompletion
         self.pendingConfirmationKey = pendingConfirmationKey
@@ -308,6 +337,10 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// `/toggle-mouse-reporting` — hand click-drag back to the terminal for
     /// native copy/paste, or take it back.
     case toggleMouseReporting
+    /// `/debug [fps]` — FPS HUD toggle / status. Scroll/log surfaces are
+    /// absent on this port, so the only subcommand is `fps` (no no-op
+    /// entries). Bare args report fps status; `fps` toggles and forces paint.
+    case debug(argument: String)
     /// `/compact-mode` — flip the USER's `[ui] compact_mode` value (upstream
     /// `Action::ToggleCompactMode`, `slash/commands/compact_mode.rs:28-30`,
     /// dispatched by `dispatch_toggle_compact_mode`,
@@ -689,6 +722,37 @@ public enum OpenGrokPagerInputRouting: Sendable, Equatable, Hashable {
     /// event so the renderer's selection state stays in sync with Tab focus.
     /// Idempotent when focus is already on the scrollback.
     case focusScrollback
+    /// Chrome / prefix / collapsed-unfocused composer click: focus the
+    /// prompt without moving the caret or arming a TextArea gesture.
+    case focusComposer
+    /// Content-rect mouse (down / drag / up / wheel). The controller applies
+    /// `TextArea.handleMouse` with `content` — the last-painted content rect,
+    /// prefix excluded. Prompt-owned drag/up keep using this case even when
+    /// the pointer leaves the pane (edge autoscroll).
+    case composerMouse(OpenGrokPagerComposerMouse)
+}
+
+/// Last-painted composer content rect plus the mouse event to apply.
+///
+/// `MouseEvent` is not Hashable in TerminalCore; this wrapper hashes the
+/// fields the routing enum needs without a retroactive conformance.
+public struct OpenGrokPagerComposerMouse: Sendable, Equatable, Hashable {
+    public var event: MouseEvent
+    public var content: TextAreaRect
+
+    public init(event: MouseEvent, content: TextAreaRect) {
+        self.event = event
+        self.content = content
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(event.kind)
+        hasher.combine(event.x)
+        hasher.combine(event.y)
+        hasher.combine(event.button)
+        hasher.combine(event.modifiers)
+        hasher.combine(content)
+    }
 }
 
 public enum OpenGrokPagerInteractiveEvent: Sendable, Equatable {
@@ -774,6 +838,36 @@ public protocol OpenGrokPagerInteractiveRenderAdapter: Sendable {
     /// and simply stay still; the cost is that this seam is easy to forget —
     /// a renderer that never implements it silently keeps the frozen UI.
     func renderAnimationTick(_ frame: OpenGrokPagerAnimationFrame) async throws
+
+    /// Relative delay until the next mouse-scroll flush, in seconds.
+    ///
+    /// Mirrors `MouseScrollState.deadline(now:)`: `nil` disarms the
+    /// controller's dedicated scroll ticker; `0` means overdue (the
+    /// controller still applies a bounded minimum sleep so a renderer that
+    /// keeps returning `0` cannot busy-spin). Absolute wall deadlines are
+    /// intentionally not used — the live renderer owns `MouseScrollState`
+    /// and reports the same relative form. Default: disarmed (`nil`).
+    func scrollClockDeadline(at now: TimeInterval) async -> TimeInterval?
+
+    /// One wake of the dedicated scroll clock (`MouseScrollState.onTick`).
+    ///
+    /// Distinct from `renderAnimationTick`: scroll coalescing must not
+    /// piggyback the motion ticker (idle screens with an active scroll
+    /// stream still need 16 ms flushes; motion demand may be `.none`).
+    /// Throws propagate through the controller's input mailbox like
+    /// `handleInput` failures — they are never swallowed into a silent
+    /// still UI. Default: no-op.
+    func handleScrollClockTick(at now: TimeInterval) async throws
+
+    /// Last-painted composer content rect (prefix excluded). The controller
+    /// uses this on TextArea drag-autoscroll ticks so a resize mid-drag
+    /// picks up the new wrap without freezing the down-time geometry.
+    /// Default: `nil`.
+    func lastComposerContentRect() async -> TextAreaRect?
+
+    /// Copy selected composer text through the renderer's OSC 52 (or test)
+    /// clipboard path. Default: no-op. Throws propagate like `handleInput`.
+    func copyToClipboard(_ text: String) async throws
 }
 
 extension OpenGrokPagerInteractiveRenderAdapter {
@@ -788,6 +882,23 @@ extension OpenGrokPagerInteractiveRenderAdapter {
 
     public func renderAnimationTick(_ frame: OpenGrokPagerAnimationFrame) async throws {
         _ = frame
+    }
+
+    public func scrollClockDeadline(at now: TimeInterval) async -> TimeInterval? {
+        _ = now
+        return nil
+    }
+
+    public func handleScrollClockTick(at now: TimeInterval) async throws {
+        _ = now
+    }
+
+    public func lastComposerContentRect() async -> TextAreaRect? {
+        nil
+    }
+
+    public func copyToClipboard(_ text: String) async throws {
+        _ = text
     }
 }
 
