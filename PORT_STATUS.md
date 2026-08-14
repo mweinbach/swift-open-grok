@@ -1,11 +1,50 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-14 (Wave 26 — Multi-Agent Subsystem Wave: MCP Meta-Discovery, Background Monitor Tool & Rate Limiting, Cursor Rules on Read, Memory MMR & Query Expansion). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0 (clean build, 2.55s); authoritative full `test --no-parallel` exit 0 — exactly **7,090 Swift Testing cases in 1,080 suites passed** after 318.630s (100% green, 0 failures, 0 regressions against baseline).
+**As of:** 2026-08-14 (Wave 27 — Multi-Provider Subsystem Wave: 9-Provider Storage, CLI Login/Logout/Status, Wire Policies & Dialects, Dynamic Catalog Broker Resolution). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0 (clean build, 3.67s); authoritative full `test --no-parallel` exit 0 — exactly **7,156 Swift Testing cases in 1,095 suites passed** after 329.722s (100% green, 0 failures, 0 regressions against baseline).
 
-**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (MCP Meta-Discovery `search_tool`/`use_tool` & FNV-1a Fingerprints, Background Monitor Tool with Token-Bucket Rate Limiter & Suppression Tracker, Cursor Rules on Read Attachment & Scope Scanner, Memory MMR Maximal Marginal Relevance & Query Expansion, Bounded Stdio MCP Auto-Restart & Backoff, Durable Session Relocation Journal & Transactional Authority, Image Normalization & Resizing with SHA-256 Digest Cache, Pre-Warmed Subagent Git Worktree Pool, Native Workflow Engine & Rhai AST/Interpreter/Journal/Escalation, Interactive Terminal Composer Rich Elements & Image Framing, Markdown Table Wrapped-Fragment & 11-Glyph Box Drawing Layout Parity, Tool Catalog Schemas & Protocol Output Caps, Agent Runtime & Turn Pipeline, ACP Transports, Custom Models Settings UI & Store Persistence, Steady-State Cache Tracking & Cold-Start Diagnostics, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
+**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (All 9 Model Providers [xAI, Codex, Kimi Platform & Code, Fireworks AI, DeepSeek, Meta Muse Spark, OpenCode Go, Wafer AI, Z AI], Multi-Provider Scoped Storage & CLI Auth Management, Provider Wire Policies & Dialects, Dynamic Catalog Broker Resolution, MCP Meta-Discovery `search_tool`/`use_tool` & FNV-1a Fingerprints, Background Monitor Tool with Token-Bucket Rate Limiter & Suppression Tracker, Cursor Rules on Read Attachment & Scope Scanner, Memory MMR Maximal Marginal Relevance & Query Expansion, Bounded Stdio MCP Auto-Restart & Backoff, Durable Session Relocation Journal & Transactional Authority, Image Normalization & Resizing with SHA-256 Digest Cache, Pre-Warmed Subagent Git Worktree Pool, Native Workflow Engine & Rhai AST/Interpreter/Journal/Escalation, Interactive Terminal Composer Rich Elements & Image Framing, Markdown Table Wrapped-Fragment & 11-Glyph Box Drawing Layout Parity, Tool Catalog Schemas & Protocol Output Caps, Agent Runtime & Turn Pipeline, ACP Transports, Custom Models Settings UI & Store Persistence, Steady-State Cache Tracking & Cold-Start Diagnostics, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`) / Forward Sync `eb215dd0` (`v1.0.0-open-grok.63`).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
+
+## Wave 27 — Multi-Provider Subsystem Porting: Scopes & Storage, CLI Auth Commands, Wire Policies & Dialects, Catalog Resolution (2026-08-14, complete)
+
+Current truth for the verified 2026-08-14 Wave 27 Multi-Provider Porting across Multi-Provider Scoped Storage & Logout (`OpenGrokAuth`), CLI Multi-Provider Login/Logout/Status (`OpenGrokCLI`), Provider Wire Policies & Dialect Formatting (`OpenGrokSampler`, `OpenGrokSamplingTypes`), and Multi-Provider Catalog Resolution (`OpenGrokModels`):
+
+**Verification (lead, local macOS, 2026-08-14; serial gate):**
+- `zsh workflows/swift-safe-verify.zsh build` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build --product open-grok` — exit 0: clean binary build in **3.67s**.
+- Authoritative full `zsh workflows/swift-safe-verify.zsh test --no-parallel` — exit 0: exactly **7,156** Swift Testing cases in **1,095** suites, elapsed **329.722s** (100% green, 0 failures, 0 regressions).
+- CLI Smokes: `open-grok --version` reports `Open Grok 1.0.0-open-grok.63` (exit 0); `paths --json` and `models --json` exit 0.
+
+### Slices Completed & Landed
+
+1. **Slice 1: Multi-Provider Scopes, Storage & Logout (`OpenGrokAuth`, `ae90872`)**
+   - Expanded `AuthAccountTarget` to all 9 supported providers plus `.all`: `xai`, `codex`, `kimi`, `fireworks`, `deepseek`, `meta`, `openCodeGo`, `wafer`, `zai`, `all`.
+   - Added typed storage and cleanup helpers for all provider scopes in `ProviderScopes.swift`.
+   - Implemented target-aware `logout(target:...)` clearing provider-specific scopes from `auth.json` with multi-target rollback safety and populated `MultiLogoutResult` (`MultiProviderAuthTests.swift`).
+
+2. **Slice 2: CLI Multi-Provider Login, Logout & Status (`OpenGrokCLI`, `e7f7375`)**
+   - Implemented `open-grok login <provider> [api-key]` and `open-grok logout <provider>` across all 9 providers with alias resolution.
+   - Interactive secret line prompt fallback for terminal sessions.
+   - Extended `LiveAuthStatus` to report structured JSON and human-readable status lines across all 9 providers (`MultiProviderAuthCLITests.swift`).
+
+3. **Slice 3: Provider Wire Policies, Request Gating & Dialect Serialization (`OpenGrokSampler`, `OpenGrokSamplingTypes`, `1ad26af`)**
+   - Verified `ProviderProfile` constants across all 9 providers.
+   - Added header sanitization (stripping `x-grok-*` headers for standard providers, retaining for xAI), Codex session affinity headers, and dialect patching for DeepSeek, Meta, and Codex (`ProviderWireTests.swift`).
+
+4. **Slice 4: Multi-Provider Catalog Resolution and Model Metadata (`OpenGrokModels`, `d814e15`)**
+   - Verified provider identification and classification across all 9 providers with `ModelPartitionKind` and `ModelCatalogPartition`.
+   - Handled all provider environment variables and alias fallbacks (`XAI_API_KEY`, `CODEX_API_KEY`, `KIMI_API_KEY`, `FIREWORKS_API_KEY`, `DEEPSEEK_API_KEY`, `META_API_KEY`, `OPENCODE_GO_API_KEY`, `WAFER_API_KEY`, `ZAI_API_KEY`).
+   - Integrated custom model merging into catalog resolution pipeline (`MultiProviderCatalogTests.swift`).
+
+### Landed Commits
+
+- `ae90872` — Support multi-provider scopes and logout orchestration in OpenGrokAuth
+- `d814e15` — feat(models): implement multi-provider catalog resolution and metadata
+- `e7f7375` — Implement CLI multi-provider login, logout, and status in OpenGrokCLI
+- `1ad26af` — feat(sampler): verify provider wire policies, request sanitization, and responses dialect patching
 
 ## Wave 26 — Multi-Agent Subsystem Porting: MCP Meta-Discovery, Monitor Tool & Rate Limiting, Cursor Rules on Read, Memory MMR & Query Expansion (2026-08-14, complete)
 
