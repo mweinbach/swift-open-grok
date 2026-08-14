@@ -192,6 +192,32 @@ public func decodeCwdFromDirname(_ dir: URL) -> String? {
     return s.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+/// Best-effort chmod 0700 on Unix, no-op elsewhere: session dirs hold chat
+/// history, and creators re-run on every touch so the mode self-heals.
+/// Failures are ignored: on chmod-hostile filesystems (FAT, some network mounts)
+/// healing pre-existing loose dirs can never succeed.
+public func setDirOwnerOnly(_ dir: URL) {
+    #if !os(Windows)
+    _ = chmod(dir.path, S_IRWXU)
+    #endif
+}
+
+/// `createDirectory` with directories born 0700 on Unix (no umask window),
+/// plus a self-heal chmod for a pre-existing `dir`. Prefer this over bare
+/// `createDirectory` for anything under `sessions/`.
+public func createDirAllOwnerOnly(_ dir: URL) throws {
+    #if !os(Windows)
+    try FileManager.default.createDirectory(
+        at: dir,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    #else
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    #endif
+    setDirOwnerOnly(dir)
+}
+
 /// Build the CWD-level session directory path:
 /// `grokHome()/sessions/{encodeCwdDirname(cwd)}`.
 ///
@@ -218,10 +244,14 @@ public func ensureSessionsCwdDir(
     environment: [String: String] = ProcessInfo.processInfo.environment
 ) throws -> URL {
     let encodedName = encodeCwdDirname(cwd)
-    let dir = grokHome(environment: environment)
+    let home = grokHome(environment: environment)
+    let dir = home
         .appendingPathComponent("sessions")
         .appendingPathComponent(encodedName)
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    // 0700 dir + root shield everything beneath (children with looser modes,
+    // cwd-path dirnames, the session search index).
+    try createDirAllOwnerOnly(dir)
+    setDirOwnerOnly(home.appendingPathComponent("sessions"))
     // Hash-based encoding is in use when the dirname differs from the plain
     // URL-encoded form. Write a `.cwd` file so decode can recover the original
     // path. withoutOverwriting ≈ O_CREAT|O_EXCL.

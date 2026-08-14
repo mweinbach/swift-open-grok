@@ -314,6 +314,45 @@ struct PathsCwdTests {
         #expect(app.path.contains("/bin/"))
         try? FileManager.default.removeItem(atPath: tmp)
     }
+
+    #if !os(Windows)
+    private func unixMode(_ url: URL) throws -> Int {
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        let perms = attrs[.posixPermissions] as? NSNumber
+        return perms?.intValue ?? 0
+    }
+
+    @Test("setDirOwnerOnly restricts mode to 0700")
+    func setDirOwnerOnlyRestricts() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ogrok-perm-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+        setDirOwnerOnly(tmp)
+        #expect(try unixMode(tmp) == 0o700)
+    }
+
+    @Test("createDirAllOwnerOnly creates directory chain born 0700")
+    func createDirAllOwnerOnlyPerms() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ogrok-chain-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let leaf = tmp.appendingPathComponent("a").appendingPathComponent("b")
+        try createDirAllOwnerOnly(leaf)
+        #expect(try unixMode(leaf) == 0o700)
+    }
+
+    @Test("ensureSessionsCwdDir enforces 0700 on sessions root and cwd dir")
+    func ensureSessionsPerms() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ogrok-sessions-perm-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let env = [OpenGrokPathPolicy.homeEnvironmentVariable: tmp.path]
+        let dir = try ensureSessionsCwdDir("/some/project", environment: env)
+        #expect(try unixMode(dir) == 0o700)
+        #expect(try unixMode(tmp.appendingPathComponent("sessions")) == 0o700)
+    }
+    #endif
 }
 
 // MARK: - Layered config / merge
