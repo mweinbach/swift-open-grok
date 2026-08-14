@@ -643,4 +643,63 @@ struct OpenGrokSandboxTests {
         #expect(!manager.applied)
     }
     #endif
+
+    @Test("normalizeAllowPath strips trailing globs and rejects invalid syntax")
+    func normalizeAllowPathCases() {
+        let cases: [(String, String?)] = [
+            // One trailing glob group strips to the parent directory.
+            ("/home/u/.cargo/cache/**", "/home/u/.cargo/cache"),
+            ("/home/u/.cargo/cache/**/", "/home/u/.cargo/cache"),
+            ("/home/u/.cargo/cache/**/*", "/home/u/.cargo/cache"),
+            ("/tmp/scratch/*", "/tmp/scratch"),
+            // Root globs grant the filesystem root, their parent directory.
+            ("/**", "/"),
+            ("/**/", "/"),
+            ("/**/*", "/"),
+            ("/*", "/"),
+            // Literal directory paths pass through unchanged.
+            ("/tmp/scratch", "/tmp/scratch"),
+            ("/tmp/scratch/", "/tmp/scratch/"),
+            ("/", "/"),
+            // Still glob-shaped after one strip: skip, never widen further.
+            ("/a/**/**", nil),
+            ("/a/*/*", nil),
+            ("/home/**/cache", nil),
+            ("/tmp/foo*", nil),
+            // Surrounding whitespace is rejected, never trimmed.
+            ("/tmp/* ", nil),
+            ("/srv/cache ", nil),
+            (" /srv/cache", nil),
+            ("   ", nil),
+            // Nothing configured, nothing to grant.
+            ("", nil),
+        ]
+
+        for (raw, expected) in cases {
+            #expect(normalizeAllowPath(raw) == expected, "Testing raw: \(raw)")
+        }
+    }
+
+    @Test("custom profile normalizes trailing globs in readOnly and readWrite")
+    func customProfileTrailingGlobResolution() throws {
+        let ws = URL(fileURLWithPath: "/workspace")
+        let config = SandboxConfig(profiles: [
+            "cargo": ProfileConfig(
+                extends: "workspace",
+                readOnly: ["/opt/tooling/**"],
+                readWrite: ["/home/user/.cargo/registry/cache/**", "/var/tmp/*"],
+                deny: ["**/.env"]
+            )
+        ])
+
+        let resolved = try ProfileName.custom("cargo").resolve(
+            workspace: ws,
+            config: config
+        )
+
+        #expect(resolved.readOnly.contains(where: { $0.path == "/opt/tooling" }))
+        #expect(resolved.readWrite.contains(where: { $0.path == "/home/user/.cargo/registry/cache" }))
+        #expect(resolved.readWrite.contains(where: { $0.path == "/var/tmp" }))
+        #expect(resolved.denyEntries == ["**/.env"])
+    }
 }

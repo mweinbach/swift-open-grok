@@ -226,10 +226,14 @@ public enum ProfileName: Sendable, Equatable, Hashable, CustomStringConvertible 
                 profile.restrictNetwork = rn
             }
             for pathStr in profileConfig.readOnly {
-                profile.readOnly.append(URL(fileURLWithPath: pathStr, relativeTo: workspace))
+                if let normalized = normalizeAllowPath(pathStr) {
+                    profile.readOnly.append(URL(fileURLWithPath: normalized, relativeTo: workspace))
+                }
             }
             for pathStr in profileConfig.readWrite {
-                profile.readWrite.append(URL(fileURLWithPath: pathStr, relativeTo: workspace))
+                if let normalized = normalizeAllowPath(pathStr) {
+                    profile.readWrite.append(URL(fileURLWithPath: normalized, relativeTo: workspace))
+                }
             }
             var denyURLs: [URL] = []
             for entry in profileConfig.deny {
