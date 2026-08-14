@@ -121,7 +121,7 @@ private func targets() -> [Target] {
     var t: [Target] = []
 
     // ---- Wave 0 ----
-    t.append(.target(name: "OpenGrokBuildSupport", dependencies: dep()))
+    t.append(.target(name: "OpenGrokBuildSupport", dependencies: dep(["OpenGrokShared"])))
     // W0-S2: the two Rust crates (`xai-grok-test-support`,
     // `xai-test-utils`) are independent, but the Swift port of
     // `OpenGrokTestSupport` imports `OpenGrokTestUtilities` (HermeticEnv,
@@ -196,8 +196,7 @@ private func targets() -> [Target] {
     t.append(.target(name: "OpenGrokConfig", dependencies: dep(w0s3, w0s4, ["OpenGrokConfigTypes"])))
 
     // ---- Wave 2 ----
-    // W2-S1: Tracing/CircuitBreaker base; HTTP -> both; Telemetry -> both.
-    t.append(.target(name: "OpenGrokCircuitBreaker", dependencies: dep(w0s3, w0s4, w1s5)))
+    // W2-S1: Tracing/HTTP base; CircuitBreaker -> HTTP; Telemetry -> both.
     t.append(.target(name: "OpenGrokTracing", dependencies: dep(w0s3, w0s4, w1s5)))
     t.append(.target(
         name: "COpenGrokSockets",
@@ -206,7 +205,8 @@ private func targets() -> [Target] {
         linkerSettings: [.linkedLibrary("ws2_32", .when(platforms: [.windows]))]
     ))
     t.append(.target(name: "OpenGrokExtraCA", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokTracing"])))
-    t.append(.target(name: "OpenGrokHTTP", dependencies: dep(w0s3, w0s4, w1s5, ["OpenGrokCircuitBreaker", "OpenGrokTracing", "COpenGrokSockets", "OpenGrokExtraCA"])))
+    t.append(.target(name: "OpenGrokHTTP", dependencies: dep(w0s3, w0s4, w1s5, ["OpenGrokTracing", "COpenGrokSockets", "OpenGrokExtraCA"])))
+    t.append(.target(name: "OpenGrokCircuitBreaker", dependencies: dep(w0s3, w0s4, w1s5, ["OpenGrokHTTP"])))
     t.append(.target(name: "OpenGrokTelemetry", dependencies: dep(w0s3, w0s4, w1s5, ["OpenGrokTracing", "OpenGrokHTTP"])))
     // W2-S2: FileUtils base; SQLiteJournal/Secrets build on it.
     t.append(.target(name: "OpenGrokFileUtils", dependencies: dep(w0s2, w0s3, w0s4, w1s5)))
@@ -550,7 +550,7 @@ private func libs(_ names: [String], _ dependencies: [Target.Dependency]) -> [Ta
 /// library. Owning slices replace the bootstrap stub test files in place.
 private func tests(_ names: [String]) -> [Target] {
     names.map { name in
-        .testTarget(name: "\(name)Tests", dependencies: [.target(name: name)])
+        .testTarget(name: "\(name)Tests", dependencies: [.target(name: name), .target(name: "OpenGrokTestUtilities")])
     }
 }
 

@@ -289,7 +289,7 @@ private final class ParityStreamingSamplerFixture: @unchecked Sendable {
             }
             await fixture.started.signal()
             if fixture.holdOpenAfterDeltas {
-                try await Task.sleep(nanoseconds: 60_000_000_000)
+                try await Task.sleep(nanoseconds: 1_000_000_000)
             }
             return OpenGrokLiveSamplingResponse(
                 output: fixture.answer,
@@ -2948,7 +2948,7 @@ struct ParityCompositionTests {
         let sampler = OpenGrokLiveSampler { _, _ in
             await started.signal()
             do {
-                try await Task.sleep(nanoseconds: 60_000_000_000)
+                try await Task.sleep(nanoseconds: 1_000_000_000)
             } catch is CancellationError {
                 throw CancellationError()
             }

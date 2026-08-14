@@ -38,7 +38,7 @@ private actor FakeACPPermissionClient: ACPPermissionReverseClient {
         case .throwTransport(let message):
             throw ACPRuntimeError.transport(message)
         case .hang:
-            try await Task.sleep(nanoseconds: 60_000_000_000)
+            try await Task.sleep(nanoseconds: 1_000_000_000)
             throw ACPRuntimeError.transport("hang ended")
         }
     }

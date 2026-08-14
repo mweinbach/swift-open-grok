@@ -17,7 +17,7 @@ readonly lock_dir="${SWIFT_SAFE_LOCK_DIR:-${TMPDIR:-/tmp}/swift-open-grok-swiftp
 readonly run_timeout_seconds="${SWIFT_SAFE_TIMEOUT_SECONDS:-600}"
 
 if (( $# == 0 )); then
-  print -u2 "usage: $0 <build|build-tests|test> [arguments...]"
+  print -u2 "usage: $0 <build|build-tests|test|test-target> [arguments...]"
   exit 64
 fi
 
@@ -142,10 +142,43 @@ case "$action" in
     run_with_timeout swift build --build-tests --scratch-path "$scratch_path" --jobs "$jobs" "$@"
     ;;
   test)
+    test_args=()
+    for arg in "$@"; do
+      if [[ "$arg" == "--skip-live" ]]; then
+        export OPENGROK_TEST_TIER=fast
+      else
+        test_args+=("$arg")
+      fi
+    done
     if [[ -z "${OPENGROK_PERFORMANCE_PROFILE:-}" ]]; then
       export OPENGROK_PERFORMANCE_PROFILE=macos-15
     fi
-    run_with_timeout swift test --scratch-path "$scratch_path" --jobs "$jobs" "$@"
+    run_with_timeout swift test --scratch-path "$scratch_path" --jobs "$jobs" "${test_args[@]}"
+    ;;
+  test-target)
+    if (( $# < 1 )); then
+      print -u2 "usage: $0 test-target <target-name> [extra swift test args...]"
+      exit 64
+    fi
+    target_name="$1"
+    shift
+    target_args=()
+    for arg in "$@"; do
+      if [[ "$arg" == "--skip-live" ]]; then
+        export OPENGROK_TEST_TIER=fast
+      else
+        target_args+=("$arg")
+      fi
+    done
+    if [[ -z "${OPENGROK_PERFORMANCE_PROFILE:-}" ]]; then
+      export OPENGROK_PERFORMANCE_PROFILE=macos-15
+    fi
+    # If testing PTY or Executable, ensure binary is compiled
+    if [[ "$target_name" == *"PTY"* || "$target_name" == *"Executable"* ]]; then
+      print -u2 "swift-safe-verify: pre-building open-grok product for $target_name"
+      run_with_timeout swift build --product open-grok --scratch-path "$scratch_path" --jobs "$jobs"
+    fi
+    run_with_timeout swift test --filter "$target_name" --scratch-path "$scratch_path" --jobs "$jobs" "${target_args[@]}"
     ;;
   *)
     print -u2 "unsupported action: $action"

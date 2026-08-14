@@ -21,12 +21,13 @@ LIBS=(
   OpenGrokTestSupport OpenGrokTestUtilities
   OpenGrokPaths OpenGrokEnvironment OpenGrokVersion
   OpenGrokShared OpenGrokCLIChatProxyTypes
+  OpenGrokDiagnostics OpenGrokScheduler OpenGrokMinimalScrollback
   OpenGrokToolTypes OpenGrokToolProtocol OpenGrokToolRuntime OpenGrokToolsAPI
   OpenGrokACP OpenGrokAgentLifecycle OpenGrokInterjection OpenGrokPromptQueue
   OpenGrokSamplingTypes OpenGrokChatState OpenGrokTokenEstimation
   OpenGrokWorkspaceTypes OpenGrokHooksPluginTypes OpenGrokCodeModeProtocol
   OpenGrokConfigTypes OpenGrokConfig
-  OpenGrokHTTP OpenGrokCircuitBreaker OpenGrokTracing OpenGrokTelemetry
+  OpenGrokHTTP OpenGrokCircuitBreaker OpenGrokTracing OpenGrokTelemetry OpenGrokExtraCA
   OpenGrokSQLiteJournal OpenGrokSecrets OpenGrokFileUtils
   OpenGrokFSNotify OpenGrokGitStatus OpenGrokCodebaseGraph OpenGrokHunkTracker
   OpenGrokPTY OpenGrokPTYCLI OpenGrokTTY OpenGrokSystemPower OpenGrokCrashHandler
@@ -35,7 +36,7 @@ LIBS=(
   OpenGrokSandbox OpenGrokFastWorktree OpenGrokWorkspace
   OpenGrokComputerHubCore OpenGrokComputerHubSDK OpenGrokWorkspaceClient
   OpenGrokToolRegistry OpenGrokFileTools OpenGrokExecutionTools OpenGrokWebMediaTools
-  OpenGrokAgentControlTools OpenGrokMCP OpenGrokComputerHubMCPAdapter
+  OpenGrokAgentControlTools OpenGrokMCP OpenGrokComputerHubMCPAdapter OpenGrokWorkflow
   OpenGrokHooks OpenGrokPluginMarketplace
   OpenGrokAgentDefinitions OpenGrokAnnouncements OpenGrokUpdate OpenGrokVoice
   OpenGrokCodeMode OpenGrokJavaScriptRuntime OpenGrokCompaction
