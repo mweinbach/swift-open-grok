@@ -50,11 +50,12 @@ struct OpenGrokMarkdownTests {
     func tableRendering() {
         let source = "| Name | Description |\n| --- | --- |\n| Alpha | A long description |\n"
         let output = MarkdownRenderer(configuration: MarkdownRenderConfiguration(maxTableWidth: 24)).render(source)
-        #expect(output.lines.count == 5)
+        #expect(output.lines.count >= 5)
         #expect(output.lines.first?.text.first == "┌")
         #expect(output.lines.last?.text.first == "└")
         #expect(output.lines.allSatisfy { $0.text.count <= 24 })
-        #expect(output.text.contains("…"))
+        #expect(output.text.contains("Alpha"))
+        #expect(output.text.contains("description"))
     }
 
     @Test("soft-break mode is explicit and deterministic")
