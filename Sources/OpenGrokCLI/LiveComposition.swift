@@ -1831,6 +1831,47 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             return []
                         }
                     }
+                    let fileSearchMatcher = FuzzyMatcher()
+                    let fileSearchRoot = suggestionCWD
+                    await controller.setFileSearchSuggestions { query, isDir, hidden in
+                        let walkerEntries = FuzzyFileTreeWalker.walk(
+                            root: fileSearchRoot,
+                            hidden: hidden,
+                            respectGitignore: true
+                        )
+                        let filtered = walkerEntries.filter { entry in
+                            if isDir && !entry.isDir { return false }
+                            return true
+                        }
+                        if query.isEmpty {
+                            return filtered.prefix(20).map { entry in
+                                OpenGrokPagerCommandSuggestion(
+                                    name: "@\(entry.relativePath)",
+                                    summary: entry.isDir ? "dir" : "",
+                                    isAvailable: true,
+                                    insertText: entry.relativePath
+                                )
+                            }
+                        }
+                        var matched: [(path: String, score: UInt32, isDir: Bool)] = []
+                        for entry in filtered {
+                            if let res = fileSearchMatcher.match(pattern: query, candidate: entry.relativePath, isDir: entry.isDir) {
+                                matched.append((entry.relativePath, res.score, entry.isDir))
+                            }
+                        }
+                        matched.sort { lhs, rhs in
+                            if lhs.score != rhs.score { return lhs.score > rhs.score }
+                            return lhs.path < rhs.path
+                        }
+                        return matched.prefix(20).map { item in
+                            OpenGrokPagerCommandSuggestion(
+                                name: "@\(item.path)",
+                                summary: item.isDir ? "dir" : "",
+                                isAvailable: true,
+                                insertText: item.path
+                            )
+                        }
+                    }
                     let request = OpenGrokPagerRequest(
                         prompt: prompt,
                         mode: pagerMode,

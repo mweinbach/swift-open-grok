@@ -213,6 +213,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
 
         var text: String { area.text }
         var isEmpty: Bool { area.isEmpty }
+        var cursor: Int { characterOffset(fromUTF8: area.cursor, in: area.text) }
 
         func state(
             pendingKey: String? = nil,
@@ -912,6 +913,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         @Sendable (String, String) -> [OpenGrokPagerCommandSuggestion]
     )?
 
+    private var fileSearchSuggestions: (
+        @Sendable (String, Bool, Bool) -> [OpenGrokPagerCommandSuggestion]
+    )?
+
     /// Whether the session is effectively in plan mode right now, read from
     /// the live plan tracker — the same one the `enter_plan_mode` tool arms —
     /// so `/plan <description>`'s already-in-plan refusal
@@ -1022,6 +1027,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         _ provider: (@Sendable (String, String) -> [OpenGrokPagerCommandSuggestion])?
     ) {
         argumentSuggestions = provider
+    }
+
+    /// Install the @-file-search completion source. Call before `run`.
+    public func setFileSearchSuggestions(
+        _ provider: (@Sendable (String, Bool, Bool) -> [OpenGrokPagerCommandSuggestion])?
+    ) {
+        fileSearchSuggestions = provider
     }
 
     /// Install the live plan-mode state source for `/plan <description>`'s
@@ -2797,6 +2809,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         guard let index = editor.selectedCompletion,
               editor.completions.indices.contains(index) else { return nil }
         let suggestion = editor.completions[index]
+        if let atContext = AtContext.detect(text: editor.text, cursor: editor.cursor) {
+            var text = editor.text
+            let lowerBound = min(text.count, atContext.range.lowerBound)
+            let upperBound = min(text.count, atContext.range.upperBound)
+            let lower = text.index(text.startIndex, offsetBy: lowerBound)
+            let upper = text.index(text.startIndex, offsetBy: upperBound)
+            let suffix = suggestion.summary == "dir" || suggestion.insertText.hasSuffix("/") ? "" : " "
+            text.replaceSubrange(lower..<upper, with: "@\(suggestion.insertText)\(suffix)")
+            editor.replace(with: text)
+            return suggestion
+        }
         // Accepting a *command* row records MRU; an argument row does
         // not (`record_mru = snap.cursor_in_command`,
         // `prompt_widget/mod.rs:1206-1211`).
@@ -3479,7 +3502,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     query: argumentPhase.query
                 )
                 : provided
-        } else {
+        } else if editor.text.hasPrefix("/") {
             // Recency scores resolved in one pass, keyed by canonical name —
             // one keystroke, one store read (`slash/mod.rs:985-992`).
             let now = UInt64(Date().timeIntervalSince1970)
@@ -3497,6 +3520,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         isAvailable: $0.availability.isAvailable
                     )
                 }
+        } else if let atContext = AtContext.detect(text: editor.text, cursor: editor.cursor),
+                  let fileSearch = fileSearchSuggestions {
+            suggestions = fileSearch(
+                atContext.matcherQuery,
+                atContext.isDirMode,
+                atContext.isHiddenMode
+            )
+        } else {
+            suggestions = []
         }
         // No row cap: every match rides through and the dropdown renderer
         // scrolls the six-row window ("No cap here -- the dropdown renderer

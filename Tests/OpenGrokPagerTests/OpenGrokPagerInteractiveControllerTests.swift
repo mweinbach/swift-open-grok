@@ -405,6 +405,41 @@ struct OpenGrokPagerInteractiveControllerTests {
         #expect(await renderer.promptStates.allSatisfy { $0.completions.isEmpty })
     }
 
+    @Test("@-file completion triggers and accepts suggestion replacing @query")
+    func atFileCompletionDropdownAndAccept() async throws {
+        let renderer = RecordingInteractiveRenderer()
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeInputStream([
+                .paste("check @foo"),
+                .key(KeyEvent(key: .tab)),
+            ]),
+            runtime: TestInteractiveRuntime(sessions: []),
+            renderer: renderer,
+            output: RecordingInteractiveOutput()
+        )
+        await controller.setFileSearchSuggestions { query, isDir, hidden in
+            if query == "foo" {
+                return [
+                    OpenGrokPagerCommandSuggestion(
+                        name: "@Sources/Foo.swift",
+                        summary: "",
+                        isAvailable: true,
+                        insertText: "Sources/Foo.swift"
+                    )
+                ]
+            }
+            return []
+        }
+
+        _ = try await controller.run(.init(prompt: "", mode: .inline))
+
+        let states = await renderer.promptStates
+        #expect(states.contains { $0.completions.contains { $0.name == "@Sources/Foo.swift" } })
+        // After accepting with Tab, the composer text has @Sources/Foo.swift with trailing space
+        #expect(states.last?.text == "check @Sources/Foo.swift ")
+        #expect(states.last?.completions.isEmpty == true)
+    }
+
     @Test("/help opens the shortcuts modal and /quit ends the run without a session")
     func slashCommandsRunLocally() async throws {
         let runtime = TestInteractiveRuntime(sessions: [])
