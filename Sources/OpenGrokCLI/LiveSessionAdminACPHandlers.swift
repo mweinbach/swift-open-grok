@@ -82,6 +82,7 @@
 import Foundation
 import OpenGrokACP
 import OpenGrokACPRuntime
+import OpenGrokSessionPersistence
 import OpenGrokShared
 
 struct LiveSessionAdminACPHandler: ACPAgentExtensionHandler, Sendable {
@@ -216,16 +217,45 @@ struct LiveSessionAdminACPHandler: ACPAgentExtensionHandler, Sendable {
     /// `{"success": true}` — `to_raw_response`, no `ExtMethodResult`
     /// envelope (extensions/mod.rs:69-73).
     private func handleRename(_ params: JSONValue) async throws -> JSONValue {
-        guard let sessionID = params["sessionId"]?.stringValue,
-              let rawTitle = params["title"]?.stringValue else {
-            throw invalidParams("invalid params: missing field `sessionId` or `title`")
+        guard let sessionID = params["sessionId"]?.stringValue else {
+            throw invalidParams("invalid params: missing field `sessionId`")
         }
-        // Manual titles must be non-blank (session_admin.rs:93-98).
-        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty else {
-            throw invalidRequest("title must not be blank")
+
+        let resetToAuto = params["resetToAuto"]?.boolValue ?? false
+        let isChat = try parseKind(params) == "chat"
+
+        if resetToAuto {
+            if isChat {
+                throw invalidRequest("chat conversations have no auto-title to restore")
+            }
+            if let raw = params["title"]?.stringValue, !sanitizeRenameTitle(raw).isEmpty {
+                throw invalidRequest("title must be empty when resetToAuto is set")
+            }
         }
-        if try parseKind(params) == "chat" {
+
+        let title: String
+        if resetToAuto {
+            title = ""
+        } else {
+            guard let rawTitle = params["title"]?.stringValue else {
+                throw invalidParams("invalid params: missing field `sessionId` or `title`")
+            }
+            if rawTitle.utf8.count > maxTitleBytes {
+                throw invalidRequest("title too large")
+            }
+            let sanitized = sanitizeRenameTitle(rawTitle)
+            guard !sanitized.isEmpty else {
+                throw invalidRequest("title must not be blank")
+            }
+            if sanitized.count > maxTitleScalars {
+                throw invalidRequest(
+                    "title too long (max \(maxTitleScalars) characters after removing control characters)"
+                )
+            }
+            title = sanitized
+        }
+
+        if isChat {
             // Byte-copy of the no-conversations-lane refusal
             // (session_admin.rs:228-231) — honest: this port has none.
             throw invalidRequest(
