@@ -275,7 +275,8 @@ public func streamMessages(
                         message: streamError.message,
                         modelMetadata: nil,
                         retryAfterSecs: nil,
-                        shouldRetry: nil
+                        shouldRetry: nil,
+                        errorCode: streamError.type
                     )
                     continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
                     continuation.finish()

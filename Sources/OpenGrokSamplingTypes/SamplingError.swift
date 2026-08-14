@@ -152,10 +152,11 @@ public enum SamplingError: Error, Sendable, Equatable {
         message: String,
         modelMetadata: ResponseModelMetadata?,
         retryAfterSecs: UInt64?,
-        shouldRetry: Bool?
+        shouldRetry: Bool?,
+        errorCode: String? = nil
     )
     case eventStreamError(String)
-    case streamError(errorType: String, message: String)
+    case streamError(errorType: String, message: String, code: String? = nil)
     case idleTimeout(elapsedSecs: UInt64)
     case emptyResponse(context: EmptyResponseContext)
     case maxTokensTruncation
@@ -187,18 +188,18 @@ public enum SamplingError: Error, Sendable, Equatable {
     public var isAuthError: Bool {
         switch self {
         case .auth(_, _): return true
-        case .api(let status, _, _, _, _): return status.isUnauthorized
+        case .api(let status, _, _, _, _, _): return status.isUnauthorized
         default: return false
         }
     }
 
     public var isRateLimited: Bool {
-        if case .api(let status, _, _, _, _) = self { return status.isTooManyRequests }
+        if case .api(let status, _, _, _, _, _) = self { return status.isTooManyRequests }
         return false
     }
 
     public var isPayloadTooLarge: Bool {
-        if case .api(let status, _, _, _, _) = self { return status.isPayloadTooLarge }
+        if case .api(let status, _, _, _, _, _) = self { return status.isPayloadTooLarge }
         return false
     }
 
@@ -206,23 +207,29 @@ public enum SamplingError: Error, Sendable, Equatable {
     /// contains `encrypted_content` from a different model family. Never
     /// retryable.
     public var isEncryptedContentError: Bool {
-        if case .api(let status, let message, _, _, _) = self {
+        if case .api(let status, let message, _, _, _, _) = self {
             return status.isBadRequest && message.contains("encrypted_content")
         }
         return false
     }
 
     /// The API rejected the request because an inline image could not be
-    /// processed. Matches both direct 400 and proxy-wrapped 500 responses.
+    /// processed. Matches both direct 400 and proxy-wrapped 500 responses,
+    /// explicit `invalid_image` error codes, and stream errors.
     public var isImageProcessingError: Bool {
-        if case .api(let status, let message, _, _, _) = self {
+        switch self {
+        case .api(let status, let message, _, _, _, let errorCode):
             let isMatchedStatus = status.code == 400 || status.code == 500
-            return isMatchedStatus && (
-                message.contains("Could not process image") ||
-                isCodexInvalidImageURLError(message)
-            )
+            let isCodeMatch = errorCode?.lowercased() == "invalid_image"
+            let isMessageMatch = message.contains("Could not process image") || isCodexInvalidImageURLError(message)
+            return isMatchedStatus && (isCodeMatch || isMessageMatch)
+        case .streamError(let errorType, let message, let code):
+            let isCodeMatch = code?.lowercased() == "invalid_image"
+            let isMessageMatch = message.contains("Could not process image") || isCodexInvalidImageURLError(message)
+            return isCodeMatch || isMessageMatch || errorType.lowercased() == "invalid_image"
+        default:
+            return false
         }
-        return false
     }
 
     public var isRetryable: Bool {
@@ -231,7 +238,7 @@ public enum SamplingError: Error, Sendable, Equatable {
         case .invalidConfiguration: return false
         case .http: return true  // mirrors is_retryable_reqwest for request/body errors
         case .serialization: return false
-        case .api(let status, _, _, _, _):
+        case .api(let status, _, _, _, _, _):
             return [429, 500, 502, 503, 504, 520].contains(status.code)
         case .eventStreamError: return true
         case .streamError: return true
@@ -243,17 +250,17 @@ public enum SamplingError: Error, Sendable, Equatable {
     }
 
     public var modelMetadata: ResponseModelMetadata? {
-        if case .api(_, _, let metadata, _, _) = self { return metadata }
+        if case .api(_, _, let metadata, _, _, _) = self { return metadata }
         return nil
     }
 
     public var retryAfter: UInt64? {
-        if case .api(_, _, _, let retryAfterSecs, _) = self { return retryAfterSecs }
+        if case .api(_, _, _, let retryAfterSecs, _, _) = self { return retryAfterSecs }
         return nil
     }
 
     public var shouldRetryHeader: Bool? {
-        if case .api(_, _, _, _, let shouldRetry) = self { return shouldRetry }
+        if case .api(_, _, _, _, let shouldRetry, _) = self { return shouldRetry }
         return nil
     }
 
@@ -261,8 +268,8 @@ public enum SamplingError: Error, Sendable, Equatable {
     /// deterministic, so retrying the same payload can't help.
     public var isContextLengthError: Bool {
         switch self {
-        case .api(_, let message, _, _, _): return OpenGrokSamplingTypes.isContextLengthError(message)
-        case .streamError(_, let message): return OpenGrokSamplingTypes.isContextLengthError(message)
+        case .api(_, let message, _, _, _, _): return OpenGrokSamplingTypes.isContextLengthError(message)
+        case .streamError(_, let message, _): return OpenGrokSamplingTypes.isContextLengthError(message)
         default: return false
         }
     }
@@ -332,6 +339,18 @@ public func parseErrorBytes(_ bytes: Data) -> String {
     structuredErrorMessage(bytes) ?? "upstream error"
 }
 
+/// Parse an API error code from body JSON.
+public func parseAPIErrorCode(bytes: Data) -> String? {
+    guard let text = String(data: bytes, encoding: .utf8),
+          let value = try? JSONDecoder().decode(JSONValue.self, from: Data(text.utf8)) else {
+        return nil
+    }
+    if let errorObj = value["error"], let code = errorObj["code"]?.stringValue {
+        return code
+    }
+    return value["code"]?.stringValue
+}
+
 /// User-facing message for a failed API call.
 public func userFacingAPIMessage(status: HTTPStatus, bytes: Data) -> String {
     structuredErrorMessage(bytes) ?? statusUserMessage(status)
@@ -347,12 +366,13 @@ public func tryParseStreamError(_ data: String) -> SamplingError? {
     if let error = value["error"] {
         let errorType = error["type"]?.stringValue ?? "unknown"
         let message = error["message"]?.stringValue ?? "unknown error"
-        return .streamError(errorType: errorType, message: message)
+        let code = error["code"]?.stringValue
+        return .streamError(errorType: errorType, message: message, code: code)
     }
     // Flat Grok proxy/gateway envelope.
     if let flatError = value["error"]?.stringValue {
         let code = value["code"]?.stringValue ?? "server_error"
-        return .streamError(errorType: code, message: flatError)
+        return .streamError(errorType: code, message: flatError, code: code)
     }
     return nil
 }

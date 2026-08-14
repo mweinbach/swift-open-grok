@@ -59,6 +59,7 @@ public struct SamplingErrorInfo: Codable, Sendable, Equatable, Error {
     public var emptyResponseContext: EmptyResponseContext?
     public var doomLoopTriggers: [String]?
     public var doomLoopAbortedAtChunk: UInt64?
+    public var errorCode: String?
 
     public init(
         kind: SamplingErrorKind,
@@ -70,7 +71,8 @@ public struct SamplingErrorInfo: Codable, Sendable, Equatable, Error {
         credential: SentCredential? = nil,
         emptyResponseContext: EmptyResponseContext? = nil,
         doomLoopTriggers: [String]? = nil,
-        doomLoopAbortedAtChunk: UInt64? = nil
+        doomLoopAbortedAtChunk: UInt64? = nil,
+        errorCode: String? = nil
     ) {
         self.kind = kind
         self.statusCode = statusCode
@@ -82,6 +84,7 @@ public struct SamplingErrorInfo: Codable, Sendable, Equatable, Error {
         self.emptyResponseContext = emptyResponseContext
         self.doomLoopTriggers = doomLoopTriggers
         self.doomLoopAbortedAtChunk = doomLoopAbortedAtChunk
+        self.errorCode = errorCode
     }
 
     public enum CodingKeys: String, CodingKey {
@@ -95,6 +98,7 @@ public struct SamplingErrorInfo: Codable, Sendable, Equatable, Error {
         case emptyResponseContext = "empty_response_context"
         case doomLoopTriggers = "doom_loop_triggers"
         case doomLoopAbortedAtChunk = "doom_loop_aborted_at_chunk"
+        case errorCode = "error_code"
     }
 
     /// Build from a rich ``SamplingError``.
@@ -115,7 +119,7 @@ public struct SamplingErrorInfo: Codable, Sendable, Equatable, Error {
             self.init(kind: .http, message: message, isRetryable: isRetryable)
         case .serialization:
             self.init(kind: .serialization, message: message, isRetryable: isRetryable)
-        case .api(let status, _, let modelMetadata, let retryAfterSecs, _):
+        case .api(let status, _, let modelMetadata, let retryAfterSecs, _, let errorCode):
             let kind: SamplingErrorKind = error.isRateLimited ? .rateLimited : .api
             self.init(
                 kind: kind,
@@ -123,12 +127,13 @@ public struct SamplingErrorInfo: Codable, Sendable, Equatable, Error {
                 message: message,
                 isRetryable: isRetryable,
                 retryAfterSecs: retryAfterSecs,
-                modelMetadata: modelMetadata
+                modelMetadata: modelMetadata,
+                errorCode: errorCode
             )
         case .eventStreamError:
             self.init(kind: .http, message: message, isRetryable: isRetryable)
-        case .streamError:
-            self.init(kind: .api, message: message, isRetryable: isRetryable)
+        case .streamError(let errorType, _, let code):
+            self.init(kind: .api, message: message, isRetryable: isRetryable, errorCode: code ?? errorType)
         case .idleTimeout:
             self.init(kind: .idleTimeout, message: message, isRetryable: isRetryable)
         case .emptyResponse(let context):
@@ -224,11 +229,11 @@ extension SamplingError {
             return "http error: \(msg)"
         case .serialization(let msg):
             return "\(Self.serializationDisplayPrefix)\(msg)"
-        case .api(let status, let message, _, _, _):
+        case .api(let status, let message, _, _, _, _):
             return "API error (\(status.code)): \(message)"
         case .eventStreamError(let msg):
             return "event stream error: \(msg)"
-        case .streamError(let errorType, let message):
+        case .streamError(let errorType, let message, _):
             return "stream error (\(errorType)): \(message)"
         case .idleTimeout(let elapsedSecs):
             return "idle timeout after \(elapsedSecs)s"

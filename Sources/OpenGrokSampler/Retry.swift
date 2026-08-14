@@ -168,7 +168,7 @@ public func formatSamplingError(_ err: SamplingError, retryCount: UInt32?) -> St
         return "\(retryPrefix)HTTP request failed: \(msg). This may be a network issue or the API endpoint may be unavailable."
     case .serialization(let msg):
         return "\(retryPrefix)Failed to parse API response: \(msg). This indicates an unexpected response format from the server."
-    case .api(let status, let message, _, let retryAfter, _):
+    case .api(let status, let message, _, let retryAfter, _, _):
         var s = "\(retryPrefix)API error (HTTP \(status.code)): \(message)."
         if let retryAfter {
             s += " Retry after \(retryAfter)s."
@@ -176,7 +176,7 @@ public func formatSamplingError(_ err: SamplingError, retryCount: UInt32?) -> St
         return s
     case .eventStreamError(let msg):
         return "\(retryPrefix)Stream transport error: \(msg)."
-    case .streamError(let errorType, let message):
+    case .streamError(let errorType, let message, _):
         return "\(retryPrefix)Stream error (\(errorType)): \(message)."
     case .idleTimeout(let elapsed):
         return "\(retryPrefix)Model idle timeout after \(elapsed)s. The stream stopped producing content."

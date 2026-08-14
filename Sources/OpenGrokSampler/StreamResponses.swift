@@ -486,12 +486,15 @@ public func streamResponsesWithClientCustomTools(
                     let message = response["error"]?["message"]?.stringValue
                         ?? response["error"]?.stringValue
                         ?? "response failed"
+                    let code = response["error"]?["code"]?.stringValue
+                        ?? response["code"]?.stringValue
                     let err = SamplingError.api(
                         status: HTTPStatus(500),
                         message: message,
                         modelMetadata: nil,
                         retryAfterSecs: nil,
-                        shouldRetry: nil
+                        shouldRetry: nil,
+                        errorCode: code
                     )
                     continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
                     continuation.finish()
@@ -500,7 +503,8 @@ public func streamResponsesWithClientCustomTools(
                 case .error(let message, let code):
                     let err = SamplingError.streamError(
                         errorType: code ?? "server_error",
-                        message: message
+                        message: message,
+                        code: code
                     )
                     continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
                     continuation.finish()
@@ -530,7 +534,8 @@ public func streamResponsesWithClientCustomTools(
                     message: "stream ended without response.completed",
                     modelMetadata: nil,
                     retryAfterSecs: nil,
-                    shouldRetry: nil
+                    shouldRetry: nil,
+                    errorCode: nil
                 )
                 continuation.yield(.failed(requestId: requestId, error: SamplingErrorInfo(from: err)))
                 continuation.finish()

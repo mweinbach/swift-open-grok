@@ -993,7 +993,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         if let sampling = error as? SamplingError {
             switch sampling {
             case .auth: return "authentication_failed"
-            case .api(let status, _, _, _, _):
+            case .api(let status, _, _, _, _, _):
                 return status.code == 429 ? "rate_limit" : "server_error"
             default: return "unknown"
             }

@@ -306,3 +306,63 @@ struct DoomLoopTests {
         #expect(DoomLoopRecoveryPolicy.clampMaxRetries(100) == 5)
     }
 }
+
+// MARK: - Sampling error classification
+
+@Suite("Sampling error classification")
+struct SamplingErrorClassificationTests {
+    @Test("isImageProcessingError matches 400 and 500 with invalid_image code or message")
+    func imageProcessingErrorMatches() {
+        let codeErr = SamplingError.api(
+            status: HTTPStatus(400),
+            message: "bad request",
+            modelMetadata: nil,
+            retryAfterSecs: nil,
+            shouldRetry: nil,
+            errorCode: "invalid_image"
+        )
+        #expect(codeErr.isImageProcessingError)
+
+        let msgErr = SamplingError.api(
+            status: HTTPStatus(500),
+            message: "Could not process image",
+            modelMetadata: nil,
+            retryAfterSecs: nil,
+            shouldRetry: nil
+        )
+        #expect(msgErr.isImageProcessingError)
+
+        let streamErr = SamplingError.streamError(
+            errorType: "invalid_request",
+            message: "stream failed",
+            code: "invalid_image"
+        )
+        #expect(streamErr.isImageProcessingError)
+
+        let unrelatedErr = SamplingError.api(
+            status: HTTPStatus(400),
+            message: "invalid json parameter",
+            modelMetadata: nil,
+            retryAfterSecs: nil,
+            shouldRetry: nil
+        )
+        #expect(!unrelatedErr.isImageProcessingError)
+    }
+
+    @Test("parseAPIErrorCode parses error code from JSON envelope")
+    func parseErrorCode() {
+        let standardJSON = Data(#"{"error": {"message": "bad image", "code": "invalid_image"}}"#.utf8)
+        #expect(parseAPIErrorCode(bytes: standardJSON) == "invalid_image")
+
+        let flatJSON = Data(#"{"code": "invalid_image", "error": "bad image"}"#.utf8)
+        #expect(parseAPIErrorCode(bytes: flatJSON) == "invalid_image")
+    }
+
+    @Test("tryParseStreamError extracts code and message")
+    func tryParseStreamErrorExtraction() {
+        let json = #"{"error": {"type": "invalid_request_error", "message": "cannot decode image", "code": "invalid_image"}}"#
+        let parsed = tryParseStreamError(json)
+        #expect(parsed != nil)
+        #expect(parsed?.isImageProcessingError == true)
+    }
+}

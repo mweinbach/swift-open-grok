@@ -712,12 +712,14 @@ public final class SamplingClient: @unchecked Sendable {
             return .auth(message, credential: SentCredential.fromSentFragment(prefix))
         }
 
+        let errorCode = parseAPIErrorCode(bytes: body)
         return .api(
             status: HTTPStatus(status),
             message: message,
             modelMetadata: meta,
             retryAfterSecs: retryAfter,
-            shouldRetry: shouldRetry
+            shouldRetry: shouldRetry,
+            errorCode: errorCode
         )
     }
 
@@ -798,7 +800,8 @@ func synthesizeFromInfo(_ info: SamplingErrorInfo) -> SamplingError {
             message: info.message,
             modelMetadata: info.modelMetadata,
             retryAfterSecs: info.retryAfterSecs,
-            shouldRetry: nil
+            shouldRetry: nil,
+            errorCode: info.errorCode
         )
     case .emptyResponse:
         if let ctx = info.emptyResponseContext {

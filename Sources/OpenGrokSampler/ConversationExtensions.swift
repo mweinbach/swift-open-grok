@@ -10,35 +10,45 @@ import OpenGrokSamplingTypes
 
 extension ConversationRequest {
     /// Replace inline images with a text placeholder. Used as a recovery
-    /// strategy when the downstream API returns 413 "Request Entity Too Large".
+    /// strategy when the downstream API returns 413 "Request Entity Too Large"
+    /// or when image processing fails.
     @discardableResult
     public mutating func stripImages() -> Int {
-        var stripped = 0
+        stripImagesWithURLs().count
+    }
+
+    /// Strip images and collect the stripped image URLs/data.
+    public mutating func stripImagesWithURLs() -> [String] {
+        var strippedURLs: [String] = []
         for i in items.indices {
             switch items[i] {
             case .user(var user):
                 for j in user.content.indices {
-                    if case .image = user.content[j] {
+                    if case .image(let url) = user.content[j] {
                         user.content[j] = .text(text: "[image removed — conversation too large]")
-                        stripped += 1
+                        strippedURLs.append(url)
                     }
                 }
                 items[i] = .user(user)
             case .toolResult(var t):
-                stripped += t.images.count
+                for part in t.images {
+                    if case .image(let url) = part {
+                        strippedURLs.append(url)
+                    }
+                }
                 t.images = []
                 for j in t.orderedContent.indices {
-                    if case .image = t.orderedContent[j] {
+                    if case .image(let url, _) = t.orderedContent[j] {
                         t.orderedContent[j] = .text(text: "[image removed — conversation too large]")
-                        stripped += 1
+                        strippedURLs.append(url)
                     }
                 }
                 items[i] = .toolResult(t)
             case .customToolOutput(var output):
                 for j in output.content.indices {
-                    if case .image = output.content[j] {
+                    if case .image(let url, _) = output.content[j] {
                         output.content[j] = .text(text: "[image removed — conversation too large]")
-                        stripped += 1
+                        strippedURLs.append(url)
                     }
                 }
                 items[i] = .customToolOutput(output)
@@ -46,7 +56,7 @@ extension ConversationRequest {
                 break
             }
         }
-        return stripped
+        return strippedURLs
     }
 }
 
