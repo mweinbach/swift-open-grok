@@ -1,11 +1,59 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-14 (Wave 24 — Native Workflow Engine, Rich Composer Elements & Image Framing, Markdown Table Parity, Tool Extras & Parity Audit Closure). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0 (clean build, 2.50s); authoritative full `test --no-parallel` exit 0 — exactly **6,987 Swift Testing cases in 1,071 suites passed** after 335.609s (100% green, 0 failures, 0 regressions against baseline).
+**As of:** 2026-08-14 (Wave 25 — Multi-Agent Subsystem Wave: Bounded Stdio MCP Auto-Restart, Session Relocation Journal, Image Normalization & Cache, Pre-Warmed Worktree Pool). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0 (clean build, 2.90s); authoritative full `test --no-parallel` exit 0 — exactly **7,024 Swift Testing cases in 1,075 suites passed** after 316.912s (100% green, 0 failures, 0 regressions against baseline).
 
-**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (Native Workflow Engine & Rhai AST/Interpreter/Journal/Escalation, Interactive Terminal Composer Rich Elements & Image Framing, Markdown Table Wrapped-Fragment & 11-Glyph Box Drawing Layout Parity, Tool Catalog Schemas & Protocol Output Caps, Agent Runtime & Turn Pipeline, ACP Transports, Custom Models Settings UI & Store Persistence, Steady-State Cache Tracking & Cold-Start Diagnostics, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
+**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (Bounded Stdio MCP Auto-Restart & Backoff, Durable Session Relocation Journal & Transactional Authority, Image Normalization & Resizing with SHA-256 Digest Cache, Pre-Warmed Subagent Git Worktree Pool, Native Workflow Engine & Rhai AST/Interpreter/Journal/Escalation, Interactive Terminal Composer Rich Elements & Image Framing, Markdown Table Wrapped-Fragment & 11-Glyph Box Drawing Layout Parity, Tool Catalog Schemas & Protocol Output Caps, Agent Runtime & Turn Pipeline, ACP Transports, Custom Models Settings UI & Store Persistence, Steady-State Cache Tracking & Cold-Start Diagnostics, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`) / Forward Sync `eb215dd0` (`v1.0.0-open-grok.63`).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
+
+## Wave 25 — Multi-Agent Subsystem Porting: Stdio MCP Auto-Restart, Session Relocation Journal, Image Normalization & Cache, Pre-Warmed Worktree Pool (2026-08-14, complete)
+
+Current truth for the verified 2026-08-14 Wave 25 Multi-Agent Porting across Bounded Stdio MCP Auto-Restart & Backoff (`OpenGrokMCP`), Durable Session Relocation Journal (`OpenGrokSessionPersistence`), Image Normalization & Resizing with SHA-256 Digest Cache (`OpenGrokWebMediaTools`), and Pre-Warmed Git Worktree Pool (`OpenGrokFastWorktree`):
+
+**Verification (lead, local macOS, 2026-08-14; serial gate):**
+- `zsh workflows/swift-safe-verify.zsh build` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build --product open-grok` — exit 0: clean binary build in **2.90s**.
+- Authoritative full `zsh workflows/swift-safe-verify.zsh test --no-parallel` — exit 0: exactly **7,024** Swift Testing cases in **1,075** suites, elapsed **316.912s** (100% green, 0 failures, 0 regressions).
+- CLI Smokes: `open-grok --version` reports `Open Grok 1.0.0-open-grok.63` (exit 0); `paths --json` and `models --json` exit 0.
+
+### Slices Completed & Landed
+
+1. **Slice 1: Bounded Stdio MCP Auto-Restart & Exponential Backoff (`OpenGrokMCP`, `2953475`)**
+   - Ported from Rust reference `crates/codegen/xai-grok-shell/src/session/mcp_restart.rs` (1,519 LOC).
+   - Implemented `McpRestartState` (Sendable, Codable, Equatable) and `McpRestart` state machine.
+   - Bounded stdio MCP auto-restart loop with exponential backoff schedule (`BACKOFF = [1.0, 4.0, 16.0]`): 3 attempts at `+1s`, `+4s`, `+16s` with a 21-second total exhaustion window.
+   - Guard rails: non-restart filter (`transportClosed` / `handshakeFailed` only), stdio transport check (skips HTTP/OAuth), ignores intentional shutdown / `killOnDrop`, and checks disabled/unconfigured server state.
+   - Status updates & tool cleanup: pushes `.restarting` / `.unavailable` status reason payloads and unregisters server tools upon exhaustion (`McpRestartTests.swift`).
+
+2. **Slice 2: Durable Session Relocation Journal & Transactional Authority (`OpenGrokSessionPersistence`, `4875cc2`)**
+   - Ported from Rust reference `crates/codegen/xai-grok-shell/src/session/storage/relocation/`.
+   - 7-stage relocation authority lifecycle (`initiated → sourceVerified → targetPublished → ready → sourcePruned → committed / rolledBack`).
+   - Authority boundary rule: Source path is authoritative through `targetPublished`; Target path becomes authoritative once `ready`. Rollbacks strictly refused after `ready`.
+   - Atomic rollback, torn write recovery, transaction leasing, and directory collision detection (`RelocationJournalTests.swift`).
+
+3. **Slice 3: Image Normalization, Resizing & Digest Hash Cache (`OpenGrokWebMediaTools`, `5956759`)**
+   - Ported from Rust reference `crates/codegen/xai-grok-shell/src/session/image_normalize.rs` and `normalize_cache.rs`.
+   - `ImageNormalizer`: Header-based dimension sniffer (PNG, JPEG, GIF, WebP, BMP), aspect-ratio-preserving downsampling bounding box calculator (`maxSide = 2000`, `maxPixels = 2_408_448`), and quality step-down recompression.
+   - `ImageNormalizeCache`: Thread-safe, disk-backed cache stored under `$OPENGROK_HOME/cache/image_normalize/` keyed by SHA-256 content hash (`<sha256>.png` and metadata) to avoid re-encoding on consecutive turns.
+   - Text-only model fallback markdown placeholder block generator (`[Image: <dimensions>, <format>]`) (`ImageNormalizeTests.swift`).
+
+4. **Slice 4: Pre-Warmed Subagent Git Worktree Pool (`OpenGrokFastWorktree`, `e9c81cf`, `fa3bb8a`)**
+   - Ported from Rust reference `crates/codegen/xai-grok-shell/src/session/worktree_pool.rs` (~2,400 LOC).
+   - `WorktreePool`: Actor managing a bounded pool of pre-warmed clean Git worktrees under `$OPENGROK_HOME/worktrees/pool/` for near-zero latency subagent spawning.
+   - Methods: `warmPool(targetCount:)`, `acquireLease(for:)`, `releaseLease(_:)`, `prune(maxAge:)`.
+   - Automatic background replenishment to maintain warm capacity, dirty state wiping (`git reset --hard HEAD` + `git clean -fdx`), branch recycling, and stale lock reclamation (`WorktreePoolTests.swift`).
+
+### Landed Commits
+
+- `aab2d25` — fix(scheduler): advance simulated test clock cleanly for detached mode tests
+- `3f3d1fe` — fix(scheduler): prevent timer race on zero-delay scheduled tasks
+- `fa3bb8a` — fix(worktree,shell,interjection): polish test harness synchronization and prune bounds
+- `e9c81cf` — feat(worktree): implement pre-warmed subagent git worktree pool
+- `5956759` — feat(media): implement image normalization, resizing, and digest hash cache
+- `4875cc2` — Implement durable session relocation journal and transactional authority
+- `2953475` — Implement bounded stdio MCP auto-restart and exponential backoff
 
 ## Wave 24 — Native Workflow Engine, Rich Composer Elements & Image Framing, Markdown Table Parity & Tool Extras Audit (2026-08-14, complete)
 
