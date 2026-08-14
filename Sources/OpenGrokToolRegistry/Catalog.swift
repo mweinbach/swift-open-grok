@@ -664,6 +664,174 @@ public enum BuiltinToolCatalog {
 
     public static let askUserQuestionQualifiedId = "GrokBuild:ask_user_question"
 
+    // MARK: - Execution & Terminal schemas
+
+    public static let bashSchema = objectSchema(
+        properties: [
+            "command": stringProp("The shell command line string to execute."),
+            "timeout": intProp("Timeout in milliseconds (default 120,000, max 300,000)."),
+            "description": stringProp("User-facing description of what the command does."),
+            "is_background": boolProp("Whether to run the command in the background."),
+        ],
+        required: ["command"]
+    )
+
+    public static let killTaskSchema = objectSchema(
+        properties: [
+            "task_id": stringProp("The task identifier to cancel/kill."),
+        ],
+        required: ["task_id"]
+    )
+
+    public static let taskOutputSchema = objectSchema(
+        properties: [
+            "task_id": stringProp("The task identifier to read output from."),
+            "block": boolProp("Whether to wait for new output if none is available."),
+            "timeout_ms": intProp("Maximum wait in milliseconds (max 600,000)."),
+        ],
+        required: ["task_id"]
+    )
+
+    public static let waitTasksSchema = objectSchema(
+        properties: [
+            "task_ids": stringArrayProp("List of task identifiers to wait for (max 20)."),
+            "timeout_ms": intProp("Maximum wait in milliseconds (max 600,000)."),
+        ],
+        required: ["task_ids"]
+    )
+
+    // MARK: - Agent Mailbox & Collaboration schemas
+
+    public static let listAgentsSchema = objectSchema(properties: [:])
+
+    public static let sendMessageSchema = objectSchema(
+        properties: [
+            "target": stringProp("Agent ID from list_agents, or \"root\" for the team root."),
+            "message": stringProp("Message text to queue for the target agent (max 32KB)."),
+        ],
+        required: ["target", "message"]
+    )
+
+    public static let followupTaskSchema = objectSchema(
+        properties: [
+            "target": stringProp("Agent ID from list_agents."),
+            "message": stringProp("Follow-up task instructions to queue (max 32KB)."),
+        ],
+        required: ["target", "message"]
+    )
+
+    public static let waitAgentSchema = objectSchema(
+        properties: [
+            "timeout_ms": intProp(
+                "Maximum wait in milliseconds (default 30,000, max 600,000; 0 for non-blocking poll)."
+            ),
+        ]
+    )
+
+    // MARK: - Agent Control schemas
+
+    public static let taskSchema = objectSchema(
+        properties: [
+            "prompt": stringProp("Task prompt to run in the subagent."),
+            "label": stringProp("Optional human-readable label for the task."),
+            "model": stringProp("Optional model override for the subagent."),
+            "reasoning_effort": stringProp("Optional reasoning effort override."),
+            "isolation_worktree": boolProp("Whether to run with git worktree isolation."),
+        ],
+        required: ["prompt"]
+    )
+
+    public static let agentSwarmSchema = objectSchema(
+        properties: [
+            "tasks": .object([
+                "type": .string("array"),
+                "description": .string("List of subagent tasks to run in parallel."),
+                "items": .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "prompt": stringProp("Task prompt."),
+                        "label": stringProp("Optional task label."),
+                    ]),
+                    "required": .array([.string("prompt")]),
+                ]),
+            ]),
+        ],
+        required: ["tasks"]
+    )
+
+    public static let swarmWaitSchema = objectSchema(
+        properties: [
+            "swarm_id": stringProp("Identifier of the detached swarm."),
+            "timeout_ms": intProp("Maximum wait in milliseconds."),
+        ],
+        required: ["swarm_id"]
+    )
+
+    // MARK: - Background & Scheduler schemas
+
+    public static let monitorSchema = objectSchema(
+        properties: [
+            "command": stringProp("Shell command to execute and monitor."),
+            "timeout_ms": intProp("Maximum monitoring duration in milliseconds."),
+            "description": stringProp("Description of the monitored process."),
+        ],
+        required: ["command"]
+    )
+
+    public static let schedulerCreateSchema = objectSchema(
+        properties: [
+            "interval": stringProp("Schedule interval (e.g. \"5m\", \"2h\", \"1d\", \"60s\")."),
+            "prompt": stringProp("Prompt to evaluate on each scheduled trigger."),
+            "fire_immediately": boolProp("Whether to fire the first turn immediately."),
+            "task_id": stringProp("Optional task ID for in-place schedule update."),
+        ],
+        required: ["interval", "prompt"]
+    )
+
+    public static let schedulerDeleteSchema = objectSchema(
+        properties: [
+            "task_id": stringProp("Scheduled task ID to delete."),
+        ],
+        required: ["task_id"]
+    )
+
+    public static let schedulerListSchema = objectSchema(properties: [:])
+
+    // MARK: - Objective & Goal schemas
+
+    public static let updateGoalSchema = objectSchema(
+        properties: [
+            "completed": boolProp("Whether the current goal has been completed."),
+            "blocked_reason": stringProp("Reason if the goal is blocked."),
+            "message": stringProp("Progress update message for the user."),
+        ]
+    )
+
+    // MARK: - Diagnostics & Workflow schemas
+
+    public static let pullDiagnosticsSchema = objectSchema(
+        properties: [
+            "path": stringProp("File or directory path to pull language diagnostics for."),
+        ],
+        required: ["path"]
+    )
+
+    public static let workflowSchema = objectSchema(
+        properties: [
+            "operation": stringProp("Workflow operation: start, pause, resume, stop, list, inspect."),
+            "name": stringProp("Workflow name."),
+            "path": stringProp("Workflow script file path."),
+            "script": stringProp("Inline workflow script content."),
+            "arguments": .object([
+                "type": .string("object"),
+                "description": .string("Arguments passed into the workflow execution."),
+            ]),
+            "run_id": stringProp("Execution run ID for pause/resume/stop/inspect."),
+        ],
+        required: ["operation"]
+    )
+
+
     /// Every spec `ToolRegistryBuilder(registerBuiltins: true)` installs.
     /// `askUserQuestionTools` is in the catalog so `setHandler` can bind, but
     /// it only reaches an advertised toolset when the live composition appends

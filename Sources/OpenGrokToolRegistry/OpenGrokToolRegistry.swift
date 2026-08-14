@@ -27,3 +27,12 @@ public let toolMetaKey: String = "x.ai/tool"
 
 /// Wire version for `_meta` payloads.
 public let toolMetaVersion: UInt32 = 1
+
+/// Maximum accepted `message` body size in bytes for agent mailbox tools (32 KB = 32,768 bytes).
+/// Mirrors Rust `MAX_AGENT_MESSAGE_BYTES`.
+public let defaultMailboxMessageByteLimit: Int = 32 * 1024
+
+/// Default maximum lines returned by `read_file` (1,000 lines).
+/// Mirrors Rust `MAX_LINES_READ`.
+public let defaultMaxLinesRead: Int = 1_000
+
