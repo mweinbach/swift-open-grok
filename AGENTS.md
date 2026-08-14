@@ -3,8 +3,9 @@
 Instructions for AI coding agents (and humans) working in this repository.
 
 **What this is:** a Swift source port of [Open Grok](https://github.com/mweinbach/open-grok) (Rust).  
-The reference clone lives at `~/Projects/grok-build` (or `/Users/mweinbach/Projects/grok-build`) and is **read-only**.  
+The reference clone lives at [`github.com/mweinbach/open-grok`](https://github.com/mweinbach/open-grok) (or the location that houses those repos, e.g. `../open-grok` or `~/Projects/grok-build`) and is **read-only**.  
 The pinned reference commit is recorded at the top of [`PORT_STATUS.md`](PORT_STATUS.md).
+
 
 | Concept | Value |
 | --- | --- |
@@ -190,3 +191,19 @@ Two practices catch this class. Both are cheap and reviewable:
 - **"Implemented" ≠ "reachable."** Distinguish *live* (reachable from the running executable) from *implemented-unwired* (tested library, no importer) from *absent*. Most gaps in this port's history were the middle case, which is why a green suite and a missing feature coexist comfortably.
 - Record what you deliberately did **not** do, and why. "Not done" is a fine answer; a silent omission is not.
 - If you decline a task because completing it would be harmful, say so and explain. That is a valid outcome. (Telemetry stayed dark in wave 8 for exactly this reason: our default was inverted from upstream's, so wiring emission first would have shipped it on by default.)
+
+---
+
+## 11. Skills index for agents
+
+When working on porting, verification, parity audits, or upstream synchronizations in this repository, load the matching repo skill below:
+
+| Task / Domain | Repo Skill |
+| --- | --- |
+| Port, refactor, implement, or test a Swift target / subsystem | [`develop-swift-open-grok`](.agents/skills/develop-swift-open-grok/SKILL.md) |
+| Coordinate parallel multi-agent waves, subagents, and DAG slices | [`coordinate-agent-teamwork`](.agents/skills/coordinate-agent-teamwork/SKILL.md) |
+| Drive real CLI, isolated OPENGROK_HOME, doctor, evidence, or live PTY | [`verify-open-grok`](.agents/skills/verify-open-grok/SKILL.md) |
+| Audit parity against Rust reference (`650c1db7`) across all domains | [`audit-open-grok-parity`](.agents/skills/audit-open-grok-parity/SKILL.md) |
+| Re-evaluate Rust pin, update protocol fixtures, forward-port deltas | [`sync-open-grok-upstream`](.agents/skills/sync-open-grok-upstream/SKILL.md) |
+
+

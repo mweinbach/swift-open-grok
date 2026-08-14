@@ -8,10 +8,13 @@ operational layer on top of it.
 
 1. `PORT_STATUS.md` — current truth: what is live, what is unwired, what is
    deliberately deferred, and the pinned reference commit.
-2. `AGENTS.md` §2 — the Swift traps that have actually bitten this repo. Skimming
+2. `AGENTS.md` §2/§5 — the Swift traps that have actually bitten this repo. Skimming
    this is cheaper than rediscovering any one of them.
-3. The Rust reference at `~/Projects/grok-build` (read-only) for anything
+3. The Rust reference at [`github.com/mweinbach/open-grok`](https://github.com/mweinbach/open-grok) (or the location that houses the Rust repo, read-only) for anything
    parity-shaped.
+
+4. Load the matching repo skill in `.agents/skills/`: `develop-swift-open-grok`,
+   `verify-open-grok`, `audit-open-grok-parity`, or `sync-open-grok-upstream`.
 
 ## The five rules that prevent most damage here
 
