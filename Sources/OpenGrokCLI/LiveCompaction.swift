@@ -311,6 +311,7 @@ actor LiveCompactionCoordinator {
             }
             compactionCount &+= 1
             lastReport = report
+            recordCompactionCheckpoint(preCompactionItems: items, replacement: replacement)
             return .compacted(items: replacement, report: report)
         }
     }
@@ -353,7 +354,59 @@ actor LiveCompactionCoordinator {
             }
             compactionCount &+= 1
             lastReport = report
+            recordCompactionCheckpoint(preCompactionItems: items, replacement: replacement)
             return .compacted(items: replacement, report: report)
+        }
+    }
+
+    private func recordCompactionCheckpoint(
+        preCompactionItems: [ConversationItem],
+        replacement: [ConversationItem]
+    ) {
+        let originalUserInfo: String? = {
+            if preCompactionItems.count > 1, case .user = preCompactionItems[1] {
+                return preCompactionItems[1].textContent()
+            }
+            if let firstUser = preCompactionItems.first(where: { if case .user = $0 { return true } else { return false } }) {
+                return firstUser.textContent()
+            }
+            return nil
+        }()
+
+        var promptIndexAtCompaction = 0
+        for item in preCompactionItems {
+            if case .user(let u) = item {
+                let startsTurn = u.syntheticReason.map(\.startsPromptTurn) ?? true
+                if startsTurn { promptIndexAtCompaction += 1 }
+            }
+        }
+
+        let sessionDir = openGrokHome.appendingPathComponent("sessions").appendingPathComponent(sessionID)
+        guard let info = try? persistCompactionCheckpoint(
+            sessionDir: sessionDir,
+            promptIndex: promptIndexAtCompaction,
+            compactedHistory: replacement,
+            autoContinue: nil,
+            originalUserInfo: originalUserInfo
+        ) else { return }
+
+        let updateRecord = SessionUpdateRecord.checkpoint(
+            id: info.checkpointID,
+            promptIndex: info.promptIndexAtCompaction,
+            autoContinueText: nil
+        )
+        if let data = try? JSONEncoder().encode(updateRecord),
+           let line = String(data: data, encoding: .utf8) {
+            let updatesURL = sessionDir.appendingPathComponent("updates.jsonl")
+            if let handle = try? FileHandle(forWritingTo: updatesURL) {
+                handle.seekToEndOfFile()
+                if let lineData = (line + "\n").data(using: .utf8) {
+                    handle.write(lineData)
+                }
+                try? handle.close()
+            } else {
+                try? (line + "\n").write(to: updatesURL, atomically: true, encoding: .utf8)
+            }
         }
     }
 

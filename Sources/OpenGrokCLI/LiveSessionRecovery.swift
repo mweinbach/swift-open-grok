@@ -43,6 +43,7 @@
 // before this file existed.
 
 import Foundation
+import OpenGrokCompaction
 import OpenGrokSamplingTypes
 import OpenGrokShared
 
@@ -532,9 +533,18 @@ enum LiveRewindError: Error, CustomStringConvertible, Equatable {
 /// behaviour after a rewind.
 func liveTruncateConversation(
     _ items: [ConversationItem],
-    toPromptIndex targetPromptIndex: Int
+    toPromptIndex targetPromptIndex: Int,
+    sessionDir: URL? = nil
 ) -> [ConversationItem] {
     guard targetPromptIndex >= 0 else { return items }
+
+    if let sessionDir {
+        if let replay = try? replayToPrompt(sessionDir: sessionDir, targetPromptIndex: targetPromptIndex),
+           !replay.conversation.isEmpty {
+            return replay.conversation
+        }
+    }
+
     var promptCount = 0
     var cutIndex: Int?
     for (offset, item) in items.enumerated() {
@@ -598,6 +608,8 @@ func livePromptText(in items: [ConversationItem], at promptIndex: Int) -> String
 /// even though it is collected lazily as tools run.
 actor LiveRewindCoordinator {
     private let store: LiveRewindStore
+    private let openGrokHome: URL
+    private let sessionID: String
     private let workingDirectory: URL
     private let limits: LiveRewindLimits
     /// See `LiveRewindStore.fileManager`: actor-local, never injected.
@@ -625,6 +637,8 @@ actor LiveRewindCoordinator {
             sessionID: sessionID,
             limits: limits
         )
+        self.openGrokHome = openGrokHome
+        self.sessionID = sessionID
         self.workingDirectory = workingDirectory.standardizedFileURL
         self.limits = limits
         // Resume numbering from whichever is further along: the points already
@@ -878,11 +892,13 @@ actor LiveRewindCoordinator {
         }
 
         let promptText = target.promptText
+        let sessionDir = openGrokHome.appendingPathComponent("sessions").appendingPathComponent(sessionID)
         let removedItemCount = mode == .filesOnly
             ? 0
             : currentItems.count - liveTruncateConversation(
                 currentItems,
-                toPromptIndex: targetPromptIndex
+                toPromptIndex: targetPromptIndex,
+                sessionDir: sessionDir
             ).count
 
         guard force else {

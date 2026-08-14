@@ -305,6 +305,11 @@ actor LiveConversationStore {
                 let rewindBytes = try Data(contentsOf: sourceRewindURL)
                 try rewindBytes.write(to: destinationRewindURL, options: .atomic)
             }
+            let sourceSessionDir = sessionsDirectory.appendingPathComponent(sourceSessionID)
+            let destinationSessionDir = sessionsDirectory.appendingPathComponent(destinationSessionID)
+            if fileManager.fileExists(atPath: sourceSessionDir.path) {
+                _ = try? copyCheckpoints(from: sourceSessionDir, to: destinationSessionDir)
+            }
         } catch {
             try? fileManager.removeItem(at: destinationRecordURL)
             try? fileManager.removeItem(at: destinationRewindURL)

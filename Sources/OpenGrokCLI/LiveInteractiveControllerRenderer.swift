@@ -2846,9 +2846,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func commitRewind(toPromptIndex targetPromptIndex: Int, summary: String) async {
         note(summary)
         guard let conversationHistory else { return }
+        let sessionDir = openGrokHome.appendingPathComponent("sessions").appendingPathComponent(sessionID)
         let truncated = liveTruncateConversation(
             await conversationHistory.items,
-            toPromptIndex: targetPromptIndex
+            toPromptIndex: targetPromptIndex,
+            sessionDir: sessionDir
         )
         do {
             try await conversationHistory.commit(sessionID: sessionID, items: truncated)
@@ -2858,6 +2860,18 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 text: "Files were restored, but the conversation could not be truncated: \(error)"
             ))
             return
+        }
+        let marker = SessionUpdateRecord.rewindMarker(targetPromptIndex: targetPromptIndex)
+        if let data = try? JSONEncoder().encode(marker),
+           let line = String(data: data, encoding: .utf8) {
+            let updatesURL = sessionDir.appendingPathComponent("updates.jsonl")
+            if let handle = try? FileHandle(forWritingTo: updatesURL) {
+                handle.seekToEndOfFile()
+                if let lineData = (line + "\n").data(using: .utf8) {
+                    handle.write(lineData)
+                }
+                try? handle.close()
+            }
         }
         truncateRenderedTranscript(toPromptIndex: targetPromptIndex)
     }
