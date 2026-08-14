@@ -3800,6 +3800,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             return .openCodeGo
         case "wafer", "wafer_ai", "wafer-ai":
             return .wafer
+        case "zai", "z_ai", "z-ai", "zai_api", "zai-api", "glm":
+            return .zai
         default:
             throw CLIApplicationError.unsupported(route: "provider \(value)")
         }
@@ -3843,7 +3845,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // the provider-override mapping in agent/config.rs:4545-4553.
         case .codex, .meta:
             return .responses
-        case .kimi, .fireworks, .deepseek, .openCodeGo, .wafer:
+        case .kimi, .fireworks, .deepseek, .openCodeGo, .wafer, .zai:
             return .chatCompletions
         }
     }
@@ -3985,6 +3987,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         case .deepseek: overrideKey = DeepSeekModels.apiBaseURLEnv
         case .openCodeGo: overrideKey = OpenCodeGoModels.apiBaseURLEnv
         case .wafer: overrideKey = WaferModels.apiBaseURLEnv
+        case .zai: overrideKey = ZaiModels.apiBaseURLEnv
         case .meta:
             // Meta endpoint constants (meta_models.rs:14-16): the
             // OPENGROK_META_API_BASE_URL override, else the model's own URL,
@@ -4019,6 +4022,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             fallback = model?.apiBaseURL ?? model?.baseURL ?? OpenCodeGoModels.apiBaseURLDefault
         case .wafer:
             fallback = model?.apiBaseURL ?? model?.baseURL ?? WaferModels.apiBaseURLDefault
+        case .zai:
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? ZaiModels.apiBaseURLDefault
         case .meta:
             fallback = model?.apiBaseURL ?? model?.baseURL ?? MetaModels.apiBaseURLDefault
         }
@@ -4061,6 +4066,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             keys = [OpenCodeGoModels.apiKeyEnv]
         case .wafer:
             keys = [WaferModels.apiKeyEnv]
+        case .zai:
+            keys = [ZaiModels.apiKeyEnv]
         case .meta:
             // META_API_KEY (meta_models.rs:16, :74-76).
             keys = [MetaModels.apiKeyEnv]
@@ -4098,6 +4105,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             return OpenCodeGoModels.apiKeyEnv
         case .wafer:
             return WaferModels.apiKeyEnv
+        case .zai:
+            return ZaiModels.apiKeyEnv
         }
     }
 

@@ -531,4 +531,19 @@ public enum ProviderCatalogActors {
             }
         )
     }
+
+    /// Z AI's `/models` queries GLM models and falls back to curated models.
+    public static func zai(
+        transport: any ModelCatalogTransport,
+        credentialSource: @escaping @Sendable () async -> ProviderCatalogCredential?,
+        baseURL: String = ZaiModels.apiBaseURLDefault
+    ) -> APIKeyCatalogActor {
+        APIKeyCatalogActor(
+            partition: .zai,
+            transport: transport,
+            credentialSource: credentialSource,
+            baseURL: baseURL,
+            project: { data, base in try ZaiModels.parseCatalog(data, baseURL: base) }
+        )
+    }
 }

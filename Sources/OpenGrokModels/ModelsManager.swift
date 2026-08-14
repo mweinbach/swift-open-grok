@@ -32,6 +32,8 @@ public protocol ModelCatalogCredentialSnapshot: Sendable {
     var openCodeGoCredentialFingerprint: String? { get }
     /// Non-secret digest for Wafer credential isolation.
     var waferCredentialFingerprint: String? { get }
+    /// Non-secret digest for Z AI credential isolation.
+    var zaiCredentialFingerprint: String? { get }
 }
 
 public extension ModelCatalogCredentialSnapshot {
@@ -41,6 +43,7 @@ public extension ModelCatalogCredentialSnapshot {
     var metaCredentialFingerprint: String? { nil }
     var openCodeGoCredentialFingerprint: String? { nil }
     var waferCredentialFingerprint: String? { nil }
+    var zaiCredentialFingerprint: String? { nil }
 }
 
 /// Default empty credential snapshot (offline / hermetic tests).
@@ -54,6 +57,7 @@ public struct EmptyCredentialSnapshot: ModelCatalogCredentialSnapshot {
     public var metaCredentialFingerprint: String?
     public var openCodeGoCredentialFingerprint: String?
     public var waferCredentialFingerprint: String?
+    public var zaiCredentialFingerprint: String?
 
     public init(
         hasXaiSession: Bool = false,
@@ -64,7 +68,8 @@ public struct EmptyCredentialSnapshot: ModelCatalogCredentialSnapshot {
         deepSeekCredentialFingerprint: String? = nil,
         metaCredentialFingerprint: String? = nil,
         openCodeGoCredentialFingerprint: String? = nil,
-        waferCredentialFingerprint: String? = nil
+        waferCredentialFingerprint: String? = nil,
+        zaiCredentialFingerprint: String? = nil
     ) {
         self.hasXaiSession = hasXaiSession
         self.hasCodexSession = hasCodexSession
@@ -75,6 +80,7 @@ public struct EmptyCredentialSnapshot: ModelCatalogCredentialSnapshot {
         self.metaCredentialFingerprint = metaCredentialFingerprint
         self.openCodeGoCredentialFingerprint = openCodeGoCredentialFingerprint
         self.waferCredentialFingerprint = waferCredentialFingerprint
+        self.zaiCredentialFingerprint = zaiCredentialFingerprint
     }
 }
 
@@ -150,6 +156,7 @@ public final class ModelsManager: @unchecked Sendable {
     private var metaCatalog: MetaModelsCatalog?
     private var openCodeGoCatalog: OpenCodeGoModelsCatalog?
     private var waferCatalog: WaferModelsCatalog?
+    private var zaiCatalog: ZaiModelsCatalog?
     private var models: OrderedModelMap
     private var currentModelID: String
     private var currentReasoningEffort: ReasoningEffort?
@@ -411,13 +418,26 @@ public final class ModelsManager: @unchecked Sendable {
         reassemble()
     }
 
+    public func applyZaiCatalog(_ catalog: ZaiModelsCatalog?) {
+        lock.lock()
+        if let catalog,
+           let expected = credentials.zaiCredentialFingerprint,
+           catalog.credentialFingerprint != expected {
+            lock.unlock()
+            return
+        }
+        self.zaiCatalog = catalog
+        lock.unlock()
+        reassemble()
+    }
+
     /// Drop ONE provider's live catalog partition, report whether anything
     /// was actually dropped, and reselect if the current model vanished.
     ///
     /// Port of upstream's per-provider `clear_*_models` family
     /// (`agent/models.rs:556-570` codex, `:623-634` kimi, `:692-703`
     /// fireworks, `:768-779` deepseek, `:834-845` meta, `:911-922`
-    /// opencode-go, `:977-988` wafer): take the partition, rebuild, reselect
+    /// opencode-go, `:977-988` wafer, `:1177-1188` zai): take the partition, rebuild, reselect
     /// if the current model is gone. Codex is the only partition with a
     /// disk cache; its arm also invalidates that cache and its `Bool` ORs
     /// in `had_cache` (`:560-562`), so "cleared: true" is honest when only
@@ -454,6 +474,9 @@ public final class ModelsManager: @unchecked Sendable {
         case .wafer:
             hadCatalog = waferCatalog != nil
             waferCatalog = nil
+        case .zai:
+            hadCatalog = zaiCatalog != nil
+            zaiCatalog = nil
         }
         lock.unlock()
         if partition == .codex {
@@ -625,7 +648,8 @@ public final class ModelsManager: @unchecked Sendable {
             deepSeekCatalog: deepSeekCatalog,
             metaCatalog: metaCatalog,
             openCodeGoCatalog: openCodeGoCatalog,
-            waferCatalog: waferCatalog
+            waferCatalog: waferCatalog,
+            zaiCatalog: zaiCatalog
         )
         models = assembled
         allowlistExcludesAll = allowlistMatchesNothing(input: input, catalog: assembled)

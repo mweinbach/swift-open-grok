@@ -188,7 +188,7 @@ enum LiveWebToolComposition {
         // no client search tool, so Meta stays inert here.
         case .meta:
             return .native
-        case .xai, .fireworks, .deepseek, .wafer, .openCodeGo:
+        case .xai, .fireworks, .deepseek, .wafer, .openCodeGo, .zai:
             return .xai
         }
     }
@@ -215,6 +215,7 @@ enum LiveWebToolComposition {
         case .meta: key = "meta"
         case .wafer: key = "wafer"
         case .openCodeGo: key = "opencode_go"
+        case .zai: key = "zai"
         }
         guard let raw = configString(
             path: ["toolset", "web_search_source", key],

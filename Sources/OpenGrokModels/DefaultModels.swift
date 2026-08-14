@@ -447,6 +447,10 @@ public func defaultModelConfigs(
             m.baseURL = MetaModels.apiBaseURL()
             m.envKey = .single(MetaModels.apiKeyEnv)
         }
+        if m.provider == .zai {
+            m.baseURL = ZaiModels.apiBaseURL()
+            m.envKey = .single(ZaiModels.apiKeyEnv)
+        }
 
         let key = m.id ?? m.model
         let contextWindow = m.contextWindow.map { max(1, $0) } ?? NEW_MODEL_DEFAULT_CONTEXT_WINDOW

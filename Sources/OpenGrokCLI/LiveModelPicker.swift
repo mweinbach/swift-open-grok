@@ -215,6 +215,7 @@ enum LiveModelPicker {
         case "meta", "meta_ai", "meta_api": return "Meta API"
         case "opencode_go", "opencode-go": return "OpenCode Go"
         case "wafer", "wafer_ai": return "Wafer AI"
+        case "zai", "z_ai", "z-ai", "zai_api", "glm": return "Z AI"
         default: return providerID
         }
     }

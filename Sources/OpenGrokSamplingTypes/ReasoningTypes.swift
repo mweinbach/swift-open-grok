@@ -193,3 +193,32 @@ public func parseReasoningEffortsMeta(_ meta: [String: JSONValue]?) -> [Reasonin
 public func reasoningEffortsMetaValue(_ opts: [ReasoningEffortOption]) -> JSONValue {
     (try? JSONValue.encode(opts)) ?? .array([])
 }
+
+// MARK: - Thinking mode
+
+/// Z AI GLM "thinking mode" type sent alongside `reasoning_effort`.
+public enum ChatThinkingType: String, Codable, Sendable, Equatable, Hashable {
+    case enabled
+    case disabled
+}
+
+/// Z AI GLM "thinking mode" switch sent alongside `reasoning_effort`. Z AI
+/// requires the explicit object to turn thinking on; no other Chat
+/// Completions provider sends it.
+public struct ChatThinkingMode: Codable, Sendable, Equatable, Hashable {
+    public var type: ChatThinkingType
+    public var clearThinking: Bool?
+
+    public init(type: ChatThinkingType = .enabled, clearThinking: Bool? = false) {
+        self.type = type
+        self.clearThinking = clearThinking
+    }
+
+    public enum CodingKeys: String, CodingKey {
+        case type
+        case clearThinking = "clear_thinking"
+    }
+
+    /// Thinking on with the content preserved, matching Z AI's quickstart.
+    public static let enabled = ChatThinkingMode(type: .enabled, clearThinking: false)
+}

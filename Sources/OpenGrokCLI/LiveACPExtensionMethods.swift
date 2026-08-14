@@ -176,6 +176,7 @@ struct LiveModelsACPHandler: ACPAgentExtensionHandler, Sendable {
         "open-grok/deepseek/models/apply",
         "open-grok/meta/models/apply",
         "open-grok/wafer/models/apply",
+        "open-grok/zai/models/apply",
         "open-grok/opencode-go/models/get",
         "open-grok/opencode-go/models/apply",
         "open-grok/opencode-go/models/credential-apply",
@@ -217,6 +218,9 @@ struct LiveModelsACPHandler: ACPAgentExtensionHandler, Sendable {
 
         case "open-grok/wafer/models/apply":
             return envelope(await applyCredentialChange(.wafer))
+
+        case "open-grok/zai/models/apply":
+            return envelope(await applyCredentialChange(.zai))
 
         case "open-grok/opencode-go/models/get":
             // Refresh only when the partition has never been fetched

@@ -456,6 +456,25 @@ public struct WaferProvider: ProviderAdapter {
     }
 }
 
+/// Z AI is an OpenAI-compatible Chat Completions provider. It supports GLM
+/// "thinking mode", and a requested effort turns on the explicit `thinking`
+/// object Z AI expects alongside it; it still drops Grok-internal
+/// `service_tier` and per-message `model_id` metadata.
+public struct ZaiProvider: ProviderAdapter {
+    public init() {}
+    public var provider: ModelProvider { .zai }
+
+    public func sanitizeChatRequest(_ request: inout ChatCompletionWireRequest) {
+        request.serviceTier = nil
+        for i in request.messages.indices {
+            request.messages[i].modelId = nil
+        }
+        // Z AI gates GLM thinking with an explicit `thinking` object; a
+        // requested reasoning_effort implies thinking enabled.
+        request.thinking = request.reasoningEffort != nil ? .enabled : nil
+    }
+}
+
 // MARK: - Registry
 
 public struct ProviderRegistration: Sendable {
@@ -476,6 +495,7 @@ private let deepSeekProvider = DeepSeekProvider()
 private let metaProvider = MetaProvider()
 private let openCodeGoProvider = OpenCodeGoProvider()
 private let waferProvider = WaferProvider()
+private let zaiProvider = ZaiProvider()
 
 /// Complete registry for the built-in providers.
 public let PROVIDER_REGISTRY: [ProviderRegistration] = [
@@ -487,6 +507,7 @@ public let PROVIDER_REGISTRY: [ProviderRegistration] = [
     ProviderRegistration(provider: .meta, adapter: metaProvider),
     ProviderRegistration(provider: .openCodeGo, adapter: openCodeGoProvider),
     ProviderRegistration(provider: .wafer, adapter: waferProvider),
+    ProviderRegistration(provider: .zai, adapter: zaiProvider),
 ]
 
 /// Look up the stateless transport adapter for a built-in provider.
@@ -500,6 +521,7 @@ public func providerAdapter(_ provider: ModelProvider) -> any ProviderAdapter {
     case .meta: return metaProvider
     case .openCodeGo: return openCodeGoProvider
     case .wafer: return waferProvider
+    case .zai: return zaiProvider
     }
 }
 

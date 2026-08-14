@@ -121,6 +121,14 @@ public enum PagerLoginProviders {
             aliases: ["wafer", "wafer-ai", "wafer_ai"],
             route: .apiKey(settingsKey: "wafer_api_key")
         ),
+        PagerLoginProvider(
+            insertText: "zai",
+            display: "Z AI",
+            matchText: "z ai zai api key glm coding plan chat completions dynamic models",
+            neutralDescription: apiKeyNeutralDescription,
+            aliases: ["zai", "z-ai", "z_ai"],
+            route: .apiKey(settingsKey: "zai_api_key")
+        ),
     ]
 
     /// `provider_action`'s matching rule (`login.rs:85-87`): trim, ASCII
@@ -137,7 +145,7 @@ public enum PagerLoginProviders {
     public static func unknownProviderMessage(_ token: String) -> String {
         "Unknown provider: \(token.trimmingCharacters(in: .whitespacesAndNewlines)). "
             + "Use /login xai, /login codex, /login kimi, /login fireworks, "
-            + "/login deepseek, /login meta, /login wafer, or /login opencode-go"
+            + "/login deepseek, /login meta, /login wafer, /login zai, or /login opencode-go"
     }
 
     /// Upstream's unknown-account error for `/logout` (`logout.rs:42-44`).

@@ -213,7 +213,8 @@ public func resolveModelCatalog(
     deepSeekCatalog: DeepSeekModelsCatalog? = nil,
     metaCatalog: MetaModelsCatalog? = nil,
     openCodeGoCatalog: OpenCodeGoModelsCatalog? = nil,
-    waferCatalog: WaferModelsCatalog? = nil
+    waferCatalog: WaferModelsCatalog? = nil,
+    zaiCatalog: ZaiModelsCatalog? = nil
 ) -> OrderedModelMap {
     var catalog = resolveModelListWithProviderCatalogs(
         input: input,
@@ -245,6 +246,13 @@ public func resolveModelCatalog(
     if let waferCatalog {
         catalog.retain { _, entry in entry.info.provider != .wafer }
         for (key, entry) in waferCatalog.entries.pairs() {
+            catalog[key] = entry
+        }
+    }
+
+    if let zaiCatalog {
+        catalog.retain { _, entry in entry.info.provider != .zai }
+        for (key, entry) in zaiCatalog.entries.pairs() {
             catalog[key] = entry
         }
     }
@@ -527,6 +535,9 @@ public func trustedBuiltInSessionEndpoint(provider: ModelProvider, baseURL: Stri
         }
         if provider == .wafer {
             return WaferModels.isTrustedAPIBaseURL(baseURL)
+        }
+        if provider == .zai {
+            return ZaiModels.isTrustedAPIBaseURL(baseURL)
         }
         return false
     case .xaiSession:

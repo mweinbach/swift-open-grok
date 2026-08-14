@@ -222,7 +222,7 @@ public struct LiveCredentialResolver: Sendable {
                 || store[apiKeyScope] != nil
         case .codex:
             return isCodexLoggedIn(at: codexAuthFile)
-        case .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer:
+        case .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai:
             // Meta joins the other API-key providers: the provider-scoped
             // stored key (`meta::api_key`, upstream `stored_api_key` at
             // meta_models.rs:74-76). This is only the "can authenticate at
@@ -386,6 +386,8 @@ public struct LiveCredentialResolver: Sendable {
             return "OPENCODE_API_KEY"
         case .wafer:
             return "WAFER_API_KEY"
+        case .zai:
+            return "ZAI_API_KEY"
         }
     }
 

@@ -136,3 +136,25 @@ public func storeWaferAPIKey(grokHome: URL, apiKey: String) throws {
 public func clearWaferAPIKey(grokHome: URL) throws {
     try clearScopedAPIKey(grokHome: grokHome, scope: waferAPIKeyScope)
 }
+
+// MARK: - Z AI
+
+/// `zai::api_key` — Z AI (GLM Coding Plan / Chat Completions).
+public let zaiAPIKeyScope = "zai::api_key"
+
+public func readZaiAPIKey(grokHome: URL) -> String? {
+    readScopedAPIKey(grokHome: grokHome, scope: zaiAPIKeyScope)
+}
+
+public func zaiAPIKeyIsConfigured(grokHome: URL) -> Bool {
+    readZaiAPIKey(grokHome: grokHome) != nil
+}
+
+public func storeZaiAPIKey(grokHome: URL, apiKey: String) throws {
+    try storeScopedAPIKeyTrimming(grokHome: grokHome, scope: zaiAPIKeyScope, apiKey: apiKey)
+}
+
+public func clearZaiAPIKey(grokHome: URL) throws {
+    try clearScopedAPIKey(grokHome: grokHome, scope: zaiAPIKeyScope)
+}
+

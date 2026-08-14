@@ -54,11 +54,12 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
     case meta
     case openCodeGo
     case wafer
+    case zai
 
     public static let defaultValue: ModelProvider = .xai
 
     public enum CodingKeys: String, CodingKey {
-        case xai, codex, kimi, fireworks, deepseek, meta, wafer
+        case xai, codex, kimi, fireworks, deepseek, meta, wafer, zai
         case openCodeGo = "opencode_go"
     }
 
@@ -74,6 +75,7 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case "meta", "meta_ai", "meta_api": self = .meta
         case "opencode_go", "opencode-go": self = .openCodeGo
         case "wafer", "wafer_ai": self = .wafer
+        case "zai", "z_ai", "z-ai", "zai_api", "glm": self = .zai
         default:
             throw DecodingError.dataCorruptedError(
                 in: container,
@@ -98,6 +100,7 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .meta: return "meta"
         case .openCodeGo: return "opencode_go"
         case .wafer: return "wafer"
+        case .zai: return "zai"
         }
     }
 
@@ -112,6 +115,7 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .meta: return "Meta API"
         case .openCodeGo: return "OpenCode Go"
         case .wafer: return "Wafer AI"
+        case .zai: return "Z AI"
         }
     }
 
@@ -123,6 +127,7 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
     public var isMeta: Bool { self == .meta }
     public var isOpenCodeGo: Bool { self == .openCodeGo }
     public var isWafer: Bool { self == .wafer }
+    public var isZai: Bool { self == .zai }
 
     /// Return the built-in provider's complete behavior policy.
     public var profile: ProviderProfile {
@@ -135,6 +140,7 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .meta: return .meta
         case .openCodeGo: return .openCodeGo
         case .wafer: return .wafer
+        case .zai: return .zai
         }
     }
 }
@@ -338,6 +344,7 @@ public struct ProviderProfile: Codable, Sendable, Equatable, Hashable {
     public var isMeta: Bool { provider.isMeta }
     public var isOpenCodeGo: Bool { provider.isOpenCodeGo }
     public var isWafer: Bool { provider.isWafer }
+    public var isZai: Bool { provider.isZai }
     public var allowsXaiServices: Bool { xaiServices.allows }
     public var hasNativeWebSearch: Bool { nativeWebSearch }
     public var responsesDialect: ResponsesDialect? { backends.responses }
@@ -439,6 +446,21 @@ public struct ProviderProfile: Codable, Sendable, Equatable, Hashable {
     /// web search, Responses, or provider-managed OAuth authentication.
     public static let wafer = ProviderProfile(
         provider: .wafer,
+        backends: ProviderBackends(chatCompletions: true, responses: nil, messages: false),
+        codeModeTransport: .unsupported,
+        hostedToolDialect: nil,
+        nativeWebSearch: false,
+        requestMetadata: .standardHeadersOnly,
+        sessionAuth: .apiKeyOnly,
+        xaiServices: .denied
+    )
+
+    /// Z AI's OpenAI-compatible Chat Completions API (GLM Coding Plan
+    /// endpoint by default). Z AI supports ordinary client-side function
+    /// tools and per-model reasoning ("thinking mode"), but does not provide
+    /// hosted tools, web search, Responses, or provider-managed OAuth.
+    public static let zai = ProviderProfile(
+        provider: .zai,
         backends: ProviderBackends(chatCompletions: true, responses: nil, messages: false),
         codeModeTransport: .unsupported,
         hostedToolDialect: nil,

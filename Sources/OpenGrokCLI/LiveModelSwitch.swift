@@ -1245,6 +1245,8 @@ private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
             key = OpenCodeGoModels.apiKeyEnv
         case .wafer:
             key = WaferModels.apiKeyEnv
+        case .zai:
+            key = ZaiModels.apiKeyEnv
         case .meta:
             // Upstream's Meta credential env key (meta_models.rs:16, :74-76).
             key = MetaModels.apiKeyEnv
@@ -1273,6 +1275,8 @@ private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
             return OpenCodeGoModels.apiBaseURL(environment: environment)
         case .wafer:
             return WaferModels.apiBaseURL(environment: environment)
+        case .zai:
+            return ZaiModels.apiBaseURL(environment: environment)
         }
     }
 }

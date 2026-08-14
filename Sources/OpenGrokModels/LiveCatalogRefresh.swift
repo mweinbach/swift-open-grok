@@ -31,6 +31,7 @@ public struct LiveCatalogRefreshers: Sendable {
     public var meta: APIKeyCatalogActor?
     public var openCodeGo: OpenCodeGoCatalogActor?
     public var wafer: APIKeyCatalogActor?
+    public var zai: APIKeyCatalogActor?
 
     public init(
         codex: CodexCatalogActor? = nil,
@@ -39,7 +40,8 @@ public struct LiveCatalogRefreshers: Sendable {
         deepSeek: APIKeyCatalogActor? = nil,
         meta: APIKeyCatalogActor? = nil,
         openCodeGo: OpenCodeGoCatalogActor? = nil,
-        wafer: APIKeyCatalogActor? = nil
+        wafer: APIKeyCatalogActor? = nil,
+        zai: APIKeyCatalogActor? = nil
     ) {
         self.codex = codex
         self.kimi = kimi
@@ -48,6 +50,7 @@ public struct LiveCatalogRefreshers: Sendable {
         self.meta = meta
         self.openCodeGo = openCodeGo
         self.wafer = wafer
+        self.zai = zai
     }
 
     /// Build the full set from one transport and one credential broker.
@@ -109,6 +112,11 @@ public struct LiveCatalogRefreshers: Sendable {
                 transport: transport,
                 credentialSource: source(.wafer),
                 baseURL: WaferModels.apiBaseURL(environment: environment)
+            ),
+            zai: ProviderCatalogActors.zai(
+                transport: transport,
+                credentialSource: source(.zai),
+                baseURL: ZaiModels.apiBaseURL(environment: environment)
             )
         )
     }
@@ -234,6 +242,18 @@ public extension ModelsManager {
                 }
                 applyWaferCatalog(
                     WaferModelsCatalog(
+                        entries: result.entries,
+                        credentialFingerprint: result.fingerprint
+                    )
+                )
+
+            case .zai:
+                guard let actor = refreshers.zai,
+                      let result = try await actor.fetch(cancellation: cancellation) else {
+                    return LiveCatalogRefreshOutcome(partition: partition, published: false)
+                }
+                applyZaiCatalog(
+                    ZaiModelsCatalog(
                         entries: result.entries,
                         credentialFingerprint: result.fingerprint
                     )

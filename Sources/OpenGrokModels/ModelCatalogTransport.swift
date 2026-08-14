@@ -31,6 +31,7 @@ public enum ModelCatalogPartition: String, Sendable, Equatable, Hashable, CaseIt
     case meta
     case openCodeGo
     case wafer
+    case zai
 
     public var provider: ModelProvider {
         switch self {
@@ -41,6 +42,7 @@ public enum ModelCatalogPartition: String, Sendable, Equatable, Hashable, CaseIt
         case .meta: return .meta
         case .openCodeGo: return .openCodeGo
         case .wafer: return .wafer
+        case .zai: return .zai
         }
     }
 }

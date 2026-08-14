@@ -40,6 +40,7 @@ struct AuthProviderScopeKeyTests {
         #expect(kimiCodeAPIKeyScope == "kimi_code::api_key")
         #expect(perplexityAPIKeyScope == "perplexity::api_key")
         #expect(waferAPIKeyScope == "wafer::api_key")
+        #expect(zaiAPIKeyScope == "zai::api_key")
     }
 
     /// The migration rule at storage.rs:445-452: Kimi **Platform** reuses the
@@ -98,6 +99,24 @@ struct AuthStoreScopeIsolationTests {
 
         #expect(readWaferAPIKey(grokHome: home) == nil)
         #expect(readAPIKey(grokHome: home) == "xai-secret")
+    }
+
+    @Test("zai round trip and clear preserve unrelated scopes")
+    func zaiIsolation() throws {
+        let home = try tempHome()
+        try storeAPIKey(grokHome: home, apiKey: "xai-secret")
+        try storePerplexityAPIKey(grokHome: home, apiKey: "pplx-secret")
+        try storeZaiAPIKey(grokHome: home, apiKey: "zai-secret")
+
+        #expect(readZaiAPIKey(grokHome: home) == "zai-secret")
+        #expect(zaiAPIKeyIsConfigured(grokHome: home))
+
+        try clearZaiAPIKey(grokHome: home)
+
+        #expect(readZaiAPIKey(grokHome: home) == nil)
+        #expect(!zaiAPIKeyIsConfigured(grokHome: home))
+        #expect(readAPIKey(grokHome: home) == "xai-secret")
+        #expect(readPerplexityAPIKey(grokHome: home) == "pplx-secret")
     }
 
     /// Provenance: `kimi_platform_migrates_existing_scope_and_code_is_fully_isolated`,

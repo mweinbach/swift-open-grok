@@ -105,6 +105,7 @@ enum LiveLoginProviderPicker {
             "meta": (MetaModels.apiKeyEnv, "meta"),
             "opencode-go": (OpenCodeGoModels.apiKeyEnv, "opencode_go"),
             "wafer": (WaferModels.apiKeyEnv, "wafer"),
+            "zai": (ZaiModels.apiKeyEnv, "zai"),
         ]
         return stored.mapValues { entry in
             secretStatus(
