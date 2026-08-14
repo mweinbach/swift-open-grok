@@ -93,7 +93,9 @@ public func parseActivityBody(_ body: String) -> ActivitySample? {
     guard let data = body.data(using: .utf8),
           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let lastActivity = json["last_activity_ms"] as? NSNumber,
-          !(lastActivity is Bool),
+          // NSNumber(value: 0) can look like Bool on Apple platforms.
+          // Use CFGetTypeID to distinguish actual JSON booleans from integers.
+          CFGetTypeID(lastActivity) != CFBooleanGetTypeID(),
           lastActivity.doubleValue == Double(lastActivity.uint64Value)
     else {
         return nil
