@@ -1,20 +1,28 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-14 (local Open Grok v1.0.0-open-grok.62 sync & parity convergence). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this v1.0.0-open-grok.62 sync (2026-08-14): `build` exit 0; `build-tests` exit 0; authoritative full `test --no-parallel` exit 0 — exactly **6,596 Swift Testing cases in 1,032 suites passed after 309.266s**.
+**As of:** 2026-08-14 (Core Subsystems Parity Porting & v1.0.0-open-grok.62 Convergence). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; authoritative full `test --no-parallel` exit 0 — exactly **6,778 Swift Testing cases in 1,048 suites passed** after 285.72s (0 failures, 0 regressions against baseline).
 
-**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All 8 upstream v1.0.0-open-grok.62 parity slices are landed, verified, and committed.
+**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (Agent Runtime & Turn Pipeline, ACP Transports, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
 **Destination was empty at baseline:** yes.
-**Reference:** `xai-org/grok-build` / `open-grok` at `b849ec76` (`v1.0.0-open-grok.62`).
+**Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`) / Forward Sync `b849ec76` (`v1.0.0-open-grok.62`).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 
-## Local Open Grok v1.0.0-open-grok.62 Sync & Parity Convergence (2026-08-14, complete)
+## Core Subsystems Parity Porting (2026-08-14, complete)
 
-Current truth for the verified 2026-08-14 Open Grok v1.0.0-open-grok.62 parity convergence against Rust pin `b849ec76`:
+Current truth for the verified 2026-08-14 Core Subsystems Parity Porting against Rust pin `b849ec76` / `v1.0.0-open-grok.62`:
 
 **Verification (lead, local macOS, 2026-08-14; serial gate):**
 - `zsh workflows/swift-safe-verify.zsh build` — exit 0.
 - `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
-- Authoritative full `zsh workflows/swift-safe-verify.zsh test --no-parallel` — exit 0: exactly **6,596** Swift Testing cases in **1,032** suites, elapsed **309.266s** (100% green).
+- `zsh workflows/swift-safe-verify.zsh build --product open-grok` — exit 0.
+- Authoritative full `zsh workflows/swift-safe-verify.zsh test --no-parallel` — exit 0: exactly **6,778** Swift Testing cases in **1,048** suites, elapsed **285.72s** (100% green).
+
+### Core Porting Milestones Completed & Landed
+
+1. **Milestone 1: Compaction Checkpoints & Cross-Compaction Rewind** — Implemented `CompactionCheckpointFile`, `CompactionCheckpointInfo`, atomic disk persistence under `compaction_checkpoints/<id>.json`, and deterministic `replayToPrompt` state machine. Restores pre-compaction prompt history and `originalUserInfo` across rewind points (`cf20aec`, `d2bcfb6`, `6690486`).
+2. **Milestone 2: Two-Pass Prefire Background Compaction** — Implemented `TwoPassCompaction.swift` with 95% token weight splitting, tool boundary snapping, substantive `<summary>` extraction, 12,000 char capping, 64-bit FNV-1a sequence fingerprinting, speculative background Pass 1 prefire at `threshold - 10%` lead, fast-path Pass 2 apply, single-pass fallback, and multi-dimensional cache invalidation (`b4cdd21`).
+3. **Milestone 3: StructuredOutput Synthetic Tool Loop & Monotonic Export Boundary** — Implemented `StructuredOutput` synthetic tool loop (`STRUCTURED_OUTPUT_TOOL = "StructuredOutput"`, up to 3 validation retries) for non-native schema backends. Enforced irreversible monotonic export boundary (`ever_used_codex` / `everUsedNonXAI`) across session routes, sharing endpoints, and subagent executions (`f39f0c9`, `0851a23`).
+4. **Milestone 4: Comprehensive 4-Tier E2E Test Suite & Parity Hardening** — Created 93+ dedicated tests across Tier 1 (Feature Coverage), Tier 2 (Boundary & Error Resilience), Tier 3 (Cross-Feature Pairwise Interactions), and Tier 4 (Real-World Multi-Turn Workflows). Full serial suite passed 6,778/6,778 tests across 1,048 suites with 0 regressions. Verified product binary `open-grok`. Published `TEST_READY.md`.
 
 ### Slices Completed & Landed
 
