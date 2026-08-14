@@ -225,26 +225,23 @@ private func targets() -> [Target] {
     // loose-object inflate/deflate throws instead of working; that is the
     // honest state until a Windows zlib is vendored, and it must not be
     // "fixed" by re-adding the target without one.
-    let zlibShimAvailable: Bool
     #if os(Windows)
-    zlibShimAvailable = false
+    let zlibShimDependencies: [String] = []
     #else
-    zlibShimAvailable = true
+    t.append(.target(
+        name: "COpenGrokZlib",
+        path: "Sources/COpenGrokZlib",
+        publicHeadersPath: "include",
+        linkerSettings: [
+            .linkedLibrary("z"),
+        ]
+    ))
+    let zlibShimDependencies: [String] = ["COpenGrokZlib"]
     #endif
-    if zlibShimAvailable {
-        t.append(.target(
-            name: "COpenGrokZlib",
-            path: "Sources/COpenGrokZlib",
-            publicHeadersPath: "include",
-            linkerSettings: [
-                .linkedLibrary("z"),
-            ]
-        ))
-    }
     t.append(.target(name: "OpenGrokFSNotify", dependencies: dep(w0s2, w0s3, w0s4)))
     t.append(.target(
         name: "OpenGrokGitStatus",
-        dependencies: dep(w0s2, w0s3, w0s4, zlibShimAvailable ? ["COpenGrokZlib"] : [])
+        dependencies: dep(w0s2, w0s3, w0s4, zlibShimDependencies)
     ))
     t.append(.target(name: "OpenGrokCodebaseGraph", dependencies: dep(w0s2, w0s3, w0s4)))
     t.append(.target(name: "OpenGrokHunkTracker", dependencies: dep(w0s2, w0s3, w0s4)))

@@ -22,7 +22,7 @@ import PackagePlugin
 @main
 struct OpenGrokVersionBuildPlugin: BuildToolPlugin {
     func createBuildCommands(context: PluginContext, target: Target) async throws -> [Command] {
-        let outputFile = context.pluginWorkDirectory.appending("CompiledVersion.generated.swift")
+        let outputFile = context.pluginWorkDirectoryURL.appendingPathComponent("CompiledVersion.generated.swift")
 
         // Resolve the version string (same resolution order as the Rust
         // crate and `regenerate-compiled-version.sh`).
@@ -33,9 +33,9 @@ struct OpenGrokVersionBuildPlugin: BuildToolPlugin {
         if let grokVersion = env["GROK_VERSION"], !grokVersion.isEmpty {
             version = grokVersion
         } else {
-            let versionFilePath = context.package.directory
-                .appending("OPEN_GROK_VERSION")
-                .string
+            let versionFilePath = context.package.directoryURL
+                .appendingPathComponent("OPEN_GROK_VERSION")
+                .path
             if FileManager.default.fileExists(atPath: versionFilePath) {
                 let content = (try? String(contentsOfFile: versionFilePath, encoding: .utf8))?
                     .components(separatedBy: "\n").first?
@@ -59,7 +59,7 @@ struct OpenGrokVersionBuildPlugin: BuildToolPlugin {
 
         let generator = try context.tool(named: "OpenGrokVersionGenerator")
 
-        var arguments = [outputFile.string, version]
+        var arguments = [outputFile.path, version]
         if let shortCommit, !shortCommit.isEmpty {
             arguments.append(shortCommit)
         }
@@ -67,7 +67,7 @@ struct OpenGrokVersionBuildPlugin: BuildToolPlugin {
         return [
             .buildCommand(
                 displayName: "Generate OpenGrokVersion from GROK_VERSION=\(version)",
-                executable: generator.path,
+                executable: generator.url,
                 arguments: arguments,
                 inputFiles: [],
                 outputFiles: [outputFile]

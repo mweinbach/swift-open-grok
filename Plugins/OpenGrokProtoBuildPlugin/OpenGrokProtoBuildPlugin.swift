@@ -32,7 +32,7 @@ import PackagePlugin
 @main
 struct OpenGrokProtoBuildPlugin: CommandPlugin {
     func performCommand(context: PluginContext, arguments: [String]) async throws {
-        let packageRoot = context.package.directory.string
+        let packageRoot = context.package.directoryURL.path
         let fixturesDir = "\(packageRoot)/ProtocolFixtures"
         let manifestPath = "\(fixturesDir)/manifest.json"
         let fm = FileManager.default
