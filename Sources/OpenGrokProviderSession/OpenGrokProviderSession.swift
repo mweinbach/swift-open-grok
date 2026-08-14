@@ -556,7 +556,7 @@ public actor ProviderSession {
         )
         self.route = initial.route
         self.state = .ready(modelID: initial.route.modelID, provider: initial.route.provider, generation: 0)
-        self.everUsedNonXAI = persistedBoundary || !initial.route.profile.isXai
+        self.everUsedNonXAI = persistedBoundary || !initial.route.profile.allowsXaiServices
     }
 
     public init(
@@ -777,7 +777,7 @@ public actor ProviderSession {
             operation: "switch_model"
         )
         generation &+= 1
-        if !resolved.route.profile.isXai { everUsedNonXAI = true }
+        if !resolved.route.profile.allowsXaiServices { everUsedNonXAI = true }
         route = resolved.route
         historyRevision &+= 1
         transition(

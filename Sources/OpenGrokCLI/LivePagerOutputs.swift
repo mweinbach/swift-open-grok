@@ -57,6 +57,7 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
     /// restored record against this rather than the launch configuration,
     /// because `/model` may have moved the session since launch.
     private let modelSwitch: LiveModelSwitchCoordinator?
+    private let registerExportBoundary: (@Sendable (String, ExportBoundary) -> Void)?
     /// The one session id turns may currently run against, and every id this
     /// process has already created in the shell. Two values because `/resume`
     /// can revisit a session created earlier in this run — recreating it in
@@ -74,7 +75,8 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         conversationStore: LiveConversationStore,
         toolExecutor: LiveToolExecutor? = nil,
         compaction: LiveCompactionCoordinator? = nil,
-        modelSwitch: LiveModelSwitchCoordinator? = nil
+        modelSwitch: LiveModelSwitchCoordinator? = nil,
+        registerExportBoundary: (@Sendable (String, ExportBoundary) -> Void)? = nil
     ) {
         self.shell = shell
         self.cwd = cwd
@@ -84,6 +86,7 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         self.toolExecutor = toolExecutor
         self.compaction = compaction
         self.modelSwitch = modelSwitch
+        self.registerExportBoundary = registerExportBoundary
         self.activeWorkingDirectory = cwd.standardizedFileURL
     }
 
@@ -259,6 +262,8 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
             workingDirectory: newWorkingDirectory
         )
         try await conversationHistory.replace(with: record)
+        let boundary = await conversationHistory.sharedExportBoundary
+        registerExportBoundary?(newSessionID, boundary)
         await compaction?.replaceSessionID(newSessionID)
         providerConfiguration = configuration
         createdSessionIDs.insert(SessionID(newSessionID))
@@ -320,6 +325,8 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
             workingDirectory: sessionDirectory
         )
         try await conversationHistory.replace(with: record)
+        let resumedBoundary = await conversationHistory.sharedExportBoundary
+        registerExportBoundary?(sessionID, resumedBoundary)
         if let modelSwitch {
             let snapshot = await modelSwitch.snapshot()
             _ = try await conversationHistory.reconcileRoute(

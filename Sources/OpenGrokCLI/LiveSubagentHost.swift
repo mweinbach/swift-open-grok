@@ -47,6 +47,7 @@ import OpenGrokSamplingTypes
 import OpenGrokShared
 import OpenGrokShell
 import OpenGrokShellBase
+import OpenGrokShellSessionSupport
 import OpenGrokSubagentResolution
 import OpenGrokToolTypes
 
@@ -105,6 +106,31 @@ func isSafeSubagentChildID(_ id: String) -> Bool {
         && id.allSatisfy(allowed.contains)
 }
 
+func resolveSubagentModelProvider(_ model: String) -> ModelProvider? {
+    let lower = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    switch lower {
+    case "xai", "grok": return .xai
+    case "codex", "openai", "openai_codex": return .codex
+    case "kimi", "moonshot", "moonshot_ai": return .kimi
+    case "fireworks", "fireworks_ai": return .fireworks
+    case "deepseek", "deep_seek", "deepseek_api", "deepseek-api": return .deepseek
+    case "meta", "meta_ai", "meta-ai", "meta_api", "meta-api": return .meta
+    case "opencode_go", "opencode-go", "opencode", "go": return .openCodeGo
+    case "wafer", "wafer_ai", "wafer-ai": return .wafer
+    case "zai", "z_ai", "z-ai", "zai_api", "zai-api", "glm": return .zai
+    default:
+        if lower.hasPrefix("grok") { return .xai }
+        if lower.hasPrefix("gpt-") || lower.hasPrefix("o1") || lower.hasPrefix("o3") || lower.hasPrefix("codex") { return .codex }
+        if lower.hasPrefix("kimi") || lower.hasPrefix("moonshot") { return .kimi }
+        if lower.hasPrefix("fireworks") { return .fireworks }
+        if lower.hasPrefix("deepseek") { return .deepseek }
+        if lower.hasPrefix("claude") { return .openCodeGo }
+        if lower.hasPrefix("wafer") { return .wafer }
+        if lower.hasPrefix("glm") || lower.hasPrefix("zai") { return .zai }
+        return nil
+    }
+}
+
 actor LiveSubagentHost: LiveSubagentQuerying {
     /// Everything a child inherits from the root session, gathered once so
     /// `spawn` does not grow a dozen loose parameters. The sampler carries the
@@ -155,6 +181,10 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         /// `makeSubagentHost` needs no LiveComposition edit; tests swap a
         /// fake that returns canned stdout/exit codes.
         var antigravityServices: LiveAntigravityServices = .production
+        /// The parent session's export boundary, monotonically closed if a child runs on a non-xAI provider.
+        var parentExportBoundary: ExportBoundary? = nil
+        /// Persisted boundary sync callback to update parent session summary.
+        var providerBoundarySync: (@Sendable (Bool) async throws -> Void)? = nil
     }
 
     /// The one coordinator per root session (scope item 1). Exposed
@@ -1155,8 +1185,21 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         }
         items.append(.user(prompt))
 
+        let childProvider = resolveSubagentModelProvider(model)
+        if let childProvider, !childProvider.profile.allowsXaiServices {
+            context.parentExportBoundary?.observe(childProvider)
+            try? await context.providerBoundarySync?(true)
+        }
+
         var record = LiveConversationRecord.new(sessionID: childID, workingDirectory: cwd)
         record.parentSessionID = context.sessionID
+        if let childProvider {
+            record.currentProvider = childProvider
+            record.currentModelID = model
+            if !childProvider.profile.allowsXaiServices {
+                record.everUsedNonXAI = true
+            }
+        }
         let history = LiveConversationHistory(record: record, store: context.conversationStore)
 
         var characters = prompt.count

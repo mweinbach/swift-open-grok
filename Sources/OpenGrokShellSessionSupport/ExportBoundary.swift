@@ -61,6 +61,15 @@ public final class ExportBoundary: @unchecked Sendable {
         return true
     }
 
+    /// In-place monotonic synchronization with a persisted or external marker.
+    /// Once closed, it can never be reopened.
+    public func sync(everUsedNonXAI: Bool) {
+        guard everUsedNonXAI else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        closed = true
+    }
+
     /// Upstream `ever_used_codex()` (persistence.rs:1661-1663).
     public var everUsedNonXAI: Bool {
         lock.lock()

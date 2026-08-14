@@ -114,11 +114,18 @@ public struct OpenGrokShellTurnRequest: Sendable, Equatable {
     public let promptID: String
     public let text: String
     public let turnID: String
+    public let jsonSchema: JSONValue?
 
-    public init(promptID: String = UUID().uuidString, text: String, turnID: String = UUID().uuidString) {
+    public init(
+        promptID: String = UUID().uuidString,
+        text: String,
+        turnID: String = UUID().uuidString,
+        jsonSchema: JSONValue? = nil
+    ) {
         self.promptID = promptID
         self.text = text
         self.turnID = turnID
+        self.jsonSchema = jsonSchema
     }
 }
 
@@ -173,11 +180,21 @@ public struct OpenGrokShellSamplingResult: Sendable, Equatable {
     public let output: String
     public let stopReason: String?
     public let cancelled: Bool
+    public let structuredOutput: JSONValue?
+    public let structuredOutputError: String?
 
-    public init(output: String, stopReason: String? = nil, cancelled: Bool = false) {
+    public init(
+        output: String,
+        stopReason: String? = nil,
+        cancelled: Bool = false,
+        structuredOutput: JSONValue? = nil,
+        structuredOutputError: String? = nil
+    ) {
         self.output = output
         self.stopReason = stopReason
         self.cancelled = cancelled
+        self.structuredOutput = structuredOutput
+        self.structuredOutputError = structuredOutputError
     }
 }
 
@@ -187,19 +204,25 @@ public struct OpenGrokShellTurnResult: Sendable, Equatable {
     public let output: String
     public let stopReason: String?
     public let cancelled: Bool
+    public let structuredOutput: JSONValue?
+    public let structuredOutputError: String?
 
     public init(
         sessionID: SessionID,
         turnID: String,
         output: String,
         stopReason: String? = nil,
-        cancelled: Bool = false
+        cancelled: Bool = false,
+        structuredOutput: JSONValue? = nil,
+        structuredOutputError: String? = nil
     ) {
         self.sessionID = sessionID
         self.turnID = turnID
         self.output = output
         self.stopReason = stopReason
         self.cancelled = cancelled
+        self.structuredOutput = structuredOutput
+        self.structuredOutputError = structuredOutputError
     }
 }
 
@@ -415,7 +438,9 @@ public struct ProviderSessionTurnDriver: OpenGrokShellTurnDriver, Sendable {
                     turnID: request.turnID,
                     output: sample.output,
                     stopReason: sample.stopReason,
-                    cancelled: true
+                    cancelled: true,
+                    structuredOutput: sample.structuredOutput,
+                    structuredOutputError: sample.structuredOutputError
                 )
             }
             try await providerSession.finishTurn(turnID: request.turnID)
@@ -424,7 +449,9 @@ public struct ProviderSessionTurnDriver: OpenGrokShellTurnDriver, Sendable {
                 turnID: request.turnID,
                 output: sample.output,
                 stopReason: sample.stopReason,
-                cancelled: false
+                cancelled: false,
+                structuredOutput: sample.structuredOutput,
+                structuredOutputError: sample.structuredOutputError
             )
         } catch {
             if error is CancellationError {
@@ -562,7 +589,13 @@ public actor ProviderBackedACPPromptDriver: ACPPromptDriver {
         let turnID = context.request.messageId ?? UUID().uuidString
         activeTurnID = turnID
         defer { activeTurnID = nil }
-        let request = OpenGrokShellTurnRequest(promptID: turnID, text: text, turnID: turnID)
+        let schema = context.request.meta?["outputSchema"] ?? context.request.meta?["jsonSchema"]
+        let request = OpenGrokShellTurnRequest(
+            promptID: turnID,
+            text: text,
+            turnID: turnID,
+            jsonSchema: schema
+        )
         let result = try await turnDriver.submit(providerSession: providerSession, request: request) { update in
             guard case let .assistantText(value) = update else { return }
             await emit(
@@ -573,9 +606,18 @@ public actor ProviderBackedACPPromptDriver: ACPPromptDriver {
                 .live
             )
         }
+        var meta: AcpMeta? = nil
+        if let structuredOutput = result.structuredOutput {
+            meta = meta ?? [:]
+            meta?["structuredOutput"] = structuredOutput
+        } else if let structuredOutputError = result.structuredOutputError {
+            meta = meta ?? [:]
+            meta?["structuredOutputError"] = .string(structuredOutputError)
+        }
         return PromptResponse(
             stopReason: result.cancelled ? .cancelled : .endTurn,
-            userMessageId: context.request.messageId ?? turnID
+            userMessageId: context.request.messageId ?? turnID,
+            meta: meta
         )
     }
 

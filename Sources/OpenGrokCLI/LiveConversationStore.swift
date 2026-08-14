@@ -547,7 +547,7 @@ struct LiveAgentToolPolicy: Sendable, Equatable {
 actor LiveConversationHistory {
     private var record: LiveConversationRecord
     private let store: LiveConversationStore
-    private var exportBoundary: ExportBoundary
+    private let exportBoundary: ExportBoundary
 
     init(
         record: LiveConversationRecord,
@@ -574,9 +574,9 @@ actor LiveConversationHistory {
     func replace(with record: LiveConversationRecord) throws {
         try LiveConversationStore.validateSessionID(record.sessionID)
         self.record = record
-        self.exportBoundary = ExportBoundary(
-            everUsedNonXAI: record.everUsedNonXAI != false
-        )
+        if record.everUsedNonXAI != false {
+            self.exportBoundary.sync(everUsedNonXAI: true)
+        }
     }
 
     /// Rewrite history to its provider-neutral spine ahead of a provider
@@ -824,6 +824,19 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             items.append(.user(wrapSystemReminder(swarmModeReminder)))
         }
 
+        // Structured output coordinator setup matching Rust turn.rs:2370-2396, 2512-2522
+        var structuredCoordinator = StructuredOutputTurnCoordinator(
+            schema: request.jsonSchema,
+            backend: active.configuration.apiBackend,
+            codeModeOnly: toolSurface.mode == .codeModeOnly
+        )
+        let (advertisedTools, structuredReminder, nativeSchema) = structuredCoordinator.prepareRequest(
+            tools: toolSurface.modelTools
+        )
+        if let structuredReminder {
+            items.append(.user(wrapSystemReminder(structuredReminder)))
+        }
+
         // UserPromptSubmit fires once the user message is staged and before
         // the turn loop starts, matching upstream (turn.rs:919-927). Payload
         // carries the prompt text (event.rs:453-456).
@@ -864,7 +877,8 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             model: active.modelID,
                             prompt: request.text,
                             items: items,
-                            tools: toolSurface.modelTools
+                            tools: advertisedTools,
+                            jsonSchema: nativeSchema
                         )) { event in
                             switch event {
                             case .output(let text):
@@ -940,34 +954,82 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                         items.append(contentsOf: late)
                         continue
                     }
+                    var structuredVal: JSONValue? = nil
+                    var structuredErr: String? = nil
+                    if let validation = structuredCoordinator.validateAssistantText(response.output) {
+                        switch validation {
+                        case .success(let v):
+                            structuredVal = v
+                        case .failure(let e):
+                            structuredErr = e
+                        }
+                    }
                     return OpenGrokShellSamplingResult(
                         output: response.output,
-                        stopReason: response.stopReason
+                        stopReason: response.stopReason,
+                        structuredOutput: structuredVal,
+                        structuredOutputError: structuredErr
                     )
                 }
-                guard toolRoundCount < 16 else {
-                    throw CLIApplicationError.failed(
-                        "tool loop exceeded 16 rounds"
-                    )
+
+                // Structured output interception & retry loop (turn.rs:1939-1987)
+                let (structuredStep, structuredResults) = structuredCoordinator.handleToolCalls(response.toolCalls)
+                for (callID, content) in structuredResults {
+                    items.append(ConversationItem.toolResult(ToolResultItem(toolCallId: callID, content: content)))
                 }
-                toolRoundCount += 1
-                items.append(contentsOf: try await executeToolCalls(
-                    response.toolCalls,
-                    sessionID: context.sessionID,
-                    emit: emit
-                ))
-                let nextTurn = toolTurnCount + 1
-                if let limit = maxTurns, nextTurn > limit {
+
+                switch structuredStep {
+                case .complete(let result):
                     try await conversationHistory.commit(
                         sessionID: context.sessionID,
                         items: items
                     )
+                    let val: JSONValue? = {
+                        if case .success(let v) = result { return v }
+                        return nil
+                    }()
+                    let err: String? = {
+                        if case .failure(let e) = result { return e }
+                        return nil
+                    }()
                     return OpenGrokShellSamplingResult(
                         output: response.output,
-                        stopReason: "max_turns_reached"
+                        stopReason: response.stopReason,
+                        structuredOutput: val,
+                        structuredOutputError: err
                     )
+
+                case .retry:
+                    continue
+
+                case .proceed(let remainingCalls):
+                    if remainingCalls.isEmpty {
+                        continue
+                    }
+                    guard toolRoundCount < 16 else {
+                        throw CLIApplicationError.failed(
+                            "tool loop exceeded 16 rounds"
+                        )
+                    }
+                    toolRoundCount += 1
+                    items.append(contentsOf: try await executeToolCalls(
+                        remainingCalls,
+                        sessionID: context.sessionID,
+                        emit: emit
+                    ))
+                    let nextTurn = toolTurnCount + 1
+                    if let limit = maxTurns, nextTurn > limit {
+                        try await conversationHistory.commit(
+                            sessionID: context.sessionID,
+                            items: items
+                        )
+                        return OpenGrokShellSamplingResult(
+                            output: response.output,
+                            stopReason: "max_turns_reached"
+                        )
+                    }
+                    toolTurnCount = nextTurn
                 }
-                toolTurnCount = nextTurn
             }
         } catch is CancellationError {
             throw CancellationError()
@@ -1099,7 +1161,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         if swarmCall, calls.count != 1 {
             return calls.map {
                 ConversationItem.toolResult(ToolResultItem(
-                    toolCallId: $0.callId,
+                    toolCallId: $0.id,
                     content: Self.swarmExclusiveBatchError
                 ))
             }
