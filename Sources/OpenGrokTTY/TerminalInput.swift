@@ -81,6 +81,8 @@ public enum TerminalInputEvent: Sendable, Equatable {
     case control(TerminalControlKey)
     case pasteStart
     case pasteEnd
+    case focusGained
+    case focusLost
     case resize(TerminalSize)
     case unknown(Data)
 }
@@ -537,6 +539,8 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
     private var pendingRead: PosixPendingRead?
     private var closed = false
     private var decoder = TerminalInputDecoder()
+    private var csiFilter = CsiFragmentFilter()
+    private var eventQueue: [TerminalInputEvent] = []
     /// Suspend-for-child state (`park_input_reader`, event_loop.rs:326-348).
     /// Guarded by `stateLock` like the read/cancel state it interacts with:
     /// a pause wake and a concurrent cancel share the wake pipe, and the
@@ -602,25 +606,40 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
 
     public func readEvent() async throws -> TerminalInputEvent? {
         while true {
+            if !eventQueue.isEmpty {
+                return eventQueue.removeFirst()
+            }
             let timeout = decoder.hasPendingEscapeSequence
                 ? escapeSequenceTimeoutMilliseconds
                 : nil
             let result = try await waitForByte(timeoutMilliseconds: timeout)
             switch result {
             case .byte(let byte):
-                let events = try decoder.feed(byte)
-                if let event = events.first {
-                    return event
+                let rawEvents = try decoder.feed(byte)
+                if !rawEvents.isEmpty {
+                    let filtered = csiFilter.filter(rawEvents)
+                    eventQueue.append(contentsOf: filtered)
+                    if !eventQueue.isEmpty {
+                        return eventQueue.removeFirst()
+                    }
                 }
             case .timedOut:
-                let events = try decoder.finish()
-                if let event = events.first {
-                    return event
+                let rawEvents = try decoder.finish()
+                if !rawEvents.isEmpty {
+                    let filtered = csiFilter.filter(rawEvents)
+                    eventQueue.append(contentsOf: filtered)
+                    if !eventQueue.isEmpty {
+                        return eventQueue.removeFirst()
+                    }
                 }
             case .endOfFile:
-                let events = try decoder.finish()
-                if let event = events.first {
-                    return event
+                let rawEvents = try decoder.finish()
+                if !rawEvents.isEmpty {
+                    let filtered = csiFilter.filter(rawEvents)
+                    eventQueue.append(contentsOf: filtered)
+                    if !eventQueue.isEmpty {
+                        return eventQueue.removeFirst()
+                    }
                 }
                 return nil
             }
@@ -722,6 +741,8 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
             if bytesRead <= 0 { break }
         }
         decoder = TerminalInputDecoder()
+        csiFilter.reset()
+        eventQueue.removeAll()
     }
 
     /// Abort an unacknowledged park: un-pause so reads keep flowing, restart

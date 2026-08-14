@@ -18,6 +18,10 @@ public struct ElementId: Hashable, Sendable, Equatable {
 public struct ElementKind: Hashable, Sendable, Equatable {
     public let raw: UInt16
     public init(_ raw: UInt16) { self.raw = raw }
+
+    public static let paste = ElementKind(1)
+    public static let fileRef = ElementKind(2)
+    public static let image = ElementKind(3)
 }
 
 public protocol ClipboardProvider: AnyObject {
@@ -623,6 +627,52 @@ public final class TextArea {
 
     public func elementAtCursor() -> TextElement? {
         elements.first { cursor >= $0.range.lowerBound && cursor < $0.range.upperBound }
+    }
+
+    /// Inline/expand raw pasted text for `[Paste]` chips at or adjacent to cursor.
+    @discardableResult
+    public func expandPasteElementAtCursor() -> Bool {
+        guard let elem = elementAtCursor() ?? elements.first(where: { elem in
+            elem.kind == .paste && cursor >= elem.range.lowerBound && cursor <= elem.range.upperBound + 1
+        }), elem.kind == .paste else { return false }
+        elements.removeAll { $0.id == elem.id }
+        wrapCache = nil
+        preferredColStorage = nil
+        postMutate()
+        return true
+    }
+
+    /// Locate and parse `@path:line` or `@path:start-end` file reference element at or adjacent to cursor.
+    public func fileRefElementAtCursor() -> (path: String, lineRange: Range<Int>?)? {
+        guard let elem = elements.first(where: { elem in
+            elem.kind == .fileRef && cursor >= elem.range.lowerBound && cursor <= elem.range.upperBound + 1
+        }) else { return nil }
+        guard elem.range.lowerBound >= 0, elem.range.upperBound <= buffer.text.utf8Count else { return nil }
+        let rawText = buffer.text.substring(utf8Range: elem.range)
+        let text = rawText.hasPrefix("@") ? String(rawText.dropFirst()) : rawText
+        if let colonPos = text.lastIndex(of: ":") {
+            let path = String(text[..<colonPos])
+            let rangeStr = String(text[text.index(after: colonPos)...])
+            if let range = Self.parseLineRange(rangeStr) {
+                return (path, range)
+            }
+            return (path, nil)
+        }
+        return (text, nil)
+    }
+
+    private static func parseLineRange(_ s: String) -> Range<Int>? {
+        if let dashPos = s.firstIndex(of: "-") {
+            let startStr = s[..<dashPos]
+            let endStr = s[s.index(after: dashPos)...]
+            guard let start = Int(startStr), let end = Int(endStr), start >= 0, start <= end else {
+                return nil
+            }
+            return start..<(end + 1)
+        } else if let line = Int(s), line >= 0 {
+            return line..<(line + 1)
+        }
+        return nil
     }
 
     public var allElements: [TextElement] { elements }

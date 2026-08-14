@@ -254,6 +254,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             selectedCompletion = nil
         }
 
+        func expandPasteElementAtCursor() -> Bool {
+            area.expandPasteElementAtCursor()
+        }
+
+        func fileRefElementAtCursor() -> (path: String, lineRange: Range<Int>?)? {
+            area.fileRefElementAtCursor()
+        }
+
         func replace(with value: String) {
             loadBuffer(value)
         }
@@ -759,6 +767,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// Last content rect applied via `.composerMouse` or queried from the
     /// renderer on a drag-autoscroll tick. Never a second TextArea.
     private var lastComposerContentRect: TextAreaRect?
+    private var lastPromptClickTime: Date?
     private var submittedPrompts: [String] = []
     private var completedTurnCount = 0
     private var currentRequest: OpenGrokPagerRequest?
@@ -2667,6 +2676,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private func applyComposerMouse(_ claim: OpenGrokPagerComposerMouse) async throws {
         lastComposerContentRect = claim.content
         let action = editor.handleMouse(claim.event, content: claim.content)
+        if claim.event.kind == .down, claim.event.resolvedButton == .left {
+            let now = Date()
+            if let last = lastPromptClickTime, now.timeIntervalSince(last) < 0.400 {
+                if let fileRef = editor.fileRefElementAtCursor() {
+                    try await emit(.overlay(.openLineViewer(path: fileRef.path, lineRange: fileRef.lineRange)))
+                } else if editor.expandPasteElementAtCursor() {
+                    try await emit(.promptChanged(promptState()))
+                }
+            }
+            lastPromptClickTime = now
+        }
         if claim.event.isScroll {
             if action != .nothing {
                 try await emit(.promptChanged(promptState()))

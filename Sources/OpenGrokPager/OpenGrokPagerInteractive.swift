@@ -630,6 +630,7 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// along because the controller resolved the title (`find_doc`) and the
     /// viewer needs nothing else.
     case showDocument(title: String, content: String)
+    case openLineViewer(path: String, lineRange: Range<Int>?)
     /// `/release-notes` (alias `/changelog`) — upstream fetches the
     /// changelog inside `run` and returns `Action::ShowReleaseNotes` with
     /// the markdown, or `CommandResult::Error` when offline with no cache

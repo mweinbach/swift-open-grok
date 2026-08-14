@@ -117,6 +117,23 @@ struct MouseSGRDecodingTests {
         let wide = try decodedEvent(sgr(0, 500, 300, press: true))
         #expect(wide.x == 499 && wide.y == 299)
     }
+
+    @Test("SGR coordinates >= 1000 decode correctly without overflow or truncation")
+    func largeSGRCoordinates() throws {
+        let press4K = try decodedEvent(sgr(0, 3840, 2160, press: true))
+        #expect(press4K.x == 3839 && press4K.y == 2159)
+
+        let pressLarge = try decodedEvent(sgr(0, 10000, 10000, press: true))
+        #expect(pressLarge.x == 9999 && pressLarge.y == 9999)
+    }
+
+    @Test("SGR release reports preserve active modifier flags")
+    func sgrReleaseModifiers() throws {
+        let releaseWithShift = try decodedEvent(sgr(4, 10, 5, press: false))
+        #expect(releaseWithShift.kind == .up)
+        #expect(releaseWithShift.modifiers == [.shift])
+        #expect(releaseWithShift.resolvedButton == .left)
+    }
 }
 
 @Suite("Mouse X10 decoding")
@@ -348,6 +365,21 @@ struct MouseStreamParserTests {
         let out = parseAll(raw)
         #expect(passthroughBytes(out) == bytes("\u{1B}"))
         #expect(events(out).count == 1)
+    }
+
+    @Test("Multi-byte UTF-8 boundary interrupt resyncs without dropping bytes")
+    func multiByteUTF8Resync() {
+        var raw = bytes("\u{1B}[<0;10") // partial SGR parameter buffer
+        raw.append(contentsOf: Array("😀".utf8)) // multi-byte UTF-8 emoji
+        raw.append(contentsOf: sgr(0, 5, 5, press: true))
+
+        var parser = MouseStreamParser()
+        let outputs = parser.feed(raw) + parser.finish()
+        let passthrough = outputs.flatMap { output -> [UInt8] in
+            if case .passthrough(let b) = output { return b }
+            return []
+        }
+        #expect(String(bytes: passthrough, encoding: .utf8)?.contains("😀") == true)
     }
 }
 

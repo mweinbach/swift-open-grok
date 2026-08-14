@@ -65,6 +65,14 @@ public enum PagerTaskPaneAction: Sendable, Equatable {
     case openWorkflowDetail(name: String)
 }
 
+/// Hit-test entry identity for inline buttons (`kill_button_rects` and `view_button_rects`).
+public enum PagerTaskEntryId: Sendable, Equatable, Hashable {
+    case bgTask(String)
+    case subagent(String)
+    case scheduled(String)
+    case workflow(String)
+}
+
 /// One pane entry, prebuilt by the composition from a feed snapshot.
 public struct PagerTaskPaneEntry: Sendable, Equatable {
     public var id: String
@@ -113,6 +121,15 @@ public struct PagerTaskPaneEntry: Sendable, Equatable {
         self.openAction = openAction
         self.searchText = searchText ?? spans.map(\.text).joined()
     }
+
+    public var entryId: PagerTaskEntryId {
+        switch group {
+        case .workflows: return .workflow(id)
+        case .subagents: return .subagent(id)
+        case .tasks: return .bgTask(id)
+        case .watchers: return .scheduled(id)
+        }
+    }
 }
 
 /// One visible row: a collapsible group header or an entry (by index into
@@ -120,6 +137,17 @@ public struct PagerTaskPaneEntry: Sendable, Equatable {
 public enum PagerTaskPaneRow: Sendable, Equatable {
     case header(group: PagerTaskPaneGroup, count: Int, collapsed: Bool)
     case entry(index: Int)
+}
+
+/// Hit-test button geometry for tasks pane inline buttons.
+public struct PagerTaskButtonRect: Sendable, Equatable, Hashable {
+    public var id: PagerTaskEntryId
+    public var rect: TerminalRect
+
+    public init(id: PagerTaskEntryId, rect: TerminalRect) {
+        self.id = id
+        self.rect = rect
+    }
 }
 
 public enum PagerTasksPaneOutcome: Sendable, Equatable {
@@ -152,6 +180,8 @@ public struct PagerTasksPaneState: Sendable, Equatable {
     /// cancels. `visibleRows` reads this and not `filterQuery` because the
     /// list restructures as you type, before anything is accepted.
     public private(set) var acceptedFilter: String?
+    public var killButtonRects: [PagerTaskButtonRect] = []
+    public var viewButtonRects: [PagerTaskButtonRect] = []
 
     public init(entries: [PagerTaskPaneEntry] = [], focused: Bool = true) {
         self.entries = []
@@ -465,13 +495,15 @@ public struct PagerTasksPaneState: Sendable, Equatable {
 /// selection band while focused, the right-aligned elapsed column, and the
 /// filter bar on the bottom row when one is open or accepted. The window
 /// follows the selection when the band is shorter than the row list.
-func drawTasksPane(
-    _ pane: PagerTasksPaneState,
+public func drawTasksPane(
+    _ pane: inout PagerTasksPaneState,
     in area: TerminalRect,
     buffer: inout CellBuffer,
     theme: PagerRenderTheme
 ) {
     guard area.height > 0, area.width > 0 else { return }
+    pane.killButtonRects.removeAll()
+    pane.viewButtonRects.removeAll()
     // The bar is carved out of the BOTTOM of the area the pane was given,
     // exactly as `ListPane` does (`list_pane/render.rs:94-108`); the matching
     // `+1` lives in `desiredHeight`.
@@ -512,6 +544,7 @@ func drawTasksPane(
         )
         var spans: [PagerStyledSpan]
         var elapsed: String?
+        var currentEntry: PagerTaskPaneEntry?
         switch rows[rowIndex] {
         case .header(let group, let count, let collapsed):
             spans = [
@@ -524,6 +557,7 @@ func drawTasksPane(
             ]
         case .entry(let index):
             let entry = pane.entries[index]
+            currentEntry = entry
             spans = [PagerStyledSpan(
                 text: entry.running ? "\(PagerGlyphs.filledDot) " : "  ",
                 foreground: entry.running ? theme.accentRunning : theme.grayDim
@@ -539,15 +573,42 @@ func drawTasksPane(
             limit: area.right - 1,
             background: background
         )
+        var rightLimit = area.right - 1
+        if let entry = currentEntry {
+            if entry.killAction != nil || entry.running {
+                let kx = area.right - 4
+                if kx > area.x + 1 {
+                    _ = paintSpans(
+                        &buffer,
+                        spans: [PagerStyledSpan(text: "[×]", foreground: theme.accentUser)],
+                        x: kx, y: y, limit: area.right, background: background
+                    )
+                    pane.killButtonRects.append(PagerTaskButtonRect(id: entry.entryId, rect: TerminalRect(x: kx, y: y, width: 3, height: 1)))
+                    rightLimit = kx - 1
+                }
+            }
+            if entry.openAction != nil {
+                let vx = (entry.killAction != nil || entry.running) ? area.right - 8 : area.right - 4
+                if vx > area.x + 1 {
+                    _ = paintSpans(
+                        &buffer,
+                        spans: [PagerStyledSpan(text: "[⤢]", foreground: theme.textSecondary)],
+                        x: vx, y: y, limit: area.right, background: background
+                    )
+                    pane.viewButtonRects.append(PagerTaskButtonRect(id: entry.entryId, rect: TerminalRect(x: vx, y: y, width: 3, height: 1)))
+                    rightLimit = vx - 1
+                }
+            }
+        }
         if let elapsed {
             let width = UnicodeDisplayWidth.width(of: elapsed)
-            if width + 2 < area.width {
+            if width + 2 < rightLimit - area.x {
                 _ = paintSpans(
                     &buffer,
                     spans: [PagerStyledSpan(text: elapsed, foreground: theme.grayDim)],
-                    x: area.right - width - 1,
+                    x: rightLimit - width,
                     y: y,
-                    limit: area.right,
+                    limit: rightLimit,
                     background: background
                 )
             }

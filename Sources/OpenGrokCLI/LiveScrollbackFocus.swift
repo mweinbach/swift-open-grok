@@ -300,7 +300,7 @@ struct LiveScrollbackSelection: Sendable {
     }
 }
 
-private extension PagerConversationItem {
+extension PagerConversationItem {
     /// A turn begins at a user prompt.
     var isTurnBoundary: Bool {
         if case .message(let message) = self { return message.role == .user }

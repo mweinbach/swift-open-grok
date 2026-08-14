@@ -44,6 +44,7 @@ public struct PagerOverlayBounds: Sendable, Equatable, Hashable {
     /// One entry per painted row, in paint order.
     public var rows: [Row]
     public var hints: [Hint]
+    public var hasScrollbar: Bool
 
     public init(
         id: String,
@@ -52,7 +53,8 @@ public struct PagerOverlayBounds: Sendable, Equatable, Hashable {
         footer: TerminalRect,
         closeButton: TerminalRect? = nil,
         rows: [Row] = [],
-        hints: [Hint] = []
+        hints: [Hint] = [],
+        hasScrollbar: Bool = false
     ) {
         self.id = id
         self.frame = frame
@@ -61,6 +63,7 @@ public struct PagerOverlayBounds: Sendable, Equatable, Hashable {
         self.closeButton = closeButton
         self.rows = rows
         self.hints = hints
+        self.hasScrollbar = hasScrollbar
     }
 
     /// The row under a screen position, or `nil` off the rows.
@@ -281,6 +284,7 @@ private func renderCenteredModal(
     }
 
     let hintBounds = drawModalFooter(hints, in: footer, buffer: &buffer, theme: theme)
+    let hasScrollbar = overlayHasScrollbar(overlay, contentHeight: content.height, rows: rows)
 
     return PagerOverlayBounds(
         id: overlay.id,
@@ -289,7 +293,8 @@ private func renderCenteredModal(
         footer: footer,
         closeButton: closeButton,
         rows: rows,
-        hints: hintBounds
+        hints: hintBounds,
+        hasScrollbar: hasScrollbar
     )
 }
 
@@ -787,13 +792,16 @@ private func renderBottomSheet(
         drawPersonaDetailBody(detail, in: content, buffer: &buffer, theme: theme)
     }
 
+    let hasScrollbar = overlayHasScrollbar(overlay, contentHeight: content.height, rows: rows)
+
     return PagerOverlayBounds(
         id: overlay.id,
         frame: frame,
         content: content,
         footer: TerminalRect(x: frame.x, y: frame.bottom - 1, width: frame.width, height: 0),
         closeButton: nil,
-        rows: rows
+        rows: rows,
+        hasScrollbar: hasScrollbar
     )
 }
 
@@ -1216,14 +1224,30 @@ private func renderFullScreenOverlay(
     default:
         break
     }
+    let hasScrollbar = overlayHasScrollbar(overlay, contentHeight: frame.height, rows: rows)
     return PagerOverlayBounds(
         id: overlay.id,
         frame: frame,
         content: frame,
         footer: TerminalRect(x: frame.x, y: frame.bottom, width: frame.width, height: 0),
         closeButton: nil,
-        rows: rows
+        rows: rows,
+        hasScrollbar: hasScrollbar
     )
+}
+
+func overlayHasScrollbar(_ overlay: PagerOverlay, contentHeight: Int, rows: [PagerOverlayBounds.Row] = []) -> Bool {
+    guard contentHeight > 0 else { return false }
+    switch overlay.content {
+    case .list(let list):
+        return list.rows.count > contentHeight
+    case .text(let text):
+        return text.lines.count > contentHeight
+    case .welcome:
+        return false
+    default:
+        return rows.count > contentHeight
+    }
 }
 
 /// Hero layout at ≥90 columns (logo left, text right, inside a rounded box);

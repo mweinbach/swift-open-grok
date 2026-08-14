@@ -284,8 +284,8 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
             links: &links
         )
     }
-    if let tasksPane = state.tasksPane, chrome.tasksPane.height > 0 {
-        drawTasksPane(tasksPane, in: chrome.tasksPane, buffer: &buffer, theme: state.theme)
+    if var tasksPane = state.tasksPane, chrome.tasksPane.height > 0 {
+        drawTasksPane(&tasksPane, in: chrome.tasksPane, buffer: &buffer, theme: state.theme)
     }
     let textSelectionModel = renderConversation(
         contentLines,
@@ -333,7 +333,7 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     layout.composerHit = makePagerComposerHitModel(composer, in: chrome.input)
     renderShortcutsBar(state.shortcuts, in: chrome.shortcuts, buffer: &buffer, theme: state.theme)
 
-    let overlayBounds = renderOverlays(
+    var overlayBounds = renderOverlays(
         state.overlays,
         layout: layout,
         buffer: &buffer,
@@ -373,7 +373,9 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     // of the hero). Safe with every other overlay because they capture input,
     // so no completion state can exist while one is up — only the
     // non-capturing welcome coexists with a focused composer.
-    renderCompletions(state.completions, in: chrome.completions, buffer: &buffer, theme: state.theme)
+    if let compBounds = renderCompletions(state.completions, in: chrome.completions, buffer: &buffer, theme: state.theme) {
+        overlayBounds.append(compBounds)
+    }
 
     // FPS HUD last on the full terminal, every pager surface this function
     // paints (welcome / agent / overlay stack). Matches `fps.render(full_area)`
@@ -1891,13 +1893,14 @@ func renderTurnStatus(
 
 // MARK: - Completion menu
 
-func renderCompletions(
+@discardableResult
+public func renderCompletions(
     _ menu: PagerCompletionMenu?,
     in area: TerminalRect,
     buffer: inout CellBuffer,
     theme: PagerRenderTheme
-) {
-    guard let menu, !menu.isEmpty, area.height > 0, area.width > 0 else { return }
+) -> PagerOverlayBounds? {
+    guard let menu, !menu.isEmpty, area.height > 0, area.width > 0 else { return nil }
     // The dropdown paints at most `maxDropdownRows` rows but the match list is
     // no longer capped upstream of here, so the window follows the selection:
     // a selected row below the fold pulls the window down, one above pulls it
@@ -1916,6 +1919,15 @@ func renderCompletions(
     let end = min(menu.rows.count, start + area.height)
     let labelWidth = menu.rows[start..<end]
         .reduce(0) { max($0, UnicodeDisplayWidth.width(of: $1.label)) }
+    let hasScrollbar = menu.rows.count > area.height
+    let contentLimit = hasScrollbar ? max(area.x, area.right - 2) : area.right
+
+    let totalRows = max(1, menu.rows.count)
+    let visibleHeight = max(1, area.height)
+    let thumbHeight = max(1, (visibleHeight * visibleHeight) / totalRows)
+    let thumbTop = min(visibleHeight - thumbHeight, (start * visibleHeight) / totalRows)
+
+    var boundsRows: [PagerOverlayBounds.Row] = []
 
     for (row, index) in (start..<end).enumerated() {
         guard row < area.height else { break }
@@ -1923,6 +1935,7 @@ func renderCompletions(
         let isSelected = index == menu.selectedIndex
         let background = isSelected ? theme.bgVisual : theme.bgBase
         let rowArea = TerminalRect(x: area.x, y: area.y + row, width: area.width, height: 1)
+        boundsRows.append(PagerOverlayBounds.Row(id: entry.label, frame: rowArea))
         paintBlank(&buffer, area: rowArea, foreground: theme.textPrimary, background: background)
 
         let labelColor = entry.isAvailable ? theme.textPrimary : theme.grayDim
@@ -1949,10 +1962,32 @@ func renderCompletions(
             spans: spans,
             x: area.x,
             y: rowArea.y,
-            limit: area.right,
+            limit: contentLimit,
             background: background
         )
+        if hasScrollbar && area.width >= 2 {
+            let isThumb = row >= thumbTop && row < thumbTop + thumbHeight
+            let glyph = isThumb ? "█" : "│"
+            let fg = isThumb ? theme.textPrimary : theme.grayDim
+            _ = paintSpans(
+                &buffer,
+                spans: [PagerStyledSpan(text: glyph + glyph, foreground: fg)],
+                x: area.right - 2,
+                y: rowArea.y,
+                limit: area.right,
+                background: theme.bgBase
+            )
+        }
     }
+
+    return PagerOverlayBounds(
+        id: "completions",
+        frame: area,
+        content: area,
+        footer: TerminalRect(x: area.x, y: area.y + area.height, width: area.width, height: 0),
+        rows: boundsRows,
+        hasScrollbar: hasScrollbar
+    )
 }
 
 // MARK: - Composer

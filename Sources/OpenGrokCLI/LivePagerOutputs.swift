@@ -1,0 +1,1377 @@
+import Foundation
+import OpenGrokAgentCoordinator
+import OpenGrokAgentDefinitions
+import OpenGrokACPRuntime
+import OpenGrokAuth
+import OpenGrokCodeMode
+import OpenGrokCompaction
+import OpenGrokConfig
+import OpenGrokConfigTypes
+import OpenGrokDiagnostics
+import OpenGrokFileTools
+import OpenGrokFastWorktree
+import OpenGrokHTTP
+import OpenGrokHooks
+import OpenGrokHooksPluginTypes
+import OpenGrokHunkTracker
+import OpenGrokInterjection
+import OpenGrokLSP
+import OpenGrokModels
+import OpenGrokPager
+import OpenGrokPagerCommandUI
+import OpenGrokPagerMinimal
+import OpenGrokPagerRender
+import OpenGrokTokenEstimation
+import OpenGrokProviderSession
+import OpenGrokSampler
+import OpenGrokSamplingTypes
+import OpenGrokSandbox
+import OpenGrokScheduler
+import OpenGrokSessionRuntime
+import OpenGrokShared
+import OpenGrokShell
+import OpenGrokShellBase
+import OpenGrokShellSessionSupport
+import OpenGrokSubagentResolution
+import OpenGrokTerminalCore
+import OpenGrokTextArea
+import OpenGrokToolRegistry
+import OpenGrokToolTypes
+import OpenGrokToolsAPI
+import OpenGrokTTY
+import OpenGrokVersion
+import OpenGrokVoice
+import OpenGrokWebMediaTools
+import OpenGrokWorkspace
+
+
+actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPagerRuntimeAdapter {
+    let shell: OpenGrokShell
+    let cwd: URL
+    private var providerConfiguration: ProviderSessionConfiguration
+    private let conversationHistory: LiveConversationHistory
+    private let conversationStore: LiveConversationStore
+    private let toolExecutor: LiveToolExecutor?
+    private let compaction: LiveCompactionCoordinator?
+    /// The route the next turn actually runs on. `/resume` reconciles the
+    /// restored record against this rather than the launch configuration,
+    /// because `/model` may have moved the session since launch.
+    private let modelSwitch: LiveModelSwitchCoordinator?
+    /// The one session id turns may currently run against, and every id this
+    /// process has already created in the shell. Two values because `/resume`
+    /// can revisit a session created earlier in this run — recreating it in
+    /// the shell would fail, but switching back to it must not.
+    private var activeShellSessionID: SessionID?
+    private var createdSessionIDs: Set<SessionID> = []
+    private var retainedRecords: [String: LiveConversationRecord] = [:]
+    private var activeWorkingDirectory: URL
+
+    init(
+        shell: OpenGrokShell,
+        cwd: URL,
+        providerConfiguration: ProviderSessionConfiguration,
+        conversationHistory: LiveConversationHistory,
+        conversationStore: LiveConversationStore,
+        toolExecutor: LiveToolExecutor? = nil,
+        compaction: LiveCompactionCoordinator? = nil,
+        modelSwitch: LiveModelSwitchCoordinator? = nil
+    ) {
+        self.shell = shell
+        self.cwd = cwd
+        self.providerConfiguration = providerConfiguration
+        self.conversationHistory = conversationHistory
+        self.conversationStore = conversationStore
+        self.toolExecutor = toolExecutor
+        self.compaction = compaction
+        self.modelSwitch = modelSwitch
+        self.activeWorkingDirectory = cwd.standardizedFileURL
+    }
+
+    func makeSession(
+        for request: OpenGrokPagerMinimalRequest
+    ) async throws -> any OpenGrokPagerMinimalSessionAdapter {
+        _ = try await shell.start()
+        let shellEvents = await shell.events()
+        let sessionID = SessionID(request.sessionID ?? providerConfiguration.sessionID)
+        let record = await conversationHistory.snapshot()
+        guard record.sessionID == sessionID.rawValue else {
+            throw CLIApplicationError.failed(
+                "interactive runtime session mismatch: \(sessionID.rawValue)"
+            )
+        }
+        let sessionDirectory = URL(
+            fileURLWithPath: record.workingDirectory,
+            isDirectory: true
+        ).standardizedFileURL
+        if !createdSessionIDs.contains(sessionID) {
+            _ = try await shell.createSession(OpenGrokShellSessionRequest(
+                sessionID: sessionID,
+                cwd: sessionDirectory,
+                providerConfiguration: providerConfiguration,
+                restorePersistedState: false
+            ))
+            try await toolExecutor?.registerSession(
+                sessionID: sessionID.rawValue,
+                workingDirectory: sessionDirectory
+            )
+            createdSessionIDs.insert(sessionID)
+            // The record is born carrying the boundary's CURRENT truth, not
+            // the launch configuration's snapshot — upstream marks the store
+            // at session open (`initialize_provider_boundary`, persistence.rs
+            // :2745-2758) for the same reason. Without this, a pre-first-turn
+            // `/model` switch to a non-xAI provider (deferred below because
+            // no record existed yet) would create a shell summary claiming
+            // the session never left xAI.
+            if await conversationHistory.sharedExportBoundary.everUsedNonXAI {
+                try await shell.synchronizeProviderBoundary(
+                    sessionID: sessionID,
+                    everUsedNonXAI: true
+                )
+            }
+        }
+        activeWorkingDirectory = sessionDirectory
+        retainedRecords[sessionID.rawValue] = record
+        activeShellSessionID = sessionID
+        // A Cron turn arrives with the RAW stored prompt plus scheduler
+        // metadata; this seam frames the model text and stamps the
+        // `scheduler-fired-` prompt id — the port of upstream's Cron drain
+        // arm (`app/dispatch/queue.rs:518-560`: `format_cron_prompt` on the
+        // wire text, raw text kept for display). The prompt-id prefix is what
+        // the turn loop later maps to the `.schedulerFired` persisted item
+        // (`PromptOrigin::from_prompt_id`, session/mod.rs:126-127).
+        let turnRequest: OpenGrokShellTurnRequest
+        if let cronTaskID = request.metadata[
+            OpenGrokPagerInteractiveController.cronTaskIDMetadataKey
+        ] {
+            let humanSchedule = request.metadata[
+                OpenGrokPagerInteractiveController.cronHumanScheduleMetadataKey
+            ] ?? "unknown"
+            turnRequest = OpenGrokShellTurnRequest(
+                promptID: OpenGrokPagerInteractiveController.schedulerFiredPromptIDPrefix
+                    + UUID().uuidString,
+                text: formatScheduledTaskPrompt(
+                    request.prompt,
+                    taskID: cronTaskID,
+                    humanSchedule: humanSchedule
+                )
+            )
+        } else if let monitorTaskID = request.metadata[
+            OpenGrokPagerInteractiveController.monitorTaskIDMetadataKey
+        ] {
+            // A monitor turn's text is already the full `<monitor-event …>`
+            // wrap — upstream's InjectNotification prompt blocks carry it
+            // verbatim (notification_bridge.rs:776-789) — so no framing
+            // here; only the `monitor-{task}-{uuid}` prompt-id shape.
+            // `from_prompt_id` has no `monitor-` arm upstream
+            // (session/mod.rs:103-133), so the turn persists as a plain
+            // user item, which is what the port's default mapping does too.
+            turnRequest = OpenGrokShellTurnRequest(
+                promptID: OpenGrokPagerInteractiveController.monitorPromptIDPrefix
+                    + monitorTaskID + "-" + UUID().uuidString,
+                text: request.prompt
+            )
+        } else {
+            turnRequest = OpenGrokShellTurnRequest(text: request.prompt)
+        }
+        let handle = try await shell.submitTurn(
+            sessionID: sessionID,
+            request: turnRequest
+        )
+        return LivePagerSession(shell: shell, handle: handle, shellEvents: shellEvents)
+    }
+
+    /// Mirror the live export boundary into the shell session's persisted
+    /// summary, the port of the persistence actor's `observe_provider` leg
+    /// on a model switch (`PersistenceMsg::CurrentModel`, persistence.rs:
+    /// 2179-2187 → `mark_ever_used_codex`).
+    ///
+    /// Before the first prompt no shell session exists — the port creates it
+    /// lazily in `makeSession`, where upstream's `init_session` runs at
+    /// session open (persistence.rs:2775) — so there is nothing to mirror
+    /// into yet and the sync defers: `makeSession` seeds the record from the
+    /// same shared `ExportBoundary` at creation, so the deferred value cannot
+    /// be lost. Once a session exists, a failure here is a real persistence
+    /// failure and still propagates to the caller's warning row.
+    func synchronizeProviderBoundary(everUsedNonXAI: Bool) async throws {
+        guard let sessionID = activeShellSessionID else { return }
+        try await shell.synchronizeProviderBoundary(
+            sessionID: sessionID,
+            everUsedNonXAI: everUsedNonXAI
+        )
+    }
+
+    func makeSession(
+        for request: OpenGrokPagerRequest
+    ) async throws -> any OpenGrokPagerSessionAdapter {
+        try await makeSession(for: request.sessionRequest)
+    }
+
+    func replaceSession(from request: OpenGrokPagerRequest) async throws -> String {
+        try await replaceSession(from: request, workingDirectory: nil)
+    }
+
+    func replaceSession(
+        from request: OpenGrokPagerRequest,
+        workingDirectory: String?
+    ) async throws -> String {
+        _ = request
+        await retainActiveRecord()
+        let newSessionID = UUID().uuidString
+        try LiveConversationStore.validateSessionID(newSessionID)
+        let newWorkingDirectory: URL
+        if let workingDirectory {
+            newWorkingDirectory = URL(
+                fileURLWithPath: workingDirectory,
+                isDirectory: true
+            ).standardizedFileURL
+        } else {
+            newWorkingDirectory = activeWorkingDirectory
+        }
+        let record = LiveConversationRecord.new(
+            sessionID: newSessionID,
+            workingDirectory: newWorkingDirectory,
+            sandboxProfile: toolExecutor?.sandbox.profileName
+        )
+        let configuration = ProviderSessionConfiguration(
+            sessionID: newSessionID,
+            modelCatalog: providerConfiguration.modelCatalog,
+            initialModelID: providerConfiguration.initialModelID,
+            credentialBindings: providerConfiguration.credentialBindings,
+            fallbackModelIDs: providerConfiguration.fallbackModelIDs,
+            auxiliaryModelIDs: providerConfiguration.auxiliaryModelIDs,
+            toolRequest: providerConfiguration.toolRequest,
+            retryPolicy: providerConfiguration.retryPolicy,
+            openGrokHome: providerConfiguration.openGrokHome,
+            environment: providerConfiguration.environment,
+            everUsedNonXAI: record.everUsedNonXAI
+        )
+
+        _ = try await shell.start()
+        _ = try await shell.createSession(OpenGrokShellSessionRequest(
+            sessionID: SessionID(newSessionID),
+            cwd: newWorkingDirectory,
+            providerConfiguration: configuration,
+            restorePersistedState: false
+        ))
+        try await conversationStore.save(record)
+        try await toolExecutor?.registerSession(
+            sessionID: newSessionID,
+            workingDirectory: newWorkingDirectory
+        )
+        try await conversationHistory.replace(with: record)
+        await compaction?.replaceSessionID(newSessionID)
+        providerConfiguration = configuration
+        createdSessionIDs.insert(SessionID(newSessionID))
+        retainedRecords[newSessionID] = record
+        activeWorkingDirectory = newWorkingDirectory
+        activeShellSessionID = SessionID(newSessionID)
+        return newSessionID
+    }
+
+    /// `/resume`: swap the live conversation to the stored session
+    /// `sessionID`, keeping the current provider stack.
+    ///
+    /// Ordering mirrors `replaceSession`: the shell session and the persisted
+    /// record land before the in-memory spine flips, so a failure partway
+    /// leaves the previous session fully live. The restored history is then
+    /// reconciled against the route the session is *currently* running
+    /// (`reconcileRoute`), which strips provider-opaque carriers when the
+    /// stored record came from a different provider — the same isolation
+    /// `/model` applies, because a resume across providers is the same seam.
+    func resumeSession(sessionID: String) async throws -> String {
+        try LiveConversationStore.validateSessionID(sessionID)
+        await retainActiveRecord()
+        let storedRecord = try await conversationStore.loadIfPresent(sessionID: sessionID)
+        guard let record = retainedRecords[sessionID] ?? storedRecord else {
+            throw CLIApplicationError.failed("session not found: \(sessionID)")
+        }
+        let sessionDirectory = URL(
+            fileURLWithPath: record.workingDirectory,
+            isDirectory: true
+        ).standardizedFileURL
+        let configuration = ProviderSessionConfiguration(
+            sessionID: sessionID,
+            modelCatalog: providerConfiguration.modelCatalog,
+            initialModelID: providerConfiguration.initialModelID,
+            credentialBindings: providerConfiguration.credentialBindings,
+            fallbackModelIDs: providerConfiguration.fallbackModelIDs,
+            auxiliaryModelIDs: providerConfiguration.auxiliaryModelIDs,
+            toolRequest: providerConfiguration.toolRequest,
+            retryPolicy: providerConfiguration.retryPolicy,
+            openGrokHome: providerConfiguration.openGrokHome,
+            environment: providerConfiguration.environment,
+            everUsedNonXAI: record.everUsedNonXAI
+        )
+
+        _ = try await shell.start()
+        let shellSessionID = SessionID(sessionID)
+        if !createdSessionIDs.contains(shellSessionID) {
+            _ = try await shell.createSession(OpenGrokShellSessionRequest(
+                sessionID: shellSessionID,
+                cwd: sessionDirectory,
+                providerConfiguration: configuration,
+                restorePersistedState: false
+            ))
+            createdSessionIDs.insert(shellSessionID)
+        }
+        try await conversationStore.save(record)
+        try await toolExecutor?.registerSession(
+            sessionID: sessionID,
+            workingDirectory: sessionDirectory
+        )
+        try await conversationHistory.replace(with: record)
+        if let modelSwitch {
+            let snapshot = await modelSwitch.snapshot()
+            _ = try await conversationHistory.reconcileRoute(
+                modelID: snapshot.modelID,
+                provider: snapshot.provider
+            )
+        }
+        await compaction?.replaceSessionID(sessionID)
+        providerConfiguration = configuration
+        retainedRecords[sessionID] = await conversationHistory.snapshot()
+        activeWorkingDirectory = sessionDirectory
+        activeShellSessionID = shellSessionID
+        return sessionID
+    }
+
+    func renameRetainedSession(sessionID: String, title: String) async throws -> Bool {
+        let activeSessionID = await conversationHistory.sessionID
+        if sessionID == activeSessionID {
+            try await conversationHistory.rename(title: title)
+            retainedRecords[sessionID] = await conversationHistory.snapshot()
+            return true
+        }
+        guard try await conversationStore.renameStored(sessionID: sessionID, title: title) else {
+            retainedRecords.removeValue(forKey: sessionID)
+            return false
+        }
+        if var record = retainedRecords[sessionID] {
+            record.title = title
+            record.updatedAt = Date()
+            retainedRecords[sessionID] = record
+        }
+        return true
+    }
+
+    func retainedSessionIDs() -> Set<String> {
+        Set(retainedRecords.keys)
+    }
+
+    func workingDirectory(sessionID: String) async -> URL? {
+        let activeSessionID = await conversationHistory.sessionID
+        if sessionID == activeSessionID {
+            return activeWorkingDirectory
+        }
+        if let record = retainedRecords[sessionID] {
+            return URL(fileURLWithPath: record.workingDirectory, isDirectory: true)
+                .standardizedFileURL
+        }
+        let storedRecord: LiveConversationRecord?
+        do {
+            storedRecord = try await conversationStore.loadIfPresent(sessionID: sessionID)
+        } catch {
+            return nil
+        }
+        guard let storedRecord else { return nil }
+        return URL(
+            fileURLWithPath: storedRecord.workingDirectory,
+            isDirectory: true
+        ).standardizedFileURL
+    }
+
+    private func retainActiveRecord() async {
+        let record = await conversationHistory.snapshot()
+        retainedRecords[record.sessionID] = record
+        activeWorkingDirectory = URL(
+            fileURLWithPath: record.workingDirectory,
+            isDirectory: true
+        ).standardizedFileURL
+    }
+}
+
+final class LivePagerSession: OpenGrokPagerMinimalSessionAdapter, @unchecked Sendable {
+    let sessionID: String?
+    let events: AsyncThrowingStream<OpenGrokPagerMinimalEvent, Error>
+
+    private let shell: OpenGrokShell
+    private let handle: OpenGrokShellTurnHandle
+    private let eventTask: Task<Void, Never>
+
+    init(
+        shell: OpenGrokShell,
+        handle: OpenGrokShellTurnHandle,
+        shellEvents: AsyncThrowingStream<OpenGrokShellEvent, Error>
+    ) {
+        self.shell = shell
+        self.handle = handle
+        self.sessionID = handle.sessionID.rawValue
+        var continuation: AsyncThrowingStream<OpenGrokPagerMinimalEvent, Error>.Continuation!
+        self.events = AsyncThrowingStream { continuation = $0 }
+        self.eventTask = Task {
+            do {
+                for try await event in shellEvents {
+                    switch event {
+                    case .turnUpdate(let update) where update.turnID == handle.turnID:
+                        switch update.kind {
+                        case .assistantText(let text): continuation.yield(.output(text))
+                        case .status(let status): continuation.yield(.status(status))
+                        case .tool(let tool):
+                            let state: OpenGrokPagerToolState
+                            switch tool.state {
+                            case .running: state = .running
+                            case .succeeded: state = .succeeded
+                            case .failed: state = .failed
+                            case .cancelled: state = .cancelled
+                            }
+                            continuation.yield(.tool(OpenGrokPagerToolUpdate(
+                                callID: tool.callID,
+                                name: tool.name,
+                                input: tool.input,
+                                output: tool.output,
+                                state: state
+                            )))
+                        }
+                    case .turnCompleted(let result) where result.turnID == handle.turnID:
+                        continuation.yield(.completed(OpenGrokPagerMinimalCompletion(
+                            sessionID: handle.sessionID.rawValue,
+                            summary: result.stopReason
+                        )))
+                        continuation.finish()
+                        return
+                    case .turnCancelled(let cancelled) where cancelled == handle:
+                        continuation.yield(.cancelled)
+                        continuation.finish()
+                        return
+                    case .turnFailed(let failed, let message) where failed == handle:
+                        continuation.finish(throwing: CLIApplicationError.failed(message))
+                        return
+                    default:
+                        continue
+                    }
+                }
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+    }
+
+    func cancel() async {
+        eventTask.cancel()
+        try? await shell.cancelTurn(handle)
+    }
+
+    func close() async {
+        eventTask.cancel()
+    }
+}
+
+actor LiveInteractiveInputResource {
+    private let input: any TerminalInput
+    private let resizeSource: any TerminalResizeSource
+    /// Swapped on suspend/resume: `beginSuspension` releases it (upstream's
+    /// `disable_raw_mode`, event_loop.rs:399) and `endSuspension` stores the
+    /// fresh lease from re-entry (event_loop.rs:401).
+    private var lease: any RawModeLease
+    /// The adapter the lease came from, kept for raw re-entry after a child
+    /// owned the tty. `nil` in constructions that never suspend.
+    private let rawModeTTY: (any TTYAdapter)?
+    private var inputTask: Task<Void, Never>?
+    private var resizeTask: Task<Void, Never>?
+    private var closed = false
+    private var suspended = false
+
+    init(
+        input: any TerminalInput,
+        resizeSource: any TerminalResizeSource,
+        lease: any RawModeLease,
+        rawModeTTY: (any TTYAdapter)? = nil
+    ) {
+        self.input = input
+        self.resizeSource = resizeSource
+        self.lease = lease
+        self.rawModeTTY = rawModeTTY
+    }
+
+    func install(
+        inputTask: Task<Void, Never>,
+        resizeTask: Task<Void, Never>
+    ) {
+        self.inputTask = inputTask
+        self.resizeTask = resizeTask
+    }
+
+    /// Park the reader, then release the raw-mode lease — the input half of
+    /// `suspend_for_child` (event_loop.rs:365-371 + :399). Single attempt:
+    /// a park timeout changes nothing here and returns `false` for the
+    /// caller to report; upstream instead requeues the request on a deferred
+    /// retry timer (event_loop.rs:646-671, 700-712). Cost of the divergence:
+    /// a reader busy at the wrong 500 ms means the user re-runs the command
+    /// rather than it firing later on its own.
+    func beginSuspension() async -> Bool {
+        guard !closed, !suspended else { return false }
+        guard await input.pauseReads() else { return false }
+        suspended = true
+        await lease.release()
+        return true
+    }
+
+    /// Re-enter raw mode and swap the lease, then discard the bytes the
+    /// terminal buffered while the child ran (DA/DSR replies,
+    /// event_loop.rs:407-411), then resume the reader. Raw comes first:
+    /// resuming reads into a cooked terminal would hand the user's next
+    /// keystrokes to the shell's line discipline.
+    func endSuspension() async throws {
+        guard suspended else { return }
+        if let rawModeTTY {
+            // A failed re-entry is a genuinely broken terminal: leave the
+            // reader paused and surface the error rather than resuming into
+            // a cooked tty silently.
+            lease = try await rawModeTTY.enterRawMode()
+        }
+        suspended = false
+        input.discardPendingInput()
+        input.resumeReads()
+    }
+
+    func close() async {
+        guard !closed else { return }
+        closed = true
+        await input.close()
+        resizeSource.stop()
+        inputTask?.cancel()
+        resizeTask?.cancel()
+        if let inputTask {
+            _ = await inputTask.value
+        }
+        if let resizeTask {
+            _ = await resizeTask.value
+        }
+        await lease.release()
+    }
+}
+
+final class LiveInteractiveInputEmitter: @unchecked Sendable {
+    private let continuation: AsyncThrowingStream<InputEvent, Error>.Continuation
+
+    init(continuation: AsyncThrowingStream<InputEvent, Error>.Continuation) {
+        self.continuation = continuation
+    }
+
+    func yield(_ event: InputEvent) {
+        continuation.yield(event)
+    }
+
+    func finish(throwing error: Error? = nil) {
+        continuation.finish(throwing: error)
+    }
+}
+
+final class FileHandlePagerTerminalSink: PagerTerminalSink, @unchecked Sendable {
+    let capabilities = PagerTerminalCapabilities.standard
+    private let handle: FileHandle
+    private let lock = NSLock()
+
+    init(handle: FileHandle = .standardOutput) {
+        self.handle = handle
+    }
+
+    func write(bytes: [UInt8]) throws {
+        guard !bytes.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        try handle.write(contentsOf: Data(bytes))
+    }
+
+    func flush() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try handle.synchronize()
+    }
+}
+
+/// Chrome the live TUI composes for every frame.
+///
+/// The reference builds its shortcut hints from an action registry
+/// (`src/actions/defaults.rs`); this port lists only the bindings the Swift
+/// controller actually honors, so the bar never advertises a key that does
+/// nothing.
+enum LivePagerChrome {
+    static func collapseHome(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        guard !home.isEmpty, path == home || path.hasPrefix(home + "/") else { return path }
+        return "~" + path.dropFirst(home.count)
+    }
+
+    static func shortcutHints(isTurnRunning: Bool) -> [PagerShortcutHint] {
+        var hints: [PagerShortcutHint] = [
+            // The submit label flips to "queue" while a turn is in flight,
+            // matching `views/agent.rs:992`.
+            PagerShortcutHint(key: "Enter", label: isTurnRunning ? "queue" : "send", isPinned: true)
+        ]
+        if isTurnRunning {
+            hints.append(PagerShortcutHint(key: "Esc", label: "cancel", isPinned: true))
+        } else {
+            hints.append(PagerShortcutHint(key: "\u{2191}", label: "history"))
+            hints.append(PagerShortcutHint(key: "/", label: "commands"))
+        }
+        hints.append(PagerShortcutHint(keys: ["PgUp", "PgDn"], label: "scroll"))
+        hints.append(PagerShortcutHint(key: "Tab", label: "scrollback"))
+        hints.append(PagerShortcutHint(key: "Ctrl+c", label: "quit", isPinned: true))
+        return hints
+    }
+
+    /// Hints for the scrollback's own focus, mirroring upstream's per-context
+    /// bar. The vim-only keys are listed only when vim mode is on, because
+    /// with it off they genuinely do nothing.
+    static func scrollbackHints(isVimMode: Bool) -> [PagerShortcutHint] {
+        var hints: [PagerShortcutHint] = [
+            PagerShortcutHint(keys: ["\u{2191}", "\u{2193}"], label: "select", isPinned: true),
+            PagerShortcutHint(keys: ["\u{2190}", "\u{2192}"], label: "fold"),
+            PagerShortcutHint(key: "Enter", label: "view")
+        ]
+        if isVimMode {
+            hints.append(PagerShortcutHint(keys: ["y", "Y"], label: "copy"))
+            hints.append(PagerShortcutHint(key: "r", label: "raw"))
+            hints.append(PagerShortcutHint(keys: ["o", "O"], label: "link"))
+        }
+        hints.append(PagerShortcutHint(key: "Tab", label: "prompt", isPinned: true))
+        return hints
+    }
+
+    /// Title for the block viewer.
+    static func blockTitle(for item: PagerConversationItem) -> String {
+        switch item {
+        case .message(let message):
+            switch message.role {
+            case .user: return "Your prompt"
+            case .assistant: return "Response"
+            case .reasoning: return "Thinking"
+            case .system: return "System"
+            case .error: return "Error"
+            }
+        case .tool(let tool):
+            return tool.name
+        case .separator:
+            return "Separator"
+        }
+    }
+
+}
+
+struct LivePagerConversationState {
+    private(set) var items: [PagerConversationItem] = []
+    private var activeAssistantIndex: Int?
+    private var toolIndicesByCallID: [String: Int] = [:]
+    /// Renders assistant messages as markdown for frame painting. `nil` leaves
+    /// them as plain text, which is what the inline and transcript paths want.
+    private let markdown: PagerMarkdownRenderer?
+
+    init(markdown: PagerMarkdownRenderer? = nil) {
+        self.markdown = markdown
+    }
+
+    /// Re-render the accumulated message body.
+    ///
+    /// The whole message is re-parsed on each delta rather than patched: a
+    /// streamed answer is bounded by the model's output budget, and markdown
+    /// structure is not stable under append (a fence or table opened by the
+    /// latest delta reinterprets earlier lines).
+    private func styledLines(for text: String) -> [PagerStyledLine] {
+        guard let markdown, !text.isEmpty else { return [] }
+        return markdown.render(text)
+    }
+
+    mutating func startTurn(prompt: String, paintUserBlock: Bool = true) {
+        toolIndicesByCallID.removeAll(keepingCapacity: true)
+        // Both blocks carry the construction instant for the `/timestamps`
+        // overlay — upstream's `ScrollbackEntry` constructors stamp
+        // `created_at: Some(Local::now())` on push (`entry.rs:198,230`).
+        //
+        // `paintUserBlock: false` is the interjection-fallback turn: the
+        // dispatch already painted the text as a user block, so the turn's
+        // own echo stays persist-only (interjection.rs:20-25).
+        if paintUserBlock {
+            items.append(.message(PagerMessage(
+                role: .user,
+                text: prompt,
+                createdAt: Date()
+            )))
+        }
+        items.append(.message(PagerMessage(
+            role: .assistant,
+            text: "",
+            isStreaming: true,
+            createdAt: Date()
+        )))
+        activeAssistantIndex = items.indices.last
+    }
+
+    mutating func appendMessage(_ message: PagerMessage) {
+        items.append(.message(message))
+    }
+
+    /// Append any conversation item (including separators). Live-seam tests
+    /// use this to inject non-selectable blocks; production paths prefer the
+    /// typed appenders above so streaming indices stay coherent.
+    mutating func appendItem(_ item: PagerConversationItem) {
+        items.append(item)
+    }
+
+    /// Drop everything from `index` on — what `/rewind` does to the visible
+    /// transcript once the persisted history has been truncated.
+    ///
+    /// The streaming bookkeeping is reset rather than adjusted: a rewind can
+    /// only run between turns, so there is no active assistant block to keep,
+    /// and a stale `activeAssistantIndex` pointing past the new end is exactly
+    /// how the next turn would append into the wrong block.
+    mutating func truncate(to index: Int) {
+        guard index >= 0, index < items.count else { return }
+        items.removeSubrange(index...)
+        activeAssistantIndex = nil
+        toolIndicesByCallID.removeAll(keepingCapacity: true)
+    }
+
+    mutating func removeAll() {
+        items.removeAll()
+        activeAssistantIndex = nil
+        toolIndicesByCallID.removeAll(keepingCapacity: true)
+    }
+
+    /// Rebuild the visible transcript from a persisted conversation — what
+    /// `/resume` paints after the runtime swaps sessions.
+    ///
+    /// The projection matches what this renderer would have accumulated live:
+    /// real user prompts, assistant prose (markdown-styled), and one settled
+    /// tool card per assistant tool call with its result attached. Synthetic
+    /// user turns, system prompts and reasoning payloads are provider/context
+    /// plumbing and never rendered as blocks in a live session either.
+    /// `promptInstants` carries the persisted instant of each restored user
+    /// turn, keyed by POSITIONAL prompt index — turns counted over
+    /// `startsPromptTurn` user items, the same rule `liveTruncateConversation`
+    /// and the rewind numbering use. The instants come from the session's
+    /// rewind sidecar (`LiveRewindPoint.createdAt`, stamped when the turn
+    /// opened) — the port of upstream restoring `created_at` from the replay
+    /// meta's `turn_start_ms` (`acp/tracker.rs:1380-1385`). Empty means "no
+    /// instants known": restored blocks paint no stamp, upstream's
+    /// `created_at: None` behavior (`entry_renderer.rs:939`), never load time.
+    mutating func seed(
+        from conversationItems: [ConversationItem],
+        promptInstants: [Int: Date] = [:]
+    ) {
+        removeAll()
+        // Pair tool calls with their results up front; an unpaired call
+        // renders with no output rather than being dropped.
+        var resultsByCallID: [String: String] = [:]
+        for item in conversationItems {
+            if case .toolResult(let result) = item {
+                resultsByCallID[result.toolCallId] = result.content
+            }
+        }
+        var promptCount = 0
+        for item in conversationItems {
+            switch item {
+            case .user(let user):
+                // Count EVERY turn-starting user item — synthetic
+                // turn-starters (scheduler fires, drains) spend a prompt slot
+                // in the rewind numbering even though they are not painted.
+                let startsTurn = user.syntheticReason.map(\.startsPromptTurn) ?? true
+                let promptIndex = promptCount
+                if startsTurn { promptCount += 1 }
+                guard user.syntheticReason == nil else { continue }
+                let text = user.content.compactMap { part -> String? in
+                    if case .text(let value) = part { return value }
+                    return nil
+                }.joined(separator: "\n")
+                guard !text.isEmpty else { continue }
+                items.append(.message(PagerMessage(
+                    role: .user,
+                    text: text,
+                    createdAt: promptInstants[promptIndex]
+                )))
+            case .assistant(let assistant):
+                let text = assistant.content
+                if !text.isEmpty {
+                    // RECORDED DIVERGENCE: restored assistant blocks carry no
+                    // instant. Upstream replays them with the original
+                    // `agentTimestampMs` from its notification journal
+                    // (`acp/tracker.rs:950-955`); this port's session store
+                    // persists no per-assistant-item instant, so the honest
+                    // projection paints no stamp (upstream's `created_at:
+                    // None` gate) rather than a load-time or turn-start lie.
+                    // Cost: after `/resume`, timestamps show on restored user
+                    // prompts and on new blocks, not on restored replies.
+                    items.append(.message(PagerMessage(
+                        role: .assistant,
+                        text: text,
+                        styledLines: styledLines(for: text)
+                    )))
+                }
+                for call in assistant.toolCalls {
+                    items.append(.tool(PagerToolCard(
+                        name: call.name,
+                        input: call.arguments,
+                        output: resultsByCallID[call.id],
+                        state: .succeeded
+                    )))
+                }
+            case .system, .toolResult, .customToolOutput, .backendToolCall,
+                 .reasoning:
+                continue
+            }
+        }
+    }
+
+    /// In-place edit of the blocks, for the fold/raw effects the scrollback's
+    /// selection applies. Deliberately narrow: nothing outside may append or
+    /// remove through this, which would desynchronize the streaming indices.
+    mutating func withItems<T>(_ body: (inout [PagerConversationItem]) -> T) -> T {
+        let countBefore = items.count
+        let result = body(&items)
+        assert(items.count == countBefore, "scrollback edits must not change the block count")
+        return result
+    }
+
+    mutating func appendAssistant(_ text: String) {
+        guard let activeAssistantIndex,
+              items.indices.contains(activeAssistantIndex),
+              case .message(var message) = items[activeAssistantIndex]
+        else {
+            items.append(.message(PagerMessage(
+                role: .assistant,
+                text: text,
+                isStreaming: true,
+                styledLines: styledLines(for: text),
+                createdAt: Date()
+            )))
+            self.activeAssistantIndex = items.indices.last
+            return
+        }
+        message.text += text
+        message.isStreaming = true
+        message.styledLines = styledLines(for: message.text)
+        items[activeAssistantIndex] = .message(message)
+    }
+
+    mutating func finishAssistant(removingIfEmpty: Bool = false) {
+        guard let activeAssistantIndex,
+              items.indices.contains(activeAssistantIndex),
+              case .message(var message) = items[activeAssistantIndex]
+        else { return }
+        if removingIfEmpty, message.text.isEmpty {
+            items.remove(at: activeAssistantIndex)
+            self.activeAssistantIndex = nil
+            return
+        }
+        message.isStreaming = false
+        message.styledLines = styledLines(for: message.text)
+        items[activeAssistantIndex] = .message(message)
+        self.activeAssistantIndex = nil
+    }
+
+    /// `atSeconds` is the motion clock's now, used to stamp
+    /// `PagerToolCard.finishedAt` the first time a tool reaches a terminal
+    /// state — the input to the 400 ms finish flash. `nil` (motion disabled,
+    /// transcript paths) renders the block already-static.
+    mutating func apply(_ tool: OpenGrokPagerToolUpdate, atSeconds seconds: TimeInterval? = nil) {
+        let state = Self.renderState(for: tool.state)
+        var finishedAt: TimeInterval?
+        if state != .running, state != .pending {
+            // First terminal update wins: a re-delivered terminal state must
+            // not restart the flash.
+            if let index = toolIndicesByCallID[tool.callID],
+               items.indices.contains(index),
+               case .tool(let existing) = items[index],
+               let existingFinish = existing.finishedAt {
+                finishedAt = existingFinish
+            } else {
+                finishedAt = seconds
+            }
+        }
+        let card = PagerToolCard(
+            name: tool.name,
+            input: tool.input,
+            output: tool.output,
+            state: state,
+            finishedAt: finishedAt
+        )
+        if let index = toolIndicesByCallID[tool.callID], items.indices.contains(index) {
+            items[index] = .tool(card)
+        } else {
+            finishAssistant(removingIfEmpty: true)
+            items.append(.tool(card))
+            toolIndicesByCallID[tool.callID] = items.indices.last
+        }
+    }
+
+    var transcript: String {
+        let lines = items.flatMap(Self.transcriptLines(for:))
+        return lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Narrow test probe: the motion-clock stamp on a tool card, when known.
+    func testingFinishedAt(callID: String) -> TimeInterval? {
+        guard let index = toolIndicesByCallID[callID],
+              items.indices.contains(index),
+              case .tool(let tool) = items[index]
+        else { return nil }
+        return tool.finishedAt
+    }
+
+    static func transcript(for tool: OpenGrokPagerToolUpdate) -> String {
+        transcriptLines(for: .tool(PagerToolCard(
+            name: tool.name,
+            input: tool.input,
+            output: tool.output,
+            state: renderState(for: tool.state)
+        ))).joined(separator: "\n") + "\n"
+    }
+
+    private static func renderState(for state: OpenGrokPagerToolState) -> PagerToolState {
+        switch state {
+        case .running: return .running
+        case .succeeded: return .succeeded
+        case .failed: return .failed
+        case .cancelled: return .cancelled
+        }
+    }
+
+    /// The plain transcript replayed to the real terminal after the alt-screen
+    /// is torn down. This is deliberately *not* the on-screen presentation: it
+    /// is a labeled plain-text log that other composition paths and their
+    /// tests share.
+    private static func transcriptLines(for item: PagerConversationItem) -> [String] {
+        switch item {
+        case .message(let message):
+            let label: String
+            switch message.role {
+            case .user: label = "You"
+            case .assistant: label = "Grok"
+            case .system: label = "System"
+            case .reasoning: label = "Reasoning"
+            case .error: label = "Error"
+            }
+            return ["\(label): \(message.text)"]
+        case .tool(let tool):
+            var lines = ["Tool \(tool.name) [\(transcriptState(tool.state))]"]
+            if !tool.input.isEmpty {
+                lines.append("  input: \(tool.input)")
+            }
+            if let output = tool.output, !output.isEmpty {
+                lines.append("  result: \(output)")
+            }
+            return lines
+        case .separator(let text):
+            return [text]
+        }
+    }
+
+    private static func transcriptState(_ state: PagerToolState) -> String {
+        switch state {
+        case .pending: return "pending"
+        case .running: return "running"
+        case .succeeded: return "done"
+        case .failed: return "failed"
+        case .cancelled: return "cancelled"
+        }
+    }
+}
+
+// Internal (not private) so the reachability suites can drive the real
+// adapter: a command's overlay/effect only exists here, and a test that
+// cannot construct the renderer can only test the registry.
+struct LiveDashboardRendererSnapshot: Sendable, Equatable {
+    let isOpen: Bool
+    let searchQuery: String?
+    let selectedRowID: String?
+    let cachedSessionIDs: Set<String>
+    let dormantSessionIDs: Set<String>
+    let inputText: String
+    let dispatchWorkingDirectory: String
+    let rowLabels: [String: String]
+}
+
+enum LiveDashboardInputMode: Sendable, Equatable {
+    case compose(rowID: String)
+    case rename(rowID: String)
+    case worktree(prompt: String)
+}
+
+struct LiveDashboardQuestionSnapshot: Sendable, Equatable {
+    let overlayID: String
+    let requestID: String
+    let prompt: String
+    let options: [String]
+    let selectedIndex: Int
+    let freeformText: String
+    let freeformFocused: Bool
+    let requiresAttach: Bool
+}
+
+/// Installs / retires the shared `LiveActiveBackgroundWorkSink` on every
+/// lifecycle source a live composition owns. Absent sources are skipped —
+/// never stubbed. Scheduler and workflow installs reseed currently-visible
+/// ids; shell/monitor share one `.shell` composition path.
+enum LiveActiveBackgroundWorkWiring {
+    static func install(
+        sink: @escaping LiveActiveBackgroundWorkSink,
+        toolExecutor: LiveToolExecutor,
+        workflowRegistry: RhaiWorkflowRunRegistry?
+    ) async {
+        await toolExecutor.setActiveBackgroundWorkSink(sink)
+        if let subagentHost = toolExecutor.subagentHost {
+            await subagentHost.setActiveBackgroundWorkSink(sink)
+        }
+        if let schedulerHost = toolExecutor.schedulerHost {
+            await schedulerHost.setActiveBackgroundWorkSink(sink)
+        }
+        if let workflowRegistry {
+            await LiveWorkflowActiveBackgroundWork.setActiveBackgroundWorkSink(
+                on: workflowRegistry,
+                sink
+            )
+        }
+    }
+
+    /// Clear host sinks so late lifecycle edges cannot reach a restored
+    /// renderer. Does not emit removes — the renderer clears its cache and
+    /// publishes final motion during `restoreTerminal`.
+    static func clear(
+        toolExecutor: LiveToolExecutor,
+        workflowRegistry: RhaiWorkflowRunRegistry?
+    ) async {
+        await toolExecutor.setActiveBackgroundWorkSink(nil)
+        if let subagentHost = toolExecutor.subagentHost {
+            await subagentHost.setActiveBackgroundWorkSink(nil)
+        }
+        if let schedulerHost = toolExecutor.schedulerHost {
+            await schedulerHost.setActiveBackgroundWorkSink(nil)
+        }
+        if let workflowRegistry {
+            await LiveWorkflowActiveBackgroundWork.setActiveBackgroundWorkSink(
+                on: workflowRegistry,
+                nil
+            )
+        }
+    }
+}
+
+
+struct SilentLiveInteractiveOutput: OpenGrokPagerInteractiveOutputAdapter, Sendable {
+    func forward(_ event: OpenGrokPagerInteractiveEvent) async throws {
+        _ = event
+    }
+}
+
+struct PlainLivePagerRenderer: OpenGrokPagerMinimalRenderAdapter, Sendable {
+    func begin() async throws {}
+    func render(_ event: OpenGrokPagerMinimalEvent) async throws {}
+    func restoreTerminal() async throws {}
+}
+
+struct LiveInteractiveFrontendFactory: OpenGrokPagerFrontendFactory, Sendable {
+    let terminal: OpenGrokLiveTerminal
+    let prompt: String
+
+    func makeFrontend(for mode: OpenGrokPagerMode) async throws -> any OpenGrokPagerFrontend {
+        // `--minimal` degrades here rather than refusing. This factory serves
+        // the path with no interactive input, which `resolveInteractivePagerMode`
+        // cannot see — it only knows whether a TTY exists, so a TTY with no
+        // input sink still arrives as `.minimal`. Refusing produced
+        // "unsupported: interactive pager mode minimal" where the flag used to
+        // work. Inline is a faithful downgrade: minimal is scrollback-native,
+        // and `LiveInteractivePagerRenderer` already renders every
+        // non-fullscreen mode as inline. `.plain` has no interactive rendering
+        // at all, so it keeps refusing.
+        let resolved: OpenGrokPagerMode
+        switch mode {
+        case .fullScreen, .inline:
+            resolved = mode
+        case .minimal:
+            resolved = .inline
+        case .plain:
+            throw CLIApplicationError.unsupported(route: "interactive pager mode \(mode.rawValue)")
+        }
+        return OpenGrokPagerForwardingFrontend(
+            renderer: LiveInteractivePagerRenderer(mode: resolved, terminal: terminal, prompt: prompt),
+            output: SilentLivePagerOutput()
+        )
+    }
+}
+
+actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
+    private let mode: OpenGrokPagerMode
+    private let terminal: OpenGrokLiveTerminal
+    private let prompt: String
+    private let renderEngine = PagerRenderEngine()
+
+    private var conversation: LivePagerConversationState
+    private var output = ""
+    private var status = "Starting"
+    private var inlineBegan = false
+    private var inlineEnded = false
+    private var inlineNeedsAssistantPrefix = false
+    private var restored = false
+    private var renderTick = 0
+
+    init(mode: OpenGrokPagerMode, terminal: OpenGrokLiveTerminal, prompt: String) {
+        self.mode = mode
+        self.terminal = terminal
+        self.prompt = prompt
+        // Inline mode streams raw text straight to the terminal and only uses
+        // the conversation state for its plain transcript, so markdown is
+        // rendered for the full-screen frame path only.
+        conversation = LivePagerConversationState(
+            markdown: mode == .fullScreen ? PagerMarkdownRenderer() : nil
+        )
+        conversation.startTurn(prompt: prompt)
+    }
+
+    func begin() async throws {
+        switch mode {
+        case .fullScreen:
+            try await terminal.write("\u{1B}[?1049h\u{1B}[?25l")
+            try await renderFullScreen()
+        case .inline:
+            inlineBegan = true
+            try await terminal.write("You: \(prompt)\nGrok: ")
+        case .minimal, .plain:
+            throw CLIApplicationError.unsupported(route: "interactive pager mode \(mode.rawValue)")
+        }
+    }
+
+    func render(_ event: OpenGrokPagerEvent) async throws {
+        switch event {
+        case .lifecycle(.starting):
+            status = "Starting"
+        case .lifecycle(.running):
+            status = "Thinking"
+        case .lifecycle(let lifecycle):
+            status = lifecycle.rawValue
+        case .output(let text):
+            output += text
+            conversation.appendAssistant(text)
+            status = "Responding"
+            if mode == .inline {
+                if inlineNeedsAssistantPrefix {
+                    inlineNeedsAssistantPrefix = false
+                    try await terminal.write("Grok: ")
+                }
+                try await terminal.write(text)
+            }
+        case .status(let value):
+            status = value
+        case .tool(let tool):
+            conversation.apply(tool)
+            status = "Tool \(tool.name) \(tool.state.rawValue)"
+            if mode == .inline, tool.state != .running {
+                try await terminal.write("\n")
+                try await terminal.write(LivePagerConversationState.transcript(for: tool))
+                inlineNeedsAssistantPrefix = true
+            }
+        case .permissionRequested(let request):
+            status = "Permission required: \(request.prompt)"
+        case .completed:
+            conversation.finishAssistant()
+            status = "Completed"
+            if mode == .inline {
+                try await finishInline()
+            }
+        case .cancelled:
+            conversation.finishAssistant()
+            status = "Cancelled"
+            if mode == .inline {
+                try await finishInline()
+            }
+        }
+        if mode == .fullScreen {
+            try await renderFullScreen()
+        }
+    }
+
+    func restoreTerminal() async throws {
+        guard !restored else { return }
+        restored = true
+        switch mode {
+        case .fullScreen:
+            try await terminal.write(TerminalRestore.fullRestore)
+            try await terminal.write(finalTranscript)
+        case .inline:
+            try await finishInline()
+        case .minimal, .plain:
+            break
+        }
+    }
+
+    private func renderFullScreen() async throws {
+        renderTick += 1
+        let terminalSize = terminal.size() ?? OpenGrokLiveTerminalSize(width: 80, height: 24)
+        let result = renderEngine.render(PagerRenderState(
+            size: OpenGrokTerminalCore.TerminalSize(
+                width: terminalSize.width,
+                height: terminalSize.height
+            ),
+            statusBar: PagerStatusBar(
+                workingDirectory: LivePagerChrome.collapseHome(
+                    FileManager.default.currentDirectoryPath
+                )
+            ),
+            conversation: conversation.items,
+            turnStatus: PagerTurnStatus(label: status, tick: renderTick),
+            input: PagerComposerState(
+                text: "",
+                isFocused: false,
+                cursorVisible: false,
+                placeholder: "",
+                maximumHeight: 3
+            ),
+            shortcuts: PagerShortcutsBar(
+                hints: [PagerShortcutHint(key: "Ctrl+c", label: "cancel", isPinned: true)]
+            )
+        ))
+        let frame = ANSIOutput.beginSynchronizedUpdate
+            + ANSIOutput.moveTo(column: 0, row: 0)
+            + result.snapshot(includeTrailingSpaces: true)
+            + ANSIOutput.clearFromCursorDown
+            + ANSIOutput.endSynchronizedUpdate
+        try await terminal.write(frame)
+    }
+
+    private func finishInline() async throws {
+        guard inlineBegan, !inlineEnded else { return }
+        inlineEnded = true
+        if !output.hasSuffix("\n") {
+            try await terminal.write("\n")
+        }
+    }
+
+    private var finalTranscript: String {
+        conversation.transcript
+    }
+}
+
+struct SilentLivePagerOutput: OpenGrokPagerOutputAdapter, Sendable {
+    func forward(_ event: OpenGrokPagerEvent) async throws {}
+}
+
+actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
+    private let streams: CLIStreams
+    private let format: CLIOutputFormat
+    private var collectedOutput = ""
+    private var wrotePlainOutput = false
+
+    init(streams: CLIStreams, format: CLIOutputFormat) {
+        self.streams = streams
+        self.format = format
+    }
+
+    func forward(_ event: OpenGrokPagerMinimalEvent) async throws {
+        switch format {
+        case .plain:
+            forwardPlain(event)
+        case .json:
+            try forwardJSON(event)
+        case .streamingJSON:
+            try forwardStreamingJSON(event, messagesOnly: false)
+        case .streamingMessagesJSON:
+            try forwardStreamingJSON(event, messagesOnly: true)
+        }
+    }
+
+    private func forwardPlain(_ event: OpenGrokPagerMinimalEvent) {
+        switch event {
+        case .output(let text):
+            collectedOutput += text
+            wrotePlainOutput = true
+            streams.out(text)
+        case .completed:
+            if wrotePlainOutput, !collectedOutput.hasSuffix("\n") {
+                streams.out("\n")
+            }
+        case .status(let status):
+            streams.err("open-grok: \(status)\n")
+        case .permissionRequested(let request):
+            streams.err("open-grok: permission required: \(request.prompt)\n")
+        case .cancelled:
+            streams.err("open-grok: cancelled\n")
+        case .lifecycle, .tool:
+            break
+        }
+    }
+
+    private func forwardJSON(_ event: OpenGrokPagerMinimalEvent) throws {
+        switch event {
+        case .output(let text):
+            collectedOutput += text
+        case .completed(let completion):
+            streams.out(try Self.jsonLine([
+                "type": "completed",
+                "session_id": completion.sessionID as Any,
+                "output": collectedOutput,
+                "summary": completion.summary as Any
+            ]))
+        case .cancelled:
+            streams.out(try Self.jsonLine(["type": "cancelled"]))
+        case .lifecycle, .status, .tool, .permissionRequested:
+            break
+        }
+    }
+
+    private func forwardStreamingJSON(
+        _ event: OpenGrokPagerMinimalEvent,
+        messagesOnly: Bool
+    ) throws {
+        switch event {
+        case .output(let text):
+            collectedOutput += text
+            streams.out(try Self.jsonLine([
+                "type": messagesOnly ? "assistant" : "output",
+                "content": text
+            ]))
+        case .status(let status) where !messagesOnly:
+            streams.out(try Self.jsonLine(["type": "status", "status": status]))
+        case .tool(let tool):
+            streams.out(try Self.jsonLine([
+                "type": "tool",
+                "call_id": tool.callID,
+                "name": tool.name,
+                "input": tool.input,
+                "output": tool.output as Any,
+                "state": tool.state.rawValue
+            ]))
+        case .completed(let completion):
+            streams.out(try Self.jsonLine([
+                "type": "completed",
+                "session_id": completion.sessionID as Any,
+                "summary": completion.summary as Any
+            ]))
+        case .cancelled:
+            streams.out(try Self.jsonLine(["type": "cancelled"]))
+        case .permissionRequested(let request) where !messagesOnly:
+            streams.out(try Self.jsonLine([
+                "type": "permission_requested",
+                "id": request.id,
+                "prompt": request.prompt
+            ]))
+        case .lifecycle, .status, .permissionRequested:
+            break
+        }
+    }
+
+    private static func jsonLine(_ object: [String: Any]) throws -> String {
+        let normalized = object.compactMapValues { value -> Any? in
+            if value is NSNull { return value }
+            let mirror = Mirror(reflecting: value)
+            if mirror.displayStyle == .optional {
+                return mirror.children.first?.value ?? NSNull()
+            }
+            return value
+        }
+        let data = try JSONSerialization.data(
+            withJSONObject: normalized,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        return String(decoding: data, as: UTF8.self) + "\n"
+    }
+}
