@@ -125,6 +125,15 @@ public enum GrokEnvGates {
         envBool("GROK_SCHEDULER_BACKGROUND_LOOPS", environment: environment)
     }
 
+    /// Session search gate (`GROK_SESSION_SEARCH` / `OPENGROK_SESSION_SEARCH`).
+    /// Consumer: `SessionSearchGate`.
+    public static func sessionSearch(
+        environment: [String: String]
+    ) -> Bool? {
+        envBool("OPENGROK_SESSION_SEARCH", environment: environment)
+            ?? envBool("GROK_SESSION_SEARCH", environment: environment)
+    }
+
     // -- Privacy --
 
     /// Privacy notice rollout override.

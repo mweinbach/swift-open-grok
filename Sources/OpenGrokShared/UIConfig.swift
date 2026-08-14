@@ -77,6 +77,31 @@ public enum ToolModePreference: String, Sendable, Codable, Equatable, Defaultabl
     }
 }
 
+// MARK: - FollowUpBehavior
+
+/// How mid-turn follow-ups join the running session.
+/// Port of `crates/codegen/xai-grok-pager-render/src/appearance/follow_up_behavior.rs`.
+public enum FollowUpBehavior: String, Sendable, Codable, Equatable, Hashable, Defaultable {
+    case queue
+    case steer
+
+    public static let defaultValue = FollowUpBehavior.queue
+
+    public var canonical: String { rawValue }
+
+    public static func fromCanonical(_ value: String) -> FollowUpBehavior? {
+        switch value {
+        case "queue": return .queue
+        case "steer": return .steer
+        default: return nil
+        }
+    }
+
+    public var isSteer: Bool {
+        self == .steer
+    }
+}
+
 /// A type with a default value, used for serde `#[default]` compatibility.
 public protocol Defaultable {
     static var defaultValue: Self { get }
@@ -336,6 +361,9 @@ public struct UiConfig: Hashable, Sendable, Codable, Equatable {
     public var cursorBlink: Bool?
     public var screenMode: String?
     public var doubleClickAction: String?
+    public var combineQueuedPrompts: Bool?
+    public var followUpBehavior: String?
+    public var enterSteers: Bool?
     public var contextualHints: ContextualHints
     public var displayRefresh: DisplayRefreshSettings
 
@@ -378,11 +406,39 @@ public struct UiConfig: Hashable, Sendable, Codable, Equatable {
         self.cursorBlink = nil
         self.screenMode = nil
         self.doubleClickAction = nil
+        self.combineQueuedPrompts = nil
+        self.followUpBehavior = nil
+        self.enterSteers = nil
         self.contextualHints = ContextualHints()
         self.displayRefresh = DisplayRefreshSettings()
     }
 
     // MARK: Resolved defaults
+
+    /// Canonical default for `[ui].follow_up_behavior`.
+    public static let followUpBehaviorDefault = "queue"
+
+    /// Resolved follow-up behavior: `"queue"` or `"steer"`.
+    /// Unknown values fall back to queue.
+    public func followUpBehaviorString() -> String {
+        switch followUpBehavior {
+        case "steer": return "steer"
+        default: return Self.followUpBehaviorDefault
+        }
+    }
+
+    /// True when mid-turn follow-ups should promote as interjections (Steer).
+    public func followUpSteerEnabled() -> Bool {
+        followUpBehaviorString() == "steer"
+    }
+
+    /// Default for `enterSteers` when unset.
+    public static let enterSteersDefault = false
+
+    /// Resolved enter-steers setting.
+    public func enterSteersEnabled() -> Bool {
+        enterSteers ?? Self.enterSteersDefault
+    }
 
     /// The single source of truth for the timeline-sidebar default (opt-in).
     public static let showTimelineDefault = false
@@ -468,6 +524,9 @@ public struct UiConfig: Hashable, Sendable, Codable, Equatable {
         case cursorBlink = "cursor_blink"
         case screenMode = "screen_mode"
         case doubleClickAction = "double_click_action"
+        case combineQueuedPrompts = "combine_queued_prompts"
+        case followUpBehavior = "follow_up_behavior"
+        case enterSteers = "enter_steers"
         case contextualHints = "contextual_hints"
         case displayRefresh = "display_refresh"
     }
@@ -517,6 +576,9 @@ public struct UiConfig: Hashable, Sendable, Codable, Equatable {
         cursorBlink = try container.decodeIfPresent(Bool.self, forKey: .cursorBlink)
         screenMode = try container.decodeIfPresent(String.self, forKey: .screenMode)
         doubleClickAction = try container.decodeIfPresent(String.self, forKey: .doubleClickAction)
+        combineQueuedPrompts = try container.decodeIfPresent(Bool.self, forKey: .combineQueuedPrompts)
+        followUpBehavior = try container.decodeIfPresent(String.self, forKey: .followUpBehavior)
+        enterSteers = try container.decodeIfPresent(Bool.self, forKey: .enterSteers)
         contextualHints = try container.decodeIfPresent(ContextualHints.self, forKey: .contextualHints)
             ?? ContextualHints()
         displayRefresh = try container.decodeIfPresent(DisplayRefreshSettings.self, forKey: .displayRefresh)
@@ -563,6 +625,9 @@ public struct UiConfig: Hashable, Sendable, Codable, Equatable {
         try container.encodeIfPresent(cursorBlink, forKey: .cursorBlink)
         try container.encodeIfPresent(screenMode, forKey: .screenMode)
         try container.encodeIfPresent(doubleClickAction, forKey: .doubleClickAction)
+        try container.encodeIfPresent(combineQueuedPrompts, forKey: .combineQueuedPrompts)
+        try container.encodeIfPresent(followUpBehavior, forKey: .followUpBehavior)
+        try container.encodeIfPresent(enterSteers, forKey: .enterSteers)
         if !contextualHints.isDefault {
             try container.encode(contextualHints, forKey: .contextualHints)
         }

@@ -604,11 +604,20 @@ public enum LiveSessionsComposition {
                 "sessions search requires a query: open-grok sessions search <query>"
             )
         }
-        let hits = LiveSessionSearch.rank(
-            documents: try catalog.documents(),
-            query: query,
-            limit: options.limit
-        )
+        let isEnabled = SessionSearchGate.shared.isIndexEnabled()
+        let hits: [LiveSessionSearchHit]
+        if isEnabled {
+            hits = LiveSessionSearch.rank(
+                documents: try catalog.documents(),
+                query: query,
+                limit: options.limit
+            )
+        } else {
+            hits = []
+        }
+        if let by = SessionSearchGate.shared.sessionSearchTurnedOffBy() {
+            streams.err("warning: local session search is off (\(by)); local sessions were not searched.\n")
+        }
         if options.json {
             streams.out(try encodeJSON(hits.map(payload(for:))) + "\n")
             return

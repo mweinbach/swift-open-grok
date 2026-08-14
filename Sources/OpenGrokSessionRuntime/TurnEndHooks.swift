@@ -425,6 +425,22 @@ public final class TurnReportSlot: @unchecked Sendable {
         return .lostToAnotherReporter
     }
 
+    public func claimForGate() -> UInt64? {
+        lock.lock()
+        let ep = currentEpoch
+        lock.unlock()
+        return claimAt(epoch: ep, kind: .gate)
+    }
+
+    /// Only from `abortTurnTask`: frees the gate claim belonging to the task it killed.
+    public func releaseAborted(epoch: TurnEpoch) {
+        lock.lock()
+        defer { lock.unlock() }
+        if currentEpoch == epoch, case .held(_, let kind) = state, kind == .gate {
+            state = .free
+        }
+    }
+
     public func release(claim: UInt64) {
         lock.lock()
         defer { lock.unlock() }
@@ -444,6 +460,25 @@ public final class TurnReportSlot: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return state
+    }
+}
+
+/// Announces a turn's abort once. A high-water mark rather than a match, because a cancel that
+/// finishes after a newer turn started must not repeat its own nor consume the successor's.
+public final class AbortAnnouncement: @unchecked Sendable {
+    private let lock = NSLock()
+    private var announced: TurnEpoch?
+
+    public init() {}
+
+    public func tryMarkAnnounced(epoch: TurnEpoch) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let seen = announced, seen >= epoch {
+            return false
+        }
+        announced = epoch
+        return true
     }
 }
 

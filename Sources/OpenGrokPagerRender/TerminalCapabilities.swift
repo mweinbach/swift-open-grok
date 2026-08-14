@@ -6,13 +6,37 @@
 // Reference: crates/codegen/xai-grok-pager-render/src/terminal/
 
 import Foundation
-import OpenGrokDiagnostics
 @_exported import OpenGrokTerminalCore
 #if canImport(CoreGraphics) && canImport(ImageIO)
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
 #endif
+
+public typealias TerminalName = MouseScrollTerminalBrand
+
+public enum HostOs: String, Sendable, Equatable, Hashable {
+    case macos
+    case linux
+    case windows
+    case other
+
+    public static func current() -> HostOs {
+        #if os(macOS)
+        return .macos
+        #elseif os(Linux)
+        return .linux
+        #elseif os(Windows)
+        return .windows
+        #else
+        return .other
+        #endif
+    }
+}
+
+public func detectTerminalBrandFromEnv(_ env: [String: String]) -> TerminalName {
+    MouseScrollTerminalBrand.from(termProgram: env["TERM_PROGRAM"])
+}
 
 // MARK: - Select All Capability
 
