@@ -23,23 +23,62 @@ private var sockStreamType: Int32 {
 }
 
 /// Which account store a login/logout command targets.
-public enum AuthAccountTarget: String, Sendable, Equatable {
+public enum AuthAccountTarget: String, Sendable, Equatable, Hashable, CaseIterable {
     /// Bare `open-grok login` / `logout` — xAI only.
     case xai
     /// `open-grok login --codex` / `logout --codex`.
     case codex
-    /// `logout --all` — both stores, independently.
+    /// `open-grok login --kimi` / `logout --kimi`.
+    case kimi
+    /// `open-grok login --fireworks` / `logout --fireworks`.
+    case fireworks
+    /// `open-grok login --deepseek` / `logout --deepseek`.
+    case deepseek
+    /// `open-grok login --meta` / `logout --meta`.
+    case meta
+    /// `open-grok login --opencode-go` / `logout --opencode-go`.
+    case openCodeGo = "opencode_go"
+    /// `open-grok login --wafer` / `logout --wafer`.
+    case wafer
+    /// `open-grok login --zai` / `logout --zai`.
+    case zai
+    /// `logout --all` — both stores and all provider scopes independently.
     case all
+
+    public init?(rawValue: String) {
+        switch rawValue.lowercased() {
+        case "xai": self = .xai
+        case "codex": self = .codex
+        case "kimi": self = .kimi
+        case "fireworks": self = .fireworks
+        case "deepseek": self = .deepseek
+        case "meta": self = .meta
+        case "opencode_go", "opencode-go", "opencodego": self = .openCodeGo
+        case "wafer": self = .wafer
+        case "zai": self = .zai
+        case "all": self = .all
+        default: return nil
+        }
+    }
 }
 
 /// Outcome of a multi-target logout.
 public struct MultiLogoutResult: Sendable, Equatable {
     public var xai: LogoutResult?
     public var codexRemoved: Bool?
+    public var removedScopes: [String]
+    public var provider: String?
 
-    public init(xai: LogoutResult? = nil, codexRemoved: Bool? = nil) {
+    public init(
+        xai: LogoutResult? = nil,
+        codexRemoved: Bool? = nil,
+        removedScopes: [String] = [],
+        provider: String? = nil
+    ) {
         self.xai = xai
         self.codexRemoved = codexRemoved
+        self.removedScopes = removedScopes
+        self.provider = provider
     }
 }
 
@@ -478,18 +517,33 @@ internal final class CodexCallbackListener: @unchecked Sendable {
 /// Logout by target. Codex-only never requires xAI auth.
 public func logout(
     target: AuthAccountTarget,
-    manager: AuthManager?,
-    codexAuthFile: URL?,
+    manager: AuthManager? = nil,
+    codexAuthFile: URL? = nil,
     codexTransport: (any HTTPTransport)? = nil,
-    codexEndpoints: CodexEndpoints = .fromEnvironment()
+    codexEndpoints: CodexEndpoints = .fromEnvironment(),
+    grokHome: URL? = nil
 ) async throws -> MultiLogoutResult {
     var result = MultiLogoutResult()
+    result.provider = target.rawValue
+
+    let resolvedGrokHome: URL
+    if let grokHome {
+        resolvedGrokHome = grokHome
+    } else if let manager {
+        resolvedGrokHome = await manager.authFilePath.deletingLastPathComponent()
+    } else if let codexAuthFile {
+        resolvedGrokHome = codexAuthFile.deletingLastPathComponent()
+    } else {
+        resolvedGrokHome = OpenGrokStatePaths.stateDirectory(environment: ProcessInfo.processInfo.environment)
+    }
+
     switch target {
     case .xai:
         guard let manager else {
             throw AuthError.protocolError("xAI AuthManager required for xAI logout")
         }
         result.xai = try await manager.clear()
+
     case .codex:
         guard let codexAuthFile else {
             throw AuthError.protocolError("codex auth path required")
@@ -499,6 +553,38 @@ public func logout(
             endpoints: codexEndpoints,
             transport: codexTransport
         )
+
+    case .kimi:
+        let platformScope = kimiAPIKeyScope(.platform)
+        let codeScope = kimiCodeAPIKeyScope
+        try clearKimiAPIKey(grokHome: resolvedGrokHome, endpoint: .platform)
+        try clearKimiAPIKey(grokHome: resolvedGrokHome, endpoint: .code)
+        result.removedScopes = [platformScope, codeScope]
+
+    case .fireworks:
+        try clearFireworksAPIKey(grokHome: resolvedGrokHome)
+        result.removedScopes = [fireworksAPIKeyScope]
+
+    case .deepseek:
+        try clearDeepSeekAPIKey(grokHome: resolvedGrokHome)
+        result.removedScopes = [deepseekAPIKeyScope]
+
+    case .meta:
+        try clearMetaAPIKey(grokHome: resolvedGrokHome)
+        result.removedScopes = [metaAPIKeyScope]
+
+    case .openCodeGo:
+        try clearOpenCodeGoAPIKey(grokHome: resolvedGrokHome)
+        result.removedScopes = [openCodeGoAPIKeyScope]
+
+    case .wafer:
+        try clearWaferAPIKey(grokHome: resolvedGrokHome)
+        result.removedScopes = [waferAPIKeyScope]
+
+    case .zai:
+        try clearZaiAPIKey(grokHome: resolvedGrokHome)
+        result.removedScopes = [zaiAPIKeyScope]
+
     case .all:
         if let manager {
             result.xai = try await manager.clear()
@@ -509,6 +595,10 @@ public func logout(
                 endpoints: codexEndpoints,
                 transport: codexTransport
             )
+        }
+        for scope in allProviderAPIKeyScopes {
+            try clearScopedAPIKey(grokHome: resolvedGrokHome, scope: scope)
+            result.removedScopes.append(scope)
         }
     }
     return result

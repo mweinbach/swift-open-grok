@@ -158,3 +158,102 @@ public func clearZaiAPIKey(grokHome: URL) throws {
     try clearScopedAPIKey(grokHome: grokHome, scope: zaiAPIKeyScope)
 }
 
+// MARK: - Fireworks AI
+
+/// `fireworks::api_key` — Fireworks AI.
+public let fireworksAPIKeyScope = "fireworks::api_key"
+
+public func readFireworksAPIKey(grokHome: URL) -> String? {
+    readScopedAPIKey(grokHome: grokHome, scope: fireworksAPIKeyScope)
+}
+
+public func fireworksAPIKeyIsConfigured(grokHome: URL) -> Bool {
+    readFireworksAPIKey(grokHome: grokHome) != nil
+}
+
+public func storeFireworksAPIKey(grokHome: URL, apiKey: String) throws {
+    try storeScopedAPIKeyTrimming(grokHome: grokHome, scope: fireworksAPIKeyScope, apiKey: apiKey)
+}
+
+public func clearFireworksAPIKey(grokHome: URL) throws {
+    try clearScopedAPIKey(grokHome: grokHome, scope: fireworksAPIKeyScope)
+}
+
+// MARK: - DeepSeek Direct
+
+/// `deepseek::api_key` — DeepSeek direct.
+public let deepseekAPIKeyScope = "deepseek::api_key"
+
+public func readDeepSeekAPIKey(grokHome: URL) -> String? {
+    readScopedAPIKey(grokHome: grokHome, scope: deepseekAPIKeyScope)
+}
+
+public func deepseekAPIKeyIsConfigured(grokHome: URL) -> Bool {
+    readDeepSeekAPIKey(grokHome: grokHome) != nil
+}
+
+public func storeDeepSeekAPIKey(grokHome: URL, apiKey: String) throws {
+    try storeScopedAPIKeyTrimming(grokHome: grokHome, scope: deepseekAPIKeyScope, apiKey: apiKey)
+}
+
+public func clearDeepSeekAPIKey(grokHome: URL) throws {
+    try clearScopedAPIKey(grokHome: grokHome, scope: deepseekAPIKeyScope)
+}
+
+// MARK: - Meta
+
+/// `meta::api_key` — Meta.
+public let metaAPIKeyScope = "meta::api_key"
+
+public func readMetaAPIKey(grokHome: URL) -> String? {
+    readScopedAPIKey(grokHome: grokHome, scope: metaAPIKeyScope)
+}
+
+public func metaAPIKeyIsConfigured(grokHome: URL) -> Bool {
+    readMetaAPIKey(grokHome: grokHome) != nil
+}
+
+public func storeMetaAPIKey(grokHome: URL, apiKey: String) throws {
+    try storeScopedAPIKeyTrimming(grokHome: grokHome, scope: metaAPIKeyScope, apiKey: apiKey)
+}
+
+public func clearMetaAPIKey(grokHome: URL) throws {
+    try clearScopedAPIKey(grokHome: grokHome, scope: metaAPIKeyScope)
+}
+
+// MARK: - OpenCode Go
+
+/// `opencode_go::api_key` — OpenCode Go.
+public let openCodeGoAPIKeyScope = "opencode_go::api_key"
+
+public func readOpenCodeGoAPIKey(grokHome: URL) -> String? {
+    readScopedAPIKey(grokHome: grokHome, scope: openCodeGoAPIKeyScope)
+}
+
+public func openCodeGoAPIKeyIsConfigured(grokHome: URL) -> Bool {
+    readOpenCodeGoAPIKey(grokHome: grokHome) != nil
+}
+
+public func storeOpenCodeGoAPIKey(grokHome: URL, apiKey: String) throws {
+    try storeScopedAPIKeyTrimming(grokHome: grokHome, scope: openCodeGoAPIKeyScope, apiKey: apiKey)
+}
+
+public func clearOpenCodeGoAPIKey(grokHome: URL) throws {
+    try clearScopedAPIKey(grokHome: grokHome, scope: openCodeGoAPIKeyScope)
+}
+
+// MARK: - All Provider Scopes
+
+/// Exhaustive list of non-xAI provider API key scopes in `auth.json`.
+public let allProviderAPIKeyScopes: [String] = [
+    providerAPIKeyScope("kimi"),
+    kimiCodeAPIKeyScope,
+    fireworksAPIKeyScope,
+    deepseekAPIKeyScope,
+    metaAPIKeyScope,
+    openCodeGoAPIKeyScope,
+    waferAPIKeyScope,
+    zaiAPIKeyScope,
+    perplexityAPIKeyScope,
+]
+
