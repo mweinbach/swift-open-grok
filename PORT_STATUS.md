@@ -1,11 +1,28 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-14 (Wave 22 — Fuzzy File Search, @-Completion Dropdown & Wrap Clipboard Image). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0; authoritative full `test --no-parallel` exit 0 — exactly **6,870 Swift Testing cases in 1,058 suites passed** after 290.70s (0 failures, 0 regressions against baseline).
+**As of:** 2026-08-14 (Wave 23 — Custom Models Settings & Steady-State Cache Telemetry). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0; authoritative full `test --no-parallel` exit 0 — exactly **6,886 Swift Testing cases in 1,060 suites passed** after 286.67s (0 failures, 0 regressions against baseline).
 
-**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (Agent Runtime & Turn Pipeline, ACP Transports, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
+**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (Agent Runtime & Turn Pipeline, ACP Transports, Custom Models Settings UI & Store Persistence, Steady-State Cache Tracking & Cold-Start Diagnostics, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`) / Forward Sync `eb215dd0` (`v1.0.0-open-grok.63`).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
+
+## Wave 23 — Custom Models Settings & Steady-State Cache Telemetry (2026-08-14, complete)
+
+Current truth for the verified 2026-08-14 Wave 23 Multi-Agent Porting against Rust commits `d8b8db24` and `1ff5a4a9`:
+
+**Verification (lead, local macOS, 2026-08-14; serial gate):**
+- `zsh workflows/swift-safe-verify.zsh build` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build --product open-grok` — exit 0.
+- Authoritative full `zsh workflows/swift-safe-verify.zsh test --no-parallel` — exit 0: exactly **6,886** Swift Testing cases in **1,060** suites, elapsed **286.67s** (100% green).
+- CLI Smokes: `open-grok --version` reports `Open Grok 1.0.0-open-grok.63` (exit 0); `paths --json` and `models --json` exit 0.
+
+### Slices Completed & Landed
+
+1. **Slice 1: Steady-State Cache Hit Rate & Cold-Start Labeling (`OpenGrokSessionRuntime`, `OpenGrokACPRuntime`)** — Added `steadyInputTokens` and `steadyCachedTokens` to `SessionCacheSnapshot` and `PromptCacheSummary`. Excluded cold turn #1 from steady totals to avoid permanent percentage dilution. Added intact prefix dip diagnostics when `< 90%` hit rate is due to appended tokens. Updated `x.ai/session_cache` RPC schema (`45774ed`).
+2. **Slice 2: Custom Models Settings Catalog & Validation (`OpenGrokPagerRender`)** — Added `custom_models` group and 10 child setting entries (`custom_models.list`, `custom_model_id`, `custom_model_slug`, `custom_model_name`, `custom_model_provider`, `custom_model_base_url`, `custom_model_context_window`, `custom_model_backend`, `custom_model_env_key`, `custom_model_save`). Added `customModelKeyIsValid` and `customModelSlugIsValid` validators (`1b8c5f5`).
+3. **Slice 3: Settings Persistence Store & Cold-Start Telemetry Formatting (`OpenGrokCLI`, `OpenGrokPagerRender`)** — Implemented draft custom model persistence via `CustomModelStore` and `PagerSettingsStore`. Wired `applySettingsEvent` for save, draft update, and deletion on multi-select uncheck. Updated `/usage` and `/cache` modal readout to render `Turn #1 — cold start` without 0.0% dilution (`7b6813f`, `7cf66eb`).
 
 ## Wave 22 — Fuzzy File Search, @-Completion Dropdown & Wrap Clipboard Image (2026-08-14, complete)
 
