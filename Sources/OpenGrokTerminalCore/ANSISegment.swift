@@ -278,3 +278,17 @@ public func splitIntoLineSegments(_ input: String, termWidth: Int) -> [LineSegme
 
     return segments
 }
+
+// MARK: - ANSI Stripping
+
+private let ansiPatternRegex: NSRegularExpression? = {
+    let pattern = #"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\].*?(?:\x07|\x1B\\))"#
+    return try? NSRegularExpression(pattern: pattern)
+}()
+
+/// Strips ANSI escape codes from a string using a precompiled regex.
+public func stripAnsiSequences(_ text: String) -> String {
+    guard let regex = ansiPatternRegex else { return text }
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    return regex.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: "")
+}

@@ -11,7 +11,6 @@
 
 import Foundation
 import Dispatch
-import OpenGrokCircuitBreaker
 import OpenGrokExtraCA
 import OpenGrokShared
 import OpenGrokTracing
@@ -23,45 +22,6 @@ import FoundationNetworking
 #if canImport(Security)
 import Security
 #endif
-
-
-/// Portable lock over mutable state. Sync `withLock` is safe to call from async.
-final class LockHolder<State>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var state: State
-    init(_ state: State) { self.state = state }
-    @discardableResult
-    func withLock<R>(_ body: (inout State) throws -> R) rethrows -> R {
-        lock.lock()
-        defer { lock.unlock() }
-        return try body(&state)
-    }
-}
-
-/// Portable monotonic timestamp (nanoseconds since boot).
-public struct MonotonicInstant: Sendable, Hashable, Comparable {
-    public var nanoseconds: UInt64
-    public init(nanoseconds: UInt64) { self.nanoseconds = nanoseconds }
-    public static func now() -> MonotonicInstant {
-        MonotonicInstant(nanoseconds: DispatchTime.now().uptimeNanoseconds)
-    }
-    public static func < (lhs: MonotonicInstant, rhs: MonotonicInstant) -> Bool {
-        lhs.nanoseconds < rhs.nanoseconds
-    }
-    public func advanced(bySeconds seconds: TimeInterval) -> MonotonicInstant {
-        if seconds >= 0 {
-            return MonotonicInstant(nanoseconds: nanoseconds &+ UInt64(seconds * 1_000_000_000))
-        } else {
-            return MonotonicInstant(nanoseconds: nanoseconds &- UInt64((-seconds) * 1_000_000_000))
-        }
-    }
-    public func seconds(until other: MonotonicInstant) -> TimeInterval {
-        if other.nanoseconds >= nanoseconds {
-            return TimeInterval(other.nanoseconds - nanoseconds) / 1_000_000_000
-        }
-        return -TimeInterval(nanoseconds - other.nanoseconds) / 1_000_000_000
-    }
-}
 
 
 // MARK: - Platform / user-agent
@@ -236,6 +196,63 @@ public struct HTTPResponseMetadata: Sendable, Equatable {
     public var isEventStream: Bool {
         contentType?.lowercased().contains("text/event-stream") == true
     }
+}
+
+// MARK: - Retry-After & HTTP-Date Parsing
+
+/// Parse a `Retry-After` header value (delta-seconds or HTTP-date).
+///
+/// Returns delta-seconds clamped to `>= 0`. If `value` is `nil`, malformed, or
+/// in the past, returns `nil` (meaning fall back to the client's configured backoff).
+public func parseRetryAfterHeader(
+    _ value: String?,
+    now: Date = Date()
+) -> TimeInterval? {
+    guard let value else { return nil }
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+
+    // Delta-seconds (and fractional seconds used by some proxies).
+    // Numeric forms never contain letters; HTTP-dates always do.
+    let isDeltaSeconds = trimmed.unicodeScalars.allSatisfy {
+        CharacterSet.decimalDigits.union(CharacterSet(charactersIn: ".")).contains($0)
+    } && trimmed.contains(where: \.isNumber)
+    if isDeltaSeconds, let seconds = Double(trimmed), seconds >= 0 {
+        return seconds
+    }
+
+    // IMF-fixdate / RFC 850 / asctime HTTP-date forms.
+    if let date = parseHTTPDate(trimmed) {
+        return max(0, date.timeIntervalSince(now))
+    }
+    return nil
+}
+
+/// Parse HTTP-date forms used by `Retry-After` / `Date` headers.
+///
+/// Preference order matches RFC 9110: IMF-fixdate, then RFC 850, then asctime.
+public func parseHTTPDate(_ value: String) -> Date? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+
+    let formats = [
+        "EEE, dd MMM yyyy HH:mm:ss zzz", // IMF-fixdate
+        "EEEE, dd-MMM-yy HH:mm:ss zzz",  // RFC 850
+        "EEE MMM d HH:mm:ss yyyy",       // asctime()
+    ]
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    for format in formats {
+        formatter.dateFormat = format
+        if let date = formatter.date(from: trimmed) {
+            return date
+        }
+    }
+    // Some servers emit "GMT" with a fixed format; try ISO8601 as a last resort.
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime]
+    return iso.date(from: trimmed)
 }
 
 public struct HTTPResponse: Sendable, Equatable {
@@ -1731,6 +1748,143 @@ public final class URLSessionWebSocketClient: WebSocketClient, @unchecked Sendab
     public func close(code: Int, reason: String) async {
         let closeCode = URLSessionWebSocketTask.CloseCode(rawValue: code) ?? .normalClosure
         task.cancel(with: closeCode, reason: reason.data(using: .utf8))
+    }
+}
+
+// MARK: - Retry Policy & Backoff
+
+/// What a caller should do with a non-2xx HTTP response, by status code.
+public enum RetryDisposition: Sendable, Equatable, Hashable {
+    /// Transient: retry with backoff (5xx, 429, etc.).
+    case retryable
+    /// Refresh credentials once, then give up (e.g. 401).
+    case authRefresh
+    /// Permanent: drop immediately, never retry (e.g. 400/403/404).
+    case terminal
+}
+
+/// Maps an HTTP status code to a ``RetryDisposition``.
+public struct RetryPolicy: Sendable, Equatable {
+    public var retryable: Set<UInt16>
+    public var authRefresh: Set<UInt16>
+    public var terminal: Set<UInt16>
+    public var defaultDisposition: RetryDisposition
+
+    public init(
+        retryable: Set<UInt16> = [],
+        authRefresh: Set<UInt16> = [],
+        terminal: Set<UInt16> = [],
+        defaultDisposition: RetryDisposition
+    ) {
+        self.retryable = retryable
+        self.authRefresh = authRefresh
+        self.terminal = terminal
+        self.defaultDisposition = defaultDisposition
+    }
+
+    /// Classify `status`. Returns `nil` for 2xx (success, not an error).
+    public func classify(_ status: UInt16) -> RetryDisposition? {
+        if (200..<300).contains(status) {
+            return nil
+        }
+        if authRefresh.contains(status) {
+            return .authRefresh
+        }
+        if terminal.contains(status) {
+            return .terminal
+        }
+        if retryable.contains(status) || (500..<600).contains(status) {
+            return .retryable
+        }
+        return defaultDisposition
+    }
+
+    /// `true` iff `status` classifies as ``RetryDisposition/retryable``.
+    public func shouldRetry(_ status: UInt16) -> Bool {
+        classify(status) == .retryable
+    }
+
+    /// Server preset: 429 and any 5xx are retryable; everything else terminal.
+    public static func server() -> RetryPolicy {
+        RetryPolicy(
+            retryable: [429],
+            authRefresh: [],
+            terminal: [],
+            defaultDisposition: .terminal
+        )
+    }
+
+    /// Client storage/upload preset: 400/403/404 terminal, 401 auth-refresh,
+    /// everything else (429, 5xx, unlisted 4xx) retried.
+    public static func clientStorage() -> RetryPolicy {
+        RetryPolicy(
+            retryable: [],
+            authRefresh: [401],
+            terminal: [400, 403, 404],
+            defaultDisposition: .retryable
+        )
+    }
+}
+
+/// Computes exponential backoff with full jitter matching the Rust reference.
+public func retryBackoffWithJitter(
+    retryCount: UInt32,
+    seed: UInt64? = nil
+) -> TimeInterval {
+    let shift = retryCount > 0 ? retryCount - 1 : 0
+    let baseMs: UInt64
+    if shift >= 63 {
+        baseMs = 30_000
+    } else {
+        baseMs = min(2000 &<< shift, 30_000)
+    }
+    let jitterRange = baseMs / 5
+    let sequence: UInt64
+    if let seed {
+        sequence = seed &+ UInt64(retryCount)
+    } else {
+        sequence = UInt64.random(in: 0...UInt64.max)
+    }
+    let jitter = sequence % (jitterRange * 2 + 1)
+    let ms = baseMs - jitterRange + jitter
+    return TimeInterval(ms) / 1000.0
+}
+
+// MARK: - Wall clock (for HTTP-date Retry-After)
+
+/// Wall-clock source for calendar-date `Retry-After` parsing.
+public protocol WallClock: Sendable {
+    func now() -> Date
+}
+
+/// Production wall clock backed by `Date()`.
+public struct SystemWallClock: WallClock, Sendable {
+    public init() {}
+    public func now() -> Date { Date() }
+}
+
+/// Controllable wall clock for deterministic tests.
+public final class MockWallClock: WallClock, @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Date
+
+    public init(now: Date = Date(timeIntervalSince1970: 1_700_000_000)) {
+        self.current = now
+    }
+
+    public func now() -> Date {
+        lock.lock(); defer { lock.unlock() }
+        return current
+    }
+
+    public func set(_ date: Date) {
+        lock.lock(); defer { lock.unlock() }
+        current = date
+    }
+
+    public func advance(_ duration: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        current = current.addingTimeInterval(duration)
     }
 }
 

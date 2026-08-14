@@ -6,6 +6,7 @@
 
 import Foundation
 import OpenGrokShared
+import OpenGrokTerminalCore
 import OpenGrokToolProtocol
 import OpenGrokToolRuntime
 import OpenGrokToolTypes
@@ -221,12 +222,7 @@ public struct MonitorOutput: Codable, Sendable, Hashable, ToolOutput {
 
 /// Strips ANSI escape codes from string.
 public func stripAnsiSequences(_ text: String) -> String {
-    let pattern = #"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\].*?(?:\x07|\x1B\\))"#
-    guard let regex = try? NSRegularExpression(pattern: pattern) else {
-        return text
-    }
-    let range = NSRange(text.startIndex..<text.endIndex, in: text)
-    return regex.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: "")
+    OpenGrokTerminalCore.stripAnsiSequences(text)
 }
 
 /// Sanitize a model-supplied monitor description for embedding in the

@@ -21,41 +21,16 @@ import OpenGrokShared
 /// opt into a more restrictive mode (`.worktree`); relying on the default
 /// for a subagent gives it shared-tree access, which is rarely the right
 /// default for an exploratory child agent.
-public enum IsolationMode: Hashable, Sendable, Codable, Equatable {
+public enum IsolationMode: String, Hashable, Sendable, Codable, Equatable, CaseIterable {
     case none
     case worktree
     case sandbox
 
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        let raw = try c.decode(String.self)
-        switch raw {
-        case "none": self = .none
-        case "worktree": self = .worktree
-        case "sandbox": self = .sandbox
-        default:
-            throw DecodingError.dataCorruptedError(in: c, debugDescription: "unknown IsolationMode: \(raw)")
-        }
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        switch self {
-        case .none: try c.encode("none")
-        case .worktree: try c.encode("worktree")
-        case .sandbox: try c.encode("sandbox")
-        }
-    }
+    public static let validValues = allCases.map(\.rawValue)
 }
 
 extension IsolationMode: CustomStringConvertible {
-    public var description: String {
-        switch self {
-        case .none: return "none"
-        case .worktree: return "worktree"
-        case .sandbox: return "sandbox"
-        }
-    }
+    public var description: String { rawValue }
 }
 
 /// Capability mode applied to a forked session.
