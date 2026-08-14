@@ -23,10 +23,12 @@
 // cannot produce differently shaped histories.
 
 import Foundation
+import OpenGrokChatState
 import OpenGrokCompaction
 import OpenGrokHTTP
 import OpenGrokModels
 import OpenGrokSamplingTypes
+import OpenGrokTokenEstimation
 
 /// Adapts the live sampler to the compaction module's sampler protocol.
 ///
@@ -201,6 +203,7 @@ actor LiveCompactionCoordinator {
     /// protocol, which upstream documents as the compatibility option.
     private let codexRemoteV2Enabled: Bool
 
+    private let prefire = PrefireState()
     private var compactionCount: UInt64 = 0
     private var step: UInt32 = 0
     private var lastReport: CompactionReport?
@@ -247,6 +250,81 @@ actor LiveCompactionCoordinator {
         step = 0
         lastReport = nil
         autoCompactSuppressed = false
+        prefire.clear()
+    }
+
+    /// Accessor for prefire state (testing and inspection).
+    var prefireState: PrefireState { prefire }
+
+    /// Speculatively prefire Pass 1 in background if token usage is within lead percentage.
+    func maybePrefire(items: [ConversationItem]) async {
+        guard !autoCompactSuppressed else { return }
+        guard !prefire.hasCache && !prefire.isInFlight else { return }
+        guard items.count >= 4 else { return }
+        let snapshot = await modelSwitch.snapshot()
+        guard snapshot.provider != .codex else { return }
+
+        let contract = LiveCompactionContract.resolve(
+            model: snapshot.modelID,
+            provider: snapshot.provider,
+            openGrokHome: openGrokHome,
+            hasCompactionSummary: compactionCount > 0
+        )
+        let totalTokens = items.map(estimateItemTokens).reduce(0, &+)
+        guard shouldPrefireTwoPass(
+            estimatedTotalTokens: totalTokens,
+            contextWindow: contract.budget.contextWindow,
+            thresholdPercent: contract.thresholdPercent,
+            leadPercent: 10,
+            provider: snapshot.provider
+        ) else { return }
+
+        guard prefire.tryBegin() else { return }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.runPrefirePass1(items: items, snapshot: snapshot)
+        }
+        prefire.setHandle(task)
+    }
+
+    func runPrefirePass1(
+        items: [ConversationItem],
+        snapshot: LiveModelSwitchCoordinator.Snapshot
+    ) async {
+        defer { prefire.finish() }
+        guard items.count >= 4 else { return }
+        let split = splitConversationForTwoPass(items, splitFraction: TWO_PASS_DEFAULT_SPLIT_FRACTION)
+        guard !split.prefix.isEmpty && !split.tail.isEmpty else { return }
+
+        let prompt = buildTwoPassCompactionPrompt(userContext: nil)
+        let pass1History = buildTwoPassPass1History(prefix: split.prefix, compactionPrompt: prompt)
+        let sampler = LiveCompactionSampler(
+            sampler: snapshot.sampler,
+            model: snapshot.modelID,
+            sessionID: sessionID
+        )
+        let startTime = Date()
+        do {
+            let output = try await sampler.sampleCompaction(
+                turns: pass1History,
+                prompt: CompactionPrompt(system: "", user: prompt),
+                timeoutSeconds: 60
+            )
+            let note1 = noteForTwoPassPass2(output.response)
+            guard !note1.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            let latencyMs = UInt64(Date().timeIntervalSince(startTime) * 1000)
+            let cache = AsyncCompactionCache(
+                note1: note1,
+                prefixLen: split.splitIndex,
+                fingerprint: fingerprintPrefix(split.prefix),
+                modelSlug: snapshot.modelID,
+                pass1LatencyMs: latencyMs,
+                timestamp: Date()
+            )
+            prefire.store(cache)
+        } catch {
+            // Speculative background task failed — no-op
+        }
     }
 
     /// The data a `/usage` or `/context` readout renders.
@@ -287,9 +365,70 @@ actor LiveCompactionCoordinator {
         let snapshot = await modelSwitch.snapshot()
         let engine = makeEngine(snapshot: snapshot, items: items)
         guard engine.trigger(items: items, step: step) != nil else {
+            await maybePrefire(items: items)
             return .notNeeded(engine.usage(items: items, compactionCount: compactionCount))
         }
         await willCompact?()
+
+        // 1. Try Two-Pass Prefire Pass 2 Apply
+        if prefire.hasCache || prefire.isInFlight {
+            let sampler = LiveCompactionSampler(
+                sampler: snapshot.sampler,
+                model: snapshot.modelID,
+                sessionID: sessionID
+            )
+            if let summaryText = await tryTwoPassPass2Apply(
+                prefire: prefire,
+                conversation: items,
+                modelSlug: snapshot.modelID,
+                sampler: sampler,
+                userContext: nil
+            ) {
+                let tokensBefore = items.map(estimateItemTokens).reduce(0, &+)
+                let split = splitConversationForTwoPass(items, splitFraction: TWO_PASS_DEFAULT_SPLIT_FRACTION)
+                let older = split.prefix
+                let retained = split.tail
+                let preamble = buildUserQueriesPreamble(
+                    turns: older,
+                    currentUserQueries: extractUserQueriesFromTurns(older)
+                )
+                let replacement = assembleCompactedHistory(CompactedHistoryParts(
+                    systemMessage: systemMessage(in: items),
+                    userMessagePrefix: preamble,
+                    lastUserQuery: extractLastRealUserQuery(older),
+                    recentMessages: retained,
+                    compactionSummary: summaryText
+                ))
+                let sanitized = sanitizeCompactedHistory(replacement).items
+                let tokensAfter = sanitized.map(estimateItemTokens).reduce(0, &+)
+                let report = CompactionReport(
+                    kind: .local,
+                    itemsBefore: items.count,
+                    itemsAfter: sanitized.count,
+                    tokensBefore: tokensBefore,
+                    tokensAfter: tokensAfter,
+                    attempts: 1,
+                    summaryCharacters: UInt64(summaryText.count),
+                    degraded: false,
+                    detail: nil
+                )
+
+                guard commitCompactionReplacement(
+                    snapshot: items,
+                    current: items,
+                    replacement: sanitized
+                ) == .applied else {
+                    autoCompactSuppressed = true
+                    return .unableToCompact(reason: "history changed during compaction")
+                }
+                compactionCount &+= 1
+                lastReport = report
+                recordCompactionCheckpoint(preCompactionItems: items, replacement: sanitized)
+                return .compacted(items: sanitized, report: report)
+            }
+        }
+
+        // 2. Fallback to standard single-pass compaction
         switch await engine.compact(items: items, compactionCount: compactionCount) {
         case .notNeeded(let usage):
             return .notNeeded(usage)
@@ -328,6 +467,71 @@ actor LiveCompactionCoordinator {
             return .unableToCompact(reason: "there is nothing to compact yet")
         }
         let snapshot = await modelSwitch.snapshot()
+
+        // 1. Try Two-Pass Prefire Pass 2 Apply if available
+        if prefire.hasCache || prefire.isInFlight {
+            let sampler = LiveCompactionSampler(
+                sampler: snapshot.sampler,
+                model: snapshot.modelID,
+                sessionID: sessionID
+            )
+            if let summaryText = await tryTwoPassPass2Apply(
+                prefire: prefire,
+                conversation: items,
+                modelSlug: snapshot.modelID,
+                sampler: sampler,
+                userContext: userContext
+            ) {
+                let tokensBefore = items.map(estimateItemTokens).reduce(0, &+)
+                let split = splitConversationForTwoPass(items, splitFraction: TWO_PASS_DEFAULT_SPLIT_FRACTION)
+                let older = split.prefix
+                let retained = split.tail
+                let preamble = buildUserQueriesPreamble(
+                    turns: older,
+                    currentUserQueries: extractUserQueriesFromTurns(older)
+                )
+                let replacement = assembleCompactedHistory(CompactedHistoryParts(
+                    systemMessage: systemMessage(in: items),
+                    userMessagePrefix: preamble,
+                    lastUserQuery: extractLastRealUserQuery(older),
+                    recentMessages: retained,
+                    compactionSummary: summaryText
+                ))
+                let sanitized = sanitizeCompactedHistory(replacement).items
+                let tokensAfter = sanitized.map(estimateItemTokens).reduce(0, &+)
+                let report = CompactionReport(
+                    kind: .local,
+                    itemsBefore: items.count,
+                    itemsAfter: sanitized.count,
+                    tokensBefore: tokensBefore,
+                    tokensAfter: tokensAfter,
+                    attempts: 1,
+                    summaryCharacters: UInt64(summaryText.count),
+                    degraded: false,
+                    detail: nil
+                )
+
+                let current = await history.items
+                guard commitCompactionReplacement(
+                    snapshot: items,
+                    current: current,
+                    replacement: sanitized
+                ) == .applied else {
+                    return .unableToCompact(reason: "the conversation changed during compaction")
+                }
+                do {
+                    try await history.commit(sessionID: sessionID, items: sanitized)
+                } catch {
+                    return .unableToCompact(reason: String(describing: error))
+                }
+                compactionCount &+= 1
+                lastReport = report
+                recordCompactionCheckpoint(preCompactionItems: items, replacement: sanitized)
+                return .compacted(items: sanitized, report: report)
+            }
+        }
+
+        // 2. Fallback to standard single-pass compaction
         let engine = makeEngine(snapshot: snapshot, items: items)
         switch await engine.compact(
             items: items,
@@ -357,6 +561,10 @@ actor LiveCompactionCoordinator {
             recordCompactionCheckpoint(preCompactionItems: items, replacement: replacement)
             return .compacted(items: replacement, report: report)
         }
+    }
+
+    private func systemMessage(in items: [ConversationItem]) -> ConversationItem {
+        items.first(where: { if case .system = $0 { return true } else { return false } }) ?? .system("You are Open Grok.")
     }
 
     private func recordCompactionCheckpoint(
