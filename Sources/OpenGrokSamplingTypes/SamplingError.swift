@@ -187,7 +187,7 @@ public enum SamplingError: Error, Sendable, Equatable {
 
     public var isAuthError: Bool {
         switch self {
-        case .auth(_, _): return true
+        case .auth: return true
         case .api(let status, _, _, _, _, _): return status.isUnauthorized
         default: return false
         }
@@ -234,7 +234,7 @@ public enum SamplingError: Error, Sendable, Equatable {
 
     public var isRetryable: Bool {
         switch self {
-        case .auth(_, _): return false
+        case .auth: return false
         case .invalidConfiguration: return false
         case .http: return true  // mirrors is_retryable_reqwest for request/body errors
         case .serialization: return false
