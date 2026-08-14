@@ -1,11 +1,29 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-14 (Wave 21 — v1.0.0-open-grok.63 Multi-Agent Convergence). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0; authoritative full `test --no-parallel` exit 0 — exactly **6,811 Swift Testing cases in 1,052 suites passed** after 300.38s (0 failures, 0 regressions against baseline).
+**As of:** 2026-08-14 (Wave 22 — Fuzzy File Search, @-Completion Dropdown & Wrap Clipboard Image). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0; authoritative full `test --no-parallel` exit 0 — exactly **6,870 Swift Testing cases in 1,058 suites passed** after 290.70s (0 failures, 0 regressions against baseline).
 
-**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (Agent Runtime & Turn Pipeline, ACP Transports, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
+**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (Agent Runtime & Turn Pipeline, ACP Transports, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`) / Forward Sync `eb215dd0` (`v1.0.0-open-grok.63`).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
+
+## Wave 22 — Fuzzy File Search, @-Completion Dropdown & Wrap Clipboard Image (2026-08-14, complete)
+
+Current truth for the verified 2026-08-14 Wave 22 Multi-Agent Porting against Rust crates `xai-fuzzy-file-search`, `views/file_search/`, and `wrap_clipboard_image.rs`:
+
+**Verification (lead, local macOS, 2026-08-14; serial gate):**
+- `zsh workflows/swift-safe-verify.zsh build` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build --product open-grok` — exit 0.
+- Authoritative full `zsh workflows/swift-safe-verify.zsh test --no-parallel` — exit 0: exactly **6,870** Swift Testing cases in **1,058** suites, elapsed **290.70s** (100% green).
+- CLI Smokes: `open-grok --version` reports `Open Grok 1.0.0-open-grok.63` (exit 0); `paths --json` and `models --json` exit 0.
+
+### Slices Completed & Landed
+
+1. **Slice 1: Fuzzy Path Matching & Background Directory Indexer (`OpenGrokWorkspace`)** — Implemented `FuzzyMatcher.swift` and `FuzzyFileMatcher.swift` with bonus scoring (prefix, consecutive, word boundaries after `/`, `_`, `-`, `.`, camelCase transitions, exact basename matches), dynamic programming matrix with safe backtrack, `.gitignore` rules engine, and `FuzzyFileMatcherDaemon` background actor (`FuzzyMatcherTests.swift`).
+2. **Slice 2: @-Completion Context & State Machine (`OpenGrokPager`)** — Implemented `FileSearchContext.swift` and `FileSearchState.swift` with `AtContext` parsing (`detect_with_drill`, `@` token extraction, directory/hidden mode flags, email false-positive guard), dropdown navigation (`selectNext`, `selectPrevious`, `pageMove`), stale generation fences (`minGeneration`), and prompt text replacements (`FileSearchTests.swift`).
+3. **Slice 3: File Search Dropdown Renderer (`OpenGrokPagerRender`)** — Implemented `FileSearchDropdown.swift` rendering matched items into `CellBuffer` with `PagerGlyphs.promptArrow`, selection and hover backgrounds, highlighted matching characters, path truncation with ellipsis (`…`), directory suffix `/`, and scrollbars.
+4. **Slice 4: Wrap Clipboard Image Paste Framing (`OpenGrokTerminalCore`)** — Implemented `WrapClipboardImage.swift` with `MAGIC_IMG` (`GROK_WRAP_IMG`), `MAGIC_NONE` (`GROK_WRAP_NONE`), `MAX_WRAP_IMAGE_BYTES` (20 MiB), `requestOscBytes()` (`ESC ] 999;GrokWrapClipboardImage? BEL`), and robust line-based decoding (`WrapClipboardImageTests.swift`).
 
 ## Wave 21 — v1.0.0-open-grok.63 Convergence (2026-08-14, complete)
 
