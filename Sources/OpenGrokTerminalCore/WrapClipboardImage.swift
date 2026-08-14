@@ -37,29 +37,22 @@ public enum WrapImagePaste: Sendable, Equatable {
 /// Returns `nil` if the payload does not start with wrap magic (caller treats as normal text).
 /// Malformed wrap frames yield `.noImage` so they never land as text.
 public func decodeWrapImagePaste(payload: String) -> WrapImagePaste? {
-    if payload == MAGIC_NONE {
+    let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed == MAGIC_NONE {
         return .noImage
     }
     guard payload.hasPrefix(MAGIC_IMG) else {
         return nil
     }
-    let rest = payload.dropFirst(MAGIC_IMG.count)
-    guard rest.hasPrefix("\n") || rest.hasPrefix("\r\n") else {
+
+    // Split into lines preserving base64 body
+    let lines = payload.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    guard lines.count >= 3, lines[0] == MAGIC_IMG else {
         return .noImage
-    }
-    let afterMagic: Substring
-    if rest.hasPrefix("\r\n") {
-        afterMagic = rest.dropFirst(2)
-    } else {
-        afterMagic = rest.dropFirst(1)
     }
 
-    guard let newlineRange = afterMagic.rangeOfCharacter(from: .newlines) else {
-        return .noImage
-    }
-    let mime = String(afterMagic[..<newlineRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-    let b64Substring = afterMagic[newlineRange.upperBound...]
-    let b64 = b64Substring.trimmingCharacters(in: .whitespacesAndNewlines)
+    let mime = lines[1]
+    let b64 = lines[2...].joined()
 
     if mime.isEmpty || b64.isEmpty {
         return .noImage

@@ -245,8 +245,9 @@ public actor FuzzyFileMatcherDaemon {
     public let root: URL
     public let maxTopK: Int
     public private(set) var generation: Int
-    private var indexedEntries: [IndexedEntry]
-    private var isIndexed: Bool
+    public private(set) var indexedEntries: [IndexedEntry]
+    public private(set) var isIndexed: Bool
+    public private(set) var indexedHidden: Bool
     private var matcher: FuzzyMatcher
 
     public init(
@@ -259,6 +260,7 @@ public actor FuzzyFileMatcherDaemon {
         self.generation = 0
         self.indexedEntries = []
         self.isIndexed = false
+        self.indexedHidden = false
         self.matcher = FuzzyMatcher(caseSensitive: caseSensitive)
     }
 
@@ -266,6 +268,7 @@ public actor FuzzyFileMatcherDaemon {
     public func setEntries(_ entries: [IndexedEntry]) {
         self.indexedEntries = entries
         self.isIndexed = true
+        self.indexedHidden = true
         self.generation += 1
     }
 
@@ -279,6 +282,7 @@ public actor FuzzyFileMatcherDaemon {
             hidden: hidden,
             respectGitignore: respectGitignore
         )
+        self.indexedHidden = hidden
         self.isIndexed = true
         self.generation += 1
     }
@@ -289,7 +293,7 @@ public actor FuzzyFileMatcherDaemon {
         isDir: Bool = false,
         hidden: Bool = false
     ) async -> FuzzyMatcherDaemonResults {
-        if !isIndexed {
+        if !isIndexed || (hidden && !indexedHidden) {
             restartWalk(hidden: hidden, respectGitignore: true)
         }
 

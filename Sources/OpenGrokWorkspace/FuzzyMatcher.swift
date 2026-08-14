@@ -89,14 +89,14 @@ public struct FuzzyMatcher: Sendable {
     // MARK: - Scoring weights and bonuses
 
     public static let baseScoreMatch: Int = 16
-    public static let penaltyGapStart: Int = 3
-    public static let penaltyGapExtension: Int = 1
+    public static let penaltyGapStart: Int = 5
+    public static let penaltyGapExtension: Int = 2
     public static let bonusPrefix: Int = 32
     public static let bonusBasenamePrefix: Int = 24
     public static let bonusBoundarySlash: Int = 20
-    public static let bonusBoundaryDelimiter: Int = 14
+    public static let bonusBoundaryDelimiter: Int = 12
     public static let bonusCamelCase: Int = 12
-    public static let bonusConsecutive: Int = 10
+    public static let bonusConsecutive: Int = 16
     public static let bonusExactBasename: Int = 100
     public static let bonusExactBasenameNoExt: Int = 80
 
@@ -272,7 +272,7 @@ public struct FuzzyMatcher: Sendable {
             var bestGapScore = Int.min / 2
             var bestGapIndex = -1
 
-            for i in 0..<n {
+            for i in j..<n {
                 if i >= 2 {
                     let k = i - 2
                     if let prevScore = dp[j - 1][k] {
@@ -293,7 +293,7 @@ public struct FuzzyMatcher: Sendable {
                     let posBonus = positionBonus(at: i, candidate: cChars, basenameStartIndex: basenameStartIndex)
 
                     // Option 1: Consecutive match (from i - 1)
-                    if let prevScore = dp[j - 1][i - 1] {
+                    if i > 0, let prevScore = dp[j - 1][i - 1] {
                         let consecScore = prevScore + Self.bonusConsecutive + Self.baseScoreMatch + posBonus
                         if consecScore > bestScore {
                             bestScore = consecScore
@@ -302,7 +302,7 @@ public struct FuzzyMatcher: Sendable {
                     }
 
                     // Option 2: Gap match (from bestGapIndex)
-                    if bestGapScore > Int.min / 2 {
+                    if bestGapIndex >= 0 && bestGapScore > Int.min / 2 {
                         let gapScore = bestGapScore + Self.baseScoreMatch + posBonus
                         if gapScore > bestScore {
                             bestScore = gapScore
@@ -310,7 +310,7 @@ public struct FuzzyMatcher: Sendable {
                         }
                     }
 
-                    if bestScore > Int.min / 2 {
+                    if bestParent >= 0 && bestScore > Int.min / 2 {
                         dp[j][i] = bestScore
                         parent[j][i] = bestParent
                     }
@@ -330,14 +330,28 @@ public struct FuzzyMatcher: Sendable {
             }
         }
 
-        guard bestLastIndex >= 0 else { return nil }
+        guard bestLastIndex >= 0 else {
+            return forwardScanFallback(pattern: pChars, candidate: cChars, isDir: isDir, baseScore: Self.baseScoreMatch * m)
+        }
 
-        // Backtrack indices
+        // Backtrack indices safely
         var matchedIndices = [UInt32](repeating: 0, count: m)
         var currIdx = bestLastIndex
+        var backtrackSuccess = true
+
         for j in stride(from: m - 1, through: 0, by: -1) {
+            guard currIdx >= 0 && currIdx < n else {
+                backtrackSuccess = false
+                break
+            }
             matchedIndices[j] = UInt32(currIdx)
-            currIdx = parent[j][currIdx]
+            if j > 0 {
+                currIdx = parent[j][currIdx]
+            }
+        }
+
+        if !backtrackSuccess {
+            return forwardScanFallback(pattern: pChars, candidate: cChars, isDir: isDir, baseScore: maxFinalScore)
         }
 
         // Whole-path bonuses
@@ -357,6 +371,32 @@ public struct FuzzyMatcher: Sendable {
             path: candidate,
             score: finalScore,
             indices: matchedIndices,
+            isDir: isDir,
+            name: basename
+        )
+    }
+
+    private func forwardScanFallback(
+        pattern: [Character],
+        candidate: [Character],
+        isDir: Bool,
+        baseScore: Int
+    ) -> FuzzyMatchResult {
+        var indices: [UInt32] = []
+        var pIdx = 0
+        for (cIdx, cChar) in candidate.enumerated() {
+            if pIdx < pattern.count && charsMatch(pattern[pIdx], cChar) {
+                indices.append(UInt32(cIdx))
+                pIdx += 1
+            }
+        }
+        let score = UInt32(clamping: max(1, baseScore))
+        let pathStr = String(candidate)
+        let basename = (pathStr as NSString).lastPathComponent
+        return FuzzyMatchResult(
+            path: pathStr,
+            score: score,
+            indices: indices,
             isDir: isDir,
             name: basename
         )
