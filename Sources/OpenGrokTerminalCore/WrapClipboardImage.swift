@@ -54,7 +54,7 @@ public func decodeWrapImagePaste(payload: String) -> WrapImagePaste? {
     let mime = lines[1]
     let b64 = lines[2...].joined()
 
-    if mime.isEmpty || b64.isEmpty {
+    if mime.isEmpty || b64.isEmpty || b64.hasPrefix("=") {
         return .noImage
     }
 

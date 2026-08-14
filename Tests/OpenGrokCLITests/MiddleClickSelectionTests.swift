@@ -18,8 +18,13 @@ struct MiddleClickSelectionTests {
             platform: .macOS,
             environment: ["DISPLAY": ":0"]
         )
-        await #expect(throws: ClipboardError.self) {
+        do {
             _ = try await provider.readPrimaryText()
+            #expect(Bool(false), "Expected readPrimaryText to throw on macOS")
+        } catch is OpenGrokWebMediaTools.ClipboardError {
+            #expect(Bool(true))
+        } catch {
+            #expect(Bool(false), "Unexpected error: \(error)")
         }
     }
 
@@ -30,8 +35,13 @@ struct MiddleClickSelectionTests {
             platform: .linux,
             environment: [:]
         )
-        await #expect(throws: ClipboardError.self) {
+        do {
             _ = try await providerNoDisplay.readPrimaryText()
+            #expect(Bool(false), "Expected readPrimaryText to throw")
+        } catch is OpenGrokWebMediaTools.ClipboardError {
+            #expect(Bool(true))
+        } catch {
+            #expect(Bool(false), "Unexpected error: \(error)")
         }
 
         // Empty DISPLAY
@@ -39,8 +49,13 @@ struct MiddleClickSelectionTests {
             platform: .linux,
             environment: ["DISPLAY": ""]
         )
-        await #expect(throws: ClipboardError.self) {
+        do {
             _ = try await providerEmptyDisplay.readPrimaryText()
+            #expect(Bool(false), "Expected readPrimaryText to throw")
+        } catch is OpenGrokWebMediaTools.ClipboardError {
+            #expect(Bool(true))
+        } catch {
+            #expect(Bool(false), "Unexpected error: \(error)")
         }
     }
 
@@ -54,8 +69,13 @@ struct MiddleClickSelectionTests {
                 "PATH": "/nonexistent_path_dir_12345"
             ]
         )
-        await #expect(throws: ClipboardError.self) {
+        do {
             _ = try await providerNoTools.readPrimaryText()
+            #expect(Bool(false), "Expected readPrimaryText to throw")
+        } catch is OpenGrokWebMediaTools.ClipboardError {
+            #expect(Bool(true))
+        } catch {
+            #expect(Bool(false), "Unexpected error: \(error)")
         }
     }
 

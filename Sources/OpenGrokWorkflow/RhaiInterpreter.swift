@@ -1122,7 +1122,7 @@ final class RhaiInterpreter {
             guard case .map = item else {
                 throw RhaiRuntimeError("parallel() items must be option maps", at: position)
             }
-            var options = try RhaiAgentOptions.fromJSON(item.json)
+            let options = try RhaiAgentOptions.fromJSON(item.json)
             guard !options.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw RhaiRuntimeError("agent prompt must not be empty", at: position)
             }

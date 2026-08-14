@@ -83,70 +83,32 @@ public enum WorkflowMetadataError: Error, Sendable, Hashable, CustomStringConver
 }
 
 public func extractWorkflowMetadata(from script: String) throws -> WorkflowMetadata {
-    guard let object = firstMetadataObject(in: script) else {
-        throw WorkflowMetadataError.metadataNotFirst
-    }
-    let map: [String: JSONValue]
     do {
-        map = try RhaiValueParser.parseMap(object)
-    } catch {
-        throw WorkflowMetadataError.parse(String(describing: error))
-    }
-    let allowed = Set(["name", "description", "when_to_use", "phases"])
-    if let unknown = map.keys.first(where: { !allowed.contains($0) }) {
-        throw WorkflowMetadataError.invalidShape("unknown field \(unknown)")
-    }
-    guard let name = map["name"]?.stringValue, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        throw WorkflowMetadataError.missingField("meta.name")
-    }
-    guard name.utf8.count <= maxWorkflowNameLength else {
-        throw WorkflowMetadataError.stringTooLong(field: "meta.name", maximum: maxWorkflowNameLength, actual: name.utf8.count)
-    }
-    guard isValidWorkflowName(name) else { throw WorkflowMetadataError.invalidName }
-    guard let description = map["description"]?.stringValue, !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        throw WorkflowMetadataError.missingField("meta.description")
-    }
-    guard description.utf8.count <= maxWorkflowDescriptionLength else {
-        throw WorkflowMetadataError.stringTooLong(field: "meta.description", maximum: maxWorkflowDescriptionLength, actual: description.utf8.count)
-    }
-    let whenToUse = map["when_to_use"]?.stringValue
-    if let whenToUse, whenToUse.utf8.count > maxWorkflowWhenToUseLength {
-        throw WorkflowMetadataError.stringTooLong(field: "meta.when_to_use", maximum: maxWorkflowWhenToUseLength, actual: whenToUse.utf8.count)
-    }
-    var phases: [WorkflowPhaseMetadata] = []
-    var titles = Set<String>()
-    if let phaseValue = map["phases"] {
-        guard let phaseValues = phaseValue.arrayValue else {
-            throw WorkflowMetadataError.invalidShape("meta.phases must be an array")
-        }
-        guard phaseValues.count <= maxWorkflowPhases else {
-            throw WorkflowMetadataError.tooManyPhases(phaseValues.count)
-        }
-        for value in phaseValues {
-            guard let phase = value.objectValue else {
-                throw WorkflowMetadataError.invalidShape("meta.phases entries must be maps")
-            }
-            let phaseKeys = Set(phase.keys)
-            guard phaseKeys.isSubset(of: ["title", "detail"]) else {
-                throw WorkflowMetadataError.invalidShape("unknown phase field")
-            }
-            guard let title = phase["title"]?.stringValue, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw WorkflowMetadataError.missingField("meta.phases[].title")
-            }
-            guard titles.insert(title).inserted else {
-                throw WorkflowMetadataError.duplicatePhaseTitle(title)
-            }
-            guard title.utf8.count <= maxWorkflowPhaseTitleLength else {
-                throw WorkflowMetadataError.stringTooLong(field: "meta.phases[].title", maximum: maxWorkflowPhaseTitleLength, actual: title.utf8.count)
-            }
-            let detail = phase["detail"]?.stringValue
-            if let detail, detail.utf8.count > maxWorkflowPhaseDetailLength {
-                throw WorkflowMetadataError.stringTooLong(field: "meta.phases[].detail", maximum: maxWorkflowPhaseDetailLength, actual: detail.utf8.count)
-            }
-            phases.append(WorkflowPhaseMetadata(title: title, detail: detail))
+        let meta = try RhaiMeta.extract(from: script)
+        return WorkflowMetadata(
+            name: meta.name,
+            description: meta.description,
+            whenToUse: meta.whenToUse,
+            phases: meta.phases.map { WorkflowPhaseMetadata(title: $0.title, detail: $0.detail) }
+        )
+    } catch let error as RhaiMetaError {
+        switch error {
+        case .parse(let value):
+            throw WorkflowMetadataError.parse(value)
+        case .metaNotFirst:
+            throw WorkflowMetadataError.metadataNotFirst
+        case .invalidShape(let value):
+            throw WorkflowMetadataError.invalidShape(value)
+        case .missingField(let field):
+            throw WorkflowMetadataError.missingField(field)
+        case .invalidName:
+            throw WorkflowMetadataError.invalidName
+        case .stringTooLong(let field, let maximum, let actual):
+            throw WorkflowMetadataError.stringTooLong(field: field, maximum: maximum, actual: actual)
+        case .tooManyPhases(_, let actual):
+            throw WorkflowMetadataError.tooManyPhases(actual)
         }
     }
-    return WorkflowMetadata(name: name, description: description, whenToUse: whenToUse, phases: phases)
 }
 
 public struct WorkflowAgentResult: Codable, Sendable, Hashable {
@@ -1338,63 +1300,11 @@ private enum WorkflowHash {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = (try? encoder.encode(payload)) ?? Data()
-        var input = Data(kind.utf8)
+        var input = Array(kind.utf8)
         input.append(0)
-        input.append(data)
-        return SHA256.hash(input).map { String(format: "%02x", $0) }.joined()
+        input.append(contentsOf: Array(data))
+        return RhaiSHA256.hash(input).map { String(format: "%02x", $0) }.joined()
     }
-}
-
-private enum SHA256 {
-    private static let constants: [UInt32] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-    ]
-
-    static func hash(_ data: Data) -> [UInt8] {
-        var bytes = Array(data)
-        let bitLength = UInt64(bytes.count) * 8
-        bytes.append(0x80)
-        while bytes.count % 64 != 56 { bytes.append(0) }
-        withUnsafeBytes(of: bitLength.bigEndian) { bytes.append(contentsOf: $0) }
-        var state: [UInt32] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
-        for chunkStart in stride(from: 0, to: bytes.count, by: 64) {
-            var words = Array(repeating: UInt32(0), count: 64)
-            for index in 0..<16 {
-                let base = chunkStart + index * 4
-                words[index] = UInt32(bytes[base]) << 24 | UInt32(bytes[base + 1]) << 16 | UInt32(bytes[base + 2]) << 8 | UInt32(bytes[base + 3])
-            }
-            for index in 16..<64 {
-                let s0 = words[index - 15].rotateRight(7) ^ words[index - 15].rotateRight(18) ^ (words[index - 15] >> 3)
-                let s1 = words[index - 2].rotateRight(17) ^ words[index - 2].rotateRight(19) ^ (words[index - 2] >> 10)
-                words[index] = words[index - 16] &+ s0 &+ words[index - 7] &+ s1
-            }
-            var a = state[0], b = state[1], c = state[2], d = state[3], e = state[4], f = state[5], g = state[6], h = state[7]
-            for index in 0..<64 {
-                let s1 = e.rotateRight(6) ^ e.rotateRight(11) ^ e.rotateRight(25)
-                let choice = (e & f) ^ ((~e) & g)
-                let temporary1 = h &+ s1 &+ choice &+ constants[index] &+ words[index]
-                let s0 = a.rotateRight(2) ^ a.rotateRight(13) ^ a.rotateRight(22)
-                let majority = (a & b) ^ (a & c) ^ (b & c)
-                let temporary2 = s0 &+ majority
-                h = g; g = f; f = e; e = d &+ temporary1; d = c; c = b; b = a; a = temporary1 &+ temporary2
-            }
-            state[0] &+= a; state[1] &+= b; state[2] &+= c; state[3] &+= d; state[4] &+= e; state[5] &+= f; state[6] &+= g; state[7] &+= h
-        }
-        return state.flatMap { word in
-            withUnsafeBytes(of: word.bigEndian) { Array($0) }
-        }
-    }
-}
-
-private extension UInt32 {
-    func rotateRight(_ amount: UInt32) -> UInt32 { (self >> amount) | (self << (32 - amount)) }
 }
 
 private extension UInt64 {

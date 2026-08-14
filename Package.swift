@@ -504,7 +504,7 @@ private func targets() -> [Target] {
     // `OpenGrokPTY`/`OpenGrokTTY` are direct here because the scenarios name
     // `ProcessExit` and `TerminalSize` in their own assertions.
     t.append(.testTarget(name: "OpenGrokPagerPTYTests", dependencies: dep(["OpenGrokPagerPTYHarness", "OpenGrokPTY", "OpenGrokTTY", "OpenGrokTestSupport", "OpenGrokTestUtilities"])))
-    t.append(.testTarget(name: "OpenGrokFuzzingTests", dependencies: dep(["OpenGrokPager", "OpenGrokCLI", "OpenGrokMarkdownCore", "OpenGrokMarkdown", "OpenGrokSampler", "OpenGrokToolRegistry", "OpenGrokFileTools", "OpenGrokShell"])))
+    t.append(.testTarget(name: "OpenGrokFuzzingTests", dependencies: dep(["OpenGrokPager", "OpenGrokCLI", "OpenGrokTerminalCore", "OpenGrokMarkdownCore", "OpenGrokMarkdown", "OpenGrokSampler", "OpenGrokToolRegistry", "OpenGrokFileTools", "OpenGrokShell"])))
     t.append(.testTarget(name: "OpenGrokPerformanceTests", dependencies: dep(["OpenGrokPager", "OpenGrokCLI", "OpenGrokMarkdown", "OpenGrokSampler", "OpenGrokSamplingTypes", "OpenGrokShared", "OpenGrokShell", "OpenGrokShellBase", "OpenGrokMemory"])))
     t.append(.testTarget(name: "OpenGrokSecurityTests", dependencies: dep([
         "OpenGrokReleaseValidation", "OpenGrokPager", "OpenGrokCLI", "OpenGrokSandbox",
