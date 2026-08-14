@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokShared
 
 public let officialMarketplaceSourceName = "xAI Official"
 public let officialMarketplaceSourceGitURL = "https://github.com/xai-org/plugin-marketplace.git"
@@ -175,44 +176,6 @@ public struct MarketplaceSource: Hashable, Sendable, Codable, Equatable {
     }
 
     public var sourceURLOrPath: String { kind.identity }
-}
-
-public enum JSONValue: Hashable, Sendable, Codable, Equatable {
-    case null
-    case boolean(Bool)
-    case number(Double)
-    case string(String)
-    case array([JSONValue])
-    case object([String: JSONValue])
-
-    public init(from decoder: Decoder) throws {
-        let single = try decoder.singleValueContainer()
-        if single.decodeNil() { self = .null; return }
-        if let value = try? single.decode(Bool.self) { self = .boolean(value); return }
-        if let value = try? single.decode(Double.self) { self = .number(value); return }
-        if let value = try? single.decode(String.self) { self = .string(value); return }
-        if let value = try? single.decode([JSONValue].self) { self = .array(value); return }
-        self = .object(try single.decode([String: JSONValue].self))
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        switch self {
-        case .null: var container = encoder.singleValueContainer(); try container.encodeNil()
-        case let .boolean(value): var container = encoder.singleValueContainer(); try container.encode(value)
-        case let .number(value): var container = encoder.singleValueContainer(); try container.encode(value)
-        case let .string(value): var container = encoder.singleValueContainer(); try container.encode(value)
-        case let .array(value): var container = encoder.unkeyedContainer(); for item in value { try container.encode(item) }
-        case let .object(value): var container = encoder.container(keyedBy: DynamicCodingKey.self); for (key, item) in value { try container.encode(item, forKey: DynamicCodingKey(key)) }
-        }
-    }
-
-    private struct DynamicCodingKey: CodingKey {
-        let stringValue: String
-        let intValue: Int? = nil
-        init(_ string: String) { stringValue = string }
-        init?(stringValue: String) { self.init(stringValue) }
-        init?(intValue: Int) { return nil }
-    }
 }
 
 public struct PluginAuthor: Hashable, Sendable, Codable, Equatable {
@@ -1175,5 +1138,4 @@ private func manifestErrorReason(_ error: Error) -> String {
 }
 private func isDirectory(_ url: URL) -> Bool { var isDirectory: ObjCBool = false; return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue }
 private func isDirectoryWithContents(_ url: URL) -> Bool { guard isDirectory(url) else { return false }; return ((try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: [])) ?? []).isEmpty == false }
-private struct DynamicCodingKey: CodingKey { let stringValue: String; let intValue: Int? = nil; init(_ string: String) { stringValue = string }; init?(stringValue: String) { self.init(stringValue) }; init?(intValue: Int) { return nil } }
 private extension UInt8 { var isASCIIAlpha: Bool { (65...90).contains(self) || (97...122).contains(self) } }

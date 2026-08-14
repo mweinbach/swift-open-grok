@@ -133,14 +133,6 @@ private enum ExternalTagCoding {
     }
 }
 
-private struct DynamicCodingKey: CodingKey, Hashable {
-    var stringValue: String
-    var intValue: Int? { nil }
-    init(_ string: String) { stringValue = string }
-    init?(stringValue: String) { self.stringValue = stringValue }
-    init?(intValue: Int) { return nil }
-}
-
 // MARK: - WaitOutcome
 
 /// Outcome of a `wait` / `terminate` call.

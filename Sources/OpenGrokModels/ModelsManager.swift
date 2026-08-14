@@ -10,6 +10,7 @@ import Foundation
 import OpenGrokConfigTypes
 import OpenGrokPaths
 import OpenGrokSamplingTypes
+import OpenGrokShared
 import OpenGrokVersion
 
 // MARK: - Injection protocols
@@ -101,27 +102,7 @@ public protocol CodexModelsTransport: Sendable {
     ) async throws -> (models: [CodexCatalogModel], etag: String?)
 }
 
-/// Simple cooperative cancellation token.
-public final class CancellationToken: @unchecked Sendable {
-    private let lock = NSLock()
-    private var _cancelled = false
-
-    public init() {}
-
-    public var isCancelled: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return _cancelled
-    }
-
-    public func cancel() {
-        lock.lock(); defer { lock.unlock() }
-        _cancelled = true
-    }
-
-    public func throwIfCancelled() throws {
-        if isCancelled { throw ModelsError.cancelled }
-    }
-}
+public typealias CancellationToken = OpenGrokShared.CancellationToken
 
 /// No-op transport that never hits the network.
 public struct OfflineModelsTransport: XaiModelsTransport, CodexModelsTransport {
@@ -131,13 +112,13 @@ public struct OfflineModelsTransport: XaiModelsTransport, CodexModelsTransport {
         fetchAuth: ModelFetchAuth,
         cancellation: CancellationToken?
     ) async throws -> FetchModelsResult {
-        try cancellation?.throwIfCancelled()
+        try cancellation?.throwIfCancelled(ModelsError.cancelled)
         return FetchModelsResult(models: [], etag: nil)
     }
     public func fetchCodexModels(
         cancellation: CancellationToken?
     ) async throws -> (models: [CodexCatalogModel], etag: String?) {
-        try cancellation?.throwIfCancelled()
+        try cancellation?.throwIfCancelled(ModelsError.cancelled)
         return ([], nil)
     }
 }

@@ -4,6 +4,7 @@
 
 import Foundation
 import OpenGrokHTTP
+import OpenGrokShared
 
 /// Why a token refresh is being requested.
 public enum RefreshReason: String, Sendable, Equatable {
@@ -163,12 +164,7 @@ public final class CallCounter: @unchecked Sendable {
 }
 
 func formURLEncoded(_ fields: [String: String]) -> String {
-    fields.map { key, value in
-        let k = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? key
-        let v = value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? value
-        return "\(k)=\(v)"
-    }
-    .joined(separator: "&")
+    FormURLEncoding.encode(fields)
 }
 
 func oauthErrorCode(from body: Data) -> String? {

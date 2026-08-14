@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokShared
 
 public enum AgentBuildError: Error, Sendable, Equatable, CustomStringConvertible {
     case parseError(String)
@@ -88,15 +89,6 @@ public enum AgentJSONValue: Codable, Sendable, Equatable, Hashable {
         guard case let .string(value) = self else { return nil }
         return value
     }
-}
-
-private struct DynamicCodingKey: CodingKey {
-    let stringValue: String
-    let intValue: Int? = nil
-
-    init(_ string: String) { stringValue = string }
-    init?(stringValue: String) { self.init(stringValue) }
-    init?(intValue: Int) { return nil }
 }
 
 private enum StableJSONWriter {

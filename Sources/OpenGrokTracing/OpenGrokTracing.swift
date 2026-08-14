@@ -12,45 +12,6 @@ import Dispatch
 import OpenGrokShared
 
 
-/// Portable lock over mutable state. Sync `withLock` is safe to call from async.
-final class LockHolder<State>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var state: State
-    init(_ state: State) { self.state = state }
-    @discardableResult
-    func withLock<R>(_ body: (inout State) throws -> R) rethrows -> R {
-        lock.lock()
-        defer { lock.unlock() }
-        return try body(&state)
-    }
-}
-
-/// Portable monotonic timestamp (nanoseconds since boot).
-public struct MonotonicInstant: Sendable, Hashable, Comparable {
-    public var nanoseconds: UInt64
-    public init(nanoseconds: UInt64) { self.nanoseconds = nanoseconds }
-    public static func now() -> MonotonicInstant {
-        MonotonicInstant(nanoseconds: DispatchTime.now().uptimeNanoseconds)
-    }
-    public static func < (lhs: MonotonicInstant, rhs: MonotonicInstant) -> Bool {
-        lhs.nanoseconds < rhs.nanoseconds
-    }
-    public func advanced(bySeconds seconds: TimeInterval) -> MonotonicInstant {
-        if seconds >= 0 {
-            return MonotonicInstant(nanoseconds: nanoseconds &+ UInt64(seconds * 1_000_000_000))
-        } else {
-            return MonotonicInstant(nanoseconds: nanoseconds &- UInt64((-seconds) * 1_000_000_000))
-        }
-    }
-    public func seconds(until other: MonotonicInstant) -> TimeInterval {
-        if other.nanoseconds >= nanoseconds {
-            return TimeInterval(other.nanoseconds - nanoseconds) / 1_000_000_000
-        }
-        return -TimeInterval(nanoseconds - other.nanoseconds) / 1_000_000_000
-    }
-}
-
-
 // MARK: - Correlation
 
 /// Correlation keys preserved across session, turn, tool, provider, and

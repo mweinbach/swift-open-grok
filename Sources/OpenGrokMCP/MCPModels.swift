@@ -1086,23 +1086,6 @@ public enum MCPWireMessage: Codable, Sendable, Hashable, Equatable {
     }
 }
 
-private struct DynamicCodingKey: CodingKey {
-    let stringValue: String
-    let intValue: Int? = nil
-
-    init(_ value: String) {
-        stringValue = value
-    }
-
-    init?(stringValue: String) {
-        self.stringValue = stringValue
-    }
-
-    init?(intValue: Int) {
-        return nil
-    }
-}
-
 public enum MCPMethod {
     public static let initialize = "initialize"
     public static let initialized = "notifications/initialized"

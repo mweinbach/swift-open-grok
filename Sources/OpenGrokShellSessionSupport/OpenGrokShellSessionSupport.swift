@@ -2106,15 +2106,6 @@ private struct ManagedMcpErrorBody: Decodable {
     let error: String?
 }
 
-private struct DynamicCodingKey: CodingKey {
-    let stringValue: String
-    let intValue: Int? = nil
-
-    init(_ value: String) { stringValue = value }
-    init?(stringValue: String) { self.stringValue = stringValue }
-    init?(intValue: Int) { return nil }
-}
-
 private extension JSONValue {
     var uint64Value: UInt64? {
         switch self {

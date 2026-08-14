@@ -1964,17 +1964,4 @@ extension CancelNotification: AcpRequest {
 
 // MARK: - Dynamic coding keys
 
-struct DynamicCodingKeys: CodingKey, Hashable {
-    var stringValue: String
-    var intValue: Int?
-
-    init?(stringValue: String) {
-        self.stringValue = stringValue
-        self.intValue = nil
-    }
-
-    init?(intValue: Int) {
-        self.stringValue = "\(intValue)"
-        self.intValue = intValue
-    }
-}
+typealias DynamicCodingKeys = DynamicCodingKey

@@ -4,47 +4,13 @@
 // Ported from `xai-computer-hub-sdk/src/cancel.rs`.
 
 import Foundation
+import OpenGrokShared
 import OpenGrokToolProtocol
 
 /// Upper bound on outstanding pre-registration tombstones.
 public let maxPendingCancelTombstones: Int = 8192
 
-/// Simple cancellation token shared across hub call paths.
-public final class CancellationToken: @unchecked Sendable {
-    private let lock = NSLock()
-    private var _cancelled = false
-    private var handlers: [@Sendable () -> Void] = []
-
-    public init() {}
-
-    public var isCancelled: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return _cancelled
-    }
-
-    public func cancel() {
-        lock.lock()
-        let already = _cancelled
-        _cancelled = true
-        let handlers = self.handlers
-        self.handlers.removeAll()
-        lock.unlock()
-        if !already {
-            for h in handlers { h() }
-        }
-    }
-
-    public func onCancel(_ handler: @escaping @Sendable () -> Void) {
-        lock.lock()
-        if _cancelled {
-            lock.unlock()
-            handler()
-            return
-        }
-        handlers.append(handler)
-        lock.unlock()
-    }
-}
+public typealias CancellationToken = OpenGrokShared.CancellationToken
 
 /// Cancels a tool call when the holder is deallocated.
 public final class CancelOnDrop: @unchecked Sendable {

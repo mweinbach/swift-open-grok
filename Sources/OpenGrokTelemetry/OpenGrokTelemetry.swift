@@ -14,20 +14,6 @@ import OpenGrokShared
 import OpenGrokTracing
 import OpenGrokVersion
 
-
-/// Portable lock over mutable state. Sync `withLock` is safe to call from async.
-final class LockHolder<State>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var state: State
-    init(_ state: State) { self.state = state }
-    @discardableResult
-    func withLock<R>(_ body: (inout State) throws -> R) rethrows -> R {
-        lock.lock()
-        defer { lock.unlock() }
-        return try body(&state)
-    }
-}
-
 // MARK: - Mode
 
 /// Telemetry mode: disabled, session-metrics only, or full product telemetry.
@@ -320,13 +306,7 @@ private func encodeJSON<T: Encodable>(_ value: T) throws -> Data {
 }
 
 private func formURLEncoded(_ fields: [String: String]) -> Data {
-    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
-    let parts = fields.map { key, value in
-        let k = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
-        let v = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
-        return "\(k)=\(v)"
-    }
-    return Data(parts.joined(separator: "&").utf8)
+    FormURLEncoding.encodeData(fields)
 }
 
 // MARK: - Product event client

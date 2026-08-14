@@ -1,5 +1,6 @@
 import Foundation
 import OpenGrokHooksPluginTypes
+import OpenGrokShared
 
 public enum HookGateKind: String, Sendable, Equatable, Codable {
     case observe
@@ -187,13 +188,6 @@ public struct HookEventEnvelope: Sendable, Equatable, Codable {
     private enum CodingKeys: String, CodingKey {
         case hookEventName, sessionId, cwd, workspaceRoot, timestamp
         case transcriptPath, clientIdentifier, promptId, permissionMode
-    }
-
-    private struct DynamicCodingKey: CodingKey {
-        var stringValue: String
-        var intValue: Int?
-        init?(stringValue: String) { self.stringValue = stringValue; self.intValue = nil }
-        init?(intValue: Int) { self.stringValue = String(intValue); self.intValue = intValue }
     }
 
     public func encode(to encoder: Encoder) throws {

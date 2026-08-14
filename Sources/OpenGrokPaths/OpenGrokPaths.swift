@@ -430,3 +430,54 @@ public func fromRelativePath(root: String, relPath: String) -> String {
     }
     return root + String(sep) + relPath
 }
+
+// MARK: - URL encoding (urlencoding::encode parity)
+
+/// Percent-encode a CWD path the way Rust `urlencoding::encode` does:
+/// every byte outside the unreserved set `A-Z a-z 0-9 - _ . ~` is encoded,
+/// **including** `/` as `%2F`. This produces a single filesystem-safe
+/// directory name component for short paths.
+public func urlEncodePath(_ s: String) -> String {
+    var out = ""
+    for byte in s.utf8 {
+        let c = Character(Unicode.Scalar(byte))
+        if (byte >= 0x30 && byte <= 0x39) // 0-9
+            || (byte >= 0x41 && byte <= 0x5A) // A-Z
+            || (byte >= 0x61 && byte <= 0x7A) // a-z
+            || byte == 0x2D // -
+            || byte == 0x5F // _
+            || byte == 0x2E // .
+            || byte == 0x7E // ~
+        {
+            out.append(c)
+        } else {
+            out += String(format: "%%%02X", byte)
+        }
+    }
+    return out
+}
+
+/// URL-decode a percent-encoded string (the inverse of `urlEncodePath`).
+/// Returns `nil` on malformed input (bad hex digits or a dangling `%`).
+public func urlDecodePath(_ s: String) -> String? {
+    var bytes: [UInt8] = []
+    var idx = s.startIndex
+    while idx < s.endIndex {
+        let c = s[idx]
+        if c == "%" {
+            let next = s.index(after: idx)
+            guard next < s.endIndex else { return nil }
+            let next2 = s.index(after: next)
+            guard next2 < s.endIndex else { return nil }
+            let hex = String(s[next...next2])
+            guard let v = UInt8(hex, radix: 16) else { return nil }
+            bytes.append(v)
+            idx = s.index(after: next2)
+        } else {
+            guard let ascii = c.asciiValue else { return nil }
+            bytes.append(ascii)
+            idx = s.index(after: idx)
+        }
+    }
+    return String(bytes: bytes, encoding: .utf8)
+}

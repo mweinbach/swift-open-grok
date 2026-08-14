@@ -76,23 +76,7 @@ public enum RelocationFS: Sendable {
     }
 
     public static func urlEncodePath(_ s: String) -> String {
-        var out = ""
-        for byte in s.utf8 {
-            let c = Character(Unicode.Scalar(byte))
-            if (byte >= 0x30 && byte <= 0x39) // 0-9
-                || (byte >= 0x41 && byte <= 0x5A) // A-Z
-                || (byte >= 0x61 && byte <= 0x7A) // a-z
-                || byte == 0x2D // -
-                || byte == 0x5F // _
-                || byte == 0x2E // .
-                || byte == 0x7E // ~
-            {
-                out.append(c)
-            } else {
-                out += String(format: "%%%02X", byte)
-            }
-        }
-        return out
+        OpenGrokPaths.urlEncodePath(s)
     }
 
     private static func slugify(_ input: String, maxLen: Int) -> String {
