@@ -159,6 +159,7 @@ struct LiveMouseReportingStickyToastTests {
         #expect(stickyAfterToggle == sticky)
 
         _ = try await fixture.renderer.handleInput(.key(KeyEvent(key: .escape)))
+        try await fixture.renderer.testingForcePaint()
         let stickyAfterEsc = await fixture.renderer.testingStickyToast()
         #expect(stickyAfterEsc == sticky)
         let paintedAfterEsc = await fixture.renderer.testingLastPaintedToast()
