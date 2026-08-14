@@ -214,7 +214,8 @@ public func resolveModelCatalog(
     metaCatalog: MetaModelsCatalog? = nil,
     openCodeGoCatalog: OpenCodeGoModelsCatalog? = nil,
     waferCatalog: WaferModelsCatalog? = nil,
-    zaiCatalog: ZaiModelsCatalog? = nil
+    zaiCatalog: ZaiModelsCatalog? = nil,
+    customModels: [CustomModelEntry]? = nil
 ) -> OrderedModelMap {
     var catalog = resolveModelListWithProviderCatalogs(
         input: input,
@@ -255,6 +256,11 @@ public func resolveModelCatalog(
         for (key, entry) in zaiCatalog.entries.pairs() {
             catalog[key] = entry
         }
+    }
+
+    // Merge custom models into the catalog before user filters are evaluated.
+    if let customModels, !customModels.isEmpty {
+        catalog.merge(customModels: customModels)
     }
 
     let enabledOpenCodeGo = Set(input.models.opencodeGoEnabledModels)

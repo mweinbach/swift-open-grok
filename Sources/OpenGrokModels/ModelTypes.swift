@@ -955,3 +955,305 @@ extension ConfigModelOverride {
         lhs.streamToolCalls == rhs.streamToolCalls
     }
 }
+
+// MARK: - ModelCatalog Type Alias
+
+/// Resolved model catalog map (keyed by model ID or catalog key).
+public typealias ModelCatalog = OrderedModelMap
+
+// MARK: - ModelInfo Provider & Capability Helpers
+
+extension ModelInfo {
+    /// Whether this model is provided by xAI.
+    public var isXai: Bool { provider == .xai }
+    /// Whether this model is provided by OpenAI Codex.
+    public var isCodex: Bool { provider == .codex }
+    /// Whether this model is provided by Kimi.
+    public var isKimi: Bool { provider == .kimi }
+    /// Whether this model is provided by Fireworks AI.
+    public var isFireworks: Bool { provider == .fireworks }
+    /// Whether this model is provided by DeepSeek.
+    public var isDeepSeek: Bool { provider == .deepseek }
+    /// Whether this model is provided by Meta.
+    public var isMeta: Bool { provider == .meta }
+    /// Whether this model is provided by OpenCode Go.
+    public var isOpenCodeGo: Bool { provider == .openCodeGo }
+    /// Whether this model is provided by Wafer AI.
+    public var isWafer: Bool { provider == .wafer }
+    /// Whether this model is provided by Z AI.
+    public var isZai: Bool { provider == .zai }
+
+    /// Whether this model supports reasoning / thinking mode.
+    public var supportsThinking: Bool {
+        supportsReasoningEffort || reasoningEffort != nil || !reasoningEfforts.isEmpty
+    }
+
+    /// Whether this model supports vision / multimodal image input.
+    public var supportsVision: Bool {
+        let slug = model.lowercased()
+        return slug.contains("vision") || slug.contains("omni") || slug.contains("vl")
+            || slug.contains("grok-vision") || slug.contains("4o") || slug.contains("4.5")
+            || slug.contains("claude-3-7") || slug.contains("claude-3-5")
+    }
+
+    /// Whether this model supports hosted tools (code execution, web search, etc.).
+    public var supportsHostedTools: Bool {
+        toolMode != nil || supportsBackendSearch || apiBackend == .responses || provider == .xai || provider == .codex
+    }
+}
+
+// MARK: - ModelEntry Provider & Capability Helpers
+
+extension ModelEntry {
+    /// Whether this model is provided by xAI.
+    public var isXai: Bool { info.isXai }
+    /// Whether this model is provided by OpenAI Codex.
+    public var isCodex: Bool { info.isCodex }
+    /// Whether this model is provided by Kimi.
+    public var isKimi: Bool { info.isKimi }
+    /// Whether this model is provided by Fireworks AI.
+    public var isFireworks: Bool { info.isFireworks }
+    /// Whether this model is provided by DeepSeek.
+    public var isDeepSeek: Bool { info.isDeepSeek }
+    /// Whether this model is provided by Meta.
+    public var isMeta: Bool { info.isMeta }
+    /// Whether this model is provided by OpenCode Go.
+    public var isOpenCodeGo: Bool { info.isOpenCodeGo }
+    /// Whether this model is provided by Wafer AI.
+    public var isWafer: Bool { info.isWafer }
+    /// Whether this model is provided by Z AI.
+    public var isZai: Bool { info.isZai }
+
+    /// Whether this model supports reasoning / thinking mode.
+    public var supportsThinking: Bool { info.supportsThinking }
+    /// Whether this model supports vision / multimodal image input.
+    public var supportsVision: Bool { info.supportsVision }
+    /// Whether this model supports hosted tools.
+    public var supportsHostedTools: Bool { info.supportsHostedTools }
+
+    /// Resolve an API key from own credentials (`apiKey` or `envKey`), falling back to provider's default env keys.
+    public func ownOrProviderCredential(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        if let own = ownCredential(environment: environment) {
+            return own
+        }
+        return info.provider.resolveEnvironmentKey(environment: environment)
+    }
+}
+
+// MARK: - ModelProvider Environment Key Resolution
+
+extension ModelProvider {
+    /// Canonical default environment variable names that may hold an API key for this provider.
+    public var defaultEnvVarNames: [String] {
+        switch self {
+        case .xai:
+            return ["XAI_API_KEY"]
+        case .codex:
+            return ["CODEX_API_KEY"]
+        case .kimi:
+            return ["KIMI_API_KEY", "MOONSHOT_API_KEY", "KIMI_CODE_API_KEY"]
+        case .fireworks:
+            return ["FIREWORKS_API_KEY"]
+        case .deepseek:
+            return ["DEEPSEEK_API_KEY"]
+        case .meta:
+            return ["META_API_KEY"]
+        case .openCodeGo:
+            return ["OPENCODE_GO_API_KEY", "OPENCODE_API_KEY"]
+        case .wafer:
+            return ["WAFER_API_KEY"]
+        case .zai:
+            return ["ZAI_API_KEY", "GLM_API_KEY"]
+        }
+    }
+
+    /// Canonical default `EnvKeys` for this provider.
+    public var defaultEnvKey: EnvKeys {
+        .new(defaultEnvVarNames)
+    }
+
+    /// Resolve an API key from the given environment using this provider's default env keys.
+    public func resolveEnvironmentKey(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        defaultEnvKey.resolveValue(environment: environment)
+    }
+}
+
+// MARK: - ModelCatalogPartition Environment Key Resolution & Helpers
+
+extension ModelCatalogPartition {
+    /// Canonical default environment variable names for this partition's provider.
+    public var defaultEnvVarNames: [String] {
+        provider.defaultEnvVarNames
+    }
+
+    /// Default `EnvKeys` for this partition.
+    public var defaultEnvKey: EnvKeys {
+        provider.defaultEnvKey
+    }
+
+    /// Resolve an API key from the environment for this partition.
+    public func resolveEnvironmentKey(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        provider.resolveEnvironmentKey(environment: environment)
+    }
+
+    /// Map a `ModelProvider` to its corresponding `ModelCatalogPartition` if applicable.
+    public init?(provider: ModelProvider) {
+        switch provider {
+        case .codex: self = .codex
+        case .kimi: self = .kimi
+        case .fireworks: self = .fireworks
+        case .deepseek: self = .deepSeek
+        case .meta: self = .meta
+        case .openCodeGo: self = .openCodeGo
+        case .wafer: self = .wafer
+        case .zai: self = .zai
+        case .xai: return nil
+        }
+    }
+}
+
+// MARK: - Model Partition Kind
+
+/// Comprehensive partition classification covering all 9 first-party providers and custom models.
+public enum ModelPartitionKind: String, Sendable, Equatable, Hashable, CaseIterable {
+    case xai
+    case codex
+    case kimi
+    case fireworks
+    case deepSeek
+    case meta
+    case openCodeGo
+    case wafer
+    case zai
+    case custom
+
+    /// Corresponding `ModelProvider` if this is a first-party provider partition.
+    public var provider: ModelProvider? {
+        switch self {
+        case .xai: return .xai
+        case .codex: return .codex
+        case .kimi: return .kimi
+        case .fireworks: return .fireworks
+        case .deepSeek: return .deepseek
+        case .meta: return .meta
+        case .openCodeGo: return .openCodeGo
+        case .wafer: return .wafer
+        case .zai: return .zai
+        case .custom: return nil
+        }
+    }
+
+    /// Corresponding `ModelCatalogPartition` if this is a remote catalog partition.
+    public var catalogPartition: ModelCatalogPartition? {
+        switch self {
+        case .codex: return .codex
+        case .kimi: return .kimi
+        case .fireworks: return .fireworks
+        case .deepSeek: return .deepSeek
+        case .meta: return .meta
+        case .openCodeGo: return .openCodeGo
+        case .wafer: return .wafer
+        case .zai: return .zai
+        case .xai, .custom: return nil
+        }
+    }
+
+    /// Canonical default environment variable names for this partition.
+    public var defaultEnvVarNames: [String] {
+        provider?.defaultEnvVarNames ?? []
+    }
+
+    /// Default `EnvKeys` for this partition.
+    public var defaultEnvKey: EnvKeys? {
+        provider?.defaultEnvKey
+    }
+
+    /// Resolve an API key from the environment for this partition.
+    public func resolveEnvironmentKey(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        provider?.resolveEnvironmentKey(environment: environment)
+    }
+}
+
+// MARK: - OrderedModelMap Partition & Custom Model Extensions
+
+extension OrderedModelMap {
+    /// Models filtered by provider.
+    public func models(for provider: ModelProvider) -> [ModelEntry] {
+        values().filter { $0.info.provider == provider }
+    }
+
+    /// Models filtered by catalog partition.
+    public func models(forPartition partition: ModelCatalogPartition) -> [ModelEntry] {
+        models(for: partition.provider)
+    }
+
+    /// Models filtered by partition kind.
+    public func models(forKind partition: ModelPartitionKind) -> [ModelEntry] {
+        if let provider = partition.provider {
+            return models(for: provider)
+        }
+        // Custom models: entries that don't match standard provider defaults
+        return values().filter { $0.info.id?.hasPrefix("custom:") == true || $0.model.hasPrefix("custom:") }
+    }
+
+    /// All distinct providers present in this catalog.
+    public var providers: Set<ModelProvider> {
+        Set(values().map(\.info.provider))
+    }
+
+    /// Merge custom models into this catalog map without duplicating or dropping provider entries.
+    public mutating func merge(customModels: [CustomModelEntry]) {
+        for custom in customModels {
+            let entry = custom.toModelEntry()
+            self[custom.key] = entry
+        }
+    }
+
+    /// Merge custom model entries into this catalog map.
+    public mutating func merge(customModelEntries: [ModelEntry]) {
+        for entry in customModelEntries {
+            let key = entry.info.id ?? entry.info.model
+            self[key] = entry
+        }
+    }
+}
+
+// MARK: - Array Custom Model Merging
+
+extension Array where Element == ModelInfo {
+    /// Merge custom models into this `[ModelInfo]` list without duplicating or dropping provider entries.
+    public mutating func merge(customModels: [CustomModelEntry]) {
+        for custom in customModels {
+            let customInfo = custom.toModelInfo()
+            let key = custom.key
+            if let idx = firstIndex(where: { ($0.id ?? $0.model) == key }) {
+                self[idx] = customInfo
+            } else {
+                append(customInfo)
+            }
+        }
+    }
+}
+
+extension Array where Element == ModelEntry {
+    /// Merge custom models into this `[ModelEntry]` list without duplicating or dropping provider entries.
+    public mutating func merge(customModels: [CustomModelEntry]) {
+        for custom in customModels {
+            let customEntry = custom.toModelEntry()
+            let key = custom.key
+            if let idx = firstIndex(where: { ($0.info.id ?? $0.info.model) == key }) {
+                self[idx] = customEntry
+            } else {
+                append(customEntry)
+            }
+        }
+    }
+}
