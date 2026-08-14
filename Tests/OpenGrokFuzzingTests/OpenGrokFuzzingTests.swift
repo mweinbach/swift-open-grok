@@ -1,6 +1,8 @@
 import Foundation
 import OpenGrokMarkdown
+import OpenGrokMarkdownCore
 import OpenGrokPager
+import OpenGrokTerminalCore
 import Testing
 
 @Suite("Markdown render fuzzing")
@@ -59,9 +61,9 @@ struct MarkdownRenderFuzzingTests {
         for hyperlink in output.hyperlinks {
             #expect(output.lines.indices.contains(hyperlink.lineIndex))
             if output.lines.indices.contains(hyperlink.lineIndex) {
-                let lineLength = output.lines[hyperlink.lineIndex].text.count
+                let lineDisplayWidth = UnicodeDisplayWidth.width(of: output.lines[hyperlink.lineIndex].text)
                 #expect(hyperlink.columnRange.lowerBound >= 0)
-                #expect(hyperlink.columnRange.upperBound <= lineLength)
+                #expect(hyperlink.columnRange.upperBound <= lineDisplayWidth)
                 #expect(hyperlink.columnRange.lowerBound < hyperlink.columnRange.upperBound)
             }
             #expect(!hyperlink.url.isEmpty)
