@@ -1,11 +1,59 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-14 (Wave 25 — Multi-Agent Subsystem Wave: Bounded Stdio MCP Auto-Restart, Session Relocation Journal, Image Normalization & Cache, Pre-Warmed Worktree Pool). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0 (clean build, 2.90s); authoritative full `test --no-parallel` exit 0 — exactly **7,024 Swift Testing cases in 1,075 suites passed** after 316.912s (100% green, 0 failures, 0 regressions against baseline).
+**As of:** 2026-08-14 (Wave 26 — Multi-Agent Subsystem Wave: MCP Meta-Discovery, Background Monitor Tool & Rate Limiting, Cursor Rules on Read, Memory MMR & Query Expansion). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0 (clean build, 2.55s); authoritative full `test --no-parallel` exit 0 — exactly **7,090 Swift Testing cases in 1,080 suites passed** after 318.630s (100% green, 0 failures, 0 regressions against baseline).
 
-**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (Bounded Stdio MCP Auto-Restart & Backoff, Durable Session Relocation Journal & Transactional Authority, Image Normalization & Resizing with SHA-256 Digest Cache, Pre-Warmed Subagent Git Worktree Pool, Native Workflow Engine & Rhai AST/Interpreter/Journal/Escalation, Interactive Terminal Composer Rich Elements & Image Framing, Markdown Table Wrapped-Fragment & 11-Glyph Box Drawing Layout Parity, Tool Catalog Schemas & Protocol Output Caps, Agent Runtime & Turn Pipeline, ACP Transports, Custom Models Settings UI & Store Persistence, Steady-State Cache Tracking & Cold-Start Diagnostics, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
+**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (MCP Meta-Discovery `search_tool`/`use_tool` & FNV-1a Fingerprints, Background Monitor Tool with Token-Bucket Rate Limiter & Suppression Tracker, Cursor Rules on Read Attachment & Scope Scanner, Memory MMR Maximal Marginal Relevance & Query Expansion, Bounded Stdio MCP Auto-Restart & Backoff, Durable Session Relocation Journal & Transactional Authority, Image Normalization & Resizing with SHA-256 Digest Cache, Pre-Warmed Subagent Git Worktree Pool, Native Workflow Engine & Rhai AST/Interpreter/Journal/Escalation, Interactive Terminal Composer Rich Elements & Image Framing, Markdown Table Wrapped-Fragment & 11-Glyph Box Drawing Layout Parity, Tool Catalog Schemas & Protocol Output Caps, Agent Runtime & Turn Pipeline, ACP Transports, Custom Models Settings UI & Store Persistence, Steady-State Cache Tracking & Cold-Start Diagnostics, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`) / Forward Sync `eb215dd0` (`v1.0.0-open-grok.63`).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
+
+## Wave 26 — Multi-Agent Subsystem Porting: MCP Meta-Discovery, Monitor Tool & Rate Limiting, Cursor Rules on Read, Memory MMR & Query Expansion (2026-08-14, complete)
+
+Current truth for the verified 2026-08-14 Wave 26 Multi-Agent Porting across MCP Meta-Discovery (`search_tool` & `use_tool`) (`OpenGrokAgentControlTools`), Background Monitor Tool with Token-Bucket Rate Limiter (`OpenGrokExecutionTools`), Cursor Rules on Read Attachment (`OpenGrokFileTools`), and Memory MMR & Query Expansion (`OpenGrokMemory`):
+
+**Verification (lead, local macOS, 2026-08-14; serial gate):**
+- `zsh workflows/swift-safe-verify.zsh build` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build --product open-grok` — exit 0: clean binary build in **2.55s**.
+- Authoritative full `zsh workflows/swift-safe-verify.zsh test --no-parallel` — exit 0: exactly **7,090** Swift Testing cases in **1,080** suites, elapsed **318.630s** (100% green, 0 failures, 0 regressions).
+- CLI Smokes: `open-grok --version` reports `Open Grok 1.0.0-open-grok.63` (exit 0); `paths --json` and `models --json` exit 0.
+
+### Slices Completed & Landed
+
+1. **Slice 1: MCP Meta-Discovery (`search_tool` & `use_tool`) (`OpenGrokAgentControlTools`, `e97d5e8`)**
+   - Ported from Rust reference `crates/codegen/xai-grok-tools/src/implementations/search_tool/` and `use_tool/`.
+   - Deterministic 64-bit FNV-1a hashing (`fnv1aHash`) with offset basis `0xcbf29ce484222325` and prime `0x00000100000001B3`.
+   - `ServerFingerprint` (`toolCount`, `descriptionHash`, `toolNamesHash`) and `fingerprintServers(_:)`.
+   - `buildServerReminder(_:)` and `buildDeltaReminder(old:newSummaries:)` for connected/updated/disconnected MCP servers.
+   - `SearchTool`: BM25 keyword search engine with compound identifier tokenization ($k_1 = 1.2, b = 0.75$), server-level result grouping, exact-match fast paths, and description truncation (`MAX_MCP_DESCRIPTION_LENGTH = 2048`).
+   - `UseTool`: Integration tool invoker with fully-qualified naming validation (`server__tool`) and argument normalization (`SearchToolTests.swift`).
+
+2. **Slice 2: Background Monitor Tool & Token-Bucket Rate Limiter (`OpenGrokExecutionTools`, `dc3bc91`)**
+   - Ported from Rust reference `crates/codegen/xai-grok-tools/src/implementations/grok_build/monitor/`.
+   - `MonitorInput` & `MonitorOutput` with 10-hour default/max deadline (`36_000_000ms`) and persistent bypass.
+   - `TokenBucket`: 10-token capacity, 1 token / 2,000ms refill schedule.
+   - `SuppressionTracker`: suppression counting, catch-up notice generation (`[N events suppressed...]`), and 30-second continuous overload auto-kill (`AUTO_KILL_THRESHOLD_MS = 30_000ms`).
+   - `LineProcessor`: ANSI escape sequence stripping, 500-char line truncation, 3,000-char batching, 200ms debounce, and 1 MB buffer cap (`MonitorToolTests.swift`).
+
+3. **Slice 3: Cursor Rules on Read Attachment (`OpenGrokFileTools`, `1c44050`, `7e856ba`)**
+   - Ported from Rust reference `crates/codegen/xai-grok-tools/src/implementations/cursor_rules_on_read.rs` (768 LOC).
+   - `.cursorrules` and `.cursor/rules/*.mdc` frontmatter parser supporting CRLF/LF line endings, `alwaysApply`, `globs`, and `description`.
+   - `CursorRulesOnReadTracker`: upward directory scope walk, scanned directory caching, relative glob pattern matching, and per-session rule injection deduplication.
+   - `appendCursorRulesForRead`: XML block attachment (`<cursor_rule path="...">...</cursor_rule>`) to full and concise read outputs (`CursorRulesOnReadTests.swift`).
+
+4. **Slice 4: Memory MMR (Maximal Marginal Relevance) & Query Expansion (`OpenGrokMemory`, `79f45b4`)**
+   - Ported from Rust reference `crates/codegen/xai-grok-memory/src/mmr.rs` and `query_expansion.rs`.
+   - `cosineSimilarity`: Dot product divided by vector norms with bounds clamping.
+   - `MMRRanker`: Maximal Marginal Relevance ranking over candidate vectors with lambda balance parameter (`lambda: 0.0 ... 1.0`, default `0.7`) and pairwise redundancy penalties.
+   - `QueryExpander`: Code search token analyzer splitting camelCase, snake_case, file extensions, and punctuation (`MMRQueryExpansionTests.swift`).
+
+### Landed Commits
+
+- `7e856ba` — fix(cursor-rules): handle CRLF Character count accurately in splitFrontmatter
+- `dc3bc91` — feat(tools): implement background monitor tool and token-bucket rate limiter
+- `e97d5e8` — feat(OpenGrokAgentControlTools): implement MCP Meta-Discovery tools (search_tool & use_tool)
+- `1c44050` — Implement Cursor rules on read attachment in OpenGrokFileTools
+- `79f45b4` — feat(memory): implement MMR diversity reranker and query expander
 
 ## Wave 25 — Multi-Agent Subsystem Porting: Stdio MCP Auto-Restart, Session Relocation Journal, Image Normalization & Cache, Pre-Warmed Worktree Pool (2026-08-14, complete)
 
