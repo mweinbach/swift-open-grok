@@ -58,16 +58,17 @@ public struct CursorRuleFrontmatter: Sendable, Equatable {
 /// Split YAML frontmatter from Markdown body.
 /// Supports both Unix LF (`\n`) and Windows CRLF (`\r\n`) line endings.
 public func splitFrontmatter(content: String) -> (frontmatter: String, body: String)? {
-    var rest: Substring
-    if content.hasPrefix("---\r\n") {
-        rest = content.dropFirst(5)
-    } else if content.hasPrefix("---\n") {
-        rest = content.dropFirst(4)
+    guard content.hasPrefix("---") else { return nil }
+    var rest = content.dropFirst(3)
+    if rest.hasPrefix("\r\n") {
+        rest = rest.dropFirst(1)
+    } else if rest.hasPrefix("\n") {
+        rest = rest.dropFirst(1)
     } else {
         return nil
     }
 
-    let delimiters = ["\n---\n", "\n---\r\n", "\r\n---\r\n", "\r\n---\n"]
+    let delimiters = ["\r\n---\r\n", "\r\n---\n", "\n---\r\n", "\n---\n"]
     for delimiter in delimiters {
         if let range = rest.range(of: delimiter) {
             let frontmatter = String(rest[..<range.lowerBound])
