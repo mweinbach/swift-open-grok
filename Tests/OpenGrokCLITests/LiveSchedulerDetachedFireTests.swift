@@ -117,8 +117,9 @@ struct LiveSchedulerDetachedModeTests {
             prompt: "check deploy status",
             durable: false,
             foreground: false,
-            fireImmediately: true
+            fireImmediately: false
         )
+        clock.advance(by: 300)
         let fires = await host.fireDue(now: clock.current)
 
         try #require(fires.count == 1)
@@ -163,8 +164,9 @@ struct LiveSchedulerDetachedModeTests {
             prompt: "in-session check",
             durable: false,
             foreground: true,
-            fireImmediately: true
+            fireImmediately: false
         )
+        clock.advance(by: 300)
         let fires = await host.fireDue(now: clock.current)
 
         try #require(fires.count == 1)
@@ -193,8 +195,9 @@ struct LiveSchedulerDetachedModeTests {
             prompt: "legacy path",
             durable: false,
             foreground: false,
-            fireImmediately: true
+            fireImmediately: false
         )
+        clock.advance(by: 300)
         let fires = await host.fireDue(now: clock.current)
 
         try #require(fires.count == 1)
@@ -215,8 +218,9 @@ struct LiveSchedulerDetachedModeTests {
             prompt: "unwired",
             durable: false,
             foreground: false,
-            fireImmediately: true
+            fireImmediately: false
         )
+        clock.advance(by: 300)
         let fires = await host.fireDue(now: clock.current)
         try #require(fires.count == 1)
         #expect(fires[0].subagentID == nil)
