@@ -143,12 +143,22 @@ private actor InterjectionSamplerStore {
         return agentRequests.count >= count
     }
 
+    /// Callback invoked when the FIRST agent request is captured.
+    private var onFirstRequest: (@Sendable () async -> Void)?
+
+    func setOnFirstRequest(_ block: @escaping @Sendable () async -> Void) {
+        onFirstRequest = block
+    }
+
     func next(_ request: OpenGrokLiveSamplingRequest) async throws -> OpenGrokLiveSamplingResponse {
         if request.tools.isEmpty || request.turnID.hasPrefix("compaction-") {
             return OpenGrokLiveSamplingResponse(output: "compacted summary")
         }
         agentRequests.append(request)
         if agentRequests.count == 1 {
+            if let onFirstRequest {
+                await onFirstRequest()
+            }
             if holdFirstResponse {
                 // Task.sleep observes cancellation, which is how the hold
                 // resolves: the cancelled turn throws out of the sampler.
@@ -228,10 +238,10 @@ struct LiveInterjectionSessionActorTests {
         let store = InterjectionSamplerStore()
         await store.enqueue([toolCallResponse()])
         let (foundation, stack) = try await makeStack(fixture: fixture, store: store)
-        // Round 1 does not return until the interjection is in the buffer,
-        // so the round-2 drain point deterministically sees it.
         let interjections = stack.interjections
-        await store.gateFirstResponse { await !interjections.isEmpty }
+        await store.setOnFirstRequest {
+            _ = await interjections.interject("hurry up")
+        }
 
         let shell = stack.shell
         _ = try await shell.start()
@@ -245,16 +255,6 @@ struct LiveInterjectionSessionActorTests {
             sessionID: sessionID,
             request: OpenGrokShellTurnRequest(promptID: "p1", text: "do a todo", turnID: "t1")
         )
-        // The turn task flips the seam active shortly after submit; a false
-        // return means it has not begun yet, so retry — a false push buffers
-        // nothing, which is what makes the retry safe.
-        var delivered = false
-        let deliverDeadline = Date().addingTimeInterval(15)
-        while !delivered, Date() < deliverDeadline {
-            delivered = await stack.interjections.interject("hurry up")
-            if !delivered { try? await Task.sleep(nanoseconds: 10_000_000) }
-        }
-        #expect(delivered, "the running turn must accept the interjection")
 
         _ = try await shell.waitForTurn(handle, timeout: ShellDuration(timeInterval: 30))
 

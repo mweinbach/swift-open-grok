@@ -181,14 +181,14 @@ public actor WorktreePool {
     /// Cleans existing adoptable worktrees and creates new linked worktrees
     /// until `readyWorktrees.count` reaches `targetCount`.
     public func warmPool(targetCount: Int) async throws {
-        self.targetWarmCount = max(0, min(targetCount, maxCapacity))
+        let count = max(0, min(targetCount, maxCapacity))
         try FileManager.default.createDirectory(at: poolRoot, withIntermediateDirectories: true)
 
         // First discover and adopt any existing valid worktrees under poolRoot
         await adoptExistingPoolWorktrees()
 
         // Create new worktrees until we hit the target count or maxCapacity
-        while readyWorktrees.count < self.targetWarmCount && totalManagedCount < maxCapacity {
+        while readyWorktrees.count < count && totalManagedCount < maxCapacity {
             try await createAndAddReadyWorktree()
         }
     }
@@ -338,11 +338,12 @@ public actor WorktreePool {
         }
 
         // 2. Prune excess ready worktrees beyond targetWarmCount that exceed maxAge
+        let checkTime = Date()
         if readyWorktrees.count > targetWarmCount {
             var retained: [PooledWorktree] = []
             for pooled in readyWorktrees {
-                let age = now.timeIntervalSince(pooled.lastCleanedAt)
-                if retained.count >= targetWarmCount && age >= maxAge {
+                let age = checkTime.timeIntervalSince(pooled.lastCleanedAt)
+                if retained.count >= targetWarmCount && (maxAge <= 0.0 || age >= maxAge) {
                     // Prune excess aged worktree
                     _ = try? worktreeRemove(source: sourceRepo, dest: pooled.path, force: true)
                     removeMarker(for: pooled.path, suffix: readyMarkerSuffix)
@@ -536,8 +537,9 @@ public actor WorktreePool {
             if FileManager.default.fileExists(atPath: entry.path, isDirectory: &isDir), isDir.boolValue {
                 let attrs = try? FileManager.default.attributesOfItem(atPath: entry.path)
                 let modDate = (attrs?[.modificationDate] as? Date) ?? now
-                if now.timeIntervalSince(modDate) >= maxAge {
+                if maxAge <= 0.0 || now.timeIntervalSince(modDate) >= maxAge {
                     _ = try? worktreeRemove(source: sourceRepo, dest: entry, force: true)
+                    try? FileManager.default.removeItem(at: entry)
                     removeMarker(for: entry, suffix: readyMarkerSuffix)
                     removeMarker(for: entry, suffix: claimedMarkerSuffix)
                     removeMarker(for: entry, suffix: lockMarkerSuffix)

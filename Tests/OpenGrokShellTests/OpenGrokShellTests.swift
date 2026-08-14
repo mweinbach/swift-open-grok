@@ -141,6 +141,10 @@ private actor RecordingTurnDriver: OpenGrokShellTurnDriver {
         try await providerSession.cancelTurn(turnID: turnID)
         release = true
     }
+
+    func unblock() {
+        release = true
+    }
 }
 
 private struct RecordingWorkspaceFactory: OpenGrokShellWorkspaceFactory {
@@ -251,7 +255,7 @@ func cancellationAndBoundedShutdown() async throws {
 func duplicateLifecycleRequests() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     let provider = RecordingProvider(sessionID: "session-3")
-    let driver = RecordingTurnDriver()
+    let driver = RecordingTurnDriver(block: true)
     let backend = RecordingBackend()
     let shell = makeShell(root: root, provider: provider, driver: driver, backend: backend)
     _ = try await shell.start()
@@ -271,6 +275,7 @@ func duplicateLifecycleRequests() async throws {
             request: OpenGrokShellTurnRequest(promptID: "prompt-4", text: "second", turnID: "turn-4")
         )
     }
+    await driver.unblock()
     _ = try await shell.waitForTurn(first, timeout: ShellDuration(timeInterval: 1))
     _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
 }
