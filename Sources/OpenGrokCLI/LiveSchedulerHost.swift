@@ -765,10 +765,9 @@ actor LiveSchedulerHost {
         // Cap one sleep at a day; an early wake finds nothing due and re-arms.
         // Guards the UInt64 conversion against a corrupt far-future date.
         let delay = min(max(0, next.timeIntervalSince(clock())), 86_400)
+        guard delay > 0 else { return }
         timer = Task { [weak self] in
-            if delay > 0 {
-                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            }
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled else { return }
             await self?.timerElapsed(generation: generation)
         }
