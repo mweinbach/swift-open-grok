@@ -12,6 +12,9 @@ import OpenGrokVersion
 /// Process-level fallback for the `x-grok-client-identifier` header.
 public let DEFAULT_CLIENT_IDENTIFIER = "grok-shell"
 public let X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state"
+public let CODEX_SESSION_ID_HEADER = "session-id"
+public let CODEX_THREAD_ID_HEADER = "thread-id"
+public let CODEX_CLIENT_REQUEST_ID_HEADER = "x-client-request-id"
 
 public let MULTI_AGENT_MODE_OPEN_TAG = "<multi_agent_mode>"
 public let MULTI_AGENT_MODE_CLOSE_TAG = "</multi_agent_mode>"
@@ -109,6 +112,8 @@ public protocol ProviderAdapter: Sendable {
 
     func applyRequestHeaders(_ headers: inout [String: String], request: ProviderRequestHeaders)
 
+    func applySessionAffinityHeaders(_ headers: inout [String: String], sessionId: String?)
+
     /// Apply provider-owned request constraints after shared defaults.
     func sanitizeChatRequest(_ request: inout ChatCompletionWireRequest)
 
@@ -172,10 +177,13 @@ extension ProviderAdapter {
     }
 
     public func applyRequestHeaders(_ headers: inout [String: String], request: ProviderRequestHeaders) {
+        applySessionAffinityHeaders(&headers, sessionId: request.sessionId)
         if profile.requestMetadata == .xGrokHeaders {
             request.applyXGrok(into: &headers)
         }
     }
+
+    public func applySessionAffinityHeaders(_ headers: inout [String: String], sessionId: String?) {}
 
     public func sanitizeChatRequest(_ request: inout ChatCompletionWireRequest) {}
 
@@ -279,6 +287,13 @@ public struct XaiProvider: ProviderAdapter {
 public struct CodexProvider: ProviderAdapter {
     public init() {}
     public var provider: ModelProvider { .codex }
+
+    public func applySessionAffinityHeaders(_ headers: inout [String: String], sessionId: String?) {
+        guard let sessionId, !sessionId.isEmpty else { return }
+        headers[CODEX_SESSION_ID_HEADER] = sessionId
+        headers[CODEX_THREAD_ID_HEADER] = sessionId
+        headers[CODEX_CLIENT_REQUEST_ID_HEADER] = sessionId
+    }
 }
 
 public struct KimiProvider: ProviderAdapter {
