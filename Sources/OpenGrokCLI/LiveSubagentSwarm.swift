@@ -347,10 +347,171 @@ func renderSwarmXML(_ results: [SwarmMemberResult]) -> String {
     return xml
 }
 
+/// Partial XML returned when the cohort was detached by a mid-swarm steer.
+/// Mirrors Rust `render_detached_xml` (agent_swarm/mod.rs:1045-1073).
+func renderDetachedSwarmXML(
+    swarmID: String,
+    description: String,
+    expectedMembers: Int,
+    slots: [SwarmMemberResult?]
+) -> String {
+    let completed = slots.compactMap { $0 }.filter { $0.outcome == .completed }.count
+    let failed = slots.compactMap { $0 }.filter { $0.outcome == .failed }.count
+    let aborted = slots.compactMap { $0 }.filter { $0.outcome == .aborted }.count
+    let running = slots.filter { $0 == nil }.count
+    var xml = "<agent_swarm_result state=\"detached\" swarm_id=\"\(swarmXMLEscape(swarmID))\" description=\"\(swarmXMLEscape(description))\">"
+    xml += "<summary>completed=\(completed) failed=\(failed) aborted=\(aborted) running=\(running) expected=\(expectedMembers)</summary>"
+    xml += "<detach_hint>Members keep running. Call swarm_wait with swarm_id=\"\(swarmXMLEscape(swarmID))\" to collect the full result, or keep working and wait later.</detach_hint>"
+    for (index, slot) in slots.enumerated() {
+        if let result = slot {
+            xml += "<subagent"
+            xml += " agent_id=\"\(swarmXMLEscape(result.agentID))\""
+            if let item = result.item {
+                xml += " item=\"\(swarmXMLEscape(item))\""
+            }
+            xml += " outcome=\"\(result.outcome.rawValue)\" state=\"started\""
+            if result.isResume {
+                xml += " mode=\"resume\""
+            }
+            xml += ">"
+            xml += swarmXMLEscape(result.body)
+            xml += "</subagent>"
+        } else {
+            xml += "<subagent index=\"\(index)\" outcome=\"running\" state=\"running\"></subagent>"
+        }
+    }
+    xml += "</agent_swarm_result>"
+    return xml
+}
+
+// MARK: - Swarm Registry & Detached Swarm
+
+final class SwarmRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var swarms: [String: DetachedSwarm] = [:]
+
+    init() {}
+
+    func insert(_ swarm: DetachedSwarm) {
+        lock.lock()
+        defer { lock.unlock() }
+        swarms[swarm.swarmID] = swarm
+    }
+
+    func get(_ swarmID: String) -> DetachedSwarm? {
+        lock.lock()
+        defer { lock.unlock() }
+        return swarms[swarmID]
+    }
+
+    func resolve(swarmID: String?, parentSessionID: String) throws -> DetachedSwarm {
+        lock.lock()
+        defer { lock.unlock() }
+        if let swarmID {
+            guard let swarm = swarms[swarmID] else {
+                throw OpenGrokShellToolRuntimeError.invalidCall("no detached swarm found with id '\(swarmID)'")
+            }
+            return swarm
+        }
+        let matching = swarms.values.filter { $0.parentSessionID == parentSessionID }
+        if matching.isEmpty {
+            throw OpenGrokShellToolRuntimeError.invalidCall("no detached swarms active for this session")
+        }
+        if matching.count > 1 {
+            throw OpenGrokShellToolRuntimeError.invalidCall("multiple detached swarms active; supply swarm_id to select which to join")
+        }
+        return matching[0]
+    }
+
+    func remove(_ swarmID: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        swarms.removeValue(forKey: swarmID)
+    }
+}
+
+final class DetachedSwarm: @unchecked Sendable {
+    let swarmID: String
+    let description: String
+    let parentSessionID: String
+    let expectedMembers: Int
+    private let lock = NSLock()
+    private var slots: [SwarmMemberResult?]
+    private var isFinishedFlag: Bool = false
+    private var finishContinuations: [CheckedContinuation<Void, Never>] = []
+
+    init(
+        swarmID: String,
+        description: String,
+        parentSessionID: String,
+        expectedMembers: Int
+    ) {
+        self.swarmID = swarmID
+        self.description = description
+        self.parentSessionID = parentSessionID
+        self.expectedMembers = expectedMembers
+        self.slots = [SwarmMemberResult?](repeating: nil, count: expectedMembers)
+    }
+
+    func store(index: Int, result: SwarmMemberResult) {
+        lock.lock()
+        if index < slots.count {
+            slots[index] = result
+        }
+        let allDone = !slots.contains { $0 == nil }
+        var toResume: [CheckedContinuation<Void, Never>] = []
+        if allDone && !isFinishedFlag {
+            isFinishedFlag = true
+            toResume = finishContinuations
+            finishContinuations.removeAll()
+        }
+        lock.unlock()
+        for cont in toResume {
+            cont.resume()
+        }
+    }
+
+    func snapshot() -> [SwarmMemberResult?] {
+        lock.lock()
+        defer { lock.unlock() }
+        return slots
+    }
+
+    var isFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isFinishedFlag
+    }
+
+    func takeComplete() -> [SwarmMemberResult]? {
+        lock.lock()
+        defer { lock.unlock() }
+        if slots.contains(where: { $0 == nil }) {
+            return nil
+        }
+        return slots.compactMap { $0 }
+    }
+
+    func waitFinished() async {
+        if isFinished { return }
+        await withCheckedContinuation { cont in
+            lock.lock()
+            if isFinishedFlag {
+                lock.unlock()
+                cont.resume()
+            } else {
+                finishContinuations.append(cont)
+                lock.unlock()
+            }
+        }
+    }
+}
+
 // MARK: - The tool
 
 extension LiveSubagentHost {
     nonisolated static let swarmToolName = "agent_swarm"
+    nonisolated static let swarmWaitToolName = "swarm_wait"
     /// Rust `MAX_MEMBERS` (agent_swarm/mod.rs:34).
     nonisolated static let swarmMaxMembers = 128
     /// Rust `INITIAL_LAUNCHES` (:35).
@@ -381,6 +542,39 @@ extension LiveSubagentHost {
         + "hints for unfinished members. agent_swarm must be the only tool call in the model "
         + "response. Keep the tree flat: swarm members cannot launch further task or "
         + "agent_swarm tools."
+
+    nonisolated static let swarmWaitToolDescription =
+        "Wait for a previously detached agent_swarm cohort to finish and return its full "
+        + "agent_swarm_result XML. Pass swarm_id from the detached result when more than one "
+        + "swarm is outstanding; omit it when only one detached swarm is active. timeout_ms "
+        + "defaults to 600000 (10 minutes); pass 0 to poll the current partial state without "
+        + "blocking. A user message arriving while this wait is held detaches again so you can "
+        + "keep working; call swarm_wait later to rejoin."
+
+    nonisolated static var swarmWaitToolSpec: ToolSpec {
+        ToolSpec(
+            name: swarmWaitToolName,
+            description: swarmWaitToolDescription,
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "swarm_id": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "Swarm id from a detached agent_swarm_result. Omit when only one detached swarm is active."
+                        ),
+                    ]),
+                    "timeout_ms": .object([
+                        "type": .string("integer"),
+                        "description": .string(
+                            "Maximum wait in milliseconds. Omit for 600000 (10 min); pass 0 for a non-blocking poll."
+                        ),
+                    ]),
+                ]),
+                "additionalProperties": .bool(false),
+            ])
+        )
+    }
 
     /// The advertised spec. Parameter descriptions mirror the Rust schemars
     /// annotations on `AgentSwarmToolInput` (xai-tool-types task.rs:138-184).
@@ -589,9 +783,17 @@ extension LiveSubagentHost {
             }
         }
 
+        let swarmID = UUID().uuidString.lowercased()
+        let detachedSwarm = DetachedSwarm(
+            swarmID: swarmID,
+            description: input.description,
+            parentSessionID: context.sessionID,
+            expectedMembers: members.count
+        )
+        swarmRegistry.insert(detachedSwarm)
+
         // Orchestration, not interruptible: a prompt arriving mid-swarm
-        // must not abort this turn, because every member is cancelled with
-        // it (agent_swarm/mod.rs:377-380).
+        // merges as an interjection and detaches the cohort into SwarmRegistry.
         foregroundWait.enter(.orchestration)
         defer { foregroundWait.exit(.orchestration) }
 
@@ -602,19 +804,89 @@ extension LiveSubagentHost {
             runtime: runtime,
             reasoningEffort: reasoningEffort,
             concurrencyCap: concurrencyCap,
-            timeoutMS: timeoutMS
+            timeoutMS: timeoutMS,
+            detachedSwarm: detachedSwarm
         )
         if Task.isCancelled {
-            // Upstream cancellation drops the whole tool future before any
-            // XML can land; the members were already cancelled through the
-            // per-member forwarders. The port's stable analog is the
-            // cancelled tool error.
+            swarmRegistry.remove(swarmID)
             return .failure(.cancelled)
         }
+        swarmRegistry.remove(swarmID)
         return .success(OpenGrokShellToolCallResult(
             value: .string(renderSwarmXML(results)),
             promptText: renderSwarmXML(results)
         ))
+    }
+
+    /// Rejoin or poll a detached `agent_swarm` cohort.
+    /// Mirrors `SwarmWaitTool::run` (agent_swarm/wait.rs:99-183).
+    func runSwarmWait(
+        args: JSONValue,
+        toolCallID: String
+    ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
+        _ = toolCallID
+        let swarmID = args["swarm_id"]?.stringValue
+        let timeoutMS = args["timeout_ms"]?.uint64Value ?? 600_000
+        let effectiveTimeoutMS = min(timeoutMS, 2 * 60 * 60 * 1000)
+
+        let parentSessionID = context.sessionID
+        let swarm: DetachedSwarm
+        do {
+            swarm = try swarmRegistry.resolve(swarmID: swarmID, parentSessionID: parentSessionID)
+        } catch let err as OpenGrokShellToolRuntimeError {
+            return .failure(err)
+        } catch {
+            return .failure(.invalidCall(error.localizedDescription))
+        }
+
+        if effectiveTimeoutMS == 0 {
+            let slots = swarm.snapshot()
+            let xml = renderDetachedSwarmXML(
+                swarmID: swarm.swarmID,
+                description: swarm.description,
+                expectedMembers: swarm.expectedMembers,
+                slots: slots
+            )
+            return .success(OpenGrokShellToolCallResult(value: .string(xml), promptText: xml))
+        }
+
+        if swarm.isFinished, let completed = swarm.takeComplete() {
+            swarmRegistry.remove(swarm.swarmID)
+            let xml = renderSwarmXML(completed)
+            return .success(OpenGrokShellToolCallResult(value: .string(xml), promptText: xml))
+        }
+
+        foregroundWait.enter(.orchestration)
+        defer { foregroundWait.exit(.orchestration) }
+
+        _ = await withTaskGroup(of: Bool.self) { group -> Bool in
+            group.addTask {
+                await swarm.waitFinished()
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: effectiveTimeoutMS * 1_000_000)
+                return false
+            }
+            let finished = await group.next() ?? false
+            group.cancelAll()
+            return finished
+        }
+
+        if swarm.isFinished, let completed = swarm.takeComplete() {
+            swarmRegistry.remove(swarm.swarmID)
+            let xml = renderSwarmXML(completed)
+            return .success(OpenGrokShellToolCallResult(value: .string(xml), promptText: xml))
+        } else {
+            let slots = swarm.snapshot()
+            let xml = renderDetachedSwarmXML(
+                swarmID: swarm.swarmID,
+                description: swarm.description,
+                expectedMembers: swarm.expectedMembers,
+                slots: slots
+            )
+            return .success(OpenGrokShellToolCallResult(value: .string(xml), promptText: xml))
+        }
     }
 
     // MARK: Scheduler
@@ -633,7 +905,8 @@ extension LiveSubagentHost {
         runtime: EffectiveRuntimeConfig,
         reasoningEffort: String?,
         concurrencyCap: Int?,
-        timeoutMS: UInt64?
+        timeoutMS: UInt64?,
+        detachedSwarm: DetachedSwarm
     ) async -> [SwarmMemberResult] {
         var slots = [SwarmMemberResult?](repeating: nil, count: members.count)
         let capacity = max(1, min(concurrencyCap ?? members.count, members.count))
@@ -700,6 +973,7 @@ extension LiveSubagentHost {
                     timerArmed = false
                 case .member(let result):
                     slots[result.index] = result
+                    detachedSwarm.store(index: result.index, result: result)
                     active -= 1
                 }
             }

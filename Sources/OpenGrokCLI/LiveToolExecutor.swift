@@ -561,7 +561,7 @@ struct LiveToolExecutor: Sendable {
         let advertisesSwarm = advertisesSubagents
             && (toolPolicy?.allows(liveToolName: LiveSubagentHost.swarmToolName) ?? true)
         self.swarmToolNames = advertisesSwarm
-            ? [LiveSubagentHost.swarmToolName]
+            ? [LiveSubagentHost.swarmToolName, LiveSubagentHost.swarmWaitToolName]
             : []
         // The collaboration quartet. Enablement is the task surface's own
         // (ad95b111 pins presence to subagents_enabled; builder.rs:848-877
@@ -628,7 +628,7 @@ struct LiveToolExecutor: Sendable {
         self.monitorToolNames = Set(monitorTools.map(\.name))
         let spawnTools: [ToolSpec] = advertisesSubagents
             ? subagentHost.map { host in
-                [host.toolSpec] + (advertisesSwarm ? [LiveSubagentHost.swarmToolSpec] : [])
+                [host.toolSpec] + (advertisesSwarm ? [LiveSubagentHost.swarmToolSpec, LiveSubagentHost.swarmWaitToolSpec] : [])
             } ?? []
             : []
         // The scheduler trio. Enablement is the host's presence (only the
@@ -1048,19 +1048,25 @@ struct LiveToolExecutor: Sendable {
         // real permission decisions — so the only gate here is the same
         // PreToolUse hook pass the spawn surface runs.
         if !swarmToolNames.isEmpty,
-           call.name == LiveSubagentHost.swarmToolName,
            let subagentHost {
-            if let denial = await gateSpawnSubagent(args: args, call: call) {
-                return .failure(denial)
+            if call.name == LiveSubagentHost.swarmToolName {
+                if let denial = await gateSpawnSubagent(args: args, call: call) {
+                    return .failure(denial)
+                }
+                return await subagentHost.runSwarm(
+                    args: args,
+                    toolCallID: call.callId,
+                    // The raw text is the only place JSON object order survives
+                    // (the JSONValue hop is a Dictionary) — the resume map's
+                    // slot order depends on it.
+                    rawArguments: call.arguments
+                )
+            } else if call.name == LiveSubagentHost.swarmWaitToolName {
+                return await subagentHost.runSwarmWait(
+                    args: args,
+                    toolCallID: call.callId
+                )
             }
-            return await subagentHost.runSwarm(
-                args: args,
-                toolCallID: call.callId,
-                // The raw text is the only place JSON object order survives
-                // (the JSONValue hop is a Dictionary) — the resume map's
-                // slot order depends on it.
-                rawArguments: call.arguments
-            )
         }
 
         // The collaboration quartet. Same hooks-only gate as the spawn and

@@ -170,6 +170,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     /// promotes instead of cancelling (the port of `BlockingWaitState`,
     /// shell tools/tool_context.rs:76-117).
     nonisolated let foregroundWait = LiveForegroundWaitState()
+    nonisolated let swarmRegistry = SwarmRegistry()
 
     let context: Context
 

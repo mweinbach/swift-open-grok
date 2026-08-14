@@ -437,7 +437,7 @@ struct AgentSwarmPlannerTests {
 
 @Suite("agent_swarm advertisement", .serialized)
 struct LiveAgentSwarmAdvertisementTests {
-    @Test("a default session advertises agent_swarm beside the spawn surface")
+    @Test("a default session advertises agent_swarm and swarm_wait beside the spawn surface")
     func advertisesSwarmTool() async throws {
         let fixture = try SwarmFixture()
         defer { fixture.dispose() }
@@ -447,6 +447,7 @@ struct LiveAgentSwarmAdvertisementTests {
         let advertised = Set(foundation.toolExecutor.tools.map(\.name))
         #expect(advertised.contains("spawn_subagent"))
         #expect(advertised.contains("agent_swarm"))
+        #expect(advertised.contains("swarm_wait"))
 
         // The upstream description pins, from its own test
         // (`tool_description_pins_swarm_workflow_and_flat_tree`,
@@ -457,9 +458,13 @@ struct LiveAgentSwarmAdvertisementTests {
         #expect(spec?.description?.contains("only tool call") == true)
         #expect(spec?.description?.contains("Keep the tree flat") == true)
         #expect(spec?.description?.contains("reasoning_effort") == true)
+
+        let waitSpec = foundation.toolExecutor.tools.first { $0.name == "swarm_wait" }
+        #expect(waitSpec?.description?.contains("swarm_id") == true)
+        #expect(waitSpec?.description?.contains("timeout_ms") == true)
     }
 
-    @Test("--no-subagents strips agent_swarm together with the spawn surface")
+    @Test("--no-subagents strips agent_swarm and swarm_wait together with the spawn surface")
     func noSubagentsStripsSwarm() async throws {
         let fixture = try SwarmFixture()
         defer { fixture.dispose() }
@@ -468,6 +473,7 @@ struct LiveAgentSwarmAdvertisementTests {
 
         let advertised = Set(foundation.toolExecutor.tools.map(\.name))
         #expect(!advertised.contains("agent_swarm"))
+        #expect(!advertised.contains("swarm_wait"))
 
         // The unadvertised surface is also undispatchable — absence of the
         // tool must mean absence, not a tool that errors differently.
@@ -485,6 +491,221 @@ struct LiveAgentSwarmAdvertisementTests {
             return
         }
         #expect(error.description.contains("unknown tool"))
+
+        let waitResult = await foundation.toolExecutor.invoke(
+            sessionID: foundation.sessionID,
+            workingDirectory: foundation.cwd,
+            call: ToolCall(
+                id: "call-wait-1",
+                name: "swarm_wait",
+                arguments: #"{}"#
+            )
+        )
+        guard case .failure(let waitError) = waitResult else {
+            Issue.record("a stripped surface must not dispatch")
+            return
+        }
+        #expect(waitError.description.contains("unknown tool"))
+    }
+}
+
+// MARK: - Detached Swarm & Registry
+
+@Suite("detached swarm & registry", .serialized)
+struct DetachedSwarmAndRegistryTests {
+    @Test("detached XML shapes matching expected summary and states")
+    func detachedXMLShape() {
+        let xml = renderDetachedSwarmXML(
+            swarmID: "swarm-123",
+            description: "test <desc>",
+            expectedMembers: 3,
+            slots: [
+                SwarmMemberResult(
+                    index: 0,
+                    item: "item0",
+                    agentID: "agent-0",
+                    outcome: .completed,
+                    isResume: false,
+                    body: "all done"
+                ),
+                nil,
+                SwarmMemberResult(
+                    index: 2,
+                    item: "item2",
+                    agentID: "agent-2",
+                    outcome: .failed,
+                    isResume: true,
+                    body: "failed"
+                ),
+            ]
+        )
+        #expect(xml.hasPrefix("<agent_swarm_result state=\"detached\" swarm_id=\"swarm-123\" description=\"test &lt;desc&gt;\">"))
+        #expect(xml.contains("<summary>completed=1 failed=1 aborted=0 running=1 expected=3</summary>"))
+        #expect(xml.contains("<detach_hint>Members keep running. Call swarm_wait with swarm_id=\"swarm-123\" to collect the full result, or keep working and wait later.</detach_hint>"))
+        #expect(xml.contains("<subagent agent_id=\"agent-0\" item=\"item0\" outcome=\"completed\" state=\"started\">all done</subagent>"))
+        #expect(xml.contains("<subagent index=\"1\" outcome=\"running\" state=\"running\"></subagent>"))
+        #expect(xml.contains("<subagent agent_id=\"agent-2\" item=\"item2\" outcome=\"failed\" state=\"started\" mode=\"resume\">failed</subagent>"))
+        #expect(xml.hasSuffix("</agent_swarm_result>"))
+    }
+
+    @Test("SwarmRegistry resolves single, explicit, missing, and ambiguous swarms")
+    func registryResolution() throws {
+        let registry = SwarmRegistry()
+        let sessionA = "session-a"
+
+        #expect(throws: OpenGrokShellToolRuntimeError.self) {
+            _ = try registry.resolve(swarmID: nil, parentSessionID: sessionA)
+        }
+
+        let swarm1 = DetachedSwarm(
+            swarmID: "swarm-1",
+            description: "first",
+            parentSessionID: sessionA,
+            expectedMembers: 2
+        )
+        registry.insert(swarm1)
+
+        let resolvedSingle = try registry.resolve(swarmID: nil, parentSessionID: sessionA)
+        #expect(resolvedSingle.swarmID == "swarm-1")
+
+        let resolvedExplicit = try registry.resolve(swarmID: "swarm-1", parentSessionID: sessionA)
+        #expect(resolvedExplicit.swarmID == "swarm-1")
+
+        #expect(throws: OpenGrokShellToolRuntimeError.self) {
+            _ = try registry.resolve(swarmID: "swarm-999", parentSessionID: sessionA)
+        }
+
+        let swarm2 = DetachedSwarm(
+            swarmID: "swarm-2",
+            description: "second",
+            parentSessionID: sessionA,
+            expectedMembers: 1
+        )
+        registry.insert(swarm2)
+
+        // Multiple active for sessionA -> ambiguous error when swarmID omitted
+        #expect(throws: OpenGrokShellToolRuntimeError.self) {
+            _ = try registry.resolve(swarmID: nil, parentSessionID: sessionA)
+        }
+
+        // But explicit succeeds
+        #expect(try registry.resolve(swarmID: "swarm-2", parentSessionID: sessionA).swarmID == "swarm-2")
+
+        // Remove swarm1
+        registry.remove("swarm-1")
+        #expect(try registry.resolve(swarmID: nil, parentSessionID: sessionA).swarmID == "swarm-2")
+    }
+
+    @Test("DetachedSwarm completion notification and slot collection")
+    func detachedSwarmCompletion() async {
+        let swarm = DetachedSwarm(
+            swarmID: "s1",
+            description: "desc",
+            parentSessionID: "p1",
+            expectedMembers: 2
+        )
+        #expect(!swarm.isFinished)
+        #expect(swarm.takeComplete() == nil)
+
+        swarm.store(
+            index: 0,
+            result: SwarmMemberResult(
+                index: 0, item: "i0", agentID: "a0",
+                outcome: .completed, isResume: false, body: "res0"
+            )
+        )
+        #expect(!swarm.isFinished)
+        #expect(swarm.takeComplete() == nil)
+
+        Task {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+            swarm.store(
+                index: 1,
+                result: SwarmMemberResult(
+                    index: 1, item: "i1", agentID: "a1",
+                    outcome: .completed, isResume: false, body: "res1"
+                )
+            )
+        }
+
+        await swarm.waitFinished()
+        #expect(swarm.isFinished)
+        let complete = swarm.takeComplete()
+        #expect(complete?.count == 2)
+        #expect(complete?[0].body == "res0")
+        #expect(complete?[1].body == "res1")
+    }
+
+    @Test("swarm_wait tool execution on detached swarm non-blocking poll and completion")
+    func swarmWaitToolExecution() async throws {
+        let fixture = try SwarmFixture()
+        defer { fixture.dispose() }
+        let foundation = try await fixture.makeFoundation()
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+
+        guard let host = foundation.subagentHost else {
+            Issue.record("subagentHost must be present")
+            return
+        }
+
+        let swarm = DetachedSwarm(
+            swarmID: "test-detached-swarm",
+            description: "test swarm wait",
+            parentSessionID: foundation.sessionID,
+            expectedMembers: 1
+        )
+        host.swarmRegistry.insert(swarm)
+
+        // Poll non-blocking (timeout_ms: 0) while running
+        let pollResult = await foundation.toolExecutor.invoke(
+            sessionID: foundation.sessionID,
+            workingDirectory: foundation.cwd,
+            call: ToolCall(
+                id: "call-wait-poll",
+                name: "swarm_wait",
+                arguments: #"{"swarm_id":"test-detached-swarm","timeout_ms":0}"#
+            )
+        )
+        guard case .success(let output) = pollResult else {
+            Issue.record("poll should succeed")
+            return
+        }
+        #expect(output.promptText.contains("state=\"detached\""))
+        #expect(output.promptText.contains("running=1"))
+
+        // Complete the swarm
+        swarm.store(
+            index: 0,
+            result: SwarmMemberResult(
+                index: 0,
+                item: "itemA",
+                agentID: "agent-a",
+                outcome: .completed,
+                isResume: false,
+                body: "finished item A"
+            )
+        )
+
+        // Wait and collect completed swarm
+        let waitResult = await foundation.toolExecutor.invoke(
+            sessionID: foundation.sessionID,
+            workingDirectory: foundation.cwd,
+            call: ToolCall(
+                id: "call-wait-complete",
+                name: "swarm_wait",
+                arguments: #"{"swarm_id":"test-detached-swarm","timeout_ms":1000}"#
+            )
+        )
+        guard case .success(let waitOutput) = waitResult else {
+            Issue.record("wait should succeed")
+            return
+        }
+        #expect(!waitOutput.promptText.contains("state=\"detached\""))
+        #expect(waitOutput.promptText.contains("<summary>completed=1 failed=0 aborted=0</summary>"))
+        #expect(waitOutput.promptText.contains("finished item A"))
+
+        // Swarm should be removed from registry on complete collection
+        #expect(host.swarmRegistry.get("test-detached-swarm") == nil)
     }
 }
 
