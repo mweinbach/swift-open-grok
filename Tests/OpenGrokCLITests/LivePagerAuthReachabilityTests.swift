@@ -340,6 +340,7 @@ struct LiveLoginPickerTests {
         #expect(statuses["meta"] == .missing)
         #expect(statuses["opencode-go"] == .missing)
         #expect(statuses["wafer"] == .missing)
+        #expect(statuses["zai"] == .missing)
 
         let overlay = LiveLoginProviderPicker.overlay(statuses: statuses)
         guard case .list(let list) = overlay.content else {
@@ -352,11 +353,11 @@ struct LiveLoginPickerTests {
         // `summary`, which the list painter never draws.
         #expect(list.rows.map(\.label) == [
             "xAI Grok", "ChatGPT Codex", "Kimi", "Fireworks AI",
-            "DeepSeek", "Meta API", "OpenCode Go", "Wafer AI",
+            "DeepSeek", "Meta API", "OpenCode Go", "Wafer AI", "Z AI",
         ])
         #expect(list.rows.map(\.id) == [
             "xai", "codex", "kimi", "fireworks",
-            "deepseek", "meta", "opencode-go", "wafer",
+            "deepseek", "meta", "opencode-go", "wafer", "zai",
         ])
         #expect(list.rows[0].detail == "Sign in with xAI")
         #expect(list.rows[1].detail == "Connect an OpenAI Codex account")

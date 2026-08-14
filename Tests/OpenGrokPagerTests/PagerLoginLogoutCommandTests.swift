@@ -128,7 +128,7 @@ struct PagerLoginLogoutCommandTests {
         #expect(await harness.notices == [
             "Unknown provider: FooBar. Use /login xai, /login codex, /login kimi, "
                 + "/login fireworks, /login deepseek, /login meta, /login wafer, "
-                + "or /login opencode-go"
+                + "/login zai, or /login opencode-go"
         ])
     }
 
@@ -159,19 +159,19 @@ struct PagerLoginLogoutCommandTests {
 
     // MARK: - Argument completion
 
-    @Test("/login offers the eight providers with neutral descriptions and ranks over match_text")
+    @Test("/login offers the nine providers with neutral descriptions and ranks over match_text")
     func loginArgumentSuggestions() async throws {
         let harness = try await AuthCommandHarness.run(events: [
             .paste("/login "),
             .paste("moonshot"),
         ])
         let states = await harness.promptStates
-        // Bare phase: all eight, upstream's picker order with the
+        // Bare phase: all nine, upstream's picker order with the
         // provider-neutral descriptions (`suggest_args`, `login.rs:124-126`).
         let opened = states.first { $0.text == "/login " && !$0.completions.isEmpty }
         #expect(opened?.completions.map(\.name) == [
             "xAI Grok", "ChatGPT Codex", "Kimi", "Fireworks AI",
-            "DeepSeek", "Meta API", "OpenCode Go", "Wafer AI",
+            "DeepSeek", "Meta API", "OpenCode Go", "Wafer AI", "Z AI",
         ])
         #expect(opened?.completions.first?.summary == "Sign in with xAI")
         #expect(opened?.completions.first?.insertText == "/login xai")

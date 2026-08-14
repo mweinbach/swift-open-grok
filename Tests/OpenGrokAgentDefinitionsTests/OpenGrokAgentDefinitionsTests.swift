@@ -189,7 +189,7 @@ private let liveRegisteredToolNames: Set<String> = [
     "grep", "image_gen", "kill_command_or_subagent", "list_dir",
     "memory_get", "memory_search", "monitor", "read_file",
     "run_terminal_command", "scheduler_create", "scheduler_delete", "scheduler_list",
-    "search_replace", "search_tool", "skill", "spawn_subagent", "todo_write",
+    "search_replace", "search_tool", "skill", "spawn_subagent", "swarm_wait", "todo_write",
     "update_goal", "use_tool", "view_image", "wait_commands_or_subagents", "web_fetch",
     "web_search", "workflow", "write",
 ]

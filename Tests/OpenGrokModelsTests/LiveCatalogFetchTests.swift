@@ -989,7 +989,7 @@ struct ModelsManagerLiveRefreshTests {
         let before = manager.catalogSnapshot().keys
 
         let outcomes = await manager.refreshBackgroundPartitions()
-        #expect(outcomes.count == 6)
+        #expect(outcomes.count == 7)
         #expect(outcomes.allSatisfy { !$0.published })
         #expect(outcomes.allSatisfy { $0.failure == nil })
         // No request was ever attempted.

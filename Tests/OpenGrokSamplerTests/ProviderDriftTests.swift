@@ -21,7 +21,7 @@ struct ProviderRegistryDriftTests {
     @Test("registry covers every built-in provider exactly once")
     func registryCoverage() {
         let expected: [ModelProvider] = [
-            .xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer,
+            .xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai,
         ]
         #expect(PROVIDER_REGISTRY.count == expected.count)
         for provider in expected {
