@@ -1,12 +1,13 @@
 // OpenGrokWorkspace.swift
 //
-// Core workspace library (Swift port of `xai-grok-workspace`):
-// permission pipeline (plan gate → PreToolUse hooks → plan-file auto-approve
-// → permission engine), rule DSL, bash segmentation, folder trust, path
-// boundary, path/resource locks, and local FS/process mediation.
-//
-// Full FS/VCS/hub server runtime continues to land in later slices; this
-// target establishes the enforceable security boundary required before
-// concrete tools and the session runtime are implemented.
+// Core workspace library (Swift port of `xai-grok-workspace` and `xai-grok-workspace-daemon`):
+// - Permission pipeline (plan gate → PreToolUse hooks → plan-file auto-approve
+//   → permission engine), rule DSL, bash segmentation, folder trust, path
+//   boundary, path/resource locks, and local FS/process mediation.
+// - Process lifecycle: self-daemonization (double-fork + `setsid()` session separation,
+//   stdio redirection, OOM protection), single-instance pidfile locking/takeover.
+// - In-sandbox preview-proxy supervision (child process lifecycle, exponential backoff,
+//   activity scraper and metric scrapers).
 
 import Foundation
+
