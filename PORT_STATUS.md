@@ -1,11 +1,30 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-14 (Core Subsystems Parity Porting & v1.0.0-open-grok.62 Convergence). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; authoritative full `test --no-parallel` exit 0 — exactly **6,778 Swift Testing cases in 1,048 suites passed** after 285.72s (0 failures, 0 regressions against baseline).
+**As of:** 2026-08-14 (Wave 21 — v1.0.0-open-grok.63 Multi-Agent Convergence). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0; authoritative full `test --no-parallel` exit 0 — exactly **6,811 Swift Testing cases in 1,052 suites passed** after 300.38s (0 failures, 0 regressions against baseline).
 
-**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (Agent Runtime & Turn Pipeline, ACP Transports, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
+**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (Agent Runtime & Turn Pipeline, ACP Transports, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
 **Destination was empty at baseline:** yes.
-**Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`) / Forward Sync `b849ec76` (`v1.0.0-open-grok.62`).
+**Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`) / Forward Sync `eb215dd0` (`v1.0.0-open-grok.63`).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
+
+## Wave 21 — v1.0.0-open-grok.63 Convergence (2026-08-14, complete)
+
+Current truth for the verified 2026-08-14 Wave 21 Multi-Agent Convergence against Rust pin `eb215dd0` / `v1.0.0-open-grok.63`:
+
+**Verification (lead, local macOS, 2026-08-14; serial gate):**
+- `zsh workflows/swift-safe-verify.zsh build` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build --product open-grok` — exit 0.
+- Authoritative full `zsh workflows/swift-safe-verify.zsh test --no-parallel` — exit 0: exactly **6,811** Swift Testing cases in **1,052** suites, elapsed **300.38s** (100% green).
+- CLI Smokes: `open-grok --version` reports `Open Grok 1.0.0-open-grok.63` (exit 0); `paths --json` and `models --json` exit 0.
+
+### Slices Completed & Landed
+
+1. **Slice 1: Token Usage Prompt Cache Hit Rate Helpers & Version Bump** — Bumped `OPEN_GROK_VERSION` to `1.0.0-open-grok.63`. Added `cacheHitRate` (`Double?`) and `cacheHitRatePct` (`Double`) across `TokenUsage`, `UsageTotals`, and `PromptUsageModel` with zero-division safety and steady-state calculations (`Usage.swift`, `UsageTests.swift`).
+2. **Slice 2: Prompt Cache Tracking & Session Cache Query** — Implemented `PromptCacheTracker.swift`, `SessionCacheQuery.swift`, and `PromptCacheTrackerTests.swift` capturing `CacheBreakReason` (`systemPromptChanged`, `toolsChanged`, `messageSequenceChanged`, `compaction`, `modelChanged`, `historyRelocated`, `unknown`), `CacheBreakEvent`, `SessionCacheSnapshot`, turn-over-turn cache performance, and `x.ai/session_cache` RPC handler.
+3. **Slice 3: Custom Model Store & Persistent Configuration** — Implemented `CustomModelStore.swift` and `CustomModelStoreTests.swift` managing `$OPENGROK_HOME/custom_models.json` atomically with full CRUD operations (`listCustomModels`, `upsertCustomModel`, `deleteCustomModel`), newline validation with `Character.isNewline`, and `mergeCustomModels` ensuring custom models survive live `/models` catalog refreshes.
+4. **Slice 4: Pager `/cache` Slash Command & `/usage` Hit Rate Display** — Added `/cache` (aliases `/cache-status`, `/prompt-cache`) command in `OpenGrokPagerCommandUI`, `OpenGrokPagerInteractiveController`, and `LiveInteractiveOverlays`. Added `LiveCacheComposition` and integrated prompt cache hit rate percentages into `/usage` modal readout.
+5. **Slice 5: Web Search Domain Filters & Turn-End Drain Queue Hooks** — Implemented `WebSearchFilter.swift` and `WebSearchFilterTests.swift` enforcing config allowlist/blocklist precedence over model-requested domain filters. Implemented `TurnEndHooks.swift` queueing `StopFailure` and `StopCancelled` hooks with `TURN_END_DRAIN_BUDGET = 250ms`.
 
 ## Core Subsystems Parity Porting (2026-08-14, complete)
 

@@ -230,6 +230,7 @@ struct LiveUsageReport: Sendable, Equatable {
     /// is an estimate rather than a provider-reported total.
     var estimatedSessionTokens: UInt64
     var turnCount: Int
+    var promptCacheHitRatePct: Double? = nil
 }
 
 enum LiveUsageComposition {
@@ -254,7 +255,8 @@ enum LiveUsageComposition {
     static func report(
         context: ContextUsage?,
         items: [ConversationItem],
-        usageSources: [ModelProvider: any ProviderUsageSource] = [:]
+        usageSources: [ModelProvider: any ProviderUsageSource] = [:],
+        cacheHitRatePct: Double? = nil
     ) async -> LiveUsageReport {
         let combined = usageSources.isEmpty
             ? CombinedProviderUsage(windows: [], failures: [])
@@ -264,7 +266,8 @@ enum LiveUsageComposition {
             quotaWindows: combined.windows,
             quotaFailures: combined.failures,
             estimatedSessionTokens: estimateTokens(items),
-            turnCount: turnCount(items)
+            turnCount: turnCount(items),
+            promptCacheHitRatePct: cacheHitRatePct
         )
     }
 
@@ -326,6 +329,9 @@ enum LiveUsageComposition {
         }
         lines.append("Turns:    \(report.turnCount)")
         lines.append("Tokens:   ~\(report.estimatedSessionTokens) estimated this session")
+        if let hitRate = report.promptCacheHitRatePct {
+            lines.append("Cache:    \(String(format: "%.1f", hitRate))% prompt cache hit rate")
+        }
 
         if !report.quotaWindows.isEmpty {
             lines.append("")
@@ -340,6 +346,39 @@ enum LiveUsageComposition {
         }
         for failure in report.quotaFailures {
             lines.append("\(failure.provider.asString): usage unavailable — \(failure.message)")
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+enum LiveCacheComposition {
+    /// Render `/cache` prompt cache report as plain text.
+    static func render(
+        cacheHitRate: Double?,
+        totalPromptTokens: UInt64,
+        cachedTokens: UInt64,
+        breakEvents: [(reason: String, details: String)] = []
+    ) -> String {
+        var lines: [String] = []
+        lines.append("Prompt Cache Diagnostics")
+        lines.append("────────────────────────")
+        if let rate = cacheHitRate {
+            lines.append("Hit Rate:      \(String(format: "%.1f", rate))%")
+        } else {
+            lines.append("Hit Rate:      None (cold start / no prompt tokens)")
+        }
+        lines.append("Prompt Tokens: \(totalPromptTokens)")
+        lines.append("Cached Tokens: \(cachedTokens)")
+
+        if !breakEvents.isEmpty {
+            lines.append("")
+            lines.append("Cache Break Events:")
+            for event in breakEvents.suffix(10) {
+                lines.append("  • [\(event.reason)] \(event.details)")
+            }
+        } else {
+            lines.append("")
+            lines.append("No cache break events recorded.")
         }
         return lines.joined(separator: "\n")
     }

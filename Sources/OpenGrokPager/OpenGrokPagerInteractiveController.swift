@@ -2964,6 +2964,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "View session token usage",
             usage: "/usage"
         ),
+        PagerCommandDefinition(
+            name: "cache",
+            aliases: ["cache-status", "prompt-cache"],
+            summary: "View prompt cache hit rates, prefix divergence, and break diagnostics",
+            usage: "/cache"
+        ),
         // B2-S2: the screen-mode switchers, upstream's registry position —
         // after `/context`, before `/model` (`slash/commands/mod.rs:99-101`).
         // Name, alias, description, and usage verbatim
@@ -3820,6 +3826,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     return .handled
                 }
                 try await emit(.overlay(.usage))
+                return .handled
+            case "cache", "cache-status", "prompt-cache":
+                let cacheArgument = Self.rejoined(invocation.arguments)
+                guard cacheArgument.isEmpty else {
+                    try await emit(.notice(
+                        "Unknown argument: \(cacheArgument). Use /cache"
+                    ))
+                    return .handled
+                }
+                try await emit(.overlay(.cache))
                 return .handled
             case "resume":
                 // Bare `/resume` opens the picker (`resume.rs:21-23`); the

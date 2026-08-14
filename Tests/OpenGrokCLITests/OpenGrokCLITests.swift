@@ -198,12 +198,12 @@ struct OpenGrokCLITests {
     func supportedBuiltIns() {
         let (versionStreams, versionOut, versionErr) = CLIStreams.buffered()
         #expect(CLIRunner.main(["--version"], environment: [:], streams: versionStreams) == 0)
-        #expect(versionOut.contents == "Open Grok 1.0.0-open-grok.62\n")
+        #expect(versionOut.contents == "Open Grok 1.0.0-open-grok.63\n")
         #expect(versionErr.contents.isEmpty)
 
         let (versionJSONStreams, versionJSONOut, versionJSONErr) = CLIStreams.buffered()
         #expect(CLIRunner.main(["version", "--json"], environment: [:], streams: versionJSONStreams) == 0)
-        #expect(versionJSONOut.contents == "{\"version\":\"1.0.0-open-grok.62\"}\n")
+        #expect(versionJSONOut.contents == "{\"version\":\"1.0.0-open-grok.63\"}\n")
         #expect(versionJSONErr.contents.isEmpty)
 
         let (pathStreams, pathOut, pathErr) = CLIStreams.buffered()

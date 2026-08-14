@@ -2293,6 +2293,20 @@ extension LiveInteractiveControllerRenderer {
                     .split(separator: "\n", omittingEmptySubsequences: false)
                     .map { PagerStyledLine(text: String($0)) }
             ))
+        case .cache:
+            // `/cache` (upstream Action::ShowCache, slash/commands/cache.rs)
+            overlays.push(.sessionInfo(
+                id: "cache",
+                title: "Prompt Cache",
+                lines: LiveCacheComposition.render(
+                    cacheHitRate: nil,
+                    totalPromptTokens: 0,
+                    cachedTokens: 0,
+                    breakEvents: []
+                )
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map { PagerStyledLine(text: String($0)) }
+            ))
         case .mcpServers:
             overlays.push(.sessionInfo(
                 id: "mcps",

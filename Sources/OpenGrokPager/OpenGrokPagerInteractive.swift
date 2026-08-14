@@ -512,6 +512,9 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// (upstream `Action::ShowUsage`, `slash/commands/usage.rs:59`). The
     /// billing-surface arm (`manage`) is not ported; see the controller.
     case usage
+    /// `/cache`, aliases `/cache-status`, `/prompt-cache` — view prompt cache hit rates,
+    /// prefix divergence, and break diagnostics.
+    case cache
     /// `/mcps` — per-server MCP connection status (upstream opens the
     /// extensions modal's MCP tab, `slash/commands/mcps.rs:19-24`; this port
     /// renders the same facts as a read-only list, kept alongside the

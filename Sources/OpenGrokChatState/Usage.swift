@@ -58,6 +58,17 @@ public struct UsageTotals: Sendable, Equatable, Hashable {
         inputTokens.addingWithSaturate(outputTokens)
     }
 
+    /// Cache hit rate as a percentage (0.0 to 100.0), or `nil` if `inputTokens == 0`.
+    public var cacheHitRate: Double? {
+        guard inputTokens > 0 else { return nil }
+        return (Double(cachedReadTokens) / Double(inputTokens)) * 100.0
+    }
+
+    /// Cache hit rate percentage, defaulting to `0.0` if `inputTokens == 0`.
+    public var cacheHitRatePct: Double {
+        cacheHitRate ?? 0.0
+    }
+
     /// `true` when some calls reported cost but at least one did not.
     public func costIsPartial() -> Bool {
         costUsdTicks != nil && costMissingCalls > 0

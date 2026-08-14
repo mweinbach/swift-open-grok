@@ -15,7 +15,7 @@ struct OpenGrokVersionTests {
 
     private var expectedCompiledVersion: String {
         ProcessInfo.processInfo.environment["GROK_TEST_EXPECTED_COMPILED_VERSION"]
-            ?? "1.0.0-open-grok.62"
+            ?? "1.0.0-open-grok.63"
     }
 
     // MARK: - Compiled version constant
@@ -39,7 +39,7 @@ struct OpenGrokVersionTests {
             .split(whereSeparator: \.isNewline)
             .first
             .map(String.init) ?? ""
-        #expect(marker == "1.0.0-open-grok.62")
+        #expect(marker == "1.0.0-open-grok.63")
         #expect(OpenGrokVersion.compiledVersion == marker)
     }
 
