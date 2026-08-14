@@ -341,4 +341,55 @@ struct CompactionCheckpointTests {
         #expect(!texts.contains("P2"))
         #expect(!texts.contains("P3"))
     }
+
+    // MARK: - 4. History Sanitization & Guard Tests
+
+    @Test("Compacted history sanitization strips orphaned tool results and custom outputs")
+    func checkpointHistorySanitization() {
+        let items: [ConversationItem] = [
+            .system("System instructions"),
+            .toolResult(ToolResultItem(toolCallId: "orphan-call-1", content: "Orphaned result")),
+            .customToolOutput(CustomToolOutputItem.text(callId: "orphan-custom-1", "Orphaned custom")),
+            .assistant(AssistantItem(content: "Calling tool", toolCalls: [ToolCall(id: "valid-call", name: "read", arguments: "{}")])),
+            .toolResult(ToolResultItem(toolCallId: "valid-call", content: "Valid result")),
+            .user("Follow-up prompt")
+        ]
+
+        let sanitized = sanitizeCompactedHistory(items)
+        #expect(sanitized.strippedToolCallIDs.sorted() == ["orphan-call-1", "orphan-custom-1"])
+        #expect(sanitized.items.count == 4)
+        #expect(!sanitized.items.contains { item in
+            if case .toolResult(let r) = item { return r.toolCallId == "orphan-call-1" }
+            return false
+        })
+    }
+
+    @Test("Compaction reduction guard boundary evaluation")
+    func checkpointReductionGuardBoundaries() {
+        #expect(compactionMeetsReductionGuard(tokensBefore: 10_000, tokensAfter: 8_000, maxReductionRatio: 0.8))
+        #expect(!compactionMeetsReductionGuard(tokensBefore: 10_000, tokensAfter: 8_001, maxReductionRatio: 0.8))
+        #expect(compactionMeetsReductionGuard(tokensBefore: 10_000, tokensAfter: 1_000, maxReductionRatio: 0.8))
+        #expect(!compactionMeetsReductionGuard(tokensBefore: 0, tokensAfter: 0, maxReductionRatio: 0.8))
+        #expect(!compactionMeetsReductionGuard(tokensBefore: 100, tokensAfter: 200, maxReductionRatio: 0.8))
+    }
+
+    @Test("AutoContinueInfo encoding and CompactionCheckpointInfo optional auto_continue round-trip")
+    func checkpointAutoContinueInfoEncoding() throws {
+        let infoWithPrompt = AutoContinueInfo(promptText: "Please analyze the compiler errors.")
+        let data1 = try JSONEncoder().encode(infoWithPrompt)
+        let decoded1 = try JSONDecoder().decode(AutoContinueInfo.self, from: data1)
+        #expect(decoded1.promptText == "Please analyze the compiler errors.")
+
+        let jsonWithoutAutoContinue = """
+        {
+            "checkpoint_id": "ckpt-no-ac",
+            "prompt_index_at_compaction": 5,
+            "checkpoint_file": "compaction_checkpoints/ckpt-no-ac.json",
+            "schema_version": 1,
+            "created_at": "2026-08-14T12:00:00Z"
+        }
+        """.data(using: .utf8)!
+        let decoded2 = try JSONDecoder().decode(CompactionCheckpointInfo.self, from: jsonWithoutAutoContinue)
+        #expect(decoded2.autoContinue == nil)
+    }
 }
