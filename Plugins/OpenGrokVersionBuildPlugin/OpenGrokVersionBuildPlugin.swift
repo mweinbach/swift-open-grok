@@ -27,7 +27,7 @@ struct OpenGrokVersionBuildPlugin: BuildToolPlugin {
         // Resolve the version string (same resolution order as the Rust
         // crate and `regenerate-compiled-version.sh`).
         let env = ProcessInfo.processInfo.environment
-        let defaultVersion = "0.1.220-open-grok.58"
+        let defaultVersion = "1.0.0-open-grok.62"
 
         let version: String
         if let grokVersion = env["GROK_VERSION"], !grokVersion.isEmpty {

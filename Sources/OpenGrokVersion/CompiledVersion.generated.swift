@@ -24,7 +24,7 @@ internal enum OpenGrokCompiledVersion {
     /// The compile-time Open Grok version, injected from `GROK_VERSION` at
     /// generation time. Mirrors the Rust `VERSION` constant.
     @usableFromInline
-    internal static let version: String = "0.1.220-open-grok.58"
+    internal static let version: String = "1.0.0-open-grok.62"
     @usableFromInline
     internal static let shortCommit: String? = nil
 }

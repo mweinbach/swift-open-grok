@@ -15,7 +15,7 @@ struct OpenGrokVersionTests {
 
     private var expectedCompiledVersion: String {
         ProcessInfo.processInfo.environment["GROK_TEST_EXPECTED_COMPILED_VERSION"]
-            ?? "0.1.220-open-grok.58"
+            ?? "1.0.0-open-grok.62"
     }
 
     // MARK: - Compiled version constant
@@ -39,7 +39,7 @@ struct OpenGrokVersionTests {
             .split(whereSeparator: \.isNewline)
             .first
             .map(String.init) ?? ""
-        #expect(marker == "0.1.220-open-grok.58")
+        #expect(marker == "1.0.0-open-grok.62")
         #expect(OpenGrokVersion.compiledVersion == marker)
     }
 
@@ -601,7 +601,7 @@ struct OpenGrokVersionTests {
         } else {
             // No OPEN_GROK_VERSION file in the package root: the script falls
             // back to the default version.
-            #expect(version == "0.1.220-open-grok.58",
+            #expect(version == "1.0.0-open-grok.62",
                     "Generated version must be the default when no OPEN_GROK_VERSION file exists")
         }
     }
