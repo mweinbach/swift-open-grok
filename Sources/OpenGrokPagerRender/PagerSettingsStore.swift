@@ -24,6 +24,11 @@ public enum PagerSettingsStoreError: Error, CustomStringConvertible, Equatable {
     case typeMismatch(key: String)
     /// A path segment exists but holds a scalar where a table is needed.
     case pathBlocked(path: String)
+    case emptyCustomModelKey
+    case emptyCustomModelSlug
+    case customModelKeyContainsNewlines
+    case customModelSlugContainsNewlines
+    case invalidCustomModelKeyCharacters(String)
 
     public var description: String {
         switch self {
@@ -31,23 +36,277 @@ public enum PagerSettingsStoreError: Error, CustomStringConvertible, Equatable {
         case .unknownKey(let key): return "unknown setting: \(key)"
         case .typeMismatch(let key): return "wrong value type for \(key)"
         case .pathBlocked(let path): return "\(path) is not a table"
+        case .emptyCustomModelKey, .emptyCustomModelSlug: return "Enter a catalog key and model id before saving"
+        case .customModelKeyContainsNewlines, .invalidCustomModelKeyCharacters:
+            return "✗ Catalog key must be a TOML table suffix (letters, digits, :, ., -, _)"
+        case .customModelSlugContainsNewlines:
+            return "✗ Model id cannot be empty or contain newlines"
         }
     }
 }
 
-/// Reads and writes the settings rows that live in `config.toml`.
+/// Draft state for the Custom Models settings sub-sheet.
+public struct CustomModelDraft: Sendable, Equatable, Codable {
+    public var id: String
+    public var slug: String
+    public var name: String
+    public var provider: String
+    public var baseUrl: String
+    public var contextWindow: Int
+    public var backend: String
+    public var envKey: String
+    public var save: Bool
+
+    public init(
+        id: String = "",
+        slug: String = "",
+        name: String = "",
+        provider: String = "",
+        baseUrl: String = "",
+        contextWindow: Int = 200_000,
+        backend: String = "chat_completions",
+        envKey: String = "",
+        save: Bool = false
+    ) {
+        self.id = id
+        self.slug = slug
+        self.name = name
+        self.provider = provider
+        self.baseUrl = baseUrl
+        self.contextWindow = contextWindow
+        self.backend = backend
+        self.envKey = envKey
+        self.save = save
+    }
+
+    public mutating func clear() {
+        self.id = ""
+        self.slug = ""
+        self.name = ""
+        self.provider = ""
+        self.baseUrl = ""
+        self.contextWindow = 200_000
+        self.backend = "chat_completions"
+        self.envKey = ""
+        self.save = false
+    }
+}
+
+/// A custom model record stored in `$OPENGROK_HOME/custom_models.json`.
+public struct PagerCustomModelRecord: Codable, Sendable, Equatable, Identifiable {
+    public var id: String { key }
+    public var key: String
+    public var modelId: String
+    public var provider: String
+    public var baseUrl: String?
+    public var contextWindow: Int?
+    public var maxOutputTokens: Int?
+    public var reasoningEfforts: [String]?
+
+    public enum CodingKeys: String, CodingKey {
+        case key
+        case modelId = "model_id"
+        case provider
+        case baseUrl = "base_url"
+        case contextWindow = "context_window"
+        case maxOutputTokens = "max_output_tokens"
+        case reasoningEfforts = "reasoning_efforts"
+
+        case modelIdCamel = "modelId"
+        case modelAlias = "model"
+        case baseUrlCamel = "baseUrl"
+        case contextWindowCamel = "contextWindow"
+        case maxOutputTokensCamel = "maxOutputTokens"
+        case maxCompletionTokens = "max_completion_tokens"
+        case reasoningEffortsCamel = "reasoningEfforts"
+    }
+
+    public init(
+        key: String,
+        modelId: String,
+        provider: String = "xai",
+        baseUrl: String? = nil,
+        contextWindow: Int? = nil,
+        maxOutputTokens: Int? = nil,
+        reasoningEfforts: [String]? = nil
+    ) {
+        self.key = key
+        self.modelId = modelId
+        self.provider = provider
+        self.baseUrl = baseUrl
+        self.contextWindow = contextWindow
+        self.maxOutputTokens = maxOutputTokens
+        self.reasoningEfforts = reasoningEfforts
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.key = try c.decode(String.self, forKey: .key)
+        if let m = try c.decodeIfPresent(String.self, forKey: .modelId) {
+            self.modelId = m
+        } else if let m = try c.decodeIfPresent(String.self, forKey: .modelIdCamel) {
+            self.modelId = m
+        } else if let m = try c.decodeIfPresent(String.self, forKey: .modelAlias) {
+            self.modelId = m
+        } else {
+            self.modelId = try c.decode(String.self, forKey: .modelId)
+        }
+        self.provider = try c.decodeIfPresent(String.self, forKey: .provider) ?? "xai"
+        if let b = try c.decodeIfPresent(String.self, forKey: .baseUrl) {
+            self.baseUrl = b
+        } else {
+            self.baseUrl = try c.decodeIfPresent(String.self, forKey: .baseUrlCamel)
+        }
+        if let cw = try c.decodeIfPresent(Int.self, forKey: .contextWindow) {
+            self.contextWindow = cw
+        } else {
+            self.contextWindow = try c.decodeIfPresent(Int.self, forKey: .contextWindowCamel)
+        }
+        if let mot = try c.decodeIfPresent(Int.self, forKey: .maxOutputTokens) {
+            self.maxOutputTokens = mot
+        } else if let mot = try c.decodeIfPresent(Int.self, forKey: .maxOutputTokensCamel) {
+            self.maxOutputTokens = mot
+        } else {
+            self.maxOutputTokens = try c.decodeIfPresent(Int.self, forKey: .maxCompletionTokens)
+        }
+        if let re = try c.decodeIfPresent([String].self, forKey: .reasoningEfforts) {
+            self.reasoningEfforts = re
+        } else {
+            self.reasoningEfforts = try c.decodeIfPresent([String].self, forKey: .reasoningEffortsCamel)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(key, forKey: .key)
+        try c.encode(modelId, forKey: .modelId)
+        try c.encode(provider, forKey: .provider)
+        try c.encodeIfPresent(baseUrl, forKey: .baseUrl)
+        try c.encodeIfPresent(contextWindow, forKey: .contextWindow)
+        try c.encodeIfPresent(maxOutputTokens, forKey: .maxOutputTokens)
+        try c.encodeIfPresent(reasoningEfforts, forKey: .reasoningEfforts)
+    }
+}
+
+/// Reads and writes the settings rows that live in `config.toml` and `$OPENGROK_HOME/custom_models.json`.
 ///
 /// Writes are read-modify-write against the file on every call rather than
 /// against a cached tree: another process — a second pager, `open-grok config` —
 /// may have edited the file since this one loaded it, and re-reading is what
 /// keeps a settings toggle from reverting someone else's change.
 public struct PagerSettingsStore: Sendable {
+    public static let customModelContextWindowMin = 1_000
+    public static let customModelContextWindowMax = 4_000_000
+    public static let customModelContextWindowDefault = 200_000
+
+    public static let customModelDraftKeys: Set<String> = [
+        "custom_model_id",
+        "custom_model_slug",
+        "custom_model_name",
+        "custom_model_provider",
+        "custom_model_base_url",
+        "custom_model_context_window",
+        "custom_model_backend",
+        "custom_model_env_key",
+        "custom_model_save",
+    ]
+
     public var configPath: URL
     public var registry: PagerSettingsRegistry
+    public var customModelsPath: URL
 
-    public init(configPath: URL, registry: PagerSettingsRegistry = .default) {
+    private static let draftLock = NSLock()
+    nonisolated(unsafe) private static var _draftsByPath: [URL: CustomModelDraft] = [:]
+
+    public var draft: CustomModelDraft {
+        get {
+            Self.draftLock.lock()
+            defer { Self.draftLock.unlock() }
+            return Self._draftsByPath[customModelsPath] ?? CustomModelDraft()
+        }
+        set {
+            Self.draftLock.lock()
+            defer { Self.draftLock.unlock() }
+            Self._draftsByPath[customModelsPath] = newValue
+        }
+    }
+
+    public init(
+        configPath: URL,
+        registry: PagerSettingsRegistry = .default,
+        customModelsPath: URL? = nil
+    ) {
         self.configPath = configPath
         self.registry = registry
+        self.customModelsPath = customModelsPath ?? configPath.deletingLastPathComponent().appendingPathComponent("custom_models.json")
+    }
+
+    // MARK: Draft Management
+
+    public func getDraft() -> CustomModelDraft {
+        Self.draftLock.lock()
+        defer { Self.draftLock.unlock() }
+        return Self._draftsByPath[customModelsPath] ?? CustomModelDraft()
+    }
+
+    public mutating func updateDraft(key: String, value: PagerSettingValue) {
+        Self.draftLock.lock()
+        defer { Self.draftLock.unlock() }
+        var current = Self._draftsByPath[customModelsPath] ?? CustomModelDraft()
+        switch key {
+        case "custom_model_id":
+            if case .string(let s) = value { current.id = s }
+        case "custom_model_slug":
+            if case .string(let s) = value { current.slug = s }
+        case "custom_model_name":
+            if case .string(let s) = value { current.name = s }
+        case "custom_model_provider":
+            if case .string(let s) = value { current.provider = s }
+        case "custom_model_base_url":
+            if case .string(let s) = value { current.baseUrl = s }
+        case "custom_model_context_window":
+            if case .integer(let n) = value {
+                current.contextWindow = min(max(n, Self.customModelContextWindowMin), Self.customModelContextWindowMax)
+            }
+        case "custom_model_backend":
+            if case .string(let s) = value { current.backend = s }
+        case "custom_model_env_key":
+            if case .string(let s) = value { current.envKey = s }
+        case "custom_model_save":
+            if case .bool(let b) = value { current.save = b }
+        default:
+            break
+        }
+        Self._draftsByPath[customModelsPath] = current
+    }
+
+    public mutating func clearDraft() {
+        Self.draftLock.lock()
+        defer { Self.draftLock.unlock() }
+        Self._draftsByPath.removeValue(forKey: customModelsPath)
+    }
+
+    public static func validateCustomModelKey(_ key: String) throws {
+        if key.isEmpty {
+            throw PagerSettingsStoreError.emptyCustomModelKey
+        }
+        if key.contains(where: { $0.isNewline }) {
+            throw PagerSettingsStoreError.customModelKeyContainsNewlines
+        }
+        for ch in key {
+            guard ch.isASCII && (ch.isLetter || ch.isNumber || ch == ":" || ch == "." || ch == "-" || ch == "_") else {
+                throw PagerSettingsStoreError.invalidCustomModelKeyCharacters(key)
+            }
+        }
+    }
+
+    public static func validateCustomModelSlug(_ slug: String) throws {
+        if slug.isEmpty {
+            throw PagerSettingsStoreError.emptyCustomModelSlug
+        }
+        if slug.contains(where: { $0.isNewline }) {
+            throw PagerSettingsStoreError.customModelSlugContainsNewlines
+        }
     }
 
     // MARK: Reading
@@ -70,11 +329,90 @@ public struct PagerSettingsStore: Sendable {
     /// The enabled entries of a multi-select row, which are stored as an array
     /// rather than a scalar and so do not round-trip through `PagerSettingValue`.
     public func loadMultiSelect(key: String) throws -> Set<String> {
+        if key == "custom_models.list" {
+            let models = (try? loadCustomModels()) ?? []
+            return Set(models.map(\.key))
+        }
         guard let meta = registry.find(key), let path = persistedPath(for: meta) else { return [] }
         let root = (try? readRoot()) ?? .table(TOMLTable())
         guard let array = root[path: path.split(separator: ".").map(String.init)]?.arrayValue
         else { return [] }
         return Set(array.compactMap(\.stringValue))
+    }
+
+    /// Load all custom model records from `$OPENGROK_HOME/custom_models.json`.
+    public func loadCustomModels() throws -> [PagerCustomModelRecord] {
+        guard FileManager.default.fileExists(atPath: customModelsPath.path) else { return [] }
+        let data = try Data(contentsOf: customModelsPath)
+        let decoder = JSONDecoder()
+        if let array = try? decoder.decode([PagerCustomModelRecord].self, from: data) {
+            return array
+        }
+        if let dict = try? decoder.decode([String: PagerCustomModelRecord].self, from: data) {
+            return Array(dict.values).sorted { $0.key < $1.key }
+        }
+        return []
+    }
+
+    private func writeCustomModelsFile(_ models: [PagerCustomModelRecord]) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(models)
+        let dir = customModelsPath.deletingLastPathComponent()
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        let tempURL = dir.appendingPathComponent(".custom_models.\(UUID().uuidString).tmp")
+        try data.write(to: tempURL, options: .atomic)
+        _ = try? FileManager.default.removeItem(at: customModelsPath)
+        try FileManager.default.moveItem(at: tempURL, to: customModelsPath)
+    }
+
+    /// Save the current custom model draft into `$OPENGROK_HOME/custom_models.json`.
+    @discardableResult
+    public func saveCustomModelDraft(_ draftToSave: CustomModelDraft? = nil) throws -> PagerCustomModelRecord {
+        let draft = draftToSave ?? getDraft()
+        let trimmedKey = draft.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSlug = draft.slug.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        try Self.validateCustomModelKey(trimmedKey)
+        try Self.validateCustomModelSlug(trimmedSlug)
+
+        let trimmedProvider = draft.provider.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedBaseUrl = draft.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        let record = PagerCustomModelRecord(
+            key: trimmedKey,
+            modelId: trimmedSlug,
+            provider: trimmedProvider.isEmpty ? "xai" : trimmedProvider,
+            baseUrl: trimmedBaseUrl.isEmpty ? nil : trimmedBaseUrl,
+            contextWindow: draft.contextWindow > 0 ? draft.contextWindow : Self.customModelContextWindowDefault
+        )
+
+        var models = (try? loadCustomModels()) ?? []
+        if let idx = models.firstIndex(where: { $0.key == trimmedKey }) {
+            models[idx] = record
+        } else {
+            models.append(record)
+        }
+
+        try writeCustomModelsFile(models)
+        var mutableSelf = self
+        mutableSelf.clearDraft()
+        return record
+    }
+
+    /// Delete a custom model by its key from `$OPENGROK_HOME/custom_models.json`.
+    @discardableResult
+    public func deleteCustomModel(key: String) throws -> Bool {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        var models = (try? loadCustomModels()) ?? []
+        guard let idx = models.firstIndex(where: { $0.key == trimmed }) else {
+            return false
+        }
+        models.remove(at: idx)
+        try writeCustomModelsFile(models)
+        return true
     }
 
     private func decode(_ stored: TOMLValue, as meta: PagerSettingMeta) -> PagerSettingValue? {
@@ -107,6 +445,15 @@ public struct PagerSettingsStore: Sendable {
     /// what actually changed.
     @discardableResult
     public func write(key: String, value: PagerSettingValue) throws -> String {
+        if Self.customModelDraftKeys.contains(key) {
+            var mutableSelf = self
+            mutableSelf.updateDraft(key: key, value: value)
+            if key == "custom_model_save", case .bool(let save) = value, save {
+                _ = try saveCustomModelDraft()
+            }
+            return key
+        }
+
         guard let meta = registry.find(key) else { throw PagerSettingsStoreError.unknownKey(key) }
         guard let path = persistedPath(for: meta) else {
             throw PagerSettingsStoreError.notPersistable(key: key)
@@ -121,6 +468,13 @@ public struct PagerSettingsStore: Sendable {
     /// Persist a multi-select row's whole enabled set.
     @discardableResult
     public func writeMultiSelect(key: String, enabled: Set<String>) throws -> String {
+        if key == "custom_models.list" {
+            var models = (try? loadCustomModels()) ?? []
+            models.removeAll { !enabled.contains($0.key) }
+            try writeCustomModelsFile(models)
+            return "custom_models.list"
+        }
+
         guard let meta = registry.find(key) else { throw PagerSettingsStoreError.unknownKey(key) }
         guard let path = persistedPath(for: meta) else {
             throw PagerSettingsStoreError.notPersistable(key: key)
@@ -142,6 +496,12 @@ public struct PagerSettingsStore: Sendable {
     /// a removed key follows it and a written one does not.
     @discardableResult
     public func reset(key: String) throws -> String {
+        if key == "custom_models" || Self.customModelDraftKeys.contains(key) {
+            var mutableSelf = self
+            mutableSelf.clearDraft()
+            return key
+        }
+
         guard let meta = registry.find(key) else { throw PagerSettingsStoreError.unknownKey(key) }
         guard let path = persistedPath(for: meta) else {
             throw PagerSettingsStoreError.notPersistable(key: key)

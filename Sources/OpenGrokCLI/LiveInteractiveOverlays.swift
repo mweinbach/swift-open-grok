@@ -2286,26 +2286,23 @@ extension LiveInteractiveControllerRenderer {
                 context: context,
                 items: usageItems
             )
+            let usageText = Self.sessionUsageBlockText(report: report)
             overlays.push(.sessionInfo(
                 id: "usage",
                 title: "Usage",
-                lines: LiveUsageComposition.render(report)
+                lines: usageText
                     .split(separator: "\n", omittingEmptySubsequences: false)
                     .map { PagerStyledLine(text: String($0)) }
             ))
         case .cache:
             // `/cache` (upstream Action::ShowCache, slash/commands/cache.rs)
+            let cacheResponse = sessionCacheResponse()
             overlays.push(.sessionInfo(
                 id: "cache",
                 title: "Prompt Cache",
-                lines: LiveCacheComposition.render(
-                    cacheHitRate: nil,
-                    totalPromptTokens: 0,
-                    cachedTokens: 0,
-                    breakEvents: []
-                )
-                .split(separator: "\n", omittingEmptySubsequences: false)
-                .map { PagerStyledLine(text: String($0)) }
+                lines: Self.sessionCacheBlockText(cacheResponse)
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .map { PagerStyledLine(text: String($0)) }
             ))
         case .mcpServers:
             overlays.push(.sessionInfo(
@@ -2558,6 +2555,46 @@ extension LiveInteractiveControllerRenderer {
             if key == "theme", case .string(let name) = value {
                 _ = applyTheme(named: name)
             }
+            if key == "custom_model_save", case .bool(let save) = value {
+                if save {
+                    let draft = store.getDraft()
+                    let keyTrimmed = draft.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let slugTrimmed = draft.slug.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if keyTrimmed.isEmpty || slugTrimmed.isEmpty {
+                        note("Enter a catalog key and model id before saving")
+                        return
+                    }
+                    do {
+                        try PagerSettingsStore.validateCustomModelKey(keyTrimmed)
+                        try PagerSettingsStore.validateCustomModelSlug(slugTrimmed)
+                    } catch {
+                        note("\(error)")
+                        return
+                    }
+                    do {
+                        let customStore = CustomModelStore(grokHome: openGrokHome)
+                        let entry = CustomModelEntry(
+                            key: keyTrimmed,
+                            modelId: slugTrimmed,
+                            provider: draft.provider.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "xai" : draft.provider.trimmingCharacters(in: .whitespacesAndNewlines),
+                            baseUrl: draft.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : draft.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines),
+                            contextWindow: draft.contextWindow > 0 ? draft.contextWindow : 200_000
+                        )
+                        try await customStore.upsertCustomModel(entry)
+                        _ = try store.saveCustomModelDraft()
+                        note("Custom model saved")
+                        reloadCatalogInput()
+                    } catch {
+                        note("Could not save custom model: \(error)")
+                    }
+                    return
+                }
+            }
+            if PagerSettingsStore.customModelDraftKeys.contains(key) {
+                var mutableStore = store
+                mutableStore.updateDraft(key: key, value: value)
+                return
+            }
             do {
                 // Defense in depth: keep_text_selection always goes through
                 // the atomic legacy-clearing write (settings_writes.rs:528-536).
@@ -2581,6 +2618,20 @@ extension LiveInteractiveControllerRenderer {
             }
 
         case .toggleMultiSelect(let key, let choice, let enabled):
+            if key == "custom_models.list" {
+                if !enabled {
+                    do {
+                        let customStore = CustomModelStore(grokHome: openGrokHome)
+                        _ = try await customStore.deleteCustomModel(key: choice)
+                        _ = try store.deleteCustomModel(key: choice)
+                        note("Removing custom model…")
+                        reloadCatalogInput()
+                    } catch {
+                        note("Could not remove custom model \(choice): \(error)")
+                    }
+                }
+                return
+            }
             var current = (try? store.loadMultiSelect(key: key)) ?? []
             if enabled { current.insert(choice) } else { current.remove(choice) }
             do {
@@ -2594,6 +2645,11 @@ extension LiveInteractiveControllerRenderer {
             }
 
         case .resetRequested(let key):
+            if key == "custom_models" || PagerSettingsStore.customModelDraftKeys.contains(key) {
+                var mutableStore = store
+                mutableStore.clearDraft()
+                return
+            }
             // A secret row's reset is a credential *removal*, not a config
             // write — upstream maps `SecretStatus::Missing` to the provider's
             // Clear action (`dispatch/settings/ui.rs:1447-1448`). Routed here
@@ -3021,6 +3077,183 @@ extension LiveInteractiveControllerRenderer {
         }
         let delta = Self.monotonicNow() - anchorMonotonic
         return motionClockAnchorSeconds + max(0, delta)
+    }
+
+    // MARK: - Prompt Cache & Usage Telemetry Formatting
+
+    func sessionCacheResponse() -> SessionCacheResponse {
+        SessionCacheResponse()
+    }
+
+    /// Format thousands with comma separators (e.g. 2,500).
+    public static func formatThousands<T: BinaryInteger>(_ value: T) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.groupingSeparator = ","
+        return formatter.string(from: NSNumber(value: Int64(value))) ?? "\(value)"
+    }
+
+    /// Renders `/cache` prompt cache block text with cold start and diagnostic formatting.
+    public static func sessionCacheBlockText(_ cache: SessionCacheResponse) -> String {
+        let s = cache.summary
+        if s.totalTurns == 0 {
+            return "Prompt cache telemetry: no turns recorded yet in this session."
+        }
+
+        var rows: [String] = []
+        if s.steadyPromptTokens > 0 {
+            rows.append(
+                "  Cache hit rate: \(String(format: "%.1f", s.cacheHitRatePct))% (\(formatThousands(s.steadyCachedTokens)) of \(formatThousands(s.steadyPromptTokens)) steady-state input tokens cached; cold start excluded)"
+            )
+        } else {
+            rows.append("  Cache hit rate: n/a (cold-start request only so far)")
+        }
+        rows.append(
+            "  Turns tracked:  \(s.totalTurns) (\(s.hits) hits · \(s.partialHits) partial · \(s.breaks) breaks)"
+        )
+
+        if let lastBreak = s.lastBreakDiagnostic, !lastBreak.isEmpty {
+            rows.append("  Last break:     \(lastBreak)")
+        }
+
+        if !cache.recentTurns.isEmpty {
+            rows.append("  Recent turns:")
+            for rec in cache.recentTurns.reversed().prefix(10) {
+                if rec.status == .firstTurn {
+                    rows.append(
+                        "    Turn #\(rec.turnIdx) (loop \(rec.loopIndex)) — cold start (\(formatThousands(rec.promptTokens)) in) · \(rec.diagnostic)"
+                    )
+                } else {
+                    rows.append(
+                        "    Turn #\(rec.turnIdx) (loop \(rec.loopIndex)) — \(String(format: "%.1f", rec.cacheHitRatePct))% hit (\(formatThousands(rec.promptTokens)) in, \(formatThousands(rec.cachedPromptTokens)) cached) · \(rec.diagnostic)"
+                    )
+                }
+            }
+        }
+
+        return (["Prompt Cache Telemetry & Diagnostics:"] + rows).joined(separator: "\n")
+    }
+
+    public static func sessionCacheBlockText(
+        summary: SessionCacheSnapshot,
+        recentTurns: [CacheTurnRecord] = []
+    ) -> String {
+        sessionCacheBlockText(SessionCacheResponse(summary: summary, recentTurns: recentTurns))
+    }
+
+    public static func sessionUsageBlockText(
+        report: LiveUsageReport? = nil,
+        context: ContextUsage? = nil,
+        items: [ConversationItem] = [],
+        turnCount: Int = 0,
+        estimatedTokens: UInt64 = 0,
+        cacheHitRatePct: Double? = nil,
+        isColdStartOnly: Bool = false
+    ) -> String {
+        let actualReport: LiveUsageReport
+        if let report {
+            actualReport = report
+        } else {
+            actualReport = LiveUsageReport(
+                context: context,
+                quotaWindows: [],
+                quotaFailures: [],
+                estimatedSessionTokens: estimatedTokens,
+                turnCount: turnCount,
+                promptCacheHitRatePct: cacheHitRatePct
+            )
+        }
+
+        var lines: [String] = []
+        if let context = actualReport.context {
+            let percent = OpenGrokTokenEstimation.usagePercentage(
+                used: context.usedTokens,
+                total: context.contextWindow
+            )
+            lines.append("Model:    \(context.modelID)")
+            lines.append(
+                "Context:  \(context.usedTokens) / \(context.contextWindow) tokens "
+                    + "(\(String(format: "%.1f", percent))%)"
+            )
+            lines.append(
+                "Compacts: \(context.compactionCount)"
+                    + (context.compactionsRemaining.map { ", \($0) remaining" } ?? "")
+            )
+        }
+        lines.append("Turns:    \(actualReport.turnCount)")
+        lines.append("Tokens:   ~\(actualReport.estimatedSessionTokens) estimated this session")
+        if actualReport.turnCount == 1 || isColdStartOnly {
+            lines.append("Cache hit rate: n/a (cold-start request only so far)")
+        } else if let hitRate = actualReport.promptCacheHitRatePct {
+            lines.append("Cache hit rate: \(String(format: "%.1f", hitRate))%")
+        }
+
+        if !actualReport.quotaWindows.isEmpty {
+            lines.append("")
+            for window in actualReport.quotaWindows {
+                let limit = window.limit.map { "\(window.used) / \($0)" } ?? "\(window.used)"
+                var line = "\(window.provider.asString): \(limit)"
+                if let resetAt = window.resetAt {
+                    line += " (resets \(LiveSessionsComposition.timestamp(resetAt)))"
+                }
+                lines.append(line)
+            }
+        }
+        for failure in actualReport.quotaFailures {
+            lines.append("\(failure.provider.asString): usage unavailable — \(failure.message)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    public static func makeTurnRecord(
+        turnIdx: String,
+        loopIndex: UInt32 = 0,
+        promptTokens: UInt32,
+        cachedPromptTokens: UInt32,
+        completionTokens: UInt32 = 0,
+        status: CacheStatus,
+        divergence: PrefixDivergence = .prefixIntact(preservedItems: 1, newItems: 1),
+        diagnostic: String? = nil
+    ) -> CacheTurnRecord {
+        let hitRatePct: Double
+        if promptTokens > 0 {
+            hitRatePct = (Double(cachedPromptTokens) / Double(promptTokens)) * 100.0
+        } else {
+            hitRatePct = 0.0
+        }
+        let resolvedDiagnostic: String
+        if let diagnostic {
+            resolvedDiagnostic = diagnostic
+        } else {
+            switch status {
+            case .firstTurn:
+                resolvedDiagnostic = "First turn in session (cold cache)."
+            case .hit:
+                var d = String(format: "Cache hit: %.1f%% (%d/%d tokens cached).", hitRatePct, cachedPromptTokens, promptTokens)
+                if hitRatePct < 90.0 && divergence.isIntact {
+                    d += " Remaining tokens are new content appended since the previous request."
+                }
+                resolvedDiagnostic = d
+            case .partialHit:
+                resolvedDiagnostic = String(format: "Partial cache hit: %.1f%% (%d/%d tokens cached). %@", hitRatePct, cachedPromptTokens, promptTokens, divergence.summaryDiagnostic)
+            case .break:
+                resolvedDiagnostic = "Cache break: 0% hit rate. \(divergence.summaryDiagnostic)"
+            case .noCacheSupport:
+                resolvedDiagnostic = "0 cached tokens reported (provider may not support prompt caching or cache expired)."
+            }
+        }
+
+        return CacheTurnRecord(
+            turnIdx: turnIdx,
+            loopIndex: loopIndex,
+            promptTokens: promptTokens,
+            cachedPromptTokens: cachedPromptTokens,
+            completionTokens: completionTokens,
+            cacheHitRatePct: hitRatePct,
+            status: status,
+            divergence: divergence,
+            diagnostic: resolvedDiagnostic
+        )
     }
 
 }
