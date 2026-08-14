@@ -76,6 +76,8 @@ public enum PagerSettingDynamicSource: String, Sendable, Equatable, Hashable {
     case auxiliaryModelCatalog
     /// The multi-select of discovered OpenCode Go models.
     case openCodeGoModels
+    /// The multi-select of user custom models.
+    case customModels
 }
 
 /// `StringValidator` (`registry.rs:196-207`).
@@ -409,6 +411,112 @@ public enum PagerSettingChoices {
         PagerSettingChoice(canonical: "xai", display: "xAI"),
         PagerSettingChoice(canonical: "perplexity", display: "Perplexity")
     ]
+
+    /// `CUSTOM_MODEL_PROVIDER_CHOICES` (`defs.rs:607-653`).
+    public static let customModelProvider: [PagerSettingChoice] = CUSTOM_MODEL_PROVIDER_CHOICES
+
+    /// `CUSTOM_MODEL_BACKEND_CHOICES` (`defs.rs:655-671`).
+    public static let customModelBackend: [PagerSettingChoice] = CUSTOM_MODEL_BACKEND_CHOICES
+}
+
+// MARK: - Custom Model Constants & Validation
+
+/// Minimum context window for custom models (`defs.rs:603`).
+public let CUSTOM_MODEL_CONTEXT_WINDOW_MIN: Int = 1_000
+/// Maximum context window for custom models (`defs.rs:604`).
+public let CUSTOM_MODEL_CONTEXT_WINDOW_MAX: Int = 4_000_000
+/// Default context window for custom models (`defs.rs:605`).
+public let CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT: Int = 200_000
+
+/// Provider choices for custom models (`CUSTOM_MODEL_PROVIDER_CHOICES`, `defs.rs:607-653`).
+public let CUSTOM_MODEL_PROVIDER_CHOICES: [PagerSettingChoice] = [
+    PagerSettingChoice(
+        canonical: "",
+        display: "(inherit)",
+        summary: "Use the default provider for this catalog key."
+    ),
+    PagerSettingChoice(
+        canonical: "xai",
+        display: "xAI",
+        summary: "xAI Grok."
+    ),
+    PagerSettingChoice(
+        canonical: "codex",
+        display: "Codex",
+        summary: "OpenAI Codex."
+    ),
+    PagerSettingChoice(
+        canonical: "kimi",
+        display: "Kimi Platform",
+        summary: "Kimi Platform / Moonshot."
+    ),
+    PagerSettingChoice(
+        canonical: "kimi_code",
+        display: "Kimi Code",
+        summary: "Kimi Code."
+    ),
+    PagerSettingChoice(
+        canonical: "fireworks",
+        display: "Fireworks AI",
+        summary: "Fireworks AI Chat Completions."
+    ),
+    PagerSettingChoice(
+        canonical: "deepseek",
+        display: "DeepSeek",
+        summary: "Direct DeepSeek API."
+    ),
+    PagerSettingChoice(
+        canonical: "wafer",
+        display: "Wafer AI",
+        summary: "pass.wafer.ai Chat Completions (WAFER_API_KEY)."
+    ),
+    PagerSettingChoice(
+        canonical: "zai",
+        display: "Z AI",
+        summary: "api.z.ai GLM Coding Plan (ZAI_API_KEY)."
+    )
+]
+
+/// API backend choices for custom models (`CUSTOM_MODEL_BACKEND_CHOICES`, `defs.rs:655-671`).
+public let CUSTOM_MODEL_BACKEND_CHOICES: [PagerSettingChoice] = [
+    PagerSettingChoice(
+        canonical: "",
+        display: "(inherit)",
+        summary: "Use the default backend for this provider."
+    ),
+    PagerSettingChoice(
+        canonical: "chat_completions",
+        display: "Chat Completions",
+        summary: "OpenAI-compatible /v1/chat/completions."
+    ),
+    PagerSettingChoice(
+        canonical: "responses",
+        display: "Responses",
+        summary: "OpenAI-compatible /v1/responses."
+    ),
+    PagerSettingChoice(
+        canonical: "messages",
+        display: "Messages",
+        summary: "Anthropic-compatible /v1/messages."
+    )
+]
+
+/// Catalog-key / `[model.<key>]` table suffix validation (`custom_model_key_is_valid`, `registry.rs:153-160`).
+/// Non-empty, contains only letters, digits, `:`, `.`, `-`, `_`, no whitespace.
+public func customModelKeyIsValid(_ key: String) -> Bool {
+    let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return false }
+    guard !trimmed.contains(where: { $0.isWhitespace || $0.isNewline }) else { return false }
+    return trimmed.allSatisfy { ch in
+        (ch.isASCII && (ch.isLetter || ch.isNumber)) || ch == ":" || ch == "." || ch == "-" || ch == "_"
+    }
+}
+
+/// Wire model id validation (`custom_model_slug_is_valid`, `registry.rs:163-166`).
+/// Non-empty, no newlines.
+public func customModelSlugIsValid(_ slug: String) -> Bool {
+    let trimmed = slug.trimmingCharacters(in: .whitespacesAndNewlines)
+    return !trimmed.isEmpty && !trimmed.contains(where: \.isNewline)
 }
 
 // MARK: - Registry
@@ -480,6 +588,20 @@ private let contextualHintsChildren = [
     "contextual_hints.small_screen",
     "contextual_hints.word_select",
     "contextual_hints.ssh_wrap"
+]
+
+/// Settings → Models → Custom models sub-sheet: saved entries plus the add-model draft (`CUSTOM_MODELS_CHILDREN`, `defs.rs:590`).
+private let customModelsChildren = [
+    "custom_models.list",
+    "custom_model_id",
+    "custom_model_slug",
+    "custom_model_name",
+    "custom_model_provider",
+    "custom_model_base_url",
+    "custom_model_context_window",
+    "custom_model_backend",
+    "custom_model_env_key",
+    "custom_model_save"
 ]
 
 /// `default_settings()` (`defs.rs:604-2427`) — all 90 rows upstream; this
@@ -986,6 +1108,111 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             keywords: ["opencode", "models"],
             kind: .dynamicMultiSelect(source: .openCodeGoModels),
             storage: .config(path: "models.opencode_go_enabled_models")
+        ),
+        PagerSettingMeta(
+            key: "custom_models",
+            category: .models,
+            label: "Custom models",
+            description: "Add or remove user [model.*] catalog entries without editing config.toml. Saving writes the same tables Settings already documents.",
+            keywords: [
+                "custom", "model", "byok", "endpoint", "ollama", "zai", "wafer", "catalog", "override"
+            ],
+            kind: .group(children: customModelsChildren),
+            storage: .sessionLocal
+        ),
+        PagerSettingMeta(
+            key: "custom_models.list",
+            category: .models,
+            label: "Saved custom models",
+            description: "User [model.*] entries. Deselect a row to delete that table from config.toml.",
+            keywords: ["custom", "models", "saved", "delete", "remove"],
+            kind: .dynamicMultiSelect(source: .customModels),
+            storage: .sessionLocal
+        ),
+        PagerSettingMeta(
+            key: "custom_model_id",
+            category: .models,
+            label: "Catalog key",
+            description: "Table name written as [model.<key>] (letters, digits, :, ., -, _). Example: zai:glm-special.",
+            keywords: ["custom", "model", "key", "id", "catalog"],
+            kind: .string(default: "", validator: .any),
+            storage: .sessionLocal
+        ),
+        PagerSettingMeta(
+            key: "custom_model_slug",
+            category: .models,
+            label: "Model id",
+            description: "Wire model id sent to the provider (the [model.<key>].model field).",
+            keywords: ["custom", "model", "slug", "id", "wire"],
+            kind: .string(default: "", validator: .any),
+            storage: .sessionLocal
+        ),
+        PagerSettingMeta(
+            key: "custom_model_name",
+            category: .models,
+            label: "Display name",
+            description: "Optional friendly name shown in the model picker.",
+            keywords: ["custom", "model", "name", "label"],
+            kind: .string(default: "", validator: .any),
+            storage: .sessionLocal
+        ),
+        PagerSettingMeta(
+            key: "custom_model_provider",
+            category: .models,
+            label: "Provider",
+            description: "Optional ModelProvider. Inherit leaves provider unset so the catalog key decides.",
+            keywords: ["custom", "model", "provider", "zai", "wafer", "kimi", "xai"],
+            kind: .enumeration(default: "", choices: CUSTOM_MODEL_PROVIDER_CHOICES, supportsPreview: false),
+            storage: .sessionLocal
+        ),
+        PagerSettingMeta(
+            key: "custom_model_base_url",
+            category: .models,
+            label: "Base URL",
+            description: "Optional API base URL. Z AI / Wafer fill their default when this is left empty.",
+            keywords: ["custom", "model", "base", "url", "endpoint"],
+            kind: .string(default: "", validator: .any),
+            storage: .sessionLocal
+        ),
+        PagerSettingMeta(
+            key: "custom_model_context_window",
+            category: .models,
+            label: "Context window",
+            description: "Token context window written to [model.<key>].context_window (1,000–4,000,000).",
+            keywords: ["custom", "model", "context", "window", "tokens"],
+            kind: .integer(
+                default: CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT,
+                minimum: CUSTOM_MODEL_CONTEXT_WINDOW_MIN,
+                maximum: CUSTOM_MODEL_CONTEXT_WINDOW_MAX
+            ),
+            storage: .sessionLocal
+        ),
+        PagerSettingMeta(
+            key: "custom_model_backend",
+            category: .models,
+            label: "API backend",
+            description: "Wire protocol: chat_completions, responses, or messages.",
+            keywords: ["custom", "model", "backend", "api", "chat", "responses"],
+            kind: .enumeration(default: "chat_completions", choices: CUSTOM_MODEL_BACKEND_CHOICES, supportsPreview: false),
+            storage: .sessionLocal
+        ),
+        PagerSettingMeta(
+            key: "custom_model_env_key",
+            category: .models,
+            label: "Env key name",
+            description: "Optional environment variable that holds the API key. Prefer this over storing a key in config.toml.",
+            keywords: ["custom", "model", "env", "key", "credential"],
+            kind: .string(default: "", validator: .any),
+            storage: .sessionLocal
+        ),
+        PagerSettingMeta(
+            key: "custom_model_save",
+            category: .models,
+            label: "Save custom model",
+            description: "Write the draft as [model.<key>] and refresh the catalog. Requires a catalog key and model id.",
+            keywords: ["custom", "model", "save", "add", "upsert"],
+            kind: .bool(default: false),
+            storage: .sessionLocal
         ),
         PagerSettingMeta(
             key: "toolset.perplexity_web_search.enabled",
