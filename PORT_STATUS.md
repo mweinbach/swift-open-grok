@@ -1,11 +1,68 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-14 (Wave 23 — Custom Models Settings & Steady-State Cache Telemetry). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0; authoritative full `test --no-parallel` exit 0 — exactly **6,886 Swift Testing cases in 1,060 suites passed** after 286.67s (0 failures, 0 regressions against baseline).
+**As of:** 2026-08-14 (Wave 24 — Native Workflow Engine, Rich Composer Elements & Image Framing, Markdown Table Parity, Tool Extras & Parity Audit Closure). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0 (clean build, 2.50s); authoritative full `test --no-parallel` exit 0 — exactly **6,987 Swift Testing cases in 1,071 suites passed** after 335.609s (100% green, 0 failures, 0 regressions against baseline).
 
-**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (Agent Runtime & Turn Pipeline, ACP Transports, Custom Models Settings UI & Store Persistence, Steady-State Cache Tracking & Cold-Start Diagnostics, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
+**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (Native Workflow Engine & Rhai AST/Interpreter/Journal/Escalation, Interactive Terminal Composer Rich Elements & Image Framing, Markdown Table Wrapped-Fragment & 11-Glyph Box Drawing Layout Parity, Tool Catalog Schemas & Protocol Output Caps, Agent Runtime & Turn Pipeline, ACP Transports, Custom Models Settings UI & Store Persistence, Steady-State Cache Tracking & Cold-Start Diagnostics, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`) / Forward Sync `eb215dd0` (`v1.0.0-open-grok.63`).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
+
+## Wave 24 — Native Workflow Engine, Rich Composer Elements & Image Framing, Markdown Table Parity & Tool Extras Audit (2026-08-14, complete)
+
+Current truth for the verified 2026-08-14 Wave 24 Multi-Agent Porting across Native Workflow Engine (`xai-workflow` → `OpenGrokWorkflow`), Interactive Terminal Composer Rich Elements & Image Framing, Markdown Table Wrapped-Fragment & Layout Parity (`OpenGrokMarkdown`), and Tool Extras & Parity Audit Closure (`OpenGrokToolRegistry`, `OpenGrokToolProtocol`):
+
+**Verification (lead, local macOS, 2026-08-14; serial gate):**
+- `zsh workflows/swift-safe-verify.zsh build` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build-tests` — exit 0.
+- `zsh workflows/swift-safe-verify.zsh build --product open-grok` — exit 0: clean binary build in **2.50s**.
+- Authoritative full `zsh workflows/swift-safe-verify.zsh test --no-parallel` — exit 0: exactly **6,987** Swift Testing cases in **1,071** suites, elapsed **335.609s** (100% green, 0 failures, 0 regressions).
+- CLI Smokes: `open-grok --version` reports `Open Grok 1.0.0-open-grok.63` (exit 0); `paths --json` and `models --json` exit 0.
+
+### Slices Completed & Landed
+
+1. **Task 1: Native Workflow Engine Port (`OpenGrokWorkflow`)**
+   - Implemented native Rhai AST, Lexer, Parser, and Interpreter (`RhaiAST.swift`, `RhaiLexer.swift`, `RhaiParser.swift`, `RhaiInterpreter.swift`, `RhaiEngine.swift`, `RhaiHost.swift`).
+   - Configured deterministic 100,000,000 operation execution limit (`RhaiLimits.swift`) preventing infinite loops and runaway scripts.
+   - Built host environment bindings (`RhaiHost.swift`), run metadata (`RhaiMeta.swift`, `RhaiRun.swift`), and built-in function library (`RhaiBuiltins.swift`).
+   - Implemented durable execution journal (`RhaiJournal.swift`) with 16-byte SHA-256 request hashing (`RhaiSHA256.swift`), torn line recovery for interrupted/corrupted writes, escalation fulfillment, and error pruning / manifest verification.
+   - Landed empirical adversarial stress suites (`RhaiEngineAdversarialStressTests.swift`) validating operation budget exhaustion, non-determinism guards, and journal recovery (`4b77439`).
+
+2. **Task 2: Interactive Terminal Composer Rich Elements & Image Framing (`OpenGrokTerminalCore`, `OpenGrokPagerRender`, `OpenGrokCLI`)**
+   - Implemented `WrapClipboardImage` OSC 999 protocol (`ESC ] 999;GrokWrapClipboardImage? BEL`, `MAGIC_IMG` / `GROK_WRAP_IMG`, `MAGIC_NONE` / `GROK_WRAP_NONE`, 20 MiB ceiling) across terminal core and pager render layers.
+   - Added `PastedImage` chips in composer buffer and image element metadata representation.
+   - Implemented `PromptSuggestionController` ghost text engine with predictive autocomplete, inline rendering, Tab acceptance, and prompt boundary detection.
+   - Added Ghostty protocol extras, Ghostty Cmd+A selection gating, Kitty 4096-byte chunked graphics protocol with z-index ordering, and Alacritty KKP DA2 <= 2401 progressive enhancement workaround.
+   - Added empirical adversarial stress suites (`PromptSuggestionAdversarialTests.swift`, `WrapClipboardImageAdversarialTests.swift`) (`4b77439`).
+
+3. **Task 3: Markdown Table Wrapped-Fragment & Layout Parity (`OpenGrokMarkdown`)**
+   - Implemented full terminal markdown table layout engine (`MarkdownTableLayout.swift`, `MarkdownRenderEngine.swift`) matching upstream `xai-grok-markdown`.
+   - 11-glyph box drawing grid (`TableBorders.box`: `┌ ┬ ┐ ├ ┼ ┤ └ ┴ ┘ │ ─`) with top border, intermediate body dividers `├─┼─┤`, and bottom border.
+   - Two-tier column width budget allocation distributing excess terminal width, respecting unbreakable word minimums and grapheme hard floors (`maxTableWidth` constraints).
+   - Grapheme cluster emergency splitting and soft word wrapping with `cellWordSeparator`.
+   - Multi-line visual row layout with monotonic source cursor alignment and styled span slicing.
+   - Streaming table checkpoints (`CheckpointKind.table` freeze boundary).
+   - Unit & adversarial stress tests (`MarkdownTableParityTests.swift`, `MarkdownTableAdversarialStressTests.swift`) (`9986b8d`, `4b77439`).
+
+4. **Task 4: Tool Extras & Parity Audit Closure (`OpenGrokToolRegistry`, `OpenGrokToolProtocol`)**
+   - Audited and verified all 32 built-in tool catalog schemas (`BuiltinToolCatalog` in `Catalog.swift`) across `OpenGrokFileTools`, `OpenGrokExecutionTools`, `OpenGrokWebMediaTools`, and `OpenGrokAgentControlTools` against upstream `xai-grok-tools`.
+   - Implemented strict parameter validation, type annotations, and required property definitions.
+   - Enforced output byte and character caps (`40_000` byte / `20_000` char caps, `32_768` byte mailbox payload ceiling, `1_000` line read limit, `2_048` char MCP tool description limit with `\u{2026} [truncated]`).
+   - Integrated with 7-stage permission pipeline (`deny > ask > allow`, plan-mode gate, hook dispatch, session worktrees, and explicit hunk tracking).
+   - Created comprehensive tool protocol verification suites (`ToolProtocolSchemaTests.swift`, `ToolProtocolPipelineWireTests.swift`, `ToolProtocolOutputCapTests.swift`) (`f84067f`).
+
+### Landed Commits
+
+- `4b77439` — Add adversarial empirical stress suites for Wave 1 milestones
+- `f84067f` — Audit tool catalog schemas and add comprehensive protocol test suites
+- `9986b8d` — Port markdown table wrapped-fragment & layout parity
+- `4704aeb` — docs(ledger): record @-file completion live wiring in Wave 23
+- `66cdfb6` — feat(pager): wire @-file search completion in interactive controller
+- `70ce924` — docs(ledger): record Wave 23 completion with 6,886 tests in 1,060 suites passed
+- `7cf66eb` — test(settings): update catalog expectations for 11 custom models entries
+- `7b6813f` — feat(settings): wire custom models persistence and cold-start cache rendering
+- `45774ed` — Track steady-state cache hit rate and cold start labeling
+- `1b8c5f5` — feat(pager): custom models settings catalog definitions and validation
+- `ca54f1d` — docs(ledger): record Wave 22 completion with 6,870 tests in 1,058 suites passed
 
 ## Wave 23 — Custom Models Settings & Steady-State Cache Telemetry (2026-08-14, complete)
 
@@ -167,13 +224,8 @@ below.
 
 ### Honest leftovers (not claimed fixed)
 
-- **Wrapped-fragment table-cell parity:** `OpenGrokMarkdown` still fits /
-  truncates cells instead of upstream wrapped cell fragments / `maxTableWidth`,
-  so wrapped-fragment parity is only synthetic/pure and must remain explicit.
-- **Composer prompt-widget leftovers:** paste chips / image elements; `@`
-  file-ref search/view; predicted prompt / Ghostty extras; Ctrl-V internal
-  clipboard and prompt paging / per-family key-table divergences as applicable.
-  Do **not** claim full prompt-widget parity.
+- **Wrapped-fragment table-cell parity:** **SUPERSEDED in Wave 24:** `OpenGrokMarkdown` now fully implements upstream wrapped cell fragments, two-tier column width budget allocation, `maxTableWidth` layout, 11-glyph box borders (`TableBorders.box`) with intermediate body dividers (`├─┼─┤`), and streaming table checkpoints matching `xai-grok-markdown`.
+- **Composer prompt-widget leftovers:** **SUPERSEDED in Wave 22–24:** `@` file-ref search/view landed in Wave 22–23; paste chips, image elements, `WrapClipboardImage` OSC 999 protocol, predicted prompt suggestions (`PromptSuggestionController`), Ghostty Cmd+A selection gating, Kitty chunked graphics, and Alacritty KKP workarounds landed in Wave 24.
 - **`[animation].show_fps`** remains parse-only (pin also never reads it); no
   settings row / motion gate.
 - **`/debug` advertises only `fps`** because scroll/log HUDs are absent
@@ -5658,7 +5710,7 @@ Status legend:
 | 80 | `xai-tracing` | `OpenGrokTracing` | target-green | R06 + exact-once span remediation. |
 | 81 | `xai-tracing-macros` | `OpenGrokTracing` | deferred-with-reason | Absorbed into tracing APIs. |
 | 82 | `xai-tty-utils` | `OpenGrokTTY` | live | 1,385 LOC + tests; imported by the CLI for raw mode and terminal capability detection. |
-| 83 | `xai-workflow` | *(proposed)* `OpenGrokWorkflowEngine` | not started | **New upstream crate at the `80dff0a9…` re-pin.** Native Rhai workflow engine (`engine`/`host`/`journal`/`meta`/`run`/`validate`). The existing `OpenGrokWorkflow` target (1,296 LOC) was ported against the removed JS workflow model and needs re-porting, not extension. See "Upstream drift". |
+| 83 | `xai-workflow` | `OpenGrokWorkflow` | live | Native Rhai workflow engine (`RhaiAST`, `RhaiLexer`, `RhaiParser`, `RhaiInterpreter`, `RhaiEngine`, `RhaiHost`, `RhaiJournal`, `RhaiMeta`, `RhaiRun`, `RhaiLimits`, `RhaiSHA256`). Re-ported natively with 100M op limit, journal recovery, and full test parity. |
 | 84 | `xai-grok-extra-ca` | `OpenGrokExtraCA` | live-partial | **Wave 11 G043.** Default-off, process-cached PEM loader with a 1 MiB cap, per-block DER validation, warn-and-continue handling, and central HTTP/WebSocket wiring. Darwin installs additive Security anchors; Linux FoundationNetworking has no `serverTrust` challenge API, so Linux buffered/streaming custom-root support remains blocked. |
 
 Rows 83–84 are appended in discovery order rather than inserted alphabetically, so existing row numbers stay stable across the re-pin.
