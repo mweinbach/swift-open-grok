@@ -122,6 +122,9 @@ public enum CacheStatus: String, Codable, Sendable, Hashable, CaseIterable {
     case `break` = "break"
     case noCacheSupport = "no_cache_support"
 
+    /// Alias for `.break` when diverged.
+    public static var breakDiverged: CacheStatus { .break }
+
     public var displayLabel: String {
         switch self {
         case .firstTurn: return "First turn (cold cache)"
@@ -238,6 +241,7 @@ public struct CacheTurnRecord: Codable, Sendable, Equatable {
 /// Comprehensive snapshot of a session's cache hit rate and break history.
 public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
     public var cacheHitRate: Double
+    public var overallHitRatePct: Double
     public var totalPromptTokens: Int
     public var cachedTokens: Int
     public var breakEvents: [CacheBreakEvent]
@@ -246,12 +250,27 @@ public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
     public var hits: Int
     public var partialHits: Int
     public var breaks: Int
-    public var steadyPromptTokens: Int
+    public var steadyInputTokens: Int
     public var steadyCachedTokens: Int
     public var lastBreakDiagnostic: String?
 
+    // Compatibility aliases:
+    public var totalInputTokens: Int {
+        get { totalPromptTokens }
+        set { totalPromptTokens = newValue }
+    }
+    public var totalCachedTokens: Int {
+        get { cachedTokens }
+        set { cachedTokens = newValue }
+    }
+    public var steadyPromptTokens: Int {
+        get { steadyInputTokens }
+        set { steadyInputTokens = newValue }
+    }
+
     public init(
         cacheHitRate: Double = 0.0,
+        overallHitRatePct: Double? = nil,
         totalPromptTokens: Int = 0,
         cachedTokens: Int = 0,
         breakEvents: [CacheBreakEvent] = [],
@@ -259,11 +278,14 @@ public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
         hits: Int = 0,
         partialHits: Int = 0,
         breaks: Int = 0,
-        steadyPromptTokens: Int = 0,
+        steadyPromptTokens: Int? = nil,
+        steadyInputTokens: Int = 0,
         steadyCachedTokens: Int = 0,
         lastBreakDiagnostic: String? = nil
     ) {
+        let resolvedSteadyInput = steadyPromptTokens ?? steadyInputTokens
         self.cacheHitRate = cacheHitRate
+        self.overallHitRatePct = overallHitRatePct ?? cacheHitRate
         self.totalPromptTokens = totalPromptTokens
         self.cachedTokens = cachedTokens
         self.breakEvents = breakEvents
@@ -271,13 +293,14 @@ public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
         self.hits = hits
         self.partialHits = partialHits
         self.breaks = breaks
-        self.steadyPromptTokens = steadyPromptTokens
+        self.steadyInputTokens = resolvedSteadyInput
         self.steadyCachedTokens = steadyCachedTokens
         self.lastBreakDiagnostic = lastBreakDiagnostic
     }
 
     /// Hit rate expressed as a percentage (0.0% to 100.0%).
     public var cacheHitRatePct: Double {
+        if overallHitRatePct > 0.0 { return overallHitRatePct }
         if cacheHitRate > 1.0 { return cacheHitRate }
         return (cacheHitRate * 1000.0).rounded() / 10.0
     }
@@ -312,11 +335,18 @@ public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.cacheHitRate = (try? c.decode(Double.self, forKey: .cacheHitRate))
+        let hitRate = (try? c.decode(Double.self, forKey: .cacheHitRate))
             ?? (try? c.decode(Double.self, forKey: .cacheHitRateCamel))
             ?? (try? c.decode(Double.self, forKey: .hitRatePct))
             ?? (try? c.decode(Double.self, forKey: .overallHitRatePct))
             ?? 0.0
+        let overallPct = (try? c.decode(Double.self, forKey: .overallHitRatePct))
+            ?? (try? c.decode(Double.self, forKey: .hitRatePct))
+            ?? (try? c.decode(Double.self, forKey: .cacheHitRate))
+            ?? (try? c.decode(Double.self, forKey: .cacheHitRateCamel))
+            ?? 0.0
+        self.cacheHitRate = hitRate
+        self.overallHitRatePct = overallPct
         self.totalPromptTokens = (try? c.decode(Int.self, forKey: .totalPromptTokens))
             ?? (try? c.decode(Int.self, forKey: .totalPromptTokensCamel))
             ?? (try? c.decode(Int.self, forKey: .totalInputTokens))
@@ -336,12 +366,12 @@ public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
             ?? (try? c.decode(Int.self, forKey: .partialHitsCamel))
             ?? 0
         self.breaks = (try? c.decode(Int.self, forKey: .breaks)) ?? 0
-        self.steadyPromptTokens = (try? c.decode(Int.self, forKey: .steadyPromptTokens))
+        self.steadyInputTokens = (try? c.decode(Int.self, forKey: .steadyInputTokens))
+            ?? (try? c.decode(Int.self, forKey: .steadyPromptTokens))
             ?? (try? c.decode(Int.self, forKey: .steadyPromptTokensCamel))
-            ?? (try? c.decode(Int.self, forKey: .steadyInputTokens))
             ?? 0
-        self.steadyCachedTokens = (try? c.decode(Int.self, forKey: .steadyCachedTokens))
-            ?? (try? c.decode(Int.self, forKey: .steadyCachedTokensCamel))
+        self.steadyCachedTokens = (try? c.decode(Int.self, forKey: .steadyCachedTokensCamel))
+            ?? (try? c.decode(Int.self, forKey: .steadyCachedTokens))
             ?? 0
         self.lastBreakDiagnostic = (try? c.decodeIfPresent(String.self, forKey: .lastBreakDiagnostic))
             ?? (try? c.decodeIfPresent(String.self, forKey: .lastBreakDiagnosticCamel))
@@ -350,16 +380,59 @@ public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(cacheHitRate, forKey: .cacheHitRate)
+        try c.encode(overallHitRatePct, forKey: .overallHitRatePct)
         try c.encode(totalPromptTokens, forKey: .totalPromptTokens)
+        try c.encode(totalPromptTokens, forKey: .totalInputTokens)
         try c.encode(cachedTokens, forKey: .cachedTokens)
+        try c.encode(cachedTokens, forKey: .totalCachedTokens)
         try c.encode(breakEvents, forKey: .breakEvents)
         try c.encode(totalTurns, forKey: .totalTurns)
         try c.encode(hits, forKey: .hits)
         try c.encode(partialHits, forKey: .partialHits)
         try c.encode(breaks, forKey: .breaks)
-        try c.encode(steadyPromptTokens, forKey: .steadyPromptTokens)
+        try c.encode(steadyInputTokens, forKey: .steadyPromptTokens)
+        try c.encode(steadyInputTokens, forKey: .steadyInputTokens)
         try c.encode(steadyCachedTokens, forKey: .steadyCachedTokens)
+        try c.encode(steadyCachedTokens, forKey: .steadyCachedTokensCamel)
         try c.encodeIfPresent(lastBreakDiagnostic, forKey: .lastBreakDiagnostic)
+    }
+}
+
+/// Typealiases for parity with Rust terminology.
+public typealias PromptCacheSummary = SessionCacheSnapshot
+public typealias CacheSummary = SessionCacheSnapshot
+
+/// Wire response for `x.ai/session_cache` and `x.ai/session/cache`.
+public struct SessionCacheResponse: Codable, Sendable, Equatable {
+    public var summary: SessionCacheSnapshot
+    public var recentTurns: [CacheTurnRecord]
+
+    public init(
+        summary: SessionCacheSnapshot = SessionCacheSnapshot(),
+        recentTurns: [CacheTurnRecord] = []
+    ) {
+        self.summary = summary
+        self.recentTurns = recentTurns
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case summary
+        case recentTurns = "recent_turns"
+        case recentTurnsCamel = "recentTurns"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.summary = (try? c.decode(SessionCacheSnapshot.self, forKey: .summary)) ?? SessionCacheSnapshot()
+        self.recentTurns = (try? c.decode([CacheTurnRecord].self, forKey: .recentTurnsCamel))
+            ?? (try? c.decode([CacheTurnRecord].self, forKey: .recentTurns))
+            ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(summary, forKey: .summary)
+        try c.encode(recentTurns, forKey: .recentTurnsCamel)
     }
 }
 
@@ -511,6 +584,16 @@ public actor PromptCacheTracker {
     /// Access the current session cache snapshot.
     public func currentSnapshot() -> SessionCacheSnapshot {
         snapshot
+    }
+
+    /// Access the running summary of cache metrics (Rust parity alias for currentSnapshot).
+    public func summary() -> SessionCacheSnapshot {
+        snapshot
+    }
+
+    /// Access a complete SessionCacheResponse for wire ACP responses.
+    public func sessionCacheResponse() -> SessionCacheResponse {
+        SessionCacheResponse(summary: snapshot, recentTurns: turnRecords)
     }
 
     /// Access recent turn cache records.
@@ -968,17 +1051,18 @@ public actor PromptCacheTracker {
         snapshot.cachedTokens += cachedTokens
 
         if status != .firstTurn {
-            snapshot.steadyPromptTokens += promptTokens
+            snapshot.steadyInputTokens += promptTokens
             snapshot.steadyCachedTokens += cachedTokens
         }
 
-        if snapshot.steadyPromptTokens > 0 {
-            snapshot.cacheHitRate = (Double(snapshot.steadyCachedTokens) / Double(snapshot.steadyPromptTokens)) * 100.0
-        } else if snapshot.totalPromptTokens > 0 {
-            snapshot.cacheHitRate = (Double(snapshot.cachedTokens) / Double(snapshot.totalPromptTokens)) * 100.0
+        // Overall hit rate covers steady-state turns only: the cold first turn
+        // cannot hit by definition and would permanently dilute the rate.
+        if snapshot.steadyInputTokens > 0 {
+            snapshot.overallHitRatePct = (Double(snapshot.steadyCachedTokens) / Double(snapshot.steadyInputTokens)) * 100.0
         } else {
-            snapshot.cacheHitRate = 0.0
+            snapshot.overallHitRatePct = 0.0
         }
+        snapshot.cacheHitRate = snapshot.overallHitRatePct
 
         switch status {
         case .hit:
