@@ -110,6 +110,42 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         case toolOutcomes = "tool_outcomes"
     }
 
+    // Explicit so `tool_outcomes` cannot silently vanish on a future
+    // synthesized-key drift. Pre-Wave-A files omit the key; that is `nil`,
+    // not an empty map inventing success. Cost: adding a stored property
+    // now requires a matching key or `/resume` drops it.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try c.decode(String.self, forKey: .sessionID)
+        workingDirectory = try c.decode(String.self, forKey: .workingDirectory)
+        parentSessionID = try c.decodeIfPresent(String.self, forKey: .parentSessionID)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        items = try c.decode([ConversationItem].self, forKey: .items)
+        sandboxProfile = try c.decodeIfPresent(String.self, forKey: .sandboxProfile)
+        currentModelID = try c.decodeIfPresent(String.self, forKey: .currentModelID)
+        currentProvider = try c.decodeIfPresent(ModelProvider.self, forKey: .currentProvider)
+        everUsedNonXAI = try c.decodeIfPresent(Bool.self, forKey: .everUsedNonXAI)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        toolOutcomes = try c.decodeIfPresent(ToolCallOutcomeMap.self, forKey: .toolOutcomes)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(sessionID, forKey: .sessionID)
+        try c.encode(workingDirectory, forKey: .workingDirectory)
+        try c.encodeIfPresent(parentSessionID, forKey: .parentSessionID)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(updatedAt, forKey: .updatedAt)
+        try c.encode(items, forKey: .items)
+        try c.encodeIfPresent(sandboxProfile, forKey: .sandboxProfile)
+        try c.encodeIfPresent(currentModelID, forKey: .currentModelID)
+        try c.encodeIfPresent(currentProvider, forKey: .currentProvider)
+        try c.encodeIfPresent(everUsedNonXAI, forKey: .everUsedNonXAI)
+        try c.encodeIfPresent(title, forKey: .title)
+        try c.encodeIfPresent(toolOutcomes, forKey: .toolOutcomes)
+    }
+
     static func new(
         sessionID: String,
         workingDirectory: URL,

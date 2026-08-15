@@ -49,10 +49,18 @@ public func cmdASelectAllSupported(brand: TerminalName) -> Bool {
 // MARK: - Graphics Protocol
 
 /// Terminal graphics protocol format.
+///
+/// Pin: `GraphicsProtocol` (`image.rs`). `protocolForBrand` never returns
+/// `.iterm2` today — OSC 1337 lacks image-id / z-index / crop / clear.
 public enum GraphicsProtocol: String, Sendable, Equatable, Hashable {
     case kitty
     case iterm2
     case none
+
+    /// Whether this protocol can render pixel images inline.
+    public var supportsImages: Bool {
+        self != .none
+    }
 }
 
 /// Image formats supported by Kitty graphics protocol.
@@ -61,16 +69,12 @@ public enum KittyImageFormat: UInt8, Sendable, Equatable {
 }
 
 /// Determine graphics protocol supported by terminal brand.
+///
+/// Pin: `protocol_for_brand` (`image.rs`). Windows is always `.none`
+/// (ConPTY strips APC). iTerm2 is `.none` (no placement/scrollback model).
+/// Warp is `.kitty` for overlay transmit, not scrollback placement.
 public func protocolForBrand(brand: TerminalName, isWindows: Bool = false) -> GraphicsProtocol {
-    if isWindows { return .none }
-    switch brand {
-    case .ghostty, .kitty, .wezTerm:
-        return .kitty
-    case .iterm2:
-        return .iterm2
-    default:
-        return .none
-    }
+    GraphicsProtocol(KittyGraphics.protocolForBrand(brand: brand, isWindows: isWindows))
 }
 
 private nonisolated(unsafe) var testGraphicsProtocolOverride: GraphicsProtocol? = nil
@@ -94,19 +98,32 @@ public func detectGraphicsProtocol(
 }
 
 // MARK: - Kitty Graphics Protocol Framing
+//
+// Bodies call `OpenGrokTerminalCore.KittyGraphics`. Public names stay on
+// this module so existing PagerRender / CLI call sites keep compiling.
+// `setInlineOverlayForceOff` / `scrollbackInlineOverlayForcedOff` are
+// already visible here via `@_exported import OpenGrokTerminalCore`.
 
 /// Render Kitty image directly with z-index = -1 (inline/scrollback).
+///
+/// PagerRender keeps z=-1 even though pin `render_kitty_image` and
+/// `KittyGraphics.render` default to z=1 (modal overlays).
 public func renderKittyImage(
     imageData: Data,
     format: KittyImageFormat = .png,
     cols: UInt16,
     rows: UInt16
 ) -> String {
-    renderKittyImageZ(imageData: imageData, format: format, cols: cols, rows: rows, z: -1)
+    KittyGraphics.renderZ(
+        imageData: imageData,
+        format: format.coreFormat,
+        cols: cols,
+        rows: rows,
+        z: -1
+    )
 }
 
 /// Render Kitty image with explicit z-index (z=1 for modal overlays, z=-1 for scrollback).
-/// Chunks base64 payload at 4096-byte boundaries.
 public func renderKittyImageZ(
     imageData: Data,
     format: KittyImageFormat = .png,
@@ -114,28 +131,13 @@ public func renderKittyImageZ(
     rows: UInt16,
     z: Int32
 ) -> String {
-    let b64 = imageData.base64EncodedString()
-    guard !b64.isEmpty else { return "" }
-
-    let chunkSize = 4096
-    var chunks: [Substring] = []
-    var index = b64.startIndex
-    while index < b64.endIndex {
-        let nextIndex = b64.index(index, offsetBy: chunkSize, limitedBy: b64.endIndex) ?? b64.endIndex
-        chunks.append(b64[index..<nextIndex])
-        index = nextIndex
-    }
-
-    var result = ""
-    for (i, chunk) in chunks.enumerated() {
-        let hasMore = (i + 1 < chunks.count) ? 1 : 0
-        if i == 0 {
-            result += "\u{1b}_Ga=T,f=\(format.rawValue),t=d,q=2,C=1,z=\(z),i=1,p=1,c=\(cols),r=\(rows),m=\(hasMore);\(chunk)\u{1b}\\"
-        } else {
-            result += "\u{1b}_Gm=\(hasMore);\(chunk)\u{1b}\\"
-        }
-    }
-    return result
+    KittyGraphics.renderZ(
+        imageData: imageData,
+        format: format.coreFormat,
+        cols: cols,
+        rows: rows,
+        z: z
+    )
 }
 
 /// Transmit Kitty image data into terminal storage without placing it.
@@ -144,28 +146,7 @@ public func transmitKittyImage(
     format: KittyImageFormat = .png,
     imageId: UInt32
 ) -> String {
-    let b64 = imageData.base64EncodedString()
-    guard !b64.isEmpty else { return "" }
-
-    let chunkSize = 4096
-    var chunks: [Substring] = []
-    var index = b64.startIndex
-    while index < b64.endIndex {
-        let nextIndex = b64.index(index, offsetBy: chunkSize, limitedBy: b64.endIndex) ?? b64.endIndex
-        chunks.append(b64[index..<nextIndex])
-        index = nextIndex
-    }
-
-    var result = ""
-    for (i, chunk) in chunks.enumerated() {
-        let hasMore = (i + 1 < chunks.count) ? 1 : 0
-        if i == 0 {
-            result += "\u{1b}_Ga=t,f=\(format.rawValue),t=d,q=2,i=\(imageId),p=1,m=\(hasMore);\(chunk)\u{1b}\\"
-        } else {
-            result += "\u{1b}_Gm=\(hasMore);\(chunk)\u{1b}\\"
-        }
-    }
-    return result
+    KittyGraphics.transmit(imageData: imageData, format: format.coreFormat, imageId: imageId)
 }
 
 /// Place a previously transmitted Kitty image at specified cell dimensions and z-index.
@@ -175,7 +156,7 @@ public func placeKittyImage(
     rows: UInt16,
     z: Int32
 ) -> String {
-    "\u{1b}_Ga=p,i=\(imageId),p=1,q=2,C=1,z=\(z),c=\(cols),r=\(rows);\u{1b}\\"
+    KittyGraphics.place(imageId: imageId, cols: cols, rows: rows, z: z)
 }
 
 /// Place a cropped slice of a previously transmitted Kitty image.
@@ -189,18 +170,28 @@ public func placeKittyImageCropped(
     srcW: UInt32,
     srcH: UInt32
 ) -> String {
-    "\u{1b}_Ga=p,i=\(imageId),p=1,q=2,C=1,z=\(z),c=\(cols),r=\(rows),x=\(srcX),y=\(srcY),w=\(srcW),h=\(srcH);\u{1b}\\"
+    KittyGraphics.placeCropped(
+        imageId: imageId,
+        cols: cols,
+        rows: rows,
+        z: z,
+        srcX: srcX,
+        srcY: srcY,
+        srcW: srcW,
+        srcH: srcH
+    )
 }
 
 /// Clear/delete Kitty image by image ID.
 public func clearKittyImage(imageId: UInt32) -> String {
-    "\u{1b}_Ga=d,d=i,i=\(imageId),p=1,q=2;\u{1b}\\"
+    KittyGraphics.clear(imageId: imageId)
 }
 
 /// Render an image using iTerm2 inline image escape sequence (OSC 1337).
+///
+/// Helper exists for the pin enum; `protocolForBrand` never selects it.
 public func renderIterm2Image(imageData: Data, cols: UInt16, rows: UInt16) -> String {
-    let b64 = imageData.base64EncodedString()
-    return "\u{1b}]1337;File=inline=1;width=\(cols);height=\(rows):\(b64)\u{07}"
+    KittyGraphics.renderITerm2Image(imageData: imageData, cols: cols, rows: rows)
 }
 
 /// Compute scaled cell bounds for image aspect ratio.
@@ -210,23 +201,7 @@ public func fitImageToCells(
     maxCols: UInt16,
     maxRows: UInt16
 ) -> (cols: UInt16, rows: UInt16) {
-    guard imgW > 0, imgH > 0, maxCols > 0, maxRows > 0 else { return (1, 1) }
-
-    // Terminal cells typically have a ~2:1 height-to-width pixel aspect ratio
-    let pixelAspect = Double(imgW) / Double(imgH)
-    let cellAspect = pixelAspect * 2.0 // cell columns / cell rows
-
-    var cols = Double(maxCols)
-    var rows = cols / cellAspect
-
-    if rows > Double(maxRows) {
-        rows = Double(maxRows)
-        cols = rows * cellAspect
-    }
-
-    let finalCols = max(1, min(maxCols, UInt16(cols.rounded())))
-    let finalRows = max(1, min(maxRows, UInt16(rows.rounded())))
-    return (finalCols, finalRows)
+    KittyGraphics.fitImageToCells(imgW: imgW, imgH: imgH, maxCols: maxCols, maxRows: maxRows)
 }
 
 /// Prepare/convert image bytes to PNG format for Kitty graphics overlay rendering.
@@ -261,5 +236,29 @@ public func prepareKittyOverlayImageBytes(_ imageData: Data) -> Data? {
     #else
     return nil
     #endif
+}
+
+// MARK: - PagerRender ↔ TerminalCore mapping
+
+extension GraphicsProtocol {
+    fileprivate init(_ proto: KittyGraphicsProtocol) {
+        switch proto {
+        case .kitty:
+            self = .kitty
+        case .iterm2:
+            self = .iterm2
+        case .none:
+            self = .none
+        }
+    }
+}
+
+extension KittyImageFormat {
+    fileprivate var coreFormat: KittyGraphicsFormat {
+        switch self {
+        case .png:
+            return .png
+        }
+    }
 }
 

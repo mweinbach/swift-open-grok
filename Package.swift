@@ -256,7 +256,9 @@ private func targets() -> [Target] {
         name: "OpenGrokCrashHandlerC",
         publicHeadersPath: "include"
     ))
-    t.append(.target(name: "OpenGrokTTY", dependencies: dep(w0s2, w0s3, w0s4)))
+    // XTVERSION DCS swallow lives on the TTY byte path. TerminalCore (w2s5)
+    // does not import TTY, so this later-slice edge is acyclic.
+    t.append(.target(name: "OpenGrokTTY", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokTerminalCore"])))
     t.append(.target(name: "OpenGrokPTY", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokTTY", "OpenGrokPTYC"])))
     t.append(.target(name: "OpenGrokPTYCLI", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokPTY", "OpenGrokTTY"])))
     t.append(.target(name: "OpenGrokSystemPower", dependencies: dep(w0s2, w0s3, w0s4)))

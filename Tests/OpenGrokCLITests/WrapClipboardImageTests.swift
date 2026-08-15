@@ -169,7 +169,8 @@ struct WrapClipboardImageTests {
         let rendered = renderKittyImageZ(imageData: testData, format: .png, cols: 80, rows: 24, z: 1)
 
         #expect(rendered.contains("\u{1b}_Ga=T,f=100,t=d,q=2,C=1,z=1,i=1,p=1,c=80,r=24,m=1;"))
-        #expect(rendered.contains("\u{1b}_Gm=0;"))
+        #expect(rendered.contains("\u{1b}_Gq=2,m=0;"))
+        #expect(!rendered.contains("\u{1b}_Gm="))
         #expect(rendered.hasSuffix("\u{1b}\\"))
     }
 

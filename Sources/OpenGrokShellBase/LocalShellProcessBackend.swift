@@ -296,7 +296,8 @@ public actor LocalShellProcessBackend: ShellProcessBackend, ShellCapabilityProvi
         let capture = try LocalShellOutputCapture(
             outputFile: request.outputFile,
             outputByteLimit: request.outputByteLimit,
-            maximumOutputFileBytes: maximumOutputFileBytes
+            maximumOutputFileBytes: maximumOutputFileBytes,
+            lifecycle: lifecycle
         )
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launch.executable)
@@ -340,15 +341,13 @@ public actor LocalShellProcessBackend: ShellProcessBackend, ShellCapabilityProvi
                 reader: controller.stdout,
                 channel: .stdout,
                 taskID: taskID,
-                capture: capture,
-                lifecycle: lifecycle
+                capture: capture
             )
             let stderrTask = makeReaderTask(
                 reader: controller.stderr,
                 channel: .stderr,
                 taskID: taskID,
-                capture: capture,
-                lifecycle: lifecycle
+                capture: capture
             )
             let monitor = Task.detached { [lifecycle, controller, capture, control, completion] in
                 let exit = await controller.waitForExit()
@@ -526,8 +525,7 @@ public actor LocalShellProcessBackend: ShellProcessBackend, ShellCapabilityProvi
         reader: LocalShellPipeReader,
         channel: ShellOutputChannel,
         taskID: String,
-        capture: LocalShellOutputCapture,
-        lifecycle: ShellProcessLifecycle
+        capture: LocalShellOutputCapture
     ) -> Task<Void, Never> {
         Task.detached(priority: .utility) {
             while true {
@@ -535,15 +533,11 @@ public actor LocalShellProcessBackend: ShellProcessBackend, ShellCapabilityProvi
                     guard let data = try reader.readChunk(), !data.isEmpty else {
                         break
                     }
-                    let event = await capture.append(data, channel: channel, taskID: taskID)
-                    if case let .output(_, _, _, sequence) = event {
-                        try? await lifecycle.appendOutput(
-                            taskID: taskID,
-                            channel: channel,
-                            data: data,
-                            sequence: sequence
-                        )
-                    }
+                    // Publish through the capture actor so stdout/stderr
+                    // sequences stay ordered. A concurrent hop after
+                    // `append` used to drop `.output` on sequence mismatch
+                    // (`try?` swallowed it) and the pager never saw a tail.
+                    await capture.publish(data, channel: channel, taskID: taskID)
                 } catch {
                     break
                 }
@@ -700,16 +694,24 @@ private actor LocalShellOutputCapture {
     private var accumulator: ShellOutputAccumulator
     private let outputFile: URL?
     private let maximumOutputFileBytes: Int
+    private let lifecycle: ShellProcessLifecycle
     private var fileHandle: FileHandle?
     private var fileBytesWritten = 0
     private var fileFailure: String?
+    private var publishFailed = false
 
-    init(outputFile: URL?, outputByteLimit: Int, maximumOutputFileBytes: Int) throws {
+    init(
+        outputFile: URL?,
+        outputByteLimit: Int,
+        maximumOutputFileBytes: Int,
+        lifecycle: ShellProcessLifecycle
+    ) throws {
         if let outputFile, outputFile.path.utf8.contains(0) {
             throw ShellError.invalidRequest("output file contains a NUL byte")
         }
         self.outputFile = outputFile
         self.maximumOutputFileBytes = max(0, maximumOutputFileBytes)
+        self.lifecycle = lifecycle
         self.accumulator = ShellOutputAccumulator(limit: outputByteLimit)
 
         if let outputFile {
@@ -745,6 +747,25 @@ private actor LocalShellOutputCapture {
             fileFailure = "writing output file \(outputFile?.path ?? "") failed: \(error)"
         }
         return event
+    }
+
+    /// Accumulate, then emit `.output` on the lifecycle stream from this
+    /// actor so stdout/stderr cannot race the sequence counter.
+    func publish(_ data: Data, channel: ShellOutputChannel, taskID: String) async {
+        let event = append(data, channel: channel, taskID: taskID)
+        guard !publishFailed, case let .output(_, _, payload, sequence) = event else {
+            return
+        }
+        do {
+            try await lifecycle.appendOutput(
+                taskID: taskID,
+                channel: channel,
+                data: payload,
+                sequence: sequence
+            )
+        } catch {
+            publishFailed = true
+        }
     }
 
     func result(
@@ -811,8 +832,42 @@ private final class LocalShellPipeReader: @unchecked Sendable {
         self.handle = pipe.fileHandleForReading
     }
 
+    /// One POSIX `read` of whatever is currently in the pipe. Foundation's
+    /// `FileHandle.read(upToCount:)` waits for the requested count or EOF
+    /// (`readData(ofLength:)`), so a 64 KiB request coalesced `printf one;
+    /// sleep; printf two` into a single post-exit blob and the live tail
+    /// never moved. `read(2)` returns as soon as any byte is available.
     func readChunk() throws -> Data? {
-        try handle.read(upToCount: 64 * 1024)
+        let fd = handle.fileDescriptor
+        guard fd >= 0 else { return nil }
+
+        #if canImport(Darwin) || canImport(Glibc)
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n: ssize_t
+            #if canImport(Darwin)
+            n = Darwin.read(fd, &buffer, buffer.count)
+            #else
+            n = Glibc.read(fd, &buffer, buffer.count)
+            #endif
+            if n == 0 {
+                return nil
+            }
+            if n > 0 {
+                return Data(buffer.prefix(Int(n)))
+            }
+            let code = errno
+            if code == EINTR {
+                continue
+            }
+            if code == EBADF || code == EPIPE {
+                return nil
+            }
+            throw ShellError.io("failed to read shell output: errno \(code)")
+        }
+        #else
+        return try handle.read(upToCount: 4096)
+        #endif
     }
 
     func close() {

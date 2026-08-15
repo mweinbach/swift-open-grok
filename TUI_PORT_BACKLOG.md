@@ -1114,13 +1114,15 @@ Do **not** mix these into A–F. They are real, but they are not why the TUI loo
 
 ### Wave A
 - [x] A1 Forward non-text sampler events (landed 2026-08-14; pager exhaustiveness glue by lead)
-- [x] A2 Honest restore of tool outcomes (`ToolCallOutcomeMap` sidecar + seed/peek)
+- [x] A2 Honest restore of tool outcomes (`ToolCallOutcomeMap` sidecar + seed/peek; save/load proven 2026-08-15)
 - [x] A3 Nonzero bash exits are failed (`displayState` on success result)
 - [x] A4 Structured tool payloads + factory (`PagerToolCard.make`; painters still generic)
-- [x] A5 Incremental tool-output sink (protocol + live `onOutput` append)
+- [x] A5 Incremental tool-output sink (protocol + live `onOutput` append; POSIX `read(2)` chunks 2026-08-15)
 - [x] A6 Merge-in-place fold/timing
 
 Wave A is **transport**, not painters. Execute/edit/read cards still share `appendToolCard` until Wave B/C.
+
+TerminalCore startup glue (2026-08-15, live): DA2 after raw mode + Kitty flag push; XTVERSION fire-and-forget write after `PlatformTerminalInput` is armed; DCS reply swallowed on the TTY byte path; `TerminalCapabilities` delegates to pin `KittyGraphics` (iTerm2 scrollback stays off).
 
 ### Wave B
 - [ ] B1 Execute painter

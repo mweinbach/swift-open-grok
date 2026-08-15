@@ -5,6 +5,7 @@ import Dispatch
 #endif
 
 #if os(macOS) || os(Linux)
+import OpenGrokTerminalCore
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -107,12 +108,23 @@ public protocol TerminalInput: Sendable {
     /// decoder, so a half-swallowed sequence cannot corrupt the first
     /// post-resume key. Only meaningful while paused.
     func discardPendingInput()
+
+    /// Last sanitized XTVERSION DCS payload swallowed on this input, if any.
+    /// Default `nil`: fakes and unsupported platforms do not filter.
+    var lastSwallowedXtversionPayload: String? { get }
+    /// Whether the XTVERSION DCS filter is still armed.
+    var isXtversionReplyFilterArmed: Bool { get }
+    /// Re-arm or disable DCS swallowing. No-op on inputs that do not filter.
+    func setSwallowXtversionReply(_ enabled: Bool)
 }
 
 extension TerminalInput {
     public func pauseReads() async -> Bool { false }
     public func resumeReads() {}
     public func discardPendingInput() {}
+    public var lastSwallowedXtversionPayload: String? { nil }
+    public var isXtversionReplyFilterArmed: Bool { false }
+    public func setSwallowXtversionReply(_ enabled: Bool) { _ = enabled }
 }
 
 public protocol TerminalResizeSource: Sendable {
@@ -541,6 +553,14 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
     private var decoder = TerminalInputDecoder()
     private var csiFilter = CsiFragmentFilter()
     private var eventQueue: [TerminalInputEvent] = []
+    /// Armed by default so a fire-and-forget `CSI > 0 q` reply (`DCS > | text ST`)
+    /// cannot type into the composer. Stays armed until a reply completes or
+    /// tests disarm it — no timed stdin read, no block-on-reply.
+    private var xtversionFilter: XtversionReplyFilter
+    /// Last sanitized payload swallowed on this input, if any. Recording into
+    /// terminal_context is lead glue; this path only keeps the bytes off the
+    /// decoder.
+    public private(set) var lastSwallowedXtversionPayload: String?
     /// Suspend-for-child state (`park_input_reader`, event_loop.rs:326-348).
     /// Guarded by `stateLock` like the read/cancel state it interacts with:
     /// a pause wake and a concurrent cancel share the wake pipe, and the
@@ -555,7 +575,8 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
         fd: Int32 = STDIN_FILENO,
         escapeSequenceTimeoutMilliseconds: Int32 = 50,
         closeFileDescriptor: Bool = false,
-        identifier: String? = nil
+        identifier: String? = nil,
+        swallowXtversionReply: Bool = true
     ) throws {
         guard escapeSequenceTimeoutMilliseconds >= 0 else {
             throw TerminalInputError.unsupported("escape sequence timeout cannot be negative")
@@ -564,6 +585,8 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
         self.escapeSequenceTimeoutMilliseconds = escapeSequenceTimeoutMilliseconds
         self.closeFileDescriptor = closeFileDescriptor
         self.identifier = identifier ?? "fd:\(fd)"
+        self.xtversionFilter = XtversionReplyFilter(armed: swallowXtversionReply)
+        self.lastSwallowedXtversionPayload = nil
 
         var descriptors: [Int32] = [0, 0]
         guard pipe(&descriptors) == 0 else {
@@ -609,37 +632,31 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
             if !eventQueue.isEmpty {
                 return eventQueue.removeFirst()
             }
-            let timeout = decoder.hasPendingEscapeSequence
+            // A held XTVERSION prefix is the same class of incomplete ESC as
+            // the decoder's pending sequence: use the existing poll timeout
+            // so Escape is not parked until the next key. This is not a
+            // timed stdin read for the reply.
+            let timeout = (decoder.hasPendingEscapeSequence || xtversionFilter.holding)
                 ? escapeSequenceTimeoutMilliseconds
                 : nil
             let result = try await waitForByte(timeoutMilliseconds: timeout)
             switch result {
             case .byte(let byte):
-                let rawEvents = try decoder.feed(byte)
-                if !rawEvents.isEmpty {
-                    let filtered = csiFilter.filter(rawEvents)
-                    eventQueue.append(contentsOf: filtered)
-                    if !eventQueue.isEmpty {
-                        return eventQueue.removeFirst()
-                    }
+                try feedXtversionThenDecode(byte)
+                if !eventQueue.isEmpty {
+                    return eventQueue.removeFirst()
                 }
             case .timedOut:
-                let rawEvents = try decoder.finish()
-                if !rawEvents.isEmpty {
-                    let filtered = csiFilter.filter(rawEvents)
-                    eventQueue.append(contentsOf: filtered)
-                    if !eventQueue.isEmpty {
-                        return eventQueue.removeFirst()
-                    }
+                try flushXtversionHoldIntoDecoder()
+                try enqueueFinishedDecoder()
+                if !eventQueue.isEmpty {
+                    return eventQueue.removeFirst()
                 }
             case .endOfFile:
-                let rawEvents = try decoder.finish()
-                if !rawEvents.isEmpty {
-                    let filtered = csiFilter.filter(rawEvents)
-                    eventQueue.append(contentsOf: filtered)
-                    if !eventQueue.isEmpty {
-                        return eventQueue.removeFirst()
-                    }
+                try flushXtversionHoldIntoDecoder()
+                try enqueueFinishedDecoder()
+                if !eventQueue.isEmpty {
+                    return eventQueue.removeFirst()
                 }
                 return nil
             }
@@ -743,6 +760,54 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
         decoder = TerminalInputDecoder()
         csiFilter.reset()
         eventQueue.removeAll()
+        xtversionFilter = XtversionReplyFilter(armed: xtversionFilter.armed)
+    }
+
+    /// Whether the XTVERSION DCS filter is still armed (pin: swallow until a
+    /// reply completes or the caller disarms).
+    public var isXtversionReplyFilterArmed: Bool { xtversionFilter.armed }
+
+    /// Re-arm or disable DCS swallowing. Tests use this so a fixture can
+    /// observe the decoder without the filter; production stays at the init
+    /// default (`true`).
+    public func setSwallowXtversionReply(_ enabled: Bool) {
+        xtversionFilter = XtversionReplyFilter(armed: enabled)
+    }
+
+    /// Feed one input byte through `XtversionReplyFilter` and decode only
+    /// residual keystrokes. Swallowed DCS reply bytes never reach the decoder.
+    private func feedXtversionThenDecode(_ byte: UInt8) throws {
+        let step = xtversionFilter.feed([byte])
+        if let payload = step.completedPayload {
+            lastSwallowedXtversionPayload = payload
+        }
+        for decodeByte in step.residual {
+            try enqueueDecoded(decodeByte)
+        }
+    }
+
+    /// Drop a confirmed DCS fragment; flush a pre-intro hold back as decoder
+    /// input (`resolve_dead_hold`, xt_filter.rs:117-125).
+    private func flushXtversionHoldIntoDecoder() throws {
+        guard xtversionFilter.holding else { return }
+        let flushed = xtversionFilter.resolveDeadHold()
+        for decodeByte in flushed {
+            try enqueueDecoded(decodeByte)
+        }
+    }
+
+    private func enqueueDecoded(_ byte: UInt8) throws {
+        let rawEvents = try decoder.feed(byte)
+        if !rawEvents.isEmpty {
+            eventQueue.append(contentsOf: csiFilter.filter(rawEvents))
+        }
+    }
+
+    private func enqueueFinishedDecoder() throws {
+        let rawEvents = try decoder.finish()
+        if !rawEvents.isEmpty {
+            eventQueue.append(contentsOf: csiFilter.filter(rawEvents))
+        }
     }
 
     /// Abort an unacknowledged park: un-pause so reads keep flowing, restart
@@ -1163,8 +1228,13 @@ public typealias PlatformTerminalResizeMonitor = PosixTerminalResizeMonitor
 public struct UnsupportedTerminalInput: TerminalInput, Sendable {
     public let identifier: String?
 
-    public init(fd: Int32 = 0, identifier: String? = nil) {
+    public init(
+        fd: Int32 = 0,
+        identifier: String? = nil,
+        swallowXtversionReply: Bool = true
+    ) {
         _ = fd
+        _ = swallowXtversionReply
         self.identifier = identifier
     }
 

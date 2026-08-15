@@ -824,12 +824,21 @@ extension OpenGrokLiveInteractiveInput {
         guard inputTTY.isATTY() else { return nil }
 
         let lease = try await inputTTY.enterRawMode()
+        // DA2 owns stdin after raw mode and before EventStream
+        // (da2.rs:16-19, app/mod.rs:1356-1361). Poll-bounded; no sleep.
+        await LiveTerminalStartupProbes.probeDa2AndPushKittyKeyboard { data in
+            try await inputTTY.write(data)
+        }
         let input: any TerminalInput
         do {
             input = try PlatformTerminalInput()
         } catch {
             await lease.release()
             throw error
+        }
+        // Filter is armed. Write CSI > 0 q once; do not timed-read.
+        await LiveTerminalStartupProbes.writeXtversionQueryIfAllowed { data in
+            try await inputTTY.write(data)
         }
 
         var continuation: AsyncThrowingStream<InputEvent, Error>.Continuation!
