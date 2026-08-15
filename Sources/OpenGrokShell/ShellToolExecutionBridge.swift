@@ -45,11 +45,123 @@ public enum OpenGrokShellBackgroundWorkEvent: Sendable, Hashable, Equatable {
 public typealias OpenGrokShellBackgroundWorkEventSink =
     @Sendable (OpenGrokShellBackgroundWorkEvent) async -> Void
 
+/// How a foreground tool-output delta should be applied to a running card.
+/// Rust `BashOutput.output_delta`: `Some(bytes)` appends, `Some([])` resets,
+/// `None` replaces with the full buffer (`output.rs` BashOutput).
+public enum OpenGrokShellOutputDeltaOp: String, Sendable, Equatable {
+    case append
+    case replace
+}
+
+/// Incremental foreground tool output for a live execute card.
+public struct OpenGrokShellOutputDelta: Sendable, Equatable {
+    public let callID: String
+    public let text: String
+    public let op: OpenGrokShellOutputDeltaOp
+
+    public init(
+        callID: String,
+        text: String,
+        op: OpenGrokShellOutputDeltaOp = .append
+    ) {
+        self.callID = callID
+        self.text = text
+        self.op = op
+    }
+}
+
+public typealias OpenGrokShellForegroundOutputSink =
+    @Sendable (OpenGrokShellOutputDelta) async -> Void
+
+/// Task-local sink so `OpenGrokShellToolRuntime.invoke` stays 2-arg while the
+/// live store can still attach a per-call progress consumer. Fakes never set it.
+public enum OpenGrokShellToolOutputContext {
+    @TaskLocal public static var onOutput: OpenGrokShellForegroundOutputSink?
+}
+
+/// Holds back trailing incomplete UTF-8 so split multibyte sequences across
+/// process chunks do not become U+FFFD (Rust tracker `Utf8Decoder`).
+public struct OpenGrokShellUTF8DeltaDecoder: Sendable {
+    private var pending: [UInt8] = []
+
+    public init() {}
+
+    public mutating func push(_ piece: Data) -> String {
+        guard !piece.isEmpty else { return "" }
+        pending.append(contentsOf: piece)
+        let incomplete = Self.trailingIncompleteLength(pending)
+        let completeCount = pending.count - incomplete
+        guard completeCount > 0 else { return "" }
+        let complete = Data(pending.prefix(completeCount))
+        pending.removeFirst(completeCount)
+        return String(decoding: complete, as: UTF8.self)
+    }
+
+    public mutating func finish() -> String {
+        guard !pending.isEmpty else { return "" }
+        let rest = String(decoding: Data(pending), as: UTF8.self)
+        pending.removeAll(keepingCapacity: false)
+        return rest
+    }
+
+    private static func trailingIncompleteLength(_ bytes: [UInt8]) -> Int {
+        guard let last = bytes.last else { return 0 }
+        // ASCII complete.
+        if last < 0x80 { return 0 }
+        // Count trailing continuation bytes, then check the lead.
+        var continuationCount = 0
+        var index = bytes.count - 1
+        while index >= 0, (bytes[index] & 0xC0) == 0x80 {
+            continuationCount += 1
+            if continuationCount > 3 {
+                return 0
+            }
+            if index == 0 { return 0 }
+            index -= 1
+        }
+        let lead = bytes[index]
+        let expected: Int
+        if lead & 0xE0 == 0xC0 {
+            expected = 2
+        } else if lead & 0xF0 == 0xE0 {
+            expected = 3
+        } else if lead & 0xF8 == 0xF0 {
+            expected = 4
+        } else {
+            return 0
+        }
+        let have = 1 + continuationCount
+        if have < expected, index + have == bytes.count {
+            return have
+        }
+        return 0
+    }
+}
+
+/// Box so a sequential chunk pump can mutate a decoder across `await`s.
+final class OpenGrokShellUTF8DeltaDecoderBox: @unchecked Sendable {
+    private var decoder = OpenGrokShellUTF8DeltaDecoder()
+
+    func push(_ data: Data) -> String {
+        decoder.push(data)
+    }
+
+    func finish() -> String {
+        decoder.finish()
+    }
+}
+
 public protocol OpenGrokShellProcessExecution: Sendable {
     var sessionID: String { get }
     var workingDirectory: URL { get }
 
     func run(_ request: ShellCommandRequest) async throws -> ShellCommandResult
+    /// Foreground run with an optional output-delta sink. Default ignores the
+    /// sink so existing fakes only implement `run(_:)`.
+    func run(
+        _ request: ShellCommandRequest,
+        onOutput: OpenGrokShellForegroundOutputSink?
+    ) async throws -> ShellCommandResult
     func runBackground(_ request: ShellCommandRequest) async throws -> ShellBackgroundHandle
     func cancel(toolCallID: String) async
     func cancelAll() async
@@ -63,6 +175,14 @@ public protocol OpenGrokShellProcessExecution: Sendable {
 
 extension OpenGrokShellProcessExecution {
     public func setBackgroundWorkEventSink(_ sink: OpenGrokShellBackgroundWorkEventSink?) async {}
+
+    public func run(
+        _ request: ShellCommandRequest,
+        onOutput: OpenGrokShellForegroundOutputSink?
+    ) async throws -> ShellCommandResult {
+        _ = onOutput
+        return try await run(request)
+    }
 }
 
 public actor OpenGrokShellOwnedProcessExecution: OpenGrokShellProcessExecution {
@@ -102,6 +222,13 @@ public actor OpenGrokShellOwnedProcessExecution: OpenGrokShellProcessExecution {
     }
 
     public func run(_ request: ShellCommandRequest) async throws -> ShellCommandResult {
+        try await run(request, onOutput: nil)
+    }
+
+    public func run(
+        _ request: ShellCommandRequest,
+        onOutput: OpenGrokShellForegroundOutputSink?
+    ) async throws -> ShellCommandResult {
         let ownedRequest = try ownedRequest(request)
         let callID = try toolCallID(from: ownedRequest)
         guard !foregroundCallIDs.contains(callID), !backgroundTaskOwners.values.contains(callID) else {
@@ -110,14 +237,46 @@ public actor OpenGrokShellOwnedProcessExecution: OpenGrokShellProcessExecution {
         foregroundCallIDs.insert(callID)
         defer { foregroundCallIDs.remove(callID) }
 
-        let result = try await withTaskCancellationHandler(
-            operation: {
-                try await backend.run(ownedRequest)
-            },
-            onCancel: {
-                Task { await backend.killForegroundCommands(ownerSessionID: sessionID) }
+        let result: ShellCommandResult
+        if let onOutput, let local = backend as? LocalShellProcessBackend {
+            // Per-call UTF-8 decoder: incomplete trailing bytes stay buffered
+            // until the next chunk (or finish) so split multibyte sequences
+            // never corrupt the running card text.
+            let decoder = OpenGrokShellUTF8DeltaDecoderBox()
+            result = try await withTaskCancellationHandler(
+                operation: {
+                    try await local.run(ownedRequest, onChunk: { data in
+                        let text = decoder.push(data)
+                        guard !text.isEmpty else { return }
+                        await onOutput(OpenGrokShellOutputDelta(
+                            callID: callID,
+                            text: text,
+                            op: .append
+                        ))
+                    })
+                },
+                onCancel: {
+                    Task { await backend.killForegroundCommands(ownerSessionID: sessionID) }
+                }
+            )
+            let tail = decoder.finish()
+            if !tail.isEmpty {
+                await onOutput(OpenGrokShellOutputDelta(
+                    callID: callID,
+                    text: tail,
+                    op: .append
+                ))
             }
-        )
+        } else {
+            result = try await withTaskCancellationHandler(
+                operation: {
+                    try await backend.run(ownedRequest)
+                },
+                onCancel: {
+                    Task { await backend.killForegroundCommands(ownerSessionID: sessionID) }
+                }
+            )
+        }
         // A foreground command that outruns `foregroundBlockBudget` is moved to
         // the background by the backend, not by an explicit `runBackground`
         // call, so its task id never passes through the branch below. Without
@@ -292,10 +451,19 @@ public struct OpenGrokShellToolCall: Sendable, Equatable {
 public struct OpenGrokShellToolCallResult: Sendable, Equatable {
     public let value: JSONValue
     public let promptText: String
+    /// Pager/card terminal state. Distinct from `Result.failure` so a nonzero
+    /// bash exit keeps real `promptText` (combined output + exit detail) while
+    /// the live update still paints a failed accent. Default `.succeeded`.
+    public let displayState: OpenGrokShellToolState
 
-    public init(value: JSONValue, promptText: String) {
+    public init(
+        value: JSONValue,
+        promptText: String,
+        displayState: OpenGrokShellToolState = .succeeded
+    ) {
         self.value = value
         self.promptText = promptText
+        self.displayState = displayState
     }
 }
 
@@ -443,7 +611,8 @@ public actor OpenGrokShellToolRuntimeComposition {
         workingDirectory: URL,
         name: String,
         args: JSONValue,
-        callID: String
+        callID: String,
+        onOutput: OpenGrokShellForegroundOutputSink? = nil
     ) async throws -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
         let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -471,22 +640,24 @@ public actor OpenGrokShellToolRuntimeComposition {
             cancelledCallKeys.remove(callKey)
         }
 
-        return await withTaskCancellationHandler(
-            operation: {
-                let result = await runtime.invoke(call, using: process)
-                if Task.isCancelled || cancelledCallKeys.contains(callKey) {
-                    try? await cancel(call)
-                    return .failure(.cancelled)
+        return await OpenGrokShellToolOutputContext.$onOutput.withValue(onOutput) {
+            await withTaskCancellationHandler(
+                operation: {
+                    let result = await runtime.invoke(call, using: process)
+                    if Task.isCancelled || cancelledCallKeys.contains(callKey) {
+                        try? await cancel(call)
+                        return .failure(.cancelled)
+                    }
+                    return result
+                },
+                onCancel: {
+                    Task {
+                        await process.cancel(toolCallID: call.callID)
+                        await runtime.cancel(call)
+                    }
                 }
-                return result
-            },
-            onCancel: {
-                Task {
-                    await process.cancel(toolCallID: call.callID)
-                    await runtime.cancel(call)
-                }
-            }
-        )
+            )
+        }
     }
 
     public func cancel(

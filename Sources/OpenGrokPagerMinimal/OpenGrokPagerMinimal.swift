@@ -54,25 +54,35 @@ public enum OpenGrokPagerToolState: String, Sendable, Equatable {
     case cancelled
 }
 
+public enum OpenGrokPagerToolOutputOp: String, Sendable, Equatable {
+    case append
+    case replace
+}
+
 public struct OpenGrokPagerToolUpdate: Sendable, Equatable {
     public var callID: String
     public var name: String
     public var input: String
     public var output: String?
     public var state: OpenGrokPagerToolState
+    /// How `output` merges onto an existing card. Progress chunks use
+    /// `.append`; terminal updates use `.replace` (the default).
+    public var outputOp: OpenGrokPagerToolOutputOp
 
     public init(
         callID: String,
         name: String,
         input: String,
         output: String? = nil,
-        state: OpenGrokPagerToolState
+        state: OpenGrokPagerToolState,
+        outputOp: OpenGrokPagerToolOutputOp = .replace
     ) {
         self.callID = callID
         self.name = name
         self.input = input
         self.output = output
         self.state = state
+        self.outputOp = outputOp
     }
 }
 
@@ -81,6 +91,28 @@ public enum OpenGrokPagerMinimalEvent: Sendable, Equatable {
     case output(String)
     case status(String)
     case tool(OpenGrokPagerToolUpdate)
+    /// Streaming reasoning/thought channel delta → `PagerMessage(role: .reasoning)`.
+    case reasoning(String)
+    /// Provisional tool-call fragment. UI may hydrate a card header; never execute.
+    case toolCallDelta(
+        toolIndex: UInt32,
+        id: String?,
+        name: String?,
+        argumentsDelta: String?
+    )
+    case retrying(
+        attempt: UInt32,
+        maxRetries: UInt32,
+        kind: String,
+        reason: String
+    )
+    /// Typed sampling failure surface (keep kind/retryability, not message alone).
+    case samplingFailed(
+        kind: String,
+        message: String,
+        isRetryable: Bool,
+        statusCode: UInt16?
+    )
     case permissionRequested(OpenGrokPagerMinimalPermissionRequest)
     case completed(OpenGrokPagerMinimalCompletion)
     case cancelled
@@ -295,7 +327,8 @@ public actor OpenGrokPagerMinimal {
                 terminalLifecycle = .cancelled
             case .completed:
                 terminalLifecycle = .completed
-            case .lifecycle, .output, .status, .tool, .permissionRequested:
+            case .lifecycle, .output, .status, .tool, .reasoning, .toolCallDelta,
+                 .retrying, .samplingFailed, .permissionRequested:
                 continue
             }
 
@@ -323,7 +356,8 @@ private extension OpenGrokPagerMinimalEvent {
         switch self {
         case .completed, .cancelled:
             return true
-        case .lifecycle, .output, .status, .tool, .permissionRequested:
+        case .lifecycle, .output, .status, .tool, .reasoning, .toolCallDelta,
+             .retrying, .samplingFailed, .permissionRequested:
             return false
         }
     }

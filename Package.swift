@@ -283,7 +283,7 @@ private func targets() -> [Target] {
     // W5-S1: ToolRegistry base; FileTools -> ToolRegistry.
     t.append(.target(name: "OpenGrokToolRegistry", dependencies: dep(w0s2, w1s1, w1s3, w1s4, w2s2, w2s3, w4s3)))
     t.append(.target(name: "OpenGrokFileTools", dependencies: dep(w0s2, w1s1, w1s3, w1s4, w2s2, w2s3, w4s3, ["OpenGrokToolRegistry"])))
-    t.append(contentsOf: libs(w5s2, dep(w0s2, w0s4, w1s1, w1s3, w2s1, w2s4, w3s3, w4s3, w4s4, w4s1)))
+    t.append(contentsOf: libs(w5s2, dep(w0s2, w0s4, w1s1, w1s3, w2s1, w2s4, w3s3, w4s3, w4s4, w4s1, ["OpenGrokTerminalCore"])))
     t.append(contentsOf: libs(w5s3, dep(w0s2, w1s1, w1s2, w1s4, w4s2, w4s3)))
     // W5-S4: MCP base; ComputerHubMCPAdapter -> MCP.
     t.append(.target(name: "OpenGrokMCP", dependencies: dep(w0s2, w0s3, w1s1, w1s4, w1s5, w2s1, w2s2, w4s4, w4s1)))

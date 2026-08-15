@@ -977,6 +977,20 @@ struct LiveToolExecutor: Sendable {
         workingDirectory: URL,
         call: ToolCall
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
+        await invoke(
+            sessionID: sessionID,
+            workingDirectory: workingDirectory,
+            call: call,
+            onOutput: nil
+        )
+    }
+
+    func invoke(
+        sessionID: String,
+        workingDirectory: URL,
+        call: ToolCall,
+        onOutput: OpenGrokShellForegroundOutputSink?
+    ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
         let args: JSONValue
         do {
             args = try JSONDecoder().decode(
@@ -1169,7 +1183,8 @@ struct LiveToolExecutor: Sendable {
                 workingDirectory: workingDirectory,
                 name: call.name,
                 args: args,
-                callID: call.callId
+                callID: call.callId,
+                onOutput: onOutput
             )
         } catch is CancellationError {
             return .failure(.cancelled)
@@ -1686,7 +1701,12 @@ struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
                 ))
             }
 
-            let result = try await process.run(request)
+            // Prefer the TaskLocal sink set by composition/store; keeps the
+            // OpenGrokShellToolRuntime protocol 2-arg so other runtimes compile.
+            let result = try await process.run(
+                request,
+                onOutput: OpenGrokShellToolOutputContext.onOutput
+            )
             let value: JSONValue = .object([
                 "type": .string(result.backgrounded ? "backgrounded" : "foreground"),
                 "combined_output": .string(result.combinedOutput),
@@ -1706,9 +1726,13 @@ struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
                 } ?? .null,
                 "task_id": result.taskID.map(JSONValue.string) ?? .null
             ])
+            // Nonzero exit / signal / timeout stay Result.success so promptText
+            // (combined output + exit detail) is not rewritten to "Tool failed:".
+            // displayState carries the failed accent for the pager.
             return .success(OpenGrokShellToolCallResult(
                 value: value,
-                promptText: Self.promptText(for: result)
+                promptText: Self.promptText(for: result),
+                displayState: Self.displayState(for: result)
             ))
         } catch is CancellationError {
             return .failure(.cancelled)
@@ -1719,6 +1743,31 @@ struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
 
     func cancel(_ call: OpenGrokShellToolCall) async {
         _ = call
+    }
+
+    /// Map process terminal metadata to a card display state.
+    /// Rust: `ToolOutput::Bash(b) => b.exit_code != 0` (`output.rs:727-730`).
+    static func displayState(for result: ShellCommandResult) -> OpenGrokShellToolState {
+        if result.cancelled {
+            return .cancelled
+        }
+        // Auto-promoted to background is not a failure — the process is still
+        // running under a task id; the tool return itself succeeded.
+        if result.backgrounded {
+            return .succeeded
+        }
+        if result.timedOut {
+            return .failed
+        }
+        if let signal = result.signal,
+           !signal.isEmpty,
+           signal != "backgrounded" {
+            return .failed
+        }
+        if let exitCode = result.exitCode, exitCode != 0 {
+            return .failed
+        }
+        return .succeeded
     }
 
     private static func integer(_ value: JSONValue?) -> Int? {

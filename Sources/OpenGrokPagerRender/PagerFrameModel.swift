@@ -73,6 +73,10 @@ public enum PagerToolState: Sendable, Equatable, Hashable {
 /// The tool families the reference gives a bespoke header verb to
 /// (`scrollback/blocks/tool/`). Anything else renders through `.generic`,
 /// which prints the bare tool name in bold like `other.rs:138-176` does.
+///
+/// Extra kinds (`memorySearch`, `integrationSearch`, `useTool`, `skill`) match
+/// `ToolCallBlock::from_name` / specialized blocks in the pin so the live seam
+/// can route them later without inventing painters here.
 public enum PagerToolKind: Sendable, Equatable, Hashable {
     case read
     case edit
@@ -82,6 +86,10 @@ public enum PagerToolKind: Sendable, Equatable, Hashable {
     case list
     case fetch
     case webSearch
+    case memorySearch
+    case integrationSearch
+    case useTool
+    case skill
     case generic
 
     /// Header label prefix, e.g. `"Read "`.
@@ -95,6 +103,12 @@ public enum PagerToolKind: Sendable, Equatable, Hashable {
         case .list: return "List"
         case .fetch: return "Fetch"
         case .webSearch: return "Web Search"
+        case .memorySearch: return "Memory Search"
+        case .integrationSearch: return "Search Tools"
+        // UseTool paints titleized server/action segments in the specialized
+        // painter; generic fallback shows the bare tool name like Other.
+        case .useTool: return nil
+        case .skill: return "Skill"
         case .generic: return nil
         }
     }
@@ -104,22 +118,47 @@ public enum PagerToolKind: Sendable, Equatable, Hashable {
     var argumentIsPath: Bool {
         switch self {
         case .read, .edit, .create, .list: return true
-        case .execute, .search, .fetch, .webSearch, .generic: return false
+        case .execute, .search, .fetch, .webSearch,
+             .memorySearch, .integrationSearch, .useTool, .skill, .generic:
+            return false
         }
     }
 
-    /// Classify a raw tool name the way the reference's block factory does.
+    /// Classify a raw tool name the way the reference's block factory does
+    /// (`ToolCallBlock::from_name`, pin `tool/mod.rs`).
     public static func infer(fromToolNamed name: String) -> PagerToolKind {
         switch name.lowercased() {
-        case "read", "read_file", "view", "cat": return .read
-        case "edit", "edit_file", "apply_patch", "str_replace": return .edit
-        case "write", "write_file", "create", "create_file": return .create
-        case "bash", "shell", "execute", "run", "run_command", "terminal": return .execute
-        case "grep", "search", "ripgrep", "search_files", "codebase_search": return .search
-        case "ls", "list", "list_dir", "list_directory", "glob": return .list
-        case "fetch", "web_fetch", "http", "curl": return .fetch
-        case "web_search", "websearch", "search_web": return .webSearch
-        default: return .generic
+        case "run_terminal_command", "run_terminal_cmd", "bash", "shell", "execute",
+             "run", "run_command", "terminal":
+            return .execute
+        case "read_file", "read", "view", "cat":
+            return .read
+        case "search_replace", "edit", "edit_file", "apply_patch", "strreplace",
+             "str_replace", "hashline_edit":
+            return .edit
+        // write → Edit with "Creating " prefix upstream; port keeps a distinct
+        // kind so the existing generic painter can emit the Creating verb.
+        case "write", "write_file", "create", "create_file":
+            return .create
+        case "list_dir", "ls", "list", "list_directory":
+            return .list
+        // glob is Search in the pin (not ListDir).
+        case "grep", "search", "glob", "ripgrep", "search_files", "codebase_search":
+            return .search
+        case "web_fetch", "fetch", "http", "curl":
+            return .fetch
+        case "web_search", "websearch", "search_web":
+            return .webSearch
+        case "search_tool":
+            return .integrationSearch
+        case "use_tool":
+            return .useTool
+        case "memory_search":
+            return .memorySearch
+        case "skill":
+            return .skill
+        default:
+            return .generic
         }
     }
 }
@@ -128,7 +167,9 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
     public var name: String
     public var kind: PagerToolKind
     /// The single argument summarized in the header — a path for file tools, a
-    /// command for execute, a query for search.
+    /// command for execute, a query for search. Factory-built cards put the
+    /// display form here so existing painters keep working without reading
+    /// `headerText`.
     public var input: String
     public var output: String?
     /// Trailing parenthetical detail such as `"(12 matches)"` or `"(empty)"`.
@@ -141,6 +182,12 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
     /// which renders as already-static — a producer that never stamps this
     /// simply gets no flash, not a stuck-bright block.
     public var finishedAt: TimeInterval?
+    /// Full raw tool arguments as received (JSON or plain string). Empty when
+    /// the producer only supplied a pre-summarized `input`.
+    public var rawInput: String
+    /// Explicit display header argument when a producer wants it distinct from
+    /// `input`. Empty/`nil` means "use `input`".
+    public var headerText: String?
 
     public init(
         name: String,
@@ -150,7 +197,9 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
         detail: String? = nil,
         state: PagerToolState = .pending,
         isExpanded: Bool = false,
-        finishedAt: TimeInterval? = nil
+        finishedAt: TimeInterval? = nil,
+        rawInput: String = "",
+        headerText: String? = nil
     ) {
         self.name = name
         self.kind = kind ?? PagerToolKind.infer(fromToolNamed: name)
@@ -160,6 +209,313 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
         self.state = state
         self.isExpanded = isExpanded
         self.finishedAt = finishedAt
+        self.rawInput = rawInput
+        self.headerText = headerText
+    }
+
+    /// Build a card from a tool name + raw arguments the way the ACP tracker
+    /// factory does: infer kind, extract path/command/description/url/query,
+    /// prefer description over command for execute headers, peel a redundant
+    /// `cd <cwd> &&` from the *header only*, and elide cwd from displayed paths.
+    ///
+    /// Full `rawInput` is retained on the card; only `input`/`headerText` are
+    /// display-peeled.
+    public static func make(
+        name: String,
+        rawInput: String = "",
+        cwd: String? = nil,
+        output: String? = nil,
+        state: PagerToolState = .pending,
+        isExpanded: Bool = false,
+        finishedAt: TimeInterval? = nil,
+        detail: String? = nil
+    ) -> PagerToolCard {
+        let kind = PagerToolKind.infer(fromToolNamed: name)
+        let fields = PagerToolRawFields.parse(rawInput)
+        let display = fields.displayHeader(kind: kind, rawInput: rawInput, cwd: cwd)
+        return PagerToolCard(
+            name: name,
+            kind: kind,
+            input: display,
+            output: output,
+            detail: detail,
+            state: state,
+            isExpanded: isExpanded,
+            finishedAt: finishedAt,
+            rawInput: rawInput,
+            headerText: display
+        )
+    }
+}
+
+/// Parsed tool-argument fields used only by `PagerToolCard.make`.
+private struct PagerToolRawFields {
+    var path: String?
+    var command: String?
+    var description: String?
+    var url: String?
+    var query: String?
+    var toolName: String?
+    var skillName: String?
+
+    static func parse(_ raw: String) -> PagerToolRawFields {
+        var fields = PagerToolRawFields()
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let data = trimmed.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dict = object as? [String: Any]
+        else {
+            return fields
+        }
+
+        func string(keys: String...) -> String? {
+            for key in keys {
+                if let value = dict[key] as? String {
+                    let t = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !t.isEmpty { return t }
+                }
+            }
+            return nil
+        }
+
+        fields.path = string(
+            keys: "file_path", "filePath", "target_file", "path", "target_directory"
+        )
+        fields.command = string(keys: "command")
+        fields.description = string(keys: "description")
+        fields.url = string(keys: "url")
+        fields.query = string(keys: "query", "pattern", "glob_pattern")
+        fields.toolName = string(keys: "tool_name", "toolName")
+        fields.skillName = string(keys: "skill", "name", "skill_name")
+        return fields
+    }
+
+    func displayHeader(kind: PagerToolKind, rawInput: String, cwd: String?) -> String {
+        let plain = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let looksLikeJSON = plain.first == "{" || plain.first == "["
+
+        switch kind {
+        case .execute:
+            // Description-first (tracker execute path); peel cd only for the
+            // command form that lands in the header.
+            if let description, !description.isEmpty {
+                return description
+            }
+            if let command, !command.isEmpty {
+                return Self.stripRedundantSessionCd(command, cwd: cwd)
+            }
+            if !looksLikeJSON, !plain.isEmpty {
+                return Self.stripRedundantSessionCd(plain, cwd: cwd)
+            }
+            return ""
+
+        case .read, .edit, .create, .list:
+            if let path {
+                return Self.elideCwd(from: path, cwd: cwd)
+            }
+            if !looksLikeJSON, !plain.isEmpty {
+                return Self.elideCwd(from: plain, cwd: cwd)
+            }
+            return ""
+
+        case .fetch:
+            if let url { return url }
+            if !looksLikeJSON, !plain.isEmpty { return plain }
+            return ""
+
+        case .search, .webSearch, .memorySearch, .integrationSearch:
+            if let query { return query }
+            if !looksLikeJSON, !plain.isEmpty { return plain }
+            return ""
+
+        case .useTool:
+            if let toolName { return toolName }
+            if !looksLikeJSON, !plain.isEmpty { return plain }
+            return ""
+
+        case .skill:
+            if let skillName { return skillName }
+            if let description { return description }
+            if !looksLikeJSON, !plain.isEmpty { return plain }
+            return ""
+
+        case .generic:
+            // Prefer a human field over dumping partial JSON.
+            if let description { return description }
+            if let path { return Self.elideCwd(from: path, cwd: cwd) }
+            if let query { return query }
+            if let url { return url }
+            if let command {
+                return Self.stripRedundantSessionCd(command, cwd: cwd)
+            }
+            if !looksLikeJSON, !plain.isEmpty { return plain }
+            return ""
+        }
+    }
+
+    /// Display-only peel of a leading `cd <session cwd> &&|;` (subset of
+    /// `strip_redundant_session_cd` in the tools util crate). Keeps the full
+    /// command available via `rawInput`.
+    static func stripRedundantSessionCd(_ command: String, cwd: String?) -> String {
+        guard let cwd, !cwd.isEmpty else { return command }
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.contains(where: \.isNewline)
+        else { return command }
+
+        var rest = trimmed[...]
+        // Optional single outer `( … )`.
+        if rest.first == "(", rest.last == ")", rest.count >= 2 {
+            let inner = rest.dropFirst().dropLast()
+            if !inner.contains(where: { $0 == "(" || $0 == ")" }) {
+                rest = inner.trimmingCharacters(in: .whitespaces)[...]
+            }
+        }
+
+        guard let cdWord = takeShellWord(&rest), cdWord.lowercased() == "cd" else {
+            return command
+        }
+        // Optional Windows `cd /d`.
+        if let flag = peekShellWord(rest), flag == "/d" || flag == "/D" {
+            _ = takeShellWord(&rest)
+        }
+        guard let pathToken = takePathToken(&rest) else { return command }
+        guard let unquoted = unquotePathToken(pathToken) else { return command }
+        guard isAbsoluteShaped(unquoted), isAbsoluteShaped(cwd) else { return command }
+        guard pathsEqualForDisplay(unquoted, cwd) else { return command }
+
+        rest = rest.drop(while: { $0.isWhitespace })
+        if rest.hasPrefix("&&") {
+            rest = rest.dropFirst(2).drop(while: { $0.isWhitespace })
+        } else if rest.first == ";" {
+            rest = rest.dropFirst().drop(while: { $0.isWhitespace })
+        } else {
+            return command
+        }
+        let remainder = String(rest)
+        return remainder.isEmpty ? command : remainder
+    }
+
+    static func elideCwd(from path: String, cwd: String?) -> String {
+        guard let cwd, !cwd.isEmpty else { return path }
+        let normalizedCwd = cwd.hasSuffix("/") ? String(cwd.dropLast()) : cwd
+        if path == normalizedCwd || path == normalizedCwd + "/" {
+            return "."
+        }
+        let prefix = normalizedCwd + "/"
+        if path.hasPrefix(prefix) {
+            let rel = String(path.dropFirst(prefix.count))
+            return rel.isEmpty ? "." : rel
+        }
+        return path
+    }
+
+    private static func isAbsoluteShaped(_ path: String) -> Bool {
+        if path.hasPrefix("/") { return true }
+        let utf8 = path.utf8
+        if utf8.count >= 2 {
+            let b0 = utf8[utf8.startIndex]
+            let b1 = utf8[utf8.index(after: utf8.startIndex)]
+            if (UInt8(ascii: "A")...UInt8(ascii: "Z")).contains(b0)
+                || (UInt8(ascii: "a")...UInt8(ascii: "z")).contains(b0),
+               b1 == UInt8(ascii: ":")
+            {
+                return true
+            }
+            if b0 == UInt8(ascii: "\\"), b1 == UInt8(ascii: "\\") {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func pathsEqualForDisplay(_ a: String, _ b: String) -> Bool {
+        let aSegs = pathSegments(a)
+        let bSegs = pathSegments(b)
+        guard aSegs.count == bSegs.count else { return false }
+        let caseInsensitive = isWindowsShaped(a) || isWindowsShaped(b)
+        for (as_, bs) in zip(aSegs, bSegs) {
+            if caseInsensitive {
+                if as_.lowercased() != bs.lowercased() { return false }
+            } else if as_ != bs {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func isWindowsShaped(_ s: String) -> Bool {
+        let utf8 = s.utf8
+        guard utf8.count >= 2 else { return false }
+        let b0 = utf8[utf8.startIndex]
+        let b1 = utf8[utf8.index(after: utf8.startIndex)]
+        if ((UInt8(ascii: "A")...UInt8(ascii: "Z")).contains(b0)
+            || (UInt8(ascii: "a")...UInt8(ascii: "z")).contains(b0)),
+           b1 == UInt8(ascii: ":")
+        {
+            return true
+        }
+        return b0 == UInt8(ascii: "\\") && b1 == UInt8(ascii: "\\")
+    }
+
+    private static func pathSegments(_ s: String) -> [Substring] {
+        let trimmed = s.trimmingCharacters(in: CharacterSet(charactersIn: "/\\"))
+        return trimmed.split { $0 == "/" || $0 == "\\" }.filter { !$0.isEmpty }
+    }
+
+    private static func peekShellWord(_ s: Substring) -> String? {
+        var copy = s
+        return takeShellWord(&copy)
+    }
+
+    private static func takeShellWord(_ s: inout Substring) -> String? {
+        s = s.drop(while: { $0.isWhitespace })
+        guard let first = s.first else { return nil }
+        if first == "'" || first == "\"" { return nil }
+        if let end = s.firstIndex(where: { $0.isWhitespace }) {
+            let word = String(s[..<end])
+            s = s[end...]
+            return word.isEmpty ? nil : word
+        }
+        let word = String(s)
+        s = s[s.endIndex...]
+        return word.isEmpty ? nil : word
+    }
+
+    private static func takePathToken(_ s: inout Substring) -> String? {
+        s = s.drop(while: { $0.isWhitespace })
+        guard let first = s.first else { return nil }
+        if first == "'" || first == "\"" {
+            let quote = first
+            s = s.dropFirst()
+            guard let close = s.firstIndex(of: quote) else { return nil }
+            let token = String(s[..<close])
+            s = s[s.index(after: close)...]
+            return String(quote) + token + String(quote)
+        }
+        var end = s.startIndex
+        while end < s.endIndex {
+            let ch = s[end]
+            if ch.isWhitespace || ch == ";" { break }
+            if ch == "&", s.index(after: end) < s.endIndex, s[s.index(after: end)] == "&" {
+                break
+            }
+            end = s.index(after: end)
+        }
+        guard end > s.startIndex else { return nil }
+        let token = String(s[..<end])
+        s = s[end...]
+        return token
+    }
+
+    private static func unquotePathToken(_ token: String) -> String? {
+        guard let first = token.first else { return nil }
+        if first == "'" || first == "\"" {
+            guard token.count >= 2, token.last == first else { return nil }
+            return String(token.dropFirst().dropLast())
+        }
+        return token
     }
 }
 

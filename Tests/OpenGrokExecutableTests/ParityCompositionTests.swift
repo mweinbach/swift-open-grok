@@ -289,7 +289,13 @@ private final class ParityStreamingSamplerFixture: @unchecked Sendable {
             }
             await fixture.started.signal()
             if fixture.holdOpenAfterDeltas {
-                try await Task.sleep(nanoseconds: 1_000_000_000)
+                // Stay mid-stream until the test cancels. A fixed sleep races
+                // extra Wave A event/render work and can complete as success
+                // (exit 0) before Ctrl-C is observed.
+                while !Task.isCancelled {
+                    try await Task.sleep(nanoseconds: 20_000_000)
+                }
+                try Task.checkCancellation()
             }
             return OpenGrokLiveSamplingResponse(
                 output: fixture.answer,
@@ -591,6 +597,34 @@ private struct ParityLiveTurnDriver: OpenGrokShellSamplingDriver, Sendable {
                 await emit(.assistantText(output))
             case .status(let status):
                 await emit(.status(status))
+            case .reasoning(let text):
+                await emit(.reasoning(text))
+            case .toolCallDelta(let toolIndex, let id, let name, let argumentsDelta):
+                await emit(.toolCallDelta(
+                    toolIndex: toolIndex, id: id, name: name, argumentsDelta: argumentsDelta
+                ))
+            case .retrying(let attempt, let maxRetries, let kind, let reason):
+                await emit(.retrying(
+                    attempt: attempt, maxRetries: maxRetries,
+                    kind: kind.asString, reason: reason
+                ))
+            case .failed(let error):
+                await emit(.samplingFailed(
+                    kind: error.kind.asString,
+                    message: error.message,
+                    isRetryable: error.isRetryable,
+                    statusCode: error.statusCode
+                ))
+            case .backendToolCallStarted(let callId, let name):
+                await emit(.backendToolStarted(callID: callId, name: name))
+            case .backendToolCallCompleted(let callId, let name, let result):
+                let text: String?
+                if let result, let data = try? JSONEncoder().encode(result) {
+                    text = String(decoding: data, as: UTF8.self)
+                } else {
+                    text = nil
+                }
+                await emit(.backendToolCompleted(callID: callId, name: name, result: text))
             }
         }
         return OpenGrokShellSamplingResult(
@@ -1419,7 +1453,9 @@ struct ParityCompositionTests {
         #expect(code == CLIRunner.ExitCode.success.rawValue)
         #expect(out.contents.isEmpty)
         #expect(err.contents.isEmpty)
-        #expect(output.contains(#"input: {"command":"printf tool-output","description":"parity tool"}"#))
+        // Wave A factory paints description-first, not raw JSON
+        // (`PagerToolCard.make`; pin execute.rs header).
+        #expect(output.contains("input: parity tool"))
         #expect(output.contains("result: tool output"))
         #expect(toolRange != nil)
         #expect(answerRange != nil)
@@ -2931,7 +2967,9 @@ struct ParityCompositionTests {
         #expect(code == CLIRunner.ExitCode.success.rawValue)
         #expect(out.contents.isEmpty)
         #expect(err.contents.isEmpty)
-        #expect(output.contains(#"input: {"command":"printf tool-output","description":"parity tool"}"#))
+        // Wave A factory paints description-first, not raw JSON
+        // (`PagerToolCard.make`; pin execute.rs header).
+        #expect(output.contains("input: parity tool"))
         #expect(output.contains("result: tool output"))
         #expect(toolRange != nil)
         #expect(answerRange != nil)

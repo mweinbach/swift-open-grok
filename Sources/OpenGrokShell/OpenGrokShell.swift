@@ -136,25 +136,36 @@ public enum OpenGrokShellToolState: String, Sendable, Equatable {
     case cancelled
 }
 
+public enum OpenGrokShellToolOutputOp: String, Sendable, Equatable {
+    case append
+    case replace
+}
+
 public struct OpenGrokShellToolUpdate: Sendable, Equatable {
     public let callID: String
     public let name: String
     public let input: String
     public let output: String?
     public let state: OpenGrokShellToolState
+    /// How `output` should merge into an existing running card. Default
+    /// `.replace` keeps prior call sites honest: a terminal update is a
+    /// full body, not a chunk.
+    public let outputOp: OpenGrokShellToolOutputOp
 
     public init(
         callID: String,
         name: String,
         input: String,
         output: String? = nil,
-        state: OpenGrokShellToolState
+        state: OpenGrokShellToolState,
+        outputOp: OpenGrokShellToolOutputOp = .replace
     ) {
         self.callID = callID
         self.name = name
         self.input = input
         self.output = output
         self.state = state
+        self.outputOp = outputOp
     }
 }
 
@@ -162,6 +173,33 @@ public enum OpenGrokShellTurnUpdateKind: Sendable, Equatable {
     case assistantText(String)
     case status(String)
     case tool(OpenGrokShellToolUpdate)
+    /// Streaming reasoning/thought channel delta. Not persisted as partial
+    /// transcript until the turn commits a full reasoning item.
+    case reasoning(String)
+    /// Provisional tool-call fragment from the sampler. Never execute from this;
+    /// partial argument JSON must not be persisted (`updates.rs:196`).
+    case toolCallDelta(
+        toolIndex: UInt32,
+        id: String?,
+        name: String?,
+        argumentsDelta: String?
+    )
+    case retrying(
+        attempt: UInt32,
+        maxRetries: UInt32,
+        kind: String,
+        reason: String
+    )
+    /// Typed sampling failure (auth / rate-limit / empty-response / …).
+    /// Keep structured fields rather than flattening to a single string.
+    case samplingFailed(
+        kind: String,
+        message: String,
+        isRetryable: Bool,
+        statusCode: UInt16?
+    )
+    case backendToolStarted(callID: String, name: String)
+    case backendToolCompleted(callID: String, name: String, result: String?)
 }
 
 public struct OpenGrokShellTurnUpdate: Sendable, Equatable {

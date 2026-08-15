@@ -431,12 +431,59 @@ final class LivePagerSession: OpenGrokPagerMinimalSessionAdapter, @unchecked Sen
                             case .failed: state = .failed
                             case .cancelled: state = .cancelled
                             }
+                            let outputOp: OpenGrokPagerToolOutputOp =
+                                tool.outputOp == .append ? .append : .replace
                             continuation.yield(.tool(OpenGrokPagerToolUpdate(
                                 callID: tool.callID,
                                 name: tool.name,
                                 input: tool.input,
                                 output: tool.output,
-                                state: state
+                                state: state,
+                                outputOp: outputOp
+                            )))
+                        case .reasoning(let text):
+                            continuation.yield(.reasoning(text))
+                        case .toolCallDelta(
+                            let toolIndex, let id, let name, let argumentsDelta
+                        ):
+                            continuation.yield(.toolCallDelta(
+                                toolIndex: toolIndex,
+                                id: id,
+                                name: name,
+                                argumentsDelta: argumentsDelta
+                            ))
+                        case .retrying(
+                            let attempt, let maxRetries, let kind, let reason
+                        ):
+                            continuation.yield(.retrying(
+                                attempt: attempt,
+                                maxRetries: maxRetries,
+                                kind: kind,
+                                reason: reason
+                            ))
+                        case .samplingFailed(
+                            let kind, let message, let isRetryable, let statusCode
+                        ):
+                            continuation.yield(.samplingFailed(
+                                kind: kind,
+                                message: message,
+                                isRetryable: isRetryable,
+                                statusCode: statusCode
+                            ))
+                        case .backendToolStarted(let callID, let name):
+                            continuation.yield(.tool(OpenGrokPagerToolUpdate(
+                                callID: callID,
+                                name: name,
+                                input: "",
+                                state: .running
+                            )))
+                        case .backendToolCompleted(let callID, let name, let result):
+                            continuation.yield(.tool(OpenGrokPagerToolUpdate(
+                                callID: callID,
+                                name: name,
+                                input: "",
+                                output: result,
+                                state: .succeeded
                             )))
                         }
                     case .turnCompleted(let result) where result.turnID == handle.turnID:
@@ -670,7 +717,11 @@ enum LivePagerChrome {
 struct LivePagerConversationState {
     private(set) var items: [PagerConversationItem] = []
     private var activeAssistantIndex: Int?
+    private var activeReasoningIndex: Int?
     private var toolIndicesByCallID: [String: Int] = [:]
+    /// Accumulated provisional tool-argument fragments keyed by stream call id.
+    /// Never persisted; only hydrates the live card header.
+    private var provisionalToolArguments: [String: String] = [:]
     /// Renders assistant messages as markdown for frame painting. `nil` leaves
     /// them as plain text, which is what the inline and transcript paths want.
     private let markdown: PagerMarkdownRenderer?
@@ -692,6 +743,8 @@ struct LivePagerConversationState {
 
     mutating func startTurn(prompt: String, paintUserBlock: Bool = true) {
         toolIndicesByCallID.removeAll(keepingCapacity: true)
+        provisionalToolArguments.removeAll(keepingCapacity: true)
+        activeReasoningIndex = nil
         // Both blocks carry the construction instant for the `/timestamps`
         // overlay — upstream's `ScrollbackEntry` constructors stamp
         // `created_at: Some(Local::now())` on push (`entry.rs:198,230`).
@@ -737,23 +790,33 @@ struct LivePagerConversationState {
         guard index >= 0, index < items.count else { return }
         items.removeSubrange(index...)
         activeAssistantIndex = nil
+        activeReasoningIndex = nil
         toolIndicesByCallID.removeAll(keepingCapacity: true)
+        provisionalToolArguments.removeAll(keepingCapacity: true)
     }
 
     mutating func removeAll() {
         items.removeAll()
         activeAssistantIndex = nil
+        activeReasoningIndex = nil
         toolIndicesByCallID.removeAll(keepingCapacity: true)
+        provisionalToolArguments.removeAll(keepingCapacity: true)
     }
 
     /// Rebuild the visible transcript from a persisted conversation — what
     /// `/resume` paints after the runtime swaps sessions.
     ///
     /// The projection matches what this renderer would have accumulated live:
-    /// real user prompts, assistant prose (markdown-styled), and one settled
-    /// tool card per assistant tool call with its result attached. Synthetic
-    /// user turns, system prompts and reasoning payloads are provider/context
-    /// plumbing and never rendered as blocks in a live session either.
+    /// real user prompts, assistant prose (markdown-styled), reasoning,
+    /// backend tool cards, custom-tool output paired onto calls, and one
+    /// settled tool card per assistant tool call with its result attached.
+    /// Synthetic user turns and system prompts remain provider/context
+    /// plumbing and are not painted.
+    ///
+    /// `toolOutcomes` is the session sidecar (`LiveConversationRecord.toolOutcomes`);
+    /// a missing entry is `.pending` when output is nil, otherwise `.succeeded`.
+    /// Never invent success for unpaired calls.
+    ///
     /// `promptInstants` carries the persisted instant of each restored user
     /// turn, keyed by POSITIONAL prompt index — turns counted over
     /// `startsPromptTurn` user items, the same rule `liveTruncateConversation`
@@ -765,69 +828,18 @@ struct LivePagerConversationState {
     /// `created_at: None` behavior (`entry_renderer.rs:939`), never load time.
     mutating func seed(
         from conversationItems: [ConversationItem],
-        promptInstants: [Int: Date] = [:]
+        promptInstants: [Int: Date] = [:],
+        toolOutcomes: ToolCallOutcomeMap = ToolCallOutcomeMap()
     ) {
         removeAll()
-        // Pair tool calls with their results up front; an unpaired call
-        // renders with no output rather than being dropped.
-        var resultsByCallID: [String: String] = [:]
-        for item in conversationItems {
-            if case .toolResult(let result) = item {
-                resultsByCallID[result.toolCallId] = result.content
-            }
-        }
-        var promptCount = 0
-        for item in conversationItems {
-            switch item {
-            case .user(let user):
-                // Count EVERY turn-starting user item — synthetic
-                // turn-starters (scheduler fires, drains) spend a prompt slot
-                // in the rewind numbering even though they are not painted.
-                let startsTurn = user.syntheticReason.map(\.startsPromptTurn) ?? true
-                let promptIndex = promptCount
-                if startsTurn { promptCount += 1 }
-                guard user.syntheticReason == nil else { continue }
-                let text = user.content.compactMap { part -> String? in
-                    if case .text(let value) = part { return value }
-                    return nil
-                }.joined(separator: "\n")
-                guard !text.isEmpty else { continue }
-                items.append(.message(PagerMessage(
-                    role: .user,
-                    text: text,
-                    createdAt: promptInstants[promptIndex]
-                )))
-            case .assistant(let assistant):
-                let text = assistant.content
-                if !text.isEmpty {
-                    // RECORDED DIVERGENCE: restored assistant blocks carry no
-                    // instant. Upstream replays them with the original
-                    // `agentTimestampMs` from its notification journal
-                    // (`acp/tracker.rs:950-955`); this port's session store
-                    // persists no per-assistant-item instant, so the honest
-                    // projection paints no stamp (upstream's `created_at:
-                    // None` gate) rather than a load-time or turn-start lie.
-                    // Cost: after `/resume`, timestamps show on restored user
-                    // prompts and on new blocks, not on restored replies.
-                    items.append(.message(PagerMessage(
-                        role: .assistant,
-                        text: text,
-                        styledLines: styledLines(for: text)
-                    )))
-                }
-                for call in assistant.toolCalls {
-                    items.append(.tool(PagerToolCard(
-                        name: call.name,
-                        input: call.arguments,
-                        output: resultsByCallID[call.id],
-                        state: .succeeded
-                    )))
-                }
-            case .system, .toolResult, .customToolOutput, .backendToolCall,
-                 .reasoning:
-                continue
-            }
-        }
+        let projected = LiveTranscriptProjection.project(
+            conversationItems,
+            promptInstants: promptInstants,
+            toolOutcomes: toolOutcomes,
+            styleAssistant: { [self] text in self.styledLines(for: text) }
+        )
+        items = projected.items
+        toolIndicesByCallID = projected.toolIndicesByCallID
     }
 
     /// In-place edit of the blocks, for the fold/raw effects the scrollback's
@@ -862,6 +874,7 @@ struct LivePagerConversationState {
     }
 
     mutating func finishAssistant(removingIfEmpty: Bool = false) {
+        finishReasoning()
         guard let activeAssistantIndex,
               items.indices.contains(activeAssistantIndex),
               case .message(var message) = items[activeAssistantIndex]
@@ -877,31 +890,148 @@ struct LivePagerConversationState {
         self.activeAssistantIndex = nil
     }
 
+    /// Append a reasoning/thought channel delta as a streaming
+    /// `PagerMessage(role: .reasoning)`. Painter paints via `appendThinking`.
+    mutating func appendReasoning(_ text: String) {
+        guard !text.isEmpty else { return }
+        guard let activeReasoningIndex,
+              items.indices.contains(activeReasoningIndex),
+              case .message(var message) = items[activeReasoningIndex],
+              message.role == .reasoning
+        else {
+            // Reasoning interrupts a provisional empty assistant streaming
+            // block the same way a tool card does.
+            finishAssistant(removingIfEmpty: true)
+            items.append(.message(PagerMessage(
+                role: .reasoning,
+                text: text,
+                isStreaming: true,
+                createdAt: Date()
+            )))
+            self.activeReasoningIndex = items.indices.last
+            return
+        }
+        message.text += text
+        message.isStreaming = true
+        items[activeReasoningIndex] = .message(message)
+    }
+
+    mutating func finishReasoning() {
+        guard let activeReasoningIndex,
+              items.indices.contains(activeReasoningIndex),
+              case .message(var message) = items[activeReasoningIndex],
+              message.role == .reasoning
+        else {
+            self.activeReasoningIndex = nil
+            return
+        }
+        message.isStreaming = false
+        // Collapse finished thinking to the one-line header, matching
+        // `thinking.rs`'s finished_display_mode.
+        message.isCollapsed = true
+        items[activeReasoningIndex] = .message(message)
+        self.activeReasoningIndex = nil
+    }
+
+    /// Hydrate a provisional tool card from a sampler tool-call delta.
+    /// Partial argument JSON is kept only in memory for the card header —
+    /// never executed, never written to history.
+    mutating func applyToolCallDelta(
+        toolIndex: UInt32,
+        id: String?,
+        name: String?,
+        argumentsDelta: String?
+    ) {
+        let callID = id ?? "stream-tool-\(toolIndex)"
+        if let argumentsDelta, !argumentsDelta.isEmpty {
+            provisionalToolArguments[callID, default: ""] += argumentsDelta
+        }
+        let accumulated = provisionalToolArguments[callID] ?? ""
+        let existingName: String?
+        if let index = toolIndicesByCallID[callID],
+           items.indices.contains(index),
+           case .tool(let existing) = items[index] {
+            existingName = existing.name
+        } else {
+            existingName = nil
+        }
+        let resolvedName = {
+            if let name, !name.isEmpty { return name }
+            if let existingName, !existingName.isEmpty, existingName != "tool" {
+                return existingName
+            }
+            return "tool"
+        }()
+        let displayInput = LiveToolCardMerge.displayInput(
+            name: resolvedName,
+            raw: accumulated
+        )
+        apply(OpenGrokPagerToolUpdate(
+            callID: callID,
+            name: resolvedName,
+            input: displayInput,
+            state: .running
+        ))
+    }
+
     /// `atSeconds` is the motion clock's now, used to stamp
     /// `PagerToolCard.finishedAt` the first time a tool reaches a terminal
     /// state — the input to the 400 ms finish flash. `nil` (motion disabled,
     /// transcript paths) renders the block already-static.
+    ///
+    /// Upsert by call ID (A4/A5/A6): merge sparse name/input, replace-or-keep
+    /// output without resetting fold, preserve first `finishedAt` and
+    /// existing `detail` unless a richer update supplies replacements.
     mutating func apply(_ tool: OpenGrokPagerToolUpdate, atSeconds seconds: TimeInterval? = nil) {
         let state = Self.renderState(for: tool.state)
-        var finishedAt: TimeInterval?
-        if state != .running, state != .pending {
+        let existing: PagerToolCard?
+        if let index = toolIndicesByCallID[tool.callID],
+           items.indices.contains(index),
+           case .tool(let card) = items[index] {
+            existing = card
+        } else {
+            existing = nil
+        }
+
+        let name = LiveToolCardMerge.mergedName(
+            incoming: tool.name,
+            existing: existing?.name
+        )
+        let rawInput = LiveToolCardMerge.mergedInput(
+            incoming: tool.input,
+            existing: existing?.input
+        )
+        // A5: append progress chunks onto the running body; a nil output
+        // keeps the existing tail so expansion is not wiped. Terminal
+        // updates default to replace (full promptText).
+        let output: String?
+        if let incoming = tool.output {
+            if tool.outputOp == .append, let previous = existing?.output, !previous.isEmpty {
+                output = previous + incoming
+            } else {
+                output = incoming
+            }
+        } else {
+            output = existing?.output
+        }
+        let detail = existing?.detail
+        let isExpanded = existing?.isExpanded ?? false
+
+        var finishedAt = existing?.finishedAt
+        if finishedAt == nil, state != .running, state != .pending {
             // First terminal update wins: a re-delivered terminal state must
             // not restart the flash.
-            if let index = toolIndicesByCallID[tool.callID],
-               items.indices.contains(index),
-               case .tool(let existing) = items[index],
-               let existingFinish = existing.finishedAt {
-                finishedAt = existingFinish
-            } else {
-                finishedAt = seconds
-            }
+            finishedAt = seconds
         }
-        let card = PagerToolCard(
-            name: tool.name,
-            input: tool.input,
-            output: tool.output,
+
+        let card = PagerToolCard.make(
+            name: name,
+            rawInput: rawInput,
+            output: output,
             state: state,
-            finishedAt: finishedAt
+            isExpanded: isExpanded,
+            finishedAt: finishedAt,
+            detail: detail
         )
         if let index = toolIndicesByCallID[tool.callID], items.indices.contains(index) {
             items[index] = .tool(card)
@@ -910,6 +1040,18 @@ struct LivePagerConversationState {
             items.append(.tool(card))
             toolIndicesByCallID[tool.callID] = items.indices.last
         }
+        if state != .running {
+            provisionalToolArguments.removeValue(forKey: tool.callID)
+        }
+    }
+
+    /// Narrow test probe: tool card by call id.
+    func testingToolCard(callID: String) -> PagerToolCard? {
+        guard let index = toolIndicesByCallID[callID],
+              items.indices.contains(index),
+              case .tool(let tool) = items[index]
+        else { return nil }
+        return tool
     }
 
     var transcript: String {
@@ -927,9 +1069,9 @@ struct LivePagerConversationState {
     }
 
     static func transcript(for tool: OpenGrokPagerToolUpdate) -> String {
-        transcriptLines(for: .tool(PagerToolCard(
+        transcriptLines(for: .tool(PagerToolCard.make(
             name: tool.name,
-            input: tool.input,
+            rawInput: tool.input,
             output: tool.output,
             state: renderState(for: tool.state)
         ))).joined(separator: "\n") + "\n"
@@ -982,6 +1124,290 @@ struct LivePagerConversationState {
         case .failed: return "failed"
         case .cancelled: return "cancelled"
         }
+    }
+}
+
+/// Shared seed/resume projection for live conversation state and dashboard peek.
+enum LiveTranscriptProjection {
+    struct Result: Sendable {
+        var items: [PagerConversationItem]
+        var toolIndicesByCallID: [String: Int]
+    }
+
+    static func project(
+        _ conversationItems: [ConversationItem],
+        promptInstants: [Int: Date] = [:],
+        toolOutcomes: ToolCallOutcomeMap = ToolCallOutcomeMap(),
+        styleAssistant: (String) -> [PagerStyledLine] = { _ in [] }
+    ) -> Result {
+        var resultsByCallID: [String: String] = [:]
+        var customOutputsByCallID: [String: String] = [:]
+        for item in conversationItems {
+            switch item {
+            case .toolResult(let result):
+                resultsByCallID[result.toolCallId] = result.content
+            case .customToolOutput(let output):
+                if let text = customOutputText(output) {
+                    customOutputsByCallID[output.callId] = text
+                }
+            default:
+                continue
+            }
+        }
+
+        var items: [PagerConversationItem] = []
+        var toolIndicesByCallID: [String: Int] = [:]
+        var promptCount = 0
+
+        for item in conversationItems {
+            switch item {
+            case .user(let user):
+                // Count EVERY turn-starting user item — synthetic
+                // turn-starters (scheduler fires, drains) spend a prompt slot
+                // in the rewind numbering even though they are not painted.
+                let startsTurn = user.syntheticReason.map(\.startsPromptTurn) ?? true
+                let promptIndex = promptCount
+                if startsTurn { promptCount += 1 }
+                guard user.syntheticReason == nil else { continue }
+                let text = user.content.compactMap { part -> String? in
+                    if case .text(let value) = part { return value }
+                    return nil
+                }.joined(separator: "\n")
+                guard !text.isEmpty else { continue }
+                items.append(.message(PagerMessage(
+                    role: .user,
+                    text: text,
+                    createdAt: promptInstants[promptIndex]
+                )))
+            case .assistant(let assistant):
+                let text = assistant.content
+                if !text.isEmpty {
+                    // RECORDED DIVERGENCE: restored assistant blocks carry no
+                    // instant. Upstream replays them with the original
+                    // `agentTimestampMs` from its notification journal
+                    // (`acp/tracker.rs:950-955`); this port's session store
+                    // persists no per-assistant-item instant, so the honest
+                    // projection paints no stamp (upstream's `created_at:
+                    // None` gate) rather than a load-time or turn-start lie.
+                    items.append(.message(PagerMessage(
+                        role: .assistant,
+                        text: text,
+                        styledLines: styleAssistant(text)
+                    )))
+                }
+                for call in assistant.toolCalls {
+                    let output = resultsByCallID[call.id] ?? customOutputsByCallID[call.id]
+                    let state = seedToolState(
+                        callID: call.id,
+                        output: output,
+                        outcomes: toolOutcomes
+                    )
+                    let detail = toolOutcomes.record(for: call.id)?.detail
+                    items.append(.tool(PagerToolCard.make(
+                        name: call.name,
+                        rawInput: call.arguments,
+                        output: output,
+                        state: state,
+                        detail: detail
+                    )))
+                    toolIndicesByCallID[call.id] = items.indices.last
+                }
+            case .reasoning(let reasoning):
+                let text = reasoningText(reasoning)
+                guard !text.isEmpty else { continue }
+                items.append(.message(PagerMessage(
+                    role: .reasoning,
+                    text: text,
+                    isCollapsed: true
+                )))
+            case .backendToolCall(let call):
+                let callID = call.id
+                let name = backendToolName(call)
+                let output = resultsByCallID[callID] ?? customOutputsByCallID[callID]
+                let state = seedToolState(
+                    callID: callID,
+                    output: output,
+                    outcomes: toolOutcomes
+                )
+                items.append(.tool(PagerToolCard.make(
+                    name: name,
+                    rawInput: call.textSummary(),
+                    output: output,
+                    state: state,
+                    detail: toolOutcomes.record(for: callID)?.detail
+                )))
+                toolIndicesByCallID[callID] = items.indices.last
+            case .customToolOutput(let output):
+                // Pair onto the matching call when an earlier card exists;
+                // otherwise project a standalone card so custom output is not
+                // dropped.
+                let text = customOutputText(output)
+                if let index = toolIndicesByCallID[output.callId],
+                   items.indices.contains(index),
+                   case .tool(var card) = items[index] {
+                    if card.output == nil || card.output?.isEmpty == true {
+                        card.output = text
+                    }
+                    if card.state == .pending, text != nil {
+                        card.state = pagerState(
+                            for: toolOutcomes.outcome(for: output.callId) ?? .succeeded
+                        )
+                    }
+                    items[index] = .tool(card)
+                } else {
+                    let state = seedToolState(
+                        callID: output.callId,
+                        output: text,
+                        outcomes: toolOutcomes
+                    )
+                    items.append(.tool(PagerToolCard.make(
+                        name: output.name ?? "custom_tool",
+                        rawInput: "",
+                        output: text,
+                        state: state,
+                        detail: toolOutcomes.record(for: output.callId)?.detail
+                    )))
+                    toolIndicesByCallID[output.callId] = items.indices.last
+                }
+            case .system, .toolResult:
+                continue
+            }
+        }
+        return Result(items: items, toolIndicesByCallID: toolIndicesByCallID)
+    }
+
+    /// Missing outcome → `.pending` when unpaired, `.succeeded` when a result
+    /// body exists. Never sniff prompt text for the word "failed".
+    static func seedToolState(
+        callID: String,
+        output: String?,
+        outcomes: ToolCallOutcomeMap
+    ) -> PagerToolState {
+        if let outcome = outcomes.outcome(for: callID) {
+            return pagerState(for: outcome)
+        }
+        if output == nil {
+            return .pending
+        }
+        return .succeeded
+    }
+
+    static func pagerState(for outcome: ToolCallDisplayOutcome) -> PagerToolState {
+        switch outcome {
+        case .succeeded: return .succeeded
+        case .failed, .denied: return .failed
+        case .cancelled: return .cancelled
+        case .pending: return .pending
+        }
+    }
+
+    private static func reasoningText(_ reasoning: ReasoningItem) -> String {
+        if let content = reasoning.content, !content.isEmpty {
+            let joined = content.map(\.text).joined()
+            if !joined.isEmpty { return joined }
+        }
+        return reasoning.summary.map(\.text).joined(separator: "\n")
+    }
+
+    private static func customOutputText(_ output: CustomToolOutputItem) -> String? {
+        let parts = output.content.compactMap { part -> String? in
+            switch part {
+            case .text(let text): return text
+            case .image: return nil
+            }
+        }
+        let joined = parts.joined(separator: "\n")
+        return joined.isEmpty ? nil : joined
+    }
+
+    private static func backendToolName(_ call: BackendToolCallItem) -> String {
+        switch call.kind {
+        case .webSearch: return "web_search"
+        case .xSearch: return "x_search"
+        case .codeInterpreter: return "code_interpreter"
+        case .codexRawInput: return "backend_tool"
+        }
+    }
+}
+
+/// Sparse merge + header extraction for live tool-card upserts (A4/A6).
+enum LiveToolCardMerge {
+    static func isSparseName(_ name: String) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty || trimmed == "tool"
+    }
+
+    static func isSparseInput(_ input: String) -> Bool {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty || trimmed == "{}" || trimmed == "null" || trimmed == "nil"
+    }
+
+    static func mergedName(incoming: String, existing: String?) -> String {
+        if !isSparseName(incoming) { return incoming }
+        if let existing, !isSparseName(existing) { return existing }
+        return isSparseName(incoming) ? (existing ?? incoming) : incoming
+    }
+
+    static func mergedInput(incoming: String, existing: String?) -> String {
+        if !isSparseInput(incoming) { return incoming }
+        if let existing, !isSparseInput(existing) { return existing }
+        return incoming
+    }
+
+    /// Prefer path/command/query fields from JSON tool arguments over raw JSON
+    /// when WAVE-A-MODEL factory glue is not yet landed.
+    static func displayInput(name: String, raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "{}" else { return raw }
+        guard let data = trimmed.data(using: .utf8),
+              let value = try? JSONDecoder().decode(JSONValue.self, from: data),
+              let object = value.objectValue
+        else {
+            return raw
+        }
+
+        let kind = PagerToolKind.infer(fromToolNamed: name)
+        switch kind {
+        case .execute:
+            if case .string(let command) = object["command"], !command.isEmpty {
+                return command
+            }
+        case .read, .edit, .create, .list:
+            for key in ["file_path", "filePath", "target_file", "path"] {
+                if case .string(let path) = object[key], !path.isEmpty {
+                    return path
+                }
+            }
+        case .search, .webSearch, .memorySearch, .integrationSearch:
+            for key in ["query", "pattern", "glob"] {
+                if case .string(let query) = object[key], !query.isEmpty {
+                    return query
+                }
+            }
+        case .fetch:
+            if case .string(let url) = object["url"], !url.isEmpty {
+                return url
+            }
+        case .useTool:
+            for key in ["tool_name", "toolName", "name"] {
+                if case .string(let toolName) = object[key], !toolName.isEmpty {
+                    return toolName
+                }
+            }
+        case .skill:
+            for key in ["skill", "skill_name", "name"] {
+                if case .string(let skill) = object[key], !skill.isEmpty {
+                    return skill
+                }
+            }
+        case .generic:
+            for key in ["command", "file_path", "filePath", "target_file", "path", "query", "url"] {
+                if case .string(let value) = object[key], !value.isEmpty {
+                    return value
+                }
+            }
+        }
+        return raw
     }
 }
 
@@ -1177,6 +1603,21 @@ actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
                 try await terminal.write(LivePagerConversationState.transcript(for: tool))
                 inlineNeedsAssistantPrefix = true
             }
+        case .reasoning(let text):
+            conversation.appendReasoning(text)
+            status = "Thinking"
+        case .toolCallDelta(let toolIndex, let id, let name, let argumentsDelta):
+            conversation.applyToolCallDelta(
+                toolIndex: toolIndex,
+                id: id,
+                name: name,
+                argumentsDelta: argumentsDelta
+            )
+            status = "Preparing tool"
+        case .retrying(let attempt, let maxRetries, _, let reason):
+            status = "Retrying (\(attempt)/\(maxRetries)): \(reason)"
+        case .samplingFailed(let kind, let message, _, _):
+            status = "Failed (\(kind)): \(message)"
         case .permissionRequested(let request):
             status = "Permission required: \(request.prompt)"
         case .completed:
@@ -1302,7 +1743,13 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
             streams.err("open-grok: permission required: \(request.prompt)\n")
         case .cancelled:
             streams.err("open-grok: cancelled\n")
-        case .lifecycle, .tool:
+        case .reasoning(let text):
+            streams.err("open-grok: reasoning: \(text)\n")
+        case .retrying(let attempt, let maxRetries, _, let reason):
+            streams.err("open-grok: retry \(attempt)/\(maxRetries): \(reason)\n")
+        case .samplingFailed(let kind, let message, _, _):
+            streams.err("open-grok: failed (\(kind)): \(message)\n")
+        case .lifecycle, .tool, .toolCallDelta:
             break
         }
     }
@@ -1320,7 +1767,17 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
             ]))
         case .cancelled:
             streams.out(try Self.jsonLine(["type": "cancelled"]))
-        case .lifecycle, .status, .tool, .permissionRequested:
+        case .reasoning(let text):
+            collectedOutput += text
+        case .samplingFailed(let kind, let message, let isRetryable, let statusCode):
+            streams.out(try Self.jsonLine([
+                "type": "failed",
+                "kind": kind,
+                "message": message,
+                "is_retryable": isRetryable,
+                "status_code": statusCode as Any
+            ]))
+        case .lifecycle, .status, .tool, .toolCallDelta, .retrying, .permissionRequested:
             break
         }
     }
@@ -1347,6 +1804,25 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
                 "output": tool.output as Any,
                 "state": tool.state.rawValue
             ]))
+        case .reasoning(let text) where !messagesOnly:
+            streams.out(try Self.jsonLine(["type": "reasoning", "content": text]))
+        case .retrying(let attempt, let maxRetries, let kind, let reason) where !messagesOnly:
+            streams.out(try Self.jsonLine([
+                "type": "retrying",
+                "attempt": attempt,
+                "max_retries": maxRetries,
+                "kind": kind,
+                "reason": reason
+            ]))
+        case .samplingFailed(let kind, let message, let isRetryable, let statusCode)
+            where !messagesOnly:
+            streams.out(try Self.jsonLine([
+                "type": "failed",
+                "kind": kind,
+                "message": message,
+                "is_retryable": isRetryable,
+                "status_code": statusCode as Any
+            ]))
         case .completed(let completion):
             streams.out(try Self.jsonLine([
                 "type": "completed",
@@ -1361,7 +1837,8 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
                 "id": request.id,
                 "prompt": request.prompt
             ]))
-        case .lifecycle, .status, .permissionRequested:
+        case .lifecycle, .status, .permissionRequested, .toolCallDelta, .reasoning,
+             .retrying, .samplingFailed:
             break
         }
     }

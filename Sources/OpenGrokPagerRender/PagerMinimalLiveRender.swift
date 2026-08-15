@@ -66,7 +66,10 @@ public final class MinimalTranscript {
             case .list: kind = .listDir
             case .fetch: kind = .webFetch
             case .webSearch: kind = .webSearch
-            case .generic: kind = .other(card.name)
+            // Specialized kinds without a minimal-pipeline body yet fall
+            // through as generic/other so frontier classification still works.
+            case .memorySearch, .integrationSearch, .useTool, .skill, .generic:
+                kind = .other(card.name)
             }
             let error: String?
             switch card.state {

@@ -1875,7 +1875,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             terminalLifecycle = .completed
                         case .cancelled:
                             terminalLifecycle = .cancelled
-                        case .lifecycle, .output, .status, .tool, .permissionRequested:
+                        case .lifecycle, .output, .status, .tool, .reasoning, .toolCallDelta,
+                             .retrying, .samplingFailed, .permissionRequested:
                             continue
                         }
                         let result = OpenGrokPagerRuntimeResult(
@@ -4940,7 +4941,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         switch event {
         case .completed, .cancelled:
             return true
-        case .lifecycle, .output, .status, .tool, .permissionRequested:
+        case .lifecycle, .output, .status, .tool, .reasoning, .toolCallDelta,
+             .retrying, .samplingFailed, .permissionRequested:
             return false
         }
     }

@@ -267,6 +267,72 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
 public enum OpenGrokLiveSamplingEvent: Sendable, Equatable {
     case output(String)
     case status(String)
+    case reasoning(String)
+    case toolCallDelta(
+        toolIndex: UInt32,
+        id: String?,
+        name: String?,
+        argumentsDelta: String?
+    )
+    case retrying(
+        attempt: UInt32,
+        maxRetries: UInt32,
+        kind: SamplingErrorKind,
+        reason: String
+    )
+    /// Typed failure from the sampler. Keep `SamplingErrorInfo` intact so
+    /// consumers can branch on kind (auth/rate-limit/…) rather than a flat
+    /// message string alone.
+    case failed(SamplingErrorInfo)
+    case backendToolCallStarted(callId: String, name: String)
+    case backendToolCallCompleted(callId: String, name: String, result: JSONValue?)
+}
+
+/// Pure mapping from a layer-2 `SamplingEvent` to the live sampler surface.
+/// Extracted so unit tests can assert event forwarding without spinning a TUI.
+enum LiveSamplingStreamMapper {
+    enum Action: Sendable, Equatable {
+        case emit(OpenGrokLiveSamplingEvent)
+        case completed(ConversationResponse)
+        case failed(SamplingErrorInfo)
+    }
+
+    /// Returns `nil` for events the live turn ignores (streamStarted,
+    /// firstToken, modelMetadata, empty channel tokens).
+    static func map(_ event: SamplingEvent) -> Action? {
+        switch event {
+        case .channelToken(_, .text, let text, _):
+            guard !text.isEmpty else { return nil }
+            return .emit(.output(text))
+        case .channelToken(_, .reasoning, let text, _):
+            guard !text.isEmpty else { return nil }
+            return .emit(.reasoning(text))
+        case .toolCallDelta(_, let toolIndex, let id, let name, let argumentsDelta):
+            return .emit(.toolCallDelta(
+                toolIndex: toolIndex,
+                id: id,
+                name: name,
+                argumentsDelta: argumentsDelta
+            ))
+        case .retrying(_, let attempt, let maxRetries, let kind, let reason, _, _):
+            return .emit(.retrying(
+                attempt: attempt,
+                maxRetries: maxRetries,
+                kind: kind,
+                reason: reason
+            ))
+        case .backendToolCallStarted(_, let callId, let name):
+            return .emit(.backendToolCallStarted(callId: callId, name: name))
+        case .backendToolCallCompleted(_, let callId, let name, let result):
+            return .emit(.backendToolCallCompleted(callId: callId, name: name, result: result))
+        case .completed(_, let response, _):
+            return .completed(response)
+        case .failed(_, let error):
+            return .failed(error)
+        case .streamStarted, .firstToken, .modelMetadata:
+            return nil
+        }
+    }
 }
 
 public struct OpenGrokLiveSamplingResponse: Sendable, Equatable {
@@ -369,9 +435,10 @@ public struct OpenGrokLiveSampler: Sendable {
         ), transport: transport)
         return OpenGrokLiveSampler { request, emit in
             await emit(.status("sampling"))
-            // Assistant text is forwarded incrementally as it arrives; the
-            // collected response carries the same bytes, so nothing is emitted
-            // again once the turn completes.
+            // Streamed events (text, reasoning, tool deltas, retries, backend
+            // tools, typed failures) are forwarded as they arrive; the
+            // collected response carries the final assistant bytes, so nothing
+            // is re-emitted once the turn completes.
             let response = try await client.streamConversation(ConversationRequest(
                 items: request.items,
                 tools: request.tools,
@@ -381,8 +448,8 @@ public struct OpenGrokLiveSampler: Sendable {
                 xGrokSessionId: request.sessionID,
                 reasoningEffort: request.reasoningEffort,
                 jsonSchema: request.jsonSchema
-            )) { delta in
-                await emit(.output(delta))
+            )) { event in
+                await emit(event)
             }
             let output = response.assistantText()
             return OpenGrokLiveSamplingResponse(
@@ -396,19 +463,23 @@ public struct OpenGrokLiveSampler: Sendable {
 }
 
 extension SamplingClient {
-    /// Run one turn over the backend's streaming API, forwarding assistant text
-    /// deltas as they arrive.
+    /// Run one turn over the backend's streaming API, forwarding live sampler
+    /// events (text, reasoning, tool-call deltas, retries, backend tools,
+    /// typed failures) as they arrive.
     ///
     /// The returned response is the same value ``conversationCollect`` would
     /// have produced — both drain the identical layer-2 event stream and read
     /// the terminal `completed` event — so persisted history is unaffected by
     /// streaming. Cancellation propagates through the underlying `AsyncStream`,
     /// which tears down the in-flight HTTP request on termination.
+    ///
+    /// Partial tool-argument JSON is forwarded only as UI hydration; callers
+    /// must not persist or execute from `.toolCallDelta`.
     fileprivate func streamConversation(
         _ request: ConversationRequest,
         requestId: RequestId = .random(),
         idleTimeout: MonotonicDuration = .seconds(300),
-        onTextDelta: @escaping @Sendable (String) async -> Void
+        onEvent: @escaping @Sendable (OpenGrokLiveSamplingEvent) async -> Void
     ) async throws -> ConversationResponse {
         let events: AsyncStream<SamplingEvent>
         switch apiBackend {
@@ -441,22 +512,108 @@ extension SamplingClient {
             )
         }
 
-        var coalescer = LiveTextDeltaCoalescer()
+        var textCoalescer = LiveTextDeltaCoalescer()
+        var reasoningCoalescer = LiveTextDeltaCoalescer()
+        // Coalesce tool-argument delta fragments into header-sized batches so
+        // a fast JSON stream does not force one repaint per byte. Never execute.
+        var toolDeltaCoalescer = LiveTextDeltaCoalescer()
+        var pendingToolDelta: (
+            toolIndex: UInt32,
+            id: String?,
+            name: String?,
+            arguments: String
+        )?
+
         for await event in events {
             try Task.checkCancellation()
-            switch event {
-            case .channelToken(_, .text, let text, _):
-                if let batch = coalescer.push(text) {
-                    await onTextDelta(batch)
+            switch LiveSamplingStreamMapper.map(event) {
+            case .emit(.output(let text)):
+                if let batch = textCoalescer.push(text) {
+                    await onEvent(.output(batch))
                 }
-            case .completed(_, let response, _):
-                if let batch = coalescer.flush() {
-                    await onTextDelta(batch)
+            case .emit(.reasoning(let text)):
+                if let batch = reasoningCoalescer.push(text) {
+                    await onEvent(.reasoning(batch))
+                }
+            case .emit(.toolCallDelta(let toolIndex, let id, let name, let argumentsDelta)):
+                var buffer = pendingToolDelta ?? (
+                    toolIndex: toolIndex,
+                    id: id,
+                    name: name,
+                    arguments: ""
+                )
+                if buffer.toolIndex != toolIndex {
+                    if let flushed = toolDeltaCoalescer.flush() {
+                        buffer.arguments += flushed
+                    }
+                    await onEvent(.toolCallDelta(
+                        toolIndex: buffer.toolIndex,
+                        id: buffer.id,
+                        name: buffer.name,
+                        argumentsDelta: buffer.arguments.isEmpty ? nil : buffer.arguments
+                    ))
+                    buffer = (toolIndex: toolIndex, id: id, name: name, arguments: "")
+                    toolDeltaCoalescer = LiveTextDeltaCoalescer()
+                }
+                if let id { buffer.id = id }
+                if let name, !name.isEmpty { buffer.name = name }
+                if let argumentsDelta, !argumentsDelta.isEmpty {
+                    if let batch = toolDeltaCoalescer.push(argumentsDelta) {
+                        buffer.arguments += batch
+                        await onEvent(.toolCallDelta(
+                            toolIndex: buffer.toolIndex,
+                            id: buffer.id,
+                            name: buffer.name,
+                            argumentsDelta: buffer.arguments
+                        ))
+                        buffer.arguments = ""
+                    }
+                } else if id != nil || name != nil {
+                    // Name/id-only delta: surface the provisional header without
+                    // waiting for argument bytes.
+                    await onEvent(.toolCallDelta(
+                        toolIndex: buffer.toolIndex,
+                        id: buffer.id,
+                        name: buffer.name,
+                        argumentsDelta: nil
+                    ))
+                }
+                pendingToolDelta = buffer
+            case .emit(let other):
+                await onEvent(other)
+            case .completed(let response):
+                if let batch = textCoalescer.flush() {
+                    await onEvent(.output(batch))
+                }
+                if let batch = reasoningCoalescer.flush() {
+                    await onEvent(.reasoning(batch))
+                }
+                if var buffer = pendingToolDelta {
+                    if let flushed = toolDeltaCoalescer.flush() {
+                        buffer.arguments += flushed
+                    }
+                    if buffer.id != nil || buffer.name != nil || !buffer.arguments.isEmpty {
+                        await onEvent(.toolCallDelta(
+                            toolIndex: buffer.toolIndex,
+                            id: buffer.id,
+                            name: buffer.name,
+                            argumentsDelta: buffer.arguments.isEmpty ? nil : buffer.arguments
+                        ))
+                    }
                 }
                 return response
-            case .failed(_, let error):
+            case .failed(let error):
+                if let batch = textCoalescer.flush() {
+                    await onEvent(.output(batch))
+                }
+                if let batch = reasoningCoalescer.flush() {
+                    await onEvent(.reasoning(batch))
+                }
+                // Emit typed failure before throwing so the UI can show kind
+                // (auth/rate-limit/…) rather than only `Turn failed: …`.
+                await onEvent(.failed(error))
                 throw CLIApplicationError.failed(error.message)
-            default:
+            case .none:
                 continue
             }
         }

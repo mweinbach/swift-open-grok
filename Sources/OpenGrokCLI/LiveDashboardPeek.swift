@@ -55,7 +55,7 @@ struct LiveDashboardPeekCache: Sendable, Equatable {
         items.reserveCapacity(records.count)
         lastActivity.reserveCapacity(records.count)
         for record in records {
-            items[record.sessionID] = peekItems(from: record.items)
+            items[record.sessionID] = peekItems(from: record)
             lastActivity[record.sessionID] = record.updatedAt
         }
         return LiveDashboardPeekCache(items: items, lastActivity: lastActivity)
@@ -77,48 +77,24 @@ struct LiveDashboardPeekCache: Sendable, Equatable {
     /// put the whole roster's transcripts through the renderer to show a
     /// handful of rows. Plain text degrades exactly the way `PagerMessage`
     /// documents (empty `styledLines` → paint `text` verbatim).
-    static func peekItems(from conversationItems: [ConversationItem]) -> [PagerConversationItem] {
-        var resultsByCallID: [String: String] = [:]
-        for item in conversationItems {
-            if case .toolResult(let result) = item {
-                resultsByCallID[result.toolCallId] = result.content
-            }
-        }
-        var items: [PagerConversationItem] = []
-        for item in conversationItems {
-            switch item {
-            case .user(let user):
-                // Synthetic turn-starters (scheduler fires, queue drains) are
-                // provider plumbing and are not painted live either — a peek
-                // that pinned one would show the user a prompt they never
-                // typed.
-                guard user.syntheticReason == nil else { continue }
-                let text = user.content.compactMap { part -> String? in
-                    if case .text(let value) = part { return value }
-                    return nil
-                }.joined(separator: "\n")
-                guard !text.isEmpty else { continue }
-                items.append(.message(PagerMessage(role: .user, text: text)))
-            case .assistant(let assistant):
-                if !assistant.content.isEmpty {
-                    items.append(.message(PagerMessage(
-                        role: .assistant,
-                        text: assistant.content
-                    )))
-                }
-                for call in assistant.toolCalls {
-                    items.append(.tool(PagerToolCard(
-                        name: call.name,
-                        input: call.arguments,
-                        output: resultsByCallID[call.id],
-                        state: .succeeded
-                    )))
-                }
-            case .system, .toolResult, .customToolOutput, .backendToolCall, .reasoning:
-                continue
-            }
-        }
-        return items
+    static func peekItems(
+        from conversationItems: [ConversationItem],
+        toolOutcomes: ToolCallOutcomeMap = ToolCallOutcomeMap()
+    ) -> [PagerConversationItem] {
+        // Same projection as `/resume` (`LiveTranscriptProjection`) so a peek
+        // cannot invent success for unpaired calls or drop reasoning / backend
+        // / custom-tool output that the live path would paint.
+        LiveTranscriptProjection.project(
+            conversationItems,
+            toolOutcomes: toolOutcomes
+        ).items
+    }
+
+    static func peekItems(from record: LiveConversationRecord) -> [PagerConversationItem] {
+        peekItems(
+            from: record.items,
+            toolOutcomes: record.toolOutcomes ?? ToolCallOutcomeMap()
+        )
     }
 }
 
@@ -294,6 +270,10 @@ enum LiveDashboardPeek {
         case .search: return "Search"
         case .fetch: return "Fetch"
         case .webSearch: return "Web search"
+        case .memorySearch: return "Memory search"
+        case .integrationSearch: return "Search tools"
+        case .useTool: return "Server action"
+        case .skill: return "Skill"
         case .generic: return "Tool"
         }
     }

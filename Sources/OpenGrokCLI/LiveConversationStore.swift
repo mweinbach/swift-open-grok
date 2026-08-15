@@ -61,6 +61,11 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
     /// real user turn instead. Optional so records written before this field
     /// existed keep decoding unchanged.
     var title: String?
+    /// Terminal tool-card display outcomes keyed by call id. Optional so
+    /// pre-Wave-A records keep decoding; `/resume` treats a missing entry as
+    /// `.pending` when the call has no paired output rather than inventing
+    /// success. See `ToolCallOutcomeMap` — not a provider wire field.
+    var toolOutcomes: ToolCallOutcomeMap?
 
     init(
         sessionID: String,
@@ -73,7 +78,8 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         currentModelID: String? = nil,
         currentProvider: ModelProvider? = nil,
         everUsedNonXAI: Bool? = nil,
-        title: String? = nil
+        title: String? = nil,
+        toolOutcomes: ToolCallOutcomeMap? = nil
     ) {
         self.sessionID = sessionID
         self.workingDirectory = workingDirectory
@@ -86,6 +92,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         self.currentProvider = currentProvider
         self.everUsedNonXAI = everUsedNonXAI
         self.title = title
+        self.toolOutcomes = toolOutcomes
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -100,6 +107,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         case currentProvider = "current_provider"
         case everUsedNonXAI = "ever_used_codex"
         case title
+        case toolOutcomes = "tool_outcomes"
     }
 
     static func new(
@@ -290,7 +298,8 @@ actor LiveConversationStore {
             currentModelID: source.currentModelID,
             currentProvider: source.currentProvider,
             everUsedNonXAI: source.everUsedNonXAI,
-            title: source.title
+            title: source.title,
+            toolOutcomes: source.toolOutcomes
         )
 
         do {
@@ -664,6 +673,35 @@ actor LiveConversationHistory {
         record.updatedAt = Date()
         try await store.save(record)
     }
+
+    /// Record a terminal tool-card display state for honest `/resume` seeding.
+    /// Persisted on the next `commit` / save of the resident record.
+    func recordToolOutcome(
+        callID: String,
+        state: OpenGrokShellToolState,
+        detail: String? = nil
+    ) {
+        let outcome: ToolCallDisplayOutcome
+        switch state {
+        case .succeeded: outcome = .succeeded
+        case .failed: outcome = .failed
+        case .cancelled: outcome = .cancelled
+        case .running: outcome = .pending
+        }
+        recordToolOutcome(callID: callID, outcome: outcome, detail: detail)
+    }
+
+    func recordToolOutcome(
+        callID: String,
+        outcome: ToolCallDisplayOutcome,
+        detail: String? = nil
+    ) {
+        var map = record.toolOutcomes ?? ToolCallOutcomeMap()
+        map.upsert(callID: callID, outcome: outcome, detail: detail)
+        record.toolOutcomes = map
+    }
+
+    var toolOutcomes: ToolCallOutcomeMap { record.toolOutcomes ?? ToolCallOutcomeMap() }
 }
 
 struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
@@ -885,6 +923,50 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                                 await emit(.assistantText(text))
                             case .status(let status):
                                 await emit(.status(status))
+                            case .reasoning(let text):
+                                await emit(.reasoning(text))
+                            case .toolCallDelta(
+                                let toolIndex, let id, let name, let argumentsDelta
+                            ):
+                                await emit(.toolCallDelta(
+                                    toolIndex: toolIndex,
+                                    id: id,
+                                    name: name,
+                                    argumentsDelta: argumentsDelta
+                                ))
+                            case .retrying(
+                                let attempt, let maxRetries, let kind, let reason
+                            ):
+                                await emit(.retrying(
+                                    attempt: attempt,
+                                    maxRetries: maxRetries,
+                                    kind: kind.asString,
+                                    reason: reason
+                                ))
+                            case .failed(let error):
+                                await emit(.samplingFailed(
+                                    kind: error.kind.asString,
+                                    message: error.message,
+                                    isRetryable: error.isRetryable,
+                                    statusCode: error.statusCode
+                                ))
+                            case .backendToolCallStarted(let callId, let name):
+                                await emit(.backendToolStarted(
+                                    callID: callId,
+                                    name: name
+                                ))
+                            case .backendToolCallCompleted(let callId, let name, let result):
+                                let resultText: String?
+                                if let result {
+                                    resultText = LiveToolResultText.jsonString(result)
+                                } else {
+                                    resultText = nil
+                                }
+                                await emit(.backendToolCompleted(
+                                    callID: callId,
+                                    name: name,
+                                    result: resultText
+                                ))
                             }
                         }
                         authRetrySchedule.resetOnSuccess()
@@ -1210,20 +1292,44 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                     let result = await toolExecutor.invoke(
                         sessionID: sessionID,
                         workingDirectory: workingDirectory,
-                        call: call
+                        call: call,
+                        onOutput: { delta in
+                            await emit(.tool(OpenGrokShellToolUpdate(
+                                callID: delta.callID,
+                                name: call.name,
+                                input: call.arguments,
+                                output: delta.text,
+                                state: .running,
+                                outputOp: delta.op == .replace ? .replace : .append
+                            )))
+                        }
                     )
                     let content: String
                     switch result {
                     case .success(let result):
                         content = result.promptText
+                        // Keep the success result (promptText / PostToolUse)
+                        // and only flip the *display* state when structured
+                        // terminal metadata shows a nonzero exit / timeout /
+                        // signal. Do not sniff prompt text for the word
+                        // "failed".
+                        let displayState = LiveToolResultText.displayState(for: result)
                         await emit(.tool(OpenGrokShellToolUpdate(
                             callID: call.callId,
                             name: call.name,
                             input: call.arguments,
                             output: content,
-                            state: .succeeded
+                            state: displayState
                         )))
-                        await emit(.status("tool \(call.name) completed"))
+                        await conversationHistory.recordToolOutcome(
+                            callID: call.callId,
+                            state: displayState
+                        )
+                        await emit(.status(
+                            displayState == .failed
+                                ? "tool \(call.name) failed"
+                                : "tool \(call.name) completed"
+                        ))
                         toolExecutor.firePostToolUse(call: call, result: result)
                     case .failure(.cancelled):
                         await emit(.tool(OpenGrokShellToolUpdate(
@@ -1233,6 +1339,10 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             output: "Cancelled",
                             state: .cancelled
                         )))
+                        await conversationHistory.recordToolOutcome(
+                            callID: call.callId,
+                            state: .cancelled
+                        )
                         throw CancellationError()
                     case .failure(.denied):
                         // The pipeline refused to authorize the call, so the
@@ -1247,6 +1357,11 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             output: content,
                             state: .failed
                         )))
+                        await conversationHistory.recordToolOutcome(
+                            callID: call.callId,
+                            outcome: .denied,
+                            detail: content
+                        )
                         await emit(.status("tool \(call.name) denied"))
                     case .failure(let error):
                         content = "Tool \(call.name) failed: \(error.description)"
@@ -1257,6 +1372,10 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             output: content,
                             state: .failed
                         )))
+                        await conversationHistory.recordToolOutcome(
+                            callID: call.callId,
+                            state: .failed
+                        )
                         await emit(.status("tool \(call.name) failed"))
                         toolExecutor.firePostToolUseFailure(call: call, error: error)
                     }
@@ -1280,4 +1399,44 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         }
     }
 
+}
+
+/// Helpers for tool-result display state and JSON flattening at the live seam.
+enum LiveToolResultText {
+    /// Derive pager/shell display state from a successful tool result without
+    /// dropping `promptText`. Nonzero exit / timeout / signal → `.failed`.
+    static func displayState(
+        for result: OpenGrokShellToolCallResult
+    ) -> OpenGrokShellToolState {
+        // Prefer the executor-stamped display state (A3). Fall back to
+        // structured terminal metadata so a result that left the default
+        // `.succeeded` but carries exit_code/signal/timeout is still honest.
+        // Never sniff prompt text.
+        if result.displayState != .succeeded {
+            return result.displayState
+        }
+        guard let object = result.value.objectValue else {
+            return .succeeded
+        }
+        if case .bool(true) = object["cancelled"] {
+            return .cancelled
+        }
+        if case .bool(true) = object["timed_out"] {
+            return .failed
+        }
+        if case .string(let signal) = object["signal"], !signal.isEmpty {
+            return .failed
+        }
+        if let code = object["exit_code"]?.int64Value, code != 0 {
+            return .failed
+        }
+        return .succeeded
+    }
+
+    static func jsonString(_ value: JSONValue) -> String {
+        guard let data = try? JSONEncoder().encode(value) else {
+            return String(describing: value)
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
 }

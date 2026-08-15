@@ -477,9 +477,12 @@ private final class LiveLeaderPagerSession: OpenGrokPagerMinimalSessionAdapter, 
         else { return nil }
 
         switch notification.update {
-        case .agentMessageChunk(let chunk), .agentThoughtChunk(let chunk):
+        case .agentMessageChunk(let chunk):
             guard case .text(let text) = chunk.content else { return nil }
             return .output(text.text)
+        case .agentThoughtChunk(let chunk):
+            guard case .text(let text) = chunk.content else { return nil }
+            return .reasoning(text.text)
         case .toolCall(let call):
             return .tool(OpenGrokPagerToolUpdate(
                 callID: call.toolCallId.rawValue,
@@ -488,10 +491,16 @@ private final class LiveLeaderPagerSession: OpenGrokPagerMinimalSessionAdapter, 
                 state: .running
             ))
         case .toolCallUpdate(let update):
+            // Sparse updates must not overwrite a known title with the
+            // placeholder "tool" or wipe a known input with "{}". Empty
+            // name/input let `LivePagerConversationState.apply` merge into the
+            // existing card (A4).
+            let name = update.title ?? ""
+            let input = update.rawInput.map(Self.jsonString) ?? ""
             return .tool(OpenGrokPagerToolUpdate(
                 callID: update.toolCallId.rawValue,
-                name: update.title ?? "tool",
-                input: Self.jsonString(update.rawInput),
+                name: name,
+                input: input,
                 output: update.rawOutput.map(Self.jsonString),
                 state: Self.toolState(update.status ?? .inProgress)
             ))

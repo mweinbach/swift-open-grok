@@ -1950,6 +1950,32 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             turnActivity = text
         case .tool(let tool):
             apply(tool)
+        case .reasoning(let text):
+            conversation.appendReasoning(text)
+            turnActivity = "Thinking\u{2026}"
+        case .toolCallDelta(let toolIndex, let id, let name, let argumentsDelta):
+            conversation.applyToolCallDelta(
+                toolIndex: toolIndex,
+                id: id,
+                name: name,
+                argumentsDelta: argumentsDelta
+            )
+            if let name, !name.isEmpty {
+                turnActivity = name
+            } else {
+                turnActivity = "Preparing tool\u{2026}"
+            }
+        case .retrying(let attempt, let maxRetries, _, let reason):
+            turnActivity = "Retrying (\(attempt)/\(maxRetries)): \(reason)"
+        case .samplingFailed(let kind, let message, let isRetryable, _):
+            // Typed failure surface before the turn-ending `.turnFailed` arm.
+            // Keep kind/retryability visible; do not collapse to message alone.
+            let retryNote = isRetryable ? " (retryable)" : ""
+            appendMessage(PagerMessage(
+                role: .error,
+                text: "Sampling failed [\(kind)]\(retryNote): \(message)"
+            ))
+            turnActivity = "Failed (\(kind))"
         case .permissionRequested(let request):
             turnActivity = "Permission required: \(request.prompt)"
         case .completed:
@@ -2767,7 +2793,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             rewindPoints.map { ($0.promptIndex, $0.createdAt) },
             uniquingKeysWith: { first, _ in first }
         )
-        conversation.seed(from: items, promptInstants: promptInstants)
+        let toolOutcomes = await conversationHistory?.toolOutcomes ?? ToolCallOutcomeMap()
+        conversation.seed(
+            from: items,
+            promptInstants: promptInstants,
+            toolOutcomes: toolOutcomes
+        )
         selection.unfocus()
         followsBottom = true
         scrollOffset = 0

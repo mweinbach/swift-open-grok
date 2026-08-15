@@ -46,8 +46,37 @@ public actor LocalShellProcessBackend: ShellProcessBackend, ShellCapabilityProvi
     }
 
     public func run(_ request: ShellCommandRequest) async throws -> ShellCommandResult {
+        try await run(request, onChunk: nil)
+    }
+
+    /// Foreground run with optional raw output-chunk delivery (stdout/stderr as
+    /// produced). Chunks are not JSON and are not persisted; callers own UTF-8
+    /// assembly. `nil` matches plain `run(_:)`.
+    public func run(
+        _ request: ShellCommandRequest,
+        onChunk: (@Sendable (Data) async -> Void)?
+    ) async throws -> ShellCommandResult {
         let record = try await startTask(request, background: false)
         let deadline = foregroundDeadline(for: request)
+
+        let pumpTask: Task<Void, Never>?
+        if let onChunk {
+            let stream = record.lifecycle.outputStream(taskID: record.taskID)
+            pumpTask = Task {
+                do {
+                    for try await event in stream {
+                        if case let .output(_, _, data, _) = event, !data.isEmpty {
+                            await onChunk(data)
+                        }
+                    }
+                } catch {
+                    // Wait path owns terminal failure; a mid-stream error just
+                    // stops progress delivery.
+                }
+            }
+        } else {
+            pumpTask = nil
+        }
 
         let waitResult = await withTaskCancellationHandler(
             operation: {
@@ -60,11 +89,24 @@ public actor LocalShellProcessBackend: ShellProcessBackend, ShellCapabilityProvi
             }
         )
 
+        // Drain the pump after the process completes so the final chunks are
+        // not cancelled mid-flight. Cancel only on paths that never finish the
+        // lifecycle stream.
+        func finishPump(cancel: Bool) async {
+            guard let pumpTask else { return }
+            if cancel {
+                pumpTask.cancel()
+            }
+            await pumpTask.value
+        }
+
         switch waitResult {
         case let .completed(result):
+            await finishPump(cancel: false)
             return try result.get()
         case .cancelled:
             await stopTask(record.taskID, cause: .cancellation, explicitlyKilled: false)
+            await finishPump(cancel: true)
             throw ShellError.cancelled
         case .timedOut:
             if request.autoBackgroundOnTimeout, await backgroundTask(record.taskID) {
@@ -77,11 +119,15 @@ public actor LocalShellProcessBackend: ShellProcessBackend, ShellCapabilityProvi
                 )
                 result.signal = "backgrounded"
                 result.terminationReason = .backgrounded
+                // Still running in background — stop progress for this call.
+                await finishPump(cancel: true)
                 return result
             }
 
             await stopTask(record.taskID, cause: .timeout, explicitlyKilled: false)
-            return try await waitForResult(record)
+            let timedOutResult = try await waitForResult(record)
+            await finishPump(cancel: false)
+            return timedOutResult
         }
     }
 
