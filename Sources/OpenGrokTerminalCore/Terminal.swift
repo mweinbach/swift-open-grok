@@ -167,8 +167,21 @@ public final class Terminal {
 
     // MARK: - Draw cycle
 
+    /// Draw one frame. Same contract as Rust `Terminal::draw`
+    /// (`terminal.rs:519-528` at pin 650c1db7): wraps `tryDraw` so a throwing
+    /// callback is the fallible path.
     @discardableResult
     public func draw(_ render: (inout TerminalFrame) throws -> Void) throws -> CompletedFrame {
+        try tryDraw(render)
+    }
+
+    /// Analog of Rust `try_draw` (`terminal.rs:594-643` at pin 650c1db7).
+    ///
+    /// The callback may throw. On failure the half-rendered frame is discarded
+    /// (it lives only in the `TerminalFrame` copy) and `current` is not flipped,
+    /// so the last completed frame stays the previous-buffer for the next diff.
+    @discardableResult
+    public func tryDraw(_ render: (inout TerminalFrame) throws -> Void) throws -> CompletedFrame {
         try drawInternal(withLinks: false, links: [], render)
     }
 
@@ -188,14 +201,30 @@ public final class Terminal {
         _ render: (inout TerminalFrame) throws -> Void
     ) throws -> CompletedFrame {
         try autoresize()
+        // Snapshot so a failed callback cannot leave `current` on the back
+        // buffer or keep a half-painted copy. Rust `try_draw` maps callback
+        // errors before flush/swap (`terminal.rs:609`); Frame there is `&mut
+        // Buffer`, so we additionally restore the live current buffer.
+        let savedCurrent = current
+        let savedBuffer = buffers[current]
+        let savedHiddenCursor = hiddenCursor
+        let savedCursorPos = lastKnownCursorPos
         var frame = getFrame()
-        try render(&frame)
+        do {
+            try render(&frame)
+        } catch {
+            buffers[savedCurrent] = savedBuffer
+            current = savedCurrent
+            hiddenCursor = savedHiddenCursor
+            lastKnownCursorPos = savedCursorPos
+            throw error
+        }
         buffers[current] = frame.buffer
         if withLinks {
             setFrameLinks(links)
-            _ = try flushWithLinks()
+            try flushWithLinks()
         } else {
-            _ = try flush()
+            try flush()
         }
         if let position = frame.cursorPosition {
             try showCursor()
@@ -229,6 +258,17 @@ public final class Terminal {
 
     public func getCursorPosition() throws -> TerminalPoint {
         try backend.cursorPosition()
+    }
+
+    /// u16 pair shim of deprecated Rust `get_cursor` (`terminal.rs:659-664`).
+    public func getCursor() throws -> (UInt16, UInt16) {
+        let position = try getCursorPosition()
+        return (UInt16(clamping: position.x), UInt16(clamping: position.y))
+    }
+
+    /// u16 pair shim of deprecated Rust `set_cursor` (`terminal.rs:666-671`).
+    public func setCursor(_ x: UInt16, _ y: UInt16) throws {
+        try setCursorPosition(TerminalPoint(x: Int(x), y: Int(y)))
     }
 
     // MARK: - Clear / buffers
