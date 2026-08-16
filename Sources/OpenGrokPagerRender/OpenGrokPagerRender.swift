@@ -44,6 +44,7 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         motion: state.motion,
         waveRows: state.waveRows,
         compact: compact,
+        groupToolVerbs: state.groupToolVerbs,
         showTimestamps: state.showTimestamps
     )
     // The rail replaces the scrollbar in its gutter while shown
@@ -60,6 +61,7 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
             motion: state.motion,
             waveRows: state.waveRows,
             compact: compact,
+            groupToolVerbs: state.groupToolVerbs,
             showTimestamps: state.showTimestamps
         )
     }
@@ -287,6 +289,9 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     if var tasksPane = state.tasksPane, chrome.tasksPane.height > 0 {
         drawTasksPane(&tasksPane, in: chrome.tasksPane, buffer: &buffer, theme: state.theme)
     }
+    if let todoPane = state.todoPane, chrome.todoPane.height > 0 {
+        renderPagerTodoPane(todoPane, in: chrome.todoPane, buffer: &buffer, theme: state.theme)
+    }
     let textSelectionModel = renderConversation(
         contentLines,
         items: state.conversation,
@@ -383,6 +388,9 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
     if let fpsHud = state.fpsHud {
         renderPagerFpsHudOverlay(fpsHud, area: bounds, buffer: &buffer)
     }
+    if let scrollDebugHud = state.scrollDebugHud {
+        renderPagerScrollDebugHud(scrollDebugHud, area: bounds, buffer: &buffer, theme: state.theme)
+    }
 
     return PagerRenderResult(
         buffer: buffer,
@@ -399,6 +407,7 @@ private struct ChromeLayout {
     var statusBar: TerminalRect
     var announcementBanner: TerminalRect
     var tasksPane: TerminalRect
+    var todoPane: TerminalRect
     var conversation: TerminalRect
     var completions: TerminalRect
     var turnStatus: TerminalRect
@@ -437,6 +446,7 @@ private func makeChromeLayout(
             statusBar: empty,
             announcementBanner: empty,
             tasksPane: empty,
+            todoPane: empty,
             conversation: empty,
             completions: empty,
             turnStatus: empty,
@@ -490,6 +500,10 @@ private func makeChromeLayout(
     let tasksPaneHeight = tasksPaneRows > 0 ? take(tasksPaneRows) : 0
     let tasksPaneGap = tasksPaneHeight > 0 ? take(1) : 0
 
+    let todoPaneRows = state.todoPane?.desiredHeight(viewHeight: bounds.height) ?? 0
+    let todoPaneHeight = todoPaneRows > 0 ? take(todoPaneRows) : 0
+    let todoPaneGap = todoPaneHeight > 0 ? take(1) : 0
+
     let shortcutsHeight = state.shortcuts != nil ? take(1) : 0
     // The reference drops the bottom padding row on short terminals, and in
     // compact mode: `shortcuts_gap` is 0 whenever `bottom_vpad` is
@@ -527,6 +541,7 @@ private func makeChromeLayout(
     let statusBar = place(statusHeight, gapAfter: statusGap)
     let announcementBanner = place(announcementHeight, gapAfter: announcementGap)
     let tasksPane = place(tasksPaneHeight, gapAfter: tasksPaneGap)
+    let todoPane = place(todoPaneHeight, gapAfter: todoPaneGap)
     let conversation = place(conversationHeight, gapAfter: completionsGap)
     let completions = place(completionsHeight, gapAfter: turnStatusGap)
     let turnStatus = place(turnStatusHeight, gapAfter: promptGap)
@@ -537,6 +552,7 @@ private func makeChromeLayout(
         statusBar: statusBar,
         announcementBanner: announcementBanner,
         tasksPane: tasksPane,
+        todoPane: todoPane,
         conversation: conversation,
         completions: completions,
         turnStatus: turnStatus,
@@ -619,6 +635,7 @@ func makeConversationLines(
     motion: PagerMotionSnapshot = PagerMotionSnapshot(),
     waveRows: Int = PagerMotion.defaultWaveRows,
     compact: Bool = false,
+    groupToolVerbs: Bool = false,
     showTimestamps: Bool = false
 ) -> [PaintLine] {
     makeConversationLayout(
@@ -629,6 +646,7 @@ func makeConversationLines(
         motion: motion,
         waveRows: waveRows,
         compact: compact,
+        groupToolVerbs: groupToolVerbs,
         showTimestamps: showTimestamps
     ).lines
 }
@@ -655,6 +673,7 @@ func makeConversationLayout(
     motion: PagerMotionSnapshot = PagerMotionSnapshot(),
     waveRows: Int = PagerMotion.defaultWaveRows,
     compact: Bool = false,
+    groupToolVerbs: Bool = false,
     showTimestamps: Bool = false
 ) -> ConversationLayout {
     guard width > 0 else {
@@ -665,7 +684,45 @@ func makeConversationLayout(
     var blockHeights: [Int] = []
     blockStartLines.reserveCapacity(items.count)
     blockHeights.reserveCapacity(items.count)
-    for (index, item) in items.enumerated() {
+    var index = 0
+    while index < items.count {
+        if groupToolVerbs,
+           pagerVerbGroupKind(of: items[index]) != nil,
+           items[index].isCollapsed {
+            var end = index + 1
+            while end < items.count,
+                  pagerVerbGroupKind(of: items[end]) != nil,
+                  items[end].isCollapsed {
+                end += 1
+            }
+            let blockStart = lines.count
+            appendVerbGroupHeader(
+                Array(items[index..<end]),
+                width: width,
+                theme: theme,
+                motion: motion,
+                waveRows: waveRows,
+                isSelected: selectedIndex.map { (index..<end).contains($0) } ?? false,
+                into: &lines
+            )
+            let headerHeight = lines.count - blockStart
+            for memberIndex in index..<end {
+                blockStartLines.append(memberIndex == index ? blockStart : lines.count)
+                blockHeights.append(memberIndex == index ? headerHeight : 0)
+            }
+            if end < items.count {
+                let last = items[end - 1]
+                let next = items[end]
+                let packs = last.isGroupable && next.isGroupable && last.isCollapsed && next.isCollapsed
+                if !packs {
+                    lines.append(PaintLine("", foreground: theme.textPrimary))
+                }
+            }
+            index = end
+            continue
+        }
+
+        let item = items[index]
         let blockStart = lines.count
         blockStartLines.append(blockStart)
         switch item {
@@ -687,6 +744,8 @@ func makeConversationLayout(
                 waveRows: waveRows,
                 into: &lines
             )
+        case .block(let block):
+            appendWaveEBlock(block, width: width, theme: theme, into: &lines)
         case .separator(let text):
             let separator = text.isEmpty ? String(repeating: "─", count: width) : text
             lines.append(PaintLine(separator, foreground: theme.grayDim))
@@ -711,18 +770,140 @@ func makeConversationLayout(
         // Gap rule (`scrollback/state/layout.rs:1375-1428`): consecutive
         // groupable-and-collapsed blocks pack tight; everything else gets one
         // blank row.
-        guard index < items.count - 1 else { continue }
-        let next = items[index + 1]
-        let packs = item.isGroupable && next.isGroupable && item.isCollapsed && next.isCollapsed
-        if !packs {
-            lines.append(PaintLine("", foreground: theme.textPrimary))
+        if index < items.count - 1 {
+            let next = items[index + 1]
+            let packs = item.isGroupable && next.isGroupable && item.isCollapsed && next.isCollapsed
+            if !packs {
+                lines.append(PaintLine("", foreground: theme.textPrimary))
+            }
         }
+        index += 1
     }
     return ConversationLayout(
         lines: lines,
         blockStartLines: blockStartLines,
         blockHeights: blockHeights
     )
+}
+
+private enum PagerVerbGroupKind: Hashable {
+    case file
+    case skill
+    case search
+    case directory
+    case webFetch
+    case webSearch
+    case memorySearch
+    case integrationSearch
+
+    func verb(running: Bool) -> String {
+        switch self {
+        case .file, .skill:
+            return running ? "Reading" : "Read"
+        case .search, .webSearch, .memorySearch, .integrationSearch:
+            return running ? "Searching" : "Searched"
+        case .directory:
+            return running ? "Listing" : "Listed"
+        case .webFetch:
+            return running ? "Fetching" : "Fetched"
+        }
+    }
+
+    func noun(count: Int) -> String {
+        switch self {
+        case .file: return count == 1 ? "file" : "files"
+        case .skill: return count == 1 ? "skill" : "skills"
+        case .search: return count == 1 ? "pattern" : "patterns"
+        case .directory: return count == 1 ? "dir" : "dirs"
+        case .webFetch, .webSearch: return count == 1 ? "website" : "websites"
+        case .memorySearch: return count == 1 ? "memory" : "memories"
+        case .integrationSearch: return count == 1 ? "MCP tool" : "MCP tools"
+        }
+    }
+}
+
+private func pagerVerbGroupKind(of item: PagerConversationItem) -> PagerVerbGroupKind? {
+    guard case .tool(let tool) = item else { return nil }
+    switch tool.kind {
+    case .read: return .file
+    case .skill: return .skill
+    case .search: return .search
+    case .list: return .directory
+    case .fetch: return .webFetch
+    case .webSearch, .xSearch: return .webSearch
+    case .memorySearch: return .memorySearch
+    case .integrationSearch: return .integrationSearch
+    case .edit, .create, .execute, .useTool, .generic: return nil
+    }
+}
+
+private func appendVerbGroupHeader(
+    _ items: [PagerConversationItem],
+    width: Int,
+    theme: PagerRenderTheme,
+    motion: PagerMotionSnapshot,
+    waveRows: Int,
+    isSelected: Bool,
+    into lines: inout [PaintLine]
+) {
+    var orderedKinds: [PagerVerbGroupKind] = []
+    var counts: [PagerVerbGroupKind: Int] = [:]
+    var isRunning = false
+    var failedCount = 0
+    for item in items {
+        guard case .tool(let tool) = item,
+              let kind = pagerVerbGroupKind(of: item) else { continue }
+        if counts[kind] == nil { orderedKinds.append(kind) }
+        counts[kind, default: 0] += 1
+        isRunning = isRunning || tool.state == .running || tool.state == .pending
+        if tool.state == .failed { failedCount += 1 }
+    }
+    var label = orderedKinds.map { kind in
+        let count = counts[kind, default: 0]
+        return "\(kind.verb(running: isRunning)) \(count) \(kind.noun(count: count))"
+    }.joined(separator: ", ")
+    if failedCount > 0 {
+        label += " · \(failedCount) failed"
+    }
+    let accent = failedCount > 0
+        ? theme.accentError
+        : (isRunning ? theme.accentRunning : theme.accentTool)
+    let wrappedRows = wrapStyledSpans([
+        PagerStyledSpan(text: PagerGlyphs.toolBullet + " ", foreground: accent),
+        PagerStyledSpan(text: label, foreground: theme.grayBright, style: [.bold])
+    ], width: width)
+    let blockOrigin = lines.count
+    for (rowIndex, row) in wrappedRows.enumerated() {
+        let paintedText = row.map(\.text).joined()
+        let semanticText = rowIndex == 0
+            ? String(paintedText.dropFirst(PagerGlyphs.toolBullet.count + 1))
+            : paintedText
+        lines.append(PaintLine(
+            spans: row,
+            foreground: theme.grayBright,
+            accentGlyph: isSelected || isRunning ? PagerGlyphs.accentBar : nil,
+            accentColor: isSelected
+                ? theme.selectionBorder
+                : isRunning
+                ? PagerMotion.runningAccentColor(
+                    theme: theme,
+                    accent: accent,
+                    tick: motion.tick,
+                    row: lines.count,
+                    waveRows: waveRows,
+                    motionEnabled: motion.enabled
+                )
+                : accent,
+            background: isSelected ? theme.bgVisual : nil,
+            selection: PaintLineSelectionSeed(
+                rangeID: 0,
+                blockLineIndex: lines.count - blockOrigin,
+                text: pagerTrimEndDisplay(semanticText),
+                selectableColStart: rowIndex == 0 ? 2 : 0,
+                joinerToPrevious: rowIndex == 0 ? nil : ""
+            )
+        ))
+    }
 }
 
 /// Map a screen Y into a conversation block index using the last-frame hit
@@ -841,7 +1022,8 @@ private func appendUserPrompt(
     // (`timestamp_reserved`, entry_renderer.rs:384-393; the same subtraction
     // upstream applies before wrapping, scrollback_pane.rs:660-670).
     let tsReserved = showTimestamps ? PagerLayoutMetrics.timestampReservedColumns : 0
-    let prefixWidth = compact ? 0 : PagerGlyphs.promptArrowWidth
+    let promptPrefix = message.promptKind.prefix
+    let prefixWidth = compact ? 0 : UnicodeDisplayWidth.width(of: promptPrefix)
     let bodyWidth = max(1, width - prefixWidth - tsReserved)
     let indentation = String(repeating: " ", count: prefixWidth)
     // The stamp overlays the FIRST CONTENT line — the row after the top
@@ -857,14 +1039,14 @@ private func appendUserPrompt(
             var spans: [PagerStyledSpan] = []
             if isFirstRow, !compact {
                 spans.append(PagerStyledSpan(
-                    text: PagerGlyphs.promptArrow,
-                    foreground: theme.accentUser
+                    text: promptPrefix,
+                    foreground: userPromptAccent(message.promptKind, theme: theme)
                 ))
             } else if !indentation.isEmpty {
                 spans.append(PagerStyledSpan(text: indentation))
             }
             isFirstRow = false
-            spans.append(contentsOf: userBodySpans(row, theme: theme))
+            spans.append(contentsOf: userBodySpans(row, kind: message.promptKind, theme: theme))
             // Soft-wrap continuation joins with a space; hard breaks have no
             // joiner (`blocks/user.rs` wrap_joiner / logical-line rules).
             let joiner: String?
@@ -895,7 +1077,7 @@ private func appendUserPrompt(
         lines.append(PaintLine(
             spans: compact
                 ? []
-                : [PagerStyledSpan(text: PagerGlyphs.promptArrow, foreground: theme.accentUser)],
+                : [PagerStyledSpan(text: promptPrefix, foreground: userPromptAccent(message.promptKind, theme: theme))],
             foreground: theme.textPrimary,
             background: band,
             selection: PaintLineSelectionSeed(
@@ -922,7 +1104,24 @@ private func appendUserPrompt(
 
 /// A recognized leading `/slash` token is painted in `accent_skill`
 /// (`blocks/user.rs:230-244`).
-private func userBodySpans(_ row: String, theme: PagerRenderTheme) -> [PagerStyledSpan] {
+private func userPromptAccent(_ kind: PagerPromptKind, theme: PagerRenderTheme) -> TerminalColor {
+    switch kind {
+    case .standard: return theme.accentUser
+    case .bash: return theme.command
+    case .cron: return theme.accentSystem
+    case .interjection: return theme.accentFeedback
+    case .skill: return theme.accentSkill
+    }
+}
+
+private func userBodySpans(
+    _ row: String,
+    kind: PagerPromptKind,
+    theme: PagerRenderTheme
+) -> [PagerStyledSpan] {
+    if kind == .bash {
+        return [PagerStyledSpan(text: row, foreground: theme.command)]
+    }
     guard row.hasPrefix("/") else {
         return [PagerStyledSpan(text: row, foreground: theme.textPrimary)]
     }
@@ -951,14 +1150,6 @@ private func appendAssistantMessage(
             .map { PagerStyledLine(text: String($0)) }
         if styledLines.isEmpty { styledLines = [PagerStyledLine(text: "")] }
     }
-    if message.isStreaming {
-        let cursor = PagerStyledSpan(text: "▌", foreground: theme.accentUser)
-        if styledLines.isEmpty {
-            styledLines = [PagerStyledLine(spans: [cursor])]
-        } else {
-            styledLines[styledLines.count - 1].spans.append(cursor)
-        }
-    }
     // Same reserve-then-overlay shape as the user prompt: wrap at the
     // reduced width (`timestamp_reserved`, entry_renderer.rs:384-393), stamp
     // the first content line. An agent message has no padding rows, so the
@@ -969,6 +1160,7 @@ private func appendAssistantMessage(
     var isFirstPhysical = true
     for styledLine in styledLines {
         let wrapWidth = max(1, width - tsReserved)
+        let lineBackground = styledLine.background == .code ? theme.bgDark : nil
         // Table-shaped box lines never soft-wrap (wrapping.rs `is_table_line`):
         // clip overflow so one physical line stays one selectable line. Markdown
         // may still wrap/truncate cells when producing `styledLines`; this skip
@@ -980,7 +1172,17 @@ private func appendAssistantMessage(
             wrapped = wrapStyledSpans(styledLine.spans, width: wrapWidth)
         }
         for (wrapIndex, row) in wrapped.enumerated() {
-            let selectionText = pagerTrimEndDisplay(row.map(\.text).joined())
+            let paintedText = pagerTrimEndDisplay(row.map(\.text).joined())
+            let quotePrefixWidth: Int
+            let selectionText: String
+            if styledLine.selectionText != nil, wrapIndex == 0 {
+                let stripped = pagerStripQuoteDecoration(paintedText)
+                quotePrefixWidth = max(0, UnicodeDisplayWidth.width(of: paintedText) - UnicodeDisplayWidth.width(of: stripped))
+                selectionText = stripped
+            } else {
+                quotePrefixWidth = 0
+                selectionText = paintedText
+            }
             let joiner: String?
             if isFirstPhysical && wrapIndex == 0 {
                 joiner = nil
@@ -992,11 +1194,12 @@ private func appendAssistantMessage(
             lines.append(PaintLine(
                 spans: row,
                 foreground: theme.textPrimary,
+                background: lineBackground,
                 selection: PaintLineSelectionSeed(
                     rangeID: 0,
                     blockLineIndex: lines.count - blockOrigin,
                     text: selectionText,
-                    selectableColStart: 0,
+                    selectableColStart: quotePrefixWidth,
                     joinerToPrevious: joiner
                 )
             ))
@@ -1020,12 +1223,6 @@ private func appendAssistantMessage(
 /// enough (`content_area.width > ts_width + 1`, entry_renderer.rs:956), with
 /// `theme.gray` as the stamp color (entry_renderer.rs:958).
 ///
-/// Divergence from upstream's buffer overlay: this painter appends spans, it
-/// cannot overwrite cells, so a first line that already reaches into the
-/// reserved column — only the streaming cursor can get there, since text is
-/// wrapped short of it — skips the stamp for that frame instead of painting
-/// over content. Cost: a one-column collision upstream would overpaint is a
-/// missing stamp here until the next repaint moves the cursor.
 private func overlayTimestamp(
     _ createdAt: Date?,
     width: Int,
@@ -1084,12 +1281,24 @@ func appendThinking(
 
     let accent = message.isStreaming ? theme.accentThinking : theme.grayDim
     let bodyWidth = max(1, width - 2)
-    var body: [String] = []
+    var styledLines = message.styledLines
+    if styledLines.isEmpty {
+        styledLines = message.text
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { PagerStyledLine(text: String($0)) }
+    }
+    var body: [(spans: [PagerStyledSpan], background: TerminalColor?, text: String)] = []
     var bodyJoiners: [String?] = []
     var isFirstPhysical = true
-    for physical in message.text.split(separator: "\n", omittingEmptySubsequences: false) {
-        let wrapped = wrapDisplayLines(String(physical), width: bodyWidth)
-        for (wrapIndex, row) in (wrapped.isEmpty ? [""] : wrapped).enumerated() {
+    for styledLine in styledLines {
+        let background = styledLine.background == .code ? theme.bgDark : nil
+        let wrapped: [[PagerStyledSpan]]
+        if pagerLineLooksLikeTable(styledLine.text) {
+            wrapped = [truncateSpans(styledLine.spans, to: bodyWidth)]
+        } else {
+            wrapped = wrapStyledSpans(styledLine.spans, width: bodyWidth)
+        }
+        for (wrapIndex, row) in wrapped.enumerated() {
             let joiner: String?
             if isFirstPhysical && wrapIndex == 0 {
                 joiner = nil
@@ -1098,7 +1307,11 @@ func appendThinking(
             } else {
                 joiner = " "
             }
-            body.append(row)
+            body.append((
+                spans: [PagerStyledSpan(text: "  ")] + row,
+                background: background,
+                text: pagerTrimEndDisplay(row.map(\.text).joined())
+            ))
             bodyJoiners.append(joiner)
         }
         isFirstPhysical = false
@@ -1119,14 +1332,15 @@ func appendThinking(
     }
     for (index, row) in body.enumerated() {
         lines.append(PaintLine(
-            spans: [PagerStyledSpan(text: "  " + row, foreground: theme.grayDim)],
+            spans: row.spans,
             foreground: theme.grayDim,
             accentGlyph: PagerGlyphs.accentBar,
             accentColor: accent,
+            background: row.background,
             selection: PaintLineSelectionSeed(
                 rangeID: 0,
                 blockLineIndex: lines.count - blockOrigin,
-                text: row,
+                text: row.text,
                 selectableColStart: 2,
                 joinerToPrevious: bodyJoiners[index]
             )
@@ -1172,6 +1386,44 @@ func appendToolCard(
     unboundedPreview: Bool = false,
     into lines: inout [PaintLine]
 ) {
+    // B-RENDER dispatch: execute/edit have dedicated painters (header,
+    // panel, gutters, wrap-stable backgrounds, no on-screen @@/+/-, trusted
+    // counts, Creating, 2+3 truncation). Generic tools keep the gray
+    // head/tail preview. Without this dispatch every kind collapsed to
+    // `toolPreviewRows` — the DIVERGED generic card the backlog records.
+    switch tool.kind {
+    case .execute:
+        let blockOrigin = lines.count
+        appendExecuteCard(
+            tool,
+            width: width,
+            theme: theme,
+            motion: motion,
+            waveRows: waveRows,
+            unboundedPreview: unboundedPreview,
+            into: &lines
+        )
+        appendSpecializedToolHooks(tool, blockOrigin: blockOrigin, width: width, theme: theme, into: &lines)
+        return
+    case .edit, .create:
+        let blockOrigin = lines.count
+        appendEditCard(tool, width: width, theme: theme, motion: motion, waveRows: waveRows, into: &lines)
+        appendSpecializedToolHooks(tool, blockOrigin: blockOrigin, width: width, theme: theme, into: &lines)
+        return
+    default:
+        let blockOrigin = lines.count
+        if appendWaveCToolCard(
+            tool,
+            width: width,
+            theme: theme,
+            motion: motion,
+            waveRows: waveRows,
+            into: &lines
+        ) {
+            appendSpecializedToolHooks(tool, blockOrigin: blockOrigin, width: width, theme: theme, into: &lines)
+            return
+        }
+    }
     let accent = pagerToolAccent(tool, theme: theme)
     // Finish flash (`scrollback/state/types.rs:84`): a block that just reached
     // a terminal state keeps its bright accent — rail included — for 400 ms,
@@ -1227,6 +1479,9 @@ func appendToolCard(
     if let detail = tool.detail, !detail.isEmpty {
         header.append(PagerStyledSpan(text: " " + detail, foreground: theme.grayDim))
     }
+    if !tool.hooks.isEmpty {
+        header.append(PagerStyledSpan(text: waveEHookSuffix(tool.hooks), foreground: theme.grayDim))
+    }
 
     let blockOrigin = lines.count
     let accentGlyph = muted ? nil : PagerGlyphs.accentBar
@@ -1247,6 +1502,9 @@ func appendToolCard(
         ))
     }
 
+    if tool.isExpanded, !tool.hooks.isEmpty {
+        appendToolHookSections(tool.hooks, width: width, theme: theme, origin: blockOrigin, into: &lines)
+    }
     guard tool.isExpanded, let output = tool.output, !output.isEmpty else { return }
     lines.append(PaintLine(
         "",
@@ -1278,7 +1536,10 @@ func appendToolCard(
 /// escape (K9 "diffs always full", `commit.rs:128`): every wrapped row, no
 /// marker — the CAP on a committed block is applied downstream by the
 /// `… N more lines` footer, not here. The strip's callers keep the preview.
-private func toolPreviewRows(
+/// B-RENDER: generic-only — execute uses its ANSI/CR-aware panel
+/// (`PagerExecuteRender.swift`), edit uses the gutter/BG painter
+/// (`PagerEditRender.swift`). Do not route execute/edit through this.
+func toolPreviewRows(
     _ output: String,
     width: Int,
     theme: PagerRenderTheme,
@@ -1702,6 +1963,17 @@ private func statusBarRightSpans(
     if status.isPlanMode {
         groups.append([PagerStyledSpan(text: "plan", foreground: theme.accentPlan)])
     }
+    if let credit = status.credit {
+        let percent = Int((credit.fractionUsed * 100).rounded())
+        let color = credit.fractionUsed >= 1
+            ? theme.accentError
+            : (credit.fractionUsed >= 0.8 ? theme.warning : theme.accentModel)
+        groups.append([PagerStyledSpan(
+            text: "\(credit.provider.rawValue) \(percent)%",
+            foreground: color,
+            style: credit.fractionUsed >= 0.8 ? [.bold] : []
+        )])
+    }
     if let context = contextIndicatorSpans(status, theme: theme) {
         contextGroupIndex = groups.count
         groups.append(context)
@@ -1867,7 +2139,9 @@ func renderTurnStatus(
             foreground: theme.gray
         ))
     }
-    right.append(PagerStyledSpan(text: " [stop]", foreground: theme.gray))
+    if status.canCancel {
+        right.append(PagerStyledSpan(text: " [stop]", foreground: theme.gray))
+    }
 
     let rightWidth = right.reduce(0) { $0 + UnicodeDisplayWidth.width(of: $1.text) }
     let leftBudget = max(0, area.width - rightWidth - 1)
@@ -2580,7 +2854,7 @@ func makePagerTextSelectionModel(
         case .message(let message):
             // System never; error is block-selectable but not text-eligible.
             dragStartable = message.role != .system && message.role != .error
-        case .tool:
+        case .tool, .block:
             dragStartable = true
         }
 

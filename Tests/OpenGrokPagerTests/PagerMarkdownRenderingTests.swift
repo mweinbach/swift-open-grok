@@ -38,15 +38,18 @@ struct PagerMarkdownRenderingTests {
         #expect(struck?.style.contains(.strike) == true)
     }
 
-    @Test("code spans and fenced code blocks map to the code color")
+    @Test("code spans and fenced code blocks map inline and syntax colors")
     func code() {
         let inline = spans("use `printf` here").first { $0.text.contains("printf") }
         #expect(inline?.foreground == .brightYellow)
 
-        let fenced = spans("```swift\nlet x = 1\n```")
-        let body = fenced.first { $0.text.contains("let x = 1") }
-        #expect(body != nil)
-        #expect(body?.foreground == .brightYellow)
+        let fenced = renderer.render("```swift\nlet x = 1\n```")
+        #expect(fenced.contains { $0.background == .code })
+        let keyword = fenced.flatMap(\.spans).first { $0.text == "let" }
+        let number = fenced.flatMap(\.spans).first { $0.text == "1" }
+        #expect(keyword?.foreground == .brightMagenta)
+        #expect(keyword?.style.contains(.bold) == true)
+        #expect(number?.foreground == .brightCyan)
     }
 
     @Test("list markers are styled separately from item text")

@@ -52,9 +52,13 @@ public enum GlobTool {
             let value: JSONValue = .object([
                 "type": .string("glob"),
                 "pattern": .string(pattern),
+                "path": .string(root),
                 "content": .string(content),
                 "match_count": .number(.int64(Int64(matches.count))),
+                "file_count": .number(.int64(Int64(matches.count))),
                 "truncated": .bool(truncated),
+                "output_mode": .string("glob"),
+                "matches": .array(shown.map { .object(["path": .string($0)]) }),
             ])
             return .success(
                 TypedToolOutput(toolId: FileToolIDs.glob, value: value, modelOutput: [.text(text: content)])

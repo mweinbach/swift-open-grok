@@ -83,8 +83,8 @@ struct PagerStyledTextTests {
         #expect(link?.row == 0)
     }
 
-    @Test("the streaming cursor trails the last styled line")
-    func streamingCursor() {
+    @Test("streaming assistants do not invent a cursor")
+    func streamingAssistantHasNoCursor() {
         let result = renderPagerFrame(PagerRenderState(
             size: TerminalSize(width: 40, height: 8),
             conversation: [
@@ -99,7 +99,8 @@ struct PagerStyledTextTests {
             showScrollbar: false
         ))
 
-        #expect(result.snapshot().contains("working▌"))
+        #expect(result.snapshot().contains("working"))
+        #expect(!result.snapshot().contains("▌"))
     }
 
     @Test("wrapping splits spans at the width boundary and preserves attributes")

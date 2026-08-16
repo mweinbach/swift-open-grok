@@ -3,6 +3,7 @@ import OpenGrokCompaction
 import OpenGrokPager
 import OpenGrokPagerRender
 import OpenGrokShared
+import OpenGrokTerminalCore
 
 /// The scrollback's selection cursor and every effect the `ScrollbackFocused`
 /// bindings have on the transcript.
@@ -76,17 +77,21 @@ struct LiveScrollbackSelection: Sendable {
         var url: String?
         /// Whether the viewport should be pulled to the selection.
         var revealsSelection: Bool
+        /// Conversation-level fold preference for future completed thinking.
+        var completedReasoningExpanded: Bool?
 
         init(
             notice: String? = nil,
             clipboard: String? = nil,
             url: String? = nil,
-            revealsSelection: Bool = true
+            revealsSelection: Bool = true,
+            completedReasoningExpanded: Bool? = nil
         ) {
             self.notice = notice
             self.clipboard = clipboard
             self.url = url
             self.revealsSelection = revealsSelection
+            self.completedReasoningExpanded = completedReasoningExpanded
         }
     }
 
@@ -153,13 +158,16 @@ struct LiveScrollbackSelection: Sendable {
                 message.isCollapsed = !anyClosed
                 items[position] = .message(message)
             }
-            return Outcome(notice: anyClosed ? "Expanded all thinking." : "Collapsed all thinking.")
+            return Outcome(
+                notice: anyClosed ? "Expanded all thinking." : "Collapsed all thinking.",
+                completedReasoningExpanded: anyClosed
+            )
 
         case .toggleRaw:
             return toggleRaw(at: current, items: &items)
 
         case .copyBlockContent:
-            let text = Self.content(of: items[current])
+            let text = Self.copyContent(of: items[current])
             guard !text.isEmpty else {
                 return Outcome(notice: "Nothing to copy in that block.")
             }
@@ -193,6 +201,15 @@ struct LiveScrollbackSelection: Sendable {
 
     // MARK: - Fold
 
+    /// B3: mouse double/triple handler uses this to avoid duplicating `setFold`'s
+    /// foldable-policy guards.
+    static func toggleFold(at position: Int, items: inout [PagerConversationItem]) {
+        guard items.indices.contains(position) else { return }
+        let folded = items[position].isFolded
+        var tmp = LiveScrollbackSelection()
+        tmp.setFold(collapsed: !folded, at: position, items: &items)
+    }
+
     private mutating func setFold(
         collapsed: Bool,
         at position: Int,
@@ -201,12 +218,17 @@ struct LiveScrollbackSelection: Sendable {
         guard items.indices.contains(position) else { return }
         switch items[position] {
         case .tool(var tool):
+            guard tool.isFoldableByKind else { return }
             tool.isExpanded = !collapsed
+            if collapsed { tool.isFullyExpanded = false }
             items[position] = .tool(tool)
         case .message(var message):
             guard message.role == .reasoning || message.role == .system else { return }
             message.isCollapsed = collapsed
             items[position] = .message(message)
+        case .block(let block):
+            guard block.isFoldable else { return }
+            items[position] = .block(block.settingCollapsed(collapsed))
         case .separator:
             break
         }
@@ -254,7 +276,66 @@ struct LiveScrollbackSelection: Sendable {
         return candidates.first { predicate(items[$0]) } ?? current
     }
 
-    // MARK: - Extraction
+    // MARK: - Extraction — including B3 copy transforms
+
+    /// Execute → ANSI-stripped plain text (`terminal_output.rs:render_terminal_plain`
+    /// at pin 650c1db7). Edit/Create → unified patch (`diff.rs:diff_hunks_to_patch`).
+    /// Other kinds and legacy cards fall back to raw output/input.
+    static func copyContent(of item: PagerConversationItem) -> String {
+        if case .tool(let tool) = item { return toolCopyText(tool) }
+        return content(of: item)
+    }
+
+    /// Execute copy is `stripAnsiSequences(output)` when present; edit is a
+    /// synthesized patch from `rawInput` JSON (`file_path` + `old_string`/`new_string` or
+    /// `content`), mirroring `diffHunksToPatch` over one hunk. `nil` patch falls back to `output`.
+    static func toolCopyText(_ tool: PagerToolCard) -> String {
+        switch tool.kind {
+        case .execute:
+            if let out = tool.output, !out.isEmpty {
+                let stripped = stripAnsiSequences(out)
+                if !stripped.isEmpty { return stripped }
+                return out
+            }
+            return tool.input
+        case .edit, .create:
+            if let patch = tool.editPatch, !patch.isEmpty { return patch }
+            if let patch = editPatch(from: tool), !patch.isEmpty { return patch }
+            if let out = tool.output, !out.isEmpty { return out }
+            return tool.input
+        default:
+            return tool.output ?? tool.input
+        }
+    }
+
+    static func editPatch(from tool: PagerToolCard) -> String? {
+        let raw = tool.rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data),
+              let dict = obj as? [String: Any] else { return nil }
+        func str(_ keys: String...) -> String? {
+            for k in keys {
+                if let v = dict[k] as? String, !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return v }
+            }
+            return nil
+        }
+        let path = str("file_path", "filePath", "target_file", "path") ?? tool.input
+        let displayPath = path.isEmpty ? "file" : path
+        if let old = dict["old_string"] as? String, let new = dict["new_string"] as? String {
+            let p = diffHunksToPatch(path: displayPath, hunks: buildDiffHunks([SearchReplaceEditDetail(oldString: old, newString: new, oldLine: 1, newLine: 1)]))
+            if !p.isEmpty { return p }
+        }
+        if let old = dict["oldString"] as? String, let new = dict["newString"] as? String {
+            let p = diffHunksToPatch(path: displayPath, hunks: buildDiffHunks([SearchReplaceEditDetail(oldString: old, newString: new, oldLine: 1, newLine: 1)]))
+            if !p.isEmpty { return p }
+        }
+        if let c = str("content") {
+            let p = diffHunksToPatch(path: displayPath, hunks: buildDiffHunks([SearchReplaceEditDetail(oldString: "", newString: c, oldLine: 1, newLine: 1)]))
+            if !p.isEmpty { return p }
+        }
+        if let p = str("patch", "input"), p.contains("*** Begin Patch") { return p }
+        return nil
+    }
 
     static func content(of item: PagerConversationItem) -> String {
         switch item {
@@ -262,6 +343,8 @@ struct LiveScrollbackSelection: Sendable {
             return message.text
         case .tool(let tool):
             return tool.output ?? tool.input
+        case .block(let block):
+            return block.plainText
         case .separator(let text):
             return text
         }
@@ -273,6 +356,9 @@ struct LiveScrollbackSelection: Sendable {
         switch item {
         case .tool(let tool):
             return tool.input.isEmpty ? nil : tool.input
+        case .block(let block):
+            if case .creditLimit(let credit) = block { return credit.accountURL }
+            return nil
         case .message, .separator:
             return nil
         }
@@ -315,8 +401,9 @@ extension PagerConversationItem {
     /// Whether `h`/`l`/`e` have anything to act on.
     var isFoldable: Bool {
         switch self {
-        case .tool: return true
+        case .tool(let tool): return tool.isFoldableByKind
         case .message(let message): return message.role == .reasoning || message.role == .system
+        case .block(let block): return block.isFoldable
         case .separator: return false
         }
     }
@@ -325,6 +412,7 @@ extension PagerConversationItem {
         switch self {
         case .tool(let tool): return !tool.isExpanded
         case .message(let message): return message.isCollapsed
+        case .block(let block): return block.isFoldable && block.settingCollapsed(true) == block
         case .separator: return true
         }
     }

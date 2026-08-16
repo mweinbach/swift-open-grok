@@ -12,6 +12,20 @@ import OpenGrokToolRuntime
 public enum GrepTool {
     public static let defaultHeadLimit = 200
 
+    private enum OutputMode: String {
+        case content
+        case filesWithMatches = "files_with_matches"
+        case count
+
+        init(_ raw: String?) {
+            switch raw?.lowercased().replacingOccurrences(of: "-", with: "_") {
+            case "files_with_matches", "fileswithmatches", "files": self = .filesWithMatches
+            case "count": self = .count
+            default: self = .content
+            }
+        }
+    }
+
     public static func run(
         args: JSONValue,
         resources: ToolResources,
@@ -29,6 +43,7 @@ public enum GrepTool {
             let caseInsensitive = bool(obj, "-i") ?? bool(obj, "case_insensitive") ?? false
             let headLimit = int(obj, "head_limit") ?? defaultHeadLimit
             let multiline = bool(obj, "multiline") ?? false
+            let outputMode = OutputMode(string(obj, "output_mode"))
 
             let root = SessionFS.resolve(cwd: resources.cwd, path: pathArg ?? ".")
             try SessionFS.enforceRoots(root, roots: resources.allowedRoots)
@@ -39,56 +54,104 @@ public enum GrepTool {
             let regex = try NSRegularExpression(pattern: pattern, options: options)
 
             let files = try collectFiles(root: root, glob: glob)
-            var matchLines: [String] = []
+            var matches: [(path: String, lineNumber: Int, text: String)] = []
+            var matchingFiles: [(path: String, count: Int)] = []
             var matchCount = 0
             var truncated = false
 
             for file in files {
-                if matchCount >= headLimit {
+                if outputMode == .content, matchCount >= headLimit {
                     truncated = true
                     break
                 }
                 guard let text = try? SessionFS.readText(at: file) else { continue }
                 let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+                var fileMatchCount = 0
                 for (idx, line) in lines.enumerated() {
                     let range = NSRange(line.startIndex..<line.endIndex, in: line)
                     if regex.firstMatch(in: line, options: [], range: range) != nil {
                         let lineNo = idx + 1
-                        let display: String
-                        if withHashline {
-                            let anchor = Hashline.anchor(for: line, line: lineNo)
-                            display = "\(file):\(lineNo)|\(anchor):\(line)"
-                        } else {
-                            display = "\(file):\(lineNo):\(line)"
-                        }
-                        matchLines.append(display)
                         matchCount += 1
-                        if matchCount >= headLimit {
+                        fileMatchCount += 1
+                        if outputMode == .content, matches.count < headLimit {
+                            matches.append((file, lineNo, line))
+                        }
+                        if outputMode == .content, matchCount >= headLimit {
                             truncated = true
                             break
                         }
                     }
                 }
+                if fileMatchCount > 0 {
+                    matchingFiles.append((file, fileMatchCount))
+                }
             }
 
-            var content = matchLines.joined(separator: "\n")
+            let shownFiles = Array(matchingFiles.prefix(headLimit))
+            if outputMode != .content, matchingFiles.count > shownFiles.count {
+                truncated = true
+            }
+            var content: String
+            switch outputMode {
+            case .content:
+                content = matches.map { match in
+                    if withHashline {
+                        let anchor = Hashline.anchor(for: match.text, line: match.lineNumber)
+                        return "\(match.path):\(match.lineNumber)|\(anchor):\(match.text)"
+                    }
+                    return "\(match.path):\(match.lineNumber):\(match.text)"
+                }.joined(separator: "\n")
+            case .filesWithMatches:
+                content = shownFiles.map(\.path).joined(separator: "\n")
+            case .count:
+                content = shownFiles.map { "\($0.path):\($0.count)" }.joined(separator: "\n")
+            }
             if content.isEmpty {
                 content = "No matches found"
             } else if truncated {
-                content += "\n\n[truncated: showing first \(headLimit) matches]"
+                let unit = outputMode == .content ? "matches" : "files"
+                content += "\n\n[truncated: showing first \(headLimit) \(unit)]"
             }
             if content.utf8.count > defaultToolOutputBytes {
                 let capped = capToolOutput(content)
                 content = capped.modelText
             }
 
-            let value: JSONValue = .object([
+            let structuredMatches: [JSONValue]
+            switch outputMode {
+            case .content:
+                structuredMatches = matches.map { match in
+                    .object([
+                        "path": .string(match.path),
+                        "line_number": .number(.int64(Int64(match.lineNumber))),
+                        "text": .string(match.text),
+                    ])
+                }
+            case .filesWithMatches:
+                structuredMatches = shownFiles.map { .object(["path": .string($0.path)]) }
+            case .count:
+                structuredMatches = shownFiles.map {
+                    .object([
+                        "path": .string($0.path),
+                        "count": .number(.int64(Int64($0.count))),
+                    ])
+                }
+            }
+            var valueFields: [String: JSONValue] = [
                 "type": .string("grep"),
                 "pattern": .string(pattern),
+                "path": .string(root),
                 "content": .string(content),
                 "match_count": .number(.int64(Int64(matchCount))),
+                "file_count": .number(.int64(Int64(matchingFiles.count))),
                 "truncated": .bool(truncated),
-            ])
+                "case_insensitive": .bool(caseInsensitive),
+                "multiline": .bool(multiline),
+                "output_mode": .string(outputMode.rawValue),
+                "matches": .array(structuredMatches),
+            ]
+            if let glob { valueFields["glob"] = .string(glob) }
+            let value: JSONValue = .object(valueFields)
             return .success(
                 TypedToolOutput(toolId: FileToolIDs.grep, value: value, modelOutput: [.text(text: content)])
             )

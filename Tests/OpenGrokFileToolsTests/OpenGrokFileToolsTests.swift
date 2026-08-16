@@ -150,6 +150,90 @@ struct FileToolsTests {
         #expect(!content.contains("b.txt"))
     }
 
+    @Test("Wave C grep modes return structured grouped records")
+    func waveCGrepModes() async throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try "foo\nbar foo\n".write(
+            to: dir.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8
+        )
+        try "none\nfoo\n".write(
+            to: dir.appendingPathComponent("b.txt"), atomically: true, encoding: .utf8
+        )
+        let res = await resources(at: dir)
+
+        for mode in ["files_with_matches", "count"] {
+            let out = await GrepTool.run(
+                args: .object([
+                    "pattern": .string("foo"),
+                    "path": .string("."),
+                    "output_mode": .string(mode),
+                    "case_insensitive": .bool(true),
+                    "multiline": .bool(true),
+                ]),
+                resources: res
+            )
+            let typed = try success(out)
+            guard case .object(let obj) = typed.value,
+                  case .string(let outputMode) = obj["output_mode"],
+                  case .number(let matchCount) = obj["match_count"],
+                  case .number(let fileCount) = obj["file_count"],
+                  case .array(let matches) = obj["matches"]
+            else {
+                Issue.record("bad structured grep mode shape")
+                return
+            }
+            #expect(outputMode == mode)
+            #expect(matchCount.int64Value == 3)
+            #expect(fileCount.int64Value == 2)
+            #expect(matches.count == 2)
+            #expect(obj["case_insensitive"] == .bool(true))
+            #expect(obj["multiline"] == .bool(true))
+        }
+    }
+
+    @Test("Wave C glob returns file records and root metadata")
+    func waveCGlobStructuredOutput() async throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try "1".write(to: dir.appendingPathComponent("a.swift"), atomically: true, encoding: .utf8)
+        try "2".write(to: dir.appendingPathComponent("b.swift"), atomically: true, encoding: .utf8)
+        let typed = try success(await GlobTool.run(
+            args: .object(["pattern": .string("*.swift"), "path": .string(".")]),
+            resources: await resources(at: dir)
+        ))
+        guard case .object(let obj) = typed.value,
+              case .string(let mode) = obj["output_mode"],
+              case .string(let path) = obj["path"],
+              case .array(let matches) = obj["matches"]
+        else {
+            Issue.record("bad structured glob shape")
+            return
+        }
+        #expect(mode == "glob")
+        #expect(path == dir.path)
+        #expect(matches.count == 2)
+    }
+
+    @Test("Wave C list entry count excludes hidden files")
+    func waveCListVisibleEntryCount() async throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try "visible".write(to: dir.appendingPathComponent("visible.txt"), atomically: true, encoding: .utf8)
+        try "hidden".write(to: dir.appendingPathComponent(".hidden"), atomically: true, encoding: .utf8)
+        let typed = try success(await ListDirTool.run(
+            args: .object(["target_directory": .string(".")]),
+            resources: await resources(at: dir)
+        ))
+        guard case .object(let obj) = typed.value,
+              case .number(let count) = obj["entry_count"]
+        else {
+            Issue.record("bad list entry count")
+            return
+        }
+        #expect(count.int64Value == 1)
+    }
+
     // MARK: - search_replace
 
     @Test("search_replace exact replace and create")

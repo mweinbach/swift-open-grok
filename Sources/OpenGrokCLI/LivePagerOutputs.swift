@@ -142,6 +142,9 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         // wire text, raw text kept for display). The prompt-id prefix is what
         // the turn loop later maps to the `.schedulerFired` persisted item
         // (`PromptOrigin::from_prompt_id`, session/mod.rs:126-127).
+        let promptID = request.metadata[
+            OpenGrokPagerInteractiveController.promptIDMetadataKey
+        ] ?? UUID().uuidString
         let turnRequest: OpenGrokShellTurnRequest
         if let cronTaskID = request.metadata[
             OpenGrokPagerInteractiveController.cronTaskIDMetadataKey
@@ -150,17 +153,16 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
                 OpenGrokPagerInteractiveController.cronHumanScheduleMetadataKey
             ] ?? "unknown"
             turnRequest = OpenGrokShellTurnRequest(
-                promptID: OpenGrokPagerInteractiveController.schedulerFiredPromptIDPrefix
-                    + UUID().uuidString,
+                promptID: promptID,
                 text: formatScheduledTaskPrompt(
                     request.prompt,
                     taskID: cronTaskID,
                     humanSchedule: humanSchedule
                 )
             )
-        } else if let monitorTaskID = request.metadata[
+        } else if request.metadata[
             OpenGrokPagerInteractiveController.monitorTaskIDMetadataKey
-        ] {
+        ] != nil {
             // A monitor turn's text is already the full `<monitor-event …>`
             // wrap — upstream's InjectNotification prompt blocks carry it
             // verbatim (notification_bridge.rs:776-789) — so no framing
@@ -169,12 +171,11 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
             // (session/mod.rs:103-133), so the turn persists as a plain
             // user item, which is what the port's default mapping does too.
             turnRequest = OpenGrokShellTurnRequest(
-                promptID: OpenGrokPagerInteractiveController.monitorPromptIDPrefix
-                    + monitorTaskID + "-" + UUID().uuidString,
+                promptID: promptID,
                 text: request.prompt
             )
         } else {
-            turnRequest = OpenGrokShellTurnRequest(text: request.prompt)
+            turnRequest = OpenGrokShellTurnRequest(promptID: promptID, text: request.prompt)
         }
         let handle = try await shell.submitTurn(
             sessionID: sessionID,
@@ -438,6 +439,8 @@ final class LivePagerSession: OpenGrokPagerMinimalSessionAdapter, @unchecked Sen
                                 name: tool.name,
                                 input: tool.input,
                                 output: tool.output,
+                                structuredOutput: tool.structuredOutput,
+                                isBashMode: tool.isBashMode,
                                 state: state,
                                 outputOp: outputOp
                             )))
@@ -707,6 +710,8 @@ enum LivePagerChrome {
             }
         case .tool(let tool):
             return tool.name
+        case .block(let block):
+            return block.displayTitle
         case .separator:
             return "Separator"
         }
@@ -725,26 +730,119 @@ struct LivePagerConversationState {
     /// Renders assistant messages as markdown for frame painting. `nil` leaves
     /// them as plain text, which is what the inline and transcript paths want.
     private let markdown: PagerMarkdownRenderer?
+    private var markdownRenderersByItemIndex: [Int: PagerStreamingMarkdownRenderer] = [:]
+    private var markdownWidth: Int?
+    private var keepCompletedReasoningExpanded = false
+    private var reasoningStartedAt: Date?
 
     init(markdown: PagerMarkdownRenderer? = nil) {
         self.markdown = markdown
     }
 
-    /// Re-render the accumulated message body.
-    ///
-    /// The whole message is re-parsed on each delta rather than patched: a
-    /// streamed answer is bounded by the model's output budget, and markdown
-    /// structure is not stable under append (a fence or table opened by the
-    /// latest delta reinterprets earlier lines).
     private func styledLines(for text: String) -> [PagerStyledLine] {
         guard let markdown, !text.isEmpty else { return [] }
-        return markdown.render(text)
+        var renderer = markdown.makeStreamingRenderer(maxTableWidth: markdownWidth)
+        renderer.pushAndRender(text)
+        return renderer.finish()
     }
 
-    mutating func startTurn(prompt: String, paintUserBlock: Bool = true) {
+    private func makeStreamingMarkdownRenderer() -> PagerStreamingMarkdownRenderer? {
+        markdown?.makeStreamingRenderer(maxTableWidth: markdownWidth)
+    }
+
+    private mutating func appendMarkdown(
+        _ text: String,
+        at index: Int
+    ) -> [PagerStyledLine] {
+        guard var renderer = markdownRenderersByItemIndex[index] ?? makeStreamingMarkdownRenderer()
+        else { return [] }
+        let lines = renderer.pushAndRender(text)
+        markdownRenderersByItemIndex[index] = renderer
+        return lines
+    }
+
+    private mutating func finishMarkdown(at index: Int, fallback text: String) -> [PagerStyledLine] {
+        guard var renderer = markdownRenderersByItemIndex[index] else {
+            return styledLines(for: text)
+        }
+        let lines = renderer.finish()
+        markdownRenderersByItemIndex[index] = renderer
+        return lines
+    }
+
+    private mutating func rebuildMarkdownRenderers() {
+        markdownRenderersByItemIndex.removeAll(keepingCapacity: true)
+        guard markdown != nil else { return }
+        for index in items.indices {
+            guard case .message(var message) = items[index],
+                  message.role == .assistant || message.role == .reasoning,
+                  !message.text.isEmpty,
+                  var renderer = makeStreamingMarkdownRenderer()
+            else { continue }
+            renderer.pushAndRender(message.text)
+            message.styledLines = renderer.finish()
+            items[index] = .message(message)
+            markdownRenderersByItemIndex[index] = renderer
+        }
+    }
+
+    @discardableResult
+    mutating func setMarkdownWidth(_ width: Int?) -> Bool {
+        let normalized = width.map { max(1, $0) }
+        guard markdown != nil, markdownWidth != normalized else { return false }
+        markdownWidth = normalized
+        for index in markdownRenderersByItemIndex.keys.sorted() {
+            guard var renderer = markdownRenderersByItemIndex[index],
+                  items.indices.contains(index),
+                  case .message(var message) = items[index]
+            else { continue }
+            message.styledLines = renderer.setMaxTableWidth(normalized)
+            items[index] = .message(message)
+            markdownRenderersByItemIndex[index] = renderer
+        }
+        return true
+    }
+
+    mutating func setCompletedReasoningExpanded(_ expanded: Bool) {
+        keepCompletedReasoningExpanded = expanded
+    }
+
+    private mutating func rebuildMarkdownRendererIfNeeded(at index: Int) {
+        guard markdown != nil,
+              items.indices.contains(index),
+              case .message(var message) = items[index],
+              message.role == .assistant || message.role == .reasoning,
+              !message.text.isEmpty,
+              var renderer = makeStreamingMarkdownRenderer()
+        else { return }
+        let rendered = renderer.pushAndRender(message.text)
+        message.styledLines = message.isStreaming ? rendered : renderer.finish()
+        items[index] = .message(message)
+        markdownRenderersByItemIndex[index] = renderer
+    }
+
+    private mutating func removeMarkdownRenderer(at removedIndex: Int) {
+        var shifted: [Int: PagerStreamingMarkdownRenderer] = [:]
+        shifted.reserveCapacity(markdownRenderersByItemIndex.count)
+        for (index, renderer) in markdownRenderersByItemIndex {
+            if index < removedIndex {
+                shifted[index] = renderer
+            } else if index > removedIndex {
+                shifted[index - 1] = renderer
+            }
+        }
+        markdownRenderersByItemIndex = shifted
+    }
+
+    mutating func startTurn(
+        prompt: String,
+        promptKind: PagerPromptKind = .standard,
+        paintUserBlock: Bool = true
+    ) {
         toolIndicesByCallID.removeAll(keepingCapacity: true)
         provisionalToolArguments.removeAll(keepingCapacity: true)
         activeReasoningIndex = nil
+        reasoningStartedAt = nil
         // Both blocks carry the construction instant for the `/timestamps`
         // overlay — upstream's `ScrollbackEntry` constructors stamp
         // `created_at: Some(Local::now())` on push (`entry.rs:198,230`).
@@ -755,6 +853,7 @@ struct LivePagerConversationState {
         if paintUserBlock {
             items.append(.message(PagerMessage(
                 role: .user,
+                promptKind: promptKind,
                 text: prompt,
                 createdAt: Date()
             )))
@@ -766,10 +865,15 @@ struct LivePagerConversationState {
             createdAt: Date()
         )))
         activeAssistantIndex = items.indices.last
+        if let activeAssistantIndex,
+           let renderer = makeStreamingMarkdownRenderer() {
+            markdownRenderersByItemIndex[activeAssistantIndex] = renderer
+        }
     }
 
     mutating func appendMessage(_ message: PagerMessage) {
         items.append(.message(message))
+        rebuildMarkdownRendererIfNeeded(at: items.count - 1)
     }
 
     /// Append any conversation item (including separators). Live-seam tests
@@ -777,6 +881,54 @@ struct LivePagerConversationState {
     /// typed appenders above so streaming indices stay coherent.
     mutating func appendItem(_ item: PagerConversationItem) {
         items.append(item)
+    }
+
+    mutating func upsertBlock(_ block: PagerTranscriptBlock) {
+        if let index = items.firstIndex(where: { item in
+            guard case .block(let existing) = item else { return false }
+            return existing.stableID == block.stableID
+        }) {
+            items[index] = .block(block)
+        } else {
+            items.append(.block(block))
+        }
+    }
+
+    mutating func attachHooks(_ hooks: [PagerHookRun], toCallID callID: String) {
+        guard let index = toolIndicesByCallID[callID],
+              items.indices.contains(index),
+              case .tool(var tool) = items[index]
+        else { return }
+        tool.hooks = hooks
+        items[index] = .tool(tool)
+    }
+
+    mutating func attachStopHooks(_ hooks: [PagerHookRun], toBlockID blockID: String) {
+        guard let index = items.firstIndex(where: { item in
+            guard case .block(let block) = item else { return false }
+            return block.stableID == blockID
+        }), case .block(.sessionEvent(var block)) = items[index]
+        else { return }
+        block.stopHooks = hooks
+        items[index] = .block(.sessionEvent(block))
+    }
+
+    mutating func removeBlock(id: String) {
+        guard let index = items.firstIndex(where: { item in
+            guard case .block(let block) = item else { return false }
+            return block.stableID == id
+        }) else { return }
+        items.remove(at: index)
+        removeMarkdownRenderer(at: index)
+        if let activeAssistantIndex, activeAssistantIndex > index {
+            self.activeAssistantIndex = activeAssistantIndex - 1
+        }
+        if let activeReasoningIndex, activeReasoningIndex > index {
+            self.activeReasoningIndex = activeReasoningIndex - 1
+        }
+        toolIndicesByCallID = toolIndicesByCallID.mapValues { value in
+            value > index ? value - 1 : value
+        }
     }
 
     /// Drop everything from `index` on — what `/rewind` does to the visible
@@ -793,6 +945,8 @@ struct LivePagerConversationState {
         activeReasoningIndex = nil
         toolIndicesByCallID.removeAll(keepingCapacity: true)
         provisionalToolArguments.removeAll(keepingCapacity: true)
+        reasoningStartedAt = nil
+        markdownRenderersByItemIndex = markdownRenderersByItemIndex.filter { $0.key < index }
     }
 
     mutating func removeAll() {
@@ -801,6 +955,8 @@ struct LivePagerConversationState {
         activeReasoningIndex = nil
         toolIndicesByCallID.removeAll(keepingCapacity: true)
         provisionalToolArguments.removeAll(keepingCapacity: true)
+        markdownRenderersByItemIndex.removeAll(keepingCapacity: true)
+        reasoningStartedAt = nil
     }
 
     /// Rebuild the visible transcript from a persisted conversation — what
@@ -840,6 +996,7 @@ struct LivePagerConversationState {
         )
         items = projected.items
         toolIndicesByCallID = projected.toolIndicesByCallID
+        rebuildMarkdownRenderers()
     }
 
     /// In-place edit of the blocks, for the fold/raw effects the scrollback's
@@ -853,23 +1010,30 @@ struct LivePagerConversationState {
     }
 
     mutating func appendAssistant(_ text: String) {
+        finishReasoning()
         guard let activeAssistantIndex,
               items.indices.contains(activeAssistantIndex),
               case .message(var message) = items[activeAssistantIndex]
         else {
+            let index = items.count
             items.append(.message(PagerMessage(
                 role: .assistant,
                 text: text,
                 isStreaming: true,
-                styledLines: styledLines(for: text),
+                styledLines: [],
                 createdAt: Date()
             )))
-            self.activeAssistantIndex = items.indices.last
+            markdownRenderersByItemIndex[index] = makeStreamingMarkdownRenderer()
+            if case .message(var created) = items[index] {
+                created.styledLines = appendMarkdown(text, at: index)
+                items[index] = .message(created)
+            }
+            self.activeAssistantIndex = index
             return
         }
         message.text += text
         message.isStreaming = true
-        message.styledLines = styledLines(for: message.text)
+        message.styledLines = appendMarkdown(text, at: activeAssistantIndex)
         items[activeAssistantIndex] = .message(message)
     }
 
@@ -881,11 +1045,12 @@ struct LivePagerConversationState {
         else { return }
         if removingIfEmpty, message.text.isEmpty {
             items.remove(at: activeAssistantIndex)
+            removeMarkdownRenderer(at: activeAssistantIndex)
             self.activeAssistantIndex = nil
             return
         }
         message.isStreaming = false
-        message.styledLines = styledLines(for: message.text)
+        message.styledLines = finishMarkdown(at: activeAssistantIndex, fallback: message.text)
         items[activeAssistantIndex] = .message(message)
         self.activeAssistantIndex = nil
     }
@@ -906,13 +1071,22 @@ struct LivePagerConversationState {
                 role: .reasoning,
                 text: text,
                 isStreaming: true,
+                styledLines: [],
                 createdAt: Date()
             )))
-            self.activeReasoningIndex = items.indices.last
+            let index = items.count - 1
+            markdownRenderersByItemIndex[index] = makeStreamingMarkdownRenderer()
+            if case .message(var created) = items[index] {
+                created.styledLines = appendMarkdown(text, at: index)
+                items[index] = .message(created)
+            }
+            reasoningStartedAt = Date()
+            self.activeReasoningIndex = index
             return
         }
         message.text += text
         message.isStreaming = true
+        message.styledLines = appendMarkdown(text, at: activeReasoningIndex)
         items[activeReasoningIndex] = .message(message)
     }
 
@@ -926,11 +1100,14 @@ struct LivePagerConversationState {
             return
         }
         message.isStreaming = false
-        // Collapse finished thinking to the one-line header, matching
-        // `thinking.rs`'s finished_display_mode.
-        message.isCollapsed = true
+        message.styledLines = finishMarkdown(at: activeReasoningIndex, fallback: message.text)
+        if message.duration == nil, let reasoningStartedAt {
+            message.duration = max(0, Date().timeIntervalSince(reasoningStartedAt))
+        }
+        message.isCollapsed = !keepCompletedReasoningExpanded
         items[activeReasoningIndex] = .message(message)
         self.activeReasoningIndex = nil
+        reasoningStartedAt = nil
     }
 
     /// Hydrate a provisional tool card from a sampler tool-call delta.
@@ -983,6 +1160,7 @@ struct LivePagerConversationState {
     /// output without resetting fold, preserve first `finishedAt` and
     /// existing `detail` unless a richer update supplies replacements.
     mutating func apply(_ tool: OpenGrokPagerToolUpdate, atSeconds seconds: TimeInterval? = nil) {
+        finishReasoning()
         let state = Self.renderState(for: tool.state)
         let existing: PagerToolCard?
         if let index = toolIndicesByCallID[tool.callID],
@@ -1015,7 +1193,16 @@ struct LivePagerConversationState {
             output = existing?.output
         }
         let detail = existing?.detail
-        let isExpanded = existing?.isExpanded ?? false
+        let structuredOutput = tool.structuredOutput ?? existing?.structuredOutput
+        let isBashMode = tool.isBashMode ?? existing?.isBashMode
+        var isExpanded = existing?.isExpanded ?? false
+        var isFullyExpanded = existing?.isFullyExpanded ?? false
+        if isBashMode == true {
+            isExpanded = true
+            if state != .running, state != .pending {
+                isFullyExpanded = true
+            }
+        }
 
         var finishedAt = existing?.finishedAt
         if finishedAt == nil, state != .running, state != .pending {
@@ -1030,8 +1217,11 @@ struct LivePagerConversationState {
             output: output,
             state: state,
             isExpanded: isExpanded,
+            isFullyExpanded: isFullyExpanded,
             finishedAt: finishedAt,
-            detail: detail
+            detail: detail,
+            isBashMode: isBashMode,
+            structuredOutput: structuredOutput
         )
         if let index = toolIndicesByCallID[tool.callID], items.indices.contains(index) {
             items[index] = .tool(card)
@@ -1042,7 +1232,114 @@ struct LivePagerConversationState {
         }
         if state != .running {
             provisionalToolArguments.removeValue(forKey: tool.callID)
+            mergeAdjacentEditCardIfNeeded(callID: tool.callID)
         }
+    }
+
+    /// Apply a file-scoped syntax result only if the call still resolves to
+    /// the same visible edit card. A stale/latest-loses worker result simply
+    /// returns false and never mutates a newer card.
+    @discardableResult
+    mutating func applyEditHighlights(
+        callID: String,
+        files highlightedFiles: [PagerEditFile]
+    ) -> Bool {
+        guard let index = toolIndicesByCallID[callID],
+              items.indices.contains(index),
+              case .tool(var card) = items[index],
+              card.kind == .edit || card.kind == .create
+        else { return false }
+        let highlightsByPath = Dictionary(uniqueKeysWithValues: highlightedFiles.map {
+            ($0.path, $0.highlights)
+        })
+        guard !highlightsByPath.isEmpty else { return false }
+        var files = card.editFiles ?? card.editHunks.map {
+            [PagerEditFile(
+                path: card.editPath ?? card.input,
+                hunks: $0,
+                isNewFile: card.isNewFileForEdit ?? false
+            )]
+        } ?? []
+        var changed = false
+        for fileIndex in files.indices {
+            guard let highlights = highlightsByPath[files[fileIndex].path] else { continue }
+            files[fileIndex].highlights = highlights
+            changed = true
+        }
+        guard changed else { return false }
+        card.editFiles = files
+        card.editHunks = files.first?.hunks
+        items[index] = .tool(card)
+        return true
+    }
+
+    private mutating func mergeAdjacentEditCardIfNeeded(callID: String) {
+        guard let index = toolIndicesByCallID[callID], index > 0,
+              items.indices.contains(index),
+              case .tool(let current) = items[index],
+              current.state != .running, current.state != .pending,
+              let currentFile = Self.singleEditFile(current),
+              case .tool(var previous) = items[index - 1],
+              previous.state != .running, previous.state != .pending,
+              let previousFile = Self.singleEditFile(previous),
+              Self.normalizedEditPath(previousFile.path) == Self.normalizedEditPath(currentFile.path)
+        else { return }
+
+        let mergedFile = PagerEditFile(
+            path: currentFile.path,
+            hunks: stitchOverlappingHunks(previousFile.hunks + currentFile.hunks),
+            isNewFile: previousFile.isNewFile && currentFile.isNewFile,
+            highlights: currentFile.highlights.isEmpty
+                ? previousFile.highlights
+                : currentFile.highlights
+        )
+        previous.editFiles = [mergedFile]
+        previous.editPath = mergedFile.path
+        previous.editHunks = mergedFile.hunks
+        previous.isNewFileForEdit = mergedFile.isNewFile
+        previous.kind = mergedFile.isNewFile ? .create : .edit
+        previous.editLinesAdded = Self.sum(previous.editLinesAdded, current.editLinesAdded)
+        previous.editLinesRemoved = Self.sum(previous.editLinesRemoved, current.editLinesRemoved)
+        previous.editCount = Self.sum(previous.editCount, current.editCount)
+        previous.editIsTrusted = previous.editIsTrusted == true && current.editIsTrusted == true
+        previous.output = current.output ?? previous.output
+        previous.state = current.state
+        previous.finishedAt = current.finishedAt ?? previous.finishedAt
+        previous.isExpanded = previous.isExpanded || current.isExpanded
+        previous.structuredOutput = current.structuredOutput ?? previous.structuredOutput
+        items[index - 1] = .tool(previous)
+        items.remove(at: index)
+        removeMarkdownRenderer(at: index)
+
+        for (mappedCallID, mappedIndex) in toolIndicesByCallID {
+            if mappedIndex == index {
+                toolIndicesByCallID[mappedCallID] = index - 1
+            } else if mappedIndex > index {
+                toolIndicesByCallID[mappedCallID] = mappedIndex - 1
+            }
+        }
+    }
+
+    private static func singleEditFile(_ card: PagerToolCard) -> PagerEditFile? {
+        guard card.kind == .edit || card.kind == .create else { return nil }
+        if let files = card.editFiles {
+            return files.count == 1 ? files[0] : nil
+        }
+        guard let hunks = card.editHunks else { return nil }
+        return PagerEditFile(
+            path: card.editPath ?? card.input,
+            hunks: hunks,
+            isNewFile: card.isNewFileForEdit ?? false
+        )
+    }
+
+    private static func normalizedEditPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
+    private static func sum(_ lhs: Int?, _ rhs: Int?) -> Int? {
+        guard lhs != nil || rhs != nil else { return nil }
+        return (lhs ?? 0) + (rhs ?? 0)
     }
 
     /// Narrow test probe: tool card by call id.
@@ -1111,6 +1408,9 @@ struct LivePagerConversationState {
                 lines.append("  result: \(output)")
             }
             return lines
+        case .block(let block):
+            let content = block.plainText
+            return content.isEmpty ? [block.displayTitle] : content.components(separatedBy: "\n")
         case .separator(let text):
             return [text]
         }
@@ -1378,7 +1678,7 @@ enum LiveToolCardMerge {
                     return path
                 }
             }
-        case .search, .webSearch, .memorySearch, .integrationSearch:
+        case .search, .webSearch, .xSearch, .memorySearch, .integrationSearch:
             for key in ["query", "pattern", "glob"] {
                 if case .string(let query) = object[key], !query.isEmpty {
                     return query
@@ -1655,7 +1955,7 @@ actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
     private func renderFullScreen() async throws {
         renderTick += 1
         let terminalSize = terminal.size() ?? OpenGrokLiveTerminalSize(width: 80, height: 24)
-        let result = renderEngine.render(PagerRenderState(
+        var result = renderEngine.render(PagerRenderState(
             size: OpenGrokTerminalCore.TerminalSize(
                 width: terminalSize.width,
                 height: terminalSize.height
@@ -1676,8 +1976,61 @@ actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
             ),
             shortcuts: PagerShortcutsBar(
                 hints: [PagerShortcutHint(key: "Ctrl+c", label: "cancel", isPinned: true)]
-            )
+            ),
+            groupToolVerbs: true
         ))
+        if conversation.setMarkdownWidth(result.layout.contentWidth) {
+            result = renderEngine.render(PagerRenderState(
+                size: OpenGrokTerminalCore.TerminalSize(
+                    width: terminalSize.width,
+                    height: terminalSize.height
+                ),
+                statusBar: PagerStatusBar(
+                    workingDirectory: LivePagerChrome.collapseHome(
+                        FileManager.default.currentDirectoryPath
+                    )
+                ),
+                conversation: conversation.items,
+                turnStatus: PagerTurnStatus(label: status, tick: renderTick),
+                input: PagerComposerState(
+                    text: "",
+                    isFocused: false,
+                    cursorVisible: false,
+                    placeholder: "",
+                    maximumHeight: 3
+                ),
+                shortcuts: PagerShortcutsBar(
+                    hints: [PagerShortcutHint(key: "Ctrl+c", label: "cancel", isPinned: true)]
+                ),
+                groupToolVerbs: true
+            ))
+            if conversation.setMarkdownWidth(result.layout.contentWidth) {
+                result = renderEngine.render(PagerRenderState(
+                    size: OpenGrokTerminalCore.TerminalSize(
+                        width: terminalSize.width,
+                        height: terminalSize.height
+                    ),
+                    statusBar: PagerStatusBar(
+                        workingDirectory: LivePagerChrome.collapseHome(
+                            FileManager.default.currentDirectoryPath
+                        )
+                    ),
+                    conversation: conversation.items,
+                    turnStatus: PagerTurnStatus(label: status, tick: renderTick),
+                    input: PagerComposerState(
+                        text: "",
+                        isFocused: false,
+                        cursorVisible: false,
+                        placeholder: "",
+                        maximumHeight: 3
+                    ),
+                    shortcuts: PagerShortcutsBar(
+                        hints: [PagerShortcutHint(key: "Ctrl+c", label: "cancel", isPinned: true)]
+                    ),
+                    groupToolVerbs: true
+                ))
+            }
+        }
         let frame = ANSIOutput.beginSynchronizedUpdate
             + ANSIOutput.moveTo(column: 0, row: 0)
             + result.snapshot(includeTrailingSpaces: true)

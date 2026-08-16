@@ -1633,6 +1633,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                 return nil
                             }
                         },
+                        bashCommandHandler: { command in
+                            try await LiveUserBashCommand.start(
+                                command: command,
+                                sessionID: sessionID,
+                                workingDirectory: cwd,
+                                toolExecutor: toolExecutor,
+                                renderer: renderer
+                            )
+                        },
                         workflowsEnabled: workflowsEnabled,
                         mouseReportingToggleEnabled: uiConfiguration.mouseReportingToggleEnabled
                     )

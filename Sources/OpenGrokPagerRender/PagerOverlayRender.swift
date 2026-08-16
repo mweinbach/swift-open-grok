@@ -619,7 +619,10 @@ private func drawTextBody(
     theme: PagerRenderTheme
 ) {
     guard area.width > 0, area.height > 0 else { return }
-    let start = min(max(0, text.scrollOffset), max(0, text.lines.count))
+    let maximum = max(0, text.lines.count - area.height)
+    let start = text.followsTail
+        ? maximum
+        : min(max(0, text.scrollOffset), maximum)
     for row in 0..<area.height {
         let index = start + row
         guard text.lines.indices.contains(index) else { break }
@@ -633,6 +636,71 @@ private func drawTextBody(
             inheritForeground: theme.textPrimary
         )
     }
+}
+
+public func pagerMinimalBelowPromptHeight(
+    _ overlay: PagerOverlay,
+    width: Int,
+    ceiling: Int = 12
+) -> Int {
+    guard overlay.minimalBelowPrompt else { return 0 }
+    let bodyRows: Int
+    switch overlay.content {
+    case .list(let list):
+        bodyRows = list.filteredRows.count + (list.isFilterable ? 2 : 0)
+    case .text(let text):
+        bodyRows = text.lines.count
+    default:
+        bodyRows = 1
+    }
+    return min(max(3, bodyRows + 2), max(3, ceiling))
+}
+
+public func renderPagerMinimalBelowPrompt(
+    _ overlay: PagerOverlay,
+    in area: TerminalRect,
+    buffer: inout CellBuffer,
+    theme: PagerRenderTheme
+) {
+    guard overlay.minimalBelowPrompt, area.width > 0, area.height > 0 else { return }
+    paintBlank(&buffer, area: area, foreground: theme.textPrimary, background: theme.bgBase)
+    _ = buffer.setString(
+        x: area.x,
+        y: area.y,
+        text: truncateToWidth("─ \(overlay.title) ", width: area.width),
+        style: [.bold],
+        foreground: theme.accentUser,
+        background: theme.bgBase
+    )
+    let body = TerminalRect(
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: max(0, area.height - 2)
+    )
+    switch overlay.content {
+    case .list(let list):
+        _ = drawListBody(list, in: body, buffer: &buffer, theme: theme)
+    case .text(let text):
+        drawTextBody(text, in: body, buffer: &buffer, theme: theme)
+    default:
+        _ = buffer.setString(
+            x: body.x,
+            y: body.y,
+            text: "Unsupported panel",
+            foreground: theme.grayDim,
+            background: theme.bgBase
+        )
+    }
+    guard area.height > 1 else { return }
+    let footer = overlay.hints.map { "\($0.key) \($0.label)" }.joined(separator: " · ")
+    _ = buffer.setString(
+        x: area.x,
+        y: area.bottom - 1,
+        text: truncateToWidth(footer, width: area.width),
+        foreground: theme.grayDim,
+        background: theme.bgBase
+    )
 }
 
 // MARK: - Bottom sheet
@@ -1160,28 +1228,45 @@ private func drawPlanApprovalBody(
     ])
     y += 1
 
-    let showFeedbackRow = prompt.focus == .feedbackInput || !prompt.feedbackText.isEmpty
-    let bodyBottom = showFeedbackRow ? area.bottom - 1 : area.bottom
+    let showEditorRow = prompt.focus != .viewing || !prompt.feedbackText.isEmpty
+    let bodyBottom = showEditorRow ? area.bottom - 1 : area.bottom
     let lines = prompt.bodyLines
     var index = min(max(0, prompt.scrollOffset), max(0, lines.count))
     while y < bodyBottom, lines.indices.contains(index) {
-        writeSpans([
+        let isSelected = index == prompt.selectedLineIndex
+        var spans = [
+            PagerStyledSpan(
+                text: isSelected ? "❯ " : "  ",
+                foreground: theme.accentUser,
+                style: isSelected ? [.bold] : []
+            ),
             PagerStyledSpan(text: lines[index], foreground: theme.textPrimary)
-        ])
+        ]
+        if let comment = prompt.comments[index], !comment.isEmpty {
+            spans.append(PagerStyledSpan(
+                text: "  ◇ \(comment)",
+                foreground: theme.accentUser
+            ))
+        }
+        writeSpans(spans, rowBackground: isSelected ? theme.bgVisual : nil)
         index += 1
     }
 
-    guard showFeedbackRow else { return }
+    guard showEditorRow else { return }
     y = max(y, area.bottom - 1)
+    let isComment = prompt.focus == .commentInput
     var feedbackSpans: [PagerStyledSpan] = [
         PagerStyledSpan(
-            text: "Feedback: ",
+            text: isComment ? "Comment L\(prompt.selectedLineIndex + 1): " : "Feedback: ",
             foreground: theme.accentUser,
-            style: prompt.focus == .feedbackInput ? [.bold] : []
+            style: prompt.focus == .viewing ? [] : [.bold]
         ),
-        PagerStyledSpan(text: prompt.feedbackText, foreground: theme.textPrimary)
+        PagerStyledSpan(
+            text: isComment ? prompt.commentText : prompt.feedbackText,
+            foreground: theme.textPrimary
+        )
     ]
-    if prompt.focus == .feedbackInput {
+    if prompt.focus != .viewing {
         feedbackSpans.append(PagerStyledSpan(text: "▌", foreground: theme.accentUser))
     }
     writeSpans(feedbackSpans, rowBackground: theme.bgVisual)
@@ -1260,6 +1345,14 @@ private func drawWelcomeBody(
     motion: PagerMotionSnapshot = PagerMotionSnapshot()
 ) -> [PagerOverlayBounds.Row] {
     guard area.width > 0, area.height > 0 else { return [] }
+    if let auth = welcome.auth {
+        return renderPagerWelcomeAuth(
+            auth,
+            in: area,
+            buffer: &buffer,
+            theme: theme
+        )
+    }
     let logo = PagerWelcomeLogo.art(forHeight: area.height)
     // The hero box always uses the full logo regardless of the height tier
     // (`hero_box.rs:326`), but it only appears once the logo itself does.

@@ -64,6 +64,8 @@ public struct OpenGrokPagerToolUpdate: Sendable, Equatable {
     public var name: String
     public var input: String
     public var output: String?
+    public var structuredOutput: String?
+    public var isBashMode: Bool?
     public var state: OpenGrokPagerToolState
     /// How `output` merges onto an existing card. Progress chunks use
     /// `.append`; terminal updates use `.replace` (the default).
@@ -74,6 +76,8 @@ public struct OpenGrokPagerToolUpdate: Sendable, Equatable {
         name: String,
         input: String,
         output: String? = nil,
+        structuredOutput: String? = nil,
+        isBashMode: Bool? = nil,
         state: OpenGrokPagerToolState,
         outputOp: OpenGrokPagerToolOutputOp = .replace
     ) {
@@ -81,6 +85,8 @@ public struct OpenGrokPagerToolUpdate: Sendable, Equatable {
         self.name = name
         self.input = input
         self.output = output
+        self.structuredOutput = structuredOutput
+        self.isBashMode = isBashMode
         self.state = state
         self.outputOp = outputOp
     }

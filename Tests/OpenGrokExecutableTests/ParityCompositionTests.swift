@@ -2762,9 +2762,17 @@ struct ParityCompositionTests {
         ])
         #expect(terminal.output.contains("\u{1B}[?1049h"))
         #expect(terminal.output.contains("\u{1B}[?1049l"))
-        #expect(terminal.output.hasSuffix(
-            "You: first question\nGrok: first answer\nYou: second question\nGrok: second answer\n"
-        ))
+        let finalTranscript = terminal.output.components(separatedBy: "\u{1B}[?1049l").last ?? ""
+        let messageLines = finalTranscript.split(separator: "\n").filter {
+            !$0.hasPrefix("Turn completed")
+        }
+        #expect(Array(messageLines.suffix(4)) == [
+            "You: first question",
+            "Grok: first answer",
+            "You: second question",
+            "Grok: second answer",
+        ])
+        #expect(finalTranscript.components(separatedBy: "Turn completed").count - 1 == 2)
     }
 
     @Test("live interactive composition redraws after terminal resize")
@@ -2823,7 +2831,15 @@ struct ParityCompositionTests {
         #expect(err.contents.isEmpty)
         #expect(sampler.recordedRequests.map(\.prompt) == ["resize question"])
         #expect(fullScreenClearCount >= 2)
-        #expect(terminal.output.hasSuffix("You: resize question\nGrok: resized answer\n"))
+        let finalTranscript = terminal.output.components(separatedBy: "\u{1B}[?1049l").last ?? ""
+        let messageLines = finalTranscript.split(separator: "\n").filter {
+            !$0.hasPrefix("Turn completed")
+        }
+        #expect(Array(messageLines.suffix(2)) == [
+            "You: resize question",
+            "Grok: resized answer",
+        ])
+        #expect(finalTranscript.contains("Turn completed"))
     }
 
     @Test("injected input drives multiple sampler-backed turns")

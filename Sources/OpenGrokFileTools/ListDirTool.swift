@@ -39,6 +39,7 @@ public enum ListDirTool {
 
             var lines: [String] = ["\(absolute)/"]
             var truncated = false
+            var entryCount = 0
             for name in contents {
                 // Skip dotfiles like Rust default listing (gitignore may filter more).
                 if name.hasPrefix(".") { continue }
@@ -52,6 +53,7 @@ public enum ListDirTool {
                     break
                 }
                 lines.append(entry)
+                entryCount += 1
             }
             if truncated {
                 lines.append("    ...")
@@ -66,7 +68,7 @@ public enum ListDirTool {
                 "path": .string(absolute),
                 "content": .string(content),
                 "truncated": .bool(truncated),
-                "entry_count": .number(.int64(Int64(contents.count))),
+                "entry_count": .number(.int64(Int64(entryCount))),
             ])
             return .success(
                 TypedToolOutput(toolId: FileToolIDs.listDir, value: value, modelOutput: [.text(text: content)])

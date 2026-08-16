@@ -143,21 +143,41 @@ struct PagerPlanApprovalOverlayKeyTests {
         ))
     }
 
-    @Test("arrows and j/k scroll the plan body")
+    @Test("arrows and j/k move the selected plan line and scroll when needed")
     func scrolling() {
         let longPlan = (1...40).map { "line \($0)" }.joined(separator: "\n")
         var stack = planStack(planRequest(content: longPlan))
         #expect(stack.handle(key(.down), viewportHeight: 10) == .redraw)
-        #expect(prompt(in: stack)?.scrollOffset == 1)
+        #expect(prompt(in: stack)?.selectedLineIndex == 1)
+        #expect(prompt(in: stack)?.scrollOffset == 0)
         #expect(stack.handle(character("j"), viewportHeight: 10) == .redraw)
-        #expect(prompt(in: stack)?.scrollOffset == 2)
+        #expect(prompt(in: stack)?.selectedLineIndex == 2)
         #expect(stack.handle(character("k"), viewportHeight: 10) == .redraw)
         #expect(stack.handle(key(.up), viewportHeight: 10) == .redraw)
+        #expect(prompt(in: stack)?.selectedLineIndex == 0)
         #expect(prompt(in: stack)?.scrollOffset == 0)
         // Clamped at the top: no state change means the key is swallowed.
         #expect(stack.handle(key(.up), viewportHeight: 10) == .consumed)
         #expect(stack.handle(key(.pageDown), viewportHeight: 10) == .redraw)
-        #expect(prompt(in: stack)?.scrollOffset == 10)
+        #expect(prompt(in: stack)?.selectedLineIndex == 10)
+        #expect(prompt(in: stack)?.scrollOffset == 1)
+    }
+
+    @Test("c edits a line comment, Enter saves it, and approval preserves it")
+    func lineComments() {
+        var stack = planStack(planRequest(content: "first\nsecond\nthird"))
+        #expect(stack.handle(key(.down), viewportHeight: 10) == .redraw)
+        #expect(stack.handle(character("c"), viewportHeight: 10) == .redraw)
+        #expect(prompt(in: stack)?.focus == .commentInput)
+        type("needs tests", into: &stack)
+        #expect(stack.handle(key(.enter), viewportHeight: 10) == .redraw)
+        #expect(prompt(in: stack)?.comments[1] == "needs tests")
+        #expect(stack.handle(character("a")) == .planApproval(
+            id: "plan-approval:req-1",
+            requestID: "req-1",
+            outcome: .approved
+        ))
+        #expect(prompt(in: stack)?.comments[1] == "needs tests")
     }
 }
 

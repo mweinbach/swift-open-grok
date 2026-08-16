@@ -10,11 +10,20 @@ public enum MarkdownTextStyle: Sendable, Equatable {
     case emphasis
     case strikethrough
     case code
+    case syntaxKeyword
+    case syntaxString
+    case syntaxNumber
+    case syntaxComment
+    case syntaxType
     case quote
     case listMarker
     case tableBorder
     case link
     case image
+}
+
+public enum MarkdownLineBackground: Sendable, Equatable {
+    case code
 }
 
 public struct MarkdownRenderSegment: Sendable, Equatable {
@@ -30,10 +39,16 @@ public struct MarkdownRenderSegment: Sendable, Equatable {
 public struct MarkdownRenderLine: Sendable, Equatable {
     public let segments: [MarkdownRenderSegment]
     public let sourceLine: Int
+    public let background: MarkdownLineBackground?
 
-    public init(segments: [MarkdownRenderSegment], sourceLine: Int) {
+    public init(
+        segments: [MarkdownRenderSegment],
+        sourceLine: Int,
+        background: MarkdownLineBackground? = nil
+    ) {
         self.segments = segments
         self.sourceLine = sourceLine
+        self.background = background
     }
 
     public var text: String {
@@ -233,6 +248,7 @@ public struct StreamingMarkdownRenderer: Sendable {
     private var frozenSourceByteCount = 0
     private var frozenOutputLineCount = 0
     private var lastCheckpointStorage: MarkdownCheckpoint?
+    private var lastRenderedSourceByteCountStorage = 0
 
     public init(configuration: MarkdownRenderConfiguration = MarkdownRenderConfiguration()) {
         self.configuration = configuration
@@ -249,6 +265,9 @@ public struct StreamingMarkdownRenderer: Sendable {
     public var frozenBytes: Int { frozenSourceByteCount }
     public var frozenLinesCount: Int { frozenOutputLineCount }
     public var lastCheckpoint: MarkdownCheckpoint? { lastCheckpointStorage }
+    /// Source bytes parsed by the most recent render. Once a prefix freezes,
+    /// this is the unfrozen tail rather than the full accumulated document.
+    public var lastRenderedSourceByteCount: Int { lastRenderedSourceByteCountStorage }
 
     public mutating func push(_ chunk: String) {
         sourceStorage.append(chunk)
@@ -262,16 +281,53 @@ public struct StreamingMarkdownRenderer: Sendable {
 
     @discardableResult
     public mutating func render() -> MarkdownRenderOutput {
-        outputStorage = MarkdownRenderer(configuration: configuration).render(sourceStorage)
+        if frozenSourceByteCount > 0,
+           frozenOutputLineCount <= outputStorage.lines.count,
+           let tailStart = sourceStorage.utf8Index(at: frozenSourceByteCount) {
+            let frozen = outputStorage.prefix(
+                lineCount: frozenOutputLineCount,
+                sourceBytes: frozenSourceByteCount
+            )
+            let tailSource = String(sourceStorage[tailStart...])
+            let sourceLineOffset = sourceStorage[..<tailStart]
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .count - 1
+            let needsSeparator = !frozen.lines.isEmpty
+                && !tailSource.isEmpty
+                && frozen.lines.last?.text.isEmpty == false
+            let separatorCount = needsSeparator ? 1 : 0
+            let linkIDOffset = (frozen.hyperlinks.map(\.id).max() ?? -1) + 1
+            let tail = MarkdownRenderer(configuration: configuration).render(tailSource)
+                .offset(
+                    sourceLines: sourceLineOffset,
+                    outputLines: frozen.lines.count + separatorCount,
+                    sourceBytes: frozenSourceByteCount,
+                    linkIDs: linkIDOffset
+                )
+            outputStorage = frozen.appendingStreamingTail(
+                tail,
+                separatorSourceLine: needsSeparator ? max(0, sourceLineOffset - 1) : nil
+            )
+            lastRenderedSourceByteCountStorage = tailSource.utf8.count
+        } else {
+            outputStorage = MarkdownRenderer(configuration: configuration).render(sourceStorage)
+            lastRenderedSourceByteCountStorage = sourceStorage.utf8.count
+        }
         updateFrozenBoundary()
         return outputStorage
     }
 
     @discardableResult
     public mutating func finish() -> MarkdownRenderOutput {
-        render()
+        outputStorage = MarkdownRenderer(configuration: configuration).render(sourceStorage)
+        lastRenderedSourceByteCountStorage = sourceStorage.utf8.count
         frozenSourceByteCount = sourceStorage.utf8.count
         frozenOutputLineCount = outputStorage.lines.count
+        lastCheckpointStorage = MarkdownCheckpoint(
+            sourceBytes: frozenSourceByteCount,
+            outputLines: frozenOutputLineCount,
+            kind: sourceStorage.lastMarkdownCheckpointKind()
+        )
         return outputStorage
     }
 
@@ -281,6 +337,7 @@ public struct StreamingMarkdownRenderer: Sendable {
         frozenSourceByteCount = 0
         frozenOutputLineCount = 0
         lastCheckpointStorage = nil
+        lastRenderedSourceByteCountStorage = 0
     }
 
     public mutating func setStyle(_ style: MarkdownStyle) {
@@ -315,47 +372,160 @@ public struct StreamingMarkdownRenderer: Sendable {
         frozenSourceByteCount = 0
         frozenOutputLineCount = 0
         lastCheckpointStorage = nil
+        lastRenderedSourceByteCountStorage = 0
     }
 
     private mutating func updateFrozenBoundary() {
-        // Find top-level block boundaries where rendering is stable and can be frozen.
-        let document = MarkdownParser().parse(sourceStorage)
-        var lastValidCheckpoint: MarkdownCheckpoint?
-
-        for block in document.blocks {
-            switch block.kind {
-            case let .table(table):
-                // When a table block is complete, find its rendered line range
-                let lastSrcLine = table.sourceLines.last ?? block.sourceLine
-                if let tableIdx = document.blocks.firstIndex(where: { $0.sourceLine == block.sourceLine }),
-                   tableIdx < document.blocks.count - 1 || sourceStorage.hasSuffix("\n\n") {
-                    let linesCount = outputStorage.lines.lastIndex(where: { $0.sourceLine <= lastSrcLine + 20 }).map { $0 + 1 } ?? outputStorage.lines.count
-                    let byteCount = sourceStorage[..<sourceStorage.endIndex].utf8.count
-                    lastValidCheckpoint = MarkdownCheckpoint(sourceBytes: byteCount, outputLines: linesCount, kind: .table)
-                }
-            case .heading:
-                lastValidCheckpoint = MarkdownCheckpoint(sourceBytes: sourceStorage.utf8.count, outputLines: outputStorage.lines.count, kind: .heading)
-            case .thematicBreak:
-                lastValidCheckpoint = MarkdownCheckpoint(sourceBytes: sourceStorage.utf8.count, outputLines: outputStorage.lines.count, kind: .thematicBreak)
-            default:
-                break
-            }
-        }
-
-        if let boundary = sourceStorage.range(of: "\n\n", options: .backwards) {
-            let byteCount = sourceStorage[..<boundary.upperBound].utf8.count
-            let lineThreshold = sourceStorage[..<boundary.lowerBound].split(separator: "\n", omittingEmptySubsequences: false).count
-            let lineCount = outputStorage.lines.lastIndex(where: {
-                $0.sourceLine < lineThreshold
-            }).map { $0 + 1 } ?? 0
-
-            frozenSourceByteCount = byteCount
-            frozenOutputLineCount = lineCount
-            lastCheckpointStorage = lastValidCheckpoint ?? MarkdownCheckpoint(sourceBytes: byteCount, outputLines: lineCount, kind: .paragraph)
-        } else {
+        guard let boundary = sourceStorage.lastStableBlankLineBoundary() else {
             frozenSourceByteCount = 0
             frozenOutputLineCount = 0
             lastCheckpointStorage = nil
+            return
         }
+        let frozenSource = String(sourceStorage[..<boundary])
+        let byteCount = frozenSource.utf8.count
+        let tailSourceLine = max(0, frozenSource
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .count - 1)
+        let lineCount = outputStorage.lines.lastIndex(where: {
+            $0.sourceLine < tailSourceLine
+        }).map { $0 + 1 } ?? 0
+        frozenSourceByteCount = byteCount
+        frozenOutputLineCount = lineCount
+        lastCheckpointStorage = MarkdownCheckpoint(
+            sourceBytes: byteCount,
+            outputLines: lineCount,
+            kind: frozenSource.lastMarkdownCheckpointKind()
+        )
+    }
+}
+
+private extension String {
+    func utf8Index(at offset: Int) -> String.Index? {
+        guard offset >= 0, offset <= utf8.count,
+              let utf8Index = utf8.index(utf8.startIndex, offsetBy: offset, limitedBy: utf8.endIndex)
+        else { return nil }
+        return String.Index(utf8Index, within: self)
+    }
+
+    func lastStableBlankLineBoundary() -> String.Index? {
+        var fence: Character?
+        var lastBoundary: String.Index?
+        var lineStart = startIndex
+        while lineStart < endIndex {
+            let lineEnd = self[lineStart...].firstIndex(of: "\n") ?? endIndex
+            let line = self[lineStart..<lineEnd]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") {
+                if fence == nil {
+                    fence = "`"
+                } else if fence == "`" {
+                    fence = nil
+                }
+            } else if trimmed.hasPrefix("~~~") {
+                if fence == nil {
+                    fence = "~"
+                } else if fence == "~" {
+                    fence = nil
+                }
+            }
+            let next = lineEnd < endIndex ? index(after: lineEnd) : endIndex
+            if fence == nil, trimmed.isEmpty {
+                lastBoundary = next
+            }
+            lineStart = next
+        }
+        return lastBoundary
+    }
+
+    func lastMarkdownCheckpointKind() -> MarkdownCheckpointKind {
+        let blocks = components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let last = blocks.last else { return .paragraph }
+        let lines = last.components(separatedBy: "\n")
+        if lines.count >= 2,
+           lines[0].contains("|"),
+           lines[1].replacingOccurrences(of: "|", with: "")
+            .trimmingCharacters(in: .whitespaces)
+            .allSatisfy({ $0 == "-" || $0 == ":" || $0.isWhitespace }) {
+            return .table
+        }
+        if last.hasPrefix("#") { return .heading }
+        if ["---", "***", "___"].contains(last) { return .thematicBreak }
+        if last.hasPrefix("```") || last.hasPrefix("~~~") { return .codeBlock }
+        if last.hasPrefix(">") { return .blockQuote }
+        if last.hasPrefix("- ") || last.hasPrefix("* ") || last.hasPrefix("+ ") { return .list }
+        return .paragraph
+    }
+}
+
+private extension MarkdownRenderOutput {
+    func prefix(lineCount: Int, sourceBytes: Int) -> MarkdownRenderOutput {
+        let count = min(max(0, lineCount), lines.count)
+        return MarkdownRenderOutput(
+            lines: Array(lines.prefix(count)),
+            lineSourceMap: Array(lineSourceMap.prefix(count)),
+            hyperlinks: hyperlinks.filter { $0.lineIndex < count },
+            codeBlocks: codeBlocks.filter {
+                $0.outputLineRange.upperBound <= count
+                    && $0.sourceByteRange.upperBound <= sourceBytes
+            }
+        )
+    }
+
+    func offset(
+        sourceLines: Int,
+        outputLines: Int,
+        sourceBytes: Int,
+        linkIDs: Int
+    ) -> MarkdownRenderOutput {
+        MarkdownRenderOutput(
+            lines: lines.map {
+                MarkdownRenderLine(
+                    segments: $0.segments,
+                    sourceLine: $0.sourceLine + sourceLines,
+                    background: $0.background
+                )
+            },
+            lineSourceMap: lineSourceMap.map { $0 + sourceLines },
+            hyperlinks: hyperlinks.map {
+                MarkdownHyperlink(
+                    lineIndex: $0.lineIndex + outputLines,
+                    columnRange: $0.columnRange,
+                    url: $0.url,
+                    id: $0.id + linkIDs
+                )
+            },
+            codeBlocks: codeBlocks.map {
+                MarkdownCodeBlockSpan(
+                    info: $0.info,
+                    body: $0.body,
+                    outputLineRange: ($0.outputLineRange.lowerBound + outputLines)..<($0.outputLineRange.upperBound + outputLines),
+                    sourceByteRange: ($0.sourceByteRange.lowerBound + sourceBytes)..<($0.sourceByteRange.upperBound + sourceBytes)
+                )
+            }
+        )
+    }
+
+    func appendingStreamingTail(
+        _ other: MarkdownRenderOutput,
+        separatorSourceLine: Int?
+    ) -> MarkdownRenderOutput {
+        let separatorLines: [MarkdownRenderLine]
+        let separatorMap: [Int]
+        if let separatorSourceLine {
+            separatorLines = [MarkdownRenderLine(segments: [], sourceLine: separatorSourceLine)]
+            separatorMap = [separatorSourceLine]
+        } else {
+            separatorLines = []
+            separatorMap = []
+        }
+        return MarkdownRenderOutput(
+            lines: lines + separatorLines + other.lines,
+            lineSourceMap: lineSourceMap + separatorMap + other.lineSourceMap,
+            hyperlinks: hyperlinks + other.hyperlinks,
+            codeBlocks: codeBlocks + other.codeBlocks
+        )
     }
 }

@@ -337,21 +337,32 @@ public final class PagerMinimalFrameHost {
             }
         }
 
-        let tailH = MinimalLiveRender.tailHeight(
+        let transcriptTailH = MinimalLiveRender.tailHeight(
             transcript, turnRunning: turnRunning, width: width, theme: theme
         )
         let promptH = pagerComposerHeight(state.input, width: width)
-        let completionsRows = (state.completions?.isEmpty == false)
+        let belowPromptOverlay = state.overlays.overlays.last(where: \.minimalBelowPrompt)
+        let belowPromptRows = belowPromptOverlay.map {
+            pagerMinimalBelowPromptHeight($0, width: width)
+        } ?? 0
+        let completionsRows = belowPromptOverlay == nil && state.completions?.isEmpty == false
             ? state.completions!.visibleRowCount + 1
             : 0
         let screenH = terminal.lastKnownArea.height
         guard screenH >= 3 else { return }
         let ceiling = max(3, screenH - 1)
+        let authRows = state.welcomeAuth.map {
+            pagerWelcomeAuthDesiredRows($0, width: width)
+        } ?? 0
+        let tailH = state.welcomeAuth == nil ? transcriptTailH : authRows
+        let todoRows = state.welcomeAuth == nil
+            ? state.todoPane?.desiredHeight(viewHeight: ceiling) ?? 0
+            : 0
         var target = MinimalLiveRender.contentTarget(
             tailHeight: tailH,
-            todosHeight: 0,
+            todosHeight: todoRows,
             btwHeight: 0,
-            overlayHeight: completionsRows,
+            overlayHeight: completionsRows + belowPromptRows,
             promptHeight: promptH,
             ceiling: ceiling
         )
@@ -363,7 +374,7 @@ public final class PagerMinimalFrameHost {
         // native scrollback cannot be pulled back). A viewport-less overlay
         // would otherwise CAPTURE INPUT while painting nowhere — the
         // invisible-modal failure this port's §3 exists to catch.
-        if !state.overlays.isEmpty {
+        if state.overlays.overlays.contains(where: { !$0.minimalBelowPrompt }) {
             target = max(target, MinimalLiveRender.appModalTarget(base: target, ceiling: ceiling))
         }
         let willCommit = MinimalLiveRender.willCommit(
@@ -509,6 +520,7 @@ public final class PagerMinimalFrameHost {
         switch item {
         case .message(let message): return message.isStreaming
         case .tool(let card): return card.state == .running || card.state == .pending
+        case .block(let block): return block.isRunning
         case .separator: return false
         }
     }
@@ -590,10 +602,9 @@ public final class PagerMinimalFrameHost {
 
     // MARK: - Live region
 
-    /// The pinned live region: tail · completions · status · composer
-    /// (`draw_live`, `live.rs:96-403`, reduced to the arms whose backings
-    /// exist in the frame model — todos//btw//panels//app-modals are
-    /// deferred, recorded in the ledger).
+    /// The pinned live region: auth/tail · todos · completions · status ·
+    /// composer · below-prompt panels, with shared app modals painted inside
+    /// the viewport (`draw_live`, `live.rs:96-403`).
     private func drawLiveRegion(
         _ state: PagerRenderState,
         turnRunning: Bool,
@@ -610,10 +621,44 @@ public final class PagerMinimalFrameHost {
                 pagerComposerHeight(state.input, width: area.width),
                 max(1, area.height - statusH)
             )
-            let overlayH = min(completionsRows, max(0, area.height - statusH - promptH))
-            let tailH = max(0, area.height - statusH - promptH - overlayH)
+            let belowPromptOverlay = state.overlays.overlays.last(where: \.minimalBelowPrompt)
+            let authVisible = state.welcomeAuth != nil
+            let panelH = min(
+                belowPromptOverlay.map {
+                    pagerMinimalBelowPromptHeight($0, width: area.width)
+                } ?? 0,
+                max(0, area.height - statusH - promptH)
+            )
+            let overlayH = !authVisible && belowPromptOverlay == nil
+                ? min(completionsRows, max(0, area.height - statusH - promptH - panelH))
+                : 0
+            let todoH = authVisible
+                ? 0
+                : min(
+                    state.todoPane?.desiredHeight(viewHeight: area.height) ?? 0,
+                    max(0, area.height - statusH - promptH - overlayH - panelH)
+                )
+            let authH = authVisible
+                ? max(0, area.height - statusH - promptH - panelH)
+                : 0
+            let tailH = !authVisible
+                ? max(0, area.height - statusH - promptH - overlayH - todoH - panelH)
+                : 0
+            let liveContentH = authH + tailH + todoH + overlayH
 
-            if tailH > 0 {
+            if let auth = state.welcomeAuth, authH > 0 {
+                _ = renderPagerWelcomeAuth(
+                    auth,
+                    in: TerminalRect(
+                        x: area.x,
+                        y: area.y,
+                        width: area.width,
+                        height: authH
+                    ),
+                    buffer: &buffer,
+                    theme: theme
+                )
+            } else if tailH > 0 {
                 MinimalLiveRender.drawTail(
                     transcript,
                     turnRunning: turnRunning,
@@ -622,18 +667,37 @@ public final class PagerMinimalFrameHost {
                     into: &buffer
                 )
             }
+            if let todoPane = state.todoPane, todoH > 0 {
+                renderPagerTodoPane(
+                    todoPane,
+                    in: TerminalRect(
+                        x: area.x,
+                        y: area.y + tailH,
+                        width: area.width,
+                        height: todoH
+                    ),
+                    buffer: &buffer,
+                    theme: theme
+                )
+            }
             if overlayH > 1 {
                 renderCompletions(
                     state.completions,
                     in: TerminalRect(
-                        x: area.x, y: area.y + tailH, width: area.width, height: overlayH - 1
+                        x: area.x,
+                        y: area.y + tailH + todoH,
+                        width: area.width,
+                        height: overlayH - 1
                     ),
                     buffer: &buffer,
                     theme: theme
                 )
             }
             let statusArea = TerminalRect(
-                x: area.x, y: area.y + tailH + overlayH, width: area.width, height: statusH
+                x: area.x,
+                y: area.y + liveContentH,
+                width: area.width,
+                height: statusH
             )
             if let status = state.turnStatus {
                 renderTurnStatus(status, in: statusArea, buffer: &buffer, theme: theme)
@@ -641,22 +705,39 @@ public final class PagerMinimalFrameHost {
                 renderMinimalIdleHint(in: statusArea, buffer: &buffer, theme: theme)
             }
             let composerArea = TerminalRect(
-                x: area.x, y: area.y + tailH + overlayH + statusH,
+                x: area.x,
+                y: area.y + liveContentH + statusH,
                 width: area.width, height: promptH
             )
             let cursor = renderComposer(
                 state.input, in: composerArea, buffer: &buffer, theme: theme
             )
+            if let belowPromptOverlay, panelH > 0 {
+                renderPagerMinimalBelowPrompt(
+                    belowPromptOverlay,
+                    in: TerminalRect(
+                        x: area.x,
+                        y: composerArea.bottom,
+                        width: area.width,
+                        height: panelH
+                    ),
+                    buffer: &buffer,
+                    theme: theme
+                )
+            }
             // Overlays (pickers, settings, permission/question sheets) paint
             // INSIDE the live viewport — the shared popup renderers, exactly
             // as upstream's minimal reuses the full-TUI modal painters
             // (`render_app_modal`//`render_modal`, live.rs:163-237). The
             // synthetic layout scopes them to the viewport: `bounds` centers
             // the modals here, `input` anchors the bottom sheets.
-            if !state.overlays.isEmpty {
+            let centeredOverlays = PagerOverlayStack(
+                state.overlays.overlays.filter { !$0.minimalBelowPrompt }
+            )
+            if !centeredOverlays.isEmpty {
                 let empty = TerminalRect(x: area.x, y: area.y, width: area.width, height: 0)
                 _ = renderOverlays(
-                    state.overlays,
+                    centeredOverlays,
                     layout: PagerFrameLayout(
                         bounds: area,
                         statusBar: empty,

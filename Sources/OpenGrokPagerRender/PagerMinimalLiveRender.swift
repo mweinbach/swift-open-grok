@@ -65,7 +65,7 @@ public final class MinimalTranscript {
             case .search: kind = .search
             case .list: kind = .listDir
             case .fetch: kind = .webFetch
-            case .webSearch: kind = .webSearch
+            case .webSearch, .xSearch: kind = .webSearch
             // Specialized kinds without a minimal-pipeline body yet fall
             // through as generic/other so frontier classification still works.
             case .memorySearch, .integrationSearch, .useTool, .skill, .generic:
@@ -78,6 +78,17 @@ public final class MinimalTranscript {
             case .running, .pending, .succeeded: error = nil
             }
             return .toolCall(kind: kind, error: error)
+        case .block(let block):
+            switch block {
+            case .backgroundTask(let task):
+                return .bgTask(command: task.title, taskID: task.id)
+            case .btw(let btw):
+                return .btw(question: btw.question, answer: btw.answer ?? "")
+            case .lifecycle:
+                return .toolCall(kind: .lifecycle, error: nil)
+            case .sessionEvent, .subagent, .swarm, .workflow, .context, .usage, .creditLimit, .plan:
+                return .system(block.stableID)
+            }
         case .separator(let text):
             return .stub(text)
         }

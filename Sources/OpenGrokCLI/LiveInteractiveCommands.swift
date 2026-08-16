@@ -470,6 +470,21 @@ extension LiveInteractiveControllerRenderer {
         requestID: String,
         outcome: PagerPlanApprovalOutcome
     ) async {
+        let prompt = overlays.overlays.compactMap { overlay -> PagerPlanApprovalPrompt? in
+            guard overlay.id == overlayID,
+                  case .planApproval(let prompt) = overlay.content else { return nil }
+            return prompt
+        }.first
+        if case .approved = outcome,
+           let prompt,
+           let body = prompt.request.planContent {
+            conversation.upsertBlock(.plan(PagerPlanBlock(
+                id: "plan-\(requestID)",
+                body: body,
+                comments: prompt.comments,
+                isExpanded: true
+            )))
+        }
         overlays.dismiss(id: overlayID)
         if currentPlanApprovalRequestID == requestID { currentPlanApprovalRequestID = nil }
         await planApprovalCoordinator?.resolve(requestID: requestID, outcome: outcome)

@@ -50,7 +50,7 @@ enum LiveRecap {
     /// synthetic here. All recap directions live in this single user message
     /// (wrapped in the reminder tag) rather than a separate system prompt, so
     /// the conversation prefix is reused verbatim and the prompt cache stays
-    /// warm. Body text only — the pager adds "Recap —" on render.
+    /// warm. Body text only — Wave E places it under the typed Recap header.
     static func instruction(tag: String) -> String {
         "<\(tag)>Write ONE sentence recap body for a user returning from idle. "
         + "Output ONLY the body (the UI adds the \"Recap \u{2014}\" label). "
@@ -419,7 +419,7 @@ enum LiveRecap {
     /// (`clean_recap_text`, `session_recap.rs:267-312`): collapse whitespace,
     /// strip a stray leading label or symmetric wrapping quotes the model
     /// added anyway, and cap at `maxChars` bytes on a scalar boundary with an
-    /// ellipsis. Does not prepend "Recap —" — the render layer adds the label.
+    /// ellipsis. Does not prepend a label — the typed block owns the header.
     static func cleanText(_ raw: String) -> String {
         // Collapse runs of whitespace/newlines into single spaces.
         var out = raw.split(whereSeparator: \.isWhitespace).joined(separator: " ")

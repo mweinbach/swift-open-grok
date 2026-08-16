@@ -52,6 +52,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     public typealias LocalCommandHandler = @Sendable (
         PagerCommandInvocation
     ) async throws -> PagerLocalCommandOutcome?
+    public typealias BashCommandHandler = @Sendable (String) async throws -> Void
 
     private enum Control: Sendable {
         /// A user Esc or Ctrl+C, fast-pathed ahead of queued input so it lands
@@ -487,6 +488,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // `Ctrl+G` toggles the tasks pane (`defaults.rs:44-55`) — bound
             // now that the B1-t pane exists.
             case "g": return .toggleTasks
+            case "t":
+                return event.modifiers.contains(.shift)
+                    ? .toggleTodoCompleted
+                    : .toggleTodos
             // `Ctrl+\` opens the Agent Dashboard (`defaults.rs:890`).
             // Terminals report the chord as the raw FS byte; both spellings
             // land here (the Ctrl+C `\u{3}` precedent in `controlAction`).
@@ -894,6 +899,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private let customCommandHandler: CustomCommandHandler?
     private let localCommandNames: Set<String>
     private let localCommandHandler: LocalCommandHandler?
+    private let bashCommandHandler: BashCommandHandler?
     /// Startup-cached `[ui] mouse_reporting_toggle` / `GROK_MOUSE_REPORTING_TOGGLE`
     /// gate. Seeds command visibility and the scrollback-only `Ctrl+R`
     /// binding; live `mouse_reporting` enable/disable is a separate flag on
@@ -951,6 +957,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         customCommandHandler: CustomCommandHandler? = nil,
         localCommands: [OpenGrokPagerCommandRegistration] = [],
         localCommandHandler: LocalCommandHandler? = nil,
+        bashCommandHandler: BashCommandHandler? = nil,
         workflowsEnabled: Bool = true,
         mouseReportingToggleEnabled: Bool = false
     ) {
@@ -994,6 +1001,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         self.customCommandHandler = customCommandHandler
         self.localCommandNames = Set(localCommands.map { PagerCommandDefinition.normalize($0.name) })
         self.localCommandHandler = localCommandHandler
+        self.bashCommandHandler = bashCommandHandler
     }
 
     public init(
@@ -1005,6 +1013,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         customCommandHandler: CustomCommandHandler? = nil,
         localCommands: [OpenGrokPagerCommandRegistration] = [],
         localCommandHandler: LocalCommandHandler? = nil,
+        bashCommandHandler: BashCommandHandler? = nil,
         workflowsEnabled: Bool = true,
         mouseReportingToggleEnabled: Bool = false
     ) {
@@ -1017,6 +1026,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             customCommandHandler: customCommandHandler,
             localCommands: localCommands,
             localCommandHandler: localCommandHandler,
+            bashCommandHandler: bashCommandHandler,
             workflowsEnabled: workflowsEnabled,
             mouseReportingToggleEnabled: mouseReportingToggleEnabled
         )
@@ -1101,6 +1111,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// (upstream's `DISPLAY_TEXT` meta, `app/dispatch/queue.rs:538-546`).
     public static let cronTaskIDMetadataKey = "schedulerCronTaskID"
     public static let cronHumanScheduleMetadataKey = "schedulerCronHumanSchedule"
+    public static let promptIDMetadataKey = "promptID"
+
+    /// Queue and request metadata for prompts expanded from a skill command.
+    /// Keeping this marker on the queued entry preserves the distinct prompt
+    /// treatment even when the command is submitted while another turn runs.
+    public static let skillQueueEntryKind = "skill"
+    public static let skillPromptMetadataKey = "skillPrompt"
 
     /// Queue-entry kind for a monitor-event wake. RECORDED DIVERGENCE from
     /// upstream, which never routes monitor events through the pager queue:
@@ -1545,8 +1562,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             try await discardQueue(reason: "quitting")
                             try await emit(.shutdown)
                             outcome = .shutdown
-                        case .submit(let generatedPrompt):
-                            try await enqueue(generatedPrompt, historyText: text)
+                        case .submit(let generatedPrompt, let promptKind):
+                            try await enqueue(
+                                generatedPrompt,
+                                historyText: text,
+                                promptKind: promptKind
+                            )
                             if let lifecycle = try await drainQueue(
                                 request: request,
                                 mailbox: mailbox,
@@ -1656,14 +1677,25 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 await inputPumpGate.resume()
                                 continue
                             }
+                            if try await runBashCommand(prompt) {
+                                recordHistory(prompt)
+                                editor.reset()
+                                try await emit(.promptChanged(promptState()))
+                                await inputPumpGate.resume()
+                                continue
+                            }
                             switch try await runSlashCommand(prompt) {
                             case .quit:
                                 try await discardQueue(reason: "quitting")
                                 try await emit(.shutdown)
                                 outcome = .shutdown
                                 continue
-                            case .submit(let generatedPrompt):
-                                try await enqueue(generatedPrompt, historyText: prompt)
+                            case .submit(let generatedPrompt, let promptKind):
+                                try await enqueue(
+                                    generatedPrompt,
+                                    historyText: prompt,
+                                    promptKind: promptKind
+                                )
                                 if let lifecycle = try await drainQueue(
                                     request: request,
                                     mailbox: mailbox,
@@ -1962,6 +1994,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                         turnOutcome = .turnPreempted
                                     }
                                 } else {
+                                    if try await runBashCommand(prompt) {
+                                        recordHistory(prompt)
+                                        editor.reset()
+                                        try await emit(.promptChanged(promptState()))
+                                        await inputPumpGate.resume()
+                                        continue
+                                    }
                                     // A UI-only slash command runs now rather
                                     // than queueing behind the turn — `/queue`
                                     // is only ever useful *here*, and queueing
@@ -1980,8 +2019,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                     case .quit:
                                         await cancelActiveSession()
                                         turnOutcome = .shutdown
-                                    case .submit(let generatedPrompt):
-                                        try await enqueue(generatedPrompt, historyText: prompt)
+                                    case .submit(let generatedPrompt, let promptKind):
+                                        try await enqueue(
+                                            generatedPrompt,
+                                            historyText: prompt,
+                                            promptKind: promptKind
+                                        )
                                         await inputPumpGate.resume()
                                     case .handled:
                                         recordHistory(prompt)
@@ -2076,8 +2119,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         case .quit:
                             await cancelActiveSession()
                             turnOutcome = .shutdown
-                        case .submit(let generatedPrompt):
-                            try await enqueue(generatedPrompt, historyText: text)
+                        case .submit(let generatedPrompt, let promptKind):
+                            try await enqueue(
+                                generatedPrompt,
+                                historyText: text,
+                                promptKind: promptKind
+                            )
                             await inputPumpGate.resume()
                         case .drain, .handled, .notACommand:
                             // `.drain` mid-turn: the fallback prompt waits at
@@ -2158,12 +2205,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private func enqueue(
         _ prompt: String,
         historyText: String? = nil,
-        insertion: QueueInsertion = .tail
+        insertion: QueueInsertion = .tail,
+        promptKind: PagerPromptKind = .standard
     ) async throws {
         nextPromptSequence += 1
         let entry = QueueEntryMeta(
             id: "prompt-\(nextPromptSequence)",
-            kind: "prompt",
+            kind: promptKind == .skill ? Self.skillQueueEntryKind : "prompt",
             text: prompt
         )
         switch insertion {
@@ -2341,8 +2389,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                case .command = PagerCommandParser.parse(entry.text) {
                 await promptQueue.completeRunning()
                 switch try await runSlashCommand(entry.text) {
-                case .submit(let generatedPrompt):
-                    try await enqueue(generatedPrompt, historyText: entry.text)
+                case .submit(let generatedPrompt, let promptKind):
+                    try await enqueue(
+                        generatedPrompt,
+                        historyText: entry.text,
+                        promptKind: promptKind
+                    )
                 case .drain, .quit, .handled, .notACommand:
                     // `.drain`: the fallback prompt is already at the front;
                     // this loop picks it up on the next iteration.
@@ -2412,6 +2464,20 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // prompt id instead of framing it as a cron prompt.
             if entry.kind == Self.monitorQueueEntryKind {
                 turnMetadata[Self.monitorTaskIDMetadataKey] = entry.taskID ?? "unknown"
+            }
+            if entry.kind == Self.skillQueueEntryKind {
+                turnMetadata[Self.skillPromptMetadataKey] = "1"
+            }
+            if turnMetadata[Self.promptIDMetadataKey] == nil {
+                if entry.kind == Self.cronQueueEntryKind {
+                    turnMetadata[Self.promptIDMetadataKey] = Self.schedulerFiredPromptIDPrefix
+                        + UUID().uuidString
+                } else if entry.kind == Self.monitorQueueEntryKind {
+                    turnMetadata[Self.promptIDMetadataKey] = Self.monitorPromptIDPrefix
+                        + (entry.taskID ?? "unknown") + "-" + UUID().uuidString
+                } else {
+                    turnMetadata[Self.promptIDMetadataKey] = UUID().uuidString
+                }
             }
             let turnRequest = OpenGrokPagerRequest(
                 prompt: promptText,
@@ -3350,14 +3416,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Set or inspect the session goal",
             usage: "/goal [objective|status|pause|resume|clear]"
         ),
-        // `/debug [fps]` — always registered and routable; listed only on
+        // `/debug [scroll|fps|log]` — always registered and routable; listed only on
         // debug binaries (`debug.rs:24-29` `LISTED_IN_COMPLETIONS =
-        // cfg!(debug_assertions)`). Scroll/log HUD surfaces are absent, so
-        // usage is `[fps]` only — no no-op subcommand rows.
+        // cfg!(debug_assertions)`).
         PagerCommandDefinition(
             name: "debug",
             summary: "Toggle debug overlays",
-            usage: "/debug [fps]",
+            usage: "/debug [scroll|fps|log]",
             isHidden: {
                 #if DEBUG
                 false
@@ -3365,6 +3430,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 true
                 #endif
             }()
+        ),
+        PagerCommandDefinition(
+            name: "scroll-debug",
+            summary: "Toggle the scroll-diagnostics HUD",
+            usage: "/scroll-debug",
+            isHidden: true
         ),
         PagerCommandDefinition(
             name: "gboom",
@@ -3716,7 +3787,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case notACommand
         case handled
         case quit
-        case submit(String)
+        case submit(String, promptKind: PagerPromptKind)
         /// The command already put work at the front of the queue — an idle
         /// caller must kick the drain, the port of
         /// `maybe_start_running_task` after the fallback enqueue
@@ -3726,6 +3797,25 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         /// path enqueues outside the slash grammar); the arm stays for the
         /// next front-inserting command.
         case drain
+    }
+
+    /// Dispatch a leading-`!` user command locally. The handler owns process
+    /// execution and transcript updates; returning `true` means the draft was
+    /// consumed and must never enter the model prompt queue.
+    private func runBashCommand(_ text: String) async throws -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.first == "!" else { return false }
+        let command = trimmed.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.isEmpty else {
+            try await emit(.notice("bash command cannot be empty"))
+            return true
+        }
+        guard let bashCommandHandler else {
+            try await emit(.notice("bash commands are unavailable in this session"))
+            return true
+        }
+        try await bashCommandHandler(command)
+        return true
     }
 
     /// Run a slash command.
@@ -3776,7 +3866,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     // Returning `.submit` here rides the same enqueue path
                     // the skill commands use, including the mid-turn
                     // deferral at every call site.
-                    return .submit(generatedPrompt)
+                    return .submit(generatedPrompt, promptKind: .skill)
                 case nil:
                     return .handled
                 }
@@ -3790,7 +3880,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     try await emit(.notice("/\(command.name) could not load its skill definition"))
                     return .handled
                 }
-                return .submit(generatedPrompt)
+                return .submit(generatedPrompt, promptKind: .skill)
             }
             switch command.name {
             case "quit":
@@ -4161,7 +4251,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 // disarmed, and the model's first edits would not be
                 // plan-gated.
                 try await emit(.overlay(.enterPlanMode))
-                return .submit(description)
+                return .submit(description, promptKind: .standard)
             case "swarm":
                 // `/swarm` (`swarm.rs:42-62`): bare toggles the persisted
                 // mode, `on`/`off` set it, anything else is a one-shot swarm
@@ -4193,7 +4283,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     // could start sampling without the swarm reminder, and
                     // the mode toggle would change nothing this turn.
                     try await emit(.overlay(.swarmTaskMode))
-                    return .submit(argument)
+                    return .submit(argument, promptKind: .standard)
                 }
             case "view-plan":
                 // Arguments are ignored — upstream's `ViewPlanCommand::run`
@@ -4292,6 +4382,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 return .handled
             case "debug":
                 try await emit(.overlay(.debug(argument: Self.rejoined(invocation.arguments))))
+                return .handled
+            case "scroll-debug":
+                guard invocation.arguments.isEmpty else {
+                    return .submit(text, promptKind: .standard)
+                }
+                try await emit(.overlay(.scrollDebug))
                 return .handled
             case "login":
                 // Bare `/login` opens the provider picker
@@ -4546,7 +4642,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             try await startNewSession()
         case .cyclePermissionMode, .toggleAlwaysApprove:
             try await emit(.global(command))
-        case .toggleTasks, .openDashboard:
+        case .toggleTasks, .toggleTodos, .toggleTodoCompleted, .openDashboard:
             // The render layer owns both surfaces (the B1-t pane state and
             // the dashboard roster/feature gate), so the chords forward the
             // way the permission-mode pair does.
@@ -4555,7 +4651,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // `Ctrl+L` — upstream opens the extensions modal on the Plugins
             // tab (`agent_view/input.rs:1266-1271`).
             try await emit(.overlay(.extensions(tab: .plugins)))
-        case .toggleTodos, .sendToBackground, .openSessions:
+        case .sendToBackground, .openSessions:
             // Unbound in `globalAction(for:)` until the backing surface exists.
             break
         }

@@ -93,6 +93,23 @@ struct PagerTimestampsRenderTests {
         #expect(lines[1].text == "Second line.")
     }
 
+    @Test("streaming assistant has no invented cursor and keeps its timestamp")
+    func streamingAssistantKeepsStampWithoutCursor() {
+        let lines = makeConversationLines(
+            [.message(PagerMessage(
+                role: .assistant,
+                text: String(repeating: "x", count: 29),
+                isStreaming: true,
+                createdAt: stamp
+            ))],
+            width: 40,
+            theme: .grokNight,
+            showTimestamps: true
+        )
+        #expect(lines.first?.text.contains("12:30") == true)
+        #expect(!lines.contains { $0.text.contains("▌") })
+    }
+
     @Test("flag off paints no stamp and reserves nothing")
     func offPaintsNothing() {
         let lines = makeConversationLines(

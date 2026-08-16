@@ -214,7 +214,7 @@ struct LiveFpsHudTests {
         #expect(recordsDisabled == 1)
     }
 
-    @Test("bare /debug reports only fps status; unknown args list [fps] only")
+    @Test("bare /debug reports every toggle; unknown args list the full grammar")
     func debugBareAndUnknown() async throws {
         let fixture = try FpsHudFixture(grokFPS: "1")
         defer { fixture.cleanup() }
@@ -224,13 +224,17 @@ struct LiveFpsHudTests {
         try await fixture.renderer.render(.overlay(.debug(argument: "")))
         let status = await fixture.renderer.testingSystemMessageTexts()
         #expect(status.contains { $0.contains("fps on") })
-        #expect(status.contains { $0.contains("/debug fps") })
-        #expect(!status.contains { $0.contains("scroll") || $0.contains("log") })
+        #expect(status.contains {
+            $0.contains("scroll off")
+                && $0.contains("log off")
+                && $0.contains("/debug <scroll|fps|log>")
+        })
 
         try await fixture.renderer.render(.overlay(.debug(argument: "wat")))
         let errors = await fixture.renderer.testingErrorMessageTexts()
-        #expect(errors.contains { $0.contains("wat") && $0.contains("/debug [fps]") })
-        #expect(!errors.contains { $0.contains("scroll") || $0.contains("log") })
+        #expect(errors.contains {
+            $0.contains("wat") && $0.contains("/debug [scroll|fps|log]")
+        })
     }
 
     @Test("samples record only after an enabled paint, not coalesced requests")

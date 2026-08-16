@@ -14,6 +14,7 @@ public enum PagerMessageRole: Sendable, Equatable, Hashable {
 
 public struct PagerMessage: Sendable, Equatable, Hashable {
     public var role: PagerMessageRole
+    public var promptKind: PagerPromptKind
     public var text: String
     public var isStreaming: Bool
     /// Pre-styled rendering of `text` (markdown, typically). When empty the
@@ -45,6 +46,7 @@ public struct PagerMessage: Sendable, Equatable, Hashable {
 
     public init(
         role: PagerMessageRole,
+        promptKind: PagerPromptKind = .standard,
         text: String,
         isStreaming: Bool = false,
         styledLines: [PagerStyledLine] = [],
@@ -53,6 +55,7 @@ public struct PagerMessage: Sendable, Equatable, Hashable {
         createdAt: Date? = nil
     ) {
         self.role = role
+        self.promptKind = promptKind
         self.text = text
         self.isStreaming = isStreaming
         self.styledLines = styledLines
@@ -86,6 +89,7 @@ public enum PagerToolKind: Sendable, Equatable, Hashable {
     case list
     case fetch
     case webSearch
+    case xSearch
     case memorySearch
     case integrationSearch
     case useTool
@@ -103,6 +107,7 @@ public enum PagerToolKind: Sendable, Equatable, Hashable {
         case .list: return "List"
         case .fetch: return "Fetch"
         case .webSearch: return "Web Search"
+        case .xSearch: return "X Search"
         case .memorySearch: return "Memory Search"
         case .integrationSearch: return "Search Tools"
         // UseTool paints titleized server/action segments in the specialized
@@ -118,7 +123,7 @@ public enum PagerToolKind: Sendable, Equatable, Hashable {
     var argumentIsPath: Bool {
         switch self {
         case .read, .edit, .create, .list: return true
-        case .execute, .search, .fetch, .webSearch,
+        case .execute, .search, .fetch, .webSearch, .xSearch,
              .memorySearch, .integrationSearch, .useTool, .skill, .generic:
             return false
         }
@@ -149,6 +154,8 @@ public enum PagerToolKind: Sendable, Equatable, Hashable {
             return .fetch
         case "web_search", "websearch", "search_web":
             return .webSearch
+        case "x_search", "xsearch", "search_x":
+            return .xSearch
         case "search_tool":
             return .integrationSearch
         case "use_tool":
@@ -161,6 +168,328 @@ public enum PagerToolKind: Sendable, Equatable, Hashable {
             return .generic
         }
     }
+}
+
+public enum PagerEditHighlightKind: Sendable, Equatable, Hashable {
+    case comment
+    case string
+    case number
+    case keyword
+    case type
+}
+
+public struct PagerEditHighlightSpan: Sendable, Equatable, Hashable {
+    public var start: Int
+    public var length: Int
+    public var kind: PagerEditHighlightKind
+
+    public init(start: Int, length: Int, kind: PagerEditHighlightKind) {
+        self.start = start
+        self.length = length
+        self.kind = kind
+    }
+}
+
+public struct PagerEditLineHighlight: Sendable, Equatable, Hashable {
+    public var lineNumber: Int
+    public var spans: [PagerEditHighlightSpan]
+
+    public init(lineNumber: Int, spans: [PagerEditHighlightSpan]) {
+        self.lineNumber = lineNumber
+        self.spans = spans
+    }
+}
+
+public struct PagerEditFile: Sendable, Equatable, Hashable {
+    public var path: String
+    public var hunks: [DiffHunk]
+    public var isNewFile: Bool
+    public var highlights: [PagerEditLineHighlight]
+
+    public init(
+        path: String,
+        hunks: [DiffHunk],
+        isNewFile: Bool = false,
+        highlights: [PagerEditLineHighlight] = []
+    ) {
+        self.path = path
+        self.hunks = hunks
+        self.isNewFile = isNewFile
+        self.highlights = highlights
+    }
+}
+
+public enum PagerReadMediaKind: Sendable, Equatable, Hashable {
+    case image
+    case pdf(pages: Int)
+}
+
+public struct PagerReadPayload: Sendable, Equatable, Hashable {
+    public var path: String
+    public var content: String?
+    public var totalLines: Int?
+    public var startLine: Int?
+    public var endLine: Int?
+    public var truncated: Bool
+    public var media: PagerReadMediaKind?
+
+    public init(
+        path: String,
+        content: String? = nil,
+        totalLines: Int? = nil,
+        startLine: Int? = nil,
+        endLine: Int? = nil,
+        truncated: Bool = false,
+        media: PagerReadMediaKind? = nil
+    ) {
+        self.path = path
+        self.content = content
+        self.totalLines = totalLines
+        self.startLine = startLine
+        self.endLine = endLine
+        self.truncated = truncated
+        self.media = media
+    }
+}
+
+public struct PagerListPayload: Sendable, Equatable, Hashable {
+    public var path: String
+    public var content: String
+    public var entryCount: Int
+    public var truncated: Bool
+
+    public init(path: String, content: String, entryCount: Int, truncated: Bool = false) {
+        self.path = path
+        self.content = content
+        self.entryCount = entryCount
+        self.truncated = truncated
+    }
+}
+
+public enum PagerSearchOutputMode: String, Sendable, Equatable, Hashable {
+    case content
+    case filesWithMatches
+    case count
+    case glob
+}
+
+public struct PagerSearchMatch: Sendable, Equatable, Hashable {
+    public var path: String
+    public var lineNumber: Int?
+    public var text: String
+
+    public init(path: String, lineNumber: Int? = nil, text: String = "") {
+        self.path = path
+        self.lineNumber = lineNumber
+        self.text = text
+    }
+}
+
+public struct PagerSearchPayload: Sendable, Equatable, Hashable {
+    public var pattern: String
+    public var path: String?
+    public var glob: String?
+    public var caseInsensitive: Bool
+    public var multiline: Bool
+    public var mode: PagerSearchOutputMode
+    public var matchCount: Int
+    public var fileCount: Int
+    public var truncated: Bool
+    public var matches: [PagerSearchMatch]
+
+    public init(
+        pattern: String,
+        path: String? = nil,
+        glob: String? = nil,
+        caseInsensitive: Bool = false,
+        multiline: Bool = false,
+        mode: PagerSearchOutputMode = .content,
+        matchCount: Int = 0,
+        fileCount: Int = 0,
+        truncated: Bool = false,
+        matches: [PagerSearchMatch] = []
+    ) {
+        self.pattern = pattern
+        self.path = path
+        self.glob = glob
+        self.caseInsensitive = caseInsensitive
+        self.multiline = multiline
+        self.mode = mode
+        self.matchCount = matchCount
+        self.fileCount = fileCount
+        self.truncated = truncated
+        self.matches = matches
+    }
+}
+
+public struct PagerFetchPayload: Sendable, Equatable, Hashable {
+    public var url: String
+    public var finalURL: String?
+    public var statusCode: Int?
+    public var contentType: String?
+    public var totalBytes: Int?
+    public var content: String?
+    public var truncated: Bool
+
+    public init(
+        url: String,
+        finalURL: String? = nil,
+        statusCode: Int? = nil,
+        contentType: String? = nil,
+        totalBytes: Int? = nil,
+        content: String? = nil,
+        truncated: Bool = false
+    ) {
+        self.url = url
+        self.finalURL = finalURL
+        self.statusCode = statusCode
+        self.contentType = contentType
+        self.totalBytes = totalBytes
+        self.content = content
+        self.truncated = truncated
+    }
+}
+
+public struct PagerWebCitation: Sendable, Equatable, Hashable {
+    public var title: String
+    public var url: String
+
+    public init(title: String = "", url: String) {
+        self.title = title
+        self.url = url
+    }
+}
+
+public struct PagerWebSearchPayload: Sendable, Equatable, Hashable {
+    public var query: String
+    public var content: String?
+    public var citations: [PagerWebCitation]
+    public var isXSearch: Bool
+
+    public init(
+        query: String,
+        content: String? = nil,
+        citations: [PagerWebCitation] = [],
+        isXSearch: Bool = false
+    ) {
+        self.query = query
+        self.content = content
+        self.citations = citations
+        self.isXSearch = isXSearch
+    }
+}
+
+public struct PagerMemoryResult: Sendable, Equatable, Hashable {
+    public var path: String
+    public var startLine: Int?
+    public var endLine: Int?
+    public var score: Double?
+    public var source: String?
+    public var snippet: String
+
+    public init(
+        path: String,
+        startLine: Int? = nil,
+        endLine: Int? = nil,
+        score: Double? = nil,
+        source: String? = nil,
+        snippet: String = ""
+    ) {
+        self.path = path
+        self.startLine = startLine
+        self.endLine = endLine
+        self.score = score
+        self.source = source
+        self.snippet = snippet
+    }
+}
+
+public struct PagerMemorySearchPayload: Sendable, Equatable, Hashable {
+    public var query: String
+    public var results: [PagerMemoryResult]
+
+    public init(query: String, results: [PagerMemoryResult]) {
+        self.query = query
+        self.results = results
+    }
+}
+
+public struct PagerIntegrationToolResult: Sendable, Equatable, Hashable {
+    public var server: String
+    public var toolName: String
+    public var description: String
+
+    public init(server: String, toolName: String, description: String = "") {
+        self.server = server
+        self.toolName = toolName
+        self.description = description
+    }
+}
+
+public struct PagerIntegrationSearchPayload: Sendable, Equatable, Hashable {
+    public var query: String
+    public var status: String?
+    public var results: [PagerIntegrationToolResult]
+
+    public init(query: String, status: String? = nil, results: [PagerIntegrationToolResult]) {
+        self.query = query
+        self.status = status
+        self.results = results
+    }
+}
+
+public struct PagerUseToolArgument: Sendable, Equatable, Hashable {
+    public var key: String
+    public var value: String
+
+    public init(key: String, value: String) {
+        self.key = key
+        self.value = value
+    }
+}
+
+public struct PagerUseToolPayload: Sendable, Equatable, Hashable {
+    public var qualifiedName: String
+    public var server: String
+    public var action: String
+    public var arguments: [PagerUseToolArgument]
+    public var output: String?
+
+    public init(
+        qualifiedName: String,
+        server: String,
+        action: String,
+        arguments: [PagerUseToolArgument] = [],
+        output: String? = nil
+    ) {
+        self.qualifiedName = qualifiedName
+        self.server = server
+        self.action = action
+        self.arguments = arguments
+        self.output = output
+    }
+}
+
+public struct PagerToolQuestionAnswer: Sendable, Equatable, Hashable {
+    public var question: String
+    public var answer: String
+
+    public init(question: String, answer: String) {
+        self.question = question
+        self.answer = answer
+    }
+}
+
+public enum PagerWaveCToolPayload: Sendable, Equatable, Hashable {
+    case read(PagerReadPayload)
+    case list(PagerListPayload)
+    case search(PagerSearchPayload)
+    case fetch(PagerFetchPayload)
+    case webSearch(PagerWebSearchPayload)
+    case memorySearch(PagerMemorySearchPayload)
+    case integrationSearch(PagerIntegrationSearchPayload)
+    case useTool(PagerUseToolPayload)
+    case questions([PagerToolQuestionAnswer])
 }
 
 public struct PagerToolCard: Sendable, Equatable, Hashable {
@@ -176,6 +505,9 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
     public var detail: String?
     public var state: PagerToolState
     public var isExpanded: Bool
+    /// Third execute fold state. `isExpanded && !isFullyExpanded` is the
+    /// bounded 2+3 preview; `isFullyExpanded` paints the complete output.
+    public var isFullyExpanded: Bool
     /// When the tool reached a terminal state, in `PagerMotionSnapshot.seconds`
     /// time. A just-finished block keeps its bright accent for the 400 ms
     /// finish flash (`scrollback/state/types.rs:84`); `nil` means "unknown",
@@ -188,6 +520,45 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
     /// Explicit display header argument when a producer wants it distinct from
     /// `input`. Empty/`nil` means "use `input`".
     public var headerText: String?
+    // MARK: - B1 execute structured fields (description-first, $ command, bashMode, rail)
+    /// Full description supplied by the model, if any (edit/execute header source).
+    public var executeDescription: String?
+    /// Full command string (the copy source). `nil` when the card was built from a
+    /// pre-summarized `input` only.
+    public var executeCommand: String?
+    /// Peeled display form of the command for the header (cd <cwd> stripped).
+    public var executeHeaderDisplay: String?
+    /// User `!` bash-mode vs agent execute. `nil` = agent (default Collapsed);
+    /// `true` = user bash streams Truncated → Expanded on finish
+    /// (`execute.rs:750-771`, `tracker.rs:1592-1601`). Optional so existing
+    /// `PagerToolCard.make` calls without the flag stay agent and keep the
+    /// `bashModeIfPresent == nil` probe green until a producer opts in.
+    public var isBashMode: Bool?
+    /// JSON-encoded typed tool result retained across sparse live updates.
+    public var structuredOutput: String?
+    /// Typed read/list/search/web/MCP/memory/Other payload used by Wave C
+    /// painters. Raw transport is retained separately for replay/debugging.
+    public var waveCPayload: PagerWaveCToolPayload?
+    // MARK: - B2 edit structured fields (hunks, gutters, trusted counts, Creating, patch)
+    /// Per-file edit bodies. Single-file producers also populate the legacy
+    /// `editHunks` / `editPath` fields below for source compatibility.
+    public var editFiles: [PagerEditFile]?
+    /// Structured diff hunks for edit/create cards. `nil` = not an edit or legacy
+    /// summary-only card (falls back to gray preview).
+    public var editHunks: [DiffHunk]?
+    /// File path for patch generation / header elision. Falls back to `input` when nil.
+    public var editPath: String?
+    public var editLinesAdded: Int?
+    public var editLinesRemoved: Int?
+    public var editIsTrusted: Bool?
+    public var editCount: Int?
+    /// Whether this edit created a new file (affects `Creating` vs `Edit` prefix
+    /// when `kind == .create` already captures the tool identity; kept for
+    /// detail fallback on synthesized cards).
+    public var isNewFileForEdit: Bool?
+    /// Pre/post tool hooks attached to this card. The collapsed painter shows
+    /// their success ratio; expanded cards render phase sections.
+    public var hooks: [PagerHookRun]
 
     public init(
         name: String,
@@ -197,9 +568,25 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
         detail: String? = nil,
         state: PagerToolState = .pending,
         isExpanded: Bool = false,
+        isFullyExpanded: Bool = false,
         finishedAt: TimeInterval? = nil,
         rawInput: String = "",
-        headerText: String? = nil
+        headerText: String? = nil,
+        executeDescription: String? = nil,
+        executeCommand: String? = nil,
+        executeHeaderDisplay: String? = nil,
+        isBashMode: Bool? = nil,
+        structuredOutput: String? = nil,
+        waveCPayload: PagerWaveCToolPayload? = nil,
+        editFiles: [PagerEditFile]? = nil,
+        editHunks: [DiffHunk]? = nil,
+        editPath: String? = nil,
+        editLinesAdded: Int? = nil,
+        editLinesRemoved: Int? = nil,
+        editIsTrusted: Bool? = nil,
+        editCount: Int? = nil,
+        isNewFileForEdit: Bool? = nil,
+        hooks: [PagerHookRun] = []
     ) {
         self.name = name
         self.kind = kind ?? PagerToolKind.infer(fromToolNamed: name)
@@ -208,9 +595,25 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
         self.detail = detail
         self.state = state
         self.isExpanded = isExpanded
+        self.isFullyExpanded = isFullyExpanded
         self.finishedAt = finishedAt
         self.rawInput = rawInput
         self.headerText = headerText
+        self.executeDescription = executeDescription
+        self.executeCommand = executeCommand
+        self.executeHeaderDisplay = executeHeaderDisplay
+        self.isBashMode = isBashMode
+        self.structuredOutput = structuredOutput
+        self.waveCPayload = waveCPayload
+        self.editFiles = editFiles
+        self.editHunks = editHunks
+        self.editPath = editPath
+        self.editLinesAdded = editLinesAdded
+        self.editLinesRemoved = editLinesRemoved
+        self.editIsTrusted = editIsTrusted
+        self.editCount = editCount
+        self.isNewFileForEdit = isNewFileForEdit
+        self.hooks = hooks
     }
 
     /// Build a card from a tool name + raw arguments the way the ACP tracker
@@ -227,12 +630,42 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
         output: String? = nil,
         state: PagerToolState = .pending,
         isExpanded: Bool = false,
+        isFullyExpanded: Bool = false,
         finishedAt: TimeInterval? = nil,
-        detail: String? = nil
+        detail: String? = nil,
+        isBashMode: Bool? = nil,
+        structuredOutput: String? = nil,
+        editFiles: [PagerEditFile]? = nil,
+        editHunks: [DiffHunk]? = nil,
+        editPath: String? = nil,
+        editLinesAdded: Int? = nil,
+        editLinesRemoved: Int? = nil,
+        editIsTrusted: Bool? = nil,
+        editCount: Int? = nil,
+        isNewFileForEdit: Bool? = nil
     ) -> PagerToolCard {
-        let kind = PagerToolKind.infer(fromToolNamed: name)
+        let inferredKind = PagerToolKind.infer(fromToolNamed: name)
+        let structured = PagerToolStructuredFields.parse(structuredOutput)
+        let kind: PagerToolKind = {
+            guard inferredKind == .edit || inferredKind == .create,
+                  let isNewFile = structured?.isNewFile
+            else { return inferredKind }
+            return isNewFile ? .create : .edit
+        }()
         let fields = PagerToolRawFields.parse(rawInput)
+        let waveCPayload = PagerWaveCToolPayload.parse(
+            kind: kind,
+            rawInput: rawInput,
+            output: output,
+            structuredOutput: structuredOutput
+        )
         let display = fields.displayHeader(kind: kind, rawInput: rawInput, cwd: cwd)
+        let execDesc: String? = fields.description
+        let execCmd: String? = fields.command
+        let execHeader: String? = execCmd.map { PagerToolRawFields.stripRedundantSessionCd($0, cwd: cwd) }
+        let resolvedEditFiles = editFiles ?? structured?.files
+        let ePath: String? = editPath ?? resolvedEditFiles?.first?.path ?? structured?.path ?? fields.path
+        let eHunks = editHunks ?? resolvedEditFiles?.first?.hunks ?? structured?.hunks
         return PagerToolCard(
             name: name,
             kind: kind,
@@ -241,10 +674,243 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
             detail: detail,
             state: state,
             isExpanded: isExpanded,
+            isFullyExpanded: isFullyExpanded,
             finishedAt: finishedAt,
             rawInput: rawInput,
-            headerText: display
+            headerText: display,
+            executeDescription: execDesc,
+            executeCommand: execCmd,
+            executeHeaderDisplay: execHeader,
+            isBashMode: isBashMode,
+            structuredOutput: structuredOutput,
+            waveCPayload: waveCPayload,
+            editFiles: resolvedEditFiles,
+            editHunks: eHunks,
+            editPath: ePath,
+            editLinesAdded: editLinesAdded ?? structured?.linesAdded,
+            editLinesRemoved: editLinesRemoved ?? structured?.linesRemoved,
+            editIsTrusted: editIsTrusted ?? structured?.trusted,
+            editCount: editCount ?? structured?.editCount,
+            isNewFileForEdit: isNewFileForEdit ?? structured?.isNewFile
         )
+    }
+
+    /// Git-applicable unified patch for copy, when hunks are available
+    /// (`edit.rs:374` → `diff.rs:374`).
+    public var editPatch: String? {
+        let files: [PagerEditFile]
+        if let editFiles, !editFiles.isEmpty {
+            files = editFiles
+        } else if let hunks = editHunks, !hunks.isEmpty {
+            files = [PagerEditFile(
+                path: editPath ?? (input.isEmpty ? "file" : input),
+                hunks: hunks,
+                isNewFile: isNewFileForEdit ?? false
+            )]
+        } else {
+            return nil
+        }
+        let patch = files.compactMap { file -> String? in
+            guard !file.hunks.isEmpty else { return nil }
+            let value = diffHunksToPatch(
+                path: file.path,
+                hunks: stitchOverlappingHunks(file.hunks)
+            )
+            return value.isEmpty ? nil : value
+        }.joined(separator: "\n")
+        return patch.isEmpty ? nil : patch
+    }
+
+    /// Synthesized hunks for cards that stored old/new text rather than hunks.
+    public var synthesizedDiffHunks: [DiffHunk]? {
+        editHunks
+    }
+
+    /// `true` when this is a user `!` bash card (streams Truncated → Expanded).
+    public var isUserBashMode: Bool { isBashMode == true }
+
+    /// Header detail for collapsed edit cards: trusted `+N/-N` (diff colors
+    /// applied by painter) or fallback `(N edits)` when untrusted/multi.
+    public var editDetailForHeader: String? {
+        guard kind == .edit || kind == .create else { return detail }
+        if let trusted = editIsTrusted, trusted,
+           let a = editLinesAdded, let r = editLinesRemoved, (a > 0 || r > 0) {
+            return " +\(a)/-\(r)"
+        }
+        if let trusted = editIsTrusted, !trusted, let c = editCount, c > 1 {
+            return " (\(c) edits)"
+        }
+        // Fallback: show detail if supplied and not already +/-
+        return detail
+    }
+
+    public var isFoldableByKind: Bool {
+        switch kind {
+        case .execute:
+            let description = executeDescription?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let normalized = description.lowercased().hasPrefix("running ")
+                ? String(description.dropFirst(8)).trimmingCharacters(in: .whitespaces)
+                : (description.lowercased().hasPrefix("run ")
+                    ? String(description.dropFirst(4)).trimmingCharacters(in: .whitespaces)
+                    : description)
+            return !normalized.isEmpty || output != nil || state == .failed || state == .cancelled
+        case .edit, .create:
+            return state != .failed && state != .cancelled
+                && ((editFiles?.contains { !$0.hunks.isEmpty } == true) || editHunks?.isEmpty == false)
+        case .read:
+            if case .read(let payload) = waveCPayload {
+                return payload.content?.isEmpty == false
+            }
+            return state != .failed && output?.isEmpty == false
+        case .list:
+            if state == .failed || state == .cancelled { return false }
+            if case .list(let payload) = waveCPayload { return !payload.content.isEmpty }
+            return output?.isEmpty == false
+        case .search:
+            return state != .failed && state != .cancelled
+        case .fetch:
+            if state == .failed || state == .cancelled { return false }
+            if case .fetch(let payload) = waveCPayload { return payload.content != nil }
+            return output != nil
+        case .webSearch:
+            if state == .failed || state == .cancelled { return false }
+            if case .webSearch(let payload) = waveCPayload { return payload.content != nil }
+            return output != nil
+        case .xSearch:
+            return false
+        case .memorySearch:
+            if state == .failed || state == .cancelled { return false }
+            if case .memorySearch(let payload) = waveCPayload { return !payload.results.isEmpty }
+            return false
+        case .integrationSearch:
+            if state == .failed || state == .cancelled { return false }
+            if case .integrationSearch(let payload) = waveCPayload { return !payload.results.isEmpty }
+            return false
+        case .useTool:
+            if case .useTool(let payload) = waveCPayload {
+                return !payload.arguments.isEmpty || payload.output != nil || state == .failed
+            }
+            return output != nil || state == .failed
+        case .generic:
+            return state != .failed && state != .cancelled && output != nil
+        case .skill:
+            return output?.isEmpty == false
+        }
+    }
+}
+
+private struct PagerToolStructuredFields {
+    var files: [PagerEditFile]?
+    var path: String?
+    var hunks: [DiffHunk]?
+    var linesAdded: Int?
+    var linesRemoved: Int?
+    var trusted: Bool?
+    var editCount: Int?
+    var isNewFile: Bool?
+
+    static func parse(_ raw: String?) -> PagerToolStructuredFields? {
+        guard let raw, let data = raw.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        let editShaped = root["file_results"] != nil
+            || root["edits"] != nil
+            || root["old_string"] != nil
+            || root["new_string"] != nil
+            || root["old_text"] != nil
+            || root["new_text"] != nil
+            || root["lines_added"] != nil
+            || root["lines_removed"] != nil
+            || root["replacements"] != nil
+        guard editShaped else { return nil }
+
+        let fileObjects = root["file_results"] as? [[String: Any]]
+        let sourceObjects = fileObjects?.isEmpty == false ? fileObjects! : [root]
+        let files = sourceObjects.compactMap(editFile(from:))
+        let primary = sourceObjects.first ?? root
+        let details = editDetails(from: primary)
+        let hunks: [DiffHunk]? = {
+            let built = buildDiffHunks(details)
+            return built.isEmpty ? nil : built
+        }()
+        let path = string(primary, keys: ["path", "absolute_path", "move_to"])
+        let linesAdded = integer(root["lines_added"]) ?? integer(primary["lines_added"])
+        let linesRemoved = integer(root["lines_removed"]) ?? integer(primary["lines_removed"])
+        let trusted = boolean(root["trusted"]) ?? boolean(primary["trusted"])
+        let isNewFile = boolean(primary["is_new_file"])
+            ?? boolean(primary["created"])
+            ?? ((primary["action"] as? String) == "added" ? true : nil)
+        let editCount = integer(root["replacements"])
+            ?? (details.isEmpty ? fileObjects?.count : details.count)
+        return PagerToolStructuredFields(
+            files: files.isEmpty ? nil : files,
+            path: path,
+            hunks: hunks,
+            linesAdded: linesAdded,
+            linesRemoved: linesRemoved,
+            trusted: trusted,
+            editCount: editCount,
+            isNewFile: isNewFile
+        )
+    }
+
+    private static func editFile(from object: [String: Any]) -> PagerEditFile? {
+        guard let path = string(object, keys: ["path", "absolute_path", "move_to"]) else {
+            return nil
+        }
+        let details = editDetails(from: object)
+        let hunks = buildDiffHunks(details)
+        let isNewFile = boolean(object["is_new_file"])
+            ?? boolean(object["created"])
+            ?? ((object["action"] as? String) == "added")
+        return PagerEditFile(path: path, hunks: hunks, isNewFile: isNewFile)
+    }
+
+    private static func editDetails(from object: [String: Any]) -> [SearchReplaceEditDetail] {
+        if let edits = object["edits"] as? [String: Any],
+           let details = edits["details"] as? [[String: Any]] {
+            return details.map(detail(from:))
+        }
+        if let old = object["old_string"] as? String,
+           let new = object["new_string"] as? String {
+            return [SearchReplaceEditDetail(oldString: old, newString: new)]
+        }
+        if let old = object["old_text"] as? String,
+           let new = object["new_text"] as? String {
+            return [SearchReplaceEditDetail(oldString: old, newString: new)]
+        }
+        return []
+    }
+
+    private static func detail(from object: [String: Any]) -> SearchReplaceEditDetail {
+        SearchReplaceEditDetail(
+            oldString: object["old_string"] as? String ?? "",
+            newString: object["new_string"] as? String ?? "",
+            oldLine: integer(object["old_line"]) ?? 1,
+            newLine: integer(object["new_line"]) ?? 1,
+            contextBefore: object["context_before"] as? String ?? "",
+            contextAfter: object["context_after"] as? String ?? "",
+            linePrefix: object["line_prefix"] as? String ?? ""
+        )
+    }
+
+    private static func string(_ object: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = object[key] as? String, !value.isEmpty { return value }
+        }
+        return nil
+    }
+
+    private static func integer(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        return nil
+    }
+
+    private static func boolean(_ value: Any?) -> Bool? {
+        if let value = value as? Bool { return value }
+        if let value = value as? NSNumber { return value.boolValue }
+        return nil
     }
 }
 
@@ -324,7 +990,7 @@ private struct PagerToolRawFields {
             if !looksLikeJSON, !plain.isEmpty { return plain }
             return ""
 
-        case .search, .webSearch, .memorySearch, .integrationSearch:
+        case .search, .webSearch, .xSearch, .memorySearch, .integrationSearch:
             if let query { return query }
             if !looksLikeJSON, !plain.isEmpty { return plain }
             return ""
@@ -522,6 +1188,7 @@ private struct PagerToolRawFields {
 public enum PagerConversationItem: Sendable, Equatable, Hashable {
     case message(PagerMessage)
     case tool(PagerToolCard)
+    case block(PagerTranscriptBlock)
     case separator(String)
 
     /// Groupable blocks pack with zero gap when consecutive and collapsed,
@@ -530,6 +1197,7 @@ public enum PagerConversationItem: Sendable, Equatable, Hashable {
     var isGroupable: Bool {
         switch self {
         case .tool: return true
+        case .block(let block): return block.isGroupable
         case .message(let message): return message.role == .reasoning || message.role == .system
         case .separator: return false
         }
@@ -538,6 +1206,7 @@ public enum PagerConversationItem: Sendable, Equatable, Hashable {
     var isCollapsed: Bool {
         switch self {
         case .tool(let tool): return !tool.isExpanded
+        case .block(let block): return block.isCollapsed
         case .message(let message): return message.isCollapsed
         case .separator: return true
         }
@@ -554,7 +1223,7 @@ public enum PagerConversationItem: Sendable, Equatable, Hashable {
             return false
         case .message(let message):
             return message.role != .system
-        case .tool:
+        case .tool, .block:
             return true
         }
     }
@@ -577,6 +1246,7 @@ public struct PagerStatusBar: Sendable, Equatable, Hashable {
     public var queuedPromptCount: Int
     public var isPlanMode: Bool
     public var backgroundTaskCount: Int
+    public var credit: PagerCreditStatus?
     /// The pointer is over the context segment — swap the tokens for the
     /// width-matched progress bar (`context_bar.rs:184-189`).
     public var contextBarHovered: Bool
@@ -593,6 +1263,7 @@ public struct PagerStatusBar: Sendable, Equatable, Hashable {
         queuedPromptCount: Int = 0,
         isPlanMode: Bool = false,
         backgroundTaskCount: Int = 0,
+        credit: PagerCreditStatus? = nil,
         contextBarHovered: Bool = false
     ) {
         self.gitBranch = gitBranch
@@ -606,6 +1277,7 @@ public struct PagerStatusBar: Sendable, Equatable, Hashable {
         self.queuedPromptCount = queuedPromptCount
         self.isPlanMode = isPlanMode
         self.backgroundTaskCount = backgroundTaskCount
+        self.credit = credit
         self.contextBarHovered = contextBarHovered
     }
 }
@@ -644,6 +1316,9 @@ public struct PagerTurnStatus: Sendable, Equatable, Hashable {
     /// Whether a bare Enter would force-send the top queued row.
     public var queueIsSendable: Bool
     public var indicator: PagerTurnIndicator
+    /// Whether the active frontend can actually invoke cancellation. Minimal
+    /// keyboard-only mode and watcher-only states set this false.
+    public var canCancel: Bool
 
     public init(
         label: String,
@@ -653,7 +1328,8 @@ public struct PagerTurnStatus: Sendable, Equatable, Hashable {
         tokenCount: Int? = nil,
         queuedPromptCount: Int = 0,
         queueIsSendable: Bool = false,
-        indicator: PagerTurnIndicator = .spinner
+        indicator: PagerTurnIndicator = .spinner,
+        canCancel: Bool = false
     ) {
         self.label = label
         self.isCancelling = isCancelling
@@ -663,6 +1339,7 @@ public struct PagerTurnStatus: Sendable, Equatable, Hashable {
         self.queuedPromptCount = queuedPromptCount
         self.queueIsSendable = queueIsSendable
         self.indicator = indicator
+        self.canCancel = canCancel
     }
 }
 
@@ -948,6 +1625,9 @@ public struct PagerRenderState: Sendable, Equatable {
     /// bar/banner and the transcript, upstream's `Constraint::Length(
     /// tasks_height)` slot (`views/agent.rs:210-213`). `nil` = hidden.
     public var tasksPane: PagerTasksPaneState?
+    /// Structured todo list shown independently from the Ctrl+G tasks pane.
+    public var todoPane: PagerTodoPane?
+    public var welcomeAuth: PagerWelcomeAuthState?
     public var scrollPosition: PagerScrollPosition
     public var theme: PagerRenderTheme
     public var showScrollbar: Bool
@@ -982,6 +1662,11 @@ public struct PagerRenderState: Sendable, Equatable {
     /// terminals — the live composition's pass-through is pinned by the
     /// auto-compact toast test for exactly that reason.
     public var compactMode: Bool
+    /// `[ui] group_tool_verbs` — aggregate consecutive collapsed
+    /// read/list/search/fetch-style tools into semantic verb headers.
+    /// Upstream defaults the optional setting to true; live producers pass
+    /// that resolved value explicitly while pure render callers opt in.
+    public var groupToolVerbs: Bool
     /// `[scrollback.display].sticky_headers` from `$OPENGROK_HOME/pager.toml`
     /// (`appearance/config.rs:158-160, 1429` at pin 650c1db7). Default
     /// **true** — absent key / absent file / producers that never wire the
@@ -1037,6 +1722,8 @@ public struct PagerRenderState: Sendable, Equatable {
     /// HUD off / not painted. Carry the formatted body here, never
     /// `PagerFpsHud` itself (that type is mutable session state).
     public var fpsHud: PagerFpsHudOverlay?
+    /// Optional scroll-normalization diagnostics HUD.
+    public var scrollDebugHud: PagerScrollDebugOverlay?
     /// Transient toast (Copied!, etc.). Wins over `stickyToast` while set.
     /// Tick/expiry and focus-specific copy (mouse-off hint swap) are
     /// live-layer concerns — pass the already-chosen strings.
@@ -1056,6 +1743,8 @@ public struct PagerRenderState: Sendable, Equatable {
         input: PagerComposerState = PagerComposerState(),
         shortcuts: PagerShortcutsBar? = nil,
         tasksPane: PagerTasksPaneState? = nil,
+        todoPane: PagerTodoPane? = nil,
+        welcomeAuth: PagerWelcomeAuthState? = nil,
         scrollPosition: PagerScrollPosition = .followTail,
         theme: PagerRenderTheme = .default,
         showScrollbar: Bool = true,
@@ -1064,6 +1753,7 @@ public struct PagerRenderState: Sendable, Equatable {
         motion: PagerMotionSnapshot = PagerMotionSnapshot(),
         waveRows: Int = PagerMotion.defaultWaveRows,
         compactMode: Bool = false,
+        groupToolVerbs: Bool = false,
         stickyHeadersEnabled: Bool = true,
         showTimestamps: Bool = false,
         showTimeline: Bool = false,
@@ -1071,6 +1761,7 @@ public struct PagerRenderState: Sendable, Equatable {
         textSelectionHighlight: PagerTextSelectionHighlight? = nil,
         tableSelectionGeometry: PagerTableSelectionGeometry? = nil,
         fpsHud: PagerFpsHudOverlay? = nil,
+        scrollDebugHud: PagerScrollDebugOverlay? = nil,
         toast: String? = nil,
         stickyToast: String? = nil
     ) {
@@ -1085,12 +1776,15 @@ public struct PagerRenderState: Sendable, Equatable {
         self.input = input
         self.shortcuts = shortcuts
         self.tasksPane = tasksPane
+        self.todoPane = todoPane
+        self.welcomeAuth = welcomeAuth
         self.scrollPosition = scrollPosition
         self.theme = theme
         self.showScrollbar = showScrollbar
         self.motion = motion
         self.waveRows = max(1, waveRows)
         self.compactMode = compactMode
+        self.groupToolVerbs = groupToolVerbs
         self.stickyHeadersEnabled = stickyHeadersEnabled
         self.showTimestamps = showTimestamps
         self.showTimeline = showTimeline
@@ -1098,6 +1792,7 @@ public struct PagerRenderState: Sendable, Equatable {
         self.textSelectionHighlight = textSelectionHighlight
         self.tableSelectionGeometry = tableSelectionGeometry
         self.fpsHud = fpsHud
+        self.scrollDebugHud = scrollDebugHud
         self.toast = toast
         self.stickyToast = stickyToast
     }

@@ -609,6 +609,23 @@ private struct RecapRendererFixture {
         return paintedCompact().contains(needle)
     }
 
+    func waitForRecap(summary: String, timeout: TimeInterval = 10) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let items = await renderer.testingConversationItems()
+            if items.contains(where: { item in
+                guard case .block(.sessionEvent(let block)) = item,
+                      case .recap(let value, let auto) = block.event
+                else { return false }
+                return value == summary && !auto && block.isExpanded
+            }) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return false
+    }
+
     /// Run the REAL controller over this renderer with typed input: each
     /// line is typed, the dropdown closed with Esc, and submitted.
     func runController(submitting lines: [String]) async throws {
@@ -677,7 +694,7 @@ struct LiveRecapLiveSeamTests {
     /// route resolves through the aux config (`sampling_config_for_model`
     /// pins `service_tier: None`, agent/config.rs:6097), the body carries NO
     /// service_tier even while the session has Fast on. The mocked text
-    /// paints as the "Recap —" line, and the conversation is UNCHANGED:
+    /// fills the original typed Recap block, and the conversation is UNCHANGED:
     /// the next real turn's body contains no recap items.
     @Test("/recap sends one tool-free request and never mutates the conversation")
     func recapWireShapeAndNoMutation() async throws {
@@ -701,7 +718,7 @@ struct LiveRecapLiveSeamTests {
         let before = fixture.inferenceBodies().count
 
         try await harness.runController(submitting: ["/recap"])
-        #expect(await harness.waitForPaint(of: "Recap \u{2014} We wired the recap side-call."))
+        #expect(await harness.waitForRecap(summary: "We wired the recap side-call."))
 
         // Exactly ONE side-call left the machine.
         #expect(fixture.inferenceBodies().count == before + 1)
@@ -761,7 +778,7 @@ struct LiveRecapLiveSeamTests {
         let before = fixture.inferenceBodies().count
 
         try await harness.runController(submitting: ["/recap"])
-        #expect(await harness.waitForPaint(of: "Recap \u{2014} We kept the active route."))
+        #expect(await harness.waitForRecap(summary: "We kept the active route."))
 
         #expect(fixture.inferenceBodies().count == before + 1)
         let body = fixture.inferenceBodies().last?.body
@@ -795,7 +812,7 @@ struct LiveRecapLiveSeamTests {
         let before = fixture.inferenceBodies().count
 
         try await harness.runController(submitting: ["/recap"])
-        #expect(await harness.waitForPaint(of: "Recap \u{2014} We trimmed the recap input."))
+        #expect(await harness.waitForRecap(summary: "We trimmed the recap input."))
         #expect(fixture.inferenceBodies().count == before + 1)
 
         let messages = fixture.inferenceBodies().last?.body?["messages"].arrayValue ?? []

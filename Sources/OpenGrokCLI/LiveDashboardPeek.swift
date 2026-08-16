@@ -247,6 +247,9 @@ enum LiveDashboardPeek {
                 }
             case .tool(let tool):
                 return label(for: tool.kind)
+            case .block(let block):
+                if block.isRunning { return block.displayTitle }
+                continue
             case .separator:
                 continue
             }
@@ -270,6 +273,7 @@ enum LiveDashboardPeek {
         case .search: return "Search"
         case .fetch: return "Fetch"
         case .webSearch: return "Web search"
+        case .xSearch: return "X search"
         case .memorySearch: return "Memory search"
         case .integrationSearch: return "Search tools"
         case .useTool: return "Server action"

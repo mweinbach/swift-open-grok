@@ -61,17 +61,17 @@ struct OpenGrokPagerRenderTests {
         #expect(result.cursorPosition == TerminalPoint(x: 8, y: result.layout.input.y + 1))
     }
 
-    @Test("tool cards use an accent rail and diamond bullet, never a box")
+    @Test("execute cards use an accent rail and diamond bullet, never a box")
     func toolCardPresentation() {
         let result = renderPagerFrame(PagerRenderState(
             size: TerminalSize(width: 44, height: 16),
             conversation: [
                 .message(PagerMessage(role: .assistant, text: "working", isStreaming: true)),
                 .tool(PagerToolCard(
-                    name: "read_file",
-                    input: "/tmp/example.txt",
+                    name: "execute",
+                    kind: .execute,
+                    input: "printf 'line one\\nline two\\n'",
                     output: "line one\nline two",
-                    detail: "(2 lines)",
                     state: .succeeded,
                     isExpanded: true
                 ))
@@ -81,8 +81,9 @@ struct OpenGrokPagerRenderTests {
         ))
 
         let snapshot = result.snapshot()
-        #expect(snapshot.contains("working\u{258C}"))
-        #expect(snapshot.contains("\u{25C6} Read /tmp/example.txt (2 lines)"))
+        #expect(snapshot.contains("working"))
+        #expect(!snapshot.contains("\u{258C}"))
+        #expect(snapshot.contains("\u{25C6} Run printf 'line one\\nline two\\n'"))
         #expect(snapshot.contains("\u{2503}"))
         #expect(snapshot.contains("line two"))
         // The reference draws no rectangle around a tool call.
@@ -198,7 +199,8 @@ struct OpenGrokPagerRenderTests {
                 elapsed: 80,
                 tokenCount: 12_000,
                 queuedPromptCount: 1,
-                queueIsSendable: true
+                queueIsSendable: true,
+                canCancel: true
             ),
             input: PagerComposerState(isFocused: false),
             showScrollbar: false

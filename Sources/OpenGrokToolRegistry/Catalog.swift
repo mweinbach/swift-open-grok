@@ -110,6 +110,7 @@ public enum BuiltinToolCatalog {
             "-i": boolProp("Case insensitive."),
             "head_limit": intProp("Limit match lines."),
             "multiline": boolProp("Multiline mode."),
+            "output_mode": stringProp("Output mode: content, files_with_matches, or count."),
         ],
         required: ["pattern"]
     )

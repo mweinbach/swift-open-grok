@@ -389,6 +389,8 @@ func renderDetachedSwarmXML(
 final class SwarmRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var swarms: [String: DetachedSwarm] = [:]
+    private var archived: [String: DetachedSwarm] = [:]
+    private var archiveOrder: [String] = []
 
     init() {}
 
@@ -426,7 +428,44 @@ final class SwarmRegistry: @unchecked Sendable {
     func remove(_ swarmID: String) {
         lock.lock()
         defer { lock.unlock() }
-        swarms.removeValue(forKey: swarmID)
+        if let swarm = swarms.removeValue(forKey: swarmID) {
+            archived[swarmID] = swarm
+            archiveOrder.removeAll { $0 == swarmID }
+            archiveOrder.append(swarmID)
+            while archiveOrder.count > 32 {
+                archived.removeValue(forKey: archiveOrder.removeFirst())
+            }
+        }
+    }
+
+    func transcriptSnapshots(parentSessionID: String) -> [LiveSwarmTranscriptSnapshot] {
+        lock.lock()
+        defer { lock.unlock() }
+        let active = swarms.values
+            .filter { $0.parentSessionID == parentSessionID }
+            .map { LiveSwarmTranscriptSnapshot(swarm: $0, isActive: true) }
+        let completed = archiveOrder.compactMap { archived[$0] }
+            .filter { $0.parentSessionID == parentSessionID }
+            .map { LiveSwarmTranscriptSnapshot(swarm: $0, isActive: false) }
+        return (completed + active).sorted { $0.swarmID < $1.swarmID }
+    }
+}
+
+struct LiveSwarmTranscriptSnapshot: Sendable, Equatable {
+    var swarmID: String
+    var description: String
+    var expectedMembers: Int
+    var slots: [SwarmMemberResult?]
+    var isActive: Bool
+    var isFinished: Bool
+
+    init(swarm: DetachedSwarm, isActive: Bool) {
+        self.swarmID = swarm.swarmID
+        self.description = swarm.description
+        self.expectedMembers = swarm.expectedMembers
+        self.slots = swarm.snapshot()
+        self.isActive = isActive
+        self.isFinished = swarm.isFinished
     }
 }
 

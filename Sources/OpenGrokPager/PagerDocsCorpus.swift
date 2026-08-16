@@ -1691,7 +1691,8 @@ the independent OpenAI Codex account and keep the xAI session active.
 
 ### `/usage`
 
-View session token usage for the current conversation in a text modal. Alias:
+Append a typed usage block with authoritative provider quota data when it is
+available, otherwise an explicitly estimated session-token section. Alias:
 `/cost`. Arguments are not supported; upstream billing arms such as `/usage
 manage` are not ported in this build.
 

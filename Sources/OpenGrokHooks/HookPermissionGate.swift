@@ -53,15 +53,33 @@ public struct HookSessionContext: Sendable {
 /// Records from every dispatch accumulate so the session can surface which
 /// hooks ran, which were skipped, and which failed open.
 public final class HookPermissionGate: PreToolUseHookRunner, @unchecked Sendable {
+    public typealias RunObserver = @Sendable (
+        HookEvent,
+        String?,
+        [HookRunRecord]
+    ) -> Void
+
     public let dispatcher: HookDispatcher
     public let context: HookSessionContext
 
     private let lock = NSLock()
     private var records: [HookRunRecord] = []
+    private var runObserver: RunObserver?
 
-    public init(dispatcher: HookDispatcher, context: HookSessionContext) {
+    public init(
+        dispatcher: HookDispatcher,
+        context: HookSessionContext,
+        runObserver: RunObserver? = nil
+    ) {
         self.dispatcher = dispatcher
         self.context = context
+        self.runObserver = runObserver
+    }
+
+    public func setRunObserver(_ observer: RunObserver?) {
+        lock.lock()
+        runObserver = observer
+        lock.unlock()
     }
 
     /// Whether any enabled `PreToolUse` hook exists. When false the pipeline
@@ -107,6 +125,7 @@ public final class HookPermissionGate: PreToolUseHookRunner, @unchecked Sendable
             context: context.runContext
         )
         append(result.results)
+        notify(event: .preToolUse, id: toolCallId, records: result.results)
 
         // Anything other than an explicit deny proceeds. A hook that timed out,
         // crashed, or emitted garbage is recorded as `.failed` by the
@@ -155,6 +174,12 @@ public final class HookPermissionGate: PreToolUseHookRunner, @unchecked Sendable
             context: context.runContext
         )
         append(records)
+        notify(
+            event: event,
+            id: promptId ?? payload.stringValue(for: "toolUseId")
+                ?? payload.stringValue(for: "toolCallId"),
+            records: records
+        )
         return records
     }
 
@@ -189,6 +214,7 @@ public final class HookPermissionGate: PreToolUseHookRunner, @unchecked Sendable
             context: context.runContext
         )
         append(result.results)
+        notify(event: event, id: promptId, records: result.results)
         return result
     }
 
@@ -217,6 +243,14 @@ public final class HookPermissionGate: PreToolUseHookRunner, @unchecked Sendable
         lock.unlock()
     }
 
+    private func notify(event: HookEvent, id: String?, records: [HookRunRecord]) {
+        guard !records.isEmpty else { return }
+        lock.lock()
+        let observer = runObserver
+        lock.unlock()
+        observer?(event, id, records)
+    }
+
     private func preToolUsePayload(
         toolName: String,
         toolCallId: String,
@@ -236,6 +270,13 @@ public final class HookPermissionGate: PreToolUseHookRunner, @unchecked Sendable
             payload["toolInput"] = hookJSON(from: input)
         }
         return payload
+    }
+}
+
+private extension Dictionary where Key == String, Value == HookJSONValue {
+    func stringValue(for key: String) -> String? {
+        guard case .string(let value) = self[key] else { return nil }
+        return value
     }
 }
 

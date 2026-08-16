@@ -12,10 +12,16 @@ struct WorkingLine: Sendable, Equatable {
     var segments: [MarkdownRenderSegment] = []
     var sourceLine: Int
     var links: [InternalLink] = []
+    var background: MarkdownLineBackground?
 
-    init(segments: [MarkdownRenderSegment] = [], sourceLine: Int) {
+    init(
+        segments: [MarkdownRenderSegment] = [],
+        sourceLine: Int,
+        background: MarkdownLineBackground? = nil
+    ) {
         self.segments = segments
         self.sourceLine = sourceLine
+        self.background = background
     }
 
     var text: String {
@@ -92,7 +98,11 @@ struct RenderEngine: Sendable {
         var hyperlinks: [MarkdownHyperlink] = []
 
         for (lineIndex, line) in fragment.lines.enumerated() {
-            lines.append(MarkdownRenderLine(segments: line.segments, sourceLine: line.sourceLine))
+            lines.append(MarkdownRenderLine(
+                segments: line.segments,
+                sourceLine: line.sourceLine,
+                background: line.background
+            ))
             for link in line.links {
                 hyperlinks.append(MarkdownHyperlink(lineIndex: lineIndex, columnRange: link.range, url: link.url, id: link.id))
             }
@@ -255,9 +265,15 @@ struct RenderEngine: Sendable {
         if configuration.pretty {
             bodyStart = 0
             if !bodyLines.isEmpty && !(bodyLines.count == 1 && bodyLines[0].isEmpty) {
-                result.lines = bodyLines.map {
-                    var line = WorkingLine(sourceLine: code.sourceLine)
-                    line.append(configuration.style.codeIndent + $0, style: .code)
+                result.lines = bodyLines.map { bodyLine in
+                    var line = WorkingLine(
+                        sourceLine: code.sourceLine,
+                        background: .code
+                    )
+                    line.append(configuration.style.codeIndent, style: .code)
+                    for segment in markdownHighlightFenceLine(bodyLine, info: code.info) {
+                        line.append(segment.text, style: segment.style)
+                    }
                     return line
                 }
             }
@@ -267,8 +283,13 @@ struct RenderEngine: Sendable {
             result.lines.append(opening)
             bodyStart = result.lines.count
             for (offset, value) in bodyLines.enumerated() {
-                var line = WorkingLine(sourceLine: code.sourceLine + offset + 1)
-                line.append(value, style: .code)
+                var line = WorkingLine(
+                    sourceLine: code.sourceLine + offset + 1,
+                    background: .code
+                )
+                for segment in markdownHighlightFenceLine(value, info: code.info) {
+                    line.append(segment.text, style: segment.style)
+                }
                 result.lines.append(line)
             }
             if code.closed {

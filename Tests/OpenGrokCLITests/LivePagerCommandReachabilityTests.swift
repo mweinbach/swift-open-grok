@@ -219,19 +219,22 @@ private func makeSessionRecord(
 
 @Suite("Live pager command surfaces", .serialized)
 struct LivePagerCommandReachabilityTests {
-    @Test("/usage paints the usage report as a text modal")
-    func usageOverlayPaints() async throws {
+    @Test("/usage appends the typed estimated usage block")
+    func usageBlockPaints() async throws {
         let fixture = try RendererFixture()
         defer { fixture.dispose() }
         try await fixture.renderer.begin()
         try await fixture.renderer.render(.overlay(.usage))
-        // No compaction coordinator in this composition, so the report is the
-        // turn/token estimate section — and must say so on screen. Needles
-        // are single tokens: the cell differ skips unchanged cells, so a
-        // space that survives from the previous frame is not re-emitted and
-        // a multi-word needle can be split in the captured stream.
-        #expect(await fixture.waitForFrame(containing: "Turns:"))
-        #expect(await fixture.waitForFrame(containing: "estimated"))
+        // No compaction coordinator or provider quota source in this
+        // composition, so Wave E emits one explicitly estimated token section.
+        let items = await fixture.renderer.testingConversationItems()
+        guard case .block(.usage(let usage)) = items.last else {
+            Issue.record("expected /usage to append a typed usage block")
+            return
+        }
+        #expect(usage.sections.count == 1)
+        #expect(usage.sections.first?.unit == "tokens")
+        #expect(usage.sections.first?.isAuthoritative == false)
         try await fixture.renderer.restoreTerminal()
     }
 

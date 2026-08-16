@@ -825,6 +825,7 @@ extension LiveInteractiveControllerRenderer {
             switch item {
             case .message(let message): return message.isStreaming
             case .tool(let tool): return tool.state == .running || tool.state == .pending
+            case .block(let block): return block.isRunning
             case .separator: return false
             }
         }

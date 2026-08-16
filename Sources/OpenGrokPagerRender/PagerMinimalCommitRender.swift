@@ -126,6 +126,18 @@ public enum MinimalCommitRender {
                 unboundedPreview: displayMode == .expanded,
                 into: &lines
             )
+        case .block(var block):
+            switch block {
+            case .sessionEvent(var value): value.isExpanded = displayMode != .collapsed; block = .sessionEvent(value)
+            case .lifecycle(var value): value.isExpanded = displayMode != .collapsed; block = .lifecycle(value)
+            case .subagent(var value): value.isExpanded = displayMode != .collapsed; block = .subagent(value)
+            case .swarm(var value): value.isExpanded = displayMode != .collapsed; block = .swarm(value)
+            case .workflow(var value): value.isExpanded = displayMode != .collapsed; block = .workflow(value)
+            case .btw(var value): value.isExpanded = displayMode != .collapsed; block = .btw(value)
+            case .plan(var value): value.isExpanded = displayMode != .collapsed; block = .plan(value)
+            case .backgroundTask, .context, .usage, .creditLimit: break
+            }
+            appendWaveEBlock(block, width: contentWidth, theme: theme, into: &lines)
         case .separator(let text):
             let separator = text.isEmpty ? String(repeating: "─", count: contentWidth) : text
             lines.append(PaintLine(separator, foreground: theme.grayDim))

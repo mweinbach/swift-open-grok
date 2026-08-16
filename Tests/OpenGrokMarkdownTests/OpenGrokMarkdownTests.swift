@@ -110,4 +110,70 @@ struct OpenGrokMarkdownTests {
         #expect(renderer.source.isEmpty)
         #expect(renderer.output.lines.isEmpty)
     }
+
+    @Test("fenced Swift, Rust, and citation info produce syntax spans and code backgrounds")
+    func fencedSyntaxAndCitation() {
+        let swift = MarkdownRenderer().render("```swift\nlet value: String = \"ok\" // note\n```")
+        let swiftStyles = swift.lines.flatMap(\.segments).map(\.style)
+        #expect(swiftStyles.contains(.syntaxKeyword))
+        #expect(swiftStyles.contains(.syntaxType))
+        #expect(swiftStyles.contains(.syntaxString))
+        #expect(swiftStyles.contains(.syntaxComment))
+        #expect(swift.lines.contains { $0.background == .code })
+
+        let rust = MarkdownRenderer().render("```rust\nfn main() { let count = 42; }\n```")
+        let rustStyles = rust.lines.flatMap(\.segments).map(\.style)
+        #expect(rustStyles.contains(.syntaxKeyword))
+        #expect(rustStyles.contains(.syntaxNumber))
+
+        let citation = MarkdownRenderer().render(
+            "```10:12:Sources/App.swift\nlet enabled = true\n```"
+        )
+        #expect(citation.lines.flatMap(\.segments).contains { $0.style == .syntaxKeyword })
+        #expect(markdownFenceLanguage("10:12:Sources/App.swift") == "swift")
+    }
+
+    @Test("streaming renderer parses only the unfrozen tail after a checkpoint")
+    func streamingFrozenPrefixReuse() {
+        var renderer = StreamingMarkdownRenderer()
+        renderer.pushAndRender("Stable **prefix**.\n\nTail")
+        #expect(renderer.frozenBytes > 0)
+
+        let output = renderer.pushAndRender(" grows")
+        #expect(renderer.lastRenderedSourceByteCount < renderer.source.utf8.count)
+        #expect(output == MarkdownRenderer().render(renderer.source))
+    }
+
+    @Test("finish performs an authoritative full render after many checkpoints")
+    func streamingFinishFullRender() {
+        let block = """
+        ## Architecture Overview
+
+        The **streaming** pager keeps [links](https://example.com) stable.
+
+        - first item
+          - nested item
+
+        ```swift
+        let value = "wide unicode 🚀 漢字"
+        ```
+
+        | stage | cached |
+        |---|---|
+        | markdown | yes |
+
+        """
+        let source = String(repeating: block, count: 8)
+        var renderer = StreamingMarkdownRenderer()
+        let characters = Array(source)
+        var offset = 0
+        while offset < characters.count {
+            let end = min(offset + 32, characters.count)
+            renderer.pushAndRender(String(characters[offset..<end]))
+            offset = end
+        }
+
+        #expect(renderer.finish() == MarkdownRenderer().render(source))
+        #expect(renderer.frozenBytes == source.utf8.count)
+    }
 }

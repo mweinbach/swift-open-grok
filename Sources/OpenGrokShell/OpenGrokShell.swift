@@ -146,6 +146,11 @@ public struct OpenGrokShellToolUpdate: Sendable, Equatable {
     public let name: String
     public let input: String
     public let output: String?
+    /// JSON-encoded typed tool result. Kept separate from `output`, which is
+    /// the model-facing/plain transcript text and may be incrementally appended.
+    public let structuredOutput: String?
+    /// True for the interactive user's `!` command path.
+    public let isBashMode: Bool?
     public let state: OpenGrokShellToolState
     /// How `output` should merge into an existing running card. Default
     /// `.replace` keeps prior call sites honest: a terminal update is a
@@ -157,6 +162,8 @@ public struct OpenGrokShellToolUpdate: Sendable, Equatable {
         name: String,
         input: String,
         output: String? = nil,
+        structuredOutput: String? = nil,
+        isBashMode: Bool? = nil,
         state: OpenGrokShellToolState,
         outputOp: OpenGrokShellToolOutputOp = .replace
     ) {
@@ -164,6 +171,8 @@ public struct OpenGrokShellToolUpdate: Sendable, Equatable {
         self.name = name
         self.input = input
         self.output = output
+        self.structuredOutput = structuredOutput
+        self.isBashMode = isBashMode
         self.state = state
         self.outputOp = outputOp
     }

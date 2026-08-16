@@ -151,6 +151,38 @@ private struct AuthRendererFixture {
         }
         return predicate()
     }
+
+    func waitForAuthState(
+        timeout: TimeInterval = 5,
+        matching predicate: @Sendable (PagerWelcomeAuthState?) -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if predicate(await renderer.testingWelcomeAuthState()) { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return predicate(await renderer.testingWelcomeAuthState())
+    }
+}
+
+private final class CapturedAuthBrowser: @unchecked Sendable {
+    private let lock = NSLock()
+    private var openedURL: URL?
+
+    func open(_ url: URL) {
+        lock.lock(); defer { lock.unlock() }
+        openedURL = url
+    }
+
+    func waitForURL(timeout: TimeInterval = 5) async -> URL? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let url = lock.withLock { openedURL }
+            if let url { return url }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return lock.withLock { openedURL }
+    }
 }
 
 /// Services whose network legs are scripted and whose browser is a no-op.
@@ -273,26 +305,34 @@ private final class PagerXAIIdPTransport: HTTPTransport, @unchecked Sendable {
     }
 }
 
-/// The fake browser for the xAI flow: stash the nonce for the token leg,
-/// then deliver `code`+`state` to the REAL loopback listener.
-private func xaiDrivingBrowser(
+/// Build the callback for the xAI flow after the test has observed the exact
+/// authorization URL on the typed trust screen.
+private func xaiCallbackURL(
+    for authURL: URL,
     transport: PagerXAIIdPTransport
-) -> @Sendable (URL) -> Void {
-    { authURL in
-        guard let components = URLComponents(url: authURL, resolvingAgainstBaseURL: false),
-              let items = components.queryItems else { return }
-        let value = { (name: String) in items.first(where: { $0.name == name })?.value }
-        transport.setNonce(value("nonce"))
-        guard let redirect = value("redirect_uri"),
-              let redirectURL = URL(string: redirect),
-              let port = redirectURL.port,
-              let state = value("state"),
-              let cbURL = URL(
-                string: "http://127.0.0.1:\(port)/callback?code=mock-code&state=\(state)"
-              )
-        else { return }
-        URLSession.shared.dataTask(with: cbURL).resume()
-    }
+) -> URL? {
+    guard let components = URLComponents(url: authURL, resolvingAgainstBaseURL: false),
+          let items = components.queryItems else { return nil }
+    let value = { (name: String) in items.first(where: { $0.name == name })?.value }
+    transport.setNonce(value("nonce"))
+    guard let redirect = value("redirect_uri"),
+          let redirectURL = URL(string: redirect),
+          let port = redirectURL.port,
+          let state = value("state")
+    else { return nil }
+    return URL(string: "http://127.0.0.1:\(port)/callback?code=mock-code&state=\(state)")
+}
+
+private func codexCallbackURL(for authURL: URL) -> URL? {
+    guard let components = URLComponents(url: authURL, resolvingAgainstBaseURL: false),
+          let redirect = components.queryItems?
+            .first(where: { $0.name == "redirect_uri" })?.value,
+          let state = components.queryItems?
+            .first(where: { $0.name == "state" })?.value,
+          let redirectURL = URL(string: redirect),
+          let port = redirectURL.port
+    else { return nil }
+    return URL(string: "http://127.0.0.1:\(port)/auth/callback?code=mock-code&state=\(state)")
 }
 
 /// A structurally valid unsigned JWT — `persistCodexTokens` validates shape,
@@ -422,6 +462,7 @@ struct LiveXAILoginFlowTests {
     @Test("the xai flow runs against the real listener and lands in the real auth.json")
     func xaiFlowLandsCredentials() async throws {
         let transport = try PagerXAIIdPTransport()
+        let browser = CapturedAuthBrowser()
         // A catalog store so the post-login refresh pair is observable at its
         // own seam. Hermetic: no provider key env, so every background
         // partition skips before any network I/O.
@@ -441,7 +482,7 @@ struct LiveXAILoginFlowTests {
             extraEnvironment: xaiPinnedEnvironment,
             authServices: fakeAuthServices(
                 transport: transport,
-                openBrowser: xaiDrivingBrowser(transport: transport)
+                openBrowser: { browser.open($0) }
             ),
             catalogStore: catalogStore
         )
@@ -449,11 +490,12 @@ struct LiveXAILoginFlowTests {
         try await fixture.renderer.begin()
         try await fixture.renderer.render(.overlay(.loginXAI))
 
-        // The start header (welcome/mod.rs:1022) and the URL announce
-        // (oidc/login.rs:439-440) land in the transcript. Single-token
-        // needles: the cell differ can split multi-word strings.
-        #expect(await fixture.waitForFrame(containing: "authentication."))
-        #expect(await fixture.waitForFrame(containing: "URL"))
+        let authURL = try #require(await browser.waitForURL())
+        #expect(await fixture.waitForAuthState { state in
+            state?.phase == .trust && state?.url == authURL.absoluteString
+        })
+        let callbackURL = try #require(xaiCallbackURL(for: authURL, transport: transport))
+        URLSession.shared.dataTask(with: callbackURL).resume()
 
         // Completion: the credential is in the REAL store file under the
         // OAuth scope, and the connected copy is the CLI's `report_signed_in`
@@ -470,7 +512,9 @@ struct LiveXAILoginFlowTests {
             with: Data(contentsOf: xaiFile)
         ) as? [String: Any])?.keys.sorted() ?? []
         #expect(storeKeys.contains("http://127.0.0.1:9::pager-client"))
-        #expect(await fixture.waitForFrame(containing: "tui@x.ai"))
+        #expect(await fixture.waitForAuthState { state in
+            state?.phase == .starting && state?.message?.contains("tui@x.ai") == true
+        })
 
         // The post-login pair fired: the background catalog refresh task
         // exists (the codex arm's effects/mod.rs:1690-1699 equivalent).
@@ -550,6 +594,7 @@ struct LiveXAILoginFlowTests {
 struct LiveCodexLoginFlowTests {
     @Test("the codex flow runs against the real listener and lands credentials on disk")
     func codexFlowLandsCredentials() async throws {
+        let browser = CapturedAuthBrowser()
         let idToken = makeTestJWT(payload: [
             "email": "tui@openai.com",
             "https://api.openai.com/auth": ["chatgpt_plan_type": "plus"],
@@ -563,39 +608,29 @@ struct LiveCodexLoginFlowTests {
                 body: Data(exchangeJSON.utf8)
             ),
         ])
-        // The fake "browser": pull the redirect port and state out of the
-        // authorize URL and drive the REAL callback listener, the way
-        // `Tests/OpenGrokAuthTests` codexBrowserLoginFlow does.
-        let openBrowser: @Sendable (URL) -> Void = { authURL in
-            guard let components = URLComponents(url: authURL, resolvingAgainstBaseURL: false),
-                  let redirect = components.queryItems?
-                      .first(where: { $0.name == "redirect_uri" })?.value,
-                  let state = components.queryItems?
-                      .first(where: { $0.name == "state" })?.value,
-                  let redirectURL = URL(string: redirect),
-                  let port = redirectURL.port,
-                  let cbURL = URL(
-                    string: "http://127.0.0.1:\(port)/auth/callback?code=mock-code&state=\(state)"
-                  )
-            else { return }
-            URLSession.shared.dataTask(with: cbURL).resume()
-        }
         let fixture = try AuthRendererFixture(
-            authServices: fakeAuthServices(transport: transport, openBrowser: openBrowser)
+            authServices: fakeAuthServices(
+                transport: transport,
+                openBrowser: { browser.open($0) }
+            )
         )
         defer { fixture.dispose() }
         try await fixture.renderer.begin()
         try await fixture.renderer.render(.overlay(.loginCodex))
 
-        // The dispatch notice (`dispatch/auth.rs:119-121`) and the auth URL
-        // announce land in the transcript.
-        #expect(await fixture.waitForFrame(containing: "Opening"))
-        #expect(await fixture.waitForFrame(containing: "automatically:"))
+        let authURL = try #require(await browser.waitForURL())
+        #expect(await fixture.waitForAuthState { state in
+            state?.phase == .trust && state?.url == authURL.absoluteString
+        })
+        let callbackURL = try #require(codexCallbackURL(for: authURL))
+        URLSession.shared.dataTask(with: callbackURL).resume()
         // Completion: the store is real and the notice carries the account
         // (`task_result.rs:3853-3869`).
         let codexFile = fixture.codexAuthFile
         #expect(await fixture.wait { isCodexLoggedIn(at: codexFile) })
-        #expect(await fixture.waitForFrame(containing: "tui@openai.com"))
+        #expect(await fixture.waitForAuthState { state in
+            state?.phase == .starting && state?.message?.contains("tui@openai.com") == true
+        })
         try await fixture.renderer.restoreTerminal()
     }
 

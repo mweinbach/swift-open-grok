@@ -424,10 +424,16 @@ public struct PagerWorkflowsOverlay: Sendable, Equatable, Hashable {
 public struct PagerTextOverlay: Sendable, Equatable, Hashable {
     public var lines: [PagerStyledLine]
     public var scrollOffset: Int
+    public var followsTail: Bool
 
-    public init(lines: [PagerStyledLine], scrollOffset: Int = 0) {
+    public init(
+        lines: [PagerStyledLine],
+        scrollOffset: Int = 0,
+        followsTail: Bool = false
+    ) {
         self.lines = lines
         self.scrollOffset = scrollOffset
+        self.followsTail = followsTail
     }
 }
 
@@ -515,6 +521,7 @@ public struct PagerWelcomeOverlay: Sendable, Equatable, Hashable {
     /// Pointer over the upgrade CTA `[label]` button — upstream's
     /// `welcome_on_upgrade_cta` (`app/app_view.rs:4453-4457`).
     public var announcementCTAHovered: Bool
+    public var auth: PagerWelcomeAuthState?
 
     public init(
         productName: String = "Open Grok Beta",
@@ -528,7 +535,8 @@ public struct PagerWelcomeOverlay: Sendable, Equatable, Hashable {
         announcement: PagerAnnouncementBanner? = nil,
         announcementExpanded: Bool = false,
         announcementHovered: Bool = false,
-        announcementCTAHovered: Bool = false
+        announcementCTAHovered: Bool = false,
+        auth: PagerWelcomeAuthState? = nil
     ) {
         self.productName = productName
         self.version = version
@@ -542,6 +550,7 @@ public struct PagerWelcomeOverlay: Sendable, Equatable, Hashable {
         self.announcementExpanded = announcementExpanded
         self.announcementHovered = announcementHovered
         self.announcementCTAHovered = announcementCTAHovered
+        self.auth = auth
     }
 }
 
@@ -1007,15 +1016,11 @@ public enum PagerPlanApprovalOutcome: Sendable, Equatable {
 
 /// Interactive state for the plan-approval bottom sheet.
 ///
-/// Divergence from upstream, recorded: `plan_approval_view.rs` hosts the plan
-/// in the fullscreen line viewer with per-line commenting (`c`/Enter enter
-/// commenting, comments become structured feedback) and an approve-with-
-/// comments path that interjects into the next turn (`plan.rs:189-215`).
-/// Neither commenting nor interject exists in this port, so the sheet is
-/// deliberately smaller: a scrollable plan body plus upstream's `a`/`s`/`q`
-/// grammar (`viewer.rs:151-166`), with `s` opening the same inline free-text
-/// editor the question sheet's "Other" row uses. The cost: feedback is one
-/// freeform message, never line-anchored comments.
+/// Wave E keeps the plan in a scrollable viewer, supports per-line comments
+/// (`c`/Enter), and exposes upstream's `a`/`s`/`q` grammar
+/// (`plan_approval_view.rs`, `viewer.rs:151-166`). `s` opens the same inline
+/// free-text editor the question sheet's "Other" row uses; saved line comments
+/// are folded into the structured approval feedback.
 public struct PagerPlanApprovalPrompt: Sendable, Equatable {
     public enum Focus: Sendable, Equatable {
         /// Keys act on the plan: scroll, `a`/`s`/`q`.
@@ -1023,17 +1028,25 @@ public struct PagerPlanApprovalPrompt: Sendable, Equatable {
         /// Typing revision feedback (upstream's `PlanApprovalFocus::Prompt`,
         /// reached by `s`, `viewer.rs:157-162`).
         case feedbackInput
+        /// Editing a comment anchored to `selectedLineIndex`.
+        case commentInput
     }
 
     public var request: PagerPlanApprovalRequest
     public private(set) var focus: Focus
     public private(set) var feedbackText: String
+    public private(set) var commentText: String
+    public private(set) var comments: [Int: String]
+    public var selectedLineIndex: Int
     public var scrollOffset: Int
 
     public init(request: PagerPlanApprovalRequest) {
         self.request = request
         self.focus = .viewing
         self.feedbackText = ""
+        self.commentText = ""
+        self.comments = [:]
+        self.selectedLineIndex = 0
         self.scrollOffset = 0
     }
 
@@ -1062,6 +1075,23 @@ public struct PagerPlanApprovalPrompt: Sendable, Equatable {
         focus = .viewing
     }
 
+    public mutating func enterCommentInput() {
+        commentText = comments[selectedLineIndex] ?? ""
+        focus = .commentInput
+    }
+
+    public mutating func leaveCommentInput(save: Bool) {
+        if save {
+            let comment = commentText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if comment.isEmpty {
+                comments.removeValue(forKey: selectedLineIndex)
+            } else {
+                comments[selectedLineIndex] = comment
+            }
+        }
+        focus = .viewing
+    }
+
     public mutating func appendFeedback(_ character: Character) {
         feedbackText.append(character)
     }
@@ -1069,6 +1099,15 @@ public struct PagerPlanApprovalPrompt: Sendable, Equatable {
     public mutating func deleteFeedbackBackward() {
         guard !feedbackText.isEmpty else { return }
         feedbackText.removeLast()
+    }
+
+    public mutating func appendComment(_ character: Character) {
+        commentText.append(character)
+    }
+
+    public mutating func deleteCommentBackward() {
+        guard !commentText.isEmpty else { return }
+        commentText.removeLast()
     }
 }
 
@@ -1103,6 +1142,7 @@ public struct PagerOverlay: Sendable, Equatable {
     /// screen, for one, is painted over the transcript while the composer stays
     /// live beneath it.
     public var capturesInput: Bool
+    public var minimalBelowPrompt: Bool
 
     public init(
         id: String,
@@ -1111,7 +1151,8 @@ public struct PagerOverlay: Sendable, Equatable {
         hints: [PagerOverlayHint] = [],
         content: PagerOverlayContent,
         dismissOnEscape: Bool = true,
-        capturesInput: Bool = true
+        capturesInput: Bool = true,
+        minimalBelowPrompt: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -1120,6 +1161,7 @@ public struct PagerOverlay: Sendable, Equatable {
         self.content = content
         self.dismissOnEscape = dismissOnEscape
         self.capturesInput = capturesInput
+        self.minimalBelowPrompt = minimalBelowPrompt
     }
 }
 
@@ -1317,7 +1359,8 @@ extension PagerOverlay {
     public static func sessionInfo(
         id: String = "session-info",
         title: String = "Session",
-        lines: [PagerStyledLine]
+        lines: [PagerStyledLine],
+        followsTail: Bool = false
     ) -> PagerOverlay {
         PagerOverlay(
             id: id,
@@ -1327,7 +1370,7 @@ extension PagerOverlay {
                 PagerOverlayHint(key: "↑/↓", label: "scroll"),
                 PagerOverlayHint(key: "Esc", label: "close")
             ],
-            content: .text(PagerTextOverlay(lines: lines))
+            content: .text(PagerTextOverlay(lines: lines, followsTail: followsTail))
         )
     }
 
@@ -1559,6 +1602,19 @@ public struct PagerOverlayStack: Sendable, Equatable {
         else { return false }
         transform(&welcome)
         overlays[index].content = .welcome(welcome)
+        return true
+    }
+
+    @discardableResult
+    public mutating func updateText(
+        id: String,
+        _ transform: (inout PagerTextOverlay) -> Void
+    ) -> Bool {
+        guard let index = overlays.firstIndex(where: { $0.id == id }),
+              case .text(var text) = overlays[index].content
+        else { return false }
+        transform(&text)
+        overlays[index].content = .text(text)
         return true
     }
 
@@ -1891,6 +1947,7 @@ public struct PagerOverlayStack: Sendable, Equatable {
             let target = min(max(0, text.scrollOffset + delta), maximum)
             guard target != text.scrollOffset else { return .consumed }
             text.scrollOffset = target
+            text.followsTail = target == maximum
             return .redraw
         }
         switch event.key {
@@ -1901,10 +1958,12 @@ public struct PagerOverlayStack: Sendable, Equatable {
         case .home:
             guard text.scrollOffset != 0 else { return .consumed }
             text.scrollOffset = 0
+            text.followsTail = false
             return .redraw
         case .end:
             guard text.scrollOffset != maximum else { return .consumed }
             text.scrollOffset = maximum
+            text.followsTail = true
             return .redraw
         case .char(let character) where event.modifiers.isEmpty:
             switch character {
@@ -2104,38 +2163,73 @@ public struct PagerOverlayStack: Sendable, Equatable {
             default:
                 return .consumed
             }
+        case .commentInput:
+            switch event.key {
+            case .escape:
+                prompt.leaveCommentInput(save: false)
+                return .redraw
+            case .enter:
+                prompt.leaveCommentInput(save: true)
+                return .redraw
+            case .backspace:
+                prompt.deleteCommentBackward()
+                return .redraw
+            case .char(let character):
+                if isCtrlC {
+                    prompt.leaveCommentInput(save: false)
+                    return .redraw
+                }
+                guard event.modifiers.subtracting(.shift).isEmpty, !character.isNewline else {
+                    return .consumed
+                }
+                prompt.appendComment(character)
+                return .redraw
+            default:
+                return .consumed
+            }
         case .viewing:
             if isCtrlC {
                 return finish(.abandoned)
             }
             let page = max(1, viewportHeight)
-            let maximum = max(0, prompt.bodyLines.count - page)
-            func scroll(by delta: Int) -> PagerOverlayOutcome {
-                let target = min(max(0, prompt.scrollOffset + delta), maximum)
-                guard target != prompt.scrollOffset else { return .consumed }
-                prompt.scrollOffset = target
+            let lineCount = max(1, prompt.bodyLines.count)
+            func moveSelection(by delta: Int) -> PagerOverlayOutcome {
+                let target = min(max(0, prompt.selectedLineIndex + delta), lineCount - 1)
+                guard target != prompt.selectedLineIndex else { return .consumed }
+                prompt.selectedLineIndex = target
+                if target < prompt.scrollOffset {
+                    prompt.scrollOffset = target
+                } else if target >= prompt.scrollOffset + page {
+                    prompt.scrollOffset = max(0, target - page + 1)
+                }
                 return .redraw
             }
             switch event.key {
             case .escape:
                 return finish(.abandoned)
-            case .up: return scroll(by: -1)
-            case .down: return scroll(by: 1)
-            case .pageUp: return scroll(by: -page)
-            case .pageDown: return scroll(by: page)
-            case .home: return scroll(by: -maximum)
-            case .end: return scroll(by: maximum)
+            case .enter:
+                prompt.enterCommentInput()
+                return .redraw
+            case .up: return moveSelection(by: -1)
+            case .down: return moveSelection(by: 1)
+            case .pageUp: return moveSelection(by: -page)
+            case .pageDown: return moveSelection(by: page)
+            case .home: return moveSelection(by: -lineCount)
+            case .end: return moveSelection(by: lineCount)
             case .char(let character) where event.modifiers.isEmpty:
                 switch character {
                 case "a": return finish(.approved)
                 case "s":
                     prompt.enterFeedbackInput()
                     return .redraw
+                case "c":
+                    prompt.enterCommentInput()
+                    return .redraw
                 case "q": return finish(.abandoned)
-                case "j": return scroll(by: 1)
-                case "k": return scroll(by: -1)
-                case "g": return scroll(by: -maximum)
-                case "G": return scroll(by: maximum)
+                case "j": return moveSelection(by: 1)
+                case "k": return moveSelection(by: -1)
+                case "g": return moveSelection(by: -lineCount)
+                case "G": return moveSelection(by: lineCount)
                 default: return .consumed
                 }
             default:

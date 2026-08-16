@@ -172,6 +172,9 @@ extension LiveInteractiveControllerRenderer {
     /// the restart-required opt-in gate.
     func testingIsMouseReportingEnabled() -> Bool { mouseReportingEnabled }
 
+    /// Auth subview state carried by the same frame builder production paints.
+    func testingWelcomeAuthState() -> PagerWelcomeAuthState? { welcomeAuthState }
+
     /// Startup-cached opt-in gate for `/toggle-mouse-reporting` / scrollback
     /// `Ctrl+R`. Live-seam probe only.
     func testingMouseReportingToggleEnabled() -> Bool { mouseReportingToggleEnabled }
@@ -281,6 +284,10 @@ extension LiveInteractiveControllerRenderer {
 
     /// Conversation item count after live appends / turns.
     func testingConversationItemCount() -> Int { conversation.items.count }
+
+    /// Typed transcript snapshot from the same conversation state the next
+    /// frame and final plain-text transcript consume.
+    func testingConversationItems() -> [PagerConversationItem] { conversation.items }
 
     /// Whether a coalesced frame is waiting on the paint-cadence flush timer.
     func testingHasScheduledFrame() -> Bool { renderer.scheduledFrameAt != nil }

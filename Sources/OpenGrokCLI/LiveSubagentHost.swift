@@ -76,6 +76,8 @@ struct LiveSubagentSnapshot: Sendable, Equatable {
     var startedAt: Date
     var durationMS: UInt64
     var exitCode: Int32?
+    var turnCount: UInt32 = 0
+    var toolCallCount: UInt32 = 0
 
     var completed: Bool { status != "running" }
 }
@@ -1419,7 +1421,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 output: runningOutput(id: id, meta: meta, startedAt: started),
                 startedAt: started,
                 durationMS: Self.milliseconds(since: started),
-                exitCode: nil
+                exitCode: nil,
+                turnCount: meta?.turns ?? 0,
+                toolCallCount: meta?.toolCalls ?? 0
             )
         }
         guard let completed = await coordinator.listCompleted()
@@ -1455,7 +1459,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             output: output,
             startedAt: started,
             durationMS: result.durationMS,
-            exitCode: status == "completed" ? 0 : 1
+            exitCode: status == "completed" ? 0 : 1,
+            turnCount: meta?.terminalTurns ?? meta?.turns ?? 0,
+            toolCallCount: meta?.terminalToolCalls ?? meta?.toolCalls ?? 0
         )
     }
 

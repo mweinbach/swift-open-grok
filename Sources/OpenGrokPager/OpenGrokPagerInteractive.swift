@@ -127,6 +127,8 @@ public enum OpenGrokPagerGlobalCommand: Sendable, Equatable, Hashable {
     case modelPicker
     /// `Ctrl+T` (`:536`).
     case toggleTodos
+    /// `Ctrl+Shift+T` — toggle completed/cancelled todo rows.
+    case toggleTodoCompleted
     /// `Ctrl+G` (`:49`).
     case toggleTasks
     /// `Ctrl+;` with `Ctrl+'` as the alternate (`:551`).
@@ -337,10 +339,10 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// `/toggle-mouse-reporting` — hand click-drag back to the terminal for
     /// native copy/paste, or take it back.
     case toggleMouseReporting
-    /// `/debug [fps]` — FPS HUD toggle / status. Scroll/log surfaces are
-    /// absent on this port, so the only subcommand is `fps` (no no-op
-    /// entries). Bare args report fps status; `fps` toggles and forces paint.
+    /// `/debug [scroll|fps|log]` — diagnostics toggle/status surface.
     case debug(argument: String)
+    /// `/scroll-debug` — hidden long-form alias for `/debug scroll`.
+    case scrollDebug
     /// `/compact-mode` — flip the USER's `[ui] compact_mode` value (upstream
     /// `Action::ToggleCompactMode`, `slash/commands/compact_mode.rs:28-30`,
     /// dispatched by `dispatch_toggle_compact_mode`,
@@ -508,9 +510,10 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     /// `Action::ShowSessionPicker`, `slash/commands/resume.rs:21-23`). The
     /// session store is a CLI-layer concern, so the intent carries no rows.
     case sessionPicker
-    /// `/usage`, alias `/cost` — session token usage as a text modal
-    /// (upstream `Action::ShowUsage`, `slash/commands/usage.rs:59`). The
-    /// billing-surface arm (`manage`) is not ported; see the controller.
+    /// `/usage`, alias `/cost` — provider quota or estimated session usage as
+    /// a typed transcript block (upstream `Action::ShowUsage`,
+    /// `slash/commands/usage.rs:59`). The billing-surface arm (`manage`) is
+    /// not ported; see the controller.
     case usage
     /// `/cache`, aliases `/cache-status`, `/prompt-cache` — view prompt cache hit rates,
     /// prefix divergence, and break diagnostics.
@@ -566,8 +569,8 @@ public enum OpenGrokPagerOverlayRequest: Sendable, Equatable, Hashable {
     case sideQuestion(question: String)
     /// `/recap` (alias `/summarize`) — upstream `Action::SendRecap{auto:false}`
     /// (`slash/commands/recap.rs:34-36`): a one-shot side-call that summarizes
-    /// the session so far and paints the result as a display-only "Recap —"
-    /// line. It bypasses the prompt queue and NEVER mutates the conversation
+    /// the session so far and fills one typed Recap block in place. It bypasses
+    /// the prompt queue and NEVER mutates the conversation
     /// (`session_recap.rs:1-12`). Carries nothing: the conversation snapshot,
     /// the helper-model choice and the failure copy all live in the render
     /// layer, the only layer that owns the live sampling stack.

@@ -216,6 +216,18 @@ private func contentPoint(
     return (x, screenY)
 }
 
+private func assistantBlockIndex(
+    in items: [PagerConversationItem],
+    containing needle: String
+) -> Int? {
+    items.firstIndex { item in
+        guard case .message(let message) = item, message.role == .assistant else {
+            return false
+        }
+        return message.text.contains(needle)
+    }
+}
+
 /// First real inter-block gap whose screen row sits inside the published
 /// conversation rect. Follow-tail often scrolls the earliest gap off-screen,
 /// so every adjacent pair is scanned — packed neighbors (gapContentY ==
@@ -253,8 +265,11 @@ struct LiveMouseBlockSelectionTests {
         try await fixture.seedTwoBlocks()
 
         let model = try #require(await fixture.renderer.lastConversationHit)
-        // Prefer a later visible content block (assistant reply of turn 1).
-        let target = min(2, model.blockStartLines.count - 1)
+        let items = await fixture.renderer.testingConversationItems()
+        let target = try #require(assistantBlockIndex(
+            in: items,
+            containing: "beta-reply-unique-token"
+        ))
         let point = try #require(contentPoint(in: model, blockIndex: target))
 
         let down = try await fixture.renderer.handleInput(.mouse(MouseEvent(
@@ -520,7 +535,11 @@ struct LiveMouseBlockSelectionTests {
         try await fixture.seedTwoBlocks()
 
         let model = try #require(await fixture.renderer.lastConversationHit)
-        let target = min(2, model.blockStartLines.count - 1)
+        let items = await fixture.renderer.testingConversationItems()
+        let target = try #require(assistantBlockIndex(
+            in: items,
+            containing: "beta-reply-unique-token"
+        ))
         let point = try #require(contentPoint(in: model, blockIndex: target))
 
         let down = try await fixture.renderer.handleInput(.mouse(MouseEvent(
@@ -551,7 +570,11 @@ struct LiveMouseBlockSelectionTests {
         try await fixture.seedTwoBlocks()
 
         let model = try #require(await fixture.renderer.lastConversationHit)
-        let target = min(2, model.blockStartLines.count - 1)
+        let items = await fixture.renderer.testingConversationItems()
+        let target = try #require(assistantBlockIndex(
+            in: items,
+            containing: "beta-reply-unique-token"
+        ))
         let point = try #require(contentPoint(in: model, blockIndex: target))
 
         for button: MouseButton in [.middle, .right] {
@@ -582,7 +605,11 @@ struct LiveMouseBlockSelectionTests {
         try await fixture.seedTwoBlocks()
 
         let model = try #require(await fixture.renderer.lastConversationHit)
-        let target = min(2, model.blockStartLines.count - 1)
+        let items = await fixture.renderer.testingConversationItems()
+        let target = try #require(assistantBlockIndex(
+            in: items,
+            containing: "beta-reply-unique-token"
+        ))
         let point = try #require(contentPoint(in: model, blockIndex: target))
         // One cell of jitter still inside the content band — not a drag event.
         let upX = point.x + 1

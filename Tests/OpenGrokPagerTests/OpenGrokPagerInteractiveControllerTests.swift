@@ -5,6 +5,31 @@ import Testing
 
 @Suite("Open Grok interactive pager controller")
 struct OpenGrokPagerInteractiveControllerTests {
+    @Test("leading bang runs locally and never submits a model prompt")
+    func leadingBangRunsLocally() async throws {
+        let capture = BashCommandCapture()
+        let runtime = TestInteractiveRuntime(sessions: [])
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeInputStream([
+                .paste("! echo hello"),
+                .key(KeyEvent(key: .enter)),
+            ]),
+            runtime: runtime,
+            renderer: RecordingInteractiveRenderer(),
+            output: RecordingInteractiveOutput(),
+            bashCommandHandler: { command in
+                await capture.record(command)
+            }
+        )
+
+        let result = try await controller.run(.init(prompt: "", mode: .inline))
+
+        #expect(result.lifecycle == .eof)
+        #expect(result.submittedPrompts.isEmpty)
+        #expect(await runtime.requests.isEmpty)
+        #expect(await capture.commands == ["echo hello"])
+    }
+
     @Test("edits and submits multiple prompts through reusable runtime sessions")
     func submitsMultipleTurns() async throws {
         let firstSession = TestInteractiveSession(sessionID: "session-1")
@@ -579,6 +604,14 @@ struct OpenGrokPagerInteractiveControllerTests {
         #expect(await session.cancelCount == 1)
         #expect(await session.closeCount == 1)
         #expect(await renderer.restoreCount == 1)
+    }
+}
+
+private actor BashCommandCapture {
+    private(set) var commands: [String] = []
+
+    func record(_ command: String) {
+        commands.append(command)
     }
 }
 

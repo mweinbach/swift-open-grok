@@ -147,6 +147,11 @@ struct LiveToolExecutor: Sendable {
     /// that predates them keeps compiling and simply advertises none of their
     /// tools; see `LiveSessionServices.swift`.
     let sessionServices: LiveSessionServices?
+    let hookPresentationStore: LiveHookPresentationStore
+    /// The exact store backing the advertised `todo_write` handler. The
+    /// renderer reads this actor through the executor so a successful tool
+    /// call and the visible pane can never point at different lists.
+    let todoStore: LiveTodoStore
     let telemetryStatus: LiveTelemetryStatus
     /// Live LSP pull session when `features.lsp_tools` registered a tool.
     private let lspPullSession: LSPPullSession?
@@ -249,11 +254,18 @@ struct LiveToolExecutor: Sendable {
             workingDirectory: workingDirectory
         )
         let standardizedWorkingDirectory = workingDirectory.standardizedFileURL
+        let hookPresentationStore = LiveHookPresentationStore()
+        self.hookPresentationStore = hookPresentationStore
         let hooks = LiveHooksComposition.load(
             sessionId: sessionID,
             workspaceRoot: standardizedWorkingDirectory,
             environment: environment
         )
+        hooks.gate?.setRunObserver { event, id, records in
+            Task {
+                await hookPresentationStore.record(event: event, id: id, records: records)
+            }
+        }
         // Config precedence, folder trust and the permission policy, resolved
         // once and shared by the file tools, `run_terminal_cmd` and MCP.
         let security = securityContext ?? LiveSecurityContext.resolve(
@@ -377,9 +389,11 @@ struct LiveToolExecutor: Sendable {
         // backing state is this session's in-memory list — so unlike the image
         // and web tools it is registered unconditionally and gated only by the
         // agent profile.
+        let todoStore = LiveTodoStore()
+        self.todoStore = todoStore
         builder.setHandler(
             qualifiedId: BuiltinToolCatalog.todoWriteQualifiedId,
-            handler: LiveTodoToolHandler(store: LiveTodoStore())
+            handler: LiveTodoToolHandler(store: todoStore)
         )
         toolConfig.tools.append(ToolConfig.fromId(
             BuiltinToolCatalog.todoWriteQualifiedId,

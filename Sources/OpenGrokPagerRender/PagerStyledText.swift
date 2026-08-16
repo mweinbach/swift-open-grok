@@ -36,19 +36,43 @@ public struct PagerStyledSpan: Sendable, Equatable, Hashable {
     public var isEmpty: Bool { text.isEmpty }
 }
 
+public enum PagerStyledLineBackground: Sendable, Equatable, Hashable {
+    case code
+}
+
 /// One pre-composed, styled logical line of conversation content.
 ///
 /// Lines are already laid out by their producer (a markdown renderer, say);
 /// the frame painter only wraps them to the content width and paints them.
 public struct PagerStyledLine: Sendable, Equatable, Hashable {
     public var spans: [PagerStyledSpan]
+    public var background: PagerStyledLineBackground?
+    /// Optional copy/selection text when painted decoration differs from the
+    /// semantic line (quote bars are the first consumer).
+    public var selectionText: String?
 
-    public init(spans: [PagerStyledSpan]) {
+    public init(
+        spans: [PagerStyledSpan],
+        background: PagerStyledLineBackground? = nil,
+        selectionText: String? = nil
+    ) {
         self.spans = spans
+        self.background = background
+        self.selectionText = selectionText
     }
 
-    public init(text: String, foreground: TerminalColor? = nil, style: CellStyle = []) {
-        self.init(spans: [PagerStyledSpan(text: text, foreground: foreground, style: style)])
+    public init(
+        text: String,
+        foreground: TerminalColor? = nil,
+        style: CellStyle = [],
+        background: PagerStyledLineBackground? = nil,
+        selectionText: String? = nil
+    ) {
+        self.init(
+            spans: [PagerStyledSpan(text: text, foreground: foreground, style: style)],
+            background: background,
+            selectionText: selectionText
+        )
     }
 
     /// The line with all styling dropped — the plain-text fallback.
@@ -95,7 +119,8 @@ func wrapStyledSpans(_ spans: [PagerStyledSpan], width: Int) -> [[PagerStyledSpa
             text: "",
             foreground: span.foreground,
             style: span.style,
-            url: span.url
+            url: span.url,
+            background: span.background
         )
         for grapheme in span.text {
             let string = String(grapheme)
@@ -107,7 +132,8 @@ func wrapStyledSpans(_ spans: [PagerStyledSpan], width: Int) -> [[PagerStyledSpa
                     text: "",
                     foreground: carried?.foreground ?? span.foreground,
                     style: carried?.style ?? span.style,
-                    url: carried?.url ?? span.url
+                    url: carried?.url ?? span.url,
+                    background: carried?.background ?? span.background
                 )
             }
             currentSpan?.text += string

@@ -94,9 +94,25 @@ extension LiveInteractiveControllerRenderer {
             }
             guard !overlays.isActive else { return }
             try await toggleTasksPane()
+        case .toggleTodos:
+            guard !overlays.isActive else { return }
+            if minimalHost == nil {
+                todoPaneVisible.toggle()
+            } else {
+                todoPaneVisible = true
+                todoForceVisible.toggle()
+            }
+            await refreshTodoPane()
+            try renderState()
+        case .toggleTodoCompleted:
+            guard !overlays.isActive else { return }
+            todoPaneVisible = true
+            todoShowCompleted.toggle()
+            await refreshTodoPane()
+            try renderState()
         case .openDashboard:
             try await presentDashboard()
-        case .toggleTodos, .sendToBackground, .newSession,
+        case .sendToBackground, .newSession,
              .openSettings, .openSessions:
             // Unbound in the controller's key table until the backing surface
             // exists, so these arrive only from a caller that built them by

@@ -1344,6 +1344,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                     switch result {
                     case .success(let result):
                         content = result.promptText
+                        let structuredOutput = LiveToolResultText.structuredOutput(for: result)
                         // Keep the success result (promptText / PostToolUse)
                         // and only flip the *display* state when structured
                         // terminal metadata shows a nonzero exit / timeout /
@@ -1355,6 +1356,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             name: call.name,
                             input: call.arguments,
                             output: content,
+                            structuredOutput: structuredOutput,
                             state: displayState
                         )))
                         await conversationHistory.recordToolOutcome(
@@ -1439,6 +1441,11 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
 
 /// Helpers for tool-result display state and JSON flattening at the live seam.
 enum LiveToolResultText {
+    static func structuredOutput(for result: OpenGrokShellToolCallResult) -> String? {
+        guard let data = try? JSONEncoder().encode(result.value) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
     /// Derive pager/shell display state from a successful tool result without
     /// dropping `promptText`. Nonzero exit / timeout / signal → `.failed`.
     static func displayState(

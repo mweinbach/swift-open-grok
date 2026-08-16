@@ -1037,15 +1037,13 @@ extension LiveInteractiveControllerRenderer {
                 : snapshot.output
                     .split(omittingEmptySubsequences: false, whereSeparator: { $0.isNewline })
                     .map { PagerStyledLine(text: String($0)) }
-            // A static snapshot modal, not upstream's BlockViewerPane: no
-            // tailing while the task runs, no in-viewer search, no visual
-            // select. Recorded divergence.
             overlays.push(.sessionInfo(
-                id: "block-viewer",
+                id: "block-viewer:background-task-\(snapshot.taskID)",
                 title: LivePagerTasksBlock.firstNonEmptyLine(
                     snapshot.displayCommand ?? snapshot.command
                 ),
-                lines: lines
+                lines: lines,
+                followsTail: true
             ))
         case .openWorkflowDetail(let name):
             guard let workflowRegistry else {
@@ -1722,23 +1720,33 @@ extension LiveInteractiveControllerRenderer {
         transientToastExpiresAt = now + Self.transientToastDuration
     }
 
-    /// `/debug [fps]` — always routable. Scroll/log surfaces are absent, so
-    /// bare status reports only fps, and unknown args list `[fps]` only.
-    /// `fps` only toggles; `render(_:)` paints immediately instead of the
-    /// coalesced final `renderState`. Bare/unknown ride that normal render.
+    /// `/debug [scroll|fps|log]` — always routable but release-hidden.
     func presentDebug(argument: String) {
         switch argument.trimmingCharacters(in: .whitespacesAndNewlines) {
         case "":
-            let on = fpsHud.isEnabled ? "on" : "off"
+            let on: (Bool) -> String = { $0 ? "on" : "off" }
             note(
-                "debug toggles: fps \(on) \u{2014} toggle with /debug fps"
+                "debug toggles: scroll \(on(scrollDebugEnabled)) \u{00b7} fps \(on(fpsHud.isEnabled)) \u{00b7} log \(on(scrollLogURL != nil)) \u{2014} toggle with /debug <scroll|fps|log>"
             )
+        case "scroll":
+            scrollDebugEnabled.toggle()
+            if scrollDebugEnabled {
+                scrollDebugOverlay = currentScrollDebugOverlay()
+            }
         case "fps":
             fpsHud.toggle()
+        case "log":
+            if scrollLogURL == nil {
+                scrollLogURL = Self.defaultWaveEScrollLogURL(openGrokHome: openGrokHome)
+                note("scroll log: recording to \(scrollLogURL!.path)")
+            } else {
+                scrollLogURL = nil
+                note("scroll log: off")
+            }
         default:
             appendMessage(PagerMessage(
                 role: .error,
-                text: "Unknown /debug option '\(argument.trimmingCharacters(in: .whitespacesAndNewlines))'. Usage: /debug [fps]"
+                text: "Unknown /debug option '\(argument.trimmingCharacters(in: .whitespacesAndNewlines))'. Usage: /debug [scroll|fps|log]"
             ))
         }
     }
@@ -1861,6 +1869,11 @@ extension LiveInteractiveControllerRenderer {
             }
         case .debug(let argument):
             presentDebug(argument: argument)
+        case .scrollDebug:
+            scrollDebugEnabled.toggle()
+            if scrollDebugEnabled {
+                scrollDebugOverlay = currentScrollDebugOverlay()
+            }
         case .toggleCompactMode:
             // The toggle flips the USER value (`dispatch_toggle_compact_mode`,
             // `ui.rs:815-820`); the next paint re-derives the render value.
@@ -2071,32 +2084,17 @@ extension LiveInteractiveControllerRenderer {
                 modes: inputModes
             )))
         case .contextUsage:
-            // Real accounting now that the renderer shares the turn loop's
-            // coordinator — the same numbers auto-compaction decides on, not a
-            // character-count estimate. The estimate remains the fallback for
-            // compositions with no coordinator (headless, tests), and says so
-            // rather than presenting a guess as a measurement.
             guard let compaction else {
-                overlays.push(.sessionInfo(
-                    id: "context-usage",
-                    title: "Context",
-                    lines: LivePagerOverlayText.contextLines(
-                        modelName: modelName,
-                        itemCount: conversation.items.count,
-                        transcriptCharacters: transcript.count
-                    )
-                ))
+                note("Context accounting is unavailable in this session.")
                 return
             }
             let usage = await compaction.usage()
-            overlays.push(.sessionInfo(
-                id: "context-usage",
-                title: "Context",
-                lines: LivePagerContextReport.lines(
-                    usage: usage,
-                    itemCount: conversation.items.count
-                )
-            ))
+            let items = await conversationHistory?.items ?? []
+            conversation.upsertBlock(.context(LiveWaveEContextUsage.block(
+                usage: usage,
+                items: items,
+                tools: toolExecutor?.tools ?? []
+            )))
         case .copyResponse(let index, let filePath):
             guard let response = LivePagerOverlayText.assistantResponse(
                 fromLast: index,
@@ -2265,11 +2263,14 @@ extension LiveInteractiveControllerRenderer {
                 return
             }
             let listings = (try? sessionCatalog.list()) ?? []
-            overlays.push(LiveSessionPicker.overlay(listings: listings))
+            var overlay = LiveSessionPicker.overlay(listings: listings)
+            overlay.minimalBelowPrompt = minimalHost != nil
+            overlays.push(overlay)
         case .usage:
-            // `/usage` (upstream usage.rs:59, `Action::ShowUsage`) rendered as
-            // a text modal the way `/context` is. The numbers come from
-            // `LiveUsageComposition`, which documents why they are estimates.
+            // `/usage` (upstream usage.rs:59, `Action::ShowUsage`) appends the
+            // typed Wave E usage block. The numbers come from
+            // `LiveUsageComposition`, which records authoritative quota data
+            // when available and marks the session-token fallback estimated.
             let context: ContextUsage?
             if let compaction {
                 context = await compaction.usage()
@@ -2282,18 +2283,8 @@ extension LiveInteractiveControllerRenderer {
             } else {
                 usageItems = []
             }
-            let report = await LiveUsageComposition.report(
-                context: context,
-                items: usageItems
-            )
-            let usageText = Self.sessionUsageBlockText(report: report)
-            overlays.push(.sessionInfo(
-                id: "usage",
-                title: "Usage",
-                lines: usageText
-                    .split(separator: "\n", omittingEmptySubsequences: false)
-                    .map { PagerStyledLine(text: String($0)) }
-            ))
+            let report = await refreshUsageReport(context: context, items: usageItems)
+            conversation.upsertBlock(.usage(await waveEUsageBlock(report)))
         case .cache:
             // `/cache` (upstream Action::ShowCache, slash/commands/cache.rs)
             let cacheResponse = sessionCacheResponse()
@@ -2305,12 +2296,14 @@ extension LiveInteractiveControllerRenderer {
                     .map { PagerStyledLine(text: String($0)) }
             ))
         case .mcpServers:
-            overlays.push(.sessionInfo(
+            var overlay = PagerOverlay.sessionInfo(
                 id: "mcps",
                 title: "MCP servers",
                 lines: LiveMCPStatusOverlay.lines(connections: mcpServers)
                     .map { PagerStyledLine(text: $0) }
-            ))
+            )
+            overlay.minimalBelowPrompt = minimalHost != nil
+            overlays.push(overlay)
         case .extensions(let tab):
             // `/hooks`, `/plugins`, `/marketplace`, `/skills`, `Ctrl+L` —
             // the read-only extensions modal, every data tab snapshotted
@@ -2834,7 +2827,13 @@ extension LiveInteractiveControllerRenderer {
         if let index = pageFlipUserBlockIndex {
             try? revealBlock(at: index)
         }
-        let result = renderPagerFrame(renderState(conversation: conversation.items))
+        var result = renderPagerFrame(renderState(conversation: conversation.items))
+        if conversation.setMarkdownWidth(result.layout.contentWidth) {
+            result = renderPagerFrame(renderState(conversation: conversation.items))
+            if conversation.setMarkdownWidth(result.layout.contentWidth) {
+                result = renderPagerFrame(renderState(conversation: conversation.items))
+            }
+        }
         // Max-scroll / follow-tail are scroll *state*, not hit geometry —
         // they must track the latest layout even when the paint coalesces,
         // or the viewport drifts from content growth.

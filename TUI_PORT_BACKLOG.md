@@ -1,6 +1,6 @@
 # TUI / streaming / tool-card port backlog
 
-**As of:** 2026-08-14  
+**As of:** 2026-08-16
 **Kind:** execution backlog (not a green-gate claim)  
 **Reference pin:** `650c1db7c2e73c59cec88bf3c6359751d6cef1bd`  
 **Rust clone:** `/Users/mweinbach/Projects/grok-build` (HEAD may be newer; enumerate from the pin first)  
@@ -363,7 +363,7 @@ On `/resume`, every restored tool is hard-coded `.succeeded`, and `.reasoning` /
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE (2026-08-15 — dedicated ANSI-aware painter and local user-bash fold lifecycle landed) |
 | **Severity** | P0 |
 | **Depends on** | A3, A4, A5, A6 |
 
@@ -397,7 +397,7 @@ On `/resume`, every restored tool is hard-coded `.succeeded`, and `.reasoning` /
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED / UNWIRED) |
+| **Status** | LIVE (2026-08-15 — painter, multi-file structured payload bridge, highlighting, and adjacent-card stitching landed) |
 | **Severity** | P0 |
 | **Depends on** | A4, A6 |
 
@@ -414,10 +414,10 @@ On `/resume`, every restored tool is hard-coded `.succeeded`, and `.reasoning` /
 5. Copy → `diffHunksToPatch`.
 6. Classify live names: `search_replace`, `strreplace`, `apply_patch`, `hashline_edit`, `write`.
 
-**Defer (P2 follow-ons, still this family):**
+**Completed follow-ons:**
 
-- `edit_highlight_worker` (async file-scoped syntax after hunk-local) — ABSENT.
-- `stitchOverlappingHunks` for adjacent same-file cards — algorithm already at `PagerDiff.swift:418`, UNWIRED.
+- `LiveEditHighlightWorker` performs bounded, latest-wins async file-scoped syntax highlighting after hunk-local rendering.
+- Adjacent terminal same-file cards merge in place with `stitchOverlappingHunks`; multi-file cards remain independent.
 
 **Files:**
 
@@ -447,7 +447,7 @@ On `/resume`, every restored tool is hard-coded `.succeeded`, and `.reasoning` /
 
 | | |
 | --- | --- |
-| **Status** | TODO (ABSENT) |
+| **Status** | LIVE (2026-08-15) |
 | **Severity** | P1 |
 | **Depends on** | A6; per-kind foldability from B1/C9 |
 
@@ -476,13 +476,13 @@ After B1, **stop** routing these kinds through `toolPreviewRows`.
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) — typed output UNWIRED |
+| **Status** | LIVE — typed read payload + dedicated painter (2026-08-15) |
 | **Severity** | P0 |
 | **Depends on** | A4 |
 
 **Rust:** `scrollback/blocks/tool/read.rs` — path surfaces (basename collapsed, cwd-relative expanded), `(11-20 of 200)`, `(empty)` / `(image)` / page count, dim line gutter, syntax/primary text, collapsed → truncated → collapsed. Empty reads not foldable. **No accent rail** on body.
 
-**Swift already has:** `ReadFileTool` typed path/content/range/total (`ReadFileTool.swift:130`). Flattened at `LiveConversationStore.swift:1217`.
+**Swift:** `PagerWaveCToolPayload.swift` now preserves typed path/content/range/total data and `PagerWaveCToolRender.swift` paints the dedicated no-rail Read card.
 
 **Files:** `PagerFrameModel.swift`, `LivePagerOutputs.swift`, `OpenGrokPagerRender.swift` (new Read painter), `ReadFileTool.swift` (keep; do not reimplement).
 
@@ -494,13 +494,13 @@ After B1, **stop** routing these kinds through `toolPreviewRows`.
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) — typed output UNWIRED |
+| **Status** | LIVE — typed list payload + full-expand painter (2026-08-15) |
 | **Severity** | P1 |
 | **Depends on** | A4 |
 
 **Rust:** `list_dir.rs` — colored/shortened path, `1 entry` / `N entries`, full expanded terminal-styled listing, errors not foldable.
 
-**Swift already has:** `ListDirTool` path/content/count (`ListDirTool.swift:64`).
+**Swift:** `ListDirTool` now emits an honest visible-entry count, the pager retains the typed envelope, and the dedicated painter expands the full listing.
 
 **Acceptance:** singular/plural count, full expand (not 2+3 truncate), error non-foldable.
 
@@ -510,13 +510,13 @@ After B1, **stop** routing these kinds through `toolPreviewRows`.
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE — grouped grep/glob modes + dedicated painter (2026-08-15) |
 | **Severity** | P0 |
 | **Depends on** | A4 |
 
 **Rust:** `search.rs` — quoted/colored pattern, glob/path spans, “N matches in M files”, mode metadata, grouped file sections, independent line-number column, `(no results)` still foldable. `tool/mod.rs:470` — `glob` is Search.
 
-**Swift:** `GrepTool.swift:85` lacks grouped file+line records and output mode. `PagerFrameModel.swift:119` maps `glob` → `.list`.
+**Swift:** grep now emits grouped file/line records for Content, FilesWithMatches, and Count modes; glob emits typed file records and maps to Search.
 
 **Acceptance:** zero results; 3 matches in 2 files; FilesWithMatches; Count; case-insensitive/multiline metadata; `glob` uses Search painter.
 
@@ -526,7 +526,7 @@ After B1, **stop** routing these kinds through `toolPreviewRows`.
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) — metadata UNWIRED |
+| **Status** | LIVE — metadata panel + URL-only selection (2026-08-15) |
 | **Severity** | P1 |
 | **Depends on** | A4 |
 
@@ -544,13 +544,13 @@ After B1, **stop** routing these kinds through `toolPreviewRows`.
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE — deduped web sites + distinct X Search card (2026-08-15) |
 | **Severity** | P1 |
 | **Depends on** | A1 (backend-hosted) + A4 |
 
 **Rust:** `web_search.rs` — query header, deduped `(N sites)`, expanded ≤3 domains + `(+N more)`. X search label, no fake empty body. Tracker materializes backend actions at `tracker.rs:1717`.
 
-**Swift:** citations flattened to a `Sources:` appendix (`LiveWebTools.swift:485`); `x_search` is generic; backend X/web is dropped in A1’s `default: continue`.
+**Swift:** web/X actions retain citation payloads, dedupe domains for the card, and keep X Search as a distinct header-only kind.
 
 **Acceptance:** duplicate domains count once; 3 + overflow; X search titled `X Search`.
 
@@ -560,13 +560,13 @@ After B1, **stop** routing these kinds through `toolPreviewRows`.
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) — envelope already LIVE |
+| **Status** | LIVE — envelope parsed into numbered result rows (2026-08-15) |
 | **Severity** | P1 |
 | **Depends on** | A4 |
 
 **Rust:** `memory_search.rs` — `Memory Search <query> (N results)`, numbered path/range/score/source, 3 snippet lines, honest `(no results)`.
 
-**Swift:** `LiveMemoryComposition.swift:411` already emits the Rust-parsable envelope. Kind falls through to `.generic`.
+**Swift:** `LiveMemoryComposition.swift`'s envelope is parsed at the pager boundary into numbered path/range/score/source rows and bounded snippets.
 
 **Acceptance:** 0 / 1 / N result fixtures match pin headers and rows.
 
@@ -576,13 +576,13 @@ After B1, **stop** routing these kinds through `toolPreviewRows`.
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) — tools themselves LIVE |
+| **Status** | LIVE — search/use payloads + dedicated MCP painters (2026-08-15) |
 | **Severity** | P1 |
 | **Depends on** | A4 |
 
 **Rust:** `search_tool.rs` / `use_tool.rs` — `Search Tools <query> (N results)`; title-cased action + ghosted server; `use_tool` → `Server Action` + key/value args + 3/10 output.
 
-**Swift:** both tools are live (`LiveToolExecutor.swift:473`); cards are raw JSON.
+**Swift:** both tools remain live; their raw/nested envelopes are parsed into dedicated Search Tools and Use Tool cards with semantic headers.
 
 **Acceptance:** prefix-stripping tests; qualified and unqualified names; nested `tool_input`.
 
@@ -592,7 +592,7 @@ After B1, **stop** routing these kinds through `toolPreviewRows`.
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE — label split, Q&A rows, and error fold policy (2026-08-15) |
 | **Severity** | P1 |
 | **Depends on** | A4 |
 
@@ -600,13 +600,19 @@ After B1, **stop** routing these kinds through `toolPreviewRows`.
 
 **Acceptance:** accepted / declined / plan-mode question results match pin rows.
 
+**Scope note:** typed media path/open-button rendering remains Wave F1/F4; do not
+duplicate that work here by scraping prose output. Rust's `started_at` /
+`elapsed_ms` fields are shared timing state across every tool kind, not an
+Other-only rendered acceptance surface; shared tool timing remains a separate
+cross-wave parity follow-up.
+
 ---
 
 ### C9. Per-kind fold policy + rail policy
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE — per-kind folds/rails + verb-group headers (2026-08-15) |
 | **Severity** | P1 / P2 |
 | **Depends on** | B1, C1–C8 |
 
@@ -616,7 +622,7 @@ After painters exist:
 - List/Search/Fetch: collapsed ↔ full; failed List not foldable; zero-result Search is.
 - Generic: not foldable without foldable content.
 - Rails: Read/List/Search **no** expanded rail (Rust); Execute yes.
-- Verb-group headers (`Reading 3 files`) are ABSENT (`tool/mod.rs:98-146`). Port after individual painters, not before.
+- Verb-group headers aggregate eligible collapsed runs with running/past tense and first-appearance bucket order (`Reading 3 files`, `Read 1 file, Searched 1 pattern`).
 
 **Files:** `PagerFrameModel.swift`, `LiveScrollbackFocus.swift` (`:315` currently marks every tool foldable), `OpenGrokPagerRender.swift`.
 
@@ -626,13 +632,13 @@ After painters exist:
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE — semantic URL/query selection, including wraps (2026-08-15) |
 | **Severity** | P2 |
 | **Depends on** | C4–C7 |
 
 **Rust:** fetch/search/memory header selection is the semantic URL or query only (`web_fetch.rs:140`, `web_search.rs:158`).
 
-**Swift:** `OpenGrokPagerRender.swift:1233` marks the complete painted header — bullet, verb, detail — as selectable.
+**Swift:** the Wave C header wrapper publishes only semantic URL/query spans, including exact concatenation across wrapped rows.
 
 **Acceptance:** dragging/copying each fetch/search/memory/search-tool header returns only its URL/query, including wrapped headers.
 
@@ -648,7 +654,7 @@ After painters exist:
 
 | | |
 | --- | --- |
-| **Status** | TODO (ABSENT live construction; painter UNWIRED) |
+| **Status** | LIVE (2026-08-15) |
 | **Severity** | P0 (wiring) / P1 (markdown body) |
 | **Depends on** | A1 |
 
@@ -671,7 +677,7 @@ After painters exist:
 
 | | |
 | --- | --- |
-| **Status** | TODO (UNWIRED renderer + DIVERGED width) |
+| **Status** | LIVE (2026-08-15) |
 | **Severity** | P0 (width) / P1 (checkpoints) |
 | **Depends on** | — (width can land without A1) |
 
@@ -691,7 +697,7 @@ After painters exist:
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE (2026-08-15) |
 | **Severity** | P2 |
 | **Depends on** | — |
 
@@ -705,7 +711,7 @@ Pin `agent.rs:165` has no cursor. Swift invents `▌` (`OpenGrokPagerRender.swif
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED / ABSENT) |
+| **Status** | LIVE (2026-08-15) |
 | **Severity** | P1 |
 | **Depends on** | D2 helpful |
 
@@ -719,7 +725,7 @@ Pin `agent.rs:165` has no cursor. Swift invents `▌` (`OpenGrokPagerRender.swif
 
 # Wave E — Non-tool transcript blocks + chrome
 
-**Depends on:** A1 typed transport. Extend `PagerConversationItem` beyond `.message | .tool | .separator` (`PagerFrameModel.swift:166`).
+**Delivered on:** A1 typed transport via `PagerConversationItem.block` and the Wave E block model/render pipeline.
 
 ---
 
@@ -727,13 +733,13 @@ Pin `agent.rs:165` has no cursor. Swift invents `▌` (`OpenGrokPagerRender.swif
 
 | | |
 | --- | --- |
-| **Status** | TODO (ABSENT typed item) |
+| **Status** | LIVE (2026-08-16 — typed variants + in-place recap) |
 | **Severity** | P1 (typed failures are P0 via A1) |
 | **Depends on** | A1 |
 
 **Rust:** `session_event.rs` — turn failed (typed), compaction, retry/auth/context, hook annotations, model change, memory/goal, recap (one block, fill in place, `:421`).
 
-**Swift:** `Turn failed: <string>` (`LiveInteractiveControllerRenderer.swift:1519`); recap = “Recap…” note + second note (`:2412`). Pager event enum has no session-event channel (`OpenGrokPagerMinimal.swift:79`).
+**Swift:** `PagerSessionEventKind` covers every pinned event family; turn/runtime events create typed blocks, stop hooks attach to the event marker, and `/recap` upserts one stable block from pending to completed.
 
 **Acceptance:** Every pin variant; recap updates the original item rather than appending a second one.
 
@@ -743,11 +749,11 @@ Pin `agent.rs:165` has no cursor. Swift invents `▌` (`OpenGrokPagerRender.swif
 
 | | |
 | --- | --- |
-| **Status** | TODO (ABSENT presentation; execution LIVE) |
+| **Status** | LIVE (2026-08-16 — typed lifecycle rows + hook sections) |
 | **Severity** | P1 |
 | **Depends on** | A4 hook-run field |
 
-Hooks **execute** (`LiveToolExecutor.swift:769`, `LiveHooksComposition.swift:26`) and are discarded from the UI path.
+**Swift:** lifecycle and tool cards retain typed pre/post/stop runs, paint collapsed `[hooks: N/M]` suffixes, and expand into phase sections. Session-start lifecycle records are isolated from later tool/stop attachment.
 
 **Rust:** `hook.rs` collapsed `[hooks: N/M]`; expanded pre/post sections; `lifecycle.rs` `session_start` / `user_prompt_submit` rows; stop hooks on the turn marker (`session_event.rs:302`). Attachment in `entry.rs:562` and `state/mod.rs:789`.
 
@@ -759,13 +765,13 @@ Hooks **execute** (`LiveToolExecutor.swift:769`, `LiveHooksComposition.swift:26`
 
 | | |
 | --- | --- |
-| **Status** | TODO (ABSENT transcript block; `/tasks` LIVE) |
+| **Status** | LIVE (2026-08-16 — typed task lifecycle + live viewer) |
 | **Severity** | P1 |
 | **Depends on** | A1 item enum; B3 for double-click viewer |
 
 **Rust:** `bg_task.rs` + `acp_handler/background.rs:74` — demote Execute → always-collapsed lifecycle row; started/completed/failed; viewer tails stdout by task ID (`block_viewer.rs:659`). **Does not** reuse the execute painter after backgrounding.
 
-**Swift:** `/tasks` is live (`LiveTasksPane.swift:149`); overlay viewer is a **static snapshot** (`LiveInteractiveOverlays.swift:1022`). No in-transcript demotion.
+**Swift:** background/auto-background/monitor records upsert typed `PagerBackgroundTaskBlock` rows, terminal state and output tails update in place, the viewer polls live task output, and double-click opens it.
 
 **Acceptance:** background / auto-background / success / fail / monitor; viewer tails; double-click opens viewer.
 
@@ -775,13 +781,13 @@ Hooks **execute** (`LiveToolExecutor.swift:769`, `LiveHooksComposition.swift:26`
 
 | | |
 | --- | --- |
-| **Status** | TODO (ABSENT painters; runtimes LIVE) |
+| **Status** | LIVE (2026-08-16 — typed activity cards + counters) |
 | **Severity** | P1 |
 | **Depends on** | A1 item enum |
 
 **Rust:** `subagent.rs`, `swarm.rs` — typed lifecycle, member tree, turns/tools/duration/activity.
 
-**Swift:** snapshots feed `/tasks`/dashboard or a generic card (`LiveInteractiveControllerRenderer.swift:2123`).
+**Swift:** live host snapshots map to in-place subagent/swarm blocks with queued/running/waiting/terminal states, member trees, activity, outcome, turn/tool counters, and duration.
 
 **Acceptance:** activity updates in place; completed/failed/cancelled accents; swarm member tree (queued/running/waiting/outcome, turns, tools, duration).
 
@@ -791,11 +797,11 @@ Hooks **execute** (`LiveToolExecutor.swift:769`, `LiveHooksComposition.swift:26`
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED — modal LIVE, transcript ABSENT) |
+| **Status** | LIVE (2026-08-16 — persistent typed workflow marker) |
 | **Severity** | P1 |
 | **Depends on** | A1 item enum |
 
-`/workflows` modal is live (`LiveWorkflowOverlay.swift:18`). Closing it removes the only structured view (`LiveInteractiveOverlays.swift:2003`).
+**Swift:** workflow refreshes upsert a transcript marker containing objective, phase trail, agent count, state, and terminal outcome; closing `/workflows` no longer removes the durable record.
 
 **Rust:** `workflow.rs` — objective, phase trail, agent count, outcome accent.
 
@@ -807,11 +813,11 @@ Hooks **execute** (`LiveToolExecutor.swift:769`, `LiveHooksComposition.swift:26`
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE (2026-08-16 — one in-place foldable block) |
 | **Severity** | P1 |
 | **Depends on** | A1 item enum |
 
-Today: two system notes that can interleave with the main turn (`LiveInteractiveControllerRenderer.swift:2530`). Source explicitly records the dedicated panel/block as absent.
+**Swift:** `/btw` creates one gold-accent typed block, performs the side call off-conversation, and fills that same block with the answer or failure copy without interleaving paired notes.
 
 **Rust:** `btw.rs` (gold accent, foldable markdown) + `views/btw_overlay.rs` (dismissible panel).
 
@@ -823,17 +829,15 @@ Today: two system notes that can interleave with the main turn (`LiveInteractive
 
 | | |
 | --- | --- |
-| **Status** | TODO (UNWIRED) |
+| **Status** | LIVE (2026-08-16 — fullscreen + minimal todo panes) |
 | **Severity** | P1 |
 | **Depends on** | — |
 
-`todo_write` works (`LiveTodoTools.swift:50`). Fullscreen and minimal pass `todosHeight: 0` (`PagerMinimalFrameHost.swift:350`). `/tasks` is **not** this pane.
+**Swift:** `LiveTodoStore` feeds ordered status-glyph rows in fullscreen and minimal layouts; completed filtering/toggle, the minimal eight-row cap, auto-hide, and force-show are wired.
 
 **Rust:** `views/todo_pane.rs` + minimal `todo.rs` (8-row cap, auto-hide completed).
 
 **Acceptance:** `todo_write` → live ordered rows; status glyphs; full-screen filtering/toggle; minimal cap + auto-hide + force-show.
-
-This is a textbook “succeeds, does nothing, says nothing” on a user-facing list.
 
 ---
 
@@ -841,13 +845,13 @@ This is a textbook “succeeds, does nothing, says nothing” on a user-facing l
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE (2026-08-16 — typed phases + honest cancel affordance) |
 | **Severity** | P0 for dishonest `[stop]`; P1 for the rest |
 | **Depends on** | A1 retry/backend events |
 
 **Rust:** `views/turn_status.rs:198-650` — thinking / responding / retrying / waiting / tools / cancel / compaction / bash; MCP startup; drain-blocked; parked watcher; `[stop]` only when cancel is real.
 
-**Swift:** freeform label + elapsed + unconditional `[stop]` (`PagerFrameModel.swift:275`, `OpenGrokPagerRender.swift:1812`).
+**Swift:** `LiveWaveETurnPhase` classifies thinking/responding/retrying/waiting/tools/compaction/bash and related status text; `[stop]` paints only when the active phase exposes a real fullscreen cancel action.
 
 **Acceptance:** table-driven states; `[stop]` only with a valid cancel action; minimal keyboard-only has no cancel button.
 
@@ -857,17 +861,15 @@ This is a textbook “succeeds, does nothing, says nothing” on a user-facing l
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE (2026-08-16 — welcome/minimal typed auth flow) |
 | **Severity** | P1 |
 | **Depends on** | — |
 
-Auth is transcript notes (`LiveInteractiveControllerRenderer.swift:2292`). Welcome model has no auth/device-code/raw-URL fields (`PagerOverlay.swift:451`). No minimal `auth.rs` painter.
+**Swift:** xAI and Codex login drive typed signing-in/trust/starting/failure states on welcome and minimal surfaces, preserve the exact URL, derive device codes, disable mouse capture for raw selection, and restore it on completion/failure.
 
 **Rust:** `views/welcome/mod.rs:1022-1147` (device code, copy feedback, raw-URL mouse-disable); `pager-minimal/src/auth.rs`.
 
 **Acceptance:** long URL copyable byte-for-byte; raw mode disables mouse; minimal signing-in → trust → starting.
-
-Static welcome hero/menu/changelog/shimmer is LIVE — only the authentication subview is missing.
 
 ---
 
@@ -875,17 +877,15 @@ Static welcome hero/menu/changelog/shimmer is LIVE — only the authentication s
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE (2026-08-16 — prompt kinds + copy-safe quote decoration) |
 | **Severity** | P2 |
 | **Depends on** | — |
 
-User prompts are one style (`LivePagerOutputs.swift:693`, `PagerFrameModel.swift:15`). Quote `│` is copied with the text (`OpenGrokPagerRender.swift:2550`).
+**Swift:** standard/bash/cron/interjection/skill prompts retain distinct typed prefixes, and selection/copy strips decorative quote bars while preserving quoted content.
 
 **Rust:** `user.rs` bash/cron/interjection/skill prefixes; `quote_bar.rs:144` excludes decorative bars from selection/copy.
 
 **Acceptance:** bash / cron / skill / interjection prefixes; selecting `│ quoted` copies `quoted`.
-
-Standard user-prompt painting (prefix, band, padding, wrapping, timestamps) is LIVE.
 
 ---
 
@@ -893,11 +893,11 @@ Standard user-prompt painting (prefix, band, padding, wrapping, timestamps) is L
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE (2026-08-16 — categorical typed context block) |
 | **Severity** | P1 |
 | **Depends on** | A1 item enum (if it becomes a scrollback block) |
 
-Modal is aggregate only (`LiveScrollbackFocus.swift:340`, `LiveInteractiveOverlays.swift:2073`).
+**Swift:** `/context` appends typed system/messages/reasoning/tool-definition/free rows with responsive 20-cell wide and 10-cell narrow bars, re-rendered through normal width/theme layout.
 
 **Rust:** `context_info.rs:45` — system / messages / reasoning / free + tool-definition rows; 5×20 or 10×10 bars.
 
@@ -909,11 +909,11 @@ Modal is aggregate only (`LiveScrollbackFocus.swift:340`, `LiveInteractiveOverla
 
 | | |
 | --- | --- |
-| **Status** | TODO (ABSENT chrome / DIVERGED usage) |
+| **Status** | LIVE (2026-08-16 — credit chrome + typed provider usage) |
 | **Severity** | P1 |
 | **Depends on** | billing client already in tree |
 
-No credit fields on `PagerStatusBar` (`PagerFrameModel.swift:209`). `/usage` is estimated session tokens (`LiveSessionServices.swift:236`).
+**Swift:** `PagerStatusBar` carries provider credit usage with 80% warning and 100% exhausted styling. `/usage` emits xAI/Codex/Antigravity sections from authoritative quota sources when present and explicitly marks only fallback estimates.
 
 **Rust:** `credit_bar.rs:167-252`; `usage.rs` Codex / Antigravity / xAI sections.
 
@@ -927,17 +927,11 @@ HEAD-only `usage_modal.rs` (tabbed modal at `92bece5d`) is **not** pin work.
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED); welcome card LIVE |
+| **Status** | LIVE (2026-08-16 — panels, plan commit/comments, ANSI transcript) |
 | **Severity** | P1 |
 | **Depends on** | B/C painters for full-view ANSI |
 
-Recorded in `PagerMinimalFrameHost.swift:593` as deferred:
-
-- Below-prompt `/resume` and `/mcps` panels (`pager-minimal/src/panel.rs`) vs centered overlays (`:650`).
-- Plan: commit full plan once into native scrollback + compact controls (`plan.rs:65`); line comments (`plan_approval_view.rs:38`). Current overlay omits per-line comments (`PagerOverlay.swift:1010`).
-- `/transcript` = expanded ANSI per-kind render (`full_view.rs`), not `conversation.transcript` (`LiveInteractiveControllerRenderer.swift:2968`).
-
-**Honest non-gap:** native-scrollback minimal frontend and one-shot welcome card are LIVE (`LiveInteractiveControllerRenderer.swift:965`, `PagerMinimalFrameHost.swift:518`).
+**Swift:** minimal mode paints `/resume` and `/mcps` below the prompt, commits approved plans once into native scrollback, preserves line-anchored comments, and `/transcript` uses expanded per-kind ANSI rendering rather than the plain final transcript.
 
 ---
 
@@ -945,11 +939,11 @@ Recorded in `PagerMinimalFrameHost.swift:593` as deferred:
 
 | | |
 | --- | --- |
-| **Status** | TODO (ABSENT) |
+| **Status** | LIVE (2026-08-16 — HUD, aliases, env gates, JSONL) |
 | **Severity** | P2 |
 | **Depends on** | existing scroll normalizer |
 
-`/debug` is FPS-only (`OpenGrokPagerInteractive.swift:340`). Pin has `GROK_SCROLL_DEBUG`, `/scroll-debug`, `GROK_SCROLL_LOG` (`scroll_debug_hud.rs`, `scroll_log.rs`).
+**Swift:** `/debug [scroll|fps|log]`, `/scroll-debug`, `GROK_SCROLL_DEBUG`, and `GROK_SCROLL_LOG` drive the normalized scroll HUD and append JSONL diagnostics with raw/normalized deltas and viewport state.
 
 **Honest non-gap:** `[animation].show_fps` remaining parse-only is pin parity; the pin also never reads it.
 
@@ -959,13 +953,13 @@ Recorded in `PagerMinimalFrameHost.swift:593` as deferred:
 
 | | |
 | --- | --- |
-| **Status** | TODO (ABSENT) |
+| **Status** | LIVE (2026-08-16 — all actions + safe URL activation) |
 | **Severity** | P1 |
 | **Depends on** | A1 item enum |
 
 **Rust:** `credit_limit.rs:18` — Enable PAYG / Increase PAYG Limit / Purchase Credits + clickable account URL.
 
-No Swift `CreditLimit` / `EnablePayg` surface exists.
+**Swift:** typed credit-limit blocks cover Enable PAYG, Increase PAYG Limit, and Purchase Credits; account links activate only through the safe URL scheme gate.
 
 **Acceptance:** all three action variants and safe URL activation.
 
@@ -1120,50 +1114,61 @@ Do **not** mix these into A–F. They are real, but they are not why the TUI loo
 - [x] A5 Incremental tool-output sink (protocol + live `onOutput` append; POSIX `read(2)` chunks 2026-08-15)
 - [x] A6 Merge-in-place fold/timing
 
-Wave A is **transport**, not painters. Execute/edit/read cards still share `appendToolCard` until Wave B/C.
+Wave A is **transport**, not painters. Execute/edit now use dedicated Wave B painters; read remains on the generic path until Wave C.
 
 TerminalCore startup glue (2026-08-15, live): DA2 after raw mode + Kitty flag push; XTVERSION fire-and-forget write after `PlatformTerminalInput` is armed; DCS reply swallowed on the TTY byte path; `TerminalCapabilities` delegates to pin `KittyGraphics` (iTerm2 scrollback stays off).
 
 ### Wave B
-- [ ] B1 Execute painter
-- [ ] B2 Edit/create painter + committed backgrounds
-- [ ] B2-follow-on Highlight worker + same-file stitch
-- [ ] B3 Double-click fold
+- Completed 2026-08-15: execute and edit/create painters, ANSI SGR/CR rendering, local streaming `!` commands with the pinned fold lifecycle, multi-file structured edit payloads, committed wrap-stable diff backgrounds, patch/ANSI copy behavior, bounded latest-wins syntax highlighting, adjacent same-file card stitching, and click-count fold interaction all have focused regression coverage.
+- Validation: `build-tests` and focused Wave B serial tests pass. The authoritative full serial run reaches all Wave B coverage but remains red only in the unrelated pre-existing `OpenGrokModelsTests.cancellationAbortsRefresh` expectation at `OpenGrokModelsTests.swift:914` (`CancellationError`).
+- [x] B1 Execute painter
+- [x] B2 Edit/create painter + committed backgrounds
+- [x] B2-follow-on Highlight worker + same-file stitch
+- [x] B3 Double-click fold
 
 ### Wave C
-- [ ] C1 Read painter
-- [ ] C2 List painter
-- [ ] C3 Search painter + `glob` → Search
-- [ ] C4 Web fetch painter
-- [ ] C5 Web/X search painter
-- [ ] C6 Memory search painter
-- [ ] C7 MCP `search_tool` / `use_tool` painters
-- [ ] C8 Generic Other (Q&A, media, elapsed)
-- [ ] C9 Per-kind fold + rail policy
-- [ ] C10 Header selection = URL/query only
+- Completed 2026-08-15: structured Read/List/Search/Fetch/Web/X/Memory/MCP payloads, dedicated painters, generic `Label: content` + AskUserQuestion rows, per-kind fold/rail rules, default-on verb-group headers, semantic header selection, and legacy-unstructured fallback for minimal full-output reprints.
+- Validation: `build-tests`; focused Wave C serial tests pass (14 render, 5 live, 3 file-tool); focused Wave B regressions pass; the authoritative full serial run reaches all Wave C/minimal coverage and remains red only in the unrelated pre-existing `OpenGrokModelsTests.cancellationAbortsRefresh` expectation at `OpenGrokModelsTests.swift:914` (`CancellationError`).
+- Scope: typed image/video path + open-button rendering remains Wave F1/F4; shared all-tool elapsed timing remains a separate cross-wave parity follow-up.
+- [x] C1 Read painter
+- [x] C2 List painter
+- [x] C3 Search painter + `glob` → Search
+- [x] C4 Web fetch painter
+- [x] C5 Web/X search painter
+- [x] C6 Memory search painter
+- [x] C7 MCP `search_tool` / `use_tool` painters
+- [x] C8 Generic Other accepted surface (Q&A/header/fold; media stays Wave F)
+- [x] C9 Per-kind fold + rail policy
+- [x] C10 Header selection = URL/query only
 
 ### Wave D
-- [ ] D1 Live thinking block + sticky Ctrl+E
-- [ ] D2 Streaming markdown + table width
-- [ ] D3 Remove invented cursor
-- [ ] D4 Syntax / citation fences / line backgrounds
+- Completed 2026-08-15: reasoning and assistant blocks own persistent streaming markdown renderers; stable prefixes reparse only the tail; `finish()` performs the pinned authoritative full render once; live content width invalidates and reflows tables; completed thinking records elapsed time, collapses by default, and honors sticky future `Ctrl+E` expansion.
+- Presentation parity: assistant/thinking streams have no invented `▌`, timestamps remain available, Swift/Rust and `10:12:path.swift` citation fences receive semantic syntax spans, and code-line backgrounds survive markdown → pager → `PaintLine`.
+- Validation: `build-tests`; focused Wave A–D, markdown (33 tests), performance, pager-render (800 tests), and fuzzing tests pass. The authoritative serial gate reaches all Wave D coverage and remains red in the pre-existing `OpenGrokModelsTests.cancellationAbortsRefresh` `CancellationError` plus an unrelated dashboard orchestration timing failure that passes its isolated 12-test suite.
+- [x] D1 Live thinking block + sticky Ctrl+E
+- [x] D2 Streaming markdown + table width
+- [x] D3 Remove invented cursor
+- [x] D4 Syntax / citation fences / line backgrounds
 
 ### Wave E
-- [ ] E1 Session-event blocks + in-place recap
-- [ ] E2 Hook + lifecycle cards
-- [ ] E3 BgTaskBlock + live viewer
-- [ ] E4 SubagentBlock + SwarmBlock
-- [ ] E5 Workflow scrollback marker
-- [ ] E6 `/btw` block or dismissible panel
-- [ ] E7 Todo pane from `LiveTodoStore`
-- [ ] E8 Turn-status state machine + honest `[stop]`
-- [ ] E9 Welcome / minimal auth
-- [ ] E10 Prompt-kind + quote-bar copy
-- [ ] E11 `/context` categorical block
-- [ ] E12 Credit bar + real `/usage`
-- [ ] E13 Minimal panels / plan commit / full-view `/transcript`
-- [ ] E14 Scroll-debug HUD + JSONL log
-- [ ] E15 Credit-limit action card
+- Completed 2026-08-16: typed session/lifecycle/background/subagent/swarm/workflow/BTW/context/usage/credit blocks now update through the live renderer; recap and side-call records fill in place; todo, turn-state, auth, prompt-kind, minimal-panel, plan-comment, ANSI transcript, and scroll-debug chrome are wired.
+- Presentation parity: provider credit thresholds, safe action links, live task viewers, subagent turn/tool counters, categorical context bars, raw selectable auth URLs, quote-copy stripping, honest `[stop]`, minimal eight-row todos, and expanded per-kind transcript output all have focused render and live-seam coverage.
+- Validation: `build-tests`; 30 focused Wave E tests across four suites; the formerly affected auth/recap/usage/debug/mouse/table/executable suites; and all 814 pager-render tests pass. The authoritative serial gate reaches all Wave E coverage and is red only in the pre-existing `OpenGrokModelsTests.cancellationAbortsRefresh` unexpected `CancellationError()` at `OpenGrokModelsTests.swift:914`.
+- [x] E1 Session-event blocks + in-place recap
+- [x] E2 Hook + lifecycle cards
+- [x] E3 BgTaskBlock + live viewer
+- [x] E4 SubagentBlock + SwarmBlock
+- [x] E5 Workflow scrollback marker
+- [x] E6 `/btw` block or dismissible panel
+- [x] E7 Todo pane from `LiveTodoStore`
+- [x] E8 Turn-status state machine + honest `[stop]`
+- [x] E9 Welcome / minimal auth
+- [x] E10 Prompt-kind + quote-bar copy
+- [x] E11 `/context` categorical block
+- [x] E12 Credit bar + real `/usage`
+- [x] E13 Minimal panels / plan commit / full-view `/transcript`
+- [x] E14 Scroll-debug HUD + JSONL log
+- [x] E15 Credit-limit action card
 
 ### Wave F
 - [ ] F1 Typed image/video on tool cards

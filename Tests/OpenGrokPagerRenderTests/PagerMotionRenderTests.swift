@@ -146,10 +146,10 @@ struct PagerMotionRenderSiteTests {
         let flashing = renderPagerFrame(finishedToolState(now: 0.2))
         #expect(flashing.buffer.cell(x: 0, y: 0)?.grapheme == PagerGlyphs.accentBar)
 
-        // Past the window the collapsed row returns to the muted, rail-less
-        // presentation this port always drew.
+        // Past the window the execute card settles to its static accent, but
+        // Wave B keeps the execute rail visible even while collapsed.
         let settled = renderPagerFrame(finishedToolState(now: 0.6))
-        #expect(settled.buffer.cell(x: 0, y: 0)?.grapheme == " ")
+        #expect(settled.buffer.cell(x: 0, y: 0)?.grapheme == PagerGlyphs.accentBar)
     }
 
     private func turnStatusState(

@@ -36,15 +36,30 @@ public struct PagerMarkdownRenderer: Sendable {
         return lines
     }
 
+    public func makeStreamingRenderer(
+        maxTableWidth: Int? = nil
+    ) -> PagerStreamingMarkdownRenderer {
+        var resolved = configuration
+        resolved.maxTableWidth = maxTableWidth
+        return PagerStreamingMarkdownRenderer(configuration: resolved)
+    }
+
     /// Map an already-rendered markdown document onto styled pager lines.
     public static func map(_ output: MarkdownRenderOutput) -> [PagerStyledLine] {
         guard !output.lines.isEmpty else { return [] }
         let linksByLine = Dictionary(grouping: output.hyperlinks, by: \.lineIndex)
         return output.lines.enumerated().map { lineIndex, line in
-            PagerStyledLine(spans: spans(
+            let mappedSpans = spans(
                 for: line,
                 hyperlinks: linksByLine[lineIndex] ?? []
-            ))
+            )
+            let renderedText = mappedSpans.map(\.text).joined()
+            let hasQuoteDecoration = line.segments.first?.style == .quote
+            return PagerStyledLine(
+                spans: mappedSpans,
+                background: line.background == .code ? .code : nil,
+                selectionText: hasQuoteDecoration ? quoteSelectionText(renderedText) : nil
+            )
         }
     }
 
@@ -71,6 +86,16 @@ public struct PagerMarkdownRenderer: Sendable {
             return (nil, [.strike])
         case .code:
             return (.brightYellow, [])
+        case .syntaxKeyword:
+            return (.brightMagenta, [.bold])
+        case .syntaxString:
+            return (.brightGreen, [])
+        case .syntaxNumber:
+            return (.brightCyan, [])
+        case .syntaxComment:
+            return (.brightBlack, [.dim, .italic])
+        case .syntaxType:
+            return (.brightBlue, [])
         case .quote:
             return (.brightBlack, [.italic])
         case .listMarker:
@@ -125,5 +150,48 @@ public struct PagerMarkdownRenderer: Sendable {
             column += characters.count
         }
         return spans
+    }
+
+    private static func quoteSelectionText(_ text: String) -> String {
+        var remaining = text[...]
+        while remaining.first == "│" {
+            remaining = remaining.dropFirst()
+            if remaining.first == " " { remaining = remaining.dropFirst() }
+        }
+        return String(remaining)
+    }
+}
+
+public struct PagerStreamingMarkdownRenderer: Sendable {
+    private var renderer: StreamingMarkdownRenderer
+
+    public init(configuration: MarkdownRenderConfiguration = MarkdownRenderConfiguration()) {
+        renderer = StreamingMarkdownRenderer(configuration: configuration)
+    }
+
+    public var source: String { renderer.source }
+    public var frozenBytes: Int { renderer.frozenBytes }
+    public var frozenLinesCount: Int { renderer.frozenLinesCount }
+    public var lastRenderedSourceByteCount: Int { renderer.lastRenderedSourceByteCount }
+
+    @discardableResult
+    public mutating func pushAndRender(_ chunk: String) -> [PagerStyledLine] {
+        PagerMarkdownRenderer.map(renderer.pushAndRender(chunk))
+    }
+
+    @discardableResult
+    public mutating func render() -> [PagerStyledLine] {
+        PagerMarkdownRenderer.map(renderer.render())
+    }
+
+    @discardableResult
+    public mutating func finish() -> [PagerStyledLine] {
+        PagerMarkdownRenderer.map(renderer.finish())
+    }
+
+    @discardableResult
+    public mutating func setMaxTableWidth(_ width: Int?) -> [PagerStyledLine] {
+        renderer.setMaxTableWidth(width)
+        return render()
     }
 }

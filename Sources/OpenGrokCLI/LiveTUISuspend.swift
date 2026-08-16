@@ -72,18 +72,29 @@ struct LiveTUISuspendHost: Sendable {
     }
 
     /// `$PAGER`, trimmed, whitespace-split into program + arguments so values
-    /// like `less -R` work; default `less` (event_loop.rs:741-756). No
-    /// `-R`/`+G` injection — those are upstream's minimal-mode ANSI-transcript
-    /// arms (event_loop.rs:757-782), and this path writes plain text.
+    /// like `less -R` work; default `less` (event_loop.rs:741-756). ANSI
+    /// transcript callers add the pinned less-only `-R` and `+G` flags.
     static func resolvePager(
-        environment: [String: String]
+        environment: [String: String],
+        ansi: Bool = false
     ) -> (program: String, arguments: [String]) {
         let raw = environment["PAGER"]?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let value = raw.isEmpty ? "less" : raw
         let parts = value.split(whereSeparator: \.isWhitespace).map(String.init)
         guard let program = parts.first else { return ("less", []) }
-        return (program, Array(parts.dropFirst()))
+        var arguments = Array(parts.dropFirst())
+        let isLess = URL(fileURLWithPath: program).lastPathComponent == "less"
+        if ansi, isLess {
+            let rawFlags = Set(["-R", "-r", "--RAW-CONTROL-CHARS", "--raw-control-chars"])
+            if !arguments.contains(where: rawFlags.contains) {
+                arguments.append("-R")
+            }
+            if !arguments.contains("+G") {
+                arguments.append("+G")
+            }
+        }
+        return (program, arguments)
     }
 
     /// `$VISUAL` → `$EDITOR` → `vi` (`external_editor.rs:131-137` at pin

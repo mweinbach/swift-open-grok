@@ -133,6 +133,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// (upstream's AgentPane::Tasks), coexisting with the composer; keys
     /// route to it only while `focused`.
     var tasksPane: PagerTasksPaneState?
+    /// Cached actor snapshot of the session's `todo_write` store. Rendering
+    /// stays synchronous; the async event loop refreshes this before paint.
+    var todoPane: PagerTodoPane?
+    var todoPaneVisible = true
+    var todoShowCompleted = true
+    var todoForceVisible = false
     /// Bounded refresh while the pane is visible. Upstream rebuilds rows
     /// every frame off actor-free state; this port's feeds are actors, so
     /// the pane refreshes on open, on action, and on this once-a-second
@@ -220,7 +226,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     let providerBoundarySync: (@Sendable (Bool) async throws -> Void)?
     /// Prompts waiting behind the running turn, as published by the controller.
     var queuedPromptCount = 0
-    var turnActivity: String?
+    var turnPhase: LiveWaveETurnPhase?
+    var turnActivity: String? { turnPhase?.label }
     var turnStartedAt: Date?
     var isCancelling = false
 
@@ -247,6 +254,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// `[animation].fps` from the same one-shot load — composition calls
     /// `controller.setMotionFPS` with this before `run`.
     var animationFPS: Int = PagerMotion.defaultFPS
+    /// `[ui] group_tool_verbs`, default-on upstream. This is the live render
+    /// gate for Wave C's aggregate read/list/search/fetch headers.
+    var groupToolVerbs = true
     /// `[scrollback.display].sticky_headers` from the same `$OPENGROK_HOME/pager.toml`
     /// one-shot (`watcher.rs:46-54`, `config.rs:1429` unwrap_or(true) at pin
     /// 650c1db7). Default true. No env. No settings-modal row — file edits
@@ -303,6 +313,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// `turnStartedAt` (wall time) stays as the fallback for motion-disabled
     /// terminals, where no animation frame ever advances `motion.seconds`.
     var turnStartedAtSeconds: TimeInterval?
+    var lastTurnElapsed: TimeInterval?
     /// UTF-8 bytes of assistant output streamed this turn, for the status
     /// row's ⇣ token counter. An estimate (bytes/4) by design: this turn path
     /// carries no provider-reported `TokenUsage`, and the estimator is the
@@ -312,6 +323,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// boundaries. Feeds the status bar's context ramp with the same numbers
     /// auto-compaction decides on.
     var contextUsage: ContextUsage?
+    let usageSources: [ModelProvider: any ProviderUsageSource]
+    var usageStatusLoaded = false
+    var creditStatus: PagerCreditStatus?
     /// Per-server MCP connection outcomes, recorded at session start; the
     /// read-only `/mcps` overlay renders them.
     let mcpServers: [MCPServerConnection]
@@ -343,6 +357,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// has no cancellation plumbing into the blocking listener thread, so a
     /// second dispatch is refused with a notice (recorded divergence).
     var xaiLoginTask: Task<Void, Never>?
+    var welcomeAuthState: PagerWelcomeAuthState?
+    var authMouseReportingRestore: Bool?
+    var authPresentationTask: Task<Void, Never>?
     /// The in-flight `/recap` side-call, if any — the port of upstream's
     /// `recap_in_flight` claim (recap.rs:294-306): manual re-requests while
     /// one is generating answer with the unavailable copy instead of
@@ -353,6 +370,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// conversation it no longer describes — upstream's `recap_epoch`
     /// cancellation (recap.rs:509-517, :430-455).
     var recapEpoch: UInt64 = 0
+    var activeRecapBlockID: String?
+    var turnMarkerSequence: UInt64 = 0
+    var currentTurnMarkerID: String?
+    var currentPromptID: String?
 
     /// Viewport state. Conversation height / max offset track the latest
     /// layout (including coalesced). PageUp/PageDown recompute sticky
@@ -451,6 +472,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// move-with-button, non-left, scroll, suspend, restore, and any down
     /// that does not re-arm.
     var pendingLinkClick: (x: Int, y: Int, url: String)?
+    /// B-INTERACTION: block-level multi-click (`last_click`, `selection.rs:868`
+    /// at pin 650c1db7: single select, double toggle fold, triple toggle+scroll).
+    var lastScrollbackClick: (timeMs: UInt64, index: Int, count: UInt8)?
     /// Last-painted text-selection model (`layout.textSelection`),
     /// replace-wholesale with the other mouse caches. Sticky-header band
     /// is excluded from hits. Table cell/grid kinds require a matching
@@ -538,6 +562,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// predate the hook wiring (tests, non-interactive minimal sessions),
     /// in which case `/compact` compacts without firing hooks.
     let toolExecutor: LiveToolExecutor?
+    let editHighlightWorker = LiveEditHighlightWorker()
     let pagerRuntime: LivePagerRuntimeAdapter?
     /// The session this renderer belongs to, and the three things the
     /// session-scoped commands act on.
@@ -631,6 +656,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     let scrollMultiplexer: MouseScrollMultiplexer
     var mouseScrollState: MouseScrollState
     var scrollConfig: ScrollConfig
+    var scrollDebugEnabled = false
+    var scrollDebugOverlay: PagerScrollDebugOverlay?
+    var scrollLogURL: URL?
     /// Actor-local mirror of the four live scroll settings. Settings commits
     /// do not mutate a shared `UiConfig` value — this snapshot is what the
     /// hot path rebuilds from (effective `UiConfig` seeds it at init).
@@ -792,6 +820,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         toolExecutor: LiveToolExecutor? = nil,
         pagerRuntime: LivePagerRuntimeAdapter? = nil,
         authServices: LivePagerAuthServices = .production,
+        usageSources: [ModelProvider: any ProviderUsageSource] = [:],
         urlOpener: (@Sendable (URL) -> Void)? = nil
     ) {
         self.mode = mode
@@ -838,7 +867,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.fpsHud = PagerFpsHud(
             environmentValue: environment[pagerFpsHudEnvironmentVariable]
         )
+        self.scrollDebugEnabled = pagerFpsHudEnvironmentIsTruthy(
+            environment["GROK_SCROLL_DEBUG"]
+        )
+        self.scrollLogURL = Self.waveEScrollLogURL(
+            environmentValue: environment["GROK_SCROLL_LOG"],
+            openGrokHome: self.openGrokHome
+        )
         self.authServices = authServices
+        self.usageSources = usageSources
         // Prefer an explicit opener (tests) over the auth-services default so
         // link-click proofs never touch the real browser seam.
         self.urlOpener = urlOpener ?? authServices.openBrowser
@@ -900,6 +937,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // `event_loop.rs:1492`). `UIConfig.compactMode` round-trips the key
         // (UIConfig.swift:420,468), so absent means the `false` default.
         userCompactMode = uiConfig.compactMode
+        groupToolVerbs = uiConfig.groupToolVerbs ?? true
         // `[ui] show_timestamps` hydrates the same way (`event_loop.rs:1496`
         // via `load_timestamps`, `appearance/cache.rs:96-108`). The key is
         // `Option<bool>` (`ui_config.rs:110`) and ABSENT MEANS ON —
@@ -1393,9 +1431,20 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     }
 
     func render(_ event: OpenGrokPagerInteractiveEvent) async throws {
+        if !usageStatusLoaded {
+            usageStatusLoaded = true
+            if !usageSources.isEmpty {
+                let usage = await compaction?.usage()
+                let items = await conversationHistory?.items ?? []
+                _ = await refreshUsageReport(context: usage, items: items)
+            }
+        }
         switch event {
         case .lifecycle(let lifecycle):
-            if lifecycle == .cancelling { isCancelling = true }
+            if lifecycle == .cancelling {
+                isCancelling = true
+                turnPhase = .cancelling
+            }
         case .promptChanged(let prompt):
             self.prompt = prompt
         case .turnStarted(let request):
@@ -1403,6 +1452,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // not land mid-turn (cancel_pending_recap_for_new_prompt,
             // recap.rs:509-512).
             recapEpoch &+= 1
+            if let activeRecapBlockID {
+                conversation.removeBlock(id: activeRecapBlockID)
+                self.activeRecapBlockID = nil
+            }
             // The welcome screen's lifetime is exactly "before the first turn".
             if !hasStartedFirstTurn {
                 hasStartedFirstTurn = true
@@ -1411,8 +1464,26 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             let paintUserBlock = request.metadata[
                 OpenGrokPagerInteractiveController.interjectionFallbackMetadataKey
             ] == nil
+            turnMarkerSequence &+= 1
+            currentTurnMarkerID = "turn-\(turnMarkerSequence)"
+            currentPromptID = request.metadata[
+                OpenGrokPagerInteractiveController.promptIDMetadataKey
+            ]
+            let promptKind: PagerPromptKind
+            if request.metadata[
+                OpenGrokPagerInteractiveController.cronTaskIDMetadataKey
+            ] != nil {
+                promptKind = .cron
+            } else if request.metadata[
+                OpenGrokPagerInteractiveController.skillPromptMetadataKey
+            ] != nil {
+                promptKind = .skill
+            } else {
+                promptKind = .standard
+            }
             conversation.startTurn(
                 prompt: request.prompt,
+                promptKind: promptKind,
                 // An interjection-fallback turn's text was already painted at
                 // dispatch; a second user block here would duplicate it.
                 paintUserBlock: paintUserBlock
@@ -1429,8 +1500,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             } else {
                 pageFlipUserBlockIndex = nil
             }
-            turnActivity = "Thinking\u{2026}"
+            turnPhase = .thinking
             turnStartedAt = Date()
+            lastTurnElapsed = nil
             // Extrapolated motion clock, not the last painted tick: after an
             // idle gap `motion.seconds` is stale and would bake the gap into
             // the status-row elapsed readout.
@@ -1442,6 +1514,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             apply(event)
         case .turnFinished:
             finishAssistant()
+            upsertTurnEvent(.turnCompleted(elapsed: currentTurnElapsed()))
             endTurn()
             await refreshContextUsage()
         case .sessionReplaced(let sessionID):
@@ -1481,7 +1554,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // upstream's `RenderBlock::interjection_prompt`
             // (acp_handler/mod.rs:743-745), stamped at push like every
             // entry (`entry.rs:198`).
-            appendMessage(PagerMessage(role: .user, text: text, createdAt: Date()))
+            appendMessage(PagerMessage(
+                role: .user,
+                promptKind: .interjection,
+                text: text,
+                createdAt: Date()
+            ))
         case .focusChanged(let region):
             switch region {
             case .scrollback:
@@ -1509,7 +1587,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             try await present(request)
         case .turnCancelled:
             finishAssistant()
-            appendMessage(PagerMessage(role: .system, text: "Cancelled."))
+            upsertTurnEvent(.turnCancelled(elapsed: currentTurnElapsed()))
             // A cancelled turn must not leave a tool parked on a sheet the user
             // just walked away from.
             await resolveOutstandingPermissions()
@@ -1518,10 +1596,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             endTurn()
         case .turnFailed(let message):
             finishAssistant()
-            // Upstream's marker wording (`session_event.rs:172`). The session
-            // stays open; the run-ending `.failed` arm below is the only one
-            // that may end the transcript.
-            appendMessage(PagerMessage(role: .error, text: "Turn failed: \(message)"))
+            upsertTurnEvent(.turnFailed(error: message, elapsed: currentTurnElapsed()))
+            upsertCreditLimitCard(message: message)
             // Same rule as a cancel: the turn that raised a sheet is gone.
             await resolveOutstandingPermissions()
             await resolveOutstandingQuestions()
@@ -1534,18 +1610,23 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             endTurn()
         case .cancelled:
             finishAssistant()
+            upsertTurnEvent(.turnCancelled(elapsed: currentTurnElapsed()))
             await resolveOutstandingPermissions()
             await resolveOutstandingQuestions()
             await resolveOutstandingPlanApprovals()
             endTurn()
         case .failed(let message):
             finishAssistant()
-            appendMessage(PagerMessage(role: .error, text: message))
+            upsertTurnEvent(.turnFailed(error: message, elapsed: currentTurnElapsed()))
+            upsertCreditLimitCard(message: message)
             await resolveOutstandingPermissions()
             await resolveOutstandingQuestions()
             await resolveOutstandingPlanApprovals()
             endTurn()
         }
+        await refreshTodoPane()
+        await refreshHookPresentation()
+        await refreshActivityBlocks()
         // `/debug fps` must paint now so the overlay appears this keystroke,
         // but not also ride the coalesced final `renderState` — that pair
         // recorded two HUD samples for one toggle.
@@ -1557,13 +1638,65 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         }
     }
 
+    func refreshTodoPane() async {
+        guard let toolExecutor, todoPaneVisible else {
+            todoPane = nil
+            return
+        }
+        let todos = await toolExecutor.todoStore.todos
+        todoPane = PagerTodoPane(
+            items: todos.map { item in
+                PagerTodoItem(
+                    id: item.id,
+                    content: item.content,
+                    status: PagerTodoStatus(rawValue: item.status.rawValue) ?? .pending
+                )
+            },
+            showCompleted: mode == .fullScreen ? todoShowCompleted : false,
+            forceVisible: todoForceVisible,
+            isMinimal: mode != .fullScreen
+        )
+    }
+
+    func refreshHookPresentation() async {
+        guard let toolExecutor else { return }
+        let snapshot = await toolExecutor.hookPresentationStore.snapshot()
+        for (callID, hooks) in snapshot.toolHooks {
+            conversation.attachHooks(hooks, toCallID: callID)
+        }
+        for lifecycle in snapshot.lifecycleBlocks {
+            conversation.upsertBlock(.lifecycle(lifecycle))
+        }
+        if let currentPromptID,
+           let currentTurnMarkerID,
+           let stopHooks = snapshot.stopHooks[currentPromptID] {
+            conversation.attachStopHooks(stopHooks, toBlockID: currentTurnMarkerID)
+        }
+    }
+
     func endTurn() {
-        turnActivity = nil
+        lastTurnElapsed = currentTurnElapsed()
+        turnPhase = nil
         turnStartedAt = nil
         turnStartedAtSeconds = nil
         turnOutputUTF8Count = 0
         isCancelling = false
         pageFlipUserBlockIndex = nil
+    }
+
+    func currentTurnElapsed() -> TimeInterval? {
+        if let turnStartedAt {
+            return max(0, Date().timeIntervalSince(turnStartedAt))
+        }
+        return lastTurnElapsed
+    }
+
+    func upsertTurnEvent(_ event: PagerSessionEventKind) {
+        let id = currentTurnMarkerID ?? "turn-\(turnMarkerSequence)"
+        conversation.upsertBlock(.sessionEvent(PagerSessionEventBlock(
+            id: id,
+            event: event
+        )))
     }
 
     func resetForNewSession(sessionID: String) {
@@ -1582,6 +1715,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         pendingQuestionRequest = nil
         currentPlanApprovalRequestID = nil
         pendingPlanApprovalRequest = nil
+        currentTurnMarkerID = nil
+        currentPromptID = nil
+        lastTurnElapsed = nil
         endTurn()
         overlays.removeAll()
         overlays.push(.welcome(welcomeOverlay(), capturesInput: false))
@@ -1711,7 +1847,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             config: priced
         )
         applySignedScrollLines(update.lines)
-        if update.lines != 0 {
+        updateScrollDiagnostics(
+            rawDelta: direction.sign,
+            normalizedDelta: update.lines,
+            trigger: "event",
+            now: now
+        )
+        if update.lines != 0 || scrollDebugEnabled {
             try renderState()
         }
         return update
@@ -1728,7 +1870,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         }
         let update = mouseScrollState.onTick(now: now)
         applySignedScrollLines(update.lines)
-        if update.lines != 0 {
+        updateScrollDiagnostics(
+            rawDelta: 0,
+            normalizedDelta: update.lines,
+            trigger: "tick",
+            now: now
+        )
+        if update.lines != 0 || scrollDebugEnabled {
             try renderState()
         }
         return update.lines
@@ -1936,8 +2084,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func apply(_ event: OpenGrokPagerEvent) {
         switch event {
         case .lifecycle(let lifecycle):
-            if lifecycle == .running, turnActivity == nil {
-                turnActivity = "Thinking\u{2026}"
+            if lifecycle == .running, turnPhase == nil {
+                turnPhase = .thinking
                 turnStartedAt = turnStartedAt ?? Date()
             }
         case .output(let text):
@@ -1945,14 +2093,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // Estimated bytes/4, not provider-reported: this event path
             // carries no `TokenUsage` (see `LiveUsageComposition.report`).
             turnOutputUTF8Count += text.utf8.count
-            turnActivity = "Responding\u{2026}"
+            turnPhase = .responding
         case .status(let text):
-            turnActivity = text
+            turnPhase = .status(text)
         case .tool(let tool):
             apply(tool)
         case .reasoning(let text):
             conversation.appendReasoning(text)
-            turnActivity = "Thinking\u{2026}"
+            turnPhase = .thinking
         case .toolCallDelta(let toolIndex, let id, let name, let argumentsDelta):
             conversation.applyToolCallDelta(
                 toolIndex: toolIndex,
@@ -1961,28 +2109,33 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 argumentsDelta: argumentsDelta
             )
             if let name, !name.isEmpty {
-                turnActivity = name
+                turnPhase = .tool(name)
             } else {
-                turnActivity = "Preparing tool\u{2026}"
+                turnPhase = .preparingTool
             }
         case .retrying(let attempt, let maxRetries, _, let reason):
-            turnActivity = "Retrying (\(attempt)/\(maxRetries)): \(reason)"
+            turnPhase = .retrying(
+                attempt: Int(attempt),
+                maximum: Int(maxRetries),
+                reason: reason
+            )
         case .samplingFailed(let kind, let message, let isRetryable, _):
-            // Typed failure surface before the turn-ending `.turnFailed` arm.
-            // Keep kind/retryability visible; do not collapse to message alone.
-            let retryNote = isRetryable ? " (retryable)" : ""
-            appendMessage(PagerMessage(
-                role: .error,
-                text: "Sampling failed [\(kind)]\(retryNote): \(message)"
-            ))
-            turnActivity = "Failed (\(kind))"
+            let retryNote = isRetryable ? "retryable \(kind)" : kind
+            conversation.upsertBlock(.sessionEvent(PagerSessionEventBlock(
+                id: "\(currentTurnMarkerID ?? "turn-\(turnMarkerSequence)")-sampling",
+                event: .retryFailed(error: message, errorType: retryNote)
+            )))
+            upsertCreditLimitCard(message: message, kind: kind)
+            turnPhase = .failed(kind)
         case .permissionRequested(let request):
-            turnActivity = "Permission required: \(request.prompt)"
+            turnPhase = .waiting(request.prompt)
         case .completed:
             finishAssistant()
+            upsertTurnEvent(.turnCompleted(elapsed: currentTurnElapsed()))
             endTurn()
         case .cancelled:
             finishAssistant()
+            upsertTurnEvent(.turnCancelled(elapsed: currentTurnElapsed()))
             endTurn()
         }
     }
@@ -2005,11 +2158,48 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             tool,
             atSeconds: motionEnabled ? currentMotionSeconds() : nil
         )
+        if tool.state == .succeeded,
+           let card = conversation.testingToolCard(callID: tool.callID),
+           card.kind == .edit || card.kind == .create {
+            let files = card.editFiles ?? card.editHunks.map {
+                [PagerEditFile(
+                    path: card.editPath ?? card.input,
+                    hunks: $0,
+                    isNewFile: card.isNewFileForEdit ?? false
+                )]
+            } ?? []
+            if !files.isEmpty {
+                let callID = tool.callID
+                let entryKey = files.map { file in
+                    URL(fileURLWithPath: file.path).standardizedFileURL.path
+                }.joined(separator: "\u{1F}")
+                let workingDirectory = URL(
+                    fileURLWithPath: workingDirectory,
+                    isDirectory: true
+                )
+                Task { [weak self, editHighlightWorker] in
+                    guard let highlighted = await editHighlightWorker.highlight(
+                        callID: entryKey,
+                        files: files,
+                        workingDirectory: workingDirectory
+                    ) else { return }
+                    await self?.applyEditHighlightResult(
+                        callID: callID,
+                        files: highlighted
+                    )
+                }
+            }
+        }
         // While a tool runs, the turn-status row shows the tool's own title —
         // the reference has no separate "tool running" phrasing.
         if tool.state == .running {
-            turnActivity = tool.name
+            turnPhase = .tool(tool.name)
         }
+    }
+
+    private func applyEditHighlightResult(callID: String, files: [PagerEditFile]) {
+        guard conversation.applyEditHighlights(callID: callID, files: files) else { return }
+        try? renderState()
     }
 
     // MARK: - Scrollback selection
@@ -2025,6 +2215,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             guard let index = selection.index,
                   conversation.items.indices.contains(index) else { return }
             let item = conversation.items[index]
+            if openWaveEBackgroundTaskViewer(for: item) {
+                return
+            }
             let body = LiveScrollbackSelection.content(of: item)
             overlays.push(.sessionInfo(
                 id: "block-viewer",
@@ -2038,6 +2231,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
 
         let outcome = conversation.withItems { items in
             selection.apply(command, items: &items)
+        }
+        if let expanded = outcome.completedReasoningExpanded {
+            conversation.setCompletedReasoningExpanded(expanded)
         }
         if let clipboard = outcome.clipboard {
             do {
@@ -2251,8 +2447,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             note("A Codex sign-in is already in progress. Finish it in your browser, or wait for it to time out.")
             return
         }
-        // Upstream's dispatch notice (`dispatch/auth.rs:119-121`).
-        note("Opening your browser to connect OpenAI Codex\u{2026}")
+        beginWaveEAuth(providerName: "ChatGPT Codex")
         let authFile = OpenGrokAuthPaths.codexAuthFileURL(environment: environment)
         let endpoints = CodexEndpoints.fromEnvironment(environment)
         let transport = authServices.makeTransport()
@@ -2262,10 +2457,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             let result: Result<CodexCredentials, any Error>
             do {
                 let credentials = try await flow(authFile, endpoints, transport, { url in
-                    // The auth URL lands in the transcript — upstream's CLI
-                    // announce copy (`codex_auth.rs:823-824`), which its
-                    // raw-terminal TUI path cannot print (recorded
-                    // divergence: upstream's TUI shows no URL at all).
+                    // Wave E routes the exact URL into the welcome/minimal
+                    // auth surface, including raw-URL mode when browser open
+                    // is unavailable. The browser callback still receives the
+                    // same byte-for-byte URL.
                     Task { await self.announceCodexAuthURL(url) }
                     openBrowser?(url)
                 })
@@ -2278,8 +2473,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     }
 
     func announceCodexAuthURL(_ url: URL) {
-        note("Open this URL if your browser does not open automatically:\n  \(url.absoluteString)")
-        try? renderState()
+        announceWaveEAuthURL(url)
     }
 
     /// Completion messages are upstream's, byte for byte
@@ -2288,7 +2482,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         codexLoginTask = nil
         switch result {
         case .success(let credentials):
-            note(liveCodexConnectedMessage(
+            finishWaveEAuthSuccess(liveCodexConnectedMessage(
                 email: credentials.email,
                 planType: credentials.planType
             ))
@@ -2300,12 +2494,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             catalogStore?.spawnBackgroundRefresh()
             Task { await self.reconcileModelStateAfterCatalogRefresh() }
         case .failure(let error):
-            appendMessage(PagerMessage(
-                role: .error,
-                text: "OpenAI Codex login failed: \(LiveAuthComposition.describe(error))"
-            ))
+            finishWaveEAuthFailure(
+                "OpenAI Codex login failed: \(LiveAuthComposition.describe(error))"
+            )
         }
-        try? renderState()
     }
 
     /// `/login xai` — upstream `Action::Login`'s browser OAuth arm
@@ -2315,10 +2507,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// browser. The credential lands in the REAL store (auth.json via
     /// `AuthManager` under its file lock) — the same store `/logout` clears.
     ///
-    /// RECORDED DIVERGENCES: upstream renders this flow on the welcome screen
-    /// with a paste box and aborts a prior attempt on re-dispatch; this port's
-    /// transcript is the channel (start header, URL announce, completion),
-    /// there is no manual paste channel, and a second dispatch is refused.
+    /// RECORDED DIVERGENCES: upstream's welcome flow includes a manual paste
+    /// box and aborts a prior attempt on re-dispatch; this port presents the
+    /// start/URL/completion states on the welcome/minimal auth surface, has no
+    /// manual paste channel, and refuses a second dispatch.
     /// The external-auth-provider / devbox pre-flight arms and the opt-in
     /// device transport (flow.rs:640-724) are not wired at this seam.
     func startXAILogin() {
@@ -2326,8 +2518,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             note("An xAI sign-in is already in progress. Finish it in your browser, or wait for it to time out.")
             return
         }
-        // Upstream's loopback-arm welcome header (views/welcome/mod.rs:1022).
-        note("A browser window will open for authentication.")
+        beginWaveEAuth(providerName: "xAI Grok")
         let env = environment
         let manager = AuthManager(
             grokHome: openGrokHome,
@@ -2341,9 +2532,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             let result: Result<GrokAuth, any Error>
             do {
                 let auth = try await flow(manager, env, transport, { url in
-                    // The CLI announce copy (oidc/login.rs:439-440); upstream's
-                    // TUI paints the same URL on the welcome screen, which this
-                    // port does not have.
+                    // The exact URL is painted on Wave E's welcome/minimal auth
+                    // surface before the browser flow completes.
                     Task { await self.announceXAIAuthURL(url) }
                     openBrowser?(url)
                 })
@@ -2356,8 +2546,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     }
 
     func announceXAIAuthURL(_ url: URL) {
-        note("Open this URL to sign in:\n  \(url.absoluteString)")
-        try? renderState()
+        announceWaveEAuthURL(url)
     }
 
     /// Success copy is the CLI's `report_signed_in` (auth/flow.rs:872-878);
@@ -2369,9 +2558,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         switch result {
         case .success(let auth):
             if let email = auth.email, !email.trimmingCharacters(in: .whitespaces).isEmpty {
-                note("✓ Signed in as \(email)")
+                finishWaveEAuthSuccess("✓ Signed in as \(email)")
             } else {
-                note("✓ Signed in")
+                finishWaveEAuthSuccess("✓ Signed in")
             }
             // Same post-login pair as the codex arm: recompute the credential
             // snapshot and fire the background catalog refresh
@@ -2384,12 +2573,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             catalogStore?.spawnBackgroundRefresh()
             Task { await self.reconcileModelStateAfterCatalogRefresh() }
         case .failure(let error):
-            appendMessage(PagerMessage(
-                role: .error,
-                text: "xAI Grok login failed: \(LiveAuthComposition.describe(error))"
-            ))
+            finishWaveEAuthFailure(
+                "xAI Grok login failed: \(LiveAuthComposition.describe(error))"
+            )
         }
-        try? renderState()
     }
 
     // MARK: - /recap
@@ -2397,8 +2584,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// `/recap` — kick off the session-recap side-call (the manual arm of
     /// `handle_recap`, acp_session_impl/recap.rs:250-507). One read-only
     /// snapshot of the live conversation, ONE tool-free model call on the
-    /// independently resolved recap route, and a display-only transcript
-    /// line; the conversation is never touched. Spawned so the sample never
+    /// independently resolved recap route, and one display-only typed recap
+    /// block filled in place; the conversation is never touched. Spawned so the sample never
     /// blocks the input loop, single-flight like upstream's `recap_in_flight`
     /// claim (recap.rs:294-306).
     func startRecap() async {
@@ -2427,21 +2614,21 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             note(LiveRecap.unavailableToast(hasUserMessages: true))
             return
         }
-        let conversation = await conversationHistory.items
+        let conversationItems = await conversationHistory.items
         // recap_gate's manual arm (session_recap.rs:232-241): nothing to
         // summarize yet — the empty-state copy, and no request leaves the
         // machine.
-        guard LiveRecap.mainTurnCount(conversation) > 0 else {
+        guard LiveRecap.mainTurnCount(conversationItems) > 0 else {
             note(LiveRecap.unavailableToast(hasUserMessages: false))
             return
         }
-        // RECORDED DIVERGENCE on the in-progress presentation: upstream shows
-        // a loading block whose "Recap" header carries an animated sidebar
-        // and is filled in place (notes.rs:398-420, apply_recap_block). This
-        // port's transcript has no fill-in-place channel, so the running
-        // state is a note in the `/compact` "Compacting…" convention. Cost:
-        // the running line stays in scrollback above the result.
-        note("Recap\u{2026}")
+        let recapBlockID = "recap-\(UUID().uuidString.lowercased())"
+        activeRecapBlockID = recapBlockID
+        conversation.upsertBlock(.sessionEvent(PagerSessionEventBlock(
+            id: recapBlockID,
+            event: .recap(summary: nil, auto: false),
+            isExpanded: true
+        )))
         try? renderState()
 
         let configured = LiveRecap.configuredModel(
@@ -2461,7 +2648,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // the prefix verbatim so the provider prompt cache stays warm
             // (session_recap.rs:62-74).
             let items = LiveRecap.buildItems(
-                conversation: conversation,
+                conversation: conversationItems,
                 tag: "system-reminder",
                 stripReasoning: route.configuration.apiBackend == .messages
             )
@@ -2492,35 +2679,39 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             } catch {
                 result = .failure(error)
             }
-            self.finishRecap(epoch: epoch, result: result)
+            self.finishRecap(epoch: epoch, blockID: recapBlockID, result: result)
         }
     }
 
     /// Land the recap. The conversation is deliberately untouched on every
     /// arm — a recap is generated from a read-only snapshot and surfaced for
     /// display only (session_recap.rs:1-12).
-    func finishRecap(epoch: UInt64, result: Result<String, any Error>) {
+    func finishRecap(
+        epoch: UInt64,
+        blockID: String,
+        result: Result<String, any Error>
+    ) {
         recapTask = nil
         // A prompt accepted (or a session swapped) while generating: keep the
         // late recap out of a conversation it no longer describes; the manual
         // path still clears its feedback (recap.rs:430-455).
         guard epoch == recapEpoch else {
-            note(LiveRecap.unavailableToast(hasUserMessages: true))
+            conversation.removeBlock(id: blockID)
+            if activeRecapBlockID == blockID { activeRecapBlockID = nil }
             try? renderState()
             return
         }
+        activeRecapBlockID = nil
+        let summary: String
         switch result {
         case .success(let raw):
-            let summary = LiveRecap.cleanText(raw)
-            if summary.isEmpty {
+            let cleaned = LiveRecap.cleanText(raw)
+            if cleaned.isEmpty {
                 // Empty after the tidy pass reads as no recap
                 // (recap.rs:405-428).
-                note(LiveRecap.unavailableToast(hasUserMessages: true))
+                summary = LiveRecap.unavailableToast(hasUserMessages: true)
             } else {
-                // The pager owns the label — manual and auto render the same
-                // "Recap — {summary}" line (SessionEvent::Recap `message()`,
-                // scrollback/blocks/session_event.rs:253-256).
-                note("Recap \u{2014} \(summary)")
+                summary = cleaned
             }
         case .failure:
             // A failed side-call must never break the session: the failure
@@ -2528,8 +2719,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // recap_unavailable_toast, notes.rs:331-340). The error detail is
             // deliberately not painted — upstream sends it to tracing, never
             // to the client.
-            note(LiveRecap.unavailableToast(hasUserMessages: true))
+            summary = LiveRecap.unavailableToast(hasUserMessages: true)
         }
+        conversation.upsertBlock(.sessionEvent(PagerSessionEventBlock(
+            id: blockID,
+            event: .recap(summary: summary, auto: false),
+            isExpanded: true
+        )))
         try? renderState()
     }
 
@@ -2569,7 +2765,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             try? renderState()
             return
         }
-        note("/btw \(question)\u{2026}")
+        let blockID = "btw-\(UUID().uuidString.lowercased())"
+        conversation.upsertBlock(.btw(PagerBtwBlock(
+            id: blockID,
+            question: question,
+            answer: nil,
+            isExpanded: true
+        )))
         try? renderState()
 
         let sessionID = self.sessionID
@@ -2665,7 +2867,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             } catch {
                 // See the persist note above.
             }
-            self.finishSideQuestion(question: question, record: record)
+            self.finishSideQuestion(blockID: blockID, question: question, record: record)
         }
     }
 
@@ -2673,20 +2875,16 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// every arm — the answer is generated from a read-only snapshot and
     /// surfaced for display only, off-conversation by contract
     /// (commands.rs:734-740).
-    func finishSideQuestion(question: String, record: LiveBtwEntry) {
-        if record.success {
-            // The panel's scrollback-persist shape: "/btw <question>" header
-            // then the response body (`BtwBlock::output`, scrollback/blocks/
-            // btw.rs:48-73) — one self-contained block, so mid-turn output
-            // interleaving cannot orphan the answer from its question.
-            note("/btw \(question)\n\(record.answer)")
-        } else {
-            // Upstream's error arm paints the failure into the panel with
-            // the "side question failed: …" prefix (effects/mod.rs:
-            // 5641-5649); the empty-answer arm carries EmptyResponse's own
-            // copy (commands.rs:34-35).
-            note(LiveBtw.failureCopy(record.error ?? LiveBtw.emptyResponseCopy))
-        }
+    func finishSideQuestion(blockID: String, question: String, record: LiveBtwEntry) {
+        let answer = record.success
+            ? record.answer
+            : LiveBtw.failureCopy(record.error ?? LiveBtw.emptyResponseCopy)
+        conversation.upsertBlock(.btw(PagerBtwBlock(
+            id: blockID,
+            question: question,
+            answer: answer,
+            isExpanded: true
+        )))
         try? renderState()
     }
 
@@ -3009,9 +3207,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// for inline, a pager that printed to the main screen leaves that text
     /// above the repainted viewport instead of being re-anchored under it.
     func presentTranscriptPager() async throws {
-        let content = transcript
+        let content = pagerExpandedTranscriptANSI(
+            items: conversation.items,
+            width: max(20, terminal.size()?.width ?? 80),
+            theme: renderTheme
+        )
         // dispatch/transcript.rs:256-263.
-        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !conversation.items.isEmpty else {
             note("No conversation transcript to view yet")
             return
         }
@@ -3021,14 +3223,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         }
         // dispatch/transcript.rs:265-277.
         let file = FileManager.default.temporaryDirectory
-            .appendingPathComponent("open-grok-transcript-\(UUID().uuidString).md")
+            .appendingPathComponent("open-grok-transcript-\(UUID().uuidString).ansi")
         do {
             try content.write(to: file, atomically: true, encoding: .utf8)
         } catch {
             note("Failed to write transcript: \(error)")
             return
         }
-        let pager = LiveTUISuspendHost.resolvePager(environment: suspendHost.environment)
+        let pager = LiveTUISuspendHost.resolvePager(
+            environment: suspendHost.environment,
+            ansi: true
+        )
 
         // Blocking this path is correct — upstream blocks its event loop in
         // `run_child` (event_loop.rs:400). Local motion hold + host
@@ -4016,15 +4221,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             || modifiers.contains(.superKey)
     }
 
-    /// Left-button up half of click-to-select: pending down cell + frozen
-    /// hit model, no drag committed → select + `.focusScrollback`. Up may
-    /// jitter off the down cell; remapping always uses the down snapshot
-    /// (`mouse.rs:830-947` — selection reads `click_row`, not the up row).
-    ///
-    /// X10 releases decode as `.up` with `resolvedButton == .none` (wire
-    /// code 3, no button attribution). Complete against the frozen left-down
-    /// pending snapshot for `.left` or `.none`; middle/right still clear
-    /// pending and refuse.
+    /// Left-button up half of click-to-select + block fold:
+    /// - 1× select in place (existing behavior)
+    /// - 2× toggle fold on foldable blocks, or open a BgTask live viewer
+    /// - 3× toggle fold + scroll block to top (fold affordance identical)
+    /// Non-foldable targets no-op on double/triple beyond select.
+    /// `MULTI_CLICK_TIMEOUT_MS = 300` (`selection.rs:868` at pin 650c1db7).
+    /// X10 `.none` completes against frozen left-down.
     func completeScrollbackClick(
         _ event: MouseEvent,
         hadPendingTextDrag: Bool = false
@@ -4035,18 +4238,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         case .middle, .right, .other:
             pendingScrollbackClick = nil
             lastTextClick = nil
+            lastScrollbackClick = nil
             return .consumed
         }
         guard let pending = pendingScrollbackClick else { return .consumed }
         pendingScrollbackClick = nil
-        // Real drag already cleared pending; a jittered up without a drag
-        // event still completes against the down cell (up coordinates are
-        // intentionally ignored for the hit remap).
         guard !overlays.isActive else { return .consumed }
 
-        // word_select multi-click: exact text hit on the down cell within
-        // 300ms (`mouse.rs:832-873`). flash/hold keep the block-select path
-        // (no invented fold on double-click).
         if keepTextSelectionMode.selectsWord,
            let textModel = lastTextSelection,
            let exact = textModel.hitTestTextExact(col: pending.x, row: pending.y)
@@ -4065,18 +4263,23 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 selection.select(at: exact.entryIndex, itemCount: conversation.items.count)
                 followsBottom = false
                 try renderState()
+                lastScrollbackClick = (textSelectionNowMs(), exact.entryIndex, 1)
                 return .focusScrollback
             case 2:
                 try selectWordAt(exact, model: textModel, nowMs: nowMs, clickCount: 2)
+                lastScrollbackClick = nil
                 return .focusScrollback
             case 3:
                 if try selectCellAt(exact, model: textModel, nowMs: nowMs, clickCount: 3) {
+                    lastScrollbackClick = nil
                     return .focusScrollback
                 }
                 try selectLineAt(exact, model: textModel, nowMs: nowMs, clickCount: 3)
+                lastScrollbackClick = nil
                 return .focusScrollback
             default:
                 lastTextClick = nil
+                lastScrollbackClick = nil
             }
         } else {
             lastTextClick = nil
@@ -4087,12 +4290,38 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
               conversation.items.indices.contains(index),
               conversation.items[index].isMouseSelectable
         else { return .consumed }
+        let nowMs = textSelectionNowMs()
+        let clicks = scrollbackClickCount(nowMs: nowMs, index: index)
         selection.select(at: index, itemCount: conversation.items.count)
-        // Following the tail while a selection cursor exists would yank the
-        // viewport away from the block the user just picked.
         followsBottom = false
+        let item = conversation.items[index]
+        if clicks == 1 {
+            lastScrollbackClick = (nowMs, index, 1)
+        } else if clicks == 2 {
+            if openWaveEBackgroundTaskViewer(for: item) {
+                lastScrollbackClick = nil
+            } else if item.isFoldable {
+                conversation.withItems { items in LiveScrollbackSelection.toggleFold(at: index, items: &items) }
+                lastScrollbackClick = (nowMs, index, 2)
+            } else {
+                lastScrollbackClick = (nowMs, index, 1)
+            }
+        } else if item.isFoldable {
+            conversation.withItems { items in LiveScrollbackSelection.toggleFold(at: index, items: &items) }
+            try revealBlock(at: index)
+            lastScrollbackClick = nil
+        } else {
+            lastScrollbackClick = nil
+        }
         try renderState()
         return .focusScrollback
+    }
+
+    func scrollbackClickCount(nowMs: UInt64, index: Int) -> UInt8 {
+        guard let last = lastScrollbackClick, last.index == index,
+              nowMs >= last.timeMs, nowMs - last.timeMs < 300
+        else { return 1 }
+        return last.count &+ 1
     }
 
     /// Per-overlay dismissal side effects. Closing the persona detail
@@ -4482,7 +4711,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// other field is this frame's real state, which is what makes the
     /// measurement match the frame the user is looking at.
     func renderState(conversation blocks: [PagerConversationItem]) -> PagerRenderState {
-        let isTurnRunning = turnActivity != nil
+        let isTurnRunning = turnPhase != nil
         let completions = prompt.completions.isEmpty
             ? nil
             : PagerCompletionMenu(
@@ -4523,13 +4752,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 contextTotalTokens: contextUsage.map { Int($0.contextWindow) },
                 queuedPromptCount: queuedPromptCount,
                 backgroundTaskCount: activeBackgroundWork.count,
+                credit: creditStatus,
                 contextBarHovered: contextBarHovered
             ),
             announcementBanner: announcementBanner,
             conversation: blocks,
-            turnStatus: turnActivity.map { label in
+            turnStatus: turnPhase.map { phase in
                 PagerTurnStatus(
-                    label: isCancelling ? "Cancelling\u{2026}" : label,
+                    label: isCancelling ? LiveWaveETurnPhase.cancelling.label : phase.label,
                     isCancelling: isCancelling,
                     tick: paintClock.tick,
                     elapsed: elapsed,
@@ -4538,14 +4768,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                     // Bare Enter force-sends the head only when the composer is
                     // empty; with a draft, Enter queues it behind the others.
                     queueIsSendable: queuedPromptCount > 0 && prompt.text.isEmpty,
-                    // The pulsing "waiting on you" diamond while a permission
-                    // sheet blocks the turn (`turn_status.rs:484-486`). The
-                    // idle-monitor pulse is deliberately not produced: this
-                    // session has no idle-watcher feed, and a guessed monitor
-                    // glyph would claim watchers that do not exist.
                     indicator: currentPermissionRequestID != nil
                         ? .pendingUserDiamond
-                        : .spinner
+                        : phase.indicator,
+                    canCancel: minimalHost == nil && !isCancelling && phase.allowsCancel
                 )
             },
             completions: completions,
@@ -4578,6 +4804,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 pendingLabel: prompt.pendingConfirmationLabel
             ),
             tasksPane: tasksPane,
+            todoPane: todoPane,
+            welcomeAuth: welcomeAuthState,
             scrollPosition: followsBottom ? .followTail : .offset(scrollOffset),
             theme: renderTheme,
             selectedBlockIndex: selection.index,
@@ -4592,6 +4820,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 userCompact: userCompactMode,
                 terminalRows: terminalSize.height
             ),
+            groupToolVerbs: groupToolVerbs,
             stickyHeadersEnabled: stickyHeadersEnabled,
             // NOT derived — upstream's appearance value IS the user setting
             // (`set_timestamps_inner`, `setters.rs:1530-1541` copies it
@@ -4615,6 +4844,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             textSelectionHighlight: currentTextSelectionHighlight(),
             tableSelectionGeometry: tableSelectionGeometry,
             fpsHud: fpsOverlay,
+            scrollDebugHud: minimalHost == nil && scrollDebugEnabled
+                ? currentScrollDebugOverlay()
+                : nil,
             toast: transientToast,
             stickyToast: displayedStickyToast()
         )

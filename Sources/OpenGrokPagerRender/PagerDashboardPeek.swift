@@ -430,6 +430,7 @@ public enum PagerDashboardPeekTail {
     private static func isFoldable(_ item: PagerConversationItem) -> Bool {
         switch item {
         case .tool: return true
+        case .block(let block): return block.isFoldable
         case .message(let message): return message.role == .reasoning
         case .separator: return false
         }
