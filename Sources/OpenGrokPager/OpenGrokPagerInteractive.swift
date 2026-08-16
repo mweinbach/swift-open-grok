@@ -200,6 +200,10 @@ public struct OpenGrokPagerInteractivePromptState: Sendable, Equatable {
     /// replaces the whole shortcuts bar with `press again to {label}`.
     public let pendingConfirmationKey: String?
     public let pendingConfirmationLabel: String?
+    /// Image attachments represented by atomic `[Image #N]` elements in
+    /// `text`. The bytes stay off the visible string and malformed wrap frames
+    /// never enter either collection.
+    public let pastedImages: [PastedImage]
 
     public init(
         text: String = "",
@@ -212,7 +216,8 @@ public struct OpenGrokPagerInteractivePromptState: Sendable, Equatable {
         completions: [OpenGrokPagerCommandSuggestion] = [],
         selectedCompletion: Int? = nil,
         pendingConfirmationKey: String? = nil,
-        pendingConfirmationLabel: String? = nil
+        pendingConfirmationLabel: String? = nil,
+        pastedImages: [PastedImage] = []
     ) {
         self.text = text
         self.cursorOffset = max(0, min(cursorOffset, text.count))
@@ -230,6 +235,7 @@ public struct OpenGrokPagerInteractivePromptState: Sendable, Equatable {
         self.selectedCompletion = selectedCompletion
         self.pendingConfirmationKey = pendingConfirmationKey
         self.pendingConfirmationLabel = pendingConfirmationLabel
+        self.pastedImages = pastedImages
     }
 }
 

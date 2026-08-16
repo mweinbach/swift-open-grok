@@ -492,6 +492,135 @@ public enum PagerWaveCToolPayload: Sendable, Equatable, Hashable {
     case questions([PagerToolQuestionAnswer])
 }
 
+public enum PagerMediaKind: String, Sendable, Equatable, Hashable {
+    case image
+    case video
+}
+
+public struct PagerMediaRef: Sendable, Equatable, Hashable {
+    public var path: String
+    public var kind: PagerMediaKind
+    public var byteSize: Int?
+    public var pixelWidth: UInt32?
+    public var pixelHeight: UInt32?
+    public var videoInlineAvailable: Bool?
+
+    public init(
+        path: String,
+        kind: PagerMediaKind,
+        byteSize: Int? = nil,
+        pixelWidth: UInt32? = nil,
+        pixelHeight: UInt32? = nil,
+        videoInlineAvailable: Bool? = nil
+    ) {
+        self.path = path
+        self.kind = kind
+        self.byteSize = byteSize
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.videoInlineAvailable = videoInlineAvailable
+    }
+
+    static func parse(toolName: String, structuredOutput: String?) -> [PagerMediaRef] {
+        guard let structuredOutput,
+              let data = structuredOutput.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let path = object["path"] as? String,
+              !path.isEmpty,
+              let kind = inferKind(
+                  toolName: toolName,
+                  path: path,
+                  explicitKind: object["media_kind"] as? String
+              )
+        else { return [] }
+
+        let byteSize = (object["byte_size"] as? NSNumber)?.intValue
+        let dimensions = kind == .image ? imageDimensions(atPath: path) : nil
+        return [PagerMediaRef(
+            path: path,
+            kind: kind,
+            byteSize: byteSize,
+            pixelWidth: dimensions?.width,
+            pixelHeight: dimensions?.height,
+            videoInlineAvailable: kind == .video
+                ? PagerInlineVideoDecoder.ffmpegAvailable()
+                : nil
+        )]
+    }
+
+    private static func inferKind(
+        toolName: String,
+        path: String,
+        explicitKind: String?
+    ) -> PagerMediaKind? {
+        if let explicitKind = explicitKind?.lowercased(),
+           let kind = PagerMediaKind(rawValue: explicitKind)
+        {
+            return kind
+        }
+
+        let normalizedName = toolName.lowercased()
+        if normalizedName.contains("video") { return .video }
+        if normalizedName.contains("image") { return .image }
+
+        switch URL(fileURLWithPath: path).pathExtension.lowercased() {
+        case "mp4", "m4v", "mov", "webm", "avi", "mkv":
+            return .video
+        case "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff", "tif":
+            return .image
+        default:
+            return nil
+        }
+    }
+
+    func reservedRows(contentWidth: Int) -> Int {
+        if kind == .video, videoInlineAvailable == false { return 1 }
+        let maxRows = min(20, max(4, contentWidth / 2))
+        guard kind == .image, let pixelWidth, let pixelHeight else {
+            return maxRows
+        }
+        return Int(fitImageToCells(
+            imgW: pixelWidth,
+            imgH: pixelHeight,
+            maxCols: UInt16(clamping: max(1, contentWidth - 2)),
+            maxRows: UInt16(clamping: maxRows)
+        ).rows)
+    }
+
+    private static func imageDimensions(atPath path: String) -> (width: UInt32, height: UInt32)? {
+        guard let bytes = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let png = prepareKittyOverlayImageBytes(bytes),
+              png.count >= 24,
+              png.starts(with: KittyGraphics.pngSignature)
+        else { return nil }
+
+        let header = [UInt8](png[16..<24])
+        let width = header[0...3].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        let height = header[4...7].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        guard width > 0, height > 0 else { return nil }
+        return (width, height)
+    }
+}
+
+public struct PagerInlineMediaPlacement: Sendable, Equatable {
+    public var media: PagerMediaRef
+    public var rect: TerminalRect
+    public var fullRowCount: Int
+    public var sourceRowOffset: Int
+
+    public init(
+        media: PagerMediaRef,
+        rect: TerminalRect,
+        fullRowCount: Int,
+        sourceRowOffset: Int = 0
+    ) {
+        self.media = media
+        self.rect = rect
+        self.fullRowCount = max(1, fullRowCount)
+        self.sourceRowOffset = max(0, sourceRowOffset)
+    }
+}
+
 public struct PagerToolCard: Sendable, Equatable, Hashable {
     public var name: String
     public var kind: PagerToolKind
@@ -539,6 +668,8 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
     /// Typed read/list/search/web/MCP/memory/Other payload used by Wave C
     /// painters. Raw transport is retained separately for replay/debugging.
     public var waveCPayload: PagerWaveCToolPayload?
+    /// Typed local media paths carried independently from prompt prose.
+    public var mediaRefs: [PagerMediaRef]
     // MARK: - B2 edit structured fields (hunks, gutters, trusted counts, Creating, patch)
     /// Per-file edit bodies. Single-file producers also populate the legacy
     /// `editHunks` / `editPath` fields below for source compatibility.
@@ -578,6 +709,7 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
         isBashMode: Bool? = nil,
         structuredOutput: String? = nil,
         waveCPayload: PagerWaveCToolPayload? = nil,
+        mediaRefs: [PagerMediaRef] = [],
         editFiles: [PagerEditFile]? = nil,
         editHunks: [DiffHunk]? = nil,
         editPath: String? = nil,
@@ -605,6 +737,7 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
         self.isBashMode = isBashMode
         self.structuredOutput = structuredOutput
         self.waveCPayload = waveCPayload
+        self.mediaRefs = mediaRefs
         self.editFiles = editFiles
         self.editHunks = editHunks
         self.editPath = editPath
@@ -659,6 +792,10 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
             output: output,
             structuredOutput: structuredOutput
         )
+        let mediaRefs = PagerMediaRef.parse(
+            toolName: name,
+            structuredOutput: structuredOutput
+        )
         let display = fields.displayHeader(kind: kind, rawInput: rawInput, cwd: cwd)
         let execDesc: String? = fields.description
         let execCmd: String? = fields.command
@@ -684,6 +821,7 @@ public struct PagerToolCard: Sendable, Equatable, Hashable {
             isBashMode: isBashMode,
             structuredOutput: structuredOutput,
             waveCPayload: waveCPayload,
+            mediaRefs: mediaRefs,
             editFiles: resolvedEditFiles,
             editHunks: eHunks,
             editPath: ePath,
@@ -2323,19 +2461,23 @@ public struct PagerRenderResult: Sendable, Equatable {
     /// the same way `links` is. An overlay too small to draw publishes nothing,
     /// so a router never acts on a previous frame's bounds.
     public var overlays: [PagerOverlayBounds]
+    /// Kitty/iTerm-independent post-flush media geometry for this frame.
+    public var inlineMedia: [PagerInlineMediaPlacement]
 
     public init(
         buffer: CellBuffer,
         layout: PagerFrameLayout,
         cursorPosition: TerminalPoint?,
         links: [LinkSpan] = [],
-        overlays: [PagerOverlayBounds] = []
+        overlays: [PagerOverlayBounds] = [],
+        inlineMedia: [PagerInlineMediaPlacement] = []
     ) {
         self.buffer = buffer
         self.layout = layout
         self.cursorPosition = cursorPosition
         self.links = links
         self.overlays = overlays
+        self.inlineMedia = inlineMedia
     }
 
     /// The topmost overlay containing a screen position, if any.

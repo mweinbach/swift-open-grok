@@ -851,10 +851,21 @@ extension OpenGrokLiveInteractiveInput {
             lease: lease,
             rawModeTTY: inputTTY
         )
+        let wrapClipboardPaste = LiveWrapClipboardPasteCoordinator { data in
+            try await inputTTY.write(data)
+        }
         let inputTask = Task {
             var pasteBuffer: String?
             do {
                 while let event = try await input.readEvent() {
+                    if pasteBuffer == nil,
+                       let pasteEvents = await wrapClipboardPaste.handle(event)
+                    {
+                        for pasteEvent in pasteEvents {
+                            emitter.yield(pasteEvent)
+                        }
+                        continue
+                    }
                     switch event {
                     case .pasteStart:
                         pasteBuffer = ""

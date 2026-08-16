@@ -349,7 +349,7 @@ private func targets() -> [Target] {
     // markdown rendering); those were only reachable transitively before.
     // `w1s2` brings in OpenGrokInterjection, which the interactive controller
     // uses to buffer mid-turn steers ("send now") until the next prompt.
-    t.append(contentsOf: libs(w10s1, dep(w1s2, w2s5, w8s1, w8s3, w8s5, w9s1, w9s2, w9s3, w9s4, w9s5)))
+    t.append(contentsOf: libs(w10s1, dep(w1s2, w2s5, w8s1, w8s2, w8s3, w8s5, w9s1, w9s2, w9s3, w9s4, w9s5)))
     // W10-S2 (OpenGrokCLI) also needs branding/paths/env/version, shared
     // identifiers, and configuration — declared here so the frozen manifest
     // already has every edge the real CLI parser will require.

@@ -172,12 +172,6 @@ enum LivePagerOverlayText {
         ]
     }
 
-    static let easterEgg = """
-        ⠀⠀⠀⠀⠀⠀⣀⣀⡀⠀⠀⠀⢀⠄
-        ⠀⠀⠀⣠⣾⠿⠛⠛⠛⠛⢀⡴⠁⠀
-        ⠀⠀⣼⡟⠁⠀⠀⠀⢀⡴⠻⣿⡀⠀   gboom.
-        """
-
     // MARK: - Line helpers
 
     private static func field(_ label: String, _ value: String) -> PagerStyledLine {

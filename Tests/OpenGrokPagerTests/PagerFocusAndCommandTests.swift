@@ -213,6 +213,32 @@ struct PagerFocusAndCommandTests {
         #expect(await harness.lastPromptText == "first\nsecond")
     }
 
+    @Test("wrap host image paste creates one atomic image chip")
+    func wrapHostImagePasteCreatesChip() async throws {
+        let image = Data([0x89, 0x50, 0x4E, 0x47])
+        let harness = try await Harness.run([
+            .paste(encodeWrapImagePayload(data: image, mimeType: "image/png")),
+        ])
+        let prompt = await harness.lastPromptState
+
+        #expect(prompt.text == "[Image #1]")
+        #expect(prompt.pastedImages.count == 1)
+        #expect(prompt.pastedImages[0].displayNumber == 1)
+        #expect(prompt.pastedImages[0].mimeType == "image/png")
+        #expect(prompt.pastedImages[0].encodedBytes == image)
+    }
+
+    @Test("malformed wrap host frames never become composer text")
+    func malformedWrapHostFrameIsSwallowed() async throws {
+        let harness = try await Harness.run([
+            .paste("\(MAGIC_IMG)\nimage/png\n!!!notbase64!!!"),
+        ])
+        let prompt = await harness.lastPromptState
+
+        #expect(prompt.text.isEmpty)
+        #expect(prompt.pastedImages.isEmpty)
+    }
+
     @Test("Ctrl+M toggles multiline and says which way it went")
     func ctrlMTogglesMultiline() async throws {
         let harness = try await Harness.run([
@@ -380,6 +406,23 @@ struct PagerFocusAndCommandTests {
         } else {
             Issue.record("/gboom should still resolve")
         }
+    }
+
+    @Test("bare gboom opens the hidden modal while arguments pass through")
+    func gboomDispatchContract() async throws {
+        let bare = try await Harness.run([
+            .paste("/gboom"),
+            .key(KeyEvent(key: .enter)),
+        ])
+        #expect(await bare.overlayRequests.contains(.easterEgg))
+        #expect(bare.submittedPrompts.isEmpty)
+
+        let withArguments = try await Harness.run([
+            .paste("/gboom guide me"),
+            .key(KeyEvent(key: .enter)),
+        ], expectedTurns: 1)
+        #expect(withArguments.submittedPrompts == ["/gboom guide me"])
+        #expect(await withArguments.overlayRequests.contains(.easterEgg) == false)
     }
 
     /// `/q` ties `quit` and `queue` at the same fuzzy score; upstream's
@@ -789,6 +832,9 @@ private actor Harness {
     var notices: [String] { get async { await renderer.notices } }
     var sessionReplacements: [String] { get async { await renderer.sessionReplacements } }
     var lastPromptText: String { get async { await renderer.lastPromptText } }
+    var lastPromptState: OpenGrokPagerInteractivePromptState {
+        get async { await renderer.lastPromptState }
+    }
     var turnPrompts: [String] { get async { await runtime.requests.map(\.prompt) } }
 
     static func run(
@@ -938,6 +984,13 @@ private actor FocusRecordingRenderer: OpenGrokPagerInteractiveRenderAdapter {
         events.reversed().compactMap {
             if case .promptChanged(let state) = $0 { return state.text } else { return nil }
         }.first ?? ""
+    }
+
+    var lastPromptState: OpenGrokPagerInteractivePromptState {
+        events.reversed().compactMap {
+            if case .promptChanged(let state) = $0 { return state }
+            return nil
+        }.first ?? OpenGrokPagerInteractivePromptState()
     }
 }
 

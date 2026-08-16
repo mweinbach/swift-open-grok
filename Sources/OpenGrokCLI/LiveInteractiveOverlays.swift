@@ -2137,10 +2137,7 @@ extension LiveInteractiveControllerRenderer {
                 lines: LivePagerOverlayText.tutorialLines()
             ))
         case .easterEgg:
-            appendMessage(PagerMessage(
-                role: .system,
-                text: LivePagerOverlayText.easterEgg
-            ))
+            try presentGboom()
         case .compact(let instructions):
             // Safe to run here only because the controller guarantees no turn
             // is in flight: `/compact` is `mutatesConversationHistory`, so a
@@ -2959,6 +2956,16 @@ extension LiveInteractiveControllerRenderer {
             report = try renderer.requestFrame(result, at: now)
         }
         guard report != nil else { return false }
+        var wrotePostFlush = try inlineMediaCompositor.postFlush(
+            placements: result.inlineMedia,
+            write: { try sink.write($0) }
+        )
+        if try postFlushGboom(result) {
+            wrotePostFlush = true
+        }
+        if wrotePostFlush {
+            try sink.flush()
+        }
         recordPaintedGeometry(result)
         return true
     }
@@ -2983,6 +2990,11 @@ extension LiveInteractiveControllerRenderer {
             seconds: frame.seconds,
             enabled: motionEnabled
         )
+        if var game = gboom {
+            game.tick(seconds: frame.seconds)
+            gboom = game
+            refreshGboomOverlay()
+        }
         // Re-anchor every painted tick so idle extrapolation stays on the
         // same epoch as `PagerMotionSnapshot.seconds`.
         noteMotionClockAnchor(seconds: frame.seconds)

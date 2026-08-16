@@ -769,7 +769,7 @@ extension LiveInteractiveControllerRenderer {
             hasVisibleRunningBlock: followsBottom && hasStreamingBlock,
             // Minimal keeps the cache for probes but must not arm a fast
             // ticker the scrollback frontend never consumes.
-            hasBackgroundTasks: minimalHost == nil && activeBackgroundWork.hasActive,
+            hasBackgroundTasks: minimalHost == nil && (activeBackgroundWork.hasActive || gboom != nil),
             showsWelcomeLogo: overlays.contains(id: "welcome"),
             hasPendingFlash: hasPendingFlash,
             motionEnabled: motionEnabled

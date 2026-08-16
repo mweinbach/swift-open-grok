@@ -6,6 +6,7 @@
 // Reference: crates/codegen/xai-grok-pager/src/wrap_clipboard_image.rs
 
 import Foundation
+import OpenGrokTTY
 import Testing
 @testable import OpenGrokCLI
 @testable import OpenGrokPagerRender
@@ -120,6 +121,63 @@ struct WrapClipboardImageTests {
         #expect(emitted.count == 1)
     }
 
+    @Test("live paste miss emits one OSC 999 request")
+    func livePasteMissRequestsWrapHost() async {
+        let writer = WrapOSCWriter()
+        let coordinator = LiveWrapClipboardPasteCoordinator(
+            environment: ["GROK_OSC52_SINK": "1"],
+            probe: { LiveClipboardPasteSnapshot() },
+            write: { data in await writer.append(data) }
+        )
+
+        let events = await coordinator.handle(.control(.character(0x16)))
+
+        #expect(events == [])
+        #expect(await writer.values == [Data(requestOscBytes())])
+    }
+
+    @Test("local clipboard text suppresses OSC 999 and becomes a paste")
+    func liveLocalTextSuppressesWrapHost() async {
+        let writer = WrapOSCWriter()
+        let coordinator = LiveWrapClipboardPasteCoordinator(
+            environment: ["LC_GROK_OSC52_SINK": "1"],
+            probe: { LiveClipboardPasteSnapshot(text: "local text") },
+            write: { data in await writer.append(data) }
+        )
+
+        let events = await coordinator.handle(.control(.character(0x16)))
+
+        #expect(events == [.paste("local text")])
+        #expect(await writer.values.isEmpty)
+    }
+
+    @Test("local clipboard image becomes a wrap frame without requesting the host")
+    func liveLocalImageSuppressesWrapHost() async {
+        let writer = WrapOSCWriter()
+        let image = tinyPngData()
+        let coordinator = LiveWrapClipboardPasteCoordinator(
+            environment: ["GROK_OSC52_SINK": "1"],
+            probe: {
+                LiveClipboardPasteSnapshot(
+                    imageData: image,
+                    imageMIMEType: "image/png"
+                )
+            },
+            write: { data in await writer.append(data) }
+        )
+
+        let events = await coordinator.handle(.key(.character(
+            "v",
+            modifiers: [.control]
+        )))
+
+        #expect(events == [.paste(encodeWrapImagePayload(
+            data: image,
+            mimeType: "image/png"
+        ))])
+        #expect(await writer.values.isEmpty)
+    }
+
     @Test("Image chip display text formatting")
     func imageChipFormatting() {
         #expect(displayText(displayNumber: 1) == "[Image #1]")
@@ -197,3 +255,10 @@ struct WrapClipboardImageTests {
     }
 }
 
+private actor WrapOSCWriter {
+    private(set) var values: [Data] = []
+
+    func append(_ data: Data) {
+        values.append(data)
+    }
+}

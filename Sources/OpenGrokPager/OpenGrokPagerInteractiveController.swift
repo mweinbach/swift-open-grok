@@ -198,6 +198,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         /// Mirrors `OpenGrokPagerInputModes.isMultiline`. Held here because it
         /// changes what `Enter` means, which only the editor can decide.
         var isMultiline = false
+        var pastedImages: [PastedImage] = []
+        var imageCounter = 0
 
         init(text: String) {
             let area = TextArea()
@@ -220,6 +222,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             pendingKey: String? = nil,
             pendingLabel: String? = nil
         ) -> OpenGrokPagerInteractivePromptState {
+            reconcile(
+                images: &pastedImages,
+                liveIds: Set(area.allElements.filter { $0.kind == .image }.map(\.id))
+            )
             let contents = area.text
             return OpenGrokPagerInteractivePromptState(
                 text: contents,
@@ -232,13 +238,23 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 completions: completions,
                 selectedCompletion: selectedCompletion,
                 pendingConfirmationKey: pendingKey,
-                pendingConfirmationLabel: pendingLabel
+                pendingConfirmationLabel: pendingLabel,
+                pastedImages: pastedImages
             )
         }
 
         func apply(_ event: InputEvent) -> PromptAction {
             switch event {
             case .paste(let value):
+                if let wrapPaste = tryDecodeWrapHostImagePaste(text: value) {
+                    switch wrapPaste {
+                    case .image(let data, let mimeType):
+                        attachImage(data: data, mimeType: mimeType)
+                        return .changed
+                    case .noImage:
+                        return .ignored
+                    }
+                }
                 insert(value)
                 return value.isEmpty ? .ignored : .changed
             case .key(let key):
@@ -251,6 +267,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         }
 
         func reset() {
+            clear(images: &pastedImages, imageCounter: &imageCounter)
             loadBuffer("")
             completions = []
             selectedCompletion = nil
@@ -265,6 +282,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         }
 
         func replace(with value: String) {
+            clear(images: &pastedImages, imageCounter: &imageCounter)
             loadBuffer(value)
         }
 
@@ -562,6 +580,26 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             area.insertStr(value)
             // New text lifts the Esc dismissal: typing after closing the
             // dropdown is a fresh query.
+            completionsDismissed = false
+        }
+
+        private func attachImage(data: Data, mimeType: String) {
+            imageCounter += 1
+            let number = imageCounter
+            let chip = displayText(displayNumber: number)
+            let elementID = area.insertElement(
+                kind: .image,
+                text: chip,
+                displayText: chip
+            )
+            pastedImages.append(PastedImage(
+                elementId: elementID,
+                displayNumber: number,
+                mimeType: mimeType,
+                byteLen: data.count,
+                encodedBytes: data,
+                preview: .pending
+            ))
             completionsDismissed = false
         }
     }
@@ -1118,6 +1156,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// treatment even when the command is submitted while another turn runs.
     public static let skillQueueEntryKind = "skill"
     public static let skillPromptMetadataKey = "skillPrompt"
+    public static let passThroughQueueEntryKind = "pass-through"
 
     /// Queue-entry kind for a monitor-event wake. RECORDED DIVERGENCE from
     /// upstream, which never routes monitor events through the pager queue:
@@ -1575,6 +1614,19 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             ) {
                                 outcome = lifecycle
                             }
+                        case .passThrough(let generatedPrompt):
+                            try await enqueue(
+                                generatedPrompt,
+                                historyText: text,
+                                queueKind: Self.passThroughQueueEntryKind
+                            )
+                            if let lifecycle = try await drainQueue(
+                                request: request,
+                                mailbox: mailbox,
+                                inputPumpGate: inputPumpGate
+                            ) {
+                                outcome = lifecycle
+                            }
                         case .drain:
                             // An interjection fallback prompt waits at the
                             // front; idle means this loop must start it.
@@ -1695,6 +1747,20 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                     generatedPrompt,
                                     historyText: prompt,
                                     promptKind: promptKind
+                                )
+                                if let lifecycle = try await drainQueue(
+                                    request: request,
+                                    mailbox: mailbox,
+                                    inputPumpGate: inputPumpGate
+                                ) {
+                                    outcome = lifecycle
+                                }
+                                continue
+                            case .passThrough(let generatedPrompt):
+                                try await enqueue(
+                                    generatedPrompt,
+                                    historyText: prompt,
+                                    queueKind: Self.passThroughQueueEntryKind
                                 )
                                 if let lifecycle = try await drainQueue(
                                     request: request,
@@ -2026,6 +2092,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                             promptKind: promptKind
                                         )
                                         await inputPumpGate.resume()
+                                    case .passThrough(let generatedPrompt):
+                                        try await enqueue(
+                                            generatedPrompt,
+                                            historyText: prompt,
+                                            queueKind: Self.passThroughQueueEntryKind
+                                        )
+                                        await inputPumpGate.resume()
                                     case .handled:
                                         recordHistory(prompt)
                                         editor.reset()
@@ -2126,6 +2199,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 promptKind: promptKind
                             )
                             await inputPumpGate.resume()
+                        case .passThrough(let generatedPrompt):
+                            try await enqueue(
+                                generatedPrompt,
+                                historyText: text,
+                                queueKind: Self.passThroughQueueEntryKind
+                            )
+                            await inputPumpGate.resume()
                         case .drain, .handled, .notACommand:
                             // `.drain` mid-turn: the fallback prompt waits at
                             // the front; the queue drains at turn end.
@@ -2206,12 +2286,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         _ prompt: String,
         historyText: String? = nil,
         insertion: QueueInsertion = .tail,
-        promptKind: PagerPromptKind = .standard
+        promptKind: PagerPromptKind = .standard,
+        queueKind: String? = nil
     ) async throws {
         nextPromptSequence += 1
         let entry = QueueEntryMeta(
             id: "prompt-\(nextPromptSequence)",
-            kind: promptKind == .skill ? Self.skillQueueEntryKind : "prompt",
+            kind: queueKind ?? (promptKind == .skill ? Self.skillQueueEntryKind : "prompt"),
             text: prompt
         )
         switch insertion {
@@ -2386,6 +2467,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // the same reason — its text is a wrapped event, never a command.
             if entry.kind != Self.cronQueueEntryKind,
                entry.kind != Self.monitorQueueEntryKind,
+               entry.kind != Self.passThroughQueueEntryKind,
                case .command = PagerCommandParser.parse(entry.text) {
                 await promptQueue.completeRunning()
                 switch try await runSlashCommand(entry.text) {
@@ -2394,6 +2476,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         generatedPrompt,
                         historyText: entry.text,
                         promptKind: promptKind
+                    )
+                case .passThrough(let generatedPrompt):
+                    try await enqueue(
+                        generatedPrompt,
+                        historyText: entry.text,
+                        queueKind: Self.passThroughQueueEntryKind
                     )
                 case .drain, .quit, .handled, .notACommand:
                     // `.drain`: the fallback prompt is already at the front;
@@ -3788,6 +3876,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case handled
         case quit
         case submit(String, promptKind: PagerPromptKind)
+        case passThrough(String)
         /// The command already put work at the front of the queue — an idle
         /// caller must kick the drain, the port of
         /// `maybe_start_running_task` after the fallback enqueue
@@ -4292,6 +4381,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 try await emit(.overlay(.showPlan))
                 return .handled
             case "gboom":
+                let argument = Self.rejoined(invocation.arguments)
+                guard argument.isEmpty else {
+                    return .passThrough("/gboom \(argument)")
+                }
                 try await emit(.overlay(.easterEgg))
                 return .handled
             case "model":

@@ -231,7 +231,7 @@ struct PagerDocsCommandTests {
             "01-getting-started.md": 9267,
             "02-authentication.md": 16269,
             "03-keyboard-shortcuts.md": 23148,
-            "04-slash-commands.md": 22018,
+            "04-slash-commands.md": 22092,
             "05-configuration.md": 49610,
             "06-theming.md": 14410,
             "07-mcp-servers.md": 16370,

@@ -97,6 +97,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     let terminal: OpenGrokLiveTerminal
     let sink: any PagerTerminalSink
     let renderer: PagerTerminalRenderer
+    var inlineMediaCompositor: PagerInlineMediaCompositor
+    var gboom: LiveGboomState?
+    var gboomImageVisible = false
     /// B2-M4: the scrollback-native frame program, constructed instead of
     /// driving `renderer` when the session resolved `.minimal`. The
     /// controller's frame states route to `minimalHost.draw` and the
@@ -864,6 +867,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // theme degrades to GrokNight instead of to mush.
         let environment = environment ?? ProcessInfo.processInfo.environment
         self.environment = environment
+        self.inlineMediaCompositor = PagerInlineMediaCompositor(
+            environment: environment,
+            enabled: mode == .fullScreen,
+            terminalProgram: terminalProgram
+        )
         self.fpsHud = PagerFpsHud(
             environmentValue: environment[pagerFpsHudEnvironmentVariable]
         )
@@ -2074,6 +2082,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         pendingQuestionRequest = nil
         currentPlanApprovalRequestID = nil
         pendingPlanApprovalRequest = nil
+        gboom = nil
+        if try inlineMediaCompositor.clearAll(write: { try sink.write($0) }) {
+            try sink.flush()
+        }
+        _ = try clearGboomImage()
         try frontendRestore()
         if mode == .fullScreen {
             try sink.write(transcript)
@@ -3911,6 +3924,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func handleInput(_ event: InputEvent) async throws -> OpenGrokPagerInputRouting {
         switch event {
         case .key(let key):
+            if gboom != nil {
+                return try handleGboomKey(key)
+            }
             // Esc clears a persistent text highlight before the controller's
             // cancel ladder (`no_esc_consumer_pending`, input.rs:239-247).
             // First refusal lives here — no controller Esc fork required.
@@ -3988,6 +4004,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             }
         case .mouse(let mouse):
             guard mouseReportingEnabled else { return .notHandled }
+            if gboom != nil {
+                return try handleGboomMouse(mouse)
+            }
             return try await handleMouse(mouse)
         case .paste:
             // A modal swallows pasted text for the same reason it swallows
@@ -4329,6 +4348,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// upstream's `PersonaDetailOutcome::Close` arm
     /// (`agent_view/modals.rs:126-132`, mouse close `:165-170`).
     func handleOverlayDismissal(_ id: String) {
+        if id == LiveGboomOverlay.overlayID {
+            gboom = nil
+            publishMotionState()
+            _ = try? clearGboomImage()
+        }
         if id == LiveAgentsComposition.personaDetailOverlayID {
             refreshAgentsPersonasSnapshot()
         }

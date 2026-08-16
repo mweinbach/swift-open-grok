@@ -975,11 +975,11 @@ HEAD-only `usage_modal.rs` (tabbed modal at `92bece5d`) is **not** pin work.
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) — generation LIVE |
+| **Status** | LIVE (2026-08-16) |
 | **Severity** | P0 |
 | **Depends on** | A4 media refs |
 
-Generation is live (`LiveToolExecutor.swift:338`). Pager gets `Saved image: <path>` (`LiveImageTools.swift:457`, `LiveVideoComposition.swift:50`).
+Typed image/video tool results now populate `PagerMediaRef` values on tool cards, while prose remains a separate rendered surface. Media rows reserve viewport geometry for the post-flush compositor.
 
 **Rust:** `tracker.rs:1947` maps typed image/video output into media-bearing tool blocks; `other.rs:15` stores refs separately from prose.
 
@@ -991,11 +991,11 @@ Generation is live (`LiveToolExecutor.swift:338`). Pager gets `Saved image: <pat
 
 | | |
 | --- | --- |
-| **Status** | TODO (UNWIRED + DIVERGED protocol bytes) |
+| **Status** | LIVE (2026-08-16) |
 | **Severity** | P1 |
 | **Depends on** | F1 |
 
-Encoder exists (`TerminalCapabilities.swift:52`), **no production caller** from `LiveInteractiveControllerRenderer.swift:1931`. iTerm2 must stay **off** for scrollback (pin `terminal/image.rs:171`). Fix ID/chunk fields before wiring (`TerminalCapabilities.swift:133` diverges: hardcodes ID `1`, enables iTerm2, continuation chunks omit pin fields).
+`PagerInlineMediaCompositor` is called after terminal flush, transmits each Kitty image once, places visible media every frame, crops placements against the viewport, and clears images by ID. Scrollback composition remains disabled for iTerm2.
 
 **Acceptance:** fake Kitty sink: transmit once, place per frame, crop on scroll, ID-specific clear. iTerm2 detection maps to `None`.
 
@@ -1005,11 +1005,11 @@ Encoder exists (`TerminalCapabilities.swift:52`), **no production caller** from 
 
 | | |
 | --- | --- |
-| **Status** | TODO (UNWIRED library; worker ABSENT) |
+| **Status** | LIVE (2026-08-16) |
 | **Severity** | P1 |
 | **Depends on** | D2 finish-time extraction; F2 for Open Image |
 
-Library is SVG (`OpenGrokMermaid.swift:38`), not imported by CLI (`Package.swift:371`). File comments record that rasterization, terminal negotiation, and pager integration are not implemented (`:98`).
+`OpenGrokPager` now imports `OpenGrokMermaid`. Closed Mermaid fences render as inline Unicode diagrams with one affordance row; `PagerMermaidWorker` caches completed renders and coalesces concurrent identical jobs. Streaming fences stay source-only until close.
 
 **Rust pin is Unicode art inline** + Open Image / Copy Path / Copy Source (`mermaid_content.rs:125-262`). PNG is **not** inlined. Worker: `mermaid_worker.rs` (3 s timeout, cache, coalesced jobs) — ABSENT.
 
@@ -1021,13 +1021,13 @@ Library is SVG (`OpenGrokMermaid.swift:38`), not imported by CLI (`Package.swift
 
 | | |
 | --- | --- |
-| **Status** | TODO (ABSENT) |
+| **Status** | LIVE (2026-08-16) |
 | **Severity** | P1 |
 | **Depends on** | F1, F2 |
 
 **Rust:** `inline_media_ffmpeg.rs` + `prompt_images.rs:290` — `ffprobe`/`ffmpeg` poster, non-looping inline play, missing-binary hint.
 
-**Swift:** `LiveVideoComposition.swift:376` is path text only.
+**Swift:** `PagerInlineVideoDecoder` uses `ffprobe`/`ffmpeg` for a one-second poster and ordered 10 FPS frames. The compositor advances non-looping playback to the final frame and exposes the compact install hint when the binaries are absent.
 
 **Acceptance:** fake ffmpeg yields a poster and ordered frames; playback stops on the last frame; missing binary produces a visible hint and path.
 
@@ -1037,11 +1037,11 @@ Library is SVG (`OpenGrokMermaid.swift:38`), not imported by CLI (`Package.swift
 
 | | |
 | --- | --- |
-| **Status** | TODO (UNWIRED) |
+| **Status** | LIVE (2026-08-16) |
 | **Severity** | P2 |
 | **Depends on** | — |
 
-Library exists (`OpenGrokTerminalCore/WrapClipboardImage.swift`, `OpenGrokPagerRender/WrapClipboardImage.swift`). Live paste never requests it.
+`LiveWrapClipboardPasteCoordinator` now owns the live paste-miss path: local clipboard text/image wins, a full miss emits one OSC 999 request, valid host frames create one image attachment, and malformed frames never leak into composer text.
 
 **Honest non-gap:** this is composer attachments, not assistant transcript media. It cannot substitute for F1.
 
@@ -1053,11 +1053,11 @@ Library exists (`OpenGrokTerminalCore/WrapClipboardImage.swift`, `OpenGrokPagerR
 
 | | |
 | --- | --- |
-| **Status** | TODO (DIVERGED) |
+| **Status** | LIVE (2026-08-16) |
 | **Severity** | P1 for dispatch honesty; game itself P2 |
 | **Depends on** | F2 |
 
-Hidden command must stay hidden. Arguments must **pass through** as a prompt (`OpenGrokPagerInteractiveController.swift:3369` swallows them). Bare `/gboom` is a Kitty game (`gboom/mod.rs:84`), not Braille art (`LivePagerOverlayText.swift:175`).
+The command remains hidden. Argument-bearing invocations use a dedicated pass-through queue kind so they reach the model without recursive slash-command replay. Bare `/gboom` opens an interactive raycast modal with keyboard/mouse controls, Kitty frame transmit/place/clear, and the pinned no-graphics notice.
 
 **Acceptance:** command remains hidden; arguments pass through; bare command opens an interactive modal; fake Kitty sink receives and clears frames.
 
@@ -1171,12 +1171,15 @@ TerminalCore startup glue (2026-08-15, live): DA2 after raw mode + Kitty flag pu
 - [x] E15 Credit-limit action card
 
 ### Wave F
-- [ ] F1 Typed image/video on tool cards
-- [ ] F2 Kitty post-flush compositor
-- [ ] F3 In-transcript Mermaid + worker
-- [ ] F4 Inline video poster / playback
-- [ ] F5 Wrap-clipboard OSC 999 live paste
-- [ ] F6 `/gboom` dispatch + game
+- Completed 2026-08-16: typed image/video refs flow onto tool cards; Kitty post-flush composition owns transmit/place/crop/clear; closed Mermaid fences render through a cached coalescing worker; inline video gains poster/non-looping playback; wrap-host clipboard images become composer attachments; and hidden `/gboom` opens the interactive graphics modal while argument-bearing forms pass through to the model.
+- Presentation parity: media reserves scrollback rows instead of parsing prose, iTerm2 stays excluded from scrollback image composition, missing `ffmpeg` remains visible with its path, malformed OSC 999 payloads never become text, and GBOOM clears its image on every dismissal path.
+- Validation: `build-tests`; 37 focused Wave F tests across media, Mermaid, wrap-clipboard, GBOOM renderer, and command-routing suites pass; the corrected `/docs` corpus pin and the isolated 12-test table-selection suite pass. The authoritative serial gate reaches all Wave F coverage and is red only in the pre-existing `OpenGrokModelsTests.cancellationAbortsRefresh` unexpected `CancellationError()` at `OpenGrokModelsTests.swift:914`.
+- [x] F1 Typed image/video on tool cards
+- [x] F2 Kitty post-flush compositor
+- [x] F3 In-transcript Mermaid + worker
+- [x] F4 Inline video poster / playback
+- [x] F5 Wrap-clipboard OSC 999 live paste
+- [x] F6 `/gboom` dispatch + game
 
 ### Wave G
 - [ ] G1 Running-subagent attach

@@ -397,7 +397,16 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
         layout: layout,
         cursorPosition: state.overlays.isActive ? nil : composerCursor,
         links: links,
-        overlays: overlayBounds
+        overlays: overlayBounds,
+        inlineMedia: state.overlays.isActive
+            ? []
+            : pagerInlineMediaPlacements(
+                lines: contentLines,
+                visibleRange: visibleRange,
+                contentArea: contentPaintArea,
+                contentX: chrome.conversation.x + PagerLayoutMetrics.chromeWidth,
+                contentWidth: contentWidth
+            )
     )
 }
 
@@ -575,6 +584,12 @@ struct PaintLineSelectionSeed: Equatable {
     var joinerToPrevious: String?
 }
 
+struct PagerInlineMediaLine: Equatable {
+    var media: PagerMediaRef
+    var sourceRowOffset: Int
+    var fullRowCount: Int
+}
+
 /// One painted transcript row: an optional accent-rail glyph, an optional
 /// full-row background band, and the styled content spans.
 struct PaintLine {
@@ -585,6 +600,7 @@ struct PaintLine {
     var style: CellStyle
     var spans: [PagerStyledSpan]
     var selection: PaintLineSelectionSeed?
+    var inlineMedia: PagerInlineMediaLine?
 
     init(
         _ text: String,
@@ -593,7 +609,8 @@ struct PaintLine {
         accentGlyph: String? = nil,
         accentColor: TerminalColor? = nil,
         background: TerminalColor? = nil,
-        selection: PaintLineSelectionSeed? = nil
+        selection: PaintLineSelectionSeed? = nil,
+        inlineMedia: PagerInlineMediaLine? = nil
     ) {
         self.init(
             spans: [PagerStyledSpan(text: text)],
@@ -602,7 +619,8 @@ struct PaintLine {
             accentGlyph: accentGlyph,
             accentColor: accentColor,
             background: background,
-            selection: selection
+            selection: selection,
+            inlineMedia: inlineMedia
         )
     }
 
@@ -613,7 +631,8 @@ struct PaintLine {
         accentGlyph: String? = nil,
         accentColor: TerminalColor? = nil,
         background: TerminalColor? = nil,
-        selection: PaintLineSelectionSeed? = nil
+        selection: PaintLineSelectionSeed? = nil,
+        inlineMedia: PagerInlineMediaLine? = nil
     ) {
         self.spans = spans
         self.foreground = foreground
@@ -622,6 +641,7 @@ struct PaintLine {
         self.accentColor = accentColor
         self.background = background
         self.selection = selection
+        self.inlineMedia = inlineMedia
     }
 
     var text: String { spans.map(\.text).joined() }
@@ -1386,6 +1406,15 @@ func appendToolCard(
     unboundedPreview: Bool = false,
     into lines: inout [PaintLine]
 ) {
+    if appendWaveFMediaCard(
+        tool,
+        width: width,
+        theme: theme,
+        into: &lines
+    ) {
+        return
+    }
+
     // B-RENDER dispatch: execute/edit have dedicated painters (header,
     // panel, gutters, wrap-stable backgrounds, no on-screen @@/+/-, trusted
     // counts, Creating, 2+3 truncation). Generic tools keep the gray
@@ -1529,6 +1558,149 @@ func appendToolCard(
             )
         ))
     }
+}
+
+@discardableResult
+private func appendWaveFMediaCard(
+    _ tool: PagerToolCard,
+    width: Int,
+    theme: PagerRenderTheme,
+    into lines: inout [PaintLine]
+) -> Bool {
+    guard let media = tool.mediaRefs.first else { return false }
+
+    let accent = pagerToolAccent(tool, theme: theme)
+    let muted = !tool.isExpanded && tool.state != .running && tool.state != .pending
+    let headerColor = muted ? theme.gray : theme.textPrimary
+    var header = [
+        PagerStyledSpan(text: PagerGlyphs.toolBullet + " ", foreground: accent),
+        PagerStyledSpan(text: tool.name, foreground: headerColor, style: [.bold])
+    ]
+    if let detail = tool.detail, !detail.isEmpty {
+        header.append(PagerStyledSpan(text: " " + detail, foreground: theme.grayDim))
+    }
+    if !tool.hooks.isEmpty {
+        header.append(PagerStyledSpan(text: waveEHookSuffix(tool.hooks), foreground: theme.grayDim))
+    }
+
+    let blockOrigin = lines.count
+    for (index, row) in wrapStyledSpans(header, width: width).enumerated() {
+        lines.append(PaintLine(
+            spans: row,
+            foreground: headerColor,
+            selection: PaintLineSelectionSeed(
+                rangeID: 0,
+                blockLineIndex: lines.count - blockOrigin,
+                text: pagerTrimEndDisplay(row.map(\.text).joined()),
+                selectableColStart: index == 0 ? 2 : 0,
+                joinerToPrevious: index == 0 ? nil : " "
+            )
+        ))
+    }
+
+    let decodedPath = media.path.removingPercentEncoding ?? media.path
+    let displayPath = pagerMiddleEllipsized(decodedPath, width: width)
+    lines.append(PaintLine(
+        displayPath,
+        foreground: theme.grayDim,
+        selection: PaintLineSelectionSeed(
+            rangeID: 1,
+            blockLineIndex: lines.count - blockOrigin,
+            text: decodedPath,
+            selectableColStart: 0,
+            joinerToPrevious: "\n"
+        )
+    ))
+    lines.append(PaintLine("", foreground: theme.grayDim))
+
+    let mediaRows = media.reservedRows(contentWidth: width)
+    if media.kind == .video, media.videoInlineAvailable == false {
+        lines.append(PaintLine(pagerFFmpegHintText, foreground: theme.warning))
+    } else {
+        for sourceRowOffset in 0..<mediaRows {
+            lines.append(PaintLine(
+                "",
+                foreground: theme.grayDim,
+                inlineMedia: PagerInlineMediaLine(
+                    media: media,
+                    sourceRowOffset: sourceRowOffset,
+                    fullRowCount: mediaRows
+                )
+            ))
+        }
+    }
+
+    lines.append(PaintLine("", foreground: theme.grayDim))
+    let openLabel = media.kind == .video && media.videoInlineAvailable != false ? "[Play]" : "[Open]"
+    let leading = max(0, (width - UnicodeDisplayWidth.width(of: openLabel)) / 2)
+    lines.append(PaintLine(
+        String(repeating: " ", count: leading) + openLabel,
+        foreground: theme.linkForeground,
+        style: [.bold]
+    ))
+    return true
+}
+
+private func pagerMiddleEllipsized(_ text: String, width: Int) -> String {
+    guard width > 0 else { return "" }
+    guard UnicodeDisplayWidth.width(of: text) > width else { return text }
+    guard width > 3 else { return truncateToWidth(text, width: width) }
+
+    let budget = width - 3
+    let leadingBudget = budget / 2
+    let trailingBudget = budget - leadingBudget
+    let leading = truncateToWidth(text, width: leadingBudget)
+    var trailing = ""
+    var trailingWidth = 0
+    for grapheme in text.reversed() {
+        let string = String(grapheme)
+        let graphemeWidth = max(0, UnicodeDisplayWidth.width(ofGrapheme: string))
+        guard trailingWidth + graphemeWidth <= trailingBudget else { break }
+        trailing.insert(contentsOf: string, at: trailing.startIndex)
+        trailingWidth += graphemeWidth
+    }
+    return leading + "..." + trailing
+}
+
+private func pagerInlineMediaPlacements(
+    lines: [PaintLine],
+    visibleRange: Range<Int>,
+    contentArea: TerminalRect,
+    contentX: Int,
+    contentWidth: Int
+) -> [PagerInlineMediaPlacement] {
+    guard contentArea.height > 0, contentWidth >= 4 else { return [] }
+    var placements: [PagerInlineMediaPlacement] = []
+
+    for (screenRow, lineIndex) in visibleRange.enumerated() {
+        guard screenRow < contentArea.height,
+              lines.indices.contains(lineIndex),
+              let marker = lines[lineIndex].inlineMedia
+        else { continue }
+
+        let y = contentArea.y + screenRow
+        if var previous = placements.last,
+           previous.media == marker.media,
+           previous.rect.bottom == y,
+           previous.sourceRowOffset + previous.rect.height == marker.sourceRowOffset
+        {
+            previous.rect.height += 1
+            placements[placements.count - 1] = previous
+        } else {
+            placements.append(PagerInlineMediaPlacement(
+                media: marker.media,
+                rect: TerminalRect(
+                    x: contentX,
+                    y: y,
+                    width: contentWidth,
+                    height: 1
+                ),
+                fullRowCount: marker.fullRowCount,
+                sourceRowOffset: marker.sourceRowOffset
+            ))
+        }
+    }
+    return placements
 }
 
 /// Head/tail preview with the reference's `… +{n} lines` marker
