@@ -1,5 +1,6 @@
 import Foundation
 import OpenGrokCLI
+import OpenGrokJavaScriptRuntime
 
 #if canImport(Glibc)
 import Glibc
@@ -12,6 +13,10 @@ import Glibc
 // own return value, which they already do.
 _ = signal(SIGPIPE, SIG_IGN)
 #endif
+
+if let workerExitCode = await JavaScriptRuntimeWorkerMain.runIfRequested() {
+    exit(workerExitCode)
+}
 
 if let captureExitCode = LiveVoiceMainIntercept.maybeRunCaptureSubprocess() {
     exit(Int32(captureExitCode))

@@ -225,6 +225,7 @@ struct LiveUsageReport: Sendable, Equatable {
     var context: ContextUsage?
     var quotaWindows: [ProviderQuotaWindow]
     var quotaFailures: [ProviderUsageFailure]
+    var antigravityQuota: LiveAntigravityQuotaSummary? = nil
     /// Estimated tokens spent across the whole session, including turns that
     /// compaction has since replaced. See `LiveUsageComposition` for why this
     /// is an estimate rather than a provider-reported total.
@@ -265,6 +266,7 @@ enum LiveUsageComposition {
             context: context,
             quotaWindows: combined.windows,
             quotaFailures: combined.failures,
+            antigravityQuota: LiveAntigravityCache.shared.quotaSummary(),
             estimatedSessionTokens: estimateTokens(items),
             turnCount: turnCount(items),
             promptCacheHitRatePct: cacheHitRatePct
@@ -346,6 +348,20 @@ enum LiveUsageComposition {
         }
         for failure in report.quotaFailures {
             lines.append("\(failure.provider.asString): usage unavailable — \(failure.message)")
+        }
+        if let antigravityQuota = report.antigravityQuota {
+            lines.append("")
+            lines.append(
+                "Antigravity quota (captured \(Int(antigravityQuota.age()))s ago):"
+            )
+            for bucket in antigravityQuota.buckets {
+                let remaining = max(0, min(1, bucket.remainingFraction)) * 100
+                var line = "\(bucket.label): \(String(format: "%.0f", remaining))% remaining"
+                if let reset = bucket.resetTime, !reset.isEmpty {
+                    line += " (resets \(reset))"
+                }
+                lines.append(line)
+            }
         }
         return lines.joined(separator: "\n")
     }

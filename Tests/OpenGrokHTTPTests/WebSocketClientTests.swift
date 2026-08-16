@@ -140,6 +140,30 @@ struct WebSocketDialOptionsTests {
         #expect(options.maximumMessageSize == WebSocketLimits.defaultMaximumMessageSize)
         #expect(options.headers.isEmpty)
     }
+
+    @Test("outbound backend is portable off Network.framework")
+    func backendSelection() {
+        #if canImport(Network)
+        #expect(WebSocketDialer.outboundBackend == .networkFramework)
+        #else
+        #expect(WebSocketDialer.outboundBackend == .urlSession)
+        #endif
+    }
+}
+
+@Suite("Windows named-pipe names")
+struct WindowsNamedPipeNameTests {
+    @Test("leader paths map deterministically to bounded pipe names")
+    func deterministicName() {
+        let first = WindowsNamedPipeName.fullName(forPath: "C:\\Users\\me\\.grok\\leader.sock")
+        let repeated = WindowsNamedPipeName.fullName(forPath: "C:\\Users\\me\\.grok\\leader.sock")
+        let other = WindowsNamedPipeName.fullName(forPath: "C:\\Users\\other\\.grok\\leader.sock")
+
+        #expect(first == repeated)
+        #expect(first != other)
+        #expect(first.hasPrefix("\\\\.\\pipe\\grok-leader-"))
+        #expect(first.utf8.count < 80)
+    }
 }
 
 @Suite("Dialling a live socket", .serialized)

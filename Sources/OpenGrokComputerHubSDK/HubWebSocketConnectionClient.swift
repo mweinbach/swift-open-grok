@@ -115,7 +115,7 @@ public final class HubWebSocketConnectionClient: ConnectionClient, @unchecked Se
     public let activityTracker: HubActivityTracker
 
     private let lock = NSLock()
-    private var socket: WebSocketConnection?
+    private var socket: (any WebSocketClient)?
     private var readerTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var closed = false
@@ -155,7 +155,7 @@ public final class HubWebSocketConnectionClient: ConnectionClient, @unchecked Se
     init(
         configuration: HubWebSocketConfiguration,
         hub: HubConnection,
-        socket: WebSocketConnection? = nil
+        socket: (any WebSocketClient)? = nil
     ) {
         self.configuration = configuration
         self.activityTracker = HubActivityTracker()
@@ -166,7 +166,7 @@ public final class HubWebSocketConnectionClient: ConnectionClient, @unchecked Se
     #if DEBUG
     static func connectForTesting(
         configuration: HubWebSocketConfiguration,
-        socket: WebSocketConnection
+        socket: any WebSocketClient
     ) async throws -> HubWebSocketConnectionClient {
         let identity = try await configuration.auth.identity()
         let hub = HubConnection(
@@ -182,7 +182,7 @@ public final class HubWebSocketConnectionClient: ConnectionClient, @unchecked Se
         return client
     }
 
-    private func startTesting(socket: WebSocketConnection) async throws {
+    private func startTesting(socket: any WebSocketClient) async throws {
         let identity = try await configuration.auth.identity()
         let ack = try await handshake(on: socket)
         guard ack.supportedProtocolVersions.contains(toolProtocolVersion) else {
@@ -274,7 +274,7 @@ public final class HubWebSocketConnectionClient: ConnectionClient, @unchecked Se
     }
 
     public func close() async {
-        let resources: (WebSocketConnection?, Task<Void, Never>?, Task<Void, Never>?)? = withState {
+        let resources: ((any WebSocketClient)?, Task<Void, Never>?, Task<Void, Never>?)? = withState {
             guard !closed else { return nil }
             closed = true
             let resources = (socket, readerTask, reconnectTask)
@@ -293,7 +293,7 @@ public final class HubWebSocketConnectionClient: ConnectionClient, @unchecked Se
     }
 
     public func disconnect() async {
-        let resources: (WebSocketConnection?, Task<Void, Never>?, Task<Void, Never>?)? = withState {
+        let resources: ((any WebSocketClient)?, Task<Void, Never>?, Task<Void, Never>?)? = withState {
             guard !closed else { return nil }
             let resources = (socket, readerTask, reconnectTask)
             socket = nil
@@ -342,7 +342,7 @@ public final class HubWebSocketConnectionClient: ConnectionClient, @unchecked Se
         let identity = try await configuration.auth.identity()
         let credential = try await configuration.auth.credential()
         let headers = Self.headers(for: credential)
-        let nextSocket: WebSocketConnection
+        let nextSocket: any WebSocketClient
         do {
             nextSocket = try await WebSocketDialer.connect(
                 to: configuration.url,
@@ -394,7 +394,7 @@ public final class HubWebSocketConnectionClient: ConnectionClient, @unchecked Se
         startReader(nextSocket)
     }
 
-    private func handshake(on socket: WebSocketConnection) async throws -> HelloAckMsg {
+    private func handshake(on socket: any WebSocketClient) async throws -> HelloAckMsg {
         let hello = HelloMsg(
             kind: .toolServer,
             serverId: configuration.serverId,
@@ -418,7 +418,7 @@ public final class HubWebSocketConnectionClient: ConnectionClient, @unchecked Se
         return try WireJSONDecoder.make().decode(HelloAckMsg.self, from: ackData)
     }
 
-    private func startReader(_ socket: WebSocketConnection) {
+    private func startReader(_ socket: any WebSocketClient) {
         readerTask?.cancel()
         readerTask = Task { [weak self] in
             guard let self else { return }
@@ -426,7 +426,7 @@ public final class HubWebSocketConnectionClient: ConnectionClient, @unchecked Se
         }
     }
 
-    private func readLoop(_ socket: WebSocketConnection) async {
+    private func readLoop(_ socket: any WebSocketClient) async {
         do {
             while !Task.isCancelled {
                 guard let message = try await socket.receive() else {
@@ -447,7 +447,7 @@ public final class HubWebSocketConnectionClient: ConnectionClient, @unchecked Se
         }
     }
 
-    private func handleDisconnect(_ error: ClientError, socket: WebSocketConnection) async {
+    private func handleDisconnect(_ error: ClientError, socket: any WebSocketClient) async {
         let shouldHandle = withState {
             guard self.socket === socket, !closed else { return false }
             self.socket = nil
@@ -567,7 +567,7 @@ public final class HubWebSocketConnectionClient: ConnectionClient, @unchecked Se
 }
 
 private actor WebSocketWriteGate {
-    func send(_ message: WebSocketMessage, on socket: WebSocketConnection) async throws {
+    func send(_ message: WebSocketMessage, on socket: any WebSocketClient) async throws {
         try await socket.send(message)
     }
 }

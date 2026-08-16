@@ -2487,6 +2487,31 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         if options.common.mcpConfig != nil {
             throw CLIApplicationError.unsupported(route: "MCP config")
         }
+        if options.chat && options.common.leader {
+            throw CLIApplicationError.failed(
+                "gateway chat mode (--chat) cannot run with leader mode; "
+                    + "pass --no-leader or disable [cli] use_leader in config"
+            )
+        }
+        if options.chat && options.forkSession {
+            throw CLIApplicationError.failed("--fork-session is not supported with --chat")
+        }
+        if options.chat && options.restoreCode {
+            throw CLIApplicationError.failed("--restore-code is not supported with --chat")
+        }
+        if options.localWorkspace != nil
+            || options.localWorkspaceAttach != nil
+            || options.localWorkspaceCWD != nil
+        {
+            throw CLIApplicationError.unsupported(
+                route: "local-workspace gateway integration, which is unavailable in this build"
+            )
+        }
+        if options.chat {
+            throw CLIApplicationError.unsupported(
+                route: "--chat gateway frontend, which is unavailable in this build"
+            )
+        }
         // `--restore-code` gets its own message because the generic one is
         // actively misleading now that rewind exists: a user who has seen
         // `/rewind` work will reasonably read "not honored yet" as "code
@@ -2779,6 +2804,18 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     ) async throws -> LiveSessionFoundation {
         let sourceCwd = try resolveWorkingDirectory(options.common.cwd)
         let openGrokHome = resolveOpenGrokHome(environment: context.environment)
+        let autoGCPolicy = WorktreeAutoGCPolicy(
+            enabled: GrokEnvGates.worktreeAutoGc(environment: context.environment) ?? true,
+            maxAge: GrokEnvGates.worktreeAutoGcMaxAge(environment: context.environment)
+                ?? WorktreeAutoGCPolicy.defaultMaxAge,
+            dryRun: GrokEnvGates.worktreeAutoGcDryRun(environment: context.environment) ?? false,
+            rebuildRegistry: GrokEnvGates.worktreeAutoGcRebuild(environment: context.environment) ?? false
+        )
+        _ = try? WorktreeAutoGC.runIfDue(
+            registry: WorktreeRegistry(openGrokHome: openGrokHome),
+            policy: autoGCPolicy,
+            protectedPaths: [sourceCwd]
+        )
         let worktreePreparation = try LiveWorktreeLaunch.prepare(
             options: options,
             sourceDirectory: sourceCwd,

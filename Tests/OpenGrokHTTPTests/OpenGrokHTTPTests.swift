@@ -13,6 +13,36 @@ import Testing
 @testable import OpenGrokHTTP
 @testable import OpenGrokTracing
 
+@Suite("Foundation trust-store bridge")
+struct FoundationTrustStoreBridgeTests {
+    @Test("combined bundle preserves system roots and appends DER certificates as PEM")
+    func combinesPEM() {
+        let system = Data("SYSTEM ROOT\n".utf8)
+        let certificate = Data([0x01, 0x02, 0x03, 0x04])
+        let bundle = FoundationTrustStoreBridge.combinedPEMBundle(
+            systemPEM: system,
+            extraRootCertificates: [certificate]
+        )
+        let text = String(decoding: bundle, as: UTF8.self)
+
+        #expect(text.hasPrefix("SYSTEM ROOT\n"))
+        #expect(text.contains("-----BEGIN CERTIFICATE-----\nAQIDBA==\n"))
+        #expect(text.hasSuffix("-----END CERTIFICATE-----\n"))
+    }
+
+    @Test("configured readable CA bundle wins over distro defaults")
+    func configuredBundleWins() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opengrok-ca-\(UUID().uuidString)")
+        try Data("CA".utf8).write(to: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        #expect(FoundationTrustStoreBridge.systemBundleURL(environment: [
+            "CURL_CA_BUNDLE": root.path,
+        ]) == root)
+    }
+}
+
 @Suite("User-Agent")
 struct UserAgentTests {
     @Test func collapsesDuplicateIdentity() {

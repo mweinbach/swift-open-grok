@@ -41,6 +41,16 @@ extension LiveInteractiveControllerRenderer {
                 isAuthoritative: true
             )
         }
+        sections.append(contentsOf: report.antigravityQuota?.buckets.map { bucket in
+            PagerUsageSection(
+                provider: .antigravity,
+                used: max(0, min(1, 1 - bucket.remainingFraction)) * 100,
+                limit: 100,
+                unit: "%",
+                resetDescription: bucket.resetTime.map { "resets \($0)" },
+                isAuthoritative: true
+            )
+        } ?? [])
         if sections.isEmpty {
             sections.append(PagerUsageSection(
                 provider: await activeWaveEUsageProvider(),

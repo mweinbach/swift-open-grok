@@ -45,12 +45,21 @@ public final class JavaScriptCellRuntime: @unchecked Sendable {
     private var watchdog: JavaScriptExecutionWatchdog?
     private var eventContinuation: AsyncStream<JavaScriptRuntimeEvent>.Continuation?
     private var terminationRequested = false
+    private var subprocess: JavaScriptRuntimeSubprocess?
 
     /// Whether this host can bound a runaway JavaScript entry. When false,
     /// `beginTermination` still stops an idle or awaiting cell, but a cell
     /// spinning inside JavaScript runs until it returns to the host.
     public static var supportsExecutionCeiling: Bool {
-        JavaScriptExecutionWatchdog.supportsExecutionCeiling
+        JavaScriptRuntimeSubprocess.workerExecutable() != nil
+            || JavaScriptExecutionWatchdog.supportsExecutionCeiling
+    }
+
+    /// Whether production can stop a busy JavaScript entry immediately by
+    /// killing its isolated worker process rather than waiting for JSC's
+    /// per-entry time limit.
+    public static var supportsHardInterrupt: Bool {
+        JavaScriptRuntimeSubprocess.workerExecutable() != nil
     }
 
     private init() {}
@@ -62,6 +71,30 @@ public final class JavaScriptCellRuntime: @unchecked Sendable {
     /// return until the engine exists, so an engine that cannot be created
     /// surfaces as a thrown error rather than as a silently dead cell.
     public static func start(
+        configuration: JavaScriptCellConfiguration,
+        pendingMode: JavaScriptPendingMode = .pauseUntilResumed
+    ) throws -> (runtime: JavaScriptCellRuntime, events: AsyncStream<JavaScriptRuntimeEvent>) {
+        #if canImport(JavaScriptCore)
+        if let executable = JavaScriptRuntimeSubprocess.workerExecutable() {
+            let runtime = JavaScriptCellRuntime()
+            let (stream, continuation) = AsyncStream<JavaScriptRuntimeEvent>.makeStream(
+                bufferingPolicy: .unbounded
+            )
+            runtime.subprocess = try JavaScriptRuntimeSubprocess.start(
+                executable: executable,
+                configuration: configuration,
+                pendingMode: pendingMode,
+                continuation: continuation
+            )
+            return (runtime, stream)
+        }
+        return try startInProcess(configuration: configuration, pendingMode: pendingMode)
+        #else
+        throw JavaScriptRuntimeError.unsupportedPlatform
+        #endif
+    }
+
+    static func startInProcess(
         configuration: JavaScriptCellConfiguration,
         pendingMode: JavaScriptPendingMode = .pauseUntilResumed
     ) throws -> (runtime: JavaScriptCellRuntime, events: AsyncStream<JavaScriptRuntimeEvent>) {
@@ -102,12 +135,20 @@ public final class JavaScriptCellRuntime: @unchecked Sendable {
     /// Queue work for the runtime thread. Mirrors sending on
     /// `RuntimeCommand`'s channel.
     public func send(_ command: JavaScriptRuntimeCommand) {
+        if let subprocess {
+            subprocess.send(.command(command))
+            return
+        }
         commands.send(command)
     }
 
     /// Release or stop a paused runtime thread. Mirrors sending on
     /// `RuntimeControlCommand`'s channel.
     public func sendControl(_ command: JavaScriptRuntimeControlCommand) {
+        if let subprocess {
+            subprocess.send(.control(command))
+            return
+        }
         controls.send(command)
     }
 
@@ -124,9 +165,14 @@ public final class JavaScriptCellRuntime: @unchecked Sendable {
         let alreadyRequested = terminationRequested
         terminationRequested = true
         let watchdog = self.watchdog
+        let subprocess = self.subprocess
         watchdogLock.unlock()
 
         guard !alreadyRequested else { return }
+        if let subprocess {
+            subprocess.terminate()
+            return
+        }
         watchdog?.requestTermination()
         commands.send(.terminate)
         controls.send(.terminate)

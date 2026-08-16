@@ -135,6 +135,9 @@ public struct TaskToolInput: Codable, Sendable, Hashable {
     /// Optional model slug for this subagent.
     public var model: String?
 
+    /// Optional reasoning effort override for this subagent.
+    public var reasoningEffort: String?
+
     /// Server-injected before execution. Becomes the subagent's session ID.
     public var taskId: String?
 
@@ -148,6 +151,7 @@ public struct TaskToolInput: Codable, Sendable, Hashable {
         case resumeFrom = "resume_from"
         case cwd
         case model
+        case reasoningEffort = "reasoning_effort"
         case taskId = "task_id"
     }
 
@@ -161,6 +165,7 @@ public struct TaskToolInput: Codable, Sendable, Hashable {
         resumeFrom: String? = nil,
         cwd: String? = nil,
         model: String? = nil,
+        reasoningEffort: String? = nil,
         taskId: String? = nil
     ) {
         self.prompt = prompt
@@ -172,6 +177,7 @@ public struct TaskToolInput: Codable, Sendable, Hashable {
         self.resumeFrom = resumeFrom
         self.cwd = cwd
         self.model = model
+        self.reasoningEffort = reasoningEffort
         self.taskId = taskId
     }
 
@@ -192,6 +198,7 @@ public struct TaskToolInput: Codable, Sendable, Hashable {
         self.resumeFrom = try c.decodeIfPresent(String.self, forKey: .resumeFrom)
         self.cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
         self.model = try c.decodeIfPresent(String.self, forKey: .model)
+        self.reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort)
         self.taskId = try c.decodeIfPresent(String.self, forKey: .taskId)
     }
 }

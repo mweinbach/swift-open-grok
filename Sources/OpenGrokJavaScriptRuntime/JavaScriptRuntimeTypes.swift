@@ -20,7 +20,7 @@ public let CODE_MODE_EXIT_SENTINEL = "__codex_code_mode_exit__"
 /// Mirrors the Rust `RuntimeConfig` (runtime/mod.rs:138) plus the
 /// `max_output_tokens` budget that the Rust runtime accepts on
 /// `ExecuteRequest` but never enforces (see `JavaScriptOutputBudget`).
-public struct JavaScriptCellConfiguration: Sendable {
+public struct JavaScriptCellConfiguration: Sendable, Codable {
     /// The outer `exec` tool call id. Echoed back on `notify` events.
     public var toolCallId: String
     /// Tools exposed through the generated `tools.*` namespace.
@@ -59,7 +59,7 @@ public struct JavaScriptCellConfiguration: Sendable {
 /// Mirrors `PendingRuntimeMode` (runtime/mod.rs:36). `pauseUntilResumed` is
 /// the production mode: the thread announces `.pending` and blocks on the
 /// control channel so the cell actor can observe a stable frontier.
-public enum JavaScriptPendingMode: Sendable, Hashable {
+public enum JavaScriptPendingMode: Sendable, Hashable, Codable {
     /// Announce `.pending` then immediately block for the next command.
     /// Test-only in Rust (`#[cfg(test)] Continue`).
     case continueImmediately
@@ -68,7 +68,7 @@ public enum JavaScriptPendingMode: Sendable, Hashable {
 
 /// Work submitted to the runtime thread. Mirrors `RuntimeCommand`
 /// (runtime/mod.rs:28).
-public enum JavaScriptRuntimeCommand: Sendable {
+public enum JavaScriptRuntimeCommand: Sendable, Codable {
     case toolResponse(id: String, result: JSONValue)
     case toolError(id: String, errorText: String)
     case timeoutFired(id: UInt64)
@@ -78,7 +78,7 @@ public enum JavaScriptRuntimeCommand: Sendable {
 
 /// Out-of-band control for a paused runtime thread. Mirrors
 /// `RuntimeControlCommand` (runtime/mod.rs:44).
-public enum JavaScriptRuntimeControlCommand: Sendable {
+public enum JavaScriptRuntimeControlCommand: Sendable, Codable {
     /// Leave the pending frontier and block for the next command.
     case `continue`
     /// Leave the pending frontier and re-poll immediately.
@@ -88,7 +88,7 @@ public enum JavaScriptRuntimeControlCommand: Sendable {
 
 /// Everything the runtime thread reports back. Mirrors `RuntimeEvent`
 /// (runtime/mod.rs:51).
-public enum JavaScriptRuntimeEvent: Sendable {
+public enum JavaScriptRuntimeEvent: Sendable, Codable {
     case started
     case pending
     case contentItem(FunctionCallOutputContentItem)

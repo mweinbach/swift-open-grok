@@ -53,6 +53,22 @@ journal, portable WSS/custom CA, Windows WinSock loopback / relaunch, and
 stop remains). Details and quoted security install lines:
 `PORT_STATUS.md` → Local correctness wave.
 
+**Local Wave G non-TUI closure (2026-08-16):** the remaining Wave G live-seam
+items are implemented: still-running subagent attachment; the full session
+`GROK_*` gate family and one resolved `EffectiveFeatures` launch authority;
+throttled automatic worktree GC; subprocess-backed Code Mode hard interrupt;
+Antigravity effort, conversation resume, log heartbeats, model/quota probes;
+packed-Git OFS/REF delta reads on the live pure-status path; portable secure
+WebSockets with additional trust roots; Windows path-derived named-pipe leader
+transport; and `--chat` / local-workspace create/attach/cwd flags. The CI
+workflow now expresses blocking macOS/Linux gates, Windows compile coverage,
+diagnostic Windows tests, and a privileged real-bwrap namespace probe. This is
+**not yet a remote-green claim**: the latest pushed run is the failing Wave F
+commit `ae45c76` from 2026-08-16, and the Wave G tree is still unpushed. The
+post-push macOS/Linux/Windows conclusions remain release evidence to collect,
+not missing product wiring. This section supersedes the Wave G items still
+listed as open in older historical paragraphs.
+
 **Local TUI interaction wave (2026-08-11):** motion clock / finish-flash /
 ordered delivery / welcome shimmer / suspend pause-restore; full X10
 preservation; iTerm/WezTerm wheel 1/1 + modal wheel quarantine; transcript
@@ -349,11 +365,10 @@ credential-file recovery, live re-probe, and best-effort RFC 7009 revoke; determ
 recap budget trimming; Windows PATHEXT resolution; pack-index-v2 lookup plus bounded
 non-delta object inflate; and versioned atomic docs extraction/how-to lookup.
 
-Platform/evidence tail: capable-Linux sandbox proof · Windows named-pipe leader IPC +
-S2 exec emulation · portable secure WebSockets · Linux custom-CA installation · signed
-share upload/export clients · post-change Linux/Windows CI and required-check evidence ·
-B1 residuals: attach to a still-running subagent and dashboard-native multiselect
-question resolution ·
+Platform/evidence tail: post-push macOS/Linux/Windows required-check conclusions for
+the Wave G tree. The CI definitions and real Linux bwrap probe are implemented; remote
+green evidence is still pending because the tree has not been pushed. Dashboard-native
+multi-select is not a pin requirement, and still-running subagent attachment is closed. ·
 Mouse long-tail (closed by Local TUI interaction wave + 2026-08-12 remaining-TUI-gap
 follow-on + sticky-header/text-selection deep-tui + final TUI divergence
 closure: scroll-stream normalizer/acceleration, live scroll settings,
@@ -372,15 +387,9 @@ prompt-widget parity); `[animation].show_fps` parse-only (pin also never reads
 it; no settings row/motion gate); `/debug` advertises only `fps` (scroll/log
 HUDs absent); auth welcome raw-url mouse-disable/clear; Windows display probe
 (Linux skip matches pin) ·
-video tools (`reference_to_video`) · `search_tool`/`use_tool` MCP meta-discovery ·
-media overlays (B10: kitty/iTerm images, mermaid, real `/gboom`) · foreign-session
-scan/resume (Claude/Codex/Cursor) ·
-Code Mode V8 debt (hard interrupt, module loader) · Computer Hub MCP adapter wiring ·
-PTY-backed `run_terminal_cmd` · local-workspace/chat env+flag family ·
-`RemoteSettings` authority allowlist · env-gate table (`GROK_*` kill-switches) ·
-`features.*` resolver consumed by tools/compaction/MCP watchers ·
-relocation journal · antigravity runner · packed Git OFS_DELTA/REF_DELTA resolution ·
-startup invocation of the landed docs extraction helper.
+auth welcome raw-url mouse-disable/clear · Windows display probe (Linux skip matches
+the pin) · startup invocation of the landed docs extraction helper. Wave G closures
+must not be re-added to this tail; see the 2026-08-16 closure above.
 
 ---
 

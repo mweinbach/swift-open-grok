@@ -5,7 +5,7 @@
 //
 // Portability:
 // - SHA-1 via pure-Swift `PortableSHA1` (no CryptoKit).
-// - zlib via Apple Compression when available, else system zlib (`COpenGrokZlib`).
+// - zlib via system zlib (`COpenGrokZlib`) when available, else Apple Compression.
 // - Pack index v2 lookup with bounded non-delta inflate.
 // - OFS_DELTA/REF_DELTA resolution with bounded depth/size ceilings.
 
@@ -945,31 +945,7 @@ private func inflatePackedZlib(
     expectedSize: Int,
     packPath: String
 ) throws -> Data {
-    #if canImport(Compression)
-    let capacity = max(expectedSize + 1, 1)
-    return try data.withUnsafeBytes { (source: UnsafeRawBufferPointer) -> Data in
-        guard let sourceBase = source.baseAddress else {
-            throw GitStatusError.corruptPack(path: packPath, reason: "missing zlib input")
-        }
-        var output = Data(count: capacity)
-        let written = output.withUnsafeMutableBytes { destination -> Int in
-            guard let destinationBase = destination.baseAddress else { return 0 }
-            return compression_decode_buffer(
-                destinationBase.assumingMemoryBound(to: UInt8.self),
-                capacity,
-                sourceBase.assumingMemoryBound(to: UInt8.self),
-                data.count,
-                nil,
-                COMPRESSION_ZLIB
-            )
-        }
-        guard written == expectedSize else {
-            throw GitStatusError.corruptPack(path: packPath, reason: "invalid zlib stream or size mismatch")
-        }
-        output.count = written
-        return output
-    }
-    #elseif canImport(COpenGrokZlib)
+    #if canImport(COpenGrokZlib)
     var stream = z_stream()
     var status = inflateInit_(&stream, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
     guard status == Z_OK else {
@@ -1010,6 +986,30 @@ private func inflatePackedZlib(
         throw GitStatusError.corruptPack(path: packPath, reason: "inflated object size mismatch")
     }
     return output
+    #elseif canImport(Compression)
+    let capacity = max(expectedSize + 1, 1)
+    return try data.withUnsafeBytes { (source: UnsafeRawBufferPointer) -> Data in
+        guard let sourceBase = source.baseAddress else {
+            throw GitStatusError.corruptPack(path: packPath, reason: "missing zlib input")
+        }
+        var output = Data(count: capacity)
+        let written = output.withUnsafeMutableBytes { destination -> Int in
+            guard let destinationBase = destination.baseAddress else { return 0 }
+            return compression_decode_buffer(
+                destinationBase.assumingMemoryBound(to: UInt8.self),
+                capacity,
+                sourceBase.assumingMemoryBound(to: UInt8.self),
+                data.count,
+                nil,
+                COMPRESSION_ZLIB
+            )
+        }
+        guard written == expectedSize else {
+            throw GitStatusError.corruptPack(path: packPath, reason: "invalid zlib stream or size mismatch")
+        }
+        output.count = written
+        return output
+    }
     #else
     throw GitStatusError.corruptPack(path: packPath, reason: "zlib inflate unavailable")
     #endif
@@ -1018,10 +1018,10 @@ private func inflatePackedZlib(
 // MARK: - zlib inflate (zlib-wrapped deflate, as used by Git objects)
 
 func inflateZlib(_ data: Data) throws -> Data {
-    #if canImport(Compression)
-    return try inflateZlibCompression(data)
-    #elseif canImport(COpenGrokZlib)
+    #if canImport(COpenGrokZlib)
     return try inflateZlibSystem(data)
+    #elseif canImport(Compression)
+    return try inflateZlibCompression(data)
     #else
     throw GitStatusError.io("zlib inflate unavailable on this platform")
     #endif
@@ -1111,10 +1111,10 @@ public func writeLooseObject(gitDir: String, type: String, payload: Data) throws
 }
 
 func deflateZlib(_ data: Data) throws -> Data {
-    #if canImport(Compression)
-    return try deflateZlibCompression(data)
-    #elseif canImport(COpenGrokZlib)
+    #if canImport(COpenGrokZlib)
     return try deflateZlibSystem(data)
+    #elseif canImport(Compression)
+    return try deflateZlibCompression(data)
     #else
     throw GitStatusError.io("zlib deflate unavailable")
     #endif

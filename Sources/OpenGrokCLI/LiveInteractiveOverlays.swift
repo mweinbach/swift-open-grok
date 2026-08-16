@@ -25,6 +25,48 @@ import OpenGrokTokenEstimation
 import OpenGrokProviderSession
 import OpenGrokSampler
 import OpenGrokSamplingTypes
+
+enum LiveSubagentAttachment {
+    static let overlayID = "subagent-attachment"
+
+    static func lines(
+        items: [ConversationItem],
+        snapshot: LiveSubagentSnapshot?
+    ) -> [PagerStyledLine] {
+        var lines: [PagerStyledLine] = []
+        for item in items {
+            let label: String
+            switch item {
+            case .system: label = "System"
+            case .user: label = "User"
+            case .assistant: label = "Assistant"
+            case .toolResult: label = "Tool result"
+            case .customToolOutput: label = "Custom tool output"
+            case .backendToolCall: label = "Backend tool"
+            case .reasoning: label = "Reasoning"
+            }
+            lines.append(PagerStyledLine(text: label, style: [.bold]))
+            let text = item.textContent()
+            if text.isEmpty {
+                lines.append(PagerStyledLine(text: "(no text)"))
+            } else {
+                lines.append(contentsOf: text
+                    .split(omittingEmptySubsequences: false, whereSeparator: { $0.isNewline })
+                    .map { PagerStyledLine(text: String($0)) })
+            }
+            lines.append(PagerStyledLine(text: ""))
+        }
+        if let snapshot {
+            lines.append(PagerStyledLine(
+                text: snapshot.completed
+                    ? "Status: \(snapshot.status)"
+                    : "Status: running — turn \(snapshot.turnCount), \(snapshot.toolCallCount) tool calls",
+                style: [.dim]
+            ))
+        }
+        return lines.isEmpty ? [PagerStyledLine(text: "(waiting for subagent output)")] : lines
+    }
+}
 import OpenGrokSandbox
 import OpenGrokScheduler
 import OpenGrokSessionRuntime
@@ -178,6 +220,52 @@ extension LiveInteractiveControllerRenderer {
         overlays.push(buildDashboardOverlay())
         refreshDashboardPeek()
         try renderState()
+    }
+
+    func presentSubagentAttachment(id: String) async {
+        guard let host = toolExecutor?.subagentHost else { return }
+        subagentAttachmentTask?.cancel()
+        attachedSubagentID = id
+        let items = await host.subagentConversationItems(id: id) ?? []
+        let snapshot = await host.subagentSnapshot(id: id)
+        overlays.dismiss(id: LiveDashboardOverlay.overlayID)
+        overlays.push(.sessionInfo(
+            id: LiveSubagentAttachment.overlayID,
+            title: "Subagent \(id)",
+            lines: LiveSubagentAttachment.lines(items: items, snapshot: snapshot),
+            followsTail: true
+        ))
+        subagentAttachmentTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let nextItems = await host.subagentConversationItems(id: id) ?? []
+                let nextSnapshot = await host.subagentSnapshot(id: id)
+                await self.refreshSubagentAttachment(
+                    id: id,
+                    items: nextItems,
+                    snapshot: nextSnapshot
+                )
+                if nextSnapshot?.completed == true { return }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+    }
+
+    func refreshSubagentAttachment(
+        id: String,
+        items: [ConversationItem],
+        snapshot: LiveSubagentSnapshot?
+    ) {
+        guard attachedSubagentID == id else { return }
+        guard overlays.updateText(id: LiveSubagentAttachment.overlayID, { text in
+            text.lines = LiveSubagentAttachment.lines(items: items, snapshot: snapshot)
+        }) else {
+            subagentAttachmentTask?.cancel()
+            subagentAttachmentTask = nil
+            attachedSubagentID = nil
+            return
+        }
+        try? renderState()
     }
 
     /// The dashboard's scoped key table (`state.rs:3533-3540`,
@@ -3212,6 +3300,20 @@ extension LiveInteractiveControllerRenderer {
         }
         for failure in actualReport.quotaFailures {
             lines.append("\(failure.provider.asString): usage unavailable — \(failure.message)")
+        }
+        if let antigravityQuota = actualReport.antigravityQuota {
+            lines.append("")
+            lines.append(
+                "Antigravity quota (captured \(Int(antigravityQuota.age()))s ago):"
+            )
+            for bucket in antigravityQuota.buckets {
+                let remaining = max(0, min(1, bucket.remainingFraction)) * 100
+                var line = "\(bucket.label): \(String(format: "%.0f", remaining))% remaining"
+                if let reset = bucket.resetTime, !reset.isEmpty {
+                    line += " (resets \(reset))"
+                }
+                lines.append(line)
+            }
         }
         return lines.joined(separator: "\n")
     }

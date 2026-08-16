@@ -134,6 +134,70 @@ public enum GrokEnvGates {
             ?? envBool("GROK_SESSION_SEARCH", environment: environment)
     }
 
+    /// Hierarchical two-pass compaction. Default OFF in the resolver.
+    public static func twoPassCompaction(
+        environment: [String: String]
+    ) -> Bool? {
+        envBool("GROK_TWO_PASS_COMPACTION", environment: environment)
+    }
+
+    /// `ask_user_question` tool gate. Default ON in the resolver.
+    public static func askUserQuestion(
+        environment: [String: String]
+    ) -> Bool? {
+        envBool("GROK_ASK_USER_QUESTION", environment: environment)
+    }
+
+    /// Direct `write_file` tool gate. Default ON in the resolver.
+    public static func writeFile(
+        environment: [String: String]
+    ) -> Bool? {
+        envBool("GROK_WRITE_FILE", environment: environment)
+    }
+
+    /// Server-side search gate. Default ON in the resolver.
+    public static func backendSearch(
+        environment: [String: String]
+    ) -> Bool? {
+        envBool("GROK_BACKEND_SEARCH", environment: environment)
+    }
+
+    /// Cancel-and-rewind behavior gate. Default ON in the resolver.
+    public static func cancelRewind(
+        environment: [String: String]
+    ) -> Bool? {
+        envBool("GROK_CANCEL_REWIND", environment: environment)
+    }
+
+    /// MCP liveness watcher gate. Default ON in the resolver.
+    public static func mcpLivenessWatchers(
+        environment: [String: String]
+    ) -> Bool? {
+        envBool("GROK_MCP_LIVENESS_WATCHERS", environment: environment)
+    }
+
+    /// Trace-upload gate. Default follows the telemetry resolver.
+    public static func traceUpload(
+        environment: [String: String]
+    ) -> Bool? {
+        envBool("GROK_TELEMETRY_TRACE_UPLOAD", environment: environment)
+            ?? envBool("GROK_TRACE_UPLOAD", environment: environment)
+    }
+
+    /// Compaction storage mode (`full_replace` or `segments`).
+    public static func compactionMode(
+        environment: [String: String]
+    ) -> String? {
+        environment["GROK_COMPACTION_MODE"]
+    }
+
+    /// Segment transcript detail (`minimal`, `balanced`, or `verbose`).
+    public static func compactionDetail(
+        environment: [String: String]
+    ) -> String? {
+        environment["GROK_COMPACTION_DETAIL"]
+    }
+
     // -- Privacy --
 
     /// Privacy notice rollout override.
@@ -160,8 +224,7 @@ public enum GrokEnvGates {
     // in the worktree auto-GC resolver when it is wired.
 
     /// Worktree auto-GC master switch.
-    /// Rust consumer: `resolve_worktree_auto_gc`. Swift consumer pending
-    /// wiring through EffectiveFeatures.
+    /// Rust consumer: `resolve_worktree_auto_gc`.
     public static func worktreeAutoGc(
         environment: [String: String]
     ) -> Bool? {
@@ -174,6 +237,19 @@ public enum GrokEnvGates {
         environment: [String: String]
     ) -> Bool? {
         envBool("GROK_WORKTREE_AUTO_GC_DRY_RUN", environment: environment)
+    }
+
+    public static func worktreeAutoGcMaxAge(
+        environment: [String: String]
+    ) -> TimeInterval? {
+        environment["GROK_WORKTREE_AUTO_GC_MAX_AGE"]
+            .flatMap(TimeInterval.init)
+    }
+
+    public static func worktreeAutoGcRebuild(
+        environment: [String: String]
+    ) -> Bool? {
+        envBool("GROK_WORKTREE_AUTO_GC_REBUILD", environment: environment)
     }
 
     // -- Update --

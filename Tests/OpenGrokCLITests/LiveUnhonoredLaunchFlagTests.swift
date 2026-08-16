@@ -11,7 +11,7 @@ import Testing
 
 @Suite("Unhonored launch flags refuse at validation", .serialized)
 struct LiveUnhonoredLaunchFlagTests {
-    private func expectRefusal(extraArguments: [String], flag: String) async {
+    private func run(_ extraArguments: [String]) async -> (Int32, String, String) {
         let (streams, out, err) = CLIStreams.buffered()
         let code = await CLIRunner.run(
             ["headless", "--prompt", "hi"] + extraArguments,
@@ -22,12 +22,17 @@ struct LiveUnhonoredLaunchFlagTests {
             streams: streams,
             application: OpenGrokApplication.live(control: .never)
         )
+        return (code, out.contents, err.contents)
+    }
+
+    private func expectRefusal(extraArguments: [String], flag: String) async {
+        let (code, out, err) = await run(extraArguments)
 
         #expect(code != CLIRunner.ExitCode.success.rawValue)
         #expect(code == CLIRunner.ExitCode.notImplemented.rawValue)
-        #expect(out.contents.isEmpty)
-        #expect(err.contents.contains(flag))
-        #expect(err.contents.contains("nothing in this composition honors yet"))
+        #expect(out.isEmpty)
+        #expect(err.contains(flag))
+        #expect(err.contains("nothing in this composition honors yet"))
     }
 
     @Test("--no-plan is refused before launch")
@@ -132,5 +137,31 @@ struct LiveUnhonoredLaunchFlagTests {
             extraArguments: ["--background-wait-timeout", "30"],
             flag: "--background-wait-timeout"
         )
+    }
+
+    @Test("--chat is parsed but honestly refuses without the gateway frontend")
+    func chatFrontendUnavailable() async {
+        let (code, out, err) = await run(["--chat", "--no-leader"])
+        #expect(code == CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(out.isEmpty)
+        #expect(err.contains("--chat gateway frontend"))
+    }
+
+    @Test("local-workspace is parsed but honestly refuses without gateway integration")
+    func localWorkspaceUnavailable() async {
+        let (code, out, err) = await run([
+            "--chat", "--no-leader", "--local-workspace=/tmp/project"
+        ])
+        #expect(code == CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(out.isEmpty)
+        #expect(err.contains("local-workspace gateway integration"))
+    }
+
+    @Test("chat and leader conflict before unavailable frontend handling")
+    func chatLeaderConflict() async {
+        let (code, out, err) = await run(["--chat", "--leader"])
+        #expect(code != CLIRunner.ExitCode.success.rawValue)
+        #expect(out.isEmpty)
+        #expect(err.contains("cannot run with leader mode"))
     }
 }

@@ -19,6 +19,7 @@
 import Foundation
 import OpenGrokAgentCoordinator
 import OpenGrokConfig
+import OpenGrokSamplingTypes
 import OpenGrokSubagentResolution
 
 enum LiveAntigravityProcessOutcome: Sendable, Equatable {
@@ -242,7 +243,9 @@ extension LiveSubagentHost {
         prompt: String,
         model: String,
         runtime: EffectiveRuntimeConfig,
-        cwd: URL
+        cwd: URL,
+        modelRoster: [String],
+        conversationID: String?
     ) async -> OpenGrokChildResult {
         let startedAt = Date()
         let services = context.antigravityServices
@@ -267,14 +270,27 @@ extension LiveSubagentHost {
         let run = LiveAntigravityRun(
             binary: config.binary,
             model: model,
+            effort: runtime.reasoningEffort,
+            modelRoster: modelRoster,
             prompt: prompt,
             workspaceDirectory: cwd,
             logFile: logFile,
             timeout: timeout,
-            skipPermissions: skipPermissions
+            skipPermissions: skipPermissions,
+            conversationID: conversationID
         )
 
+        let monitor = Task {
+            await monitorAntigravityRun(
+                childID: childID,
+                prompt: prompt,
+                logFile: logFile,
+                services: services
+            )
+        }
         let outcome = await services.runPrint(run)
+        monitor.cancel()
+        _ = await monitor.value
         bookkeeping[childID]?.terminalToolCalls = 0
         bookkeeping[childID]?.terminalTurns = 1
         bookkeeping[childID]?.model =
@@ -283,7 +299,14 @@ extension LiveSubagentHost {
         let elapsed = Date().timeIntervalSince(startedAt)
         let durationMS = UInt64(max(0, elapsed * 1000.0).rounded(.down))
         switch outcome {
-        case .success(let output):
+        case .success(let output, let returnedConversationID):
+            bookkeeping[childID]?.antigravityConversationID =
+                returnedConversationID ?? conversationID
+            bookkeeping[childID]?.antigravityPhase = "Completed"
+            bookkeeping[childID]?.liveItems = [
+                .user(prompt),
+                .assistant(AssistantItem(content: output)),
+            ]
             return OpenGrokChildResult(
                 id: childID,
                 success: true,
@@ -291,13 +314,29 @@ extension LiveSubagentHost {
                 durationMS: durationMS
             )
         case .failure(let message):
+            let renderedMessage: String
+            if let note = antigravityExhaustedQuotaNote(), !message.contains(note) {
+                renderedMessage = "\(message)\n\(note)"
+            } else {
+                renderedMessage = message
+            }
+            bookkeeping[childID]?.antigravityPhase = "Failed"
+            bookkeeping[childID]?.liveItems = [
+                .user(prompt),
+                .assistant(AssistantItem(content: renderedMessage)),
+            ]
             return OpenGrokChildResult(
                 id: childID,
                 success: false,
-                error: message,
+                error: renderedMessage,
                 durationMS: durationMS
             )
         case .cancelled:
+            bookkeeping[childID]?.antigravityPhase = "Cancelled"
+            bookkeeping[childID]?.liveItems = [
+                .user(prompt),
+                .assistant(AssistantItem(content: "Subagent was cancelled")),
+            ]
             return OpenGrokChildResult(
                 id: childID,
                 success: false,
@@ -305,6 +344,47 @@ extension LiveSubagentHost {
                 error: "Subagent was cancelled",
                 durationMS: durationMS
             )
+        }
+    }
+
+    private func monitorAntigravityRun(
+        childID: String,
+        prompt: String,
+        logFile: URL,
+        services: LiveAntigravityServices
+    ) async {
+        var lastPhase: String?
+        var quotaProbeStarted = false
+        while !Task.isCancelled {
+            let log = (try? String(contentsOf: logFile, encoding: .utf8)) ?? ""
+            let phase = antigravityPhase(from: log)
+            if phase != lastPhase {
+                lastPhase = phase
+                bookkeeping[childID]?.antigravityPhase = phase
+                bookkeeping[childID]?.liveItems = [
+                    .user(prompt),
+                    .assistant(AssistantItem(content: "Antigravity: \(phase)")),
+                ]
+            }
+            if !quotaProbeStarted, let port = parseAntigravityHTTPPort(log) {
+                quotaProbeStarted = true
+                Task.detached(priority: .utility) {
+                    async let quota = services.fetchQuotaSummary(port)
+                    async let models = services.fetchAvailableModels(port)
+                    let (quotaResult, modelResult) = await (quota, models)
+                    if let quotaResult {
+                        LiveAntigravityCache.shared.store(quota: quotaResult)
+                    }
+                    if let modelResult {
+                        LiveAntigravityCache.shared.store(models: modelResult)
+                    }
+                }
+            }
+            do {
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+            } catch {
+                return
+            }
         }
     }
 }

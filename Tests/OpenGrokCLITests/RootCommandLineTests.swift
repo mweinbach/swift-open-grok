@@ -179,6 +179,45 @@ struct RootCommandLineTests {
         #expect(parseError(["--ref", "main"]) == .requiresOption("--worktree-ref", "--worktree"))
     }
 
+    @Test("--chat retains local-workspace ownership and cwd options")
+    func chatLocalWorkspace() throws {
+        let owned = try launch([
+            "--chat",
+            "--local-workspace=/tmp/project",
+            "--local-workspace-cwd", "/tmp/override",
+        ])
+        #expect(owned.chat)
+        #expect(owned.localWorkspace == "/tmp/project")
+        #expect(owned.localWorkspaceCWD == "/tmp/override")
+
+        let current = try launch(["--chat", "--local-workspace"])
+        #expect(current.localWorkspace == "")
+
+        let attached = try launch([
+            "--chat", "--local-workspace-attach", "server-123"
+        ])
+        #expect(attached.localWorkspaceAttach == "server-123")
+    }
+
+    @Test("local-workspace options require chat and ownership conflicts with attach")
+    func localWorkspaceValidation() {
+        #expect(parseError(["--local-workspace"]) == .requiresOption(
+            "local-workspace flags",
+            "--chat"
+        ))
+        #expect(parseError([
+            "--chat", "--local-workspace", "--local-workspace-attach", "server"
+        ]) == .conflictingOptions("--local-workspace", "--local-workspace-attach"))
+        let emptyArgument = try? launch([
+            "--chat", "--local-workspace-attach", ""
+        ])
+        #expect(emptyArgument?.localWorkspaceAttach == "")
+        let emptyInline = try? launch([
+            "--chat", "--local-workspace-attach="
+        ])
+        #expect(emptyInline?.localWorkspaceAttach == "")
+    }
+
     // MARK: - Permissions and sandbox
 
     @Test("--allow and --deny split on commas, repeat, and preserve order")

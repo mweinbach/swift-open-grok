@@ -777,11 +777,21 @@ struct TaskToolsTests {
         #expect(input.model == "grok-3")
     }
 
+    @Test("TaskToolInput reasoning effort parses and round-trips")
+    func taskToolInputReasoningEffort() throws {
+        let input = try decodeJSON(TaskToolInput.self, #"{"description":"d","prompt":"p","reasoning_effort":"xhigh"}"#)
+        #expect(input.reasoningEffort == "xhigh")
+
+        let json = try encodeJSON(input)
+        #expect(json.contains(#""reasoning_effort":"xhigh""#))
+    }
+
     @Test("TaskToolInput model nil skips serialize")
     func taskToolInputModelNilSkipsSerialize() throws {
         let input = TaskToolInput(prompt: "p", description: "d", runInBackground: false)
         let json = try encodeJSON(input)
         #expect(!json.contains("\"model\""))
+        #expect(!json.contains("\"reasoning_effort\""))
     }
 
     @Test("sanitizeOptionalArg")

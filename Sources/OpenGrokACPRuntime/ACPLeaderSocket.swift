@@ -110,16 +110,17 @@ public enum ACPLeaderLockError: Error, Sendable, CustomStringConvertible {
 ///
 /// Advisory rather than a PID-file check because a PID file alone races: two
 /// clients can both read "no leader" and both spawn one. `flock` makes the
-/// decision atomic on supported platforms. Windows refuses before touching the
-/// filesystem because the Swift leader transport is Unix-only; adding a
-/// `LockFileEx` helper without a named-pipe transport would still advertise a
-/// leader that cannot accept clients.
+/// decision atomic on Unix. Windows holds an exclusive file handle beside the
+/// named pipe for the same lifetime and spawn-coordination guarantee.
 public final class ACPLeaderLock: @unchecked Sendable {
     public let lockPath: URL
     public let socketPath: URL
     private var descriptor: Int32 = -1
     private var owned = false
     private let stateLock = NSLock()
+    #if os(Windows)
+    private var windowsLock: WindowsExclusiveFileLock?
+    #endif
 
     public init(lockPath: URL, socketPath: URL) {
         self.lockPath = lockPath
@@ -129,7 +130,29 @@ public final class ACPLeaderLock: @unchecked Sendable {
     /// Take the lock, or report who holds it.
     public func acquire() throws {
 #if os(Windows)
-        throw ACPLeaderLockError.unsupportedPlatform(path: lockPath.path)
+        try FileManager.default.createDirectory(
+            at: lockPath.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let lock = WindowsExclusiveFileLock(path: lockPath.path)
+        do {
+            try lock.acquire(contents: "\(ProcessInfo.processInfo.processIdentifier)")
+        } catch let error as WindowsNamedPipeError {
+            if case .operationFailed(let code, _) = error, code == 32 || code == 33 {
+                throw ACPLeaderLockError.held(
+                    byProcess: Self.readPID(at: lockPath),
+                    path: lockPath.path
+                )
+            }
+            throw ACPLeaderLockError.cannotOpen(
+                path: lockPath.path,
+                reason: error.description
+            )
+        }
+        stateLock.lock()
+        windowsLock = lock
+        owned = true
+        stateLock.unlock()
 #else
         try FileManager.default.createDirectory(
             at: lockPath.deletingLastPathComponent(),
@@ -184,6 +207,14 @@ public final class ACPLeaderLock: @unchecked Sendable {
         close(fd)
         try? FileManager.default.removeItem(at: socketPath)
         try? FileManager.default.removeItem(at: lockPath)
+#else
+        guard wasOwner else { return }
+        stateLock.lock()
+        let lock = windowsLock
+        windowsLock = nil
+        stateLock.unlock()
+        lock?.release()
+        try? FileManager.default.removeItem(at: lockPath)
 #endif
     }
 
@@ -200,11 +231,25 @@ public final class ACPLeaderLock: @unchecked Sendable {
 /// because `ACPLeaderLock` was taken first — belongs here.
 public actor ACPLeaderSocketListener {
     public let path: URL
+    #if os(Windows)
+    public let pipeName: String
+    private let listener: WindowsNamedPipeListener
+    private var stream: AsyncStream<any WebSocketByteChannel>?
+    private var continuation: AsyncStream<any WebSocketByteChannel>.Continuation?
+    private var acceptTask: Task<Void, Never>?
+    #else
     private let listener: UnixSocketListener
+    #endif
 
     public init(path: URL) {
         self.path = path
+        #if os(Windows)
+        let pipeName = WindowsNamedPipeName.fullName(forPath: path.path)
+        self.pipeName = pipeName
+        self.listener = WindowsNamedPipeListener(pipeName: pipeName)
+        #else
         self.listener = UnixSocketListener(path: path.path)
+        #endif
     }
 
     /// Bind and begin accepting. Returns the stream of client channels.
@@ -215,15 +260,81 @@ public actor ACPLeaderSocketListener {
     /// proves no live leader owns it.
     @discardableResult
     public func start() async throws -> AsyncStream<any WebSocketByteChannel> {
+        #if os(Windows)
+        if let stream { return stream }
+        try listener.start()
+        let (stream, continuation) = AsyncStream<any WebSocketByteChannel>.makeStream()
+        self.stream = stream
+        self.continuation = continuation
+        acceptTask = Task { [weak self, listener] in
+            while !Task.isCancelled {
+                do {
+                    let channel = try await listener.accept()
+                    await self?.yield(channel)
+                } catch {
+                    break
+                }
+            }
+        }
+        return stream
+        #else
         try FileManager.default.createDirectory(
             at: path.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
         try? FileManager.default.removeItem(at: path)
         return try await listener.start()
+        #endif
     }
 
     public func stop() async {
+        #if os(Windows)
+        let task = acceptTask
+        acceptTask = nil
+        task?.cancel()
+        listener.close()
+        await task?.value
+        continuation?.finish()
+        continuation = nil
+        stream = nil
+        #else
         await listener.stop()
+        #endif
+    }
+
+    #if os(Windows)
+    private func yield(_ channel: any WebSocketByteChannel) {
+        guard let continuation else {
+            Task { await channel.close() }
+            return
+        }
+        continuation.yield(channel)
+    }
+    #endif
+}
+
+public enum ACPLeaderSocketDialer {
+    public static func connect(
+        path: URL,
+        timeoutSeconds: Double = 10
+    ) async throws -> any WebSocketByteChannel {
+        #if os(Windows)
+        return try await WindowsNamedPipeDialer.connect(
+            pipeName: WindowsNamedPipeName.fullName(forPath: path.path),
+            timeoutSeconds: timeoutSeconds
+        )
+        #else
+        return try await UnixSocketDialer.connect(path: path.path)
+        #endif
+    }
+
+    public static func isReady(path: URL) -> Bool {
+        #if os(Windows)
+        return WindowsNamedPipeDialer.isReady(
+            pipeName: WindowsNamedPipeName.fullName(forPath: path.path)
+        )
+        #else
+        return FileManager.default.fileExists(atPath: path.path)
+        #endif
     }
 }

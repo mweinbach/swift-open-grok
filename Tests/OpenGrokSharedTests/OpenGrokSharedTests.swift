@@ -109,6 +109,7 @@ struct JSONValueTests {
     @Test("Decode number as int64")
     func decodeInt() throws {
         let value = try JSONDecoder().decode(JSONValue.self, from: Data("42".utf8))
+        #expect(value == .number(.int64(42)))
         #expect(value.int64Value == 42)
     }
 
@@ -143,6 +144,7 @@ struct JSONValueTests {
         let data = try encoder.encode(original)
         let decoded = try JSONDecoder().decode(JSONValue.self, from: data)
         #expect(decoded["name"]?.stringValue == "test")
+        #expect(decoded["count"] == .number(.int64(42)))
         #expect(decoded["count"]?.int64Value == 42)
         #expect(decoded["items"]?.arrayValue?.count == 2)
     }

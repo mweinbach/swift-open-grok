@@ -3,12 +3,14 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
 #include <io.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 typedef int og_socklen_t;
 #else
 #include <arpa/inet.h>
@@ -53,6 +55,31 @@ static void og_set_system_error(const char *detail) {
     og_set_error(errno, detail);
 #endif
 }
+
+#ifdef _WIN32
+static void og_set_windows_error(const char *detail) {
+    og_set_error((int)GetLastError(), detail);
+}
+
+static wchar_t *og_utf8_to_wide(const char *value) {
+    if (!value) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, NULL, 0);
+    if (length <= 0) return NULL;
+    wchar_t *wide = (wchar_t *)calloc((size_t)length, sizeof(wchar_t));
+    if (!wide) {
+        SetLastError(ERROR_OUTOFMEMORY);
+        return NULL;
+    }
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, wide, length) <= 0) {
+        free(wide);
+        return NULL;
+    }
+    return wide;
+}
+#endif
 
 int og_socket_last_error_code(void) {
     return og_last_error;
@@ -568,3 +595,323 @@ int og_socket_close(OGSocketHandle handle) {
     return close(og_socket_value(handle));
 #endif
 }
+
+#ifdef _WIN32
+
+typedef struct OGNamedPipeListener {
+    wchar_t *pipe_name;
+    HANDLE pending;
+    CRITICAL_SECTION lock;
+    int closed;
+} OGNamedPipeListener;
+
+static HANDLE og_named_pipe_create_instance(const wchar_t *pipe_name, int first) {
+    DWORD open_mode = PIPE_ACCESS_DUPLEX;
+    if (first) open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+    return CreateNamedPipeW(
+        pipe_name,
+        open_mode,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES,
+        64 * 1024,
+        64 * 1024,
+        0,
+        NULL
+    );
+}
+
+int og_named_pipe_listener_create(const char *pipe_name, OGSocketHandle *listener) {
+    if (!pipe_name || !listener) {
+        og_set_error(ERROR_INVALID_PARAMETER, "invalid named-pipe listener arguments");
+        return -1;
+    }
+    wchar_t *wide = og_utf8_to_wide(pipe_name);
+    if (!wide) {
+        og_set_windows_error("named-pipe name is not valid UTF-8");
+        return -1;
+    }
+    HANDLE pending = og_named_pipe_create_instance(wide, 1);
+    if (pending == INVALID_HANDLE_VALUE) {
+        og_set_windows_error("could not create named-pipe listener");
+        free(wide);
+        return -1;
+    }
+    OGNamedPipeListener *state = (OGNamedPipeListener *)calloc(1, sizeof(*state));
+    if (!state) {
+        CloseHandle(pending);
+        free(wide);
+        og_set_error(ERROR_OUTOFMEMORY, "could not allocate named-pipe listener");
+        return -1;
+    }
+    state->pipe_name = wide;
+    state->pending = pending;
+    InitializeCriticalSection(&state->lock);
+    *listener = (OGSocketHandle)(uintptr_t)state;
+    return 0;
+}
+
+int og_named_pipe_listener_accept(OGSocketHandle listener, OGSocketHandle *handle) {
+    if (listener == OG_SOCKET_INVALID || !handle) {
+        og_set_error(ERROR_INVALID_PARAMETER, "invalid named-pipe accept arguments");
+        return -1;
+    }
+    OGNamedPipeListener *state = (OGNamedPipeListener *)(uintptr_t)listener;
+    EnterCriticalSection(&state->lock);
+    if (state->closed) {
+        LeaveCriticalSection(&state->lock);
+        og_set_error(ERROR_OPERATION_ABORTED, "named-pipe listener is closed");
+        return -1;
+    }
+    if (state->pending == INVALID_HANDLE_VALUE) {
+        state->pending = og_named_pipe_create_instance(state->pipe_name, 0);
+    }
+    HANDLE pending = state->pending;
+    LeaveCriticalSection(&state->lock);
+    if (pending == INVALID_HANDLE_VALUE) {
+        og_set_windows_error("could not create the next named-pipe instance");
+        return -1;
+    }
+
+    BOOL connected = ConnectNamedPipe(pending, NULL);
+    if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
+        og_set_windows_error("could not accept a named-pipe client");
+        return -1;
+    }
+
+    EnterCriticalSection(&state->lock);
+    if (state->closed) {
+        LeaveCriticalSection(&state->lock);
+        CloseHandle(pending);
+        og_set_error(ERROR_OPERATION_ABORTED, "named-pipe listener is closed");
+        return -1;
+    }
+    if (state->pending == pending) {
+        state->pending = og_named_pipe_create_instance(state->pipe_name, 0);
+    }
+    LeaveCriticalSection(&state->lock);
+    *handle = (OGSocketHandle)(uintptr_t)pending;
+    return 0;
+}
+
+int og_named_pipe_listener_close(OGSocketHandle listener) {
+    if (listener == OG_SOCKET_INVALID) return 0;
+    OGNamedPipeListener *state = (OGNamedPipeListener *)(uintptr_t)listener;
+    EnterCriticalSection(&state->lock);
+    if (!state->closed) {
+        state->closed = 1;
+        if (state->pending != INVALID_HANDLE_VALUE) {
+            CancelIoEx(state->pending, NULL);
+            CloseHandle(state->pending);
+            state->pending = INVALID_HANDLE_VALUE;
+        }
+    }
+    LeaveCriticalSection(&state->lock);
+    return 0;
+}
+
+int og_named_pipe_listener_destroy(OGSocketHandle listener) {
+    if (listener == OG_SOCKET_INVALID) return 0;
+    OGNamedPipeListener *state = (OGNamedPipeListener *)(uintptr_t)listener;
+    og_named_pipe_listener_close(listener);
+    DeleteCriticalSection(&state->lock);
+    free(state->pipe_name);
+    free(state);
+    return 0;
+}
+
+int og_named_pipe_connect(
+    const char *pipe_name,
+    double timeout_seconds,
+    OGSocketHandle *handle
+) {
+    if (!pipe_name || !handle) {
+        og_set_error(ERROR_INVALID_PARAMETER, "invalid named-pipe connection arguments");
+        return -1;
+    }
+    wchar_t *wide = og_utf8_to_wide(pipe_name);
+    if (!wide) {
+        og_set_windows_error("named-pipe name is not valid UTF-8");
+        return -1;
+    }
+    double milliseconds = timeout_seconds <= 0.0 ? 1.0 : timeout_seconds * 1000.0;
+    DWORD timeout = milliseconds >= (double)MAXDWORD ? MAXDWORD : (DWORD)(milliseconds + 0.5);
+    if (!WaitNamedPipeW(wide, timeout)) {
+        og_set_windows_error("timed out waiting for named-pipe leader");
+        free(wide);
+        return -1;
+    }
+    HANDLE pipe = CreateFileW(
+        wide,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL
+    );
+    free(wide);
+    if (pipe == INVALID_HANDLE_VALUE) {
+        og_set_windows_error("could not connect to named-pipe leader");
+        return -1;
+    }
+    DWORD mode = PIPE_READMODE_BYTE;
+    if (!SetNamedPipeHandleState(pipe, &mode, NULL, NULL)) {
+        og_set_windows_error("could not configure named-pipe byte mode");
+        CloseHandle(pipe);
+        return -1;
+    }
+    *handle = (OGSocketHandle)(uintptr_t)pipe;
+    return 0;
+}
+
+int og_named_pipe_is_ready(const char *pipe_name) {
+    wchar_t *wide = og_utf8_to_wide(pipe_name);
+    if (!wide) return 0;
+    BOOL ready = WaitNamedPipeW(wide, 1);
+    DWORD error = ready ? ERROR_SUCCESS : GetLastError();
+    free(wide);
+    if (ready) return 1;
+    return error == ERROR_FILE_NOT_FOUND ? 0 : 1;
+}
+
+int64_t og_named_pipe_read(OGSocketHandle handle, void *buffer, size_t capacity) {
+    if (!buffer || capacity == 0) return 0;
+    DWORD count = 0;
+    if (ReadFile((HANDLE)(uintptr_t)handle, buffer, (DWORD)capacity, &count, NULL)) {
+        return (int64_t)count;
+    }
+    DWORD error = GetLastError();
+    if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED) return 0;
+    og_set_error((int)error, NULL);
+    return -1;
+}
+
+int64_t og_named_pipe_write_all(
+    OGSocketHandle handle,
+    const void *buffer,
+    size_t length
+) {
+    size_t written = 0;
+    while (written < length) {
+        DWORD count = 0;
+        DWORD chunk = length - written > (size_t)MAXDWORD
+            ? MAXDWORD
+            : (DWORD)(length - written);
+        if (!WriteFile(
+                (HANDLE)(uintptr_t)handle,
+                (const char *)buffer + written,
+                chunk,
+                &count,
+                NULL
+            )) {
+            og_set_windows_error("named-pipe write failed");
+            return -1;
+        }
+        if (count == 0) {
+            og_set_error(ERROR_BROKEN_PIPE, "named pipe closed while writing");
+            return -1;
+        }
+        written += (size_t)count;
+    }
+    return (int64_t)written;
+}
+
+int og_named_pipe_close(OGSocketHandle handle) {
+    if (handle == OG_SOCKET_INVALID) return 0;
+    HANDLE pipe = (HANDLE)(uintptr_t)handle;
+    CancelIoEx(pipe, NULL);
+    return CloseHandle(pipe) ? 0 : -1;
+}
+
+int og_file_lock_acquire(
+    const char *path,
+    const char *contents,
+    OGSocketHandle *handle
+) {
+    if (!path || !handle) {
+        og_set_error(ERROR_INVALID_PARAMETER, "invalid file-lock arguments");
+        return -1;
+    }
+    wchar_t *wide = og_utf8_to_wide(path);
+    if (!wide) {
+        og_set_windows_error("file-lock path is not valid UTF-8");
+        return -1;
+    }
+    HANDLE file = CreateFileW(
+        wide,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    free(wide);
+    if (file == INVALID_HANDLE_VALUE) {
+        og_set_windows_error("could not acquire exclusive file lock");
+        return -1;
+    }
+    SetFilePointer(file, 0, NULL, FILE_BEGIN);
+    if (!SetEndOfFile(file)) {
+        og_set_windows_error("could not truncate file lock");
+        CloseHandle(file);
+        return -1;
+    }
+    if (contents && contents[0] != '\0') {
+        DWORD length = (DWORD)strlen(contents);
+        DWORD count = 0;
+        if (!WriteFile(file, contents, length, &count, NULL) || count != length) {
+            og_set_windows_error("could not write file-lock owner");
+            CloseHandle(file);
+            return -1;
+        }
+    }
+    FlushFileBuffers(file);
+    *handle = (OGSocketHandle)(uintptr_t)file;
+    return 0;
+}
+
+int og_file_lock_release(OGSocketHandle handle) {
+    if (handle == OG_SOCKET_INVALID) return 0;
+    return CloseHandle((HANDLE)(uintptr_t)handle) ? 0 : -1;
+}
+
+#else
+
+int og_named_pipe_listener_create(const char *pipe_name, OGSocketHandle *listener) {
+    (void)pipe_name; (void)listener;
+    og_set_error(ENOTSUP, "named pipes are only available on Windows");
+    return -1;
+}
+int og_named_pipe_listener_accept(OGSocketHandle listener, OGSocketHandle *handle) {
+    (void)listener; (void)handle;
+    og_set_error(ENOTSUP, "named pipes are only available on Windows");
+    return -1;
+}
+int og_named_pipe_listener_close(OGSocketHandle listener) { (void)listener; return 0; }
+int og_named_pipe_listener_destroy(OGSocketHandle listener) { (void)listener; return 0; }
+int og_named_pipe_connect(const char *pipe_name, double timeout_seconds, OGSocketHandle *handle) {
+    (void)pipe_name; (void)timeout_seconds; (void)handle;
+    og_set_error(ENOTSUP, "named pipes are only available on Windows");
+    return -1;
+}
+int og_named_pipe_is_ready(const char *pipe_name) { (void)pipe_name; return 0; }
+int64_t og_named_pipe_read(OGSocketHandle handle, void *buffer, size_t capacity) {
+    (void)handle; (void)buffer; (void)capacity;
+    og_set_error(ENOTSUP, "named pipes are only available on Windows");
+    return -1;
+}
+int64_t og_named_pipe_write_all(OGSocketHandle handle, const void *buffer, size_t length) {
+    (void)handle; (void)buffer; (void)length;
+    og_set_error(ENOTSUP, "named pipes are only available on Windows");
+    return -1;
+}
+int og_named_pipe_close(OGSocketHandle handle) { (void)handle; return 0; }
+int og_file_lock_acquire(const char *path, const char *contents, OGSocketHandle *handle) {
+    (void)path; (void)contents; (void)handle;
+    og_set_error(ENOTSUP, "portable file locks are only available on Windows");
+    return -1;
+}
+int og_file_lock_release(OGSocketHandle handle) { (void)handle; return 0; }
+
+#endif

@@ -1,5 +1,6 @@
 import Foundation
 import OpenGrokFastWorktree
+@testable import OpenGrokGitStatus
 import Testing
 @testable import OpenGrokCLI
 
@@ -114,6 +115,52 @@ struct LiveWorktreeLauncherReachabilityTests {
             return
         }
         #expect(error.description.contains("does not accept --force"))
+    }
+
+    @Test("live dirty guard reads HEAD from packed Git objects")
+    func packedGitDirtyGuard() throws {
+        let root = try makeRepository()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("repo", isDirectory: true)
+        let destination = root.appendingPathComponent("packed-worktree", isDirectory: true)
+        let report = try WorktreeBuilder(
+            source: source,
+            dest: destination,
+            creationMode: .gitCheckout,
+            allowedPoolRoot: root
+        ).create()
+        let packed = try runGit(["gc", "--prune=now"], cwd: source)
+        #expect(packed.exitCode == 0)
+        let record = WorktreeRecord(
+            id: "packed",
+            path: report.worktreePath,
+            sourceRepository: source,
+            repositoryName: "repo",
+            kind: .manual,
+            creationMode: report.creationMode,
+            head: report.commit
+        )
+
+        do {
+            let (_, gitDir, meta) = try discoverRepository(from: record.path)
+            _ = try GitObjectStore(gitDir: resolveCommonGitDir(gitDir: gitDir))
+                .loadHeadTree(headCommitHex: meta.headCommit)
+            let snapshot = try gitStatus(path: record.path)
+            if !snapshot.clean {
+                Issue.record("packed Git status entries: \(snapshot.entries)")
+            }
+            let hasLocalChanges = try LiveWorktreeComposition.hasLocalChanges(record)
+            #expect(hasLocalChanges == false)
+        } catch {
+            Issue.record("packed Git dirty guard failed: \(error)")
+            return
+        }
+        try "changed\n".write(
+            to: destination.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        #expect(try LiveWorktreeComposition.hasLocalChanges(record) == true)
     }
 
     @Test("missing worktree targets propagate a failure")

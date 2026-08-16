@@ -546,7 +546,7 @@ public final class ModelsManager: @unchecked Sendable {
         strategy: RefreshStrategy = .onlineIfUncached,
         cancellation: CancellationToken? = nil
     ) async throws {
-        try cancellation?.throwIfCancelled()
+        try cancellation?.throwIfCancelled(ModelsError.cancelled)
         let snap = lock.withLock { (input, credentials) }
         let fetchAuth = ModelFetchAuth.resolve(
             endpoints: snap.0.endpoints,
@@ -564,13 +564,13 @@ public final class ModelsManager: @unchecked Sendable {
             if strategy == .offline { return }
         }
 
-        try cancellation?.throwIfCancelled()
+        try cancellation?.throwIfCancelled(ModelsError.cancelled)
         let result = try await xaiTransport.fetchModels(
             listURL: origin,
             fetchAuth: fetchAuth,
             cancellation: cancellation
         )
-        try cancellation?.throwIfCancelled()
+        try cancellation?.throwIfCancelled(ModelsError.cancelled)
         guard !result.models.isEmpty else { return }
 
         let apiBaseOverride: String? = fetchAuth == .apiKey ? snap.0.endpoints.xaiApiBaseURL : nil
@@ -589,7 +589,7 @@ public final class ModelsManager: @unchecked Sendable {
         strategy: RefreshStrategy = .onlineIfUncached,
         cancellation: CancellationToken? = nil
     ) async throws {
-        try cancellation?.throwIfCancelled()
+        try cancellation?.throwIfCancelled(ModelsError.cancelled)
         let fingerprint = lock.withLock { credentials.codexAccountFingerprint }
         guard let fingerprint else { return }
 
@@ -601,9 +601,9 @@ public final class ModelsManager: @unchecked Sendable {
             if strategy == .offline { return }
         }
 
-        try cancellation?.throwIfCancelled()
+        try cancellation?.throwIfCancelled(ModelsError.cancelled)
         let (models, etag) = try await codexTransport.fetchCodexModels(cancellation: cancellation)
-        try cancellation?.throwIfCancelled()
+        try cancellation?.throwIfCancelled(ModelsError.cancelled)
         // Re-check fingerprint before publish.
         let still = lock.withLock { credentials.codexAccountFingerprint }
         guard still == fingerprint else { return }
@@ -677,4 +677,3 @@ private extension NSLock {
         return body()
     }
 }
-

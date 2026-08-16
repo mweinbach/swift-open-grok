@@ -81,7 +81,7 @@ public struct LiveLeaderClientAcquisition: Sendable {
 
     public init(
         dial: @escaping Dial = { path in
-            try await UnixSocketDialer.connect(path: path.path)
+            try await ACPLeaderSocketDialer.connect(path: path)
         },
         spawn: @escaping Spawn = { request in
             try LiveLeaderProcess.spawn(request)

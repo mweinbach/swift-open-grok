@@ -80,10 +80,9 @@ public final class InProcessCodeModeSession: CodeModeSession {
 
     private let runtime: CodeModeSessionRuntime
 
-    /// - Parameter executionCeilingMs: how long one uninterrupted
-    ///   JavaScript entry may hold a cell's runtime thread. Also the
-    ///   worst-case latency for terminating a cell that is spinning inside
-    ///   JavaScript; see `JavaScriptExecutionWatchdog`.
+    /// - Parameter executionCeilingMs: fallback ceiling used when the runtime
+    ///   cannot launch the isolated `open-grok` worker (primarily tests).
+    ///   Production cells run in that worker and terminate by process kill.
     public init(
         delegate: CodeModeSessionDelegate = NoopCodeModeSessionDelegate(),
         executionCeilingMs: UInt64 = CODE_MODE_DEFAULT_EXECUTION_CEILING_MS

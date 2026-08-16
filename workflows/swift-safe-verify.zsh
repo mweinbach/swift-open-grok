@@ -93,6 +93,15 @@ run_with_timeout() {
   return $cmd_status
 }
 
+prepare_code_mode_worker() {
+  run_with_timeout swift build --product open-grok --scratch-path "$scratch_path" --jobs "$jobs"
+  local worker_name="open-grok"
+  if [[ "${OSTYPE:-}" == msys* || "${OSTYPE:-}" == cygwin* ]]; then
+    worker_name="open-grok.exe"
+  fi
+  export OPENGROK_CODE_MODE_WORKER_EXECUTABLE="${scratch_path}/debug/${worker_name}"
+}
+
 lock_acquired=false
 cleanup_lock() {
   kill_active_command_group
@@ -153,6 +162,7 @@ case "$action" in
     if [[ -z "${OPENGROK_PERFORMANCE_PROFILE:-}" ]]; then
       export OPENGROK_PERFORMANCE_PROFILE=macos-15
     fi
+    prepare_code_mode_worker
     run_with_timeout swift test --scratch-path "$scratch_path" --jobs "$jobs" "${test_args[@]}"
     ;;
   test-target)
@@ -173,10 +183,10 @@ case "$action" in
     if [[ -z "${OPENGROK_PERFORMANCE_PROFILE:-}" ]]; then
       export OPENGROK_PERFORMANCE_PROFILE=macos-15
     fi
-    # If testing PTY or Executable, ensure binary is compiled
-    if [[ "$target_name" == *"PTY"* || "$target_name" == *"Executable"* ]]; then
-      print -u2 "swift-safe-verify: pre-building open-grok product for $target_name"
-      run_with_timeout swift build --product open-grok --scratch-path "$scratch_path" --jobs "$jobs"
+    # If testing PTY, Executable, or JavaScriptRuntime, ensure binary is compiled
+    if [[ "$target_name" == *"PTY"* || "$target_name" == *"Executable"* || "$target_name" == *"JavaScriptRuntime"* ]]; then
+        print -u2 "swift-safe-verify: pre-building open-grok product for $target_name"
+        prepare_code_mode_worker
     fi
     run_with_timeout swift test --filter "$target_name" --scratch-path "$scratch_path" --jobs "$jobs" "${target_args[@]}"
     ;;

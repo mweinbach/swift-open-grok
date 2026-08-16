@@ -41,9 +41,9 @@ import OpenGrokShared
 /// in the same type. Distinct from `ACPWebSocketTransport`, which sits on the
 /// URLSession-backed `WebSocketClient` and cannot serve.
 public struct ACPWebSocketConnectionTransport: ACPTransport {
-    private let connection: WebSocketConnection
+    private let connection: any WebSocketClient
 
-    public init(connection: WebSocketConnection) {
+    public init(connection: any WebSocketClient) {
         self.connection = connection
     }
 

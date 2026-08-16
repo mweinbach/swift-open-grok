@@ -145,13 +145,16 @@ private struct AntigravityHostFixture {
     static func spawnArgs(
         model: String = "antigravity:gemini-3.6-flash",
         capabilityMode: String? = nil,
-        resumeFrom: String? = nil
+        resumeFrom: String? = nil,
+        taskID: String? = nil,
+        reasoningEffort: String? = nil,
+        background: Bool = false
     ) -> JSONValue {
         var object: [String: JSONValue] = [
             "prompt": .string("probe the fixture"),
             "description": .string("antigravity probe"),
             "subagent_type": .string("general-purpose"),
-            "background": .bool(false),
+            "background": .bool(background),
             "model": .string(model),
         ]
         if let capabilityMode {
@@ -159,6 +162,12 @@ private struct AntigravityHostFixture {
         }
         if let resumeFrom {
             object["resume_from"] = .string(resumeFrom)
+        }
+        if let taskID {
+            object["task_id"] = .string(taskID)
+        }
+        if let reasoningEffort {
+            object["reasoning_effort"] = .string(reasoningEffort)
         }
         return .object(object)
     }
@@ -172,7 +181,10 @@ private struct AntigravityHostFixture {
             models: ["gemini-3.6-flash", "claude-sonnet-4-6"],
             detail: nil
         ),
-        runOutcome: LiveAntigravityRunOutcome = .success(output: "agy final answer")
+        runOutcome: LiveAntigravityRunOutcome = .success(
+            output: "agy final answer",
+            conversationID: nil
+        )
     ) -> LiveAntigravityServices {
         LiveAntigravityServices(
             loadConfig: { LiveAntigravityConfig.load(environment: $0) },
@@ -233,6 +245,104 @@ struct LiveAntigravityHelperTests {
             skipPermissions: false
         )
         #expect(!antigravityArguments(for: run).contains("--dangerously-skip-permissions"))
+    }
+
+    @Test("effort planning swaps suffixed siblings and clamps base-model effort")
+    func effortPlanning() {
+        let roster = [
+            "gemini-3.6-flash-low",
+            "gemini-3.6-flash-medium",
+            "gemini-3.6-flash-high",
+            "claude-sonnet-4-6",
+        ]
+        #expect(planAntigravityModelArguments(
+            model: "gemini-3.6-flash-high",
+            effort: "minimal",
+            roster: roster
+        ) == LiveAntigravityModelPlan(model: "gemini-3.6-flash-low", effort: nil))
+        #expect(planAntigravityModelArguments(
+            model: "claude-sonnet-4-6",
+            effort: "ultra",
+            roster: roster
+        ) == LiveAntigravityModelPlan(model: "claude-sonnet-4-6", effort: "high"))
+        #expect(normalizeAntigravityEffort("none") == nil)
+    }
+
+    @Test("argv carries planned effort and conversation continuation")
+    func argvEffortAndConversation() {
+        let run = LiveAntigravityRun(
+            binary: "agy",
+            model: "gemini-3.6-flash",
+            effort: "xhigh",
+            modelRoster: ["gemini-3.6-flash"],
+            prompt: "continue",
+            workspaceDirectory: URL(fileURLWithPath: "/tmp/ws", isDirectory: true),
+            logFile: URL(fileURLWithPath: "/tmp/agy.log"),
+            timeout: 45,
+            skipPermissions: false,
+            conversationID: "3605d5fa-fbdd-442c-83f4-90325fbc9186"
+        )
+        let args = antigravityArguments(for: run)
+        #expect(args.containsSubsequence(["--effort", "high"]))
+        #expect(args.containsSubsequence([
+            "--conversation", "3605d5fa-fbdd-442c-83f4-90325fbc9186"
+        ]))
+    }
+
+    @Test("model guidance floats the reference family first")
+    func rosterOrdering() {
+        let status = LiveAntigravityStatus(
+            signedIn: true,
+            models: [
+                "claude-sonnet-4-6",
+                "gemini-3.6-flash-high",
+                "gemini-3.6-flash",
+                "gemini-3.6-pro",
+            ],
+            detail: nil
+        )
+        #expect(status.prefixedModels == [
+            "antigravity:gemini-3.6-flash",
+            "antigravity:gemini-3.6-flash-high",
+            "antigravity:claude-sonnet-4-6",
+            "antigravity:gemini-3.6-pro",
+        ])
+    }
+
+    @Test("log helpers recover HTTP port, conversation id, and phases")
+    func logHelpers() {
+        let conversation = "3605d5fa-fbdd-442c-83f4-90325fbc9186"
+        let log = """
+        Language server listening on random port at 51042 for HTTPS
+        Print mode: conversation=\(conversation), sending message
+        Language server listening on random port at 51043 for HTTP
+        ExecuteCommand tool_call
+        """
+        #expect(parseAntigravityHTTPPort(log) == 51043)
+        #expect(extractAntigravityConversationID(log) == conversation)
+        #expect(antigravityPhase(from: log) == "Working")
+        #expect(antigravityPhase(from: "Language server shutting down") == "Wrapping up")
+    }
+
+    @Test("quota and available-model Connect payloads parse")
+    func quotaParsers() throws {
+        let quota = try #require(parseAntigravityQuotaSummary(Data("""
+        {"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+          {"displayName":"Daily Limit","bucketId":"daily","window":"daily","remainingFraction":0.25,"resetTime":"2026-08-17T00:00:00Z"}
+        ]}]}}
+        """.utf8)))
+        #expect(quota.count == 1)
+        #expect(quota[0].label == "Daily Limit")
+        #expect(quota[0].remainingFraction == 0.25)
+
+        let models = try #require(parseAntigravityAvailableModels(Data("""
+        {"response":{"models":{
+          "gemini-3.6-flash":{"quotaInfo":{"remainingFraction":1}},
+          "gemini-3.6-pro":{"quotaInfo":{"remainingFraction":0}}
+        }}}
+        """.utf8)))
+        #expect(models.count == 2)
+        #expect(models.first(where: { $0.key == "gemini-3.6-pro" })?.isExhausted == true)
     }
 
     @Test("classify_output success returns trimmed stdout")
@@ -353,6 +463,62 @@ struct LiveAntigravityHelperTests {
 
 @Suite("antigravity spawn through the live seam", .serialized)
 struct LiveAntigravitySpawnTests {
+    @Test("running antigravity child retains attachable live items")
+    func runningChildAttachment() async throws {
+        let gate = AntigravityRunGate()
+        let capture = AntigravityRunCapture()
+        let services = LiveAntigravityServices(
+            loadConfig: { _ in
+                LiveAntigravityConfig(enabled: true, binary: "agy", skipPermissions: true)
+            },
+            isCLIInstalled: { _, _ in true },
+            probeModels: { _ in
+                LiveAntigravityStatus(
+                    signedIn: true,
+                    models: ["gemini-3.6-flash"],
+                    detail: nil
+                )
+            },
+            runPrint: { run in
+                capture.append(run)
+                return await gate.wait()
+            }
+        )
+        let fixture = try AntigravityHostFixture(services: services)
+        defer { fixture.dispose() }
+
+        let spawn = await fixture.host.spawn(
+            args: AntigravityHostFixture.spawnArgs(taskID: "agy-running", background: true),
+            toolCallID: "call-agy-running"
+        )
+        guard case .success = spawn else {
+            Issue.record("background spawn failed: \(spawn)")
+            return
+        }
+
+        for _ in 0..<50 {
+            if await fixture.host.subagentSnapshot(id: "agy-running") != nil { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let items = try #require(await fixture.host.subagentConversationItems(id: "agy-running"))
+        let snapshot = try #require(await fixture.host.subagentSnapshot(id: "agy-running"))
+        #expect(snapshot.status == "running")
+        #expect(items.contains { item in
+            if case .assistant(let assistant) = item {
+                return assistant.content.contains("Antigravity: Starting")
+            }
+            return false
+        })
+        let rendered = LiveSubagentAttachment.lines(items: items, snapshot: snapshot)
+            .map(\.text).joined(separator: "\n")
+        #expect(rendered.contains("Status: running"))
+        #expect(rendered.contains("Antigravity: Starting"))
+
+        await gate.release(.success(output: "done", conversationID: "conversation-running"))
+        let completed = await fixture.host.awaitSubagent(id: "agy-running", timeoutMS: 2_000)
+        #expect(completed?.completed == true)
+    }
+
     @Test("antigravity model routes to the CLI runner, not runChild")
     func routesToCLIRunner() async throws {
         let fixture = try AntigravityHostFixture(
@@ -378,6 +544,96 @@ struct LiveAntigravitySpawnTests {
         #expect(run.model == "gemini-3.6-flash")
         #expect(run.skipPermissions == true)
         #expect(antigravityArguments(for: run).contains("--dangerously-skip-permissions"))
+    }
+
+    @Test("resume passes the stored Antigravity conversation and effort")
+    func conversationResume() async throws {
+        let capture = AntigravityRunCapture()
+        let services = LiveAntigravityServices(
+            loadConfig: { _ in
+                LiveAntigravityConfig(enabled: true, binary: "agy", skipPermissions: true)
+            },
+            isCLIInstalled: { _, _ in true },
+            probeModels: { _ in
+                LiveAntigravityStatus(
+                    signedIn: true,
+                    models: ["gemini-3.6-flash"],
+                    detail: nil
+                )
+            },
+            runPrint: { run in
+                capture.append(run)
+                return .success(
+                    output: run.conversationID == nil ? "first" : "continued",
+                    conversationID: run.conversationID ?? "conversation-source"
+                )
+            }
+        )
+        let fixture = try AntigravityHostFixture(services: services)
+        defer { fixture.dispose() }
+
+        guard case .success = await fixture.host.spawn(
+            args: AntigravityHostFixture.spawnArgs(
+                taskID: "agy-source",
+                reasoningEffort: "xhigh"
+            ),
+            toolCallID: "call-agy-source"
+        ) else {
+            Issue.record("source Antigravity spawn failed")
+            return
+        }
+        guard case .success = await fixture.host.spawn(
+            args: AntigravityHostFixture.spawnArgs(
+                resumeFrom: "agy-source",
+                taskID: "agy-resumed"
+            ),
+            toolCallID: "call-agy-resumed"
+        ) else {
+            Issue.record("resumed Antigravity spawn failed")
+            return
+        }
+
+        #expect(capture.all.count == 2)
+        #expect(capture.all[0].effort == "xhigh")
+        #expect(capture.all[0].modelRoster == ["gemini-3.6-flash"])
+        #expect(capture.all[1].conversationID == "conversation-source")
+        #expect(capture.all[1].model == "gemini-3.6-flash")
+    }
+
+    @Test("cached availability and quota surface before spawning")
+    func cachedAvailabilityAndUsage() async throws {
+        LiveAntigravityComposition.invalidateCaches()
+        defer { LiveAntigravityComposition.invalidateCaches() }
+        LiveAntigravityCache.shared.store(models: [
+            LiveAntigravityModelAvailability(
+                key: "gemini-3.6-pro",
+                remainingFraction: 0
+            )
+        ])
+        LiveAntigravityCache.shared.store(quota: [
+            LiveAntigravityQuotaBucket(
+                group: "Gemini Models",
+                displayName: "Daily Limit",
+                bucketID: "daily",
+                window: "daily",
+                remainingFraction: 0,
+                resetTime: "2026-08-17T00:00:00Z"
+            )
+        ])
+        #expect(antigravityModelAvailabilityIssue(
+            model: "gemini-3.6-pro",
+            roster: ["gemini-3.6-pro"]
+        ) == .exhausted)
+        let message = antigravityUnavailableModelMessage(
+            model: "gemini-3.6-pro",
+            issue: .exhausted
+        )
+        #expect(message.contains("out of quota"))
+        #expect(message.contains("Daily Limit exhausted"))
+
+        let report = await LiveUsageComposition.report(context: nil, items: [])
+        #expect(report.antigravityQuota?.buckets.count == 1)
+        #expect(LiveUsageComposition.render(report).contains("Antigravity quota"))
     }
 
     @Test("Error:-prefixed runner outcome surfaces as spawn failure")
@@ -440,7 +696,7 @@ struct LiveAntigravitySpawnTests {
             runPrint: { run in
                 capture.append(run)
                 Issue.record("runPrint must not run when feature is disabled")
-                return .success(output: "nope")
+                return .success(output: "nope", conversationID: nil)
             }
         )
         let fixture = try AntigravityHostFixture(services: services)
@@ -472,7 +728,7 @@ struct LiveAntigravitySpawnTests {
             },
             runPrint: { run in
                 capture.append(run)
-                return .success(output: "nope")
+                return .success(output: "nope", conversationID: nil)
             }
         )
         let fixture = try AntigravityHostFixture(services: services)
@@ -507,7 +763,7 @@ struct LiveAntigravitySpawnTests {
             },
             runPrint: { run in
                 capture.append(run)
-                return .success(output: "nope")
+                return .success(output: "nope", conversationID: nil)
             }
         )
         let fixture = try AntigravityHostFixture(services: services)
@@ -544,7 +800,7 @@ struct LiveAntigravitySpawnTests {
             },
             runPrint: { run in
                 capture.append(run)
-                return .success(output: "ok")
+                return .success(output: "ok", conversationID: nil)
             }
         )
         let fixture = try AntigravityHostFixture(services: services)
@@ -586,7 +842,7 @@ struct LiveAntigravitySpawnTests {
                     detail: nil
                 )
             },
-            runPrint: { _ in .success(output: "ok") }
+            runPrint: { _ in .success(output: "ok", conversationID: nil) }
         )
         let fixture = try AntigravityHostFixture(services: services)
         defer { fixture.dispose() }
@@ -618,7 +874,7 @@ struct LiveAntigravitySpawnTests {
             },
             runPrint: { _ in
                 ran.set(true)
-                return .success(output: "ok")
+                return .success(output: "ok", conversationID: nil)
             }
         )
         let fixture = try AntigravityHostFixture(services: services)
@@ -657,5 +913,37 @@ private final class LockedBox: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return value
+    }
+}
+
+private actor AntigravityRunGate {
+    private var continuation: CheckedContinuation<LiveAntigravityRunOutcome, Never>?
+    private var pending: LiveAntigravityRunOutcome?
+
+    func wait() async -> LiveAntigravityRunOutcome {
+        if let pending {
+            self.pending = nil
+            return pending
+        }
+        return await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release(_ outcome: LiveAntigravityRunOutcome) {
+        if let continuation {
+            self.continuation = nil
+            continuation.resume(returning: outcome)
+        } else {
+            pending = outcome
+        }
+    }
+}
+
+private extension Array where Element == String {
+    func containsSubsequence(_ subsequence: [String]) -> Bool {
+        guard !subsequence.isEmpty, subsequence.count <= count else { return false }
+        for start in 0...(count - subsequence.count) {
+            if Array(self[start..<(start + subsequence.count)]) == subsequence { return true }
+        }
+        return false
     }
 }

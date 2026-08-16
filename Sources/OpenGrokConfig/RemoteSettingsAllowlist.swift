@@ -77,6 +77,16 @@ public struct AllowlistedRemoteSettings: Sendable, Equatable {
     /// `LiveRecap.enabled` (`resolve_session_recap`, config.rs:2657-2667).
     public var sessionRecap: Bool?
 
+    // -- Session feature authority (EffectiveFeatures) --
+
+    public var traceUploadEnabled: Bool?
+    public var twoPassCompactionEnabled: Bool?
+    public var askUserQuestionEnabled: Bool?
+    public var writeFileEnabled: Bool?
+    public var cancelRewindEnabled: Bool?
+    public var compactionMode: String?
+    public var compactionDetail: String?
+
     public init() {}
 }
 
@@ -100,6 +110,13 @@ extension AllowlistedRemoteSettings {
         self.zdrAccessEnabled = remote.zdrAccessEnabled
         self.gateMessage = remote.gateMessage
         self.sessionRecap = remote.sessionRecap
+        self.traceUploadEnabled = remote.traceUploadEnabled
+        self.twoPassCompactionEnabled = remote.twoPassCompactionEnabled
+        self.askUserQuestionEnabled = remote.askUserQuestionEnabled
+        self.writeFileEnabled = remote.writeFileEnabled
+        self.cancelRewindEnabled = remote.cancelRewindEnabled
+        self.compactionMode = remote.compactionMode
+        self.compactionDetail = remote.compactionDetail
     }
 }
 
@@ -121,4 +138,11 @@ public let remoteSettingsAllowlistedWireNames: Set<String> = [
     "zdr_access_enabled",
     "gate_message",
     "session_recap",
+    "trace_upload_enabled",
+    "two_pass_compaction_enabled",
+    "ask_user_question_enabled",
+    "write_file_enabled",
+    "cancel_rewind_enabled",
+    "compaction_mode",
+    "compaction_detail",
 ]

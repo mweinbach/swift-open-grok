@@ -32,9 +32,9 @@
 // isolation, the foreground await budget with auto-backgrounding, and durable
 // cross-process resume metadata. Antigravity CLI runners live in
 // `LiveAntigravity.swift` / `LiveAntigravityRunner.swift` and branch from
-// `spawn` when the resolved model carries the `antigravity:` prefix. Resume
-// works within the session through the same conversation store the root
-// session uses (Antigravity `--conversation` resume is not wired this slice).
+// `spawn` when the resolved model carries the `antigravity:` prefix. Ordinary
+// children resume from the conversation store; Antigravity children resume
+// within the process from their retained `--conversation` id.
 
 import Foundation
 import OpenGrokAgentCoordinator
@@ -248,6 +248,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         var errors: UInt32 = 0
         var terminalToolCalls: UInt32?
         var terminalTurns: UInt32?
+        var liveItems: [ConversationItem] = []
+        var antigravityConversationID: String? = nil
+        var antigravityPhase: String? = nil
     }
     var bookkeeping: [String: Bookkeeping] = [:]
     private var childExecutors: [String: LiveToolExecutor] = [:]
@@ -522,6 +525,10 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                         "type": .string("string"),
                         "description": .string("Optional model slug for this agent. If provided, it must resolve to one of the available model slugs, and its provider must have usable credentials. If omitted, the subagent uses the same model as the parent agent."),
                     ]),
+                    "reasoning_effort": .object([
+                        "type": .string("string"),
+                        "description": .string("Optional reasoning effort for this agent. May also be supplied with resume_from to select the resumed continuation's effort."),
+                    ]),
                 ]),
                 "required": .array([.string("prompt"), .string("description")]),
                 "additionalProperties": .bool(false),
@@ -688,6 +695,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             overrides: SubagentRuntimeOverrides(
                 model: sanitizeOptionalArg(input.model),
                 persona: effectivePersona,
+                reasoningEffort: sanitizeOptionalArg(input.reasoningEffort),
                 capabilityMode: requestedCapability,
                 isolation: input.isolation,
                 allowNestedSubagents: false
@@ -767,16 +775,25 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                         modelID: source.model,
                         childCWD: source.childCWD?.path ?? "",
                         worktreePath: source.worktreePath,
-                        childSessionID: resumeID
+                        childSessionID: resumeID,
+                        antigravityConversationID: source.antigravityConversationID
                     )
                 )
             } catch {
                 return .failure(.invalidCall(String(describing: error)))
             }
-            guard let record = try? await context.conversationStore.loadIfPresent(sessionID: resumeID) else {
-                return .failure(.invalidCall(Self.resumeNotFoundMessage(resumeID)))
+            if LiveAntigravityComposition.stripModelPrefix(source.model) != nil {
+                guard source.antigravityConversationID != nil else {
+                    return .failure(.invalidCall(
+                        LiveAntigravityRefusal.cannotResume(subagentID: resumeID)
+                    ))
+                }
+            } else {
+                guard let record = try? await context.conversationStore.loadIfPresent(sessionID: resumeID) else {
+                    return .failure(.invalidCall(Self.resumeNotFoundMessage(resumeID)))
+                }
+                resumeItems = record.items
             }
-            resumeItems = record.items
             // A resumed child pins the source's model; an explicit override is
             // ignored, mirroring `run_shell_child`'s resume arm.
             runtime.model = source.model
@@ -805,6 +822,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
 
         let childModel = runtime.model ?? context.parentModel
         let antigravityModel = LiveAntigravityComposition.stripModelPrefix(childModel)
+        var antigravityRoster: [String] = []
         // Upstream assigns `Uuid::now_v7()`. The port has no v7 helper; a v4
         // UUID costs the time-ordered id sort (cosmetic only — completion
         // order is tracked separately), noted in the slice report.
@@ -824,11 +842,6 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         // (antigravity_runner.rs:100-127), before coordinator.spawn so a
         // background spawn cannot escape with a refusal.
         if let antigravityModel {
-            if let resumeID {
-                return .failure(.invalidCall(
-                    LiveAntigravityRefusal.cannotResume(subagentID: resumeID)
-                ))
-            }
             let config = context.antigravityServices.loadConfig(context.environment)
             guard config.enabled else {
                 return .failure(.invalidCall(LiveAntigravityRefusal.featureDisabled))
@@ -858,6 +871,15 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                     )
                 ))
             }
+            antigravityRoster = status.models
+            if let issue = antigravityModelAvailabilityIssue(
+                model: antigravityModel,
+                roster: status.models
+            ) {
+                return .failure(.invalidCall(
+                    antigravityUnavailableModelMessage(model: antigravityModel, issue: issue)
+                ))
+            }
         }
 
         // The child's tool policy: the resolved definition after the nested
@@ -883,6 +905,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         let childDefinition = strippedDefinition
         let childRuntime = runtime
         let inheritedItems = resumeItems
+        let childAntigravityRoster = antigravityRoster
+        let inheritedAntigravityConversationID = resumeSource?.antigravityConversationID
 
         bookkeeping[childID] = Bookkeeping(
             startedAt: Date(),
@@ -891,7 +915,13 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             model: childModel,
             persona: runtime.persona,
             childCWD: childCWD,
-            worktreePath: resumedWorktree
+            worktreePath: resumedWorktree,
+            liveItems: antigravityModel == nil ? [] : [
+                .user(input.prompt),
+                .assistant(AssistantItem(content: "Antigravity: Starting")),
+            ],
+            antigravityConversationID: inheritedAntigravityConversationID,
+            antigravityPhase: antigravityModel == nil ? nil : "Starting"
         )
         let request = OpenGrokChildRequest(
             id: childID,
@@ -922,7 +952,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                             prompt: input.prompt,
                             model: antigravityModel,
                             runtime: childRuntime,
-                            cwd: childCWD
+                            cwd: childCWD,
+                            modelRoster: childAntigravityRoster,
+                            conversationID: inheritedAntigravityConversationID
                         )
                     }
                     return await self.runChild(
@@ -1186,6 +1218,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             }
         }
         items.append(.user(prompt))
+        bookkeeping[childID]?.liveItems = items
 
         let childProvider = resolveSubagentModelProvider(model)
         if let childProvider, !childProvider.profile.allowsXaiServices {
@@ -1223,6 +1256,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             // loop's "safe model boundary" (the root loop's identical drain
             // point sits at LiveShellSamplingDriver.runTurn's round top).
             items.append(contentsOf: takeChildFollowups(childID))
+            bookkeeping[childID]?.liveItems = items
             // Child sampling effort (Rust handle_request.rs:705-714): parse
             // the resolved runtime token when present. A non-nil but unknown
             // token is treated as no override so the parent sampler default
@@ -1252,6 +1286,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             }
             characters += response.output.count
             items.append(contentsOf: response.items)
+            bookkeeping[childID]?.liveItems = items
 
             guard !response.toolCalls.isEmpty else {
                 if stopHookContinuations < 8 {
@@ -1271,6 +1306,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                         stopHookContinuations += 1
                         stopHookActive = true
                         items.append(.autoContinue(formatLiveStopFeedback(stopResult)))
+                        bookkeeping[childID]?.liveItems = items
                         continue
                     }
                 }
@@ -1291,6 +1327,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                     executor: executor
                 )
                 items.append(contentsOf: toolItems)
+                bookkeeping[childID]?.liveItems = items
             } catch is CancellationError {
                 cancelled = true
                 terminalError = "Subagent was cancelled"
@@ -1302,6 +1339,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         }
 
         let stats = bookkeeping[childID]
+        bookkeeping[childID]?.liveItems = items
         bookkeeping[childID]?.terminalToolCalls = stats?.toolCalls
         bookkeeping[childID]?.terminalTurns = stats?.turns
         // The transcript is the resume substrate: only a child whose save
@@ -1465,20 +1503,28 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         )
     }
 
+    func subagentConversationItems(id: String) -> [ConversationItem]? {
+        bookkeeping[id]?.liveItems
+    }
+
     /// The Running arm of `format_subagent_snapshot`, minus the context-token
     /// fraction this composition does not measure (recorded divergence).
     private func runningOutput(id: String, meta: Bookkeeping?, startedAt: Date) -> String {
         let elapsed = Double(Self.milliseconds(since: startedAt)) / 1_000
         let tools = meta?.toolsUsed.isEmpty == false ? (meta?.toolsUsed.joined(separator: ", ") ?? "") : "none yet"
-        return """
-        Subagent is still running.
-        Type: \(meta?.subagentType ?? "unknown")
-        Description: \(meta?.description ?? "")
-        Elapsed: \(String(format: "%.1f", elapsed))s
-        Progress: turn \(meta?.turns ?? 0), \(meta?.toolCalls ?? 0) tool calls
-        Tools used: \(tools)
-        Errors: \(meta?.errors ?? 0)
-        """
+        var lines = [
+            "Subagent is still running.",
+            "Type: \(meta?.subagentType ?? "unknown")",
+            "Description: \(meta?.description ?? "")",
+            "Elapsed: \(String(format: "%.1f", elapsed))s",
+            "Progress: turn \(meta?.turns ?? 0), \(meta?.toolCalls ?? 0) tool calls",
+        ]
+        if let phase = meta?.antigravityPhase {
+            lines.append("Phase: \(phase)")
+        }
+        lines.append("Tools used: \(tools)")
+        lines.append("Errors: \(meta?.errors ?? 0)")
+        return lines.joined(separator: "\n")
     }
 
     func awaitSubagent(id: String, timeoutMS: UInt64) async -> LiveSubagentSnapshot? {

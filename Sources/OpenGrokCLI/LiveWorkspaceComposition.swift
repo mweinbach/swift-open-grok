@@ -539,7 +539,7 @@ public enum LiveWorkspaceComposition {
             environment: environment
         )
         do {
-            let channel = try await UnixSocketDialer.connect(path: paths.socket.path)
+            let channel = try await ACPLeaderSocketDialer.connect(path: paths.socket)
             return try await LeaderWorkspaceControlChannel.register(channel: channel)
         } catch let error as WorkspaceRouteError {
             throw error

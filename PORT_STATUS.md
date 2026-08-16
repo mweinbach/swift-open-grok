@@ -1,11 +1,42 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-14 (Wave 27 — Multi-Provider Subsystem Wave: 9-Provider Storage, CLI Login/Logout/Status, Wire Policies & Dialects, Dynamic Catalog Broker Resolution). **No platform CI job is green yet.** Platform CI *runs* on macOS and Linux (builds, links, reaches the suite) but is not green. Local serial gate for this verification (2026-08-14): `build` exit 0; `build-tests` exit 0; `build --product open-grok` exit 0 (clean build, 3.67s); authoritative full `test --no-parallel` exit 0 — exactly **7,156 Swift Testing cases in 1,095 suites passed** after 329.722s (100% green, 0 failures, 0 regressions against baseline).
+**As of:** 2026-08-16 (Wave G — non-TUI parity closure). **The current Wave G tree is locally green but has not been pushed, so there is no current remote platform-green claim.** The latest pushed CI run is Wave F commit `ae45c76` from 2026-08-16 and failed its macOS, Linux, and Windows compile jobs. Local Wave G serial gate: `build-tests` exit 0; authoritative full `test --no-parallel` exit 0 — exactly **7,573 Swift Testing cases in 1,137 suites across 106 nonempty summaries passed** (0 failures, 0 recorded issues).
 
 **Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (All 9 Model Providers [xAI, Codex, Kimi Platform & Code, Fireworks AI, DeepSeek, Meta Muse Spark, OpenCode Go, Wafer AI, Z AI], Multi-Provider Scoped Storage & CLI Auth Management, Provider Wire Policies & Dialects, Dynamic Catalog Broker Resolution, MCP Meta-Discovery `search_tool`/`use_tool` & FNV-1a Fingerprints, Background Monitor Tool with Token-Bucket Rate Limiter & Suppression Tracker, Cursor Rules on Read Attachment & Scope Scanner, Memory MMR Maximal Marginal Relevance & Query Expansion, Bounded Stdio MCP Auto-Restart & Backoff, Durable Session Relocation Journal & Transactional Authority, Image Normalization & Resizing with SHA-256 Digest Cache, Pre-Warmed Subagent Git Worktree Pool, Native Workflow Engine & Rhai AST/Interpreter/Journal/Escalation, Interactive Terminal Composer Rich Elements & Image Framing, Markdown Table Wrapped-Fragment & 11-Glyph Box Drawing Layout Parity, Tool Catalog Schemas & Protocol Output Caps, Agent Runtime & Turn Pipeline, ACP Transports, Custom Models Settings UI & Store Persistence, Steady-State Cache Tracking & Cold-Start Diagnostics, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`) / Forward Sync `eb215dd0` (`v1.0.0-open-grok.63`).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
+
+## Wave G — Non-TUI parity closure (2026-08-16, complete locally)
+
+Current truth for the Wave G backlog against reference pin `650c1db7`:
+
+1. **Running subagent attachment** — live attachments read retained in-memory conversation items while a child is still running; Antigravity publishes its starting transcript and phase before coordinator exposure.
+2. **Session feature gates** — the remaining `GROK_*` family covers two-pass compaction, ask-user-question, write-file, backend search, cancel rewind, MCP liveness watchers, compaction mode/detail, and telemetry trace upload.
+3. **Single launch authority** — `EffectiveFeatures.resolve` produces the session feature document consumed by launch composition instead of independent live-surface re-resolution.
+4. **Automatic worktree GC** — launch-time GC is policy-gated, throttled, protects active/primary paths, and reports disabled, throttled, dry-run, or collected outcomes.
+5. **Code Mode hard interrupt** — the packaged JavaScript worker subprocess provides immediate process termination while preserving the actor command/control terminal signals.
+6. **Antigravity follow-ons** — reasoning effort planning, conversation continuation, log-phase heartbeats, available-model state, and quota caching are live.
+7. **Packed Git status** — the live pure-status path reads pack-index-v2 objects and resolves bounded OFS/REF deltas with system zlib support.
+8. **Portable secure WebSockets** — `wss://` uses the portable connection path and the Foundation trust bridge prepares additional trust roots on supported hosts.
+9. **Windows leader IPC** — the leader listener/dialer uses path-derived Windows named pipes while Unix platforms retain domain sockets.
+10. **Chat/local workspace CLI** — `--chat`, local workspace create/attach, and cwd flags parse, validate their relationships, and reach executable composition.
+11. **Platform gate implementation** — CI defines blocking macOS/Linux build-and-test jobs, Windows compile coverage, diagnostic Windows tests, and a privileged Linux bwrap namespace probe. Post-push platform conclusions remain evidence to collect, not missing product wiring.
+
+Verification (local macOS, 2026-08-16):
+
+| Command | Result |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh build-tests` | exit 0 |
+| `SWIFT_SAFE_TIMEOUT_SECONDS=2400 zsh workflows/swift-safe-verify.zsh test --no-parallel` | exit 0; **7,573 tests / 1,137 suites / 106 nonempty summaries**, 0 failures |
+| `SWIFT_SAFE_TIMEOUT_SECONDS=900 zsh workflows/swift-safe-verify.zsh test-target OpenGrokCLITests --no-parallel` | exit 0; **1,570 tests / 237 suites**, 0 failures |
+| `SWIFT_SAFE_TIMEOUT_SECONDS=300 zsh workflows/swift-safe-verify.zsh test --filter 'runningChildAttachment' --no-parallel` | exit 0; **1 test / 1 suite** |
+| `SWIFT_SAFE_TIMEOUT_SECONDS=300 zsh workflows/swift-safe-verify.zsh test --filter 'resizeAndAutoscrollUseFrozenSidecar' --no-parallel` | exit 0; **1 test / 1 suite** |
+
+The full gate also retires two suite-order flakes found during closure: Antigravity
+registration now exposes its initial attachment state atomically, and the long-cadence
+table-selection regression advances the injected monotonic paint clock rather than
+waiting on a five-second wall-clock boundary.
 
 ## Wave 27 — Multi-Provider Subsystem Porting: Scopes & Storage, CLI Auth Commands, Wire Policies & Dialects, Catalog Resolution (2026-08-14, complete)
 

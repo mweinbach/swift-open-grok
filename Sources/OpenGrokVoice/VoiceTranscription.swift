@@ -136,7 +136,7 @@ public actor URLSessionVoiceTranscriptionSession: VoiceTranscriptionSession {
         while true {
             do {
                 try Task.checkCancellation()
-                let message = try await client.receive()
+                guard let message = try await client.receive() else { return nil }
                 guard case .text(let text) = message else { continue }
                 guard let data = text.data(using: .utf8) else {
                     throw VoiceError.transcription("STT event was not UTF-8")

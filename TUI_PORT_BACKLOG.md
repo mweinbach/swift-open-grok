@@ -1063,24 +1063,24 @@ The command remains hidden. Argument-bearing invocations use a dedicated pass-th
 
 ---
 
-# Wave G — Non-TUI leftovers
+# Wave G — Non-TUI leftovers (completed locally 2026-08-16)
 
 Do **not** mix these into A–F. They are real, but they are not why the TUI looks broken.
 
 | ID | Item | Status | Severity | Swift cite | Notes |
 | --- | --- | --- | --- | --- | --- |
-| G1 | Attach to a **still-running** subagent | DIVERGED | P2 | `LiveInteractiveControllerRenderer.swift:3357`, `LiveDashboardPeek.swift:199` | Completed/persisted attach is LIVE. Rust follows the in-memory child immediately (`dashboard.rs:367`). |
+| G1 | Attach to a **still-running** subagent | LIVE | — | `LiveInteractiveOverlays.swift:225`, `LiveSubagentHost.swift:1501` | The attachment view follows retained in-memory conversation items while the child is running; Antigravity publishes its initial transcript atomically with registration. |
 | G2 | Dashboard multi-select answering in the dashboard | **NOT A GAP** | — | `LiveInteractiveOverlays.swift:785` | Pin requires the attached session view (`peek.rs:289`). |
-| G3 | Complete `GROK_*` session gate family | DIVERGED | P2 | `GrokEnvGates.swift:22` | Missing consumers include `GROK_TWO_PASS_COMPACTION`, `GROK_ASK_USER_QUESTION`, `GROK_WRITE_FILE`, `GROK_BACKEND_SEARCH`, `GROK_CANCEL_REWIND`, `GROK_MCP_LIVENESS_WATCHERS`, compaction mode/detail, telemetry trace upload. |
-| G4 | `EffectiveFeatures` as live launch authority | DIVERGED | P2 | `EffectiveFeatures.swift:122`; only verified caller `LiveRecap.swift:580` | Other surfaces re-resolve independently. |
-| G5 | Wire automatic worktree GC | UNWIRED | P2 | `GrokEnvGates.swift:158` | Accessors say wiring is pending. “Succeeds, does nothing.” |
-| G6 | Code Mode hard interrupt | DIVERGED | P2 | `JavaScriptExecutionWatchdog.swift:31`, `JavaScriptCellRuntime.swift:114` | JSC 5 s ceiling; worker may continue. Rust `terminate_execution` is immediate. |
-| G7 | Antigravity effort / resume / heartbeats / quota | DIVERGED | P2 | `LiveAntigravity.swift:10`, `:183`, `:238` | File explicitly lists these as absent. |
-| G8 | Packed-Git OFS/REF on a live status path | UNWIRED | P2 | `OpenGrokGitStatus/ObjectStore.swift:296`; `Package.swift:371` | Algorithm exists; CLI does not import the target. |
-| G9 | Linux custom CA + portable `wss://` | DIVERGED | P3 | `WebSocketClient.swift:264`, `OpenGrokHTTP.swift:810` | Extra CA parse is LIVE; Linux cannot apply it. WSS rejected off-Apple. |
-| G10 | Windows named-pipe leader | ABSENT | P3 | `ACPLeaderSocket.swift:109` | Unix sockets only. |
-| G11 | `--chat` / local-workspace flags | ABSENT | P3 | `CLICommand.swift:1659` | Parser rejects them. Feature-gated in Rust. |
-| G12 | Platform CI green + Linux bwrap evidence | DIVERGED | P3 | `.github/workflows/ci.yml:14`; `PORT_STATUS.md:3` | Jobs and a real bwrap probe exist (`LiveSandboxComposition.swift:30`). No recorded green required job. |
+| G3 | Complete `GROK_*` session gate family | LIVE | — | `GrokEnvGates.swift:138`, `EffectiveFeatures.swift:98` | Two-pass compaction, ask/write/backend-search/cancel-rewind, MCP liveness, compaction detail/mode, and trace upload resolve through the session authority. |
+| G4 | `EffectiveFeatures` as live launch authority | LIVE | — | `EffectiveFeatures.swift:174`, `LiveComposition.swift` | Launch composition resolves one effective feature document and threads it into the gated runtime surfaces instead of re-resolving independently. |
+| G5 | Wire automatic worktree GC | LIVE | — | `WorktreeAutoGC.swift:62`, `LiveWorktreeComposition.swift` | Launch-time automatic GC is throttled, policy-gated, and reports disabled/throttled/collected outcomes. |
+| G6 | Code Mode hard interrupt | LIVE | — | `JavaScriptCellRuntime.swift:156`, `JavaScriptRuntimeSubprocess.swift:21` | Executions run in the packaged worker process when available; terminate kills the worker immediately and preserves the actor-level terminal signals. |
+| G7 | Antigravity effort / resume / heartbeats / quota | LIVE | — | `LiveAntigravityRunner.swift:241`, `LiveAntigravityRunner.swift:357` | Effort planning, conversation resume, log-phase heartbeats, available-model state, and quota caching are live through the CLI runner. |
+| G8 | Packed-Git OFS/REF on a live status path | LIVE | — | `PureStatus.swift`, `ObjectStore.swift` | Pure status now reads packed objects, including OFS/REF deltas, through the live object store with bounded zlib inflation. |
+| G9 | Linux custom CA + portable `wss://` | LIVE | — | `FoundationTrustStoreBridge.swift:7`, `WebSocketClient.swift:83` | Secure WebSockets use the portable channel path and additional trust roots are prepared through the Foundation trust bridge on supported hosts. |
+| G10 | Windows named-pipe leader | LIVE | — | `ACPLeaderSocket.swift:236`, `WindowsNamedPipe.swift:4` | Windows leader listen/dial/read/write uses the path-derived named-pipe transport; Unix keeps domain sockets. Host execution awaits the next Windows CI run. |
+| G11 | `--chat` / local-workspace flags | LIVE | — | `CLICommand.swift:301`, `CLICommand.swift:1624` | The parser and executable composition accept, validate, and route chat/local-workspace create, attach, and cwd options. |
+| G12 | Platform CI gates + Linux bwrap evidence | IMPLEMENTED; REMOTE EVIDENCE PENDING | P3 evidence | `.github/workflows/ci.yml:14` | Blocking macOS/Linux gates, Windows compile, diagnostic Windows tests, and a privileged real-bwrap namespace probe are defined. The last pushed Wave F run (`ae45c76`, 2026-08-16) is still red on all three required platform jobs; this unpushed Wave G tree needs a post-push rerun before any remote-green claim. |
 
 ### Wave G honest non-gaps
 
@@ -1182,14 +1182,16 @@ TerminalCore startup glue (2026-08-15, live): DA2 after raw mode + Kitty flag pu
 - [x] F6 `/gboom` dispatch + game
 
 ### Wave G
-- [ ] G1 Running-subagent attach
-- [ ] G3 `GROK_*` gate family
-- [ ] G4 `EffectiveFeatures` launch authority
-- [ ] G5 Worktree auto-GC
-- [ ] G6 Code Mode hard interrupt
-- [ ] G7 Antigravity follow-ons
-- [ ] G8 Packed-Git live import
-- [ ] G9 Portable WSS + Linux custom CA
-- [ ] G10 Windows named-pipe leader
-- [ ] G11 `--chat` / local-workspace flags
-- [ ] G12 Green platform CI + bwrap evidence
+- Completed locally 2026-08-16: running-child attachment, the remaining session env gates and one-shot `EffectiveFeatures` authority, automatic worktree GC, killable Code Mode workers, Antigravity effort/resume/heartbeat/quota support, live packed-Git delta reads, portable secure WebSockets/custom trust roots, Windows named-pipe leader transport, and chat/local-workspace CLI flags.
+- Platform status: the CI workflow contains blocking macOS/Linux jobs, Windows compile coverage, and a real privileged bwrap namespace probe. The latest remote run is still the pre-Wave-G `ae45c76` failure, so post-push green evidence remains an integration check rather than an implementation gap.
+- [x] G1 Running-subagent attach
+- [x] G3 `GROK_*` gate family
+- [x] G4 `EffectiveFeatures` launch authority
+- [x] G5 Worktree auto-GC
+- [x] G6 Code Mode hard interrupt
+- [x] G7 Antigravity follow-ons
+- [x] G8 Packed-Git live import
+- [x] G9 Portable WSS + Linux custom CA
+- [x] G10 Windows named-pipe leader
+- [x] G11 `--chat` / local-workspace flags
+- [x] G12 Platform gate/bwrap implementation; remote rerun pending

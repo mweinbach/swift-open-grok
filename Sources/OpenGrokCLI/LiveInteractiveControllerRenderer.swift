@@ -171,6 +171,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// and post-delete rebuilds repaint the same child rows without another
     /// actor round-trip.
     var dashboardSubagents: [LiveSubagentSnapshot] = []
+    var subagentAttachmentTask: Task<Void, Never>?
+    var attachedSubagentID: String?
     /// The C-1 close arm's press-again state — the port's no-timer analog of
     /// upstream's 2 s arm window (`arm_or_delete`, dashboard.rs:2125-2140):
     /// pressing `x` on a DIFFERENT row re-arms instead of deleting.
@@ -3607,6 +3609,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 target = String(rowID.dropFirst(LiveDashboardOverlay.attachPrefix.count))
             } else if rowID.hasPrefix(LiveDashboardOverlay.subagentPrefix) {
                 target = String(rowID.dropFirst(LiveDashboardOverlay.subagentPrefix.count))
+                if dashboardSubagents.first(where: { $0.subagentID == target })?.status == "running" {
+                    await presentSubagentAttachment(id: target)
+                    return nil
+                }
                 guard dashboardPeekCache.items[target] != nil else {
                     note("Subagent attach is available after its transcript is persisted.")
                     rebuildDashboardRows()
@@ -4362,6 +4368,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             dashboardPeekCache = LiveDashboardPeekCache()
             dashboardDormant = []
             dashboardSearchQuery = nil
+        }
+        if id == LiveSubagentAttachment.overlayID {
+            subagentAttachmentTask?.cancel()
+            subagentAttachmentTask = nil
+            attachedSubagentID = nil
         }
     }
 

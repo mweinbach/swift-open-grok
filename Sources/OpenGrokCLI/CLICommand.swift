@@ -298,6 +298,15 @@ public struct CLIExecutionOptions: Sendable, Equatable {
     public var includePartialMessages: Bool
     /// `--json-schema`, which implies `--output-format json`.
     public var jsonSchema: String?
+    /// Gateway chat frontend mode. The Swift release parses and validates this
+    /// even when the proprietary gateway backend is unavailable.
+    public var chat: Bool
+    /// `--local-workspace[=CWD]`; `""` means own the current directory.
+    public var localWorkspace: String?
+    /// Existing local workspace server id to attach.
+    public var localWorkspaceAttach: String?
+    /// Explicit cwd override for either local-workspace mode.
+    public var localWorkspaceCWD: String?
     /// Root `--minimal`: scrollback-native rendering for an *interactive*
     /// session. Distinct from ``CLIRunMode/minimal``, which is this port's
     /// one-shot mode word, so selecting the renderer never silently demands a
@@ -328,6 +337,10 @@ public struct CLIExecutionOptions: Sendable, Equatable {
         verbatim: Bool = false,
         includePartialMessages: Bool = false,
         jsonSchema: String? = nil,
+        chat: Bool = false,
+        localWorkspace: String? = nil,
+        localWorkspaceAttach: String? = nil,
+        localWorkspaceCWD: String? = nil,
         minimalRendering: Bool = false,
         oauth: Bool = false,
         agentOptions: CLIAgentOptions = CLIAgentOptions(),
@@ -352,6 +365,10 @@ public struct CLIExecutionOptions: Sendable, Equatable {
         self.verbatim = verbatim
         self.includePartialMessages = includePartialMessages
         self.jsonSchema = jsonSchema
+        self.chat = chat
+        self.localWorkspace = localWorkspace
+        self.localWorkspaceAttach = localWorkspaceAttach
+        self.localWorkspaceCWD = localWorkspaceCWD
         self.minimalRendering = minimalRendering
         self.oauth = oauth
         self.agentOptions = agentOptions
@@ -1556,6 +1573,10 @@ fileprivate struct LaunchState {
     var verbatim = false
     var includePartialMessages = false
     var jsonSchema: String?
+    var chat = false
+    var localWorkspace: String?
+    var localWorkspaceAttach: String?
+    var localWorkspaceCWD: String?
     var oauth = false
     var agentOptions = CLIAgentOptions()
     var advanced = CLIAdvancedOptions()
@@ -1600,6 +1621,14 @@ fileprivate struct LaunchState {
             includePartialMessages = true
         case "--json-schema":
             jsonSchema = try cursor.value(for: option)
+        case "--chat":
+            chat = true
+        case "--local-workspace":
+            localWorkspace = cursor.optionalValue(for: option)
+        case "--local-workspace-attach":
+            localWorkspaceAttach = try cursor.valueAllowingEmpty(for: option)
+        case "--local-workspace-cwd":
+            localWorkspaceCWD = try cursor.value(for: option)
         case "--output-format":
             let value = try cursor.value(for: option)
             guard let parsed = CLIOutputFormat(rawValue: value) else {
@@ -1767,6 +1796,15 @@ fileprivate struct LaunchState {
         if forkSession && worktree != nil {
             throw CLIParseError.conflictingOptions("--fork-session", "--worktree")
         }
+        if localWorkspace != nil && localWorkspaceAttach != nil {
+            throw CLIParseError.conflictingOptions(
+                "--local-workspace",
+                "--local-workspace-attach"
+            )
+        }
+        if (localWorkspace != nil || localWorkspaceAttach != nil || localWorkspaceCWD != nil), !chat {
+            throw CLIParseError.requiresOption("local-workspace flags", "--chat")
+        }
         if agentOptions.experimentalMemory && agentOptions.noMemory {
             throw CLIParseError.conflictingOptions("--experimental-memory", "--no-memory")
         }
@@ -1806,6 +1844,10 @@ fileprivate struct LaunchState {
             verbatim: verbatim,
             includePartialMessages: includePartialMessages,
             jsonSchema: jsonSchema,
+            chat: chat,
+            localWorkspace: localWorkspace,
+            localWorkspaceAttach: localWorkspaceAttach,
+            localWorkspaceCWD: localWorkspaceCWD,
             minimalRendering: minimalRendering,
             oauth: oauth,
             agentOptions: agentOptions,
@@ -1852,6 +1894,14 @@ fileprivate struct ArgumentCursor: Sendable {
     mutating func value(for option: OptionToken) throws -> String {
         if let inlineValue = option.inlineValue, !inlineValue.isEmpty { return inlineValue }
         guard let value = pop(), !value.isEmpty, !value.hasPrefix("-") else {
+            throw CLIParseError.missingValue(option.name)
+        }
+        return value
+    }
+
+    mutating func valueAllowingEmpty(for option: OptionToken) throws -> String {
+        if let inlineValue = option.inlineValue { return inlineValue }
+        guard let value = pop(), !value.hasPrefix("-") else {
             throw CLIParseError.missingValue(option.name)
         }
         return value

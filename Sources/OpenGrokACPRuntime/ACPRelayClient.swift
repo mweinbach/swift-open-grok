@@ -167,7 +167,7 @@ public struct ACPRelayTransport: ACPTransport {
     private let log: @Sendable (String) -> Void
 
     init(
-        connection: WebSocketConnection,
+        connection: any WebSocketClient,
         readLivenessSeconds: Double?,
         outcome: ACPRelayOutcomeBox,
         log: @escaping @Sendable (String) -> Void
@@ -280,7 +280,7 @@ public actor ACPRelayClient {
 
     private var stopped = false
     private var authorization: ACPRelayAuthorization?
-    private var activeConnection: WebSocketConnection?
+    private var activeConnection: (any WebSocketClient)?
     private var connectionCount = 0
     private var lastEndReason: ACPRelayEndReason?
 
@@ -461,7 +461,7 @@ public actor ACPRelayClient {
         await transport.close()
     }
 
-    private func dial() async throws -> WebSocketConnection {
+    private func dial() async throws -> any WebSocketClient {
         try await WebSocketDialer.connect(
             to: configuration.url,
             options: WebSocketDialOptions(
@@ -482,7 +482,7 @@ public actor ACPRelayClient {
     ///
     /// The client pings, not the server: this leg is the one that traverses the
     /// user's NAT, and it is the client that needs the mapping kept open.
-    private func startKeepAlive(on connection: WebSocketConnection) -> Task<Void, Never>? {
+    private func startKeepAlive(on connection: any WebSocketClient) -> Task<Void, Never>? {
         guard let seconds = configuration.keepAliveSeconds, seconds > 0 else { return nil }
         let nanoseconds = UInt64(seconds * 1_000_000_000)
         return Task {

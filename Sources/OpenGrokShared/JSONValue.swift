@@ -41,8 +41,8 @@ public enum JSONValue: Codable, Hashable, Sendable, Equatable {
             self = .null
         } else if let bool = try? container.decode(Bool.self) {
             self = .bool(bool)
-        } else if let double = try? container.decode(Double.self) {
-            self = .number(.double(double))
+        } else if let number = try? container.decode(JSONNumber.self) {
+            self = .number(number)
         } else if let string = try? container.decode(String.self) {
             self = .string(string)
         } else if let array = try? container.decode([JSONValue].self) {
@@ -162,7 +162,7 @@ public enum JSONValue: Codable, Hashable, Sendable, Equatable {
 /// or a float. Swift's `JSONDecoder` decodes numbers as `Double` by default,
 /// which loses integer precision for large values (e.g. `u64` timestamps).
 /// `JSONNumber` retains both representations so round-tripping is lossless.
-public enum JSONNumber: Hashable, Sendable, Equatable {
+public enum JSONNumber: Codable, Hashable, Sendable, Equatable {
     case int64(Int64)
     case uint64(UInt64)
     case double(Double)

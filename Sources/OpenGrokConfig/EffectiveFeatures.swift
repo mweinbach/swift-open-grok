@@ -94,6 +94,33 @@ public struct EffectiveFeatures: Sendable, Equatable {
     /// Sharing. Default OFF.
     public var sharing: Resolved<Bool>
 
+    /// Hierarchical two-pass compaction. Default OFF.
+    public var twoPassCompaction: Resolved<Bool>
+
+    /// Interactive questionnaire tool. Default ON.
+    public var askUserQuestion: Resolved<Bool>
+
+    /// Direct write-file tool. Default ON.
+    public var writeFile: Resolved<Bool>
+
+    /// Provider-side search tools. Default ON.
+    public var backendSearch: Resolved<Bool>
+
+    /// Cancel restores the interrupted prompt. Default ON.
+    public var cancelRewind: Resolved<Bool>
+
+    /// MCP liveness watchers. Default ON.
+    public var mcpLivenessWatchers: Resolved<Bool>
+
+    /// Upload process traces when telemetry permits it. Default OFF.
+    public var traceUpload: Resolved<Bool>
+
+    /// Compaction storage mode. Default `full_replace`.
+    public var compactionMode: Resolved<String>
+
+    /// Segment transcript detail. Default `verbose`.
+    public var compactionDetail: Resolved<String>
+
     public init(
         sessionRecap: Resolved<Bool> = Resolved(value: true, source: .default),
         webFetch: Resolved<Bool> = Resolved(value: true, source: .default),
@@ -103,7 +130,16 @@ public struct EffectiveFeatures: Sendable, Equatable {
         workspaceCommand: Resolved<Bool> = Resolved(value: false, source: .default),
         folderTrust: Resolved<Bool> = Resolved(value: true, source: .default),
         workflows: Resolved<Bool> = Resolved(value: false, source: .default),
-        sharing: Resolved<Bool> = Resolved(value: false, source: .default)
+        sharing: Resolved<Bool> = Resolved(value: false, source: .default),
+        twoPassCompaction: Resolved<Bool> = Resolved(value: false, source: .default),
+        askUserQuestion: Resolved<Bool> = Resolved(value: true, source: .default),
+        writeFile: Resolved<Bool> = Resolved(value: true, source: .default),
+        backendSearch: Resolved<Bool> = Resolved(value: true, source: .default),
+        cancelRewind: Resolved<Bool> = Resolved(value: true, source: .default),
+        mcpLivenessWatchers: Resolved<Bool> = Resolved(value: true, source: .default),
+        traceUpload: Resolved<Bool> = Resolved(value: false, source: .default),
+        compactionMode: Resolved<String> = Resolved(value: "full_replace", source: .default),
+        compactionDetail: Resolved<String> = Resolved(value: "verbose", source: .default)
     ) {
         self.sessionRecap = sessionRecap
         self.webFetch = webFetch
@@ -114,6 +150,15 @@ public struct EffectiveFeatures: Sendable, Equatable {
         self.folderTrust = folderTrust
         self.workflows = workflows
         self.sharing = sharing
+        self.twoPassCompaction = twoPassCompaction
+        self.askUserQuestion = askUserQuestion
+        self.writeFile = writeFile
+        self.backendSearch = backendSearch
+        self.cancelRewind = cancelRewind
+        self.mcpLivenessWatchers = mcpLivenessWatchers
+        self.traceUpload = traceUpload
+        self.compactionMode = compactionMode
+        self.compactionDetail = compactionDetail
     }
 }
 
@@ -190,6 +235,70 @@ extension EffectiveFeatures {
                 remoteValue: inputs.remote.sharingEnabled,
                 defaultValue: false,
                 inputs: inputs
+            ),
+            twoPassCompaction: resolveFlag(
+                key: "two_pass_compaction",
+                envVar: "GROK_TWO_PASS_COMPACTION",
+                remoteValue: inputs.remote.twoPassCompactionEnabled,
+                defaultValue: false,
+                inputs: inputs
+            ),
+            askUserQuestion: resolveFlag(
+                key: "ask_user_question",
+                envVar: "GROK_ASK_USER_QUESTION",
+                remoteValue: inputs.remote.askUserQuestionEnabled,
+                defaultValue: true,
+                inputs: inputs
+            ),
+            writeFile: resolveFlag(
+                key: "write_file",
+                envVar: "GROK_WRITE_FILE",
+                remoteValue: inputs.remote.writeFileEnabled,
+                defaultValue: true,
+                inputs: inputs
+            ),
+            backendSearch: resolveFlag(
+                key: "backend_tools",
+                envVar: "GROK_BACKEND_SEARCH",
+                remoteValue: nil,
+                defaultValue: true,
+                inputs: inputs
+            ),
+            cancelRewind: resolveFlag(
+                key: "cancel_rewind",
+                envVar: "GROK_CANCEL_REWIND",
+                remoteValue: inputs.remote.cancelRewindEnabled,
+                defaultValue: true,
+                inputs: inputs
+            ),
+            mcpLivenessWatchers: resolveBool(
+                configPath: ["mcp", "liveness_watchers"],
+                envVar: "GROK_MCP_LIVENESS_WATCHERS",
+                remoteValue: nil,
+                defaultValue: true,
+                inputs: inputs
+            ),
+            traceUpload: resolveBool(
+                configPath: ["telemetry", "trace_upload"],
+                envVar: "GROK_TELEMETRY_TRACE_UPLOAD",
+                fallbackEnvVar: "GROK_TRACE_UPLOAD",
+                remoteValue: inputs.remote.traceUploadEnabled,
+                defaultValue: false,
+                inputs: inputs
+            ),
+            compactionMode: resolveString(
+                key: "compaction_mode",
+                envVar: "GROK_COMPACTION_MODE",
+                remoteValue: inputs.remote.compactionMode,
+                defaultValue: "full_replace",
+                inputs: inputs
+            ),
+            compactionDetail: resolveString(
+                key: "compaction_detail",
+                envVar: "GROK_COMPACTION_DETAIL",
+                remoteValue: inputs.remote.compactionDetail,
+                defaultValue: "verbose",
+                inputs: inputs
             )
         )
     }
@@ -212,6 +321,53 @@ extension EffectiveFeatures {
             return Resolved(value: toml, source: .config)
         }
         if let remote = remoteValue {
+            return Resolved(value: remote, source: .remote)
+        }
+        return Resolved(value: defaultValue, source: .default)
+    }
+
+    private static func resolveBool(
+        configPath: [String],
+        envVar: String,
+        fallbackEnvVar: String? = nil,
+        remoteValue: Bool?,
+        defaultValue: Bool,
+        inputs: FeatureResolutionInputs
+    ) -> Resolved<Bool> {
+        if let req = inputs.requirements[configPath.last ?? ""] {
+            return Resolved(value: req, source: .requirement)
+        }
+        if let env = envBool(envVar, environment: inputs.environment)
+            ?? fallbackEnvVar.flatMap({ envBool($0, environment: inputs.environment) }) {
+            return Resolved(value: env, source: .env)
+        }
+        if let configured = inputs.effectiveConfig[path: configPath]?.boolValue {
+            return Resolved(value: configured, source: .config)
+        }
+        if let remoteValue {
+            return Resolved(value: remoteValue, source: .remote)
+        }
+        return Resolved(value: defaultValue, source: .default)
+    }
+
+    private static func resolveString(
+        key: String,
+        envVar: String,
+        remoteValue: String?,
+        defaultValue: String,
+        inputs: FeatureResolutionInputs
+    ) -> Resolved<String> {
+        if let raw = inputs.environment[envVar]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            return Resolved(value: raw, source: .env)
+        }
+        if let configured = inputs.effectiveConfig[path: ["features", key]]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !configured.isEmpty {
+            return Resolved(value: configured, source: .config)
+        }
+        if let remote = remoteValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !remote.isEmpty {
             return Resolved(value: remote, source: .remote)
         }
         return Resolved(value: defaultValue, source: .default)

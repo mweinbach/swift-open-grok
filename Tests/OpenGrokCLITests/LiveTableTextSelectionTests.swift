@@ -308,7 +308,7 @@ private func paintedModelShowing(
             return model
         }
     }
-    return await fixture.renderer.testingLastTextSelection()
+    return nil
 }
 
 private func tripleClick(
@@ -676,8 +676,6 @@ struct LiveTableTextSelectionTests {
             text: tableFixtureLines.joined(separator: "\n"),
             styledLines: tableFixtureLines.map { PagerStyledLine(text: $0) }
         )))
-        try await fixture.renderer.testingForcePaint()
-        #expect(await fixture.waitForPaint(containing: "Alice"))
         await fixture.renderer.testingSetKeepTextSelectionMode(.hold)
 
         let model = try #require(

@@ -1,5 +1,6 @@
 import Foundation
 import OpenGrokFastWorktree
+import OpenGrokGitStatus
 
 enum LiveWorktreeComposition {
     private struct RenderedRecord: Codable, Sendable {
@@ -143,7 +144,7 @@ enum LiveWorktreeComposition {
                 streams.out("would remove \(record.id) \(record.path)\n")
                 continue
             }
-            if !options.force, record.isLive, try getModifiedFiles(repoPath: record.url).allDirtyPaths.isEmpty == false {
+            if !options.force, record.isLive, try hasLocalChanges(record) {
                 throw CLIApplicationError.failed(
                     "worktree \(record.id) has local changes; use --force to remove it"
                 )
@@ -252,6 +253,14 @@ enum LiveWorktreeComposition {
         let path = URL(fileURLWithPath: target).standardizedFileURL.path
         if let byPath = records.first(where: { $0.path == path }) { return byPath }
         throw CLIApplicationError.failed("worktree not found: \(target)")
+    }
+
+    static func hasLocalChanges(_ record: WorktreeRecord) throws -> Bool {
+        do {
+            return try !gitStatus(path: record.path).clean
+        } catch {
+            return try !getModifiedFiles(repoPath: record.url).allDirtyPaths.isEmpty
+        }
     }
 
     private static func parseAge(_ value: String) throws -> TimeInterval {

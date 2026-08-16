@@ -179,7 +179,7 @@ enum LiveDashboardPeek {
                 items: [],
                 emptyHint: subagentHints[sessionID].flatMap { $0.isEmpty ? nil : $0 }
                     ?? (childStatus == "Working"
-                        ? "Subagent is still running; attach is available after it finishes."
+                        ? "Subagent is still running; press Enter to attach."
                         : "No persisted subagent transcript is available.")
             )
         }

@@ -806,6 +806,7 @@ public enum HTTPSessionConfigurationBuilder {
 public final class HTTPTransportSessionDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
     public let validateCertificates: Bool
     public let extraRootCertificates: [Data]
+    public let additionalTrustRootsApplied: Bool
 
     /// Whether this platform can install additive trust anchors in a server
     /// trust challenge. FoundationNetworking currently exposes no equivalent
@@ -813,6 +814,8 @@ public final class HTTPTransportSessionDelegate: NSObject, URLSessionDelegate, @
     public static var supportsAdditionalTrustRoots: Bool {
         #if canImport(Darwin) && canImport(Security)
         return true
+        #elseif os(Linux)
+        return FoundationTrustStoreBridge.supportsAdditionalTrustRoots
         #else
         return false
         #endif
@@ -822,7 +825,7 @@ public final class HTTPTransportSessionDelegate: NSObject, URLSessionDelegate, @
     /// URLSession implementation. The transport remains strict rather than
     /// weakening validation or replacing system roots.
     public var additionalTrustRootsUnavailable: Bool {
-        !extraRootCertificates.isEmpty && !Self.supportsAdditionalTrustRoots
+        !extraRootCertificates.isEmpty && !additionalTrustRootsApplied
     }
 
     /// Whether this platform can honor `validateCertificates == false`.
@@ -854,6 +857,15 @@ public final class HTTPTransportSessionDelegate: NSObject, URLSessionDelegate, @
     ) {
         self.validateCertificates = validateCertificates
         self.extraRootCertificates = extraRootCertificates
+        #if canImport(Darwin) && canImport(Security)
+        self.additionalTrustRootsApplied = true
+        #elseif os(Linux)
+        self.additionalTrustRootsApplied = FoundationTrustStoreBridge.prepare(
+            extraRootCertificates: extraRootCertificates
+        )
+        #else
+        self.additionalTrustRootsApplied = extraRootCertificates.isEmpty
+        #endif
         super.init()
     }
 
@@ -1634,10 +1646,17 @@ public enum WebSocketMessage: Sendable, Equatable {
 }
 
 /// Cross-platform WebSocket client protocol.
-public protocol WebSocketClient: Sendable {
+public protocol WebSocketClient: AnyObject, Sendable {
     func send(_ message: WebSocketMessage) async throws
-    func receive() async throws -> WebSocketMessage
-    func close(code: Int, reason: String) async
+    func receive() async throws -> WebSocketMessage?
+    func ping() async throws
+    func close(code: UInt16, reason: String) async
+}
+
+public extension WebSocketClient {
+    func close() async {
+        await close(code: 1000, reason: "")
+    }
 }
 
 /// URLSession-backed WebSocket (available on Apple platforms and recent Foundation).
@@ -1646,6 +1665,7 @@ public final class URLSessionWebSocketClient: WebSocketClient, @unchecked Sendab
     /// Retained so the session (and its TLS/proxy delegate) outlives the task.
     private let session: URLSession
     private let sessionDelegate: HTTPTransportSessionDelegate?
+    private let maximumMessageSize: Int
     /// Configuration snapshot for deterministic forwarding tests.
     public let appliedConfigurationSnapshot: HTTPSessionConfigurationBuilder.Snapshot
 
@@ -1653,12 +1673,14 @@ public final class URLSessionWebSocketClient: WebSocketClient, @unchecked Sendab
         task: URLSessionWebSocketTask,
         session: URLSession,
         sessionDelegate: HTTPTransportSessionDelegate? = nil,
-        appliedConfigurationSnapshot: HTTPSessionConfigurationBuilder.Snapshot
+        appliedConfigurationSnapshot: HTTPSessionConfigurationBuilder.Snapshot,
+        maximumMessageSize: Int = WebSocketLimits.defaultMaximumMessageSize
     ) {
         self.task = task
         self.session = session
         self.sessionDelegate = sessionDelegate
         self.appliedConfigurationSnapshot = appliedConfigurationSnapshot
+        self.maximumMessageSize = maximumMessageSize
         task.resume()
     }
 
@@ -1708,7 +1730,8 @@ public final class URLSessionWebSocketClient: WebSocketClient, @unchecked Sendab
     public static func connect(
         url: URL,
         configuration: HTTPTransportConfiguration = HTTPTransportConfiguration(),
-        headers: [String: String] = [:]
+        headers: [String: String] = [:],
+        maximumMessageSize: Int = WebSocketLimits.defaultMaximumMessageSize
     ) throws -> URLSessionWebSocketClient {
         let prepared = makeSessionAndRequest(
             url: url,
@@ -1720,7 +1743,8 @@ public final class URLSessionWebSocketClient: WebSocketClient, @unchecked Sendab
             task: task,
             session: prepared.session,
             sessionDelegate: prepared.delegate,
-            appliedConfigurationSnapshot: prepared.snapshot
+            appliedConfigurationSnapshot: prepared.snapshot,
+            maximumMessageSize: maximumMessageSize
         )
     }
 
@@ -1733,20 +1757,38 @@ public final class URLSessionWebSocketClient: WebSocketClient, @unchecked Sendab
         }
     }
 
-    public func receive() async throws -> WebSocketMessage {
+    public func receive() async throws -> WebSocketMessage? {
         let message = try await task.receive()
         switch message {
         case .string(let s):
+            guard s.utf8.count <= maximumMessageSize else {
+                throw HTTPError.bufferExceeded(limit: maximumMessageSize)
+            }
             return .text(s)
         case .data(let d):
+            guard d.count <= maximumMessageSize else {
+                throw HTTPError.bufferExceeded(limit: maximumMessageSize)
+            }
             return .data(d)
         @unknown default:
             throw HTTPError.webSocketUnsupported("unknown message kind")
         }
     }
 
-    public func close(code: Int, reason: String) async {
-        let closeCode = URLSessionWebSocketTask.CloseCode(rawValue: code) ?? .normalClosure
+    public func ping() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            task.sendPing { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    public func close(code: UInt16, reason: String) async {
+        let closeCode = URLSessionWebSocketTask.CloseCode(rawValue: Int(code)) ?? .normalClosure
         task.cancel(with: closeCode, reason: reason.data(using: .utf8))
     }
 }

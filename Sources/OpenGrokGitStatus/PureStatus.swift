@@ -37,8 +37,9 @@ public struct PureGitStatusScanner: Sendable {
             )
         }
 
+        let commonGitDir = resolveCommonGitDir(gitDir: gitDir)
         let index = try loadGitIndex(gitDir: gitDir)
-        let ignore = GitIgnoreMatcher(root: root, gitDir: gitDir)
+        let ignore = GitIgnoreMatcher(root: root, gitDir: commonGitDir)
         var entries: [GitStatusEntry] = []
 
         // Group index entries by path for conflict detection (stages 1/2/3).
@@ -60,7 +61,7 @@ public struct PureGitStatusScanner: Sendable {
         // HEAD tree for staged comparisons (pure object store; no shell).
         // Pack-only objects surface as `packedObjectUnsupported` (explicit
         // non-parity) rather than being swallowed into an empty HEAD tree.
-        let store = GitObjectStore(gitDir: gitDir)
+        let store = GitObjectStore(gitDir: commonGitDir)
         let headTree: [String: GitTreeEntry]
         if let head = meta.headCommit {
             do {
@@ -365,6 +366,7 @@ public func discoverRepository(from path: String) throws -> (String, String, Rep
 
 func readRepoMeta(gitDir: String, worktreeRoot: String) throws -> RepoMeta {
     let fm = FileManager.default
+    let commonGitDir = resolveCommonGitDir(gitDir: gitDir)
     let headPath = (gitDir as NSString).appendingPathComponent("HEAD")
     let headText = (try? String(contentsOfFile: headPath, encoding: .utf8))?
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -376,12 +378,15 @@ func readRepoMeta(gitDir: String, worktreeRoot: String) throws -> RepoMeta {
         if ref.hasPrefix("refs/heads/") {
             branch = String(ref.dropFirst("refs/heads/".count))
         }
-        let refPath = (gitDir as NSString).appendingPathComponent(ref)
-        if let oid = try? String(contentsOfFile: refPath, encoding: .utf8) {
+        let worktreeRefPath = (gitDir as NSString).appendingPathComponent(ref)
+        let commonRefPath = (commonGitDir as NSString).appendingPathComponent(ref)
+        if let oid = try? String(contentsOfFile: worktreeRefPath, encoding: .utf8) {
+            headCommit = oid.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if let oid = try? String(contentsOfFile: commonRefPath, encoding: .utf8) {
             headCommit = oid.trimmingCharacters(in: .whitespacesAndNewlines)
         } else {
             // packed-refs
-            headCommit = resolvePackedRef(gitDir: gitDir, name: ref)
+            headCommit = resolvePackedRef(gitDir: commonGitDir, name: ref)
         }
     } else if !headText.isEmpty {
         isDetached = true
@@ -390,9 +395,11 @@ func readRepoMeta(gitDir: String, worktreeRoot: String) throws -> RepoMeta {
 
     let sparse = fm.fileExists(
         atPath: (gitDir as NSString).appendingPathComponent("info/sparse-checkout")
+    ) || fm.fileExists(
+        atPath: (commonGitDir as NSString).appendingPathComponent("info/sparse-checkout")
     )
     // Also check config core.sparseCheckout
-    let configPath = (gitDir as NSString).appendingPathComponent("config")
+    let configPath = (commonGitDir as NSString).appendingPathComponent("config")
     var isSparse = sparse
     if let config = try? String(contentsOfFile: configPath, encoding: .utf8),
        config.contains("sparseCheckout = true") || config.contains("sparsecheckout = true") {
@@ -414,6 +421,23 @@ func readRepoMeta(gitDir: String, worktreeRoot: String) throws -> RepoMeta {
         isSparseCheckout: isSparse,
         isLinkedWorktree: false
     )
+}
+
+func resolveCommonGitDir(gitDir: String) -> String {
+    let commonDirPath = (gitDir as NSString).appendingPathComponent("commondir")
+    guard let text = try? String(contentsOfFile: commonDirPath, encoding: .utf8) else {
+        return gitDir
+    }
+    let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !raw.isEmpty else { return gitDir }
+    let commonDir: URL
+    if (raw as NSString).isAbsolutePath {
+        commonDir = URL(fileURLWithPath: raw, isDirectory: true)
+    } else {
+        commonDir = URL(fileURLWithPath: gitDir, isDirectory: true)
+            .appendingPathComponent(raw, isDirectory: true)
+    }
+    return commonDir.standardizedFileURL.resolvingSymlinksInPath().path
 }
 
 func resolvePackedRef(gitDir: String, name: String) -> String? {

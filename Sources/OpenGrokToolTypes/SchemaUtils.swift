@@ -253,11 +253,11 @@ private func inferArgType(_ sample: JSONValue?) -> ArgumentType {
 /// Normalise whole-number `.double` values inside a `JSONValue` to
 /// `.int64`/`.uint64`, matching Rust `serde_json::Number` semantics.
 ///
-/// `JSONValue.init(from:)` in OpenGrokShared decodes all JSON numbers as
-/// `.double(...)` by default, but JSON Schema values like `"default": 10`
+/// Programmatically constructed schemas can still carry whole-number
+/// `.double(...)` values, but JSON Schema values like `"default": 10`
 /// should be `.number(.int64(10))` (matching Rust
 /// `serde_json::Number::from(10)`). This normaliser walks the value and
-/// converts whole-number doubles back to their integer representation,
+/// converts whole-number doubles to their integer representation,
 /// preferring `.int64` for values that fit (matching the Rust
 /// `serde_json::Number` i64/u64/f64 representation where small positive
 /// integers are stored as `PosInt(u64)` but compare equal to `I64`).
@@ -297,11 +297,10 @@ extension JSONNumber {
     /// Construct a `JSONNumber` from a `JSONValue`, normalising whole-number
     /// doubles to `Int64`/`UInt64` to match Rust `serde_json::Number` semantics.
     ///
-    /// `JSONValue.init(from:)` in OpenGrokShared decodes all JSON numbers as
-    /// `.double(...)` by default, but JSON Schema numeric bounds like
-    /// `"minimum": 0` should be `.int64(0)` (matching Rust
-    /// `serde_json::Number::from(0)`). This normaliser converts whole-number
-    /// doubles back to their integer representation.
+    /// Programmatically constructed schema bounds may still be whole-number
+    /// doubles. Values like `"minimum": 0` should be `.int64(0)` (matching
+    /// Rust `serde_json::Number::from(0)`), so this normaliser converts them
+    /// to their integer representation.
     public init?(normalizedFrom v: JSONValue?) {
         guard let v = v else { return nil }
         guard case .number(let n) = v else { return nil }
@@ -332,12 +331,3 @@ extension JSONNumber {
         .number(self)
     }
 }
-
-// MARK: - JSONNumber Codable conformance
-
-// `JSONNumber` in OpenGrokShared has `init(from:)` and `encode(to:)` methods
-// but does not declare `Codable` conformance. We add it here so it can be
-// used directly in `decodeIfPresent`/`encodeIfPresent` calls. The existing
-// `init(from:)` tries Int64 → UInt64 → Double, preserving integer precision
-// for large values — matching Rust `serde_json::Number` semantics.
-extension JSONNumber: Codable {}

@@ -213,8 +213,9 @@ private func targets() -> [Target] {
     t.append(.target(name: "OpenGrokSQLiteJournal", dependencies: dep(w0s2, w0s3, w0s4, w1s5, ["OpenGrokFileUtils"])))
     t.append(.target(name: "OpenGrokSecrets", dependencies: dep(w0s2, w0s3, w0s4, w1s5, ["OpenGrokFileUtils"])))
     // W2-S3: FSNotify / CodebaseGraph / HunkTracker share base deps; GitStatus
-    // depends on a thin C zlib shim for portable inflate/deflate when Apple
-    // Compression is unavailable (notably Linux). Apple hosts prefer Compression.
+    // depends on a thin C zlib shim for standards-compatible Git object and
+    // pack inflate/deflate. Apple Compression remains the fallback where the
+    // system zlib module is unavailable.
     //
     // The shim is omitted on Windows, where the SDK ships no <zlib.h> and no
     // `z` import library: declaring it there fails the whole build in the
@@ -370,7 +371,7 @@ private func targets() -> [Target] {
     // `scheduler_*` tool handlers, the session scheduler host, and `/loop`
     // consume the pure library; the edge stays one-way — the scheduler
     // target must never import back (see its declaration).
-    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s4, w2s5, w3s1, w3s2, w3s3, w4s2, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w6s5, w7s3, w7s4, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokToolTypes", "OpenGrokCodeMode", "OpenGrokReleaseValidation", "OpenGrokDiagnostics", "OpenGrokScheduler", "OpenGrokLSP"])))
+    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s3, w2s4, w2s5, w3s1, w3s2, w3s3, w4s2, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w6s5, w7s3, w7s4, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokToolTypes", "OpenGrokCodeMode", "OpenGrokReleaseValidation", "OpenGrokDiagnostics", "OpenGrokScheduler", "OpenGrokLSP"])))
 
     // ---- Wave 11 (libraries + executable) ----
     // Distribution support only imports build support, version, and update
@@ -387,7 +388,7 @@ private func targets() -> [Target] {
     t.append(contentsOf: libs(w11s5Lib, dep(["OpenGrokDistributionSupport"])))
     t.append(.executableTarget(
         name: "OpenGrokExecutable",
-        dependencies: dep(["OpenGrokCLI", "OpenGrokPager", "OpenGrokPagerMinimal", "OpenGrokShell", "OpenGrokVersion", "OpenGrokDistributionSupport"])
+        dependencies: dep(["OpenGrokCLI", "OpenGrokPager", "OpenGrokPagerMinimal", "OpenGrokShell", "OpenGrokVersion", "OpenGrokDistributionSupport", "OpenGrokJavaScriptRuntime"])
     ))
 
     // ---- Test targets (one per library target) ----

@@ -127,7 +127,7 @@ actor ByteMailbox {
 /// write side, and interleaving either would corrupt the stream. Ping/pong and
 /// close handling happen inside `receive()`, so callers only ever see
 /// application messages.
-public actor WebSocketConnection {
+public actor WebSocketConnection: WebSocketClient {
     public let role: WebSocketRole
     public let maximumMessageSize: Int
 
@@ -269,7 +269,11 @@ public actor WebSocketConnection {
     /// Send a ping. This is the keepalive upstream sends every 15s
     /// (`crates/codegen/xai-grok-shell/src/agent/server.rs:265-269`, empty
     /// payload).
-    public func ping(payload: [UInt8] = []) async throws {
+    public func ping() async throws {
+        try await ping(payload: [])
+    }
+
+    public func ping(payload: [UInt8]) async throws {
         guard !isClosed, !didSendClose else { throw WebSocketChannelError.closed }
         try await sendFrame(
             WebSocketFrame(opcode: .ping, payload: payload, maskingKey: outboundMaskingKey())

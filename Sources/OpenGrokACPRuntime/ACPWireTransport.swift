@@ -285,7 +285,10 @@ public struct ACPWebSocketTransport: ACPTransport {
     }
 
     public func receive() async throws -> ACPMessage {
-        switch try await client.receive() {
+        guard let message = try await client.receive() else {
+            throw ACPTransportError.closed
+        }
+        switch message {
         case .text(let text):
             guard let data = text.data(using: .utf8) else { throw ACPTransportError.unsupportedPayload }
             return try ACPMessage(data: data)

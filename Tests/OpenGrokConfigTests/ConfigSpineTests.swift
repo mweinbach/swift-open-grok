@@ -72,6 +72,13 @@ struct RemoteSettingsAllowlistTests {
         #expect(projected.workspaceCommandEnabled == nil)
         #expect(projected.zdrAccessEnabled == nil)
         #expect(projected.gateMessage == nil)
+        #expect(projected.traceUploadEnabled == nil)
+        #expect(projected.twoPassCompactionEnabled == nil)
+        #expect(projected.askUserQuestionEnabled == nil)
+        #expect(projected.writeFileEnabled == nil)
+        #expect(projected.cancelRewindEnabled == nil)
+        #expect(projected.compactionMode == nil)
+        #expect(projected.compactionDetail == nil)
     }
 
     @Test("non-allowlisted fields cannot reach AllowlistedRemoteSettings")
@@ -83,14 +90,11 @@ struct RemoteSettingsAllowlistTests {
         rs.memoryEnabled = true
         rs.lspToolsEnabled = true
         rs.folderTrustEnabled = false
-        rs.writeFileEnabled = false
         rs.fileToolset = "restricted"
         rs.webFetchEnabled = false
         rs.imageGenEnabled = false
         rs.videoGenEnabled = false
         rs.feedbackEnabled = false
-        rs.compactionMode = "aggressive"
-        rs.twoPassCompactionEnabled = true
         rs.defaultModel = "grok-5"
         rs.subscriptionTier = "premium"
         rs.permissionMode = "auto"
@@ -113,21 +117,39 @@ struct RemoteSettingsAllowlistTests {
         #expect(projected.sessionRecap == nil)
     }
 
+    @Test("session feature authority fields are allowlisted")
+    func sessionAuthorityFieldsProject() {
+        var rs = RemoteSettings()
+        rs.traceUploadEnabled = true
+        rs.twoPassCompactionEnabled = true
+        rs.askUserQuestionEnabled = false
+        rs.writeFileEnabled = false
+        rs.cancelRewindEnabled = false
+        rs.compactionMode = "segments"
+        rs.compactionDetail = "minimal"
+
+        let projected = AllowlistedRemoteSettings(projecting: rs)
+        #expect(projected.traceUploadEnabled == true)
+        #expect(projected.twoPassCompactionEnabled == true)
+        #expect(projected.askUserQuestionEnabled == false)
+        #expect(projected.writeFileEnabled == false)
+        #expect(projected.cancelRewindEnabled == false)
+        #expect(projected.compactionMode == "segments")
+        #expect(projected.compactionDetail == "minimal")
+    }
+
     @Test("allowlisted wire name set is complete")
     func wireNameSetComplete() {
-        #expect(remoteSettingsAllowlistedWireNames.count == 12)
-        #expect(remoteSettingsAllowlistedWireNames.contains("telemetry_mode"))
-        #expect(remoteSettingsAllowlistedWireNames.contains("telemetry_enabled"))
-        #expect(remoteSettingsAllowlistedWireNames.contains("external_otel_disabled"))
-        #expect(remoteSettingsAllowlistedWireNames.contains("external_otel_content_gates_locked"))
-        #expect(remoteSettingsAllowlistedWireNames.contains("privacy_notice_rollout"))
-        #expect(remoteSettingsAllowlistedWireNames.contains("privacy_banner_reshow_days"))
-        #expect(remoteSettingsAllowlistedWireNames.contains("announcements"))
-        #expect(remoteSettingsAllowlistedWireNames.contains("sharing_enabled"))
-        #expect(remoteSettingsAllowlistedWireNames.contains("workspace_command_enabled"))
-        #expect(remoteSettingsAllowlistedWireNames.contains("zdr_access_enabled"))
-        #expect(remoteSettingsAllowlistedWireNames.contains("gate_message"))
-        #expect(remoteSettingsAllowlistedWireNames.contains("session_recap"))
+        let expected: Set<String> = [
+            "telemetry_mode", "telemetry_enabled", "external_otel_disabled",
+            "external_otel_content_gates_locked", "privacy_notice_rollout",
+            "privacy_banner_reshow_days", "announcements", "sharing_enabled",
+            "workspace_command_enabled", "zdr_access_enabled", "gate_message",
+            "session_recap", "trace_upload_enabled", "two_pass_compaction_enabled",
+            "ask_user_question_enabled", "write_file_enabled", "cancel_rewind_enabled",
+            "compaction_mode", "compaction_detail",
+        ]
+        #expect(remoteSettingsAllowlistedWireNames == expected)
     }
 
     @Test("non-allowlisted wire names are not in the set")
@@ -135,9 +157,9 @@ struct RemoteSettingsAllowlistTests {
         let shouldNotBeAllowlisted: [String] = [
             "leader_mode", "max_upload_file_bytes",
             "memory_enabled", "lsp_tools_enabled", "folder_trust_enabled",
-            "write_file_enabled", "file_toolset",
+            "file_toolset",
             "web_fetch_enabled", "image_gen_enabled", "video_gen_enabled",
-            "feedback_enabled", "compaction_mode", "two_pass_compaction_enabled",
+            "feedback_enabled",
             "default_model", "subscription_tier", "permission_mode",
             "auto_mode", "suggestions_enabled", "auto_compact_threshold_percent",
             "compaction_wall_clock_budget_secs", "subagents_max_depth",
@@ -205,6 +227,30 @@ struct GrokEnvGatesTests {
     func worktreeAutoGc() {
         #expect(GrokEnvGates.worktreeAutoGc(environment: ["GROK_WORKTREE_AUTO_GC": "false"]) == false)
         #expect(GrokEnvGates.worktreeAutoGc(environment: [:]) == nil)
+    }
+
+    @Test("session gate family parses booleans, aliases, and strings")
+    func sessionGateFamily() {
+        let environment = [
+            "GROK_TWO_PASS_COMPACTION": "1",
+            "GROK_ASK_USER_QUESTION": "false",
+            "GROK_WRITE_FILE": "off",
+            "GROK_BACKEND_SEARCH": "true",
+            "GROK_CANCEL_REWIND": "0",
+            "GROK_MCP_LIVENESS_WATCHERS": "disabled",
+            "GROK_TRACE_UPLOAD": "yes",
+            "GROK_COMPACTION_MODE": "segments",
+            "GROK_COMPACTION_DETAIL": "minimal",
+        ]
+        #expect(GrokEnvGates.twoPassCompaction(environment: environment) == true)
+        #expect(GrokEnvGates.askUserQuestion(environment: environment) == false)
+        #expect(GrokEnvGates.writeFile(environment: environment) == false)
+        #expect(GrokEnvGates.backendSearch(environment: environment) == true)
+        #expect(GrokEnvGates.cancelRewind(environment: environment) == false)
+        #expect(GrokEnvGates.mcpLivenessWatchers(environment: environment) == false)
+        #expect(GrokEnvGates.traceUpload(environment: environment) == true)
+        #expect(GrokEnvGates.compactionMode(environment: environment) == "segments")
+        #expect(GrokEnvGates.compactionDetail(environment: environment) == "minimal")
     }
 
     @Test("crashHandler prefers OPENGROK spelling")
@@ -329,6 +375,54 @@ struct EffectiveFeaturesPrecedenceTests {
         #expect(features.workflows.source == .default)
         #expect(features.sharing.value == false)
         #expect(features.sharing.source == .default)
+        #expect(features.twoPassCompaction.value == false)
+        #expect(features.askUserQuestion.value == true)
+        #expect(features.writeFile.value == true)
+        #expect(features.backendSearch.value == true)
+        #expect(features.cancelRewind.value == true)
+        #expect(features.mcpLivenessWatchers.value == true)
+        #expect(features.traceUpload.value == false)
+        #expect(features.compactionMode.value == "full_replace")
+        #expect(features.compactionDetail.value == "verbose")
+    }
+
+    @Test("session authority resolves env over config over remote")
+    func sessionAuthorityPrecedence() {
+        var remote = AllowlistedRemoteSettings()
+        remote.twoPassCompactionEnabled = false
+        remote.writeFileEnabled = true
+        remote.compactionMode = "remote"
+        let config = try! parseTOML("""
+        [features]
+        two_pass_compaction = true
+        write_file = false
+        compaction_mode = "segments"
+
+        [mcp]
+        liveness_watchers = false
+
+        [telemetry]
+        trace_upload = true
+        """)
+        let features = EffectiveFeatures.resolve(FeatureResolutionInputs(
+            effectiveConfig: config,
+            remote: remote,
+            environment: [
+                "GROK_WRITE_FILE": "true",
+                "GROK_COMPACTION_MODE": "env",
+            ]
+        ))
+
+        #expect(features.twoPassCompaction.value == true)
+        #expect(features.twoPassCompaction.source == .config)
+        #expect(features.writeFile.value == true)
+        #expect(features.writeFile.source == .env)
+        #expect(features.compactionMode.value == "env")
+        #expect(features.compactionMode.source == .env)
+        #expect(features.mcpLivenessWatchers.value == false)
+        #expect(features.mcpLivenessWatchers.source == .config)
+        #expect(features.traceUpload.value == true)
+        #expect(features.traceUpload.source == .config)
     }
 
     @Test("full precedence chain: requirement > env > config > remote > default")
@@ -428,17 +522,20 @@ struct RemoteFieldsInertnessTests {
         #expect(features.feedback.source == .default)
     }
 
-    @Test("non-allowlisted remote compactionMode cannot reach AllowlistedRemoteSettings")
-    func compactionModeInert() {
+    @Test("allowlisted remote compaction settings reach EffectiveFeatures")
+    func compactionSettingsProject() {
         var rs = RemoteSettings()
-        rs.compactionMode = "aggressive"
+        rs.compactionMode = "segments"
+        rs.compactionDetail = "minimal"
         rs.twoPassCompactionEnabled = true
-        rs.compactionWallClockBudgetSecs = 30
 
         let projected = AllowlistedRemoteSettings(projecting: rs)
+        let features = EffectiveFeatures.resolve(FeatureResolutionInputs(remote: projected))
 
-        #expect(projected.telemetryMode == nil)
-        #expect(projected.announcements == nil)
+        #expect(features.compactionMode.value == "segments")
+        #expect(features.compactionMode.source == .remote)
+        #expect(features.compactionDetail.value == "minimal")
+        #expect(features.twoPassCompaction.value == true)
     }
 
     @Test("non-allowlisted remote folderTrustEnabled cannot override EffectiveFeatures")

@@ -703,28 +703,25 @@ struct ACPLeaderLockTests {
         #expect(!FileManager.default.fileExists(atPath: lockPath.path))
     }
 #else
-    @Test("Windows refuses leader locking before creating endpoint artifacts")
-    func windowsRefusesWithoutArtifacts() throws {
+    @Test("Windows leader lock is exclusive and records the owner pid")
+    func windowsLockIsExclusive() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("leader-lock-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
         let lockPath = directory.appendingPathComponent("leader.lock")
         let socketPath = directory.appendingPathComponent("leader.sock")
-        let lock = ACPLeaderLock(lockPath: lockPath, socketPath: socketPath)
+        let owner = ACPLeaderLock(lockPath: lockPath, socketPath: socketPath)
+        try owner.acquire()
+        #expect(ACPLeaderLock.readPID(at: lockPath) == ProcessInfo.processInfo.processIdentifier)
 
-        do {
-            try lock.acquire()
-            Issue.record("Windows leader locking unexpectedly succeeded")
-        } catch let error as ACPLeaderLockError {
-            guard case .unsupportedPlatform(let path) = error else {
-                Issue.record("expected unsupportedPlatform, got \(error)")
-                return
-            }
-            #expect(path == lockPath.path)
-        }
+        let contender = ACPLeaderLock(lockPath: lockPath, socketPath: socketPath)
+        #expect(throws: ACPLeaderLockError.self) { try contender.acquire() }
 
-        #expect(!FileManager.default.fileExists(atPath: directory.path))
+        owner.release()
         #expect(!FileManager.default.fileExists(atPath: lockPath.path))
-        #expect(!FileManager.default.fileExists(atPath: socketPath.path))
+        let successor = ACPLeaderLock(lockPath: lockPath, socketPath: socketPath)
+        try successor.acquire()
+        successor.release()
     }
 #endif
 }

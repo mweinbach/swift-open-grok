@@ -390,6 +390,36 @@ struct JavaScriptHostBridgeTests {
 
 @Suite("JavaScript termination and bounds")
 struct JavaScriptTerminationTests {
+    @Test("isolated worker hard-interrupts a CPU-bound JavaScript cell")
+    func isolatedWorkerHardInterrupt() async throws {
+        let executable = try #require(
+            JavaScriptRuntimeSubprocess.workerExecutable(),
+            "the safe test runner must provide the open-grok worker executable"
+        )
+
+        let (events, continuation) = AsyncStream<JavaScriptRuntimeEvent>.makeStream(
+            bufferingPolicy: .unbounded
+        )
+        let worker = try JavaScriptRuntimeSubprocess.start(
+            executable: executable,
+            configuration: configuration(
+                source: "const until = Date.now() + 10000; while (Date.now() < until) {}"
+            ),
+            pendingMode: .continueImmediately,
+            continuation: continuation
+        )
+        let collector = EventCollector(events)
+        guard case .started = try #require(await collector.next(skippingNoise: false)) else {
+            Issue.record("expected the isolated worker runtime to start")
+            return
+        }
+
+        let start = ContinuousClock.now
+        worker.terminate()
+        #expect(await collector.drainUntilClosed(timeout: .seconds(2)))
+        #expect(ContinuousClock.now - start < .seconds(1))
+    }
+
     /// The ceiling is what reclaims a thread spinning inside JavaScript.
     /// Whether it *fires* is deliberately not asserted: it does under a
     /// normal process (verified out of band) but not under
