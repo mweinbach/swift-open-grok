@@ -228,7 +228,7 @@ public actor MCPStdioTransport: MCPTransport {
         // it must return EPIPE rather than raising SIGPIPE and killing us.
         #if canImport(Darwin)
         _ = fcntl(stdinPipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
-        #else
+        #elseif canImport(Glibc)
         _ = signal(SIGPIPE, SIG_IGN)
         #endif
         started = true
@@ -306,9 +306,30 @@ public actor MCPStdioTransport: MCPTransport {
     }
 
     private static func resolveExecutable(_ command: String, environment: [String: String]) -> URL {
-        if command.contains("/") {
+        if command.contains("/") || command.contains("\\") {
             return URL(fileURLWithPath: command)
         }
+
+        #if os(Windows)
+        let searchPath = environment["PATH"] ?? ""
+        var candidateNames = [command]
+        if URL(fileURLWithPath: command).pathExtension.isEmpty {
+            let executableExtensions = (environment["PATHEXT"] ?? ".COM;.EXE")
+                .split(separator: ";")
+                .map(String.init)
+                .filter { !$0.isEmpty }
+            candidateNames.append(contentsOf: executableExtensions.map { command + $0 })
+        }
+        for rawDirectory in searchPath.split(separator: ";") where !rawDirectory.isEmpty {
+            let directory = rawDirectory.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            for name in candidateNames {
+                let candidate = URL(fileURLWithPath: directory).appendingPathComponent(name)
+                if FileManager.default.fileExists(atPath: candidate.path) {
+                    return candidate
+                }
+            }
+        }
+        #else
         let searchPath = environment["PATH"] ?? "/usr/bin:/bin:/usr/local/bin"
         for directory in searchPath.split(separator: ":") where !directory.isEmpty {
             let candidate = URL(fileURLWithPath: String(directory)).appendingPathComponent(command)
@@ -316,6 +337,7 @@ public actor MCPStdioTransport: MCPTransport {
                 return candidate
             }
         }
+        #endif
         // Let `Process.run` surface the not-found error with the real name.
         return URL(fileURLWithPath: command)
     }

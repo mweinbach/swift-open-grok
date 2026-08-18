@@ -16,15 +16,19 @@ import FoundationNetworking
 import Testing
 @testable import OpenGrokTestSupport
 import OpenGrokTestUtilities
+#if os(Windows)
+import COpenGrokSockets
+import ucrt
+#endif
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
 #endif
 
-/// Cross-platform `SOCK_STREAM` value: on Darwin it is already `Int32`,
-/// on Linux/Windows it is a struct with a `.rawValue` Int32 member. Used
-/// by the BSD-socket test helpers below.
+#if !os(Windows)
+/// Cross-platform `SOCK_STREAM` value: on Darwin it is already `Int32`, while
+/// Linux exposes a struct with a `.rawValue` member.
 private var sockStreamType: Int32 {
     #if canImport(Darwin)
     return SOCK_STREAM
@@ -32,6 +36,105 @@ private var sockStreamType: Int32 {
     return Int32(SOCK_STREAM.rawValue)
     #endif
 }
+#endif
+
+private func setTestEnvironment(_ key: String, _ value: String) {
+    #if os(Windows)
+    _ = _putenv_s(key, value)
+    #else
+    setenv(key, value, 1)
+    #endif
+}
+
+private func unsetTestEnvironment(_ key: String) {
+    #if os(Windows)
+    _ = _putenv_s(key, "")
+    #else
+    unsetenv(key)
+    #endif
+}
+
+#if os(Windows)
+private typealias CountingSocketHandle = OGSocketHandle
+
+private func openCountingSocket(host: String, port: Int) throws -> CountingSocketHandle {
+    var handle: OGSocketHandle = -1
+    let result = host.withCString {
+        og_socket_tcp_connect($0, UInt16(port), 5.0, &handle)
+    }
+    guard result == 0 else {
+        throw NSError(domain: "CountingServerTest", code: 2)
+    }
+    return handle
+}
+
+private func closeCountingSocket(_ handle: CountingSocketHandle) {
+    _ = og_socket_close(handle)
+}
+
+private func readCountingSocket(
+    _ handle: CountingSocketHandle,
+    into buffer: UnsafeMutableRawPointer?,
+    capacity: Int
+) -> Int {
+    Int(og_socket_read(handle, buffer, capacity))
+}
+
+private func writeCountingSocket(
+    _ handle: CountingSocketHandle,
+    from buffer: UnsafeRawPointer?,
+    length: Int
+) -> Int {
+    Int(og_socket_write_all(handle, buffer, length))
+}
+#else
+private typealias CountingSocketHandle = Int32
+
+private func openCountingSocket(host: String, port: Int) throws -> CountingSocketHandle {
+    let handle = socket(AF_INET, sockStreamType, 0)
+    guard handle >= 0 else {
+        throw NSError(domain: "CountingServerTest", code: 1)
+    }
+    var address = sockaddr_in()
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = UInt16(port).bigEndian
+    address.sin_addr.s_addr = inet_addr(host)
+    let connected = withUnsafePointer(to: &address) { pointer -> Int32 in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            Foundation.connect(
+                handle,
+                socketAddress,
+                socklen_t(MemoryLayout<sockaddr_in>.size)
+            )
+        }
+    }
+    guard connected >= 0 else {
+        close(handle)
+        throw NSError(domain: "CountingServerTest", code: 2)
+    }
+    return handle
+}
+
+private func closeCountingSocket(_ handle: CountingSocketHandle) {
+    close(handle)
+}
+
+private func readCountingSocket(
+    _ handle: CountingSocketHandle,
+    into buffer: UnsafeMutableRawPointer?,
+    capacity: Int
+) -> Int {
+    Foundation.read(handle, buffer, capacity)
+}
+
+private func writeCountingSocket(
+    _ handle: CountingSocketHandle,
+    from buffer: UnsafeRawPointer?,
+    length: Int
+) -> Int {
+    Foundation.write(handle, buffer, length)
+}
+#endif
 
 @Suite("OpenGrokTestSupport")
 struct OpenGrokTestSupportTests {
@@ -704,8 +807,8 @@ struct OpenGrokTestSupportTests {
         // guard, then set a guard that overwrites it, then dispose the
         // guard — the outside value must come back.
         let key = "OG_TEST_ENVGUARD_PRIOR_\(UUID().uuidString)"
-        setenv(key, "outside", 1)
-        defer { unsetenv(key) }
+        setTestEnvironment(key, "outside")
+        defer { unsetTestEnvironment(key) }
         let guard1 = EnvGuard.set(key, "inside")
         #expect(ProcessInfo.processInfo.environment[key] == "inside")
         guard1.dispose()
@@ -738,7 +841,6 @@ struct OpenGrokTestSupportTests {
         // not validate pooling at all. This test pins the contract:
         // two requests over one retained client socket = 1 accept.
         let server = try spawnCountingServer()
-        let url = URL(string: server.baseURL + "/chat/completions")!
         // Open a single raw TCP connection and send two HTTP/1.1 requests
         // over it without `Connection: close`, so the server keeps the
         // socket alive.
@@ -808,6 +910,11 @@ struct OpenGrokTestSupportTests {
             try writeFrame(fd: client, body: payload)
             let echo = try readFrame(fd: client)
             #expect(echo == payload)
+        }
+        let counterDeadline = Date().addingTimeInterval(1)
+        while proxy.handle.forwarded(.clientToLeader) < 3 || proxy.handle.forwarded(.leaderToClient) < 3 {
+            guard Date() < counterDeadline else { break }
+            Thread.sleep(forTimeInterval: 0.001)
         }
         #expect(proxy.handle.forwarded(.clientToLeader) == 3)
         #expect(proxy.handle.forwarded(.leaderToClient) == 3)
@@ -1079,21 +1186,8 @@ struct OpenGrokTestSupportTests {
     private func twoRequestsOverOneSocket(
         host: String, port: Int, path: String
     ) throws -> (UInt16, Data, UInt16, Data) {
-        let fd = socket(AF_INET, sockStreamType, 0)
-        if fd < 0 { throw NSError(domain: "CountingServerTest", code: 1) }
-        defer { close(fd) }
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = UInt16(port).bigEndian
-        addr.sin_addr.s_addr = inet_addr(host)
-        let connected = withUnsafePointer(to: &addr) { ptr -> Int32 in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                Foundation.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        if connected < 0 {
-            throw NSError(domain: "CountingServerTest", code: 2)
-        }
+        let handle = try openCountingSocket(host: host, port: port)
+        defer { closeCountingSocket(handle) }
         // Two identical POSTs without `Connection: close`: the counting
         // server must keep the socket alive between them.
         let body = "{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
@@ -1101,8 +1195,8 @@ struct OpenGrokTestSupportTests {
         let head = "POST \(path) HTTP/1.1\r\nHost: \(host):\(port)\r\nContent-Type: application/json\r\nContent-Length: \(bodyBytes.count)\r\nConnection: keep-alive\r\n\r\n"
         func sendRequest() throws {
             let headBytes = Data(head.utf8)
-            try sendAll(fd: fd, data: headBytes)
-            try sendAll(fd: fd, data: bodyBytes)
+            try sendAll(handle: handle, data: headBytes)
+            try sendAll(handle: handle, data: bodyBytes)
         }
         func readResponse() throws -> (UInt16, Data) {
             // Read until \r\n\r\n, parse status + content-length, then
@@ -1111,7 +1205,7 @@ struct OpenGrokTestSupportTests {
             while buf.range(of: Data("\r\n\r\n".utf8)) == nil {
                 var chunk = [UInt8](repeating: 0, count: 4096)
                 let n = chunk.withUnsafeMutableBufferPointer { ptr in
-                    Foundation.read(fd, ptr.baseAddress, ptr.count)
+                    readCountingSocket(handle, into: ptr.baseAddress, capacity: ptr.count)
                 }
                 if n <= 0 {
                     throw NSError(domain: "CountingServerTest", code: 3)
@@ -1135,7 +1229,7 @@ struct OpenGrokTestSupportTests {
             while body.count < contentLength {
                 var chunk = [UInt8](repeating: 0, count: 4096)
                 let n = chunk.withUnsafeMutableBufferPointer { ptr in
-                    Foundation.read(fd, ptr.baseAddress, ptr.count)
+                    readCountingSocket(handle, into: ptr.baseAddress, capacity: ptr.count)
                 }
                 if n <= 0 { break }
                 body.append(contentsOf: chunk.prefix(n))
@@ -1149,12 +1243,16 @@ struct OpenGrokTestSupportTests {
         return (r1.0, r1.1, r2.0, r2.1)
     }
 
-    /// Write `data` fully to `fd`, retrying partial writes.
-    private func sendAll(fd: Int32, data: Data) throws {
+    /// Write `data` fully to `handle`, retrying partial writes.
+    private func sendAll(handle: CountingSocketHandle, data: Data) throws {
         var sent = 0
         while sent < data.count {
             let n = data.withUnsafeBytes { ptr -> Int in
-                Foundation.write(fd, ptr.baseAddress!.advanced(by: sent), data.count - sent)
+                writeCountingSocket(
+                    handle,
+                    from: ptr.baseAddress!.advanced(by: sent),
+                    length: data.count - sent
+                )
             }
             if n <= 0 {
                 throw NSError(domain: "CountingServerTest", code: 4)

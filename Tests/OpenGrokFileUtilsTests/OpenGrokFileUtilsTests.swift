@@ -53,6 +53,17 @@ struct OpenGrokFileUtilsTests {
         #expect(try String(contentsOf: path, encoding: .utf8) == "nested")
     }
 
+    @Test("atomic write with noFollow creates and replaces regular file")
+    func noFollowRegularFile() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("secure.json")
+        let options = AtomicWriteOptions(mode: 0o600, noFollowFinal: true)
+        try AtomicFile.write(path, contents: "first", options: options)
+        try AtomicFile.write(path, contents: "second", options: options)
+        #expect(try String(contentsOf: path, encoding: .utf8) == "second")
+    }
+
     @Test("atomic write cleans up temp on failure path collision")
     func atomicTempNaming() throws {
         let dir = try tempDir()
@@ -135,17 +146,13 @@ struct OpenGrokFileUtilsTests {
 
     // MARK: - Owner-only secure file
 
-    @Test("secure file is owner-only on Unix")
+    @Test("secure file is owner-only")
     func secureOwnerOnly() throws {
-        #if os(Windows)
-        return
-        #else
         let dir = try tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("auth.json")
         try SecureFile.write(at: path, contents: "token")
         #expect(try SecureFile.isOwnerOnly(at: path))
-        #endif
     }
 
     @Test("ensureOwnerOnly tightens world-readable file")
@@ -230,12 +237,6 @@ struct OpenGrokFileUtilsTests {
 
     @Test("exclusive lock blocks non-blocking peer")
     func advisoryLockBusy() throws {
-        #if os(Windows)
-        #expect(throws: FileUtilsError.self) {
-            _ = try AdvisoryFileLock.acquire(at: FileManager.default.temporaryDirectory
-                .appendingPathComponent("x.lock"))
-        }
-        #else
         let dir = try tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("res.lock")
@@ -247,7 +248,6 @@ struct OpenGrokFileUtilsTests {
         let after = try AdvisoryFileLock.tryAcquire(at: path)
         #expect(after != nil)
         after?.release()
-        #endif
     }
 
     // MARK: - Path security

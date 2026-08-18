@@ -274,7 +274,7 @@ struct TOMLParser {
     /// `-warnings-as-errors`.
     mutating func advance() {
         let c = src[pos]
-        if c == "\n" {
+        if c.isTOMLLineBreak {
             line += 1
             col = 1
         } else {
@@ -288,11 +288,7 @@ struct TOMLParser {
             let c = src[pos]
             if c == " " || c == "\t" { advance() }
             else if c == "#" { skipComment() }
-            else if c == "\n" { advance() }
-            else if c == "\r" {
-                advance()
-                if current == "\n" { advance() }
-            }
+            else if c.isTOMLLineBreak { advance() }
             else { break }
         }
     }
@@ -306,7 +302,7 @@ struct TOMLParser {
     }
 
     mutating func skipComment() {
-        while !isAtEnd && src[pos] != "\n" { advance() }
+        while !isAtEnd && !src[pos].isTOMLLineBreak { advance() }
     }
 
     func error(_ message: String) -> TOMLError {
@@ -472,7 +468,7 @@ struct TOMLParser {
         // Skip the rest of the line (whitespace + optional comment).
         skipInlineWhitespace()
         if let c = current, c == "#" { skipComment() }
-        if let c = current, c != "\n" && c != "\r" {
+        if let c = current, !c.isTOMLLineBreak {
             throw error("expected newline after table header, got '\(c)'")
         }
     }
@@ -530,7 +526,7 @@ struct TOMLParser {
         // Skip trailing inline whitespace + optional comment.
         skipInlineWhitespace()
         if let c = current, c == "#" { skipComment() }
-        if let c = current, c != "\n" && c != "\r" {
+        if let c = current, !c.isTOMLLineBreak {
             throw error("expected newline after value, got '\(c)'")
         }
         let fullPath = currentPath + keyPath
@@ -631,7 +627,6 @@ struct TOMLParser {
         // We require at least one `-` or `:` after a digit, and limit the
         // lexical run to digits, `-`, `:`, `.`, `T`, `t`, `Z`, `z`, `+`, and
         // space (only between date and time if a `T`/`t` is not used).
-        let start = pos
         // Quick check: must start with a digit (or sign followed by digit).
         guard let c = current, c.isNumber || c == "-" || c == "+" else { return nil }
         // Scan forward; bail if we see anything not in the datetime charset.
@@ -800,7 +795,7 @@ struct TOMLParser {
                 out.append(try parseEscape())
                 continue
             }
-            if c == "\n" { throw error("unterminated basic string (newline)") }
+            if c.isTOMLLineBreak { throw error("unterminated basic string (newline)") }
             out.append(c)
             advance()
         }
@@ -852,7 +847,7 @@ struct TOMLParser {
         while !isAtEnd {
             let c = src[pos]
             if c == "'" { advance(); return out }
-            if c == "\n" { throw error("unterminated literal string (newline)") }
+            if c.isTOMLLineBreak { throw error("unterminated literal string (newline)") }
             out.append(c); advance()
         }
         throw error("unterminated literal string")
@@ -865,8 +860,7 @@ struct TOMLParser {
         // Consume opening `"""`.
         advance(); advance(); advance()
         // Trim a leading newline.
-        if current == "\n" { advance() }
-        else if current == "\r" { advance(); if current == "\n" { advance() } }
+        if current?.isTOMLLineBreak == true { advance() }
         var out = ""
         while !isAtEnd {
             // Closing `"""`?
@@ -878,11 +872,11 @@ struct TOMLParser {
             if c == "\\" {
                 // Line-ending backslash: trim whitespace until next non-WS.
                 let nextIdx = src.index(after: pos)
-                if nextIdx < src.endIndex, src[nextIdx] == "\n" || src[nextIdx] == "\r" {
+                if nextIdx < src.endIndex, src[nextIdx].isTOMLLineBreak {
                     advance() // consume backslash
                     while !isAtEnd {
                         let ch = src[pos]
-                        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" { advance() }
+                        if ch == " " || ch == "\t" || ch.isTOMLLineBreak { advance() }
                         else { break }
                     }
                     continue
@@ -900,8 +894,7 @@ struct TOMLParser {
     /// immediately after `'''` is trimmed. No escapes.
     mutating func parseMultilineLiteralString() throws -> String {
         advance(); advance(); advance()
-        if current == "\n" { advance() }
-        else if current == "\r" { advance(); if current == "\n" { advance() } }
+        if current?.isTOMLLineBreak == true { advance() }
         var out = ""
         while !isAtEnd {
             if src[pos...].hasPrefix("'''") {
@@ -1089,6 +1082,10 @@ public func parseTOML(_ data: Data) throws -> TOMLValue {
 }
 
 extension Character {
+    var isTOMLLineBreak: Bool {
+        self == "\n" || self == "\r" || self == "\r\n"
+    }
+
     var isHexDigit: Bool {
         return isNumber || ("a"..."f").contains(self) || ("A"..."F").contains(self)
     }

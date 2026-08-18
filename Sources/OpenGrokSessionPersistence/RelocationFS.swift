@@ -213,7 +213,7 @@ public enum RelocationFS: Sendable {
 
         let tempURL = parent.appendingPathComponent(".\(path.lastPathComponent).\(UUID().uuidString).tmp")
         do {
-            try data.write(to: tempURL, options: [.atomicWrite])
+            try data.write(to: tempURL, options: [.atomic])
             #if !os(Windows)
             let mode = permissions ?? 0o600
             _ = chmod(tempURL.path, mode_t(mode))

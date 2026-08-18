@@ -29,13 +29,76 @@ struct OpenGrokHooksTests {
             context: HookRunContext(sessionId: "s", workspaceRoot: URL(fileURLWithPath: "/tmp")),
             mode: .tool,
             launchTransform: { executable, arguments in
+                #if os(Windows)
+                #expect((executable as NSString).lastPathComponent.lowercased() == "cmd.exe")
+                #expect(arguments == ["/C", "exit 7"])
+                let systemRoot = ProcessInfo.processInfo.environment["SystemRoot"] ?? #"C:\Windows"#
+                let powershell = (systemRoot as NSString)
+                    .appendingPathComponent(#"System32\WindowsPowerShell\v1.0\powershell.exe"#)
+                return (
+                    powershell,
+                    ["-NoProfile", "-NonInteractive", "-Command", #"[Console]::Out.Write('{"decision":"deny","reason":"transformed"}')"#]
+                )
+                #else
                 #expect(executable == "/bin/sh")
                 #expect(arguments == ["-c", "exit 7"])
                 return (executable, ["-c", #"printf '{"decision":"deny","reason":"transformed"}'"#])
+                #endif
             }
         )
         #expect(result.result == .decision(.deny(reason: "transformed", hookName: "rewritten")))
     }
+
+    #if os(Windows)
+    @Test("Windows command-script hooks launch under a minimal session environment")
+    func windowsCommandScriptLaunchesWithMinimalEnvironment() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opengrok-hook-cmd-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appendingPathComponent("launched.txt")
+        let script = root.appendingPathComponent("record.cmd")
+        let systemRoot = ProcessInfo.processInfo.environment["SystemRoot"] ?? #"C:\Windows"#
+        let moreExecutable = (systemRoot as NSString)
+            .appendingPathComponent(#"System32\more.com"#)
+        try """
+        @echo off
+        "\(moreExecutable)" > "\(marker.path)"
+        """.write(to: script, atomically: true, encoding: .utf8)
+
+        let spec = HookSpec(
+            name: "windows-cmd",
+            event: .sessionStart,
+            handlerType: .command,
+            command: script.path,
+            commandRaw: script.path,
+            timeoutMs: 5_000,
+            sourceDirectory: root
+        )
+        let envelope = HookEventEnvelope(
+            hookEventName: .sessionStart,
+            sessionId: "s",
+            cwd: root.path,
+            workspaceRoot: root.path
+        )
+        let result = await HookRunner.run(
+            spec: spec,
+            envelope: envelope,
+            context: HookRunContext(
+                sessionId: "s",
+                workspaceRoot: root,
+                environment: ["HOME": root.path]
+            ),
+            mode: .observe
+        )
+        guard result.result == .success else {
+            Issue.record("Windows .cmd hook failed: \(result.result)")
+            return
+        }
+        let recorded = try String(contentsOf: marker, encoding: .utf8)
+        #expect(recorded.contains(#""hookEventName":"session_start""#))
+    }
+    #endif
 
     @Test("a throwing command launch transform records failure without running the hook")
     func commandLaunchTransformFailureDoesNotSpawn() async {

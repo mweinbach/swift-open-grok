@@ -53,7 +53,9 @@ func runBoundedProcess(
     if finished.wait(timeout: .now() + timeout) == .timedOut {
         process.terminate()
         if finished.wait(timeout: .now() + 0.3) == .timedOut {
+            #if !os(Windows)
             kill(process.processIdentifier, SIGKILL)
+            #endif
             _ = finished.wait(timeout: .now() + 1.0)
         }
         return .timedOut

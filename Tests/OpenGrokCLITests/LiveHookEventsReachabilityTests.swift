@@ -9,8 +9,8 @@
 // generates, so every assertion reads the side-effect file the hook command
 // appends to, not the in-memory gate buffer.
 //
-// The hook command is a small Python script that reads the envelope JSON off
-// stdin and appends `hookEventName` plus the key payload fields to a log file.
+// The hook command is a small script that reads the envelope JSON off stdin
+// and appends it to a log file for platform-neutral normalization in the test.
 // A second, deliberately-failing hook proves a broken hook command does not
 // fail the turn (observe events fail open, PORT_PLAN.md gate order).
 
@@ -67,13 +67,23 @@ private struct HookEventsFixture {
         )
 
         logPath = home.appendingPathComponent("events.log").path
+        #if os(Windows)
+        scriptPath = home.appendingPathComponent("record_hook.cmd").path
+        #else
         scriptPath = home.appendingPathComponent("record_hook.py").path
-        // The hook command: read the envelope JSON off stdin and append
-        // `hookEventName` plus the key payload fields to the log. Key fields
-        // are top-level in the envelope (the encoder flattens payload).
-        // The shebang makes the `.py` file directly executable — the hook
-        // runner treats a command with no shell metacharacters as a path to
-        // an executable and launches it directly.
+        #endif
+        // The hook command reads the envelope JSON off stdin. Windows records
+        // the raw envelope with cmd.exe to avoid managed PowerShell startup;
+        // POSIX formats it in the script. The test normalizes both forms.
+        #if os(Windows)
+        let systemRoot = ProcessInfo.processInfo.environment["SystemRoot"] ?? #"C:\Windows"#
+        let moreExecutable = (systemRoot as NSString)
+            .appendingPathComponent(#"System32\more.com"#)
+        let recorder = """
+        @echo off
+        "\(moreExecutable)" >> "\(logPath)"
+        """
+        #else
         let recorder = """
         #!/usr/bin/env python3
         import json, sys
@@ -92,42 +102,59 @@ private struct HookEventsFixture {
         with open("\(logPath)", "a") as f:
             f.write("|".join(parts) + "\\n")
         """
+        #endif
         try recorder.write(to: URL(fileURLWithPath: scriptPath), atomically: true, encoding: .utf8)
+        #if !os(Windows)
         try FileManager.default.setAttributes(
             [.posixPermissions: NSNumber(value: Int16(0o755))],
             ofItemAtPath: scriptPath
         )
+        #endif
 
         // A deliberately-broken hook for UserPromptSubmit: exits 7 (neither
         // 0 nor 2), so it is an operational failure that must fail open and
         // be recorded without failing the turn.
+        #if os(Windows)
+        let brokenPath = home.appendingPathComponent("broken_hook.cmd").path
+        let brokenHook = "@echo off\nexit /b 7\n"
+        #else
         let brokenPath = home.appendingPathComponent("broken_hook.sh").path
-        try "#!/bin/sh\nexit 7\n".write(
+        let brokenHook = "#!/bin/sh\nexit 7\n"
+        #endif
+        try brokenHook.write(
             to: URL(fileURLWithPath: brokenPath),
             atomically: true,
             encoding: .utf8
         )
+        #if !os(Windows)
         try FileManager.default.setAttributes(
             [.posixPermissions: NSNumber(value: Int16(0o755))],
             ofItemAtPath: brokenPath
         )
+        #endif
 
         // Hook file: one command hook per observe event, all pointing at the
         // recorder, plus a broken UserPromptSubmit hook to prove fail-open.
+        let escapedScriptPath = scriptPath
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedBrokenPath = brokenPath
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
         let hooksJSON = """
         {
           "hooks": {
-            "SessionStart":        [{"hooks": [{"type": "command", "command": "\(scriptPath)"}]}],
-            "UserPromptSubmit":    [{"hooks": [{"type": "command", "command": "\(brokenPath)"},
-                                              {"type": "command", "command": "\(scriptPath)"}]}],
-            "PostToolUse":         [{"hooks": [{"type": "command", "command": "\(scriptPath)"}]}],
-            "PostToolUseFailure":  [{"hooks": [{"type": "command", "command": "\(scriptPath)"}]}],
-            "PermissionDenied":     [{"hooks": [{"type": "command", "command": "\(scriptPath)"}]}],
-            "StopFailure":          [{"hooks": [{"type": "command", "command": "\(scriptPath)"}]}],
-            "Notification":        [{"hooks": [{"type": "command", "command": "\(scriptPath)"}]}],
-            "PreCompact":           [{"hooks": [{"type": "command", "command": "\(scriptPath)"}]}],
-            "PostCompact":          [{"hooks": [{"type": "command", "command": "\(scriptPath)"}]}],
-            "SessionEnd":           [{"hooks": [{"type": "command", "command": "\(scriptPath)"}]}]
+            "SessionStart":        [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
+            "UserPromptSubmit":    [{"hooks": [{"type": "command", "command": "\(escapedBrokenPath)"},
+                                              {"type": "command", "command": "\(escapedScriptPath)"}]}],
+            "PostToolUse":         [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
+            "PostToolUseFailure":  [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
+            "PermissionDenied":     [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
+            "StopFailure":          [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
+            "Notification":        [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
+            "PreCompact":           [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
+            "PostCompact":          [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
+            "SessionEnd":           [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}]
           }
         }
         """
@@ -175,7 +202,24 @@ private struct HookEventsFixture {
     func recordedEvents() -> [String] {
         guard let contents = try? String(contentsOf: URL(fileURLWithPath: logPath), encoding: .utf8)
         else { return [] }
-        return contents.split(whereSeparator: \.isNewline).map(String.init)
+        let fields = [
+            "source", "prompt", "toolName", "toolUseId", "error",
+            "notificationType", "reason", "toolInputTruncated",
+            "toolResultTruncated", "isBackgrounded",
+        ]
+        return contents.split(whereSeparator: \.isNewline).map { rawLine in
+            let line = String(rawLine)
+            guard line.hasPrefix("{"),
+                  let data = line.data(using: .utf8),
+                  let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return line }
+            var parts = [envelope["hookEventName"] as? String ?? ""]
+            for key in fields {
+                guard let value = envelope[key], !(value is NSNull) else { continue }
+                parts.append("\(key)=\(value)")
+            }
+            return parts.joined(separator: "|")
+        }
     }
 
     /// Wait for `event` to appear in the log, polling the file the hook

@@ -28,10 +28,13 @@
 // backup bytes+mode, no leftover artifacts, validator failure/timeout).
 
 import Foundation
+import COpenGrokSockets
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif os(Windows)
+import WinSDK
 #endif
 
 // MARK: - Public types (mod.rs)
@@ -757,23 +760,99 @@ struct ManagedSourceState: Sendable, Equatable {
     }
 }
 
+private enum ManagedPathKind {
+    case missing
+    case directory
+    case regular
+    case symbolicLink
+    case other
+}
+
+private func managedPathKind(_ path: String) throws -> ManagedPathKind {
+    #if os(Windows)
+    let attributes = path.withCString(encodedAs: UTF16.self) { pointer in
+        GetFileAttributesW(pointer)
+    }
+    if attributes == DWORD(INVALID_FILE_ATTRIBUTES) {
+        let code = GetLastError()
+        if code == DWORD(ERROR_FILE_NOT_FOUND) || code == DWORD(ERROR_PATH_NOT_FOUND) {
+            return .missing
+        }
+        throw ManagedConfigError.read(path: path, detail: "Windows error \(code)")
+    }
+    if attributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return .symbolicLink
+    }
+    if attributes & DWORD(FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return .directory
+    }
+    return .regular
+    #else
+    var status = stat()
+    if lstat(path, &status) == 0 {
+        switch status.st_mode & S_IFMT {
+        case S_IFLNK: return .symbolicLink
+        case S_IFDIR: return .directory
+        case S_IFREG: return .regular
+        default: return .other
+        }
+    }
+    if errno == ENOENT {
+        return .missing
+    }
+    throw ManagedConfigError.read(path: path, detail: errnoString())
+    #endif
+}
+
+private func managedPathIsAbsolute(_ path: String) -> Bool {
+    (path as NSString).isAbsolutePath
+}
+
+private func managedAppendPath(_ base: String, _ component: String) -> String {
+    (base as NSString).appendingPathComponent(component)
+}
+
 /// `FileIdentity` (source.rs:185-215) — dev/ino on unix.
 struct ManagedFileIdentity: Sendable, Equatable {
     var dev: UInt64
     var ino: UInt64
 
     init?(path: String) {
+        #if os(Windows)
+        let handle = path.withCString(encodedAs: UTF16.self) { pointer in
+            CreateFileW(
+                pointer,
+                DWORD(FILE_READ_ATTRIBUTES),
+                DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+                nil,
+                DWORD(OPEN_EXISTING),
+                DWORD(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT),
+                nil
+            )
+        }
+        guard handle != INVALID_HANDLE_VALUE else { return nil }
+        defer { CloseHandle(handle) }
+        var information = BY_HANDLE_FILE_INFORMATION()
+        guard GetFileInformationByHandle(handle, &information) else { return nil }
+        self.dev = UInt64(information.dwVolumeSerialNumber)
+        self.ino = (UInt64(information.nFileIndexHigh) << 32) | UInt64(information.nFileIndexLow)
+        #else
         var status = stat()
         guard lstat(path, &status) == 0 else { return nil }
         self.dev = UInt64(status.st_dev)
         self.ino = UInt64(status.st_ino)
+        #endif
     }
 }
 
 private func fileMode(_ path: String) -> UInt16? {
+    #if os(Windows)
+    nil
+    #else
     var status = stat()
     guard stat(path, &status) == 0 else { return nil }
     return UInt16(status.st_mode & 0o7777)
+    #endif
 }
 
 /// `ParentPlan` (source.rs:30-125): capture the existing directory chain
@@ -797,32 +876,27 @@ struct ManagedParentPlan: Sendable, Equatable {
         var firstMissing: String?
         let components = (parent as NSString).pathComponents
         for component in components {
-            if component == "/" {
-                if current.isEmpty { current = "/" }
-                continue
-            }
-            current = current == "/" ? "/" + component : current + "/" + component
-            var status = stat()
-            if lstat(current, &status) == 0 {
-                if (status.st_mode & S_IFMT) == S_IFLNK {
-                    throw ManagedConfigError.unsafePath(
-                        path: current, reason: "symlinked parent directory is not allowed"
-                    )
-                }
-                if (status.st_mode & S_IFMT) != S_IFDIR {
-                    throw ManagedConfigError.unsafePath(
-                        path: current, reason: "parent component is not a directory"
-                    )
-                }
+            current = current.isEmpty ? component : managedAppendPath(current, component)
+            switch try managedPathKind(current) {
+            case .symbolicLink:
+                throw ManagedConfigError.unsafePath(
+                    path: current, reason: "symlinked parent directory is not allowed"
+                )
+            case .directory:
                 guard let identity = ManagedFileIdentity(path: current) else {
                     throw ManagedConfigError.read(path: current, detail: "stat failed")
                 }
                 chain.append((current, identity))
-            } else if errno == ENOENT {
+            case .missing:
                 firstMissing = current
                 break
-            } else {
-                throw ManagedConfigError.read(path: current, detail: errnoString())
+            case .regular, .other:
+                throw ManagedConfigError.unsafePath(
+                    path: current, reason: "parent component is not a directory"
+                )
+            }
+            if firstMissing != nil {
+                break
             }
         }
         return ManagedParentPlan(parent: parent, existingChain: chain, firstMissing: firstMissing)
@@ -860,13 +934,7 @@ struct ManagedParentPlan: Sendable, Equatable {
     /// `revalidate_existing` (source.rs:112-124).
     private func revalidateExisting() throws {
         for (path, expected) in existingChain {
-            var status = stat()
-            guard lstat(path, &status) == 0 else {
-                throw ManagedConfigError.parentChanged(path)
-            }
-            if (status.st_mode & S_IFMT) == S_IFLNK
-                || (status.st_mode & S_IFMT) != S_IFDIR
-                || ManagedFileIdentity(path: path) != expected {
+            if try managedPathKind(path) != .directory || ManagedFileIdentity(path: path) != expected {
                 throw ManagedConfigError.parentChanged(path)
             }
         }
@@ -878,47 +946,60 @@ struct ManagedParentPlan: Sendable, Equatable {
 final class ManagedParentAnchor {
     let path: String
     let identity: ManagedFileIdentity
+    #if !os(Windows)
     private let fd: Int32
+    #endif
 
+    #if os(Windows)
+    private init(path: String, identity: ManagedFileIdentity) {
+        self.path = path
+        self.identity = identity
+    }
+    #else
     private init(path: String, identity: ManagedFileIdentity, fd: Int32) {
         self.path = path
         self.identity = identity
         self.fd = fd
     }
+    #endif
 
-    deinit { close(fd) }
+    deinit {
+        #if !os(Windows)
+        close(fd)
+        #endif
+    }
 
     static func capture(_ path: String) throws -> ManagedParentAnchor {
-        var status = stat()
-        guard lstat(path, &status) == 0 else {
-            throw ManagedConfigError.read(path: path, detail: errnoString())
-        }
-        if (status.st_mode & S_IFMT) == S_IFLNK || (status.st_mode & S_IFMT) != S_IFDIR {
+        guard try managedPathKind(path) == .directory else {
             throw ManagedConfigError.parentChanged(path)
         }
         guard let identity = ManagedFileIdentity(path: path) else {
             throw ManagedConfigError.read(path: path, detail: "stat failed")
         }
+        #if os(Windows)
+        return ManagedParentAnchor(path: path, identity: identity)
+        #else
         let fd = open(path, O_RDONLY)
         guard fd >= 0 else {
             throw ManagedConfigError.read(path: path, detail: errnoString())
         }
         return ManagedParentAnchor(path: path, identity: identity, fd: fd)
+        #endif
     }
 
     func revalidate() throws {
-        var status = stat()
-        guard lstat(path, &status) == 0,
-              (status.st_mode & S_IFMT) == S_IFDIR,
+        guard try managedPathKind(path) == .directory,
               ManagedFileIdentity(path: path) == identity else {
             throw ManagedConfigError.parentChanged(path)
         }
     }
 
     func sync() throws {
+        #if !os(Windows)
         if fsync(fd) != 0 {
             throw ManagedConfigError.sync(path: path, detail: errnoString())
         }
+        #endif
     }
 }
 
@@ -929,6 +1010,16 @@ private func errnoString() -> String {
 /// `absolute_lexical` (source.rs:217-243): absolute + lexically normalized
 /// (`.` dropped, `..` popped) without touching the filesystem.
 func absoluteLexical(_ path: String) throws -> String {
+    #if os(Windows)
+    let url: URL
+    if managedPathIsAbsolute(path) {
+        url = URL(fileURLWithPath: path)
+    } else {
+        let base = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        url = URL(fileURLWithPath: path, relativeTo: base)
+    }
+    return url.standardizedFileURL.path
+    #else
     let absolute: String
     if path.hasPrefix("/") {
         absolute = path
@@ -947,6 +1038,7 @@ func absoluteLexical(_ path: String) throws -> String {
         }
     }
     return "/" + normalized.joined(separator: "/")
+    #endif
 }
 
 /// `resolve_final_symlink` (source.rs:245-296): physicalize the parent, then
@@ -960,28 +1052,24 @@ func resolveFinalSymlink(_ path: String) throws -> String {
         if !seen.insert(current).inserted {
             throw ManagedConfigError.unsafePath(path: path, reason: "symlink cycle detected")
         }
-        var status = stat()
-        if lstat(current, &status) == 0 {
-            if (status.st_mode & S_IFMT) == S_IFLNK {
+        switch try managedPathKind(current) {
+        case .symbolicLink:
                 followed = true
                 guard let link = try? FileManager.default.destinationOfSymbolicLink(atPath: current) else {
                     throw ManagedConfigError.read(path: current, detail: "could not read symlink")
                 }
-                if link.hasPrefix("/") {
+                if managedPathIsAbsolute(link) {
                     current = try absoluteLexical(link)
                 } else {
                     let parent = (current as NSString).deletingLastPathComponent
-                    current = try absoluteLexical((parent.isEmpty ? "/" : parent) + "/" + link)
+                    current = try absoluteLexical(managedAppendPath(parent, link))
                 }
-            } else {
-                return current
-            }
-        } else if errno == ENOENT && !followed {
+        case .missing where !followed:
             return current
-        } else if errno == ENOENT {
+        case .missing:
             throw ManagedConfigError.unsafePath(path: path, reason: "symlink target does not exist")
-        } else {
-            throw ManagedConfigError.read(path: current, detail: errnoString())
+        case .directory, .regular, .other:
+            return current
         }
     }
     throw ManagedConfigError.unsafePath(
@@ -996,8 +1084,20 @@ private func physicalizeParent(_ path: String) throws -> String {
     var probe = parent
     var missing: [String] = []
     while true {
+        #if os(Windows)
+        if try managedPathKind(probe) != .missing {
+            var physical = URL(fileURLWithPath: probe).resolvingSymlinksInPath().standardizedFileURL.path
+            for component in missing.reversed() {
+                physical = managedAppendPath(physical, component)
+            }
+            let name = (path as NSString).lastPathComponent
+            if !name.isEmpty {
+                physical = managedAppendPath(physical, name)
+            }
+            return physical
+        }
+        #else
         var resolved: String?
-        // realpath resolves the existing prefix; NotFound walks upward.
         if let buffer = realpath(probe, nil) {
             resolved = String(cString: buffer)
             free(buffer)
@@ -1013,9 +1113,13 @@ private func physicalizeParent(_ path: String) throws -> String {
             }
             return physical
         }
-        if errno == ENOENT {
+        if errno != ENOENT {
+            throw ManagedConfigError.read(path: probe, detail: errnoString())
+        }
+        #endif
+        do {
             let name = (probe as NSString).lastPathComponent
-            if name.isEmpty || name == "/" {
+            if name.isEmpty || name == "/" || name == probe {
                 throw ManagedConfigError.unsafePath(path: path, reason: "could not resolve config parent")
             }
             missing.append(name)
@@ -1024,8 +1128,6 @@ private func physicalizeParent(_ path: String) throws -> String {
                 throw ManagedConfigError.unsafePath(path: path, reason: "could not resolve config parent")
             }
             probe = next
-        } else {
-            throw ManagedConfigError.read(path: probe, detail: errnoString())
         }
     }
 }
@@ -1033,21 +1135,23 @@ private func physicalizeParent(_ path: String) throws -> String {
 /// `read_source` (source.rs:341-387): fail closed on non-regular files,
 /// oversize files, and NUL bytes.
 func readManagedSource(_ path: String) throws -> ManagedSourceState {
-    var status = stat()
-    guard stat(path, &status) == 0 else {
-        if errno == ENOENT {
-            return ManagedSourceState(bytes: nil, mode: 0o644, identity: nil)
-        }
-        throw ManagedConfigError.read(path: path, detail: errnoString())
-    }
-    if (status.st_mode & S_IFMT) != S_IFREG {
+    switch try managedPathKind(path) {
+    case .missing:
+        #if os(Windows)
+        return ManagedSourceState(bytes: nil, mode: nil, identity: nil)
+        #else
+        return ManagedSourceState(bytes: nil, mode: 0o644, identity: nil)
+        #endif
+    case .regular:
+        break
+    case .directory, .symbolicLink, .other:
         throw ManagedConfigError.unsafePath(path: path, reason: "target is not a regular file")
-    }
-    if status.st_size > Int64(managedMaxConfigBytes) {
-        throw ManagedConfigError.unsafePath(path: path, reason: "file exceeds \(managedMaxConfigBytes) bytes")
     }
     guard let data = FileManager.default.contents(atPath: path) else {
         throw ManagedConfigError.read(path: path, detail: "could not read file")
+    }
+    if data.count > managedMaxConfigBytes {
+        throw ManagedConfigError.unsafePath(path: path, reason: "file exceeds \(managedMaxConfigBytes) bytes")
     }
     let bytes = [UInt8](data)
     if bytes.contains(0) {
@@ -1055,7 +1159,7 @@ func readManagedSource(_ path: String) throws -> ManagedSourceState {
     }
     return ManagedSourceState(
         bytes: bytes,
-        mode: UInt16(status.st_mode & 0o7777),
+        mode: fileMode(path),
         identity: ManagedFileIdentity(path: path)
     )
 }
@@ -1077,6 +1181,60 @@ func revalidateManagedSource(_ plan: ManagedConfigPlan) throws {
 // MARK: - transaction.rs
 
 private let artifactNonce = ManagedNonce()
+
+#if os(Windows)
+private final class ManagedTransactionLock {
+    private var handle: OGSocketHandle
+
+    init(path: String) throws {
+        var handle: OGSocketHandle = -1
+        let result = path.withCString { pointer in
+            og_file_lock_acquire(pointer, nil, &handle)
+        }
+        guard result == 0 else {
+            let message = String(cString: og_socket_last_error_message())
+            throw ManagedConfigError.lock(
+                path: path,
+                detail: message.isEmpty ? "Windows error \(og_socket_last_error_code())" : message
+            )
+        }
+        self.handle = handle
+    }
+
+    func release() {
+        guard handle != -1 else { return }
+        _ = og_file_lock_release(handle)
+        handle = -1
+    }
+
+    deinit { release() }
+}
+#else
+private final class ManagedTransactionLock {
+    private var fd: Int32
+
+    init(path: String) throws {
+        let fd = open(path, O_RDWR | O_CREAT, 0o600)
+        guard fd >= 0 else {
+            throw ManagedConfigError.lock(path: path, detail: errnoString())
+        }
+        guard flock(fd, LOCK_EX) == 0 else {
+            let detail = errnoString()
+            close(fd)
+            throw ManagedConfigError.lock(path: path, detail: detail)
+        }
+        self.fd = fd
+    }
+
+    func release() {
+        guard fd >= 0 else { return }
+        close(fd)
+        fd = -1
+    }
+
+    deinit { release() }
+}
+#endif
 
 /// `ARTIFACT_NONCE` (transaction.rs:9): process-wide unique-name counter.
 private final class ManagedNonce: @unchecked Sendable {
@@ -1133,19 +1291,16 @@ func managedTransactionApply(_ plan: ManagedConfigPlan) throws -> ManagedConfigO
         )
     }
 
-    let lockFD = try openManagedLock(plan.lockPath)
-    defer { close(lockFD) } // close releases the flock
-    if flock(lockFD, LOCK_EX) != 0 {
-        throw ManagedConfigError.lock(path: plan.lockPath, detail: errnoString())
-    }
+    let transactionLock = try ManagedTransactionLock(path: plan.lockPath)
+    defer { transactionLock.release() }
     try parentAnchor.revalidate()
     try revalidateManagedSource(plan)
 
     var backup: String?
     var temp: String?
     func cleanupArtifacts() {
-        if let temp { unlink(temp) }
-        if let backup { unlink(backup) }
+        if let temp { removeManagedFile(temp) }
+        if let backup { removeManagedFile(backup) }
     }
 
     do {
@@ -1171,9 +1326,7 @@ func managedTransactionApply(_ plan: ManagedConfigPlan) throws -> ManagedConfigO
         try parentAnchor.revalidate()
         try revalidateManagedSource(plan)
         try applyExactPathMode(tempPath, mode: plan.original.mode)
-        if rename(tempPath, plan.targetPath) != 0 {
-            throw ManagedConfigError.publish(path: plan.targetPath, detail: errnoString())
-        }
+        try replaceManagedFile(source: tempPath, target: plan.targetPath)
         temp = nil
     } catch {
         cleanupArtifacts()
@@ -1189,7 +1342,7 @@ func managedTransactionApply(_ plan: ManagedConfigPlan) throws -> ManagedConfigO
         // Post-publish failure: restore the original exactly, or remove a
         // newly created target (transaction.rs:347-390).
         try rollbackManagedTransaction(plan, parentAnchor: parentAnchor, primary: error)
-        if let backup { unlink(backup) }
+        if let backup { removeManagedFile(backup) }
         throw error
     }
 
@@ -1216,7 +1369,9 @@ private func reserveArtifact(
         } else {
             candidate = artifactCandidate(target, kind: kind, attempt: attempt)
         }
-        let fd = open(candidate, O_WRONLY | O_CREAT | O_EXCL, mode_t(mode ?? 0o644))
+        let fd = candidate.withCString {
+            og_file_descriptor_create_exclusive($0, Int32(mode ?? 0o644))
+        }
         if fd >= 0 {
             return (candidate, fd)
         }
@@ -1230,30 +1385,80 @@ private func reserveArtifact(
 
 /// `write_reserved` (transaction.rs:279-292): write, exact mode, fsync.
 private func writeReserved(path: String, fd: Int32, bytes: [UInt8], mode: UInt16?) throws {
-    defer { close(fd) }
-    var written = 0
-    while written < bytes.count {
-        let result = bytes.withUnsafeBytes { buffer -> Int in
-            write(fd, buffer.baseAddress!.advanced(by: written), bytes.count - written)
-        }
-        if result <= 0 {
+    #if os(Windows)
+    var closed = false
+    defer {
+        if !closed { _ = og_file_descriptor_close(fd) }
+    }
+    let written = bytes.withUnsafeBytes { buffer in
+        og_file_descriptor_write_all(fd, buffer.baseAddress, buffer.count)
+    }
+    guard written == Int64(bytes.count) else {
+        throw ManagedConfigError.write(path: path, detail: managedNativeFileError())
+    }
+    guard og_file_descriptor_flush(fd) == 0 else {
+        throw ManagedConfigError.write(path: path, detail: managedNativeFileError())
+    }
+    guard og_file_descriptor_close(fd) == 0 else {
+        throw ManagedConfigError.write(path: path, detail: managedNativeFileError())
+    }
+    closed = true
+    #else
+    let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    do {
+        try file.write(contentsOf: Data(bytes))
+        if let mode, fchmod(fd, mode_t(mode)) != 0 {
             throw ManagedConfigError.write(path: path, detail: errnoString())
         }
-        written += result
+        try file.synchronize()
+        try file.close()
+    } catch let error as ManagedConfigError {
+        try? file.close()
+        throw error
+    } catch {
+        try? file.close()
+        throw ManagedConfigError.write(path: path, detail: error.localizedDescription)
     }
-    if let mode, fchmod(fd, mode_t(mode)) != 0 {
-        throw ManagedConfigError.write(path: path, detail: errnoString())
-    }
-    if fsync(fd) != 0 {
-        throw ManagedConfigError.write(path: path, detail: errnoString())
-    }
+    #endif
+}
+
+private func managedNativeFileError() -> String {
+    let message = String(cString: og_socket_last_error_message())
+    return message.isEmpty ? "system error \(og_socket_last_error_code())" : message
 }
 
 /// `apply_exact_path_mode` (transaction.rs:308-320).
 private func applyExactPathMode(_ path: String, mode: UInt16?) throws {
+    #if !os(Windows)
     if let mode, chmod(path, mode_t(mode)) != 0 {
         throw ManagedConfigError.write(path: path, detail: errnoString())
     }
+    #endif
+}
+
+private func removeManagedFile(_ path: String) {
+    try? FileManager.default.removeItem(atPath: path)
+}
+
+private func replaceManagedFile(source: String, target: String) throws {
+    #if os(Windows)
+    let moved = source.withCString(encodedAs: UTF16.self) { sourcePointer in
+        target.withCString(encodedAs: UTF16.self) { targetPointer in
+            MoveFileExW(
+                sourcePointer,
+                targetPointer,
+                DWORD(MOVEFILE_REPLACE_EXISTING) | DWORD(MOVEFILE_WRITE_THROUGH)
+            )
+        }
+    }
+    guard moved else {
+        throw ManagedConfigError.publish(path: target, detail: "Windows error \(GetLastError())")
+    }
+    #else
+    if rename(source, target) != 0 {
+        throw ManagedConfigError.publish(path: target, detail: errnoString())
+    }
+    #endif
 }
 
 /// `verify_published` (transaction.rs:327-345): published bytes and mode
@@ -1289,17 +1494,22 @@ private func rollbackManagedTransaction(
             try writeReserved(path: rollbackPath, fd: rollbackFD, bytes: original, mode: plan.original.mode)
             try applyExactPathMode(rollbackPath, mode: plan.original.mode)
         } catch {
-            unlink(rollbackPath)
+            removeManagedFile(rollbackPath)
             throw error
         }
-        if rename(rollbackPath, plan.targetPath) != 0 {
-            let detail = errnoString()
-            unlink(rollbackPath)
-            throw ManagedConfigError.publish(path: plan.targetPath, detail: detail)
+        do {
+            try replaceManagedFile(source: rollbackPath, target: plan.targetPath)
+        } catch {
+            removeManagedFile(rollbackPath)
+            throw error
         }
     } else {
-        if unlink(plan.targetPath) != 0 && errno != ENOENT {
-            throw ManagedConfigError.publish(path: plan.targetPath, detail: errnoString())
+        do {
+            try FileManager.default.removeItem(atPath: plan.targetPath)
+        } catch {
+            if FileManager.default.fileExists(atPath: plan.targetPath) {
+                throw ManagedConfigError.publish(path: plan.targetPath, detail: error.localizedDescription)
+            }
         }
     }
     try parentAnchor.sync()
@@ -1322,15 +1532,6 @@ private func verifyRollback(_ plan: ManagedConfigPlan) throws {
             path: plan.targetPath, reason: "rollback did not remove the newly created target"
         )
     }
-}
-
-/// `open_lock` (transaction.rs:434-448).
-private func openManagedLock(_ path: String) throws -> Int32 {
-    let fd = open(path, O_RDWR | O_CREAT, 0o600)
-    guard fd >= 0 else {
-        throw ManagedConfigError.lock(path: path, detail: errnoString())
-    }
-    return fd
 }
 
 // MARK: - validator.rs

@@ -336,7 +336,7 @@ public func discoverRepository(from path: String) throws -> (String, String, Rep
                     let raw = trimmed.dropFirst("gitdir:".count)
                         .trimmingCharacters(in: .whitespaces)
                     let resolved: URL
-                    if raw.hasPrefix("/") {
+                    if (raw as NSString).isAbsolutePath {
                         resolved = URL(fileURLWithPath: raw)
                     } else {
                         resolved = current.appendingPathComponent(raw)
@@ -588,7 +588,30 @@ struct GitIgnoreMatcher {
 
 /// Minimal glob: `*` and `?` only, no `**`.
 func globMatch(_ pattern: String, _ text: String) -> Bool {
-    fnmatch(pattern, text, 0) == 0
+    let patternCharacters = Array(pattern)
+    let textCharacters = Array(text)
+    var previous = [Bool](repeating: false, count: textCharacters.count + 1)
+    previous[0] = true
+
+    for patternCharacter in patternCharacters {
+        var current = [Bool](repeating: false, count: textCharacters.count + 1)
+        if patternCharacter == "*" {
+            current[0] = previous[0]
+            if !textCharacters.isEmpty {
+                for index in 1...textCharacters.count {
+                    current[index] = previous[index] || current[index - 1]
+                }
+            }
+        } else if !textCharacters.isEmpty {
+            for index in 1...textCharacters.count {
+                current[index] = previous[index - 1]
+                    && (patternCharacter == "?" || patternCharacter == textCharacters[index - 1])
+            }
+        }
+        previous = current
+    }
+
+    return previous[textCharacters.count]
 }
 
 // MARK: - Walk

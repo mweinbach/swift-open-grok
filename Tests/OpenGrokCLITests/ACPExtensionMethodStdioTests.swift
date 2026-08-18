@@ -36,23 +36,35 @@ private final class RecordingFeedbackStore: LiveFeedbackStore, @unchecked Sendab
 private final class StdioPipeHarness: @unchecked Sendable {
     let agentIO: ACPStandardIO
     let clientTransport: ACPStdioTransport
-    private let descriptors: [Int32]
+    private let toAgent: Pipe
+    private let fromAgent: Pipe
 
     init() throws {
-        var toAgent: [Int32] = [0, 0]
-        var fromAgent: [Int32] = [0, 0]
-        guard pipe(&toAgent) == 0, pipe(&fromAgent) == 0 else {
-            throw ACPTransportError.closed
-        }
-        descriptors = [toAgent[0], toAgent[1], fromAgent[0], fromAgent[1]]
-        agentIO = ACPStandardIO(input: toAgent[0], output: fromAgent[1])
+        let toAgent = Pipe()
+        let fromAgent = Pipe()
+        self.toAgent = toAgent
+        self.fromAgent = fromAgent
+        agentIO = ACPStandardIO(
+            input: toAgent.fileHandleForReading,
+            output: fromAgent.fileHandleForWriting
+        )
         clientTransport = ACPStdioTransport(
-            io: ACPStandardIO(input: fromAgent[0], output: toAgent[1])
+            io: ACPStandardIO(
+                input: fromAgent.fileHandleForReading,
+                output: toAgent.fileHandleForWriting
+            )
         )
     }
 
     func dispose() {
-        for descriptor in descriptors { close(descriptor) }
+        for handle in [
+            toAgent.fileHandleForReading,
+            toAgent.fileHandleForWriting,
+            fromAgent.fileHandleForReading,
+            fromAgent.fileHandleForWriting,
+        ] {
+            try? handle.close()
+        }
     }
 }
 

@@ -59,11 +59,19 @@ public func decideFolderTrust(featureEnabled: Bool, inputs: FolderTrustDecideInp
 
 /// Over-broad roots that must never be persisted as trusted.
 public func isUnsafeTrustRoot(_ path: String, home: String? = nil) -> Bool {
-    let p = normalizeLexically(path)
-    if p.isEmpty || !p.hasPrefix("/") { return true }
+    let p = trustPathKey(path)
+    if p.isEmpty || !(path.hasPrefix("/") || isAbsolutePath(path)) { return true }
     if p == "/" { return true }
+    #if os(Windows)
+    if p.count == 3, p[p.index(after: p.startIndex)] == ":", p.hasSuffix("/") {
+        return true
+    }
+    if p.hasPrefix("//"), p.split(separator: "/").count <= 2 {
+        return true
+    }
+    #endif
     if let home {
-        let h = normalizeLexically(home)
+        let h = trustPathKey(home)
         if p == h { return true }
     }
     return false
@@ -124,13 +132,13 @@ public struct DurableTrustStore: Sendable {
     }
 
     public mutating func setTrusted(_ path: URL, home: String? = nil) {
-        let key = normalizeLexically(path.path)
+        let key = trustPathKey(path.path)
         if isUnsafeTrustRoot(key, home: home) { return }
         folders[key] = Record(trusted: true)
     }
 
     public mutating func setUntrusted(_ path: URL, home: String? = nil) {
-        let key = normalizeLexically(path.path)
+        let key = trustPathKey(path.path)
         if isUnsafeTrustRoot(key, home: home) { return }
         folders[key] = Record(trusted: false)
     }
@@ -140,13 +148,14 @@ public struct DurableTrustStore: Sendable {
     /// inherits ancestor trust here; use `FolderTrustStore` for exact root
     /// registration that does not inherit.
     public func isTrusted(_ path: URL) -> Bool {
-        let key = normalizeLexically(path.path)
+        let key = trustPathKey(path.path)
         if isUnsafeTrustRoot(key) { return false }
         var bestDepth: Int?
         var trusted = false
         for (folder, record) in folders {
             if isUnsafeTrustRoot(folder) { continue }
-            if key == folder || key.hasPrefix(folder.hasSuffix("/") ? folder : folder + "/") {
+            let folderKey = trustPathKey(folder)
+            if key == folderKey || key.hasPrefix(folderKey.hasSuffix("/") ? folderKey : folderKey + "/") {
                 let depth = folder.split(separator: "/").count
                 if let d = bestDepth {
                     if depth < d { continue }
@@ -233,7 +242,7 @@ public struct PersistentFolderTrustStore: Sendable {
         for (rawPath, entry) in folders.pairs {
             guard case .table(let fields) = entry else { continue }
             guard case .boolean(let trusted)? = fields["trusted"] else { continue }
-            let key = normalizeLexically(rawPath)
+            let key = trustPathKey(rawPath)
             if isUnsafeTrustRoot(key, home: home) { continue }
             var decidedAt: Date?
             if case .integer(let seconds)? = fields["decided_at"] {

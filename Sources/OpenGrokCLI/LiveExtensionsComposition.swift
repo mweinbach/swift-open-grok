@@ -238,12 +238,27 @@ public enum LiveExtensionsComposition {
         isDefaultGrokHome: Bool,
         homeDirectory: String?
     ) -> String {
-        let source = URL(fileURLWithPath: sourceDir).resolvingSymlinksInPath().path
+        func normalized(_ path: String) -> String {
+            path.replacingOccurrences(of: "\\", with: "/")
+        }
+        func comparisonKey(_ path: String) -> String {
+            #if os(Windows)
+            return path.lowercased()
+            #else
+            return path
+            #endif
+        }
+        func isEqualOrDescendant(_ path: String, of base: String) -> Bool {
+            let pathKey = comparisonKey(path)
+            let baseKey = comparisonKey(base)
+            return pathKey == baseKey || pathKey.hasPrefix(baseKey + "/")
+        }
+        let source = normalized(URL(fileURLWithPath: sourceDir).resolvingSymlinksInPath().path)
         let homeURL = grokHome.resolvingSymlinksInPath()
         func pluginName(_ subdir: String) -> String? {
             // User grok home (`OPENGROK_HOME`-aware).
-            let base = homeURL.appendingPathComponent(subdir).path
-            if source.hasPrefix(base + "/") {
+            let base = normalized(homeURL.appendingPathComponent(subdir).path)
+            if comparisonKey(source).hasPrefix(comparisonKey(base) + "/") {
                 let rest = source.dropFirst(base.count + 1)
                 if let first = rest.split(separator: "/").first, !first.isEmpty {
                     return String(first)
@@ -263,8 +278,8 @@ public enum LiveExtensionsComposition {
         if let name = pluginName("plugins") ?? pluginName("installed-plugins") {
             return "Plugin: \(name)"
         }
-        let globalHooks = homeURL.appendingPathComponent("hooks").path
-        if source == globalHooks || source.hasPrefix(globalHooks + "/") {
+        let globalHooks = normalized(homeURL.appendingPathComponent("hooks").path)
+        if isEqualOrDescendant(source, of: globalHooks) {
             return "Global hooks"
         }
         if source.contains("/.claude/") {
@@ -273,16 +288,16 @@ public enum LiveExtensionsComposition {
         if source.hasSuffix("/.opengrok/hooks") || source.contains("/.opengrok/hooks/") {
             return "Project hooks"
         }
-        let grokPath = homeURL.path
-        if source.hasPrefix(grokPath) {
+        let grokPath = normalized(homeURL.path)
+        if isEqualOrDescendant(source, of: grokPath) {
             var rest = String(source.dropFirst(grokPath.count))
             if rest.hasPrefix("/") { rest.removeFirst() }
             let prefix = isDefaultGrokHome ? "~/.opengrok" : "$OPENGROK_HOME"
             return "Custom: \(prefix)/\(rest)"
         }
         if let home = homeDirectory, !home.isEmpty {
-            let resolvedHome = URL(fileURLWithPath: home).resolvingSymlinksInPath().path
-            if source.hasPrefix(resolvedHome) {
+            let resolvedHome = normalized(URL(fileURLWithPath: home).resolvingSymlinksInPath().path)
+            if isEqualOrDescendant(source, of: resolvedHome) {
                 return "Custom: ~\(source.dropFirst(resolvedHome.count))"
             }
         }

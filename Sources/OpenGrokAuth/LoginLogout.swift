@@ -3,24 +3,9 @@
 // High-level login/logout orchestration for xAI and Codex scopes.
 
 import Foundation
+import COpenGrokSockets
 import OpenGrokHTTP
 import OpenGrokPaths
-
-#if canImport(Darwin)
-import Darwin
-#elseif canImport(Glibc)
-import Glibc
-#endif
-
-/// Cross-platform `SOCK_STREAM`: Darwin spells it as a bare `Int32`, glibc as
-/// a `__socket_type` enum whose `rawValue` is the `Int32` `socket(2)` wants.
-private var sockStreamType: Int32 {
-    #if canImport(Darwin)
-    return SOCK_STREAM
-    #else
-    return Int32(SOCK_STREAM.rawValue)
-    #endif
-}
 
 /// Which account store a login/logout command targets.
 public enum AuthAccountTarget: String, Sendable, Equatable, Hashable, CaseIterable {
@@ -385,7 +370,7 @@ internal struct CodexCallbackResponse: Sendable {
 }
 
 internal final class CodexCallbackListener: @unchecked Sendable {
-    private var serverFd: Int32 = -1
+    private var serverFd: OGSocketHandle = -1
     let port: UInt16
 
     init(preferredPort: UInt16 = 1455, fallbackPort: UInt16 = 1457) throws {
@@ -406,43 +391,18 @@ internal final class CodexCallbackListener: @unchecked Sendable {
     // Named `bindListener` rather than `bind` so the libc `bind(2)` below
     // resolves without module-qualifying it — the qualifier would have to name
     // Darwin on Apple and Glibc on Linux.
-    private static func bindListener(port: UInt16) -> (fd: Int32, port: UInt16)? {
-        let fd = socket(AF_INET, sockStreamType, 0)
-        guard fd >= 0 else { return nil }
-        var opt: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, socklen_t(MemoryLayout<Int32>.size))
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = port.bigEndian
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let res = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        if res == 0 {
-            guard listen(fd, 1) == 0 else {
-                close(fd)
-                return nil
-            }
-            var boundAddr = sockaddr_in()
-            var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-            withUnsafeMutablePointer(to: &boundAddr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    getsockname(fd, $0, &len)
-                }
-            }
-            let boundPort = UInt16(bigEndian: boundAddr.sin_port)
-            return (fd, boundPort)
-        } else {
-            close(fd)
+    private static func bindListener(port: UInt16) -> (fd: OGSocketHandle, port: UInt16)? {
+        var fd: OGSocketHandle = -1
+        var boundPort: UInt16 = 0
+        guard og_socket_tcp_listen("127.0.0.1", port, &fd, &boundPort) == 0 else {
             return nil
         }
+        return (fd, boundPort)
     }
 
     func closeListener() {
         if serverFd >= 0 {
-            close(serverFd)
+            _ = og_socket_close(serverFd)
             serverFd = -1
         }
     }
@@ -455,29 +415,22 @@ internal final class CodexCallbackListener: @unchecked Sendable {
 
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                var pfd = pollfd(fd: sFd, events: Int16(POLLIN), revents: 0)
-                let pollRes = poll(&pfd, 1, Int32(timeoutSeconds * 1000))
-                if pollRes <= 0 {
+                var clientFd: OGSocketHandle = -1
+                let acceptResult = og_socket_accept_with_timeout(
+                    sFd, timeoutSeconds, &clientFd)
+                if acceptResult != 0 {
                     continuation.resume(throwing: AuthError.protocolError("timed out waiting for the Codex OAuth callback"))
                     return
                 }
-
-                var clientAddr = sockaddr_in()
-                var clientLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-                let clientFd = withUnsafeMutablePointer(to: &clientAddr) {
-                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        accept(sFd, $0, &clientLen)
-                    }
-                }
-                guard clientFd >= 0 else {
-                    continuation.resume(throwing: AuthError.protocolError("Codex OAuth callback server failed to accept connection"))
-                    return
-                }
-                defer { close(clientFd) }
+                defer { _ = og_socket_close(clientFd) }
 
                 var buffer = [UInt8](repeating: 0, count: 4096)
-                let bytesRead = recv(clientFd, &buffer, buffer.count - 1, 0)
-                guard bytesRead > 0, let reqStr = String(bytes: buffer[..<bytesRead], encoding: .utf8) else {
+                let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer in
+                    og_socket_read(clientFd, rawBuffer.baseAddress, rawBuffer.count - 1)
+                }
+                guard bytesRead > 0,
+                      let reqStr = String(bytes: buffer[..<Int(bytesRead)], encoding: .utf8)
+                else {
                     continuation.resume(throwing: AuthError.protocolError("Codex OAuth callback payload was empty"))
                     return
                 }
@@ -489,7 +442,10 @@ internal final class CodexCallbackListener: @unchecked Sendable {
                 \r
                 <html><body><h1>Sign in successful</h1><p>You can close this tab and return to Open Grok.</p></body></html>
                 """
-                _ = html.withCString { send(clientFd, $0, strlen($0), 0) }
+                let responseBytes = Array(html.utf8)
+                _ = responseBytes.withUnsafeBufferPointer {
+                    og_socket_write_all(clientFd, $0.baseAddress, $0.count)
+                }
 
                 guard let firstLine = reqStr.components(separatedBy: "\r\n").first,
                       firstLine.hasPrefix("GET ")

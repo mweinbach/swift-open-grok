@@ -945,7 +945,13 @@ private func inflatePackedZlib(
     expectedSize: Int,
     packPath: String
 ) throws -> Data {
-    #if canImport(COpenGrokZlib)
+    #if os(Windows)
+    return try inflatePackedZlibWindows(
+        data,
+        expectedSize: expectedSize,
+        packPath: packPath
+    )
+    #elseif canImport(COpenGrokZlib)
     var stream = z_stream()
     var status = inflateInit_(&stream, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
     guard status == Z_OK else {
@@ -1018,7 +1024,9 @@ private func inflatePackedZlib(
 // MARK: - zlib inflate (zlib-wrapped deflate, as used by Git objects)
 
 func inflateZlib(_ data: Data) throws -> Data {
-    #if canImport(COpenGrokZlib)
+    #if os(Windows)
+    return try inflateZlibWindows(data)
+    #elseif canImport(COpenGrokZlib)
     return try inflateZlibSystem(data)
     #elseif canImport(Compression)
     return try inflateZlibCompression(data)
@@ -1056,7 +1064,7 @@ private func inflateZlibCompression(_ data: Data) throws -> Data {
 }
 #endif
 
-#if canImport(COpenGrokZlib)
+#if canImport(COpenGrokZlib) && !os(Windows)
 private func inflateZlibSystem(_ data: Data) throws -> Data {
     var stream = z_stream()
     var status = inflateInit_(&stream, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
@@ -1111,7 +1119,9 @@ public func writeLooseObject(gitDir: String, type: String, payload: Data) throws
 }
 
 func deflateZlib(_ data: Data) throws -> Data {
-    #if canImport(COpenGrokZlib)
+    #if os(Windows)
+    return try deflateZlibWindows(data)
+    #elseif canImport(COpenGrokZlib)
     return try deflateZlibSystem(data)
     #elseif canImport(Compression)
     return try deflateZlibCompression(data)
@@ -1144,7 +1154,7 @@ private func deflateZlibCompression(_ data: Data) throws -> Data {
 }
 #endif
 
-#if canImport(COpenGrokZlib)
+#if canImport(COpenGrokZlib) && !os(Windows)
 private func deflateZlibSystem(_ data: Data) throws -> Data {
     var stream = z_stream()
     var status = deflateInit_(

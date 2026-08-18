@@ -1045,24 +1045,20 @@ struct LiveLeaderRosterBridgeTests {
 
 #if os(Windows)
 
-@Suite("Windows leader refusal")
+@Suite("Windows leader support")
 struct LiveLeaderCompositionWindowsTests {
-    @Test("leader refuses before prompt startup or endpoint creation")
-    func leaderRefusesWithoutArtifacts() async throws {
+    @Test("leader reaches prompt startup through the Windows transport")
+    func leaderReachesPromptStartup() async throws {
         let home = FileManager.default.temporaryDirectory
             .appendingPathComponent("og-ldr-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
         let environment = [
             "OPENGROK_HOME": home.path,
             "GROK_WS_URL": "wss://staging.invalid/ws",
         ]
-        let paths = ACPLeaderSocketPaths.resolve(
-            openGrokHome: home,
-            relayURL: environment["GROK_WS_URL"],
-            environment: environment
-        )
-        let services = LiveACPServices { _ in
-            throw CLIApplicationError.failed("prompt driver should not be requested before Windows refusal")
-        }
+        let services = LiveACPServices(makePromptDriver: { _ in
+            throw CLIApplicationError.failed("prompt driver reached through Windows transport")
+        })
 
         do {
             _ = try await LiveLeaderComposition.session(
@@ -1073,20 +1069,14 @@ struct LiveLeaderCompositionWindowsTests {
                 ),
                 services: services
             )
-            Issue.record("expected Windows leader mode to refuse")
+            Issue.record("expected prompt-driver sentinel failure")
         } catch let error as CLIApplicationError {
             guard case .failed(let message) = error else {
                 Issue.record("expected .failed, got \(error)")
                 return
             }
-            #expect(message.contains("unavailable on Windows"))
-            #expect(message.contains(paths.lock.path))
-            #expect(message.contains("named-pipe transport"))
+            #expect(message == "prompt driver reached through Windows transport")
         }
-
-        #expect(!FileManager.default.fileExists(atPath: home.path))
-        #expect(!FileManager.default.fileExists(atPath: paths.lock.path))
-        #expect(!FileManager.default.fileExists(atPath: paths.socket.path))
     }
 }
 

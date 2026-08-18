@@ -801,25 +801,6 @@ public enum LiveSessionsComposition {
     /// when present, otherwise the process cwd, and reject a missing path.
     /// Kept private so call sites cannot invent a second process-cwd default.
     private static func resolveWorkingDirectory(_ path: String?) throws -> URL {
-        let processCwd = FileManager.default.currentDirectoryPath
-        let url: URL
-        if let path, !path.isEmpty {
-            if path.hasPrefix("/") {
-                url = URL(fileURLWithPath: path).standardizedFileURL
-            } else {
-                url = URL(fileURLWithPath: processCwd, isDirectory: true)
-                    .appendingPathComponent(path)
-                    .standardizedFileURL
-            }
-        } else {
-            url = URL(fileURLWithPath: processCwd, isDirectory: true).standardizedFileURL
-        }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-              isDirectory.boolValue
-        else {
-            throw CLIApplicationError.failed("working directory does not exist: \(url.path)")
-        }
-        return url
+        try liveResolveWorkingDirectory(path)
     }
 }

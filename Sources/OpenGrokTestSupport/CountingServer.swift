@@ -14,6 +14,9 @@
 // own per-connection keep-alive read/write loop.
 
 import Foundation
+#if os(Windows)
+import COpenGrokSockets
+#endif
 #if canImport(Network)
 import Network
 #endif
@@ -134,7 +137,10 @@ private final class CountingServerImpl: @unchecked Sendable {
     #if canImport(Network)
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "opengrok-counting-server")
-    #elseif !os(Windows)
+    #elseif os(Windows)
+    private var listenHandle: OGSocketHandle = -1
+    private var acceptThread: Thread?
+    #else
     private var listenFD: Int32 = -1
     private var acceptThread: Thread?
     #endif
@@ -150,12 +156,7 @@ private final class CountingServerImpl: @unchecked Sendable {
         #if canImport(Network)
         try startWithNetwork()
         #elseif os(Windows)
-        // The BSD backend below is POSIX-only; Windows would need the WinSock
-        // path that `COpenGrokSockets` already implements for the production
-        // transports. Refused explicitly rather than silently binding nothing,
-        // so a Windows test that needs a loopback server fails naming the
-        // reason instead of timing out on a URL that was never served.
-        throw HttpServerError.unsupportedPlatform
+        try startWithPortableSockets()
         #else
         try startWithSockets()
         #endif
@@ -169,7 +170,13 @@ private final class CountingServerImpl: @unchecked Sendable {
         #if canImport(Network)
         listener?.cancel()
         listener = nil
-        #elseif !os(Windows)
+        #elseif os(Windows)
+        if listenHandle >= 0 {
+            _ = og_socket_close(listenHandle)
+            listenHandle = -1
+        }
+        acceptThread = nil
+        #else
         if listenFD >= 0 {
             close(listenFD)
             listenFD = -1
@@ -434,6 +441,91 @@ private final class CountingServerImpl: @unchecked Sendable {
         close(fd)
     }
     #endif // !canImport(Network) && !os(Windows)
+
+    #if os(Windows)
+    private func startWithPortableSockets() throws {
+        var handle: OGSocketHandle = -1
+        var port: UInt16 = 0
+        let result = "127.0.0.1".withCString { host in
+            og_socket_tcp_listen(host, 0, &handle, &port)
+        }
+        guard result == 0, handle >= 0, port != 0 else {
+            if handle >= 0 {
+                _ = og_socket_close(handle)
+            }
+            throw HttpServerError.bindFailed
+        }
+        listenHandle = handle
+        baseURL = "http://127.0.0.1:\(port)\(basePath)"
+        let thread = Thread { [weak self] in self?.acceptPortableLoop() }
+        thread.start()
+        acceptThread = thread
+    }
+
+    private func acceptPortableLoop() {
+        while !stopped {
+            var clientHandle: OGSocketHandle = -1
+            guard og_socket_accept(listenHandle, &clientHandle) == 0 else { break }
+            _ = state.bumpAccepts()
+            let acceptedHandle = clientHandle
+            let thread = Thread { [weak self] in self?.handlePortableClient(acceptedHandle) }
+            thread.start()
+        }
+    }
+
+    private func handlePortableClient(_ handle: OGSocketHandle) {
+        defer { _ = og_socket_close(handle) }
+        while !stopped {
+            var headBytes = Data()
+            while let byte = readPortableByte(from: handle) {
+                headBytes.append(byte)
+                if headBytes.suffix(4) == Data("\r\n\r\n".utf8) {
+                    break
+                }
+            }
+            guard !headBytes.isEmpty,
+                  let headString = String(data: headBytes, encoding: .utf8) else { return }
+            state.recordHead(headString)
+            let lines = headString.components(separatedBy: "\r\n")
+            let contentLength = lines.dropFirst().compactMap { line -> Int? in
+                guard let colon = line.firstIndex(of: ":") else { return nil }
+                let name = String(line[..<colon]).trimmingCharacters(in: .whitespaces).lowercased()
+                guard name == "content-length" else { return nil }
+                return Int(String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces))
+            }.first ?? 0
+            let connectionClose = lines.dropFirst().contains { line in
+                guard let colon = line.firstIndex(of: ":") else { return false }
+                let name = String(line[..<colon]).trimmingCharacters(in: .whitespaces).lowercased()
+                let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces).lowercased()
+                return name == "connection" && value.contains("close")
+            }
+            var bodyCount = 0
+            while bodyCount < contentLength {
+                guard readPortableByte(from: handle) != nil else { return }
+                bodyCount += 1
+            }
+            let connectionHeader = connectionClose ? "close" : "keep-alive"
+            let response = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: \(connectionHeader)\r\nserver: opengrok-test-mock/1.0\r\n\r\n{}"
+            guard writePortableData(Data(response.utf8), to: handle), !connectionClose else { return }
+        }
+    }
+
+    private func readPortableByte(from handle: OGSocketHandle) -> UInt8? {
+        var byte: UInt8 = 0
+        let count = withUnsafeMutableBytes(of: &byte) { raw in
+            og_socket_read(handle, raw.baseAddress, raw.count)
+        }
+        return count == 1 ? byte : nil
+    }
+
+    private func writePortableData(_ data: Data, to handle: OGSocketHandle) -> Bool {
+        guard !data.isEmpty else { return true }
+        return data.withUnsafeBytes { raw in
+            guard let baseAddress = raw.baseAddress else { return false }
+            return og_socket_write_all(handle, baseAddress, raw.count) == Int64(raw.count)
+        }
+    }
+    #endif
 }
 
 /// Write all `count` bytes from `ptr` to `fd`, retrying partial writes.

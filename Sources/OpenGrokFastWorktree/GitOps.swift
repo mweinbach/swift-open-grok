@@ -394,18 +394,27 @@ public func runGit(_ args: [String], cwd: URL) throws -> GitCommandResult {
         }
     }
 
+    let environment = ProcessInfo.processInfo.environment.merging([
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+    ]) { _, new in new }
     let process = Process()
+    #if os(Windows)
+    guard let git = resolveWindowsGit(environment: environment) else {
+        throw FastWorktreeError.gitFailed("failed to spawn git: executable not found on PATH")
+    }
+    process.executableURL = URL(fileURLWithPath: git)
+    process.arguments = args
+    #else
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
     process.arguments = ["git"] + args
+    #endif
     process.currentDirectoryURL = cwd
     let out = Pipe()
     let err = Pipe()
     process.standardOutput = out
     process.standardError = err
-    process.environment = ProcessInfo.processInfo.environment.merging([
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_OPTIONAL_LOCKS": "0",
-    ]) { _, new in new }
+    process.environment = environment
 
     let finished = DispatchSemaphore(value: 0)
     process.terminationHandler = { _ in
@@ -421,3 +430,27 @@ public func runGit(_ args: [String], cwd: URL) throws -> GitCommandResult {
     let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     return GitCommandResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr)
 }
+
+#if os(Windows)
+private func resolveWindowsGit(environment: [String: String]) -> String? {
+    let pathValue = environment["PATH"]
+        ?? environment["Path"]
+        ?? ProcessInfo.processInfo.environment["PATH"]
+        ?? ProcessInfo.processInfo.environment["Path"]
+        ?? ""
+    let pathExt = environment["PATHEXT"]
+        ?? ProcessInfo.processInfo.environment["PATHEXT"]
+        ?? ".EXE;.CMD;.BAT"
+    let suffixes = [""] + pathExt.split(separator: ";").map(String.init)
+    for directory in pathValue.split(separator: ";", omittingEmptySubsequences: true) {
+        for suffix in suffixes {
+            let candidate = (String(directory) as NSString)
+                .appendingPathComponent("git" + suffix)
+            if FileManager.default.fileExists(atPath: candidate) {
+                return candidate
+            }
+        }
+    }
+    return nil
+}
+#endif

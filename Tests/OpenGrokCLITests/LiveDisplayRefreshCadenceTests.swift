@@ -19,6 +19,7 @@ struct LiveDisplayRefreshCadenceTests {
             environment: [:],
             policy: policy,
             isInteractive: true,
+            host: .macos,
             platform: platform
         )
         #expect(cadence == 0.008)
@@ -33,6 +34,7 @@ struct LiveDisplayRefreshCadenceTests {
             environment: [:],
             policy: policy,
             isInteractive: true,
+            host: .macos,
             platform: platform
         )
         #expect(cadence == PagerMotion.defaultPaintCadence)
@@ -47,6 +49,7 @@ struct LiveDisplayRefreshCadenceTests {
             environment: ["SSH_TTY": "/dev/pts/0"],
             policy: policy,
             isInteractive: true,
+            host: .macos,
             platform: platform
         )
         #expect(cadence == PagerMotion.defaultPaintCadence)

@@ -12,6 +12,11 @@
 
 import Foundation
 
+#if os(Windows)
+import COpenGrokSockets
+import WinSDK
+#endif
+
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -328,14 +333,271 @@ private func writeNoFollow(
     data: Data,
     options: AtomicWriteOptions
 ) throws {
-    // Windows reparse-point no-follow walk is a dedicated adapter. Until
-    // LockFileEx/CreateFileW with FILE_FLAG_OPEN_REPARSE_POINT is wired,
-    // refuse silent weakening of the no-follow contract.
-    _ = data
-    _ = options
-    throw FileUtilsError.unsupported(
-        "Windows no-follow atomic write (reparse-point safe open) is not yet wired"
+    let parent = finalPath.deletingLastPathComponent().standardizedFileURL
+    let finalName = finalPath.lastPathComponent
+    guard !finalName.isEmpty, finalName != "..", finalName != "." else {
+        throw FileUtilsError.hostilePath(
+            path: finalPath.path,
+            reason: "invalid final component"
+        )
+    }
+
+    let directoryHandles = try windowsPrepareDirectoriesNoFollow(parent)
+    defer {
+        for handle in directoryHandles.reversed() {
+            CloseHandle(handle)
+        }
+    }
+
+    try windowsRejectReparsePoint(at: finalPath, allowMissing: true)
+
+    let pid = UInt64(ProcessInfo.processInfo.processIdentifier)
+    let nonce = WriteNonce.shared.next()
+    let tmp = parent.appendingPathComponent("\(finalName).\(pid).\(nonce).tmp")
+    do {
+        try windowsCreateAndWriteTemp(tmp, data: data, options: options)
+
+        try windowsRejectReparsePoint(at: finalPath, allowMissing: true)
+        try renameReplacing(tmp, to: finalPath)
+        try applyDirectorySync(parent, policy: options.directorySync)
+    } catch {
+        try? FileManager.default.removeItem(at: tmp)
+        throw error
+    }
+}
+
+private func windowsCreateAndWriteTemp(
+    _ path: URL,
+    data: Data,
+    options: AtomicWriteOptions
+) throws {
+    if options.mode == 0o600 {
+        var handle: OGSocketHandle = -1
+        let created = path.path.withCString { pointer in
+            og_file_create_owner_only(pointer, &handle)
+        }
+        guard created == 0 else {
+            throw windowsNativeFileError(path: path.path, operation: "create owner-only temp")
+        }
+        var closed = false
+        defer {
+            if !closed { _ = og_file_handle_close(handle) }
+        }
+        let count = data.withUnsafeBytes { bytes in
+            og_file_handle_write_all(handle, bytes.baseAddress, bytes.count)
+        }
+        guard count == data.count else {
+            throw windowsNativeFileError(path: path.path, operation: "write owner-only temp")
+        }
+        if options.syncFile, og_file_handle_flush(handle) != 0 {
+            throw windowsNativeFileError(path: path.path, operation: "flush owner-only temp")
+        }
+        guard og_file_handle_close(handle) == 0 else {
+            throw windowsNativeFileError(path: path.path, operation: "close owner-only temp")
+        }
+        closed = true
+        return
+    }
+
+    let rawHandle = path.path.withCString(encodedAs: UTF16.self) { pointer in
+        CreateFileW(
+            pointer,
+            DWORD(GENERIC_WRITE),
+            DWORD(FILE_SHARE_READ),
+            nil,
+            DWORD(CREATE_NEW),
+            DWORD(FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_OPEN_REPARSE_POINT),
+            nil
+        )
+    }
+    guard let handle = rawHandle, handle != INVALID_HANDLE_VALUE else {
+        throw windowsFileError(path: path.path, operation: "create exclusive temp")
+    }
+    defer { CloseHandle(handle) }
+    try windowsWriteAll(handle: handle, data: data, path: path.path)
+    if options.syncFile, !FlushFileBuffers(handle) {
+        throw windowsFileError(path: path.path, operation: "flush temp")
+    }
+}
+
+private func windowsNativeFileError(path: String, operation: String) -> FileUtilsError {
+    let code = Int(og_socket_last_error_code())
+    let detail = String(cString: og_socket_last_error_message())
+    return .io(
+        path: path,
+        detail: "\(operation): \(detail.isEmpty ? "Windows error \(code)" : detail)"
     )
+}
+
+private func windowsPrepareDirectoriesNoFollow(_ directory: URL) throws -> [HANDLE] {
+    let prefixes = try windowsDirectoryPrefixes(directory.path)
+    var handles: [HANDLE] = []
+    do {
+        for (index, path) in prefixes.enumerated() {
+            if index > 0 {
+                let created = path.withCString(encodedAs: UTF16.self) { pointer in
+                    CreateDirectoryW(pointer, nil)
+                }
+                if !created {
+                    let code = GetLastError()
+                    guard code == DWORD(ERROR_ALREADY_EXISTS) else {
+                        throw windowsFileError(
+                            path: path,
+                            operation: "create parent directory",
+                            code: code
+                        )
+                    }
+                }
+            }
+            handles.append(try windowsOpenDirectoryNoFollow(path))
+        }
+        return handles
+    } catch {
+        for handle in handles.reversed() {
+            CloseHandle(handle)
+        }
+        throw error
+    }
+}
+
+private func windowsDirectoryPrefixes(_ path: String) throws -> [String] {
+    let normalized = path.replacingOccurrences(of: "/", with: "\\")
+    if normalized.hasPrefix("\\\\") {
+        let components = normalized.dropFirst(2).split(separator: "\\", omittingEmptySubsequences: true)
+        guard components.count >= 2 else {
+            throw FileUtilsError.hostilePath(path: path, reason: "invalid UNC path")
+        }
+        var current = "\\\\\(components[0])\\\(components[1])\\"
+        var result = [current]
+        for component in components.dropFirst(2) {
+            current += "\(component)\\"
+            result.append(String(current.dropLast()))
+        }
+        return result
+    }
+
+    guard normalized.count >= 3 else {
+        throw FileUtilsError.hostilePath(path: path, reason: "path is not absolute")
+    }
+    let driveEnd = normalized.index(normalized.startIndex, offsetBy: 2)
+    guard normalized[normalized.index(after: normalized.startIndex)] == ":",
+          normalized[driveEnd] == "\\"
+    else {
+        throw FileUtilsError.hostilePath(path: path, reason: "path is not absolute")
+    }
+
+    let rootEnd = normalized.index(after: driveEnd)
+    var current = String(normalized[..<rootEnd])
+    var result = [current]
+    let remainder = normalized[rootEnd...]
+    for component in remainder.split(separator: "\\", omittingEmptySubsequences: true) {
+        if !current.hasSuffix("\\") { current += "\\" }
+        current += component
+        result.append(current)
+    }
+    return result
+}
+
+private func windowsOpenDirectoryNoFollow(_ path: String) throws -> HANDLE {
+    let rawHandle = path.withCString(encodedAs: UTF16.self) { pointer in
+        CreateFileW(
+            pointer,
+            DWORD(FILE_READ_ATTRIBUTES),
+            DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE),
+            nil,
+            DWORD(OPEN_EXISTING),
+            DWORD(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT),
+            nil
+        )
+    }
+    guard let handle = rawHandle, handle != INVALID_HANDLE_VALUE else {
+        throw windowsFileError(path: path, operation: "open parent directory")
+    }
+    var information = BY_HANDLE_FILE_INFORMATION()
+    guard GetFileInformationByHandle(handle, &information) else {
+        let error = windowsFileError(path: path, operation: "inspect parent directory")
+        CloseHandle(handle)
+        throw error
+    }
+    let attributes = information.dwFileAttributes
+    guard attributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) == 0 else {
+        CloseHandle(handle)
+        throw FileUtilsError.symlinkEncountered(path: path)
+    }
+    guard attributes & DWORD(FILE_ATTRIBUTE_DIRECTORY) != 0 else {
+        CloseHandle(handle)
+        throw FileUtilsError.hostilePath(path: path, reason: "parent component is not a directory")
+    }
+    return handle
+}
+
+private func windowsRejectReparsePoint(at path: URL, allowMissing: Bool) throws {
+    let rawHandle = path.path.withCString(encodedAs: UTF16.self) { pointer in
+        CreateFileW(
+            pointer,
+            DWORD(FILE_READ_ATTRIBUTES),
+            DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+            nil,
+            DWORD(OPEN_EXISTING),
+            DWORD(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT),
+            nil
+        )
+    }
+    guard let handle = rawHandle, handle != INVALID_HANDLE_VALUE else {
+        let code = GetLastError()
+        if allowMissing, code == DWORD(ERROR_FILE_NOT_FOUND) || code == DWORD(ERROR_PATH_NOT_FOUND) {
+            return
+        }
+        throw windowsFileError(path: path.path, operation: "inspect final path", code: code)
+    }
+    defer { CloseHandle(handle) }
+    var information = BY_HANDLE_FILE_INFORMATION()
+    guard GetFileInformationByHandle(handle, &information) else {
+        throw windowsFileError(path: path.path, operation: "inspect final path")
+    }
+    let attributes = information.dwFileAttributes
+    if attributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        throw FileUtilsError.symlinkEncountered(path: path.path)
+    }
+    if attributes & DWORD(FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        throw FileUtilsError.hostilePath(path: path.path, reason: "final component is a directory")
+    }
+}
+
+private func windowsWriteAll(handle: HANDLE, data: Data, path: String) throws {
+    try data.withUnsafeBytes { buffer in
+        guard let base = buffer.baseAddress else { return }
+        var offset = 0
+        while offset < buffer.count {
+            let remaining = min(buffer.count - offset, Int(UInt32.max))
+            var written: DWORD = 0
+            let succeeded = WriteFile(
+                handle,
+                base + offset,
+                DWORD(remaining),
+                &written,
+                nil
+            )
+            guard succeeded, written > 0 else {
+                throw windowsFileError(path: path, operation: "write temp")
+            }
+            offset += Int(written)
+        }
+    }
+}
+
+private func windowsFileError(
+    path: String,
+    operation: String,
+    code: DWORD = GetLastError()
+) -> FileUtilsError {
+    if code == DWORD(ERROR_ACCESS_DENIED) {
+        return .permissionDenied(path: path, detail: "\(operation): Windows error \(code)")
+    }
+    if code == DWORD(ERROR_FILE_NOT_FOUND) || code == DWORD(ERROR_PATH_NOT_FOUND) {
+        return .notFound(path: path)
+    }
+    return .io(path: path, detail: "\(operation): Windows error \(code)")
 }
 #endif
 
@@ -405,10 +667,30 @@ private func applyUnixMode(_ mode: UInt32, to path: URL) throws {
 
 private func renameReplacing(_ source: URL, to destination: URL) throws {
     #if os(Windows)
-    if FileManager.default.fileExists(atPath: destination.path) {
-        _ = try FileManager.default.replaceItemAt(destination, withItemAt: source)
-    } else {
-        try FileManager.default.moveItem(at: source, to: destination)
+    let maximumAttempts = 40
+    for attempt in 0..<maximumAttempts {
+        let moved = source.path.withCString(encodedAs: UTF16.self) { sourcePointer in
+            destination.path.withCString(encodedAs: UTF16.self) { destinationPointer in
+                MoveFileExW(
+                    sourcePointer,
+                    destinationPointer,
+                    DWORD(MOVEFILE_REPLACE_EXISTING) | DWORD(MOVEFILE_WRITE_THROUGH)
+                )
+            }
+        }
+        if moved { return }
+
+        let code = GetLastError()
+        if code == DWORD(ERROR_NOT_SAME_DEVICE) {
+            throw FileUtilsError.crossDevice(source: source.path, destination: destination.path)
+        }
+        let isTransientCollision = code == DWORD(ERROR_ACCESS_DENIED)
+            || code == DWORD(ERROR_SHARING_VIOLATION)
+            || code == DWORD(ERROR_LOCK_VIOLATION)
+        if !isTransientCollision || attempt == maximumAttempts - 1 {
+            throw FileUtilsError.io(path: destination.path, detail: "Windows error \(code)")
+        }
+        Sleep(DWORD(min(attempt + 1, 10)))
     }
     #else
     let rc = source.path.withCString { src in

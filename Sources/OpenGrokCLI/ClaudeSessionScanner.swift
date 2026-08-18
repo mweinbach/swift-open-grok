@@ -156,7 +156,7 @@ public enum ClaudeSessionScanner {
             return nil
         }
 
-        guard storedCwd == requestedCwd else { return nil }
+        guard let storedCwd, foreignSessionPathsEqual(storedCwd, requestedCwd) else { return nil }
 
         let tail = readTail(candidate)
 

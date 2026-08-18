@@ -123,20 +123,7 @@ public enum LiveWorkflowComposition {
     }
 
     private static func resolveWorkingDirectory(_ path: String?) throws -> URL {
-        let base = FileManager.default.currentDirectoryPath
-        let url: URL
-        if let path, path.hasPrefix("/") {
-            url = URL(fileURLWithPath: path).standardizedFileURL
-        } else {
-            url = URL(fileURLWithPath: base, isDirectory: true)
-                .appendingPathComponent(path ?? ".")
-                .standardizedFileURL
-        }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw CLIApplicationError.failed("working directory does not exist: \(url.path)")
-        }
-        return url
+        try liveResolveWorkingDirectory(path)
     }
 
     static func readScript(at path: String) throws -> String {

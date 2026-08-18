@@ -224,26 +224,119 @@ struct MCPTransportConstructionTests {
 
 // MARK: - Stdio transport
 
-/// Writes a tiny newline-delimited-JSON MCP server as a shell script, so the
-/// transport is exercised against a real child process.
+private enum StdioServerBehavior {
+    case respond(requireTransformedArgument: Bool, emitNoise: Bool)
+    case markStarted
+    case drain
+    case exitImmediately
+    case sleep
+}
+
 private struct StdioServerScript {
     let root: URL
     let path: String
+    let command: String
+    let arguments: [String]
 
-    init(body: String) throws {
-        root = URL(fileURLWithPath: NSTemporaryDirectory())
+    init(behavior: StdioServerBehavior) throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("mcp-stdio-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        #if os(Windows)
+        let script = root.appendingPathComponent("server.ps1")
+        try Self.windowsBody(for: behavior).write(to: script, atomically: true, encoding: .utf8)
+        let systemRoot = ProcessInfo.processInfo.environment["SystemRoot"] ?? "C:\\Windows"
+        let powerShell = URL(fileURLWithPath: systemRoot, isDirectory: true)
+            .appendingPathComponent("System32")
+            .appendingPathComponent("WindowsPowerShell")
+            .appendingPathComponent("v1.0")
+            .appendingPathComponent("powershell.exe")
+        command = powerShell.path.replacingOccurrences(of: "\\", with: "/")
+        arguments = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script.path]
+        #else
         let script = root.appendingPathComponent("server.sh")
-        try "#!/bin/sh\n\(body)\n".write(to: script, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\n\(Self.unixBody(for: behavior))\n"
+            .write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
             [.posixPermissions: NSNumber(value: Int16(0o755))],
             ofItemAtPath: script.path
         )
+        command = script.path
+        arguments = []
+        #endif
+
+        self.root = root
         path = script.path
     }
 
+    func configuration(requestTimeout: TimeInterval = 60) -> MCPStdioTransportConfiguration {
+        MCPStdioTransportConfiguration(
+            command: command,
+            arguments: arguments,
+            requestTimeout: requestTimeout
+        )
+    }
+
     func cleanup() { try? FileManager.default.removeItem(at: root) }
+
+    private static func unixBody(for behavior: StdioServerBehavior) -> String {
+        switch behavior {
+        case .respond(let requireTransformedArgument, let emitNoise):
+            let argumentCheck = requireTransformedArgument
+                ? "if [ \"$1\" != \"--transformed\" ]; then exit 7; fi\n"
+                : ""
+            let noise = emitNoise
+                ? "printf 'this is not json\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\\n'\n"
+                : ""
+            return """
+            \(argumentCheck)while IFS= read -r line; do
+              id=$(printf '%s' "$line" | sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+              if [ -n "$id" ]; then
+                \(noise)printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\\n' "$id"
+              fi
+            done
+            """
+        case .markStarted:
+            return "printf started > \"$0.started\""
+        case .drain:
+            return "cat > /dev/null"
+        case .exitImmediately:
+            return "exit 0"
+        case .sleep:
+            return "sleep 30"
+        }
+    }
+
+    private static func windowsBody(for behavior: StdioServerBehavior) -> String {
+        switch behavior {
+        case .respond(let requireTransformedArgument, let emitNoise):
+            let argumentCheck = requireTransformedArgument
+                ? "if ($args.Count -eq 0 -or $args[0] -ne '--transformed') { exit 7 }\n"
+                : ""
+            let noise = emitNoise
+                ? "[Console]::Out.WriteLine('this is not json')\n[Console]::Out.WriteLine('{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}')\n"
+                : ""
+            return """
+            \(argumentCheck)while (($line = [Console]::In.ReadLine()) -ne $null) {
+              try { $message = $line | ConvertFrom-Json } catch { continue }
+              if ($null -ne $message.id) {
+                \(noise)$response = [ordered]@{ jsonrpc = '2.0'; id = $message.id; result = [ordered]@{ ok = $true } }
+                [Console]::Out.WriteLine(($response | ConvertTo-Json -Compress -Depth 4))
+                [Console]::Out.Flush()
+              }
+            }
+            """
+        case .markStarted:
+            return "Set-Content -Path ($PSCommandPath + '.started') -Value 'started'"
+        case .drain:
+            return "while ([Console]::In.ReadLine() -ne $null) {}"
+        case .exitImmediately:
+            return "exit 0"
+        case .sleep:
+            return "Start-Sleep -Seconds 30"
+        }
+    }
 }
 
 private enum MCPLaunchTransformTestError: Error {
@@ -254,23 +347,17 @@ private enum MCPLaunchTransformTestError: Error {
 struct MCPStdioTransportTests {
     @Test("a launch transform rewrites the child argv before spawn")
     func launchTransformRewritesArguments() async throws {
-        let script = try StdioServerScript(body: """
-        if [ "$1" != "--transformed" ]; then exit 7; fi
-        while IFS= read -r line; do
-          id=$(printf '%s' "$line" | sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
-          if [ -n "$id" ]; then
-            printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\\n' "$id"
-          fi
-        done
-        """)
+        let script = try StdioServerScript(
+            behavior: .respond(requireTransformedArgument: true, emitNoise: false)
+        )
         defer { script.cleanup() }
 
         let transport = MCPStdioTransport(
-            configuration: MCPStdioTransportConfiguration(command: script.path, requestTimeout: 15),
+            configuration: script.configuration(requestTimeout: 15),
             launchTransform: { executable, arguments in
-                #expect(executable == script.path)
-                #expect(arguments.isEmpty)
-                return (executable, ["--transformed"])
+                #expect(executable == script.command)
+                #expect(arguments == script.arguments)
+                return (executable, arguments + ["--transformed"])
             }
         )
         defer { Task { await transport.close() } }
@@ -285,12 +372,12 @@ struct MCPStdioTransportTests {
 
     @Test("a throwing launch transform prevents the stdio child from running")
     func launchTransformFailureDoesNotSpawn() async throws {
-        let script = try StdioServerScript(body: "printf started > \"$0.started\"")
+        let script = try StdioServerScript(behavior: .markStarted)
         let marker = URL(fileURLWithPath: script.path + ".started")
         defer { script.cleanup() }
 
         let transport = MCPStdioTransport(
-            configuration: MCPStdioTransportConfiguration(command: script.path, requestTimeout: 5),
+            configuration: script.configuration(requestTimeout: 5),
             launchTransform: { _, _ in throw MCPLaunchTransformTestError.rejected }
         )
         defer { Task { await transport.close() } }
@@ -303,21 +390,12 @@ struct MCPStdioTransportTests {
 
     @Test("a request gets the matching response back over stdio")
     func roundTripsARequest() async throws {
-        // Reads one request line, replies with a ping result carrying its id.
-        let script = try StdioServerScript(body: """
-        while IFS= read -r line; do
-          id=$(printf '%s' "$line" | sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
-          if [ -n "$id" ]; then
-            printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\\n' "$id"
-          fi
-        done
-        """)
+        let script = try StdioServerScript(
+            behavior: .respond(requireTransformedArgument: false, emitNoise: false)
+        )
         defer { script.cleanup() }
 
-        let transport = MCPStdioTransport(configuration: MCPStdioTransportConfiguration(
-            command: script.path,
-            requestTimeout: 15
-        ))
+        let transport = MCPStdioTransport(configuration: script.configuration(requestTimeout: 15))
         defer { Task { await transport.close() } }
 
         let request = MCPRequest(id: .number(1), method: MCPMethod.ping, params: nil)
@@ -333,22 +411,12 @@ struct MCPStdioTransportTests {
 
     @Test("noise and malformed lines are skipped rather than failing the call")
     func skipsNoiseLines() async throws {
-        let script = try StdioServerScript(body: """
-        while IFS= read -r line; do
-          id=$(printf '%s' "$line" | sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
-          if [ -n "$id" ]; then
-            printf 'this is not json\\n'
-            printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{}}\\n'
-            printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\\n' "$id"
-          fi
-        done
-        """)
+        let script = try StdioServerScript(
+            behavior: .respond(requireTransformedArgument: false, emitNoise: true)
+        )
         defer { script.cleanup() }
 
-        let transport = MCPStdioTransport(configuration: MCPStdioTransportConfiguration(
-            command: script.path,
-            requestTimeout: 15
-        ))
+        let transport = MCPStdioTransport(configuration: script.configuration(requestTimeout: 15))
         defer { Task { await transport.close() } }
 
         let request = MCPRequest(id: .number(1), method: MCPMethod.ping, params: nil)
@@ -362,13 +430,10 @@ struct MCPStdioTransportTests {
 
     @Test("a notification returns nil without waiting for a reply")
     func notificationDoesNotWait() async throws {
-        let script = try StdioServerScript(body: "cat > /dev/null")
+        let script = try StdioServerScript(behavior: .drain)
         defer { script.cleanup() }
 
-        let transport = MCPStdioTransport(configuration: MCPStdioTransportConfiguration(
-            command: script.path,
-            requestTimeout: 15
-        ))
+        let transport = MCPStdioTransport(configuration: script.configuration(requestTimeout: 15))
         defer { Task { await transport.close() } }
 
         let response = try await transport.send(
@@ -379,13 +444,10 @@ struct MCPStdioTransportTests {
 
     @Test("a server that exits without answering surfaces a transport error")
     func serverExitSurfacesError() async throws {
-        let script = try StdioServerScript(body: "exit 0")
+        let script = try StdioServerScript(behavior: .exitImmediately)
         defer { script.cleanup() }
 
-        let transport = MCPStdioTransport(configuration: MCPStdioTransportConfiguration(
-            command: script.path,
-            requestTimeout: 15
-        ))
+        let transport = MCPStdioTransport(configuration: script.configuration(requestTimeout: 15))
         defer { Task { await transport.close() } }
 
         await #expect(throws: MCPError.self) {
@@ -395,14 +457,10 @@ struct MCPStdioTransportTests {
 
     @Test("a silent server times out instead of hanging the caller")
     func silentServerTimesOut() async throws {
-        // Holds stdin open forever and never writes: exactly the wedge case.
-        let script = try StdioServerScript(body: "sleep 30")
+        let script = try StdioServerScript(behavior: .sleep)
         defer { script.cleanup() }
 
-        let transport = MCPStdioTransport(configuration: MCPStdioTransportConfiguration(
-            command: script.path,
-            requestTimeout: 0.75
-        ))
+        let transport = MCPStdioTransport(configuration: script.configuration(requestTimeout: 0.75))
         defer { Task { await transport.close() } }
 
         let started = Date()
@@ -427,12 +485,10 @@ struct MCPStdioTransportTests {
 
     @Test("a closed transport refuses further sends")
     func closedTransportRefuses() async throws {
-        let script = try StdioServerScript(body: "cat > /dev/null")
+        let script = try StdioServerScript(behavior: .drain)
         defer { script.cleanup() }
 
-        let transport = MCPStdioTransport(configuration: MCPStdioTransportConfiguration(
-            command: script.path
-        ))
+        let transport = MCPStdioTransport(configuration: script.configuration())
         await transport.close()
 
         await #expect(throws: MCPError.self) {

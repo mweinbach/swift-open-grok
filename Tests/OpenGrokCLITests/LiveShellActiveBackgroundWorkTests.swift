@@ -419,8 +419,13 @@ struct LiveShellActiveBackgroundWorkLocalBackendTests {
             on: process
         )
 
+        #if os(Windows)
+        let completionCommand = "Write-Output 'done'"
+        #else
+        let completionCommand = "printf done\\n"
+        #endif
         let handle = try await process.runBackground(
-            bridgeRequest(command: "printf done\\n", callID: "call-local", cwd: cwd)
+            bridgeRequest(command: completionCommand, callID: "call-local", cwd: cwd)
         )
         let upsert = try #require(LiveActiveBackgroundWorkEvent.upsert(
             kind: .shell,

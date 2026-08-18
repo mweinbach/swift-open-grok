@@ -16,6 +16,7 @@
 // one long-lived writer thread.
 
 import Foundation
+import OpenGrokShared
 
 /// An owned, `Sendable` snapshot ready to write to disk — `MruSnapshot`
 /// (`mru.rs:236-268`). Produced on the owning actor; written off it.
@@ -36,13 +37,7 @@ public struct PagerSlashMruSnapshot: Sendable {
         let temporary = url.appendingPathExtension("tmp")
         do {
             try data.write(to: temporary)
-            // `rename` replaces atomically on POSIX; a reader sees either the
-            // old file or the new one, never a torn write.
-            if FileManager.default.fileExists(atPath: url.path) {
-                _ = try FileManager.default.replaceItemAt(url, withItemAt: temporary)
-            } else {
-                try FileManager.default.moveItem(at: temporary, to: url)
-            }
+            try atomicallyReplaceItem(at: url, with: temporary)
             return true
         } catch {
             try? FileManager.default.removeItem(at: temporary)

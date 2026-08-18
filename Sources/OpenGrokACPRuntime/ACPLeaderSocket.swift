@@ -184,7 +184,11 @@ public final class ACPLeaderLock: @unchecked Sendable {
 
     /// The PID recorded in a lock file, if it is readable and parseable.
     public static func readPID(at path: URL) -> Int32? {
+        #if os(Windows)
+        guard let text = WindowsExclusiveFileLock.readContents(at: path.path) else { return nil }
+        #else
         guard let text = try? String(contentsOf: path, encoding: .utf8) else { return nil }
+        #endif
         return Int32(text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 

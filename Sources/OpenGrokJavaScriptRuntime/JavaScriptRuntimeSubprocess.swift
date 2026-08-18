@@ -131,12 +131,20 @@ final class JavaScriptRuntimeSubprocess: @unchecked Sendable {
             return
         }
         process.terminate()
+        #if os(Windows)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+            if self.process.isRunning {
+                self.process.terminate()
+            }
+        }
+        #else
         let pid = process.processIdentifier
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
             if self.process.isRunning {
                 _ = kill(pid, SIGKILL)
             }
         }
+        #endif
     }
 
     private func consume(_ data: Data) {

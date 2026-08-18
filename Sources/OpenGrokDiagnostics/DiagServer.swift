@@ -4,6 +4,7 @@
 // standalone workspace-server. Swift port of `xai-grok-diag-server`.
 
 import Foundation
+import COpenGrokSockets
 
 #if canImport(Network)
 import Network
@@ -36,41 +37,23 @@ public enum LogTailError: Error {
 
 /// Read at most the last `maxBytes` bytes of `path`.
 public func tailFile(path: String, maxBytes: UInt64) throws -> [UInt8] {
-    let fd = open(path, O_RDONLY)
-    guard fd >= 0 else {
-        if errno == ENOENT {
+    guard FileManager.default.fileExists(atPath: path) else {
+        throw LogTailError.notFound
+    }
+
+    do {
+        let file = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        defer { try? file.close() }
+        let fileSize = try file.seekToEnd()
+        let readSize = min(maxBytes, fileSize, UInt64(Int.max))
+        try file.seek(toOffset: fileSize - readSize)
+        return Array(try file.read(upToCount: Int(readSize)) ?? Data())
+    } catch {
+        if !FileManager.default.fileExists(atPath: path) {
             throw LogTailError.notFound
         }
-        throw LogTailError.ioError(String(cString: strerror(errno)))
+        throw LogTailError.ioError(error.localizedDescription)
     }
-    defer { close(fd) }
-
-    var st = stat()
-    guard fstat(fd, &st) == 0 else {
-        throw LogTailError.ioError(String(cString: strerror(errno)))
-    }
-    let fileSize = UInt64(max(0, st.st_size))
-    let offset = fileSize > maxBytes ? (fileSize - maxBytes) : 0
-    guard lseek(fd, off_t(offset), SEEK_SET) >= 0 else {
-        throw LogTailError.ioError(String(cString: strerror(errno)))
-    }
-
-    var result: [UInt8] = []
-    let toRead = Int(min(maxBytes, fileSize - offset))
-    result.reserveCapacity(toRead)
-
-    var buffer = [UInt8](repeating: 0, count: 64 * 1024)
-    var totalRead: UInt64 = 0
-    while totalRead < maxBytes {
-        let chunkLimit = Int(min(UInt64(buffer.count), maxBytes - totalRead))
-        let bytesRead = read(fd, &buffer, chunkLimit)
-        if bytesRead <= 0 {
-            break
-        }
-        result.append(contentsOf: buffer[0..<bytesRead])
-        totalRead += UInt64(bytesRead)
-    }
-    return result
 }
 
 /// A successfully bound diagnostics server.
@@ -81,19 +64,19 @@ public final class BoundDiag: @unchecked Sendable {
     public let port: UInt16?
     /// The serve task; held by the production launcher for the process lifetime.
     public let task: Task<Void, Never>
-    private let serverFd: Int32
+    private let serverHandle: OGSocketHandle
     private let stateLock = NSLock()
     private var isStopped = false
 
     public init(
         addr: String,
         port: UInt16?,
-        serverFd: Int32,
+        serverHandle: OGSocketHandle,
         task: Task<Void, Never>
     ) {
         self.addr = addr
         self.port = port
-        self.serverFd = serverFd
+        self.serverHandle = serverHandle
         self.task = task
     }
 
@@ -107,7 +90,7 @@ public final class BoundDiag: @unchecked Sendable {
         stateLock.unlock()
 
         task.cancel()
-        close(serverFd)
+        _ = og_socket_close(serverHandle)
     }
 }
 
@@ -129,50 +112,23 @@ public func serve(
     case .unix(let path):
         #if !os(Windows)
         unlink(path)
-        let serverFd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard serverFd >= 0 else {
-            let err = String(cString: strerror(errno))
-            throw DiagServerError.bindFailed("bind \(path): \(err)")
+        var serverHandle: OGSocketHandle = -1
+        let listenResult = path.withCString { pathPointer in
+            og_socket_unix_listen(pathPointer, &serverHandle)
         }
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathLen = path.utf8.count
-        guard pathLen < MemoryLayout.size(ofValue: addr.sun_path) else {
-            close(serverFd)
-            throw DiagServerError.bindFailed("bind \(path): socket path too long")
+        guard listenResult == 0 else {
+            throw DiagServerError.bindFailed("bind \(path): \(diagSocketErrorMessage())")
         }
-        _ = path.withCString {
-            strncpy(&addr.sun_path.0, $0, MemoryLayout.size(ofValue: addr.sun_path))
-        }
-
-        let bindRes = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(serverFd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard bindRes == 0 else {
-            let err = String(cString: strerror(errno))
-            close(serverFd)
-            throw DiagServerError.bindFailed("bind \(path): \(err)")
-        }
-
         chmod(path, S_IRUSR | S_IWUSR)
 
-        guard listen(serverFd, 128) == 0 else {
-            let err = String(cString: strerror(errno))
-            close(serverFd)
-            throw DiagServerError.bindFailed("bind \(path): \(err)")
-        }
-
-        let fdToRun = serverFd
+        let listenerHandle = serverHandle
         let task = Task.detached(priority: .userInitiated) { [ctx] in
-            await runAcceptLoop(serverFd: fdToRun, ctx: ctx)
+            await runAcceptLoop(serverHandle: listenerHandle, ctx: ctx)
         }
         return BoundDiag(
             addr: "unix:\(path)",
             port: nil,
-            serverFd: serverFd,
+            serverHandle: listenerHandle,
             task: task
         )
         #else
@@ -180,89 +136,44 @@ public func serve(
         #endif
 
     case .tcp(let port):
-        let serverFd = socket(AF_INET, SOCK_STREAM, 0)
-        guard serverFd >= 0 else {
-            let err = String(cString: strerror(errno))
-            throw DiagServerError.bindFailed("bind 127.0.0.1:\(port): \(err)")
+        var serverHandle: OGSocketHandle = -1
+        var boundPort: UInt16 = 0
+        let listenResult = "127.0.0.1".withCString { hostPointer in
+            og_socket_tcp_listen(hostPointer, port, &serverHandle, &boundPort)
+        }
+        guard listenResult == 0 else {
+            throw DiagServerError.bindFailed("bind 127.0.0.1:\(port): \(diagSocketErrorMessage())")
         }
 
-        var reuse: Int32 = 1
-        setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
-        #if canImport(Darwin)
-        var nosigpipe: Int32 = 1
-        setsockopt(serverFd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, socklen_t(MemoryLayout<Int32>.size))
-        #endif
-
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(port.bigEndian)
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-
-        let bindRes = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(serverFd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard bindRes == 0 else {
-            let err = String(cString: strerror(errno))
-            close(serverFd)
-            throw DiagServerError.bindFailed("bind 127.0.0.1:\(port): \(err)")
-        }
-
-        guard listen(serverFd, 128) == 0 else {
-            let err = String(cString: strerror(errno))
-            close(serverFd)
-            throw DiagServerError.bindFailed("bind 127.0.0.1:\(port): \(err)")
-        }
-
-        var boundAddr = sockaddr_in()
-        var boundAddrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-        _ = withUnsafeMutablePointer(to: &boundAddr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                getsockname(serverFd, $0, &boundAddrLen)
-            }
-        }
-        let boundPort = UInt16(bigEndian: boundAddr.sin_port)
-
-        let fdToRun = serverFd
+        let listenerHandle = serverHandle
         let task = Task.detached(priority: .userInitiated) { [ctx] in
-            await runAcceptLoop(serverFd: fdToRun, ctx: ctx)
+            await runAcceptLoop(serverHandle: listenerHandle, ctx: ctx)
         }
         return BoundDiag(
             addr: "http://127.0.0.1:\(boundPort)",
             port: boundPort,
-            serverFd: serverFd,
+            serverHandle: listenerHandle,
             task: task
         )
     }
 }
 
-private func runAcceptLoop(serverFd: Int32, ctx: DiagContext) async {
+private func runAcceptLoop(serverHandle: OGSocketHandle, ctx: DiagContext) async {
     while !Task.isCancelled {
-        var clientAddr = sockaddr_storage()
-        var clientAddrLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
-        let clientFd = withUnsafeMutablePointer(to: &clientAddr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                accept(serverFd, $0, &clientAddrLen)
-            }
-        }
-        guard clientFd >= 0 else {
+        var clientHandle: OGSocketHandle = -1
+        guard og_socket_accept(serverHandle, &clientHandle) == 0 else {
             break
         }
-        #if canImport(Darwin)
-        var nosigpipe: Int32 = 1
-        setsockopt(clientFd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, socklen_t(MemoryLayout<Int32>.size))
-        #endif
 
         Task.detached(priority: .userInitiated) { [ctx] in
-            await handleConnection(clientFd: clientFd, ctx: ctx)
+            await handleConnection(clientHandle: clientHandle, ctx: ctx)
         }
     }
 }
 
-private func handleConnection(clientFd: Int32, ctx: DiagContext) async {
+private func handleConnection(clientHandle: OGSocketHandle, ctx: DiagContext) async {
     defer {
-        close(clientFd)
+        _ = og_socket_close(clientHandle)
     }
 
     var accumulated = [UInt8]()
@@ -270,13 +181,13 @@ private func handleConnection(clientFd: Int32, ctx: DiagContext) async {
     let maxHeaderSize = 16384
 
     while accumulated.count < maxHeaderSize {
-        let count = buffer.withUnsafeMutableBytes { raw in
-            read(clientFd, raw.baseAddress, raw.count)
+        let count = buffer.withUnsafeMutableBytes { raw -> Int64 in
+            og_socket_read(clientHandle, raw.baseAddress, raw.count)
         }
         if count <= 0 {
             break
         }
-        accumulated.append(contentsOf: buffer[0..<count])
+        accumulated.append(contentsOf: buffer.prefix(Int(count)))
         if hasCompleteHTTPHeader(accumulated) {
             break
         }
@@ -290,29 +201,28 @@ private func handleConnection(clientFd: Int32, ctx: DiagContext) async {
             body: Array("Bad Request".utf8)
         )
         _ = badRequest.withUnsafeBytes { raw in
-            writeAll(fd: clientFd, buffer: raw.baseAddress, length: raw.count)
+            writeAll(handle: clientHandle, buffer: raw.baseAddress, length: raw.count)
         }
         return
     }
 
     let response = processRequest(requestString: requestString, ctx: ctx)
     _ = response.withUnsafeBytes { raw in
-        writeAll(fd: clientFd, buffer: raw.baseAddress, length: raw.count)
+        writeAll(handle: clientHandle, buffer: raw.baseAddress, length: raw.count)
     }
 }
 
-private func writeAll(fd: Int32, buffer: UnsafeRawPointer?, length: Int) -> Bool {
+private func writeAll(handle: OGSocketHandle, buffer: UnsafeRawPointer?, length: Int) -> Bool {
     guard let buffer, length > 0 else { return true }
-    var totalWritten = 0
-    while totalWritten < length {
-        let ptr = buffer.advanced(by: totalWritten)
-        let count = write(fd, ptr, length - totalWritten)
-        if count <= 0 {
-            return false
-        }
-        totalWritten += count
+    return og_socket_write_all(handle, buffer, length) == Int64(length)
+}
+
+private func diagSocketErrorMessage() -> String {
+    let message = String(cString: og_socket_last_error_message())
+    if !message.isEmpty {
+        return message
     }
-    return true
+    return "native socket error \(og_socket_last_error_code())"
 }
 
 private func hasCompleteHTTPHeader(_ data: [UInt8]) -> Bool {

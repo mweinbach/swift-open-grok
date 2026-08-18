@@ -9,16 +9,11 @@
 // can dial is pinned to 127.0.0.1; assertions parse JSON.
 
 import Foundation
+import COpenGrokSockets
 import OpenGrokHTTP
 import OpenGrokShared
 import Testing
 @testable import OpenGrokMCP
-
-#if canImport(Darwin)
-import Darwin
-#elseif canImport(Glibc)
-import Glibc
-#endif
 
 // MARK: - Routed transport fake
 
@@ -178,35 +173,28 @@ private func makeManager(
 /// return the raw HTTP response (the fake browser's transport).
 @discardableResult
 private func socketGET(port: UInt16, target: String, method: String = "GET") -> String {
-    let fd = socket(AF_INET, {
-        #if canImport(Darwin)
-        SOCK_STREAM
-        #else
-        Int32(SOCK_STREAM.rawValue)
-        #endif
-    }(), 0)
-    guard fd >= 0 else { return "" }
-    defer { close(fd) }
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = port.bigEndian
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-    let connected = withUnsafePointer(to: &addr) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
+    var handle: OGSocketHandle = -1
+    let connected = "127.0.0.1".withCString {
+        og_socket_tcp_connect($0, port, 5.0, &handle)
     }
     guard connected == 0 else { return "" }
+    defer { _ = og_socket_close(handle) }
+
     let request = "\(method) \(target) HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nConnection: close\r\n\r\n"
-    _ = Array(request.utf8).withUnsafeBufferPointer {
-        send(fd, $0.baseAddress, $0.count, 0)
+    let requestData = Data(request.utf8)
+    let written = requestData.withUnsafeBytes {
+        og_socket_write_all(handle, $0.baseAddress, $0.count)
     }
+    guard written == Int64(requestData.count) else { return "" }
+
     var response = Data()
     var buffer = [UInt8](repeating: 0, count: 4096)
     while true {
-        let n = recv(fd, &buffer, buffer.count, 0)
-        if n <= 0 { break }
-        response.append(contentsOf: buffer[..<n])
+        let count = buffer.withUnsafeMutableBytes {
+            og_socket_read(handle, $0.baseAddress, $0.count)
+        }
+        if count <= 0 { break }
+        response.append(contentsOf: buffer.prefix(Int(count)))
     }
     return String(decoding: response, as: UTF8.self)
 }

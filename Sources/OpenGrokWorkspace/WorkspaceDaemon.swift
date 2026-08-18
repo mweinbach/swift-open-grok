@@ -62,6 +62,10 @@ public let WORKSPACE_SERVER_OOM_SCORE_ADJ: Int32 = -900
 /// `oom_score_adj` for the supervised preview-proxy.
 public let PREVIEW_PROXY_OOM_SCORE_ADJ: Int32 = -500
 
+/// Owner read/write mode used for daemon-owned files on Unix. Windows accepts
+/// the value through the CRT open call but enforces access through the ACL.
+public let DAEMON_OWNER_READ_WRITE_MODE: Int32 = 0o600
+
 // MARK: - OOM Protection Storage
 
 private final class OOMProtectMetrics: @unchecked Sendable {
@@ -130,7 +134,7 @@ public func applyWorkspaceOOMProtect() -> Bool {
             return true
         }
         #endif
-        fputs("failed to lower oom_score_adj to \(WORKSPACE_SERVER_OOM_SCORE_ADJ): \(error)\n", stderr)
+        FileHandle.standardError.write(Data("failed to lower oom_score_adj to \(WORKSPACE_SERVER_OOM_SCORE_ADJ): \(error)\n".utf8))
         recordOOMProtect(outcome: "failed")
         return false
     }
@@ -140,7 +144,11 @@ public func applyWorkspaceOOMProtect() -> Bool {
 
 /// Open a daemon-owned file (log or pidfile) with defense-in-depth posture:
 /// `O_NOFOLLOW` and mode `0600` (user read/write only).
-public func daemonFileOpen(path: String, flags: Int32, mode: mode_t = S_IRUSR | S_IWUSR) throws -> Int32 {
+public func daemonFileOpen(
+    path: String,
+    flags: Int32,
+    mode: Int32 = DAEMON_OWNER_READ_WRITE_MODE
+) throws -> Int32 {
     let url = URL(fileURLWithPath: path)
     let parent = url.deletingLastPathComponent()
     if !parent.path.isEmpty && parent.path != "/" {
@@ -153,7 +161,11 @@ public func daemonFileOpen(path: String, flags: Int32, mode: mode_t = S_IRUSR | 
     let effectiveFlags = flags | O_NOFOLLOW
     #endif
 
+    #if os(Windows)
     let fd = open(path, effectiveFlags, mode)
+    #else
+    let fd = open(path, effectiveFlags, mode_t(mode))
+    #endif
     if fd < 0 {
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
@@ -174,7 +186,7 @@ public func daemonize(logPath: String = DEFAULT_LOG_PATH) throws {
     if !parent.path.isEmpty {
         try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
     }
-    let fd = try daemonFileOpen(path: logPath, flags: O_CREAT | O_WRONLY | O_APPEND, mode: S_IRUSR | S_IWUSR)
+    let fd = try daemonFileOpen(path: logPath, flags: O_CREAT | O_WRONLY | O_APPEND)
     _ = dup2(fd, STDOUT_FILENO)
     _ = dup2(fd, STDERR_FILENO)
     close(fd)
@@ -233,7 +245,7 @@ public func openStdioTargets(logPath: String) throws -> (stdinFd: Int32, logFd: 
     }
 
     do {
-        let logFd = try daemonFileOpen(path: logPath, flags: O_CREAT | O_WRONLY | O_APPEND, mode: S_IRUSR | S_IWUSR)
+        let logFd = try daemonFileOpen(path: logPath, flags: O_CREAT | O_WRONLY | O_APPEND)
         return (stdinFd, logFd)
     } catch {
         close(stdinFd)

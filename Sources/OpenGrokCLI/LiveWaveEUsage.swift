@@ -14,7 +14,7 @@ extension LiveInteractiveControllerRenderer {
             items: items,
             usageSources: usageSources
         )
-        creditStatus = report.quotaWindows.compactMap { window in
+        creditStatus = report.quotaWindows.compactMap { window -> PagerCreditStatus? in
             guard let provider = waveEUsageProvider(window.provider),
                   let limit = window.limit,
                   limit > 0 else { return nil }

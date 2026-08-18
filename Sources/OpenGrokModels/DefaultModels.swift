@@ -6,7 +6,6 @@
 //   CLI flag > ENV var > config.toml > remote settings > these defaults
 
 import Foundation
-import CoreFoundation
 import OpenGrokSamplingTypes
 
 /// Specialty model role used for auxiliary tasks.
@@ -285,7 +284,7 @@ private func parseDefaultModelJSON(_ obj: [String: Any]) throws -> DefaultModelJ
 
     let compactionsRemaining: CompactionsRemaining?
     if let n = obj["compactions_remaining"] as? NSNumber {
-        if CFGetTypeID(n) == CFBooleanGetTypeID() {
+        if isJSONBoolean(n) {
             compactionsRemaining = .dynamic(n.boolValue)
         } else {
             compactionsRemaining = .fixed(n.uint8Value)
@@ -295,7 +294,7 @@ private func parseDefaultModelJSON(_ obj: [String: Any]) throws -> DefaultModelJ
     }
     let compactionAtTokens: CompactionAtTokens?
     if let n = obj["compaction_at_tokens"] as? NSNumber {
-        if CFGetTypeID(n) == CFBooleanGetTypeID() {
+        if isJSONBoolean(n) {
             compactionAtTokens = .enabled(n.boolValue)
         } else {
             compactionAtTokens = .fixed(n.uint64Value)
@@ -334,6 +333,11 @@ private func parseDefaultModelJSON(_ obj: [String: Any]) throws -> DefaultModelJ
         autoCompactThresholdPercent: autoCompact,
         systemPromptLabel: obj["system_prompt_label"] as? String
     )
+}
+
+private func isJSONBoolean(_ number: NSNumber) -> Bool {
+    let typeEncoding = String(cString: number.objCType)
+    return typeEncoding == "B" || typeEncoding == "c"
 }
 
 /// Built-in default model entries, keyed by stable catalog id.

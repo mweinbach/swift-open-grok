@@ -777,18 +777,27 @@ actor LiveRewindCoordinator {
     private func relativePath(for rawPath: String) -> String? {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let absolute: URL = trimmed.hasPrefix("/")
-            ? URL(fileURLWithPath: trimmed).standardizedFileURL
-            : workingDirectory.appendingPathComponent(trimmed).standardizedFileURL
-
-        let root = workingDirectory.path.hasSuffix("/")
-            ? workingDirectory.path
-            : workingDirectory.path + "/"
-        guard absolute.path.hasPrefix(root) else { return nil }
-        let relative = String(absolute.path.dropFirst(root.count))
+        let absolute = liveResolveURL(trimmed, relativeTo: workingDirectory.path)
+        func normalized(_ path: String) -> String {
+            path.replacingOccurrences(of: "\\", with: "/")
+        }
+        var root = normalized(workingDirectory.standardizedFileURL.path)
+        while root.count > 1 && root.hasSuffix("/") {
+            root.removeLast()
+        }
+        let candidate = normalized(absolute.path)
+        #if os(Windows)
+        let rootKey = root.lowercased()
+        let candidateKey = candidate.lowercased()
+        #else
+        let rootKey = root
+        let candidateKey = candidate
+        #endif
+        guard candidateKey.hasPrefix(rootKey + "/") else { return nil }
+        let relative = String(candidate.dropFirst(root.count + 1))
         guard !relative.isEmpty else { return nil }
         let firstComponent = relative.split(separator: "/").first.map(String.init)
-        guard firstComponent != ".git" else { return nil }
+        guard firstComponent?.caseInsensitiveCompare(".git") != .orderedSame else { return nil }
         return relative
     }
 

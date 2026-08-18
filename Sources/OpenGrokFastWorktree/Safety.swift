@@ -69,8 +69,8 @@ public struct WorktreeSafetyPolicy: Sendable {
 
     /// Lexical + parent-symlink containment under `pool`.
     private func validateInsidePool(dest: URL, pool: URL, resolved: Bool = false) throws {
-        let poolPath = normalizeLexically(pool.path)
-        let destPath = normalizeLexically(dest.path)
+        let poolPath = worktreePathKey(pool.path)
+        let destPath = worktreePathKey(dest.path)
         let prefix = poolPath.hasSuffix("/") ? poolPath : poolPath + "/"
         if destPath != poolPath && !destPath.hasPrefix(prefix) {
             throw FastWorktreeError.pathEscape(
@@ -93,7 +93,7 @@ public struct WorktreeSafetyPolicy: Sendable {
             if FileManager.default.fileExists(atPath: current.path) {
                 if let isLink = try? PathSecurity.isSymlink(current), isLink {
                     let target = current.resolvingSymlinksInPath()
-                    let targetPath = normalizeLexically(target.path)
+                    let targetPath = worktreePathKey(target.path)
                     if targetPath != poolPath && !targetPath.hasPrefix(poolPrefix) {
                         throw FastWorktreeError.pathEscape(
                             "symlink escape via \(current.path) -> \(target.path)"
@@ -101,7 +101,7 @@ public struct WorktreeSafetyPolicy: Sendable {
                     }
                 }
             }
-            if normalizeLexically(current.path) == poolPath { break }
+            if worktreePathKey(current.path) == poolPath { break }
             if parent.path == current.path { break }
             current = parent
         }
@@ -151,7 +151,18 @@ public func rejectHostileGitRef(_ ref: String) throws {
 }
 
 func pathsEqual(_ a: URL, _ b: URL) -> Bool {
-    a.standardizedFileURL.path == b.standardizedFileURL.path
+    worktreePathKey(a.standardizedFileURL.path)
+        == worktreePathKey(b.standardizedFileURL.path)
+}
+
+func worktreePathKey(_ path: String) -> String {
+    let normalized = normalizeLexically(path)
+        .replacingOccurrences(of: "\\", with: "/")
+    #if os(Windows)
+    return normalized.lowercased()
+    #else
+    return normalized
+    #endif
 }
 
 /// Ensure destination does not already exist (unless empty and reusable).

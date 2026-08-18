@@ -211,12 +211,23 @@ private struct DashboardFixture {
             .rows ?? []
     }
 
-    func selectDashboardRow(_ rowID: String) async throws {
-        let maximumMoves = await dashboardRows().count + 2
-        var selectedRowID = await renderer.dashboardSnapshotForTesting().selectedRowID
-        for _ in 0..<maximumMoves where selectedRowID != rowID {
-            #expect(try await renderer.handleInput(.key(KeyEvent(key: .down))) == .consumed)
-            selectedRowID = await renderer.dashboardSnapshotForTesting().selectedRowID
+    func selectDashboardRow(
+        _ rowID: String,
+        timeout: TimeInterval = 3
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        var selectedRowID: String?
+        while Date() < deadline {
+            let snapshot = await renderer.dashboardSnapshotForTesting()
+            selectedRowID = snapshot.selectedRowID
+            if selectedRowID == rowID { return }
+            guard snapshot.isOpen, snapshot.rowLabels[rowID] != nil else {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+                continue
+            }
+            if try await renderer.handleInput(.key(KeyEvent(key: .down))) != .consumed {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
         }
         #expect(selectedRowID == rowID)
     }

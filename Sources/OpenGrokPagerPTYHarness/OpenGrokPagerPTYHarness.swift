@@ -432,7 +432,7 @@ public struct PagerPTYHarness: Sendable {
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
 
-        let process = try await PosixPTYAdapter().spawn(
+        let process = try await PlatformPTYAdapter().spawn(
             ProcessSpec(
                 command: binaryPath,
                 arguments: arguments,

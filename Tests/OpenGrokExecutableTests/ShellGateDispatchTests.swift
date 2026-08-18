@@ -340,11 +340,35 @@ struct ShellGateDispatchTests {
         let hooksDirectory = URL(fileURLWithPath: workspace.environment["OPENGROK_HOME"]!)
             .appendingPathComponent("hooks")
         try FileManager.default.createDirectory(at: hooksDirectory, withIntermediateDirectories: true)
-        let hook = #"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"printf '%s' '{\"decision\":\"deny\",\"reason\":\"blocked by Bash hook\"}'"}]}]}}"#
-        try hook.write(
-            to: hooksDirectory.appendingPathComponent("deny-live-shell.json"),
+        let hookScript = hooksDirectory.appendingPathComponent("deny-live-shell.sh")
+        try #"""
+        #!/bin/sh
+        printf '%s' '{"decision":"deny","reason":"blocked by Bash hook"}'
+        """#.write(
+            to: hookScript,
             atomically: true,
             encoding: .utf8
+        )
+        #if !os(Windows)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: hookScript.path
+        )
+        #endif
+        let hook: [String: Any] = [
+            "hooks": [
+                "PreToolUse": [[
+                    "matcher": "Bash",
+                    "hooks": [[
+                        "type": "command",
+                        "command": hookScript.path,
+                    ]],
+                ]],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: hook).write(
+            to: hooksDirectory.appendingPathComponent("deny-live-shell.json"),
+            options: .atomic
         )
 
         let backend = SpyShellBackend()

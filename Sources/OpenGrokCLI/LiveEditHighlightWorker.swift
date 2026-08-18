@@ -78,9 +78,7 @@ actor LiveEditHighlightWorker {
     }
 
     private static func readCapped(path: String, workingDirectory: URL) -> String? {
-        let pathURL = URL(fileURLWithPath: path)
-        let url = (pathURL.path.hasPrefix("/") ? pathURL : workingDirectory.appendingPathComponent(path))
-            .standardizedFileURL
+        let url = liveResolveURL(path, relativeTo: workingDirectory.path)
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
               let type = attributes[.type] as? FileAttributeType,
               type == .typeRegular,

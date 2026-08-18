@@ -16,15 +16,10 @@
 // parameter, serves upstream's own HTML pages, and has no CORS layer.
 
 import Foundation
+import COpenGrokSockets
 import OpenGrokConfigTypes
 import OpenGrokFileUtils
 import OpenGrokHTTP
-
-#if canImport(Darwin)
-import Darwin
-#elseif canImport(Glibc)
-import Glibc
-#endif
 
 // MARK: - Flow errors
 
@@ -107,22 +102,13 @@ func mcpCallbackFailureHTML(_ message: String) -> String {
 
 // MARK: - Loopback listener
 
-/// Cross-platform `SOCK_STREAM` (Darwin: bare Int32; glibc: enum).
-private var mcpSockStreamType: Int32 {
-    #if canImport(Darwin)
-    return SOCK_STREAM
-    #else
-    return Int32(SOCK_STREAM.rawValue)
-    #endif
-}
-
 /// Loopback OAuth callback server for MCP consent redirects.
 ///
 /// Serves an accept loop until a decisive `/callback` (GET or POST, matching
 /// upstream's axum route, oauth.rs:584) arrives or the deadline passes.
 /// Unknown paths get 404 and do not consume the wait.
 final class MCPOAuthLoopbackListener: @unchecked Sendable {
-    private var serverFd: Int32 = -1
+    private var serverFd: OGSocketHandle = -1
     let port: UInt16
 
     /// Bind 127.0.0.1 on `port` (0 = OS-assigned; a BYO `callback_port`
@@ -136,43 +122,18 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
         self.port = bound.port
     }
 
-    private static func bindListener(port: UInt16) -> (fd: Int32, port: UInt16)? {
-        let fd = socket(AF_INET, mcpSockStreamType, 0)
-        guard fd >= 0 else { return nil }
-        var opt: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, socklen_t(MemoryLayout<Int32>.size))
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = port.bigEndian
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let res = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard res == 0, listen(fd, 4) == 0 else {
-            close(fd)
+    private static func bindListener(port: UInt16) -> (fd: OGSocketHandle, port: UInt16)? {
+        var fd: OGSocketHandle = -1
+        var boundPort: UInt16 = 0
+        guard og_socket_tcp_listen("127.0.0.1", port, &fd, &boundPort) == 0 else {
             return nil
         }
-        var boundAddr = sockaddr_in()
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let nameResult = withUnsafeMutablePointer(to: &boundAddr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                getsockname(fd, $0, &len)
-            }
-        }
-        // An ephemeral bind whose port cannot be read back would advertise
-        // ":0" in the redirect_uri; fail the bind instead.
-        guard nameResult == 0 else {
-            close(fd)
-            return nil
-        }
-        return (fd, UInt16(bigEndian: boundAddr.sin_port))
+        return (fd, boundPort)
     }
 
     func closeListener() {
         if serverFd >= 0 {
-            close(serverFd)
+            _ = og_socket_close(serverFd)
             serverFd = -1
         }
     }
@@ -225,43 +186,35 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
     }
 
     private static func serveUntilCallback(
-        fd: Int32,
+        fd: OGSocketHandle,
         timeoutSeconds: TimeInterval
     ) throws -> MCPOAuthCallbackPayload {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while true {
-            let remainingMs = Int32((deadline.timeIntervalSinceNow * 1000).rounded(.down))
-            guard remainingMs > 0 else {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else {
                 throw MCPOAuthFlowError(
                     "OAuth consent timed out after \(UInt64(timeoutSeconds))s; "
                         + "re-run authentication to try again")
             }
-            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-            let pollRes = poll(&pfd, 1, remainingMs)
-            if pollRes == 0 {
+            var clientFd: OGSocketHandle = -1
+            let acceptResult = og_socket_accept_with_timeout(fd, remaining, &clientFd)
+            if acceptResult == 1 {
                 throw MCPOAuthFlowError(
                     "OAuth consent timed out after \(UInt64(timeoutSeconds))s; "
                         + "re-run authentication to try again")
             }
-            guard pollRes > 0 else {
-                if errno == EINTR { continue }
-                throw MCPOAuthFlowError("OAuth callback failed: poll failed: errno \(errno)")
+            guard acceptResult == 0 else {
+                throw MCPOAuthFlowError("OAuth callback failed: \(socketErrorDetail())")
             }
-
-            var clientAddr = sockaddr_in()
-            var clientLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let clientFd = withUnsafeMutablePointer(to: &clientAddr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    accept(fd, $0, &clientLen)
-                }
-            }
-            guard clientFd >= 0 else { continue }
-            defer { close(clientFd) }
+            defer { _ = og_socket_close(clientFd) }
 
             var buffer = [UInt8](repeating: 0, count: 8192)
-            let bytesRead = recv(clientFd, &buffer, buffer.count - 1, 0)
+            let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer in
+                og_socket_read(clientFd, rawBuffer.baseAddress, rawBuffer.count - 1)
+            }
             guard bytesRead > 0,
-                  let request = String(bytes: buffer[..<bytesRead], encoding: .utf8)
+                  let request = String(bytes: buffer[..<Int(bytesRead)], encoding: .utf8)
             else { continue }
 
             if let outcome = handle(request: request, clientFd: clientFd) {
@@ -276,7 +229,7 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
     }
 
     private static func serveUntilCallbackOrCredential(
-        fd: Int32,
+        fd: OGSocketHandle,
         timeoutSeconds: TimeInterval,
         credentialPollIntervalSeconds: TimeInterval,
         credentialsChanged: @escaping @Sendable () -> Bool
@@ -299,29 +252,20 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
             let untilDeadline = deadline.timeIntervalSince(now)
             let untilCredentialPoll = nextCredentialPoll.timeIntervalSince(now)
             let waitSeconds = min(untilDeadline, untilCredentialPoll)
-            let waitMs = Int32(max(1, (waitSeconds * 1000).rounded(.up)))
-            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-            let pollRes = poll(&pfd, 1, waitMs)
-            if pollRes == 0 { continue }
-            guard pollRes > 0 else {
-                if errno == EINTR { continue }
-                throw MCPOAuthFlowError("OAuth callback failed: poll failed: errno \(errno)")
+            var clientFd: OGSocketHandle = -1
+            let acceptResult = og_socket_accept_with_timeout(fd, waitSeconds, &clientFd)
+            if acceptResult == 1 { continue }
+            guard acceptResult == 0 else {
+                throw MCPOAuthFlowError("OAuth callback failed: \(socketErrorDetail())")
             }
-
-            var clientAddr = sockaddr_in()
-            var clientLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let clientFd = withUnsafeMutablePointer(to: &clientAddr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    accept(fd, $0, &clientLen)
-                }
-            }
-            guard clientFd >= 0 else { continue }
-            defer { close(clientFd) }
+            defer { _ = og_socket_close(clientFd) }
 
             var buffer = [UInt8](repeating: 0, count: 8192)
-            let bytesRead = recv(clientFd, &buffer, buffer.count - 1, 0)
+            let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer in
+                og_socket_read(clientFd, rawBuffer.baseAddress, rawBuffer.count - 1)
+            }
             guard bytesRead > 0,
-                  let request = String(bytes: buffer[..<bytesRead], encoding: .utf8)
+                  let request = String(bytes: buffer[..<Int(bytesRead)], encoding: .utf8)
             else { continue }
 
             if let outcome = handle(request: request, clientFd: clientFd) {
@@ -337,7 +281,7 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
     /// `nil` means "answered, not decisive" (unknown path).
     private static func handle(
         request: String,
-        clientFd: Int32
+        clientFd: OGSocketHandle
     ) -> Result<MCPOAuthCallbackPayload, MCPOAuthFlowError>? {
         // AGENTS.md §2: `\r\n` is ONE Character — split on `isNewline`, never
         // on the "\n" Character.
@@ -377,7 +321,7 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
         return result
     }
 
-    private static func respond(_ clientFd: Int32, status: String, body: String) {
+    private static func respond(_ clientFd: OGSocketHandle, status: String, body: String) {
         var response = "HTTP/1.1 \(status)\r\n"
         response += "Content-Type: text/html; charset=utf-8\r\n"
         response += "Content-Length: \(body.utf8.count)\r\n"
@@ -386,8 +330,14 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
         response += body
         let bytes = Array(response.utf8)
         _ = bytes.withUnsafeBufferPointer { ptr in
-            send(clientFd, ptr.baseAddress, ptr.count, 0)
+            og_socket_write_all(clientFd, ptr.baseAddress, ptr.count)
         }
+    }
+
+    private static func socketErrorDetail() -> String {
+        let detail = String(cString: og_socket_last_error_message())
+        if !detail.isEmpty { return detail }
+        return "socket error \(og_socket_last_error_code())"
     }
 }
 

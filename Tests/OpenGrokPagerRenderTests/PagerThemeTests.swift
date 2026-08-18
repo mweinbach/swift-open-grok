@@ -109,7 +109,8 @@ struct PagerThemeCatalogTests {
     func terminalDefaultIsSafe() {
         let theme = PagerRenderTheme.terminalDefault
         for keyPath in PagerRenderTheme.colorSlots {
-            switch theme[keyPath: keyPath] {
+            let color = theme[keyPath: keyPath]
+            switch color {
             case .rgb, .indexed:
                 Issue.record("terminal_default must not carry an RGB or indexed color")
             default:
@@ -204,7 +205,8 @@ struct PagerColorSupportTests {
     func quantizedThemeIsComplete() {
         let folded = PagerRenderTheme.tokyoNight.quantized(to: .basic)
         for keyPath in PagerRenderTheme.colorSlots {
-            if case .rgb = folded[keyPath: keyPath] {
+            let color = folded[keyPath: keyPath]
+            if case .rgb = color {
                 Issue.record("a slot survived quantization as RGB — colorSlots is missing a field")
             }
         }
@@ -333,7 +335,8 @@ struct PagerThemeResolutionTests {
     func resolvedThemeIsQuantized() {
         let resolved = pagerResolveTheme(preference: .fixed(.grokNight), colorLevel: .basic)
         for keyPath in PagerRenderTheme.colorSlots {
-            if case .rgb = resolved.theme[keyPath: keyPath] {
+            let color = resolved.theme[keyPath: keyPath]
+            if case .rgb = color {
                 Issue.record("resolution handed back an unquantized palette")
             }
         }

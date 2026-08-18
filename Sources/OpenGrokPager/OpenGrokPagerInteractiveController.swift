@@ -686,46 +686,58 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
 
     private actor SignalMailbox {
         private var queued: [Signal] = []
-        private var waiter: (UUID, CheckedContinuation<Signal?, Never>)?
+        private var waiter: (UUID, CheckedContinuation<Void, Never>)?
         private var isClosed = false
+        private static let naturalEOFPriorityGraceNanos: UInt64 = 5_000_000
 
         func send(_ signal: Signal, priority: Bool = false) {
             guard !isClosed else { return }
-            if let waiter {
-                self.waiter = nil
-                waiter.1.resume(returning: signal)
-            } else if priority {
+            if priority {
                 queued.insert(signal, at: 0)
             } else {
                 queued.append(signal)
             }
+            waiter?.1.resume()
+            waiter = nil
         }
 
         func next() async -> Signal? {
-            if let signal = dequeue() { return signal }
-            if isClosed { return nil }
-            let waiterID = UUID()
-            return await withTaskCancellationHandler(operation: {
-                await withCheckedContinuation { continuation in
-                    if let signal = dequeue() {
-                        continuation.resume(returning: signal)
-                    } else if isClosed {
-                        continuation.resume(returning: nil)
-                    } else {
-                        waiter = (waiterID, continuation)
+            while true {
+                if shouldDeferNaturalEOF {
+                    do {
+                        try await Task.sleep(nanoseconds: Self.naturalEOFPriorityGraceNanos)
+                    } catch {
+                        return nil
                     }
                 }
-            }, onCancel: {
-                Task { await self.cancelWaiter(waiterID) }
-            })
+                if let signal = dequeue() { return signal }
+                if isClosed || Task.isCancelled { return nil }
+                let waiterID = UUID()
+                await withTaskCancellationHandler(operation: {
+                    await withCheckedContinuation { continuation in
+                        if !queued.isEmpty || isClosed || Task.isCancelled {
+                            continuation.resume()
+                        } else {
+                            waiter = (waiterID, continuation)
+                        }
+                    }
+                }, onCancel: {
+                    Task { await self.cancelWaiter(waiterID) }
+                })
+            }
         }
 
         func close() {
             guard !isClosed else { return }
             isClosed = true
-            waiter?.1.resume(returning: nil)
+            waiter?.1.resume()
             waiter = nil
             queued.removeAll(keepingCapacity: false)
+        }
+
+        private var shouldDeferNaturalEOF: Bool {
+            guard queued.count == 1, case .input(.end) = queued[0] else { return false }
+            return true
         }
 
         private func dequeue() -> Signal? {
@@ -748,7 +760,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         private func cancelWaiter(_ waiterID: UUID) {
             guard waiter?.0 == waiterID, let waiter else { return }
             self.waiter = nil
-            waiter.1.resume(returning: nil)
+            waiter.1.resume()
         }
     }
 
@@ -829,6 +841,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private var launchSessionID: String?
     private var terminalRestored = false
     private var running = false
+    private var inputExhausted = false
     private var rendererBegan = false
     private var shutdownRequested = false
     private var activeSession: (any OpenGrokPagerSessionAdapter)?
@@ -1325,6 +1338,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         guard !shutdownRequested else { throw OpenGrokPagerInteractiveError.shutdown }
 
         running = true
+        inputExhausted = false
         // A prior run's teardown sets `motionShutdownLatched` (and may leave
         // `motionSuspended`) so a racing resume cannot re-arm into restore;
         // clear both for this run before anything can demand frames.
@@ -2160,8 +2174,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             }
                         }
                     case .end:
-                        await cancelActiveSession()
-                        turnOutcome = .eof
+                        inputExhausted = true
+                        if await promptQueue.count == 0,
+                           deferredSessionDispatches.isEmpty {
+                            await cancelActiveSession()
+                            turnOutcome = .eof
+                        }
                     case .failure(let message):
                         throw OpenGrokPagerInteractiveError.inputFailed(message)
                     case .cancelled:
@@ -2454,6 +2472,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             } catch {
                 // `.empty` is the normal exit; `.alreadyRunning` cannot happen
                 // because every path below clears the running marker.
+                if inputExhausted {
+                    try await transition(to: .eof)
+                    return .eof
+                }
                 return nil
             }
             // A queued slash command is a command, not a prompt. This is the

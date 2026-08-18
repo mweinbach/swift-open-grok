@@ -484,13 +484,18 @@ struct LivePagerTasksReachabilityTests {
         )
 
         // A real process, backgrounded by the model's own flag.
+        #if os(Windows)
+        let backgroundArguments = #"{"command": "Start-Sleep -Seconds 30", "is_background": true, "description": "long sleeper"}"#
+        #else
+        let backgroundArguments = #"{"command": "sleep 30", "is_background": true, "description": "long sleeper"}"#
+        #endif
         let spawned = await session.executor.invoke(
             sessionID: session.sessionID,
             workingDirectory: workspace.root,
             call: ToolCall(
                 id: "bg-1",
                 name: "run_terminal_cmd",
-                arguments: #"{"command": "sleep 30", "is_background": true, "description": "long sleeper"}"#
+                arguments: backgroundArguments
             )
         )
         let spawnedTaskID = taskID(from: spawned)

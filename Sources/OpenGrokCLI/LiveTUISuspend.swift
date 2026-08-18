@@ -81,8 +81,8 @@ struct LiveTUISuspendHost: Sendable {
         let raw = environment["PAGER"]?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let value = raw.isEmpty ? "less" : raw
-        let parts = value.split(whereSeparator: \.isWhitespace).map(String.init)
-        guard let program = parts.first else { return ("less", []) }
+        let parts = shellSplit(value) ?? [value]
+        guard let program = parts.first, !program.isEmpty else { return ("less", []) }
         var arguments = Array(parts.dropFirst())
         let isLess = URL(fileURLWithPath: program).lastPathComponent == "less"
         if ansi, isLess {
@@ -157,17 +157,26 @@ struct LiveTUISuspendHost: Sendable {
                 while let inner = nextCharacter() {
                     if inner == "\"" { closed = true; break }
                     if inner == "\\" {
+                        #if os(Windows)
+                        current.append(inner)
+                        #else
                         guard let escaped = nextCharacter() else { return nil }
                         current.append(escaped)
+                        #endif
                         continue
                     }
                     current.append(inner)
                 }
                 guard closed else { return nil }
             case "\\":
+                #if os(Windows)
+                hasToken = true
+                current.append(character)
+                #else
                 guard let escaped = nextCharacter() else { return nil }
                 hasToken = true
                 current.append(escaped)
+                #endif
             default:
                 hasToken = true
                 current.append(character)
@@ -178,9 +187,9 @@ struct LiveTUISuspendHost: Sendable {
         return tokens
     }
 
-    /// Run the child with inherited stdio, through `/usr/bin/env` so a bare
-    /// `$PAGER` name gets PATH lookup. Returns the launch error, if any; the
-    /// exit status is discarded as upstream discards it
+    /// Run the child with inherited stdio and host-native executable/script
+    /// resolution. Returns the launch error, if any; the exit status is
+    /// discarded as upstream discards it
     /// (event_loop.rs:783-786).
     ///
     /// `terminationHandler` bridged to a continuation — `waitUntilExit` is
@@ -192,8 +201,24 @@ struct LiveTUISuspendHost: Sendable {
         environment: [String: String]
     ) async -> (any Error)? {
         let process = Process()
+        #if os(Windows)
+        guard let launch = windowsChildLaunch(
+            program: program,
+            arguments: arguments,
+            environment: environment
+        ) else {
+            return NSError(
+                domain: NSCocoaErrorDomain,
+                code: CocoaError.fileNoSuchFile.rawValue,
+                userInfo: [NSFilePathErrorKey: program]
+            )
+        }
+        process.executableURL = URL(fileURLWithPath: launch.executable)
+        process.arguments = launch.arguments
+        #else
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [program] + arguments
+        #endif
         process.environment = environment
         return await withCheckedContinuation { continuation in
             // Exactly-once: the handler is installed before `run()` and fires
@@ -210,4 +235,76 @@ struct LiveTUISuspendHost: Sendable {
             }
         }
     }
+
+    #if os(Windows)
+    private static func windowsChildLaunch(
+        program: String,
+        arguments: [String],
+        environment: [String: String]
+    ) -> (executable: String, arguments: [String])? {
+        switch URL(fileURLWithPath: program).pathExtension.lowercased() {
+        case "ps1":
+            guard let shell = resolveWindowsChildExecutable("powershell.exe", environment: environment) else {
+                return nil
+            }
+            return (
+                shell,
+                ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", program] + arguments
+            )
+        case "cmd", "bat":
+            let interpreter = environment["COMSPEC"]
+                ?? ProcessInfo.processInfo.environment["COMSPEC"]
+                ?? "cmd.exe"
+            guard let shell = resolveWindowsChildExecutable(interpreter, environment: environment) else {
+                return nil
+            }
+            return (shell, ["/D", "/S", "/C", program] + arguments)
+        case "sh":
+            guard let shell = resolveWindowsChildExecutable("sh.exe", environment: environment) else {
+                return nil
+            }
+            return (shell, [program] + arguments)
+        default:
+            guard let executable = resolveWindowsChildExecutable(program, environment: environment) else {
+                return nil
+            }
+            return (executable, arguments)
+        }
+    }
+
+    private static func resolveWindowsChildExecutable(
+        _ executable: String,
+        environment: [String: String]
+    ) -> String? {
+        let fileManager = FileManager.default
+        if (executable as NSString).isAbsolutePath
+            || executable.contains("/")
+            || executable.contains("\\") {
+            return fileManager.fileExists(atPath: executable) ? executable : nil
+        }
+        let pathValue = environment["PATH"]
+            ?? environment["Path"]
+            ?? ProcessInfo.processInfo.environment["PATH"]
+            ?? ProcessInfo.processInfo.environment["Path"]
+            ?? ""
+        let pathExt = environment["PATHEXT"]
+            ?? ProcessInfo.processInfo.environment["PATHEXT"]
+            ?? ".COM;.EXE;.BAT;.CMD"
+        let extensions = pathExt.split(separator: ";").map(String.init)
+        let hasKnownExtension = extensions.contains {
+            executable.lowercased().hasSuffix($0.lowercased())
+        }
+        let suffixes = hasKnownExtension || executable.contains(".") ? [""] : extensions
+        for directory in pathValue.split(separator: ";", omittingEmptySubsequences: true) {
+            for suffix in suffixes {
+                let candidate = (String(directory) as NSString)
+                    .appendingPathComponent(executable + suffix)
+                if fileManager.fileExists(atPath: candidate) {
+                    return candidate
+                }
+            }
+        }
+        return nil
+    }
+    #endif
 }

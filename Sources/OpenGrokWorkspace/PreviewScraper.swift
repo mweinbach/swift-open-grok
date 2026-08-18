@@ -5,6 +5,10 @@
 
 import Foundation
 
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
 // MARK: - Constants
 
 /// Default loopback control port for the preview-proxy.
@@ -93,13 +97,12 @@ public func parseActivityBody(_ body: String) -> ActivitySample? {
     guard let data = body.data(using: .utf8),
           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let lastActivity = json["last_activity_ms"] as? NSNumber,
-          // NSNumber(value: 0) can look like Bool on Apple platforms.
-          // Use CFGetTypeID to distinguish actual JSON booleans from integers.
-          CFGetTypeID(lastActivity) != CFBooleanGetTypeID(),
           lastActivity.doubleValue == Double(lastActivity.uint64Value)
     else {
         return nil
     }
+    // JSONDecoder performs the final typed check, including rejecting booleans
+    // that JSONSerialization may bridge through NSNumber.
     return try? JSONDecoder().decode(ActivitySample.self, from: data)
 }
 

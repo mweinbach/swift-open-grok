@@ -123,9 +123,13 @@ private struct TranscriptPagerFixture {
         var env = [
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
-            // The pager script's `cp` needs a real PATH; nothing else does.
-            "PATH": "/usr/bin:/bin",
         ]
+        #if os(Windows)
+        env["PATH"] = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        #else
+        // The pager script's `cp` needs a real PATH; nothing else does.
+        env["PATH"] = "/usr/bin:/bin"
+        #endif
         if let pagerScript {
             env["PAGER"] = pagerScript.path
         }
@@ -201,19 +205,36 @@ private struct TranscriptPagerFixture {
 private func writePagerScript(
     in directory: URL
 ) throws -> (script: URL, output: URL, argumentPath: URL) {
+    #if os(Windows)
+    let script = directory.appendingPathComponent("fake-pager.cmd")
+    #else
     let script = directory.appendingPathComponent("fake-pager.sh")
+    #endif
     let output = directory.appendingPathComponent("pager-saw.txt")
     let argumentPath = directory.appendingPathComponent("pager-arg.txt")
+    #if os(Windows)
+    let systemRoot = ProcessInfo.processInfo.environment["SystemRoot"] ?? #"C:\Windows"#
+    let moreExecutable = (systemRoot as NSString)
+        .appendingPathComponent(#"System32\more.com"#)
+    let contents = """
+    @echo off
+    > "%~dp0pager-arg.txt" echo(%~1
+    "\(moreExecutable)" < "%~1" > "%~dp0pager-saw.txt"
+    """
+    #else
     let contents = """
     #!/bin/sh
     cp "$1" "\(output.path)"
     printf '%s' "$1" > "\(argumentPath.path)"
     """
+    #endif
     try contents.write(to: script, atomically: true, encoding: .utf8)
+    #if !os(Windows)
     try FileManager.default.setAttributes(
         [.posixPermissions: 0o755],
         ofItemAtPath: script.path
     )
+    #endif
     return (script, output, argumentPath)
 }
 
@@ -276,6 +297,7 @@ struct LiveTranscriptPagerReachabilityTests {
         let sawContent = try String(contentsOf: pager.output, encoding: .utf8)
         #expect(sawContent.contains("transcript seed alpha"))
         let handedPath = try String(contentsOf: pager.argumentPath, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         #expect(handedPath.contains("open-grok-transcript-"))
         #expect(!FileManager.default.fileExists(atPath: handedPath))
 

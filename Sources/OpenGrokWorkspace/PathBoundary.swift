@@ -51,7 +51,7 @@ public struct PathBoundary: Sendable {
         if raw.contains("\0") { throw PathBoundaryError.nullByte(raw) }
 
         let candidate: URL
-        if raw.hasPrefix("/") {
+        if raw.hasPrefix("/") || isAbsolutePath(raw) {
             candidate = URL(fileURLWithPath: raw)
         } else {
             candidate = root.appendingPathComponent(raw)
@@ -111,7 +111,10 @@ public struct PathBoundary: Sendable {
 }
 
 private func normalizeForContainment(_ path: String) -> String {
-    let normalized = normalizeLexically(path)
+    var normalized = normalizeLexically(path)
+    #if os(Windows)
+    normalized = normalized.replacingOccurrences(of: "\\", with: "/").lowercased()
+    #endif
     #if os(macOS)
     for directory in ["tmp", "var", "etc"] {
         let privatePrefix = "/private/\(directory)"
@@ -128,9 +131,11 @@ private func normalizeForContainment(_ path: String) -> String {
 
 /// Component-aware containment: candidate is root or a strict descendant.
 public func containsPath(root: String, candidate: String) -> Bool {
-    if root == candidate { return true }
-    let prefix = root.hasSuffix("/") ? root : root + "/"
-    return candidate.hasPrefix(prefix)
+    let normalizedRoot = normalizeForContainment(root)
+    let normalizedCandidate = normalizeForContainment(candidate)
+    if normalizedRoot == normalizedCandidate { return true }
+    let prefix = normalizedRoot.hasSuffix("/") ? normalizedRoot : normalizedRoot + "/"
+    return normalizedCandidate.hasPrefix(prefix)
 }
 
 /// Resolve a path with realpath when possible.
@@ -180,28 +185,39 @@ public struct FolderTrustStore: Sendable {
     private var untrustedRoots: Set<String>
 
     public init(trustedRoots: [URL] = []) {
-        self.trustedRoots = Set(trustedRoots.map { normalizeLexically($0.path) })
+        self.trustedRoots = Set(trustedRoots.map { trustPathKey($0.path) })
         self.untrustedRoots = []
     }
 
     public mutating func trust(_ root: URL) {
-        let key = normalizeLexically(root.path)
+        let key = trustPathKey(root.path)
         if isUnsafeTrustRoot(key) { return }
         trustedRoots.insert(key)
         untrustedRoots.remove(key)
     }
 
     public mutating func untrust(_ root: URL) {
-        let key = normalizeLexically(root.path)
+        let key = trustPathKey(root.path)
         trustedRoots.remove(key)
         untrustedRoots.insert(key)
     }
 
     public func state(for root: URL) -> FolderTrustState {
-        let key = normalizeLexically(root.path)
+        let key = trustPathKey(root.path)
         if untrustedRoots.contains(key) { return .untrusted }
         if trustedRoots.contains(key) { return .trusted }
         // Parent trust does not automatically trust children (fail closed).
         return .untrusted
     }
+}
+
+func trustPathKey(_ path: String) -> String {
+    var key = normalizeLexically(path).replacingOccurrences(of: "\\", with: "/")
+    while key.count > 1, key.hasSuffix("/"), !key.hasSuffix(":/") {
+        key.removeLast()
+    }
+    #if os(Windows)
+    key = key.lowercased()
+    #endif
+    return key
 }

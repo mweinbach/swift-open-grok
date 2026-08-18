@@ -72,11 +72,7 @@ public enum HermeticGit {
         env["GIT_AUTHOR_EMAIL"] = "test@test.com"
         env["GIT_COMMITTER_NAME"] = "Test User"
         env["GIT_COMMITTER_EMAIL"] = "test@test.com"
-        #if os(Windows)
-        env["GIT_CONFIG_GLOBAL"] = "NUL"
-        #else
         env["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        #endif
         env["GIT_CONFIG_NOSYSTEM"] = "1"
         env["GIT_TERMINAL_PROMPT"] = "0"
         return env
@@ -170,7 +166,7 @@ public enum HermeticGit {
     /// (which does not exist on Windows).
     static func resolveGitExecutable(binary: String, environment: [String: String]) -> String {
         // Absolute path or path-with-separator: use verbatim.
-        if binary.hasPrefix("/") || binary.contains("/") {
+        if (binary as NSString).isAbsolutePath || binary.contains("/") || binary.contains("\\") {
             return binary
         }
         #if os(Windows)
@@ -178,7 +174,7 @@ public enum HermeticGit {
         let pathExt = environment["PATHEXT"]
             ?? ".EXE;.CMD;.BAT"
         let extensions = pathExt.split(separator: ";").map(String.init)
-        let executableExtensions = extensions.isEmpty ? [""] : extensions
+        let executableExtensions = [""] + extensions
         #else
         let pathSeparator: Character = ":"
         let executableExtensions = [""]
@@ -193,9 +189,15 @@ public enum HermeticGit {
             let dirString = String(dir)
             for ext in executableExtensions {
                 let candidate = (dirString as NSString).appendingPathComponent(binary + ext)
+                #if os(Windows)
+                if fm.fileExists(atPath: candidate) {
+                    return candidate
+                }
+                #else
                 if fm.isExecutableFile(atPath: candidate) {
                     return candidate
                 }
+                #endif
             }
         }
         // No PATH entry matched: return the bare name so `Process.run`

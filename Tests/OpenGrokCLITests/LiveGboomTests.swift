@@ -55,6 +55,8 @@ struct LiveGboomTests {
 
     @Test("live modal transmits, places, and clears Kitty frames")
     func liveKittyLifecycle() async throws {
+        setTestGraphicsProtocolOverride(.kitty)
+        defer { setTestGraphicsProtocolOverride(nil) }
         let home = FileManager.default.temporaryDirectory
             .appendingPathComponent("opengrok-gboom-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)

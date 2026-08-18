@@ -5,6 +5,9 @@
 
 import Foundation
 import OpenGrokPaths
+#if os(Windows)
+import COpenGrokSockets
+#endif
 
 /// How a path-shaped rule pattern and a path-shaped access are anchored before
 /// they are compared. Ported from the `resolve_following_symlinks` /
@@ -183,21 +186,59 @@ func expandTildePath(_ path: String, home: String?) -> String {
 /// form and collapses to a single `/`.
 func anchorPath(_ path: String, context: PathRuleContext) -> String {
     let expanded = expandTildePath(path, home: context.home)
+    #if os(Windows)
+    if isAbsolutePath(expanded) {
+        return normalizePathMatchForm(normalizeLexically(expanded))
+    }
+    if expanded.hasPrefix("//") {
+        return normalizePathMatchForm(normalizeLexically(String(expanded.dropFirst())))
+    }
+    if expanded.hasPrefix("/") {
+        return normalizePathMatchForm(normalizeLexically(expanded))
+    }
+    #else
     if expanded.hasPrefix("//") {
         return normalizeLexically(String(expanded.dropFirst()))
     }
     if expanded.hasPrefix("/") {
         return normalizeLexically(expanded)
     }
-    return normalizeLexically((context.cwd as NSString).appendingPathComponent(expanded))
+    #endif
+    return normalizePathMatchForm(
+        normalizeLexically((context.cwd as NSString).appendingPathComponent(expanded))
+    )
 }
 
 /// Resolve symlinks so a link out of the workspace cannot dodge a deny rule.
 /// Falls back to the lexical form when the path does not exist yet — a Write
 /// to a not-yet-created file must still be matchable.
 func canonicalizePath(_ path: String) -> String {
+    #if os(Windows)
+    let required = path.withCString { og_file_canonical_path($0, nil, 0) }
+    if required >= 0 {
+        var buffer = [CChar](repeating: 0, count: Int(required) + 1)
+        let count = path.withCString { pathPointer in
+            buffer.withUnsafeMutableBufferPointer { bufferPointer in
+                og_file_canonical_path(pathPointer, bufferPointer.baseAddress, bufferPointer.count)
+            }
+        }
+        if count >= 0 {
+            return normalizePathMatchForm(
+                String(decoding: buffer.prefix(Int(count)).map(UInt8.init(bitPattern:)), as: UTF8.self)
+            )
+        }
+    }
+    #endif
     let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
-    return normalizeLexically(resolved)
+    return normalizePathMatchForm(normalizeLexically(resolved))
+}
+
+private func normalizePathMatchForm(_ path: String) -> String {
+    #if os(Windows)
+    return path.replacingOccurrences(of: "\\", with: "/").lowercased()
+    #else
+    return path
+    #endif
 }
 
 /// Every form of a path-shaped access worth comparing against a pattern that
@@ -223,7 +264,9 @@ func pathPatternMatches(
     pattern: String,
     context: PathRuleContext?
 ) -> Bool {
-    if globMatches(text: path, pattern: pattern, pathContext: true) { return true }
+    let rawPath = normalizePathMatchForm(path)
+    let rawPattern = normalizePathMatchForm(pattern)
+    if globMatches(text: rawPath, pattern: rawPattern, pathContext: true) { return true }
     guard let context else { return false }
     let anchoredPattern = anchorPath(pattern, context: context)
     let anchoredPath = anchorPath(path, context: context)

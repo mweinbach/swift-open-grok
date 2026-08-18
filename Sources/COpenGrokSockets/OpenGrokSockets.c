@@ -1,16 +1,21 @@
 #include "OpenGrokSockets.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <wchar.h>
 
 #ifdef _WIN32
 #include <io.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <aclapi.h>
 typedef int og_socklen_t;
 #else
 #include <arpa/inet.h>
@@ -292,8 +297,14 @@ int og_socket_tcp_listen(
 #ifdef _WIN32
         SOCKET socket_value = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
         if (socket_value == INVALID_SOCKET) continue;
-        BOOL reuse = TRUE;
-        setsockopt(socket_value, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+        BOOL exclusive = TRUE;
+        setsockopt(
+            socket_value,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (const char *)&exclusive,
+            sizeof(exclusive)
+        );
         if (bind(socket_value, entry->ai_addr, (int)entry->ai_addrlen) != 0 || listen(socket_value, 128) != 0) {
             closesocket(socket_value);
             continue;
@@ -509,6 +520,45 @@ int og_socket_accept(OGSocketHandle listener, OGSocketHandle *handle) {
     og_disable_sigpipe(og_socket_handle(accepted));
     *handle = og_socket_handle(accepted);
     return 0;
+}
+
+int og_socket_accept_with_timeout(
+    OGSocketHandle listener,
+    double timeout_seconds,
+    OGSocketHandle *handle
+) {
+    if (!handle) {
+#ifdef _WIN32
+        og_set_error(WSAEINVAL, "invalid timed accept handle");
+#else
+        og_set_error(EINVAL, "invalid timed accept handle");
+#endif
+        return -1;
+    }
+    if (timeout_seconds < 0.0) timeout_seconds = 0.0;
+    long seconds = (long)timeout_seconds;
+    long microseconds = (long)((timeout_seconds - (double)seconds) * 1000000.0);
+    for (;;) {
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(og_socket_value(listener), &readable);
+        struct timeval timeout;
+        timeout.tv_sec = seconds;
+        timeout.tv_usec = (int)microseconds;
+#ifdef _WIN32
+        int selected = select(0, &readable, NULL, NULL, &timeout);
+        if (selected < 0 && WSAGetLastError() == WSAEINTR) continue;
+#else
+        int selected = select(og_socket_value(listener) + 1, &readable, NULL, NULL, &timeout);
+        if (selected < 0 && errno == EINTR) continue;
+#endif
+        if (selected == 0) return 1;
+        if (selected < 0) {
+            og_set_system_error("timed accept failed");
+            return -1;
+        }
+        return og_socket_accept(listener, handle);
+    }
 }
 
 int64_t og_socket_read(OGSocketHandle handle, void *buffer, size_t capacity) {
@@ -840,7 +890,7 @@ int og_file_lock_acquire(
     HANDLE file = CreateFileW(
         wide,
         GENERIC_READ | GENERIC_WRITE,
-        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL,
         OPEN_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
@@ -851,9 +901,24 @@ int og_file_lock_acquire(
         og_set_windows_error("could not acquire exclusive file lock");
         return -1;
     }
+    OVERLAPPED lock_range = {0};
+    lock_range.OffsetHigh = 1;
+    if (!LockFileEx(
+            file,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &lock_range
+        )) {
+        og_set_windows_error("could not acquire exclusive file lock");
+        CloseHandle(file);
+        return -1;
+    }
     SetFilePointer(file, 0, NULL, FILE_BEGIN);
     if (!SetEndOfFile(file)) {
         og_set_windows_error("could not truncate file lock");
+        UnlockFileEx(file, 0, 1, 0, &lock_range);
         CloseHandle(file);
         return -1;
     }
@@ -862,6 +927,7 @@ int og_file_lock_acquire(
         DWORD count = 0;
         if (!WriteFile(file, contents, length, &count, NULL) || count != length) {
             og_set_windows_error("could not write file-lock owner");
+            UnlockFileEx(file, 0, 1, 0, &lock_range);
             CloseHandle(file);
             return -1;
         }
@@ -871,9 +937,537 @@ int og_file_lock_acquire(
     return 0;
 }
 
+int64_t og_file_lock_read_contents(const char *path, void *buffer, size_t capacity) {
+    if (!path || (!buffer && capacity > 0)) {
+        og_set_error(ERROR_INVALID_PARAMETER, "invalid file-lock read arguments");
+        return -1;
+    }
+    wchar_t *wide = og_utf8_to_wide(path);
+    if (!wide) {
+        og_set_windows_error("file-lock path is not valid UTF-8");
+        return -1;
+    }
+    HANDLE file = CreateFileW(
+        wide,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    free(wide);
+    if (file == INVALID_HANDLE_VALUE) {
+        og_set_windows_error("could not read file-lock owner");
+        return -1;
+    }
+    DWORD count = 0;
+    DWORD requested = capacity > (size_t)UINT32_MAX ? UINT32_MAX : (DWORD)capacity;
+    if (!ReadFile(file, buffer, requested, &count, NULL)) {
+        og_set_windows_error("could not read file-lock owner");
+        CloseHandle(file);
+        return -1;
+    }
+    CloseHandle(file);
+    return (int64_t)count;
+}
+
 int og_file_lock_release(OGSocketHandle handle) {
     if (handle == OG_SOCKET_INVALID) return 0;
-    return CloseHandle((HANDLE)(uintptr_t)handle) ? 0 : -1;
+    HANDLE file = (HANDLE)(uintptr_t)handle;
+    OVERLAPPED lock_range = {0};
+    lock_range.OffsetHigh = 1;
+    UnlockFileEx(file, 0, 1, 0, &lock_range);
+    return CloseHandle(file) ? 0 : -1;
+}
+
+int64_t og_file_canonical_path(const char *path, char *buffer, size_t capacity) {
+    if (!path || (!buffer && capacity > 0)) {
+        og_set_error(ERROR_INVALID_PARAMETER, "invalid canonical-path arguments");
+        return -1;
+    }
+    wchar_t *wide = og_utf8_to_wide(path);
+    if (!wide) {
+        og_set_windows_error("canonical path is not valid UTF-8");
+        return -1;
+    }
+    HANDLE file = CreateFileW(
+        wide,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        NULL
+    );
+    free(wide);
+    if (file == INVALID_HANDLE_VALUE) {
+        og_set_windows_error("could not open canonical path");
+        return -1;
+    }
+
+    DWORD wide_capacity = GetFinalPathNameByHandleW(
+        file,
+        NULL,
+        0,
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+    );
+    if (wide_capacity == 0) {
+        DWORD error = GetLastError();
+        CloseHandle(file);
+        og_set_error((int)error, "could not resolve canonical path");
+        return -1;
+    }
+    wchar_t *resolved = (wchar_t *)calloc((size_t)wide_capacity + 1, sizeof(wchar_t));
+    if (!resolved) {
+        CloseHandle(file);
+        og_set_error(ERROR_OUTOFMEMORY, "could not allocate canonical path");
+        return -1;
+    }
+    DWORD written = GetFinalPathNameByHandleW(
+        file,
+        resolved,
+        wide_capacity + 1,
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+    );
+    CloseHandle(file);
+    if (written == 0 || written > wide_capacity) {
+        DWORD error = GetLastError();
+        free(resolved);
+        og_set_error((int)error, "could not resolve canonical path");
+        return -1;
+    }
+
+    wchar_t *logical = resolved;
+    wchar_t *unc = NULL;
+    if (wcsncmp(resolved, L"\\\\?\\UNC\\", 8) == 0) {
+        size_t suffix_length = wcslen(resolved + 8);
+        unc = (wchar_t *)calloc(suffix_length + 3, sizeof(wchar_t));
+        if (!unc) {
+            free(resolved);
+            og_set_error(ERROR_OUTOFMEMORY, "could not allocate canonical UNC path");
+            return -1;
+        }
+        unc[0] = L'\\';
+        unc[1] = L'\\';
+        memcpy(unc + 2, resolved + 8, (suffix_length + 1) * sizeof(wchar_t));
+        logical = unc;
+    } else if (wcsncmp(resolved, L"\\\\?\\", 4) == 0) {
+        logical = resolved + 4;
+    }
+
+    int utf8_capacity = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        logical,
+        -1,
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+    if (utf8_capacity <= 0) {
+        DWORD error = GetLastError();
+        free(unc);
+        free(resolved);
+        og_set_error((int)error, "could not encode canonical path as UTF-8");
+        return -1;
+    }
+    if (!buffer && capacity == 0) {
+        free(unc);
+        free(resolved);
+        return (int64_t)(utf8_capacity - 1);
+    }
+    if (capacity < (size_t)utf8_capacity) {
+        free(unc);
+        free(resolved);
+        og_set_error(ERROR_INSUFFICIENT_BUFFER, "canonical path buffer is too small");
+        return -1;
+    }
+    int encoded = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        logical,
+        -1,
+        buffer,
+        (int)capacity,
+        NULL,
+        NULL
+    );
+    free(unc);
+    free(resolved);
+    if (encoded <= 0) {
+        og_set_windows_error("could not encode canonical path as UTF-8");
+        return -1;
+    }
+    return (int64_t)(encoded - 1);
+}
+
+static int og_reject_reparse_handle(HANDLE file, const char *detail) {
+    FILE_ATTRIBUTE_TAG_INFO info;
+    if (!GetFileInformationByHandleEx(
+            file,
+            FileAttributeTagInfo,
+            &info,
+            sizeof(info)
+        )) {
+        og_set_windows_error(detail);
+        return -1;
+    }
+    if ((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        og_set_error(ERROR_REPARSE_TAG_INVALID, detail);
+        return -1;
+    }
+    return 0;
+}
+
+static int og_owner_only_acl_for_sid(PSID sid, PACL *acl) {
+    EXPLICIT_ACCESSW access;
+    ZeroMemory(&access, sizeof(access));
+    access.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+    access.grfAccessMode = SET_ACCESS;
+    access.grfInheritance = NO_INHERITANCE;
+    access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+    access.Trustee.ptstrName = (LPWSTR)sid;
+    DWORD result = SetEntriesInAclW(1, &access, NULL, acl);
+    if (result != ERROR_SUCCESS) {
+        og_set_error((int)result, "could not build owner-only DACL");
+        return -1;
+    }
+    return 0;
+}
+
+static int og_current_user_token(PTOKEN_USER *user) {
+    HANDLE token = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        og_set_windows_error("could not open current process token");
+        return -1;
+    }
+    DWORD size = 0;
+    GetTokenInformation(token, TokenUser, NULL, 0, &size);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size == 0) {
+        og_set_windows_error("could not size current user token");
+        CloseHandle(token);
+        return -1;
+    }
+    PTOKEN_USER value = (PTOKEN_USER)calloc(1, size);
+    if (!value) {
+        CloseHandle(token);
+        og_set_error(ERROR_OUTOFMEMORY, "could not allocate current user token");
+        return -1;
+    }
+    if (!GetTokenInformation(token, TokenUser, value, size, &size)) {
+        og_set_windows_error("could not read current user token");
+        free(value);
+        CloseHandle(token);
+        return -1;
+    }
+    CloseHandle(token);
+    *user = value;
+    return 0;
+}
+
+int og_file_create_owner_only(const char *path, OGSocketHandle *handle) {
+    if (!path || !handle) {
+        og_set_error(ERROR_INVALID_PARAMETER, "invalid owner-only create arguments");
+        return -1;
+    }
+    wchar_t *wide = og_utf8_to_wide(path);
+    if (!wide) {
+        og_set_windows_error("owner-only path is not valid UTF-8");
+        return -1;
+    }
+    PTOKEN_USER user = NULL;
+    PACL acl = NULL;
+    if (og_current_user_token(&user) != 0 || og_owner_only_acl_for_sid(user->User.Sid, &acl) != 0) {
+        free(user);
+        free(wide);
+        return -1;
+    }
+    SECURITY_DESCRIPTOR descriptor;
+    if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION)
+        || !SetSecurityDescriptorOwner(&descriptor, user->User.Sid, FALSE)
+        || !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE)) {
+        og_set_windows_error("could not initialize owner-only security descriptor");
+        LocalFree(acl);
+        free(user);
+        free(wide);
+        return -1;
+    }
+    SECURITY_ATTRIBUTES attributes;
+    ZeroMemory(&attributes, sizeof(attributes));
+    attributes.nLength = sizeof(attributes);
+    attributes.lpSecurityDescriptor = &descriptor;
+    HANDLE file = CreateFileW(
+        wide,
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        &attributes,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    LocalFree(acl);
+    free(user);
+    free(wide);
+    if (file == INVALID_HANDLE_VALUE) {
+        og_set_windows_error("could not create owner-only file");
+        return -1;
+    }
+    *handle = (OGSocketHandle)(uintptr_t)file;
+    return 0;
+}
+
+int64_t og_file_handle_write_all(OGSocketHandle handle, const void *buffer, size_t length) {
+    size_t written = 0;
+    HANDLE file = (HANDLE)(uintptr_t)handle;
+    while (written < length) {
+        DWORD count = 0;
+        DWORD chunk = length - written > (size_t)MAXDWORD
+            ? MAXDWORD
+            : (DWORD)(length - written);
+        if (!WriteFile(file, (const char *)buffer + written, chunk, &count, NULL)) {
+            og_set_windows_error("could not write owner-only file");
+            return -1;
+        }
+        if (count == 0) {
+            og_set_error(ERROR_WRITE_FAULT, "owner-only file closed while writing");
+            return -1;
+        }
+        written += (size_t)count;
+    }
+    return (int64_t)written;
+}
+
+int og_file_handle_flush(OGSocketHandle handle) {
+    if (FlushFileBuffers((HANDLE)(uintptr_t)handle)) return 0;
+    og_set_windows_error("could not flush owner-only file");
+    return -1;
+}
+
+int og_file_handle_close(OGSocketHandle handle) {
+    if (handle == OG_SOCKET_INVALID) return 0;
+    if (CloseHandle((HANDLE)(uintptr_t)handle)) return 0;
+    og_set_windows_error("could not close file handle");
+    return -1;
+}
+
+int64_t og_file_descriptor_write_all(int descriptor, const void *buffer, size_t length) {
+    size_t written = 0;
+    while (written < length) {
+        unsigned int chunk = length - written > (size_t)INT_MAX
+            ? (unsigned int)INT_MAX
+            : (unsigned int)(length - written);
+        int count = _write(descriptor, (const char *)buffer + written, chunk);
+        if (count < 0) {
+            og_set_error(errno, "could not write reserved file");
+            return -1;
+        }
+        if (count == 0) {
+            og_set_error(EIO, "reserved file closed while writing");
+            return -1;
+        }
+        written += (size_t)count;
+    }
+    return (int64_t)written;
+}
+
+int og_file_descriptor_create_exclusive(const char *path, int mode) {
+    (void)mode;
+    if (!path) {
+        og_set_error(EINVAL, "invalid reserved-file path");
+        return -1;
+    }
+    wchar_t *wide = og_utf8_to_wide(path);
+    if (!wide) {
+        og_set_windows_error("reserved-file path is not valid UTF-8");
+        return -1;
+    }
+    int descriptor = _wopen(
+        wide,
+        _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+        _S_IREAD | _S_IWRITE
+    );
+    free(wide);
+    if (descriptor < 0) {
+        og_set_error(errno, "could not reserve file");
+    }
+    return descriptor;
+}
+
+int og_file_descriptor_flush(int descriptor) {
+    if (_commit(descriptor) == 0) return 0;
+    og_set_error(errno, "could not flush reserved file");
+    return -1;
+}
+
+int og_file_descriptor_close(int descriptor) {
+    if (_close(descriptor) == 0) return 0;
+    og_set_error(errno, "could not close reserved file");
+    return -1;
+}
+
+int og_file_apply_owner_only(const char *path) {
+    if (!path) {
+        og_set_error(ERROR_INVALID_PARAMETER, "invalid owner-only path");
+        return -1;
+    }
+    wchar_t *wide = og_utf8_to_wide(path);
+    if (!wide) {
+        og_set_windows_error("owner-only path is not valid UTF-8");
+        return -1;
+    }
+    HANDLE file = CreateFileW(
+        wide,
+        READ_CONTROL | WRITE_DAC,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    free(wide);
+    if (file == INVALID_HANDLE_VALUE) {
+        og_set_windows_error("could not open file for owner-only DACL");
+        return -1;
+    }
+    if (og_reject_reparse_handle(file, "refusing owner-only DACL on a reparse point") != 0) {
+        CloseHandle(file);
+        return -1;
+    }
+    PSID owner = NULL;
+    PSECURITY_DESCRIPTOR security = NULL;
+    DWORD result = GetSecurityInfo(
+        file,
+        SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION,
+        &owner,
+        NULL,
+        NULL,
+        NULL,
+        &security
+    );
+    if (result != ERROR_SUCCESS) {
+        CloseHandle(file);
+        og_set_error((int)result, "could not read file owner");
+        return -1;
+    }
+    PACL acl = NULL;
+    if (og_owner_only_acl_for_sid(owner, &acl) != 0) {
+        LocalFree(security);
+        CloseHandle(file);
+        return -1;
+    }
+    result = SetSecurityInfo(
+        file,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        NULL,
+        NULL,
+        acl,
+        NULL
+    );
+    LocalFree(acl);
+    LocalFree(security);
+    CloseHandle(file);
+    if (result != ERROR_SUCCESS) {
+        og_set_error((int)result, "could not apply owner-only DACL");
+        return -1;
+    }
+    return 0;
+}
+
+int og_file_is_owner_only(const char *path) {
+    if (!path) {
+        og_set_error(ERROR_INVALID_PARAMETER, "invalid owner-only inspection path");
+        return -1;
+    }
+    wchar_t *wide = og_utf8_to_wide(path);
+    if (!wide) {
+        og_set_windows_error("owner-only path is not valid UTF-8");
+        return -1;
+    }
+    HANDLE file = CreateFileW(
+        wide,
+        READ_CONTROL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    free(wide);
+    if (file == INVALID_HANDLE_VALUE) {
+        og_set_windows_error("could not open file for owner-only inspection");
+        return -1;
+    }
+    if (og_reject_reparse_handle(file, "refusing owner-only inspection on a reparse point") != 0) {
+        CloseHandle(file);
+        return -1;
+    }
+    PSID owner = NULL;
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR security = NULL;
+    DWORD result = GetSecurityInfo(
+        file,
+        SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &owner,
+        NULL,
+        &dacl,
+        NULL,
+        &security
+    );
+    CloseHandle(file);
+    if (result != ERROR_SUCCESS) {
+        og_set_error((int)result, "could not inspect owner-only DACL");
+        return -1;
+    }
+    if (!dacl) {
+        LocalFree(security);
+        return 0;
+    }
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    if (!GetSecurityDescriptorControl(security, &control, &revision)) {
+        og_set_windows_error("could not inspect DACL inheritance");
+        LocalFree(security);
+        return -1;
+    }
+    if ((control & SE_DACL_PROTECTED) == 0) {
+        LocalFree(security);
+        return 0;
+    }
+    ACL_SIZE_INFORMATION info;
+    if (!GetAclInformation(dacl, &info, sizeof(info), AclSizeInformation)) {
+        og_set_windows_error("could not inspect DACL entries");
+        LocalFree(security);
+        return -1;
+    }
+    int owner_allowed = 0;
+    for (DWORD index = 0; index < info.AceCount; index += 1) {
+        void *raw = NULL;
+        if (!GetAce(dacl, index, &raw)) {
+            og_set_windows_error("could not read DACL entry");
+            LocalFree(security);
+            return -1;
+        }
+        ACE_HEADER *header = (ACE_HEADER *)raw;
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) continue;
+        ACCESS_ALLOWED_ACE *ace = (ACCESS_ALLOWED_ACE *)raw;
+        PSID sid = (PSID)&ace->SidStart;
+        if (!EqualSid(owner, sid)) {
+            LocalFree(security);
+            return 0;
+        }
+        if ((ace->Mask & FILE_GENERIC_READ) == FILE_GENERIC_READ
+            && (ace->Mask & FILE_GENERIC_WRITE) == FILE_GENERIC_WRITE) {
+            owner_allowed = 1;
+        }
+    }
+    LocalFree(security);
+    return owner_allowed;
 }
 
 #else
@@ -912,6 +1506,72 @@ int og_file_lock_acquire(const char *path, const char *contents, OGSocketHandle 
     og_set_error(ENOTSUP, "portable file locks are only available on Windows");
     return -1;
 }
+int64_t og_file_lock_read_contents(const char *path, void *buffer, size_t capacity) {
+    (void)path; (void)buffer; (void)capacity;
+    og_set_error(ENOTSUP, "file-lock reads are only available on Windows");
+    return -1;
+}
 int og_file_lock_release(OGSocketHandle handle) { (void)handle; return 0; }
+int64_t og_file_canonical_path(const char *path, char *buffer, size_t capacity) {
+    (void)path; (void)buffer; (void)capacity;
+    og_set_error(ENOTSUP, "native canonical paths are only available on Windows");
+    return -1;
+}
+int og_file_create_owner_only(const char *path, OGSocketHandle *handle) {
+    (void)path; (void)handle;
+    og_set_error(ENOTSUP, "owner-only files are only available on Windows through this shim");
+    return -1;
+}
+int64_t og_file_handle_write_all(OGSocketHandle handle, const void *buffer, size_t length) {
+    (void)handle; (void)buffer; (void)length;
+    og_set_error(ENOTSUP, "native file handles are only available on Windows through this shim");
+    return -1;
+}
+int og_file_handle_flush(OGSocketHandle handle) { (void)handle; return 0; }
+int og_file_handle_close(OGSocketHandle handle) { (void)handle; return 0; }
+int64_t og_file_descriptor_write_all(int descriptor, const void *buffer, size_t length) {
+    size_t written = 0;
+    while (written < length) {
+        ssize_t count = write(descriptor, (const char *)buffer + written, length - written);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            og_set_error(errno, "could not write reserved file");
+            return -1;
+        }
+        if (count == 0) {
+            og_set_error(EIO, "reserved file closed while writing");
+            return -1;
+        }
+        written += (size_t)count;
+    }
+    return (int64_t)written;
+}
+int og_file_descriptor_create_exclusive(const char *path, int mode) {
+    int descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, (mode_t)mode);
+    if (descriptor < 0) {
+        og_set_error(errno, "could not reserve file");
+    }
+    return descriptor;
+}
+int og_file_descriptor_flush(int descriptor) {
+    if (fsync(descriptor) == 0) return 0;
+    og_set_error(errno, "could not flush reserved file");
+    return -1;
+}
+int og_file_descriptor_close(int descriptor) {
+    if (close(descriptor) == 0) return 0;
+    og_set_error(errno, "could not close reserved file");
+    return -1;
+}
+int og_file_apply_owner_only(const char *path) {
+    (void)path;
+    og_set_error(ENOTSUP, "owner-only DACLs are only available on Windows");
+    return -1;
+}
+int og_file_is_owner_only(const char *path) {
+    (void)path;
+    og_set_error(ENOTSUP, "owner-only DACLs are only available on Windows");
+    return -1;
+}
 
 #endif

@@ -1,11 +1,33 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-16 (Wave G — non-TUI parity closure). **The current Wave G tree is locally green but has not been pushed, so there is no current remote platform-green claim.** The latest pushed CI run is Wave F commit `ae45c76` from 2026-08-16 and failed its macOS, Linux, and Windows compile jobs. Local Wave G serial gate: `build-tests` exit 0; authoritative full `test --no-parallel` exit 0 — exactly **7,573 Swift Testing cases in 1,137 suites across 106 nonempty summaries passed** (0 failures, 0 recorded issues).
+**As of:** 2026-08-17 (local cross-platform closure after Wave G). **The current uncommitted tree passes the targeted platform-backlog gates on macOS, OrbStack Ubuntu 22.04 arm64, and Parallels Windows 11 ARM64. This pass intentionally uses local VMs instead of GitHub Actions and makes no remote CI or release-green claim.** The last authoritative full-package macOS gate remains the 2026-08-16 Wave G run: `build-tests` exit 0 and `test --no-parallel` exit 0 with exactly **7,573 Swift Testing cases in 1,137 suites across 106 nonempty summaries passed** (0 failures, 0 recorded issues).
 
 **Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (All 9 Model Providers [xAI, Codex, Kimi Platform & Code, Fireworks AI, DeepSeek, Meta Muse Spark, OpenCode Go, Wafer AI, Z AI], Multi-Provider Scoped Storage & CLI Auth Management, Provider Wire Policies & Dialects, Dynamic Catalog Broker Resolution, MCP Meta-Discovery `search_tool`/`use_tool` & FNV-1a Fingerprints, Background Monitor Tool with Token-Bucket Rate Limiter & Suppression Tracker, Cursor Rules on Read Attachment & Scope Scanner, Memory MMR Maximal Marginal Relevance & Query Expansion, Bounded Stdio MCP Auto-Restart & Backoff, Durable Session Relocation Journal & Transactional Authority, Image Normalization & Resizing with SHA-256 Digest Cache, Pre-Warmed Subagent Git Worktree Pool, Native Workflow Engine & Rhai AST/Interpreter/Journal/Escalation, Interactive Terminal Composer Rich Elements & Image Framing, Markdown Table Wrapped-Fragment & 11-Glyph Box Drawing Layout Parity, Tool Catalog Schemas & Protocol Output Caps, Agent Runtime & Turn Pipeline, ACP Transports, Custom Models Settings UI & Store Persistence, Steady-State Cache Tracking & Cold-Start Diagnostics, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`) / Forward Sync `eb215dd0` (`v1.0.0-open-grok.63`).
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
+
+## Local cross-platform closure (2026-08-17)
+
+All SwiftPM commands below ran through `zsh workflows/swift-safe-verify.zsh`; no GitHub Actions run is used as evidence for this pass. The Linux guest is OrbStack `swift-open-grok-linux` (Ubuntu 22.04 arm64, Swift 6.3.3). The Windows guest is Parallels `Windows 11` (Windows 11 ARM64, Swift 6.3.3).
+
+| Platform | Command | Result |
+|---|---|---|
+| macOS | `test-target OpenGrokCLITests --no-parallel` | exit 0; **1,570 tests / 237 suites**, 73.616s |
+| macOS | `test-target OpenGrokShellBaseTests --no-parallel` | exit 0; **28 tests / 4 suites**, 5.653s |
+| macOS | `test-target OpenGrokHooksTests --no-parallel` | exit 0; **35 tests / 5 suites**, 1.226s |
+| macOS | `test-target OpenGrokConfigTests --no-parallel` | exit 0; **129 tests / 21 suites**, 0.045s |
+| OrbStack Linux | `test-target OpenGrokCLITests --no-parallel` | exit 0; **1,558 tests / 233 suites**, 50.806s |
+| OrbStack Linux | `test-target OpenGrokShellBaseTests --no-parallel` | exit 0; **28 tests / 4 suites**, 1.232s |
+| OrbStack Linux | `test-target OpenGrokHooksTests --no-parallel` | exit 0; **35 tests / 5 suites**, 65.066s |
+| OrbStack Linux | `test-target OpenGrokConfigTests --no-parallel` | exit 0; **129 tests / 21 suites**, 0.037s |
+| Parallels Windows | `test-target OpenGrokCLITests --no-parallel` | exit 0; **1,552 tests / 232 suites**, 71.757s |
+| Parallels Windows | `test-target OpenGrokShellBaseTests --no-parallel` | exit 0; **29 tests / 4 suites**, 3.135s |
+| Parallels Windows | `test-target OpenGrokHooksTests --no-parallel` | exit 0; **36 tests / 5 suites**, 61.732s |
+| Parallels Windows | `test-target OpenGrokConfigTests --no-parallel` | exit 0; **127 tests / 21 suites**, 0.138s |
+| Parallels Windows | `build-tests` | exit 0; all test products compiled and linked, 10.37s |
+
+The local matrix closed the remaining platform backlog: CRLF TOML parsing; Windows command-fixture and inherited-`PATH` behavior; Windows drive-letter handling for linked-worktree `.git` pointers; packed-object inflate/deflate through dynamically loaded Git for Windows `zlib1.dll`; and Windows session persistence through unique temp files plus the retrying `MoveFileExW` replacement adapter. The exact hook scenario that originally exposed the session-save sharing violation also passes independently on Windows (**1 test / 1 suite**, 0.829s).
 
 ## Wave G — Non-TUI parity closure (2026-08-16, complete locally)
 
@@ -4818,12 +4840,11 @@ This is the port's largest honesty gap and the reason "91 non-placeholder target
 - Provider policy: model metadata identity; backend/profile/auth separated; explicit keys win; credential/history/tool/export isolation.
 - Tool policy: fixed plan/hook/auto-approve/permission/sandbox/dispatch order and direct write attribution.
 - Persistence: atomic, schema-versioned, Rust-compatible migration under OPENGROK_HOME.
-- Platforms: macOS and Linux full support targets; Windows continuously compiled with dedicated adapters and only explicit genuine capability gaps.
+- Platforms: macOS and Linux full support targets; Windows uses dedicated adapters and locally exercised targeted tests, with only explicit genuine capability gaps.
 - Licensing: Apache-2.0 first-party; preserve all derived-source revisions and third-party notices in source, distribution, and notices UI.
 - **C shims:** platform C helpers live in pure-C targets (`OpenGrokPTYC`, `OpenGrokCrashHandlerC`); SwiftPM does not allow mixed-language source trees in one target.
 - **OTLP:** export bodies are real protobuf (`ExportTraceServiceRequest`), never JSON labeled `application/x-protobuf`.
-- **Git status:** portable pure-Swift SHA-1; zlib via Compression (Apple) or linked `COpenGrokZlib`/libz **on Apple platforms and Linux only**; pack-only objects are explicit non-parity.
-  - **Windows divergence (2026-08-11, deliberate):** `COpenGrokZlib` is not declared on Windows (`Package.swift`, `zlibShimAvailable`) because the Swift Windows SDK ships no `<zlib.h>` and no `z` import library, so declaring the target failed the entire Windows build inside the shim's header. `ObjectStore` selects Compression → `COpenGrokZlib` → a typed `zlib … unavailable on this platform` throw, and dropping the target is what arms that third arm. **Cost: Git loose-object and pack inflation do not work on Windows** — they return the typed unavailable error rather than a result. This is the honest state until a Windows zlib is vendored, and it must not be "fixed" by re-adding the target without one.
+- **Git status:** portable pure-Swift SHA-1 plus pack-index-v2 and bounded OFS/REF delta resolution. Inflate/deflate uses Apple Compression on Apple platforms, linked `COpenGrokZlib`/libz on Linux, and a header-free Windows `COpenGrokZlib` loader that resolves Git for Windows `zlib1.dll` at runtime. Missing Windows zlib still fails through typed `GitStatusError` results rather than fabricating a clean tree.
 
 ## Upstream drift since re-pin baseline
 
@@ -5813,7 +5834,7 @@ Status legend:
 | 17 | `xai-fast-worktree` | `OpenGrokFastWorktree` | orphaned | 2,037 LOC + tests, but no importer; `worktree` CLI route refuses. |
 | 18 | `xai-file-utils` | `OpenGrokFileUtils` | target-green | R07 + remediation. |
 | 19 | `xai-fsnotify` | `OpenGrokFSNotify` | in-progress | R08 native adapters remediations. |
-| 20 | `xai-gix-status` | `OpenGrokGitStatus` | in-progress | R08 + R10 portable SHA-1, COpenGrokZlib, pack non-parity. |
+| 20 | `xai-gix-status` | `OpenGrokGitStatus` | live | Portable SHA-1, pack-index-v2 plus bounded OFS/REF deltas, linked libz on Linux, and dynamic Git for Windows `zlib1.dll`; live pure-status reachability and Windows packed-object fixtures are green. |
 | 21 | `xai-grok-agent` | `OpenGrokAgentDefinitions` | live | 1,554 LOC + tests; imported by `OpenGrokCLI` and drives `--profile` agent-profile selection and live tool filtering. Was mislabeled "pending". |
 | 22 | `xai-grok-announcements` | `OpenGrokAnnouncements` | orphaned | 403 LOC + tests; no importer. Was mislabeled "pending". |
 | 23 | `xai-grok-auth` | `OpenGrokAuth` | live | 3,958 LOC + tests. Reached from the CLI as of the 2026-08-04 wave-1 integration: `login`/`logout` run through `LiveAuthComposition`, and `resolveSamplingConfiguration` resolves credentials via `LiveCredentialResolver`. Not exercised against a live Codex account. |

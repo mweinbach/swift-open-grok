@@ -1,13 +1,14 @@
 // AdvisoryLock.swift
 //
 // Exclusive advisory file locks for coordinated writers (auth.json.lock,
-// managed_config.lock, session journals). Unix uses `flock(LOCK_EX)`;
-// Windows exposes a typed seam that returns `unsupported` until a
-// LockFileEx adapter lands — never a silent no-op.
+// managed_config.lock, session journals). Unix uses `flock(LOCK_EX)` and
+// Windows uses `LockFileEx` on a reserved byte range.
 
 import Foundation
 
-#if canImport(Darwin)
+#if os(Windows)
+import WinSDK
+#elseif canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
@@ -22,7 +23,7 @@ public final class AdvisoryLock: @unchecked Sendable {
     private var released = false
     private let lock = NSLock()
     #if os(Windows)
-    private var handle: FileHandle?
+    private var handle: HANDLE?
     #else
     private var fd: Int32 = -1
     #endif
@@ -36,7 +37,7 @@ public final class AdvisoryLock: @unchecked Sendable {
         self.fd = fd
     }
     #else
-    fileprivate func attach(handle: FileHandle) {
+    fileprivate func attach(handle: HANDLE) {
         self.handle = handle
     }
     #endif
@@ -47,7 +48,12 @@ public final class AdvisoryLock: @unchecked Sendable {
         guard !released else { return }
         released = true
         #if os(Windows)
-        try? handle?.close()
+        if let handle {
+            var overlapped = OVERLAPPED()
+            overlapped.OffsetHigh = 1
+            _ = UnlockFileEx(handle, DWORD(0), DWORD(1), DWORD(0), &overlapped)
+            CloseHandle(handle)
+        }
         handle = nil
         #else
         if fd >= 0 {
@@ -89,11 +95,70 @@ public enum AdvisoryFileLock: Sendable {
         options: AdvisoryLockOptions = AdvisoryLockOptions()
     ) throws -> AdvisoryLock {
         #if os(Windows)
-        _ = options
-        // Explicit unsupported: never claim a lock that is not held.
-        throw FileUtilsError.unsupported(
-            "Windows LockFileEx advisory locks are not yet wired; refuse silent no-op"
+        try PathSecurity.rejectHostileLexical(path.path)
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(),
+            withIntermediateDirectories: true
         )
+
+        let disposition = options.create ? DWORD(OPEN_ALWAYS) : DWORD(OPEN_EXISTING)
+        let rawHandle = path.path.withCString(encodedAs: UTF16.self) { pointer in
+            CreateFileW(
+                pointer,
+                DWORD(GENERIC_READ) | DWORD(GENERIC_WRITE),
+                DWORD(FILE_SHARE_READ) | DWORD(FILE_SHARE_WRITE) | DWORD(FILE_SHARE_DELETE),
+                nil,
+                disposition,
+                DWORD(FILE_ATTRIBUTE_NORMAL) | DWORD(FILE_FLAG_OPEN_REPARSE_POINT),
+                nil
+            )
+        }
+        guard let handle = rawHandle, handle != INVALID_HANDLE_VALUE else {
+            let code = GetLastError()
+            if code == DWORD(ERROR_FILE_NOT_FOUND) || code == DWORD(ERROR_PATH_NOT_FOUND) {
+                throw FileUtilsError.notFound(path: path.path)
+            }
+            if code == DWORD(ERROR_ACCESS_DENIED) {
+                throw FileUtilsError.permissionDenied(
+                    path: path.path,
+                    detail: "open lock: Windows error \(code)"
+                )
+            }
+            throw FileUtilsError.io(path: path.path, detail: "open lock: Windows error \(code)")
+        }
+
+        var information = BY_HANDLE_FILE_INFORMATION()
+        guard GetFileInformationByHandle(handle, &information) else {
+            let code = GetLastError()
+            CloseHandle(handle)
+            throw FileUtilsError.io(path: path.path, detail: "inspect lock: Windows error \(code)")
+        }
+        if information.dwFileAttributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            CloseHandle(handle)
+            throw FileUtilsError.symlinkEncountered(path: path.path)
+        }
+
+        var flags = DWORD(LOCKFILE_EXCLUSIVE_LOCK)
+        if options.nonBlocking {
+            flags |= DWORD(LOCKFILE_FAIL_IMMEDIATELY)
+        }
+        var overlapped = OVERLAPPED()
+        overlapped.OffsetHigh = 1
+        guard LockFileEx(handle, flags, DWORD(0), DWORD(1), DWORD(0), &overlapped) else {
+            let code = GetLastError()
+            CloseHandle(handle)
+            if code == DWORD(ERROR_LOCK_VIOLATION) || code == DWORD(ERROR_IO_PENDING) {
+                throw FileUtilsError.lockFailed(
+                    path: path.path,
+                    detail: "busy: Windows error \(code)"
+                )
+            }
+            throw FileUtilsError.lockFailed(path: path.path, detail: "Windows error \(code)")
+        }
+
+        let held = AdvisoryLock(path: path)
+        held.attach(handle: handle)
+        return held
         #else
         try PathSecurity.rejectHostileLexical(path.path)
         try FileManager.default.createDirectory(

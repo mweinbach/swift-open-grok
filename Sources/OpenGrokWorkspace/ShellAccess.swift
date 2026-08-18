@@ -168,10 +168,12 @@ extension CompiledPolicy {
     ) -> PermissionDecision? {
         if isSafeWriteSink(token) { return nil }
         let absolute: String
-        if token.hasPrefix("/") {
-            absolute = normalizeLexically(token)
+        if token.hasPrefix("/") || isAbsolutePath(token) {
+            absolute = permissionPathKey(token)
         } else {
-            absolute = normalizeLexically((cwd as NSString).appendingPathComponent(token))
+            absolute = permissionPathKey(
+                URL(fileURLWithPath: cwd, isDirectory: true).appendingPathComponent(token).path
+            )
         }
         let access: AccessKind
         switch mode {
@@ -357,14 +359,14 @@ public func editTargetProtection(
     _ path: String,
     userGrokHome: String? = nil
 ) -> ProtectedEditReason? {
-    guard path.hasPrefix("/") else { return .sensitive }
-    let lexical = normalizeLexically(path)
+    guard path.hasPrefix("/") || isAbsolutePath(path) else { return .sensitive }
+    let lexical = permissionPathKey(path)
     if let reason = protectedEditReason(lexical, userGrokHome: userGrokHome) {
         return reason
     }
     let resolved = URL(fileURLWithPath: lexical).resolvingSymlinksInPath().path
     if resolved != lexical,
-       let reason = protectedEditReason(normalizeLexically(resolved), userGrokHome: userGrokHome) {
+       let reason = protectedEditReason(permissionPathKey(resolved), userGrokHome: userGrokHome) {
         return reason
     }
     if resolved == "/etc" || resolved.hasPrefix("/etc/") { return .sensitive }
@@ -377,7 +379,7 @@ public func protectedEditReason(
     _ path: String,
     userGrokHome: String? = nil
 ) -> ProtectedEditReason? {
-    let lexical = normalizeLexically(path)
+    let lexical = permissionPathKey(path)
     let parts = lexical.split(separator: "/").map { $0.lowercased() }
     let file = parts.last ?? ""
 
@@ -389,10 +391,10 @@ public func protectedEditReason(
         return .hookRoot
     }
     if let home = userGrokHome {
-        let normalizedHome = normalizeLexically(home)
-        let hookRoot = (normalizedHome as NSString).appendingPathComponent("hooks")
+        let normalizedHome = permissionPathKey(home)
+        let hookRoot = normalizedHome + "/hooks"
         if lexical == hookRoot || lexical.hasPrefix(hookRoot + "/") { return .hookRoot }
-        if lexical == (normalizedHome as NSString).appendingPathComponent("hooks-paths") {
+        if lexical == normalizedHome + "/hooks-paths" {
             return .hookRoot
         }
     }
@@ -432,10 +434,12 @@ public func protectedEditReason(
         let inDotGrok = parts.count >= 2 && parts[parts.count - 2] == ".opengrok"
         var inGrokHome = false
         if let home = userGrokHome {
-            let parent = (lexical as NSString).deletingLastPathComponent
-            let normalizedHome = normalizeLexically(home)
+            let parent = permissionPathKey(URL(fileURLWithPath: lexical).deletingLastPathComponent().path)
+            let normalizedHome = permissionPathKey(home)
             inGrokHome = parent == normalizedHome
-                || parent == URL(fileURLWithPath: normalizedHome).resolvingSymlinksInPath().path
+                || parent == permissionPathKey(
+                    URL(fileURLWithPath: normalizedHome).resolvingSymlinksInPath().path
+                )
         }
         if inDotGrok || inGrokHome { return configReason }
     }
@@ -458,4 +462,12 @@ private func adjacentPair(_ parts: [String], _ first: String, _ second: String) 
 /// `protectedEditReason` for the call sites that only branch on it.
 public func protectedEditPath(_ path: String, userGrokHome: String? = nil) -> Bool {
     protectedEditReason(path, userGrokHome: userGrokHome) != nil
+}
+
+private func permissionPathKey(_ path: String) -> String {
+    var key = normalizeLexically(path).replacingOccurrences(of: "\\", with: "/")
+    #if os(Windows)
+    key = key.lowercased()
+    #endif
+    return key
 }

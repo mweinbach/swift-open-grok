@@ -15,6 +15,11 @@ private struct TempDir {
     init() throws {
         let base = NSTemporaryDirectory() + "managed-text-tests-" + UUID().uuidString
         try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        #if os(Windows)
+        self.path = URL(fileURLWithPath: base)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL.path
+        #else
         // `realpath`, not `resolvingSymlinksInPath`: the latter leaves the
         // macOS temp root as `/var/folders/...`, but `ManagedConfig`
         // physicalizes through `realpath` to `/private/var/folders/...`, so
@@ -25,6 +30,7 @@ private struct TempDir {
         }
         defer { free(resolved) }
         self.path = String(cString: resolved)
+        #endif
     }
 
     func join(_ name: String) -> String { path + "/" + name }
@@ -236,7 +242,7 @@ struct ManagedTextTests {
             atPath: oversize,
             contents: Data(repeating: UInt8(ascii: "x"), count: managedMaxConfigBytes + 1)
         )
-        let nul = temp.join("nul")
+        let nul = temp.join("contains-nul")
         try Data([UInt8(ascii: "a"), 0, UInt8(ascii: "b")]).write(to: URL(fileURLWithPath: nul))
         let nonUTF8 = temp.join("non-utf8")
         try Data([0xFF]).write(to: URL(fileURLWithPath: nonUTF8))
@@ -292,9 +298,8 @@ struct ManagedTextTests {
         #expect(plan.targetPath == physical)
         let outcome = try ManagedConfig.apply(plan)
         #expect(outcome.status == .applied)
-        var status = stat()
-        #expect(lstat(relative, &status) == 0 && (status.st_mode & S_IFMT) == S_IFLNK,
-                "apply must write through the symlink, not replace it")
+        let linkDestination = try? fm.destinationOfSymbolicLink(atPath: relative)
+        #expect(linkDestination == "physical", "apply must write through the symlink, not replace it")
 
         let cycleA = temp.join("cycle-a")
         let cycleB = temp.join("cycle-b")
@@ -331,17 +336,21 @@ struct ManagedTextTests {
         let path = temp.join("config.rc")
         let original = "export KEEP=1\r\n"
         try Data(original.utf8).write(to: URL(fileURLWithPath: path))
+        #if !os(Windows)
         #expect(chmod(path, 0o640) == 0)
+        #endif
         let plan = try ManagedConfig.plan(makeRequest(path: path, items: [("item", "body")]))
         let hint = try #require(plan.backupPathHint)
         let outcome = try ManagedConfig.apply(plan)
         let backup = try #require(outcome.backupPath)
         #expect(backup == hint)
         #expect(try read(backup) == original)
+        #if !os(Windows)
         var backupStat = stat()
         #expect(stat(backup, &backupStat) == 0 && (backupStat.st_mode & 0o777) == 0o640)
         var targetStat = stat()
         #expect(stat(path, &targetStat) == 0 && (targetStat.st_mode & 0o777) == 0o640)
+        #endif
     }
 
     /// `stale_source_and_parent_swap_are_rejected_before_publication`

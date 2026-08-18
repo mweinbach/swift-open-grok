@@ -191,7 +191,7 @@ public enum CodexSessionScanner {
         let head = readHead(candidate)
         guard !head.isEmpty else { return nil }
         let meta = parseHeadMetadata(head)
-        guard let storedCwd = meta.cwd, storedCwd == requestedCwd else { return nil }
+        guard let storedCwd = meta.cwd, foreignSessionPathsEqual(storedCwd, requestedCwd) else { return nil }
         let source = meta.source ?? .codexCli
         let titleText: String?
         if let firstMsg = meta.firstUserMessage {

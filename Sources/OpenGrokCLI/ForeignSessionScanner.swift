@@ -95,6 +95,18 @@ public struct ForeignSessionSummary: Sendable, Equatable {
     }
 }
 
+func foreignSessionPathsEqual(_ lhs: String, _ rhs: String) -> Bool {
+    let left = URL(fileURLWithPath: lhs).standardizedFileURL.path
+        .replacingOccurrences(of: "\\", with: "/")
+    let right = URL(fileURLWithPath: rhs).standardizedFileURL.path
+        .replacingOccurrences(of: "\\", with: "/")
+    #if os(Windows)
+    return left.caseInsensitiveCompare(right) == .orderedSame
+    #else
+    return left == right
+    #endif
+}
+
 /// Which foreign sources to scan. Defaults to all-off so the feature is
 /// opt-in, matching Rust's `EnabledForeignSessionSources`.
 ///

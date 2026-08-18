@@ -197,6 +197,20 @@ struct TOMLTests {
         #expect(v2["d"]?.stringValue == "raw\\n")
     }
 
+    @Test("CRLF statement separators are accepted")
+    func crlfStatementSeparators() throws {
+        let value = try parseTOML(
+            "description = \"edited by editor\" # Windows output\r\n"
+                + "instructions = \"Lead with questions.\"\r\n"
+                + "[metadata]\r\n"
+                + "enabled = true\r\n"
+        )
+
+        #expect(value["description"]?.stringValue == "edited by editor")
+        #expect(value["instructions"]?.stringValue == "Lead with questions.")
+        #expect(value["metadata"]?["enabled"]?.boolValue == true)
+    }
+
     @Test("error messages never include source line")
     func errorRedaction() {
         do {

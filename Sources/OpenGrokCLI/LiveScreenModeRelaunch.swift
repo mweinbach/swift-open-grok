@@ -10,6 +10,10 @@
 // parked behind the same process exactly as before the switch.
 
 import Foundation
+#if os(Windows)
+import WinSDK
+import ucrt
+#endif
 
 enum LiveScreenModeRelaunch {
     /// Env var that forces screen-mode resolution regardless of CLI flag or
@@ -159,24 +163,28 @@ enum LiveScreenModeRelaunch {
         guard let raw = ProcessInfo.processInfo.environment[environmentKey] else {
             return nil
         }
+        #if os(Windows)
+        _ = _putenv_s(environmentKey, "")
+        #else
         unsetenv(environmentKey)
+        #endif
         return raw
     }
 
     /// Replace the current process with a relaunch into the requested mode
-    /// (`exec_screen_mode_relaunch`, `:222-247`). On success this never
-    /// returns (Unix `execv` — the port has no Windows arm; upstream's
-    /// spawn-and-WAIT emulation is recorded as a platform gap in the
-    /// ledger). On failure the IO error string returns so the caller can
-    /// fall back to the pasteable resume hint.
+    /// (`exec_screen_mode_relaunch`, `:222-290`). On success this never
+    /// returns: Unix replaces the process image, while Windows spawns on the
+    /// inherited console, parks the parent, and exits with the child's status.
+    /// On failure the IO error string returns so the caller can fall back to
+    /// the pasteable resume hint.
     static func exec(sessionID: String, wantMinimal: Bool) -> String {
         let exe = CommandLine.arguments[0]
         let exePath: String
-        if exe.contains("/") {
+        if exe.contains("/") || exe.contains("\\") {
             exePath = URL(fileURLWithPath: exe).path
         } else if let resolved = ProcessInfo.processInfo.environment["PATH"]?
-            .split(separator: ":")
-            .map({ "\($0)/\(exe)" })
+            .split(separator: pathListSeparator)
+            .map({ URL(fileURLWithPath: String($0)).appendingPathComponent(exe).path })
             .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
             exePath = resolved
         } else {
@@ -187,12 +195,40 @@ enum LiveScreenModeRelaunch {
             sessionID: sessionID,
             wantMinimal: wantMinimal
         )
-        // Force mode resolution even when config carries the opposite
-        // preference; the child consumes (and removes) it at startup.
-        setenv(environmentKey, environmentValue(wantMinimal: wantMinimal), 1)
 
         FileHandle.standardError.write(Data((relaunchBanner(wantMinimal: wantMinimal) + "\n").utf8))
 
+        #if os(Windows)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: exePath)
+        process.arguments = args
+        var environment = ProcessInfo.processInfo.environment
+        environment[environmentKey] = environmentValue(wantMinimal: wantMinimal)
+        process.environment = environment
+        process.standardInput = FileHandle.standardInput
+        process.standardOutput = FileHandle.standardOutput
+        process.standardError = FileHandle.standardError
+
+        // The parent must remain attached until the replacement exits. If it
+        // returns early, the launching shell and child TUI concurrently read
+        // the same console. Ignoring Ctrl events keeps the parked parent from
+        // being killed while the child still owns that console; the short
+        // delay lets the old input reader finish its final poll first.
+        _ = SetConsoleCtrlHandler(nil, true)
+        Thread.sleep(forTimeInterval: 0.15)
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        do {
+            try process.run()
+        } catch {
+            return "failed to spawn relaunch: \(error)"
+        }
+        finished.wait()
+        exit(process.terminationStatus)
+        #else
+        // Force mode resolution even when config carries the opposite
+        // preference; the replacement consumes it at startup.
+        setenv(environmentKey, environmentValue(wantMinimal: wantMinimal), 1)
         var argv: [UnsafeMutablePointer<CChar>?] = [strdup(exePath)]
         argv.append(contentsOf: args.map { strdup($0) })
         argv.append(nil)
@@ -201,5 +237,14 @@ enum LiveScreenModeRelaunch {
         let message = String(cString: strerror(errno))
         for pointer in argv { free(pointer) }
         return "failed to exec relaunch: \(message)"
+        #endif
+    }
+
+    private static var pathListSeparator: Character {
+        #if os(Windows)
+        ";"
+        #else
+        ":"
+        #endif
     }
 }

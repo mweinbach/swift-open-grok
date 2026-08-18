@@ -2674,21 +2674,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     }
 
     private static func resolveWorkingDirectory(_ path: String?) throws -> URL {
-        let url = resolveURL(path ?? FileManager.default.currentDirectoryPath, relativeTo: FileManager.default.currentDirectoryPath)
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw CLIApplicationError.failed("working directory does not exist: \(url.path)")
-        }
-        return url
+        try liveResolveWorkingDirectory(path)
     }
 
     private static func resolveURL(_ path: String, relativeTo cwd: String) -> URL {
-        if path.hasPrefix("/") {
-            return URL(fileURLWithPath: path).standardizedFileURL
-        }
-        return URL(fileURLWithPath: cwd, isDirectory: true)
-            .appendingPathComponent(path)
-            .standardizedFileURL
+        liveResolveURL(path, relativeTo: cwd)
     }
 
     private static func resolveOpenGrokHome(environment: [String: String]) -> URL {
@@ -4215,6 +4205,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         environment: [String: String],
         policy: PagerDisplayRefreshPolicy,
         isInteractive: Bool? = nil,
+        host: PagerDisplayRefreshHost = PagerDisplayRefreshHost.current(),
         platform: (any PagerDisplayRefreshPlatformProbing)? = nil
     ) -> TimeInterval {
         let probe = PagerDisplayRefreshProbe.probe(
@@ -4224,6 +4215,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             minHz: policy.minHz,
             maxHz: policy.maxHz,
             isInteractive: isInteractive,
+            host: host,
             platform: platform
         )
         return PagerFrameClock.cadence(

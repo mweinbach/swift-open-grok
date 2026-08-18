@@ -14,11 +14,11 @@ enum PortableSocketError: Error, Sendable, CustomStringConvertible {
 }
 
 final class PortableSocketChannel: WebSocketByteChannel, @unchecked Sendable {
-    private let handle: Int64
+    private let handle: OGSocketHandle
     private let stateLock = NSLock()
     private var closed = false
 
-    init(handle: Int64) {
+    init(handle: OGSocketHandle) {
         self.handle = handle
     }
 
@@ -73,18 +73,18 @@ final class PortableSocketChannel: WebSocketByteChannel, @unchecked Sendable {
 }
 
 final class PortableSocketListener: @unchecked Sendable {
-    let handle: Int64
+    let handle: OGSocketHandle
     let port: UInt16?
     private let stateLock = NSLock()
     private var closed = false
 
-    private init(handle: Int64, port: UInt16?) {
+    private init(handle: OGSocketHandle, port: UInt16?) {
         self.handle = handle
         self.port = port
     }
 
     static func tcp(host: String, port: UInt16) throws -> PortableSocketListener {
-        var handle: Int64 = -1
+        var handle: OGSocketHandle = -1
         var boundPort: UInt16 = 0
         let result = host.withCString { hostPointer in
             og_socket_tcp_listen(hostPointer, port, &handle, &boundPort)
@@ -99,7 +99,7 @@ final class PortableSocketListener: @unchecked Sendable {
         #if os(Windows)
         throw PortableSocketError.unsupported("Windows leader IPC requires named pipes")
         #else
-        var handle: Int64 = -1
+        var handle: OGSocketHandle = -1
         let result = path.withCString { pathPointer in
             og_socket_unix_listen(pathPointer, &handle)
         }
@@ -114,7 +114,7 @@ final class PortableSocketListener: @unchecked Sendable {
         guard !isClosed else { throw PortableSocketError.operationFailed("socket listener is closed") }
         let listener = handle
         return try await Task.detached(priority: .utility) {
-            var accepted: Int64 = -1
+            var accepted: OGSocketHandle = -1
             guard og_socket_accept(listener, &accepted) == 0 else {
                 throw PortableSocketError.operationFailed(PortableSocketSupport.lastError())
             }
@@ -142,7 +142,7 @@ final class PortableSocketListener: @unchecked Sendable {
 
 enum PortableSocketConnector {
     static func tcp(host: String, port: UInt16, timeoutSeconds: Double) async throws -> PortableSocketChannel {
-        var handle: Int64 = -1
+        var handle: OGSocketHandle = -1
         let result = host.withCString { hostPointer in
             og_socket_tcp_connect(hostPointer, port, timeoutSeconds, &handle)
         }
@@ -156,7 +156,7 @@ enum PortableSocketConnector {
         #if os(Windows)
         throw PortableSocketError.unsupported("Windows leader IPC requires named pipes")
         #else
-        var handle: Int64 = -1
+        var handle: OGSocketHandle = -1
         let result = path.withCString { pathPointer in
             og_socket_unix_connect(pathPointer, timeoutSeconds, &handle)
         }

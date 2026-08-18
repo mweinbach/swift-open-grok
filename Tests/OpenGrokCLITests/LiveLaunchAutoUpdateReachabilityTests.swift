@@ -147,7 +147,7 @@ struct LiveLaunchAutoUpdateReachabilityTests {
 
         let counts = await counter.counts()
         #expect(counts.fetches == 1)
-        #expect(counts.installs == 1)
+        #expect(counts.installs == (ReleasePlatform.current.isSupportedForRelease ? 1 : 0))
         #expect(err.contents.contains("A new version of Open Grok is available: 0.1.0 -> 9.9.9 [stable]"))
         await stack.codeMode?.shutdown()
     }

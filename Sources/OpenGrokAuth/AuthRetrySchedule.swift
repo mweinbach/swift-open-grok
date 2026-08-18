@@ -14,6 +14,10 @@
 import Foundation
 import OpenGrokSamplingTypes
 
+#if os(Windows)
+import WinSDK
+#endif
+
 /// Wire-credential provenance of a request that failed authentication.
 ///
 /// A 401 for a request that went out with **no** credential header is not
@@ -45,6 +49,13 @@ public struct DualClock: Sendable, Hashable {
 
     /// Suspend-pausing monotonic reading, in seconds.
     public static func monotonicNow() -> TimeInterval {
+        #if os(Windows)
+        var unbiasedTime: ULONGLONG = 0
+        if QueryUnbiasedInterruptTime(&unbiasedTime) {
+            return TimeInterval(unbiasedTime) / 10_000_000
+        }
+        return ProcessInfo.processInfo.systemUptime
+        #else
         var ts = timespec()
         #if canImport(Darwin)
         clock_gettime(CLOCK_UPTIME_RAW, &ts)
@@ -52,6 +63,7 @@ public struct DualClock: Sendable, Hashable {
         clock_gettime(CLOCK_MONOTONIC, &ts)
         #endif
         return TimeInterval(ts.tv_sec) + TimeInterval(ts.tv_nsec) / 1_000_000_000
+        #endif
     }
 
     public static func now() -> DualClock {

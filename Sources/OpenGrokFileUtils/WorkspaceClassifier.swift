@@ -91,8 +91,11 @@ private func knownOSDirs() -> [URL] {
 private func isPlatformSystemDir(_ cwd: URL) -> Bool {
     let path = cwd.path
     #if os(Windows)
-    let lower = path.lowercased()
-    return lower.hasPrefix("c:\\windows") || lower.hasPrefix("c:\\program files")
+    let normalized = path.lowercased().replacingOccurrences(of: "\\", with: "/")
+    return normalized == "c:/windows"
+        || normalized.hasPrefix("c:/windows/")
+        || normalized == "c:/program files"
+        || normalized.hasPrefix("c:/program files/")
     #else
     if path == "/tmp" || path.hasPrefix("/tmp/")
         || path == "/var/tmp" || path.hasPrefix("/var/tmp/")

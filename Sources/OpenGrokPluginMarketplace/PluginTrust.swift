@@ -252,12 +252,18 @@ public struct PluginGitClient: Sendable {
         // non-interactive terminal cannot hang the CLI forever.
         let deadline = Date().addingTimeInterval(120)
         while process.isRunning && Date() < deadline {
-            usleep(20_000)
+            Thread.sleep(forTimeInterval: 0.02)
         }
         if process.isRunning {
             process.terminate()
-            usleep(200_000)
-            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            Thread.sleep(forTimeInterval: 0.2)
+            if process.isRunning {
+                #if os(Windows)
+                process.terminate()
+                #else
+                kill(process.processIdentifier, SIGKILL)
+                #endif
+            }
             throw PluginInstallError.gitFailed(
                 command: arguments.first ?? "?",
                 status: -1,

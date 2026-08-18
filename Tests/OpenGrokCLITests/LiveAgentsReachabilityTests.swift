@@ -25,6 +25,7 @@
 // in `Tests/OpenGrokPagerTests/PagerAgentsCommandTests.swift`.
 
 import Foundation
+import OpenGrokConfig
 import OpenGrokHTTP
 import OpenGrokPager
 import OpenGrokPagerRender
@@ -706,7 +707,18 @@ struct LiveAgentsReachabilityTests {
             at: scriptDirectory, withIntermediateDirectories: true
         )
         defer { try? FileManager.default.removeItem(at: scriptDirectory) }
+        #if os(Windows)
+        let script = scriptDirectory.appendingPathComponent("fake-editor.cmd")
+        #else
         let script = scriptDirectory.appendingPathComponent("fake-editor.sh")
+        #endif
+        #if os(Windows)
+        try """
+        @echo off
+        > "%~1" echo description = "edited by editor"
+        >> "%~1" echo instructions = "Lead with questions."
+        """.write(to: script, atomically: true, encoding: .utf8)
+        #else
         try """
         #!/bin/sh
         printf 'description = "edited by editor"\\ninstructions = "Lead with questions."\\n' > "$1"
@@ -714,6 +726,7 @@ struct LiveAgentsReachabilityTests {
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o755], ofItemAtPath: script.path
         )
+        #endif
 
         let fixture = try AgentsRendererFixture()
         defer { fixture.dispose() }
@@ -722,15 +735,18 @@ struct LiveAgentsReachabilityTests {
         // The recording suspend host carries `$EDITOR` — the host owns the
         // environment the editor resolves from (`resolve_editor_argv`).
         let log = AgentsSuspendLog()
+        var editorEnvironment = ["EDITOR": script.path]
+        #if os(Windows)
+        editorEnvironment["PATH"] = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        #else
+        editorEnvironment["PATH"] = "/usr/bin:/bin"
+        #endif
         await fixture.renderer.setSuspendHost(LiveTUISuspendHost(
             beginInputSuspension: {
                 await log.record("park")
                 return LiveInputSuspension(end: { await log.record("end") })
             },
-            environment: [
-                "EDITOR": script.path,
-                "PATH": "/usr/bin:/bin",
-            ]
+            environment: editorEnvironment
         ))
         try await fixture.renderer.render(.overlay(.agentsModal(initialTab: .personas)))
         #expect(await fixture.waitForPaint(of: "Asks questions before answering"))
@@ -749,9 +765,27 @@ struct LiveAgentsReachabilityTests {
             encoding: .utf8
         )
         #expect(saved.contains("edited by editor"))
+        do {
+            let parsed = try parseTOML(saved)
+            #expect(parsed["description"]?.stringValue == "edited by editor")
+        } catch {
+            Issue.record("editor output was not valid TOML: \(error); bytes: \(Array(saved.utf8))")
+        }
         // …and the refreshed list states the editor's content, not the
         // open-time snapshot.
-        #expect(await fixture.waitForPaint(of: "edited by editor"))
+        let refreshedRows = LiveAgentsComposition.personaRows(
+            document: LiveAgentsComposition.effectiveDocument(
+                cwd: fixture.home,
+                environment: ["HOME": fixture.home.path, "OPENGROK_HOME": fixture.home.path]
+            ),
+            openGrokHome: fixture.home,
+            cwd: fixture.home
+        )
+        #expect(refreshedRows.first { $0.name == "socratic" }?.description == "edited by editor")
+        #expect(
+            await fixture.waitForPaint(of: "edited by editor"),
+            "refreshed rows: \(refreshedRows); painted: \(fixture.paintedCompact())"
+        )
         #expect(await fixture.waitForErase(of: "Asks questions before answering"))
         try await fixture.renderer.restoreTerminal()
     }

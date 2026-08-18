@@ -131,7 +131,7 @@ final class MutexBox<Value>: @unchecked Sendable {
 /// delivered immediately and the buffer is left empty.
 final class EventHub: @unchecked Sendable {
     private struct State {
-        var continuations: [UUID: AsyncThrowingStream<WatchEvent, Error>.Continuation] = [:]
+        var continuations: [Foundation.UUID: AsyncThrowingStream<WatchEvent, Error>.Continuation] = [:]
         var closed = false
         var buffer: [WatchEvent] = []
     }
@@ -145,7 +145,7 @@ final class EventHub: @unchecked Sendable {
 
     func subscribe() -> AsyncThrowingStream<WatchEvent, Error> {
         AsyncThrowingStream { continuation in
-            let id = UUID()
+            let id = Foundation.UUID()
             let result: (closed: Bool, buffered: [WatchEvent]) = self.state.withLock { s in
                 if s.closed { return (true, []) }
                 let buffered = s.buffer
@@ -927,7 +927,6 @@ public final class WindowsFileSystemWatcher: FileSystemWatcher, @unchecked Senda
     }
 
     private func armRoot(_ path: String) throws {
-        let wide = path.withCString(encodedAs: UTF16.self) { $0 }
         // CreateFileW with FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED
         let handle = path.withCString(encodedAs: UTF16.self) { cPath -> HANDLE in
             CreateFileW(

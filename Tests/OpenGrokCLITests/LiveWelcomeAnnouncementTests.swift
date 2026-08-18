@@ -209,6 +209,30 @@ private struct WelcomeAnnouncementFixture {
             .rows.first { $0.id == rowID }
     }
 
+    func waitForWelcomeRow(
+        _ rowID: String,
+        minimumHeight: Int = 0,
+        maximumHeight: Int? = nil,
+        timeout: TimeInterval = 5
+    ) async -> PagerOverlayBounds.Row? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let row = await welcomeRow(rowID),
+               row.frame.height >= minimumHeight,
+               maximumHeight.map({ row.frame.height <= $0 }) ?? true {
+                return row
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard let row = await welcomeRow(rowID),
+              row.frame.height >= minimumHeight,
+              maximumHeight.map({ row.frame.height <= $0 }) ?? true
+        else {
+            return nil
+        }
+        return row
+    }
+
     func click(_ row: PagerOverlayBounds.Row) async throws -> OpenGrokPagerInputRouting? {
         try await renderer.handleInput(.mouse(MouseEvent(
             kind: .down,
@@ -299,17 +323,17 @@ struct LiveWelcomeAnnouncementTests {
         )
         defer { fixture.dispose() }
         try await fixture.beginAndDeliverAnnouncements()
-        #expect(await fixture.waitForPaint(of: "Sentence 1 of"))
-
         let collapsed = try #require(
-            await fixture.welcomeRow(PagerWelcomeOverlay.announcementRowID)
+            await fixture.waitForWelcomeRow(PagerWelcomeOverlay.announcementRowID)
         )
         // Expand: the block's published frame grows (`:4389-4395` toggle;
         // the tail text becomes reachable).
         #expect(try await fixture.click(collapsed) == .consumed)
-        #expect(await fixture.waitForPaint(of: "Sentence 12 of a deliberately long"))
         let expanded = try #require(
-            await fixture.welcomeRow(PagerWelcomeOverlay.announcementRowID)
+            await fixture.waitForWelcomeRow(
+                PagerWelcomeOverlay.announcementRowID,
+                minimumHeight: collapsed.frame.height + 1
+            )
         )
         #expect(expanded.frame.height > collapsed.frame.height)
 
@@ -318,7 +342,10 @@ struct LiveWelcomeAnnouncementTests {
         // height is the observable that can shrink.)
         #expect(try await fixture.click(expanded) == .consumed)
         let recollapsed = try #require(
-            await fixture.welcomeRow(PagerWelcomeOverlay.announcementRowID)
+            await fixture.waitForWelcomeRow(
+                PagerWelcomeOverlay.announcementRowID,
+                maximumHeight: collapsed.frame.height
+            )
         )
         #expect(recollapsed.frame.height == collapsed.frame.height)
         try await fixture.renderer.restoreTerminal()

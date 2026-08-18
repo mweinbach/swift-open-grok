@@ -1,6 +1,25 @@
 import Foundation
 import Testing
 @testable import OpenGrokPluginMarketplace
+#if os(Windows)
+import ucrt
+#endif
+
+private func setMarketplaceTestEnvironment(_ key: String, _ value: String) {
+    #if os(Windows)
+    _ = _putenv_s(key, value)
+    #else
+    setenv(key, value, 1)
+    #endif
+}
+
+private func unsetMarketplaceTestEnvironment(_ key: String) {
+    #if os(Windows)
+    _ = _putenv_s(key, "")
+    #else
+    unsetenv(key)
+    #endif
+}
 
 @Suite("Marketplace transactional install and update", .serialized)
 struct MarketplaceInstallerTests {
@@ -120,8 +139,15 @@ struct MarketplaceInstallerTests {
                 return
             }
 
-            setenv(MarketplaceInstallRegistry.testFailRegistrySaveEnvironmentKey, "1", 1)
-            defer { unsetenv(MarketplaceInstallRegistry.testFailRegistrySaveEnvironmentKey) }
+            setMarketplaceTestEnvironment(
+                MarketplaceInstallRegistry.testFailRegistrySaveEnvironmentKey,
+                "1"
+            )
+            defer {
+                unsetMarketplaceTestEnvironment(
+                    MarketplaceInstallRegistry.testFailRegistrySaveEnvironmentKey
+                )
+            }
 
             let updateResult = Result {
                 try updateFromMarketplaceEntryTransactional(

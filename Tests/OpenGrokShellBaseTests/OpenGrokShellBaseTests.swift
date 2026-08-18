@@ -17,6 +17,30 @@ struct OpenGrokShellPreparationTests {
         #expect(ShellQuoting.cmd("a") == "a")
     }
 
+    #if os(Windows)
+    @Test("Windows defaults to PowerShell and resolves it through Path")
+    func windowsPowerShellSelection() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opengrok-shell-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let executable = directory.appendingPathComponent("powershell.EXE")
+        try Data().write(to: executable)
+        let environment = [
+            "ComSpec": #"C:\Windows\System32\cmd.exe"#,
+            "Path": directory.path,
+            "PATHEXT": ".EXE;.CMD",
+        ]
+
+        #expect(ShellKind.detect(environment: environment) == .powerShell)
+        #expect(
+            ShellKind.powerShell.binaryPath(environment: environment).lowercased()
+                == executable.path.lowercased()
+        )
+    }
+    #endif
+
     @Test("Preparation resolves relative cwd and applies control environment last")
     func preparation() throws {
         let base = URL(fileURLWithPath: "/workspace/project")
@@ -52,7 +76,11 @@ struct OpenGrokShellPreparationTests {
         )
 
         #expect(environment["PATH"] == "/bin")
+        #if os(Windows)
+        #expect(environment["HOME"] == nil)
+        #else
         #expect(environment["HOME"] == "/home/test")
+        #endif
         #expect(environment["AWS_SECRET"] == nil)
         #expect(environment["aws_region"] == nil)
         #expect(environment["CUSTOM"] == "value")

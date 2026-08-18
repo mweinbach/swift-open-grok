@@ -56,11 +56,7 @@ func terminalSupportsTruecolorBrand(_ terminal: TerminalName) -> Bool {
          .vsCode, .windowsTerminal, .foot:
         return true
     default:
-        #if os(Windows)
-        return true
-        #else
         return false
-        #endif
     }
 }
 
@@ -90,9 +86,14 @@ public func standaloneColorEvidence(
     environment: [String: String] = ProcessInfo.processInfo.environment,
     terminal: TerminalName
 ) -> StandaloneColorEvidence {
-    standaloneColorEvidence(
+    #if os(Windows)
+    let stderrIsTerminal = _isatty(STDERR_FILENO) == 1
+    #else
+    let stderrIsTerminal = isatty(STDERR_FILENO) == 1
+    #endif
+    return standaloneColorEvidence(
         environment: environment,
-        stderrIsTerminal: isatty(STDERR_FILENO) == 1,
+        stderrIsTerminal: stderrIsTerminal,
         controllingTerminal: controllingTerminalAvailable(),
         terminal: terminal
     )

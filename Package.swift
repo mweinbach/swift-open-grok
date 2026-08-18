@@ -130,7 +130,7 @@ private func targets() -> [Target] {
     // declared here so the SwiftPM graph is valid and a clean
     // `swift build --build-tests` resolves without cached build order.
     t.append(.target(name: "OpenGrokTestUtilities", dependencies: dep()))
-    t.append(.target(name: "OpenGrokTestSupport", dependencies: dep(["OpenGrokTestUtilities"])))
+    t.append(.target(name: "OpenGrokTestSupport", dependencies: dep(["OpenGrokTestUtilities", "COpenGrokSockets"])))
     // W0-S3: OpenGrokPaths and OpenGrokEnvironment are simple targets.
     // OpenGrokVersion is declared separately with a build-tool plugin
     // (OpenGrokVersionBuildPlugin) that generates CompiledVersion.generated.swift
@@ -155,11 +155,12 @@ private func targets() -> [Target] {
     t.append(.target(name: "OpenGrokShared", dependencies: dep(["OpenGrokCLIChatProxyTypes"])))
     // OpenGrokDiagnostics: the PURE `/doctor` diagnostics + fix engine
     // (xai-grok-pager/src/diagnostics + xai-grok-config/src/managed_text).
-    // Deliberately minimal edge: only OpenGrokShared (clipboard OSC/SSH env
-    // helpers). It must never grow an OpenGrokCLI/OpenGrokPager edge — the
+    // Deliberately minimal edges: OpenGrokShared (clipboard OSC/SSH env
+    // helpers) and the platform-neutral C socket shim used by the diagnostics
+    // listener. It must never grow an OpenGrokCLI/OpenGrokPager edge — the
     // CLI/pager wiring is a separate serial slice, and the library's tests
     // build with no pager import as the disjointness guarantee.
-    t.append(.target(name: "OpenGrokDiagnostics", dependencies: dep(["OpenGrokShared"])))
+    t.append(.target(name: "OpenGrokDiagnostics", dependencies: dep(["OpenGrokShared", "COpenGrokSockets"])))
     // OpenGrokScheduler: the PURE scheduler library (interval parsing, the
     // ScheduledTask/SchedulerState store with next-fire math against an
     // injected clock) from `xai-grok-tools/.../grok_build/scheduler/`.
@@ -202,32 +203,29 @@ private func targets() -> [Target] {
         name: "COpenGrokSockets",
         path: "Sources/COpenGrokSockets",
         publicHeadersPath: "include",
-        linkerSettings: [.linkedLibrary("ws2_32", .when(platforms: [.windows]))]
+        linkerSettings: [
+            .linkedLibrary("ws2_32", .when(platforms: [.windows])),
+            .linkedLibrary("advapi32", .when(platforms: [.windows])),
+        ]
     ))
     t.append(.target(name: "OpenGrokExtraCA", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokTracing"])))
     t.append(.target(name: "OpenGrokHTTP", dependencies: dep(w0s3, w0s4, w1s5, ["OpenGrokTracing", "COpenGrokSockets", "OpenGrokExtraCA"])))
     t.append(.target(name: "OpenGrokCircuitBreaker", dependencies: dep(w0s3, w0s4, w1s5, ["OpenGrokHTTP"])))
     t.append(.target(name: "OpenGrokTelemetry", dependencies: dep(w0s3, w0s4, w1s5, ["OpenGrokTracing", "OpenGrokHTTP"])))
     // W2-S2: FileUtils base; SQLiteJournal/Secrets build on it.
-    t.append(.target(name: "OpenGrokFileUtils", dependencies: dep(w0s2, w0s3, w0s4, w1s5)))
+    t.append(.target(name: "OpenGrokFileUtils", dependencies: dep(w0s2, w0s3, w0s4, w1s5, ["COpenGrokSockets"])))
     t.append(.target(name: "OpenGrokSQLiteJournal", dependencies: dep(w0s2, w0s3, w0s4, w1s5, ["OpenGrokFileUtils"])))
     t.append(.target(name: "OpenGrokSecrets", dependencies: dep(w0s2, w0s3, w0s4, w1s5, ["OpenGrokFileUtils"])))
     // W2-S3: FSNotify / CodebaseGraph / HunkTracker share base deps; GitStatus
     // depends on a thin C zlib shim for standards-compatible Git object and
-    // pack inflate/deflate. Apple Compression remains the fallback where the
-    // system zlib module is unavailable.
-    //
-    // The shim is omitted on Windows, where the SDK ships no <zlib.h> and no
-    // `z` import library: declaring it there fails the whole build in the
-    // shim's header. `ObjectStore` already selects Compression, then
-    // COpenGrokZlib, then a typed `zlib … unavailable on this platform` throw,
-    // and that third arm is only reachable when this module is genuinely
-    // absent — so dropping the target here is what arms it. Cost: Windows Git
-    // loose-object inflate/deflate throws instead of working; that is the
-    // honest state until a Windows zlib is vendored, and it must not be
-    // "fixed" by re-adding the target without one.
+    // pack inflate/deflate. Windows resolves zlib1.dll dynamically; Apple
+    // Compression remains the fallback where the system zlib module is absent.
     #if os(Windows)
-    let zlibShimDependencies: [String] = []
+    t.append(.target(
+        name: "COpenGrokZlib",
+        path: "Sources/COpenGrokZlib",
+        publicHeadersPath: "include"
+    ))
     #else
     t.append(.target(
         name: "COpenGrokZlib",
@@ -237,8 +235,8 @@ private func targets() -> [Target] {
             .linkedLibrary("z"),
         ]
     ))
-    let zlibShimDependencies: [String] = ["COpenGrokZlib"]
     #endif
+    let zlibShimDependencies: [String] = ["COpenGrokZlib"]
     t.append(.target(name: "OpenGrokFSNotify", dependencies: dep(w0s2, w0s3, w0s4)))
     t.append(.target(
         name: "OpenGrokGitStatus",
@@ -269,14 +267,14 @@ private func targets() -> [Target] {
     t.append(.target(name: "OpenGrokTextArea", dependencies: dep(w0s2, w0s4, ["OpenGrokTerminalCore"])))
 
     // ---- Wave 3 ----
-    t.append(contentsOf: libs(w3s1, dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s1, w2s2)))
+    t.append(contentsOf: libs(w3s1, dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s1, w2s2, ["COpenGrokSockets"])))
     t.append(contentsOf: libs(w3s2, dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s1)))
     t.append(contentsOf: libs(w3s3, dep(w0s2, w0s3, w0s4, w1s1, w1s3, w1s5, w2s1)))
 
     // ---- Wave 4 ----
     t.append(contentsOf: libs(w4s1, dep(w0s2, w0s3, w1s4, w1s5, w2s2, w2s4)))
     t.append(contentsOf: libs(w4s2, dep(w0s2, w0s3, w2s2, w2s3)))
-    t.append(contentsOf: libs(w4s3, dep(w0s2, w0s3, w0s4, w1s1, w1s4, w1s5, w2s2, w2s3, w2s4)))
+    t.append(contentsOf: libs(w4s3, dep(w0s2, w0s3, w0s4, w1s1, w1s4, w1s5, w2s2, w2s3, w2s4, ["COpenGrokSockets"])))
     // W4-S4: Core base; SDK -> Core; WorkspaceClient -> Core/SDK.
     t.append(.target(name: "OpenGrokComputerHubCore", dependencies: dep(w0s2, w0s4, w1s1, w1s4, w2s1, w2s4)))
     t.append(.target(name: "OpenGrokComputerHubSDK", dependencies: dep(w0s2, w0s4, w1s1, w1s4, w2s4, ["OpenGrokComputerHubCore", "OpenGrokHTTP"])))
@@ -289,7 +287,7 @@ private func targets() -> [Target] {
     t.append(contentsOf: libs(w5s2, dep(w0s2, w0s4, w1s1, w1s3, w2s1, w2s4, w3s3, w4s3, w4s4, w4s1, ["OpenGrokTerminalCore"])))
     t.append(contentsOf: libs(w5s3, dep(w0s2, w1s1, w1s2, w1s4, w4s2, w4s3)))
     // W5-S4: MCP base; ComputerHubMCPAdapter -> MCP.
-    t.append(.target(name: "OpenGrokMCP", dependencies: dep(w0s2, w0s3, w1s1, w1s4, w1s5, w2s1, w2s2, w4s4, w4s1)))
+    t.append(.target(name: "OpenGrokMCP", dependencies: dep(w0s2, w0s3, w1s1, w1s4, w1s5, w2s1, w2s2, w4s4, w4s1, ["COpenGrokSockets"])))
     t.append(.target(name: "OpenGrokComputerHubMCPAdapter", dependencies: dep(w0s2, w0s3, w1s1, w1s4, w1s5, w2s1, w2s2, w4s4, ["OpenGrokMCP"])))
     // OpenGrokLSP: stdio JSON-RPC client, document sync (didOpen/didChange),
     // publishDiagnostics push + pull diagnostics, and drain for after-edit
@@ -341,7 +339,7 @@ private func targets() -> [Target] {
     // ---- Wave 9 ----
     t.append(contentsOf: libs(w9s1, dep(w2s4, w2s5, w5s2, w7s5, w8s3, w8s4, w8s5)))
     t.append(contentsOf: libs(w9s2, dep(w1s1, w1s3, w2s5, w5s1, w6s1, w8s1, w8s2, w8s3, w8s4)))
-    t.append(contentsOf: libs(w9s3, dep(w1s5, w3s2, w4s3, w5s3, w5s4, w5s5, w5s6, w8s3, w8s4)))
+    t.append(contentsOf: libs(w9s3, dep(w1s5, w3s2, w4s3, w5s3, w5s4, w5s5, w5s6, w8s3, w8s4, ["OpenGrokShared"])))
     t.append(contentsOf: libs(w9s4, dep(w3s1, w3s2, w5s6, w7s2, w7s3, w7s4, w7s5, w8s3, w8s4)))
     t.append(contentsOf: libs(w9s5, dep(w2s5, w7s1, w7s2, w7s5, w8s3, w8s4, w8s5)))
 
@@ -371,7 +369,7 @@ private func targets() -> [Target] {
     // `scheduler_*` tool handlers, the session scheduler host, and `/loop`
     // consume the pure library; the edge stays one-way — the scheduler
     // target must never import back (see its declaration).
-    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s3, w2s4, w2s5, w3s1, w3s2, w3s3, w4s2, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w6s5, w7s3, w7s4, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokToolRegistry", "OpenGrokToolTypes", "OpenGrokCodeMode", "OpenGrokReleaseValidation", "OpenGrokDiagnostics", "OpenGrokScheduler", "OpenGrokLSP"])))
+    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s3, w2s4, w2s5, w3s1, w3s2, w3s3, w4s2, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w6s5, w7s3, w7s4, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["OpenGrokFileTools", "OpenGrokFileUtils", "OpenGrokToolRegistry", "OpenGrokToolTypes", "OpenGrokCodeMode", "OpenGrokReleaseValidation", "OpenGrokDiagnostics", "OpenGrokScheduler", "OpenGrokLSP"])))
 
     // ---- Wave 11 (libraries + executable) ----
     // Distribution support only imports build support, version, and update
@@ -404,7 +402,7 @@ private func targets() -> [Target] {
     // Declared here so W0-S2 never edits Package.swift.
     t.append(.testTarget(
         name: "OpenGrokTestSupportTests",
-        dependencies: dep(["OpenGrokTestSupport", "OpenGrokTestUtilities"])
+        dependencies: dep(["OpenGrokTestSupport", "OpenGrokTestUtilities", "COpenGrokSockets"])
     ))
     t.append(.testTarget(
         name: "OpenGrokTestUtilitiesTests",
@@ -439,7 +437,11 @@ private func targets() -> [Target] {
     ))
     t.append(contentsOf: tests(["OpenGrokWebMediaTools"]))
     t.append(contentsOf: tests(w5s3))
-    t.append(contentsOf: tests(["OpenGrokMCP", "OpenGrokComputerHubMCPAdapter"]))
+    t.append(.testTarget(
+        name: "OpenGrokMCPTests",
+        dependencies: dep(["OpenGrokMCP", "OpenGrokTestUtilities", "COpenGrokSockets"])
+    ))
+    t.append(contentsOf: tests(["OpenGrokComputerHubMCPAdapter"]))
     t.append(.testTarget(
         name: "OpenGrokLSPTests",
         dependencies: dep(["OpenGrokLSP"]),
@@ -490,7 +492,7 @@ private func targets() -> [Target] {
     // helper gives a test target only its own library.
     t.append(.testTarget(
         name: "OpenGrokCLITests",
-        dependencies: dep(w10s2, w4s4, w4s3)
+        dependencies: dep(w10s2, w4s4, w4s3, ["COpenGrokSockets"])
     ))
     // OpenGrokExecutable tests exercise the composition via libraries (test
     // targets do not depend on the executable target directly).

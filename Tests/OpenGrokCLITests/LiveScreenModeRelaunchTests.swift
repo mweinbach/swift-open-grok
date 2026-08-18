@@ -12,6 +12,17 @@ import Foundation
 import OpenGrokPager
 import Testing
 @testable import OpenGrokCLI
+#if os(Windows)
+import ucrt
+#endif
+
+private func setScreenModeEnvironment(_ value: String) {
+    #if os(Windows)
+    _ = _putenv_s(LiveScreenModeRelaunch.environmentKey, value)
+    #else
+    setenv(LiveScreenModeRelaunch.environmentKey, value, 1)
+    #endif
+}
 
 private func rebuild(
     _ args: [String],
@@ -105,13 +116,13 @@ struct ScreenModeEnvOverrideTests {
     func overrideIsConsumedOnce() {
         // `:330-354`: read AND removed, so spawned children (tool shells,
         // workers, nested invocations) never inherit a forced mode.
-        setenv(LiveScreenModeRelaunch.environmentKey, "minimal", 1)
+        setScreenModeEnvironment("minimal")
         #expect(LiveScreenModeRelaunch.takeScreenModeEnvOverride() == "minimal")
         #expect(getenv(LiveScreenModeRelaunch.environmentKey) == nil)
         #expect(LiveScreenModeRelaunch.takeScreenModeEnvOverride() == nil)
 
         // Even an unparseable value is removed — it must not linger either.
-        setenv(LiveScreenModeRelaunch.environmentKey, "bogus", 1)
+        setScreenModeEnvironment("bogus")
         #expect(LiveScreenModeRelaunch.takeScreenModeEnvOverride() == "bogus")
         #expect(getenv(LiveScreenModeRelaunch.environmentKey) == nil)
     }

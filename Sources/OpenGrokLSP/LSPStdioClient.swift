@@ -201,7 +201,7 @@ public actor LSPStdioClient {
 
         #if canImport(Darwin)
         _ = fcntl(stdinPipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
-        #else
+        #elseif canImport(Glibc)
         _ = signal(SIGPIPE, SIG_IGN)
         #endif
 
@@ -305,14 +305,20 @@ public actor LSPStdioClient {
             // leaked child is recoverable, a wedged suite is not. Do not
             // "simplify" this back to awaiting the handler alone.
             let once = TerminationOnce()
+            #if !os(Windows)
             let pid = process.processIdentifier
+            #endif
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 once.arm(continuation)
                 process.terminationHandler = { _ in once.fire() }
                 if !process.isRunning { once.fire() }
                 process.terminate()
                 DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                    #if os(Windows)
+                    self.process.terminate()
+                    #else
                     kill(pid, SIGKILL)
+                    #endif
                     DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
                         once.fire()
                     }

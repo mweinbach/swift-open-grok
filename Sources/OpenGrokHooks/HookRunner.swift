@@ -16,7 +16,7 @@ import Glibc
 func suppressSIGPIPE(on handle: FileHandle) {
     #if canImport(Darwin)
     _ = fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1)
-    #else
+    #elseif canImport(Glibc)
     // Linux has no per-descriptor equivalent; the process-wide disposition is
     // set once so a broken pipe surfaces as a write error.
     _ = signal(SIGPIPE, SIG_IGN)
@@ -274,11 +274,18 @@ private final class HookProcessController: @unchecked Sendable {
         // the runner open. The guard is our own exit record rather than `isRunning`, which
         // reads false during the window before Foundation has reaped and so let the
         // escalation be skipped for a child that was still alive.
+        #if os(Windows)
+        hookIOQueue.asyncAfter(deadline: .now() + .milliseconds(200)) { [weak self] in
+            guard let self, !self.hasExited else { return }
+            self.process.terminate()
+        }
+        #else
         let pid = process.processIdentifier
         hookIOQueue.asyncAfter(deadline: .now() + .milliseconds(200)) { [weak self] in
             guard let self, !self.hasExited else { return }
             kill(pid, SIGKILL)
         }
+        #endif
     }
 }
 
@@ -316,7 +323,19 @@ private func runCommand(
     let arguments: [String]
     if shell {
         #if os(Windows)
-        executable = context.environment["COMSPEC"] ?? "cmd.exe"
+        let commandInterpreter = context.environment["COMSPEC"]
+            ?? ProcessInfo.processInfo.environment["COMSPEC"]
+            ?? "cmd.exe"
+        guard let resolved = resolveWindowsHookExecutable(
+            commandInterpreter,
+            environment: context.environment
+        ) else {
+            return HookInvocation(
+                result: .failed("command interpreter not found: \(commandInterpreter)"),
+                elapsedMs: elapsedMilliseconds(since: started)
+            )
+        }
+        executable = resolved
         arguments = ["/C", command]
         #else
         executable = "/bin/sh"
@@ -327,8 +346,58 @@ private func runCommand(
         guard FileManager.default.fileExists(atPath: path.path) else {
             return HookInvocation(result: .failed("command not found: \(path.path)"), elapsedMs: elapsedMilliseconds(since: started))
         }
+        #if os(Windows)
+        switch path.pathExtension.lowercased() {
+        case "ps1":
+            guard let shellExecutable = resolveWindowsHookExecutable(
+                "powershell.exe",
+                environment: context.environment
+            ) else {
+                return HookInvocation(
+                    result: .failed("command interpreter not found: powershell.exe"),
+                    elapsedMs: elapsedMilliseconds(since: started)
+                )
+            }
+            executable = shellExecutable
+            arguments = [
+                "-NoLogo", "-NoProfile", "-NonInteractive",
+                "-ExecutionPolicy", "Bypass", "-File", path.path,
+            ]
+        case "sh":
+            guard let shellExecutable = resolveWindowsHookExecutable(
+                "sh.exe",
+                environment: context.environment
+            ) else {
+                return HookInvocation(
+                    result: .failed("command interpreter not found: sh.exe"),
+                    elapsedMs: elapsedMilliseconds(since: started)
+                )
+            }
+            executable = shellExecutable
+            arguments = [path.path]
+        case "cmd", "bat":
+            let commandInterpreter = context.environment["COMSPEC"]
+                ?? ProcessInfo.processInfo.environment["COMSPEC"]
+                ?? "cmd.exe"
+            guard let resolved = resolveWindowsHookExecutable(
+                commandInterpreter,
+                environment: context.environment
+            ) else {
+                return HookInvocation(
+                    result: .failed("command interpreter not found: \(commandInterpreter)"),
+                    elapsedMs: elapsedMilliseconds(since: started)
+                )
+            }
+            executable = resolved
+            arguments = ["/C", path.path]
+        default:
+            executable = path.path
+            arguments = []
+        }
+        #else
         executable = path.path
         arguments = []
+        #endif
     }
 
     let launch: (executable: String, arguments: [String])
@@ -514,6 +583,42 @@ private func unresolvedEnvironmentVariables(in command: String, extra: [String: 
     }
     return names.sorted()
 }
+
+#if os(Windows)
+private func resolveWindowsHookExecutable(
+    _ executable: String,
+    environment: [String: String]
+) -> String? {
+    let fileManager = FileManager.default
+    if (executable as NSString).isAbsolutePath
+        || executable.contains("/")
+        || executable.contains("\\") {
+        return fileManager.fileExists(atPath: executable) ? executable : nil
+    }
+
+    let pathValue = environment["PATH"]
+        ?? environment["Path"]
+        ?? ProcessInfo.processInfo.environment["PATH"]
+        ?? ProcessInfo.processInfo.environment["Path"]
+        ?? ""
+    let pathExt = environment["PATHEXT"]
+        ?? ProcessInfo.processInfo.environment["PATHEXT"]
+        ?? ".EXE;.CMD;.BAT"
+    let extensions = executable.contains(".")
+        ? [""]
+        : [""] + pathExt.split(separator: ";").map(String.init)
+    for directory in pathValue.split(separator: ";", omittingEmptySubsequences: true) {
+        for ext in extensions {
+            let candidate = (String(directory) as NSString)
+                .appendingPathComponent(executable + ext)
+            if fileManager.fileExists(atPath: candidate) {
+                return candidate
+            }
+        }
+    }
+    return nil
+}
+#endif
 
 private func elapsedMilliseconds(since start: Date) -> UInt64 {
     UInt64(max(0, Date().timeIntervalSince(start)) * 1000)

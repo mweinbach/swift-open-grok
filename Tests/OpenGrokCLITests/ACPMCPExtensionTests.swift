@@ -24,6 +24,7 @@
 // environments passed explicitly everywhere.
 
 import Foundation
+import COpenGrokSockets
 import OpenGrokACP
 import OpenGrokHTTP
 import OpenGrokMCP
@@ -35,12 +36,6 @@ import Testing
 
 @testable import OpenGrokACPRuntime
 @testable import OpenGrokCLI
-
-#if canImport(Darwin)
-import Darwin
-#elseif canImport(Glibc)
-import Glibc
-#endif
 
 private typealias JSONValue = OpenGrokShared.JSONValue
 
@@ -274,34 +269,28 @@ private func makeToolset() -> FinalizedToolset {
 
 @discardableResult
 private func socketGET(port: UInt16, target: String) -> String {
-    #if canImport(Darwin)
-    let streamType = SOCK_STREAM
-    #else
-    let streamType = Int32(SOCK_STREAM.rawValue)
-    #endif
-    let fd = socket(AF_INET, streamType, 0)
-    guard fd >= 0 else { return "" }
-    defer { close(fd) }
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = port.bigEndian
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-    let connected = withUnsafePointer(to: &addr) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
+    var handle: OGSocketHandle = -1
+    let connected = "127.0.0.1".withCString {
+        og_socket_tcp_connect($0, port, 5.0, &handle)
     }
     guard connected == 0 else { return "" }
+    defer { _ = og_socket_close(handle) }
+
     let request = "GET \(target) HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nConnection: close\r\n\r\n"
-    _ = Array(request.utf8).withUnsafeBufferPointer {
-        send(fd, $0.baseAddress, $0.count, 0)
+    let requestData = Data(request.utf8)
+    let written = requestData.withUnsafeBytes {
+        og_socket_write_all(handle, $0.baseAddress, $0.count)
     }
+    guard written == Int64(requestData.count) else { return "" }
+
     var response = Data()
     var buffer = [UInt8](repeating: 0, count: 4096)
     while true {
-        let n = recv(fd, &buffer, buffer.count, 0)
-        if n <= 0 { break }
-        response.append(contentsOf: buffer[..<n])
+        let count = buffer.withUnsafeMutableBytes {
+            og_socket_read(handle, $0.baseAddress, $0.count)
+        }
+        if count <= 0 { break }
+        response.append(contentsOf: buffer.prefix(Int(count)))
     }
     return String(decoding: response, as: UTF8.self)
 }

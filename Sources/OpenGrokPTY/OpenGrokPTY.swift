@@ -1056,9 +1056,7 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
 
     public func resize(to size: TerminalSize) async throws {
         #if canImport(WinSDK)
-        lock.lock()
-        let hpc = pseudoConsole
-        lock.unlock()
+        let hpc = lock.withLock { pseudoConsole }
         guard let hpc else {
             throw PTYError.unsupported("resize requires an active ConPTY")
         }
@@ -1075,9 +1073,7 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
 
     public func write(_ data: Data) async throws {
         #if canImport(WinSDK)
-        lock.lock()
-        let pipe = inputWrite
-        lock.unlock()
+        let pipe = lock.withLock { inputWrite }
         guard let pipe else {
             throw PTYError.unsupported("ConPTY input pipe is unavailable.")
         }
@@ -1085,7 +1081,7 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
             guard let base = raw.baseAddress else { return }
             var written: DWORD = 0
             let ok = WriteFile(pipe, base, DWORD(raw.count), &written, nil)
-            if ok == 0 {
+            if !ok {
                 throw PTYError.ioFailed("WriteFile(ConPTY) failed: \(GetLastError())")
             }
         }
@@ -1098,11 +1094,7 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
     public func output() -> AsyncThrowingStream<Data, Error> {
         #if canImport(WinSDK)
         AsyncThrowingStream { continuation in
-            let pipe: HANDLE? = {
-                self.lock.lock()
-                defer { self.lock.unlock() }
-                return self.outputRead
-            }()
+            let pipe = self.lock.withLock { self.outputRead }
             guard let pipe else {
                 continuation.finish(throwing: PTYError.unsupported("ConPTY output pipe missing"))
                 return
@@ -1113,7 +1105,7 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
                     var nread: DWORD = 0
                     let ok = buf.withUnsafeMutableBytes { raw -> Bool in
                         guard let base = raw.baseAddress else { return false }
-                        return ReadFile(pipe, base, DWORD(raw.count), &nread, nil) != 0
+                        return ReadFile(pipe, base, DWORD(raw.count), &nread, nil)
                     }
                     if !ok || nread == 0 {
                         continuation.finish()
@@ -1133,10 +1125,7 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
 
     public func signal(_ signal: ProcessSignal) async throws {
         #if canImport(WinSDK)
-        lock.lock()
-        let proc = processHandle
-        let job = jobHandle
-        lock.unlock()
+        let (proc, job) = lock.withLock { (processHandle, jobHandle) }
         switch signal {
         case .kill, .terminate:
             if let job {
@@ -1159,27 +1148,17 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
 
     public func waitForExit() async throws -> ProcessExit {
         #if canImport(WinSDK)
-        lock.lock()
-        if exitStatus != .stillRunning {
-            let e = exitStatus
-            lock.unlock()
-            return e
-        }
-        let proc = processHandle
-        lock.unlock()
+        let (currentExit, proc) = lock.withLock { (exitStatus, processHandle) }
+        if currentExit != .stillRunning { return currentExit }
         guard let proc else { return .code(-1) }
         _ = WaitForSingleObject(proc, INFINITE)
         var code: DWORD = 0
         GetExitCodeProcess(proc, &code)
         let exit: ProcessExit = .code(Int32(bitPattern: code))
-        lock.lock()
-        exitStatus = exit
-        lock.unlock()
+        lock.withLock { exitStatus = exit }
         return exit
         #else
-        lock.lock()
-        defer { lock.unlock() }
-        return exitStatus
+        return lock.withLock { exitStatus }
         #endif
     }
 
@@ -1189,12 +1168,12 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
         try? await Task.sleep(nanoseconds: 200_000_000)
         try? await signal(.kill)
         #endif
-        lock.lock()
-        cancelled = true
-        if exitStatus == .stillRunning {
-            exitStatus = .signal(9)
+        lock.withLock {
+            cancelled = true
+            if exitStatus == .stillRunning {
+                exitStatus = .signal(9)
+            }
         }
-        lock.unlock()
     }
 }
 
@@ -1266,8 +1245,8 @@ enum WindowsConPTY {
         var sa = SECURITY_ATTRIBUTES()
         sa.nLength = DWORD(MemoryLayout<SECURITY_ATTRIBUTES>.size)
         sa.bInheritHandle = true
-        guard CreatePipe(&inputRead, &inputWrite, &sa, 0) != 0,
-              CreatePipe(&outputRead, &outputWrite, &sa, 0) != 0
+        guard CreatePipe(&inputRead, &inputWrite, &sa, 0),
+              CreatePipe(&outputRead, &outputWrite, &sa, 0)
         else {
             throw PTYError.spawnFailed("CreatePipe failed: \(GetLastError())")
         }
@@ -1307,12 +1286,12 @@ enum WindowsConPTY {
         }
 
         // Attribute list for PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE.
-        var attrSize = 0
+        var attrSize: SIZE_T = 0
         InitializeProcThreadAttributeList(nil, 1, 0, &attrSize)
-        let attrBuf = UnsafeMutableRawPointer.allocate(byteCount: attrSize, alignment: 16)
+        let attrBuf = UnsafeMutableRawPointer.allocate(byteCount: Int(attrSize), alignment: 16)
         defer { attrBuf.deallocate() }
         let attrList = LPPROC_THREAD_ATTRIBUTE_LIST(attrBuf)
-        guard InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize) != 0 else {
+        guard InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize) else {
             ClosePseudoConsole(hpc)
             CloseHandle(inputWrite)
             CloseHandle(outputRead)
@@ -1327,7 +1306,7 @@ enum WindowsConPTY {
             0,
             DWORD_PTR(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE),
             &hpcRef,
-            MemoryLayout<HPCON>.size,
+            SIZE_T(MemoryLayout<HPCON>.size),
             nil,
             nil
         )
@@ -1357,7 +1336,7 @@ enum WindowsConPTY {
                 dirPtr,
                 &si.StartupInfo,
                 &pi
-            ) != 0
+            )
         }
 
         guard created else {

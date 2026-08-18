@@ -838,10 +838,9 @@ private final class LocalShellPipeReader: @unchecked Sendable {
     /// sleep; printf two` into a single post-exit blob and the live tail
     /// never moved. `read(2)` returns as soon as any byte is available.
     func readChunk() throws -> Data? {
+        #if canImport(Darwin) || canImport(Glibc)
         let fd = handle.fileDescriptor
         guard fd >= 0 else { return nil }
-
-        #if canImport(Darwin) || canImport(Glibc)
         var buffer = [UInt8](repeating: 0, count: 4096)
         while true {
             let n: ssize_t

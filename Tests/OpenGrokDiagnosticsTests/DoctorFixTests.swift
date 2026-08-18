@@ -922,24 +922,50 @@ struct ValidatorResolutionTests {
         let valid = temp.join("valid")
         try fm.createDirectory(atPath: shadow, withIntermediateDirectories: true)
         try fm.createDirectory(atPath: valid, withIntermediateDirectories: true)
+        #if os(Windows)
+        let executableName = "bash.exe"
+        try fm.createDirectory(atPath: shadow + "/" + executableName, withIntermediateDirectories: true)
+        let real = valid + "/" + executableName
+        try Data().write(to: URL(fileURLWithPath: real))
+        #else
+        let executableName = "bash"
         try "not executable".write(toFile: shadow + "/bash", atomically: true, encoding: .utf8)
         let real = valid + "/bash"
         try "#!/bin/sh\nexit 0\n".write(toFile: real, atomically: true, encoding: .utf8)
         #expect(chmod(real, 0o755) == 0)
+        #endif
+        #if os(Windows)
+        #expect(findOnPathIn("bash", directories: [shadow, valid])?.lowercased() == real.lowercased())
+        #else
         #expect(findOnPathIn("bash", directories: [shadow, valid]) == real)
+        #endif
 
-        let custom = temp.join("custom/bash")
+        let custom = temp.join("custom/\(executableName)")
         try fm.createDirectory(atPath: (custom as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        #if os(Windows)
+        try Data().write(to: URL(fileURLWithPath: custom))
+        #else
         try "#!/bin/sh\nexit 0\n".write(toFile: custom, atomically: true, encoding: .utf8)
         #expect(chmod(custom, 0o755) == 0)
+        #endif
         #expect(resolveValidatorProgram(custom, environment: [:]) == custom)
 
+        #if os(Windows)
+        try fm.removeItem(atPath: custom)
+        try fm.createDirectory(atPath: custom, withIntermediateDirectories: true)
+        #else
         #expect(chmod(custom, 0o644) == 0)
+        #endif
         // A non-executable explicit SHELL path is not silently substituted
         // with a different same-basename shell from PATH.
         #expect(resolveValidatorProgram(custom, environment: ["PATH": valid]) == nil)
 
+        #if os(Windows)
+        #expect(findOnPathIn("bash", directories: [shadow, valid])?.lowercased() == real.lowercased(),
+                "basename-only shell names may resolve through PATH")
+        #else
         #expect(findOnPathIn("bash", directories: [shadow, valid]) == real,
                 "basename-only shell names may resolve through PATH")
+        #endif
     }
 }

@@ -216,7 +216,7 @@ public func isHealthy(
 
 /// Open the WS-owned proxy log, truncating it on every (re)start.
 public func openTruncatedLog(path: String = PREVIEW_PROXY_LOG_PATH) throws -> FileHandle {
-    let fd = try daemonFileOpen(path: path, flags: O_CREAT | O_WRONLY | O_TRUNC, mode: S_IRUSR | S_IWUSR)
+    let fd = try daemonFileOpen(path: path, flags: O_CREAT | O_WRONLY | O_TRUNC)
     return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
 }
 

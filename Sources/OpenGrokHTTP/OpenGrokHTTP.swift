@@ -737,7 +737,7 @@ public enum HTTPSessionConfigurationBuilder {
         // TLS minimum protocol is an Apple URLSession seam. Linux
         // FoundationNetworking does not expose the same API; the normalized
         // value is still recorded on the configuration snapshot for tests.
-        #if !os(Linux)
+        #if canImport(Darwin)
         if let min = normalizedTLSMinimumVersion(transport.tls.minimumTLSVersion) {
             switch min {
             case "1.0":

@@ -122,8 +122,13 @@ public struct MarketplaceRelativePath: Hashable, Sendable, Codable, Equatable, C
     }
 
     private static func isContained(_ path: URL, in root: URL) -> Bool {
+        #if os(Windows)
+        let rootComponents = root.standardizedFileURL.pathComponents.map { $0.lowercased() }
+        let pathComponents = path.standardizedFileURL.pathComponents.map { $0.lowercased() }
+        #else
         let rootComponents = root.standardizedFileURL.pathComponents
         let pathComponents = path.standardizedFileURL.pathComponents
+        #endif
         guard pathComponents.count >= rootComponents.count else { return false }
         return Array(pathComponents.prefix(rootComponents.count)) == rootComponents
     }
@@ -961,7 +966,7 @@ public func planMarketplaceUpdate(root: URL, entry: MarketplaceEntry, provenance
     guard let current = installed.first(where: { $0.provenance.sourceURLOrPath == provenance.sourceURLOrPath && $0.provenance.pluginSubdirectory == normalizedPath }) else { throw MarketplaceError.notInstalled(plugin: entry.name) }
     let installDirectory = marketplaceInstallDirectory(environment: environment, homeDirectory: homeDirectory)
     let safeCurrentPath = try MarketplaceRelativePath(current.key).resolve(under: installDirectory)
-    guard safeCurrentPath.path == URL(fileURLWithPath: current.path).standardizedFileURL.path else { throw MarketplaceError.invalidPath(path: current.path, reason: .escapesRoot) }
+    guard marketplacePathsEqual(safeCurrentPath, URL(fileURLWithPath: current.path)) else { throw MarketplaceError.invalidPath(path: current.path, reason: .escapesRoot) }
     let result = try planMarketplaceInstall(root: root, entry: entry, provenance: provenance, installed: [], requireSHA: requireSHA, environment: environment, homeDirectory: homeDirectory)
     guard case let .planned(planned) = result else { throw MarketplaceError.installFailed(detail: "update planning unexpectedly found an existing installation") }
     return MarketplacePlan(operation: .update, pluginName: entry.name, relativePath: planned.relativePath, source: planned.source, provenance: planned.provenance, repositoryKey: current.key, finalPath: current.path, stagingPath: installDirectory.appendingPathComponent(".staging-\(current.key)").path, backupPath: installDirectory.appendingPathComponent(".backup-\(current.key)").path, requiresNetwork: planned.requiresNetwork, requiresConfirmation: true, keepData: false, oldVersion: current.version, newVersion: entry.version)
@@ -972,7 +977,7 @@ public func planMarketplaceRemove(pluginName: String, provenance: MarketplacePro
     guard let current = installed.first(where: { $0.provenance.sourceURLOrPath == provenance.sourceURLOrPath && $0.provenance.pluginSubdirectory == normalizedPath }) else { throw MarketplaceError.notInstalled(plugin: pluginName) }
     let installDirectory = marketplaceInstallDirectory(environment: environment, homeDirectory: homeDirectory)
     let safePath = try MarketplaceRelativePath(current.key).resolve(under: installDirectory)
-    guard safePath.path == URL(fileURLWithPath: current.path).standardizedFileURL.path else { throw MarketplaceError.invalidPath(path: current.path, reason: .escapesRoot) }
+    guard marketplacePathsEqual(safePath, URL(fileURLWithPath: current.path)) else { throw MarketplaceError.invalidPath(path: current.path, reason: .escapesRoot) }
     let normalizedProvenance = MarketplaceProvenance(sourceURLOrPath: provenance.sourceURLOrPath, sourceDisplayName: provenance.sourceDisplayName, pluginSubdirectory: normalizedPath)
     return MarketplacePlan(operation: .remove, pluginName: pluginName, relativePath: normalizedPath, source: nil, provenance: normalizedProvenance, repositoryKey: current.key, finalPath: current.path, stagingPath: nil, backupPath: nil, requiresNetwork: false, requiresConfirmation: true, keepData: keepData, oldVersion: current.version)
 }
@@ -1137,5 +1142,14 @@ private func manifestErrorReason(_ error: Error) -> String {
     return "invalid manifest"
 }
 private func isDirectory(_ url: URL) -> Bool { var isDirectory: ObjCBool = false; return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue }
+private func marketplacePathsEqual(_ lhs: URL, _ rhs: URL) -> Bool {
+    let left = lhs.standardizedFileURL.path.replacingOccurrences(of: "\\", with: "/")
+    let right = rhs.standardizedFileURL.path.replacingOccurrences(of: "\\", with: "/")
+    #if os(Windows)
+    return left.lowercased() == right.lowercased()
+    #else
+    return left == right
+    #endif
+}
 private func isDirectoryWithContents(_ url: URL) -> Bool { guard isDirectory(url) else { return false }; return ((try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: [])) ?? []).isEmpty == false }
 private extension UInt8 { var isASCIIAlpha: Bool { (65...90).contains(self) || (97...122).contains(self) } }

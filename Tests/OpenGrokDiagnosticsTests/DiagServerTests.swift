@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import Testing
 @testable import OpenGrokDiagnostics
 
@@ -6,6 +9,16 @@ import Testing
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#endif
+
+#if !os(Windows)
+private var diagnosticSocketStreamType: Int32 {
+    #if canImport(Darwin)
+    SOCK_STREAM
+    #else
+    Int32(SOCK_STREAM.rawValue)
+    #endif
+}
 #endif
 
 struct DiagServerTests {
@@ -308,7 +321,7 @@ struct DiagServerTests {
         let sockPath = tempDir.appendingPathComponent("ws.sock").path
 
         // Create stale socket file
-        let staleFd = socket(AF_UNIX, SOCK_STREAM, 0)
+        let staleFd = socket(AF_UNIX, diagnosticSocketStreamType, 0)
         #expect(staleFd >= 0)
         var staleAddr = sockaddr_un()
         staleAddr.sun_family = sa_family_t(AF_UNIX)
@@ -334,7 +347,7 @@ struct DiagServerTests {
         #expect((posixPerms & 0o777) == 0o600, "socket must be owner-only permissions")
 
         // Connect over Unix socket
-        let clientFd = socket(AF_UNIX, SOCK_STREAM, 0)
+        let clientFd = socket(AF_UNIX, diagnosticSocketStreamType, 0)
         #expect(clientFd >= 0)
         defer { close(clientFd) }
 

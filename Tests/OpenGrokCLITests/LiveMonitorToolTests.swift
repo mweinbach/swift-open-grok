@@ -471,9 +471,14 @@ struct LiveMonitorDispatchTests {
         let collector = MonitorEventCollector()
         await host.setEventSink { event in await collector.record(event) }
 
+        #if os(Windows)
+        let monitorCommand = "Write-Output 'hello'; Write-Output 'world'"
+        #else
+        let monitorCommand = "printf 'hello\\nworld\\n'"
+        #endif
         let result = await LiveMonitorTools.invoke(
             args: .object([
-                "command": .string("printf 'hello\\nworld\\n'"),
+                "command": .string(monitorCommand),
                 "description": .string("watch demo"),
             ]),
             callID: "mon-live-1",

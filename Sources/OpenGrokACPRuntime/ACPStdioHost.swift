@@ -33,6 +33,10 @@
 
 import Foundation
 
+#if os(Windows)
+import WinSDK
+#endif
+
 // MARK: - Line mailbox
 
 /// Hand-off point between the blocking reader thread and the async loop.
@@ -95,11 +99,26 @@ public struct ACPStandardIO: ACPLineIO {
 
     /// Bind to the process's own stdin/stdout.
     public init() {
-        self.init(input: FileHandle.standardInput.fileDescriptor, output: FileHandle.standardOutput.fileDescriptor)
+        self.init(input: .standardInput, output: .standardOutput)
     }
 
-    /// Bind to arbitrary descriptors. Tests use a `pipe(2)` pair here; the
-    /// production path uses `init()`.
+    /// Bind to arbitrary file handles. Tests use a pair of `Pipe` instances;
+    /// the production path uses `init()`.
+    public init(input: FileHandle, output: FileHandle) {
+        let mailbox = ACPLineMailbox()
+        self.mailbox = mailbox
+        #if os(Windows)
+        self.writer = ACPLineWriter(handle: output)
+        self.reader = ACPLineReader(handle: input, mailbox: mailbox)
+        #else
+        self.writer = ACPLineWriter(descriptor: output.fileDescriptor)
+        self.reader = ACPLineReader(descriptor: input.fileDescriptor, mailbox: mailbox)
+        #endif
+        reader.start()
+    }
+
+    /// Bind to arbitrary descriptors on POSIX hosts.
+    #if !os(Windows)
     public init(input: Int32, output: Int32) {
         let mailbox = ACPLineMailbox()
         self.mailbox = mailbox
@@ -107,6 +126,7 @@ public struct ACPStandardIO: ACPLineIO {
         self.reader = ACPLineReader(descriptor: input, mailbox: mailbox)
         reader.start()
     }
+    #endif
 
     public func readLine() async throws -> String? {
         // A blank line is not a protocol violation, just noise from a client
@@ -131,15 +151,35 @@ public struct ACPStandardIO: ACPLineIO {
 
 /// Serializes writes to one descriptor.
 private actor ACPLineWriter {
+    #if os(Windows)
+    private let handle: FileHandle
+
+    init(handle: FileHandle) { self.handle = handle }
+    #else
     private let descriptor: Int32
 
     init(descriptor: Int32) { self.descriptor = descriptor }
+    #endif
 
     func write(_ string: String) throws {
-        var bytes = Array(string.utf8)
+        let bytes = Array(string.utf8)
         var offset = 0
         while offset < bytes.count {
-            let written = bytes.withUnsafeBytes { buffer -> Int in
+            #if os(Windows)
+            var count: DWORD = 0
+            let succeeded = bytes.withUnsafeBytes { buffer in
+                WriteFile(
+                    handle._handle,
+                    buffer.baseAddress! + offset,
+                    DWORD(buffer.count - offset),
+                    &count,
+                    nil
+                )
+            }
+            guard succeeded, count > 0 else { throw ACPTransportError.closed }
+            offset += Int(count)
+            #else
+            let written = bytes.withUnsafeBytes { buffer in
                 Foundation.write(descriptor, buffer.baseAddress! + offset, buffer.count - offset)
             }
             if written > 0 {
@@ -148,6 +188,7 @@ private actor ACPLineWriter {
             }
             if written < 0 && (errno == EINTR || errno == EAGAIN) { continue }
             throw ACPTransportError.closed
+            #endif
         }
     }
 }
@@ -158,15 +199,26 @@ private actor ACPLineWriter {
 /// and `stop()` are the only two things touching it, and the descriptor is
 /// read-only after construction.
 private final class ACPLineReader: @unchecked Sendable {
+    #if os(Windows)
+    private let handle: FileHandle
+    #else
     private let descriptor: Int32
+    #endif
     private let mailbox: ACPLineMailbox
     private let lock = NSLock()
     private var stopped = false
 
+    #if os(Windows)
+    init(handle: FileHandle, mailbox: ACPLineMailbox) {
+        self.handle = handle
+        self.mailbox = mailbox
+    }
+    #else
     init(descriptor: Int32, mailbox: ACPLineMailbox) {
         self.descriptor = descriptor
         self.mailbox = mailbox
     }
+    #endif
 
     private var isStopped: Bool {
         lock.lock()
@@ -178,6 +230,9 @@ private final class ACPLineReader: @unchecked Sendable {
         lock.lock()
         stopped = true
         lock.unlock()
+        #if os(Windows)
+        _ = CancelIoEx(handle._handle, nil)
+        #endif
     }
 
     func start() {
@@ -191,6 +246,28 @@ private final class ACPLineReader: @unchecked Sendable {
         var buffer = [UInt8]()
         var chunk = [UInt8](repeating: 0, count: 8192)
         while !isStopped {
+            #if os(Windows)
+            var requestedCount = chunk.count
+            if GetFileType(handle._handle) == FILE_TYPE_PIPE {
+                var available: DWORD = 0
+                let peeked = PeekNamedPipe(handle._handle, nil, 0, nil, &available, nil)
+                if !peeked { break }
+                if available == 0 {
+                    Sleep(10)
+                    continue
+                }
+                requestedCount = min(requestedCount, Int(available))
+            }
+            var count: DWORD = 0
+            let succeeded = chunk.withUnsafeMutableBytes { pointer in
+                ReadFile(handle._handle, pointer.baseAddress, DWORD(requestedCount), &count, nil)
+            }
+            if !succeeded {
+                if GetLastError() == ERROR_BROKEN_PIPE { break }
+                break
+            }
+            let byteCount = Int(count)
+            #else
             let count = chunk.withUnsafeMutableBytes { pointer in
                 read(descriptor, pointer.baseAddress, pointer.count)
             }
@@ -198,26 +275,49 @@ private final class ACPLineReader: @unchecked Sendable {
                 if errno == EINTR { continue }
                 break
             }
-            if count == 0 { break }
-            buffer.append(contentsOf: chunk[0..<count])
-            while let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-                let lineBytes = Array(buffer[buffer.startIndex..<newline])
-                buffer.removeSubrange(buffer.startIndex...newline)
-                // A CRLF client leaves the carriage return behind.
-                let trimmed = lineBytes.last == UInt8(ascii: "\r") ? lineBytes.dropLast() : lineBytes[...]
-                let line = String(decoding: trimmed, as: UTF8.self)
-                let mailbox = self.mailbox
-                Task { await mailbox.deliver(line) }
-            }
+            let byteCount = count
+            #endif
+            if byteCount == 0 { break }
+            buffer.append(contentsOf: chunk[0..<byteCount])
+            deliverCompleteLines(from: &buffer)
         }
         // A client that closes without a trailing newline still sent a frame.
         if !buffer.isEmpty {
             let line = String(decoding: buffer, as: UTF8.self)
-            let mailbox = self.mailbox
-            Task { await mailbox.deliver(line) }
+            deliver(line)
         }
+        finishMailbox()
+    }
+
+    private func deliverCompleteLines(from buffer: inout [UInt8]) {
+        while let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+            let lineBytes = Array(buffer[buffer.startIndex..<newline])
+            buffer.removeSubrange(buffer.startIndex...newline)
+            // A CRLF client leaves the carriage return behind.
+            let trimmed = lineBytes.last == UInt8(ascii: "\r") ? lineBytes.dropLast() : lineBytes[...]
+            let line = String(decoding: trimmed, as: UTF8.self)
+            deliver(line)
+        }
+    }
+
+    private func deliver(_ line: String) {
+        let completed = DispatchSemaphore(value: 0)
         let mailbox = self.mailbox
-        Task { await mailbox.finish() }
+        Task {
+            await mailbox.deliver(line)
+            completed.signal()
+        }
+        completed.wait()
+    }
+
+    private func finishMailbox() {
+        let completed = DispatchSemaphore(value: 0)
+        let mailbox = self.mailbox
+        Task {
+            await mailbox.finish()
+            completed.signal()
+        }
+        completed.wait()
     }
 }
 

@@ -420,19 +420,24 @@ struct LiveMotionClockAndPublishTests {
             // latch must not grow from later publishes.
             let next = MotionDeliveryLatch { _ in false }
             await renderer.setMotionStateSink(next.sink())
+            let installCount = next.snapshot.count
             try await renderer.render(.turnStarted(OpenGrokPagerRequest(
                 prompt: "after-clear",
                 mode: .fullScreen
             )))
+            #expect(await next.waitUntil(timeout: 5) { states in
+                states.dropFirst(installCount).contains { $0.demand >= .fast }
+            })
+            let startedCount = next.snapshot.count
             try await renderer.render(.turnFinished(OpenGrokPagerRuntimeResult(
                 lifecycle: .completed,
                 sessionID: nil,
                 forwardedEventCount: 0,
                 terminalRestored: false
             )))
-            #expect(await next.waitUntil { states in
-                states.contains { $0.demand >= .fast }
-                    && states.contains { $0.demand == PagerTickDemand.none }
+            #expect(await next.waitUntil(timeout: 5) { states in
+                states.count > startedCount
+                    && states.last?.demand == PagerTickDemand.none
             })
             #expect(oldLatch.snapshot.count == oldCountAfterInstall + 1)
 

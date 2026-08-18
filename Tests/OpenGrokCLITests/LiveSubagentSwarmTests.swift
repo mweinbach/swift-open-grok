@@ -185,18 +185,37 @@ private func appendDecodedStrings(from value: Any, into out: inout [String]) {
 }
 
 /// `RESUME_CWD=` value from a decoded `function_call_output` / content string.
-/// Only absolute shell output lines (`RESUME_CWD=/…`) count — the tool-call
-/// arguments leaf also contains `RESUME_CWD=$(pwd)` and must be ignored.
+/// Only absolute shell output lines count — the tool-call arguments leaf also
+/// contains an unresolved cwd expression and must be ignored.
 private func resumeCWD(listedIn entry: LogEntry) -> String? {
     let prefix = "RESUME_CWD="
     for text in decodedBodyStrings(entry) {
         for line in text.split(whereSeparator: \.isNewline) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.hasPrefix("RESUME_CWD=/") else { continue }
-            return String(trimmed.dropFirst(prefix.count))
+            guard trimmed.hasPrefix(prefix) else { continue }
+            let path = String(trimmed.dropFirst(prefix.count))
+            #if os(Windows)
+            let bytes = Array(path.utf8)
+            let isDrivePath = bytes.count >= 3
+                && bytes[1] == 58
+                && (bytes[2] == 92 || bytes[2] == 47)
+            guard isDrivePath || path.hasPrefix("\\\\") else { continue }
+            return path.replacingOccurrences(of: "\\", with: "/")
+            #else
+            guard path.hasPrefix("/") else { continue }
+            return path
+            #endif
         }
     }
     return nil
+}
+
+private func resumeCWDToolArguments() -> String {
+    #if os(Windows)
+    #"{"command":"Write-Output ('RESUME_CWD=' + (Get-Location).Path)","timeout_ms":5000}"#
+    #else
+    #"{"command":"echo RESUME_CWD=$(pwd)","timeout_ms":5000}"#
+    #endif
 }
 
 private func decodedBodyContains(_ entry: LogEntry, _ needle: String) -> Bool {
@@ -366,12 +385,18 @@ struct AgentSwarmPlannerTests {
     // Upstream `subagent_timeout_from_env` arms (:531-546).
     @Test("timeout env grammar: default two hours, zero disables")
     func timeoutEnvGrammar() {
-        #expect(timeout([:]) == 2 * 60 * 60 * 1_000)
-        #expect(timeout(["OPENGROK_SUBAGENT_TIMEOUT_MS": "  "]) == 2 * 60 * 60 * 1_000)
-        #expect(timeout(["OPENGROK_SUBAGENT_TIMEOUT_MS": "1500"]) == 1_500)
-        #expect(timeout(["KIMI_SUBAGENT_TIMEOUT_MS": "800"]) == 800)
-        #expect(timeout(["OPENGROK_SUBAGENT_TIMEOUT_MS": "0"]) == nil,
-                "an explicit 0 disables the timeout")
+        let defaultTimeout: UInt64 = 2 * 60 * 60 * 1_000
+        let missing = timeout([:])
+        let blank = timeout(["OPENGROK_SUBAGENT_TIMEOUT_MS": "  "])
+        let explicit = timeout(["OPENGROK_SUBAGENT_TIMEOUT_MS": "1500"])
+        let fallback = timeout(["KIMI_SUBAGENT_TIMEOUT_MS": "800"])
+        let disabled = timeout(["OPENGROK_SUBAGENT_TIMEOUT_MS": "0"])
+
+        #expect(missing == defaultTimeout)
+        #expect(blank == defaultTimeout)
+        #expect(explicit == UInt64(1_500))
+        #expect(fallback == UInt64(800))
+        #expect(disabled == nil, "an explicit 0 disables the timeout")
         guard case .failure(let error) = swarmSubagentTimeoutFromEnvironment(
             ["OPENGROK_SUBAGENT_TIMEOUT_MS": "soon"]
         ) else {
@@ -871,7 +896,7 @@ struct LiveAgentSwarmEndToEndTests {
                 reasoning: "Checking cwd.",
                 callId: "call-swarm-pwd-1",
                 name: "run_terminal_cmd",
-                arguments: #"{"command":"echo RESUME_CWD=$(pwd)","timeout_ms":5000}"#,
+                arguments: resumeCWDToolArguments(),
                 model: "grok-4.5"
             ))
         )

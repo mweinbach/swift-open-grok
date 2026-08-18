@@ -113,13 +113,19 @@ final class AntigravityProcessCanceller: @unchecked Sendable {
         let running = process
         lock.unlock()
         guard let running, running.isRunning else { return }
+        #if !os(Windows)
         let pid = running.processIdentifier
+        #endif
         running.terminate()
         // Escalate rather than trust SIGTERM: an agy that traps or ignores it
         // would otherwise keep the workspace mutable until the hard deadline,
         // which is the whole failure this handle exists to close.
         DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+            #if os(Windows)
+            if running.isRunning { running.terminate() }
+            #else
             if running.isRunning { kill(pid, SIGKILL) }
+            #endif
         }
     }
 }
@@ -206,7 +212,11 @@ func runBoundedAntigravityProcess(
     if finished.wait(timeout: .now() + timeout) == .timedOut {
         process.terminate()
         if finished.wait(timeout: .now() + 0.3) == .timedOut {
+            #if os(Windows)
+            process.terminate()
+            #else
             kill(process.processIdentifier, SIGKILL)
+            #endif
             _ = finished.wait(timeout: .now() + 1.0)
         }
         canceller?.finish()

@@ -81,6 +81,18 @@ struct OpenGrokGitStatusTests {
         #expect(hex == "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0")
     }
 
+    @Test("minimal glob supports literals star and question")
+    func minimalGlob() {
+        #expect(globMatch("config.rc", "config.rc"))
+        #expect(!globMatch("config.rc", "config.toml"))
+        #expect(globMatch("*.swift", "main.swift"))
+        #expect(globMatch("src/*.swift", "src/nested/main.swift"))
+        #expect(globMatch("file?.txt", "file1.txt"))
+        #expect(globMatch("?.txt", "é.txt"))
+        #expect(!globMatch("file?.txt", "file10.txt"))
+        #expect(globMatch("a**b", "axxb"))
+    }
+
     @Test("portable SHA-1 empty and multi-chunk match single buffer")
     func portableSHA1Parity() {
         let empty = PortableSHA1.hash(Data())
@@ -123,7 +135,11 @@ struct OpenGrokGitStatusTests {
             path: root.path,
             options: GitStatusOptions(includeUntracked: true, includeIgnored: false)
         )
+        #if os(Windows)
+        #expect(snap.root.lowercased() == root.path.lowercased())
+        #else
         #expect(snap.root == root.path)
+        #endif
         #expect(snap.untracked.contains { $0.path == "extra.txt" })
         #expect(!snap.isBare)
     }

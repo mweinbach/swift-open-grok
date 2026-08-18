@@ -4,12 +4,14 @@
 //
 // Owner-only file creation for credential-adjacent material:
 // - Unix: mode 0o600 via no-follow open + fchmod (never follows a final symlink)
-// - Windows: explicit unsupported until owner-only DACL adapter lands
-//   (never reports owner-only success without an enforced ACL)
+// - Windows: protected DACL granting file read/write only to the owner
 
 import Foundation
 
-#if canImport(Darwin)
+#if os(Windows)
+import COpenGrokSockets
+import WinSDK
+#elseif canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
@@ -20,16 +22,8 @@ public enum SecureFile: Sendable {
     /// Create parent directories if needed, write `contents`, and enforce
     /// owner-only permissions (Unix `0o600`).
     public static func write(at path: URL, contents: Data) throws {
-        #if os(Windows)
-        // Refuse silent weakening: without a DACL adapter, "secure write"
-        // cannot uphold the contract.
-        throw FileUtilsError.unsupported(
-            "Windows owner-only DACL secure write is not yet wired; use Credential Manager"
-        )
-        #else
         try AtomicFile.write(path, data: contents, options: .ownerOnly)
         try ensureOwnerOnlyPermissions(at: path)
-        #endif
     }
 
     /// UTF-8 convenience wrapper.
@@ -54,14 +48,13 @@ public enum SecureFile: Sendable {
         }
     }
 
-    /// Whether the path currently has owner-only mode bits on Unix.
-    /// On Windows throws `unsupported` — never reports success without a DACL.
+    /// Whether the path currently has owner-only mode bits or DACL entries.
     public static func isOwnerOnly(at path: URL) throws -> Bool {
         #if os(Windows)
-        _ = path
-        throw FileUtilsError.unsupported(
-            "Windows owner-only DACL inspection is not yet wired"
-        )
+        try PathSecurity.rejectHostileLexical(path.path)
+        let result = path.path.withCString { og_file_is_owner_only($0) }
+        if result >= 0 { return result == 1 }
+        throw windowsSecureFileError(path: path.path, operation: "inspect owner-only DACL")
         #else
         try PathSecurity.rejectHostileLexical(path.path)
         let fd = try PathSecurity.openFileNoFollow(at: path, flags: O_RDONLY)
@@ -77,10 +70,14 @@ public enum SecureFile: Sendable {
 
 private func ensureOwnerOnlyPermissionsInner(at path: URL) throws {
     #if os(Windows)
-    _ = path
-    throw FileUtilsError.unsupported(
-        "Windows owner-only DACL enforcement is not yet wired"
-    )
+    try PathSecurity.rejectHostileLexical(path.path)
+    let result = path.path.withCString { og_file_apply_owner_only($0) }
+    if result == 0 { return }
+    let code = Int(og_socket_last_error_code())
+    if code == Int(ERROR_FILE_NOT_FOUND) || code == Int(ERROR_PATH_NOT_FOUND) {
+        throw FileUtilsError.notFound(path: path.path)
+    }
+    throw windowsSecureFileError(path: path.path, operation: "apply owner-only DACL")
     #else
     try PathSecurity.rejectHostileLexical(path.path)
     // Open no-follow so a raced symlink is never fchmod'd.
@@ -106,3 +103,14 @@ private func ensureOwnerOnlyPermissionsInner(at path: URL) throws {
     }
     #endif
 }
+
+#if os(Windows)
+private func windowsSecureFileError(path: String, operation: String) -> FileUtilsError {
+    let code = Int(og_socket_last_error_code())
+    let detail = String(cString: og_socket_last_error_message())
+    return .io(
+        path: path,
+        detail: "\(operation): \(detail.isEmpty ? "Windows error \(code)" : detail)"
+    )
+}
+#endif

@@ -317,17 +317,7 @@ public enum LiveServeComposition {
     // MARK: - working directory
 
     private static func resolveWorkingDirectory(_ path: String?) throws -> URL {
-        guard let path, !path.isEmpty else {
-            return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        }
-        let url = URL(fileURLWithPath: path).standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-              isDirectory.boolValue
-        else {
-            throw CLIApplicationError.failed("working directory does not exist: \(url.path)")
-        }
-        return url
+        try liveResolveWorkingDirectory(path)
     }
 
     // MARK: - leader

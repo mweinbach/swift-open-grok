@@ -45,12 +45,8 @@
 // (`tool_config.rs:294-297`).
 
 import Foundation
+import OpenGrokFileUtils
 import OpenGrokScheduler
-#if canImport(Darwin)
-import Darwin
-#else
-import Glibc
-#endif
 
 struct LiveSchedulerPersistence: Sendable {
     /// `resources_state.json` (`registry/types.rs:1138`).
@@ -181,26 +177,23 @@ struct LiveSchedulerPersistence: Sendable {
     /// on the state path is removed before the rename — rename(2) onto a
     /// directory fails, and upstream treats the squatter as legacy debris.
     private func replaceStatePath(with tempURL: URL) throws {
+        let parent = stateFileURL.deletingLastPathComponent()
+        var parentIsDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: parent.path, isDirectory: &parentIsDirectory),
+              parentIsDirectory.boolValue else {
+            throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: parent.path])
+        }
         var isDirectory: ObjCBool = false
         if FileManager.default.fileExists(atPath: stateFileURL.path, isDirectory: &isDirectory),
            isDirectory.boolValue {
             try FileManager.default.removeItem(at: stateFileURL)
         }
-        guard rename(tempURL.path, stateFileURL.path) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
+        try AtomicFile.rename(tempURL, to: stateFileURL, directorySync: .none)
     }
 
     /// The parent-directory fsync that makes the rename itself durable
     /// (`publish_durable`, `persistence.rs:341-347`).
     private func syncDirectory(_ directory: URL) throws {
-        let fd = open(directory.path, O_RDONLY)
-        guard fd >= 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        defer { close(fd) }
-        guard fsync(fd) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
+        try AtomicFile.fsyncDirectory(at: directory)
     }
 }

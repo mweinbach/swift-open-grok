@@ -13,14 +13,9 @@
 // these strings to the user.
 
 import Foundation
+import COpenGrokSockets
 import OpenGrokHTTP
 import OpenGrokVersion
-
-#if canImport(Darwin)
-import Darwin
-#elseif canImport(Glibc)
-import Glibc
-#endif
 
 /// Flow-level failure whose `description` is exactly the user-facing copy —
 /// `LiveAuthComposition.describe` (String(describing:)) must reproduce
@@ -168,15 +163,6 @@ struct XAILoginCallback: Sendable {
     let state: String
 }
 
-/// Cross-platform `SOCK_STREAM` (Darwin: bare Int32; glibc: enum).
-private var xaiSockStreamType: Int32 {
-    #if canImport(Darwin)
-    return SOCK_STREAM
-    #else
-    return Int32(SOCK_STREAM.rawValue)
-    #endif
-}
-
 /// Loopback callback server for the xAI OAuth redirect.
 ///
 /// Unlike the codex listener this one serves an accept LOOP: the accounts app
@@ -188,7 +174,7 @@ private var xaiSockStreamType: Int32 {
 /// auth/oidc/login.rs:117-125): only the production accounts-app origin is
 /// echoed.
 final class XAILoopbackListener: @unchecked Sendable {
-    private var serverFd: Int32 = -1
+    private var serverFd: OGSocketHandle = -1
     let port: UInt16
 
     /// Bind 127.0.0.1 on `port` (0 = OS-assigned). Upstream binds a random
@@ -202,43 +188,18 @@ final class XAILoopbackListener: @unchecked Sendable {
         self.port = bound.port
     }
 
-    private static func bindListener(port: UInt16) -> (fd: Int32, port: UInt16)? {
-        let fd = socket(AF_INET, xaiSockStreamType, 0)
-        guard fd >= 0 else { return nil }
-        var opt: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, socklen_t(MemoryLayout<Int32>.size))
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = port.bigEndian
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let res = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard res == 0, listen(fd, 4) == 0 else {
-            close(fd)
+    private static func bindListener(port: UInt16) -> (fd: OGSocketHandle, port: UInt16)? {
+        var fd: OGSocketHandle = -1
+        var boundPort: UInt16 = 0
+        guard og_socket_tcp_listen("127.0.0.1", port, &fd, &boundPort) == 0 else {
             return nil
         }
-        var boundAddr = sockaddr_in()
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let nameResult = withUnsafeMutablePointer(to: &boundAddr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                getsockname(fd, $0, &len)
-            }
-        }
-        // An ephemeral bind whose port cannot be read back would advertise
-        // ":0" in the redirect_uri; fail the bind instead.
-        guard nameResult == 0 else {
-            close(fd)
-            return nil
-        }
-        return (fd, UInt16(bigEndian: boundAddr.sin_port))
+        return (fd, boundPort)
     }
 
     func closeListener() {
         if serverFd >= 0 {
-            close(serverFd)
+            _ = og_socket_close(serverFd)
             serverFd = -1
         }
     }
@@ -262,39 +223,31 @@ final class XAILoopbackListener: @unchecked Sendable {
     }
 
     private static func serveUntilCallback(
-        fd: Int32,
+        fd: OGSocketHandle,
         timeoutSeconds: TimeInterval
     ) throws -> XAILoginCallback {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while true {
-            let remainingMs = Int32((deadline.timeIntervalSinceNow * 1000).rounded(.down))
-            guard remainingMs > 0 else {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else {
                 throw XAILoginFlowError.callbackTimeout
             }
-            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-            let pollRes = poll(&pfd, 1, remainingMs)
-            if pollRes == 0 {
+            var clientFd: OGSocketHandle = -1
+            let acceptResult = og_socket_accept_with_timeout(fd, remaining, &clientFd)
+            if acceptResult == 1 {
                 throw XAILoginFlowError.callbackTimeout
             }
-            guard pollRes > 0 else {
-                if errno == EINTR { continue }
-                throw XAILoginFlowError.bindLoopback("poll failed: errno \(errno)")
+            guard acceptResult == 0 else {
+                throw XAILoginFlowError.bindLoopback(socketErrorDetail())
             }
-
-            var clientAddr = sockaddr_in()
-            var clientLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let clientFd = withUnsafeMutablePointer(to: &clientAddr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    accept(fd, $0, &clientLen)
-                }
-            }
-            guard clientFd >= 0 else { continue }
-            defer { close(clientFd) }
+            defer { _ = og_socket_close(clientFd) }
 
             var buffer = [UInt8](repeating: 0, count: 8192)
-            let bytesRead = recv(clientFd, &buffer, buffer.count - 1, 0)
+            let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer in
+                og_socket_read(clientFd, rawBuffer.baseAddress, rawBuffer.count - 1)
+            }
             guard bytesRead > 0,
-                  let request = String(bytes: buffer[..<bytesRead], encoding: .utf8)
+                  let request = String(bytes: buffer[..<Int(bytesRead)], encoding: .utf8)
             else { continue }
 
             if let outcome = handle(request: request, clientFd: clientFd) {
@@ -310,7 +263,7 @@ final class XAILoopbackListener: @unchecked Sendable {
     /// `nil` means "answered, not decisive" (preflight, unknown path).
     private static func handle(
         request: String,
-        clientFd: Int32
+        clientFd: OGSocketHandle
     ) -> Result<XAILoginCallback, XAILoginFlowError>? {
         // AGENTS.md §2: `\r\n` is ONE Character, so splitting on the "\n"
         // Character never finds a CRLF boundary — `isNewline` matches both
@@ -410,7 +363,7 @@ final class XAILoopbackListener: @unchecked Sendable {
     }
 
     private static func respond(
-        _ clientFd: Int32,
+        _ clientFd: OGSocketHandle,
         status: String,
         extraHeaders: [String],
         body: String
@@ -426,8 +379,14 @@ final class XAILoopbackListener: @unchecked Sendable {
         response += body
         let bytes = Array(response.utf8)
         _ = bytes.withUnsafeBufferPointer { ptr in
-            send(clientFd, ptr.baseAddress, ptr.count, 0)
+            og_socket_write_all(clientFd, ptr.baseAddress, ptr.count)
         }
+    }
+
+    private static func socketErrorDetail() -> String {
+        let detail = String(cString: og_socket_last_error_message())
+        if !detail.isEmpty { return detail }
+        return "socket error \(og_socket_last_error_code())"
     }
 }
 

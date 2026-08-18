@@ -94,11 +94,18 @@ extension PagerDocs {
             to: staging.appendingPathComponent(extractionVersionFileName)
         )
 
+        #if os(Windows)
+        if fileManager.fileExists(atPath: destination.path) {
+            try fileManager.removeItem(at: destination)
+        }
+        try fileManager.moveItem(at: staging, to: destination)
+        #else
         if fileManager.fileExists(atPath: destination.path) {
             _ = try fileManager.replaceItemAt(destination, withItemAt: staging)
         } else {
             try fileManager.moveItem(at: staging, to: destination)
         }
+        #endif
         published = true
         return .extracted(version: version)
     }

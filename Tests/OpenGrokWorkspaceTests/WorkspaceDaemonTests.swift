@@ -16,6 +16,10 @@ import Glibc
 
 @Suite("WorkspaceDaemon & PidFile tests")
 struct WorkspaceDaemonTests {
+    private var currentProcessID: Int32 {
+        ProcessInfo.processInfo.processIdentifier
+    }
+
     private func temporaryDirectory() -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ws-daemon-test-\(UUID().uuidString)")
@@ -64,7 +68,7 @@ struct WorkspaceDaemonTests {
         #expect(guardFile != nil)
         let contents = try String(contentsOfFile: path, encoding: .utf8)
         let pid = Int(contents.trimmingCharacters(in: .whitespacesAndNewlines))
-        #expect(pid == Int(getpid()))
+        #expect(pid == Int(currentProcessID))
         guardFile?.close()
     }
 
@@ -102,7 +106,7 @@ struct WorkspaceDaemonTests {
         let guardFile = try PidFile.acquire(path: path)
         #expect(guardFile != nil)
         let contents = try String(contentsOfFile: path, encoding: .utf8)
-        #expect(contents == "\(getpid())\n", "stale content must be fully truncated")
+        #expect(contents == "\(currentProcessID)\n", "stale content must be fully truncated")
         guardFile?.close()
     }
 
@@ -145,8 +149,8 @@ struct WorkspaceDaemonTests {
 
         let targets = try openStdioTargets(logPath: logPath)
         defer {
-            Darwin.close(targets.stdinFd)
-            Darwin.close(targets.logFd)
+            close(targets.stdinFd)
+            close(targets.logFd)
         }
 
         #expect(FileManager.default.fileExists(atPath: logPath))
@@ -171,8 +175,8 @@ struct WorkspaceDaemonTests {
 
         let targets = try openStdioTargets(logPath: logPath)
         defer {
-            Darwin.close(targets.stdinFd)
-            Darwin.close(targets.logFd)
+            close(targets.stdinFd)
+            close(targets.logFd)
         }
 
         let more = "more\n"
@@ -233,14 +237,10 @@ struct WorkspaceDaemonTests {
         let guardFile = try PidFile.acquire(path: path)
         #expect(guardFile != nil)
 
-        var statBuf = stat()
-        #if canImport(Darwin)
-        stat(path, &statBuf)
-        #elseif canImport(Glibc)
-        Glibc.stat(path, &statBuf)
-        #endif
-        let mode = statBuf.st_mode
-        #expect(mode & 0o077 == 0, "pidfile must not be group/other-accessible")
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+        #expect(permissions != nil)
+        #expect((permissions ?? 0) & 0o077 == 0, "pidfile must not be group/other-accessible")
         guardFile?.close()
     }
     #endif
@@ -254,7 +254,7 @@ struct WorkspaceDaemonTests {
         let guardFile = try PidFile.acquireOrTakeOver(path: path, grace: 0.1)
         #expect(guardFile != nil)
         let contents = try String(contentsOfFile: path, encoding: .utf8)
-        #expect(contents == "\(getpid())\n")
+        #expect(contents == "\(currentProcessID)\n")
         guardFile?.close()
     }
 
@@ -264,9 +264,8 @@ struct WorkspaceDaemonTests {
         defer { cleanUp(dir: dir) }
         let path = dir.appendingPathComponent("ws.pid").path
 
-        let holder = try PidFile.acquire(path: path)
+        let holder = try PidFile.acquire(path: path, contents: "not a pid")
         #expect(holder != nil)
-        try "not a pid".write(toFile: path, atomically: false, encoding: .utf8)
 
         let taken = try PidFile.acquireOrTakeOverMatching(path: path, grace: 0.1, nameFragment: "sleep")
         #expect(taken == nil, "an unidentifiable holder must be declined")

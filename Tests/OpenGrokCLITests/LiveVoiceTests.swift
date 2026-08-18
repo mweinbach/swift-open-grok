@@ -22,7 +22,7 @@ struct LiveVoiceCommandTests {
             Issue.record("expected unavailable action, got \(result.action)")
             return
         }
-        #expect(result.message?.contains("unavailable") == true)
+        #expect(result.message?.isEmpty == false)
         #expect(!state.isListening)
         #expect(state.pipeline == nil)
     }

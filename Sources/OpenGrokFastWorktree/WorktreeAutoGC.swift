@@ -210,7 +210,10 @@ public enum WorktreeAutoGC {
     }
 
     private static func isWithin(_ candidate: String, root: String) -> Bool {
-        candidate == root || candidate.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+        let candidatePath = worktreePathKey(candidate)
+        let rootPath = worktreePathKey(root)
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        return candidatePath == rootPath || candidatePath.hasPrefix(prefix)
     }
 
     private static func metadataURL(registry: WorktreeRegistry) -> URL {

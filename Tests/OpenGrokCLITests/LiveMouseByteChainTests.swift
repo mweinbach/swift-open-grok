@@ -14,6 +14,8 @@ import OpenGrokTTY
 import Testing
 @testable import OpenGrokCLI
 
+#if !os(Windows)
+
 @Suite("Live mouse byte chain")
 struct LiveMouseByteChainTests {
     /// Feed raw bytes through a real PosixTerminalInput over a pipe and
@@ -150,3 +152,5 @@ struct LiveMouseByteChainTests {
         await input.close()
     }
 }
+
+#endif

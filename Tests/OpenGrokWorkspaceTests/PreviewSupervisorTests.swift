@@ -233,6 +233,7 @@ struct PreviewSupervisorTests {
 
         #expect(parseActivityBody(#"{"other":1}"#) == nil)
         #expect(parseActivityBody(#"{"last_activity_ms":"7"}"#) == nil)
+        #expect(parseActivityBody(#"{"last_activity_ms":true}"#) == nil)
         #expect(parseActivityBody(#"{"last_activity_ms":1.5}"#) == nil)
         #expect(parseActivityBody("not json") == nil)
         #expect(parseActivityBody("") == nil)

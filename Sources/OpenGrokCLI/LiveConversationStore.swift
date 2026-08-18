@@ -256,7 +256,11 @@ actor LiveConversationStore {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
             let data = try encoder.encode(record)
-            try data.write(to: fileURL(sessionID: record.sessionID), options: .atomic)
+            try writeLiveConversationDataAtomically(
+                data,
+                to: fileURL(sessionID: record.sessionID),
+                fileManager: fileManager
+            )
         } catch {
             throw CLIApplicationError.failed("failed to save session \(record.sessionID): \(error)")
         }
@@ -345,10 +349,18 @@ actor LiveConversationStore {
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-            try encoder.encode(child).write(to: destinationRecordURL, options: .atomic)
+            try writeLiveConversationDataAtomically(
+                encoder.encode(child),
+                to: destinationRecordURL,
+                fileManager: fileManager
+            )
             if fileManager.fileExists(atPath: sourceRewindURL.path) {
                 let rewindBytes = try Data(contentsOf: sourceRewindURL)
-                try rewindBytes.write(to: destinationRewindURL, options: .atomic)
+                try writeLiveConversationDataAtomically(
+                    rewindBytes,
+                    to: destinationRewindURL,
+                    fileManager: fileManager
+                )
             }
             let sourceSessionDir = sessionsDirectory.appendingPathComponent(sourceSessionID)
             let destinationSessionDir = sessionsDirectory.appendingPathComponent(destinationSessionID)
@@ -1437,6 +1449,19 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         }
     }
 
+}
+
+private func writeLiveConversationDataAtomically(
+    _ data: Data,
+    to destination: URL,
+    fileManager: FileManager
+) throws {
+    let temporary = destination.deletingLastPathComponent().appendingPathComponent(
+        "\(destination.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier).\(UUID().uuidString).tmp"
+    )
+    defer { try? fileManager.removeItem(at: temporary) }
+    try data.write(to: temporary, options: [.withoutOverwriting])
+    try atomicallyReplaceItem(at: destination, with: temporary)
 }
 
 /// Helpers for tool-result display state and JSON flattening at the live seam.

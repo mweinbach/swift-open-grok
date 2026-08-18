@@ -19,40 +19,44 @@ import Testing
 private final class StdioPipeHarness: @unchecked Sendable {
     let agentIO: ACPStandardIO
     let clientTransport: ACPStdioTransport
-    private let descriptors: [Int32]
+    private let toAgent: Pipe
+    private let fromAgent: Pipe
 
     init() throws {
-        var toAgent: [Int32] = [0, 0]
-        var fromAgent: [Int32] = [0, 0]
-        guard pipe(&toAgent) == 0, pipe(&fromAgent) == 0 else {
-            throw ACPTransportError.closed
-        }
-        descriptors = [toAgent[0], toAgent[1], fromAgent[0], fromAgent[1]]
-        agentIO = ACPStandardIO(input: toAgent[0], output: fromAgent[1])
+        let toAgent = Pipe()
+        let fromAgent = Pipe()
+        self.toAgent = toAgent
+        self.fromAgent = fromAgent
+        agentIO = ACPStandardIO(
+            input: toAgent.fileHandleForReading,
+            output: fromAgent.fileHandleForWriting
+        )
         clientTransport = ACPStdioTransport(
-            io: ACPStandardIO(input: fromAgent[0], output: toAgent[1])
+            io: ACPStandardIO(
+                input: fromAgent.fileHandleForReading,
+                output: toAgent.fileHandleForWriting
+            )
         )
     }
 
     /// Close the agent's stdin write end so the agent sees EOF.
-    func closeAgentInput() { close(descriptors[1]) }
+    func closeAgentInput() { try? toAgent.fileHandleForWriting.close() }
 
     /// Push raw bytes at the agent's stdin, bypassing `ACPStdioTransport`, so
     /// a test can spell out exactly what lands on the wire.
     func writeRaw(_ text: String) {
-        var bytes = Array(text.utf8)
-        var offset = 0
-        while offset < bytes.count {
-            let written = bytes.withUnsafeBytes {
-                write(descriptors[1], $0.baseAddress! + offset, $0.count - offset)
-            }
-            guard written > 0 else { break }
-            offset += written
-        }
+        try? toAgent.fileHandleForWriting.write(contentsOf: Data(text.utf8))
     }
 
     func dispose() {
-        for descriptor in descriptors { close(descriptor) }
+        for handle in [
+            toAgent.fileHandleForReading,
+            toAgent.fileHandleForWriting,
+            fromAgent.fileHandleForReading,
+            fromAgent.fileHandleForWriting,
+        ] {
+            try? handle.close()
+        }
     }
 }
 

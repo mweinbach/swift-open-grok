@@ -53,9 +53,22 @@ struct SafeAbsoluteDirectory: Sendable, Equatable {
 
     /// `SafeAbsoluteDirectory::parse` (fix.rs:48-62).
     static func parse(_ path: String, label: String) throws -> SafeAbsoluteDirectory {
-        let isAbsolute = path.hasPrefix("/")
-        let components = (path as NSString).pathComponents.filter { $0 != "/" }
-        let isRootOnly = components.isEmpty
+        let normalized = path.replacingOccurrences(of: "\\", with: "/")
+        let firstByte = normalized.utf8.first
+        let hasDriveLetter = firstByte.map {
+            ($0 >= Character("A").asciiValue! && $0 <= Character("Z").asciiValue!)
+                || ($0 >= Character("a").asciiValue! && $0 <= Character("z").asciiValue!)
+        } ?? false
+        let isDriveAbsolute = normalized.count >= 3
+            && normalized[normalized.index(after: normalized.startIndex)] == ":"
+            && normalized[normalized.index(normalized.startIndex, offsetBy: 2)] == "/"
+            && hasDriveLetter
+        let isUNCAbsolute = normalized.hasPrefix("//")
+        let isAbsolute = normalized.hasPrefix("/") || isDriveAbsolute || isUNCAbsolute
+        let components = normalized.split(separator: "/", omittingEmptySubsequences: true)
+        let isDriveRoot = isDriveAbsolute && components.count == 1
+        let isUNCRoot = isUNCAbsolute && components.count <= 2
+        let isRootOnly = components.isEmpty || isDriveRoot || isUNCRoot
         let hasUnsafeComponent = components.contains { $0 == "." || $0 == ".." }
         // Rust `char::is_control` covers C0, DEL, and C1 (fix.rs:55-57).
         let isRenderable = !path.unicodeScalars.contains { scalar in
@@ -127,7 +140,10 @@ public enum ShellKind: String, Sendable, Equatable, CaseIterable {
 
     /// `from_shell_path` (fix.rs:111-118).
     public static func fromShellPath(_ shell: String) -> ShellKind? {
-        let name = (shell as NSString).lastPathComponent
+        var name = (shell as NSString).lastPathComponent
+        if name.lowercased().hasSuffix(".exe") {
+            name.removeLast(4)
+        }
         return ShellKind(rawValue: name)
     }
 
@@ -549,9 +565,6 @@ private func planSshWrap(
     report: DiagnosticReport,
     terminal: TerminalContext
 ) throws -> FixPlan {
-    #if os(Windows)
-    throw FixError.platformUnsupported
-    #else
     if terminal.isOfficialVSCodeRemote {
         throw FixError.notApplicable
     }
@@ -591,7 +604,6 @@ private func planSshWrap(
         ],
         payload: .sshWrap(SshWrapPlan(shell: shell, managed: managed))
     )
-    #endif
 }
 
 /// `plan_tmux_option` (fix.rs:745-804).
@@ -1271,7 +1283,7 @@ private func validatorFor(_ shell: ShellKind, overridePath: String?) -> SyntaxVa
 /// `resolve_validator_program` (fix.rs:1459-1465).
 func resolveValidatorProgram(_ shell: String, environment: [String: String]) -> String? {
     guard let kind = ShellKind.fromShellPath(shell) else { return nil }
-    if shell.contains("/") {
+    if shell.contains("/") || shell.contains("\\") {
         return executableFile(shell) ? shell : nil
     }
     return findOnPath(kind.name, environment: environment)
@@ -1279,26 +1291,74 @@ func resolveValidatorProgram(_ shell: String, environment: [String: String]) -> 
 
 /// `find_on_path` (fix.rs:1467-1469).
 func findOnPath(_ name: String, environment: [String: String] = ProcessInfo.processInfo.environment) -> String? {
+    #if os(Windows)
+    guard let path = environment["PATH"] ?? environment["Path"] else { return nil }
+    let pathExtensions = environment["PATHEXT"] ?? ".EXE;.CMD;.BAT"
+    return findOnPathIn(
+        name,
+        directories: path.split(separator: ";").map(String.init),
+        executableSuffixes: windowsExecutableSuffixes(name: name, pathExtensions: pathExtensions)
+    )
+    #else
     guard let path = environment["PATH"] else { return nil }
     return findOnPathIn(name, directories: path.split(separator: ":").map(String.init))
+    #endif
 }
 
 /// `find_on_path_in` (fix.rs:1471-1479).
 func findOnPathIn(_ name: String, directories: [String]) -> String? {
+    #if os(Windows)
+    return findOnPathIn(
+        name,
+        directories: directories,
+        executableSuffixes: windowsExecutableSuffixes(
+            name: name,
+            pathExtensions: ".EXE;.CMD;.BAT"
+        )
+    )
+    #else
+    return findOnPathIn(name, directories: directories, executableSuffixes: [""])
+    #endif
+}
+
+private func findOnPathIn(
+    _ name: String,
+    directories: [String],
+    executableSuffixes: [String]
+) -> String? {
     for directory in directories {
-        let candidate = directory.hasSuffix("/") ? directory + name : directory + "/" + name
-        if executableFile(candidate) {
-            return candidate
+        for suffix in executableSuffixes {
+            let candidate = (directory as NSString).appendingPathComponent(name + suffix)
+            if executableFile(candidate) {
+                return candidate
+            }
         }
     }
     return nil
 }
 
+#if os(Windows)
+private func windowsExecutableSuffixes(name: String, pathExtensions: String) -> [String] {
+    let suffixes = pathExtensions.split(separator: ";").map(String.init)
+    guard !suffixes.isEmpty else { return [""] }
+    if suffixes.contains(where: { name.lowercased().hasSuffix($0.lowercased()) }) {
+        return [""]
+    }
+    return suffixes
+}
+#endif
+
 /// `executable_file` (fix.rs:1481-1486): regular file with any execute bit.
 func executableFile(_ path: String) -> Bool {
+    #if os(Windows)
+    var isDirectory = ObjCBool(false)
+    return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+        && !isDirectory.boolValue
+    #else
     var status = stat()
     guard stat(path, &status) == 0 else { return false }
     return (status.st_mode & S_IFMT) == S_IFREG && (status.st_mode & 0o111) != 0
+    #endif
 }
 
 // MARK: - Existing-customization scanners (fix.rs:1493-1581)

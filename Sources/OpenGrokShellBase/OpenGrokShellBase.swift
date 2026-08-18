@@ -9,9 +9,21 @@ public enum ShellKind: String, Codable, Sendable, Equatable, Hashable {
 
     public static func detect(environment: [String: String] = ProcessInfo.processInfo.environment) -> ShellKind {
         #if os(Windows)
-        let configured = environment["GROK_SHELL"] ?? environment["ComSpec"] ?? environment["SHELL"] ?? ""
+        let configured = environment["GROK_SHELL"] ?? environment["SHELL"] ?? ""
         let name = shellExecutableName(configured)
-        return name.contains("cmd") ? .cmd : .powerShell
+        if name.contains("cmd") {
+            return .cmd
+        }
+        if name.contains("zsh") {
+            return .zsh
+        }
+        if name == "sh" || name == "sh.exe" || name == "dash" || name == "dash.exe" {
+            return .sh
+        }
+        if name.contains("bash") {
+            return .bash
+        }
+        return .powerShell
         #else
         let name = shellExecutableName(environment["GROK_SHELL"] ?? environment["SHELL"] ?? "")
         if name.contains("zsh") {
@@ -44,7 +56,11 @@ public enum ShellKind: String, Codable, Sendable, Equatable, Hashable {
         case .sh:
             return "sh"
         case .powerShell:
+            #if os(Windows)
+            return "powershell.exe"
+            #else
             return "pwsh"
+            #endif
         case .cmd:
             return "cmd.exe"
         }
@@ -59,7 +75,11 @@ public enum ShellKind: String, Codable, Sendable, Equatable, Hashable {
         case .sh:
             return "/bin/sh"
         case .powerShell:
+            #if os(Windows)
+            return "powershell.exe"
+            #else
             return "pwsh"
+            #endif
         case .cmd:
             return "cmd.exe"
         }
@@ -109,12 +129,16 @@ public enum ShellKind: String, Codable, Sendable, Equatable, Hashable {
         }
     }
 
+    #if os(Windows)
+    private static let commonShellDirectories: [String] = []
+    #else
     private static let commonShellDirectories = [
         "/bin",
         "/usr/bin",
         "/usr/local/bin",
         "/opt/homebrew/bin"
     ]
+    #endif
 }
 
 public enum ShellDialect: String, Codable, Sendable, Equatable, Hashable {
@@ -1497,20 +1521,41 @@ private func isAbsolutePath(_ path: String) -> Bool {
 }
 
 private func isExecutableFile(_ url: URL) -> Bool {
+    #if os(Windows)
+    FileManager.default.fileExists(atPath: url.path)
+    #else
     FileManager.default.isExecutableFile(atPath: url.path)
+    #endif
 }
 
 private func which(_ name: String, environment: [String: String]) -> String? {
-    let pathValue = environment["PATH"] ?? ""
     #if os(Windows)
+    let pathValue = environment["PATH"] ?? environment["Path"] ?? ""
     let separator: Character = ";"
+    let pathExt = environment["PATHEXT"] ?? ".COM;.EXE;.BAT;.CMD"
+    let extensions = pathExt.split(separator: ";").map(String.init)
+    let hasKnownExtension = extensions.contains {
+        name.lowercased().hasSuffix($0.lowercased())
+    }
+    let suffixes = hasKnownExtension ? [""] : extensions
     #else
+    let pathValue = environment["PATH"] ?? ""
     let separator: Character = ":"
+    let suffixes = [""]
     #endif
     for directory in pathValue.split(separator: separator, omittingEmptySubsequences: false) {
-        let candidate = URL(fileURLWithPath: String(directory)).appendingPathComponent(name)
-        if isExecutableFile(candidate) {
-            return candidate.path
+        for suffix in suffixes {
+            #if os(Windows)
+            let candidate = (String(directory) as NSString).appendingPathComponent(name + suffix)
+            if FileManager.default.fileExists(atPath: candidate) {
+                return candidate
+            }
+            #else
+            let candidate = URL(fileURLWithPath: String(directory)).appendingPathComponent(name + suffix)
+            if isExecutableFile(candidate) {
+                return candidate.path
+            }
+            #endif
         }
     }
     return nil

@@ -77,6 +77,24 @@ struct OpenGrokFastWorktreeTests {
         }
     }
 
+    #if os(Windows)
+    @Test("Windows pool-root containment and primary protection ignore path case")
+    func windowsPathCaseIsInsensitive() {
+        let safety = WorktreeSafetyPolicy(
+            primaryCheckout: URL(fileURLWithPath: "C:/repo"),
+            allowedPoolRoot: URL(fileURLWithPath: "C:/Windows/Temp/pool")
+        )
+        do {
+            try safety.validateDestination(URL(fileURLWithPath: "C:/WINDOWS/TEMP/pool/wt-1"))
+        } catch {
+            Issue.record("case-only pool spelling should be allowed: \(error)")
+        }
+        #expect(throws: FastWorktreeError.self) {
+            try safety.validateNotPrimary(URL(fileURLWithPath: "C:/REPO"))
+        }
+    }
+    #endif
+
     @Test("symlink escape out of pool is rejected")
     func symlinkEscapeRejected() throws {
         let root = try tempDir("og-symlink-escape")
@@ -1122,6 +1140,7 @@ struct OpenGrokFastWorktreeTests {
         #expect(!delegate.createCalled, "force must not invoke the delegate")
     }
 
+    #if !os(Windows)
     @Test("executable mode 0o755 survives CoW and non-CoW copy")
     func executableBitPreserved() throws {
         let root = try tempDir("og-exec-bit")
@@ -1150,4 +1169,5 @@ struct OpenGrokFastWorktreeTests {
             #expect((mode & 0o755) == 0o755 || (mode & 0o111) == 0o111)
         }
     }
+    #endif
 }

@@ -200,6 +200,18 @@ public final class WindowsExclusiveFileLock: @unchecked Sendable {
         handle = acquired
     }
 
+    public static func readContents(at path: String, maxBytes: Int = 64) -> String? {
+        guard maxBytes > 0 else { return "" }
+        var bytes = [UInt8](repeating: 0, count: maxBytes)
+        let count = path.withCString { pathPointer in
+            bytes.withUnsafeMutableBytes { buffer in
+                og_file_lock_read_contents(pathPointer, buffer.baseAddress, buffer.count)
+            }
+        }
+        guard count >= 0 else { return nil }
+        return String(decoding: bytes.prefix(Int(count)), as: UTF8.self)
+    }
+
     public func release() {
         stateLock.lock()
         let acquired = handle
