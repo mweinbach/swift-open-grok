@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokAuth
 import OpenGrokModels
 
 public enum CLIRunner {
@@ -38,7 +39,7 @@ public enum CLIRunner {
                 dependencies: releaseValidationDependencies
             )
         case .models(let options):
-            writeModels(options: options, streams: streams)
+            writeModels(options: options, environment: environment, streams: streams)
             return ExitCode.success.rawValue
         case .mcp(let options):
             // `LiveMCPComposition.run` is synchronous, so the `mcp` route needs
@@ -146,7 +147,7 @@ public enum CLIRunner {
                 dependencies: releaseValidationDependencies
             )
         case .models(let options):
-            writeModels(options: options, streams: streams)
+            writeModels(options: options, environment: environment, streams: streams)
             return ExitCode.success.rawValue
         // Synchronous like the arms above; the live binary reaches `doctor`
         // through this entry point (`OpenGrokExecutable/main.swift`).
@@ -200,21 +201,144 @@ public enum CLIRunner {
         }
     }
 
-    private static func writeModels(options: CLIModelsOptions, streams: CLIStreams) {
-        let catalog = embeddedDefaultModels()
-        let visibleModels = catalog.models.filter { !$0.hidden && $0.supportedInApi }.map(\.model)
+    private static func writeModels(
+        options: CLIModelsOptions,
+        environment: [String: String],
+        streams: CLIStreams
+    ) {
+        let embedded = embeddedDefaultModels()
+        let home = OpenGrokHomeResolver.resolve(environment: environment)
+        let workingDirectory = URL(
+            fileURLWithPath: environment["PWD"] ?? FileManager.default.currentDirectoryPath,
+            isDirectory: true
+        ).standardizedFileURL
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: workingDirectory,
+            environment: environment,
+            isInteractive: false
+        )
+        var input = liveCatalogResolutionInput(
+            workingDirectory: workingDirectory,
+            environment: environment
+        )
+        input.models.default = security.document[path: ["models", "default"]]?.stringValue
+        input.models.openRouterEnabledModels = security.document[
+            path: ["models", "openrouter_enabled_models"]
+        ]?.arrayValue?.compactMap(\.stringValue) ?? []
+        input.configModels = parseConfiguredModelCatalog(
+            from: security.document,
+            environment: environment
+        ).modelOverrides
+        for (key, override) in (try? loadCustomModelOverrides(grokHome: home)) ?? [] {
+            if let index = input.configModels.firstIndex(where: { $0.0 == key }) {
+                input.configModels[index] = (key, override)
+            } else {
+                input.configModels.append((key, override))
+            }
+        }
+
+        let store = LiveModelCatalogStore(
+            input: input,
+            environment: environment,
+            openGrokHome: home
+        )
+        let runInfraBaseURL = RunInfraModels.apiBaseURL(environment: environment)
+        let runInfraKey = RunInfraModels.selectAPIKey(
+            baseURL: runInfraBaseURL,
+            environmentKey: runInfraAPIKeyFromEnvironment(environment),
+            storedKey: readRunInfraAPIKey(grokHome: home)
+        )
+        let runInfraPublished: Bool
+        if let runInfraKey {
+            runInfraPublished = store.applyRunInfraCatalog(RunInfraModelsCatalog(
+                entries: RunInfraModels.curatedCatalog(baseURL: runInfraBaseURL),
+                credentialFingerprint: RunInfraModels.credentialFingerprint(apiKey: runInfraKey)
+            ))
+        } else {
+            runInfraPublished = false
+        }
+
+        let geminiBaseURL = GeminiModels.apiBaseURL(environment: environment)
+        let geminiKey = GeminiModels.selectAPIKey(
+            baseURL: geminiBaseURL,
+            environmentKey: geminiAPIKeyFromEnvironment(environment),
+            storedKey: readGeminiAPIKey(grokHome: home)
+        )
+        let geminiPublished: Bool
+        if let geminiKey {
+            geminiPublished = store.applyGeminiCatalog(GeminiModelsCatalog(
+                entries: GeminiModels.curatedCatalog(baseURL: geminiBaseURL),
+                credentialFingerprint: GeminiModels.credentialFingerprint(apiKey: geminiKey)
+            ))
+        } else {
+            geminiPublished = false
+        }
+
+        let openRouterKey = OpenRouterModels.selectAPIKey(
+            baseURL: OpenRouterModels.apiBaseURL(environment: environment),
+            environmentKey: openRouterAPIKeyFromEnvironment(environment),
+            storedKey: readOpenRouterAPIKey(grokHome: home)
+        )
+        let openRouterAllowlist = Set(input.models.openRouterEnabledModels)
+        var snapshot = store.snapshot()
+        snapshot.retain { key, entry in
+            switch entry.info.provider {
+            case .runinfra:
+                return runInfraPublished
+            case .gemini:
+                return geminiPublished
+            case .openRouter:
+                return openRouterKey != nil
+                    && (openRouterAllowlist.contains(key)
+                        || openRouterAllowlist.contains(entry.model))
+            default:
+                return true
+            }
+        }
+
+        var visibleModels = embedded.models
+            .filter { !$0.hidden && $0.supportedInApi }
+            .map(\.model)
+        var seen = Set(visibleModels)
+        for (key, entry) in snapshot.pairs() {
+            guard entry.info.provider == .runinfra
+                || entry.info.provider == .gemini
+                || entry.info.provider == .openRouter,
+                !entry.info.hidden,
+                entry.info.supportedInApi,
+                entry.info.userSelectable,
+                seen.insert(key).inserted
+            else { continue }
+            visibleModels.append(key)
+        }
+
+        let resolvedDefault = resolveDefaultModel(
+            input: input,
+            catalog: snapshot,
+            hasXaiSession: false,
+            hasCodexSession: false,
+            environment: environment
+        )
+        let defaultModel: String
+        if seen.contains(resolvedDefault.catalogKey) {
+            defaultModel = resolvedDefault.catalogKey
+        } else if seen.contains(resolvedDefault.entry.model) {
+            defaultModel = resolvedDefault.entry.model
+        } else {
+            defaultModel = embedded.default
+        }
         switch options.action {
         case .default:
             if options.json {
-                writeJSON(DefaultModelOutput(model: catalog.default), streams: streams)
+                writeJSON(DefaultModelOutput(model: defaultModel), streams: streams)
             } else {
-                streams.out("\(catalog.default)\n")
+                streams.out("\(defaultModel)\n")
             }
         case .list:
             if options.json {
-                writeJSON(ModelsOutput(defaultModel: catalog.default, models: visibleModels), streams: streams)
+                writeJSON(ModelsOutput(defaultModel: defaultModel, models: visibleModels), streams: streams)
             } else {
-                streams.out("Default: \(catalog.default)\n")
+                streams.out("Default: \(defaultModel)\n")
                 for model in visibleModels {
                     streams.out("\(model)\n")
                 }
