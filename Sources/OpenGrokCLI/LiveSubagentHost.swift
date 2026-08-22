@@ -261,11 +261,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     /// type/description, live progress, terminal stats, and the in-session
     /// resume index.
     ///
-    /// `childCWD` / `worktreePath` are the same-process half of upstream's
-    /// `SubagentMeta.child_cwd` / `worktree_path` (handle_request.rs:830-832):
-    /// a resume reads them here before selecting the new child's cwd. They are
-    /// not durable across process restarts — that needs the meta.json path
-    /// upstream writes under the parent session's `subagents/<id>/`.
+    /// `childCWD` / `worktreePath` mirror upstream's `SubagentMeta` fields.
+    /// The private session metadata store restores these identities after a
+    /// process restart before the resumed child's working directory is chosen.
     struct Bookkeeping {
         var startedAt: Date
         var subagentType: String
@@ -852,8 +850,21 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                     "Cannot resume from subagent '\(resumeID)': it is still running. Wait for it to complete before resuming."
                 ))
             }
-            guard let source = bookkeeping[resumeID] else {
-                return .failure(.invalidCall(Self.resumeNotFoundMessage(resumeID)))
+            let source: Bookkeeping
+            if let cached = bookkeeping[resumeID] {
+                source = cached
+            } else {
+                do {
+                    guard let recovered = try durableResumeBookkeeping(id: resumeID) else {
+                        return .failure(.invalidCall(Self.resumeNotFoundMessage(resumeID)))
+                    }
+                    bookkeeping[resumeID] = recovered
+                    source = recovered
+                } catch {
+                    return .failure(.invalidCall(
+                        "Cannot resume from subagent '\(resumeID)': \(error)"
+                    ))
+                }
             }
             resumeSource = source
             do {
@@ -1083,6 +1094,11 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             shellChildProviderBindings[childID] = .unresolved
         }
         do {
+            try persistSubagentStart(
+                id: childID,
+                prompt: input.prompt,
+                resumedFrom: resumeID
+            )
             try await coordinator.spawn(request) { [weak self] in
                 guard let self else {
                     return OpenGrokChildResult(
@@ -1095,8 +1111,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 // Upsert/remove bracket the child so background, foreground,
                 // antigravity, and resume share one counting seam.
                 return await self.withActiveBackgroundWorkCounting(for: request) {
+                    let result: OpenGrokChildResult
                     if let antigravityModel {
-                        return await self.runAntigravityChild(
+                        result = await self.runAntigravityChild(
                             childID: childID,
                             prompt: input.prompt,
                             model: antigravityModel,
@@ -1105,16 +1122,28 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                             modelRoster: childAntigravityRoster,
                             conversationID: inheritedAntigravityConversationID
                         )
+                    } else {
+                        result = await self.runChild(
+                            childID: childID,
+                            prompt: input.prompt,
+                            definition: childDefinition,
+                            runtime: childRuntime,
+                            model: childModel,
+                            cwd: childCWD,
+                            resumeItems: inheritedItems
+                        )
                     }
-                    return await self.runChild(
-                        childID: childID,
-                        prompt: input.prompt,
-                        definition: childDefinition,
-                        runtime: childRuntime,
-                        model: childModel,
-                        cwd: childCWD,
-                        resumeItems: inheritedItems
-                    )
+                    do {
+                        try await self.persistSubagentCompletion(result)
+                    } catch {
+                        return OpenGrokChildResult(
+                            id: childID,
+                            success: false,
+                            error: "could not persist durable subagent completion: \(error)",
+                            durationMS: result.durationMS
+                        )
+                    }
+                    return result
                 }
             }
             if case .revoked? = shellChildProviderBindings[childID] {
@@ -1362,6 +1391,22 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             return providerRotationCancellation(childID: childID, startedAt: startedAt)
         }
         shellChildProviderBindings[childID] = .resolved(samplingRoute.provider)
+        if bookkeeping[childID] != nil {
+            do {
+                try durableSubagentMetadata.updateModelRoute(
+                    id: childID,
+                    model: model,
+                    provider: samplingRoute.provider
+                )
+            } catch {
+                return OpenGrokChildResult(
+                    id: childID,
+                    success: false,
+                    error: "child agent durable model route unavailable: \(error)",
+                    durationMS: Self.milliseconds(since: startedAt)
+                )
+            }
+        }
         // Live-loop registration brackets the whole run: a follow-up that
         // arrives after the final drain but before this defer runs is
         // accepted and never seen — the same window upstream has, where
