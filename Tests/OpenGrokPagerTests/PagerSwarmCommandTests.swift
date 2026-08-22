@@ -140,12 +140,12 @@ struct PagerSwarmCommandTests {
         let harness = try await SwarmCommandHarness.runSteering(
             orchestrationActive: false
         )
-        #expect(await harness.turnPrompts.contains("steer me"),
-                "the steered draft must run next after the preempt")
-        // By `/queue` time the draft has already drained out of the queue —
-        // the mid-turn listing is empty, the mirror of the orchestration
-        // case above.
-        #expect(await harness.queueListings.contains([]))
+        #expect(await harness.turnPrompts == ["long swarm turn", "steer me"],
+                "the steered draft must run immediately after the preempted turn")
+        // The replacement turn completes immediately, so shutdown may beat
+        // the optional `/queue` overlay. Its ordered start and the explicit
+        // send-now notice prove cancellation and dispatch without that race.
+        #expect(await harness.notices.contains("sending the queued prompt now"))
     }
 }
 
