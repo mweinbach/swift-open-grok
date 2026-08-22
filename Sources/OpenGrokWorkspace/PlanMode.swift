@@ -47,7 +47,7 @@ public struct PlanModeTracker: Sendable, Equatable {
 
     /// Canonical absolute plan-file path when resolvable.
     public func resolvedPlanFilePath() -> String {
-        if planFilePath.hasPrefix("/") {
+        if isAbsolutePath(planFilePath) {
             return normalizeLexically(planFilePath)
         }
         if let sessionDirectory {
@@ -60,8 +60,27 @@ public struct PlanModeTracker: Sendable, Equatable {
 
     /// Whether an edit path targets the session plan file (auto-approve candidate).
     public func shouldAutoApproveEdit(_ path: String) -> Bool {
-        guard isActive else { return false }
-        return pathsReferToSameFile(path, resolvedPlanFilePath())
+        guard isActive, !path.isEmpty, !path.contains("\0") else { return false }
+        let authorized = resolvedPlanFilePath()
+        let candidate: String
+
+        if isAbsolutePath(path) {
+            candidate = path
+        } else if isAbsolutePath(authorized) {
+            guard let sessionDirectory, isAbsolutePath(sessionDirectory) else { return false }
+            candidate = (sessionDirectory as NSString).appendingPathComponent(path)
+        } else {
+            candidate = path
+        }
+
+        guard pathsReferToSameFile(candidate, authorized) else { return false }
+        if let sessionDirectory, isAbsolutePath(sessionDirectory), isAbsolutePath(authorized) {
+            guard let rootIdentity = canonicalPlanFileIdentity(sessionDirectory),
+                  let planIdentity = canonicalPlanFileIdentity(authorized),
+                  containsPath(root: rootIdentity, candidate: planIdentity)
+            else { return false }
+        }
+        return true
     }
 }
 
@@ -98,21 +117,70 @@ public func planModeEditGate(
     }
 }
 
-/// Lexical same-file compare: basename + normalized parent.
+/// Exact canonical plan identity; relative and absolute spellings never mix.
 func pathsReferToSameFile(_ a: String, _ b: String) -> Bool {
-    let na = normalizeLexically(a)
-    let nb = normalizeLexically(b)
-    if na == nb { return true }
-    // Compare last two components (parent + file) for relative vs absolute mixes.
-    let aName = (na as NSString).lastPathComponent
-    let bName = (nb as NSString).lastPathComponent
-    guard aName == bName, !aName.isEmpty else { return false }
-    let aParent = normalizeLexically((na as NSString).deletingLastPathComponent)
-    let bParent = normalizeLexically((nb as NSString).deletingLastPathComponent)
-    if aParent == bParent { return true }
-    // Relative plan.md vs absolute …/plan.md: accept basename-only plan paths.
-    if !a.hasPrefix("/") || !b.hasPrefix("/") {
-        return aName == bName && (aName == "plan.md" || a.hasSuffix("/plan.md") || b.hasSuffix("/plan.md"))
+    guard !a.isEmpty, !b.isEmpty, !a.contains("\0"), !b.contains("\0") else {
+        return false
     }
-    return false
+    guard isAbsolutePath(a) == isAbsolutePath(b) else { return false }
+    if !isAbsolutePath(a) {
+        return planPathComparisonKey(normalizeLexically(a))
+            == planPathComparisonKey(normalizeLexically(b))
+    }
+    guard let first = canonicalPlanFileIdentity(a),
+          let second = canonicalPlanFileIdentity(b)
+    else { return false }
+    return first == second
+}
+
+private func canonicalPlanFileIdentity(_ path: String) -> String? {
+    guard isAbsolutePath(path), !path.contains("\0") else { return nil }
+    var ancestor = path
+    var missingComponents: [String] = []
+    var remainingSymlinkResolutions = 64
+
+    while !FileManager.default.fileExists(atPath: ancestor) {
+        if let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: ancestor) {
+            guard remainingSymlinkResolutions > 0 else { return nil }
+            remainingSymlinkResolutions -= 1
+            if isAbsolutePath(destination) {
+                ancestor = destination
+            } else {
+                let parent = (ancestor as NSString).deletingLastPathComponent
+                ancestor = (parent as NSString).appendingPathComponent(destination)
+            }
+            continue
+        }
+        let component = (ancestor as NSString).lastPathComponent
+        let parent = (ancestor as NSString).deletingLastPathComponent
+        guard !component.isEmpty, component != "..", parent != ancestor, !parent.isEmpty else {
+            return nil
+        }
+        if component != "." {
+            missingComponents.append(component)
+        }
+        ancestor = parent
+    }
+
+    #if os(Windows)
+    var canonical = canonicalizePath(ancestor)
+    #else
+    guard let resolved = try? resolveCanonicalPath(URL(fileURLWithPath: ancestor)) else {
+        return nil
+    }
+    var canonical = resolved.path
+    #endif
+
+    for component in missingComponents.reversed() {
+        canonical = (canonical as NSString).appendingPathComponent(component)
+    }
+    return planPathComparisonKey(normalizeLexically(canonical))
+}
+
+private func planPathComparisonKey(_ path: String) -> String {
+    #if os(Windows)
+    return path.replacingOccurrences(of: "\\", with: "/").lowercased()
+    #else
+    return path
+    #endif
 }
