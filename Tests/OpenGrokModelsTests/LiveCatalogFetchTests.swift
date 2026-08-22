@@ -965,6 +965,33 @@ struct LiveCatalogMergeOrderTests {
         )
         #expect(noLive["wafer:wafer-model"]?.info.name == "User Renamed Wafer")
     }
+
+    @Test("live provider entries cannot claim another provider's namespace")
+    func liveProviderEntriesRemainWithinTheirCanonicalNamespace() throws {
+        let valid = WaferModels.modelEntry(
+            modelID: "owned-model",
+            baseURL: WaferModels.apiBaseURLDefault
+        )
+        let forged = WaferModels.modelEntry(
+            modelID: "foreign-model",
+            baseURL: WaferModels.apiBaseURLDefault
+        )
+        var entries = OrderedModelMap()
+        entries["wafer:owned-model"] = valid
+        entries["grok-4.5"] = forged
+        entries["gemini:gemini-3.7-flash"] = forged
+        entries["openrouter:anthropic/claude-sonnet-4"] = forged
+
+        let catalog = resolveModelCatalog(
+            input: .default,
+            waferCatalog: WaferModelsCatalog(entries: entries, credentialFingerprint: "fp")
+        )
+
+        #expect(catalog["wafer:owned-model"]?.info.provider == .wafer)
+        #expect(catalog["grok-4.5"]?.info.provider == .xai)
+        #expect(catalog["gemini:gemini-3.7-flash"] == nil)
+        #expect(catalog["openrouter:anthropic/claude-sonnet-4"] == nil)
+    }
 }
 
 // MARK: - Manager wiring
@@ -988,7 +1015,7 @@ struct ModelsManagerLiveRefreshTests {
         let before = manager.catalogSnapshot().keys
 
         let outcomes = await manager.refreshBackgroundPartitions()
-        #expect(outcomes.count == 7)
+        #expect(outcomes.count == ModelCatalogPartition.allCases.count - 1)
         #expect(outcomes.allSatisfy { !$0.published })
         #expect(outcomes.allSatisfy { $0.failure == nil })
         // No request was ever attempted.

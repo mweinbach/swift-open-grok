@@ -408,8 +408,11 @@ private func replaceLiveProviderPartition(
     entries: OrderedModelMap
 ) {
     catalog.retain { _, entry in entry.info.provider != provider }
+    let ownedNamespace = "\(provider.rawValue):"
     for (key, entry) in entries.pairs() where entry.info.provider == provider {
-        guard catalog[key].map({ $0.info.provider == provider }) ?? true else {
+        // Initial config overlays may create an xAI fallback at this exact
+        // key; the authenticated provider still owns its canonical namespace.
+        guard key.hasPrefix(ownedNamespace) else {
             continue
         }
         catalog[key] = entry
