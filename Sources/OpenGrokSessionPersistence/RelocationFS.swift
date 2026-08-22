@@ -101,11 +101,9 @@ public enum RelocationFS: Sendable {
             throw RelocationError.io(operation: "syncDirectory.open", path: path, message: String(cString: strerror(err)))
         }
         defer { close(fd) }
-        #if os(macOS)
-        _ = fcntl(fd, F_FULLFSYNC)
-        #else
+        // Directory durability requires persisting metadata, not a stable-media
+        // file flush; F_FULLFSYNC remains reserved for file contents below.
         _ = fsync(fd)
-        #endif
         #endif
     }
 
