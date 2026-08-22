@@ -246,24 +246,40 @@ struct LiveSecurityContext: Sendable {
         let base = layers?.effectiveConfigBase() ?? .table(TOMLTable())
 
         let featureEnabled = folderTrustEnabled(document: base, environment: environment)
-        let store = PersistentFolderTrustStore(environment: environment)
+        let canonicalWorkspaceRoot = workspaceRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let keyRecordable = !isUnsafeTrustRoot(
+            canonicalWorkspaceRoot.path,
+            home: environment["HOME"]
+        )
+        var store = PersistentFolderTrustStore(environment: environment)
+        var explicitTrustPersisted = false
+        if cli.trustFolder, keyRecordable {
+            do {
+                try store.record(canonicalWorkspaceRoot, trusted: true)
+                explicitTrustPersisted = PersistentFolderTrustStore(environment: environment)
+                    .isTrusted(canonicalWorkspaceRoot)
+            } catch {
+                explicitTrustPersisted = false
+            }
+        }
         let outcome = decideFolderTrust(
             featureEnabled: featureEnabled,
             inputs: FolderTrustDecideInputs(
-                storeTrusted: store.isTrusted(workspaceRoot),
-                repoConfigsPresent: repoConfigsPresent(at: workspaceRoot),
+                storeTrusted: store.isTrusted(canonicalWorkspaceRoot),
+                repoConfigsPresent: repoConfigsPresent(at: canonicalWorkspaceRoot),
                 isInteractive: isInteractive,
-                keyRecordable: !isUnsafeTrustRoot(
-                    workspaceRoot.path,
-                    home: environment["HOME"]
-                )
+                keyRecordable: keyRecordable
             )
         )
         // `.prompt` is "not yet decided". Until the pager can raise a trust
         // sheet, an undecided folder is treated as untrusted — the failure mode
         // is a repo whose servers do not start, not one whose servers run.
-        // `--trust` is the explicit answer to that undecided case.
-        let projectTrusted = outcome == .trusted || cli.trustFolder
+        // An explicit CLI answer becomes authoritative only after it survives
+        // an independent disk reload; a failed write cannot create an ephemeral
+        // grant that silently disappears before the next process starts.
+        let projectTrusted = cli.trustFolder
+            ? explicitTrustPersisted
+            : outcome == .trusted
 
         // Passing `cwd: nil` for an untrusted folder is the whole gate: the
         // project chain is never discovered, so its MCP servers, hooks and
