@@ -697,7 +697,7 @@ public actor PromptCacheTracker {
         }
 
         var tools: [ToolSummary] = []
-        tools.reserveCapacity(request.tools.count)
+        tools.reserveCapacity(request.tools.count + request.hostedTools.count)
         for tool in request.tools {
             let descHash = tool.description.map(fnv1a64) ?? 0
             let paramsStr = (try? WireJSONEncoder.makeSorted().encode(tool.parameters))
@@ -708,6 +708,63 @@ public actor PromptCacheTracker {
                 totalBodyBytes += d.utf8.count
             }
             tools.push(ToolSummary(name: tool.name, descriptionHash: descHash, paramsHash: paramsHash))
+        }
+        for hosted in request.hostedTools {
+            let description: String?
+            let fingerprint: JSONValue
+            switch hosted {
+            case .webSearch(
+                let mode,
+                let allowedDomains,
+                let userLocation,
+                let searchContextSize,
+                let searchContentTypes
+            ):
+                description = nil
+                let location = userLocation.map { value in
+                    JSONValue.object([
+                        "country": value.country.map(JSONValue.string) ?? .null,
+                        "region": value.region.map(JSONValue.string) ?? .null,
+                        "city": value.city.map(JSONValue.string) ?? .null,
+                        "timezone": value.timezone.map(JSONValue.string) ?? .null,
+                    ])
+                } ?? .null
+                fingerprint = .object([
+                    "type": .string("web_search"),
+                    "mode": mode.map { .string(String(describing: $0)) } ?? .null,
+                    "allowed_domains": allowedDomains.map {
+                        .array($0.map(JSONValue.string))
+                    } ?? .null,
+                    "user_location": location,
+                    "search_context_size": searchContextSize.map {
+                        .string(String(describing: $0))
+                    } ?? .null,
+                    "search_content_types": searchContentTypes.map {
+                        .array($0.map(JSONValue.string))
+                    } ?? .null,
+                ])
+            case .xSearch:
+                description = nil
+                fingerprint = .object(["type": .string("x_search")])
+            case .clientCustom(let custom):
+                description = custom.description
+                fingerprint = .object([
+                    "type": .string("custom"),
+                    "name": .string(custom.name),
+                    "description": custom.description.map(JSONValue.string) ?? .null,
+                    "format": .string(custom.format.rawValue),
+                ])
+            }
+
+            let canonical = (try? WireJSONEncoder.makeSorted().encode(fingerprint))
+                .flatMap { String(data: $0, encoding: .utf8) }
+                ?? String(reflecting: hosted)
+            totalBodyBytes += canonical.utf8.count
+            tools.push(ToolSummary(
+                name: hosted.wireName,
+                descriptionHash: description.map(fnv1a64) ?? 0,
+                paramsHash: fnv1a64(canonical)
+            ))
         }
 
         var items: [ItemSummary] = []

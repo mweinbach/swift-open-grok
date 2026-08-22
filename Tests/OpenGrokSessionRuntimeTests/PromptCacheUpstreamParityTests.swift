@@ -1,6 +1,7 @@
 import Foundation
 import OpenGrokSamplingTypes
 @testable import OpenGrokSessionRuntime
+import OpenGrokShared
 import Testing
 
 @Suite("Upstream prompt cache accounting parity")
@@ -131,6 +132,166 @@ struct PromptCacheUpstreamParityTests {
         #expect(turn.diagnostic.contains("xai/grok-4.6"))
         #expect(turn.diagnostic.contains("provider cache expiry or eviction"))
         #expect(turn.diagnostic.contains("minutes"))
+    }
+
+    @Test("native Codex custom descriptions and grammar formats participate in cache fingerprints")
+    func nativeCustomToolChangesInvalidatePrefix() async {
+        let function = ToolSpec(
+            name: "read_file",
+            description: "Read a workspace file",
+            parameters: .object([:])
+        )
+        let original = ConversationRequest(
+            items: [.user("inspect the source")],
+            tools: [function],
+            hostedTools: [.clientCustom(CustomToolSpec(
+                name: "exec",
+                description: "Run tools.read_file",
+                format: .grammar
+            ))],
+            model: "gpt-codex"
+        )
+        let changedDescription = ConversationRequest(
+            items: original.items,
+            tools: [function],
+            hostedTools: [.clientCustom(CustomToolSpec(
+                name: "exec",
+                description: "Run tools.read_file and tools.apply_patch",
+                format: .grammar
+            ))],
+            model: "gpt-codex"
+        )
+        let changedFormat = ConversationRequest(
+            items: original.items,
+            tools: [function],
+            hostedTools: [.clientCustom(CustomToolSpec(
+                name: "exec",
+                description: "Run tools.read_file",
+                format: .string
+            ))],
+            model: "gpt-codex"
+        )
+
+        let originalSummary = PromptCacheTracker.summarizeRequest(original)
+        for modified in [changedDescription, changedFormat] {
+            let changedSummary = PromptCacheTracker.summarizeRequest(modified)
+            #expect(changedSummary.tools.count == 2)
+            #expect(changedSummary.tools[0] == originalSummary.tools[0])
+            #expect(changedSummary.tools[1] != originalSummary.tools[1])
+            guard case .toolsChanged = PromptCacheTracker.analyzePrefixDivergence(
+                previous: originalSummary,
+                current: changedSummary
+            ) else {
+                Issue.record("native custom-tool changes must invalidate the request prefix")
+                return
+            }
+        }
+
+        let tracker = PromptCacheTracker()
+        await tracker.recordTurn(request: original, promptTokens: 1_000, cachedTokens: 0)
+        let change = await tracker.recordTurn(
+            request: changedDescription,
+            promptTokens: 1_200,
+            cachedTokens: 0
+        )
+        #expect(change?.reason == .toolsChanged)
+        #expect(await tracker.summary().breaks == 1)
+    }
+
+    @Test("every provider-hosted web search option and hosted declaration changes its fingerprint")
+    func hostedSearchConfigurationInvalidatesPrefix() {
+        let function = ToolSpec(name: "read_file", description: nil, parameters: .object([:]))
+        let base = HostedTool.webSearch(
+            mode: .live,
+            allowedDomains: ["docs.x.ai", "arxiv.org"],
+            userLocation: WebSearchUserLocation(
+                country: "US",
+                region: "CA",
+                city: "San Francisco",
+                timezone: "America/Los_Angeles"
+            ),
+            searchContextSize: .medium,
+            searchContentTypes: ["text"]
+        )
+        let original = ConversationRequest(
+            items: [.user("search safely")],
+            tools: [function],
+            hostedTools: [base],
+            model: "grok-search"
+        )
+        let variants: [[HostedTool]] = [
+            [.webSearch(
+                mode: .live,
+                allowedDomains: ["example.org"],
+                userLocation: WebSearchUserLocation(
+                    country: "US", region: "CA", city: "San Francisco",
+                    timezone: "America/Los_Angeles"
+                ),
+                searchContextSize: .medium,
+                searchContentTypes: ["text"]
+            )],
+            [.webSearch(
+                mode: .cached,
+                allowedDomains: ["docs.x.ai", "arxiv.org"],
+                userLocation: WebSearchUserLocation(
+                    country: "US", region: "CA", city: "San Francisco",
+                    timezone: "America/Los_Angeles"
+                ),
+                searchContextSize: .medium,
+                searchContentTypes: ["text"]
+            )],
+            [.webSearch(
+                mode: .live,
+                allowedDomains: ["docs.x.ai", "arxiv.org"],
+                userLocation: WebSearchUserLocation(
+                    country: "CA", region: "CA", city: "San Francisco",
+                    timezone: "America/Los_Angeles"
+                ),
+                searchContextSize: .medium,
+                searchContentTypes: ["text"]
+            )],
+            [.webSearch(
+                mode: .live,
+                allowedDomains: ["docs.x.ai", "arxiv.org"],
+                userLocation: WebSearchUserLocation(
+                    country: "US", region: "CA", city: "San Francisco",
+                    timezone: "America/Los_Angeles"
+                ),
+                searchContextSize: .high,
+                searchContentTypes: ["text"]
+            )],
+            [.webSearch(
+                mode: .live,
+                allowedDomains: ["docs.x.ai", "arxiv.org"],
+                userLocation: WebSearchUserLocation(
+                    country: "US", region: "CA", city: "San Francisco",
+                    timezone: "America/Los_Angeles"
+                ),
+                searchContextSize: .medium,
+                searchContentTypes: ["text", "images"]
+            )],
+            [base, .xSearch],
+            [],
+        ]
+
+        let originalSummary = PromptCacheTracker.summarizeRequest(original)
+        for hosted in variants {
+            let modified = ConversationRequest(
+                items: original.items,
+                tools: [function],
+                hostedTools: hosted,
+                model: "grok-search"
+            )
+            let changed = PromptCacheTracker.summarizeRequest(modified)
+            #expect(changed.tools.first == originalSummary.tools.first)
+            guard case .toolsChanged = PromptCacheTracker.analyzePrefixDivergence(
+                previous: originalSummary,
+                current: changed
+            ) else {
+                Issue.record("hosted search option/declaration change incorrectly appeared intact")
+                return
+            }
+        }
     }
 
     @Test("legacy summaries decode safely without newly introduced upstream fields")
