@@ -112,9 +112,8 @@ struct ActiveSessionFileLock: Sendable {
                 detail: "active-session root is not an accessible directory"
             )
         }
-        if attributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) != 0
-            || (try PathSecurity.isSymlink(root))
-        {
+        let isSymlink = try PathSecurity.isSymlink(root)
+        if attributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) != 0 || isSymlink {
             throw FileUtilsError.symlinkEncountered(path: root.path)
         }
         #elseif canImport(Darwin) || canImport(Glibc)
