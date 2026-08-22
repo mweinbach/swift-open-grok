@@ -7,6 +7,7 @@
 // Isolation invariant: the raw `SQLiteConnection` never leaves this actor.
 // Public APIs are typed journal operations only.
 
+import Dispatch
 import Foundation
 import OpenGrokFileUtils
 
@@ -63,7 +64,7 @@ public actor SQLiteJournal {
         path: URL,
         migrations: [SchemaMigration] = SQLiteJournal.defaultMigrations,
         modeOverride: JournalMode? = nil,
-        busyRetryDeadline: ContinuousClock.Instant? = nil
+        busyRetryDeadline: DispatchTime? = nil
     ) throws {
         let validated = try Self.validateMigrationPlan(migrations)
         let mode = modeOverride ?? JournalMode.forDBPath(path)
@@ -95,7 +96,7 @@ public actor SQLiteJournal {
         readOnlyPath path: URL,
         modeOverride: JournalMode? = nil,
         supportedVersion: Int = SQLiteJournal.defaultSupportedSchemaVersion,
-        busyRetryDeadline: ContinuousClock.Instant? = nil
+        busyRetryDeadline: DispatchTime? = nil
     ) throws {
         let mode = modeOverride ?? JournalMode.forDBPath(path)
         let effective = mode.effectiveDBPath(path)
@@ -325,8 +326,8 @@ extension JournalMode {
     func openReadonly(_ dbPath: URL) throws -> SQLiteConnection {
         try openReadonly(
             dbPath,
-            until: ContinuousClock.now.advanced(
-                by: .milliseconds(Int64(Self.busyRetryBudgetMilliseconds))
+            until: SQLiteConnection.retryDeadline(
+                afterMilliseconds: Self.busyRetryBudgetMilliseconds
             )
         )
     }
@@ -334,7 +335,7 @@ extension JournalMode {
     /// Open read-only while sharing the caller's existing retry deadline.
     func openReadonly(
         _ dbPath: URL,
-        until deadline: ContinuousClock.Instant
+        until deadline: DispatchTime
     ) throws -> SQLiteConnection {
         let effective = effectiveDBPath(dbPath)
         guard FileManager.default.fileExists(atPath: effective.path) else {

@@ -4,6 +4,7 @@
 // the raw handle must never escape `SQLiteJournal` isolation. System SQLite
 // is used on Apple platforms and Linux when available.
 
+import Dispatch
 import Foundation
 
 #if canImport(SQLite3)
@@ -59,7 +60,7 @@ final class SQLiteConnection {
         path: URL,
         mode: JournalMode,
         readOnly: Bool,
-        deadline: ContinuousClock.Instant? = nil
+        deadline: DispatchTime? = nil
     ) throws {
         self.path = path
         self.mode = mode
@@ -68,8 +69,8 @@ final class SQLiteConnection {
         if Task.isCancelled {
             throw SQLiteJournalError.cancelled
         }
-        let retryDeadline = deadline ?? ContinuousClock.now.advanced(
-            by: .milliseconds(Int64(JournalMode.busyRetryBudgetMilliseconds))
+        let retryDeadline = deadline ?? Self.retryDeadline(
+            afterMilliseconds: JournalMode.busyRetryBudgetMilliseconds
         )
         var flags: Int32 = SQLITE_OPEN_NOMUTEX
         if readOnly {
@@ -150,19 +151,30 @@ final class SQLiteConnection {
         #endif
     }
 
-    func applyJournalModeWithRetry(until deadline: ContinuousClock.Instant) throws {
+    static func retryDeadline(
+        afterMilliseconds milliseconds: Int32,
+        from start: DispatchTime = .now()
+    ) -> DispatchTime {
+        let interval = UInt64(max(milliseconds, 0)) * 1_000_000
+        let (deadline, overflow) = start.uptimeNanoseconds.addingReportingOverflow(interval)
+        return overflow ? .distantFuture : DispatchTime(uptimeNanoseconds: deadline)
+    }
+
+    func applyJournalModeWithRetry(until deadline: DispatchTime) throws {
         try applyJournalModeWithRetry(until: deadline) {
             try self.applyJournalMode()
         }
     }
 
     func applyJournalModeWithRetry(
-        until deadline: ContinuousClock.Instant,
+        until deadline: DispatchTime,
         operation: () throws -> Void
     ) throws {
         #if canImport(SQLite3)
-        let started = ContinuousClock.now
-        let retryPause = Duration.milliseconds(Int64(JournalMode.busyRetryPauseMilliseconds))
+        let started = DispatchTime.now().uptimeNanoseconds
+        let retryPause = UInt64(JournalMode.busyRetryPauseMilliseconds) * 1_000_000
+        let maxAttempt = UInt64(JournalMode.maxBusyAttemptMilliseconds) * 1_000_000
+        let deadlineNanoseconds = deadline.uptimeNanoseconds
 
         do {
             while true {
@@ -170,25 +182,19 @@ final class SQLiteConnection {
                     throw SQLiteJournalError.cancelled
                 }
 
-                let remaining = max(.zero, ContinuousClock.now.duration(to: deadline))
-                let bounded = min(
-                    max(remaining, retryPause),
-                    .milliseconds(Int64(JournalMode.maxBusyAttemptMilliseconds))
-                )
-                let components = bounded.components
-                let timeout = Int32(
-                    components.seconds * 1_000
-                        + components.attoseconds / 1_000_000_000_000_000
-                )
+                let now = DispatchTime.now().uptimeNanoseconds
+                let remaining = deadlineNanoseconds > now ? deadlineNanoseconds - now : 0
+                let bounded = min(max(remaining, retryPause), maxAttempt)
+                let timeout = Int32(bounded / 1_000_000)
                 try setBusyTimeout(timeout)
 
                 do {
                     try operation()
                     break
                 } catch {
-                    if !isRetryableBusy(error)
-                        || ContinuousClock.now.advanced(by: retryPause) >= deadline
-                    {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    let remaining = deadlineNanoseconds > now ? deadlineNanoseconds - now : 0
+                    if !isRetryableBusy(error) || remaining <= retryPause {
                         throw journalModeFailure(error, started: started)
                     }
                     if Task.isCancelled {
@@ -229,11 +235,10 @@ final class SQLiteConnection {
 
     private func journalModeFailure(
         _ error: any Error,
-        started: ContinuousClock.Instant
+        started: UInt64
     ) -> any Error {
-        let elapsed = started.duration(to: ContinuousClock.now).components
-        let elapsedMilliseconds = elapsed.seconds * 1_000
-            + elapsed.attoseconds / 1_000_000_000_000_000
+        let now = DispatchTime.now().uptimeNanoseconds
+        let elapsedMilliseconds = now >= started ? (now - started) / 1_000_000 : 0
         let detail = "failed to set journal mode \(mode.pragmaValue) "
             + "after \(elapsedMilliseconds)ms: \(error)"
 

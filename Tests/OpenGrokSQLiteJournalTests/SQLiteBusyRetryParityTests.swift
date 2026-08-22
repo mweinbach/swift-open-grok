@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import Testing
 @testable import OpenGrokSQLiteJournal
@@ -18,7 +19,7 @@ struct SQLiteBusyRetryParityTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let connection = try JournalMode.wal.open(directory.appendingPathComponent("retry.sqlite"))
         defer { connection.close() }
-        let deadline = ContinuousClock.now.advanced(by: .milliseconds(500))
+        let deadline = DispatchTime.now() + .milliseconds(500)
         var attempts = 0
         var attemptTimeouts: [Int64] = []
 
@@ -57,11 +58,11 @@ struct SQLiteBusyRetryParityTests {
         var exhaustedBudgetTimeout: Int64?
 
         try connection.applyJournalModeWithRetry(
-            until: ContinuousClock.now.advanced(by: .seconds(10))
+            until: .now() + .seconds(10)
         ) {
             longBudgetTimeout = try connection.queryInt64("PRAGMA busy_timeout")
         }
-        try connection.applyJournalModeWithRetry(until: ContinuousClock.now) {
+        try connection.applyJournalModeWithRetry(until: .now()) {
             exhaustedBudgetTimeout = try connection.queryInt64("PRAGMA busy_timeout")
         }
 
@@ -76,8 +77,8 @@ struct SQLiteBusyRetryParityTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let connection = try JournalMode.wal.open(directory.appendingPathComponent("timeout.sqlite"))
         defer { connection.close() }
-        let started = ContinuousClock.now
-        let deadline = started.advanced(by: .milliseconds(110))
+        let started = DispatchTime.now()
+        let deadline = started + .milliseconds(110)
         var attempts = 0
 
         do {
@@ -91,10 +92,10 @@ struct SQLiteBusyRetryParityTests {
             #expect(message.contains("peer retained an exclusive lock"))
         }
 
-        let elapsed = started.duration(to: ContinuousClock.now)
+        let elapsed = elapsedNanoseconds(since: started)
         #expect(attempts >= 2)
-        #expect(elapsed >= .milliseconds(40))
-        #expect(elapsed < .seconds(1))
+        #expect(elapsed >= 40_000_000)
+        #expect(elapsed < 1_000_000_000)
         #expect(try connection.queryInt64("PRAGMA busy_timeout") == 5_000)
     }
 
@@ -108,7 +109,7 @@ struct SQLiteBusyRetryParityTests {
 
         do {
             try connection.applyJournalModeWithRetry(
-                until: ContinuousClock.now.advanced(by: .seconds(10))
+                until: .now() + .seconds(10)
             ) {
                 attempts += 1
                 throw SQLiteJournalError.corrupt("malformed database page")
@@ -131,17 +132,17 @@ struct SQLiteBusyRetryParityTests {
         try await holder.acquire(at: path)
 
         let release = Task {
-            try await Task.sleep(for: .milliseconds(150))
+            try await Task.sleep(nanoseconds: 150_000_000)
             await holder.release()
         }
-        let started = ContinuousClock.now
+        let started = DispatchTime.now()
         let connection = try SQLiteConnection(
             path: path,
             mode: .wal,
             readOnly: false,
-            deadline: started.advanced(by: .seconds(2))
+            deadline: started + .seconds(2)
         )
-        #expect(started.duration(to: ContinuousClock.now) >= .milliseconds(80))
+        #expect(elapsedNanoseconds(since: started) >= 80_000_000)
         #expect(try connection.journalMode() == "wal")
         #expect(try connection.queryInt64("PRAGMA busy_timeout") == 5_000)
         #expect(try connection.queryInt64("SELECT count(*) FROM contention_holder") == 1)
@@ -157,8 +158,8 @@ struct SQLiteBusyRetryParityTests {
         let effective = JournalMode.truncate.effectiveDBPath(logical)
         let holder = SQLiteExclusiveLockHolder()
         try await holder.acquire(at: effective)
-        let started = ContinuousClock.now
-        let deadline = started.advanced(by: .milliseconds(140))
+        let started = DispatchTime.now()
+        let deadline = started + .milliseconds(140)
 
         do {
             let connection = try JournalMode.truncate.openReadonly(logical, until: deadline)
@@ -171,7 +172,7 @@ struct SQLiteBusyRetryParityTests {
             #expect(message.contains("TRUNCATE"))
         }
 
-        #expect(started.duration(to: ContinuousClock.now) < .seconds(1))
+        #expect(elapsedNanoseconds(since: started) < 1_000_000_000)
         await holder.release()
 
         let reopened = try JournalMode.truncate.openReadonly(logical)
@@ -213,6 +214,11 @@ struct SQLiteBusyRetryParityTests {
         )
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
+    }
+
+    private func elapsedNanoseconds(since started: DispatchTime) -> UInt64 {
+        let now = DispatchTime.now().uptimeNanoseconds
+        return now >= started.uptimeNanoseconds ? now - started.uptimeNanoseconds : 0
     }
 }
 
