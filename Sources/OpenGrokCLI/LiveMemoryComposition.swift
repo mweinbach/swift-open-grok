@@ -593,9 +593,13 @@ actor LiveMemoryBackend {
             throw LiveMemoryLifecycleError.indexUnavailable(path.path)
         }
         let result = try index.reindexFile(path: path, source: storage.classifySource(path))
-        guard result.added > 0 || result.updated > 0
-            || (try index.allIndexedPaths()).contains(path.path)
-        else {
+        let alreadyIndexed: Bool
+        if result.added > 0 || result.updated > 0 {
+            alreadyIndexed = true
+        } else {
+            alreadyIndexed = try index.allIndexedPaths().contains(path.path)
+        }
+        guard alreadyIndexed else {
             throw LiveMemoryLifecycleError.summaryWasNotIndexed(path.path)
         }
         previousFlushContent = content
@@ -625,9 +629,13 @@ actor LiveMemoryBackend {
             throw LiveMemoryLifecycleError.indexUnavailable(path.path)
         }
         let result = try index.reindexFile(path: path, source: storage.classifySource(path))
-        guard result.added > 0 || result.updated > 0
-            || (try index.allIndexedPaths()).contains(path.path)
-        else {
+        let alreadyIndexed: Bool
+        if result.added > 0 || result.updated > 0 {
+            alreadyIndexed = true
+        } else {
+            alreadyIndexed = try index.allIndexedPaths().contains(path.path)
+        }
+        guard alreadyIndexed else {
             throw LiveMemoryLifecycleError.summaryWasNotIndexed(path.path)
         }
         completedSessionPaths[sessionID] = path.path

@@ -19,7 +19,8 @@ private actor CredentialRotationProbe {
         if released.contains(key) { return }
 
         try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, any Error>) in
                 if cancelled.contains(key) {
                     continuation.resume(throwing: CancellationError())
                 } else if released.contains(key) {

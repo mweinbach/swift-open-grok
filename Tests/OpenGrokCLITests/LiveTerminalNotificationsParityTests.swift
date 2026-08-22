@@ -261,7 +261,9 @@ struct LiveTerminalNotificationsParityTests {
 
     @Test("automatic protocol selection matches every upstream terminal family")
     func automaticProtocolSelection() {
-        let expected: [(TerminalName, LiveTerminalNotifications.Protocol)] = [
+        let expected: [
+            (OpenGrokDiagnostics.TerminalName, LiveTerminalNotifications.NotificationProtocol)
+        ] = [
             (.iterm2, .osc9),
             (.wezTerm, .osc9),
             (.warpTerminal, .osc9),

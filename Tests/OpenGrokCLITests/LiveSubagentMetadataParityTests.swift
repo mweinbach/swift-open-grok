@@ -117,11 +117,11 @@ struct LiveSubagentMetadataParityTests {
                 parentSessionID: "durable-parent",
                 parentWorkingDirectory: fixture.workspace
             )
-            let source = try #require(recoveredStore.resumeSource(id: id))
+            let source = try #require(try recoveredStore.resumeSource(id: id))
             #expect(source.childSessionID == id)
             #expect(source.persona == "careful")
             #expect(source.modelRoute?.provider == "xai")
-            let persisted = try #require(recoveredStore.load(id: id))
+            let persisted = try #require(try recoveredStore.load(id: id))
             #expect(persisted.status == status)
             #expect(persisted.durationMS == 123)
             #expect(persisted.toolCalls == 4)
@@ -234,7 +234,7 @@ struct LiveSubagentMetadataParityTests {
             parentSessionID: "durable-parent",
             parentWorkingDirectory: fixture.workspace
         )
-        let resumed = try #require(restarted.resumeSource(id: "isolated-child"))
+        let resumed = try #require(try restarted.resumeSource(id: "isolated-child"))
         #expect(resumed.worktreePath == worktree.path.resolvingSymlinksInPath())
         #expect(try String(
             contentsOf: worktree.path.appendingPathComponent("child.txt"),

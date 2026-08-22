@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import OpenGrokShared
 
@@ -13,11 +14,10 @@ public actor SessionEventTracker {
 
     private struct ActiveTool: Sendable {
         let name: String
-        let startedAt: ContinuousClock.Instant
+        let startedAt: DispatchTime
         let source: SessionEventToolSource
     }
 
-    private let clock = ContinuousClock()
     private var nextTurnNumber: UInt64
     private var nextLoopIndex: UInt32 = 0
     private var tokenSeenInRound = false
@@ -106,7 +106,7 @@ public actor SessionEventTracker {
     ) -> Bool {
         guard turnIsActive, activeTools[callID] == nil else { return false }
         guard activeTools.count < Self.maximumActiveTools else { return false }
-        activeTools[callID] = ActiveTool(name: name, startedAt: clock.now, source: source)
+        activeTools[callID] = ActiveTool(name: name, startedAt: .now(), source: source)
         let phaseWritten = changePhase(.toolExecution)
         return log.emit(.toolStarted(toolName: name)) && phaseWritten
     }
@@ -190,17 +190,10 @@ public actor SessionEventTracker {
         active: ActiveTool,
         outcome: SessionEventToolOutcome
     ) -> Bool {
-        let duration = active.startedAt.duration(to: clock.now).components
-        let seconds = UInt64(max(0, duration.seconds))
-        let milliseconds = seconds.multipliedReportingOverflow(by: 1_000)
-        let submilliseconds = UInt64(max(0, duration.attoseconds / 1_000_000_000_000_000))
-        let total: UInt64
-        if milliseconds.overflow {
-            total = .max
-        } else {
-            let sum = milliseconds.partialValue.addingReportingOverflow(submilliseconds)
-            total = sum.overflow ? .max : sum.partialValue
-        }
+        let now = DispatchTime.now().uptimeNanoseconds
+        let startedAt = active.startedAt.uptimeNanoseconds
+        let elapsedNanoseconds = now >= startedAt ? now - startedAt : 0
+        let total = elapsedNanoseconds / 1_000_000
         return log.emit(.toolCompleted(
             toolName: active.name,
             durationMilliseconds: total,

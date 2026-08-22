@@ -2,6 +2,7 @@ import Foundation
 import OpenGrokAgentDefinitions
 import OpenGrokConfig
 import OpenGrokHTTP
+import OpenGrokSampler
 import OpenGrokSamplingTypes
 import OpenGrokShared
 import OpenGrokShellBase

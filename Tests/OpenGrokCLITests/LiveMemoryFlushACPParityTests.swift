@@ -254,7 +254,7 @@ struct LiveMemoryFlushACPParityTests {
             Issue.record("real ACP memory rewrite did not succeed")
             return
         }
-        #expect(rewrittenResult["rewritten"]?.stringValue.contains("phosphorescent") == true)
+        #expect(rewrittenResult["rewritten"]?.stringValue?.contains("phosphorescent") == true)
         let requests = await fixture.probe.requests
         #expect(requests.count == 2)
         #expect(requests[1].prompt.contains("workspace architecture"))

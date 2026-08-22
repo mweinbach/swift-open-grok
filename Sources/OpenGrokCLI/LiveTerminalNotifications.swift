@@ -211,7 +211,7 @@ struct LiveTerminalNotificationConfiguration: Sendable, Equatable {
 }
 
 struct LiveTerminalNotifications: Sendable {
-    enum Protocol: String, Sendable, Equatable {
+    enum NotificationProtocol: String, Sendable, Equatable {
         case osc9
         case osc99
         case osc777
@@ -221,7 +221,7 @@ struct LiveTerminalNotifications: Sendable {
 
     let configuration: LiveTerminalNotificationConfiguration
     let terminalContext: TerminalContext
-    let notificationProtocol: Protocol
+    let notificationProtocol: NotificationProtocol
     var sleepInhibition: LiveSleepInhibition
 
     private(set) var focused = true
@@ -253,7 +253,7 @@ struct LiveTerminalNotifications: Sendable {
     static func resolveProtocol(
         method: LiveTerminalNotificationConfiguration.Method,
         context: TerminalContext
-    ) -> Protocol {
+    ) -> NotificationProtocol {
         switch method {
         case .osc9: return .osc9
         case .osc99: return .osc99
