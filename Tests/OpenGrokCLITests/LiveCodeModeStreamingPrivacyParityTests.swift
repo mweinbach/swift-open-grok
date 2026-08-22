@@ -3,6 +3,7 @@ import Foundation
 import OpenGrokCodeModeProtocol
 import OpenGrokHTTP
 import OpenGrokPager
+import OpenGrokPagerMinimal
 import OpenGrokPagerRender
 import OpenGrokSamplingTypes
 import OpenGrokShared
@@ -157,10 +158,10 @@ struct LiveCodeModeStreamingPrivacyParityTests {
             codeModeActive: true
         )
         await renderer.apply(.toolCallDelta(
-            0,
-            "outer-exec",
-            "exec",
-            "tools.search_files({token:'never-visible'})"
+            toolIndex: 0,
+            id: "outer-exec",
+            name: "exec",
+            argumentsDelta: "tools.search_files({token:'never-visible'})"
         ))
 
         let activity = await renderer.turnActivity
