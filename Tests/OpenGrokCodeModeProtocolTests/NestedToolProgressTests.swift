@@ -6,7 +6,7 @@ import Testing
 
 @Suite("Nested Code Mode tool progress protocol")
 struct NestedToolProgressProtocolTests {
-    @Test("progress chunks preserve structured payloads and explicit JSON null")
+    @Test("progress chunks preserve structured payloads and omit absent payloads")
     func progressWireShape() throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -24,7 +24,7 @@ struct NestedToolProgressProtocolTests {
 
         let plain = NestedToolProgress.text("plain")
         let plainJSON = try #require(String(data: try encoder.encode(plain), encoding: .utf8))
-        #expect(plainJSON == #"{"payload":null,"text":"plain"}"#)
+        #expect(plainJSON == #"{"text":"plain"}"#)
         #expect(try JSONDecoder().decode(NestedToolProgress.self, from: Data(#"{"text":"plain"}"#.utf8)) == plain)
     }
 
@@ -88,6 +88,30 @@ struct NestedToolProgressProtocolTests {
         #expect(sink.isClosed)
     }
 
+    @Test("closing the producer preserves queued chunks and invalidates retained references")
+    func producerCloseInvalidatesRetainedHandles() async {
+        let (sink, receiver) = nestedToolProgressChannel()
+        let retained = sink
+        sink.push(.text("queued"))
+        sink.close()
+        retained.push(.text("late"))
+
+        #expect(retained.isClosed)
+        #expect(await receiver.receive() == .text("queued"))
+        #expect(await receiver.receive() == nil)
+    }
+
+    @Test("closing the producer wakes an already-suspended receiver")
+    func producerCloseWakesWaitingReceiver() async {
+        let (sink, receiver) = nestedToolProgressChannel()
+        let waiting = Task { await receiver.receive() }
+        await Task.yield()
+        sink.close()
+
+        #expect(await waiting.value == nil)
+        #expect(receiver.isClosed)
+    }
+
     @Test("dropping the receiver closes every retained producer")
     func droppingReceiverClosesProducer() {
         var retainedSink: NestedToolProgressSink?
@@ -143,6 +167,7 @@ struct NestedToolProgressProtocolTests {
         )
 
         #expect(description.contains("onProgress(handler)"))
+        #expect(description.contains("Early chunks are buffered until a handler is registered."))
         #expect(description.contains("oldest queued chunks are dropped"))
         #expect(description.contains("Defaults to 30000 ms."))
     }

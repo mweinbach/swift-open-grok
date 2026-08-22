@@ -550,9 +550,6 @@ private func applyGlobalScalarDefaults(
         if entry.info.inferenceIdleTimeoutSecs == nil, let v = models.inferenceIdleTimeoutSecs {
             entry.info.inferenceIdleTimeoutSecs = v
         }
-        if entry.info.streamToolCalls == nil, let v = models.streamToolCalls {
-            entry.info.streamToolCalls = v
-        }
         resolved[key] = entry
     }
 }

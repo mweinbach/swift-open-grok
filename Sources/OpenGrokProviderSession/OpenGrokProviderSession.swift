@@ -2,9 +2,43 @@ import Foundation
 import OpenGrokAuth
 import OpenGrokChatState
 import OpenGrokCompaction
+import OpenGrokConfig
+import OpenGrokConfigTypes
 import OpenGrokModels
 import OpenGrokSampler
 import OpenGrokSamplingTypes
+
+/// Resolve the live preference without turning a global setting into a
+/// per-model override. Invalid environment values fall through to disk.
+public func resolveStreamToolCallsPreference(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> Bool {
+    if let raw = environment["GROK_STREAM_TOOL_CALLS"]?.trimmingCharacters(
+        in: .whitespacesAndNewlines
+    ).lowercased() {
+        switch raw {
+        case "1", "true", "on", "yes":
+            return true
+        case "0", "false", "off", "no":
+            return false
+        default:
+            break
+        }
+    }
+
+    guard environment["OPENGROK_HOME"] != nil
+        || environment["HOME"] != nil
+        || environment["USERPROFILE"] != nil
+    else {
+        return true
+    }
+    guard let document = try? loadEffectiveConfigDiskOnly(environment: environment) else {
+        return true
+    }
+    return document[path: ["ui", "stream_tool_calls"]]?.boolValue
+        ?? document[path: ["models", "stream_tool_calls"]]?.boolValue
+        ?? true
+}
 
 public enum ProviderSessionError: Error, Sendable, Equatable, CustomStringConvertible {
     case invalidSessionID(String)
@@ -543,7 +577,9 @@ public actor ProviderSession {
         self.auxiliaryModelIDs = configuration.auxiliaryModelIDs
         self.toolRequest = configuration.toolRequest
         self.retryPolicy = configuration.retryPolicy
-        self.environment = configuration.environment
+        var sessionEnvironment = configuration.environment
+        sessionEnvironment["OPENGROK_HOME"] = configuration.openGrokHome.path
+        self.environment = sessionEnvironment
         let persistedBoundary = configuration.everUsedNonXAI ?? true
         let initial = try ProviderSession.resolveRoute(
             candidates: [configuration.initialModelID] + configuration.fallbackModelIDs,
@@ -551,7 +587,7 @@ public actor ProviderSession {
             credentialBindings: configuration.credentialBindings,
             toolRequest: configuration.toolRequest,
             retryPolicy: configuration.retryPolicy,
-            environment: configuration.environment,
+            environment: sessionEnvironment,
             everUsedNonXAI: persistedBoundary
         )
         self.route = initial.route
@@ -1006,7 +1042,11 @@ public actor ProviderSession {
             extraHeaders: info.extraHeaders.map { (name: $0.0, value: $0.1) },
             contextWindow: info.contextWindow,
             maxRetries: info.maxRetries ?? retryPolicy.maxRetries,
-            streamToolCalls: info.streamToolCalls ?? false,
+            streamToolCalls: shouldInjectStreamToolCalls(
+                info.streamToolCalls ?? resolveStreamToolCallsPreference(environment: environment),
+                provider: info.provider,
+                backend: info.apiBackend
+            ),
             idleTimeoutSecs: info.inferenceIdleTimeoutSecs,
             reasoningEffort: info.reasoningEffort,
             supportsBackendSearch: info.supportsBackendSearch,

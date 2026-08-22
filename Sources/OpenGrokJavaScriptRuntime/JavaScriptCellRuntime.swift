@@ -417,6 +417,7 @@ private final class JavaScriptCellEngine {
     private(set) var storedValueWrites: [String: JSONValue] = [:]
     private var pendingToolCalls: [String: (resolve: JSValue, reject: JSValue)] = [:]
     private var pendingProgressCallbacks: [String: JSValue] = [:]
+    private var pendingProgressChunks: [String: [NestedToolProgress]] = [:]
     private var pendingTimeouts: [UInt64: JSValue] = [:]
     private var nextToolCallId: UInt64 = 1
     private var nextTimeoutId: UInt64 = 1
@@ -608,6 +609,7 @@ private final class JavaScriptCellEngine {
     func releasePendingCallbacks() {
         pendingToolCalls.removeAll()
         pendingProgressCallbacks.removeAll()
+        pendingProgressChunks.removeAll()
         pendingTimeouts.removeAll()
     }
 
@@ -666,6 +668,10 @@ private final class JavaScriptCellEngine {
         }
         guard pendingToolCalls[callID] != nil else { return }
         pendingProgressCallbacks[callID] = handler
+        let buffered = pendingProgressChunks.removeValue(forKey: callID) ?? []
+        for progress in buffered {
+            deliverToolProgress(id: callID, progress: progress)
+        }
     }
 
     /// Delivers on the JavaScript thread only while the invocation remains
@@ -673,14 +679,23 @@ private final class JavaScriptCellEngine {
     func deliverToolProgress(id: String, progress: NestedToolProgress) {
         guard pendingToolCalls[id] != nil else {
             pendingProgressCallbacks.removeValue(forKey: id)
+            pendingProgressChunks.removeValue(forKey: id)
             return
         }
-        guard let callback = pendingProgressCallbacks[id],
-              let argument = jsValue(from: .object([
-                "text": .string(progress.text),
-                "payload": progress.payload ?? .null,
-              ]))
-        else { return }
+        guard let callback = pendingProgressCallbacks[id] else {
+            var buffered = pendingProgressChunks[id] ?? []
+            if buffered.count >= NESTED_TOOL_PROGRESS_CAPACITY {
+                buffered.removeFirst()
+            }
+            buffered.append(progress)
+            pendingProgressChunks[id] = buffered
+            return
+        }
+        var value: [String: JSONValue] = ["text": .string(progress.text)]
+        if let payload = progress.payload {
+            value["payload"] = payload
+        }
+        guard let argument = jsValue(from: .object(value)) else { return }
         watchdog?.armForEntry()
         callback.call(withArguments: [argument])
         if takeExceptionText() != nil {
@@ -695,6 +710,7 @@ private final class JavaScriptCellEngine {
             return "unknown tool call `\(id)`"
         }
         pendingProgressCallbacks.removeValue(forKey: id)
+        pendingProgressChunks.removeValue(forKey: id)
         switch result {
         case .success(let value):
             guard let bridged = jsValue(from: value) else {

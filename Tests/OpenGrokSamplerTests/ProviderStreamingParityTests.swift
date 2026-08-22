@@ -170,14 +170,17 @@ struct ProviderStreamingParityTests {
         #expect(response.usage?.reasoningTokens == 77)
     }
 
-    @Test("later Chat call index finalizes the earlier call before the next delta")
-    func chatCompletesPriorCallAtNextIndex() async {
+    @Test("parallel Chat call fragments can interleave until the terminal finish reason")
+    func chatKeepsInterleavedArgumentsOpenUntilFinish() async {
         let events = await chatEvents([
             chatChunk(delta: ChatChunkDelta(toolCalls: [
-                ToolCallDelta(index: 0, id: "call_a", function: ToolCallFunctionDelta(name: "first", arguments: "{}")),
+                ToolCallDelta(index: 0, id: "call_a", function: ToolCallFunctionDelta(name: "first", arguments: #"{"path":"#)),
             ])),
             chatChunk(delta: ChatChunkDelta(toolCalls: [
                 ToolCallDelta(index: 1, id: "call_b", function: ToolCallFunctionDelta(name: "second", arguments: "{}")),
+            ])),
+            chatChunk(delta: ChatChunkDelta(toolCalls: [
+                ToolCallDelta(index: 0, function: ToolCallFunctionDelta(arguments: #""a.swift"}"#)),
             ])),
             chatChunk(delta: ChatChunkDelta(), finishReason: .toolCalls),
         ])
@@ -193,12 +196,13 @@ struct ProviderStreamingParityTests {
         }
         #expect(firstCompletion != nil)
         #expect(secondDelta != nil)
-        #expect(firstCompletion! < secondDelta!)
+        #expect(firstCompletion! > secondDelta!)
         guard case .completed(_, let response, _) = events.last else {
             Issue.record("expected completed response")
             return
         }
         #expect(response.toolCalls().count == 2)
+        #expect(response.toolCalls().first?.arguments == #"{"path":"a.swift"}"#)
     }
 
     @Test("Chat stream ending without finish reason finalizes each started call once")
@@ -220,6 +224,31 @@ struct ProviderStreamingParityTests {
             return
         }
         #expect(response.toolCalls().first?.arguments == #"{"x":1}"#)
+    }
+
+    @Test("Interrupted Chat streams never finalize incomplete parallel calls")
+    func interruptedChatNeverCompletesTools() async {
+        let first = chatChunk(delta: ChatChunkDelta(toolCalls: [
+            ToolCallDelta(index: 0, id: "call_a", function: ToolCallFunctionDelta(
+                name: "first", arguments: #"{"path":"#
+            )),
+        ]))
+        let events = await collect(streamChatCompletions(
+            rawStream: makeResultStream([
+                .success(first),
+                .failure(.streamError(errorType: "transport", message: "interrupted")),
+            ]),
+            modelMetadata: nil,
+            requestId: RequestId("interrupted-chat"),
+            idleTimeout: .seconds(60)
+        ))
+
+        #expect(completions(events).isEmpty)
+        if case .failed = events.last {
+            #expect(Bool(true))
+        } else {
+            Issue.record("interrupted stream must fail instead of completing")
+        }
     }
 
     @Test("Messages tool block stop emits one completion before the canonical response")
@@ -255,6 +284,79 @@ struct ProviderStreamingParityTests {
             return
         }
         #expect(response.toolCalls().first?.arguments == #"{"path":"a"}"#)
+    }
+
+    @Test("Messages preserves nonempty tool input provided in the initial block")
+    func messagesPreservesInitialToolInput() async {
+        let events = await collect(streamMessages(
+            rawStream: makeResultStream([
+                .success(.contentBlockStart(index: 2, contentBlock: .toolUse(
+                    id: "tool_1",
+                    name: "read_file",
+                    input: .object(["value": .number(.int64(7))])
+                ))),
+                .success(.contentBlockStop(index: 2)),
+                .success(.messageStop),
+            ]),
+            modelMetadata: nil,
+            requestId: RequestId("messages-initial-input"),
+            idleTimeout: .seconds(60)
+        ))
+
+        #expect(argumentDeltas(events, index: 0) == [#"{"value":7}"#])
+        guard case .completed(_, let response, _) = events.last else {
+            Issue.record("expected completed response")
+            return
+        }
+        #expect(response.toolCalls().first?.arguments == #"{"value":7}"#)
+    }
+
+    @Test("Messages normalizes an untouched empty tool input before completion")
+    func messagesNormalizesEmptyToolInput() async {
+        let events = await collect(streamMessages(
+            rawStream: makeResultStream([
+                .success(.contentBlockStart(index: 0, contentBlock: .toolUse(
+                    id: "tool_1", name: "read_file", input: .object([:])
+                ))),
+                .success(.contentBlockStop(index: 0)),
+            ]),
+            modelMetadata: nil,
+            requestId: RequestId("messages-empty-input"),
+            idleTimeout: .seconds(60)
+        ))
+
+        #expect(argumentDeltas(events, index: 0) == ["{}"])
+        #expect(completions(events).count == 1)
+        guard case .completed(_, let response, _) = events.last else {
+            Issue.record("expected completed response")
+            return
+        }
+        #expect(response.toolCalls().first?.arguments == "{}")
+    }
+
+    @Test("Messages retains tool start order when block stops arrive in reverse")
+    func messagesPreservesParallelStartOrder() async {
+        let events = await collect(streamMessages(
+            rawStream: makeResultStream([
+                .success(.contentBlockStart(index: 2, contentBlock: .toolUse(
+                    id: "first", name: "first", input: .object([:])
+                ))),
+                .success(.contentBlockStart(index: 5, contentBlock: .toolUse(
+                    id: "second", name: "second", input: .object([:])
+                ))),
+                .success(.contentBlockStop(index: 5)),
+                .success(.contentBlockStop(index: 2)),
+            ]),
+            modelMetadata: nil,
+            requestId: RequestId("messages-parallel"),
+            idleTimeout: .seconds(60)
+        ))
+
+        guard case .completed(_, let response, _) = events.last else {
+            Issue.record("expected completed response")
+            return
+        }
+        #expect(response.toolCalls().map(\.name) == ["first", "second"])
     }
 
     @Test("Responses function done finalizes exactly once despite duplicate and item-done frames")
@@ -300,6 +402,72 @@ struct ProviderStreamingParityTests {
             return false
         }
         #expect(deltaPosition! < completionPosition!)
+    }
+
+    @Test("Responses function done emits only the missing authoritative suffix")
+    func responsesFunctionDoneCompletesPartialSuffix() async {
+        let full = #"{"source":"return 1"}"#
+        let events = await responseEvents([
+            .outputItemAdded(outputIndex: 0, item: functionItem(id: "call_1", name: "exec")),
+            .functionCallArgumentsDelta(delta: #"{"source":"#, itemId: "item_1", outputIndex: 0),
+            .functionCallArgumentsDone(arguments: full, itemId: "item_1", outputIndex: 0),
+            .completed(response: completedResponse(output: [
+                functionItem(id: "call_1", name: "exec", arguments: full),
+            ])),
+        ])
+
+        #expect(argumentDeltas(events, index: 0) == [#"{"source":"#, #""return 1"}"#])
+        #expect(completions(events).count == 1)
+    }
+
+    @Test("Responses initial function arguments precede subsequent fragments exactly once")
+    func responsesInitialFunctionInputIsPreserved() async {
+        let full = #"{"source":"return 1"}"#
+        let events = await responseEvents([
+            .outputItemAdded(outputIndex: 0, item: functionItem(
+                id: "call_1", name: "exec", arguments: #"{"source":"#
+            )),
+            .functionCallArgumentsDelta(delta: #""return 1"}"#, itemId: "item_1", outputIndex: 0),
+            .functionCallArgumentsDone(arguments: full, itemId: "item_1", outputIndex: 0),
+            .completed(response: completedResponse()),
+        ])
+
+        #expect(argumentDeltas(events, index: 0) == [#"{"source":"#, #""return 1"}"#])
+        #expect(completions(events).count == 1)
+    }
+
+    @Test("Responses custom completion adds its missing suffix and rejects late deltas")
+    func responsesCustomSuffixAndLateDeltaIsolation() async {
+        let events = await responseEvents([
+            .outputItemAdded(outputIndex: 0, item: customItem(id: "call_exec", name: "exec")),
+            .customToolCallInputDelta(delta: "return ", itemId: "item_exec", outputIndex: 0),
+            .customToolCallInputDone(input: "return 1", itemId: "item_exec", outputIndex: 0),
+            .customToolCallInputDone(input: "return 1", itemId: "item_exec", outputIndex: 0),
+            .customToolCallInputDelta(delta: ";secret()", itemId: "item_exec", outputIndex: 0),
+            .completed(response: completedResponse(output: [
+                customItem(id: "call_exec", name: "exec", input: "return 1"),
+            ])),
+        ], clientCustomToolNames: ["exec"])
+
+        #expect(argumentDeltas(events, index: 0) == ["return ", "1"])
+        #expect(completions(events).count == 1)
+    }
+
+    @Test("Responses terminal snapshot completes missing function bytes and identity")
+    func responsesTerminalSnapshotFinalizesMissingSuffix() async {
+        let full = #"{"path":"a.swift"}"#
+        let events = await responseEvents([
+            .outputItemAdded(outputIndex: 0, item: functionItem(id: "call_1", name: "read_file")),
+            .functionCallArgumentsDelta(delta: #"{"path":"#, itemId: "item_1", outputIndex: 0),
+            .completed(response: completedResponse(output: [
+                functionItem(id: "call_1", name: "read_file", arguments: full),
+            ])),
+        ])
+
+        #expect(argumentDeltas(events, index: 0) == [#"{"path":"#, #""a.swift"}"#])
+        #expect(completions(events).count == 1)
+        #expect(completions(events).first?.id == "call_1")
+        #expect(completions(events).first?.name == "read_file")
     }
 
     @Test("Responses item-done backstop catches up unstreamed function arguments")

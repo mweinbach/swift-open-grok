@@ -134,6 +134,13 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
     }
 
     public var isXai: Bool { self == .xai }
+
+    /// The request field is private to xAI's Responses dialect; every other
+    /// provider/backend already streams through its own native protocol.
+    public func supportsStreamToolCallsRequest(_ backend: ApiBackend) -> Bool {
+        self == .xai && backend == .responses
+    }
+
     public var isCodex: Bool { self == .codex }
     public var isKimi: Bool { self == .kimi }
     public var isFireworks: Bool { self == .fireworks }
@@ -163,6 +170,15 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .openRouter: return .openRouter
         }
     }
+}
+
+/// Prevent an xAI-private request field from crossing a provider boundary.
+public func shouldInjectStreamToolCalls(
+    _ requested: Bool,
+    provider: ModelProvider,
+    backend: ApiBackend
+) -> Bool {
+    requested && provider.supportsStreamToolCallsRequest(backend)
 }
 
 // MARK: - ResponsesDialect

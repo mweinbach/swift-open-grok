@@ -119,6 +119,63 @@ struct JavaScriptNestedToolProgressTests {
         #expect(result.texts == ["new:chunk"])
     }
 
+    @Test("early progress is buffered until registration and retains only the newest 64 chunks")
+    func earlyProgressReplaysWithinBoundedCapacity() async throws {
+        let (runtime, events) = try startProgressRuntime(
+            """
+            const chunks = [];
+            const pending = tools.demo({ role: "stream" });
+            const barrier = tools.demo({ role: "barrier" });
+            await barrier;
+            pending.onProgress((chunk) => chunks.push(chunk.text));
+            await pending;
+            text(JSON.stringify(chunks));
+            """
+        )
+        defer { runtime.beginTermination() }
+
+        let streamingID = try await nextProgressToolID(events)
+        let barrierID = try await nextProgressToolID(events)
+        for index in 0...NESTED_TOOL_PROGRESS_CAPACITY {
+            runtime.send(.toolProgress(id: streamingID, progress: .text("early-\(index)")))
+        }
+        runtime.send(.toolResponse(id: barrierID, result: .null))
+        runtime.send(.toolResponse(id: streamingID, result: .null))
+
+        let result = await events.outputUntilResult()
+        let expected = try #require(String(
+            data: JSONEncoder().encode(
+                (1...NESTED_TOOL_PROGRESS_CAPACITY).map { "early-\($0)" }
+            ),
+            encoding: .utf8
+        ))
+        #expect(result.errorText == nil)
+        #expect(result.texts == [expected])
+    }
+
+    @Test("absent progress payload is omitted from the JavaScript callback object")
+    func callbackOmitsAbsentPayload() async throws {
+        let (runtime, events) = try startProgressRuntime(
+            """
+            const pending = tools.demo({});
+            pending.onProgress((chunk) => {
+              text(String(Object.prototype.hasOwnProperty.call(chunk, "payload")));
+            });
+            await pending;
+            """
+        )
+        defer { runtime.beginTermination() }
+
+        let callID = try await nextProgressToolID(events)
+        runtime.send(.toolProgress(id: callID, progress: .text("plain")))
+        runtime.send(.toolProgress(id: callID, progress: .withPayload("structured", .bool(true))))
+        runtime.send(.toolResponse(id: callID, result: .null))
+
+        let result = await events.outputUntilResult()
+        #expect(result.errorText == nil)
+        #expect(result.texts == ["false", "true"])
+    }
+
     @Test("throwing progress handlers cannot fail the nested tool or cell")
     func handlerExceptionDoesNotFailCell() async throws {
         let (runtime, events) = try startProgressRuntime(

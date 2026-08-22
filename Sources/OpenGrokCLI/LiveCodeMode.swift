@@ -360,7 +360,22 @@ struct LiveCodeModeNestedExecutor: CodeModeToolExecutor {
                             state: .running,
                             outputOp: delta.op == .replace ? .replace : .append
                         )))
-                    }
+                    },
+                    onProgress: { chunk in
+                        guard !cancellationToken.isCancelled, !progress.isClosed else { return }
+                        progress.push(chunk)
+                        if let output = Self.visibleNestedProgressOutput(chunk) {
+                            await emitter.send(.tool(OpenGrokShellToolUpdate(
+                                callID: callID,
+                                name: name,
+                                input: arguments,
+                                output: output,
+                                state: .running,
+                                outputOp: .append
+                            )))
+                        }
+                    },
+                    cancellationToken: cancellationToken
                 )
             }
         )
@@ -395,6 +410,25 @@ struct LiveCodeModeNestedExecutor: CodeModeToolExecutor {
             )))
             return .failure(CodeModeError(message))
         }
+    }
+
+    static func visibleNestedProgressOutput(_ progress: NestedToolProgress) -> String? {
+        if progress.payload?["subkind"]?.stringValue == "bash_output_chunk" {
+            return nil
+        }
+        if !progress.text.isEmpty {
+            return progress.text
+        }
+        if let blocks = progress.payload?["blocks"]?.arrayValue {
+            let text = blocks.compactMap { $0["text"]?.stringValue }.joined()
+            return text.isEmpty ? nil : text
+        }
+        guard let payload = progress.payload?["payload"] else { return nil }
+        if let delta = payload["delta"]?.stringValue ?? payload["text"]?.stringValue {
+            return delta.isEmpty ? nil : delta
+        }
+        guard let encoded = try? JSONEncoder().encode(payload) else { return nil }
+        return String(data: encoded, encoding: .utf8)
     }
 
     func deliverNotification(

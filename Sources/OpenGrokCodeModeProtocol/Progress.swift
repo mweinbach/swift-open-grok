@@ -7,9 +7,8 @@ public let NESTED_TOOL_PROGRESS_CAPACITY = 64
 
 /// Observation-only output emitted while a nested tool is still running.
 ///
-/// Rust serializes an absent payload as JSON null, rather than omitting it.
-/// Keeping that detail makes the subprocess transport and JavaScript callback
-/// agree with `xai-grok-code-mode-protocol/src/progress.rs:27-49`.
+/// Absent structured payloads are omitted, matching the upstream
+/// `skip_serializing_if = "Option::is_none"` wire contract.
 public struct NestedToolProgress: Codable, Equatable, Sendable {
     public let text: String
     public let payload: JSONValue?
@@ -41,11 +40,7 @@ public struct NestedToolProgress: Codable, Equatable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(text, forKey: .text)
-        if let payload {
-            try container.encode(payload, forKey: .payload)
-        } else {
-            try container.encodeNil(forKey: .payload)
-        }
+        try container.encodeIfPresent(payload, forKey: .payload)
     }
 }
 
@@ -150,6 +145,11 @@ public final class NestedToolProgressSink: @unchecked Sendable {
 
     public func push(_ progress: NestedToolProgress) {
         state.push(progress)
+    }
+
+    /// Invalidate every retained producer while preserving already-queued chunks.
+    public func close() {
+        state.close()
     }
 
     public var droppedChunks: UInt64 {

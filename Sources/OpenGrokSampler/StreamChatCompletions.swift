@@ -152,17 +152,6 @@ public func streamChatCompletions(
 
                     for tcDelta in delta.toolCalls {
                         chunkHasContent = true
-                        for earlierIndex in toolCallAcc.keys.sorted() where earlierIndex < tcDelta.index {
-                            guard argumentsCompleteEmitted.insert(earlierIndex).inserted,
-                                  let (id, name, _) = toolCallAcc[earlierIndex]
-                            else { continue }
-                            continuation.yield(.toolCallArgumentsComplete(
-                                requestId: requestId,
-                                toolIndex: earlierIndex,
-                                id: id,
-                                name: name
-                            ))
-                        }
                         var entry = toolCallAcc[tcDelta.index] ?? ("", "", "")
                         var idForEvent: String?
                         var nameForEvent: String?

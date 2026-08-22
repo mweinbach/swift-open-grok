@@ -822,6 +822,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         codingDataRetention: LiveCodingDataRetentionClient? = nil,
         paintCadence: TimeInterval = PagerMotion.defaultPaintCadence,
         environment: [String: String]? = nil,
+        codeModeActive: Bool? = nil,
         toolExecutor: LiveToolExecutor? = nil,
         pagerRuntime: LivePagerRuntimeAdapter? = nil,
         authServices: LivePagerAuthServices = .production,
@@ -869,6 +870,17 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // theme degrades to GrokNight instead of to mush.
         let environment = environment ?? ProcessInfo.processInfo.environment
         self.environment = environment
+        let resolvedCodeModeActive = codeModeActive ?? (
+            LiveCodeModeSettings.resolveToolMode(
+                environment: environment,
+                workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
+                openGrokHome: self.openGrokHome
+            ) != .direct
+        )
+        self.conversation = LivePagerConversationState(
+            markdown: PagerMarkdownRenderer(),
+            codeModeActive: resolvedCodeModeActive
+        )
         self.inlineMediaCompositor = PagerInlineMediaCompositor(
             environment: environment,
             enabled: mode == .fullScreen,
@@ -1685,6 +1697,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     }
 
     func endTurn() {
+        conversation.finishToolStreams()
         lastTurnElapsed = currentTurnElapsed()
         turnPhase = nil
         turnStartedAt = nil
@@ -2119,14 +2132,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             conversation.appendReasoning(text)
             turnPhase = .thinking
         case .toolCallDelta(let toolIndex, let id, let name, let argumentsDelta):
-            conversation.applyToolCallDelta(
+            let visibleName = conversation.applyToolCallDelta(
                 toolIndex: toolIndex,
                 id: id,
                 name: name,
                 argumentsDelta: argumentsDelta
             )
-            if let name, !name.isEmpty {
-                turnPhase = .tool(name)
+            if let visibleName, !visibleName.isEmpty {
+                turnPhase = .tool(visibleName)
             } else {
                 turnPhase = .preparingTool
             }
@@ -3009,10 +3022,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             uniquingKeysWith: { first, _ in first }
         )
         let toolOutcomes = await conversationHistory?.toolOutcomes ?? ToolCallOutcomeMap()
+        let hiddenTransportCallIDs = await conversationHistory?.codeModeTransportCallIDs ?? []
         conversation.seed(
             from: items,
             promptInstants: promptInstants,
-            toolOutcomes: toolOutcomes
+            toolOutcomes: toolOutcomes,
+            hiddenTransportCallIDs: hiddenTransportCallIDs
         )
         selection.unfocus()
         followsBottom = true

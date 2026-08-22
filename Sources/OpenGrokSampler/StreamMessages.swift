@@ -76,7 +76,7 @@ public func streamMessages(
             var finalStopSequence: String?
 
             var assistantText = ""
-            var assistantToolCalls: [ToolCall] = []
+            var assistantToolCalls: [UInt32: ToolCall] = [:]
             var assistantReasoning: ReasoningItem?
 
             var chunkIndex: UInt64 = 0
@@ -160,22 +160,30 @@ public func streamMessages(
                             firstTokenEmitted = true
                             continuation.yield(.firstToken(requestId: requestId))
                         }
-                    case .toolUse(let id, let name, _):
+                    case .toolUse(let id, let name, let input):
                         let toolIndex = nextToolIndex
                         nextToolIndex += 1
                         blockToToolIndex[index] = toolIndex
+                        let initialArguments: String?
+                        if case .object(let object) = input, object.isEmpty {
+                            initialArguments = nil
+                        } else if let encoded = try? JSONEncoder().encode(input) {
+                            initialArguments = String(data: encoded, encoding: .utf8)
+                        } else {
+                            initialArguments = nil
+                        }
                         blocks[index] = MessagesBlockState(
                             kind: .toolUse,
                             toolName: name,
                             toolId: id,
-                            argsAcc: ""
+                            argsAcc: initialArguments ?? ""
                         )
                         continuation.yield(.toolCallDelta(
                             requestId: requestId,
                             toolIndex: toolIndex,
                             id: id,
                             name: name,
-                            argumentsDelta: nil
+                            argumentsDelta: initialArguments
                         ))
                     case .image, .toolResult:
                         break
@@ -266,18 +274,28 @@ public func streamMessages(
                         }
                     case .toolUse:
                         if let toolIndex = blockToToolIndex[index] {
+                            let arguments = state.argsAcc.isEmpty ? "{}" : state.argsAcc
+                            if state.argsAcc.isEmpty {
+                                continuation.yield(.toolCallDelta(
+                                    requestId: requestId,
+                                    toolIndex: toolIndex,
+                                    id: nil,
+                                    name: nil,
+                                    argumentsDelta: arguments
+                                ))
+                            }
                             continuation.yield(.toolCallArgumentsComplete(
                                 requestId: requestId,
                                 toolIndex: toolIndex,
                                 id: state.toolId,
                                 name: state.toolName
                             ))
+                            assistantToolCalls[toolIndex] = ToolCall(
+                                id: state.toolId,
+                                name: state.toolName,
+                                arguments: arguments
+                            )
                         }
-                        assistantToolCalls.append(ToolCall(
-                            id: state.toolId,
-                            name: state.toolName,
-                            arguments: state.argsAcc
-                        ))
                     }
 
                 case .messageDelta(let delta, let usage):
@@ -362,7 +380,7 @@ public func streamMessages(
             }
             items.append(.assistant(AssistantItem(
                 content: assistantText,
-                toolCalls: assistantToolCalls,
+                toolCalls: assistantToolCalls.keys.sorted().compactMap { assistantToolCalls[$0] },
                 modelId: finalModel
             )))
 

@@ -749,6 +749,18 @@ enum LivePagerChrome {
 }
 
 struct LivePagerConversationState {
+    private struct StreamIdentity {
+        var callID: String
+        var name: String?
+    }
+
+    private static let maximumTransportStreams = 8
+    private static let maximumTransportBufferCharacters = 6_000
+    private static let retainedTransportBufferCharacters = 4_000
+    private static let maximumInferredTools = 16
+    private static let maximumInferredToolNameBytes = 128
+    private static let previewCallIDPrefix = "code-mode-preview:"
+
     private(set) var items: [PagerConversationItem] = []
     private var activeAssistantIndex: Int?
     private var activeReasoningIndex: Int?
@@ -756,6 +768,11 @@ struct LivePagerConversationState {
     /// Accumulated provisional tool-argument fragments keyed by stream call id.
     /// Never persisted; only hydrates the live card header.
     private var provisionalToolArguments: [String: String] = [:]
+    private var streamIdentities: [UInt32: StreamIdentity] = [:]
+    private var codeModeTransportCallIDs: Set<String> = []
+    private var transportStreamOrder: [String] = []
+    private var transportPreviewCallIDs: [String: [String]] = [:]
+    private let codeModeActive: Bool
     /// Renders assistant messages as markdown for frame painting. `nil` leaves
     /// them as plain text, which is what the inline and transcript paths want.
     private let markdown: PagerMarkdownRenderer?
@@ -764,8 +781,9 @@ struct LivePagerConversationState {
     private var keepCompletedReasoningExpanded = false
     private var reasoningStartedAt: Date?
 
-    init(markdown: PagerMarkdownRenderer? = nil) {
+    init(markdown: PagerMarkdownRenderer? = nil, codeModeActive: Bool = false) {
         self.markdown = markdown
+        self.codeModeActive = codeModeActive
     }
 
     private func styledLines(for text: String) -> [PagerStyledLine] {
@@ -868,8 +886,12 @@ struct LivePagerConversationState {
         promptKind: PagerPromptKind = .standard,
         paintUserBlock: Bool = true
     ) {
+        retireTransportPreviews()
         toolIndicesByCallID.removeAll(keepingCapacity: true)
         provisionalToolArguments.removeAll(keepingCapacity: true)
+        streamIdentities.removeAll(keepingCapacity: true)
+        codeModeTransportCallIDs.removeAll(keepingCapacity: true)
+        transportStreamOrder.removeAll(keepingCapacity: true)
         activeReasoningIndex = nil
         reasoningStartedAt = nil
         // Both blocks carry the construction instant for the `/timestamps`
@@ -974,6 +996,10 @@ struct LivePagerConversationState {
         activeReasoningIndex = nil
         toolIndicesByCallID.removeAll(keepingCapacity: true)
         provisionalToolArguments.removeAll(keepingCapacity: true)
+        streamIdentities.removeAll(keepingCapacity: true)
+        codeModeTransportCallIDs.removeAll(keepingCapacity: true)
+        transportStreamOrder.removeAll(keepingCapacity: true)
+        transportPreviewCallIDs.removeAll(keepingCapacity: true)
         reasoningStartedAt = nil
         markdownRenderersByItemIndex = markdownRenderersByItemIndex.filter { $0.key < index }
     }
@@ -984,6 +1010,10 @@ struct LivePagerConversationState {
         activeReasoningIndex = nil
         toolIndicesByCallID.removeAll(keepingCapacity: true)
         provisionalToolArguments.removeAll(keepingCapacity: true)
+        streamIdentities.removeAll(keepingCapacity: true)
+        codeModeTransportCallIDs.removeAll(keepingCapacity: true)
+        transportStreamOrder.removeAll(keepingCapacity: true)
+        transportPreviewCallIDs.removeAll(keepingCapacity: true)
         markdownRenderersByItemIndex.removeAll(keepingCapacity: true)
         reasoningStartedAt = nil
     }
@@ -1014,13 +1044,24 @@ struct LivePagerConversationState {
     mutating func seed(
         from conversationItems: [ConversationItem],
         promptInstants: [Int: Date] = [:],
-        toolOutcomes: ToolCallOutcomeMap = ToolCallOutcomeMap()
+        toolOutcomes: ToolCallOutcomeMap = ToolCallOutcomeMap(),
+        hiddenTransportCallIDs: Set<String> = []
     ) {
         removeAll()
+        var hidden = hiddenTransportCallIDs
+        if codeModeActive {
+            for item in conversationItems {
+                guard case .assistant(let assistant) = item else { continue }
+                for call in assistant.toolCalls where Self.isTransportName(call.name) {
+                    hidden.insert(call.id)
+                }
+            }
+        }
         let projected = LiveTranscriptProjection.project(
             conversationItems,
             promptInstants: promptInstants,
             toolOutcomes: toolOutcomes,
+            hiddenTransportCallIDs: hidden,
             styleAssistant: { [self] text in self.styledLines(for: text) }
         )
         items = projected.items
@@ -1142,16 +1183,63 @@ struct LivePagerConversationState {
     /// Hydrate a provisional tool card from a sampler tool-call delta.
     /// Partial argument JSON is kept only in memory for the card header —
     /// never executed, never written to history.
+    @discardableResult
     mutating func applyToolCallDelta(
         toolIndex: UInt32,
         id: String?,
         name: String?,
         argumentsDelta: String?
-    ) {
-        let callID = id ?? "stream-tool-\(toolIndex)"
+    ) -> String? {
+        let previous = streamIdentities[toolIndex]
+        let callID = id ?? previous?.callID ?? "stream-tool-\(toolIndex)"
+        if let previous, previous.callID != callID {
+            provisionalToolArguments[callID] = provisionalToolArguments.removeValue(
+                forKey: previous.callID
+            )
+            if codeModeTransportCallIDs.remove(previous.callID) != nil {
+                codeModeTransportCallIDs.insert(callID)
+                retireTransportPreviews(for: previous.callID)
+            }
+        }
+        let knownName = name.flatMap { $0.isEmpty ? nil : $0 } ?? previous?.name
+        streamIdentities[toolIndex] = StreamIdentity(callID: callID, name: knownName)
+
         if let argumentsDelta, !argumentsDelta.isEmpty {
             provisionalToolArguments[callID, default: ""] += argumentsDelta
         }
+
+        if codeModeActive,
+           codeModeTransportCallIDs.contains(callID)
+                || knownName.map(Self.isTransportName) == true {
+            if codeModeTransportCallIDs.insert(callID).inserted {
+                transportStreamOrder.append(callID)
+                if transportStreamOrder.count > Self.maximumTransportStreams {
+                    let oldest = transportStreamOrder.removeFirst()
+                    retireTransportPreviews(for: oldest)
+                    provisionalToolArguments.removeValue(forKey: oldest)
+                }
+            }
+
+            var payload = provisionalToolArguments[callID] ?? ""
+            if payload.count > Self.maximumTransportBufferCharacters {
+                payload = String(payload.suffix(Self.retainedTransportBufferCharacters))
+                provisionalToolArguments[callID] = payload
+            }
+            guard knownName == "exec" else {
+                retireTransportPreviews(for: callID)
+                return nil
+            }
+            let names = Self.inferredNestedToolNames(from: payload)
+            updateTransportPreviews(callID: callID, names: names)
+            return names.first
+        }
+
+        // In Code Mode a nameless first fragment could still become `exec`;
+        // retain it privately until authoritative stream metadata arrives.
+        if codeModeActive, knownName == nil {
+            return nil
+        }
+
         let accumulated = provisionalToolArguments[callID] ?? ""
         let existingName: String?
         if let index = toolIndicesByCallID[callID],
@@ -1162,7 +1250,7 @@ struct LivePagerConversationState {
             existingName = nil
         }
         let resolvedName = {
-            if let name, !name.isEmpty { return name }
+            if let knownName, !knownName.isEmpty { return knownName }
             if let existingName, !existingName.isEmpty, existingName != "tool" {
                 return existingName
             }
@@ -1178,6 +1266,147 @@ struct LivePagerConversationState {
             input: displayInput,
             state: .running
         ))
+        return resolvedName
+    }
+
+    mutating func finishToolStreams() {
+        retireTransportPreviews()
+        streamIdentities.removeAll(keepingCapacity: true)
+        for callID in transportStreamOrder {
+            provisionalToolArguments.removeValue(forKey: callID)
+        }
+        transportStreamOrder.removeAll(keepingCapacity: true)
+    }
+
+    private static func isTransportName(_ name: String) -> Bool {
+        name == "exec" || name == "wait"
+    }
+
+    private static func inferredNestedToolNames(from payload: String) -> [String] {
+        let source: String
+        if let data = payload.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(JSONValue.self, from: data),
+           case .object(let object) = decoded,
+           case .string(let value)? = object["source"] {
+            source = value
+        } else {
+            source = payload
+        }
+
+        let bytes = Array(source.utf8)
+        let tools = Array("tools".utf8)
+        var names: [String] = []
+        var index = 0
+
+        func identifier(_ value: UInt8) -> Bool {
+            (48...57).contains(value) || (65...90).contains(value)
+                || (97...122).contains(value) || value == 95 || value == 36
+        }
+        func whitespace(_ value: UInt8) -> Bool {
+            value == 32 || value == 9 || value == 10 || value == 13
+        }
+
+        while index + tools.count <= bytes.count,
+              names.count < Self.maximumInferredTools {
+            guard Array(bytes[index..<(index + tools.count)]) == tools else {
+                index += 1
+                continue
+            }
+            let start = index
+            index += tools.count
+            if start > 0, identifier(bytes[start - 1]) { continue }
+            while index < bytes.count, whitespace(bytes[index]) { index += 1 }
+
+            let nameStart: Int
+            let nameEnd: Int
+            if index < bytes.count, bytes[index] == 46 {
+                index += 1
+                while index < bytes.count, whitespace(bytes[index]) { index += 1 }
+                nameStart = index
+                while index < bytes.count, identifier(bytes[index]) { index += 1 }
+                nameEnd = index
+            } else if index < bytes.count, bytes[index] == 91 {
+                index += 1
+                while index < bytes.count, whitespace(bytes[index]) { index += 1 }
+                guard index < bytes.count, bytes[index] == 34 || bytes[index] == 39 else {
+                    continue
+                }
+                let quote = bytes[index]
+                index += 1
+                nameStart = index
+                while index < bytes.count, identifier(bytes[index]) { index += 1 }
+                nameEnd = index
+                guard index < bytes.count, bytes[index] == quote else { continue }
+                index += 1
+                while index < bytes.count, whitespace(bytes[index]) { index += 1 }
+                guard index < bytes.count, bytes[index] == 93 else { continue }
+                index += 1
+            } else {
+                continue
+            }
+
+            guard nameEnd > nameStart,
+                  nameEnd - nameStart <= Self.maximumInferredToolNameBytes
+            else { continue }
+            while index < bytes.count, whitespace(bytes[index]) { index += 1 }
+            guard index < bytes.count, bytes[index] == 40 else { continue }
+            let name = String(decoding: bytes[nameStart..<nameEnd], as: UTF8.self)
+            if !Self.isTransportName(name) {
+                names.append(name)
+            }
+        }
+        return names
+    }
+
+    private mutating func updateTransportPreviews(callID: String, names: [String]) {
+        let old = transportPreviewCallIDs[callID] ?? []
+        var active: [String] = []
+        for (index, name) in names.enumerated() {
+            let previewID = "\(Self.previewCallIDPrefix)\(callID):\(index)"
+            active.append(previewID)
+            apply(OpenGrokPagerToolUpdate(
+                callID: previewID,
+                name: name,
+                input: "",
+                state: .running
+            ))
+        }
+        for previewID in old where !active.contains(previewID) {
+            removeToolCard(callID: previewID)
+        }
+        if active.isEmpty {
+            transportPreviewCallIDs.removeValue(forKey: callID)
+        } else {
+            transportPreviewCallIDs[callID] = active
+        }
+    }
+
+    private mutating func retireTransportPreviews(for callID: String? = nil) {
+        let ids: [String]
+        if let callID {
+            ids = transportPreviewCallIDs.removeValue(forKey: callID) ?? []
+        } else {
+            ids = transportPreviewCallIDs.values.flatMap { $0 }
+            transportPreviewCallIDs.removeAll(keepingCapacity: true)
+        }
+        for identifier in ids {
+            removeToolCard(callID: identifier)
+        }
+    }
+
+    private mutating func removeToolCard(callID: String) {
+        guard let index = toolIndicesByCallID.removeValue(forKey: callID),
+              items.indices.contains(index)
+        else { return }
+        items.remove(at: index)
+        removeMarkdownRenderer(at: index)
+        if let activeAssistantIndex, activeAssistantIndex > index {
+            self.activeAssistantIndex = activeAssistantIndex - 1
+        }
+        if let activeReasoningIndex, activeReasoningIndex > index {
+            self.activeReasoningIndex = activeReasoningIndex - 1
+        }
+        toolIndicesByCallID = toolIndicesByCallID.mapValues { $0 > index ? $0 - 1 : $0 }
     }
 
     /// `atSeconds` is the motion clock's now, used to stamp
@@ -1189,6 +1418,12 @@ struct LivePagerConversationState {
     /// output without resetting fold, preserve first `finishedAt` and
     /// existing `detail` unless a richer update supplies replacements.
     mutating func apply(_ tool: OpenGrokPagerToolUpdate, atSeconds seconds: TimeInterval? = nil) {
+        if codeModeActive, codeModeTransportCallIDs.contains(tool.callID) {
+            return
+        }
+        if codeModeActive, !tool.callID.hasPrefix(Self.previewCallIDPrefix) {
+            retireTransportPreviews()
+        }
         finishReasoning()
         let state = Self.renderState(for: tool.state)
         let existing: PagerToolCard?
@@ -1467,6 +1702,7 @@ enum LiveTranscriptProjection {
         _ conversationItems: [ConversationItem],
         promptInstants: [Int: Date] = [:],
         toolOutcomes: ToolCallOutcomeMap = ToolCallOutcomeMap(),
+        hiddenTransportCallIDs: Set<String> = [],
         styleAssistant: (String) -> [PagerStyledLine] = { _ in [] }
     ) -> Result {
         var resultsByCallID: [String: String] = [:]
@@ -1525,6 +1761,7 @@ enum LiveTranscriptProjection {
                     )))
                 }
                 for call in assistant.toolCalls {
+                    guard !hiddenTransportCallIDs.contains(call.id) else { continue }
                     let output = resultsByCallID[call.id] ?? customOutputsByCallID[call.id]
                     let state = seedToolState(
                         callID: call.id,
@@ -1567,6 +1804,7 @@ enum LiveTranscriptProjection {
                 )))
                 toolIndicesByCallID[callID] = items.indices.last
             case .customToolOutput(let output):
+                guard !hiddenTransportCallIDs.contains(output.callId) else { continue }
                 // Pair onto the matching call when an earlier card exists;
                 // otherwise project a standalone card so custom output is not
                 // dropped.
@@ -1952,12 +2190,14 @@ actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
         case .responseStarted, .reasoningCompleted, .responseCompleted:
             break
         case .completed:
+            conversation.finishToolStreams()
             conversation.finishAssistant()
             status = "Completed"
             if mode == .inline {
                 try await finishInline()
             }
         case .cancelled:
+            conversation.finishToolStreams()
             conversation.finishAssistant()
             status = "Cancelled"
             if mode == .inline {

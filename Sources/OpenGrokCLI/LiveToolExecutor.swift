@@ -5,6 +5,7 @@ import OpenGrokAgentDefinitions
 import OpenGrokACPRuntime
 import OpenGrokAuth
 import OpenGrokCodeMode
+import OpenGrokCodeModeProtocol
 import OpenGrokCompaction
 import OpenGrokConfig
 import OpenGrokConfigTypes
@@ -38,6 +39,7 @@ import OpenGrokSubagentResolution
 import OpenGrokTerminalCore
 import OpenGrokTextArea
 import OpenGrokToolRegistry
+import OpenGrokToolRuntime
 import OpenGrokToolTypes
 import OpenGrokToolsAPI
 import OpenGrokTTY
@@ -1153,7 +1155,9 @@ struct LiveToolExecutor: Sendable {
         sessionID: String,
         workingDirectory: URL,
         call: ToolCall,
-        onOutput: OpenGrokShellForegroundOutputSink?
+        onOutput: OpenGrokShellForegroundOutputSink?,
+        onProgress: (@Sendable (NestedToolProgress) async -> Void)? = nil,
+        cancellationToken: CodeModeCancellationToken? = nil
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
         let args: JSONValue
         do {
@@ -1187,11 +1191,41 @@ struct LiveToolExecutor: Sendable {
             if Task.isCancelled {
                 return .failure(.cancelled)
             }
-            switch await fileToolBridge.call(
-                name: call.name,
-                args: args,
-                callId: call.callId
-            ) {
+            let bridgeResult: Result<ToolBridgeResult, ToolError>
+            if let onProgress {
+                let cancellation = OpenGrokToolRuntime.Cancellation()
+                cancellationToken?.onCancel { cancellation.cancel() }
+                bridgeResult = await fileToolBridge.callNested(
+                    name: call.name,
+                    args: args,
+                    callId: call.callId,
+                    viewerContext: WorkspaceViewerContext(streamToolProgress: true),
+                    onProgress: { event in
+                        let progress: NestedToolProgress
+                        switch event {
+                        case .text(let text):
+                            progress = .text(text)
+                        case .content(let blocks):
+                            guard let encoded = try? JSONValue.encode(blocks) else { return }
+                            progress = .withPayload("", .object(["blocks": encoded]))
+                        case .custom(let subkind, let payload):
+                            progress = .withPayload("", .object([
+                                "subkind": .string(subkind),
+                                "payload": payload,
+                            ]))
+                        }
+                        await onProgress(progress)
+                    },
+                    cancellation: cancellation
+                )
+            } else {
+                bridgeResult = await fileToolBridge.call(
+                    name: call.name,
+                    args: args,
+                    callId: call.callId
+                )
+            }
+            switch bridgeResult {
             case .success(let result):
                 let promptText = await appendLspDiagnostics(
                     toolName: call.name,

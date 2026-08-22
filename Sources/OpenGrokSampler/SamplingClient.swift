@@ -182,6 +182,15 @@ public final class SamplingClient: @unchecked Sendable {
         )
         if case .object(var obj) = body {
             obj["stream"] = .bool(true)
+            if shouldInjectStreamToolCalls(
+                defaults.streamToolCalls,
+                provider: defaults.provider,
+                backend: defaults.apiBackend
+            ) {
+                obj["stream_tool_calls"] = .bool(true)
+            } else {
+                obj.removeValue(forKey: "stream_tool_calls")
+            }
             body = .object(obj)
         }
 

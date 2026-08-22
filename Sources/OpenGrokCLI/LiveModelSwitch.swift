@@ -328,6 +328,7 @@ struct LiveModelCatalogResolver: Sendable {
                 apiBackend: backend,
                 extraHeaders: headers,
                 queryParams: entry.queryParams,
+                environment: environment,
                 tuning: OpenGrokLiveSamplingTuning(
                     entry: entry,
                     effortOverride: effort,
@@ -808,6 +809,7 @@ actor LiveModelSwitchCoordinator {
             apiBackend: active.apiBackend,
             extraHeaders: active.extraHeaders,
             queryParams: active.queryParams,
+            environment: active.environment,
             tuning: tuning,
             bearerResolver: active.bearerResolver,
             credentialProvider: active.credentialProvider,
@@ -1539,7 +1541,8 @@ func liveCatalogResolutionInput(
         models: ModelsSectionConfig(
             default: document[path: ["models", "default"]]?.stringValue,
             opencodeGoEnabledModels: openCodeGoEnabled,
-            openRouterEnabledModels: openRouterEnabled
+            openRouterEnabledModels: openRouterEnabled,
+            streamToolCalls: document[path: ["models", "stream_tool_calls"]]?.boolValue
         ),
         configModels: modelOverrides
     )

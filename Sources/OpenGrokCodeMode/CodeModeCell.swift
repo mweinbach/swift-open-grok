@@ -543,7 +543,7 @@ actor CodeModeCell {
                 cancellationToken: token,
                 progress: progressSink
             )
-            progressReceiver.close()
+            progressSink.close()
             await forwarder.value
             switch result {
             case .success(let value):
