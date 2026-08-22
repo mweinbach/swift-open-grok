@@ -515,6 +515,10 @@ final class LivePagerSession: OpenGrokPagerMinimalSessionAdapter, @unchecked Sen
                         continuation.yield(.completed(OpenGrokPagerMinimalCompletion(
                             sessionID: handle.sessionID.rawValue,
                             summary: result.stopReason,
+                            structuredOutput: try result.structuredOutput.map { value in
+                                try JSONEncoder().encode(value)
+                            },
+                            structuredOutputError: result.structuredOutputError,
                             messageID: result.messageID,
                             rawStopReason: result.rawStopReason,
                             stopSequence: result.stopSequence,
@@ -2330,6 +2334,7 @@ struct SilentLivePagerOutput: OpenGrokPagerOutputAdapter, Sendable {
 actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
     private let streams: CLIStreams
     private let format: CLIOutputFormat
+    private let structuredOutputRequested: Bool
     private var nativeMessages: NativeMessagesOutputReducer?
     private var collectedOutput = ""
     private var wrotePlainOutput = false
@@ -2337,6 +2342,7 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
     init(
         streams: CLIStreams,
         format: CLIOutputFormat,
+        structuredOutputRequested: Bool = false,
         includePartialMessages: Bool = false,
         sessionID: String? = nil,
         model: String? = nil,
@@ -2349,11 +2355,13 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
     ) {
         self.streams = streams
         self.format = format
+        self.structuredOutputRequested = structuredOutputRequested
         if format == .streamingMessagesJSON {
             self.nativeMessages = NativeMessagesOutputReducer(
                 sessionID: sessionID ?? "",
                 model: model,
                 workingDirectory: workingDirectory ?? "",
+                structuredOutputRequested: structuredOutputRequested,
                 includePartialMessages: includePartialMessages,
                 tools: tools,
                 slashCommands: slashCommands,
@@ -2415,12 +2423,18 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
         case .output(let text):
             collectedOutput += text
         case .completed(let completion):
-            streams.out(try Self.jsonLine([
+            var result: [String: Any] = [
                 "type": "completed",
                 "session_id": completion.sessionID as Any,
                 "output": collectedOutput,
                 "summary": completion.summary as Any
-            ]))
+            ]
+            Self.attachStructuredOutput(
+                to: &result,
+                completion: completion,
+                requested: structuredOutputRequested
+            )
+            streams.out(try Self.jsonLine(result))
         case .cancelled:
             streams.out(try Self.jsonLine(["type": "cancelled"]))
         case .reasoning(let text):
@@ -2478,11 +2492,17 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
                 "status_code": statusCode as Any
             ]))
         case .completed(let completion):
-            streams.out(try Self.jsonLine([
+            var result: [String: Any] = [
                 "type": "completed",
                 "session_id": completion.sessionID as Any,
                 "summary": completion.summary as Any
-            ]))
+            ]
+            Self.attachStructuredOutput(
+                to: &result,
+                completion: completion,
+                requested: structuredOutputRequested
+            )
+            streams.out(try Self.jsonLine(result))
         case .cancelled:
             streams.out(try Self.jsonLine(["type": "cancelled"]))
         case .permissionRequested(let request):
@@ -2494,6 +2514,24 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
         case .lifecycle, .toolCallDelta, .responseStarted, .reasoningCompleted,
              .responseCompleted:
             break
+        }
+    }
+
+    private static func attachStructuredOutput(
+        to result: inout [String: Any],
+        completion: OpenGrokPagerMinimalCompletion,
+        requested: Bool
+    ) {
+        guard requested else { return }
+        if let error = completion.structuredOutputError {
+            result["structuredOutput"] = NSNull()
+            result["structuredOutputError"] = error
+        } else if let data = completion.structuredOutput,
+                  let value = validatedStructuredOutput(from: data) {
+            result["structuredOutput"] = value
+        } else {
+            result["structuredOutput"] = NSNull()
+            result["structuredOutputError"] = "model did not produce structured output"
         }
     }
 
@@ -2512,6 +2550,12 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
         )
         return String(decoding: data, as: UTF8.self) + "\n"
     }
+}
+
+/// Decode only the shell-validated JSON carrier. Assistant text is never a
+/// fallback: doing so would bypass the schema validator's authority boundary.
+private func validatedStructuredOutput(from data: Data) -> Any? {
+    try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
 }
 
 /// Native Messages API NDJSON frames; upstream keeps this reducer independent
@@ -2558,6 +2602,7 @@ private struct NativeMessagesOutputReducer {
     private var sessionID: String
     private var model: String
     private let workingDirectory: String
+    private let structuredOutputRequested: Bool
     private let includePartialMessages: Bool
     private let tools: [String]
     private let slashCommands: [String]
@@ -2603,6 +2648,7 @@ private struct NativeMessagesOutputReducer {
         sessionID: String,
         model: String?,
         workingDirectory: String,
+        structuredOutputRequested: Bool,
         includePartialMessages: Bool,
         tools: [String],
         slashCommands: [String],
@@ -2613,6 +2659,7 @@ private struct NativeMessagesOutputReducer {
         self.sessionID = sessionID
         self.model = model.flatMap { $0.isEmpty ? nil : $0 } ?? "unknown"
         self.workingDirectory = workingDirectory
+        self.structuredOutputRequested = structuredOutputRequested
         self.includePartialMessages = includePartialMessages
         self.tools = tools
         self.slashCommands = slashCommands
@@ -3144,6 +3191,14 @@ private struct NativeMessagesOutputReducer {
         into lines: inout [[String: Any]]
     ) {
         ensureInitialized(into: &lines)
+        let structuredOutput = structuredOutputRequested
+            ? completion?.structuredOutput.flatMap(validatedStructuredOutput(from:))
+            : nil
+        let structuredError: String? = structuredOutputRequested
+            ? completion?.structuredOutputError
+                ?? (structuredOutput == nil ? "model did not produce structured output" : nil)
+            : nil
+        let terminalError = error ?? structuredError
         let unresolvedSearches = Array(pendingWebSearches.values)
         for search in unresolvedSearches {
             completeWebSearch(
@@ -3158,7 +3213,7 @@ private struct NativeMessagesOutputReducer {
             )
         }
         pendingWebSearches.removeAll(keepingCapacity: false)
-        let defaultStopReason = error == nil
+        let defaultStopReason = terminalError == nil
             ? (stopReason == "max_tokens" ? "max_tokens" : "end_turn")
             : nil
         flushAssistant(defaultStopReason: defaultStopReason, into: &lines)
@@ -3189,8 +3244,12 @@ private struct NativeMessagesOutputReducer {
         let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
         var result: [String: Any] = [
             "type": "result",
-            "subtype": error == nil ? "success" : "error_during_execution",
-            "is_error": error != nil,
+            "subtype": error != nil
+                ? "error_during_execution"
+                : structuredError != nil
+                    ? "error_max_structured_output_retries"
+                    : "success",
+            "is_error": terminalError != nil,
             "duration_ms": elapsed / 1_000_000,
             "duration_api_ms": 0,
             "num_turns": completedResponses == 0 ? assistantFrames : completedResponses,
@@ -3201,10 +3260,13 @@ private struct NativeMessagesOutputReducer {
             "session_id": completion?.sessionID ?? sessionID,
             "uuid": UUID().uuidString.lowercased(),
         ]
-        if let error {
-            result["errors"] = [error]
+        if let terminalError {
+            result["errors"] = [terminalError]
         } else {
             result["result"] = lastText
+            if let structuredOutput {
+                result["structured_output"] = structuredOutput
+            }
         }
         lines.append(result)
         terminalEmitted = true

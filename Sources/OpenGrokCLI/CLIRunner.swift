@@ -436,7 +436,7 @@ public enum CLIRunner {
             case "trace":
                 return "Trace export and upload are not implemented."
             case "setup":
-                return "Managed configuration fetch and install are not implemented."
+                return "Managed configuration fetch requires the asynchronous live application composition."
             case "share":
                 return "Session sharing is fail-closed in the synchronous runner; the live route refuses before upload because signed-URL and backend share clients are not ported."
             case "dashboard":

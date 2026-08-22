@@ -1558,7 +1558,11 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     let toolExecutor: LiveToolExecutor
     let conversationHistory: LiveConversationHistory
     let systemPrompt: String?
+    /// A complete override also replaces the head of a resumed transcript.
+    let systemPromptIsOverride: Bool
     let skillsListing: String?
+    /// Prompt-local ACP/workflow schemas retain priority over the CLI default.
+    let launchJSONSchema: JSONValue?
     /// The tool list this session advertises. In Code Mode it carries `exec`
     /// and `wait` and, in `code_mode_only`, hides everything the cell can
     /// reach through `tools.*`.
@@ -1722,12 +1726,17 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 return value
             }
             .joined(separator: "\n\n")
-        if !combinedSystemPrompt.isEmpty,
-           !items.contains(where: {
-               if case .system = $0 { return true }
-               return false
-           }) {
-            items.insert(.system(combinedSystemPrompt), at: 0)
+        if !combinedSystemPrompt.isEmpty {
+            if let existingIndex = items.firstIndex(where: {
+                if case .system = $0 { return true }
+                return false
+            }) {
+                if systemPromptIsOverride {
+                    items[existingIndex] = .system(combinedSystemPrompt)
+                }
+            } else {
+                items.insert(.system(combinedSystemPrompt), at: 0)
+            }
         }
         // Memory is injected after the system prompt exists so it has an item
         // to splice into, and before compaction runs so the injected block
@@ -1753,7 +1762,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
 
         // Structured output coordinator setup matching Rust turn.rs:2370-2396, 2512-2522
         var structuredCoordinator = StructuredOutputTurnCoordinator(
-            schema: request.jsonSchema,
+            schema: request.jsonSchema ?? launchJSONSchema,
             backend: active.configuration.apiBackend,
             codeModeOnly: activeToolSurface.mode == .codeModeOnly
         )

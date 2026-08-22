@@ -35,14 +35,43 @@ struct LiveUnhonoredLaunchFlagTests {
         #expect(err.contains("nothing in this composition honors yet"))
     }
 
-    @Test("--no-plan is refused before launch")
-    func noPlan() async {
-        await expectRefusal(extraArguments: ["--no-plan"], flag: "--no-plan")
+    @Test("--no-plan removes both plan-mode tools through live launch authority")
+    func noPlan() throws {
+        let command = try CLICommandParser.parseOrThrow(
+            ["headless", "--prompt", "hi", "--no-plan"]
+        )
+        guard case .launch(let options) = command else {
+            Issue.record("expected --no-plan to select the live launch route")
+            return
+        }
+        let authority = try LiveAgentLaunchAuthority.resolve(
+            options: options,
+            workingDirectory: URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true),
+            environment: ["HOME": NSTemporaryDirectory(), "OPENGROK_HOME": NSTemporaryDirectory()]
+        )
+        let policy = try #require(authority.toolPolicy(tools: nil, disallowedTools: nil))
+        #expect(authority.noPlan)
+        #expect(!policy.allows(liveToolName: "enter_plan_mode"))
+        #expect(!policy.allows(liveToolName: "exit_plan_mode"))
     }
 
-    @Test("--no-ask-user is refused before launch")
-    func noAskUser() async {
-        await expectRefusal(extraArguments: ["--no-ask-user"], flag: "--no-ask-user")
+    @Test("--no-ask-user removes the actual question tool through live launch authority")
+    func noAskUser() throws {
+        let command = try CLICommandParser.parseOrThrow(
+            ["headless", "--prompt", "hi", "--no-ask-user"]
+        )
+        guard case .launch(let options) = command else {
+            Issue.record("expected --no-ask-user to select the live launch route")
+            return
+        }
+        let authority = try LiveAgentLaunchAuthority.resolve(
+            options: options,
+            workingDirectory: URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true),
+            environment: ["HOME": NSTemporaryDirectory(), "OPENGROK_HOME": NSTemporaryDirectory()]
+        )
+        let policy = try #require(authority.toolPolicy(tools: nil, disallowedTools: nil))
+        #expect(authority.noAskUser)
+        #expect(!policy.allows(liveToolName: "ask_user_question"))
     }
 
     @Test("--todo-gate is refused before launch")

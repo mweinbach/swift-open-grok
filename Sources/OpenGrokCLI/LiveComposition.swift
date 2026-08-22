@@ -1459,6 +1459,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             if LiveAuthComposition.handles(command) {
                 return try await LiveAuthComposition.session(for: command, context: context)
             }
+            if LiveManagedSetupComposition.handles(command) {
+                return try await LiveManagedSetupComposition.session(
+                    for: command,
+                    context: context
+                )
+            }
             if LiveUpdateComposition.handles(command) {
                 return try await LiveUpdateComposition.session(
                     for: command,
@@ -1692,18 +1698,21 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         openGrokHome: openGrokHome,
                         telemetryBootstrapContext: foundation.telemetryBootstrapContext,
                         systemPrompt: [
-                            agentProfile?.systemPrompt,
-                            LiveSkills.listing(foundation.discoveredSkills)
+                            foundation.launchAuthority.applyingSystemPrompt(
+                                to: agentProfile?.systemPrompt
+                            ),
+                            foundation.launchAuthority.hasSystemPromptOverride
+                                ? nil
+                                : LiveSkills.listing(foundation.discoveredSkills)
                         ]
                         .compactMap { value in
                             guard let value, !value.isEmpty else { return nil }
                             return value
                         }
                         .joined(separator: "\n\n"),
-                        toolPolicy: LiveAgentToolPolicy.resolveLaunchPolicy(
+                        toolPolicy: foundation.launchAuthority.toolPolicy(
                             tools: options.agentOptions.tools,
-                            disallowedTools: options.agentOptions.disallowedTools,
-                            profile: agentProfile?.toolPolicy
+                            disallowedTools: options.agentOptions.disallowedTools
                         ),
                         fileAccessPolicy: Self.resolveFileAccessPolicy(
                             environment: context.environment,
@@ -2548,6 +2557,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     output: LivePagerOutput(
                         streams: context.streams,
                         format: options.outputFormat,
+                        structuredOutputRequested: options.jsonSchema != nil,
                         includePartialMessages: options.includePartialMessages,
                         sessionID: sessionID,
                         model: samplingConfiguration.model,
@@ -2780,6 +2790,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             output: LivePagerOutput(
                 streams: context.streams,
                 format: options.outputFormat,
+                structuredOutputRequested: options.jsonSchema != nil,
                 includePartialMessages: options.includePartialMessages,
                 sessionID: options.sessionID,
                 model: options.common.model,
@@ -2837,13 +2848,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // `--tools` / `--disallowed-tools` are honored by
         // `LiveAgentToolPolicy.resolveLaunchPolicy` at tool-executor
         // construction — not refused here.
-        if options.agentOptions.agent != nil { return "--agent" }
-        if options.agentOptions.agentsJSON != nil { return "--agents" }
-        if options.agentOptions.noPlan { return "--no-plan" }
-        if options.agentOptions.noAskUser { return "--no-ask-user" }
-        if options.agentOptions.rules != nil { return "--rules" }
-        if options.agentOptions.systemPromptOverride != nil { return "--system-prompt-override" }
-        if options.jsonSchema != nil { return "--json-schema" }
         if options.restoreCode { return "--restore-code" }
         if options.advanced.reauthenticate { return "--reauth" }
         if options.advanced.storageMode != nil { return "--storage-mode" }
@@ -3094,6 +3098,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let options: CLIExecutionOptions
         let cwd: URL
         let openGrokHome: URL
+        let launchAuthority: LiveAgentLaunchAuthority
         let agentProfile: LiveAgentProfile?
         let sessionID: String
         let conversationRecord: LiveConversationRecord
@@ -3246,11 +3251,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             isCancelled: context.control.isCancelled
         )
         let cwd = worktreePreparation?.effectiveDirectory ?? sourceCwd
-        let agentProfile = try resolveAgentProfile(
-            named: options.common.profile,
+        let launchAuthority = try LiveAgentLaunchAuthority.resolve(
+            options: options,
             workingDirectory: cwd,
             environment: context.environment
         )
+        let agentProfile = launchAuthority.agentProfile
         let discoveredSkills: [SkillInfo]
         if agentProfile?.discoverSkills ?? true {
             discoveredSkills = LiveSkills.discover(cwd: cwd, environment: context.environment)
@@ -3423,6 +3429,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             parentCacheAffinityID: conversationRecord.cacheAffinityID ?? sessionID,
             openGrokHome: openGrokHome,
             agentProfile: agentProfile,
+            cliAgents: launchAuthority.cliAgents,
             samplingConfiguration: samplingConfiguration,
             sampler: sampler,
             conversationStore: conversationStore,
@@ -3448,7 +3455,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // absence shape `spawn_subagent` uses. Upstream's equivalent gate
         // strips the tool from the config when disabled (`builder.rs:819-825`).
         let questionCoordinator: PagerQuestionCoordinator? =
-            interactiveSurfaceAvailable ? PagerQuestionCoordinator() : nil
+            interactiveSurfaceAvailable && !launchAuthority.noAskUser
+                ? PagerQuestionCoordinator()
+                : nil
         // Same gate for the plan-approval view: it exists exactly when the
         // pager renderer (its only presenter) will be constructed. Absence
         // keeps `exit_plan_mode` approval on the generic permission sheet.
@@ -3457,7 +3466,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // stdout-only probe advertised `ask_user_question` in
         // `open-grok < file` launches where no presenter could ever attach.
         let planApprovalCoordinator: PagerPlanApprovalCoordinator? =
-            interactiveSurfaceAvailable ? PagerPlanApprovalCoordinator() : nil
+            interactiveSurfaceAvailable && !launchAuthority.noPlan
+                ? PagerPlanApprovalCoordinator()
+                : nil
         // `[scheduler] background_loops`, resolved once at session build —
         // upstream resolves the same value at session spawn and hands it to
         // the scheduler as a resource (`resolve_scheduler_background_loops`,
@@ -3531,10 +3542,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             processBackend: processBackend,
             sessionID: sessionID,
             workingDirectory: cwd,
-            toolPolicy: LiveAgentToolPolicy.resolveLaunchPolicy(
+            toolPolicy: launchAuthority.toolPolicy(
                 tools: options.agentOptions.tools,
-                disallowedTools: options.agentOptions.disallowedTools,
-                profile: agentProfile?.toolPolicy
+                disallowedTools: options.agentOptions.disallowedTools
             ),
             telemetryBootstrapContext: telemetryBootstrapContext,
             fileAccessPolicy: fileAccessPolicy,
@@ -3564,6 +3574,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             options: options,
             cwd: cwd,
             openGrokHome: openGrokHome,
+            launchAuthority: launchAuthority,
             agentProfile: agentProfile,
             sessionID: sessionID,
             conversationRecord: conversationRecord,
@@ -3607,6 +3618,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         parentCacheAffinityID: String,
         openGrokHome: URL,
         agentProfile: LiveAgentProfile?,
+        cliAgents: [AgentDefinition],
         samplingConfiguration: OpenGrokLiveSamplingConfiguration,
         sampler: OpenGrokLiveSampler,
         conversationStore: LiveConversationStore,
@@ -3629,6 +3641,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         }
         let definitionContext = DefinitionResolutionContext(
             cwd: cwd,
+            cliAgents: cliAgents,
             toggles: toggles,
             includeFilesystemDefinitions: true,
             environment: environment
@@ -3758,10 +3771,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             environment: context.environment,
             configuration: foundation.securityContext.document,
             disableWebSearch: foundation.options.agentOptions.disableWebSearch,
-            toolPolicy: LiveAgentToolPolicy.resolveLaunchPolicy(
+            toolPolicy: foundation.launchAuthority.toolPolicy(
                 tools: foundation.options.agentOptions.tools,
-                disallowedTools: foundation.options.agentOptions.disallowedTools,
-                profile: foundation.agentProfile?.toolPolicy
+                disallowedTools: foundation.options.agentOptions.disallowedTools
             ),
             permissionRules: foundation.securityContext.permissions.config.rules
         )
@@ -3929,8 +3941,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 modelSwitch: modelSwitch,
                 toolExecutor: foundation.toolExecutor,
                 conversationHistory: conversationHistory,
-                systemPrompt: foundation.agentProfile?.systemPrompt,
-                skillsListing: LiveSkills.listing(foundation.discoveredSkills),
+                systemPrompt: foundation.launchAuthority.applyingSystemPrompt(
+                    to: foundation.agentProfile?.systemPrompt
+                ),
+                systemPromptIsOverride: foundation.launchAuthority.hasSystemPromptOverride,
+                skillsListing: foundation.launchAuthority.hasSystemPromptOverride
+                    ? nil
+                    : LiveSkills.listing(foundation.discoveredSkills),
+                launchJSONSchema: foundation.launchAuthority.jsonSchema,
                 toolSurface: toolSurface,
                 hostedSearchPolicy: hostedSearchPolicy,
                 codeMode: codeMode,
@@ -4791,36 +4809,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             }
         }
         return merged
-    }
-
-    private static func resolveAgentProfile(
-        named name: String?,
-        workingDirectory: URL,
-        environment: [String: String]
-    ) throws -> LiveAgentProfile? {
-        guard let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
-        }
-        guard let definition = AgentDefinition.byName(
-            name,
-            in: workingDirectory,
-            environment: environment
-        ) else {
-            throw CLIApplicationError.failed("agent profile '\(name)' was not found")
-        }
-        let instructionFiles = definition.agentsMd
-            ? AgentInstructionDiscovery(environment: environment).discover(at: workingDirectory)
-            : []
-        let composedPrompt = definition.composePrompt(
-            basePrompt: "",
-            agentsMdFiles: instructionFiles
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
-        return LiveAgentProfile(
-            model: definition.model.modelID,
-            systemPrompt: composedPrompt.isEmpty ? nil : composedPrompt,
-            toolPolicy: LiveAgentToolPolicy(definition: definition),
-            discoverSkills: definition.discoverSkills
-        )
     }
 
     private static func resolveProvider(_ value: String) throws -> ModelProvider {

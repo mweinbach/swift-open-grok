@@ -30,6 +30,10 @@ public struct OpenGrokPagerMinimalRequest: Sendable, Equatable {
 public struct OpenGrokPagerMinimalCompletion: Sendable, Equatable {
     public var sessionID: String?
     public var summary: String?
+    /// JSON bytes produced from the shell's already validated schema result;
+    /// carrying bytes keeps this minimal target independent of JSONValue.
+    public var structuredOutput: Data?
+    public var structuredOutputError: String?
     public var messageID: String?
     public var rawStopReason: String?
     public var stopSequence: String?
@@ -41,6 +45,8 @@ public struct OpenGrokPagerMinimalCompletion: Sendable, Equatable {
     public init(
         sessionID: String? = nil,
         summary: String? = nil,
+        structuredOutput: Data? = nil,
+        structuredOutputError: String? = nil,
         messageID: String? = nil,
         rawStopReason: String? = nil,
         stopSequence: String? = nil,
@@ -51,6 +57,8 @@ public struct OpenGrokPagerMinimalCompletion: Sendable, Equatable {
     ) {
         self.sessionID = sessionID
         self.summary = summary
+        self.structuredOutput = structuredOutput
+        self.structuredOutputError = structuredOutputError
         self.messageID = messageID
         self.rawStopReason = rawStopReason
         self.stopSequence = stopSequence
