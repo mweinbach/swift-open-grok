@@ -549,6 +549,29 @@ struct SessionDocumentStoreTests {
         #expect(siblings.map(\.lastPathComponent) == ["summary.json"])
     }
 
+    @Test("durable directory creation still restricts existing directories")
+    func durableDirectoryCreationRestrictsExistingDirectory() throws {
+        let home = try temporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let directory = home.appendingPathComponent("private", isDirectory: true)
+
+        try RelocationFS.createDirectoryDurable(directory)
+        #if !os(Windows)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o777],
+            ofItemAtPath: directory.path
+        )
+        #endif
+        try RelocationFS.createDirectoryDurable(directory)
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: directory.path)
+        #expect(attributes[.type] as? FileAttributeType == .typeDirectory)
+        #if !os(Windows)
+        let permissions = try #require(attributes[.posixPermissions] as? NSNumber)
+        #expect(permissions.intValue & 0o777 == 0o700)
+        #endif
+    }
+
     private func temporaryHome() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("open-grok-documents-\(UUID().uuidString)", isDirectory: true)

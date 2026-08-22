@@ -130,6 +130,9 @@ public enum RelocationFS: Sendable {
     // MARK: - Durable Creation and Removal
 
     public static func createDirectoryDurable(_ url: URL) throws {
+        let existingType = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.type]
+            as? FileAttributeType
+        let alreadyExisted = existingType == .typeDirectory
         #if !os(Windows)
         try FileManager.default.createDirectory(
             at: url,
@@ -140,6 +143,10 @@ public enum RelocationFS: Sendable {
         #else
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         #endif
+        // Only a newly published directory needs a durable parent entry. Still
+        // create and restrict existing directories above; skipping that work
+        // would permit stale permissions or a changed path type.
+        guard !alreadyExisted else { return }
         let parent = url.deletingLastPathComponent()
         try? syncDirectory(parent)
         try? syncDirectory(url)
@@ -195,7 +202,8 @@ public enum RelocationFS: Sendable {
             try syncFile(tempURL)
 
             try atomicallyReplaceItem(at: path, with: tempURL)
-            try? syncFile(path)
+            // Rename moves the already-synced inode; only its new directory
+            // entry still needs a durability barrier.
             try? syncDirectory(parent)
         } catch {
             _ = try? FileManager.default.removeItem(at: tempURL)
