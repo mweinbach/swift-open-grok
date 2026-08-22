@@ -48,6 +48,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     struct ResolvedUIConfiguration: Sendable {
         let config: UiConfig
         let inputModes: OpenGrokPagerInputModes
+        let notifications: LiveTerminalNotificationConfiguration
         /// Startup-cached opt-in for `Ctrl+R` / `/toggle-mouse-reporting`.
         /// Resolved once from env + effective `[ui]` — restart-required in
         /// the settings modal; live `mouseReportingEnabled` is separate.
@@ -97,6 +98,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     let terminal: OpenGrokLiveTerminal
     let sink: any PagerTerminalSink
     let renderer: PagerTerminalRenderer
+    var terminalNotifications: LiveTerminalNotifications
+    var terminalNotificationTurnPending = false
+    var terminalNotificationTurnWasCancelling = false
     var inlineMediaCompositor: PagerInlineMediaCompositor
     var gboom: LiveGboomState?
     var gboomImageVisible = false
@@ -871,6 +875,19 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // theme degrades to GrokNight instead of to mush.
         let environment = environment ?? ProcessInfo.processInfo.environment
         self.environment = environment
+        let resolvedUIConfiguration = uiConfiguration ?? Self.resolveUIConfig(
+            workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
+            environment: environment
+        )
+        var notificationEnvironment = environment
+        if notificationEnvironment["TERM_PROGRAM"]?.isEmpty != false,
+           let terminalProgram, !terminalProgram.isEmpty {
+            notificationEnvironment["TERM_PROGRAM"] = terminalProgram
+        }
+        self.terminalNotifications = LiveTerminalNotifications(
+            configuration: resolvedUIConfiguration.notifications,
+            terminalContext: standaloneTerminalContext(environment: notificationEnvironment)
+        )
         let resolvedCodeModeActive = codeModeActive ?? (
             LiveCodeModeSettings.resolveToolMode(
                 environment: environment,
@@ -904,10 +921,6 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.urlOpener = urlOpener ?? authServices.openBrowser
         self.voiceState = LiveVoiceSessionState(
             capabilities: LiveVoiceComposition.resolveCapabilities(environment: environment)
-        )
-        let resolvedUIConfiguration = uiConfiguration ?? Self.resolveUIConfig(
-            workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
-            environment: environment
         )
         // Explicit init override wins (tests); otherwise the startup-resolved
         // gate from effective UiConfig / env. Never re-read process cwd here.
@@ -1057,11 +1070,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             cwd: workingDirectory,
             environment: environment
         ).effective()) ?? .table(TOMLTable())
+        let notifications = LiveTerminalNotificationConfiguration.resolve(document: document)
         guard let ui = document[path: ["ui"]] else {
             let config = UiConfig()
             return ResolvedUIConfiguration(
                 config: config,
                 inputModes: OpenGrokPagerInputModes(),
+                notifications: notifications,
                 mouseReportingToggleEnabled: resolveMouseReportingToggle(
                     document: document,
                     ui: config,
@@ -1078,6 +1093,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 enterSteers: boolValue(ui[path: ["enter_steers"]]),
                 combineQueuedPrompts: boolValue(ui[path: ["combine_queued_prompts"]])
             ),
+            notifications: notifications,
             mouseReportingToggleEnabled: resolveMouseReportingToggle(
                 document: document,
                 ui: config,
@@ -1438,10 +1454,19 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     }
 
     func frontendSuspendToChild() throws {
-        if let minimalHost {
-            try minimalHost.suspendToChild()
-        } else {
-            try renderer.suspendToChild()
+        let wasReportingFocus = terminalNotifications.focusReportingEnabled
+        do {
+            try suspendTerminalNotificationReporting()
+            if let minimalHost {
+                try minimalHost.suspendToChild()
+            } else {
+                try renderer.suspendToChild()
+            }
+        } catch {
+            if wasReportingFocus, !terminalNotifications.focusReportingEnabled {
+                try? startTerminalNotificationReporting()
+            }
+            throw error
         }
     }
 
@@ -1451,6 +1476,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         } else {
             try renderer.resumeFromChild()
         }
+        try startTerminalNotificationReporting()
     }
 
     func render(_ event: OpenGrokPagerInteractiveEvent) async throws {
@@ -1466,6 +1492,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         case .lifecycle(let lifecycle):
             if lifecycle == .cancelling {
                 isCancelling = true
+                terminalNotificationTurnWasCancelling = true
                 turnPhase = .cancelling
             }
         case .promptChanged(let prompt):
@@ -1532,14 +1559,35 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             turnStartedAtSeconds = motionEnabled ? currentMotionSeconds() : nil
             turnOutputUTF8Count = 0
             isCancelling = false
+            terminalNotificationTurnPending = true
+            terminalNotificationTurnWasCancelling = false
             await refreshContextUsage()
         case .session(let event):
             apply(event)
-        case .turnFinished:
+        case .turnFinished(let result):
+            let elapsed = currentTurnElapsed()
+            let shouldNotify = terminalNotificationTurnPending
+                && result.lifecycle == .completed
+                && !isCancelling
+                && !terminalNotificationTurnWasCancelling
+                && queuedPromptCount == 0
+            terminalNotificationTurnPending = false
+            terminalNotificationTurnWasCancelling = false
             finishAssistant()
-            upsertTurnEvent(.turnCompleted(elapsed: currentTurnElapsed()))
+            upsertTurnEvent(.turnCompleted(elapsed: elapsed))
             endTurn()
             await refreshContextUsage()
+            if shouldNotify {
+                updateTerminalNotificationPresentation()
+                let body = elapsed.map {
+                    "Turn complete in \(LivePagerTasksBlock.formatDuration($0))."
+                } ?? "Turn complete."
+                emitTerminalNotification(
+                    .turnComplete,
+                    title: terminalNotificationSessionName ?? "Open Grok",
+                    body: body
+                )
+            }
         case .sessionReplaced(let sessionID):
             // A swapped conversation invalidates an in-flight recap the same
             // way a new prompt does — it no longer describes this session.
@@ -1609,6 +1657,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         case .overlay(let request):
             try await present(request)
         case .turnCancelled:
+            terminalNotificationTurnPending = false
+            terminalNotificationTurnWasCancelling = false
             finishAssistant()
             upsertTurnEvent(.turnCancelled(elapsed: currentTurnElapsed()))
             // A cancelled turn must not leave a tool parked on a sheet the user
@@ -1618,6 +1668,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await resolveOutstandingPlanApprovals()
             endTurn()
         case .turnFailed(let message):
+            terminalNotificationTurnPending = false
+            terminalNotificationTurnWasCancelling = false
             finishAssistant()
             upsertTurnEvent(.turnFailed(error: message, elapsed: currentTurnElapsed()))
             upsertCreditLimitCard(message: message)
@@ -1626,12 +1678,18 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await resolveOutstandingQuestions()
             await resolveOutstandingPlanApprovals()
             endTurn()
+            updateTerminalNotificationPresentation()
+            emitTerminalNotification(.agentError, body: "Error: \(message)")
         case .eof, .shutdown:
+            terminalNotificationTurnPending = false
+            terminalNotificationTurnWasCancelling = false
             await resolveOutstandingPermissions()
             await resolveOutstandingQuestions()
             await resolveOutstandingPlanApprovals()
             endTurn()
         case .cancelled:
+            terminalNotificationTurnPending = false
+            terminalNotificationTurnWasCancelling = false
             finishAssistant()
             upsertTurnEvent(.turnCancelled(elapsed: currentTurnElapsed()))
             await resolveOutstandingPermissions()
@@ -1639,6 +1697,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await resolveOutstandingPlanApprovals()
             endTurn()
         case .failed(let message):
+            terminalNotificationTurnPending = false
+            terminalNotificationTurnWasCancelling = false
             finishAssistant()
             upsertTurnEvent(.turnFailed(error: message, elapsed: currentTurnElapsed()))
             upsertCreditLimitCard(message: message)
@@ -1646,7 +1706,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await resolveOutstandingQuestions()
             await resolveOutstandingPlanApprovals()
             endTurn()
+            updateTerminalNotificationPresentation()
+            emitTerminalNotification(.agentError, body: "Error: \(message)")
         }
+        updateTerminalNotificationPresentation()
         await refreshTodoPane()
         await refreshHookPresentation()
         await refreshActivityBlocks()
@@ -2103,6 +2166,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             try sink.flush()
         }
         _ = try clearGboomImage()
+        try stopTerminalNotificationReporting()
         try frontendRestore()
         if mode == .fullScreen {
             try sink.write(transcript)
@@ -2113,7 +2177,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func apply(_ event: OpenGrokPagerEvent) {
         switch event {
         case .lifecycle(let lifecycle):
-            if lifecycle == .running, turnPhase == nil {
+            if lifecycle == .cancelling {
+                terminalNotificationTurnWasCancelling = true
+                isCancelling = true
+                turnPhase = .cancelling
+            } else if lifecycle == .running, turnPhase == nil {
                 turnPhase = .thinking
                 turnStartedAt = turnStartedAt ?? Date()
             }
@@ -3419,6 +3487,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// Push or replace the permission sheet. Driven by the coordinator's
     /// presenter callback, so `nil` means "the queue drained".
     func showPermission(_ request: PagerPermissionRequest?) async {
+        let hadPendingPermission = currentPermissionRequestID != nil
         if let current = currentPermissionRequestID {
             overlays.dismiss(id: "permission:\(current)")
             currentPermissionRequestID = nil
@@ -3440,7 +3509,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             pushQuestionOverlay(parked)
             currentQuestionRequestID = parked.id
         }
+        if request == nil {
+            terminalNotifications.clearApprovalNotification()
+        }
         try? renderState()
+        updateTerminalNotificationPresentation()
+        if request != nil, !hadPendingPermission {
+            emitTerminalApprovalNotification()
+        }
     }
 
     /// Push or replace the question sheet. Driven by the question
@@ -3574,7 +3650,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             openGrokHome: openGrokHome,
             sessionID: sessionID,
             connections: mcpServers,
-            environment: environment
+            environment: environment,
+            projectTrusted: toolExecutor?.projectTrusted
         )))
     }
 
@@ -4026,6 +4103,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 try renderState()
                 return .consumed
             }
+        case .focusGained:
+            terminalNotifications.focusGained()
+            updateTerminalNotificationPresentation()
+            return .consumed
+        case .focusLost:
+            terminalNotifications.focusLost()
+            updateTerminalNotificationPresentation()
+            return .consumed
         case .mouse(let mouse):
             guard mouseReportingEnabled else { return .notHandled }
             if gboom != nil {
