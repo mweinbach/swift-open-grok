@@ -1,0 +1,143 @@
+{
+  "$schema": "open-grok/protocol-fixtures/provider-streaming-policy",
+  "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+  "providers": [
+    "xai",
+    "codex",
+    "kimi",
+    "fireworks",
+    "deepseek",
+    "meta",
+    "opencode_go",
+    "wafer",
+    "zai",
+    "runinfra",
+    "gemini",
+    "openrouter"
+  ],
+  "backends": [
+    "chat_completions",
+    "responses",
+    "messages"
+  ],
+  "streamToolCalls": {
+    "requestField": "stream_tool_calls",
+    "onlySupportedProvider": "xai",
+    "onlySupportedBackend": "responses",
+    "falseValueOmitted": true,
+    "vectors": [
+      {
+        "provider": "xai",
+        "backend": "responses",
+        "requested": true,
+        "wireFieldPresent": true,
+        "wireFieldValue": true
+      },
+      {
+        "provider": "xai",
+        "backend": "responses",
+        "requested": false,
+        "wireFieldPresent": false
+      },
+      {
+        "provider": "xai",
+        "backend": "chat_completions",
+        "requested": true,
+        "wireFieldPresent": false
+      },
+      {
+        "provider": "codex",
+        "backend": "responses",
+        "requested": true,
+        "wireFieldPresent": false
+      },
+      {
+        "provider": "gemini",
+        "backend": "messages",
+        "requested": true,
+        "wireFieldPresent": false
+      },
+      {
+        "provider": "openrouter",
+        "backend": "responses",
+        "requested": true,
+        "wireFieldPresent": false
+      }
+    ]
+  },
+  "codexPermissions": {
+    "provider": "codex",
+    "configurationField": "codex_permissions",
+    "absentConfigurationFieldOmitted": true,
+    "metadataHeader": "x-codex-turn-metadata",
+    "metadataKeys": [
+      "sandbox",
+      "sandbox_mode",
+      "auto_review_enabled"
+    ],
+    "optionalMetadataKeys": [
+      "session_id",
+      "thread_id",
+      "turn_id",
+      "open_grok_sandbox_profile"
+    ],
+    "approvalPolicies": [
+      "on-request",
+      "never"
+    ],
+    "workspaceWriteSample": {
+      "sandbox": "seatbelt",
+      "sandbox_mode": "workspace-write",
+      "sandbox_profile": "workspace",
+      "network_access": true,
+      "writable_roots": [
+        "/tmp/project"
+      ],
+      "approval_policy": "on-request",
+      "auto_review_enabled": true
+    },
+    "unsandboxedSample": {
+      "sandbox": "none",
+      "sandbox_mode": "danger-full-access",
+      "network_access": true,
+      "writable_roots": [],
+      "approval_policy": "never",
+      "auto_review_enabled": false
+    }
+  },
+  "nestedToolProgress": {
+    "capacity": 64,
+    "absentPayloadOmitted": true,
+    "textOnly": {
+      "text": "tool output"
+    },
+    "structured": {
+      "text": "tool output",
+      "payload": {
+        "chunk": 1
+      }
+    }
+  },
+  "provenance": {
+    "source": "xai-grok-sampling-types provider-local streaming gate, xai-grok-sampler Codex execution policy, and xai-grok-code-mode-protocol nested progress wire",
+    "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+    "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+    "pinVerdict": "recaptured",
+    "recapturedFields": [
+      "providers",
+      "streamToolCalls",
+      "codexPermissions",
+      "nestedToolProgress"
+    ],
+    "keyProvenance": {
+      "providers/streamToolCalls": "crates/codegen/xai-grok-sampling-types/src/types.rs:1714-1721,1864-1870,2265-2300; xai-grok-sampler/src/client.rs:2764-2774",
+      "codexPermissions": "crates/codegen/xai-grok-sampler/src/config.rs:27-49,164; xai-grok-sampler/src/provider.rs:867-945; HEAD 538a16df restores codex_permissions in streaming/session fixtures",
+      "nestedToolProgress": "crates/codegen/xai-grok-code-mode-protocol/src/progress.rs:24-48; absent Option payload uses serde skip_serializing_if and the bounded channel capacity is 64"
+    },
+    "evidence": [
+      "Commit bf1b6556 exhaustively checks all twelve provider identities against Chat Completions, Responses, and Messages; only an enabled xAI Responses request emits stream_tool_calls=true, while false and every other route omit the field.",
+      "Commits 77cba804 and 538a16df restore the optional codex_permissions field to cancellation, session compaction, model-switch, and subagent test configurations at Rust release 1.0.0-open-grok.81.",
+      "The nested Code Mode streaming sequence adds a bounded 64-chunk observer channel; serde omits an absent structured payload rather than serializing JSON null."
+    ]
+  }
+}

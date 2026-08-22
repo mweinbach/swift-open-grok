@@ -4,8 +4,8 @@
 
 **Overall state:** First-class RunInfra, direct Google Gemini, explicitly enabled OpenRouter, machine-local session collaboration, live MCP server changes, reverse ACP-hosted MCP servers, and native Messages output now reach the running executable. This remains **not complete parity** with the current Rust reference: ACP-hosted sessions intentionally reject peer auto-wake, the Windows session bus has no named-pipe implementation, and the executable version/reference pin were not advanced. Those boundaries and their security rationale are recorded below.
 **Destination was empty at baseline:** yes.
-**Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`); historical forward sync `eb215dd0` (`v1.0.0-open-grok.63`).
-**Current audited Rust snapshot:** `00db8a4b0205d9d477edf70bdffc47935f96d6f0`, product version `1.0.0-open-grok.80`, **159 commits beyond the original pin**. The Swift executable currently reports `1.0.0-open-grok.64`; this pass does not claim a version or reference-pin synchronization.
+**Reference:** `xai-org/grok-build` at `538a16dfb6b5989d835bc1503b600b4d2be9aad6` (release `v1.0.0-open-grok.81`); historical original reference `650c1db7c2e73c59cec88bf3c6359751d6cef1bd`.
+**Current audited Rust snapshot:** `538a16dfb6b5989d835bc1503b600b4d2be9aad6`, product version `1.0.0-open-grok.81`, **178 commits beyond the historical original pin**.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 
 ## Foundational live-seam correction (2026-08-21–22)

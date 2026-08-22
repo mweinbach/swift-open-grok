@@ -6,12 +6,11 @@
 //   scripts/build-macos-release.sh:9-11
 //     artifact_name="open-grok-macos-aarch64"
 //     target_triple="aarch64-apple-darwin"
+//   scripts/build-linux-release.sh:10-25
+//     artifact_name="open-grok-linux-${arch}"
+//     target_triple="${arch}-unknown-linux-gnu"
 //   scripts/build-windows-release.ps1:18
 //     $artifactName = 'open-grok-windows-x86_64.exe'
-//
-// `install.sh:36-40` refuses to install on anything but Apple Silicon macOS,
-// so a Linux release artifact does not exist at this pin. Modelling it here
-// would invent a name no upstream job produces.
 
 import Foundation
 
@@ -19,6 +18,10 @@ import Foundation
 public enum ReleasePlatform: String, Sendable, Hashable, CaseIterable, CustomStringConvertible {
     /// Apple Silicon macOS (`aarch64-apple-darwin`).
     case macOSAppleSilicon = "macos-aarch64"
+    /// 64-bit x86 Linux (`x86_64-unknown-linux-gnu`).
+    case linuxX86_64 = "linux-x86_64"
+    /// 64-bit ARM Linux (`aarch64-unknown-linux-gnu`).
+    case linuxAarch64 = "linux-aarch64"
     /// 64-bit Windows (`x86_64-pc-windows-msvc`).
     case windowsX86_64 = "windows-x86_64"
 
@@ -27,10 +30,13 @@ public enum ReleasePlatform: String, Sendable, Hashable, CaseIterable, CustomStr
     /// The published binary asset name.
     ///
     /// - macOS: `open-grok-macos-aarch64` (`scripts/build-macos-release.sh:9`)
+    /// - Linux: `open-grok-linux-${arch}` (`scripts/build-linux-release.sh:25`)
     /// - Windows: `open-grok-windows-x86_64.exe` (`scripts/build-windows-release.ps1:18`)
     public var artifactName: String {
         switch self {
         case .macOSAppleSilicon: return "open-grok-macos-aarch64"
+        case .linuxX86_64: return "open-grok-linux-x86_64"
+        case .linuxAarch64: return "open-grok-linux-aarch64"
         case .windowsX86_64: return "open-grok-windows-x86_64.exe"
         }
     }
@@ -43,37 +49,50 @@ public enum ReleasePlatform: String, Sendable, Hashable, CaseIterable, CustomStr
     public var targetTriple: String {
         switch self {
         case .macOSAppleSilicon: return "aarch64-apple-darwin"
+        case .linuxX86_64: return "x86_64-unknown-linux-gnu"
+        case .linuxAarch64: return "aarch64-unknown-linux-gnu"
         case .windowsX86_64: return "x86_64-pc-windows-msvc"
         }
     }
 
     /// The installer script published alongside the binary.
     ///
-    /// macOS copies the repo-root `install.sh`
-    /// (`scripts/build-macos-release.sh`); Windows copies
+    /// The macOS and Linux builders copy the repo-root `install.sh`; Windows copies
     /// `crates/codegen/xai-grok-pager/scripts/install.ps1`
     /// (`scripts/build-windows-release.ps1:149`).
     public var installerAssetName: String {
         switch self {
-        case .macOSAppleSilicon: return "install.sh"
+        case .macOSAppleSilicon, .linuxX86_64, .linuxAarch64: return "install.sh"
         case .windowsX86_64: return "install.ps1"
         }
     }
 
     /// Whether the reference's `install.sh` will install onto this platform.
     ///
-    /// `install.sh:36-40` hard-fails on anything that is not Apple Silicon
-    /// macOS. Windows installs go through `install.ps1` instead.
+    /// `install.sh:35-53` accepts Apple Silicon macOS and x86_64/aarch64 Linux.
+    /// Windows installs go through `install.ps1` instead.
     public var isSupportedByPosixInstaller: Bool {
-        self == .macOSAppleSilicon
+        switch self {
+        case .macOSAppleSilicon, .linuxX86_64, .linuxAarch64:
+            return true
+        case .windowsX86_64:
+            return false
+        }
     }
 
     /// Resolve the platform for a host OS/arch pair as reported by `uname`.
     ///
-    /// Mirrors `install.sh:35-40`, which accepts `Darwin` with either `arm64`
-    /// or `aarch64` and rejects everything else.
+    /// Mirrors the exact host aliases in `install.sh:35-53`.
     public static func forPosixHost(unameS: String, unameM: String) -> ReleasePlatform? {
-        guard unameS == "Darwin", unameM == "arm64" || unameM == "aarch64" else { return nil }
-        return .macOSAppleSilicon
+        switch (unameS, unameM) {
+        case ("Darwin", "arm64"), ("Darwin", "aarch64"):
+            return .macOSAppleSilicon
+        case ("Linux", "x86_64"), ("Linux", "amd64"):
+            return .linuxX86_64
+        case ("Linux", "aarch64"), ("Linux", "arm64"):
+            return .linuxAarch64
+        default:
+            return nil
+        }
     }
 }

@@ -1,11 +1,11 @@
 {
   "$schema": "open-grok/protocol-fixtures/provenance",
-  "generatedAt": "2026-08-08",
-  "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
-  "previousReferenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
+  "generatedAt": "2026-08-22",
+  "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+  "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
   "note": "Fixtures are provenance-labelled compatibility artifacts for implemented foundation formats. Binary goldens are re-encoded or structurally decoded in tests (OTLP, GCRX, git zlib metadata, hunk/PTY/tracing/storage keys) rather than digest-only validation.",
-  "recaptureNote": "Every entry below was re-evaluated against the 2026-08-08 re-pin from 70002584 to 650c1db7 (release .58: one substantive commit, f0a5a29f 'Harden provider reasoning and fast routing', plus the release stamp). For each family the upstream Rust source paths were diffed across the two refs; a family is 'unchanged (verified)' only when that diff is empty or provably non-semantic for the asserted content, and 'recaptured' when the fixture had to be re-derived from the new-pin source. The .58 delta touched only xai-grok-sampling-types, xai-grok-sampler, xai-grok-shell (fireworks/opencode-go models, agent config, subagent, tool_calls), xai-grok-pager/acp/model_state.rs, OPEN_GROK_VERSION, and docs — no fixture family's source moved (verified per-family, including Cargo.lock), so the only recaptures are the two release-stamped artifacts. Per-file evidence lives in each fixture's own `provenance` block.",
-  "method": "Hand-derivation from the Rust reference with file:line provenance, cross-checked against the corresponding Swift port target. The pinned commit is read via git plumbing from the clone at /Users/mweinbach/Projects/open-grok (git show/diff at the pin; the working tree is never consulted). No network access; the reference clone is read-only and was left clean.",
+  "recaptureNote": "Every entry was re-evaluated against the 2026-08-22 re-pin from 650c1db7 (0.1.220-open-grok.58) to 538a16df (1.0.0-open-grok.81), a 178-commit upstream delta. The CLI version, Linux x86_64/aarch64 distribution support, and fixed-width crash release stamp were recaptured; SQLite gained a real shared 10s busy-retry budget; provider-local streamed-tool-call gates, Codex execution permissions, and bounded nested Code Mode progress are recorded in a new fixture. Other families are marked unchanged only when their asserted source surface is unchanged or an additive/comment-only source delta cannot change the captured wire bytes.",
+  "method": "Hand-derivation from immutable Rust source with file:line provenance, cross-checked against production Swift targets. Both revisions and every family-level diff were read through git plumbing from the read-only reference clone at /Users/mweinbach/Projects/grok-build; release-stamped binary goldens were structurally re-encoded and the manifest was regenerated from actual file bytes.",
   "entries": [
     {
       "file": "PROVENANCE.json",
@@ -20,7 +20,7 @@
       "referenceSources": [
         "crates/codegen/xai-acp-lib"
       ],
-      "evidence": "git diff 70002584..650c1db7 -- crates/codegen/xai-acp-lib => empty (source and Cargo.toml both untouched)."
+      "evidence": "git diff 650c1db7..538a16df -- crates/codegen/xai-acp-lib => empty (source and Cargo.toml both untouched)."
     },
     {
       "file": "cli-version-and-home.json",
@@ -28,11 +28,13 @@
       "family": "cli-version-and-home",
       "referenceSources": [
         "OPEN_GROK_VERSION",
+        "install.sh",
+        "scripts/build-linux-release.sh",
         "crates/codegen/xai-grok-version",
         "crates/codegen/xai-grok-config/src/paths.rs",
         "crates/codegen/xai-grok-paths"
       ],
-      "evidence": "OPEN_GROK_VERSION moved 0.1.220-open-grok.57 -> .58. The xai-grok-version, xai-grok-config/src/paths.rs, and xai-grok-paths surfaces asserted by this fixture are unchanged across 70002584..650c1db7."
+      "evidence": "OPEN_GROK_VERSION moved from 0.1.220-open-grok.58 to 1.0.0-open-grok.81. install.sh:35-53 and scripts/build-linux-release.sh:9-26 now publish GNU Linux x86_64/aarch64 releases and their exact uname aliases. Version-library behavior and the branded home-policy contract are unchanged; config paths additionally harden session directories to mode 0700 without changing home selection."
     },
     {
       "file": "config-workspace-codemode-keys.json",
@@ -44,7 +46,7 @@
         "crates/codegen/xai-grok-workspace-types/src/types/permission.rs",
         "crates/codegen/xai-grok-code-mode-protocol/src/runtime.rs"
       ],
-      "evidence": "git diff 70002584..650c1db7 is empty for the asserted ConfigSource, RuleAction, workspace permission, and Code Mode runtime-default surfaces. The Swift Code Mode exec default now matches the reference value of 30_000ms."
+      "evidence": "git diff 650c1db7..538a16df is empty for the asserted ConfigSource, RuleAction, workspace permission, and Code Mode runtime-default surfaces. The Swift Code Mode exec default now matches the reference value of 30_000ms."
     },
     {
       "file": "crash-gcrx-format.json",
@@ -54,7 +56,7 @@
         "crates/codegen/xai-crash-handler/src/format.rs",
         "crates/codegen/xai-crash-handler/src/handler.rs"
       ],
-      "evidence": "git diff 70002584..650c1db7 -- crates/codegen/xai-crash-handler => empty, so the GCRX layout and signal capture remain unchanged; only the sample app_version was re-encoded to the .58 release marker."
+      "evidence": "git diff 650c1db7..538a16df -- crates/codegen/xai-crash-handler => empty, so the GCRX layout and signal capture remain unchanged; only the sample app_version was re-encoded to the 1.0.0-open-grok.81 release marker."
     },
     {
       "file": "crash-gcrx-sample.bin",
@@ -63,7 +65,7 @@
       "referenceSources": [
         "crates/codegen/xai-crash-handler/src/format.rs"
       ],
-      "evidence": "Re-encoded 64-byte header with app_version = 0.1.220-open-grok.58 (in-place same-length substitution at offset 32). All other bytes are identical to the prior golden."
+      "evidence": "Re-encoded the complete 32-byte NUL-padded version field at offset 32 with the 18-byte 1.0.0-open-grok.81 release; bytes 0...31 remain identical and the golden stays exactly 64 bytes."
     },
     {
       "file": "git-loose-blob-hello.zlib",
@@ -72,7 +74,7 @@
       "referenceSources": [
         "crates/codegen/xai-gix-status"
       ],
-      "evidence": "git diff 70002584..650c1db7 -- crates/codegen/xai-gix-status => empty. The artifact encodes git's own loose-object framing, which the reference does not define."
+      "evidence": "git diff 650c1db7..538a16df -- crates/codegen/xai-gix-status => empty. The artifact encodes git's own loose-object framing, which the reference does not define."
     },
     {
       "file": "git-object-and-index.json",
@@ -81,7 +83,7 @@
       "referenceSources": [
         "crates/codegen/xai-gix-status"
       ],
-      "evidence": "git diff 70002584..650c1db7 -- crates/codegen/xai-gix-status => empty."
+      "evidence": "git diff 650c1db7..538a16df -- crates/codegen/xai-gix-status => empty."
     },
     {
       "file": "hunk-tracker-snapshot.json",
@@ -90,7 +92,7 @@
       "referenceSources": [
         "crates/codegen/xai-hunk-tracker/src/types.rs"
       ],
-      "evidence": "git diff 70002584..650c1db7 -- crates/codegen/xai-hunk-tracker => empty for the persisted wire declarations. HunkTrackerSnapshot, SessionStats, and the HunkSource variant set are untouched, so the wire shape is identical."
+      "evidence": "git diff 650c1db7..538a16df -- crates/codegen/xai-hunk-tracker => empty for the persisted wire declarations. HunkTrackerSnapshot, SessionStats, and the HunkSource variant set are untouched, so the wire shape is identical."
     },
     {
       "file": "otlp-export-trace-grpc.bin",
@@ -100,7 +102,7 @@
         "Cargo.lock (opentelemetry-proto)",
         "crates/codegen/xai-grok-telemetry/src/otlp_http.rs"
       ],
-      "evidence": "git diff 70002584..650c1db7 is empty for Cargo.lock and the OTLP exporter surface; the protobuf schema and framing remain unchanged."
+      "evidence": "Cargo.lock changed in unrelated packages, but all opentelemetry-proto/otlp versions and checksums are unchanged; the exporter diff is one comment, so the protobuf schema and gRPC framing remain byte-identical."
     },
     {
       "file": "otlp-export-trace-http.pb",
@@ -120,7 +122,20 @@
         "Cargo.lock (opentelemetry-proto)",
         "crates/codegen/xai-grok-telemetry/src/otlp_http.rs"
       ],
-      "evidence": "See the fixture's provenance.evidence for the full argument, including why the large telemetry-crate drift is confined to the external event stream."
+      "evidence": "See the fixture's provenance.evidence for exact unchanged dependency identities and the comment-only exporter diff; unrelated telemetry changes do not alter this serialized span fixture."
+    },
+    {
+      "file": "provider-streaming-policy.json",
+      "verdict": "recaptured",
+      "family": "provider-streaming/codex-permissions/nested-progress",
+      "referenceSources": [
+        "crates/codegen/xai-grok-sampling-types/src/types.rs",
+        "crates/codegen/xai-grok-sampler/src/client.rs",
+        "crates/codegen/xai-grok-sampler/src/config.rs",
+        "crates/codegen/xai-grok-sampler/src/provider.rs",
+        "crates/codegen/xai-grok-code-mode-protocol/src/progress.rs"
+      ],
+      "evidence": "Release .81 exhaustively enforces stream_tool_calls=true only for xAI Responses across all 12 providers and 3 backends, preserves Codex-only execution permissions, and omits absent payloads from bounded nested progress chunks."
     },
     {
       "file": "pty-process-signals.json",
@@ -129,16 +144,16 @@
       "referenceSources": [
         "crates/codegen/ptyctl"
       ],
-      "evidence": "git diff 70002584..650c1db7 -- crates/codegen/ptyctl => empty. No behavioral change."
+      "evidence": "git diff 650c1db7..538a16df -- crates/codegen/ptyctl => empty. No behavioral change."
     },
     {
       "file": "sqlite-journal-modes.json",
-      "verdict": "unchanged (verified)",
+      "verdict": "recaptured",
       "family": "sqlite-journal",
       "referenceSources": [
         "crates/codegen/xai-sqlite-journal"
       ],
-      "evidence": "git diff 70002584..650c1db7 -- crates/codegen/xai-sqlite-journal => empty. The fixture's referenceEnvOverride key remains documentation of the existing port extension, not a pin change."
+      "evidence": "xai-sqlite-journal/src/lib.rs adds a shared 10000ms SQLITE_BUSY/SQLITE_LOCKED retry deadline, 20ms retry pauses, 1000ms maximum attempts, and restoration of the normal 5000ms busy timeout; mode names and the reference-only environment override remain unchanged."
     },
     {
       "file": "tracing-w3c-traceparent.json",
@@ -149,7 +164,7 @@
         "crates/codegen/xai-tracing-macros",
         "crates/codegen/xai-grok-telemetry/src/otel_layer/redact.rs"
       ],
-      "evidence": "git diff 70002584..650c1db7 is empty for the tracing and redaction surfaces asserted here; the denylist remains untouched."
+      "evidence": "The W3C encoder and redaction denylist are unchanged; grpc_client.rs adds current_traceparent() using the same version/trace/span/flags representation, so the fixture's traceparent wire value remains valid."
     }
   ],
   "openPortDrift": [],
@@ -166,6 +181,7 @@
     "otlp-export-trace-grpc.bin",
     "otlp-export-trace-http.pb",
     "otlp-span-export-shape.json",
+    "provider-streaming-policy.json",
     "pty-process-signals.json",
     "sqlite-journal-modes.json",
     "tracing-w3c-traceparent.json"

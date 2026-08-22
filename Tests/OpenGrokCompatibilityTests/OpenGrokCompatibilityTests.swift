@@ -19,6 +19,8 @@ import Testing
 import OpenGrokACP
 import OpenGrokCodeModeProtocol
 import OpenGrokDistributionSupport
+import OpenGrokSampler
+import OpenGrokSamplingTypes
 
 private let acceptedVerdicts: Set<String> = ["unchanged (verified)", "recaptured"]
 
@@ -420,6 +422,24 @@ struct RecapturedFixtureContentTests {
     func versionFixtureNamesPinnedRelease() throws {
         let fixture = try FixtureCorpus.json("cli-version-and-home.json")
         #expect(fixture["referencePinnedRelease"] as? String == OpenGrokDistributionSupport.referencePinnedRelease)
+        let fixturePlatforms = try #require(fixture["supportedPosixReleasePlatforms"] as? [String])
+        let actualPlatforms = ReleasePlatform.allCases
+            .filter(\.isSupportedByPosixInstaller)
+            .map(\.rawValue)
+        #expect(fixturePlatforms == actualPlatforms)
+        let aliases = try #require(fixture["posixHostAliases"] as? [String: String])
+        #expect(aliases.count == 6)
+        for (host, expectedPlatform) in aliases {
+            let components = host.split(separator: ":", maxSplits: 1)
+            #expect(components.count == 2)
+            guard components.count == 2 else { continue }
+            let actual = ReleasePlatform.forPosixHost(
+                unameS: String(components[0]),
+                unameM: String(components[1])
+            )
+            #expect(actual?.rawValue == expectedPlatform)
+        }
+        #expect(!ReleasePlatform.windowsX86_64.isSupportedByPosixInstaller)
         // Home policy did not move with the pin.
         #expect(fixture["homeEnv"] as? String == "OPENGROK_HOME")
         #expect(fixture["homeFallback"] as? String == "~/.opengrok")
@@ -494,6 +514,16 @@ struct RecapturedFixtureContentTests {
         #expect(fixture["permissionRuleActionDefault"] as? String == "deny")
     }
 
+    @Test("SQLite busy-retry fixture preserves one bounded upstream lock budget")
+    func sqliteFixtureRecordsBoundedBusyRetry() throws {
+        let fixture = try FixtureCorpus.json("sqlite-journal-modes.json")
+        #expect(fixture["busyTimeoutMilliseconds"] as? Int == 5_000)
+        #expect(fixture["busyRetryBudgetMilliseconds"] as? Int == 10_000)
+        #expect(fixture["busyRetryPauseMilliseconds"] as? Int == 20)
+        #expect(fixture["maxBusyAttemptMilliseconds"] as? Int == 1_000)
+        #expect(fixture["referenceEnvOverride"] as? String == "GROK_SQLITE_JOURNAL_MODE")
+    }
+
     @Test("resolved Swift-port drift is removed from fixture provenance")
     func resolvedPortDriftIsRemoved() throws {
         let fixture = try FixtureCorpus.json("config-workspace-codemode-keys.json")
@@ -503,5 +533,130 @@ struct RecapturedFixtureContentTests {
         let provenance = try FixtureCorpus.json("PROVENANCE.json")
         let openDrift = provenance["openPortDrift"] as? [String] ?? []
         #expect(openDrift.isEmpty)
+    }
+}
+
+@Suite("Upstream provider streaming fixture parity")
+struct UpstreamProviderStreamingFixtureParityTests {
+    private let providers: [ModelProvider] = [
+        .xai, .codex, .kimi, .fireworks, .deepseek, .meta,
+        .openCodeGo, .wafer, .zai, .runinfra, .gemini, .openRouter,
+    ]
+
+    private let backends: [(ApiBackend, String)] = [
+        (.chatCompletions, "chat_completions"),
+        (.responses, "responses"),
+        (.messages, "messages"),
+    ]
+
+    @Test("all twelve real provider adapters enforce the captured streaming matrix")
+    func providerStreamingPolicyMatchesProductionContracts() throws {
+        let fixture = try FixtureCorpus.json("provider-streaming-policy.json")
+        #expect(fixture["providers"] as? [String] == providers.map(\.asString))
+        #expect(fixture["backends"] as? [String] == backends.map { $0.1 })
+
+        let policy = try #require(fixture["streamToolCalls"] as? [String: Any])
+        #expect(policy["requestField"] as? String == "stream_tool_calls")
+        #expect(policy["onlySupportedProvider"] as? String == "xai")
+        #expect(policy["onlySupportedBackend"] as? String == "responses")
+        #expect(policy["falseValueOmitted"] as? Bool == true)
+
+        for provider in providers {
+            for (backend, backendName) in backends {
+                let supported = provider == .xai && backend == .responses
+                #expect(
+                    provider.supportsStreamToolCallsRequest(backend) == supported,
+                    "\(provider.asString) / \(backendName)"
+                )
+                #expect(
+                    shouldInjectStreamToolCalls(true, provider: provider, backend: backend) == supported,
+                    "\(provider.asString) / \(backendName)"
+                )
+                #expect(!shouldInjectStreamToolCalls(false, provider: provider, backend: backend))
+            }
+        }
+
+        let vectors = try #require(policy["vectors"] as? [[String: Any]])
+        for vector in vectors {
+            let providerName = try #require(vector["provider"] as? String)
+            let backendName = try #require(vector["backend"] as? String)
+            let provider = try #require(providers.first { $0.asString == providerName })
+            let backend = try #require(backends.first { $0.1 == backendName }?.0)
+            let requested = try #require(vector["requested"] as? Bool)
+            let expectedPresence = try #require(vector["wireFieldPresent"] as? Bool)
+            #expect(
+                shouldInjectStreamToolCalls(requested, provider: provider, backend: backend)
+                    == expectedPresence
+            )
+        }
+    }
+
+    @Test("Codex permission fixture round-trips actual production wire fields")
+    func codexPermissionFixtureMatchesRealSamplerConfiguration() throws {
+        let fixture = try FixtureCorpus.json("provider-streaming-policy.json")
+        let contract = try #require(fixture["codexPermissions"] as? [String: Any])
+        let sample = try #require(contract["workspaceWriteSample"] as? [String: Any])
+        let permissions = CodexPermissions(
+            sandbox: "seatbelt",
+            sandboxMode: "workspace-write",
+            sandboxProfile: "workspace",
+            networkAccess: true,
+            writableRoots: ["/tmp/project"],
+            approvalPolicy: .onRequest,
+            autoReviewEnabled: true
+        )
+        let encoded = try JSONEncoder().encode(permissions)
+        let wire = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+
+        #expect(Set(wire.keys) == Set(sample.keys))
+        #expect(wire["sandbox"] as? String == sample["sandbox"] as? String)
+        #expect(wire["sandbox_mode"] as? String == sample["sandbox_mode"] as? String)
+        #expect(wire["sandbox_profile"] as? String == sample["sandbox_profile"] as? String)
+        #expect(wire["network_access"] as? Bool == sample["network_access"] as? Bool)
+        #expect(wire["writable_roots"] as? [String] == sample["writable_roots"] as? [String])
+        #expect(wire["approval_policy"] as? String == sample["approval_policy"] as? String)
+        #expect(wire["auto_review_enabled"] as? Bool == sample["auto_review_enabled"] as? Bool)
+        #expect(try JSONDecoder().decode(CodexPermissions.self, from: encoded) == permissions)
+        #expect(contract["metadataHeader"] as? String == X_CODEX_TURN_METADATA_HEADER)
+
+        let configuration = SamplerConfig(provider: .codex, codexPermissions: permissions)
+        let configurationWire = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(configuration)) as? [String: Any]
+        )
+        let configured = try #require(configurationWire["codex_permissions"] as? [String: Any])
+        #expect(configured["sandbox_mode"] as? String == "workspace-write")
+
+        let omitted = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(SamplerConfig(provider: .codex)))
+                as? [String: Any]
+        )
+        #expect(omitted["codex_permissions"] == nil)
+    }
+
+    @Test("nested progress omits absent payloads and retains structured payloads")
+    func nestedProgressFixtureMatchesRealCodeModeSerialization() throws {
+        let fixture = try FixtureCorpus.json("provider-streaming-policy.json")
+        let contract = try #require(fixture["nestedToolProgress"] as? [String: Any])
+        #expect(contract["capacity"] as? Int == NESTED_TOOL_PROGRESS_CAPACITY)
+        #expect(contract["absentPayloadOmitted"] as? Bool == true)
+
+        let textOnly = try #require(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(NestedToolProgress.text("tool output"))
+            ) as? [String: Any]
+        )
+        #expect(textOnly["text"] as? String == "tool output")
+        #expect(textOnly.keys.sorted() == ["text"])
+
+        let structured = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(
+                NestedToolProgress.withPayload("tool output", .object([
+                    "chunk": .number(.int64(1)),
+                ]))
+            )) as? [String: Any]
+        )
+        let payload = try #require(structured["payload"] as? [String: Any])
+        #expect(payload["chunk"] as? Int == 1)
+        #expect(structured["text"] as? String == "tool output")
     }
 }

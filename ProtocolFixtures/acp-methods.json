@@ -1,6 +1,6 @@
 {
   "$schema": "https://agentsdk.com/schemas/acp-methods.json",
-  "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+  "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
   "methods": [
     "initialize",
     "authenticate",
@@ -24,13 +24,13 @@
   },
   "provenance": {
     "source": "OpenGrokACP method name surface vs xai-acp-lib",
-    "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
-    "previousReferenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
+    "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+    "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
     "pinVerdict": "unchanged (verified)",
     "evidence": [
-      "git diff 70002584..650c1db7 -- crates/codegen/xai-acp-lib => empty (no source change)",
-      "git diff 70002584..650c1db7 -- crates/codegen/xai-acp-lib/Cargo.toml => empty (agent-client-protocol dependency pin unchanged)",
-      "crates/codegen/xai-acp-lib/src/normalize.rs:99,113,154,168 spell the same session/* JSON-RPC method names at 650c1db7"
+      "git diff 650c1db7..538a16df -- crates/codegen/xai-acp-lib => empty (no source change)",
+      "git diff 650c1db7..538a16df -- crates/codegen/xai-acp-lib/Cargo.toml => empty (agent-client-protocol dependency pin unchanged)",
+      "crates/codegen/xai-acp-lib/src/normalize.rs:99,113,154,168 spell the same session/* JSON-RPC method names at 538a16df"
     ]
   }
 }

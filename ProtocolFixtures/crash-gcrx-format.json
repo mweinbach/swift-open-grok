@@ -32,13 +32,13 @@
     "pid": 4242,
     "timestamp": 1700000000,
     "nFrames": 0,
-    "appVersion": "0.1.220-open-grok.58"
+    "appVersion": "1.0.0-open-grok.81"
   },
-  "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+  "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
   "provenance": {
     "source": "OpenGrokCrashHandler.CrashBlobFormat / CrashBlob.serialize vs xai-crash-handler",
-    "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
-    "previousReferenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
+    "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+    "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
     "pinVerdict": "recaptured",
     "recapturedFields": [
       "sample.appVersion",
@@ -46,14 +46,14 @@
     ],
     "keyProvenance": {
       "magic/version/maxFrames/versionStringLength/headerSize/maxFileSize": "crates/codegen/xai-crash-handler/src/format.rs:7,10,13,16,30,33 — byte-identical between the two pins",
-      "sample.appVersion": "release marker OPEN_GROK_VERSION at 650c1db7 (0.1.220-open-grok.58); asserted equal to OpenGrokDistributionSupport.referencePinnedRelease",
+      "sample.appVersion": "release marker OPEN_GROK_VERSION at 538a16df (1.0.0-open-grok.81); asserted equal to OpenGrokDistributionSupport.referencePinnedRelease",
       "layout": "crates/codegen/xai-crash-handler/src/format.rs:136-151 (writer) and :53-71 (parser); mirrored by Sources/OpenGrokCrashHandler/OpenGrokCrashHandler.swift:100-197",
       "capturedSignals.unix": "crates/codegen/xai-crash-handler/src/handler.rs:306-308 (SIGBUS, SIGSEGV, SIGABRT)",
       "capturedSignals.windows": "crates/codegen/xai-crash-handler/src/handler.rs:1-8 module doc — abort() does not route through SetUnhandledExceptionFilter, so SIGABRT capture is Unix-only"
     },
     "evidence": [
-      "git diff 70002584..650c1db7 -- crates/codegen/xai-crash-handler => empty. The GCRX header layout, magic, version byte, frame cap, version-string field, and captured signal set remain unchanged from the prior pin.",
-      "crash-gcrx-sample.bin re-encoded with app_version = 0.1.220-open-grok.58 from the 650c1db7 release marker; every other header byte is identical to the prior golden (stamp-only in-place substitution at offset 32, same 20-byte length)."
+      "git diff 650c1db7..538a16df -- crates/codegen/xai-crash-handler => empty. The GCRX header layout, magic, version byte, frame cap, version-string field, and captured signal set remain unchanged from the prior pin.",
+      "crash-gcrx-sample.bin re-encoded with the 18-byte app_version 1.0.0-open-grok.81; the complete 32-byte field at offset 32 is NUL-padded, the first 32 bytes are preserved, and the header remains exactly 64 bytes."
     ]
   }
 }

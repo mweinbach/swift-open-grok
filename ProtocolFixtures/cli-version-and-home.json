@@ -5,30 +5,46 @@
     "help",
     "paths"
   ],
-  "compiledVersionDefault": "0.1.220-open-grok.58",
-  "referencePinnedRelease": "0.1.220-open-grok.58",
+  "compiledVersionDefault": "1.0.0-open-grok.81",
+  "referencePinnedRelease": "1.0.0-open-grok.81",
   "compiledVersionEnv": "GROK_VERSION",
   "emptyTestVersionReturnsEmpty": true,
   "homeEnv": "OPENGROK_HOME",
   "homeFallback": "~/.opengrok",
   "legacyHomeForbidden": "~/.grok",
-  "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+  "supportedPosixReleasePlatforms": [
+    "macos-aarch64",
+    "linux-x86_64",
+    "linux-aarch64"
+  ],
+  "posixHostAliases": {
+    "Darwin:arm64": "macos-aarch64",
+    "Darwin:aarch64": "macos-aarch64",
+    "Linux:x86_64": "linux-x86_64",
+    "Linux:amd64": "linux-x86_64",
+    "Linux:aarch64": "linux-aarch64",
+    "Linux:arm64": "linux-aarch64"
+  },
+  "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
   "testVersionEnv": "GROK_TEST_VERSION",
   "unimplementedStayUnavailable": true,
   "provenance": {
     "source": "OpenGrokVersion/OpenGrokCLI semantics vs Rust xai-grok-version + xai-grok-config path resolution",
-    "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
-    "previousReferenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
+    "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+    "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
     "pinVerdict": "recaptured",
     "recapturedFields": [
       "referencePinnedRelease",
-      "compiledVersionDefault"
+      "compiledVersionDefault",
+      "supportedPosixReleasePlatforms",
+      "posixHostAliases"
     ],
     "evidence": [
-      "OPEN_GROK_VERSION moved 0.1.220-open-grok.57 at 70002584 -> 0.1.220-open-grok.58 at 650c1db7; the Swift compiled default now follows the current marker.",
-      "git diff 70002584..650c1db7 -- crates/codegen/xai-grok-version => empty; TEST_VERSION_ENV=\"GROK_TEST_VERSION\" (src/lib.rs:5), VERSION = option_env!(\"GROK_VERSION\") else CARGO_PKG_VERSION (src/lib.rs:7-10), and installed() trimming semantics are unchanged.",
-      "git diff 70002584..650c1db7 -- crates/codegen/xai-grok-config/src/paths.rs => empty; default_grok_home() = <home>/.opengrok and grok_home() still prefers $OPENGROK_HOME.",
-      "git diff 70002584..650c1db7 -- crates/codegen/xai-grok-paths => empty for the path-policy surface asserted here."
+      "OPEN_GROK_VERSION moved from 0.1.220-open-grok.58 at 650c1db7 to 1.0.0-open-grok.81 at 538a16df; the marker, build plugin, checked-in generated source, CLI output, and release baseline now agree.",
+      "install.sh:35-53 now accepts Darwin arm64/aarch64, Linux x86_64/amd64, and Linux aarch64/arm64; scripts/build-linux-release.sh:9-26 publishes GNU x86_64 and aarch64 binaries with install.sh and SHA-256 sidecars.",
+      "git diff 650c1db7..538a16df -- crates/codegen/xai-grok-version/src/lib.rs => empty; TEST_VERSION_ENV=\"GROK_TEST_VERSION\", compile-time GROK_VERSION fallback, and installed() trimming semantics are unchanged.",
+      "xai-grok-config/src/paths.rs added explicit-home helpers and owner-only session directories, but default_grok_home() still resolves <home>/.opengrok and grok_home() still prefers $OPENGROK_HOME.",
+      "git diff 650c1db7..538a16df -- crates/codegen/xai-grok-paths => empty for the path-policy surface asserted here."
     ]
   }
 }

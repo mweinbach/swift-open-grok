@@ -11,7 +11,7 @@
 //   :79-90   both directories must be absolute, and must not contain `:`,
 //            newline, or carriage return
 //   :92      download_dir="${open_grok_home}/downloads"
-//   :157     versioned_name="open-grok-${installed_version}-macos-aarch64"
+//   :172     versioned_name="open-grok-${installed_version}-${versioned_platform}"
 //            (a `-reinstall-$$` suffix is appended when that path is taken)
 //
 // The `~/.grok` legacy directory is never read or written; that invariant is
@@ -114,13 +114,13 @@ public struct InstallLayout: Sendable, Hashable {
 
     /// The staged, versioned download name for an installed binary.
     ///
-    /// `install.sh:157` builds `open-grok-${installed_version}-macos-aarch64`
+    /// `install.sh:172` builds `open-grok-${installed_version}-${versioned_platform}`
     /// — the version is spliced into the middle of the platform artifact name,
     /// not appended.
     ///
-    /// The reference defines this only for macOS (its POSIX installer refuses
-    /// every other platform). The Windows form keeps the `.exe` extension last
-    /// so the staged file stays executable on that OS.
+    /// The POSIX installer uses this form for macOS and both Linux architectures.
+    /// The Windows form keeps the `.exe` extension last so the staged file stays
+    /// executable on that OS.
     public static func versionedDownloadName(
         version: ReleaseVersion,
         platform: ReleasePlatform

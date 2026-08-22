@@ -53,14 +53,14 @@
       "allow"
     ]
   },
-  "notes": "Checked-in key-order fixtures for implemented foundation contracts, re-evaluated at the 9ed09e2a pin with per-key Rust file:line provenance.",
-  "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+  "notes": "Checked-in key-order fixtures for implemented foundation contracts, re-evaluated against Rust revision 538a16df with per-key source provenance.",
+  "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
   "portDrift": {},
   "provenance": {
     "source": "xai-grok-config-types (ConfigSource, RuleAction) + xai-grok-code-mode-protocol (runtime defaults), cross-checked against OpenGrokConfigTypes/OpenGrokWorkspaceTypes/OpenGrokCodeModeProtocol",
-    "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
-    "previousReferenceRevision": "70002584da34e4c37ea14a3bce35341b7d04f9a7",
-    "pinVerdict": "recaptured",
+    "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+    "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+    "pinVerdict": "unchanged (verified)",
     "keyProvenance": {
       "configSourceOrder": "crates/codegen/xai-grok-config-types/src/flags.rs:9-19 (declaration order; strum serialize_all = snake_case at :8). Mirrored by Sources/OpenGrokConfigTypes/Flags.swift:14-23.",
       "boolFlagResolutionPrecedence": "crates/codegen/xai-grok-config-types/src/flags.rs:39 (doc comment on the bool-flag resolver)",
@@ -74,10 +74,10 @@
       "`workspacePermissionOrder` retained unchanged: verified still correct at 80dff0a9."
     ],
     "evidence": [
-      "git diff 70002584..650c1db7 -- crates/codegen/xai-grok-config-types/src/flags.rs => empty (ConfigSource unchanged at the current pin)",
-      "git diff 70002584..650c1db7 -- crates/codegen/xai-grok-config-types/src/permission.rs => empty (RuleAction unchanged at the current pin)",
-      "git diff 70002584..650c1db7 -- crates/codegen/xai-grok-workspace-types/src/types/permission.rs => empty (PermissionDecision and policy shape unchanged)",
-      "git diff 70002584..650c1db7 -- crates/codegen/xai-grok-code-mode-protocol => empty (the 30_000ms exec default is unchanged at the current pin)"
+      "git diff 650c1db7..538a16df -- crates/codegen/xai-grok-config-types/src/flags.rs => empty (ConfigSource unchanged at the current pin)",
+      "git diff 650c1db7..538a16df -- crates/codegen/xai-grok-config-types/src/permission.rs => empty (RuleAction unchanged at the current pin)",
+      "git diff 650c1db7..538a16df -- crates/codegen/xai-grok-workspace-types/src/types/permission.rs => empty (PermissionDecision and policy shape unchanged)",
+      "git diff 650c1db7..538a16df -- crates/codegen/xai-grok-code-mode-protocol/src/runtime.rs => empty (the 30_000ms exec default is unchanged; newly added nested-progress transport is covered by provider-streaming-policy.json)"
     ]
   }
 }

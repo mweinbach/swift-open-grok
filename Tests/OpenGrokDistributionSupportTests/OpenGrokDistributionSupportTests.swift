@@ -1,7 +1,7 @@
 // OpenGrokDistributionSupportTests.swift
 //
 // Every expectation here is anchored to a concrete line in the Rust reference
-// at 9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05 (see the target's source
+// at 538a16dfb6b5989d835bc1503b600b4d2be9aad6 (see the target's source
 // comments for the file:line citations).
 
 import Foundation
@@ -125,9 +125,12 @@ struct ReleaseVersionTests {
 
 @Suite("Release platform naming")
 struct ReleasePlatformTests {
-    @Test("artifact names match the two release builders byte for byte")
+    @Test("artifact names match all four published release targets byte for byte")
     func artifactNames() {
+        #expect(ReleasePlatform.allCases.count == 4)
         #expect(ReleasePlatform.macOSAppleSilicon.artifactName == "open-grok-macos-aarch64")
+        #expect(ReleasePlatform.linuxX86_64.artifactName == "open-grok-linux-x86_64")
+        #expect(ReleasePlatform.linuxAarch64.artifactName == "open-grok-linux-aarch64")
         #expect(ReleasePlatform.windowsX86_64.artifactName == "open-grok-windows-x86_64.exe")
     }
 
@@ -136,6 +139,14 @@ struct ReleasePlatformTests {
         #expect(
             ReleasePlatform.macOSAppleSilicon.checksumAssetName
                 == "open-grok-macos-aarch64.sha256"
+        )
+        #expect(
+            ReleasePlatform.linuxX86_64.checksumAssetName
+                == "open-grok-linux-x86_64.sha256"
+        )
+        #expect(
+            ReleasePlatform.linuxAarch64.checksumAssetName
+                == "open-grok-linux-aarch64.sha256"
         )
         // The Windows sidecar keeps the `.exe` in the middle: the builder
         // appends to `$artifactPath`, it does not replace the extension.
@@ -148,21 +159,33 @@ struct ReleasePlatformTests {
     @Test("target triples match the release build invocations")
     func targetTriples() {
         #expect(ReleasePlatform.macOSAppleSilicon.targetTriple == "aarch64-apple-darwin")
+        #expect(ReleasePlatform.linuxX86_64.targetTriple == "x86_64-unknown-linux-gnu")
+        #expect(ReleasePlatform.linuxAarch64.targetTriple == "aarch64-unknown-linux-gnu")
         #expect(ReleasePlatform.windowsX86_64.targetTriple == "x86_64-pc-windows-msvc")
     }
 
     @Test("installer asset differs per platform")
     func installerAssets() {
         #expect(ReleasePlatform.macOSAppleSilicon.installerAssetName == "install.sh")
+        #expect(ReleasePlatform.linuxX86_64.installerAssetName == "install.sh")
+        #expect(ReleasePlatform.linuxAarch64.installerAssetName == "install.sh")
         #expect(ReleasePlatform.windowsX86_64.installerAssetName == "install.ps1")
     }
 
-    @Test("the POSIX installer accepts only Apple Silicon macOS")
+    @Test("the POSIX installer accepts macOS and Linux release host aliases only")
     func posixHostDetection() {
         #expect(ReleasePlatform.forPosixHost(unameS: "Darwin", unameM: "arm64") == .macOSAppleSilicon)
         #expect(ReleasePlatform.forPosixHost(unameS: "Darwin", unameM: "aarch64") == .macOSAppleSilicon)
+        #expect(ReleasePlatform.forPosixHost(unameS: "Linux", unameM: "x86_64") == .linuxX86_64)
+        #expect(ReleasePlatform.forPosixHost(unameS: "Linux", unameM: "amd64") == .linuxX86_64)
+        #expect(ReleasePlatform.forPosixHost(unameS: "Linux", unameM: "aarch64") == .linuxAarch64)
+        #expect(ReleasePlatform.forPosixHost(unameS: "Linux", unameM: "arm64") == .linuxAarch64)
         #expect(ReleasePlatform.forPosixHost(unameS: "Darwin", unameM: "x86_64") == nil)
-        #expect(ReleasePlatform.forPosixHost(unameS: "Linux", unameM: "aarch64") == nil)
+        #expect(ReleasePlatform.forPosixHost(unameS: "Linux", unameM: "riscv64") == nil)
+        #expect(ReleasePlatform.forPosixHost(unameS: "Windows", unameM: "x86_64") == nil)
+        #expect(ReleasePlatform.macOSAppleSilicon.isSupportedByPosixInstaller)
+        #expect(ReleasePlatform.linuxX86_64.isSupportedByPosixInstaller)
+        #expect(ReleasePlatform.linuxAarch64.isSupportedByPosixInstaller)
         #expect(!ReleasePlatform.windowsX86_64.isSupportedByPosixInstaller)
     }
 }
@@ -298,6 +321,24 @@ struct ReleaseArtifactLayoutTests {
             "LICENSE",
             "THIRD-PARTY-NOTICES",
         ])
+    }
+
+    @Test("both Linux asset sets match the GNU release builder staging")
+    func linuxReferenceAssets() throws {
+        let version = try pinnedVersion()
+        for (platform, architecture) in [
+            (ReleasePlatform.linuxX86_64, "x86_64"),
+            (ReleasePlatform.linuxAarch64, "aarch64"),
+        ] {
+            let layout = ReleaseArtifactLayout(platform: platform, version: version)
+            #expect(layout.referenceAssetNames == [
+                "open-grok-linux-\(architecture)",
+                "open-grok-linux-\(architecture).sha256",
+                "install.sh",
+                "LICENSE",
+                "THIRD-PARTY-NOTICES",
+            ])
+        }
     }
 
     @Test("the Windows asset set matches what the reference builder stages")
@@ -459,6 +500,14 @@ struct InstallLayoutTests {
             InstallLayout.versionedDownloadName(version: version, platform: .macOSAppleSilicon)
                 == "open-grok-\(version.value)-macos-aarch64"
         )
+        #expect(
+            InstallLayout.versionedDownloadName(version: version, platform: .linuxX86_64)
+                == "open-grok-\(version.value)-linux-x86_64"
+        )
+        #expect(
+            InstallLayout.versionedDownloadName(version: version, platform: .linuxAarch64)
+                == "open-grok-\(version.value)-linux-aarch64"
+        )
         // Windows keeps `.exe` last so the staged file stays executable.
         #expect(
             InstallLayout.versionedDownloadName(version: version, platform: .windowsX86_64)
@@ -472,6 +521,10 @@ struct InstallLayoutTests {
         #expect(
             layout.versionedDownloadPath(version: version, platform: .macOSAppleSilicon)
                 == "/tmp/home/downloads/open-grok-\(version.value)-macos-aarch64"
+        )
+        #expect(
+            layout.versionedDownloadPath(version: version, platform: .linuxAarch64)
+                == "/tmp/home/downloads/open-grok-\(version.value)-linux-aarch64"
         )
     }
 }
