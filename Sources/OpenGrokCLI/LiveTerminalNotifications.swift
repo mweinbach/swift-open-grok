@@ -3,6 +3,7 @@ import Foundation
 import OpenGrokConfig
 import OpenGrokDiagnostics
 import OpenGrokPagerRender
+import OpenGrokSystemPower
 import OpenGrokTerminalCore
 
 struct LiveTerminalNotificationConfiguration: Sendable, Equatable {
@@ -221,6 +222,7 @@ struct LiveTerminalNotifications: Sendable {
     let configuration: LiveTerminalNotificationConfiguration
     let terminalContext: TerminalContext
     let notificationProtocol: Protocol
+    var sleepInhibition: LiveSleepInhibition
 
     private(set) var focused = true
     private(set) var focusLostAtNanoseconds: UInt64?
@@ -233,13 +235,18 @@ struct LiveTerminalNotifications: Sendable {
 
     init(
         configuration: LiveTerminalNotificationConfiguration,
-        terminalContext: TerminalContext
+        terminalContext: TerminalContext,
+        powerAdapter: any PowerAdapter = PlatformPowerAdapter()
     ) {
         self.configuration = configuration
         self.terminalContext = terminalContext
         self.notificationProtocol = Self.resolveProtocol(
             method: configuration.method,
             context: terminalContext
+        )
+        self.sleepInhibition = LiveSleepInhibition(
+            enabled: configuration.sleepPrevention,
+            adapter: powerAdapter
         )
     }
 
@@ -488,6 +495,9 @@ struct LiveTerminalNotifications: Sendable {
 
 extension LiveInteractiveControllerRenderer {
     func startTerminalNotificationReporting() throws {
+        terminalNotifications.sleepInhibition.resume(
+            anyAgentBusy: anyTerminalNotificationAgentBusy
+        )
         guard terminal.isTTY(), !terminalNotifications.focusReportingEnabled else { return }
         do {
             try sink.write(ANSIMouse.enableFocusReporting)
@@ -497,6 +507,7 @@ extension LiveInteractiveControllerRenderer {
             }
             try sink.flush()
         } catch {
+            terminalNotifications.sleepInhibition.suspend()
             if terminalNotifications.focusReportingEnabled {
                 try? sink.write(ANSIMouse.disableFocusReporting)
                 try? sink.flush()
@@ -508,6 +519,7 @@ extension LiveInteractiveControllerRenderer {
     }
 
     func suspendTerminalNotificationReporting() throws {
+        terminalNotifications.sleepInhibition.suspend()
         guard terminalNotifications.focusReportingEnabled else { return }
         if let clearProgress = terminalNotifications.suspendProgressSequence() {
             try sink.write(clearProgress)
@@ -518,6 +530,7 @@ extension LiveInteractiveControllerRenderer {
     }
 
     func stopTerminalNotificationReporting() throws {
+        terminalNotifications.sleepInhibition.shutdown()
         guard terminalNotifications.sessionStarted else { return }
         try sink.write(terminalNotifications.shutdownSequence())
         if terminalNotifications.focusReportingEnabled {
@@ -528,6 +541,7 @@ extension LiveInteractiveControllerRenderer {
     }
 
     func updateTerminalNotificationPresentation() {
+        synchronizeTerminalSleepInhibition()
         guard terminalNotifications.focusReportingEnabled,
               let presentation = terminalNotificationPresentationSequence()
         else { return }
@@ -561,6 +575,16 @@ extension LiveInteractiveControllerRenderer {
               !title.isEmpty, title != "New session"
         else { return nil }
         return title
+    }
+
+    func synchronizeTerminalSleepInhibition() {
+        terminalNotifications.sleepInhibition.synchronize(
+            anyAgentBusy: anyTerminalNotificationAgentBusy
+        )
+    }
+
+    private var anyTerminalNotificationAgentBusy: Bool {
+        turnPhase != nil || activeBackgroundWork.count(of: .subagent) > 0
     }
 
     private func terminalNotificationPresentationSequence() -> String? {
