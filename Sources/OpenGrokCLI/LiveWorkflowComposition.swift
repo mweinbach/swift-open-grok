@@ -78,7 +78,19 @@ public enum LiveWorkflowComposition {
             guard let target = options.target else {
                 throw CLIApplicationError.failed("workflow validate requires a script path")
             }
-            let script = try readScript(at: target)
+            let security = LiveSecurityContext.resolve(
+                workspaceRoot: cwd,
+                environment: environment,
+                isInteractive: false,
+                cli: options.common.permissions
+            )
+            let script = try readScript(
+                at: target,
+                workingDirectory: cwd,
+                openGrokHome: home,
+                sessionID: "workflow-validation",
+                projectTrusted: security.projectTrusted
+            )
             switch await RhaiWorkflowValidator.validate(script: script) {
             case .success(let report):
                 streams.out("\(report.name): \(report.phases) phase(s) — \(report.outcomeSummary)\n")
@@ -126,10 +138,21 @@ public enum LiveWorkflowComposition {
         try liveResolveWorkingDirectory(path)
     }
 
-    static func readScript(at path: String) throws -> String {
-        let url = URL(fileURLWithPath: path)
+    static func readScript(
+        at path: String,
+        workingDirectory: URL,
+        openGrokHome: URL,
+        sessionID: String,
+        projectTrusted: Bool
+    ) throws -> String {
         do {
-            return try String(contentsOf: url, encoding: .utf8)
+            return try LiveWorkflowSourceAuthority.read(
+                candidate: path,
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                sessionID: sessionID,
+                projectTrusted: projectTrusted
+            )
         } catch {
             throw CLIApplicationError.failed("cannot read workflow script \(path): \(error)")
         }

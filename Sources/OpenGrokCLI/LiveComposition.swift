@@ -1695,9 +1695,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             } else {
                 workflowRegistry = nil
             }
-            if let workflowPath = options.common.workflow, let registry = workflowRegistry {
+            if options.common.workflow != nil, let registry = workflowRegistry {
+                guard let authorizedWorkflowScript = foundation.authorizedWorkflowScript else {
+                    throw CLIApplicationError.failed("workflow source was not authorized")
+                }
                 let record = try await LiveWorkflowLaunch.start(
-                    script: try LiveWorkflowComposition.readScript(at: workflowPath),
+                    script: authorizedWorkflowScript,
                     registry: registry,
                     session: LiveWorkflowLaunch.Session(
                         sampler: sampler,
@@ -3108,6 +3111,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let cwd: URL
         let openGrokHome: URL
         let launchAuthority: LiveAgentLaunchAuthority
+        let authorizedWorkflowScript: String?
         let agentProfile: LiveAgentProfile?
         let sessionID: String
         let conversationRecord: LiveConversationRecord
@@ -3298,6 +3302,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             isInteractive: fileAccessPolicy.isInteractive,
             cli: options.common.permissions
         )
+        let authorizedWorkflowScript = try options.common.workflow.map {
+            try LiveWorkflowComposition.readScript(
+                at: $0,
+                workingDirectory: cwd,
+                openGrokHome: openGrokHome,
+                sessionID: sessionID,
+                projectTrusted: securityContext.projectTrusted
+            )
+        }
         let doomLoopRecovery = resolveDoomLoopRecovery(
             environment: context.environment,
             document: securityContext.document,
@@ -3584,6 +3597,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             cwd: cwd,
             openGrokHome: openGrokHome,
             launchAuthority: launchAuthority,
+            authorizedWorkflowScript: authorizedWorkflowScript,
             agentProfile: agentProfile,
             sessionID: sessionID,
             conversationRecord: conversationRecord,

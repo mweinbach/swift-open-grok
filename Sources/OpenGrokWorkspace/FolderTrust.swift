@@ -89,6 +89,12 @@ public func repoConfigsPresent(at cwd: URL) -> Bool {
         ".opengrok/hooks.toml",
         ".opengrok/lsp.json",
         ".opengrok/mcp.toml",
+        ".opengrok/plugins",
+        ".opengrok/agents",
+        ".claude/agents",
+        ".opengrok/roles",
+        ".opengrok/personas",
+        ".opengrok/workflows",
         // `.opengrok/config.toml` belongs here: it can declare `[mcp_servers]`
         // — the exact table `LiveMCPComposition.connectConfiguredServers` reads
         // and spawns from — and `[permission]` rules that would widen this
@@ -106,6 +112,9 @@ public func repoConfigsPresent(at cwd: URL) -> Bool {
             if repositoryTrustMarkerPresentOrUncertain(candidate) {
                 return true
             }
+        }
+        if repositoryTrustMarkerPresentOrUncertain(dir.appendingPathComponent(".git")) {
+            break
         }
         let parent = dir.deletingLastPathComponent()
         if parent.path == dir.path { break }
