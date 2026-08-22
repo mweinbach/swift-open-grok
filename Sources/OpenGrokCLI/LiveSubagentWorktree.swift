@@ -1,6 +1,35 @@
 import Foundation
 import OpenGrokFastWorktree
 
+/// Foundation resolves a nonexistent descendant of `/var` inconsistently with
+/// its existing `/private/var` ancestor. Resolve only the deepest existing
+/// entry, then reconstruct missing components in that same physical namespace.
+enum LiveSubagentCanonicalPath {
+    static func resolve(_ url: URL) -> URL {
+        let files = FileManager.default
+        var existing = url.standardizedFileURL
+        var unresolved: [String] = []
+
+        while !files.fileExists(atPath: existing.path),
+              (try? files.destinationOfSymbolicLink(atPath: existing.path)) == nil {
+            let parent = existing.deletingLastPathComponent()
+            guard parent != existing else { break }
+            unresolved.append(existing.lastPathComponent)
+            existing = parent
+        }
+
+        var canonical = existing.resolvingSymlinksInPath()
+        let components = unresolved.reversed()
+        for (index, component) in components.enumerated() {
+            canonical.appendPathComponent(
+                component,
+                isDirectory: index < unresolved.count - 1 || url.hasDirectoryPath
+            )
+        }
+        return canonical
+    }
+}
+
 /// A real detached Git worktree backing one explicitly isolated subagent.
 ///
 /// Rust derives `$OPENGROK_HOME/worktrees/<repo-slug>/subagent-<id>` in
@@ -223,10 +252,9 @@ struct LiveSubagentWorktree: Sendable {
     }
 
     private static func managedRoot(openGrokHome: URL) throws -> URL {
-        let home = openGrokHome.standardizedFileURL.resolvingSymlinksInPath()
+        let home = LiveSubagentCanonicalPath.resolve(openGrokHome)
         let expected = home.appendingPathComponent("worktrees", isDirectory: true)
-            .standardizedFileURL
-        let resolved = expected.resolvingSymlinksInPath()
+        let resolved = LiveSubagentCanonicalPath.resolve(expected)
         guard resolved == expected else {
             throw Failure.managedRootEscapesHome(expected.path)
         }

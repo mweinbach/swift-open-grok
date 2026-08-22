@@ -31,6 +31,12 @@ private actor MemoryFlushSamplingProbe {
     var count: Int { requests.count }
 }
 
+private enum MemoryFlushWorkspaceIdentity {
+    case owned
+    case ownedSymlinkAlias
+    case unrelated
+}
+
 private struct MemoryFlushFixture {
     let root: URL
     let workspace: URL
@@ -45,7 +51,8 @@ private struct MemoryFlushFixture {
         output: String = "## Technical context\n\nThe phosphorescent index is durable.",
         provider: ModelProvider = .xai,
         everUsedNonXAI: Bool = false,
-        delayNanoseconds: UInt64 = 0
+        delayNanoseconds: UInt64 = 0,
+        recordWorkspaceIdentity: MemoryFlushWorkspaceIdentity = .owned
     ) throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -66,10 +73,27 @@ private struct MemoryFlushFixture {
             throw CocoaError(.fileNoSuchFile)
         }
         self.backend = backend
+        let recordedWorkspace: URL
+        switch recordWorkspaceIdentity {
+        case .owned:
+            recordedWorkspace = workspace
+        case .ownedSymlinkAlias:
+            recordedWorkspace = root.appendingPathComponent("workspace-alias")
+            try FileManager.default.createSymbolicLink(
+                at: recordedWorkspace,
+                withDestinationURL: workspace
+            )
+        case .unrelated:
+            recordedWorkspace = root.appendingPathComponent("unrelated-workspace")
+            try FileManager.default.createDirectory(
+                at: recordedWorkspace,
+                withIntermediateDirectories: true
+            )
+        }
         let now = Date()
         let record = LiveConversationRecord(
             sessionID: owner,
-            workingDirectory: workspace.path,
+            workingDirectory: recordedWorkspace.path,
             parentSessionID: nil,
             createdAt: now,
             updatedAt: now,
@@ -151,6 +175,34 @@ struct LiveMemoryFlushACPParityTests {
     @Test("closed provider boundary refuses flush without sampling")
     func providerBoundaryFailsClosed() async throws {
         let fixture = try MemoryFlushFixture(everUsedNonXAI: true)
+        defer { fixture.cleanup() }
+
+        await #expect(throws: LiveMemoryFlushError.self) {
+            try await fixture.coordinator.flush()
+        }
+        #expect(await fixture.probe.count == 0)
+        #expect(await fixture.backend.memoryFilePaths.isEmpty)
+    }
+
+    #if !os(Windows)
+    @Test("a symlink alias of the same owned workspace preserves filesystem identity")
+    func canonicalWorkspaceAliasRemainsAuthorized() async throws {
+        let fixture = try MemoryFlushFixture(recordWorkspaceIdentity: .ownedSymlinkAlias)
+        defer { fixture.cleanup() }
+
+        let outcome = try await fixture.coordinator.flush()
+        guard case .written(let path) = outcome else {
+            Issue.record("the canonical owned workspace was incorrectly rejected")
+            return
+        }
+        #expect(try SecureFile.isOwnerOnly(at: URL(fileURLWithPath: path)))
+        #expect(await fixture.probe.count == 1)
+    }
+    #endif
+
+    @Test("a different real workspace is rejected before model sampling")
+    func unrelatedWorkspaceFailsClosed() async throws {
+        let fixture = try MemoryFlushFixture(recordWorkspaceIdentity: .unrelated)
         defer { fixture.cleanup() }
 
         await #expect(throws: LiveMemoryFlushError.self) {

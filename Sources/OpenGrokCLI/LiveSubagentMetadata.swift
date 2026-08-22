@@ -161,7 +161,7 @@ struct LiveSubagentMetadataStore: Sendable {
     let parentWorkingDirectory: URL
 
     init(openGrokHome: URL, parentSessionID: String, parentWorkingDirectory: URL) {
-        self.openGrokHome = openGrokHome.standardizedFileURL.resolvingSymlinksInPath()
+        self.openGrokHome = LiveSubagentCanonicalPath.resolve(openGrokHome)
         self.parentSessionID = parentSessionID
         self.parentWorkingDirectory = parentWorkingDirectory.standardizedFileURL
     }
@@ -171,19 +171,42 @@ struct LiveSubagentMetadataStore: Sendable {
             throw LiveSubagentMetadataError.invalidIdentifier(id)
         }
 
-        let sessionsRoot = openGrokHome.appendingPathComponent("sessions", isDirectory: true)
-        let parentDirectory = try SessionDocumentStore(grokHome: openGrokHome)
-            .sessionDirectory(sessionID: parentSessionID, cwd: parentWorkingDirectory.path)
-        let candidate = parentDirectory
+        let documents = SessionDocumentStore(grokHome: openGrokHome)
+        let sessionsRoot = documents.grokHome
+            .appendingPathComponent("sessions", isDirectory: true)
+            .standardizedFileURL
+        let parentDirectory = try documents.sessionDirectory(
+            sessionID: parentSessionID,
+            cwd: parentWorkingDirectory.path
+        )
+        let rootComponents = sessionsRoot.pathComponents
+        let parentComponents = parentDirectory.pathComponents
+        guard parentComponents.starts(with: rootComponents) else {
+            throw LiveSubagentMetadataError.insecurePath(parentDirectory.path)
+        }
+
+        let canonicalSessionsRoot = LiveSubagentCanonicalPath.resolve(sessionsRoot)
+        let expectedSessionsRoot = LiveSubagentCanonicalPath.resolve(documents.grokHome)
+            .appendingPathComponent("sessions", isDirectory: true)
+        guard canonicalSessionsRoot == expectedSessionsRoot else {
+            throw LiveSubagentMetadataError.insecurePath(sessionsRoot.path)
+        }
+
+        var expectedParent = canonicalSessionsRoot
+        for component in parentComponents.dropFirst(rootComponents.count) {
+            expectedParent.appendPathComponent(component, isDirectory: true)
+        }
+        guard LiveSubagentCanonicalPath.resolve(parentDirectory) == expectedParent else {
+            throw LiveSubagentMetadataError.insecurePath(parentDirectory.path)
+        }
+
+        let candidate = expectedParent
             .appendingPathComponent("subagents", isDirectory: true)
             .appendingPathComponent(id, isDirectory: true)
             .appendingPathComponent("meta.json", isDirectory: false)
 
-        let canonicalSessionsRoot = sessionsRoot.standardizedFileURL
-        let canonicalCandidate = candidate.standardizedFileURL
-        guard canonicalCandidate.pathComponents.starts(with: canonicalSessionsRoot.pathComponents),
-              sessionsRoot.resolvingSymlinksInPath().standardizedFileURL == canonicalSessionsRoot,
-              candidate.resolvingSymlinksInPath().standardizedFileURL == canonicalCandidate
+        guard candidate.pathComponents.starts(with: canonicalSessionsRoot.pathComponents),
+              LiveSubagentCanonicalPath.resolve(candidate) == candidate
         else {
             throw LiveSubagentMetadataError.insecurePath(candidate.path)
         }

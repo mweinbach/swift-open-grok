@@ -60,6 +60,39 @@ private struct DurableSubagentMetadataFixture {
 
 @Suite("Durable subagent resume metadata", .serialized)
 struct LiveSubagentMetadataParityTests {
+    @Test("Missing descendants retain the canonical namespace of an existing aliased home")
+    func canonicalizesExistingHomeBeforeAppendingMissingDescendants() throws {
+        let fixture = try DurableSubagentMetadataFixture()
+        defer { fixture.dispose() }
+
+        let canonicalHome = fixture.home.resolvingSymlinksInPath()
+        let aliasedHome: URL
+        #if os(macOS)
+        if canonicalHome.path.hasPrefix("/private/var/") {
+            aliasedHome = URL(fileURLWithPath: String(canonicalHome.path.dropFirst(8)))
+        } else if canonicalHome.path.hasPrefix("/var/") {
+            aliasedHome = URL(fileURLWithPath: "/private" + canonicalHome.path)
+        } else {
+            aliasedHome = canonicalHome
+        }
+        #else
+        aliasedHome = canonicalHome
+        #endif
+
+        let store = LiveSubagentMetadataStore(
+            openGrokHome: aliasedHome,
+            parentSessionID: "durable-parent",
+            parentWorkingDirectory: fixture.workspace
+        )
+        try store.save(fixture.metadata(id: "aliased-child"))
+        let metadata = try #require(try store.load(id: "aliased-child"))
+        #expect(metadata.subagentID == "aliased-child")
+        let aliasedPath = try store.metadataURL(id: "aliased-child")
+        let originalPath = try fixture.store.metadataURL(id: "aliased-child")
+        #expect(aliasedPath.resolvingSymlinksInPath()
+            == originalPath.resolvingSymlinksInPath())
+    }
+
     @Test("Rust-compatible metadata is atomic, parent-scoped, and owner-private")
     func exactRustShapeAndPrivateStorage() throws {
         let fixture = try DurableSubagentMetadataFixture()

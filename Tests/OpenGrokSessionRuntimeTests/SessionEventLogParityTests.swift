@@ -78,13 +78,13 @@ struct SessionEventLogParityTests {
         #expect(values[0]["type"] == .string("turn_started"))
         #expect(values[0]["session_id"] == .string("session-1"))
         #expect(values[0]["schema_version"] == .string("1.0"))
-        #expect(values[0]["turn_number"] == .number(.uint64(4)))
+        #expect(values[0]["turn_number"]?.uint64Value == 4)
         #expect(values[0]["session_relationship"] == .string("primary"))
         #expect(values[0]["redirect_kind"] == nil)
         #expect(values[1]["tool_call_id"] == nil)
         #expect(values[1]["session_id"] == nil)
         #expect(values[2]["tool_call_id"] == .string("call-1"))
-        #expect(values[2]["duration_ms"] == .number(.uint64(12)))
+        #expect(values[2]["duration_ms"]?.uint64Value == 12)
         #expect(values[2]["source"] == nil)
     }
 
@@ -162,7 +162,7 @@ struct SessionEventLogParityTests {
 
         let values = try fixture.read()
         let types = values.compactMap { $0["type"]?.stringValue }
-        #expect(values.first?["turn_number"] == .number(.uint64(9)))
+        #expect(values.first?["turn_number"]?.uint64Value == 9)
         #expect(types.filter { $0 == "first_token" }.count == 2)
         #expect(types.filter { $0 == "turn_ended" }.count == 1)
         #expect(Array(types.suffix(2)) == ["tool_completed", "turn_ended"])
@@ -215,6 +215,43 @@ struct SessionEventLogParityTests {
         let value = try #require(fixture.read().first)
         #expect(value["type"] == .string("mcp_server_failed"))
         #expect(value["target"] == .string("stdio"))
-        #expect(value["timeout_sec"] == .number(.uint64(30)))
+        #expect(value["timeout_sec"]?.uint64Value == 30)
+    }
+
+    @Test("unsigned event counters stay exact JSON integers through the entire UInt64 range")
+    func unsignedWireCountersRemainLossless() throws {
+        let fixture = try SessionEventLogFixture()
+        defer { fixture.cleanup() }
+        let log = try SessionEventLog(sessionDirectory: fixture.directory)
+
+        #expect(log.emit(.turnStarted(
+            sessionID: "unsigned-boundary",
+            turnNumber: UInt64.max,
+            modelID: "grok",
+            yoloMode: false,
+            conversationMessageCount: 0,
+            relationship: .primary,
+            redirectKind: nil
+        )))
+        #expect(log.emit(.toolCompleted(
+            toolName: "read_file",
+            durationMilliseconds: UInt64.max,
+            outcome: .success,
+            toolCallID: "boundary",
+            source: .shell
+        )))
+
+        let values = try fixture.read()
+        #expect(values[0]["turn_number"]?.uint64Value == UInt64.max)
+        #expect(values[0]["conversation_message_count"]?.uint64Value == 0)
+        #expect(values[1]["duration_ms"]?.uint64Value == UInt64.max)
+
+        let wire = try String(
+            contentsOf: fixture.directory.appendingPathComponent("events.jsonl"),
+            encoding: .utf8
+        )
+        #expect(wire.contains(#""turn_number":18446744073709551615"#))
+        #expect(wire.contains(#""duration_ms":18446744073709551615"#))
+        #expect(wire.contains(#""conversation_message_count":0"#))
     }
 }

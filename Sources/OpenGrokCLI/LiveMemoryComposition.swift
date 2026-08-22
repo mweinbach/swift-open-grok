@@ -268,9 +268,16 @@ struct LiveMemoryFlushCoordinator: Sendable {
         else {
             throw LiveMemoryFlushError.rejected("provider privacy boundary prevents memory export")
         }
+        let recordedWorkspace = URL(fileURLWithPath: record.workingDirectory)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+        let ownedWorkspace = (await backend.workspacePath)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
         guard !(await backend.isEphemeralWorkspace),
-              URL(fileURLWithPath: record.workingDirectory).standardizedFileURL
-                == (await backend.workspacePath).standardizedFileURL
+              recordedWorkspace == ownedWorkspace
         else {
             throw LiveMemoryFlushError.rejected("memory workspace does not match its owner")
         }

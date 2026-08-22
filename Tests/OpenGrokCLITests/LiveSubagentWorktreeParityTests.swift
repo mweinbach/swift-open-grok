@@ -53,8 +53,8 @@ private actor WorktreeSamplingBehavior {
                 output: "Creating an isolated file.",
                 toolCalls: [ToolCall(
                     id: "write-\(request.sessionID)",
-                    name: "write",
-                    arguments: #"{"file_path":"child-created.txt","content":"only the child"}"#
+                    name: "search_replace",
+                    arguments: #"{"file_path":"child-created.txt","old_string":"","new_string":"only the child"}"#
                 )],
                 usage: usage
             )
@@ -259,6 +259,15 @@ struct LiveSubagentWorktreeParityTests {
         let result = await fixture.spawn(id: "isolated-child")
         guard case .success(let output) = result else {
             Issue.record("isolated live child failed: \(result)")
+            return
+        }
+        let completedRecord = try await fixture.store.load(sessionID: "isolated-child")
+        let writeResult = try #require(completedRecord.items.compactMap { item -> ToolResultItem? in
+            guard case .toolResult(let value) = item else { return nil }
+            return value
+        }.first)
+        guard !writeResult.content.hasPrefix("Tool search_replace failed:") else {
+            Issue.record("isolated child write was refused: \(writeResult.content)")
             return
         }
         let worktreeString = try #require(output.value["worktree_path"]?.stringValue)

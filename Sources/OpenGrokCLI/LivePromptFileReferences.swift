@@ -178,20 +178,20 @@ final class LivePromptFileReferences: @unchecked Sendable {
                 continue
             }
 
-            let name = entryURL.lastPathComponent
-            guard name != ".git", hidden || !name.hasPrefix(".") else {
-                enumerator.skipDescendants()
-                continue
-            }
-
             guard let resourceValues = try? entryURL.resourceValues(forKeys: propertyKeys),
                   resourceValues.isSymbolicLink != true
             else {
-                enumerator.skipDescendants()
                 continue
             }
             let isDirectory = resourceValues.isDirectory == true
             guard isDirectory || resourceValues.isRegularFile == true else { continue }
+
+            let name = entryURL.lastPathComponent
+            guard name != ".git", hidden || !name.hasPrefix(".") else {
+                // Applying this to an ignore file skips its enclosing directory's remaining entries.
+                if isDirectory { enumerator.skipDescendants() }
+                continue
+            }
 
             if !hidden {
                 let parent = entryURL.deletingLastPathComponent()
