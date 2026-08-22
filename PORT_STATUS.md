@@ -1,11 +1,81 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-17 (local cross-platform closure after Wave G). **The current uncommitted tree passes the targeted platform-backlog gates on macOS, OrbStack Ubuntu 22.04 arm64, and Parallels Windows 11 ARM64. This pass intentionally uses local VMs instead of GitHub Actions and makes no remote CI or release-green claim.** The last authoritative full-package macOS gate remains the 2026-08-16 Wave G run: `build-tests` exit 0 and `test --no-parallel` exit 0 with exactly **7,573 Swift Testing cases in 1,137 suites across 106 nonempty summaries passed** (0 failures, 0 recorded issues).
+**As of:** 2026-08-21. The authoritative local macOS package gate exits 0 with **7,909 Swift Testing cases in 1,172 suites across 106 nonempty test-product summaries**, with no failures or recorded issues. The product build, the complete pager target, focused foundational live-seam suites, and isolated real-binary commands also pass. These are local results; they do not establish current Linux, Windows, remote CI, or release readiness.
 
-**Overall state:** The package builds and tests green on macOS locally, and `open-grok` launches a working full-screen TUI agent with multiple live utility routes. All core subsystems (All 9 Model Providers [xAI, Codex, Kimi Platform & Code, Fireworks AI, DeepSeek, Meta Muse Spark, OpenCode Go, Wafer AI, Z AI], Multi-Provider Scoped Storage & CLI Auth Management, Provider Wire Policies & Dialects, Dynamic Catalog Broker Resolution, MCP Meta-Discovery `search_tool`/`use_tool` & FNV-1a Fingerprints, Background Monitor Tool with Token-Bucket Rate Limiter & Suppression Tracker, Cursor Rules on Read Attachment & Scope Scanner, Memory MMR Maximal Marginal Relevance & Query Expansion, Bounded Stdio MCP Auto-Restart & Backoff, Durable Session Relocation Journal & Transactional Authority, Image Normalization & Resizing with SHA-256 Digest Cache, Pre-Warmed Subagent Git Worktree Pool, Native Workflow Engine & Rhai AST/Interpreter/Journal/Escalation, Interactive Terminal Composer Rich Elements & Image Framing, Markdown Table Wrapped-Fragment & 11-Glyph Box Drawing Layout Parity, Tool Catalog Schemas & Protocol Output Caps, Agent Runtime & Turn Pipeline, ACP Transports, Custom Models Settings UI & Store Persistence, Steady-State Cache Tracking & Cold-Start Diagnostics, Fuzzy Path Matcher & Scoring, Background Directory Matcher Daemon, File Search @-Completion Dropdown Engine, Wrap Clipboard Image Framing, Prompt Cache Tracking & Break Diagnostics, Custom Model Store & Persistence, Web Search Filter Precedence, Turn-End Drain Queue Hooks, Compaction Checkpoints & Two-Pass Prefire, Workspace Primitives, StructuredOutput Synthetic Tool Loop, and Monotonic Export Boundary) are 100% LIVE, audited CLEAN, and verified.
+**Overall state:** The executable and many foundational systems are live, but this is **not** complete parity with the current Rust reference. The previous blanket "100% LIVE" claim was incorrect: some audited facilities existed only as library types without production consumers, while newer upstream provider, session-collaboration, MCP, and Messages-streaming features are still absent or unwired. The verified closures and remaining gaps are enumerated below.
 **Destination was empty at baseline:** yes.
-**Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`) / Forward Sync `eb215dd0` (`v1.0.0-open-grok.63`).
+**Original pinned reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`); historical forward sync `eb215dd0` (`v1.0.0-open-grok.63`).
+**Current audited Rust snapshot:** `00db8a4b0205d9d477edf70bdffc47935f96d6f0`, product version `1.0.0-open-grok.80`, **159 commits beyond the original pin**. The Swift executable currently reports `1.0.0-open-grok.64`; this pass does not claim a version or reference-pin synchronization.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
+
+## Foundational live-seam correction (2026-08-21)
+
+The central failure mode in this wave was implementation without reachability: existing session, billing, permission, provider, and protocol types passed isolated tests while the running executable either bypassed them or silently discarded their results. Rust behaviors were enumerated first, then verified through executable/session seams.
+
+### Verified local gates
+
+| Command or surface | Result |
+|---|---|
+| `zsh workflows/swift-safe-verify.zsh build-tests` | exit 0 |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | exit 0; product build completed in 2.72s |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | exit 0; **7,909 tests / 1,172 suites / 106 nonempty product summaries**, no failures |
+| `zsh workflows/swift-safe-verify.zsh test-target OpenGrokPagerTests --no-parallel` | exit 0; **372 tests / 43 suites** |
+| Serialized focused session, subagent, billing, cache-creation, Codex turn-state, sandbox, compaction, interjection, and terminal filters | exit 0; **120 tests / 16 suites / 6 nonempty product summaries** |
+| Isolated helper health check; real `doctor`, `version --json`, `paths --json`, `models --json`, and `sessions list --json` | all exit 0; version `1.0.0-open-grok.64`; isolated home `/tmp/open-grok-verify-20260821-230331-92397` |
+
+The full gate exercised the current checkout, including pre-existing user-owned `Package.swift` and crash-handler worktree changes. Those unrelated changes were neither staged nor included in the foundational commits.
+
+### Foundations now reachable from the running executable
+
+1. **Configuration, trust, and fail-closed authorization:** managed permission layers remain additive; managed denies/asks cannot be bypassed by broad Bash rules or permissive modes; remote project configuration cannot inject executable hooks; folder trust is canonical, locked, and durable; path locks prevent alias bypass and writer starvation. Required sandbox enforcement now rejects an unavailable policy or inactive sandbox (`Sources/OpenGrokWorkspace/WorkspaceCore.swift:282`):
+
+   ```swift
+   if config.requireSandbox && (config.isolation != .sandbox || !remotePolicyAvailable) {
+       throw WorkspaceRuntimeError.sandboxRequired(
+           "sandbox policy unavailable or required sandbox inactive; refusing local process fallback"
+       )
+   }
+   ```
+
+   Resumed sessions also reconcile canonical and compatibility documents without allowing a weaker sandbox profile or ambiguous equal-rank profile to downgrade the persisted pin (`Sources/OpenGrokCLI/LiveConversationStore.swift:495`).
+
+2. **Durable Rust-compatible session authority:** live turns publish canonical cwd-bucketed session documents and ACP update journals; legacy mirrors migrate safely; interrupted turns preserve acknowledged prompts and tool results; recovery, rewind, fork isolation, hidden subagents, deletion, provider-neutral history, and durable cache-affinity identities are exercised through the live session seam.
+
+3. **Provider-accurate root and child billing:** production no longer drops `ConversationResponse.usage` or `costUsdTicks`. Each live session owns a real `ChatStateHandle`; root calls and child folds preserve input, output, reasoning, cache-read, cache-creation, per-model, call-count, and cost data. Child accounting is acknowledged exactly once; late children affect the session without contaminating a later prompt; unknown or partial costs remain explicitly incomplete rather than appearing free. Canonical session summaries preserve cumulative bills and resume them without replay or double-counting; forks start a fresh bill. Both `/usage` text surfaces and the pager consume these real snapshots (`Sources/OpenGrokCLI/LiveUsageState.swift:6`, `LiveConversationStore.swift:1186`, `LiveSessionServices.swift:224`).
+
+4. **Correct cache-write accounting:** Anthropic/Messages cache creation is represented separately from cache reads while remaining part of the full prompt total. Legacy normalized usage remains decodable, malformed provider counts saturate, and root/child per-model ledgers retain both cache buckets (`Sources/OpenGrokSamplingTypes/ConversationRequest.swift:148`, `Sources/OpenGrokChatState/Usage.swift:29`).
+
+5. **Real Codex credential, policy, and routing foundations:** account-scoped OAuth refresh and catalog publication are principal-aware; parent and child permission handles share the real authorization actor without weakening policy; Codex request metadata accurately reflects sandbox, approval, network, and writable-root decisions. A bounded session/current-logical-turn registry now propagates first-write-wins `x-codex-turn-state` across live inference and streaming/unary compaction while isolating parent/child sessions and subsequent turns. Failed HTTP responses and forged request headers cannot poison the routing cell (`Sources/OpenGrokCLI/LiveComposition.swift:415`, `Sources/OpenGrokCLI/LiveCompaction.swift:750`, `Sources/OpenGrokCompaction/CodexCompactionHTTP.swift:235`).
+
+6. **Provider streaming and executable tool dispatch:** streamed tool-argument completion is emitted exactly once; hosted and client tools remain distinct; reasoning whitespace and OpenRouter-shaped reasoning deltas are retained as wire-format groundwork; tool arguments are validated before hooks, authorization, and execution; child tools inherit the actual parent permission handle; process cancellation, unlimited backgrounds, and durable outcomes no longer rely on unsafe process waits.
+
+7. **Code Mode, MCP, and ACP transport:** nested tools deliver bounded `p.onProgress` updates across the real execution stack; runtime defaults match upstream; concurrent MCP responses remain correlated; HTTP/SSE handles CRLF and multiline framing; ACP reverse permissions and cancellation are typed and bounded; frame size is enforced before allocation.
+
+8. **Terminal, pager, and orchestration:** Kitty keys, modified Unicode, terminal focus, bounded bracketed paste, and split SGR/CSI fragments survive arbitrary input boundaries without delaying ordinary literal input. Pager EOF and steering tests now prove actual cancellation, queued execution, and preemption without relying on a racy optional overlay. Child workflow execution preserves provider isolation, prompt identity, cancellation, budget enforcement, hidden persistence, and stable logical turns across tool rounds.
+
+### Known remaining upstream gaps
+
+1. **RunInfra, direct Google Gemini, and OpenRouter remain absent as first-class providers.** Rust adds these typed providers and aliases in `crates/codegen/xai-grok-sampling-types/src/types.rs:1204`; its isolated credentials, catalogs, provider-specific wire policies, and settings live in `xai-grok-shell/src/{runinfra_models,gemini_models,openrouter_models}.rs`. Swift's provider enum still stops at its original nine (`Sources/OpenGrokSamplingTypes/ProviderTypes.swift:48`). OpenRouter-shaped reasoning parsing and the external Antigravity Gemini adapter do not implement these providers. The eventual port must atomically add typed identities, scoped credentials, catalog partitions, OpenRouter's explicit opt-in allowlist, trusted endpoints, settings, and executable tests.
+
+2. **Machine-local cross-process session collaboration is absent.** Rust provides presence/socket discovery and real `list_sessions`, `read_session`, and `message_session` tools (`crates/codegen/xai-grok-shell/src/session_bus/presence.rs:1`; `crates/codegen/xai-grok-tools/src/implementations/grok_build/session_collaboration/mod.rs:90`). Swift only has same-session agent-team mailboxes and ACP persisted-session listing; neither is the live cross-process bus, and the three tools are not registered.
+
+3. **MCP server-change lifecycle is implemented-unwired.** Swift has MCP event value types, but its stdio/HTTP transports discard unmatched notifications instead of feeding the live dispatcher. Rust coalesces server tool/resource changes into ACP server status, refreshes toolsets, and schedules bounded restarts (`crates/codegen/xai-grok-shell/src/session/mcp_dispatcher.rs:1`); Swift's restart/event helpers must not be described as live until a real transport-to-session producer exists.
+
+4. **In-process SDK MCP-over-ACP remains absent.** Rust implements reverse SDK MCP transport (`crates/codegen/xai-grok-mcp/src/acp_transport.rs:30`); Swift correctly withholds the unsupported `x.ai/mcp/sdk` capability (`Sources/OpenGrokCLI/LiveMCPACPHandlers.swift:57`).
+
+5. **Native Messages streaming remains incomplete.** Cache reads and writes now reach real billing ledgers, but provider response-open metadata/signature events, provider message IDs, verbatim stop reasons, matched stop sequences, and genuine `streaming-messages-json` / `--include-partial-messages` `system`/`assistant`/`user`/`stream_event`/`result` framing are absent. The currently advertised Messages format still uses the generic flat JSON adapter (`Sources/OpenGrokCLI/LivePagerOutputs.swift:2070`; Rust `crates/codegen/xai-grok-pager/src/headless/reducer/messages/wire.rs:99`).
+
+### Foundational commits
+
+- `7a17726` — Enforce foundational workspace and tool security.
+- `3e16d13` — Restore nested Code Mode progress and runtime defaults.
+- `0755ac6` — Harden MCP, ACP, and terminal transport foundations.
+- `69c1272` — Connect provider credentials and trustworthy model catalogs.
+- `18ee7f1` — Rebuild durable agent runtime and Codex sampling foundations.
+- `a66953f` — Repair stale pager EOF harnesses and durable JSON assertions.
+- `c3b6cbf` — Repair fail-closed session pins and fragmented terminal compatibility.
+- `7cba965` — Wire durable live usage accounting and isolated Codex turn state.
+- `a45dd1f` — Assert pager steering semantics without shutdown timing races.
 
 ## Local cross-platform closure (2026-08-17)
 
