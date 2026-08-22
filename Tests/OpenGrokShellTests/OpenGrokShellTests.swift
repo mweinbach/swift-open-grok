@@ -415,7 +415,7 @@ func resumedSessionRestoresCanonicalStateAndPreservesMetadata() async throws {
     #expect(restored.summary.currentModelID == "test-model")
     #expect(restored.summary.everUsedCodex)
     #expect(restored.summary.sessionKind == "restored-kind")
-    #expect(restored.summary.extra["relocation_generation"] == .number(.uint64(8)))
+    #expect(restored.summary.extra["relocation_generation"]?.uint64Value == 8)
     #expect(restored.updates == [originalUpdate])
     #expect(restored.transcript == originalTranscript)
     #expect(restored.toolHistory == [originalTool])

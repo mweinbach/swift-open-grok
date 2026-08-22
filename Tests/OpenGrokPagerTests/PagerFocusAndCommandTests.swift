@@ -865,8 +865,14 @@ private actor Harness {
         // finish: exhaustion ends the run from inside the turn loop, which
         // would race the drain it is trying to observe. Those tests keep the
         // stream open and shut the controller down once the turn has landed.
+        // A finite script with an intentionally endless held session needs an
+        // explicit Ctrl+D: natural EOF preserves queued prompts and waits for
+        // the current turn, which this fixture would otherwise never finish.
+        let scriptedEvents = !sessions.isEmpty && expectedTurns == nil
+            ? events + [.key(KeyEvent(key: .char("d"), modifiers: [.control], character: "d"))]
+            : events
         let controller = OpenGrokPagerInteractiveController(
-            input: expectedTurns == nil ? makeStream(events) : makeOpenStream(events),
+            input: expectedTurns == nil ? makeStream(scriptedEvents) : makeOpenStream(scriptedEvents),
             runtime: runtime,
             renderer: renderer,
             output: SilentOutput(),
@@ -876,8 +882,8 @@ private actor Harness {
         await controller.setInputModes(modes)
 
         // A held session needs releasing only when the test wants the turn to
-        // finish on its own; otherwise input exhaustion ends the run, and
-        // releasing early would race the very thing under test.
+        // finish on its own; otherwise the explicit EOF above ends the run,
+        // and releasing early would race the very thing under test.
         let releaser: Task<Void, Never>? = releaseAfterQueueReaches.map { threshold in
             Task {
                 await renderer.waitForQueueCount(atLeast: threshold)

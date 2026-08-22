@@ -206,9 +206,9 @@ private actor SwarmCommandHarness {
     /// draft submitted mid-turn. The turn starts at `run` entry (the
     /// initial-session form the live composition uses for a non-empty
     /// launch prompt), so the steering events can only be consumed by the
-    /// running-turn input path. The input stream then ends, which is the
-    /// only thing allowed to tear the parked turn down when the exemption
-    /// holds.
+    /// running-turn input path. An explicit Ctrl+D after the queue snapshot
+    /// tears down the parked turn; natural input exhaustion deliberately
+    /// preserves queued prompts and cannot finish an indefinitely held turn.
     static func runSteering(orchestrationActive: Bool) async throws -> SwarmCommandHarness {
         let events: [InputEvent] = [
             // NO Escape after the steer text: plain text opens no dropdown,
@@ -226,6 +226,7 @@ private actor SwarmCommandHarness {
             .paste("/queue"),
             .key(KeyEvent(key: .escape)),
             .key(KeyEvent(key: .enter)),
+            .key(KeyEvent(key: .char("d"), modifiers: [.control], character: "d")),
         ]
         let renderer = SwarmRecordingRenderer()
         let runtime = SwarmParkedRuntime()
