@@ -8,7 +8,7 @@ import Foundation
 /// to update when the grammar in `CLICommand.swift` changes.
 public enum OpenGrokCompletions {
     static let commands: [String] = [
-        "agent", "completions", "dashboard", "doctor", "export", "help", "inspect",
+        "agent", "completions", "dashboard", "disk-usage", "doctor", "du", "export", "help", "inspect",
         "leader", "login", "logout", "mcp", "memory", "models", "paths", "plugin",
         "serve", "sessions", "setup", "share", "trace", "update", "version",
         "workflow", "workspace", "worktree", "wrap"

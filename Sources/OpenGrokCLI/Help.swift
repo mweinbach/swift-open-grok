@@ -76,6 +76,7 @@ public enum OpenGrokHelp {
       plugin marketplace list|add|remove|update
       memory clear                          Clear cross-session memory.
       worktree list|show|rm|gc|prune|db     Manage git worktrees.
+      du, disk-usage [--json]               Show Open Grok home disk usage.
       workspace start|pause|resume|stop|restart|status
       login, logout                         Manage credentials.
       inspect, doctor [fix]                 Diagnose config and terminal.
@@ -248,6 +249,15 @@ public enum OpenGrokHelp {
             directory. Not an upstream command.
 
             """
+        case "du", "disk-usage":
+            return """
+            open-grok du [--json]
+            open-grok disk-usage [--json]
+
+            Lists Open Grok home directories and managed worktrees by disk
+            usage. Never creates the state directory or follows symlinks.
+
+            """
         case "models", "model":
             return """
             open-grok models [default] [--json]
@@ -333,7 +343,7 @@ public enum OpenGrokHelp {
     /// `open-grok <command> --help` always lands on something rather than
     /// reporting an unknown topic for a command that plainly exists.
     public static let topics: [String] = [
-        "agent", "completions", "dashboard", "doctor", "export", "help",
+        "agent", "completions", "dashboard", "disk-usage", "doctor", "du", "export", "help",
         "inspect", "leader", "login", "logout", "mcp", "memory", "models",
         "path", "paths", "plugin", "serve", "session", "sessions", "setup",
         "share", "trace", "update", "version", "workflow", "workspace",

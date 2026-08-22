@@ -160,15 +160,22 @@ struct SubcommandGrammarTests {
         #expect(parseError(["memory"]) == .missingSubcommand("memory"))
         #expect(parseError(["memory", "clean"]) == .unknownCommand("clean"))
 
-        let command = try CLICommandParser.parseOrThrow(["memory", "clear", "--workspace", "--all", "-y"])
+        let command = try CLICommandParser.parseOrThrow(["memory", "clear", "--workspace", "-y"])
         guard case .utility(let options) = command else {
             Issue.record("expected the utility route")
             return
         }
         #expect(options.values == ["clear"])
         #expect(options.isSet("--workspace"))
-        #expect(options.isSet("--all"))
         #expect(options.isSet("--yes"))
+        #expect(parseError(["memory", "clear", "--workspace", "--global"])
+            == .conflictingOptions("--workspace", "--global"))
+        #expect(parseError(["memory", "clear", "--workspace", "--all"])
+            == .conflictingOptions("--workspace", "--all"))
+        #expect(parseError(["memory", "clear", "--global", "--all"])
+            == .conflictingOptions("--global", "--all"))
+        #expect(parseError(["memory", "clear", "extra"])
+            == .unexpectedArgument("memory clear accepts no positional targets"))
     }
 
     @Test("update accepts every upstream flag and conflicts its three channels")
@@ -332,7 +339,7 @@ struct SubcommandGrammarTests {
     @Test("every subcommand answers --help and -h with its own topic")
     func perSubcommandHelp() {
         let commands = [
-            "agent", "completions", "dashboard", "doctor", "export", "inspect",
+            "agent", "completions", "dashboard", "disk-usage", "doctor", "du", "export", "inspect",
             "leader", "login", "logout", "mcp", "memory", "models", "paths",
             "plugin", "serve", "sessions", "setup", "share", "trace", "update",
             "version", "workflow", "workspace", "worktree"
@@ -379,7 +386,6 @@ struct SubcommandGrammarTests {
         let cases: [(args: [String], needle: String)] = [
             (["wrap", "sh"], "clipboard"),
             (["export", "abc"], "sessions show"),
-            (["inspect"], "paths"),
             (["trace", "--local"], "trace"),
             (["session", "new"], "list")
         ]

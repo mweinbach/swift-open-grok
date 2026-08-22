@@ -630,6 +630,7 @@ public enum CLICommand: Sendable, Equatable {
     case version(json: Bool)
     case help(topic: String?)
     case paths(json: Bool)
+    case diskUsage(json: Bool)
     case inspect(json: Bool)
     case doctor(CLIDoctorOptions)
     case completions(shell: String)
@@ -650,6 +651,7 @@ public enum CLICommand: Sendable, Equatable {
         case .version: return "version"
         case .help: return "help"
         case .paths: return "paths"
+        case .diskUsage: return "du"
         case .inspect: return "inspect"
         case .doctor: return "doctor"
         case .completions: return "completions"
@@ -687,7 +689,7 @@ public enum CLICommandParser {
     /// else is the positional `PROMPT`, which is what makes
     /// `open-grok "fix the bug"` work.
     private static let subcommandNames: Set<String> = [
-        "version", "v", "help", "paths", "path", "inspect", "doctor", "completions",
+        "version", "v", "help", "paths", "path", "du", "disk-usage", "inspect", "doctor", "completions",
         "interactive", "minimal", "headless", "acp", "serve", "leader", "agent",
         "session", "sessions", "model", "models", "plugin", "mcp", "workflow",
         "release-validate",
@@ -767,6 +769,8 @@ public enum CLICommandParser {
             return .help(topic: try parseHelpTopic(args))
         case "paths", "path":
             return .paths(json: try parseJSONFlag(args))
+        case "du", "disk-usage":
+            return .diskUsage(json: try parseJSONFlag(args))
         case "inspect":
             return .inspect(json: try parseJSONFlag(args))
         case "doctor":
@@ -1230,6 +1234,11 @@ public enum CLICommandParser {
                 "--workspace": "--workspace", "--global": "--global", "--all": "--all",
                 "--yes": "--yes", "-y": "--yes"
             ]
+            grammar.conflicts = [
+                ("--workspace", "--global"),
+                ("--workspace", "--all"),
+                ("--global", "--all"),
+            ]
         case "workspace":
             grammar.valued = [
                 "--hub-url": "--hub-url", "--cwd": "--cwd", "--pid": "--pid"
@@ -1302,6 +1311,9 @@ public enum CLICommandParser {
         }
         if utilitySubcommands[name] != nil, values.isEmpty {
             throw CLIParseError.missingSubcommand(name)
+        }
+        if name == "memory", values.count != 1 {
+            throw CLIParseError.unexpectedArgument("memory clear accepts no positional targets")
         }
         if name == "worktree" {
             try validateWorktreeGrammar(values: values, options: options, flags: flags)

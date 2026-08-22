@@ -31,6 +31,14 @@ public enum CLIRunner {
         case .paths(let json):
             writePaths(json: json, environment: environment, streams: streams)
             return ExitCode.success.rawValue
+        case .diskUsage(let json):
+            return LiveDiskUsageComposition.run(
+                json: json, environment: environment, streams: streams
+            )
+        case .inspect(let json):
+            return LiveInspectComposition.run(
+                json: json, environment: environment, streams: streams
+            )
         case .releaseValidate(let options):
             return LiveReleaseValidation.run(
                 options: options,
@@ -95,6 +103,8 @@ public enum CLIRunner {
                 streams.err("open-grok: \(error).\n")
                 return ExitCode.failure.rawValue
             }
+        case .utility(let options) where options.name == "memory":
+            return runMemoryClear(options: options, environment: environment, streams: streams)
         // `doctor` is synchronous end to end (standalone probes + managed
         // config writes), so like `mcp` and `sessions` it runs without the
         // async application seam.
@@ -139,6 +149,14 @@ public enum CLIRunner {
         case .paths(let json):
             writePaths(json: json, environment: environment, streams: streams)
             return ExitCode.success.rawValue
+        case .diskUsage(let json):
+            return LiveDiskUsageComposition.run(
+                json: json, environment: environment, streams: streams
+            )
+        case .inspect(let json):
+            return LiveInspectComposition.run(
+                json: json, environment: environment, streams: streams
+            )
         case .releaseValidate(let options):
             return LiveReleaseValidation.run(
                 options: options,
@@ -155,6 +173,8 @@ public enum CLIRunner {
             return LiveDoctorComposition.run(
                 options: options, environment: environment, streams: streams
             )
+        case .utility(let options) where options.name == "memory":
+            return runMemoryClear(options: options, environment: environment, streams: streams)
         case .invalid(let error):
             writeUsageError(error, streams: streams)
             return ExitCode.usage.rawValue
@@ -182,6 +202,37 @@ public enum CLIRunner {
         } else {
             streams.out("Open Grok \(version)\n")
         }
+    }
+
+    private static func runMemoryClear(
+        options: CLIUtilityOptions,
+        environment: [String: String],
+        streams: CLIStreams
+    ) -> Int32 {
+        let scope: LiveMemoryClearScope
+        if options.isSet("--all") {
+            scope = .all
+        } else if options.isSet("--global") {
+            scope = .global
+        } else {
+            scope = .workspace
+        }
+        let workingDirectory = URL(
+            fileURLWithPath: options.common.cwd
+                ?? environment["PWD"]
+                ?? FileManager.default.currentDirectoryPath,
+            isDirectory: true
+        ).standardizedFileURL
+        return LiveMemoryComposition.runClear(
+            scope: scope,
+            skipConfirmation: options.isSet("--yes"),
+            workingDirectory: workingDirectory,
+            environment: environment,
+            // CLIStreams has no stdin; absent --yes must never authorize a deletion.
+            confirmation: { nil },
+            output: streams.out,
+            error: streams.err
+        )
     }
 
     private static func writePaths(json: Bool, environment: [String: String], streams: CLIStreams) {
@@ -369,9 +420,6 @@ public enum CLIRunner {
     /// route name so the parser stays the single source of truth for spelling.
     private static func unavailableDetail(for command: CLICommand) -> String {
         switch command {
-        case .inspect:
-            return "Configuration discovery is not wired up yet. "
-                + "'open-grok paths' reports the resolved state directories today."
         case .plugin(let options):
             if LivePluginComposition.actions.contains(options.action) {
                 return "The live plugin action '\(options.action)' requires the live application composition."
@@ -391,8 +439,6 @@ public enum CLIRunner {
                 return "Managed configuration fetch and install are not implemented."
             case "share":
                 return "Session sharing is fail-closed in the synchronous runner; the live route refuses before upload because signed-URL and backend share clients are not ported."
-            case "memory":
-                return "Cross-session memory management is not implemented."
             case "dashboard":
                 return "The agent dashboard is not implemented."
             default:
