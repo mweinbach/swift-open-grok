@@ -1,5 +1,6 @@
 import Dispatch
 import Foundation
+import OpenGrokHTTP
 import Testing
 @testable import OpenGrokCLI
 
@@ -11,6 +12,30 @@ import Glibc
 
 @Suite("Live session-bus cross-process transport")
 struct LiveSessionBusTransportTests {
+    @Test("Windows session-bus names reproduce Rust Path SipHash golden vectors")
+    func windowsPipeNamesMatchRustPathHash() {
+        let first = "C:\\Users\\me\\.grok\\leader.sock"
+        let normalized = "c:/Users//me/./.grok/leader.sock"
+        let session = "C:\\Users\\me\\.opengrok\\session-bus\\p42-deadbeef.sock"
+        let otherDrive = "D:\\repo\\session-bus\\p1234-abcdef12.sock"
+        let network = "\\\\server\\share\\session-bus\\p42-deadbeef.sock"
+
+        #expect(WindowsNamedPipeName.fullName(forPath: first, namespace: .sessionBus)
+            == "\\\\.\\pipe\\grok-sbus-b1ee14cfc418ef29")
+        #expect(WindowsNamedPipeName.fullName(forPath: normalized, namespace: .sessionBus)
+            == "\\\\.\\pipe\\grok-sbus-b1ee14cfc418ef29")
+        #expect(WindowsNamedPipeName.fullName(forPath: session, namespace: .sessionBus)
+            == "\\\\.\\pipe\\grok-sbus-8579e5da79e6a016")
+        #expect(WindowsNamedPipeName.fullName(forPath: otherDrive, namespace: .sessionBus)
+            == "\\\\.\\pipe\\grok-sbus-8ff30c6f5895e2ba")
+        #expect(WindowsNamedPipeName.fullName(forPath: network, namespace: .sessionBus)
+            == "\\\\.\\pipe\\grok-sbus-07f5d797c68fd022")
+        #expect(WindowsNamedPipeName.fullName(
+            forPath: "session-bus\\p42-deadbeef.sock",
+            namespace: .sessionBus
+        ) == "\\\\.\\pipe\\grok-sbus-5965cb4f3ac97468")
+    }
+
     #if os(macOS) || os(Linux)
     private func makeHome() throws -> URL {
         #if os(macOS)
@@ -351,12 +376,24 @@ struct LiveSessionBusTransportTests {
     #endif
 
     #if os(Windows)
-    @Test("Windows fails closed until its named-pipe session-bus transport exists")
-    func windowsFailsClosed() async {
-        let transport = LiveSessionBusTransport(homeURL: URL(fileURLWithPath: "C:/Temp")) { $0 }
-        await #expect(throws: LiveSessionBusTransportError.unsupportedPlatform) {
-            _ = try await transport.start(socketName: "p1-12345678.sock")
-        }
+    @Test("Windows routes real owner-only named-pipe frames without a fake socket file")
+    func windowsNamedPipeRoundTrip() async throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ogb-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let transport = LiveSessionBusTransport(homeURL: home) { $0 }
+        let logicalSocket = try await transport.start(
+            socketName: "p\(ProcessInfo.processInfo.processIdentifier)-deadbeef.sock"
+        )
+        #expect(!FileManager.default.fileExists(atPath: logicalSocket.path))
+        let ping = Data(#"{"type":"ping"}"#.utf8)
+        #expect(try await LiveSessionBusTransport.request(
+            socketURL: logicalSocket,
+            payload: ping
+        ) == ping)
+        await transport.stop()
     }
     #endif
 }

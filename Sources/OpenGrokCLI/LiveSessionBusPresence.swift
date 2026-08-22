@@ -4,6 +4,11 @@ import Foundation
 import Darwin
 #elseif os(Linux)
 import Glibc
+#elseif os(Windows)
+import COpenGrokSockets
+import OpenGrokFileUtils
+import OpenGrokHTTP
+import WinSDK
 #endif
 
 enum LiveSessionBusStatus: String, Codable, Sendable, Equatable {
@@ -300,6 +305,222 @@ enum LiveSessionBusPresenceStore {
 
     private static func fileType(_ information: stat) -> mode_t {
         information.st_mode & mode_t(S_IFMT)
+    }
+}
+#elseif os(Windows)
+enum LiveSessionBusPresenceStore {
+    static let protocolVersion: UInt32 = 1
+    static let staleTTLMS: UInt64 = 20_000
+    static let heartbeatIntervalNanoseconds: UInt64 = 5_000_000_000
+
+    static func directory(openGrokHome: URL) -> URL {
+        openGrokHome.standardizedFileURL
+            .appendingPathComponent("session-bus", isDirectory: true)
+    }
+
+    static func nowMilliseconds() -> UInt64 {
+        UInt64(max(0, Date().timeIntervalSince1970 * 1_000))
+    }
+
+    static func makeInstanceID(processID: Int32) -> String {
+        let hex = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        return "p\(processID)-\(hex.suffix(8).lowercased())"
+    }
+
+    static func ensureSecureDirectory(_ directory: URL) throws {
+        try PathSecurity.rejectHostileLexical(directory.path)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let secured = directory.path.withCString { og_directory_secure_current_user($0) }
+        guard secured == 0 else {
+            throw LiveSessionBusError.insecurePresence(
+                "session-bus directory is not a private directory owned by the current user"
+            )
+        }
+    }
+
+    static func write(_ presence: LiveSessionBusPresenceFile, directory: URL) throws {
+        try ensureSecureDirectory(directory)
+        guard isPresenceFileName("\(presence.instanceID).json"),
+              presence.instanceID.hasPrefix("p\(presence.pid)-")
+        else {
+            throw LiveSessionBusError.insecurePresence("invalid session-bus presence identity")
+        }
+        let expected = directory
+            .appendingPathComponent("\(presence.instanceID).sock")
+            .standardizedFileURL
+        guard URL(fileURLWithPath: presence.socketPath).standardizedFileURL == expected else {
+            throw LiveSessionBusError.insecurePresence("session-bus pipe escaped its directory")
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(presence)
+        let destination = directory.appendingPathComponent("\(presence.instanceID).json")
+        try SecureFile.write(at: destination, contents: data)
+        guard privatePath(destination, directory: false) else {
+            throw LiveSessionBusError.insecurePresence("session-bus presence ACL is not owner-only")
+        }
+    }
+
+    static func remove(instanceID: String, directory: URL) {
+        guard isPresenceFileName("\(instanceID).json") else { return }
+        let presence = directory.appendingPathComponent("\(instanceID).json")
+        guard privatePath(presence, directory: false) else { return }
+        try? FileManager.default.removeItem(at: presence)
+    }
+
+    static func liveSessions(
+        directory: URL,
+        now: UInt64 = nowMilliseconds()
+    ) -> [LiveSessionBusDiscoveredSession] {
+        guard privatePath(directory, directory: true),
+              let entries = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+              )
+        else { return [] }
+
+        var best: [String: LiveSessionBusDiscoveredSession] = [:]
+        for entry in entries where isPresenceFileName(entry.lastPathComponent) {
+            guard let file = validatedPresence(at: entry, directory: directory),
+                  now >= file.heartbeatAtMS
+                    ? now - file.heartbeatAtMS <= staleTTLMS
+                    : true,
+                  processIsAlive(file.pid)
+            else { continue }
+
+            for presence in file.sessions {
+                let discovered = LiveSessionBusDiscoveredSession(
+                    presence: presence,
+                    socketURL: URL(fileURLWithPath: file.socketPath),
+                    processID: file.pid,
+                    instanceID: file.instanceID,
+                    conflict: false
+                )
+                guard var previous = best[presence.sessionID] else {
+                    best[presence.sessionID] = discovered
+                    continue
+                }
+                if discovered.presence.updatedAtMS > previous.presence.updatedAtMS {
+                    var replacement = discovered
+                    replacement.conflict = true
+                    best[presence.sessionID] = replacement
+                } else {
+                    previous.conflict = true
+                    best[presence.sessionID] = previous
+                }
+            }
+        }
+
+        return best.values.sorted { lhs, rhs in
+            if lhs.presence.updatedAtMS == rhs.presence.updatedAtMS {
+                return lhs.presence.sessionID < rhs.presence.sessionID
+            }
+            return lhs.presence.updatedAtMS > rhs.presence.updatedAtMS
+        }
+    }
+
+    static func collectStale(
+        directory: URL,
+        now: UInt64 = nowMilliseconds()
+    ) -> [String] {
+        guard privatePath(directory, directory: true),
+              let entries = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+              )
+        else { return [] }
+
+        var removed: [String] = []
+        for entry in entries where isPresenceFileName(entry.lastPathComponent) {
+            guard privatePath(entry, directory: false) else { continue }
+            let modifiedAt = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate.map {
+                    UInt64(max(0, $0.timeIntervalSince1970 * 1_000))
+                } ?? 0
+            let ageExpired = now >= modifiedAt && now - modifiedAt > staleTTLMS
+            guard let file = decodedPresence(at: entry) else {
+                if ageExpired { try? FileManager.default.removeItem(at: entry) }
+                continue
+            }
+            guard entry.deletingPathExtension().lastPathComponent == file.instanceID,
+                  file.instanceID.hasPrefix("p\(file.pid)-")
+            else {
+                if ageExpired { try? FileManager.default.removeItem(at: entry) }
+                continue
+            }
+            let beatExpired = now >= file.heartbeatAtMS
+                && now - file.heartbeatAtMS > staleTTLMS
+            guard beatExpired || ageExpired || !processIsAlive(file.pid) else { continue }
+            do {
+                try FileManager.default.removeItem(at: entry)
+                removed.append(file.instanceID)
+            } catch {
+            }
+        }
+        return removed.sorted()
+    }
+
+    static func isPresenceFileName(_ name: String) -> Bool {
+        name.range(
+            of: #"^p[0-9]+-[0-9a-fA-F]{8}\.json$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func validatedPresence(
+        at url: URL,
+        directory: URL
+    ) -> LiveSessionBusPresenceFile? {
+        guard privatePath(url, directory: false),
+              let file = decodedPresence(at: url),
+              file.protocolVersion == protocolVersion,
+              url.deletingPathExtension().lastPathComponent == file.instanceID,
+              file.instanceID.hasPrefix("p\(file.pid)-"),
+              file.pid > 0
+        else { return nil }
+
+        let expected = directory
+            .appendingPathComponent("\(file.instanceID).sock")
+            .standardizedFileURL
+        let announced = URL(fileURLWithPath: file.socketPath).standardizedFileURL
+        guard announced == expected,
+              (try? LiveSessionBusSocketSupport.validateSocket(at: announced)) != nil
+        else { return nil }
+        let pipe = WindowsNamedPipeName.fullName(forPath: announced.path, namespace: .sessionBus)
+        guard pipe.withCString({ og_named_pipe_is_ready($0) }) != 0 else { return nil }
+        return file
+    }
+
+    private static func decodedPresence(at url: URL) -> LiveSessionBusPresenceFile? {
+        guard let data = try? PathSecurity.readNoFollow(url),
+              data.count <= 128 * 1_024
+        else { return nil }
+        return try? JSONDecoder().decode(LiveSessionBusPresenceFile.self, from: data)
+    }
+
+    private static func processIsAlive(_ processID: Int32) -> Bool {
+        guard processID > 0 else { return false }
+        if processID == ProcessInfo.processInfo.processIdentifier { return true }
+        guard let handle = OpenProcess(
+            DWORD(PROCESS_QUERY_LIMITED_INFORMATION),
+            false,
+            DWORD(processID)
+        ), handle != INVALID_HANDLE_VALUE else { return false }
+        defer { CloseHandle(handle) }
+        var exitCode: DWORD = 0
+        guard GetExitCodeProcess(handle, &exitCode) else { return false }
+        return exitCode == DWORD(STILL_ACTIVE)
+    }
+
+    private static func privatePath(_ path: URL, directory: Bool) -> Bool {
+        path.path.withCString {
+            og_path_is_private_to_current_user($0, directory ? 1 : 0)
+        } == 1
     }
 }
 #else

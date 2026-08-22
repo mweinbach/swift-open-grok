@@ -653,24 +653,74 @@ typedef struct OGNamedPipeListener {
     HANDLE pending;
     CRITICAL_SECTION lock;
     int closed;
+    int owner_only;
 } OGNamedPipeListener;
 
-static HANDLE og_named_pipe_create_instance(const wchar_t *pipe_name, int first) {
+static int og_owner_only_acl_for_sid(PSID sid, PACL *acl);
+static int og_current_user_token(PTOKEN_USER *user);
+
+static HANDLE og_named_pipe_create_instance(
+    const wchar_t *pipe_name,
+    int first,
+    int owner_only
+) {
     DWORD open_mode = PIPE_ACCESS_DUPLEX;
     if (first) open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
-    return CreateNamedPipeW(
+    DWORD pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT;
+    SECURITY_ATTRIBUTES *security_attributes = NULL;
+    SECURITY_ATTRIBUTES attributes;
+    SECURITY_DESCRIPTOR descriptor;
+    PTOKEN_USER user = NULL;
+    PACL acl = NULL;
+    if (owner_only) {
+        if (og_current_user_token(&user) != 0
+            || og_owner_only_acl_for_sid(user->User.Sid, &acl) != 0) {
+            free(user);
+            return INVALID_HANDLE_VALUE;
+        }
+        if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION)
+            || !SetSecurityDescriptorOwner(&descriptor, user->User.Sid, FALSE)
+            || !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE)
+            || !SetSecurityDescriptorControl(
+                &descriptor,
+                SE_DACL_PROTECTED,
+                SE_DACL_PROTECTED
+            )) {
+            og_set_windows_error("could not secure session-bus named pipe");
+            LocalFree(acl);
+            free(user);
+            return INVALID_HANDLE_VALUE;
+        }
+        ZeroMemory(&attributes, sizeof(attributes));
+        attributes.nLength = sizeof(attributes);
+        attributes.lpSecurityDescriptor = &descriptor;
+        security_attributes = &attributes;
+        pipe_mode |= PIPE_REJECT_REMOTE_CLIENTS;
+    }
+    HANDLE handle = CreateNamedPipeW(
         pipe_name,
         open_mode,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        pipe_mode,
         PIPE_UNLIMITED_INSTANCES,
         64 * 1024,
         64 * 1024,
         0,
-        NULL
+        security_attributes
     );
+    DWORD creation_error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    if (owner_only) {
+        LocalFree(acl);
+        free(user);
+    }
+    if (handle == INVALID_HANDLE_VALUE) SetLastError(creation_error);
+    return handle;
 }
 
-int og_named_pipe_listener_create(const char *pipe_name, OGSocketHandle *listener) {
+static int og_named_pipe_listener_create_inner(
+    const char *pipe_name,
+    OGSocketHandle *listener,
+    int owner_only
+) {
     if (!pipe_name || !listener) {
         og_set_error(ERROR_INVALID_PARAMETER, "invalid named-pipe listener arguments");
         return -1;
@@ -680,7 +730,7 @@ int og_named_pipe_listener_create(const char *pipe_name, OGSocketHandle *listene
         og_set_windows_error("named-pipe name is not valid UTF-8");
         return -1;
     }
-    HANDLE pending = og_named_pipe_create_instance(wide, 1);
+    HANDLE pending = og_named_pipe_create_instance(wide, 1, owner_only);
     if (pending == INVALID_HANDLE_VALUE) {
         og_set_windows_error("could not create named-pipe listener");
         free(wide);
@@ -695,9 +745,18 @@ int og_named_pipe_listener_create(const char *pipe_name, OGSocketHandle *listene
     }
     state->pipe_name = wide;
     state->pending = pending;
+    state->owner_only = owner_only;
     InitializeCriticalSection(&state->lock);
     *listener = (OGSocketHandle)(uintptr_t)state;
     return 0;
+}
+
+int og_named_pipe_listener_create(const char *pipe_name, OGSocketHandle *listener) {
+    return og_named_pipe_listener_create_inner(pipe_name, listener, 0);
+}
+
+int og_named_pipe_secure_listener_create(const char *pipe_name, OGSocketHandle *listener) {
+    return og_named_pipe_listener_create_inner(pipe_name, listener, 1);
 }
 
 int og_named_pipe_listener_accept(OGSocketHandle listener, OGSocketHandle *handle) {
@@ -713,7 +772,7 @@ int og_named_pipe_listener_accept(OGSocketHandle listener, OGSocketHandle *handl
         return -1;
     }
     if (state->pending == INVALID_HANDLE_VALUE) {
-        state->pending = og_named_pipe_create_instance(state->pipe_name, 0);
+        state->pending = og_named_pipe_create_instance(state->pipe_name, 0, state->owner_only);
     }
     HANDLE pending = state->pending;
     LeaveCriticalSection(&state->lock);
@@ -730,13 +789,15 @@ int og_named_pipe_listener_accept(OGSocketHandle listener, OGSocketHandle *handl
 
     EnterCriticalSection(&state->lock);
     if (state->closed) {
+        int owns_pending = state->pending == pending;
+        if (owns_pending) state->pending = INVALID_HANDLE_VALUE;
         LeaveCriticalSection(&state->lock);
-        CloseHandle(pending);
+        if (owns_pending) CloseHandle(pending);
         og_set_error(ERROR_OPERATION_ABORTED, "named-pipe listener is closed");
         return -1;
     }
     if (state->pending == pending) {
-        state->pending = og_named_pipe_create_instance(state->pipe_name, 0);
+        state->pending = og_named_pipe_create_instance(state->pipe_name, 0, state->owner_only);
     }
     LeaveCriticalSection(&state->lock);
     *handle = (OGSocketHandle)(uintptr_t)pending;
@@ -1121,12 +1182,17 @@ static int og_reject_reparse_handle(HANDLE file, const char *detail) {
     return 0;
 }
 
-static int og_owner_only_acl_for_sid(PSID sid, PACL *acl) {
+static int og_owner_only_acl_for_sid_with_access(
+    PSID sid,
+    DWORD permissions,
+    DWORD inheritance,
+    PACL *acl
+) {
     EXPLICIT_ACCESSW access;
     ZeroMemory(&access, sizeof(access));
-    access.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+    access.grfAccessPermissions = permissions;
     access.grfAccessMode = SET_ACCESS;
-    access.grfInheritance = NO_INHERITANCE;
+    access.grfInheritance = inheritance;
     access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
     access.Trustee.TrusteeType = TRUSTEE_IS_USER;
     access.Trustee.ptstrName = (LPWSTR)sid;
@@ -1138,10 +1204,19 @@ static int og_owner_only_acl_for_sid(PSID sid, PACL *acl) {
     return 0;
 }
 
-static int og_current_user_token(PTOKEN_USER *user) {
+static int og_owner_only_acl_for_sid(PSID sid, PACL *acl) {
+    return og_owner_only_acl_for_sid_with_access(
+        sid,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+        NO_INHERITANCE,
+        acl
+    );
+}
+
+static int og_process_user_token(HANDLE process, PTOKEN_USER *user) {
     HANDLE token = NULL;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
-        og_set_windows_error("could not open current process token");
+    if (!OpenProcessToken(process, TOKEN_QUERY, &token)) {
+        og_set_windows_error("could not open process token");
         return -1;
     }
     DWORD size = 0;
@@ -1166,6 +1241,233 @@ static int og_current_user_token(PTOKEN_USER *user) {
     CloseHandle(token);
     *user = value;
     return 0;
+}
+
+static int og_current_user_token(PTOKEN_USER *user) {
+    return og_process_user_token(GetCurrentProcess(), user);
+}
+
+int og_named_pipe_peer_is_current_user(OGSocketHandle handle, int server_side) {
+    if (handle == OG_SOCKET_INVALID) {
+        og_set_error(ERROR_INVALID_HANDLE, "invalid session-bus named pipe");
+        return -1;
+    }
+    ULONG process_id = 0;
+    BOOL identified = server_side
+        ? GetNamedPipeClientProcessId((HANDLE)(uintptr_t)handle, &process_id)
+        : GetNamedPipeServerProcessId((HANDLE)(uintptr_t)handle, &process_id);
+    if (!identified || process_id == 0) {
+        og_set_windows_error("could not identify session-bus named-pipe peer");
+        return -1;
+    }
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+    if (!process) {
+        og_set_windows_error("could not open session-bus named-pipe peer");
+        return -1;
+    }
+    PTOKEN_USER current = NULL;
+    PTOKEN_USER peer = NULL;
+    int result = -1;
+    if (og_current_user_token(&current) == 0 && og_process_user_token(process, &peer) == 0) {
+        result = EqualSid(current->User.Sid, peer->User.Sid) ? 1 : 0;
+        if (result == 0) {
+            og_set_error(ERROR_ACCESS_DENIED, "session-bus named-pipe peer has a different user");
+        }
+    }
+    free(peer);
+    free(current);
+    CloseHandle(process);
+    return result;
+}
+
+static HANDLE og_open_private_path(const char *path) {
+    if (!path) {
+        og_set_error(ERROR_INVALID_PARAMETER, "invalid owner-only path");
+        return INVALID_HANDLE_VALUE;
+    }
+    wchar_t *wide = og_utf8_to_wide(path);
+    if (!wide) {
+        og_set_windows_error("owner-only path is not valid UTF-8");
+        return INVALID_HANDLE_VALUE;
+    }
+    HANDLE handle = CreateFileW(
+        wide,
+        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    DWORD error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    free(wide);
+    if (handle == INVALID_HANDLE_VALUE) {
+        og_set_error((int)error, "could not open owner-only path");
+    }
+    return handle;
+}
+
+static int og_private_path_metadata(
+    HANDLE handle,
+    int require_directory,
+    PSID *owner,
+    PACL *dacl,
+    PSECURITY_DESCRIPTOR *security
+) {
+    FILE_ATTRIBUTE_TAG_INFO attributes;
+    if (!GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            &attributes,
+            sizeof(attributes)
+        )) {
+        og_set_windows_error("could not inspect owner-only path");
+        return -1;
+    }
+    if ((attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        og_set_error(ERROR_REPARSE_TAG_INVALID, "owner-only path is a reparse point");
+        return -1;
+    }
+    int is_directory = (attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if (is_directory != (require_directory != 0)) {
+        og_set_error(ERROR_INVALID_PARAMETER, "owner-only path has an unexpected file type");
+        return -1;
+    }
+    DWORD result = GetSecurityInfo(
+        handle,
+        SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        owner,
+        NULL,
+        dacl,
+        NULL,
+        security
+    );
+    if (result != ERROR_SUCCESS) {
+        og_set_error((int)result, "could not inspect owner-only path security");
+        return -1;
+    }
+    PTOKEN_USER current = NULL;
+    if (og_current_user_token(&current) != 0) {
+        LocalFree(*security);
+        *security = NULL;
+        return -1;
+    }
+    int matches = EqualSid(*owner, current->User.Sid);
+    free(current);
+    if (!matches) {
+        LocalFree(*security);
+        *security = NULL;
+        og_set_error(ERROR_ACCESS_DENIED, "owner-only path belongs to a different user");
+        return 0;
+    }
+    return 1;
+}
+
+int og_path_is_private_to_current_user(const char *path, int require_directory) {
+    HANDLE handle = og_open_private_path(path);
+    if (handle == INVALID_HANDLE_VALUE) return -1;
+    PSID owner = NULL;
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR security = NULL;
+    int metadata = og_private_path_metadata(
+        handle,
+        require_directory,
+        &owner,
+        &dacl,
+        &security
+    );
+    CloseHandle(handle);
+    if (metadata <= 0) return metadata;
+    if (!dacl) {
+        LocalFree(security);
+        return 0;
+    }
+    if (require_directory) {
+        SECURITY_DESCRIPTOR_CONTROL control = 0;
+        DWORD revision = 0;
+        if (!GetSecurityDescriptorControl(security, &control, &revision)) {
+            og_set_windows_error("could not inspect session-bus directory DACL inheritance");
+            LocalFree(security);
+            return -1;
+        }
+        if ((control & SE_DACL_PROTECTED) == 0) {
+            LocalFree(security);
+            return 0;
+        }
+    }
+    ACL_SIZE_INFORMATION information;
+    if (!GetAclInformation(dacl, &information, sizeof(information), AclSizeInformation)) {
+        og_set_windows_error("could not inspect session-bus DACL entries");
+        LocalFree(security);
+        return -1;
+    }
+    int owner_allowed = 0;
+    for (DWORD index = 0; index < information.AceCount; index += 1) {
+        void *raw = NULL;
+        if (!GetAce(dacl, index, &raw)) {
+            og_set_windows_error("could not inspect session-bus DACL entry");
+            LocalFree(security);
+            return -1;
+        }
+        ACE_HEADER *header = (ACE_HEADER *)raw;
+        if (header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+            LocalFree(security);
+            return 0;
+        }
+        ACCESS_ALLOWED_ACE *entry = (ACCESS_ALLOWED_ACE *)raw;
+        if (!EqualSid(owner, (PSID)&entry->SidStart)) {
+            LocalFree(security);
+            return 0;
+        }
+        DWORD required = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+        if (require_directory) required |= FILE_TRAVERSE;
+        if ((entry->Mask & required) == required) owner_allowed = 1;
+    }
+    LocalFree(security);
+    return owner_allowed;
+}
+
+int og_directory_secure_current_user(const char *path) {
+    HANDLE handle = og_open_private_path(path);
+    if (handle == INVALID_HANDLE_VALUE) return -1;
+    PSID owner = NULL;
+    PACL previous = NULL;
+    PSECURITY_DESCRIPTOR security = NULL;
+    int metadata = og_private_path_metadata(handle, 1, &owner, &previous, &security);
+    if (metadata <= 0) {
+        CloseHandle(handle);
+        return -1;
+    }
+    PACL acl = NULL;
+    if (og_owner_only_acl_for_sid_with_access(
+            owner,
+            FILE_ALL_ACCESS,
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            &acl
+        ) != 0) {
+        LocalFree(security);
+        CloseHandle(handle);
+        return -1;
+    }
+    DWORD result = SetSecurityInfo(
+        handle,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        NULL,
+        NULL,
+        acl,
+        NULL
+    );
+    LocalFree(acl);
+    LocalFree(security);
+    CloseHandle(handle);
+    if (result != ERROR_SUCCESS) {
+        og_set_error((int)result, "could not secure session-bus directory DACL");
+        return -1;
+    }
+    return og_path_is_private_to_current_user(path, 1) == 1 ? 0 : -1;
 }
 
 int og_file_create_owner_only(const char *path, OGSocketHandle *handle) {
@@ -1477,6 +1779,11 @@ int og_named_pipe_listener_create(const char *pipe_name, OGSocketHandle *listene
     og_set_error(ENOTSUP, "named pipes are only available on Windows");
     return -1;
 }
+int og_named_pipe_secure_listener_create(const char *pipe_name, OGSocketHandle *listener) {
+    (void)pipe_name; (void)listener;
+    og_set_error(ENOTSUP, "secure named pipes are only available on Windows");
+    return -1;
+}
 int og_named_pipe_listener_accept(OGSocketHandle listener, OGSocketHandle *handle) {
     (void)listener; (void)handle;
     og_set_error(ENOTSUP, "named pipes are only available on Windows");
@@ -1501,6 +1808,11 @@ int64_t og_named_pipe_write_all(OGSocketHandle handle, const void *buffer, size_
     return -1;
 }
 int og_named_pipe_close(OGSocketHandle handle) { (void)handle; return 0; }
+int og_named_pipe_peer_is_current_user(OGSocketHandle handle, int server_side) {
+    (void)handle; (void)server_side;
+    og_set_error(ENOTSUP, "named-pipe peer identity is only available on Windows");
+    return -1;
+}
 int og_file_lock_acquire(const char *path, const char *contents, OGSocketHandle *handle) {
     (void)path; (void)contents; (void)handle;
     og_set_error(ENOTSUP, "portable file locks are only available on Windows");
@@ -1571,6 +1883,16 @@ int og_file_apply_owner_only(const char *path) {
 int og_file_is_owner_only(const char *path) {
     (void)path;
     og_set_error(ENOTSUP, "owner-only DACLs are only available on Windows");
+    return -1;
+}
+int og_directory_secure_current_user(const char *path) {
+    (void)path;
+    og_set_error(ENOTSUP, "owner-only directory DACLs are only available on Windows");
+    return -1;
+}
+int og_path_is_private_to_current_user(const char *path, int require_directory) {
+    (void)path; (void)require_directory;
+    og_set_error(ENOTSUP, "owner-only DACL inspection is only available on Windows");
     return -1;
 }
 

@@ -57,7 +57,7 @@ public actor LiveSessionBusTransport {
     private let processID: Int32
     private let handler: Handler
 
-    #if os(macOS) || os(Linux)
+    #if os(macOS) || os(Linux) || os(Windows)
     private var listener: LiveSessionBusSocketListener?
     private var listeningURL: URL?
     private var activeConnections: [UUID: ActiveConnection] = [:]
@@ -80,11 +80,12 @@ public actor LiveSessionBusTransport {
 
     @discardableResult
     public func start(socketName: String) async throws -> URL {
-        #if os(macOS) || os(Linux)
+        #if os(macOS) || os(Linux) || os(Windows)
         guard !socketName.isEmpty,
               socketName != ".",
               socketName != "..",
               !socketName.contains("/"),
+              !socketName.contains("\\"),
               !socketName.utf8.contains(0)
         else {
             throw LiveSessionBusTransportError.invalidSocketName(socketName)
@@ -115,7 +116,7 @@ public actor LiveSessionBusTransport {
     }
 
     public func stop() async {
-        #if os(macOS) || os(Linux)
+        #if os(macOS) || os(Linux) || os(Windows)
         let listener = self.listener
         self.listener = nil
         listeningURL = nil
@@ -134,14 +135,21 @@ public actor LiveSessionBusTransport {
         payload: Data,
         timeout: TimeInterval = 5
     ) async throws -> Data {
-        #if os(macOS) || os(Linux)
+        #if os(macOS) || os(Linux) || os(Windows)
         try Task.checkCancellation()
         try LiveSessionBusSocketSupport.validateFrame(payload)
         let deadline = try LiveSessionBusSocketSupport.deadline(after: timeout)
+        #if os(Windows)
+        let connection = try await LiveSessionBusSocketConnection.connect(
+            to: socketURL.standardizedFileURL,
+            deadline: deadline
+        )
+        #else
         let connection = try LiveSessionBusSocketConnection.connect(
             to: socketURL.standardizedFileURL,
             deadline: deadline
         )
+        #endif
         defer { connection.close() }
         return try await withTaskCancellationHandler {
             try await connection.writeFrame(payload, deadline: deadline)
@@ -157,7 +165,7 @@ public actor LiveSessionBusTransport {
         #endif
     }
 
-    #if os(macOS) || os(Linux)
+    #if os(macOS) || os(Linux) || os(Windows)
     private func accept(_ connection: LiveSessionBusSocketConnection) {
         guard listener != nil else {
             connection.close()

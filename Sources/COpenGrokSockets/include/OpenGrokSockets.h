@@ -44,6 +44,7 @@ int64_t og_socket_write_all(
 );
 int og_socket_close(OGSocketHandle handle);
 int og_named_pipe_listener_create(const char *pipe_name, OGSocketHandle *listener);
+int og_named_pipe_secure_listener_create(const char *pipe_name, OGSocketHandle *listener);
 int og_named_pipe_listener_accept(OGSocketHandle listener, OGSocketHandle *handle);
 int og_named_pipe_listener_close(OGSocketHandle listener);
 int og_named_pipe_listener_destroy(OGSocketHandle listener);
@@ -60,6 +61,7 @@ int64_t og_named_pipe_write_all(
     size_t length
 );
 int og_named_pipe_close(OGSocketHandle handle);
+int og_named_pipe_peer_is_current_user(OGSocketHandle handle, int server_side);
 int og_file_lock_acquire(
     const char *path,
     const char *contents,
@@ -78,6 +80,8 @@ int og_file_descriptor_flush(int descriptor);
 int og_file_descriptor_close(int descriptor);
 int og_file_apply_owner_only(const char *path);
 int og_file_is_owner_only(const char *path);
+int og_directory_secure_current_user(const char *path);
+int og_path_is_private_to_current_user(const char *path, int require_directory);
 int og_socket_last_error_code(void);
 const char *og_socket_last_error_message(void);
 
