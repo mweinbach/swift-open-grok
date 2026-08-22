@@ -836,8 +836,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.sessionCatalog = sessionCatalog
         self.conversationStore = conversationStore
         self.mcpServers = mcpServers
-        self.openGrokHome = openGrokHome ?? OpenGrokHomeResolver
+        let resolvedOpenGrokHome = openGrokHome ?? OpenGrokHomeResolver
             .resolve(environment: ProcessInfo.processInfo.environment)
+        self.openGrokHome = resolvedOpenGrokHome
         self.announcements = announcements
         self.changelog = changelog
         self.codingDataRetention = codingDataRetention
@@ -874,7 +875,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             LiveCodeModeSettings.resolveToolMode(
                 environment: environment,
                 workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
-                openGrokHome: self.openGrokHome
+                openGrokHome: resolvedOpenGrokHome
             ) != .direct
         )
         self.conversation = LivePagerConversationState(
@@ -894,7 +895,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         )
         self.scrollLogURL = Self.waveEScrollLogURL(
             environmentValue: environment["GROK_SCROLL_LOG"],
-            openGrokHome: self.openGrokHome
+            openGrokHome: resolvedOpenGrokHome
         )
         self.authServices = authServices
         self.usageSources = usageSources
