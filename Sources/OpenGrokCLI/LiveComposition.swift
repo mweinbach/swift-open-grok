@@ -3650,6 +3650,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             environment: context.environment,
             openGrokHome: foundation.openGrokHome
         )
+        let launchedCatalogID = catalogStore.entryForWireModel(
+            foundation.samplingConfiguration.model,
+            provider: foundation.samplingConfiguration.provider
+        )?.id ?? foundation.samplingConfiguration.model
+        catalogStore.noteModelSwitch(
+            catalogID: launchedCatalogID,
+            effort: foundation.samplingConfiguration.reasoningEffort
+        )
         // Post-readiness one-shot remote catalog refresh, upstream's
         // `spawn_background_refresh` (agent/models.rs:1817-1835, fired from
         // acp/spawn.rs:210 and app.rs:194/:1250 after session readiness).

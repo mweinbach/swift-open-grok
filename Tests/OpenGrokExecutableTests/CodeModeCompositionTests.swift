@@ -386,11 +386,28 @@ struct CodeModeCompositionTests {
         // are in the same class: a foreground spawn (or a parked cohort's
         // orchestration wait) parks the turn on the children
         // (`is_code_mode_direct_only_tool`, session/code_mode.rs:68-77).
-        // The collaboration quartet is direct-only too (code_mode.rs:83-86):
-        // wait_agent parks the turn on the mailbox exactly like the task
-        // waits park it on completion.
+        // Both collaboration surfaces are direct-only (code_mode.rs:88-94):
+        // wait_agent parks on the team mailbox, while cross-session reads and
+        // untrusted peer messages must stay outside nested JavaScript cells.
         #expect(
-            Set(names) == ["get_command_or_subagent_output", "wait_commands_or_subagents", "kill_command_or_subagent", "spawn_subagent", "agent_swarm", "list_agents", "send_message", "followup_task", "wait_agent", "enter_plan_mode", "exit_plan_mode", "exec", "wait"]
+            Set(names) == [
+                "get_command_or_subagent_output",
+                "wait_commands_or_subagents",
+                "kill_command_or_subagent",
+                "spawn_subagent",
+                "agent_swarm",
+                "list_agents",
+                "send_message",
+                "followup_task",
+                "wait_agent",
+                "list_sessions",
+                "read_session",
+                "message_session",
+                "enter_plan_mode",
+                "exit_plan_mode",
+                "exec",
+                "wait",
+            ]
         )
         // The transport pair is always last, after any direct-only tool.
         #expect(names.suffix(2) == ["exec", "wait"])
@@ -398,6 +415,12 @@ struct CodeModeCompositionTests {
         // declarations for the nested namespace.
         let exec = sampler.recordedRequests.first?.tools.first { $0.name == "exec" }
         #expect(exec?.description?.contains("### `read_file`") == true)
+        for collaborationTool in [
+            "list_agents", "send_message", "followup_task", "wait_agent",
+            "list_sessions", "read_session", "message_session",
+        ] {
+            #expect(exec?.description?.contains("### `\(collaborationTool)`") == false)
+        }
     }
 
     @Test("direct mode leaves the tool surface untouched")

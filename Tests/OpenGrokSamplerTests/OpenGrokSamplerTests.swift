@@ -335,9 +335,29 @@ struct ErrorInfoTests {
 struct ProviderTests {
     @Test("registry covers all providers")
     func registry() {
-        #expect(PROVIDER_REGISTRY.count == 9)
-        for p in [ModelProvider.xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai] {
-            #expect(providerAdapter(p).provider == p)
+        let expected: [(provider: ModelProvider, profile: ProviderProfile)] = [
+            (.xai, .xai),
+            (.codex, .codex),
+            (.kimi, .kimi),
+            (.fireworks, .fireworks),
+            (.deepseek, .deepseek),
+            (.meta, .meta),
+            (.openCodeGo, .openCodeGo),
+            (.wafer, .wafer),
+            (.zai, .zai),
+            (.runinfra, .runinfra),
+            (.gemini, .gemini),
+            (.openRouter, .openRouter),
+        ]
+
+        #expect(PROVIDER_REGISTRY.count == 12)
+        #expect(PROVIDER_REGISTRY.map { $0.provider } == expected.map { $0.provider })
+        for item in expected {
+            let matching = PROVIDER_REGISTRY.filter { $0.provider == item.provider }
+            #expect(matching.count == 1)
+            let adapter = providerAdapter(item.provider)
+            #expect(adapter.provider == item.provider)
+            #expect(adapter.profile == item.profile)
         }
     }
 
