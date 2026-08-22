@@ -349,8 +349,10 @@ public struct PagerPTYHarness: Sendable {
         // not assumed. The compile-time source location is the only anchor to
         // the package, so walk up from it to `Package.swift` and look in the
         // build directories beneath.
-        var directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-        while directory.path != "/" {
+        var directory = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().standardizedFileURL
+        var visited: Set<String> = []
+        while visited.insert(directory.path).inserted {
             let manifest = directory.appendingPathComponent("Package.swift")
             if FileManager.default.fileExists(atPath: manifest.path) {
                 let build = directory.appendingPathComponent(".build")
@@ -365,8 +367,9 @@ public struct PagerPTYHarness: Sendable {
                 return build.appendingPathComponent("debug/open-grok").path
             }
             let parent = directory.deletingLastPathComponent()
-            if parent == directory { break }
-            directory = parent
+            // NSURL's filesystem-root parent can grow `/..` indefinitely.
+            guard parent.path.count < directory.path.count else { break }
+            directory = parent.standardizedFileURL
         }
         return "open-grok"
     }

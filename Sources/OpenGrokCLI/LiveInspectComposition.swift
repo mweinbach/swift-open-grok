@@ -643,14 +643,14 @@ public enum LiveInspectComposition {
             candidates.append(("system-requirements", system.appendingPathComponent("requirements.toml")))
         }
 
-        let boundary = findProjectRoot(cwd) ?? cwd
-        var current = cwd
+        let boundary = (findProjectRoot(cwd) ?? cwd).standardizedFileURL
+        var current = cwd.standardizedFileURL
         var project: [URL] = []
-        while true {
+        var visited: Set<String> = []
+        while visited.insert(current.path).inserted {
             project.append(current.appendingPathComponent(".opengrok/config.toml"))
-            if current.standardizedFileURL == boundary.standardizedFileURL { break }
-            let parent = current.deletingLastPathComponent()
-            if parent == current { break }
+            if current.path == boundary.path { break }
+            guard let parent = strictlyAscendingParent(of: current) else { break }
             current = parent
         }
         candidates.append(contentsOf: project.reversed().map { ("project", $0) })
@@ -682,14 +682,23 @@ public enum LiveInspectComposition {
 
     private static func findProjectRoot(_ cwd: URL) -> URL? {
         var current = cwd.standardizedFileURL
-        while true {
+        var visited: Set<String> = []
+        while visited.insert(current.path).inserted {
             if FileManager.default.fileExists(atPath: current.appendingPathComponent(".git").path) {
                 return current
             }
-            let parent = current.deletingLastPathComponent()
-            if parent == current { return nil }
+            guard let parent = strictlyAscendingParent(of: current) else { return nil }
             current = parent
         }
+        return nil
+    }
+
+    private static func strictlyAscendingParent(of directory: URL) -> URL? {
+        let current = directory.standardizedFileURL
+        let parent = current.deletingLastPathComponent()
+        // NSURL can produce ever-growing `/..` parents at a filesystem root.
+        guard parent.path.count < current.path.count else { return nil }
+        return parent.standardizedFileURL
     }
 
     private static func stringArray(_ value: TOMLValue?) -> [String] {
