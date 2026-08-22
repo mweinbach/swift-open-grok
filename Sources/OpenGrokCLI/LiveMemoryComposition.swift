@@ -52,6 +52,7 @@ struct LiveMemoryConfiguration: Sendable, Equatable {
     var search: MemorySearchConfig
     var initialInjection: MemoryInitialInjectionConfig
     var index: MemoryIndexConfig
+    var session: MemorySessionConfig
     /// Vector dimensions, or 0 when no embedding model is configured. The
     /// index treats 0 as "text search only", which is the only mode that works
     /// without an embedding provider — and this port has no embedding
@@ -64,6 +65,7 @@ struct LiveMemoryConfiguration: Sendable, Equatable {
         search: MemorySearchConfig(),
         initialInjection: MemoryInitialInjectionConfig(),
         index: MemoryIndexConfig(),
+        session: MemorySessionConfig(),
         embeddingDimensions: 0,
         dream: MemoryDreamConfig()
     )
@@ -140,6 +142,14 @@ struct LiveMemoryConfiguration: Sendable, Equatable {
             config.index = index
         }
 
+        if let table = document[path: ["memory", "session"]] {
+            var session = MemorySessionConfig()
+            if let saveOnEnd = table["save_on_end"]?.boolValue {
+                session.saveOnEnd = saveOnEnd
+            }
+            config.session = session
+        }
+
         // Vectors need an embedding provider. This port has none, so a
         // configured model still resolves to 0 dimensions and the index runs
         // text-only rather than pretending to score against embeddings it
@@ -180,6 +190,7 @@ actor LiveMemoryBackend {
     /// Set once the first search has forced a reindex, so a session with many
     /// searches walks the memory tree once rather than per call.
     private var didReindex = false
+    private var completedSessionPaths: [String: String] = [:]
 
     /// Returns nil when memory is switched off, so every seam can hold an
     /// optional backend and a disabled session allocates nothing.
@@ -314,6 +325,40 @@ actor LiveMemoryBackend {
         index = nil
         didReindex = false
     }
+
+    /// Saves the upstream's local-only, structured shutdown summary exactly
+    /// once per backend lifetime and makes it searchable before returning.
+    func saveSessionSummary(
+        sessionID: String,
+        conversation: [ConversationItem],
+        realQueries: [String],
+        date: Date = Date()
+    ) throws -> LiveMemorySessionEndResult {
+        if let existingPath = completedSessionPaths[sessionID] {
+            return .alreadySaved(path: existingPath)
+        }
+
+        let path = try LiveMemorySessionStorage.writeSummary(
+            storage: storage,
+            sessionID: sessionID,
+            conversation: conversation,
+            realQueries: realQueries,
+            date: date
+        )
+        guard let index = openIndex() else {
+            throw LiveMemoryLifecycleError.indexUnavailable(path.path)
+        }
+        let result = try index.reindexFile(path: path, source: storage.classifySource(path))
+        guard result.added > 0 || result.updated > 0
+            || (try index.allIndexedPaths()).contains(path.path)
+        else {
+            throw LiveMemoryLifecycleError.summaryWasNotIndexed(path.path)
+        }
+        completedSessionPaths[sessionID] = path.path
+        return .written(path: path.path)
+    }
+
+    var workspacePath: URL { storage.workspacePath }
 
     var memoryFilePaths: [String] {
         ((try? storage.listMemoryFiles()) ?? []).map(\.path)
@@ -765,5 +810,128 @@ enum LiveMemoryCommands {
             sample: sampler.sample
         )
         return dreamStatusMessage(for: result)
+    }
+}
+
+enum LiveMemoryClearScope: Sendable, Equatable {
+    case workspace
+    case global
+    case all
+}
+
+enum LiveMemoryComposition {
+    private struct ClearTarget: Sendable {
+        let label: String
+        let path: URL
+        let isDirectory: Bool
+        let clear: @Sendable (MemoryStorage) throws -> Bool
+    }
+
+    @discardableResult
+    static func runClear(
+        scope: LiveMemoryClearScope,
+        skipConfirmation: Bool,
+        workingDirectory: URL,
+        environment: [String: String],
+        confirmation: @Sendable () -> String?,
+        output: @Sendable (String) -> Void,
+        error errorOutput: @Sendable (String) -> Void
+    ) -> Int32 {
+        let storage = MemoryStorage(
+            cwd: workingDirectory.standardizedFileURL,
+            environment: environment
+        )
+        let workspace = ClearTarget(
+            label: "workspace memory",
+            path: storage.workspaceDir,
+            isDirectory: true,
+            clear: { try $0.clearWorkspace() }
+        )
+        let global = ClearTarget(
+            label: "global MEMORY.md",
+            path: storage.globalMemoryFile,
+            isDirectory: false,
+            clear: { try $0.clearGlobal() }
+        )
+        let targets: [ClearTarget]
+        switch scope {
+        case .workspace: targets = [workspace]
+        case .global: targets = [global]
+        case .all: targets = [workspace, global]
+        }
+
+        let existing = targets.filter {
+            FileManager.default.fileExists(atPath: $0.path.path)
+        }
+        guard !existing.isEmpty else {
+            output("Nothing to clear — no memory files found.\n")
+            return CLIRunner.ExitCode.success.rawValue
+        }
+
+        do {
+            for target in existing {
+                try LiveMemorySessionStorage.validateClearTarget(
+                    target.path,
+                    root: storage.globalDir,
+                    isDirectory: target.isDirectory
+                )
+            }
+        } catch {
+            errorOutput("Failed to clear memory:\n  \(error)\n")
+            return CLIRunner.ExitCode.failure.rawValue
+        }
+
+        output("The following will be deleted:\n")
+        for target in existing {
+            output("  \(target.label): \(target.path.path)\n")
+        }
+
+        if !skipConfirmation {
+            output("\nAre you sure? [y/N] ")
+            guard let reply = confirmation()?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased(),
+                  reply == "y" || reply == "yes"
+            else {
+                output("Cancelled.\n")
+                return CLIRunner.ExitCode.success.rawValue
+            }
+        }
+
+        var cleared = false
+        var failures: [String] = []
+        for target in targets {
+            do {
+                if FileManager.default.fileExists(atPath: target.path.path) {
+                    try LiveMemorySessionStorage.validateClearTarget(
+                        target.path,
+                        root: storage.globalDir,
+                        isDirectory: target.isDirectory
+                    )
+                }
+                if try target.clear(storage) {
+                    cleared = true
+                    output("  Cleared: \(target.label)\n")
+                }
+            } catch {
+                failures.append("\(target.label): \(error)")
+            }
+        }
+
+        if cleared, failures.isEmpty {
+            output("Memory cleared.\n")
+        } else if cleared {
+            output("Memory partially cleared. Errors:\n")
+            for failure in failures {
+                errorOutput("  \(failure)\n")
+            }
+        } else if !failures.isEmpty {
+            errorOutput("Failed to clear memory:\n")
+            for failure in failures {
+                errorOutput("  \(failure)\n")
+            }
+            return CLIRunner.ExitCode.failure.rawValue
+        }
+
+        return CLIRunner.ExitCode.success.rawValue
     }
 }

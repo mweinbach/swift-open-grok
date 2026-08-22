@@ -26,6 +26,7 @@ struct LiveSessionServices: Sendable {
     var rewind: LiveRewindCoordinator?
     var memory: LiveMemoryBackend?
     var goal: LiveGoalCoordinator?
+    let owningSessionID: String?
     /// Cached because `LiveToolExecutor.tools` is a `let` computed once at
     /// construction: the advertised list cannot change mid-session, so it is
     /// resolved once with the goal state as it stood at launch.
@@ -35,11 +36,13 @@ struct LiveSessionServices: Sendable {
         rewind: LiveRewindCoordinator?,
         memory: LiveMemoryBackend?,
         goal: LiveGoalCoordinator?,
-        goalIsActive: Bool
+        goalIsActive: Bool,
+        owningSessionID: String? = nil
     ) {
         self.rewind = rewind
         self.memory = memory
         self.goal = goal
+        self.owningSessionID = owningSessionID
         var specs: [ToolSpec] = []
         if let memory {
             specs += LiveMemoryTools.toolSpecs(configuration: memory.configuration)
@@ -113,6 +116,58 @@ struct LiveSessionServices: Sendable {
     /// Close the rewind point, recording what the turn left behind.
     func endPrompt() async {
         await rewind?.endPrompt()
+    }
+
+    /// Runs after turn shutdown, when the shared provider boundary and
+    /// conversation can no longer change beneath the persistence decision.
+    func endSession(
+        history: LiveConversationHistory,
+        isSubagent: Bool = false
+    ) async -> LiveMemorySessionEndResult {
+        guard let memory else { return .disabled }
+        let record = await history.snapshot()
+        guard owningSessionID == nil || owningSessionID == record.sessionID else {
+            return .sessionMismatch
+        }
+        guard !isSubagent, record.sessionKind != "subagent" else {
+            return .subagent
+        }
+        guard memory.configuration.session.saveOnEnd else {
+            return .configuredOff
+        }
+        let exportBoundary = await history.sharedExportBoundary
+        guard record.currentProvider == .xai,
+              record.everUsedNonXAI == false,
+              exportBoundary.allowsXaiExport
+        else {
+            return .providerBoundaryClosed
+        }
+        guard !(await memory.isEphemeralWorkspace) else { return .ephemeralWorkspace }
+        let sessionDirectory = URL(fileURLWithPath: record.workingDirectory)
+            .standardizedFileURL
+        guard sessionDirectory == (await memory.workspacePath) else {
+            return .workspaceMismatch
+        }
+
+        let queries = LiveMemorySessionSummary.realUserQueries(record.items)
+        guard queries.count >= LiveMemorySessionSummary.minimumUserMessages else {
+            return .tooFewPrompts
+        }
+        guard queries.reduce(0, { $0 + $1.utf8.count })
+            >= LiveMemorySessionSummary.minimumTotalQueryBytes
+        else {
+            return .tooFewQueryBytes
+        }
+
+        do {
+            return try await memory.saveSessionSummary(
+                sessionID: record.sessionID,
+                conversation: record.items,
+                realQueries: queries
+            )
+        } catch {
+            return .failed(String(describing: error))
+        }
     }
 
     /// First-turn memory injection.
@@ -207,7 +262,8 @@ extension OpenGrokLiveApplicationLauncher {
             rewind: rewind,
             memory: memory,
             goal: goal,
-            goalIsActive: await goal.isActive
+            goalIsActive: await goal.isActive,
+            owningSessionID: sessionID
         )
     }
 }
