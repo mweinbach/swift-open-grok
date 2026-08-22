@@ -369,7 +369,7 @@ struct LiveWorkflowSourceAuthoritySecurityTests {
         let (streams, _, error) = CLIStreams.buffered()
 
         let code = await CLIRunner.run(
-            ["workflow", "validate", hostile.path, "--cwd", fixture.workspace.path],
+            ["--cwd", fixture.workspace.path, "workflow", "validate", hostile.path],
             environment: fixture.environment,
             streams: streams,
             application: OpenGrokApplication.live(control: .never)

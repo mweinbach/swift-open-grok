@@ -195,15 +195,17 @@ enum LiveWorkflowSourceAuthority {
 
     private static func projectRoot(for workingDirectory: URL) -> URL {
         var cursor = workingDirectory
-        while true {
+        var visited = Set<String>()
+        while visited.insert(cursor.standardizedFileURL.resolvingSymlinksInPath().path).inserted {
             let gitMarker = cursor.appendingPathComponent(".git")
             if FileManager.default.fileExists(atPath: gitMarker.path) {
                 return cursor
             }
             let parent = cursor.deletingLastPathComponent()
-            guard parent.path != cursor.path else { return workingDirectory }
-            cursor = parent
+            guard parent.path.count < cursor.path.count else { return workingDirectory }
+            cursor = parent.standardizedFileURL
         }
+        return workingDirectory
     }
 
     private static func attributes(at url: URL) throws -> [FileAttributeKey: Any] {
@@ -245,7 +247,8 @@ enum LiveWorkflowSourceAuthority {
         and authorizedRoot: URL
     ) throws {
         var cursor = candidate.standardizedFileURL
-        while true {
+        var visited = Set<String>()
+        while visited.insert(cursor.standardizedFileURL.resolvingSymlinksInPath().path).inserted {
             let values = try attributes(at: cursor)
             try rejectSymbolicLink(at: cursor, attributes: values)
             let canonical = cursor.standardizedFileURL.resolvingSymlinksInPath()
@@ -253,11 +256,12 @@ enum LiveWorkflowSourceAuthority {
                 return
             }
             let parent = cursor.deletingLastPathComponent()
-            guard parent.path != cursor.path else {
+            guard parent.path.count < cursor.path.count else {
                 throw LiveWorkflowSourceAuthorityError.outsideAllowedRoots(candidate.path)
             }
-            cursor = parent
+            cursor = parent.standardizedFileURL
         }
+        throw LiveWorkflowSourceAuthorityError.outsideAllowedRoots(candidate.path)
     }
 
     private static func contains(_ candidate: URL, inside root: URL) -> Bool {

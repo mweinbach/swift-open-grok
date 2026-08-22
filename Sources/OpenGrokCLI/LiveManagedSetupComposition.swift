@@ -606,6 +606,7 @@ public enum LiveManagedSetupComposition {
         }
         let fingerprint = fetched.principal.keyFingerprint
         do {
+            try rejectSymbolicManagedArtifacts(in: home)
             if managedConfigIdentityChangedAt(
                 home,
                 newPrincipal: principal,
@@ -652,6 +653,24 @@ public enum LiveManagedSetupComposition {
             throw LiveManagedSetupFailure.disk
         }
         return fetched.body.configured ? .installed : .nothingConfigured
+    }
+
+    private static func rejectSymbolicManagedArtifacts(in home: URL) throws {
+        let artifacts = [
+            MANAGED_CONFIG_FILENAME,
+            REQUIREMENTS_FILENAME,
+            SIGNATURE_SIDECAR_FILE,
+            MANAGED_IDENTITY_SIDECAR_FILE,
+            MANAGED_CONFIG_CACHE_FILE,
+        ]
+        for artifact in artifacts {
+            let path = home.appendingPathComponent(artifact)
+            if (try? FileManager.default.destinationOfSymbolicLink(atPath: path.path)) != nil
+                || (try? path.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true
+            {
+                throw LiveManagedSetupFailure.disk
+            }
+        }
     }
 
     private static func installArtifact(_ contents: String?, at path: URL) throws {
