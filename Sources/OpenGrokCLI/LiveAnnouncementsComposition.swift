@@ -32,10 +32,10 @@
 //     deliberate divergence — see `PORT_STATUS.md`.)
 //   * **`features.remote_fetch`** (default true): the deployment knob that
 //     disables all xAI-backend fetches (catalog + settings) on firewalled /
-//     air-gapped installs. Upstream walks the policy layers first-match
-//     (requirements > managed > user, default true); this port reads the
-//     effective config base, which is the merge the rest of the composition
-//     already uses. A denied remote_fetch suppresses the spawn entirely.
+//     air-gapped installs. The shared policy resolver matches upstream's
+//     first-match precedence (requirements > managed > user, default true),
+//     preserving administrator pins even if user config fails to load.
+//     A denied remote_fetch suppresses the spawn entirely.
 
 import Foundation
 import OpenGrokAnnouncements
@@ -51,22 +51,14 @@ import OpenGrokSamplingTypes
 /// Whether xAI-backend fetches (model catalog + remote settings/announcements)
 /// are permitted. Mirrors upstream `resolve_remote_fetch_enabled`
 /// (`util/config/resolve/features.rs:40-54`): the `features.remote_fetch`
-/// knob, default true. Upstream walks the policy layers first-match
-/// (requirements > managed > user) so a deployment can pin "never fetch";
-/// this port reads the effective config base — the same merge
-/// `LiveSessionServices` and the rest of the composition use — and defaults
-/// to true when the key is absent or unreadable, matching upstream's
-/// "fail open only when policy is genuinely absent."
+/// knob, default true. The shared resolver walks policy layers first-match
+/// (requirements > managed > user) and independently reloads administrator
+/// policy when malformed user config prevents loading the complete chain.
 ///
 /// Deliberately no env var: upstream's knob has none (an env var would be one
 /// more way to re-arm the fetches this knob is meant to suppress).
 public func resolveRemoteFetchEnabled(environment: [String: String]) -> Bool {
-    let document = (try? ConfigLayers.load(environment: environment))?
-        .effectiveConfigBase() ?? .table(TOMLTable())
-    if case let .boolean(value)? = document[path: ["features", "remote_fetch"]] {
-        return value
-    }
-    return true
+    resolveTrustedRemoteFetchEnabled(environment: environment)
 }
 
 // MARK: - Banner projection
