@@ -219,6 +219,8 @@ struct LiveTerminalNotificationsParityTests {
         #expect(defaults.idleThresholdSeconds == 3)
         #expect(defaults.events == [.turnComplete, .approvalRequired])
         #expect(defaults.progressBar)
+        #expect(defaults.sessionRecap)
+        #expect(defaults.sessionRecapThresholdSeconds == 30)
         #expect(defaults.title.enabled)
 
         let document = try parseTOML("""
@@ -363,7 +365,41 @@ struct LiveTerminalNotificationsParityTests {
         #expect(!overflow.shouldEmit(nowNanoseconds: UInt64.max))
     }
 
-    @Test("real fullscreen and minimal frontends enable focus and restore it safely")
+    @Test("away recaps use their own threshold, retry backoff, and one-shot rearming")
+    func awayRecapThresholdBackoffAndRearming() {
+        var configuration = LiveTerminalNotificationConfiguration()
+        configuration.idleThresholdSeconds = 3
+        configuration.sessionRecapThresholdSeconds = 30
+        var notifications = LiveTerminalNotifications(
+            configuration: configuration,
+            terminalContext: TerminalContext()
+        )
+
+        notifications.focusLost(nowNanoseconds: 100)
+        #expect(notifications.shouldEmit(nowNanoseconds: 3_000_000_100))
+        #expect(!notifications.recapDue(nowNanoseconds: 30_000_000_099))
+        #expect(notifications.recapDue(nowNanoseconds: 30_000_000_100))
+
+        notifications.noteAutoRecapAttempt(nowNanoseconds: 30_000_000_100)
+        #expect(!notifications.recapDue(nowNanoseconds: 120_000_000_099))
+        #expect(notifications.recapDue(nowNanoseconds: 120_000_000_100))
+        notifications.markRecapShown()
+        #expect(!notifications.recapDue(nowNanoseconds: 220_000_000_100))
+
+        notifications.focusGained()
+        notifications.focusLost(nowNanoseconds: 250_000_000_100)
+        #expect(notifications.recapDue(nowNanoseconds: 280_000_000_100))
+
+        configuration.sessionRecapThresholdSeconds = UInt64.max
+        var overflow = LiveTerminalNotifications(
+            configuration: configuration,
+            terminalContext: TerminalContext()
+        )
+        overflow.focusLost(nowNanoseconds: 0)
+        #expect(!overflow.recapDue(nowNanoseconds: UInt64.max))
+    }
+
+    @Test("fullscreen and minimal frontends pair focus and bracketed-paste ownership")
     func focusReportingLifecycleInBothScreenModes() async throws {
         for mode in [OpenGrokPagerMode.fullScreen, .minimal] {
             try await withNotificationFixture(
@@ -371,12 +407,18 @@ struct LiveTerminalNotificationsParityTests {
                 mode: mode
             ) { fixture in
                 #expect(fixture.sink.count(ANSIMouse.enableFocusReporting) == 1)
+                #expect(fixture.sink.count(LiveTerminalNotifications.enableBracketedPaste) == 1)
                 try await fixture.renderer.restoreTerminal()
+                #expect(fixture.sink.count(LiveTerminalNotifications.disableBracketedPaste) == 1)
                 #expect(fixture.sink.count(ANSIMouse.disableFocusReporting) == 1)
+                let pasteDisable = try #require(
+                    fixture.sink.offsets(of: LiveTerminalNotifications.disableBracketedPaste).first
+                )
+                let focusDisable = try #require(
+                    fixture.sink.offsets(of: ANSIMouse.disableFocusReporting).first
+                )
+                #expect(pasteDisable < focusDisable)
                 if mode == .fullScreen {
-                    let focusDisable = try #require(
-                        fixture.sink.offsets(of: ANSIMouse.disableFocusReporting).first
-                    )
                     let alternateLeave = try #require(
                         fixture.sink.offsets(of: "\u{1B}[?1049l").first
                     )
@@ -396,9 +438,28 @@ struct LiveTerminalNotificationsParityTests {
             try await fixture.renderer.begin()
         }
         #expect(fixture.sink.count(ANSIMouse.enableFocusReporting) == 1)
+        #expect(fixture.sink.count(LiveTerminalNotifications.enableBracketedPaste) == 1)
+        #expect(fixture.sink.count(LiveTerminalNotifications.disableBracketedPaste) == 1)
         #expect(fixture.sink.count(ANSIMouse.disableFocusReporting) == 1)
         #expect(fixture.sink.count("\u{1B}[?1049h") == 1)
         #expect(fixture.sink.count("\u{1B}[?1049l") == 1)
+    }
+
+    @Test("failed bracketed-paste entry rolls back only modes that actually entered")
+    func bracketedPasteStartupFailureRestoresFocus() async throws {
+        for mode in [OpenGrokPagerMode.fullScreen, .minimal] {
+            let fixture = try NotificationFixture(mode: mode)
+            defer { fixture.dispose() }
+            fixture.sink.failNextWrite(containing: LiveTerminalNotifications.enableBracketedPaste)
+
+            await #expect(throws: NotificationSinkFailure.self) {
+                try await fixture.renderer.begin()
+            }
+            #expect(fixture.sink.count(ANSIMouse.enableFocusReporting) == 1)
+            #expect(fixture.sink.count(ANSIMouse.disableFocusReporting) == 1)
+            #expect(fixture.sink.count(LiveTerminalNotifications.enableBracketedPaste) == 0)
+            #expect(fixture.sink.count(LiveTerminalNotifications.disableBracketedPaste) == 0)
+        }
     }
 
     @Test("non-interactive sinks never receive forged terminal capabilities")
@@ -410,7 +471,28 @@ struct LiveTerminalNotificationsParityTests {
             try await fixture.startTurn()
             try await fixture.finishTurn()
             #expect(fixture.sink.count(ANSIMouse.enableFocusReporting) == 0)
+            #expect(fixture.sink.count(LiveTerminalNotifications.enableBracketedPaste) == 0)
+            #expect(fixture.sink.count(LiveTerminalNotifications.disableBracketedPaste) == 0)
             #expect(fixture.sink.count("\u{1B}]99;") == 0)
+        }
+    }
+
+    @Test("automatic refocus without an established sampling session stays silent")
+    func automaticRecapWithoutLiveSessionDoesNotPaintRefusal() async throws {
+        try await withNotificationFixture(configuration: """
+        [ui.notifications]
+        method = "none"
+        condition = "never"
+        session_recap = true
+        session_recap_threshold_secs = 0
+        """) { fixture in
+            let before = await fixture.renderer.testingConversationItems()
+            let lost = try await fixture.renderer.handleInput(.focusLost)
+            #expect(lost == .consumed)
+            let gained = try await fixture.renderer.handleInput(.focusGained)
+            #expect(gained == .consumed)
+            #expect(await fixture.renderer.testingConversationItems() == before)
+            #expect(await fixture.renderer.recapTask == nil)
         }
     }
 
@@ -716,19 +798,21 @@ struct LiveTerminalNotificationsParityTests {
         }
     }
 
-    @Test("terminal focus reporting is disabled around child ownership and reenabled afterwards")
+    @Test("focus and bracketed paste are disabled around child ownership and reenabled afterwards")
     func focusReportingSuspendsAndResumesWithChild() async throws {
         try await withNotificationFixture(
             configuration: quietAlwaysOSC99Configuration
         ) { fixture in
             try await fixture.renderer.frontendSuspendToChild()
+            #expect(fixture.sink.count(LiveTerminalNotifications.disableBracketedPaste) == 1)
             #expect(fixture.sink.count(ANSIMouse.disableFocusReporting) == 1)
             try await fixture.renderer.frontendResumeFromChild()
+            #expect(fixture.sink.count(LiveTerminalNotifications.enableBracketedPaste) == 2)
             #expect(fixture.sink.count(ANSIMouse.enableFocusReporting) == 2)
         }
     }
 
-    @Test("suspend flush failures restore focus reporting before surfacing the error")
+    @Test("suspend flush failures restore focus and bracketed paste before surfacing the error")
     func failedSuspendRearmsFocusReporting() async throws {
         try await withNotificationFixture(
             configuration: quietAlwaysOSC99Configuration
@@ -737,9 +821,29 @@ struct LiveTerminalNotificationsParityTests {
             await #expect(throws: NotificationSinkFailure.self) {
                 try await fixture.renderer.frontendSuspendToChild()
             }
+            #expect(fixture.sink.count(LiveTerminalNotifications.disableBracketedPaste) == 1)
             #expect(fixture.sink.count(ANSIMouse.disableFocusReporting) == 1)
+            #expect(fixture.sink.count(LiveTerminalNotifications.enableBracketedPaste) == 2)
             #expect(fixture.sink.count(ANSIMouse.enableFocusReporting) == 2)
             #expect(await fixture.renderer.terminalNotifications.focusReportingEnabled)
+            #expect(await fixture.renderer.terminalNotifications.bracketedPasteEnabled)
+        }
+    }
+
+    @Test("partial suspend failure restores bracketed paste without duplicating live focus")
+    func failedFocusDisableRearmsBracketedPaste() async throws {
+        try await withNotificationFixture(
+            configuration: quietAlwaysOSC99Configuration
+        ) { fixture in
+            fixture.sink.failNextWrite(containing: ANSIMouse.disableFocusReporting)
+            await #expect(throws: NotificationSinkFailure.self) {
+                try await fixture.renderer.frontendSuspendToChild()
+            }
+            #expect(fixture.sink.count(LiveTerminalNotifications.disableBracketedPaste) == 1)
+            #expect(fixture.sink.count(LiveTerminalNotifications.enableBracketedPaste) == 2)
+            #expect(fixture.sink.count(ANSIMouse.enableFocusReporting) == 1)
+            #expect(await fixture.renderer.terminalNotifications.focusReportingEnabled)
+            #expect(await fixture.renderer.terminalNotifications.bracketedPasteEnabled)
         }
     }
 

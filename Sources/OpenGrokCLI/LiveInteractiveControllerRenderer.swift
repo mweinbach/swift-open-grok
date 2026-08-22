@@ -27,6 +27,7 @@ import OpenGrokSampler
 import OpenGrokSamplingTypes
 import OpenGrokSandbox
 import OpenGrokScheduler
+import OpenGrokSessionPersistence
 import OpenGrokSessionRuntime
 import OpenGrokShared
 import OpenGrokShell
@@ -238,6 +239,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     var turnPhase: LiveWaveETurnPhase?
     var turnActivity: String? { turnPhase?.label }
     var turnStartedAt: Date?
+    var lastMainTurnRequestedAt: Date?
     var isCancelling = false
 
     /// The animation clock, fed exclusively by the controller's wall-clock
@@ -374,6 +376,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// one is generating answer with the unavailable copy instead of
     /// stacking side-calls.
     var recapTask: Task<Void, Never>?
+    var recapLaunchInProgress = false
     /// Bumped when a new turn starts or the session is swapped, so a recap
     /// that finishes late is discarded instead of painting into a
     /// conversation it no longer describes — upstream's `recap_epoch`
@@ -1494,6 +1497,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
 
     func frontendSuspendToChild() throws {
         let wasReportingFocus = terminalNotifications.focusReportingEnabled
+        let wasReportingBracketedPaste = terminalNotifications.bracketedPasteEnabled
         do {
             try suspendTerminalNotificationReporting()
             if let minimalHost {
@@ -1502,7 +1506,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 try renderer.suspendToChild()
             }
         } catch {
-            if wasReportingFocus, !terminalNotifications.focusReportingEnabled {
+            if (wasReportingFocus && !terminalNotifications.focusReportingEnabled)
+                || (wasReportingBracketedPaste && !terminalNotifications.bracketedPasteEnabled) {
                 try? startTerminalNotificationReporting()
             }
             throw error
@@ -1591,6 +1596,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             }
             turnPhase = .thinking
             turnStartedAt = Date()
+            lastMainTurnRequestedAt = turnStartedAt
             lastTurnElapsed = nil
             // Extrapolated motion clock, not the last painted tick: after an
             // idle gap `motion.seconds` is stale and would bake the gap into
@@ -1827,6 +1833,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
 
     func resetForNewSession(sessionID: String) {
         self.sessionID = sessionID
+        lastMainTurnRequestedAt = nil
         conversation.removeAll()
         selection.unfocus()
         followsBottom = true
@@ -2719,14 +2726,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
 
     // MARK: - /recap
 
-    /// `/recap` — kick off the session-recap side-call (the manual arm of
-    /// `handle_recap`, acp_session_impl/recap.rs:250-507). One read-only
+    /// Kick off a manual or return-from-away session-recap side-call
+    /// (`handle_recap`, acp_session_impl/recap.rs:250-507). One read-only
     /// snapshot of the live conversation, ONE tool-free model call on the
     /// independently resolved recap route, and one display-only typed recap
     /// block filled in place; the conversation is never touched. Spawned so the sample never
     /// blocks the input loop, single-flight like upstream's `recap_in_flight`
     /// claim (recap.rs:294-306).
-    func startRecap() async {
+    func startRecap(auto: Bool = false) async {
         let workingDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
         // The shell-side gate is authoritative; default ON
         // (resolve_session_recap, agent/config.rs:2657-2667). Refusal copy is
@@ -2736,38 +2743,83 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             openGrokHome: openGrokHome,
             environment: environment
         ) else {
-            note("Session recap is not enabled")
+            if !auto { note("Session recap is not enabled") }
             return
         }
         // No live sampling stack or conversation behind this renderer means
         // no session to recap (notes.rs:379-384).
-        guard let modelSwitch, let conversationHistory else {
-            note("No active session")
+        guard !sessionID.isEmpty, let modelSwitch, let conversationHistory else {
+            if !auto { note("No active session") }
             return
         }
-        guard recapTask == nil else {
+        guard recapTask == nil, !recapLaunchInProgress else {
             // Another recap is generating; upstream's in-flight skip answers
             // the manual re-request through the unavailable toast
             // (recap.rs:296-302 → notes.rs:331-340).
-            note(LiveRecap.unavailableToast(hasUserMessages: true))
+            if !auto { note(LiveRecap.unavailableToast(hasUserMessages: true)) }
             return
         }
-        let conversationItems = await conversationHistory.items
+        if auto {
+            guard terminalNotifications.configuration.sessionRecap,
+                  turnPhase == nil,
+                  queuedPromptCount == 0,
+                  !overlays.isActive,
+                  currentPermissionRequestID == nil,
+                  currentQuestionRequestID == nil,
+                  currentPlanApprovalRequestID == nil,
+                  !activeBackgroundWork.hasActive
+            else { return }
+        }
+
+        recapLaunchInProgress = true
+        defer { recapLaunchInProgress = false }
+
+        let launchEpoch = recapEpoch
+        let launchSessionID = sessionID
+        let record = await conversationHistory.snapshot()
+        guard recapEpoch == launchEpoch, sessionID == launchSessionID else { return }
+        if auto {
+            guard turnPhase == nil,
+                  queuedPromptCount == 0,
+                  !overlays.isActive,
+                  currentPermissionRequestID == nil,
+                  currentQuestionRequestID == nil,
+                  currentPlanApprovalRequestID == nil,
+                  !activeBackgroundWork.hasActive
+            else { return }
+        }
+        let conversationItems = record.items
+        let mainTurnCount = LiveRecap.mainTurnCount(conversationItems)
         // recap_gate's manual arm (session_recap.rs:232-241): nothing to
         // summarize yet — the empty-state copy, and no request leaves the
         // machine.
-        guard LiveRecap.mainTurnCount(conversationItems) > 0 else {
-            note(LiveRecap.unavailableToast(hasUserMessages: false))
+        guard mainTurnCount > 0 else {
+            if !auto { note(LiveRecap.unavailableToast(hasUserMessages: false)) }
             return
+        }
+        if auto {
+            var previousRecapMainTurn = loadRecapWatermark()
+            if previousRecapMainTurn > mainTurnCount {
+                previousRecapMainTurn = max(0, mainTurnCount - 1)
+                saveRecapWatermark(previousRecapMainTurn)
+            }
+            let lastMainTurn = lastMainTurnRequestedAt ?? record.updatedAt
+            guard mainTurnCount >= 3,
+                  mainTurnCount > previousRecapMainTurn,
+                  Date().timeIntervalSince(lastMainTurn) >= 180
+            else { return }
+            terminalNotifications.noteAutoRecapAttempt()
         }
         let recapBlockID = "recap-\(UUID().uuidString.lowercased())"
         activeRecapBlockID = recapBlockID
-        conversation.upsertBlock(.sessionEvent(PagerSessionEventBlock(
-            id: recapBlockID,
-            event: .recap(summary: nil, auto: false),
-            isExpanded: true
-        )))
-        try? renderState()
+        if !auto {
+            conversation.upsertBlock(.sessionEvent(PagerSessionEventBlock(
+                id: recapBlockID,
+                event: .recap(summary: nil, auto: false),
+                isExpanded: true
+            )))
+            try? renderState()
+        }
 
         let configured = LiveRecap.configuredModel(
             workingDirectory: workingDirectoryURL,
@@ -2817,8 +2869,36 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             } catch {
                 result = .failure(error)
             }
-            self.finishRecap(epoch: epoch, blockID: recapBlockID, result: result)
+            self.finishRecap(
+                epoch: epoch,
+                blockID: recapBlockID,
+                auto: auto,
+                mainTurnCount: mainTurnCount,
+                result: result
+            )
         }
+    }
+
+    private func recapWatermarkURL() -> URL? {
+        guard let directory = try? SessionDocumentStore(grokHome: openGrokHome)
+            .sessionDirectory(sessionID: sessionID, cwd: workingDirectory),
+              FileManager.default.fileExists(atPath: directory.path)
+        else { return nil }
+        return directory.appendingPathComponent("last_recap_main_turn")
+    }
+
+    private func loadRecapWatermark() -> Int {
+        guard let url = recapWatermarkURL(),
+              let text = try? String(contentsOf: url, encoding: .utf8),
+              let value = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              value >= 0
+        else { return 0 }
+        return value
+    }
+
+    private func saveRecapWatermark(_ mainTurnCount: Int) {
+        guard let url = recapWatermarkURL() else { return }
+        try? String(mainTurnCount).write(to: url, atomically: true, encoding: .utf8)
     }
 
     /// Land the recap. The conversation is deliberately untouched on every
@@ -2827,6 +2907,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func finishRecap(
         epoch: UInt64,
         blockID: String,
+        auto: Bool,
+        mainTurnCount: Int,
         result: Result<String, any Error>
     ) {
         recapTask = nil
@@ -2847,9 +2929,16 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             if cleaned.isEmpty {
                 // Empty after the tidy pass reads as no recap
                 // (recap.rs:405-428).
+                if auto { return }
                 summary = LiveRecap.unavailableToast(hasUserMessages: true)
             } else {
+                if auto, raw.utf8.count > 500 {
+                    saveRecapWatermark(mainTurnCount)
+                    return
+                }
                 summary = cleaned
+                saveRecapWatermark(mainTurnCount)
+                terminalNotifications.markRecapShown()
             }
         case .failure:
             // A failed side-call must never break the session: the failure
@@ -2857,11 +2946,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // recap_unavailable_toast, notes.rs:331-340). The error detail is
             // deliberately not painted — upstream sends it to tracing, never
             // to the client.
+            if auto { return }
             summary = LiveRecap.unavailableToast(hasUserMessages: true)
         }
         conversation.upsertBlock(.sessionEvent(PagerSessionEventBlock(
             id: blockID,
-            event: .recap(summary: summary, auto: false),
+            event: .recap(summary: summary, auto: auto),
             isExpanded: true
         )))
         try? renderState()
@@ -3111,6 +3201,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// of what is now on disk.
     func applyResumedSession(sessionID: String) async {
         self.sessionID = sessionID
+        lastMainTurnRequestedAt = nil
         let items = await conversationHistory?.items ?? []
         // The restored user prompts' original instants, for the
         // `/timestamps` overlay — upstream restores `created_at` from the
@@ -4143,8 +4234,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 return .consumed
             }
         case .focusGained:
+            let recapDue = terminalNotifications.configuration.sessionRecap
+                && terminalNotifications.recapDue()
             terminalNotifications.focusGained()
             updateTerminalNotificationPresentation()
+            if recapDue {
+                await startRecap(auto: true)
+            }
             return .consumed
         case .focusLost:
             terminalNotifications.focusLost()

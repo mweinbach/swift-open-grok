@@ -211,6 +211,9 @@ struct LiveTerminalNotificationConfiguration: Sendable, Equatable {
 }
 
 struct LiveTerminalNotifications: Sendable {
+    static let enableBracketedPaste = "\u{1B}[?2004h"
+    static let disableBracketedPaste = "\u{1B}[?2004l"
+
     enum NotificationProtocol: String, Sendable, Equatable {
         case osc9
         case osc99
@@ -227,7 +230,10 @@ struct LiveTerminalNotifications: Sendable {
     private(set) var focused = true
     private(set) var focusLostAtNanoseconds: UInt64?
     private(set) var focusReportingEnabled = false
+    private(set) var bracketedPasteEnabled = false
     private(set) var sessionStarted = false
+    private(set) var recapShownThisAway = false
+    private(set) var lastAutoRecapAttemptAtNanoseconds: UInt64?
     private(set) var approvalNotified = false
     private(set) var progressActive = false
     private(set) var progressLastSentNanoseconds: UInt64?
@@ -277,8 +283,14 @@ struct LiveTerminalNotifications: Sendable {
         if enabled { sessionStarted = true }
     }
 
+    mutating func setBracketedPasteEnabled(_ enabled: Bool) {
+        bracketedPasteEnabled = enabled
+        if enabled { sessionStarted = true }
+    }
+
     mutating func markSessionStopped() {
         focusReportingEnabled = false
+        bracketedPasteEnabled = false
         sessionStarted = false
     }
 
@@ -290,6 +302,34 @@ struct LiveTerminalNotifications: Sendable {
     mutating func focusLost(nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds) {
         focused = false
         focusLostAtNanoseconds = nowNanoseconds
+        recapShownThisAway = false
+        lastAutoRecapAttemptAtNanoseconds = nil
+    }
+
+    func recapDue(nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Bool {
+        guard !focused, !recapShownThisAway, let lostAt = focusLostAtNanoseconds else {
+            return false
+        }
+        if let attemptedAt = lastAutoRecapAttemptAtNanoseconds {
+            let sinceAttempt = nowNanoseconds >= attemptedAt
+                ? nowNanoseconds - attemptedAt
+                : 0
+            guard sinceAttempt >= 90_000_000_000 else { return false }
+        }
+        let elapsed = nowNanoseconds >= lostAt ? nowNanoseconds - lostAt : 0
+        let (threshold, overflow) = configuration.sessionRecapThresholdSeconds
+            .multipliedReportingOverflow(by: 1_000_000_000)
+        return !overflow && elapsed >= threshold
+    }
+
+    mutating func noteAutoRecapAttempt(
+        nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) {
+        lastAutoRecapAttemptAtNanoseconds = nowNanoseconds
+    }
+
+    mutating func markRecapShown() {
+        recapShownThisAway = true
     }
 
     func shouldEmit(nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Bool {
@@ -498,20 +538,32 @@ extension LiveInteractiveControllerRenderer {
         terminalNotifications.sleepInhibition.resume(
             anyAgentBusy: anyTerminalNotificationAgentBusy
         )
-        guard terminal.isTTY(), !terminalNotifications.focusReportingEnabled else { return }
+        guard terminal.isTTY(),
+              !terminalNotifications.focusReportingEnabled
+                  || !terminalNotifications.bracketedPasteEnabled
+        else { return }
         do {
-            try sink.write(ANSIMouse.enableFocusReporting)
-            terminalNotifications.setFocusReportingEnabled(true)
+            if !terminalNotifications.focusReportingEnabled {
+                try sink.write(ANSIMouse.enableFocusReporting)
+                terminalNotifications.setFocusReportingEnabled(true)
+            }
+            if !terminalNotifications.bracketedPasteEnabled {
+                try sink.write(LiveTerminalNotifications.enableBracketedPaste)
+                terminalNotifications.setBracketedPasteEnabled(true)
+            }
             if let presentation = terminalNotificationPresentationSequence() {
                 try sink.write(presentation)
             }
             try sink.flush()
         } catch {
             terminalNotifications.sleepInhibition.suspend()
+            if terminalNotifications.bracketedPasteEnabled {
+                try? sink.write(LiveTerminalNotifications.disableBracketedPaste)
+            }
             if terminalNotifications.focusReportingEnabled {
                 try? sink.write(ANSIMouse.disableFocusReporting)
-                try? sink.flush()
             }
+            try? sink.flush()
             terminalNotifications.markSessionStopped()
             try? frontendRestore()
             throw error
@@ -520,12 +572,20 @@ extension LiveInteractiveControllerRenderer {
 
     func suspendTerminalNotificationReporting() throws {
         terminalNotifications.sleepInhibition.suspend()
-        guard terminalNotifications.focusReportingEnabled else { return }
+        guard terminalNotifications.focusReportingEnabled
+            || terminalNotifications.bracketedPasteEnabled
+        else { return }
         if let clearProgress = terminalNotifications.suspendProgressSequence() {
             try sink.write(clearProgress)
         }
-        try sink.write(ANSIMouse.disableFocusReporting)
-        terminalNotifications.setFocusReportingEnabled(false)
+        if terminalNotifications.bracketedPasteEnabled {
+            try sink.write(LiveTerminalNotifications.disableBracketedPaste)
+            terminalNotifications.setBracketedPasteEnabled(false)
+        }
+        if terminalNotifications.focusReportingEnabled {
+            try sink.write(ANSIMouse.disableFocusReporting)
+            terminalNotifications.setFocusReportingEnabled(false)
+        }
         try sink.flush()
     }
 
@@ -533,8 +593,13 @@ extension LiveInteractiveControllerRenderer {
         terminalNotifications.sleepInhibition.shutdown()
         guard terminalNotifications.sessionStarted else { return }
         try sink.write(terminalNotifications.shutdownSequence())
+        if terminalNotifications.bracketedPasteEnabled {
+            try sink.write(LiveTerminalNotifications.disableBracketedPaste)
+            terminalNotifications.setBracketedPasteEnabled(false)
+        }
         if terminalNotifications.focusReportingEnabled {
             try sink.write(ANSIMouse.disableFocusReporting)
+            terminalNotifications.setFocusReportingEnabled(false)
         }
         try sink.flush()
         terminalNotifications.markSessionStopped()
