@@ -149,15 +149,21 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         var sampler: OpenGrokLiveSampler
         var provider: ModelProvider
         var codexPermissions: CodexPermissions?
+        var apiBackend: ApiBackend?
+        var supportsBackendSearch: Bool?
 
         init(
             sampler: OpenGrokLiveSampler,
             provider: ModelProvider,
-            codexPermissions: CodexPermissions? = nil
+            codexPermissions: CodexPermissions? = nil,
+            apiBackend: ApiBackend? = nil,
+            supportsBackendSearch: Bool? = nil
         ) {
             self.sampler = sampler
             self.provider = provider
             self.codexPermissions = provider == .codex ? codexPermissions : nil
+            self.apiBackend = apiBackend
+            self.supportsBackendSearch = supportsBackendSearch
         }
     }
 
@@ -220,6 +226,12 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         var parentProvider: ModelProvider? = nil
         /// The parent's applied execution policy, disclosed only to Codex.
         var parentCodexPermissions: CodexPermissions? = nil
+        /// Missing launch authority withholds provider-executed tools entirely.
+        var parentHostedSearchPolicy: LiveHostedSearchPolicy? = nil
+        var parentAPIBackend: ApiBackend? = nil
+        var parentSupportsBackendSearch: Bool? = nil
+        /// A synthetic context must never turn the root's master kill switch on.
+        var disableWebSearch: Bool = true
         /// Resolves another model into its own provider transport and scoped
         /// credentials. Cross-provider children fail closed when unavailable.
         var childSamplerFactory: (
@@ -1362,6 +1374,11 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             )
         }
         childExecutors[childID] = executor
+        let hostedTools = childHostedTools(
+            definition: definition,
+            route: samplingRoute,
+            executor: executor
+        )
 
         var items = resumeItems ?? []
         if resumeItems == nil {
@@ -1451,6 +1468,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                     prompt: prompt,
                     items: items,
                     tools: executor.tools,
+                    hostedTools: hostedTools,
                     reasoningEffort: childEffort,
                     codexPermissions: childCodexPermissions
                 )) { _ in
@@ -1591,6 +1609,40 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         )
     }
 
+    private func childHostedTools(
+        definition: AgentDefinition,
+        route: ChildSamplerRoute,
+        executor: LiveToolExecutor
+    ) -> [HostedTool] {
+        guard let parent = context.parentHostedSearchPolicy,
+              let backend = route.apiBackend,
+              let supportsBackendSearch = route.supportsBackendSearch
+        else { return [] }
+
+        let scoped = LiveHostedSearchComposition.policy(
+            environment: context.environment,
+            configuration: context.securityContext.document,
+            disableWebSearch: context.disableWebSearch,
+            toolPolicy: LiveAgentToolPolicy(definition: definition),
+            permissionRules: context.securityContext.permissions.config.rules
+        )
+        let inherited = LiveHostedSearchPolicy(
+            backendSearchEnabled: parent.backendSearchEnabled && scoped.backendSearchEnabled,
+            webSearchAllowed: parent.webSearchAllowed && scoped.webSearchAllowed,
+            xSearchAllowed: parent.xSearchAllowed && scoped.xSearchAllowed,
+            allowedDomains: parent.allowedDomains ?? scoped.allowedDomains,
+            excludedDomains: parent.excludedDomains ?? scoped.excludedDomains
+        )
+        return LiveHostedSearchComposition.resolve(
+            provider: route.provider,
+            backend: backend,
+            modelSupportsBackendSearch: supportsBackendSearch,
+            policy: inherited,
+            availableFunctionTools: executor.currentToolSpecs(),
+            existingHostedTools: []
+        )
+    }
+
     private func resolveChildSamplerRoute(model: String) async throws -> ChildSamplerRoute {
         let parentProvider = context.parentProvider
             ?? resolveSubagentModelProvider(context.parentModel)
@@ -1600,7 +1652,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             return ChildSamplerRoute(
                 sampler: context.sampler,
                 provider: parentProvider,
-                codexPermissions: context.parentCodexPermissions
+                codexPermissions: context.parentCodexPermissions,
+                apiBackend: context.parentAPIBackend,
+                supportsBackendSearch: context.parentSupportsBackendSearch
             )
         }
 
@@ -1611,7 +1665,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 provider: resolved.provider,
                 codexPermissions: resolved.provider == .codex
                     ? resolved.codexPermissions ?? context.parentCodexPermissions
-                    : nil
+                    : nil,
+                apiBackend: resolved.apiBackend,
+                supportsBackendSearch: resolved.supportsBackendSearch
             )
         }
 
@@ -1624,7 +1680,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         return ChildSamplerRoute(
             sampler: context.sampler,
             provider: parentProvider,
-            codexPermissions: context.parentCodexPermissions
+            codexPermissions: context.parentCodexPermissions,
+            apiBackend: context.parentAPIBackend,
+            supportsBackendSearch: context.parentSupportsBackendSearch
         )
     }
 

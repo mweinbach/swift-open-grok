@@ -4,6 +4,8 @@ import OpenGrokConfig
 import OpenGrokHTTP
 import OpenGrokSamplingTypes
 import OpenGrokShared
+import OpenGrokShellBase
+import OpenGrokSubagentResolution
 import OpenGrokWorkspace
 import Testing
 @testable import OpenGrokCLI
@@ -42,8 +44,124 @@ private func hostedSearchParityTools(
     )
 }
 
+private actor HostedChildSamplingCapture {
+    private var recorded: [OpenGrokLiveSamplingRequest] = []
+
+    func append(_ request: OpenGrokLiveSamplingRequest) {
+        recorded.append(request)
+    }
+
+    func snapshot() -> [OpenGrokLiveSamplingRequest] {
+        recorded
+    }
+}
+
 @Suite("Live provider-hosted search parity")
 struct LiveHostedSearchParityTests {
+    private func childSamplingRequest(
+        provider: ModelProvider = .codex,
+        backend: ApiBackend? = .responses,
+        modelSupportsBackendSearch: Bool? = true,
+        parentPolicy: LiveHostedSearchPolicy? = .unrestricted,
+        disableWebSearch: Bool = false,
+        definition: AgentDefinition = AgentDefinition(
+            name: "search-child",
+            description: "search the web"
+        ),
+        permissionRules: [PermissionRule] = [],
+        crossProvider: ModelProvider? = nil
+    ) async throws -> OpenGrokLiveSamplingRequest {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "hosted-search-child-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let environment = [
+            "HOME": home.path,
+            "OPENGROK_HOME": home.path,
+            "XDG_STATE_HOME": home.appendingPathComponent("state").path,
+        ]
+        let capture = HostedChildSamplingCapture()
+        let sampler = OpenGrokLiveSampler { request, _ in
+            await capture.append(request)
+            return OpenGrokLiveSamplingResponse(
+                output: "child completed",
+                usage: TokenUsage(promptTokens: 1, completionTokens: 1, totalTokens: 2)
+            )
+        }
+        var security = LiveSecurityContext.resolve(
+            workspaceRoot: workspace,
+            environment: environment,
+            isInteractive: false
+        )
+        security.permissions.config.rules = permissionRules
+        let childFactory: (
+            @Sendable (String, CodexPermissions?) async throws -> LiveSubagentHost.ChildSamplerRoute
+        )?
+        if let crossProvider {
+            childFactory = { _, inheritedPermissions in
+                LiveSubagentHost.ChildSamplerRoute(
+                    sampler: sampler,
+                    provider: crossProvider,
+                    codexPermissions: inheritedPermissions,
+                    apiBackend: backend,
+                    supportsBackendSearch: modelSupportsBackendSearch
+                )
+            }
+        } else {
+            childFactory = nil
+        }
+        let host = LiveSubagentHost(context: LiveSubagentHost.Context(
+            sampler: sampler,
+            parentModel: "parent-search-model",
+            workingDirectory: workspace,
+            sessionID: "parent-search-session",
+            openGrokHome: home,
+            conversationStore: LiveConversationStore(openGrokHome: home),
+            processBackend: LocalShellProcessBackend(inheritedEnvironment: environment),
+            securityContext: security,
+            sandboxDecision: LiveSandboxDecision(profileName: "none", mode: .none, enforced: false),
+            permissionOptions: CLIPermissionOptions(),
+            fileAccessPolicy: .allowAll,
+            telemetryBootstrapContext: .empty,
+            imageToolContext: nil,
+            webToolContext: nil,
+            environment: environment,
+            parentCapabilityCeiling: nil,
+            definitionContext: DefinitionResolutionContext(
+                cwd: workspace,
+                includeFilesystemDefinitions: true,
+                environment: environment
+            ),
+            modelSlugs: ["parent-search-model", "child-search-model"],
+            parentProvider: provider,
+            parentHostedSearchPolicy: parentPolicy,
+            parentAPIBackend: backend,
+            parentSupportsBackendSearch: modelSupportsBackendSearch,
+            disableWebSearch: disableWebSearch,
+            childSamplerFactory: childFactory
+        ))
+        let result = await host.runChild(
+            childID: "hosted-search-child",
+            prompt: "Find relevant documentation",
+            definition: definition,
+            runtime: EffectiveRuntimeConfig(),
+            model: crossProvider == nil ? "parent-search-model" : "child-search-model",
+            cwd: workspace,
+            resumeItems: nil
+        )
+        await host.shutdown()
+        #expect(result.success, "child runner failed: \(result.error ?? "unknown error")")
+        let recorded = await capture.snapshot()
+        #expect(recorded.count == 1)
+        return try #require(recorded.first)
+    }
+
     private func productionRequestBody(
         provider: ModelProvider,
         hostedTools: [HostedTool],
@@ -132,6 +250,101 @@ struct LiveHostedSearchParityTests {
         let body = try await productionRequestBody(provider: .codex, hostedTools: hosted)
         #expect(body["tools"] == nil)
         #expect(body["include"] == .array([.string("reasoning.encrypted_content")]))
+    }
+
+    @Test("a real child turn carries the provider-native web descriptor but no unsupported custom exec")
+    func childTurnReceivesAuthorizedHostedSearch() async throws {
+        let request = try await childSamplingRequest(provider: .codex)
+        #expect(request.hostedTools.map(\.wireName) == ["web_search"])
+        #expect(!request.hostedTools.contains {
+            if case .clientCustom = $0 { return true }
+            return false
+        })
+    }
+
+    @Test("the inherited no-web master switch removes child web and X search")
+    func childTurnHonorsNoWebMasterSwitch() async throws {
+        let request = try await childSamplingRequest(provider: .xai, disableWebSearch: true)
+        #expect(request.hostedTools.isEmpty)
+    }
+
+    @Test("child definition denylists narrow provider-native capabilities")
+    func childDefinitionDeniesHostedSearch() async throws {
+        let definition = AgentDefinition(
+            name: "no-search-child",
+            description: "search forbidden",
+            disallowedTools: ["web_search", "x_search"]
+        )
+        let request = try await childSamplingRequest(provider: .xai, definition: definition)
+        #expect(request.hostedTools.isEmpty)
+    }
+
+    @Test("a parent deny remains binding even when the child profile allows search")
+    func childCannotWidenParentHostedPolicy() async throws {
+        let parent = LiveHostedSearchPolicy(
+            backendSearchEnabled: true,
+            webSearchAllowed: false,
+            xSearchAllowed: false,
+            allowedDomains: nil,
+            excludedDomains: nil
+        )
+        let definition = AgentDefinition(
+            name: "search-child",
+            description: "attempt to widen parent policy",
+            tools: ["web_search", "x_search"]
+        )
+        let request = try await childSamplingRequest(
+            provider: .xai,
+            parentPolicy: parent,
+            definition: definition
+        )
+        #expect(request.hostedTools.isEmpty)
+    }
+
+    @Test("child-hosted execution cannot bypass ask and deny permission rules",
+          arguments: [RuleAction.ask, .deny])
+    func childPermissionRulesFailClosed(_ action: RuleAction) async throws {
+        let request = try await childSamplingRequest(
+            provider: .codex,
+            permissionRules: [PermissionRule(action: action, tool: .webSearch)]
+        )
+        #expect(request.hostedTools.isEmpty)
+    }
+
+    @Test("providers and models without hosted-search support receive no child descriptors")
+    func unsupportedChildRouteRemainsSearchFree() async throws {
+        let unsupportedProvider = try await childSamplingRequest(
+            provider: .kimi,
+            backend: .chatCompletions
+        )
+        #expect(unsupportedProvider.hostedTools.isEmpty)
+
+        let unsupportedModel = try await childSamplingRequest(
+            provider: .codex,
+            modelSupportsBackendSearch: false
+        )
+        #expect(unsupportedModel.hostedTools.isEmpty)
+    }
+
+    @Test("missing parent policy or authoritative route metadata fails closed")
+    func childMissingSearchAuthorityFailsClosed() async throws {
+        let noParentPolicy = try await childSamplingRequest(parentPolicy: nil)
+        #expect(noParentPolicy.hostedTools.isEmpty)
+
+        let noBackend = try await childSamplingRequest(backend: nil)
+        #expect(noBackend.hostedTools.isEmpty)
+
+        let noModelCapability = try await childSamplingRequest(modelSupportsBackendSearch: nil)
+        #expect(noModelCapability.hostedTools.isEmpty)
+    }
+
+    @Test("cross-provider child routes keep destination search capabilities without leaking X search")
+    func crossProviderChildUsesItsOwnHostedDialect() async throws {
+        let request = try await childSamplingRequest(
+            provider: .xai,
+            crossProvider: .codex
+        )
+        #expect(request.hostedTools.map(\.wireName) == ["web_search"])
     }
 
     @Test("Codex, DeepSeek Responses and Meta expose web but never xAI X search",
