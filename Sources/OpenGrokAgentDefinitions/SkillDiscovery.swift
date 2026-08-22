@@ -769,8 +769,8 @@ public struct SkillDiscovery: Sendable {
         gitRoot: URL?,
         alreadyChecked: inout Set<String>
     ) -> [SkillInfo] {
-        let cwdKey = cwd.standardizedFileURL.path
-        let gitRootKey = gitRoot?.standardizedFileURL.path
+        let cwdKey = Self.ancestorPathKey(cwd)
+        let gitRootKey = gitRoot.map(Self.ancestorPathKey)
         var files: [(url: URL, scope: SkillScope)] = []
         var seenFiles = Set<String>()
 
@@ -780,11 +780,14 @@ public struct SkillDiscovery: Sendable {
             var current: URL? = (exists && isDirectory.boolValue)
                 ? filePath
                 : filePath.deletingLastPathComponent()
+            var visitedAncestors = Set<String>()
+            let maximumAncestors = Self.maximumAncestorCount(from: current ?? filePath)
 
-            while let directory = current {
-                let key = directory.standardizedFileURL.path
+            while let directory = current, visitedAncestors.count < maximumAncestors {
+                let key = Self.ancestorPathKey(directory)
+                guard visitedAncestors.insert(key).inserted else { break }
                 if key == cwdKey { break }
-                if let gitRootKey, !key.hasPrefix(gitRootKey) { break }
+                if let gitRootKey, !Self.isAncestorPath(key, within: gitRootKey) { break }
 
                 // Already-visited short-circuits the scan but not the ascent.
                 if alreadyChecked.insert(key).inserted {
@@ -800,7 +803,9 @@ public struct SkillDiscovery: Sendable {
                 }
 
                 let parent = directory.deletingLastPathComponent()
-                if parent.standardizedFileURL == directory.standardizedFileURL { break }
+                guard parent.path.count < directory.path.count,
+                      Self.ancestorPathKey(parent) != key
+                else { break }
                 current = parent
             }
         }
@@ -979,14 +984,21 @@ public struct SkillDiscovery: Sendable {
     /// root only `cwd` itself is returned — no unbounded upward walk.
     static func ancestorChain(from cwd: URL, stoppingAt gitRoot: URL?) -> [URL] {
         guard let gitRoot else { return [cwd] }
-        let rootPath = gitRoot.standardizedFileURL.path
+        let rootPath = ancestorPathKey(gitRoot)
         var chain: [URL] = []
         var current = cwd.standardizedFileURL
-        while true {
+        var visitedAncestors = Set<String>()
+        let maximumAncestors = maximumAncestorCount(from: current)
+        while visitedAncestors.count < maximumAncestors {
+            let currentPath = ancestorPathKey(current)
+            guard visitedAncestors.insert(currentPath).inserted else { break }
             chain.append(current)
-            if current.path == rootPath { break }
+            if currentPath == rootPath { break }
+            if !isAncestorPath(currentPath, within: rootPath) { break }
             let parent = current.deletingLastPathComponent().standardizedFileURL
-            if parent == current || !current.path.hasPrefix(rootPath) { break }
+            guard parent.path.count < current.path.count,
+                  ancestorPathKey(parent) != currentPath
+            else { break }
             current = parent
         }
         return chain
@@ -995,13 +1007,40 @@ public struct SkillDiscovery: Sendable {
     public static func findGitRoot(from cwd: URL) -> URL? {
         var current = cwd.standardizedFileURL
         let fileManager = FileManager.default
-        while true {
+        var visitedAncestors = Set<String>()
+        let maximumAncestors = maximumAncestorCount(from: current)
+        while visitedAncestors.count < maximumAncestors {
+            let currentPath = ancestorPathKey(current)
+            guard visitedAncestors.insert(currentPath).inserted else { return nil }
             if fileManager.fileExists(atPath: current.appendingPathComponent(".git").path) {
                 return current
             }
             let parent = current.deletingLastPathComponent().standardizedFileURL
-            if parent == current { return nil }
+            guard parent.path.count < current.path.count,
+                  ancestorPathKey(parent) != currentPath
+            else { return nil }
             current = parent
         }
+        return nil
+    }
+
+    private static func ancestorPathKey(_ directory: URL) -> String {
+        let path = directory.standardizedFileURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+        #if os(Windows)
+        return path.replacingOccurrences(of: "\\", with: "/").lowercased()
+        #else
+        return path
+        #endif
+    }
+
+    private static func maximumAncestorCount(from directory: URL) -> Int {
+        max(2, directory.standardizedFileURL.pathComponents.count + 2)
+    }
+
+    private static func isAncestorPath(_ path: String, within root: String) -> Bool {
+        path == root || path.hasPrefix(root.hasSuffix("/") ? root : "\(root)/")
     }
 }
