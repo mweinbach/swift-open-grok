@@ -244,7 +244,7 @@ struct Wave11NewSessionCompositionTests {
         terminal: ParityTerminalFixture
     ) async {
         for _ in 0..<1_000 {
-            if terminal.output.contains(text) {
+            if terminal.paintedText.contains(text) || terminal.output.contains(text) {
                 return
             }
             try? await Task.sleep(nanoseconds: 5_000_000)
@@ -1990,13 +1990,14 @@ struct ParityCompositionTests {
     @Test("/model switches the live session and refuses what it cannot authenticate")
     func liveInteractiveModelPicker() async {
         let outcome = await runInteractiveOverlaySession { terminal, continuation in
+            // The input-pump gate awaits each overlay/command before consuming
+            // the next event, so buffered picker interactions are ordered.
             continuation.yield(.paste("/model"))
             continuation.yield(.key(KeyEvent(key: .enter)))
             await Self.waitForPaintedText("Select model", terminal: terminal)
             // The picker opens on the active model, so a bare Enter is a no-op
             // rather than a pointless rebuild.
             continuation.yield(.key(KeyEvent(key: .enter)))
-            await Self.waitForPaintedText("Already using", terminal: terminal)
 
             continuation.yield(.paste("/model"))
             continuation.yield(.key(KeyEvent(key: .enter)))
@@ -2010,7 +2011,6 @@ struct ParityCompositionTests {
             // Codex model leads the partition is the one selected.
             for event in Self.typed("codex:") { continuation.yield(event) }
             continuation.yield(.key(KeyEvent(key: .enter)))
-            await Self.waitForPaintedText("Could not switch to", terminal: terminal)
         }
         #expect(outcome.painted.contains("Select model"))
         #expect(outcome.output.contains("Already using"))
@@ -2025,18 +2025,13 @@ struct ParityCompositionTests {
     /// else". Mirrors upstream's `Unknown model: …` result.
     @Test("/model <selector> switches directly and refuses an unknown name")
     func liveInteractiveTypedModelSelector() async {
-        let outcome = await runInteractiveOverlaySession { terminal, continuation in
-            await Self.waitForPaintedText("Build anything", terminal: terminal)
-
+        let outcome = await runInteractiveOverlaySession { _, continuation in
             continuation.yield(.paste("/model codex:gpt-5.6-sol"))
             continuation.yield(.key(KeyEvent(key: .enter)))
             // Codex cannot authenticate here, so the switch is refused — but it
             // was attempted, which is what proves the selector resolved.
-            await Self.waitForPaintedText("Could not switch to", terminal: terminal)
-
             continuation.yield(.paste("/model definitely-not-a-model"))
             continuation.yield(.key(KeyEvent(key: .enter)))
-            await Self.waitForPaintedText("Unknown model", terminal: terminal)
         }
         #expect(outcome.output.contains("Could not switch to"))
         #expect(outcome.output.contains("Unknown model"))
@@ -2062,11 +2057,9 @@ struct ParityCompositionTests {
         provider = "xai"
         base_url = "https://api.x.ai/v1"
         api_backend = "chat_completions"
-        """) { terminal, continuation in
-            await Self.waitForPaintedText("Build anything", terminal: terminal)
+        """) { _, continuation in
             continuation.yield(.paste("/model Ambiguous Fixture Model"))
             continuation.yield(.key(KeyEvent(key: .enter)))
-            await Self.waitForPaintedText("Unknown model", terminal: terminal)
         }
         #expect(outcome.output.contains("Unknown model: Ambiguous Fixture Model"))
         #expect(!outcome.painted.contains("Select model"))
@@ -3431,7 +3424,7 @@ struct ParityCompositionTests {
         terminal: ParityTerminalFixture
     ) async {
         for _ in 0..<1_000 {
-            if terminal.output.contains(text) {
+            if terminal.paintedText.contains(text) || terminal.output.contains(text) {
                 return
             }
             try? await Task.sleep(nanoseconds: 5_000_000)
