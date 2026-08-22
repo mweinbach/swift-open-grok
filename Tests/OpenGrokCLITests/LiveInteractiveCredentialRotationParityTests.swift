@@ -3,6 +3,7 @@ import OpenGrokAuth
 import OpenGrokHTTP
 import OpenGrokPager
 import OpenGrokPagerRender
+import OpenGrokProviderSession
 import OpenGrokSamplingTypes
 import OpenGrokShared
 import OpenGrokShellBase
@@ -30,7 +31,8 @@ private actor InteractiveCredentialChildGate {
         if released.contains(id) { return }
 
         try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, any Error>) in
                 if cancelled.contains(id) {
                     continuation.resume(throwing: CancellationError())
                 } else if released.contains(id) {

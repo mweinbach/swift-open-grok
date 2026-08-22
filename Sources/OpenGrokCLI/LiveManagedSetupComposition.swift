@@ -536,7 +536,9 @@ public enum LiveManagedSetupComposition {
             throw LiveManagedSetupFailure.invalidSignature
         }
 
-        let verifiedClaim = preferredEnvelope(body.managedIdentitySignatures).flatMap { claim in
+        let verifiedClaim: SignatureEnvelope? = preferredEnvelope(
+            body.managedIdentitySignatures
+        ).flatMap { claim -> SignatureEnvelope? in
             guard let value = try? verifyFetchedClaim(
                 sidecar: claim,
                 nowUnix: UInt64(max(0, now.timeIntervalSince1970))

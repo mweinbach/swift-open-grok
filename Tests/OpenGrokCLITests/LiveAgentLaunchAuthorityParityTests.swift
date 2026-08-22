@@ -202,9 +202,10 @@ struct LiveAgentLaunchAuthorityParityTests {
 
     @Test("--json-schema accepts only valid object roots and preserves nested schema values")
     func schemaRequiresJSONObject() throws {
-        let schema = try #require(LiveAgentLaunchAuthority.parseJSONSchema(
+        let parsedSchema = try LiveAgentLaunchAuthority.parseJSONSchema(
             #"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#
-        ))
+        )
+        let schema = try #require(parsedSchema)
         #expect(schema.objectValue?["type"] == .string("object"))
         #expect(schema.objectValue?["properties"]?.objectValue?["answer"]?.objectValue?["type"] == .string("string"))
 
@@ -427,7 +428,8 @@ struct LiveAgentLaunchAuthorityParityTests {
         let fixture = try AgentLaunchParityFixture()
         defer { fixture.cleanup() }
         let rawSchema = #"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#
-        let expected = try #require(LiveAgentLaunchAuthority.parseJSONSchema(rawSchema))
+        let parsedSchema = try LiveAgentLaunchAuthority.parseJSONSchema(rawSchema)
+        let expected = try #require(parsedSchema)
         let result = await fixture.run(
             ["--json-schema", rawSchema],
             response: #"{"answer":"validated"}"#

@@ -1,6 +1,7 @@
 import Foundation
 import OpenGrokAuth
 import OpenGrokHTTP
+import OpenGrokProviderSession
 import OpenGrokSampler
 import OpenGrokSamplingTypes
 import Testing
