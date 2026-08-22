@@ -47,6 +47,7 @@ let LIVE_CODE_MODE_DIRECT_ONLY_TOOLS: Set<String> = [
     "task",
     "spawn_subagent",
     "agent_swarm",
+    "swarm_wait",
     "workflow",
     "get_task_output",
     "get_command_or_subagent_output",
@@ -150,17 +151,22 @@ enum LiveCodeModeSettings {
 /// (session/tool_surface.rs:189).
 struct LiveCodeModeToolSurface: Sendable {
     let mode: ToolModePreference
+    let provider: ModelProvider
     /// What the model is offered this session.
     let modelTools: [ToolSpec]
+    /// Native Responses declarations, distinct from ordinary function tools.
+    let hostedTools: [HostedTool]
     /// The `tools.*` namespace a cell sees. Empty in `.direct`.
     let snapshot: CodeModeToolRegistrySnapshot
 
     var isCodeMode: Bool { mode != .direct }
 
-    init(mode: ToolModePreference, baseTools: [ToolSpec]) {
+    init(mode: ToolModePreference, baseTools: [ToolSpec], provider: ModelProvider = .xai) {
         self.mode = mode
+        self.provider = provider
         guard mode != .direct else {
             self.modelTools = baseTools
+            self.hostedTools = []
             self.snapshot = CodeModeToolRegistrySnapshot(tools: [])
             return
         }
@@ -168,33 +174,59 @@ struct LiveCodeModeToolSurface: Sendable {
         // `exec` / `wait` are reserved: an ordinary tool that claims either
         // name loses it (tool_surface.rs:228).
         let ordinary = baseTools.filter { isCodeModeNestedTool($0.name) }
+        var normalizedNames = Set<String>()
         let nested = ordinary
             .filter { !isLiveCodeModeDirectOnlyTool($0.name) }
             .map(Self.definition)
+            .filter { normalizedNames.insert($0.name).inserted }
         let direct = mode == .codeModeOnly
             ? ordinary.filter { isLiveCodeModeDirectOnlyTool($0.name) }
             : ordinary
 
         self.snapshot = CodeModeToolRegistrySnapshot(tools: nested)
-        self.modelTools = direct + [
-            Self.execTool(nested: nested, codeModeOnly: mode == .codeModeOnly),
-            Self.waitTool()
-        ]
+        if provider.profile.codeModeTransport == .nativeCustomGrammar {
+            self.modelTools = direct + [Self.waitTool()]
+            self.hostedTools = [.clientCustom(Self.nativeExecTool(
+                nested: nested,
+                codeModeOnly: mode == .codeModeOnly
+            ))]
+        } else {
+            self.modelTools = direct + [
+                Self.execTool(nested: nested, codeModeOnly: mode == .codeModeOnly),
+                Self.waitTool()
+            ]
+            self.hostedTools = []
+        }
     }
 
     private static func definition(for tool: ToolSpec) -> ToolDefinition {
-        ToolDefinition(
-            name: tool.name,
+        let freeform = tool.name == "apply_patch"
+        return ToolDefinition(
+            name: normalizeCodeModeIdentifier(tool.name),
             toolName: .plain(tool.name),
             description: tool.description ?? "",
-            kind: .function,
-            inputSchema: tool.parameters
+            kind: freeform ? .freeform : .function,
+            inputSchema: freeform ? nil : tool.parameters
         )
     }
 
-    /// The function-envelope `exec` (`create_exec_function_tool`,
-    /// code_mode.rs:923). The Codex native custom-grammar form is not built
-    /// here: the live sampler advertises function tools only.
+    private static func nativeExecTool(
+        nested: [ToolDefinition],
+        codeModeOnly: Bool
+    ) -> CustomToolSpec {
+        CustomToolSpec(
+            name: PUBLIC_TOOL_NAME,
+            description: buildExecToolDescription(
+                enabledTools: nested.map(augmentToolDefinition),
+                deferredTools: [],
+                namespaceDescriptions: [:],
+                codeModeOnly: codeModeOnly
+            ),
+            format: .grammar
+        )
+    }
+
+    /// Providers without native custom input receive the JSON function envelope.
     private static func execTool(
         nested: [ToolDefinition],
         codeModeOnly: Bool
@@ -205,9 +237,18 @@ struct LiveCodeModeToolSurface: Sendable {
             namespaceDescriptions: [:],
             codeModeOnly: codeModeOnly
         )
+        let nativeGuidance =
+            "- Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences."
+        let functionGuidance =
+            "- Call this function with JSON arguments shaped as "
+            + "`{\"source\":\"<raw JavaScript>\"}`; the `source` string must contain "
+            + "JavaScript, not a nested JSON object or Markdown code fence."
+        let description = native.contains(nativeGuidance)
+            ? native.replacingOccurrences(of: nativeGuidance, with: functionGuidance)
+            : functionGuidance + "\n\n" + native
         return ToolSpec(
             name: PUBLIC_TOOL_NAME,
-            description: "Pass the JavaScript source in the `source` field.\n\n\(native)",
+            description: description,
             parameters: .object([
                 "type": .string("object"),
                 "properties": .object([
@@ -333,7 +374,13 @@ struct LiveCodeModeNestedExecutor: CodeModeToolExecutor {
         // (tool_calls.rs:998), which is what keeps a nested card distinct
         // from the model's own call ids.
         let callID = "exec-\(UUID().uuidString)"
-        let arguments = Self.argumentsJSON(invocation.input)
+        let arguments: String
+        switch Self.argumentsJSON(for: invocation) {
+        case .success(let encoded):
+            arguments = encoded
+        case .failure(let error):
+            return .failure(error)
+        }
 
         await emitter.send(.tool(OpenGrokShellToolUpdate(
             callID: callID,
@@ -444,15 +491,37 @@ struct LiveCodeModeNestedExecutor: CodeModeToolExecutor {
         return .success(())
     }
 
-    private static func argumentsJSON(_ input: JSONValue?) -> String {
-        guard let input else { return "{}" }
+    static func argumentsJSON(for invocation: CodeModeNestedToolCall) -> Result<String, CodeModeError> {
+        let input: JSONValue
+        switch (invocation.toolKind, invocation.input) {
+        case (.function, nil):
+            input = .object([:])
+        case (.function, .some(.object(let object))):
+            input = .object(object)
+        case (.function, .some):
+            return .failure(CodeModeError(
+                "tool `\(invocation.toolName.name)` expects a JSON object for arguments"
+            ))
+        case (.freeform, .some(.string(let source))):
+            if invocation.toolName.name == "apply_patch" {
+                input = .object(["patch": .string(source)])
+            } else {
+                return .success(source)
+            }
+        case (.freeform, _):
+            return .failure(CodeModeError(
+                "tool `\(invocation.toolName.name)` expects a string input"
+            ))
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         guard let data = try? encoder.encode(input),
               let text = String(data: data, encoding: .utf8) else {
-            return "{}"
+            return .failure(CodeModeError(
+                "failed to serialize `\(invocation.toolName.name)` input"
+            ))
         }
-        return text
+        return .success(text)
     }
 
     private enum RaceOutcome {
@@ -528,6 +597,7 @@ private struct LiveDynamicCodeModeDelegate: CodeModeSessionDelegate {
     let executor: LiveCodeModeNestedExecutor
     let toolExecutor: LiveToolExecutor
     let mode: ToolModePreference
+    let provider: ModelProvider
 
     func invokeTool(
         _ invocation: CodeModeNestedToolCall,
@@ -536,7 +606,8 @@ private struct LiveDynamicCodeModeDelegate: CodeModeSessionDelegate {
     ) async -> Result<JSONValue, CodeModeError> {
         let snapshot = LiveCodeModeToolSurface(
             mode: mode,
-            baseTools: toolExecutor.currentToolSpecs()
+            baseTools: toolExecutor.currentToolSpecs(),
+            provider: provider
         ).snapshot
         guard snapshot.definition(for: invocation.toolName) != nil else {
             return .failure(
@@ -589,6 +660,7 @@ actor LiveCodeModeCoordinator {
 
     private var session: InProcessCodeModeSession?
     private var activeSnapshot: CodeModeToolRegistrySnapshot
+    private var activeProvider: ModelProvider
     private var liveCells: Set<CellId> = []
     private var isShutDown = false
 
@@ -603,6 +675,7 @@ actor LiveCodeModeCoordinator {
         let notifications = LiveCodeModeNotifications()
         self.surface = surface
         self.activeSnapshot = surface.snapshot
+        self.activeProvider = surface.provider
         self.sessionID = sessionID
         self.workingDirectory = workingDirectory
         self.toolExecutor = toolExecutor
@@ -629,7 +702,8 @@ actor LiveCodeModeCoordinator {
     func beginTurn(emit: @escaping LiveCodeModeEmitter.Sink) async {
         activeSnapshot = LiveCodeModeToolSurface(
             mode: surface.mode,
-            baseTools: toolExecutor.currentToolSpecs()
+            baseTools: toolExecutor.currentToolSpecs(),
+            provider: activeProvider
         ).snapshot
         await emitter.attach(emit)
     }
@@ -669,6 +743,7 @@ actor LiveCodeModeCoordinator {
     /// deliberately does not reset — Rust has no such edge, and a cell that
     /// outlives a compaction still resolves.
     func noteModelSwitch(from previous: ModelProvider, to next: ModelProvider) async {
+        activeProvider = next
         guard previous != next else { return }
         await reset()
     }
@@ -699,8 +774,11 @@ actor LiveCodeModeCoordinator {
 
     private func handleExec(_ call: ToolCall) async -> String {
         guard !isShutDown else { return "Code Mode is unavailable: the session has ended." }
-        guard let source = Self.execSource(call.arguments) else {
-            return "exec expects a `source` field carrying raw JavaScript."
+        guard let source = Self.execSource(call, provider: activeProvider) else {
+            if activeProvider.profile.codeModeTransport == .nativeCustomGrammar {
+                return "exec expects a native custom call carrying raw JavaScript."
+            }
+            return "exec expects a function call with a `source` field carrying raw JavaScript."
         }
         let parsed: ParsedExecSource
         switch parseExecSource(source) {
@@ -766,7 +844,8 @@ actor LiveCodeModeCoordinator {
         let delegate = LiveDynamicCodeModeDelegate(
             executor: executor,
             toolExecutor: toolExecutor,
-            mode: surface.mode
+            mode: surface.mode,
+            provider: activeProvider
         )
         let created: InProcessCodeModeSession
         if let executionCeilingMs {
@@ -824,16 +903,19 @@ actor LiveCodeModeCoordinator {
 
     /// The JavaScript body of an `exec` call.
     ///
-    /// The function envelope carries it in `source`; Codex's native custom
-    /// tool sends the raw body as the whole argument string, so a payload that
-    /// is not an object with a `source` field is taken verbatim.
-    private static func execSource(_ arguments: String) -> String? {
-        if let object = object(arguments) {
-            if case .string(let source)? = object["source"] { return source }
+    /// The wire kind must match the active provider: accepting both lets
+    /// function-shaped calls masquerade as native custom invocations.
+    static func execSource(_ call: ToolCall, provider: ModelProvider) -> String? {
+        if provider.profile.codeModeTransport == .nativeCustomGrammar {
+            guard call.isCustom, let source = call.customInput else { return nil }
+            return source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : source
+        }
+        guard !call.isCustom,
+              let arguments = object(call.arguments),
+              case .string(let source)? = arguments["source"] else {
             return nil
         }
-        let trimmed = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : arguments
+        return source
     }
 
     /// `OpenGrokShared` and `OpenGrokCodeModeProtocol` both extend `JSONValue`

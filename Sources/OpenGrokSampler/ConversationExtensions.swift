@@ -413,6 +413,18 @@ public func projectMessagesRequest(
 
 // MARK: - Projection: ConversationRequest → Responses wire (JSON body)
 
+/// Pinned free-form grammar for the Codex native Code Mode `exec` tool.
+/// The surrounding newlines are part of Rust's raw-string declaration.
+public let CODEX_CODE_MODE_FREEFORM_GRAMMAR: String = "\n" + #"""
+start: pragma_source | plain_source
+pragma_source: PRAGMA_LINE NEWLINE SOURCE
+plain_source: SOURCE
+
+PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
+NEWLINE: /\r?\n/
+SOURCE: /[\s\S]+/
+"""# + "\n"
+
 /// Project a conversation request onto a Responses API JSON body.
 ///
 /// `applyResponseDefaults` is the sampling client's `apply_response_defaults`
@@ -431,8 +443,12 @@ public func projectResponsesRequestBody(
     adapter: any ProviderAdapter,
     applyResponseDefaults: Bool = false
 ) -> JSONValue {
+    let nativeCustomTransport = adapter.profile.codeModeTransport == .nativeCustomGrammar
+    let conversationItems = nativeCustomTransport
+        ? req.items
+        : projectNativeCustomHistoryToFunctionEnvelope(req.items)
     var input: [JSONValue] = []
-    for item in req.items {
+    for item in conversationItems {
         switch item {
         case .system(let s):
             input.append(.object([
@@ -490,10 +506,29 @@ public func projectResponsesRequestBody(
                 }
             }
         case .toolResult(let t):
+            let output: JSONValue
+            if !t.orderedContent.isEmpty {
+                output = .array(t.orderedContent.map(responsesCustomOutputContent))
+            } else if !t.images.isEmpty {
+                var parts: [JSONValue] = [
+                    .object(["type": .string("input_text"), "text": .string(t.content)])
+                ]
+                parts.append(contentsOf: t.images.compactMap { image -> JSONValue? in
+                    guard case .image(let url) = image else { return nil }
+                    return .object([
+                        "type": .string("input_image"),
+                        "image_url": .string(url),
+                        "detail": .string("auto"),
+                    ])
+                })
+                output = .array(parts)
+            } else {
+                output = .string(t.content)
+            }
             input.append(.object([
                 "type": .string("function_call_output"),
                 "call_id": .string(t.toolCallId),
-                "output": .string(t.content),
+                "output": output,
             ]))
         case .reasoning(let r):
             var obj: [String: JSONValue] = [
@@ -506,15 +541,24 @@ public func projectResponsesRequestBody(
             }
             input.append(.object(obj))
         case .customToolOutput(let o):
-            let text = o.content.compactMap { part -> String? in
-                if case .text(let t) = part { return t }
-                return nil
-            }.joined()
-            input.append(.object([
+            let output: JSONValue
+            if o.content.count == 1, case .text(let text) = o.content[0] {
+                output = .string(text)
+            } else {
+                output = .array(o.content.map(responsesCustomOutputContent))
+            }
+            var item: [String: JSONValue] = [
                 "type": .string("custom_tool_call_output"),
                 "call_id": .string(o.callId),
-                "output": .string(text),
-            ]))
+                "output": output,
+            ]
+            if let itemID = o.itemId {
+                item["id"] = .string(itemID)
+            }
+            if let name = o.name {
+                item["name"] = .string(name)
+            }
+            input.append(.object(item))
         case .backendToolCall(let b):
             // Opaque provider-native history replays only into the dialect
             // that produced it (upstream `raw_responses_input_replacements`,
@@ -547,16 +591,38 @@ public func projectResponsesRequestBody(
     }
     for hosted in hostedToolsForProvider(hostedTools: req.hostedTools, provider: adapter.provider) {
         switch hosted {
-        case .webSearch:
-            tools.append(.object(["type": .string("web_search")]))
-        case .xSearch:
-            tools.append(.object(["type": .string("x_search")]))
+        case .webSearch, .xSearch:
+            if let wire = hostedSearchToolWireValue(hosted) {
+                tools.append(wire)
+            }
         case .clientCustom(let spec):
-            tools.append(.object([
-                "type": .string("custom"),
-                "name": .string(spec.name),
-                "description": spec.description.map { .string($0) } ?? .null,
-            ]))
+            if nativeCustomTransport {
+                let format: JSONValue
+                switch spec.format {
+                case .string:
+                    format = .object(["type": .string("text")])
+                case .grammar:
+                    format = .object([
+                        "type": .string("grammar"),
+                        "syntax": .string("lark"),
+                        "definition": .string(CODEX_CODE_MODE_FREEFORM_GRAMMAR),
+                    ])
+                }
+                tools.append(.object([
+                    "type": .string("custom"),
+                    "name": .string(spec.name),
+                    "description": spec.description.map { .string($0) } ?? .null,
+                    "format": format,
+                ]))
+            } else if spec.name == "exec",
+                      !tools.contains(where: { $0["name"]?.stringValue == spec.name }) {
+                tools.append(.object([
+                    "type": .string("function"),
+                    "name": .string(spec.name),
+                    "description": .string(codeModeFunctionDescription(spec.description)),
+                    "parameters": codeModeFunctionParameters,
+                ]))
+            }
         }
     }
 
@@ -580,7 +646,7 @@ public func projectResponsesRequestBody(
             ])
         case .custom(let name):
             body["tool_choice"] = .object([
-                "type": .string("custom"),
+                "type": .string(nativeCustomTransport ? "custom" : "function"),
                 "name": .string(name),
             ])
         }
@@ -629,6 +695,148 @@ public func projectResponsesRequestBody(
     var value = JSONValue.object(body)
     adapter.patchResponsesRequest(&value, policy: policy)
     return value
+}
+
+private let codeModeFunctionParameters: JSONValue = .object([
+    "type": .string("object"),
+    "properties": .object([
+        "source": .object([
+            "type": .string("string"),
+            "description": .string("JavaScript source code to execute"),
+        ]),
+    ]),
+    "required": .array([.string("source")]),
+    "additionalProperties": .bool(false),
+])
+
+private func codeModeFunctionDescription(_ native: String?) -> String {
+    let rawGuidance =
+        "- Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences."
+    let functionGuidance =
+        "- Call this function with JSON arguments shaped as "
+        + "`{\"source\":\"<raw JavaScript>\"}`; the `source` string must contain "
+        + "JavaScript, not a nested JSON object or Markdown code fence."
+    guard let native, !native.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return functionGuidance
+    }
+    if native.contains(functionGuidance) { return native }
+    if native.contains(rawGuidance) {
+        return native.replacingOccurrences(of: rawGuidance, with: functionGuidance)
+    }
+    return functionGuidance + "\n\n" + native
+}
+
+private func responsesCustomOutputContent(_ part: CustomToolOutputContent) -> JSONValue {
+    switch part {
+    case .text(let text):
+        return .object(["type": .string("input_text"), "text": .string(text)])
+    case .image(let url, let detail):
+        return .object([
+            "type": .string("input_image"),
+            "image_url": .string(url),
+            "detail": .string(detail.rawValue),
+        ])
+    }
+}
+
+/// Cross-provider history never exposes Codex-only wire identities to xAI.
+private func projectNativeCustomHistoryToFunctionEnvelope(
+    _ items: [ConversationItem]
+) -> [ConversationItem] {
+    let customOutputIDs = Set(items.compactMap { item -> String? in
+        switch item {
+        case .customToolOutput(let output):
+            return output.callId
+        case .toolResult(let result):
+            return ToolCall.decodeCustomToolCallId(result.toolCallId)?.callId
+        default:
+            return nil
+        }
+    })
+
+    var combinedOutputs: [String: [CustomToolOutputContent]] = [:]
+    var lastOutputIndex: [String: Int] = [:]
+    for (index, item) in items.enumerated() {
+        switch item {
+        case .customToolOutput(let output):
+            combinedOutputs[output.callId, default: []].append(contentsOf: output.content)
+            lastOutputIndex[output.callId] = index
+        case .toolResult(let result):
+            let decoded = ToolCall.decodeCustomToolCallId(result.toolCallId)?.callId
+            guard let callID = decoded
+                ?? (customOutputIDs.contains(result.toolCallId) ? result.toolCallId : nil) else {
+                continue
+            }
+            if result.orderedContent.isEmpty {
+                combinedOutputs[callID, default: []].append(.text(text: result.content))
+                combinedOutputs[callID, default: []].append(contentsOf: result.images.compactMap {
+                    image -> CustomToolOutputContent? in
+                    guard case .image(let url) = image else { return nil }
+                    return .image(url: url, detail: .auto)
+                })
+            } else {
+                combinedOutputs[callID, default: []].append(contentsOf: result.orderedContent)
+            }
+            lastOutputIndex[callID] = index
+        default:
+            continue
+        }
+    }
+
+    var projected: [ConversationItem] = []
+    projected.reserveCapacity(items.count)
+    for (index, item) in items.enumerated() {
+        switch item {
+        case .assistant(var assistant):
+            for callIndex in assistant.toolCalls.indices where assistant.toolCalls[callIndex].isCustom {
+                let call = assistant.toolCalls[callIndex]
+                let source = JSONValue.object(["source": .string(call.arguments)])
+                guard let encoded = try? JSONEncoder().encode(source) else { continue }
+                assistant.toolCalls[callIndex] = ToolCall(
+                    id: call.callId,
+                    name: call.name,
+                    arguments: String(decoding: encoded, as: UTF8.self)
+                )
+            }
+            projected.append(.assistant(assistant))
+        case .customToolOutput(let output):
+            guard lastOutputIndex[output.callId] == index else { continue }
+            projected.append(projectedFunctionOutput(
+                callID: output.callId,
+                parts: combinedOutputs[output.callId] ?? []
+            ))
+        case .toolResult(let result):
+            let decoded = ToolCall.decodeCustomToolCallId(result.toolCallId)?.callId
+            guard let callID = decoded
+                ?? (customOutputIDs.contains(result.toolCallId) ? result.toolCallId : nil) else {
+                projected.append(item)
+                continue
+            }
+            guard lastOutputIndex[callID] == index else { continue }
+            projected.append(projectedFunctionOutput(
+                callID: callID,
+                parts: combinedOutputs[callID] ?? []
+            ))
+        default:
+            projected.append(item)
+        }
+    }
+    return projected
+}
+
+private func projectedFunctionOutput(
+    callID: String,
+    parts: [CustomToolOutputContent]
+) -> ConversationItem {
+    let text = parts.compactMap { part -> String? in
+        guard case .text(let text) = part else { return nil }
+        return text
+    }.joined()
+    return .toolResult(ToolResultItem(
+        toolCallId: callID,
+        content: text,
+        orderedContent: parts
+    ))
 }
 
 /// Responses API `reasoning.effort` wire value. `max`/`ultra` clamp to

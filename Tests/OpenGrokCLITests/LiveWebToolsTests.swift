@@ -141,7 +141,7 @@ private func availability(
 
 // MARK: - Source defaults
 
-@Test func codexFallsBackToItsNativeSearchWhenNoXaiKeyExists() {
+@Test func codexDefaultsToNativeSearchEvenWhenAnXaiCredentialExists() {
     let directory = temporaryDirectory()
     #expect(
         LiveWebToolComposition.effectiveSource(
@@ -161,7 +161,35 @@ private func availability(
             environment: hermeticEnvironment,
             xaiAvailable: true,
             perplexityAvailable: false
+        ) == .native
+    )
+}
+
+@Test func codexUsesXaiOnlyWhenADifferentSearchModelExplicitlyOptsIn() {
+    let directory = temporaryDirectory()
+    var environment = hermeticEnvironment
+    environment["GROK_WEB_SEARCH_MODEL"] = "grok-search-explicit"
+    #expect(
+        LiveWebToolComposition.effectiveSource(
+            provider: .codex,
+            workingDirectory: directory,
+            openGrokHome: directory,
+            environment: environment,
+            xaiAvailable: true,
+            perplexityAvailable: false
         ) == .xai
+    )
+
+    environment["GROK_WEB_SEARCH_MODEL"] = LiveWebToolComposition.defaultWebSearchModel
+    #expect(
+        LiveWebToolComposition.effectiveSource(
+            provider: .codex,
+            workingDirectory: directory,
+            openGrokHome: directory,
+            environment: environment,
+            xaiAvailable: true,
+            perplexityAvailable: false
+        ) == .native
     )
 }
 

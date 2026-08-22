@@ -1563,6 +1563,8 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     /// and `wait` and, in `code_mode_only`, hides everything the cell can
     /// reach through `tools.*`.
     let toolSurface: LiveCodeModeToolSurface
+    /// Hosted tools cannot cross the local permission gate after provider dispatch.
+    let hostedSearchPolicy: LiveHostedSearchPolicy
     /// `nil` in `direct` mode, which leaves the turn loop byte-identical to a
     /// session that has never heard of Code Mode.
     let codeMode: LiveCodeModeCoordinator?
@@ -1689,9 +1691,19 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         // the next turn, never to half of this one.
         let active = await modelSwitch.snapshot()
         let sampler = active.sampler
+        let currentTools = toolExecutor.currentToolSpecs()
         let activeToolSurface = LiveCodeModeToolSurface(
             mode: toolSurface.mode,
-            baseTools: toolExecutor.currentToolSpecs()
+            baseTools: currentTools,
+            provider: active.provider
+        )
+        let hostedTools = LiveHostedSearchComposition.resolve(
+            provider: active.provider,
+            backend: active.configuration.apiBackend,
+            modelSupportsBackendSearch: active.configuration.tuning.supportsBackendSearch,
+            policy: hostedSearchPolicy,
+            availableFunctionTools: currentTools,
+            existingHostedTools: activeToolSurface.hostedTools
         )
         var items = await conversationHistory.itemsForTurn(
             sessionID: context.sessionID,
@@ -1806,12 +1818,14 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 }
                 let streamedText = LiveSamplingTextEmission()
                 var response: OpenGrokLiveSamplingResponse?
+                var cacheRequestStartedAt = DispatchTime.now()
                 while response == nil {
                     do {
                         await streamedText.reset()
                         let codexPermissions = await toolExecutor.currentCodexPermissions(
                             provider: active.provider
                         )
+                        cacheRequestStartedAt = .now()
                         response = try await sampler.sample(OpenGrokLiveSamplingRequest(
                             sessionID: context.sessionID,
                             cacheAffinityID: await conversationHistory.cacheAffinityID,
@@ -1821,6 +1835,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             prompt: request.text,
                             items: items,
                             tools: advertisedTools,
+                            hostedTools: hostedTools,
                             jsonSchema: nativeSchema,
                             codexPermissions: codexPermissions
                         )) { event in
@@ -1926,6 +1941,22 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 }
                 }
                 guard let response else { throw CLIApplicationError.failed("sampling produced no response") }
+                await LivePromptCacheTracking.shared.record(
+                    history: conversationHistory,
+                    sessionID: context.sessionID,
+                    promptID: request.promptID,
+                    loopIndex: UInt32(toolRoundCount),
+                    request: ConversationRequest(
+                        items: items,
+                        tools: advertisedTools,
+                        hostedTools: hostedTools,
+                        model: active.modelID
+                    ),
+                    usage: response.usage,
+                    provider: active.provider,
+                    modelID: active.modelID,
+                    requestStartedAt: cacheRequestStartedAt
+                )
                 if let codeMode {
                     let transportCallIDs = response.toolCalls
                         .filter { codeMode.isTransportCall($0) }
@@ -2421,8 +2452,19 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             for try await (index, result) in group {
                 orderedResults[index] = result
             }
-            return orderedResults.compactMap { result in
-                result.map(ConversationItem.toolResult)
+            return orderedResults.enumerated().compactMap { index, result in
+                guard let result else { return nil }
+                let call = calls[index]
+                guard call.isCustom else { return .toolResult(result) }
+                let content = result.orderedContent.isEmpty
+                    ? [CustomToolOutputContent.text(text: result.content)]
+                    : result.orderedContent
+                return .customToolOutput(CustomToolOutputItem(
+                    callId: call.callId,
+                    itemId: call.customItemId,
+                    name: call.name,
+                    content: content
+                ))
             }
         }
     }

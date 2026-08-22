@@ -66,6 +66,8 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
     public var serviceTier: String?
     /// Explicit model override; nil preserves the session-wide streaming policy.
     public var streamToolCalls: Bool?
+    /// Backend-hosted search is available only when the resolved model declares it.
+    public var supportsBackendSearch: Bool
     public var codexMultiAgentV2: Bool
     public var temperature: Float?
     public var topP: Float?
@@ -77,6 +79,7 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
         reasoningSummary: ReasoningSummary? = nil,
         serviceTier: String? = nil,
         streamToolCalls: Bool? = nil,
+        supportsBackendSearch: Bool = false,
         codexMultiAgentV2: Bool = false,
         temperature: Float? = nil,
         topP: Float? = nil,
@@ -87,6 +90,7 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
         self.reasoningSummary = reasoningSummary
         self.serviceTier = serviceTier
         self.streamToolCalls = streamToolCalls
+        self.supportsBackendSearch = supportsBackendSearch
         self.codexMultiAgentV2 = codexMultiAgentV2
         self.temperature = temperature
         self.topP = topP
@@ -123,6 +127,7 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
                 info.serviceTiers.contains { $0.id == tier } ? tier : nil
             },
             streamToolCalls: info.streamToolCalls,
+            supportsBackendSearch: info.supportsBackendSearch,
             codexMultiAgentV2: info.codexMultiAgentV2,
             temperature: info.temperature,
             topP: info.topP,
@@ -271,6 +276,7 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
     public let prompt: String
     public let items: [ConversationItem]
     public let tools: [ToolSpec]
+    public let hostedTools: [HostedTool]
     /// Force the model to answer in this JSON Schema (strict mode).
     ///
     /// A workflow's `agent(prompt, #{output_schema: ...})` is the only caller
@@ -298,6 +304,7 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         prompt: String,
         items: [ConversationItem]? = nil,
         tools: [ToolSpec] = [],
+        hostedTools: [HostedTool] = [],
         jsonSchema: JSONValue? = nil,
         reasoningEffort: ReasoningEffort? = nil,
         codexPermissions: CodexPermissions? = nil
@@ -310,6 +317,7 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         self.prompt = prompt
         self.items = items ?? [.user(prompt)]
         self.tools = tools
+        self.hostedTools = hostedTools
         self.jsonSchema = jsonSchema
         self.reasoningEffort = reasoningEffort
         self.codexPermissions = codexPermissions
@@ -582,6 +590,7 @@ public struct OpenGrokLiveSampler: Sendable {
             reasoningEffort: configuredReasoningEffort,
             serviceTier: configuration.tuning.serviceTier,
             reasoningSummary: configuration.tuning.reasoningSummary,
+            supportsBackendSearch: configuration.tuning.supportsBackendSearch,
             codexMultiAgentV2: configuration.tuning.codexMultiAgentV2,
             codexPermissions: configuration.codexPermissions,
             doomLoopRecovery: configuration.doomLoopRecovery,
@@ -622,7 +631,8 @@ public struct OpenGrokLiveSampler: Sendable {
             let response = try await turnClient.streamConversation(ConversationRequest(
                 items: request.items,
                 tools: request.tools,
-                toolChoice: request.tools.isEmpty ? nil : .auto,
+                hostedTools: request.hostedTools,
+                toolChoice: request.tools.isEmpty && request.hostedTools.isEmpty ? nil : .auto,
                 model: request.model,
                 xGrokReqId: request.turnID,
                 xGrokSessionId: request.sessionID,
@@ -2380,46 +2390,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             return []
                         }
                     }
-                    let fileSearchMatcher = FuzzyMatcher()
-                    let fileSearchRoot = suggestionCWD
-                    await controller.setFileSearchSuggestions { query, isDir, hidden in
-                        let walkerEntries = FuzzyFileTreeWalker.walk(
-                            root: fileSearchRoot,
-                            hidden: hidden,
-                            respectGitignore: true
+                    let promptFileReferences = LivePromptFileReferences(
+                        workingDirectory: suggestionCWD
+                    )
+                    await controller.setFileSearchSuggestions { query, isDirectoryMode, hidden in
+                        promptFileReferences.suggestions(
+                            query: query,
+                            isDirectoryMode: isDirectoryMode,
+                            hidden: hidden
                         )
-                        let filtered = walkerEntries.filter { entry in
-                            if isDir && !entry.isDir { return false }
-                            return true
-                        }
-                        if query.isEmpty {
-                            return filtered.prefix(20).map { entry in
-                                OpenGrokPagerCommandSuggestion(
-                                    name: "@\(entry.relativePath)",
-                                    summary: entry.isDir ? "dir" : "",
-                                    isAvailable: true,
-                                    insertText: entry.relativePath
-                                )
-                            }
-                        }
-                        var matched: [(path: String, score: UInt32, isDir: Bool)] = []
-                        for entry in filtered {
-                            if let res = fileSearchMatcher.match(pattern: query, candidate: entry.relativePath, isDir: entry.isDir) {
-                                matched.append((entry.relativePath, res.score, entry.isDir))
-                            }
-                        }
-                        matched.sort { lhs, rhs in
-                            if lhs.score != rhs.score { return lhs.score > rhs.score }
-                            return lhs.path < rhs.path
-                        }
-                        return matched.prefix(20).map { item in
-                            OpenGrokPagerCommandSuggestion(
-                                name: "@\(item.path)",
-                                summary: item.isDir ? "dir" : "",
-                                isAvailable: true,
-                                insertText: item.path
-                            )
-                        }
                     }
                     let request = OpenGrokPagerRequest(
                         prompt: prompt,
@@ -2473,6 +2452,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                 stack.sessionBusObserver?.cancel()
                                 await foundation.sessionBus.stop()
                                 _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                                await Self.persistSessionMemoryIfNeeded(
+                                    toolExecutor: toolExecutor,
+                                    history: stack.conversationHistory,
+                                    streams: context.streams
+                                )
                                 await codeMode?.shutdown()
                                 await toolExecutor.shutdown()
                                 exportBoundaries.remove(sessionID: sessionID)
@@ -2501,6 +2485,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             stack.sessionBusObserver?.cancel()
                             await foundation.sessionBus.stop()
                             _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                            await Self.persistSessionMemoryIfNeeded(
+                                toolExecutor: toolExecutor,
+                                history: stack.conversationHistory,
+                                streams: context.streams
+                            )
                             await codeMode?.shutdown()
                             await toolExecutor.shutdown()
                             exportBoundaries.remove(sessionID: sessionID)
@@ -2542,6 +2531,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         stack.sessionBusObserver?.cancel()
                         await foundation.sessionBus.stop()
                         _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                        await Self.persistSessionMemoryIfNeeded(
+                            toolExecutor: toolExecutor,
+                            history: stack.conversationHistory,
+                            streams: context.streams
+                        )
                         await codeMode?.shutdown()
                         await toolExecutor.shutdown()
                         exportBoundaries.remove(sessionID: sessionID)
@@ -2586,6 +2580,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         stack.sessionBusObserver?.cancel()
                         await foundation.sessionBus.stop()
                         _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                        await Self.persistSessionMemoryIfNeeded(
+                            toolExecutor: toolExecutor,
+                            history: stack.conversationHistory,
+                            streams: context.streams
+                        )
                         await codeMode?.shutdown()
                         await toolExecutor.shutdown()
                         exportBoundaries.remove(sessionID: sessionID)
@@ -3707,6 +3706,18 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         ))
     }
 
+    private static func persistSessionMemoryIfNeeded(
+        toolExecutor: LiveToolExecutor,
+        history: LiveConversationHistory,
+        streams: CLIStreams
+    ) async {
+        guard let services = toolExecutor.sessionServices else { return }
+        let outcome = await services.endSession(history: history)
+        if case .failed(let reason) = outcome {
+            streams.err("open-grok: unable to save session memory: \(reason)\n")
+        }
+    }
+
     static func makeAgentStack(
         foundation: LiveSessionFoundation,
         context: CLIApplicationContext,
@@ -3724,7 +3735,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         )
         let toolSurface = LiveCodeModeToolSurface(
             mode: toolMode,
-            baseTools: foundation.toolExecutor.tools
+            baseTools: foundation.toolExecutor.tools,
+            provider: foundation.samplingConfiguration.provider
+        )
+        let hostedSearchPolicy = LiveHostedSearchComposition.policy(
+            environment: context.environment,
+            configuration: foundation.securityContext.document,
+            disableWebSearch: foundation.options.agentOptions.disableWebSearch,
+            toolPolicy: LiveAgentToolPolicy.resolveLaunchPolicy(
+                tools: foundation.options.agentOptions.tools,
+                disallowedTools: foundation.options.agentOptions.disallowedTools,
+                profile: foundation.agentProfile?.toolPolicy
+            ),
+            permissionRules: foundation.securityContext.permissions.config.rules
         )
         let codeMode = toolSurface.isCodeMode
             ? LiveCodeModeCoordinator(
@@ -3893,6 +3916,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 systemPrompt: foundation.agentProfile?.systemPrompt,
                 skillsListing: LiveSkills.listing(foundation.discoveredSkills),
                 toolSurface: toolSurface,
+                hostedSearchPolicy: hostedSearchPolicy,
                 codeMode: codeMode,
                 compaction: compaction,
                 interjections: interjections,
@@ -4117,6 +4141,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 shutdown: {
                     stack.sessionBusObserver?.cancel()
                     await foundation.sessionBus.stop()
+                    _ = await stack.shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                    await Self.persistSessionMemoryIfNeeded(
+                        toolExecutor: foundation.toolExecutor,
+                        history: stack.conversationHistory,
+                        streams: context.streams
+                    )
                     await stack.codeMode?.shutdown()
                     await foundation.toolExecutor.shutdown()
                 }
@@ -4634,6 +4664,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     ? (effortOverride ?? profile.reasoningEffort)
                     : nil,
                 reasoningSummary: profile.provider == .codex ? .detailed : nil,
+                supportsBackendSearch: profile.supportsBackendSearch,
                 codexMultiAgentV2: profile.provider == .codex
                     && profile.multiAgentVersion == "v2",
                 temperature: profile.temperature,

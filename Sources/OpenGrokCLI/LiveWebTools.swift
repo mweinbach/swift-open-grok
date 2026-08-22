@@ -152,10 +152,11 @@ enum LiveWebToolComposition {
     /// `effective_source_for` (`config.rs:516-540`).
     ///
     /// An explicit `[toolset.web_search_source]` entry wins outright. Otherwise
-    /// Kimi honours the legacy Perplexity toggle, Codex prefers xAI when a key
-    /// is present and falls back to its own native search, and every other
-    /// provider defaults to xAI — Fireworks included, which is why Fireworks
-    /// needs an explicit Perplexity selection rather than inheriting Kimi's.
+    /// Kimi honours the legacy Perplexity toggle, Codex keeps its own native
+    /// search unless a separately configured xAI search model explicitly opts
+    /// in, and every other provider defaults to xAI — Fireworks included,
+    /// which is why Fireworks needs an explicit Perplexity selection rather
+    /// than inheriting Kimi's.
     static func effectiveSource(
         provider: ModelProvider,
         workingDirectory: URL,
@@ -182,7 +183,19 @@ enum LiveWebToolComposition {
             ) ?? false
             return legacyToggle && perplexityAvailable ? .perplexity : .xai
         case .codex:
-            return xaiAvailable ? .xai : .native
+            let configuredModel = environment["GROK_WEB_SEARCH_MODEL"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+                ?? configString(
+                    path: ["toolset", "web_search", "model"],
+                    workingDirectory: workingDirectory,
+                    openGrokHome: openGrokHome,
+                    environment: environment
+                )
+            return xaiAvailable
+                && configuredModel != nil
+                && configuredModel != defaultWebSearchModel
+                ? .xai
+                : .native
         // Meta keeps its native hosted search (`effective_source_for`,
         // tools/config.rs:540); for a non-xAI provider "native" resolves to
         // no client search tool, so Meta stays inert here.

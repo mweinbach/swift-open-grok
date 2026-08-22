@@ -205,6 +205,7 @@ extension ProviderAdapter {
     public func sanitizeChatRequest(_ request: inout ChatCompletionWireRequest) {}
 
     public func patchResponsesRequest(_ body: inout JSONValue, policy: ResponsesRequestPolicy) {
+        sanitizeHostedSearchDeclarations(&body, profile: profile)
         switch profile.responsesDialect {
         case .none, .some(.xai):
             break
@@ -292,6 +293,95 @@ extension ProviderAdapter {
     public func ignoresUnknownResponseEvent(error: SamplingError, data: String) -> Bool {
         profile.responsesDialect == .codex && isUnknownTopLevelResponseEvent(error: error, data: data)
     }
+}
+
+/// Encode provider-native search through the raw Responses tool channel. The
+/// typed OpenAI tool shape cannot carry every upstream filter, so emitting a
+/// second typed declaration would register the same backend tool twice.
+public func hostedSearchToolWireValue(_ tool: HostedTool) -> JSONValue? {
+    switch tool {
+    case .webSearch(let mode, let allowedDomains, _, _, _):
+        guard mode != .disabled else { return nil }
+        var object: [String: JSONValue] = ["type": .string("web_search")]
+        if let allowedDomains, !allowedDomains.isEmpty {
+            object["filters"] = .object([
+                "allowed_domains": .array(
+                    allowedDomains.prefix(MAX_WEB_SEARCH_DOMAINS).map(JSONValue.string)
+                ),
+            ])
+        }
+        return .object(object)
+    case .xSearch:
+        return .object(["type": .string("x_search")])
+    case .clientCustom:
+        return nil
+    }
+}
+
+private func sanitizeHostedSearchDeclarations(
+    _ body: inout JSONValue,
+    profile: ProviderProfile
+) {
+    guard case .object(var object) = body,
+          case .array(let tools) = object["tools"]
+    else { return }
+
+    var hostedNames = Set<String>()
+    var validHostedIndices = Set<Int>()
+    for (index, tool) in tools.enumerated() {
+        let type = tool["type"]?.stringValue
+        let name: String
+        switch type {
+        case "web_search":
+            guard profile.hostedToolDialect != nil, profile.nativeWebSearch else { continue }
+            name = "web_search"
+        case "x_search":
+            guard profile.hostedToolDialect == .xai else { continue }
+            name = "x_search"
+        case "custom":
+            guard let customName = tool["name"]?.stringValue, !customName.isEmpty else {
+                continue
+            }
+            name = customName
+        default:
+            continue
+        }
+        if hostedNames.insert(name).inserted {
+            validHostedIndices.insert(index)
+        }
+    }
+
+    var sanitized: [JSONValue] = []
+    sanitized.reserveCapacity(tools.count)
+    for (index, tool) in tools.enumerated() {
+        switch tool["type"]?.stringValue {
+        case "web_search", "x_search", "custom":
+            if validHostedIndices.contains(index) {
+                sanitized.append(tool)
+            }
+        case "function":
+            if let name = tool["name"]?.stringValue, hostedNames.contains(name) {
+                continue
+            }
+            sanitized.append(tool)
+        default:
+            sanitized.append(tool)
+        }
+    }
+    if sanitized.isEmpty {
+        object.removeValue(forKey: "tools")
+    } else {
+        object["tools"] = .array(sanitized)
+    }
+
+    if hostedNames.contains("web_search"), object["include"] != nil {
+        let sources = JSONValue.string("web_search_call.action.sources")
+        var include = object["include"]?.arrayValue ?? []
+        include.removeAll { $0 == sources }
+        include.insert(sources, at: 0)
+        object["include"] = .array(include)
+    }
+    body = .object(object)
 }
 
 // MARK: - Concrete adapters
