@@ -368,13 +368,19 @@ struct FileToolsTests {
         #expect(text2.contains("HELLO"))
     }
 
-    @Test("apply_patch empty is success")
-    func applyPatchEmpty() async throws {
+    @Test("apply_patch rejects missing input instead of reporting a successful edit")
+    func applyPatchMissingInput() async throws {
         let dir = try tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let res = await resources(at: dir)
         let out = await ApplyPatchTool.run(args: .object([:]), resources: res)
-        _ = try success(out)
+        switch out {
+        case .failure(let error):
+            #expect(error.kind == .invalidArguments)
+            #expect(error.detail.contains("input"))
+        case .success:
+            Issue.record("apply_patch reported success without receiving a patch")
+        }
     }
 
     @Test("apply_patch onlyTouchesPlanFile helper")

@@ -119,16 +119,8 @@ public enum ApplyPatchParser {
             var i = 1
             while i < lines.count {
                 let l = lines[i]
-                let t = l.trimmingCharacters(in: .whitespaces)
-                if t.hasPrefix("*** ") { break }
-                if l.hasPrefix("+") {
-                    contents.append(String(l.dropFirst()))
-                } else if l.isEmpty {
-                    contents.append("")
-                } else {
-                    // Lenient: accept raw content lines.
-                    contents.append(l)
-                }
+                guard l.hasPrefix("+") else { break }
+                contents.append(String(l.dropFirst()))
                 i += 1
             }
             let body = contents.joined(separator: "\n")
@@ -207,13 +199,21 @@ public enum ApplyPatchParser {
                     oldLines.append("")
                     newLines.append("")
                 } else {
-                    // Context without marker.
-                    oldLines.append(l)
-                    newLines.append(l)
+                    throw PatchParseError.invalid(
+                        "Unexpected line in update hunk at line \(lineNumber + i): \(l). "
+                            + "Every line must begin with ' ', '+', or '-'."
+                    )
                 }
                 i += 1
             }
             flush()
+            guard !chunks.isEmpty,
+                  chunks.allSatisfy({ !$0.oldLines.isEmpty || !$0.newLines.isEmpty })
+            else {
+                throw PatchParseError.invalid(
+                    "Update file hunk for path '\(path)' is empty at line \(lineNumber)"
+                )
+            }
             return (.updateFile(path: path, movePath: movePath, chunks: chunks), i)
         }
         throw PatchParseError.invalid("Unknown hunk marker at line \(lineNumber): \(trimmed)")
@@ -255,25 +255,44 @@ public enum ApplyPatchTool {
             guard case .object(let obj) = args else {
                 throw SessionFSError.invalidInput("expected object")
             }
-            let patchText =
-                string(obj, "input")
-                ?? string(obj, "patch")
-                ?? string(obj, "apply_patch")
-            guard let patchText, !patchText.isEmpty else {
+            let supplied = ["patch", "input", "apply_patch"].compactMap { name in
+                obj[name].map { (name, $0) }
+            }
+            guard let first = supplied.first else {
+                return .failure(.invalidArguments(
+                    "apply_patch requires a string 'input', 'patch', or 'apply_patch' argument"
+                ))
+            }
+            guard supplied.allSatisfy({ $0.1 == first.1 }) else {
+                return .failure(.invalidArguments("conflicting apply_patch argument aliases"))
+            }
+            guard case .string(let patchText) = first.1 else {
+                return .failure(.invalidArguments(
+                    "apply_patch requires a string 'input', 'patch', or 'apply_patch' argument"
+                ))
+            }
+
+            let parsed = try ApplyPatchParser.parse(patchText)
+            if parsed.hunks.isEmpty {
+                let summary = "No files were modified."
                 return .success(
                     TypedToolOutput(
                         toolId: FileToolIDs.applyPatch,
                         value: .object([
                             "type": .string("apply_patch"),
-                            "content": .string("Success. Updated the following files:\n"),
+                            "EmptyPatch": .string(summary),
+                            "content": .string(summary),
                             "files": .array([]),
+                            "file_results": .array([]),
+                            "lines_added": .number(.int64(0)),
+                            "lines_removed": .number(.int64(0)),
+                            "trusted": .bool(false),
+                            "patch": .string(patchText),
                         ]),
-                        modelOutput: [.text(text: "Success. Updated the following files:\n")]
+                        modelOutput: [.text(text: summary)]
                     )
                 )
             }
-
-            let parsed = try ApplyPatchParser.parse(patchText)
 
             // Compute all changes in-memory first (atomic: no write until every hunk validates).
             // Mirrors Rust's compute_all_changes overlay semantics (tool.rs:compute_all_changes).
@@ -366,7 +385,7 @@ public enum ApplyPatchTool {
                 )
             }
         } catch let e as PatchParseError {
-            return .failure(.invalidArguments(e.description))
+            return .failure(.invalidArguments("Invalid patch: \(e.description)"))
         } catch let e as SessionFSError {
             return .failure(.invalidArguments(e.description))
         } catch {

@@ -145,11 +145,12 @@ public final class FinalizedToolset: @unchecked Sendable {
         // path, and a malformed remote call must never reach its server.
         let canonical: JSONValue
         do {
+            let compatibleArguments = try normalizeApplyPatchArguments(clientArguments, for: tool)
             canonical = try ToolInputSchemaValidator(
                 schema: tool.inputSchema,
                 namespace: tool.namespace,
                 toolID: tool.id
-            ).normalize(reverseRemap(clientArguments, map: tool.reverseParams))
+            ).normalize(reverseRemap(compatibleArguments, map: tool.reverseParams))
         } catch let error as ToolInputValidationError {
             return .failure(.invalidArguments(error.description))
         } catch {
@@ -327,6 +328,40 @@ private func reverseRemap(_ args: JSONValue, map: [String: String]) -> JSONValue
         out[canonical] = v
     }
     return .object(out)
+}
+
+private func normalizeApplyPatchArguments(
+    _ args: JSONValue,
+    for tool: FinalizedTool
+) throws -> JSONValue {
+    guard tool.namespace == .codex,
+          tool.id == "apply_patch",
+          case .object(var object) = args
+    else {
+        return args
+    }
+
+    let configuredAliases = tool.reverseParams
+        .filter { $0.value == "patch" }
+        .map(\.key)
+    let argumentNames = Set(["patch", "input"] + configuredAliases)
+    let supplied = argumentNames.compactMap { name in
+        object[name].map { (name, $0) }
+    }
+
+    guard let first = supplied.first else { return args }
+    guard supplied.allSatisfy({ $0.1 == first.1 }) else {
+        throw ToolInputValidationError(
+            path: "$.patch",
+            reason: "conflicting apply_patch argument aliases"
+        )
+    }
+
+    for name in argumentNames where name != "patch" {
+        object.removeValue(forKey: name)
+    }
+    object["patch"] = first.1
+    return .object(object)
 }
 
 private func normalizeClientArguments(_ args: JSONValue, for tool: FinalizedTool) -> JSONValue {

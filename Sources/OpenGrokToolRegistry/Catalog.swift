@@ -127,9 +127,9 @@ public enum BuiltinToolCatalog {
 
     public static let applyPatchSchema = objectSchema(
         properties: [
-            "input": stringProp("Freeform apply-patch text."),
+            "patch": stringProp("Freeform apply-patch text."),
         ],
-        required: ["input"]
+        required: ["patch"]
     )
 
     public static let openCodeEditSchema = objectSchema(

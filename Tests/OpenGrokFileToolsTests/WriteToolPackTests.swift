@@ -82,7 +82,7 @@ struct WriteToolPackTests {
         let expected: [String: [String]] = [
             "write": ["file_path", "content"],
             "search_replace": ["file_path", "old_string", "new_string"],
-            "apply_patch": ["input"],
+            "apply_patch": ["patch"],
         ]
         for (name, required) in expected {
             guard let definition = definitions.first(where: { $0.name == name }),
