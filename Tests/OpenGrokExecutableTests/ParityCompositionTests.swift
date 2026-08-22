@@ -9,10 +9,20 @@ import Testing
 @testable import OpenGrokCLI
 
 private final class ParityTerminalFixture: @unchecked Sendable {
+    private enum EscapeState {
+        case text
+        case escape
+        case csi
+        case osc
+    }
+
     private let lock = NSLock()
     private let tty: Bool
     private let terminalSize: OpenGrokLiveTerminalSize?
     private var storage = Data()
+    private var paintedStorage = Data()
+    private var cachedPaintedText: String?
+    private var escapeState = EscapeState.text
 
     init(tty: Bool, size: OpenGrokLiveTerminalSize?) {
         self.tty = tty
@@ -40,36 +50,97 @@ private final class ParityTerminalFixture: @unchecked Sendable {
     /// `output` never contains a readable word. Stripping the sequences leaves
     /// the cells in paint order, which for a full frame is reading order.
     var paintedText: String {
-        var result = ""
-        var iterator = output[...]
-        while let escape = iterator.firstIndex(of: "\u{1B}") {
-            result += iterator[iterator.startIndex..<escape]
-            var cursor = iterator.index(after: escape)
-            guard cursor < iterator.endIndex else { break }
-            if iterator[cursor] == "[" || iterator[cursor] == "]" {
-                let isOSC = iterator[cursor] == "]"
-                cursor = iterator.index(after: cursor)
-                while cursor < iterator.endIndex {
-                    let scalar = iterator[cursor].unicodeScalars.first!.value
-                    let isFinal = isOSC
-                        ? (scalar == 0x07 || iterator[cursor] == "\\")
-                        : (scalar >= 0x40 && scalar <= 0x7E)
-                    cursor = iterator.index(after: cursor)
-                    if isFinal { break }
-                }
-            } else {
-                cursor = iterator.index(after: cursor)
-            }
-            iterator = iterator[cursor...]
+        lock.lock()
+        defer { lock.unlock() }
+        if let cachedPaintedText {
+            return cachedPaintedText
         }
-        result += iterator
+        let result = String(decoding: paintedStorage, as: UTF8.self)
+        cachedPaintedText = result
         return result
     }
 
     func append(_ data: Data) {
         lock.lock()
+        defer { lock.unlock() }
         storage.append(data)
-        lock.unlock()
+
+        var appendedVisibleBytes = false
+        for byte in data {
+            switch escapeState {
+            case .text:
+                if byte == 0x1B {
+                    escapeState = .escape
+                } else {
+                    paintedStorage.append(byte)
+                    appendedVisibleBytes = true
+                }
+            case .escape:
+                switch byte {
+                case 0x5B:
+                    escapeState = .csi
+                case 0x5D:
+                    escapeState = .osc
+                default:
+                    escapeState = .text
+                }
+            case .csi:
+                if (0x40...0x7E).contains(byte) {
+                    escapeState = .text
+                }
+            case .osc:
+                if byte == 0x07 || byte == 0x5C {
+                    escapeState = .text
+                }
+            }
+        }
+        if appendedVisibleBytes {
+            cachedPaintedText = nil
+        }
+    }
+}
+
+@Suite("Executable terminal fixture streaming ANSI")
+private struct ParityTerminalFixtureStreamingTests {
+    @Test("fragmented control sequences and UTF-8 preserve painted and raw terminal bytes")
+    func fragmentedTerminalOutput() {
+        let terminal = ParityTerminalFixture(tty: true, size: nil)
+        var rawBytes = Data()
+
+        func append(_ bytes: [UInt8]) {
+            let data = Data(bytes)
+            rawBytes.append(data)
+            terminal.append(data)
+        }
+
+        append(Array("visible".utf8))
+        #expect(terminal.paintedText == "visible")
+        append([0x1B])
+        #expect(terminal.paintedText == "visible")
+        append(Array("[38;5".utf8))
+        #expect(terminal.paintedText == "visible")
+        append(Array("m".utf8))
+        append([0xF0, 0x9F])
+        append([0xA6, 0x8A])
+        #expect(terminal.paintedText == "visible🦊")
+
+        append([0x1B, 0x5D])
+        append(Array("2;ignored".utf8))
+        #expect(terminal.paintedText == "visible🦊")
+        append([0x07])
+        append(Array("!".utf8))
+        #expect(terminal.paintedText == "visible🦊!")
+
+        append([0x1B, 0x5D])
+        append(Array("0;also ignored".utf8))
+        append([0x1B])
+        #expect(terminal.paintedText == "visible🦊!")
+        append([0x5C])
+        append([0x1B, 0x37])
+        append(Array("done".utf8))
+        #expect(terminal.paintedText == "visible🦊!done")
+        #expect(terminal.paintedText == "visible🦊!done")
+        #expect(terminal.output == String(decoding: rawBytes, as: UTF8.self))
     }
 }
 
