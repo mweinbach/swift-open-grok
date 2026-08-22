@@ -94,7 +94,8 @@ enum LiveACPExtensionRouter {
         mcp: LiveMCPACPHandler? = nil,
         sessionAdmin: LiveSessionAdminACPHandler? = nil,
         share: LiveShareACPHandler? = nil,
-        memory: LiveMemoryACPHandler? = nil
+        memory: LiveMemoryACPHandler? = nil,
+        persistentSessions: LivePersistentSessionACPHandler? = nil
     ) -> ACPExtensionMethodRouter {
         var router = ACPExtensionMethodRouter()
         if let feedback {
@@ -156,6 +157,11 @@ enum LiveACPExtensionRouter {
         if let memory, memory.backend != nil {
             for method in LiveMemoryACPHandler.methods {
                 router = router.register(exact: method, handler: memory)
+            }
+        }
+        if let persistentSessions {
+            for method in LivePersistentSessionACPHandler.methods {
+                router = router.register(exact: method, handler: persistentSessions)
             }
         }
         return router
@@ -278,10 +284,8 @@ struct LiveMemoryACPHandler: ACPAgentExtensionHandler, Sendable {
 ///     contract — the running session's next request carries the applied
 ///     key — is delivered here by `LiveModelSwitchCoordinator
 ///     .rebindCredential`. Divergence in mechanism, recorded; identical in
-///     effect. The provider-scoped subagent cancel is NOT ported (the port's
-///     subagent host has only per-id cancel): a resident subagent child on
-///     the applied provider keeps its spawn-captured credential until it
-///     finishes.
+///     effect. Provider-scoped child revocation completes before any mutated
+///     credential or model allowlist becomes visible to subsequent requests.
 ///   * `refresh`/`query`/`get`: partition refetch, no credential mutation.
 ///   * `clear`: drop the partition, report whether anything was dropped.
 ///   * `kimi/endpoint/apply` (:4017): swap the service, rebuild the live
@@ -292,6 +296,17 @@ struct LiveMemoryACPHandler: ACPAgentExtensionHandler, Sendable {
 struct LiveModelsACPHandler: ACPAgentExtensionHandler, Sendable {
     let catalogStore: LiveModelCatalogStore
     let modelSwitch: LiveModelSwitchCoordinator?
+    let subagentHost: LiveSubagentHost?
+
+    init(
+        catalogStore: LiveModelCatalogStore,
+        modelSwitch: LiveModelSwitchCoordinator?,
+        subagentHost: LiveSubagentHost? = nil
+    ) {
+        self.catalogStore = catalogStore
+        self.modelSwitch = modelSwitch
+        self.subagentHost = subagentHost
+    }
 
     /// Exact names from the upstream dispatch (`acp_agent.rs:3794-4049`).
     static let methods: [String] = [
@@ -304,9 +319,14 @@ struct LiveModelsACPHandler: ACPAgentExtensionHandler, Sendable {
         "open-grok/meta/models/apply",
         "open-grok/wafer/models/apply",
         "open-grok/zai/models/apply",
+        "open-grok/runinfra/models/apply",
+        "open-grok/gemini/models/apply",
         "open-grok/opencode-go/models/get",
         "open-grok/opencode-go/models/apply",
         "open-grok/opencode-go/models/credential-apply",
+        "open-grok/openrouter/models/get",
+        "open-grok/openrouter/models/apply",
+        "open-grok/openrouter/models/credential-apply",
         "open-grok/kimi/endpoint/apply",
     ]
 
@@ -349,6 +369,12 @@ struct LiveModelsACPHandler: ACPAgentExtensionHandler, Sendable {
         case "open-grok/zai/models/apply":
             return envelope(await applyCredentialChange(.zai))
 
+        case "open-grok/runinfra/models/apply":
+            return envelope(await applyCredentialChange(.runinfra))
+
+        case "open-grok/gemini/models/apply":
+            return envelope(await applyCredentialChange(.gemini))
+
         case "open-grok/opencode-go/models/get":
             // Refresh only when the partition has never been fetched
             // (:3940-3957).
@@ -356,8 +382,8 @@ struct LiveModelsACPHandler: ACPAgentExtensionHandler, Sendable {
             return envelope(openCodeGoPayload(outcome))
 
         case "open-grok/opencode-go/models/apply":
-            // Allowlist change (:3958-3988): not a credential mutation, so
-            // the running session's sampler is untouched.
+            // A changed allowlist can invalidate a child's captured route.
+            await revokeProviderChildren(.openCodeGo)
             let enabled = params["enabled_models"]?.arrayValue?
                 .compactMap(\.stringValue) ?? []
             catalogStore.applyOpenCodeGoEnabledModels(enabled)
@@ -368,6 +394,23 @@ struct LiveModelsACPHandler: ACPAgentExtensionHandler, Sendable {
             let payload = await applyCredentialChange(.openCodeGo)
             guard case .object(let fields) = payload else { return envelope(payload) }
             return envelope(openCodeGoFields(merging: fields))
+
+        case "open-grok/openrouter/models/get":
+            let outcome = await refreshOpenRouterIfEmpty()
+            return envelope(openRouterPayload(outcome))
+
+        case "open-grok/openrouter/models/apply":
+            await revokeProviderChildren(.openRouter)
+            let enabled = params["enabled_models"]?.arrayValue?
+                .compactMap(\.stringValue) ?? []
+            catalogStore.applyOpenRouterEnabledModels(enabled)
+            let outcome = await refreshOpenRouterIfEmpty()
+            return envelope(openRouterPayload(outcome))
+
+        case "open-grok/openrouter/models/credential-apply":
+            let payload = await applyCredentialChange(.openRouter)
+            guard case .object(let fields) = payload else { return envelope(payload) }
+            return envelope(openRouterFields(merging: fields))
 
         case "open-grok/kimi/endpoint/apply":
             guard let raw = params["endpoint"]?.stringValue,
@@ -386,6 +429,7 @@ struct LiveModelsACPHandler: ACPAgentExtensionHandler, Sendable {
                     )
                 )
             }
+            await revokeProviderChildren(.kimi)
             let outcome = await catalogStore.applyKimiEndpoint(endpoint)
             // Kimi's settings-key save re-applies the endpoint upstream
             // (effects/mod.rs:1474-1491), so this arm carries the live
@@ -422,6 +466,7 @@ struct LiveModelsACPHandler: ACPAgentExtensionHandler, Sendable {
     private func applyCredentialChange(
         _ partition: ModelCatalogPartition
     ) async -> JSONValue {
+        await revokeProviderChildren(partition.provider)
         // The port of the pager's post-store snapshot re-read
         // (effects/mod.rs:832-861): without it the manager's fingerprint
         // gate rejects catalogs fetched under the just-applied key.
@@ -438,6 +483,12 @@ struct LiveModelsACPHandler: ACPAgentExtensionHandler, Sendable {
         }
         let rebindWarning = await rebindRunningSession(provider: partition.provider)
         return refreshedPayload(outcome, rebind: rebindWarning)
+    }
+
+    private func revokeProviderChildren(_ provider: ModelProvider) async {
+        guard let subagentHost else { return }
+        let revokedChildren = await subagentHost.cancelChildrenForProviderRuntimeChange(provider)
+        assert(revokedChildren >= 0, "provider-scoped cancellation returned an invalid count")
     }
 
     /// Rebind the running session's sampler to the freshly stored credential
@@ -460,6 +511,13 @@ struct LiveModelsACPHandler: ACPAgentExtensionHandler, Sendable {
             return await catalogStore.refreshPartition(.openCodeGo)
         }
         return LiveCatalogRefreshOutcome(partition: .openCodeGo, published: false)
+    }
+
+    private func refreshOpenRouterIfEmpty() async -> LiveCatalogRefreshOutcome {
+        if catalogStore.openRouterDescriptors().isEmpty {
+            return await catalogStore.refreshPartition(.openRouter)
+        }
+        return LiveCatalogRefreshOutcome(partition: .openRouter, published: false)
     }
 
     // MARK: Payload builders (acp_agent.rs:32-181)
@@ -517,6 +575,38 @@ struct LiveModelsACPHandler: ACPAgentExtensionHandler, Sendable {
             catalogStore.openCodeGoEnabledModels().map(JSONValue.string)
         )
         return .object(payload)
+    }
+
+    private func openRouterPayload(_ outcome: LiveCatalogRefreshOutcome) -> JSONValue {
+        guard case .object(let fields) = refreshedPayload(outcome) else { return .null }
+        return openRouterFields(merging: fields)
+    }
+
+    private func openRouterFields(merging fields: [String: JSONValue]) -> JSONValue {
+        var payload = fields
+        payload["catalog"] = .array(
+            catalogStore.openRouterDescriptors().map(Self.openRouterDescriptorJSON)
+        )
+        payload["enabled_models"] = .array(
+            catalogStore.openRouterEnabledModels().map(JSONValue.string)
+        )
+        return .object(payload)
+    }
+
+    private static func openRouterDescriptorJSON(
+        _ descriptor: OpenRouterModelDescriptor
+    ) -> JSONValue {
+        var fields: [String: JSONValue] = [
+            "key": .string(descriptor.key),
+            "id": .string(descriptor.id),
+            "name": .string(descriptor.name),
+            "api_backend": .string(wireAPIBackend(descriptor.apiBackend)),
+        ]
+        if let pricing = descriptor.pricing,
+           let encodedPricing = try? JSONValue.encode(pricing) {
+            fields["pricing"] = encodedPricing
+        }
+        return .object(fields)
     }
 
     /// `acp::SessionModelState::new(current_model_id, available)` — the

@@ -4271,7 +4271,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 feedback: LiveFeedbackACPHandler(composition: foundation.feedback),
                 models: LiveModelsACPHandler(
                     catalogStore: stack.catalogStore,
-                    modelSwitch: modelSwitch
+                    modelSwitch: modelSwitch,
+                    subagentHost: foundation.subagentHost
                 ),
                 recap: LiveRecapACPHandler(
                     gateway: gateway,
@@ -4307,6 +4308,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     auxiliaryRoute: { explicit in
                         await modelSwitch.auxiliaryRecapRoute(explicitModelID: explicit)
                     }
+                ),
+                persistentSessions: LivePersistentSessionACPHandler(
+                    openGrokHome: foundation.openGrokHome
                 )
             )
             // Inbound ext notifications land on the LIVE state, never a

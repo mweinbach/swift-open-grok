@@ -239,6 +239,51 @@ struct ACPExtensionMethodTableTests {
         }
     }
 
+    @Test("RunInfra and Gemini credential routes report their actual provider partitions")
+    func additionalProviderCredentialRoutes() async throws {
+        let family = try HermeticFamily()
+        try await family.initialize()
+
+        for (index, method) in [
+            "open-grok/runinfra/models/apply",
+            "open-grok/gemini/models/apply",
+        ].enumerated() {
+            let (result, error) = await family.call(method, id: "expanded-provider-\(index)")
+            #expect(error == nil)
+            #expect(result?["result"]?["refreshed"]?.boolValue == false)
+            #expect(result?["result"]?["models"] != nil)
+        }
+        #expect(family.catalogTransport.recordedRequests.isEmpty)
+    }
+
+    @Test("OpenRouter ACP routes expose the real catalog and authoritative model allowlist")
+    func openRouterCredentialAndAllowlistRoutes() async throws {
+        let family = try HermeticFamily()
+        try await family.initialize()
+
+        let (applied, applyError) = await family.call(
+            "open-grok/openrouter/models/apply",
+            id: "openrouter-model-allowlist",
+            params: .object([
+                "enabled_models": .array([.string("openrouter/example-model")]),
+            ])
+        )
+        #expect(applyError == nil)
+        #expect(applied?["result"]?["enabled_models"] == .array([
+            .string("openrouter/example-model"),
+        ]))
+        #expect(applied?["result"]?["catalog"] != nil)
+
+        let (credential, credentialError) = await family.call(
+            "open-grok/openrouter/models/credential-apply",
+            id: "openrouter-credential"
+        )
+        #expect(credentialError == nil)
+        #expect(credential?["result"]?["refreshed"]?.boolValue == false)
+        #expect(credential?["result"]?["enabled_models"] != nil)
+        #expect(credential?["result"]?["catalog"] != nil)
+    }
+
     @Test("x.ai/feedback still routes beside the family")
     func feedbackStillRoutes() async throws {
         let store = RecordingFeedbackStore()
