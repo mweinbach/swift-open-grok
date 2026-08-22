@@ -957,6 +957,7 @@ public actor ACPAgentRuntime {
     private func cancel(_ params: JSONValue) async throws -> JSONValue {
         try requireReady()
         let request = try decode(CancelNotification.self, from: params, method: AgentMethodNames.sessionCancel)
+        startingPrompts.remove(request.sessionId)
         activePrompts[request.sessionId]?.cancel()
         await promptDriver.cancel(sessionId: request.sessionId)
         return try encode(EmptyAcpResponse())

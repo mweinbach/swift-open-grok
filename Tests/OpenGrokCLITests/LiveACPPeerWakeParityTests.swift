@@ -35,6 +35,29 @@ private actor ACPPeerSamplingProbe {
     }
 }
 
+private actor ACPPeerStartingPromptGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var reached = false
+
+    func hold(_ message: ACPMessage, matching text: String) async {
+        guard message.method == ClientMethodNames.sessionUpdate,
+              let update = message.params?.objectValue?["update"]?.objectValue,
+              update["sessionUpdate"]?.stringValue == "user_message_chunk",
+              update["content"]?.objectValue?["text"]?.stringValue == text
+        else { return }
+
+        reached = true
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 private final class ACPPeerSessionIDFactory: @unchecked Sendable {
     private let lock = NSLock()
     private var next = 0
@@ -372,6 +395,55 @@ struct LiveACPPeerWakeParityTests {
             }
             #expect(try response.decode(PromptResponse.self).stopReason == .cancelled)
             #expect(await fixture.probe.requests.count == 1)
+        }
+    }
+
+    @Test("cancelling a reserved ACP prompt before its task starts never dispatches provider work")
+    func cancellingACPHostedPromptDuringDurableEchoPreventsDispatch() async throws {
+        try await withACPPeerFixture { fixture in
+            let gate = ACPPeerStartingPromptGate()
+            let userMessage = "cancel this ACP prompt while its durable echo is suspended"
+            await fixture.runtime.setNotificationSink { message in
+                await gate.hold(message, matching: userMessage)
+            }
+            defer { Task { await gate.release() } }
+
+            let task = Task {
+                await fixture.runtime.handle(.request(
+                    id: .string("reserved-acp-user-prompt"),
+                    method: AgentMethodNames.sessionPrompt,
+                    params: try JSONValue.encode(PromptRequest(
+                        sessionId: fixture.wireSessionID,
+                        prompt: [.text(userMessage)],
+                        messageId: "reserved-acp-user-turn"
+                    ))
+                ))
+            }
+
+            let deadline = Date().addingTimeInterval(5)
+            while !(await gate.reached), Date() < deadline {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            #expect(await gate.reached)
+            #expect(await fixture.probe.requests.isEmpty)
+
+            let cancellation = await fixture.runtime.handle(.request(
+                id: .string("cancel-reserved-acp-turn"),
+                method: AgentMethodNames.sessionCancel,
+                params: try JSONValue.encode(CancelNotification(
+                    sessionId: fixture.wireSessionID
+                ))
+            ))
+            #expect(cancellation.last?.id == .string("cancel-reserved-acp-turn"))
+
+            await gate.release()
+            let result = try await task.value
+            guard case .response(_, nil, let error?)? = result.last else {
+                Issue.record("reserved ACP prompt did not report its cancellation")
+                return
+            }
+            #expect(error.code == .requestCancelled)
+            #expect(await fixture.probe.requests.isEmpty)
         }
     }
 
