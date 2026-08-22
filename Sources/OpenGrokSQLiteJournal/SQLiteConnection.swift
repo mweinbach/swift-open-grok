@@ -53,13 +53,24 @@ final class SQLiteConnection {
     private(set) var isReadOnly: Bool
 
     /// Busy timeout applied at open (matches Rust 5s).
-    static let busyTimeoutMilliseconds: Int32 = 5000
+    static let busyTimeoutMilliseconds = JournalMode.busyTimeoutMilliseconds
 
-    init(path: URL, mode: JournalMode, readOnly: Bool) throws {
+    init(
+        path: URL,
+        mode: JournalMode,
+        readOnly: Bool,
+        deadline: ContinuousClock.Instant? = nil
+    ) throws {
         self.path = path
         self.mode = mode
         self.isReadOnly = readOnly
         #if canImport(SQLite3)
+        if Task.isCancelled {
+            throw SQLiteJournalError.cancelled
+        }
+        let retryDeadline = deadline ?? ContinuousClock.now.advanced(
+            by: .milliseconds(Int64(JournalMode.busyRetryBudgetMilliseconds))
+        )
         var flags: Int32 = SQLITE_OPEN_NOMUTEX
         if readOnly {
             if mode == .truncate {
@@ -81,23 +92,28 @@ final class SQLiteConnection {
             throw SQLiteJournalError.openFailed(path: path.path, code: rc, message: msg)
         }
         self.db = ptr
-        try setBusyTimeout(Self.busyTimeoutMilliseconds)
+        do {
+            try setBusyTimeout(Self.busyTimeoutMilliseconds)
 
-        // Match Rust `JournalMode::open` / `open_readonly` branching exactly:
-        //  * read-write: always apply journal mode
-        //  * WAL read-only: open read-only, set busy timeout, do NOT apply
-        //    PRAGMA journal_mode (would fail / mutate on a read-only open)
-        //  * TRUNCATE read-only: open read-write (no CREATE), apply conversion,
-        //    then set query_only
-        if readOnly {
-            if mode == .truncate {
-                try applyJournalMode()
-                try exec("PRAGMA query_only = 1")
-                self.isReadOnly = true
+            // Match Rust `JournalMode::open` / `open_readonly` branching exactly:
+            //  * read-write: always apply journal mode
+            //  * WAL read-only: open read-only, set busy timeout, do NOT apply
+            //    PRAGMA journal_mode (would fail / mutate on a read-only open)
+            //  * TRUNCATE read-only: open read-write (no CREATE), apply conversion,
+            //    then set query_only
+            if readOnly {
+                if mode == .truncate {
+                    try applyJournalModeWithRetry(until: retryDeadline)
+                    try exec("PRAGMA query_only = 1")
+                    self.isReadOnly = true
+                }
+                // WAL read-only: no apply.
+            } else {
+                try applyJournalModeWithRetry(until: retryDeadline)
             }
-            // WAL read-only: no apply.
-        } else {
-            try applyJournalMode()
+        } catch {
+            close()
+            throw error
         }
         #else
         throw SQLiteJournalError.unavailable(
@@ -132,6 +148,104 @@ final class SQLiteConnection {
             try pragmaUpdate("locking_mode", value: "NORMAL")
         }
         #endif
+    }
+
+    func applyJournalModeWithRetry(until deadline: ContinuousClock.Instant) throws {
+        try applyJournalModeWithRetry(until: deadline) {
+            try self.applyJournalMode()
+        }
+    }
+
+    func applyJournalModeWithRetry(
+        until deadline: ContinuousClock.Instant,
+        operation: () throws -> Void
+    ) throws {
+        #if canImport(SQLite3)
+        let started = ContinuousClock.now
+        let retryPause = Duration.milliseconds(Int64(JournalMode.busyRetryPauseMilliseconds))
+
+        do {
+            while true {
+                if Task.isCancelled {
+                    throw SQLiteJournalError.cancelled
+                }
+
+                let remaining = max(.zero, ContinuousClock.now.duration(to: deadline))
+                let bounded = min(
+                    max(remaining, retryPause),
+                    .milliseconds(Int64(JournalMode.maxBusyAttemptMilliseconds))
+                )
+                let components = bounded.components
+                let timeout = Int32(
+                    components.seconds * 1_000
+                        + components.attoseconds / 1_000_000_000_000_000
+                )
+                try setBusyTimeout(timeout)
+
+                do {
+                    try operation()
+                    break
+                } catch {
+                    if !isRetryableBusy(error)
+                        || ContinuousClock.now.advanced(by: retryPause) >= deadline
+                    {
+                        throw journalModeFailure(error, started: started)
+                    }
+                    if Task.isCancelled {
+                        throw SQLiteJournalError.cancelled
+                    }
+                    Thread.sleep(forTimeInterval: Double(
+                        JournalMode.busyRetryPauseMilliseconds
+                    ) / 1_000)
+                }
+            }
+        } catch {
+            // Preserve the original failure if restoring the handler also fails.
+            try? setBusyTimeout(Self.busyTimeoutMilliseconds)
+            throw error
+        }
+        try setBusyTimeout(Self.busyTimeoutMilliseconds)
+        #else
+        throw SQLiteJournalError.unavailable("SQLite3 not linked")
+        #endif
+    }
+
+    private func isRetryableBusy(_ error: any Error) -> Bool {
+        guard let sqliteError = error as? SQLiteJournalError else { return false }
+        switch sqliteError {
+        case .busy:
+            return true
+        case .execFailed(let code, _):
+            #if canImport(SQLite3)
+            let primary = code & 0xff
+            return primary == SQLITE_BUSY || primary == SQLITE_LOCKED
+            #else
+            return false
+            #endif
+        default:
+            return false
+        }
+    }
+
+    private func journalModeFailure(
+        _ error: any Error,
+        started: ContinuousClock.Instant
+    ) -> any Error {
+        let elapsed = started.duration(to: ContinuousClock.now).components
+        let elapsedMilliseconds = elapsed.seconds * 1_000
+            + elapsed.attoseconds / 1_000_000_000_000_000
+        let detail = "failed to set journal mode \(mode.pragmaValue) "
+            + "after \(elapsedMilliseconds)ms: \(error)"
+
+        guard let sqliteError = error as? SQLiteJournalError else { return error }
+        switch sqliteError {
+        case .busy:
+            return SQLiteJournalError.busy(detail)
+        case .execFailed(let code, _):
+            return SQLiteJournalError.execFailed(code: code, message: detail)
+        default:
+            return error
+        }
     }
 
     /// Run SQL that does not return rows.

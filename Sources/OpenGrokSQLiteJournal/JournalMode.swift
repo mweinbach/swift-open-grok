@@ -15,6 +15,18 @@ public enum JournalMode: String, Sendable, Equatable, Codable, CaseIterable {
     /// `PRAGMA journal_mode` value.
     public var pragmaValue: String { rawValue }
 
+    /// Steady-state SQLite busy handler timeout after journal-mode setup.
+    public static let busyTimeoutMilliseconds: Int32 = 5_000
+
+    /// One shared monotonic budget for all journal-mode conversion attempts.
+    public static let busyRetryBudgetMilliseconds: Int32 = 10_000
+
+    /// Pause between fail-fast SQLITE_BUSY and SQLITE_LOCKED attempts.
+    public static let busyRetryPauseMilliseconds: Int32 = 20
+
+    /// Upper bound for one SQLite busy-handler wait inside the shared budget.
+    public static let maxBusyAttemptMilliseconds: Int32 = 1_000
+
     /// Pick the journal mode for a database at `dbPath`.
     ///
     /// Classifies the parent directory (the DB file itself may not exist

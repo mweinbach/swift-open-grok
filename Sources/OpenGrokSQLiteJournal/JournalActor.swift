@@ -62,7 +62,8 @@ public actor SQLiteJournal {
     public init(
         path: URL,
         migrations: [SchemaMigration] = SQLiteJournal.defaultMigrations,
-        modeOverride: JournalMode? = nil
+        modeOverride: JournalMode? = nil,
+        busyRetryDeadline: ContinuousClock.Instant? = nil
     ) throws {
         let validated = try Self.validateMigrationPlan(migrations)
         let mode = modeOverride ?? JournalMode.forDBPath(path)
@@ -71,7 +72,12 @@ public actor SQLiteJournal {
             at: effective.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        let conn = try SQLiteConnection(path: effective, mode: mode, readOnly: false)
+        let conn = try SQLiteConnection(
+            path: effective,
+            mode: mode,
+            readOnly: false,
+            deadline: busyRetryDeadline
+        )
         self.connection = conn
         self.logicalPath = path
         self.effectivePath = effective
@@ -88,14 +94,20 @@ public actor SQLiteJournal {
     public init(
         readOnlyPath path: URL,
         modeOverride: JournalMode? = nil,
-        supportedVersion: Int = SQLiteJournal.defaultSupportedSchemaVersion
+        supportedVersion: Int = SQLiteJournal.defaultSupportedSchemaVersion,
+        busyRetryDeadline: ContinuousClock.Instant? = nil
     ) throws {
         let mode = modeOverride ?? JournalMode.forDBPath(path)
         let effective = mode.effectiveDBPath(path)
         guard FileManager.default.fileExists(atPath: effective.path) else {
             throw SQLiteJournalError.notFound(effective.path)
         }
-        let conn = try SQLiteConnection(path: effective, mode: mode, readOnly: true)
+        let conn = try SQLiteConnection(
+            path: effective,
+            mode: mode,
+            readOnly: true,
+            deadline: busyRetryDeadline
+        )
         self.connection = conn
         self.logicalPath = path
         self.effectivePath = effective
@@ -311,10 +323,28 @@ extension JournalMode {
 
     /// Open read-only (never creates). See Rust `open_readonly`.
     func openReadonly(_ dbPath: URL) throws -> SQLiteConnection {
+        try openReadonly(
+            dbPath,
+            until: ContinuousClock.now.advanced(
+                by: .milliseconds(Int64(Self.busyRetryBudgetMilliseconds))
+            )
+        )
+    }
+
+    /// Open read-only while sharing the caller's existing retry deadline.
+    func openReadonly(
+        _ dbPath: URL,
+        until deadline: ContinuousClock.Instant
+    ) throws -> SQLiteConnection {
         let effective = effectiveDBPath(dbPath)
         guard FileManager.default.fileExists(atPath: effective.path) else {
             throw SQLiteJournalError.notFound(effective.path)
         }
-        return try SQLiteConnection(path: effective, mode: self, readOnly: true)
+        return try SQLiteConnection(
+            path: effective,
+            mode: self,
+            readOnly: true,
+            deadline: deadline
+        )
     }
 }
