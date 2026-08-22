@@ -128,6 +128,16 @@ public struct CsiFragmentFilter: Sendable {
             }
         }
 
+        // A typed `[` must render immediately. Upstream only retains deeper
+        // `[<...` prefixes between drain batches; carrying the lone bracket
+        // delays every array literal until the user presses another key.
+        if state == .bracket {
+            result.append(contentsOf: tentative)
+            tentative.removeAll()
+            state = .idle
+            hadEsc = false
+        }
+
         return result
     }
 

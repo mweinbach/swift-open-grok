@@ -292,4 +292,93 @@ struct OpenGrokMCPTests {
         #expect(http.recordedRequests[0].headers["Content-Type"] == "application/json")
         _ = try MCPWireCodec.decode(http.recordedRequests[0].body ?? Data())
     }
+
+    @Test("HTTP event streams handle CRLF and skip notifications before the matching response")
+    func httpEventStreamCorrelatesCRLFResponse() async throws {
+        let body = Data([
+            ": heartbeat\r\n",
+            "event: message\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\r\n",
+            "\r\n",
+            "event: message\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\r\n",
+            "\r\n",
+        ].joined().utf8)
+        let http = MockHTTPTransport(responses: [
+            MockHTTPTransport.ScriptedResponse(
+                metadata: HTTPResponseMetadata(
+                    statusCode: 200,
+                    headers: ["Content-Type": "text/event-stream"]
+                ),
+                body: body
+            )
+        ])
+        let transport = MCPHTTPTransport(
+            httpTransport: http,
+            configuration: MCPHTTPTransportConfiguration(endpoint: URL(string: "https://example.test/mcp")!)
+        )
+
+        let message = try await transport.send(.request(MCPRequest(id: .number(7), method: MCPMethod.ping)))
+        guard case .response(let response)? = message else {
+            Issue.record("expected the JSON-RPC response after the progress event")
+            return
+        }
+        #expect(response.id == .number(7))
+        #expect(response.result == .object(["ok": .bool(true)]))
+    }
+
+    @Test("HTTP event streams preserve multiline SSE data and ignore other response ids")
+    func httpEventStreamPreservesEventsAndMultilineData() async throws {
+        let body = Data("""
+        data: {"jsonrpc":"2.0","id":"other","result":{"ok":false}}
+
+        event: message
+        data: {"jsonrpc":"2.0",
+        data: "id":"wanted","result":{"ok":true}}
+
+        """.utf8)
+        let http = MockHTTPTransport(responses: [
+            MockHTTPTransport.ScriptedResponse(
+                metadata: HTTPResponseMetadata(
+                    statusCode: 200,
+                    headers: ["Content-Type": "text/event-stream; charset=utf-8"]
+                ),
+                body: body
+            )
+        ])
+        let transport = MCPHTTPTransport(
+            httpTransport: http,
+            configuration: MCPHTTPTransportConfiguration(endpoint: URL(string: "https://example.test/mcp")!)
+        )
+
+        let message = try await transport.send(.request(MCPRequest(id: .string("wanted"), method: MCPMethod.ping)))
+        guard case .response(let response)? = message else {
+            Issue.record("expected the multiline response matching the requested id")
+            return
+        }
+        #expect(response.id == .string("wanted"))
+        #expect(response.result == .object(["ok": .bool(true)]))
+    }
+
+    @Test("HTTP event streams refuse to substitute a response for another request")
+    func httpEventStreamRejectsMissingMatchingResponse() async throws {
+        let body = Data("data: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n\n".utf8)
+        let http = MockHTTPTransport(responses: [
+            MockHTTPTransport.ScriptedResponse(
+                metadata: HTTPResponseMetadata(
+                    statusCode: 200,
+                    headers: ["Content-Type": "text/event-stream"]
+                ),
+                body: body
+            )
+        ])
+        let transport = MCPHTTPTransport(
+            httpTransport: http,
+            configuration: MCPHTTPTransportConfiguration(endpoint: URL(string: "https://example.test/mcp")!)
+        )
+
+        await #expect(throws: MCPError.self) {
+            _ = try await transport.send(.request(MCPRequest(id: .number(7), method: MCPMethod.ping)))
+        }
+    }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import OpenGrokHTTP
+import OpenGrokToolProtocol
 
 public protocol MCPTransport: Sendable {
     func send(_ message: MCPWireMessage) async throws -> MCPWireMessage?
@@ -119,7 +120,17 @@ public actor MCPHTTPTransport: MCPTransport {
                 sessionID = value
             }
             guard !response.body.isEmpty else { return nil }
-            return try decodeHTTPBody(response.body, contentType: response.metadata.contentType)
+            let requestID: JsonRpcId?
+            if case .request(let request) = message {
+                requestID = request.id
+            } else {
+                requestID = nil
+            }
+            return try decodeHTTPBody(
+                response.body,
+                contentType: response.metadata.contentType,
+                matching: requestID
+            )
         } catch let error as MCPError {
             throw error
         } catch {
@@ -165,23 +176,51 @@ public actor MCPHTTPTransport: MCPTransport {
         isClosed = true
     }
 
-    private func decodeHTTPBody(_ data: Data, contentType: String?) throws -> MCPWireMessage {
-        if contentType?.lowercased().contains("text/event-stream") == true {
-            let text = String(decoding: data, as: UTF8.self)
-            let eventData = text
-                .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
-                .compactMap { line -> String? in
-                    let value = line.trimmingCharacters(in: .whitespaces)
-                    guard value.hasPrefix("data:") else { return nil }
-                    return String(value.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-                }
-                .joined()
-            guard let eventBytes = eventData.data(using: .utf8), !eventData.isEmpty else {
-                throw MCPError.parse("MCP event stream contained no data event")
-            }
-            return try MCPWireCodec.decode(eventBytes)
+    private func decodeHTTPBody(
+        _ data: Data,
+        contentType: String?,
+        matching requestID: JsonRpcId?
+    ) throws -> MCPWireMessage {
+        guard contentType?.lowercased().contains("text/event-stream") == true else {
+            return try MCPWireCodec.decode(data)
         }
-        return try MCPWireCodec.decode(data)
+
+        let text = String(decoding: data, as: UTF8.self)
+        var eventData: [String] = []
+        var sawDataEvent = false
+
+        func matchingMessage() throws -> MCPWireMessage? {
+            guard !eventData.isEmpty else { return nil }
+            sawDataEvent = true
+            defer { eventData.removeAll(keepingCapacity: true) }
+
+            let message = try MCPWireCodec.decodeString(eventData.joined(separator: "\n"))
+            guard let requestID else { return message }
+            guard case .response(let response) = message, response.id == requestID else {
+                return nil
+            }
+            return message
+        }
+
+        // CRLF is one Swift Character, so checking against "\r" and "\n"
+        // separately misses the most common HTTP event-stream delimiter.
+        for line in text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
+            if line.isEmpty {
+                if let message = try matchingMessage() { return message }
+                continue
+            }
+
+            guard line.hasPrefix("data:") else { continue }
+            var value = line.dropFirst(5)
+            if value.first == " " { value = value.dropFirst() }
+            eventData.append(String(value))
+        }
+
+        if let message = try matchingMessage() { return message }
+        guard sawDataEvent else {
+            throw MCPError.parse("MCP event stream contained no data event")
+        }
+        throw MCPError.parse("MCP event stream contained no response matching the request id")
     }
 
     private func headerValue(_ name: String, in headers: [String: String]) -> String? {

@@ -45,8 +45,9 @@ import WinSDK
 /// points that hop onto the actor); the async side only ever awaits `next()`.
 actor ACPLineMailbox {
     private var pending: [String] = []
-    private var waiter: CheckedContinuation<String?, Never>?
+    private var waiter: CheckedContinuation<String?, Error>?
     private var finished = false
+    private var failure: ACPTransportError?
 
     func deliver(_ line: String) {
         guard !finished else { return }
@@ -61,21 +62,29 @@ actor ACPLineMailbox {
     /// Close the mailbox. Queued lines are still drained before `next()`
     /// starts reporting end-of-stream, so a final message that arrived with
     /// the EOF is not dropped.
-    func finish() {
+    func finish(error: ACPTransportError? = nil) {
         guard !finished else { return }
         finished = true
+        failure = error
         if let waiter {
             self.waiter = nil
-            waiter.resume(returning: nil)
+            if let error {
+                waiter.resume(throwing: error)
+            } else {
+                waiter.resume(returning: nil)
+            }
         }
     }
 
-    func next() async -> String? {
+    func next() async throws -> String? {
         if !pending.isEmpty { return pending.removeFirst() }
+        if let failure { throw failure }
         if finished { return nil }
-        return await withCheckedContinuation { continuation in
+        return try await withCheckedThrowingContinuation { continuation in
             if !pending.isEmpty {
                 continuation.resume(returning: pending.removeFirst())
+            } else if let failure {
+                continuation.resume(throwing: failure)
             } else if finished {
                 continuation.resume(returning: nil)
             } else {
@@ -93,6 +102,8 @@ actor ACPLineMailbox {
 /// cooperative executor thread. Writes are serialized through an actor because
 /// two concurrent notifications must not interleave halfway through a line.
 public struct ACPStandardIO: ACPLineIO {
+    private static let maximumFrameBytes = 64 * 1024 * 1024
+
     private let mailbox: ACPLineMailbox
     private let writer: ACPLineWriter
     private let reader: ACPLineReader
@@ -105,14 +116,26 @@ public struct ACPStandardIO: ACPLineIO {
     /// Bind to arbitrary file handles. Tests use a pair of `Pipe` instances;
     /// the production path uses `init()`.
     public init(input: FileHandle, output: FileHandle) {
+        self.init(input: input, output: output, maximumFrameBytes: Self.maximumFrameBytes)
+    }
+
+    init(input: FileHandle, output: FileHandle, maximumFrameBytes: Int) {
         let mailbox = ACPLineMailbox()
         self.mailbox = mailbox
         #if os(Windows)
         self.writer = ACPLineWriter(handle: output)
-        self.reader = ACPLineReader(handle: input, mailbox: mailbox)
+        self.reader = ACPLineReader(
+            handle: input,
+            mailbox: mailbox,
+            maximumFrameBytes: maximumFrameBytes
+        )
         #else
         self.writer = ACPLineWriter(descriptor: output.fileDescriptor)
-        self.reader = ACPLineReader(descriptor: input.fileDescriptor, mailbox: mailbox)
+        self.reader = ACPLineReader(
+            descriptor: input.fileDescriptor,
+            mailbox: mailbox,
+            maximumFrameBytes: maximumFrameBytes
+        )
         #endif
         reader.start()
     }
@@ -123,7 +146,11 @@ public struct ACPStandardIO: ACPLineIO {
         let mailbox = ACPLineMailbox()
         self.mailbox = mailbox
         self.writer = ACPLineWriter(descriptor: output)
-        self.reader = ACPLineReader(descriptor: input, mailbox: mailbox)
+        self.reader = ACPLineReader(
+            descriptor: input,
+            mailbox: mailbox,
+            maximumFrameBytes: Self.maximumFrameBytes
+        )
         reader.start()
     }
     #endif
@@ -133,7 +160,7 @@ public struct ACPStandardIO: ACPLineIO {
         // that terminates its frames generously. Skipping here keeps
         // `ACPStdioTransport.receive()` from raising `.invalidLine` and
         // tearing the session down over a stray newline.
-        while let line = await mailbox.next() {
+        while let line = try await mailbox.next() {
             if !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return line }
         }
         return nil
@@ -205,18 +232,21 @@ private final class ACPLineReader: @unchecked Sendable {
     private let descriptor: Int32
     #endif
     private let mailbox: ACPLineMailbox
+    private let maximumFrameBytes: Int
     private let lock = NSLock()
     private var stopped = false
 
     #if os(Windows)
-    init(handle: FileHandle, mailbox: ACPLineMailbox) {
+    init(handle: FileHandle, mailbox: ACPLineMailbox, maximumFrameBytes: Int) {
         self.handle = handle
         self.mailbox = mailbox
+        self.maximumFrameBytes = max(1, maximumFrameBytes)
     }
     #else
-    init(descriptor: Int32, mailbox: ACPLineMailbox) {
+    init(descriptor: Int32, mailbox: ACPLineMailbox, maximumFrameBytes: Int) {
         self.descriptor = descriptor
         self.mailbox = mailbox
+        self.maximumFrameBytes = max(1, maximumFrameBytes)
     }
     #endif
 
@@ -245,6 +275,7 @@ private final class ACPLineReader: @unchecked Sendable {
     private func run() {
         var buffer = [UInt8]()
         var chunk = [UInt8](repeating: 0, count: 8192)
+        var failure: ACPTransportError?
         while !isStopped {
             #if os(Windows)
             var requestedCount = chunk.count
@@ -278,26 +309,41 @@ private final class ACPLineReader: @unchecked Sendable {
             let byteCount = count
             #endif
             if byteCount == 0 { break }
-            buffer.append(contentsOf: chunk[0..<byteCount])
-            deliverCompleteLines(from: &buffer)
+            guard consume(chunk[0..<byteCount], into: &buffer) else {
+                buffer.removeAll(keepingCapacity: false)
+                failure = .invalidMessage("ACP message exceeds \(maximumFrameBytes) byte limit")
+                break
+            }
         }
         // A client that closes without a trailing newline still sent a frame.
-        if !buffer.isEmpty {
+        if failure == nil, !buffer.isEmpty {
             let line = String(decoding: buffer, as: UTF8.self)
             deliver(line)
         }
-        finishMailbox()
+        finishMailbox(error: failure)
     }
 
-    private func deliverCompleteLines(from buffer: inout [UInt8]) {
-        while let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-            let lineBytes = Array(buffer[buffer.startIndex..<newline])
-            buffer.removeSubrange(buffer.startIndex...newline)
+    private func consume(_ bytes: ArraySlice<UInt8>, into buffer: inout [UInt8]) -> Bool {
+        var remaining = bytes
+        while !remaining.isEmpty {
+            guard let newline = remaining.firstIndex(of: UInt8(ascii: "\n")) else {
+                guard remaining.count <= maximumFrameBytes - buffer.count else { return false }
+                buffer.append(contentsOf: remaining)
+                return true
+            }
+
+            let lineBytes = remaining[remaining.startIndex..<newline]
+            // Upstream counts the newline as part of the 64 MiB frame.
+            guard lineBytes.count + 1 <= maximumFrameBytes - buffer.count else { return false }
+            buffer.append(contentsOf: lineBytes)
             // A CRLF client leaves the carriage return behind.
-            let trimmed = lineBytes.last == UInt8(ascii: "\r") ? lineBytes.dropLast() : lineBytes[...]
+            let trimmed = buffer.last == UInt8(ascii: "\r") ? buffer.dropLast() : buffer[...]
             let line = String(decoding: trimmed, as: UTF8.self)
             deliver(line)
+            buffer.removeAll(keepingCapacity: true)
+            remaining = remaining[remaining.index(after: newline)...]
         }
+        return true
     }
 
     private func deliver(_ line: String) {
@@ -310,11 +356,11 @@ private final class ACPLineReader: @unchecked Sendable {
         completed.wait()
     }
 
-    private func finishMailbox() {
+    private func finishMailbox(error: ACPTransportError?) {
         let completed = DispatchSemaphore(value: 0)
         let mailbox = self.mailbox
         Task {
-            await mailbox.finish()
+            await mailbox.finish(error: error)
             completed.signal()
         }
         completed.wait()

@@ -74,7 +74,10 @@ struct CsiFragmentFilterStressTests {
     func multiBatchFragmentedDelivery() {
         let fullFragment = sgrFragment("35", "261", "67")
 
-        for chunkSize in 1...fullFragment.count {
+        // Rust flushes a lone `[` at every batch boundary so real typed input
+        // paints immediately. Fragments remain recognizable only after the
+        // introducer and `<` arrive together in their first batch.
+        for chunkSize in 2...fullFragment.count {
             var filter = CsiFragmentFilter()
             var index = 0
             var output: [TerminalInputEvent] = []
@@ -88,6 +91,10 @@ struct CsiFragmentFilterStressTests {
 
             #expect(output.isEmpty, "Multi-batch chunk size \(chunkSize) failed to swallow fragment, emitted \(output)")
         }
+
+        var bytewise = CsiFragmentFilter()
+        let bytewiseOutput = fullFragment.flatMap { bytewise.filter([$0]) }
+        #expect(bytewiseOutput == fullFragment)
     }
 
     @Test("Overlong digit run in digits1 state handles large buffers")

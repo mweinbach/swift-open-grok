@@ -7,11 +7,9 @@
 // and stderr reserved for the server's own logging (never protocol traffic).
 //
 // The `MCPTransport` seam is request/response shaped while stdio is a
-// full-duplex stream, so `send` writes the line and then drains inbound lines
-// until the response whose id matches the request arrives. Server-initiated
-// notifications and requests seen while draining are discarded rather than
-// treated as protocol errors — a server that logs progress mid-call must not
-// break the caller.
+// full-duplex stream. Multiple sends can overlap because the transport actor
+// becomes reentrant while waiting, so inbound responses must be correlated by
+// JSON-RPC id rather than handed to whichever caller happens to read next.
 
 import Foundation
 import OpenGrokSandbox
@@ -51,99 +49,124 @@ public struct MCPStdioTransportConfiguration: Sendable, Equatable {
 
 // MARK: - Line sink
 
-/// Accumulates the child's stdout into whole lines and hands them to at most
-/// one waiter at a time. Fed from `FileHandle.readabilityHandler`, which runs
-/// on a private dispatch queue, so every access is lock-guarded.
+/// Accumulates the child's stdout into complete messages and hands responses
+/// directly to the waiter registered for their JSON-RPC id. Fed from
+/// `FileHandle.readabilityHandler`, which runs on a private dispatch queue,
+/// so every access is lock-guarded.
 private final class MCPStdioLineSink: @unchecked Sendable {
     private let lock = NSLock()
-    private var pending: [String] = []
+    private var activeRequests: Set<JsonRpcId> = []
+    private var pending: [JsonRpcId: MCPWireMessage] = [:]
     private var buffer = Data()
     private var closed = false
-    private var waiter: CheckedContinuation<String?, Never>?
-    /// Set when a waiter is cancelled before it managed to register, so the
-    /// continuation resumes immediately instead of parking forever.
-    private var cancelPending = false
+    private var waiters: [JsonRpcId: CheckedContinuation<MCPWireMessage?, Never>] = [:]
+    /// Cancellation can run before `withCheckedContinuation` registers.
+    private var cancelledRequests: Set<JsonRpcId> = []
 
     /// Guards against a runaway server emitting one unbounded line.
     private static let maxLineBytes = 32 * 1024 * 1024
 
     func ingest(_ data: Data) {
-        var resume: CheckedContinuation<String?, Never>?
-        var value: String?
+        var resumptions: [(CheckedContinuation<MCPWireMessage?, Never>, MCPWireMessage?)] = []
 
         lock.lock()
         if data.isEmpty {
             closed = true
-            resume = waiter
-            waiter = nil
-            value = pending.isEmpty ? nil : pending.removeFirst()
+            resumptions = waiters.values.map { ($0, nil) }
+            waiters.removeAll()
         } else {
             buffer.append(data)
+            while let index = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                let lineData = buffer[buffer.startIndex..<index]
+                if lineData.count > Self.maxLineBytes {
+                    buffer.removeAll(keepingCapacity: false)
+                    closed = true
+                    break
+                }
+                buffer.removeSubrange(buffer.startIndex...index)
+                let line = String(decoding: lineData, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !line.isEmpty,
+                      let message = try? MCPWireCodec.decodeString(line),
+                      case .response(let response) = message,
+                      activeRequests.contains(response.id) else {
+                    continue
+                }
+                if let continuation = waiters.removeValue(forKey: response.id) {
+                    resumptions.append((continuation, message))
+                } else {
+                    pending[response.id] = message
+                }
+            }
             if buffer.count > Self.maxLineBytes {
                 buffer.removeAll(keepingCapacity: false)
                 closed = true
             }
-            while let index = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-                let lineData = buffer[buffer.startIndex..<index]
-                buffer.removeSubrange(buffer.startIndex...index)
-                let line = String(decoding: lineData, as: UTF8.self)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !line.isEmpty { pending.append(line) }
-            }
-            if let continuation = waiter, !pending.isEmpty {
-                resume = continuation
-                waiter = nil
-                value = pending.removeFirst()
+            if closed {
+                resumptions.append(contentsOf: waiters.values.map { ($0, nil) })
+                waiters.removeAll()
             }
         }
         lock.unlock()
 
-        resume?.resume(returning: value)
+        for (continuation, message) in resumptions {
+            continuation.resume(returning: message)
+        }
     }
 
     func close() {
         ingest(Data())
     }
 
-    /// Resume any parked waiter with `nil`. Called when the surrounding task is
-    /// cancelled — a `CheckedContinuation` is not itself cancellable, so
-    /// without this a timed-out read would keep its task group alive until the
-    /// child process happened to exit.
-    func cancelWaiter() {
+    func register(_ id: JsonRpcId) {
         lock.lock()
-        let parked = waiter
-        waiter = nil
-        if parked == nil { cancelPending = true }
+        activeRequests.insert(id)
+        lock.unlock()
+    }
+
+    func unregister(_ id: JsonRpcId) {
+        lock.lock()
+        activeRequests.remove(id)
+        pending.removeValue(forKey: id)
+        cancelledRequests.remove(id)
+        let parked = waiters.removeValue(forKey: id)
         lock.unlock()
         parked?.resume(returning: nil)
     }
 
-    /// Next complete line, or `nil` once the stream is drained and closed (or
-    /// the calling task is cancelled).
-    func nextLine() async -> String? {
+    /// A timed-out request must unblock its own continuation without waking
+    /// or consuming the response for another request on the same transport.
+    func cancelWaiter(for id: JsonRpcId) {
+        lock.lock()
+        let parked = waiters.removeValue(forKey: id)
+        if parked == nil, activeRequests.contains(id) {
+            cancelledRequests.insert(id)
+        }
+        lock.unlock()
+        parked?.resume(returning: nil)
+    }
+
+    /// The matching response, or `nil` if this request is cancelled or the
+    /// shared stream closes.
+    func nextResponse(for id: JsonRpcId) async -> MCPWireMessage? {
         await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
+            await withCheckedContinuation { (continuation: CheckedContinuation<MCPWireMessage?, Never>) in
                 lock.lock()
-                if !pending.isEmpty {
-                    let line = pending.removeFirst()
+                if let message = pending.removeValue(forKey: id) {
                     lock.unlock()
-                    continuation.resume(returning: line)
+                    continuation.resume(returning: message)
                     return
                 }
-                if closed || cancelPending {
-                    cancelPending = false
+                if closed || cancelledRequests.remove(id) != nil {
                     lock.unlock()
                     continuation.resume(returning: nil)
                     return
                 }
-                // A second concurrent waiter would be a caller bug; the
-                // transport actor serialises `send`, so only one can exist.
-                waiter?.resume(returning: nil)
-                waiter = continuation
+                waiters[id] = continuation
                 lock.unlock()
             }
         } onCancel: {
-            cancelWaiter()
+            cancelWaiter(for: id)
         }
     }
 }
@@ -160,6 +183,7 @@ public actor MCPStdioTransport: MCPTransport {
     private let sink = MCPStdioLineSink()
     private var started = false
     private var isClosed = false
+    private var pendingRequestIDs: Set<JsonRpcId> = []
 
     public init(
         configuration: MCPStdioTransportConfiguration,
@@ -240,14 +264,31 @@ public actor MCPStdioTransport: MCPTransport {
 
         var line = try MCPWireCodec.encode(message)
         line.append(UInt8(ascii: "\n"))
+
+        guard case .request(let request) = message else {
+            try write(line)
+            return nil
+        }
+
+        guard pendingRequestIDs.insert(request.id).inserted else {
+            throw MCPError.invalidRequest("duplicate MCP request id: \(request.id)")
+        }
+        sink.register(request.id)
+        defer {
+            pendingRequestIDs.remove(request.id)
+            sink.unregister(request.id)
+        }
+
+        try write(line)
+        return try await awaitResponse(id: request.id, method: request.method)
+    }
+
+    private func write(_ line: Data) throws {
         do {
             try stdinPipe.fileHandleForWriting.write(contentsOf: line)
         } catch {
             throw MCPError.transport("MCP stdio write failed: \(error.localizedDescription)")
         }
-
-        guard case .request(let request) = message else { return nil }
-        return try await awaitResponse(id: request.id, method: request.method)
     }
 
     public func close() {
@@ -272,37 +313,31 @@ public actor MCPStdioTransport: MCPTransport {
 
     private func awaitResponse(id: JsonRpcId, method: String) async throws -> MCPWireMessage {
         let deadline = Date().addingTimeInterval(configuration.requestTimeout)
-        while true {
-            if Date() >= deadline {
+        if Date() >= deadline {
+            throw MCPError.transport(
+                "MCP stdio request '\(method)' timed out after \(Int(configuration.requestTimeout))s"
+            )
+        }
+        let message = try await withThrowingTaskGroup(of: MCPWireMessage?.self) { group in
+            let sink = self.sink
+            group.addTask { await sink.nextResponse(for: id) }
+            group.addTask {
+                let remaining = deadline.timeIntervalSinceNow
+                if remaining > 0 {
+                    try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+                }
                 throw MCPError.transport(
-                    "MCP stdio request '\(method)' timed out after \(Int(configuration.requestTimeout))s"
+                    "MCP stdio request '\(method)' timed out after \(Int(self.configuration.requestTimeout))s"
                 )
             }
-            let line = try await withThrowingTaskGroup(of: String?.self) { group in
-                let sink = self.sink
-                group.addTask { await sink.nextLine() }
-                group.addTask {
-                    let remaining = deadline.timeIntervalSinceNow
-                    if remaining > 0 {
-                        try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
-                    }
-                    throw MCPError.transport(
-                        "MCP stdio request '\(method)' timed out after \(Int(self.configuration.requestTimeout))s"
-                    )
-                }
-                let first = try await group.next()
-                group.cancelAll()
-                return first ?? nil
-            }
-            guard let line else {
-                throw MCPError.transport("MCP server closed stdout before answering '\(method)'")
-            }
-            // A malformed line is the server's problem, not a reason to abort
-            // the call: skip it and keep draining toward our response.
-            guard let decoded = try? MCPWireCodec.decodeString(line) else { continue }
-            guard case .response(let response) = decoded, response.id == id else { continue }
-            return decoded
+            let first = try await group.next()
+            group.cancelAll()
+            return first ?? nil
         }
+        guard let message else {
+            throw MCPError.transport("MCP server closed stdout before answering '\(method)'")
+        }
+        return message
     }
 
     private static func resolveExecutable(_ command: String, environment: [String: String]) -> URL {

@@ -254,8 +254,8 @@ public actor ACPAgentRuntime {
             guard case .success(let clientMessage) = decoded else { return }
             _ = channel.send(clientMessage)
         }
-        setReverseSender { message in
-            guard case .request(_, let method, let params) = message else {
+        setReverseSender { [reverseRequests] message in
+            guard case .request(let id, let method, let params) = message else {
                 throw ACPRuntimeError.transport("reverse ACP message is not a request")
             }
             let responseChannel = ResponseChannel<JSONValue>()
@@ -271,16 +271,24 @@ public actor ACPAgentRuntime {
                 throw ACPRuntimeError.transport("ACP client channel is closed")
             }
             switch await responseChannel.awaitResponse() {
-            case .success:
-                break
+            case .success(let result):
+                guard await reverseRequests.resolve(.response(id: id, result: result, error: nil)) else {
+                    throw ACPRuntimeError.transport("reverse ACP response has no pending request")
+                }
             case .failure(let error):
                 throw error
             }
         }
-        for await message in channel.messages {
-            await handleTyped(message)
+        let runtime = self
+        await withTaskGroup(of: Void.self) { group in
+            for await message in channel.messages {
+                group.addTask {
+                    await runtime.handleTyped(message)
+                }
+            }
+            await runtime.close()
+            group.cancelAll()
         }
-        await close()
     }
 
     @discardableResult

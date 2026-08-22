@@ -42,9 +42,14 @@ public struct TerminalKeyModifiers: OptionSet, Sendable, Equatable, Hashable {
     public static let alt = TerminalKeyModifiers(rawValue: 1 << 1)
     public static let control = TerminalKeyModifiers(rawValue: 1 << 2)
     public static let meta = TerminalKeyModifiers(rawValue: 1 << 3)
+    public static let superKey = TerminalKeyModifiers(rawValue: 1 << 4)
 }
 
 public enum TerminalNamedKey: Sendable, Equatable, Hashable {
+    case enter
+    case tab
+    case backspace
+    case escape
     case up
     case down
     case left
@@ -142,8 +147,12 @@ public struct TerminalInputDecoder: Sendable {
         /// payload bytes (`Cb Cx Cy`), which are raw and must not be re-scanned
         /// as UTF-8, ESC, or CSI — otherwise they leak as `.text` / composer keys.
         case x10(bytes: [UInt8], remaining: Int)
+        /// Bracketed-paste bytes are data, never input controls. Only the exact
+        /// closing marker is recognized; both retained fragments are bounded.
+        case paste(utf8Bytes: [UInt8], expectedLength: Int, terminator: [UInt8])
     }
 
+    private static let pasteTerminator: [UInt8] = [0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e]
     private var state: State = .normal
     private let maxSequenceLength: Int
 
@@ -158,7 +167,14 @@ public struct TerminalInputDecoder: Sendable {
             return true
         case .normal, .utf8:
             return false
+        case .paste(_, _, let terminator):
+            return !terminator.isEmpty
         }
+    }
+
+    var isBracketedPasteActive: Bool {
+        if case .paste = state { return true }
+        return false
     }
 
     public mutating func feed(_ byte: UInt8) throws -> [TerminalInputEvent] {
@@ -173,6 +189,13 @@ public struct TerminalInputDecoder: Sendable {
             return try feedAltText(byte, bytes: bytes)
         case .x10(let bytes, let remaining):
             return feedX10Byte(byte, bytes: bytes, remaining: remaining)
+        case .paste(let utf8Bytes, let expectedLength, let terminator):
+            return try feedPasteByte(
+                byte,
+                utf8Bytes: utf8Bytes,
+                expectedLength: expectedLength,
+                terminator: terminator
+            )
         }
     }
 
@@ -197,6 +220,86 @@ public struct TerminalInputDecoder: Sendable {
             // through rather than hanging waiting for three payload bytes.
             state = .normal
             return [.unknown(Data(bytes))]
+        case .paste(let utf8Bytes, _, let terminator):
+            guard utf8Bytes.isEmpty else {
+                state = .normal
+                throw TerminalInputError.invalidUTF8
+            }
+            if !terminator.isEmpty {
+                // Escape-disambiguation timeout, not necessarily EOF: a lone
+                // pasted ESC stays literal and the surrounding paste remains open.
+                state = .paste(utf8Bytes: [], expectedLength: 0, terminator: [])
+                return [.text(String(decoding: terminator, as: UTF8.self))]
+            }
+            state = .normal
+            return [.pasteEnd]
+        }
+    }
+
+    private mutating func feedPasteByte(
+        _ byte: UInt8,
+        utf8Bytes: [UInt8],
+        expectedLength: Int,
+        terminator: [UInt8]
+    ) throws -> [TerminalInputEvent] {
+        if !utf8Bytes.isEmpty {
+            guard (0x80...0xbf).contains(byte) else {
+                state = .normal
+                throw TerminalInputError.invalidUTF8
+            }
+            var nextBytes = utf8Bytes
+            nextBytes.append(byte)
+            guard nextBytes.count == expectedLength else {
+                state = .paste(utf8Bytes: nextBytes, expectedLength: expectedLength, terminator: [])
+                return []
+            }
+            guard let text = String(bytes: nextBytes, encoding: .utf8) else {
+                state = .normal
+                throw TerminalInputError.invalidUTF8
+            }
+            state = .paste(utf8Bytes: [], expectedLength: 0, terminator: [])
+            return [.text(text)]
+        }
+
+        if !terminator.isEmpty {
+            if byte == Self.pasteTerminator[terminator.count] {
+                let matched = terminator + [byte]
+                if matched.count == Self.pasteTerminator.count {
+                    state = .normal
+                    return [.pasteEnd]
+                }
+                state = .paste(utf8Bytes: [], expectedLength: 0, terminator: matched)
+                return []
+            }
+
+            let literal = TerminalInputEvent.text(String(decoding: terminator, as: UTF8.self))
+            state = .paste(utf8Bytes: [], expectedLength: 0, terminator: [])
+            return [literal] + (try feedPasteByte(
+                byte,
+                utf8Bytes: [],
+                expectedLength: 0,
+                terminator: []
+            ))
+        }
+
+        switch byte {
+        case 0x1b:
+            state = .paste(utf8Bytes: [], expectedLength: 0, terminator: [byte])
+            return []
+        case 0x00...0x7f:
+            return [.text(String(UnicodeScalar(byte)))]
+        case 0xc2...0xdf:
+            state = .paste(utf8Bytes: [byte], expectedLength: 2, terminator: [])
+            return []
+        case 0xe0...0xef:
+            state = .paste(utf8Bytes: [byte], expectedLength: 3, terminator: [])
+            return []
+        case 0xf0...0xf4:
+            state = .paste(utf8Bytes: [byte], expectedLength: 4, terminator: [])
+            return []
+        default:
+            state = .normal
+            throw TerminalInputError.invalidUTF8
         }
     }
 
@@ -304,10 +407,13 @@ public struct TerminalInputDecoder: Sendable {
         _ byte: UInt8,
         bytes: [UInt8]
     ) throws -> [TerminalInputEvent] {
-        guard let firstByte = bytes.last else {
+        guard bytes.count >= 2 else {
             state = .normal
             throw TerminalInputError.invalidUTF8
         }
+        // `bytes.last` becomes a continuation after the first fragment of a
+        // three- or four-byte scalar; the UTF-8 lead always follows ESC.
+        let firstByte = bytes[1]
         let expectedLength: Int
         switch firstByte {
         case 0xc2...0xdf:
@@ -403,7 +509,19 @@ public struct TerminalInputDecoder: Sendable {
         let body = String(decoding: bodyBytes, as: UTF8.self)
         let parts = body.split(separator: ";", omittingEmptySubsequences: false)
         let firstParameter = Int(String(parts.first ?? "")) ?? 1
-        let modifierValue = parts.count > 1 ? Int(String(parts[1])) ?? 1 : 1
+        let modifierFields = parts.count > 1
+            ? parts[1].split(separator: ":", omittingEmptySubsequences: false)
+            : []
+        let modifierValue = modifierFields.first.flatMap { Int($0) } ?? 1
+        let eventType = modifierFields.count > 1
+            ? Int(modifierFields[1])
+            : 1
+        // REPORT_EVENT_TYPES is negotiated by default. Releases cannot be
+        // represented by the legacy event model and must never act as a
+        // second press; upstream's normal input handlers filter them too.
+        if eventType == 3 {
+            return []
+        }
         let modifiers = modifiers(for: modifierValue)
 
         switch finalByte {
@@ -419,6 +537,12 @@ public struct TerminalInputDecoder: Sendable {
             return [.key(.named(.home, modifiers: modifiers))]
         case 0x46:
             return [.key(.named(.end, modifiers: modifiers))]
+        case 0x49 where body.isEmpty:
+            return [.focusGained]
+        case 0x4f where body.isEmpty:
+            return [.focusLost]
+        case 0x75:
+            return parseKittyKeyboard(parts: parts, bytes: bytes)
         case 0x7e:
             switch firstParameter {
             case 1, 7:
@@ -440,6 +564,7 @@ public struct TerminalInputDecoder: Sendable {
             case 23, 24:
                 return [.key(.named(.function(firstParameter - 12), modifiers: modifiers))]
             case 200:
+                state = .paste(utf8Bytes: [], expectedLength: 0, terminator: [])
                 return [.pasteStart]
             case 201:
                 return [.pasteEnd]
@@ -448,6 +573,89 @@ public struct TerminalInputDecoder: Sendable {
             }
         default:
             return [.unknown(Data(bytes))]
+        }
+    }
+
+    private func parseKittyKeyboard(
+        parts: [Substring],
+        bytes: [UInt8]
+    ) -> [TerminalInputEvent] {
+        guard let codepointField = parts.first, !codepointField.isEmpty else {
+            return [.unknown(Data(bytes))]
+        }
+        let codepoints = codepointField.split(separator: ":", omittingEmptySubsequences: false)
+        guard let primary = codepoints.first, let codepoint = UInt32(primary) else {
+            return [.unknown(Data(bytes))]
+        }
+
+        var modifiers: TerminalKeyModifiers = []
+        if parts.count > 1 {
+            let modifierFields = parts[1].split(separator: ":", omittingEmptySubsequences: false)
+            guard let first = modifierFields.first,
+                  let encoded = UInt16(first),
+                  (1...256).contains(encoded)
+            else {
+                return [.unknown(Data(bytes))]
+            }
+            if modifierFields.count > 1 {
+                guard let eventType = UInt8(modifierFields[1]), (1...3).contains(eventType) else {
+                    return [.unknown(Data(bytes))]
+                }
+                if eventType == 3 { return [] }
+            }
+            let mask = encoded - 1
+            if mask & 0b000001 != 0 { modifiers.insert(.shift) }
+            if mask & 0b000010 != 0 { modifiers.insert(.alt) }
+            if mask & 0b000100 != 0 { modifiers.insert(.control) }
+            if mask & 0b001000 != 0 { modifiers.insert(.superKey) }
+            if mask & 0b100000 != 0 { modifiers.insert(.meta) }
+        }
+
+        if let named = kittyNamedKey(codepoint) {
+            return [.key(.named(named, modifiers: modifiers))]
+        }
+        if (57_399...57_408).contains(codepoint) {
+            let digit = String(codepoint - 57_399)
+            return [.key(.character(digit, modifiers: modifiers))]
+        }
+        if (0xe000...0xf8ff).contains(codepoint) {
+            return [.unknown(Data(bytes))]
+        }
+        guard let scalar = UnicodeScalar(codepoint) else {
+            return [.unknown(Data(bytes))]
+        }
+
+        var text = String(scalar)
+        if modifiers.contains(.shift), codepoints.count > 1,
+           let shiftedCodepoint = UInt32(codepoints[1]),
+           let shiftedScalar = UnicodeScalar(shiftedCodepoint)
+        {
+            text = String(shiftedScalar)
+            modifiers.remove(.shift)
+        } else if modifiers.contains(.shift), (0x61...0x7a).contains(codepoint) {
+            text = String(UnicodeScalar(codepoint - 0x20)!)
+        }
+        return [.key(.character(text, modifiers: modifiers))]
+    }
+
+    private func kittyNamedKey(_ codepoint: UInt32) -> TerminalNamedKey? {
+        switch codepoint {
+        case 9: return .tab
+        case 13, 57_414: return .enter
+        case 27: return .escape
+        case 127: return .backspace
+        case 57_417: return .left
+        case 57_418: return .right
+        case 57_419: return .up
+        case 57_420: return .down
+        case 57_421: return .pageUp
+        case 57_422: return .pageDown
+        case 57_423: return .home
+        case 57_424: return .end
+        case 57_425: return .insert
+        case 57_426: return .delete
+        case 57_376...57_398: return .function(Int(codepoint - 57_363))
+        default: return nil
         }
     }
 
@@ -777,6 +985,10 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
     /// Feed one input byte through `XtversionReplyFilter` and decode only
     /// residual keystrokes. Swallowed DCS reply bytes never reach the decoder.
     private func feedXtversionThenDecode(_ byte: UInt8) throws {
+        if decoder.isBracketedPasteActive {
+            try enqueueDecoded(byte)
+            return
+        }
         let step = xtversionFilter.feed([byte])
         if let payload = step.completedPayload {
             lastSwallowedXtversionPayload = payload
@@ -797,9 +1009,14 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
     }
 
     private func enqueueDecoded(_ byte: UInt8) throws {
+        let wasPasting = decoder.isBracketedPasteActive
         let rawEvents = try decoder.feed(byte)
         if !rawEvents.isEmpty {
-            eventQueue.append(contentsOf: csiFilter.filter(rawEvents))
+            if wasPasting, decoder.isBracketedPasteActive {
+                eventQueue.append(contentsOf: rawEvents)
+            } else {
+                eventQueue.append(contentsOf: csiFilter.filter(rawEvents))
+            }
         }
     }
 

@@ -22,15 +22,23 @@ private final class StdioPipeHarness: @unchecked Sendable {
     private let toAgent: Pipe
     private let fromAgent: Pipe
 
-    init() throws {
+    init(maximumFrameBytes: Int? = nil) throws {
         let toAgent = Pipe()
         let fromAgent = Pipe()
         self.toAgent = toAgent
         self.fromAgent = fromAgent
-        agentIO = ACPStandardIO(
-            input: toAgent.fileHandleForReading,
-            output: fromAgent.fileHandleForWriting
-        )
+        if let maximumFrameBytes {
+            agentIO = ACPStandardIO(
+                input: toAgent.fileHandleForReading,
+                output: fromAgent.fileHandleForWriting,
+                maximumFrameBytes: maximumFrameBytes
+            )
+        } else {
+            agentIO = ACPStandardIO(
+                input: toAgent.fileHandleForReading,
+                output: fromAgent.fileHandleForWriting
+            )
+        }
         clientTransport = ACPStdioTransport(
             io: ACPStandardIO(
                 input: fromAgent.fileHandleForReading,
@@ -367,5 +375,41 @@ struct ACPStdioHostTests {
         #expect(error == nil)
 
         await host.shutdown()
+    }
+
+    @Test("bounded reader preserves fragmented CRLF frames and rejects oversized input")
+    func frameLimitPreservesCRLFAndRejectsOversizedInput() async throws {
+        let harness = try StdioPipeHarness(maximumFrameBytes: 12)
+        defer { harness.dispose() }
+
+        harness.writeRaw("frag")
+        harness.writeRaw("mented\r")
+        harness.writeRaw("\n")
+        #expect(try await harness.agentIO.readLine() == "fragmented")
+
+        harness.writeRaw(String(repeating: "x", count: 13))
+        do {
+            _ = try await harness.agentIO.readLine()
+            Issue.record("expected an oversized ACP frame to fail before EOF")
+        } catch let error as ACPTransportError {
+            #expect(error == .invalidMessage("ACP message exceeds 12 byte limit"))
+        }
+    }
+
+    @Test("an oversized unterminated ACP frame closes the live runtime")
+    func oversizedFrameClosesRuntime() async throws {
+        let harness = try StdioPipeHarness(maximumFrameBytes: 32)
+        defer { harness.dispose() }
+        let runtime = ACPAgentRuntime()
+        let host = ACPStdioHost(
+            runtime: runtime,
+            transport: ACPStdioTransport(io: harness.agentIO)
+        )
+        let served = Task { await host.run() }
+
+        harness.writeRaw(String(repeating: "x", count: 33))
+
+        await served.value
+        #expect(await runtime.connectionState() == .closed)
     }
 }

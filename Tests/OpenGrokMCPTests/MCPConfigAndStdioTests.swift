@@ -226,6 +226,7 @@ struct MCPTransportConstructionTests {
 
 private enum StdioServerBehavior {
     case respond(requireTransformedArgument: Bool, emitNoise: Bool)
+    case respondOutOfOrder
     case markStarted
     case drain
     case exitImmediately
@@ -297,6 +298,21 @@ private struct StdioServerScript {
               fi
             done
             """
+        case .respondOutOfOrder:
+            return """
+            first_id=""
+            while IFS= read -r line; do
+              id=$(printf '%s' "$line" | sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+              if [ -z "$id" ]; then continue; fi
+              if [ -z "$first_id" ]; then
+                first_id="$id"
+              else
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"order":"second"}}\\n' "$id"
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"order":"first"}}\\n' "$first_id"
+                first_id=""
+              fi
+            done
+            """
         case .markStarted:
             return "printf started > \"$0.started\""
         case .drain:
@@ -324,6 +340,24 @@ private struct StdioServerScript {
                 \(noise)$response = [ordered]@{ jsonrpc = '2.0'; id = $message.id; result = [ordered]@{ ok = $true } }
                 [Console]::Out.WriteLine(($response | ConvertTo-Json -Compress -Depth 4))
                 [Console]::Out.Flush()
+              }
+            }
+            """
+        case .respondOutOfOrder:
+            return """
+            $first = $null
+            while (($line = [Console]::In.ReadLine()) -ne $null) {
+              try { $message = $line | ConvertFrom-Json } catch { continue }
+              if ($null -eq $message.id) { continue }
+              if ($null -eq $first) {
+                $first = $message
+              } else {
+                foreach ($entry in @(@{ message = $message; order = 'second' }, @{ message = $first; order = 'first' })) {
+                  $response = [ordered]@{ jsonrpc = '2.0'; id = $entry.message.id; result = [ordered]@{ order = $entry.order } }
+                  [Console]::Out.WriteLine(($response | ConvertTo-Json -Compress -Depth 4))
+                  [Console]::Out.Flush()
+                }
+                $first = $null
               }
             }
             """
@@ -407,6 +441,66 @@ struct MCPStdioTransportTests {
         }
         #expect(payload.id == request.id)
         #expect(payload.error == nil)
+    }
+
+    @Test("overlapping requests correlate out-of-order child responses by JSON-RPC id")
+    func concurrentRequestsCorrelateOutOfOrderResponses() async throws {
+        let script = try StdioServerScript(behavior: .respondOutOfOrder)
+        defer { script.cleanup() }
+
+        let transport = MCPStdioTransport(configuration: script.configuration(requestTimeout: 15))
+        defer { Task { await transport.close() } }
+
+        async let first = transport.send(.request(MCPRequest(
+            id: .number(1),
+            method: MCPMethod.ping
+        )))
+        async let second = transport.send(.request(MCPRequest(
+            id: .number(2),
+            method: MCPMethod.ping
+        )))
+
+        let (firstMessage, secondMessage) = try await (first, second)
+        guard case .response(let firstResponse)? = firstMessage,
+              case .response(let secondResponse)? = secondMessage else {
+            Issue.record("expected both overlapping calls to receive responses")
+            return
+        }
+
+        #expect(firstResponse.id == .number(1))
+        #expect(secondResponse.id == .number(2))
+        #expect(Set([
+            firstResponse.result?["order"]?.stringValue ?? "",
+            secondResponse.result?["order"]?.stringValue ?? "",
+        ]) == ["first", "second"])
+    }
+
+    @Test("duplicate in-flight JSON-RPC ids are rejected without replacing the first waiter")
+    func duplicateConcurrentRequestIDsAreRejected() async throws {
+        let script = try StdioServerScript(behavior: .respondOutOfOrder)
+        defer { script.cleanup() }
+
+        let transport = MCPStdioTransport(configuration: script.configuration(requestTimeout: 15))
+        defer { Task { await transport.close() } }
+
+        let first = Task {
+            try await transport.send(.request(MCPRequest(id: .number(1), method: MCPMethod.ping)))
+        }
+
+        await Task.yield()
+        await #expect(throws: MCPError.self) {
+            _ = try await transport.send(.request(MCPRequest(id: .number(1), method: MCPMethod.ping)))
+        }
+
+        let peer = try await transport.send(.request(MCPRequest(id: .number(2), method: MCPMethod.ping)))
+        let original = try await first.value
+        guard case .response(let peerResponse)? = peer,
+              case .response(let originalResponse)? = original else {
+            Issue.record("expected the original request and its distinct peer to complete")
+            return
+        }
+        #expect(peerResponse.id == .number(2))
+        #expect(originalResponse.id == .number(1))
     }
 
     @Test("noise and malformed lines are skipped rather than failing the call")

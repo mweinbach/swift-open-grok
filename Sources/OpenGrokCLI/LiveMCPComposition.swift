@@ -67,6 +67,7 @@ public struct MCPClientTransportAdapter: McpTransport {
     public func listTools() async throws -> [McpToolDefinition] {
         var allTools: [McpToolDefinition] = []
         var cursor: String?
+        var visitedCursors = Set<String>()
         repeat {
             let page = try await client.listTools(MCPListToolsParams(cursor: cursor))
             allTools.append(contentsOf: page.tools.map { tool in
@@ -77,6 +78,9 @@ public struct MCPClientTransportAdapter: McpTransport {
                 )
             })
             cursor = page.nextCursor
+            if let cursor, !visitedCursors.insert(cursor).inserted {
+                throw MCPError.invalidRequest("MCP tools/list repeated pagination cursor '\(cursor)'")
+            }
         } while cursor != nil
         return allTools
     }
@@ -143,15 +147,38 @@ public struct MCPClientToolProvider: MCPToolProviding {
     }
 
     public func listBridgedTools() async throws -> [MCPBridgedTool] {
-        let result = try await client.listTools()
-        return result.tools.map { tool in
-            MCPBridgedTool(
-                name: tool.name,
-                description: tool.description ?? tool.title ?? "",
-                inputSchema: tool.inputSchema,
-                modelVisible: Self.isModelVisible(tool)
-            )
+        var bridged: [MCPBridgedTool] = []
+        var cursor: String?
+        var visitedCursors = Set<String>()
+        repeat {
+            let page = try await client.listTools(MCPListToolsParams(cursor: cursor))
+            bridged.append(contentsOf: page.tools.map { tool in
+                MCPBridgedTool(
+                    name: tool.name,
+                    description: tool.description ?? tool.title ?? "",
+                    inputSchema: Self.normalizedInputSchema(tool.inputSchema),
+                    modelVisible: Self.isModelVisible(tool)
+                )
+            })
+            cursor = page.nextCursor
+            if let cursor, !visitedCursors.insert(cursor).inserted {
+                throw MCPError.invalidRequest("MCP tools/list repeated pagination cursor '\(cursor)'")
+            }
+        } while cursor != nil
+        return bridged
+    }
+
+    private static func normalizedInputSchema(_ schema: JSONValue) -> JSONValue {
+        guard case .object(var object) = schema else {
+            return .object(["type": .string("object"), "properties": .object([:])])
         }
+        if object["type"] == nil {
+            object["type"] = .string("object")
+        }
+        if object["properties"] == nil {
+            object["properties"] = .object([:])
+        }
+        return .object(object)
     }
 
     public func callBridgedTool(
