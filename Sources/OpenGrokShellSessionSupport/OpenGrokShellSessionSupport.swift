@@ -1510,79 +1510,149 @@ public struct ActiveSessionRecord: Codable, Sendable, Hashable {
         self.cwd = cwd
         self.openedAt = openedAt
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case pid
+        case cwd
+        case openedAt = "opened_at"
+        case legacySessionID = "sessionID"
+        case legacyOpenedAt = "openedAt"
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.sessionID) {
+            sessionID = try container.decode(SessionID.self, forKey: .sessionID)
+        } else {
+            sessionID = try container.decode(SessionID.self, forKey: .legacySessionID)
+        }
+        pid = try container.decode(UInt32.self, forKey: .pid)
+        cwd = try container.decode(String.self, forKey: .cwd)
+
+        if container.contains(.openedAt) {
+            let timestamp = try container.decode(String.self, forKey: .openedAt)
+            let fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = fractional.date(from: timestamp) {
+                openedAt = date
+            } else if let date = ISO8601DateFormatter().date(from: timestamp) {
+                openedAt = date
+            } else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .openedAt,
+                    in: container,
+                    debugDescription: "active-session timestamp must be RFC 3339"
+                )
+            }
+        } else {
+            openedAt = try container.decode(Date.self, forKey: .legacyOpenedAt)
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(sessionID, forKey: .sessionID)
+        try container.encode(pid, forKey: .pid)
+        try container.encode(cwd, forKey: .cwd)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        try container.encode(formatter.string(from: openedAt), forKey: .openedAt)
+    }
 }
 
 public actor ActiveSessionRegistry {
     public static let dataFileName = "active_sessions.json"
-    private let root: URL
+    public static let lockFileName = "active_sessions.lock"
+    private let storage: ActiveSessionFileLock
     private var sessions: [ActiveSessionRecord] = []
 
     public init(root: URL) {
-        self.root = root
+        storage = ActiveSessionFileLock(root: root.standardizedFileURL)
     }
 
     public func load() throws {
-        let file = root.appendingPathComponent(Self.dataFileName)
-        guard FileManager.default.fileExists(atPath: file.path) else {
-            sessions = []
-            return
-        }
-        do {
-            sessions = try JSONDecoder().decode([ActiveSessionRecord].self, from: Data(contentsOf: file))
-        } catch {
-            sessions = []
-        }
+        sessions = try withPersistenceErrors { try storage.read() }
     }
 
     public func register(_ record: ActiveSessionRecord) throws {
         try validateSessionPathComponent(record.sessionID.rawValue)
-        try ensureLoadedIfNeeded()
-        sessions.removeAll { $0.sessionID == record.sessionID }
-        sessions.append(record)
-        try persist()
+        sessions = try withPersistenceErrors {
+            try storage.modify { records in
+                records.removeAll { $0.sessionID == record.sessionID }
+                records.append(record)
+                return records
+            }
+        }
     }
 
     public func unregister(sessionID: SessionID) throws -> Bool {
-        try ensureLoadedIfNeeded()
-        let oldCount = sessions.count
-        sessions.removeAll { $0.sessionID == sessionID }
-        if oldCount != sessions.count { try persist(); return true }
-        return false
+        try validateSessionPathComponent(sessionID.rawValue)
+        let result = try withPersistenceErrors {
+            try storage.modify { records in
+                let previousCount = records.count
+                records.removeAll { $0.sessionID == sessionID }
+                return (records, previousCount != records.count)
+            }
+        }
+        sessions = result.0
+        return result.1
+    }
+
+    /// A contended shutdown must not hang; the next startup reaps its orphan.
+    public func tryUnregister(sessionID: SessionID) throws -> Bool {
+        try validateSessionPathComponent(sessionID.rawValue)
+        let updated = try withPersistenceErrors {
+            try storage.tryModify { records in
+                records.removeAll { $0.sessionID == sessionID }
+                return records
+            }
+        }
+        guard let updated else { return false }
+        sessions = updated
+        return true
     }
 
     public func list() throws -> [ActiveSessionRecord] {
-        try ensureLoadedIfNeeded()
+        sessions = try withPersistenceErrors { try storage.read() }
         return sessions.sorted { $0.sessionID.rawValue < $1.sessionID.rawValue }
     }
 
     public func collectCrashed(alivePIDs: Set<UInt32>) throws -> [ActiveSessionRecord] {
-        try ensureLoadedIfNeeded()
-        let crashed = sessions.filter { !alivePIDs.contains($0.pid) }
-        sessions.removeAll { !alivePIDs.contains($0.pid) }
-        if !crashed.isEmpty { try persist() }
-        return crashed.sorted { $0.sessionID.rawValue < $1.sessionID.rawValue }
+        try collectCrashed(whereAlive: { alivePIDs.contains($0) })
     }
 
-    private func ensureLoadedIfNeeded() throws {
-        if sessions.isEmpty {
-            try load()
+    public func collectCrashed() throws -> [ActiveSessionRecord] {
+        try collectCrashed(whereAlive: ActiveSessionProcessLiveness.isAlive)
+    }
+
+    private func collectCrashed(
+        whereAlive isAlive: (UInt32) -> Bool
+    ) throws -> [ActiveSessionRecord] {
+        let result = try withPersistenceErrors {
+            try storage.modify { records in
+                var crashed: [ActiveSessionRecord] = []
+                records.removeAll { record in
+                    guard !isAlive(record.pid) else { return false }
+                    crashed.append(record)
+                    return true
+                }
+                return (records, crashed)
+            }
         }
+        sessions = result.0
+        return result.1.sorted { $0.sessionID.rawValue < $1.sessionID.rawValue }
     }
 
-    private func persist() throws {
+    private func withPersistenceErrors<Value>(
+        _ operation: () throws -> Value
+    ) throws -> Value {
         do {
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            let data = try encoder.encode(sessions)
-            let temporary = root.appendingPathComponent("\(Self.dataFileName).tmp")
-            try data.write(to: temporary, options: .atomic)
-            try atomicallyReplaceItem(
-                at: root.appendingPathComponent(Self.dataFileName),
-                with: temporary
-            )
+            return try operation()
+        } catch let error as ShellSessionSupportError {
+            throw error
         } catch {
-            throw ShellSessionSupportError.persistence(error.localizedDescription)
+            throw ShellSessionSupportError.persistence(String(describing: error))
         }
     }
 }

@@ -343,11 +343,18 @@ public struct OpenGrokShellStartupReport: Sendable, Equatable {
     public let restoredWorkflowRuns: Int
     public let activeSessionCount: Int
     public let state: OpenGrokShellState
+    public let crashedSessions: [ActiveSessionRecord]
 
-    public init(restoredWorkflowRuns: Int, activeSessionCount: Int, state: OpenGrokShellState) {
+    public init(
+        restoredWorkflowRuns: Int,
+        activeSessionCount: Int,
+        state: OpenGrokShellState,
+        crashedSessions: [ActiveSessionRecord] = []
+    ) {
         self.restoredWorkflowRuns = restoredWorkflowRuns
         self.activeSessionCount = activeSessionCount
         self.state = state
+        self.crashedSessions = crashedSessions
     }
 }
 
@@ -356,12 +363,20 @@ public struct OpenGrokShellShutdownReport: Sendable, Equatable {
     public let cancelledTurnCount: Int
     public let timedOut: Bool
     public let state: OpenGrokShellState
+    public let deferredSessionCleanupCount: Int
 
-    public init(closedSessionCount: Int, cancelledTurnCount: Int, timedOut: Bool, state: OpenGrokShellState) {
+    public init(
+        closedSessionCount: Int,
+        cancelledTurnCount: Int,
+        timedOut: Bool,
+        state: OpenGrokShellState,
+        deferredSessionCleanupCount: Int = 0
+    ) {
         self.closedSessionCount = closedSessionCount
         self.cancelledTurnCount = cancelledTurnCount
         self.timedOut = timedOut
         self.state = state
+        self.deferredSessionCleanupCount = deferredSessionCleanupCount
     }
 }
 
@@ -956,12 +971,14 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         do {
             let restored = try await configuration.workflowStore.restore()
             try await configuration.activeSessionRegistry.load()
+            let crashed = try await configuration.activeSessionRegistry.collectCrashed()
             let activeCount = try await configuration.activeSessionRegistry.list().count
             state = .running
             let report = OpenGrokShellStartupReport(
                 restoredWorkflowRuns: restored.count,
                 activeSessionCount: activeCount,
-                state: state
+                state: state,
+                crashedSessions: crashed
             )
             startupReport = report
             await eventHub.emit(.startupCompleted(report))
@@ -1291,12 +1308,19 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         }
         if !processWorkFinished { timedOut = true }
 
+        var deferredSessionCleanupCount = 0
         for (sessionID, var session) in sessionValues {
             session.phase = .shuttingDown
             sessions[sessionID] = session
             try? await persistSession(sessionID)
             await session.acp.runtime.close()
-            _ = try? await configuration.activeSessionRegistry.unregister(sessionID: sessionID)
+            do {
+                if try await configuration.activeSessionRegistry.tryUnregister(sessionID: sessionID) == false {
+                    deferredSessionCleanupCount += 1
+                }
+            } catch {
+                deferredSessionCleanupCount += 1
+            }
             sessions.removeValue(forKey: sessionID)
             await eventHub.emit(.sessionClosed(sessionID))
         }
@@ -1311,7 +1335,8 @@ public actor OpenGrokShell: OpenGrokShellFacade {
             closedSessionCount: sessionValues.count,
             cancelledTurnCount: handles.count,
             timedOut: timedOut,
-            state: state
+            state: state,
+            deferredSessionCleanupCount: deferredSessionCleanupCount
         )
         await eventHub.emit(.shutdownCompleted(report))
         await eventHub.finish()
