@@ -55,6 +55,7 @@ public struct MCPStdioTransportConfiguration: Sendable, Equatable {
 /// so every access is lock-guarded.
 private final class MCPStdioLineSink: @unchecked Sendable {
     private let lock = NSLock()
+    private let eventEmitter: MCPTransportEventEmitter
     private var activeRequests: Set<JsonRpcId> = []
     private var pending: [JsonRpcId: MCPWireMessage] = [:]
     private var buffer = Data()
@@ -66,10 +67,16 @@ private final class MCPStdioLineSink: @unchecked Sendable {
     /// Guards against a runaway server emitting one unbounded line.
     private static let maxLineBytes = 32 * 1024 * 1024
 
+    init(eventEmitter: MCPTransportEventEmitter) {
+        self.eventEmitter = eventEmitter
+    }
+
     func ingest(_ data: Data) {
         var resumptions: [(CheckedContinuation<MCPWireMessage?, Never>, MCPWireMessage?)] = []
+        var notifications: [MCPNotification] = []
 
         lock.lock()
+        let wasClosed = closed
         if data.isEmpty {
             closed = true
             resumptions = waiters.values.map { ($0, nil) }
@@ -87,15 +94,22 @@ private final class MCPStdioLineSink: @unchecked Sendable {
                 let line = String(decoding: lineData, as: UTF8.self)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !line.isEmpty,
-                      let message = try? MCPWireCodec.decodeString(line),
-                      case .response(let response) = message,
-                      activeRequests.contains(response.id) else {
+                      let message = try? MCPWireCodec.decodeString(line) else {
                     continue
                 }
-                if let continuation = waiters.removeValue(forKey: response.id) {
-                    resumptions.append((continuation, message))
-                } else {
-                    pending[response.id] = message
+
+                switch message {
+                case .notification(let notification):
+                    notifications.append(notification)
+                case .response(let response):
+                    guard activeRequests.contains(response.id) else { continue }
+                    if let continuation = waiters.removeValue(forKey: response.id) {
+                        resumptions.append((continuation, message))
+                    } else {
+                        pending[response.id] = message
+                    }
+                case .request:
+                    continue
                 }
             }
             if buffer.count > Self.maxLineBytes {
@@ -107,8 +121,15 @@ private final class MCPStdioLineSink: @unchecked Sendable {
                 waiters.removeAll()
             }
         }
+        let becameClosed = closed && !wasClosed
         lock.unlock()
 
+        for notification in notifications {
+            eventEmitter.notification(notification)
+        }
+        if becameClosed {
+            eventEmitter.transportClosed()
+        }
         for (continuation, message) in resumptions {
             continuation.resume(returning: message)
         }
@@ -180,7 +201,8 @@ public actor MCPStdioTransport: MCPTransport {
     private let stdinPipe = Pipe()
     private let stdoutPipe = Pipe()
     private let stderrPipe = Pipe()
-    private let sink = MCPStdioLineSink()
+    private let sink: MCPStdioLineSink
+    private let eventEmitter: MCPTransportEventEmitter
     private var started = false
     private var isClosed = false
     private var pendingRequestIDs: Set<JsonRpcId> = []
@@ -192,6 +214,17 @@ public actor MCPStdioTransport: MCPTransport {
         self.configuration = configuration
         self.launchTransform = launchTransform
         self.process = Process()
+        let eventEmitter = MCPTransportEventEmitter()
+        self.eventEmitter = eventEmitter
+        self.sink = MCPStdioLineSink(eventEmitter: eventEmitter)
+    }
+
+    public func setEventSink(
+        _ events: MCPEventStream?,
+        serverName: String,
+        clientID: UInt64 = 0
+    ) {
+        eventEmitter.configure(events, serverName: serverName, clientID: clientID)
     }
 
     /// Spawns the child. Safe to call repeatedly; only the first call starts it.
@@ -259,6 +292,28 @@ public actor MCPStdioTransport: MCPTransport {
     }
 
     public func send(_ message: MCPWireMessage) async throws -> MCPWireMessage? {
+        let isInitialize: Bool
+        if case .request(let request) = message {
+            isInitialize = request.method == MCPMethod.initialize
+        } else {
+            isInitialize = false
+        }
+
+        do {
+            let response = try await sendMessage(message)
+            if isInitialize, case .response(let payload)? = response {
+                eventEmitter.initialized(payload)
+            }
+            return response
+        } catch {
+            if isInitialize {
+                eventEmitter.handshakeFailed(error)
+            }
+            throw error
+        }
+    }
+
+    private func sendMessage(_ message: MCPWireMessage) async throws -> MCPWireMessage? {
         guard !isClosed else { throw MCPError.transportClosed }
         if !started { try start() }
 

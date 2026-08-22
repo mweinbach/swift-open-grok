@@ -26,6 +26,8 @@ private actor ACPTransportWriter {
 
 public actor ACPAgentRuntime {
     public typealias NotificationSink = @Sendable (ACPMessage) async -> Void
+    public typealias SessionOpenedHook = @Sendable (AcpSessionId, AcpMeta?) async throws -> Void
+    public typealias SessionClosedHook = @Sendable (AcpSessionId) async -> Void
 
     private let configuration: ACPAgentConfiguration
     private let store: any ACPSessionStore
@@ -38,6 +40,8 @@ public actor ACPAgentRuntime {
     /// and an unmatched name is ignored, not answered with an error.
     private let extensionNotifications: ACPExtensionNotificationRouter?
     private let reverseRequests: ACPReverseRequestBroker
+    private let onSessionOpened: SessionOpenedHook?
+    private let onSessionClosed: SessionClosedHook?
     private let makeSessionId: @Sendable () -> String
     private let timestamp: @Sendable () -> String
     private let rosterTimestampMilliseconds: @Sendable () -> Int64
@@ -52,6 +56,7 @@ public actor ACPAgentRuntime {
     private var notificationSink: NotificationSink?
     private var rosterNotificationSink: NotificationSink?
     private var reverseSender: (@Sendable (ACPMessage) async throws -> Void)?
+    private var openedLifecycleSessions: Set<AcpSessionId> = []
 
     private struct RosterMetadata: Sendable {
         var title: String?
@@ -67,6 +72,8 @@ public actor ACPAgentRuntime {
         extensionHandler: (any ACPAgentExtensionHandler)? = nil,
         extensionNotifications: ACPExtensionNotificationRouter? = nil,
         reverseRequests: ACPReverseRequestBroker = ACPReverseRequestBroker(),
+        onSessionOpened: SessionOpenedHook? = nil,
+        onSessionClosed: SessionClosedHook? = nil,
         makeSessionId: @escaping @Sendable () -> String = { UUID().uuidString },
         timestamp: @escaping @Sendable () -> String = { ISO8601DateFormatter().string(from: Date()) },
         rosterTimestampMilliseconds: @escaping @Sendable () -> Int64 = {
@@ -88,6 +95,8 @@ public actor ACPAgentRuntime {
         }
         self.extensionNotifications = extensionNotifications
         self.reverseRequests = reverseRequests
+        self.onSessionOpened = onSessionOpened
+        self.onSessionClosed = onSessionClosed
         self.makeSessionId = makeSessionId
         self.timestamp = timestamp
         self.rosterTimestampMilliseconds = rosterTimestampMilliseconds
@@ -107,6 +116,10 @@ public actor ACPAgentRuntime {
 
     public func setReverseSender(_ sender: (@Sendable (ACPMessage) async throws -> Void)?) {
         reverseSender = sender
+    }
+
+    public func hasConnectedReverseClient() -> Bool {
+        state != .closed && reverseSender != nil
     }
 
     public func requestClient(method: String, params: JSONValue) async throws -> JSONValue {
@@ -186,6 +199,13 @@ public actor ACPAgentRuntime {
             task.cancel()
         }
         activePrompts.removeAll()
+        let sessions = openedLifecycleSessions
+        openedLifecycleSessions.removeAll()
+        if let onSessionClosed {
+            for session in sessions {
+                await onSessionClosed(session)
+            }
+        }
         await reverseRequests.cancelAll()
         rosterNotificationSink = nil
         reverseSender = nil
@@ -445,12 +465,18 @@ public actor ACPAgentRuntime {
             throw ACPRuntimeError.protocolVersionUnsupported(request.protocolVersion)
         }
         state = .initialized
+        var meta = configuration.meta ?? [:]
+        if onSessionOpened != nil && reverseSender != nil {
+            meta["x.ai/mcp/sdk"] = .bool(true)
+        } else {
+            meta.removeValue(forKey: "x.ai/mcp/sdk")
+        }
         return try encode(InitializeResponse(
             protocolVersion: configuration.protocolVersion,
             agentCapabilities: configuration.agentCapabilities,
             authMethods: configuration.authMethods,
             agentInfo: configuration.agentInfo,
-            meta: configuration.meta
+            meta: meta.isEmpty ? nil : meta
         ))
     }
 
@@ -488,7 +514,13 @@ public actor ACPAgentRuntime {
             createdAt: timestamp(),
             updatedAt: timestamp()
         )
-        try await store.create(session)
+        try await openSessionLifecycle(sessionId: session.sessionId, meta: request.meta)
+        do {
+            try await store.create(session)
+        } catch {
+            await closeSessionLifecycle(sessionId: session.sessionId)
+            throw error
+        }
         rosterMetadata[session.sessionId] = RosterMetadata(
             title: nil,
             yolo: Self.metaBool(request.meta, key: "yoloMode") ?? false
@@ -512,7 +544,17 @@ public actor ACPAgentRuntime {
         session.mcpServers = request.mcpServers
         session.closed = false
         session.updatedAt = timestamp()
-        try await store.update(session)
+        if request.meta != nil {
+            try await openSessionLifecycle(sessionId: session.sessionId, meta: request.meta)
+        }
+        do {
+            try await store.update(session)
+        } catch {
+            if request.meta != nil {
+                await closeSessionLifecycle(sessionId: session.sessionId)
+            }
+            throw error
+        }
         updateRosterMetadata(sessionId: session.sessionId, meta: request.meta)
         await replay(session)
         await publishRosterUpsert(sessionId: session.sessionId)
@@ -536,7 +578,17 @@ public actor ACPAgentRuntime {
         }
         session.closed = false
         session.updatedAt = timestamp()
-        try await store.update(session)
+        if request.meta != nil {
+            try await openSessionLifecycle(sessionId: session.sessionId, meta: request.meta)
+        }
+        do {
+            try await store.update(session)
+        } catch {
+            if request.meta != nil {
+                await closeSessionLifecycle(sessionId: session.sessionId)
+            }
+            throw error
+        }
         updateRosterMetadata(sessionId: session.sessionId, meta: request.meta)
         await replay(session)
         await publishRosterUpsert(sessionId: session.sessionId)
@@ -609,10 +661,31 @@ public actor ACPAgentRuntime {
         session.closed = true
         session.updatedAt = timestamp()
         try await store.update(session)
+        await closeSessionLifecycle(sessionId: request.sessionId)
         await publishRosterRemoved(sessionId: request.sessionId)
         rosterMetadata.removeValue(forKey: request.sessionId)
         pendingRosterInteractions.removeValue(forKey: request.sessionId)
         return try encode(CloseSessionResponse())
+    }
+
+    private func openSessionLifecycle(sessionId: AcpSessionId, meta: AcpMeta?) async throws {
+        guard let onSessionOpened else { return }
+        do {
+            try await onSessionOpened(sessionId, meta)
+            guard state != .closed else {
+                throw ACPRuntimeError.transport("ACP client disconnected while opening its session")
+            }
+            openedLifecycleSessions.insert(sessionId)
+        } catch {
+            await onSessionClosed?(sessionId)
+            openedLifecycleSessions.remove(sessionId)
+            throw error
+        }
+    }
+
+    private func closeSessionLifecycle(sessionId: AcpSessionId) async {
+        guard openedLifecycleSessions.remove(sessionId) != nil else { return }
+        await onSessionClosed?(sessionId)
     }
 
     private func prompt(_ params: JSONValue) async throws -> JSONValue {

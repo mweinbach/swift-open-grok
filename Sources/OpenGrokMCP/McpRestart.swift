@@ -164,7 +164,7 @@ public extension McpRestartActions {
 public final class McpRestartCancellationToken: @unchecked Sendable {
     private let lock = NSLock()
     private var isCancelledFlag = false
-    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
 
     public init() {}
 
@@ -176,7 +176,7 @@ public final class McpRestartCancellationToken: @unchecked Sendable {
         let resumeList: [CheckedContinuation<Void, Never>] = lock.withLock {
             guard !isCancelledFlag else { return [] }
             isCancelledFlag = true
-            let list = continuations
+            let list = Array(continuations.values)
             continuations.removeAll()
             return list
         }
@@ -186,21 +186,27 @@ public final class McpRestartCancellationToken: @unchecked Sendable {
     }
 
     public func cancelled() async {
-        let alreadyCancelled: Bool = lock.withLock { isCancelledFlag }
-        if alreadyCancelled { return }
+        guard !Task.isCancelled, !isCancelled else { return }
+        let identifier = UUID()
 
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let shouldResumeImmediately: Bool = lock.withLock {
-                if isCancelledFlag {
-                    return true
-                } else {
-                    continuations.append(continuation)
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let shouldResumeImmediately: Bool = lock.withLock {
+                    if isCancelledFlag || Task.isCancelled {
+                        return true
+                    }
+                    continuations[identifier] = continuation
                     return false
                 }
+                if shouldResumeImmediately {
+                    continuation.resume()
+                }
             }
-            if shouldResumeImmediately {
-                continuation.resume()
+        } onCancel: {
+            let continuation = self.lock.withLock {
+                self.continuations.removeValue(forKey: identifier)
             }
+            continuation?.resume()
         }
     }
 }
@@ -222,38 +228,54 @@ public enum McpRestart {
         sleeper: Sleeper? = nil,
         onStateChange: (@Sendable (McpRestartState) async -> Void)? = nil
     ) async -> Bool {
+        await scheduleRestartTask(
+            actions: actions,
+            sessionId: sessionId,
+            server: server,
+            kind: kind,
+            cancellationToken: cancellationToken,
+            sleeper: sleeper,
+            onStateChange: onStateChange
+        ) != nil
+    }
+
+    /// Returns the supervised restart task so its owner can cancel and join it.
+    public static func scheduleRestartTask(
+        actions: any McpRestartActions,
+        sessionId: String,
+        server: String,
+        kind: McpClientEventKind,
+        cancellationToken: McpRestartCancellationToken? = nil,
+        sleeper: Sleeper? = nil,
+        onStateChange: (@Sendable (McpRestartState) async -> Void)? = nil
+    ) async -> Task<Void, Never>? {
         // Guard 1: Non-restart event kind — only transportClosed / handshakeFailed trigger restarts.
         guard kind.isRestartTrigger else {
-            return false
+            return nil
         }
 
         // Guard 2: Already-empty — a previous handshake exhausted attempts.
         if let stateKind = await actions.serverClientStateKind(server: server), stateKind == .empty {
-            return false
+            return nil
         }
 
         // Guard 3: Intentional shutdown / killOnDrop.
         if await actions.isInShuttingDown(server: server) {
-            return false
+            return nil
         }
 
         // Guard 4: Stdio only — must be currently configured as stdio and enabled.
         // Non-stdio (HTTP/OAuth) returns false here, skipping auto-restart.
         guard await actions.isStdioServerConfigured(server: server) else {
-            return false
+            return nil
         }
 
         // Guard 5: Dedup against an already-in-flight restart task.
         guard await actions.beginRestart(server: server) else {
-            return false
+            return nil
         }
 
-        Task {
-            defer {
-                Task {
-                    await actions.endRestart(server: server)
-                }
-            }
+        return Task {
             await autoRestartStdio(
                 actions: actions,
                 sessionId: sessionId,
@@ -262,8 +284,8 @@ public enum McpRestart {
                 sleeper: sleeper,
                 onStateChange: onStateChange
             )
+            await actions.endRestart(server: server)
         }
-        return true
     }
 
     /// One-shot bounded stdio restart loop: sleeps backoff, re-checks guard rails, and calls `respawnStdio`.
@@ -432,35 +454,45 @@ public enum McpRestart {
         cancellationToken: McpRestartCancellationToken? = nil,
         sleeper: Sleeper? = nil
     ) async -> Bool {
+        await scheduleHttpRecoveryTask(
+            actions: actions,
+            server: server,
+            cancellationToken: cancellationToken,
+            sleeper: sleeper
+        ) != nil
+    }
+
+    /// Returns the supervised in-place HTTP recovery task for deterministic teardown.
+    public static func scheduleHttpRecoveryTask(
+        actions: any McpRestartActions,
+        server: String,
+        cancellationToken: McpRestartCancellationToken? = nil,
+        sleeper: Sleeper? = nil
+    ) async -> Task<Void, Never>? {
         // Guard 1: Intentional teardown
         if await actions.isInShuttingDown(server: server) {
-            return false
+            return nil
         }
 
         // Guard 2: Must be an enabled HTTP/SSE entry
         guard await actions.isHttpServerConfigured(server: server) else {
-            return false
+            return nil
         }
 
         // Guard 3: Dedup in-flight restart/recovery task
         guard await actions.beginRestart(server: server) else {
-            return false
+            return nil
         }
 
-        Task {
-            defer {
-                Task {
-                    await actions.endRestart(server: server)
-                }
-            }
+        return Task {
             await httpRecoveryLoop(
                 actions: actions,
                 server: server,
                 cancellationToken: cancellationToken,
                 sleeper: sleeper
             )
+            await actions.endRestart(server: server)
         }
-        return true
     }
 
     /// Retry loop backing HTTP recovery: immediate attempt, then back off on `HTTP_RECOVERY_BACKOFF`.

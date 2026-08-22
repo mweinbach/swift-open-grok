@@ -88,6 +88,8 @@ public struct ACPExtensionNotificationRouter: Sendable {
 /// router retains its handlers, the handlers retain this gateway, and a
 /// strong runtime reference here would complete a cycle.
 public actor ACPNotificationGateway {
+    public typealias ReverseRequester = @Sendable (String, JSONValue) async throws -> JSONValue
+
     private weak var runtime: ACPAgentRuntime?
     /// Process-global monotonic event counter, the port of `EVENT_COUNTER`
     /// (`xai-grok-shell-base/src/util/event_id.rs:24-27`): one sequence per
@@ -98,6 +100,46 @@ public actor ACPNotificationGateway {
 
     public func attach(_ runtime: ACPAgentRuntime) {
         self.runtime = runtime
+    }
+
+    /// A weak runtime reference alone is not a usable reverse bridge: a
+    /// connected stdio/channel sender must also have been installed.
+    public func hasConnectedRuntime() async -> Bool {
+        guard let runtime else { return false }
+        return await runtime.hasConnectedReverseClient()
+    }
+
+    /// Bind reverse requests to the connection that owns the current session.
+    /// The gateway itself is repointed when a WebSocket client reconnects;
+    /// looking its runtime up again at request time would send an older
+    /// session's server payload to the newer, unrelated client.
+    public func connectedReverseRequester() async throws -> ReverseRequester {
+        guard let runtime else {
+            throw ACPRuntimeError.transport("no ACP runtime is attached")
+        }
+        guard await runtime.hasConnectedReverseClient() else {
+            throw ACPRuntimeError.transport("no ACP client is connected")
+        }
+
+        return { [weak runtime] method, params in
+            guard let runtime else {
+                throw ACPRuntimeError.transport("the owning ACP runtime has disconnected")
+            }
+            guard await runtime.hasConnectedReverseClient() else {
+                throw ACPRuntimeError.transport("the owning ACP client has disconnected")
+            }
+            return try await runtime.requestClient(method: method, params: params)
+        }
+    }
+
+    /// Correlated agent-to-client request on the actual attached ACP carrier.
+    /// Unlike notifications, dropping a request would silently grant a bridge
+    /// that cannot exist, so an absent runtime is always an explicit failure.
+    public func requestClient(method: String, params: JSONValue) async throws -> JSONValue {
+        guard let runtime else {
+            throw ACPRuntimeError.transport("no ACP runtime is attached")
+        }
+        return try await runtime.requestClient(method: method, params: params)
     }
 
     /// Whether the attached runtime knows `sessionId`. The recap ext method

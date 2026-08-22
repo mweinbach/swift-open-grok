@@ -81,6 +81,7 @@ public actor MCPHTTPTransport: MCPTransport {
     private let httpTransport: any HTTPTransport
     private let configuration: MCPHTTPTransportConfiguration
     private let authorization: (any MCPAuthorizationProviding)?
+    private let eventEmitter = MCPTransportEventEmitter()
     private var sessionID: String?
     private var isClosed = false
 
@@ -96,7 +97,39 @@ public actor MCPHTTPTransport: MCPTransport {
 
     public var currentSessionID: String? { sessionID }
 
+    public func setEventSink(
+        _ events: MCPEventStream?,
+        serverName: String,
+        clientID: UInt64 = 0
+    ) {
+        eventEmitter.configure(events, serverName: serverName, clientID: clientID)
+    }
+
     public func send(_ message: MCPWireMessage) async throws -> MCPWireMessage? {
+        let isInitialize: Bool
+        if case .request(let request) = message {
+            isInitialize = request.method == MCPMethod.initialize
+        } else {
+            isInitialize = false
+        }
+
+        do {
+            let response = try await sendMessage(message)
+            if isInitialize, case .response(let payload)? = response {
+                eventEmitter.initialized(payload)
+            } else if isInitialize, response == nil {
+                eventEmitter.handshakeFailed(MCPError.transport("MCP initialize returned no response"))
+            }
+            return response
+        } catch {
+            if isInitialize {
+                eventEmitter.handshakeFailed(error)
+            }
+            throw error
+        }
+    }
+
+    private func sendMessage(_ message: MCPWireMessage) async throws -> MCPWireMessage? {
         guard !isClosed else { throw MCPError.transportClosed }
         let body = try MCPWireCodec.encode(message)
 
@@ -174,6 +207,7 @@ public actor MCPHTTPTransport: MCPTransport {
 
     public func close() {
         isClosed = true
+        eventEmitter.transportClosed()
     }
 
     private func decodeHTTPBody(
@@ -195,6 +229,10 @@ public actor MCPHTTPTransport: MCPTransport {
             defer { eventData.removeAll(keepingCapacity: true) }
 
             let message = try MCPWireCodec.decodeString(eventData.joined(separator: "\n"))
+            if case .notification(let notification) = message {
+                eventEmitter.notification(notification)
+                if requestID != nil { return nil }
+            }
             guard let requestID else { return message }
             guard case .response(let response) = message, response.id == requestID else {
                 return nil
@@ -202,11 +240,15 @@ public actor MCPHTTPTransport: MCPTransport {
             return message
         }
 
+        var matchedMessage: MCPWireMessage?
+
         // CRLF is one Swift Character, so checking against "\r" and "\n"
         // separately misses the most common HTTP event-stream delimiter.
         for line in text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
             if line.isEmpty {
-                if let message = try matchingMessage() { return message }
+                if let message = try matchingMessage(), matchedMessage == nil {
+                    matchedMessage = message
+                }
                 continue
             }
 
@@ -216,7 +258,10 @@ public actor MCPHTTPTransport: MCPTransport {
             eventData.append(String(value))
         }
 
-        if let message = try matchingMessage() { return message }
+        if let message = try matchingMessage(), matchedMessage == nil {
+            matchedMessage = message
+        }
+        if let matchedMessage { return matchedMessage }
         guard sawDataEvent else {
             throw MCPError.parse("MCP event stream contained no data event")
         }

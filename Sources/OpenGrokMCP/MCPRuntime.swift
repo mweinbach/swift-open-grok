@@ -130,6 +130,7 @@ public actor MCPServer {
     }
 
     public func close() {
+        guard serverState != .closed else { return }
         for task in inFlight.values { task.cancel() }
         inFlight.removeAll()
         cancellationReasons.removeAll()
@@ -354,6 +355,18 @@ public actor MCPClient {
 
     public func initializeResultValue() -> MCPInitializeResult? { initializeResult }
 
+    public func setEventSink(
+        _ events: MCPEventStream?,
+        serverName: String,
+        clientID: UInt64 = 0
+    ) async {
+        if let stdio = transport as? MCPStdioTransport {
+            await stdio.setEventSink(events, serverName: serverName, clientID: clientID)
+        } else if let http = transport as? MCPHTTPTransport {
+            await http.setEventSink(events, serverName: serverName, clientID: clientID)
+        }
+    }
+
     public func initialize() async throws -> MCPInitializeResult {
         guard clientState == .disconnected else {
             if clientState == .closed { throw MCPError.transportClosed }
@@ -445,13 +458,15 @@ public actor MCPClient {
     }
 
     public func close() async {
-        if clientState == .initialized || clientState == .shuttingDown {
+        guard clientState != .closed else { return }
+        let shouldSendExit = clientState == .initialized || clientState == .shuttingDown
+        clientState = .closed
+        if shouldSendExit {
             try? await performNotification(MCPNotification(method: MCPMethod.exit))
         }
         await transport.close()
         pending.values.forEach { $0.cancel() }
         pending.removeAll()
-        clientState = .closed
     }
 
     private func requestTyped<Params: Encodable & Sendable, Response: Decodable & Sendable>(
