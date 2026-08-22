@@ -1358,7 +1358,7 @@ struct ParityCompositionTests {
     }
 
     @Test("live streaming JSON reports structured tool lifecycle events")
-    func liveStreamingJSONToolLifecycleComposition() async {
+    func liveStreamingJSONToolLifecycleComposition() async throws {
         for outputFormat in ["streaming-json", "streaming-messages-json"] {
             let backend = ParityShellCommandBackend()
             let sampler = ParityToolLoopSamplerFixture()
@@ -1391,20 +1391,48 @@ struct ParityCompositionTests {
             let records = out.contents.split(separator: "\n").compactMap { line in
                 try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
             }
-            let toolRecords = records.filter { $0["type"] as? String == "tool" }
-
             #expect(code == CLIRunner.ExitCode.success.rawValue)
-            #expect(toolRecords.count == 2)
-            #expect(toolRecords[0]["call_id"] as? String == "call-1")
-            #expect(toolRecords[0]["name"] as? String == "run_terminal_cmd")
-            #expect(toolRecords[0]["input"] as? String == #"{"command":"printf tool-output","description":"parity tool"}"#)
-            #expect(toolRecords[0]["state"] as? String == "running")
-            #expect(toolRecords[0]["output"] is NSNull)
-            #expect(toolRecords[1]["call_id"] as? String == "call-1")
-            #expect(toolRecords[1]["state"] as? String == "succeeded")
-            #expect((toolRecords[1]["output"] as? String)?.contains("tool output") == true)
-            #expect(records.contains { $0["type"] as? String == "completed" })
-            if outputFormat == "streaming-messages-json" {
+            if outputFormat == "streaming-json" {
+                let toolRecords = records.filter { $0["type"] as? String == "tool" }
+                try #require(toolRecords.count == 2)
+                #expect(toolRecords[0]["call_id"] as? String == "call-1")
+                #expect(toolRecords[0]["name"] as? String == "run_terminal_cmd")
+                #expect(toolRecords[0]["input"] as? String == #"{"command":"printf tool-output","description":"parity tool"}"#)
+                #expect(toolRecords[0]["state"] as? String == "running")
+                #expect(toolRecords[0]["output"] is NSNull)
+                #expect(toolRecords[1]["call_id"] as? String == "call-1")
+                #expect(toolRecords[1]["state"] as? String == "succeeded")
+                #expect((toolRecords[1]["output"] as? String)?.contains("tool output") == true)
+                #expect(records.contains { $0["type"] as? String == "completed" })
+            } else {
+                let toolUses = records
+                    .filter { $0["type"] as? String == "assistant" }
+                    .compactMap { $0["message"] as? [String: Any] }
+                    .flatMap { $0["content"] as? [[String: Any]] ?? [] }
+                    .filter { $0["type"] as? String == "tool_use" }
+                try #require(toolUses.count == 1)
+                #expect(toolUses[0]["id"] as? String == "call-1")
+                #expect(toolUses[0]["name"] as? String == "run_terminal_cmd")
+                let toolInput = try #require(toolUses[0]["input"] as? [String: Any])
+                #expect(toolInput["command"] as? String == "printf tool-output")
+                #expect(toolInput["description"] as? String == "parity tool")
+
+                let toolResults = records
+                    .filter { $0["type"] as? String == "user" }
+                    .compactMap { $0["message"] as? [String: Any] }
+                    .flatMap { $0["content"] as? [[String: Any]] ?? [] }
+                    .filter { $0["type"] as? String == "tool_result" }
+                try #require(toolResults.count == 1)
+                #expect(toolResults[0]["tool_use_id"] as? String == "call-1")
+                #expect((toolResults[0]["content"] as? String)?.contains("tool output") == true)
+                #expect(toolResults[0]["is_error"] as? Bool == false)
+
+                let terminalRecords = records.filter { $0["type"] as? String == "result" }
+                try #require(terminalRecords.count == 1)
+                #expect(records.last?["type"] as? String == "result")
+                #expect(terminalRecords[0]["subtype"] as? String == "success")
+                #expect(records.contains { $0["type"] as? String == "tool" } == false)
+                #expect(records.contains { $0["type"] as? String == "completed" } == false)
                 #expect(records.contains { $0["type"] as? String == "status" } == false)
             }
         }
@@ -1550,6 +1578,8 @@ struct ParityCompositionTests {
         // subagents are enabled and the built-in roster is non-empty
         // (builder.rs:848-896). `LiveSubagentToolTests` pins the gates and
         // the end-to-end spawn.
+        // The shared session bus also offers discovery, transcript reads, and
+        // peer delivery independently of the selected sampling provider.
         let advertised = Set(requests.first?.tools.map(\.name) ?? [])
         #expect(advertised == Set([
             "run_terminal_cmd", "read_file", "list_dir", "grep",
@@ -1558,6 +1588,7 @@ struct ParityCompositionTests {
             "get_command_or_subagent_output", "wait_commands_or_subagents", "kill_command_or_subagent",
             "spawn_subagent", "agent_swarm", "swarm_wait",
             "list_agents", "send_message", "followup_task", "wait_agent",
+            "list_sessions", "read_session", "message_session",
             "enter_plan_mode", "exit_plan_mode",
             "web_search", "web_fetch", "x_search",
             "search_tool", "use_tool",
@@ -3150,7 +3181,7 @@ struct ParityCompositionTests {
     }
 
     @Test("streaming JSON forwards assistant deltas in order without coalescing them")
-    func liveStreamingJSONAssistantDeltaOrdering() async {
+    func liveStreamingJSONAssistantDeltaOrdering() async throws {
         for outputFormat in ["streaming-json", "streaming-messages-json"] {
             let deltas = ["The ", "answer ", "arrives ", "in pieces."]
             let sampler = ParityStreamingSamplerFixture(deltas: deltas)
@@ -3163,12 +3194,17 @@ struct ParityCompositionTests {
             let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
             let (streams, out, _) = CLIStreams.buffered()
 
+            var arguments = [
+                "headless", "--prompt", "stream it",
+                "--cwd", root.path,
+                "--output-format", outputFormat,
+            ]
+            if outputFormat == "streaming-messages-json" {
+                arguments.append("--include-partial-messages")
+            }
+
             let code = await CLIRunner.run(
-                [
-                    "headless", "--prompt", "stream it",
-                    "--cwd", root.path,
-                    "--output-format", outputFormat
-                ],
+                arguments,
                 environment: [
                     "HOME": root.path,
                     "OPENGROK_HOME": root.appendingPathComponent("state").path,
@@ -3178,22 +3214,79 @@ struct ParityCompositionTests {
                 application: application
             )
 
-            let records = out.contents.split(separator: "\n").compactMap { line in
-                try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            let lines = out.contents.split(separator: "\n")
+            try #require(!lines.isEmpty)
+            let records = try lines.map { line in
+                try #require(
+                    JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+                )
             }
-            let textType = outputFormat == "streaming-messages-json" ? "assistant" : "output"
-            let textRecords = records.filter { $0["type"] as? String == textType }
-            let contents = textRecords.compactMap { $0["content"] as? String }
-
             #expect(code == CLIRunner.ExitCode.success.rawValue)
-            #expect(contents == deltas)
-            #expect(contents.joined() == sampler.answer)
-            // The terminal event must not overtake the deltas that precede it.
-            let completedIndex = records.firstIndex { $0["type"] as? String == "completed" }
-            let lastTextIndex = records.lastIndex { $0["type"] as? String == textType }
-            #expect(completedIndex != nil)
-            if let completedIndex, let lastTextIndex {
+
+            if outputFormat == "streaming-json" {
+                let textRecords = records.filter { $0["type"] as? String == "output" }
+                try #require(textRecords.count == deltas.count)
+                let contents = textRecords.compactMap { $0["content"] as? String }
+                #expect(contents == deltas)
+                #expect(contents.joined() == sampler.answer)
+                let completedIndex = try #require(records.firstIndex {
+                    $0["type"] as? String == "completed"
+                })
+                let lastTextIndex = try #require(records.lastIndex {
+                    $0["type"] as? String == "output"
+                })
                 #expect(lastTextIndex < completedIndex)
+            } else {
+                let streamRecords = records.filter { $0["type"] as? String == "stream_event" }
+                try #require(!streamRecords.isEmpty)
+                let events = try streamRecords.map { record in
+                    try #require(record["event"] as? [String: Any])
+                }
+                let textDeltas = events
+                    .filter { $0["type"] as? String == "content_block_delta" }
+                    .compactMap { $0["delta"] as? [String: Any] }
+                    .filter { $0["type"] as? String == "text_delta" }
+                try #require(textDeltas.count == deltas.count)
+                let contents = textDeltas.compactMap { $0["text"] as? String }
+                #expect(contents == deltas)
+                #expect(contents.joined() == sampler.answer)
+                #expect(events.compactMap { $0["type"] as? String } == [
+                    "message_start", "content_block_start",
+                    "content_block_delta", "content_block_delta",
+                    "content_block_delta", "content_block_delta",
+                    "content_block_stop", "message_delta", "message_stop",
+                ])
+
+                let assistantRecords = records.filter { $0["type"] as? String == "assistant" }
+                try #require(assistantRecords.count == 1)
+                let message = try #require(assistantRecords[0]["message"] as? [String: Any])
+                #expect(message["role"] as? String == "assistant")
+                let blocks = try #require(message["content"] as? [[String: Any]])
+                try #require(blocks.count == 1)
+                #expect(blocks[0]["type"] as? String == "text")
+                #expect(blocks[0]["text"] as? String == sampler.answer)
+
+                let resultRecords = records.filter { $0["type"] as? String == "result" }
+                try #require(resultRecords.count == 1)
+                #expect(resultRecords[0]["subtype"] as? String == "success")
+                #expect(records.last?["type"] as? String == "result")
+                let lastDeltaIndex = try #require(records.lastIndex { record in
+                    guard let event = record["event"] as? [String: Any],
+                          event["type"] as? String == "content_block_delta",
+                          let delta = event["delta"] as? [String: Any]
+                    else { return false }
+                    return delta["type"] as? String == "text_delta"
+                })
+                let assistantIndex = try #require(records.firstIndex {
+                    $0["type"] as? String == "assistant"
+                })
+                let resultIndex = try #require(records.firstIndex {
+                    $0["type"] as? String == "result"
+                })
+                #expect(lastDeltaIndex < assistantIndex)
+                #expect(assistantIndex < resultIndex)
+                #expect(records.contains { $0["type"] as? String == "output" } == false)
+                #expect(records.contains { $0["type"] as? String == "completed" } == false)
             }
         }
     }
