@@ -359,6 +359,7 @@ static void register_crash_signals(void (*handler)(int, siginfo_t *, void *)) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
 }
 
 int opengrok_crash_install_fd(int crash_fd, const char *app_version) {

@@ -7,8 +7,9 @@
 extern "C" {
 #endif
 
-/// Install SIGSEGV/SIGBUS handlers that write a GCRX blob to `crash_file_path`
+/// Install SIGSEGV/SIGBUS/SIGABRT handlers that write a GCRX blob to `crash_file_path`
 /// (opened owner-only by this function) and re-raise with default disposition.
+/// SIGABRT capture is Unix-only (`panic = "abort"` builds abort via SIGABRT).
 /// Returns 1 on success, 0 on failure.
 int opengrok_crash_install(const char *crash_file_path, const char *app_version);
 
@@ -17,7 +18,8 @@ int opengrok_crash_install(const char *crash_file_path, const char *app_version)
 /// Returns 1 on success, 0 on failure.
 int opengrok_crash_install_fd(int crash_fd, const char *app_version);
 
-/// Minimal install: termios restore only (no crash blob).
+/// Minimal install: termios restore only (no crash blob). Installs
+/// SIGSEGV/SIGBUS/SIGABRT handlers that only restore the terminal.
 void opengrok_crash_install_terminal_restore_only(void);
 
 /// Upgrade handlers to also write terminal escape restore sequences.

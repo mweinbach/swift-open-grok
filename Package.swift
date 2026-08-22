@@ -261,7 +261,7 @@ private func targets() -> [Target] {
     t.append(.target(name: "OpenGrokPTY", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokTTY", "OpenGrokPTYC"])))
     t.append(.target(name: "OpenGrokPTYCLI", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokPTY", "OpenGrokTTY"])))
     t.append(.target(name: "OpenGrokSystemPower", dependencies: dep(w0s2, w0s3, w0s4)))
-    t.append(.target(name: "OpenGrokCrashHandler", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokCrashHandlerC"])))
+    t.append(.target(name: "OpenGrokCrashHandler", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokCrashHandlerC", "OpenGrokSecrets"])))
     // W2-S5: TerminalCore base; TextArea -> TerminalCore.
     t.append(.target(name: "OpenGrokTerminalCore", dependencies: dep(w0s2, w0s4)))
     t.append(.target(name: "OpenGrokTextArea", dependencies: dep(w0s2, w0s4, ["OpenGrokTerminalCore"])))

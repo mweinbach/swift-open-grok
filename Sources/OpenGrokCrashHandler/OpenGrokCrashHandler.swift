@@ -5,8 +5,13 @@
 // - Binary crash blob format "GCRX" (signal-handler safe layout)
 // - Startup `checkPreviousCrash` + owner-only report write under OPENGROK_HOME
 // - Terminal restore sequences for signal-handler / panic paths
-// - Install registers SIGBUS/SIGSEGV via a C sigaction + alternate-stack shim
+// - Install registers SIGBUS/SIGSEGV/SIGABRT via a C sigaction + alternate-stack shim
 //   that only performs async-signal-safe ops and never touches session journals
+//   (SIGABRT matters because release builds use `panic = "abort"`; Windows abort
+//   does not route through SetUnhandledExceptionFilter, so SIGABRT is Unix-only:
+//   handler.rs:1-8, lib.rs:1-8, handler.rs:306-308 at pin 650c1db7).
+// - Report redaction delegates to `xai-grok-secrets` canonical 10-pattern
+//   sanitizer (sanitizer.rs at pin 650c1db7) via `OpenGrokSecrets.SecretSanitizer`
 //
 // Platform seams:
 //   - Unix: C shim (sigaction SA_SIGINFO|SA_ONSTACK|SA_RESETHAND + alt stack)
@@ -14,6 +19,7 @@
 
 import Foundation
 import OpenGrokCrashHandlerC
+import OpenGrokSecrets
 
 #if canImport(Darwin)
 import Darwin
@@ -237,10 +243,11 @@ private func writeU64(_ b: inout [UInt8], _ o: Int, _ v: UInt64) {
 
 // MARK: - Symbol / report formatting
 
-/// Human-readable signal name.
+/// Human-readable signal name — mirrors `xai-crash-handler/src/symbolicate.rs:signal_name` at pin 650c1db7.
 public func signalName(_ sig: UInt8) -> String {
     switch Int32(sig) {
     case 4: return "SIGILL (Illegal instruction)"
+    case 6: return "SIGABRT (Abort)"
     case 7, 10: return "SIGBUS (Bus error)"
     case 11: return "SIGSEGV (Segmentation fault)"
     default: return "Unknown signal"
@@ -248,6 +255,10 @@ public func signalName(_ sig: UInt8) -> String {
 }
 
 public func siCodeName(signal: UInt8, code: Int32) -> String {
+    // SIGABRT is raised by abort() (panic=abort) — no fault si_code (symbolicate.rs:94-99).
+    if signal == 6 {
+        return "abort() - raised by the process (e.g. Rust panic with panic=abort)"
+    }
     let isBus = signal == 7 || signal == 10
     if isBus {
         switch code {
@@ -293,25 +304,14 @@ public func formatReport(blob: CrashBlob, frames: [ResolvedFrame]) -> String {
 }
 
 /// Redact common secret patterns from crash text.
+///
+/// Delegates to the canonical `xai-grok-secrets` 10-pattern sanitizer
+/// (`sanitizer.rs` at pin 650c1db7) via `SecretSanitizer.redactSecrets`.
+/// Kept as a free function so call sites (`formatReport`, `PlatformCrashHandler.record`,
+/// tests) remain source-compatible — the caller-visible marker stays
+/// `SecretRedaction.secret` == `[REDACTED_SECRET]`.
 public func redactSecrets(_ text: String) -> String {
-    var result = text
-    let patterns = [
-        #"sk-[A-Za-z0-9_\-]{10,}"#,
-        #"Bearer\s+[A-Za-z0-9._\-]{10,}"#,
-        #"xai-[A-Za-z0-9_\-]{10,}"#,
-        #"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+"#,
-    ]
-    for pattern in patterns {
-        if let re = try? NSRegularExpression(pattern: pattern) {
-            let range = NSRange(result.startIndex..., in: result)
-            result = re.stringByReplacingMatches(
-                in: result,
-                range: range,
-                withTemplate: "<redacted>"
-            )
-        }
-    }
-    return result
+    SecretSanitizer.redactSecrets(text)
 }
 
 /// Redact absolute home-directory paths.
@@ -720,7 +720,7 @@ public func installCrashHandler(
     #endif
 }
 
-/// Install a minimal SIGSEGV/SIGBUS handler that only restores the terminal.
+/// Install a minimal SIGSEGV/SIGBUS/SIGABRT handler that only restores the terminal.
 public func installTerminalRestoreOnly() {
     #if os(macOS) || os(Linux)
     opengrok_crash_install_terminal_restore_only()
