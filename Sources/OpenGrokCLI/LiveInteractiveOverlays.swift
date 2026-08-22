@@ -2782,7 +2782,7 @@ extension LiveInteractiveControllerRenderer {
             // and would silently swallow the request.
             if let meta = PagerSettingsRegistry.default.entries.first(where: { $0.key == key }),
                case .secretStore = meta.storage {
-                applySecret(key: key, value: "")
+                await applySecret(key: key, value: "")
                 return
             }
             do {
@@ -2835,7 +2835,7 @@ extension LiveInteractiveControllerRenderer {
             }
 
         case .secret(let key, let value):
-            applySecret(key: key, value: value)
+            await applySecret(key: key, value: value)
         }
     }
 
@@ -2846,7 +2846,7 @@ extension LiveInteractiveControllerRenderer {
     /// `SecretStatus::Missing` → the Clear action, ui.rs:1447-1448; write
     /// path `store_provider_api_key` / `clear_provider_api_key`,
     /// effects/mod.rs:832-843).
-    func applySecret(key: String, value: String) {
+    func applySecret(key: String, value: String) async {
         guard let meta = PagerSettingsRegistry.default.entries.first(where: { $0.key == key }),
               case .secretStore(let account) = meta.storage
         else {
@@ -2864,30 +2864,82 @@ extension LiveInteractiveControllerRenderer {
             ? kimiAPIKeyScope(.platform)
             : providerAPIKeyScope(account)
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let provider = Self.secretSamplingProvider(account: account)
+
+        var revokedChildren = 0
+        var invalidatedRunningSession = false
+        if let provider {
+            if let subagentHost = toolExecutor?.subagentHost {
+                revokedChildren = await subagentHost.cancelChildrenForProviderRuntimeChange(provider)
+            }
+            if let modelSwitch {
+                // Actor reentrancy permits a prompt between credential
+                // persistence and an awaited rebind. Replace the captured
+                // bearer first so that window can only reject, never reuse a
+                // key the user just rotated or removed.
+                invalidatedRunningSession = await modelSwitch.invalidateCredential(
+                    provider: provider
+                )
+            }
+        }
+
         do {
             if trimmed.isEmpty {
                 try clearScopedAPIKey(grokHome: openGrokHome, scope: scope)
-                note("Removed \(meta.label). New sessions and model switches no longer see it.")
             } else {
                 try storeScopedAPIKey(grokHome: openGrokHome, scope: scope, apiKey: trimmed)
-                note("Saved \(meta.label). It applies to new sessions and model switches; "
-                    + "the running session keeps its current credential.")
             }
         } catch {
+            if invalidatedRunningSession, let provider, let modelSwitch {
+                let restored = await modelSwitch.rebindCredential(provider: provider)
+                if case .failed(let reason) = restored {
+                    appendMessage(PagerMessage(
+                        role: .error,
+                        text: "Could not save \(meta.label): \(error). The running "
+                            + "session remains blocked because its credential could not "
+                            + "be restored: \(reason)"
+                    ))
+                    return
+                }
+            }
             appendMessage(PagerMessage(
                 role: .error,
                 text: "Could not save \(meta.label): \(error)"
             ))
             return
         }
-        // Make the change visible to the catalog publish gate and kick the
-        // background refresh, mirroring upstream's post-store
-        // `apply_meta_models` (effects/mod.rs:844-861). KNOWN DEFERRAL: the
-        // upstream rebind of LIVE sessions after a credential change
-        // (task_result.rs:1087-1300) is not ported — the new key reaches new
-        // sessions and `/model` switches only. Effort/tier reconcile against
-        // the refreshed catalog still runs (model_state.rs:155-192).
         catalogStore?.refreshCredentialSnapshot()
+
+        if invalidatedRunningSession, let provider, let modelSwitch {
+            switch await modelSwitch.rebindCredential(provider: provider) {
+            case .rebound:
+                note(trimmed.isEmpty
+                    ? "Removed \(meta.label). The running session reloaded its remaining credentials."
+                    : "Saved \(meta.label). The running session is using the updated credential.")
+            case .notActive:
+                note(trimmed.isEmpty
+                    ? "Removed \(meta.label)."
+                    : "Saved \(meta.label).")
+            case .failed(let reason):
+                appendMessage(PagerMessage(
+                    role: .error,
+                    text: (trimmed.isEmpty
+                        ? "Removed \(meta.label), but the running session has no usable credential"
+                        : "Saved \(meta.label), but the running session could not load it")
+                        + ": \(reason). Sampling is blocked until valid credentials are available."
+                ))
+            }
+        } else {
+            note(trimmed.isEmpty ? "Removed \(meta.label)." : "Saved \(meta.label).")
+        }
+        if revokedChildren > 0 {
+            let noun = revokedChildren == 1 ? "subagent" : "subagents"
+            note("Stopped \(revokedChildren) \(noun) before changing provider credentials.")
+        }
+
+        // Refresh only after the live provider route is either rebuilt or
+        // fail-closed; detached catalog reconciliation must never reopen
+        // the revoked-bearer window.
         catalogStore?.spawnBackgroundRefresh()
         refreshOpenProviderSettingsOverlay()
         let refresh = catalogStore?.backgroundRefreshTask
@@ -2895,6 +2947,25 @@ extension LiveInteractiveControllerRenderer {
             await refresh?.value
             self.refreshOpenProviderSettingsOverlay()
             await self.reconcileModelStateAfterCatalogRefresh()
+        }
+    }
+
+    private static func secretSamplingProvider(account: String) -> ModelProvider? {
+        switch account {
+        case "xai": .xai
+        case "codex": .codex
+        case "kimi", "kimi_platform", "kimi_code": .kimi
+        case "fireworks": .fireworks
+        case "deepseek": .deepseek
+        case "meta": .meta
+        case "opencode_go": .openCodeGo
+        case "wafer": .wafer
+        case "zai": .zai
+        case "runinfra": .runinfra
+        case "gemini": .gemini
+        case "openrouter": .openRouter
+        // Search-only providers have no root sampler to revoke.
+        default: nil
         }
     }
 

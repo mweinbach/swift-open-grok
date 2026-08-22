@@ -531,6 +531,15 @@ public struct OpenGrokLiveSampler: Sendable {
         try await sampleOperation(request, emit)
     }
 
+    func withSamplingGate(
+        _ gate: @escaping @Sendable () throws -> Void
+    ) -> OpenGrokLiveSampler {
+        OpenGrokLiveSampler(codexTurnStateRegistry: codexTurnStateRegistry) { request, emit in
+            try gate()
+            return try await self.sample(request, emit: emit)
+        }
+    }
+
     func codexTurnState(sessionID: String, turnID: String) -> CodexTurnStateCell? {
         codexTurnStateRegistry?.state(sessionID: sessionID, turnID: turnID)
     }

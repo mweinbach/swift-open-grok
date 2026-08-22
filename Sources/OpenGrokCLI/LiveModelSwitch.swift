@@ -366,9 +366,34 @@ enum LiveCredentialRebindOutcome: Sendable, Equatable {
     /// The active route re-resolved and the sampler was swapped; the next
     /// sampling request carries the freshly resolved credential.
     case rebound(provider: ModelProvider)
-    /// Resolution or sampler construction failed; the previous sampler and
-    /// its previous credential remain live.
+    /// Resolution or sampler construction failed; an already-invalidated
+    /// session stays blocked until a usable credential can be resolved.
     case failed(message: String)
+}
+
+/// Snapshots leave their owning actor before a turn's tool loop starts, so
+/// replacing that actor's sampler alone cannot revoke an already-issued one.
+/// The lock makes revocation immediately visible at every sampling boundary.
+private final class LiveCredentialGeneration: @unchecked Sendable {
+    private let lock = NSLock()
+    private var valid: Bool
+
+    init(valid: Bool = true) {
+        self.valid = valid
+    }
+
+    func invalidate() {
+        lock.withLock { valid = false }
+    }
+
+    func requireValid(provider: ModelProvider) throws {
+        guard lock.withLock({ valid }) else {
+            throw LiveModelSwitchError.credentialsUnavailable(
+                provider: provider,
+                detail: "credential was removed or rotated; update it or switch providers"
+            )
+        }
+    }
 }
 
 struct LiveModelSwitchSummary: Sendable, Equatable {
@@ -447,10 +472,33 @@ actor LiveModelSwitchCoordinator {
         /// server-side compaction endpoint, which is not a sampling call and so
         /// cannot borrow the sampler's already-built client.
         let configuration: OpenGrokLiveSamplingConfiguration
+        private let credentialValidation: @Sendable () throws -> Void
+
+        init(
+            sampler: OpenGrokLiveSampler,
+            modelID: String,
+            provider: ModelProvider,
+            configuration: OpenGrokLiveSamplingConfiguration,
+            credentialValidation: @escaping @Sendable () throws -> Void
+        ) {
+            self.sampler = sampler
+            self.modelID = modelID
+            self.provider = provider
+            self.configuration = configuration
+            self.credentialValidation = credentialValidation
+        }
+
+        /// Direct Codex compaction bypasses `sampler`; its HTTP transport must
+        /// check this same captured generation immediately before every send.
+        func requireValidCredential() throws {
+            try credentialValidation()
+        }
     }
 
     private var sampling: OpenGrokLiveSamplingConfiguration
     private var sampler: OpenGrokLiveSampler
+    private var credentialGeneration = LiveCredentialGeneration()
+    private var credentialInvalidated = false
     private let resolver: LiveModelCatalogResolver
     private let makeSampler: @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler
     private let history: LiveConversationHistory?
@@ -477,12 +525,28 @@ actor LiveModelSwitchCoordinator {
     }
 
     func snapshot() -> Snapshot {
-        Snapshot(
-            sampler: sampler,
+        let generation = credentialGeneration
+        let provider = sampling.provider
+        return Snapshot(
+            sampler: guardedSampler(sampler, provider: provider, generation: generation),
             modelID: sampling.model,
-            provider: sampling.provider,
-            configuration: sampling
+            provider: provider,
+            configuration: sampling,
+            credentialValidation: {
+                try generation.requireValid(provider: provider)
+            }
         )
+    }
+
+    private func guardedSampler(
+        _ sampler: OpenGrokLiveSampler,
+        provider: ModelProvider,
+        generation: LiveCredentialGeneration? = nil
+    ) -> OpenGrokLiveSampler {
+        let generation = generation ?? credentialGeneration
+        return sampler.withSamplingGate {
+            try generation.requireValid(provider: provider)
+        }
     }
 
     var activeModelID: String { sampling.model }
@@ -490,6 +554,49 @@ actor LiveModelSwitchCoordinator {
     /// The tier the live sampler is actually built with — the `/fast` state
     /// derives from here, never from a controller-side mirror.
     var activeServiceTier: String? { sampling.serviceTier }
+
+    /// Revoke the active provider's captured bearer before its backing store
+    /// changes. The whole transition is synchronous on this actor: no prompt
+    /// can observe the previous sampler after this method returns.
+    func invalidateCredential(provider: ModelProvider) -> Bool {
+        guard sampling.provider == provider else { return false }
+
+        credentialGeneration.invalidate()
+        credentialGeneration = LiveCredentialGeneration(valid: false)
+        let previous = sampling
+        let credentialHeaders: Set<String> = [
+            "authorization", "x-api-key", "x-goog-api-key", "api-key",
+        ]
+        let credentialQueryParameters: Set<String> = [
+            "key", "api_key", "apikey", "access_token",
+        ]
+        sampling = OpenGrokLiveSamplingConfiguration(
+            model: previous.model,
+            baseURL: previous.baseURL,
+            apiKey: "",
+            provider: previous.provider,
+            apiBackend: previous.apiBackend,
+            extraHeaders: previous.extraHeaders.filter {
+                !credentialHeaders.contains($0.key.lowercased())
+            },
+            queryParams: previous.queryParams.filter {
+                !credentialQueryParameters.contains($0.key.lowercased())
+            },
+            environment: previous.environment,
+            tuning: previous.tuning,
+            doomLoopRecovery: previous.doomLoopRecovery,
+            codexPermissions: previous.codexPermissions,
+            transport: previous.transport
+        )
+        sampler = OpenGrokLiveSampler { _, _ in
+            throw LiveModelSwitchError.credentialsUnavailable(
+                provider: provider,
+                detail: "credential was removed or rotated; update it or switch providers"
+            )
+        }
+        credentialInvalidated = true
+        return true
+    }
 
     /// Rebuild the sampling stack for `modelID`.
     ///
@@ -515,6 +622,7 @@ actor LiveModelSwitchCoordinator {
         serviceTier: String?? = nil
     ) async -> LiveModelSwitchOutcome {
         let previous = sampling
+        let previousGeneration = credentialGeneration
         let requestedTier: String?
         switch serviceTier {
         case .none: requestedTier = previous.serviceTier
@@ -526,7 +634,8 @@ actor LiveModelSwitchCoordinator {
         )?.info.provider
         let picksActiveModel = requestedProvider == previous.provider
             && (modelID == previous.model || modelID == activeCatalogID(for: previous))
-        if picksActiveModel,
+        if !credentialInvalidated,
+           picksActiveModel,
            effort == nil || effort == previous.reasoningEffort,
            requestedTier == previous.serviceTier {
             return .unchanged(modelID: modelID)
@@ -543,7 +652,7 @@ actor LiveModelSwitchCoordinator {
         } catch {
             return .failed(modelID: modelID, message: String(describing: error))
         }
-        guard !hasSameSamplingRoute(resolution.sampling, previous) else {
+        guard credentialInvalidated || !hasSameSamplingRoute(resolution.sampling, previous) else {
             return .unchanged(modelID: modelID)
         }
         let rebuilt: OpenGrokLiveSampler
@@ -567,8 +676,19 @@ actor LiveModelSwitchCoordinator {
                 )
             }
         }
+        guard previous.provider != resolution.sampling.provider
+            || previousGeneration === credentialGeneration else {
+            return .failed(
+                modelID: modelID,
+                message: "\(previous.provider.asString) credential changed during the model switch"
+            )
+        }
+        if credentialInvalidated || previous.provider != resolution.sampling.provider {
+            credentialGeneration = LiveCredentialGeneration()
+        }
         sampling = resolution.sampling
         sampler = rebuilt
+        credentialInvalidated = false
         await codeMode?.noteModelSwitch(
             from: previous.provider,
             to: resolution.sampling.provider
@@ -602,6 +722,7 @@ actor LiveModelSwitchCoordinator {
         serviceTier: String?
     ) async -> LiveModelSwitchOutcome {
         let previous = sampling
+        let previousGeneration = credentialGeneration
         let resolution: LiveModelResolution
         do {
             resolution = try await resolver.resolve(
@@ -614,7 +735,7 @@ actor LiveModelSwitchCoordinator {
         } catch {
             return .failed(modelID: modelID, message: String(describing: error))
         }
-        guard !hasSameSamplingRoute(resolution.sampling, previous) else {
+        guard credentialInvalidated || !hasSameSamplingRoute(resolution.sampling, previous) else {
             return .unchanged(modelID: modelID)
         }
         let rebuilt: OpenGrokLiveSampler
@@ -638,8 +759,19 @@ actor LiveModelSwitchCoordinator {
                 )
             }
         }
+        guard previous.provider != resolution.sampling.provider
+            || previousGeneration === credentialGeneration else {
+            return .failed(
+                modelID: modelID,
+                message: "\(previous.provider.asString) credential changed during the model switch"
+            )
+        }
+        if credentialInvalidated || previous.provider != resolution.sampling.provider {
+            credentialGeneration = LiveCredentialGeneration()
+        }
         sampling = resolution.sampling
         sampler = rebuilt
+        credentialInvalidated = false
         await codeMode?.noteModelSwitch(
             from: previous.provider,
             to: resolution.sampling.provider
@@ -671,23 +803,23 @@ actor LiveModelSwitchCoordinator {
     /// stored key at use time (`api_key_for_base_url` →
     /// `stored_api_key()` reads disk per call, fireworks_models.rs:113-140);
     /// only spawn-captured subagent samplers get cancelled
-    /// (acp_agent.rs:3835-3850). This port's sampler captures the key when
+    /// (agent/mvp_agent/acp_agent.rs:2557-2576). This port's sampler captures the key when
     /// the sampler is BUILT (the E6 measurement: a static API-key session
     /// kept the old key until a re-pick or restart), so the same observable
     /// contract — "the next sampling request carries the applied key" —
     /// requires rebuilding the sampler here.
     ///
-    /// Fail-closed like `apply`: nothing mutates unless resolution AND
-    /// sampler construction succeed. In particular, applying a CLEARED key
-    /// leaves the old sampler (and its old credential) live and reports the
-    /// failure — the session is not torn down mid-turn, matching upstream,
-    /// where a resident root session also keeps working until its next
-    /// credential read fails.
+    /// Resolution and sampler construction must both succeed before a live
+    /// route is restored. A caller changing provider credentials invalidates
+    /// the existing bearer first; if the replacement cannot be resolved, the
+    /// throwing sentinel remains installed, matching the upstream pager's
+    /// held-prompt behavior (`task_result.rs:859-875`).
     func rebindCredential(provider: ModelProvider) async -> LiveCredentialRebindOutcome {
         let active = sampling
         guard active.provider == provider else {
             return .notActive(activeProvider: active.provider)
         }
+        let previousGeneration = credentialGeneration
         let modelID = activeCatalogID(for: active) ?? active.model
         let resolution: LiveModelResolution
         do {
@@ -707,10 +839,19 @@ actor LiveModelSwitchCoordinator {
         } catch {
             return .failed(message: String(describing: error))
         }
+        guard sampling.provider == provider else {
+            return .notActive(activeProvider: sampling.provider)
+        }
+        guard previousGeneration === credentialGeneration else {
+            return .failed(message: "\(provider.asString) credential changed while it was reloading")
+        }
         // Same model and provider by construction: no history reconcile and
         // no Code Mode invalidation — only the credential route changed.
+        credentialGeneration.invalidate()
+        credentialGeneration = LiveCredentialGeneration()
         sampling = resolution.sampling
         sampler = rebuilt
+        credentialInvalidated = false
         return .rebound(provider: provider)
     }
 
@@ -776,7 +917,9 @@ actor LiveModelSwitchCoordinator {
     func auxiliaryRecapRoute(
         explicitModelID: String?
     ) async -> (configuration: OpenGrokLiveSamplingConfiguration, sampler: OpenGrokLiveSampler) {
+        guard !credentialInvalidated else { return (sampling, sampler) }
         let active = sampling
+        let generation = credentialGeneration
         let catalog = resolver.catalogSource()
         if let desired = LiveRecap.desiredModel(
             configured: explicitModelID,
@@ -790,7 +933,11 @@ actor LiveModelSwitchCoordinator {
                     serviceTier: nil
                 )
                 if desired.explicit || resolution.sampling.provider == active.provider {
-                    return (resolution.sampling, try makeSampler(resolution.sampling))
+                    let rebuilt = try makeSampler(resolution.sampling)
+                    let safeSampler = resolution.sampling.provider == active.provider
+                        ? guardedSampler(rebuilt, provider: active.provider, generation: generation)
+                        : rebuilt
+                    return (resolution.sampling, safeSampler)
                 }
             } catch {
                 // Fall through to the active model — upstream's
@@ -806,7 +953,12 @@ actor LiveModelSwitchCoordinator {
             }?.1.info
         var tuning = active.tuning
         tuning.reasoningEffort = activeInfo.flatMap(acceptedAuxiliaryEffort(info:))
-        guard tuning != active.tuning else { return (active, sampler) }
+        guard tuning != active.tuning else {
+            return (
+                active,
+                guardedSampler(sampler, provider: active.provider, generation: generation)
+            )
+        }
         let adjusted = OpenGrokLiveSamplingConfiguration(
             model: active.model,
             baseURL: active.baseURL,
@@ -822,8 +974,16 @@ actor LiveModelSwitchCoordinator {
             credentialProvider: active.credentialProvider,
             transport: active.transport
         )
-        guard let rebuilt = try? makeSampler(adjusted) else { return (active, sampler) }
-        return (adjusted, rebuilt)
+        guard let rebuilt = try? makeSampler(adjusted) else {
+            return (
+                active,
+                guardedSampler(sampler, provider: active.provider, generation: generation)
+            )
+        }
+        return (
+            adjusted,
+            guardedSampler(rebuilt, provider: active.provider, generation: generation)
+        )
     }
 
     /// The auxiliary effort for one catalog entry, dropped when the model's
