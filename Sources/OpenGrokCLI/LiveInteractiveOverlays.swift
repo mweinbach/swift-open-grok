@@ -2313,11 +2313,7 @@ extension LiveInteractiveControllerRenderer {
         case .recall(let query):
             note(await LiveMemoryCommands.recall(query, backend: sessionServices?.memory))
         case .flush(let text):
-            note(await LiveMemoryCommands.flush(
-                text,
-                sessionID: sessionID,
-                backend: sessionServices?.memory
-            ))
+            await runMemoryFlushCommand(argument: text)
         case .dream:
             await runDreamCommand()
         case .voice:

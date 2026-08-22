@@ -93,7 +93,8 @@ enum LiveACPExtensionRouter {
         btw: LiveBtwACPHandler? = nil,
         mcp: LiveMCPACPHandler? = nil,
         sessionAdmin: LiveSessionAdminACPHandler? = nil,
-        share: LiveShareACPHandler? = nil
+        share: LiveShareACPHandler? = nil,
+        memory: LiveMemoryACPHandler? = nil
     ) -> ACPExtensionMethodRouter {
         var router = ACPExtensionMethodRouter()
         if let feedback {
@@ -152,7 +153,110 @@ enum LiveACPExtensionRouter {
             // answering without auth/upload clients.
             router = router.register(exact: LiveShareACPHandler.method, handler: share)
         }
+        if let memory, memory.backend != nil {
+            for method in LiveMemoryACPHandler.methods {
+                router = router.register(exact: method, handler: memory)
+            }
+        }
         return router
+    }
+}
+
+// MARK: - Session-owned memory operations
+
+struct LiveMemoryACPHandler: ACPAgentExtensionHandler, Sendable {
+    static let methods = ["x.ai/memory/flush", "x.ai/memory/rewrite"]
+
+    let gateway: ACPNotificationGateway
+    let ownerSessionID: String
+    let history: LiveConversationHistory
+    let backend: LiveMemoryBackend?
+    let auxiliaryRoute: LiveMemoryAuxiliaryRoute
+
+    func handle(method: String, params: JSONValue) async throws -> JSONValue {
+        let field = method == Self.methods[0] ? "session_id" : "sessionId"
+        guard let wireSessionID = params[field]?.stringValue else {
+            throw AcpError.invalidParams().withData(.string("invalid params: missing field `\(field)`"))
+        }
+        guard wireSessionID == ownerSessionID,
+              await gateway.sessionExists(AcpSessionId(wireSessionID))
+        else {
+            throw AcpError.invalidParams().withData(.string("session not found: \(wireSessionID)"))
+        }
+        guard backend != nil else {
+            throw AcpError.invalidRequest().withData(.string("memory is not enabled"))
+        }
+
+        let connection: ACPNotificationGateway.PeerSessionConnection
+        do {
+            connection = try await gateway.connectedPeerSession()
+        } catch {
+            throw AcpError.invalidRequest().withData(.string("the owning ACP client is not connected"))
+        }
+        let coordinator = LiveMemoryFlushCoordinator(
+            ownerSessionID: ownerSessionID,
+            history: history,
+            backend: backend,
+            auxiliaryRoute: auxiliaryRoute
+        )
+
+        do {
+            switch method {
+            case "x.ai/memory/flush":
+                let outcome = try await coordinator.flush(
+                    trigger: "user_requested",
+                    beforeSampling: {
+                        try await connection.sendSessionUpdate(
+                            wireSessionID,
+                            .object(["sessionUpdate": .string("memory_flush_started")])
+                        )
+                    },
+                    beforePersist: {
+                        guard await gateway.hasConnectedRuntime(),
+                              await gateway.sessionExists(AcpSessionId(wireSessionID))
+                        else {
+                            throw LiveMemoryFlushError.rejected("the owning ACP session disconnected")
+                        }
+                    }
+                )
+                if case .alreadyInProgress = outcome {
+                    throw LiveMemoryFlushError.rejected("another memory flush is already in progress")
+                }
+                var update: [String: JSONValue] = [
+                    "sessionUpdate": .string("memory_flush_completed"),
+                    "result": .string(outcome.resultName),
+                ]
+                if case .written(let path) = outcome { update["path"] = .string(path) }
+                try await connection.sendSessionUpdate(wireSessionID, .object(update))
+                return .object(["result": .object([:])])
+
+            case "x.ai/memory/rewrite":
+                guard let rawText = params["rawText"]?.stringValue,
+                      let contextSummary = params["contextSummary"]?.stringValue
+                else {
+                    throw AcpError.invalidParams().withData(
+                        .string("invalid params: missing rawText or contextSummary")
+                    )
+                }
+                let rewritten = try await coordinator.rewrite(
+                    rawText: rawText,
+                    contextSummary: contextSummary
+                )
+                guard await gateway.hasConnectedRuntime(),
+                      await gateway.sessionExists(AcpSessionId(wireSessionID))
+                else {
+                    throw LiveMemoryFlushError.rejected("the owning ACP session disconnected")
+                }
+                return .object(["rewritten": .string(rewritten)])
+
+            default:
+                throw AcpError.methodNotFound()
+            }
+        } catch let error as AcpError {
+            throw error
+        } catch {
+            throw AcpError.invalidRequest().withData(.string(String(describing: error)))
+        }
     }
 }
 

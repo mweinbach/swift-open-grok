@@ -1209,6 +1209,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         }
         guard !restored else { return }
         guard activeBackgroundWork.apply(event) else { return }
+        synchronizeTerminalSleepInhibition()
         // Minimal: membership stays accurate for probes / tear-down, but the
         // scrollback frontend has no chip and must not force a fast ticker.
         guard minimalHost == nil else { return }
@@ -1220,6 +1221,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// installed so a final `.none` (background-only) can land ordered.
     func clearActiveBackgroundWorkCache() {
         activeBackgroundWork.removeAll()
+        synchronizeTerminalSleepInhibition()
     }
 
     /// Install the settings-to-controller mode bridge after both actors exist.
@@ -1243,6 +1245,43 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// controller's editor, not only this renderer's painted copy.
     func setVoicePromptSink(_ sink: (@Sendable (String) async -> Void)?) {
         voicePromptSink = sink
+    }
+
+    func runMemoryFlushCommand(argument: String) async {
+        guard argument.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            note(await LiveMemoryCommands.flush(
+                argument,
+                sessionID: sessionID,
+                backend: sessionServices?.memory
+            ))
+            return
+        }
+        guard let backend = sessionServices?.memory else {
+            note("Memory is not enabled. Set `memory.enabled = true` in config.toml or OPENGROK_MEMORY=1.")
+            return
+        }
+        guard let conversationHistory, let modelSwitch else {
+            note("Could not flush memory: this session has no auxiliary model route.")
+            return
+        }
+        let coordinator = LiveMemoryFlushCoordinator(
+            ownerSessionID: sessionID,
+            history: conversationHistory,
+            backend: backend,
+            auxiliaryRoute: { explicit in
+                await modelSwitch.auxiliaryRecapRoute(explicitModelID: explicit)
+            }
+        )
+        do {
+            switch try await coordinator.flush() {
+            case .written(let path): note("Saved session memory to \(path).")
+            case .nothingToStore: note("No new session memory needed to be saved.")
+            case .duplicate: note("This session memory has already been saved.")
+            case .alreadyInProgress: note("Another memory flush is already in progress.")
+            }
+        } catch {
+            note("Could not flush session memory: \(error)")
+        }
     }
 
     /// `/dream` — consolidate session logs through the auxiliary sampler route.

@@ -33,6 +33,7 @@
 import Foundation
 import OpenGrokConfig
 import OpenGrokConfigTypes
+import OpenGrokFileUtils
 import OpenGrokMemory
 import OpenGrokSamplingTypes
 import OpenGrokShared
@@ -59,6 +60,7 @@ struct LiveMemoryConfiguration: Sendable, Equatable {
     /// provider, so 0 is what it always resolves to today.
     var embeddingDimensions: Int
     var dream: MemoryDreamConfig
+    var flush: MemoryFlushConfig
 
     static let disabled = LiveMemoryConfiguration(
         enabled: false,
@@ -67,7 +69,8 @@ struct LiveMemoryConfiguration: Sendable, Equatable {
         index: MemoryIndexConfig(),
         session: MemorySessionConfig(),
         embeddingDimensions: 0,
-        dream: MemoryDreamConfig()
+        dream: MemoryDreamConfig(),
+        flush: MemoryFlushConfig()
     )
 
     /// Read `[memory]` out of the resolved config document.
@@ -172,7 +175,225 @@ struct LiveMemoryConfiguration: Sendable, Equatable {
             config.dream = dream
         }
 
+        if let table = document[path: ["compaction", "memory_flush"]] {
+            if let enabled = table["enabled"]?.boolValue { config.flush.enabled = enabled }
+            if let model = table["flush_model"]?.stringValue { config.flush.flushModel = model }
+            if let limit = table["max_flush_write_chars"]?.int64Value {
+                config.flush.maxFlushWriteChars = max(1, Int(limit))
+            }
+        }
+
         return config
+    }
+}
+
+typealias LiveMemoryAuxiliaryRoute = @Sendable (String?) async -> (
+    configuration: OpenGrokLiveSamplingConfiguration,
+    sampler: OpenGrokLiveSampler
+)
+
+enum LiveMemoryFlushError: Error, CustomStringConvertible, Sendable, Equatable {
+    case rejected(String)
+
+    var description: String {
+        switch self {
+        case .rejected(let message): message
+        }
+    }
+}
+
+enum LiveMemoryFlushOutcome: Sendable, Equatable {
+    case written(path: String)
+    case nothingToStore
+    case duplicate
+    case alreadyInProgress
+
+    var resultName: String {
+        switch self {
+        case .written: "written"
+        case .nothingToStore: "nothing_to_store"
+        case .duplicate: "duplicate"
+        case .alreadyInProgress: "already_in_progress"
+        }
+    }
+}
+
+struct LiveMemoryFlushCoordinator: Sendable {
+    let ownerSessionID: String
+    let history: LiveConversationHistory
+    let backend: LiveMemoryBackend?
+    let auxiliaryRoute: LiveMemoryAuxiliaryRoute
+
+    private static let systemPrompt = """
+    You are a memory assistant. Extract ALL useful information from this conversation that would help you be more effective in future sessions with this user. Write a concise markdown summary with ## headers covering:
+
+    - **Decisions & rationale** — what was chosen and why
+    - **Technical context** — architecture, APIs, patterns, tools, file paths discussed
+    - **Debugging techniques & tools** — external APIs, CLI commands, query patterns, investigation workflows, or services discovered or used during debugging
+    - **Problems & solutions** — bugs found, how they were fixed, workarounds
+
+    Omit any section where there is nothing substantive to report. Do NOT include user preferences like OS, shell, or editor — these belong in global memory. Do NOT include an ephemeral progress section — transient status is not useful for future sessions.
+
+    Respond with NO_REPLY if nothing genuinely useful was learned — a routine task that followed standard patterns, brief Q&A, or sessions with no novel decisions or discoveries are not worth persisting. Only write content that a future session would concretely benefit from.
+    """
+
+    private static let rewritePrompt = """
+    You are a memory note formatter. Rewrite the user's note into well-structured markdown suitable for a persistent MEMORY.md file. The note should be:
+    - Concise but complete
+    - Start with a descriptive ## heading
+    - Include enough context to be useful months later
+    - Reference specific files, decisions, or patterns when relevant
+    - Use bullet points for multiple items
+    - Do NOT include timestamps or session IDs
+    - Do NOT add information that is not present in the original note
+
+    Return ONLY the formatted markdown, no explanations.
+    """
+
+    private func authorizedRecord() async throws -> LiveConversationRecord {
+        guard let backend else {
+            throw LiveMemoryFlushError.rejected("memory is not enabled")
+        }
+        let record = await history.snapshot()
+        guard record.sessionID == ownerSessionID else {
+            throw LiveMemoryFlushError.rejected("memory session does not match its owner")
+        }
+        guard record.sessionKind != "subagent", record.parentSessionID == nil else {
+            throw LiveMemoryFlushError.rejected("subagent sessions cannot export memory")
+        }
+        let boundary = await history.sharedExportBoundary
+        guard record.currentProvider == .xai,
+              record.everUsedNonXAI == false,
+              boundary.allowsXaiExport
+        else {
+            throw LiveMemoryFlushError.rejected("provider privacy boundary prevents memory export")
+        }
+        guard !(await backend.isEphemeralWorkspace),
+              URL(fileURLWithPath: record.workingDirectory).standardizedFileURL
+                == (await backend.workspacePath).standardizedFileURL
+        else {
+            throw LiveMemoryFlushError.rejected("memory workspace does not match its owner")
+        }
+        return record
+    }
+
+    func flush(
+        trigger: String = "slash_command",
+        beforeSampling: (@Sendable () async throws -> Void)? = nil,
+        beforePersist: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> LiveMemoryFlushOutcome {
+        guard let backend else {
+            throw LiveMemoryFlushError.rejected("memory is not enabled")
+        }
+        let record = try await authorizedRecord()
+        guard await backend.beginGeneratedFlush() else { return .alreadyInProgress }
+        do {
+            try await beforeSampling?()
+            let previous = await backend.previousGeneratedFlush
+            let system = previous.map {
+                "You are a memory assistant performing an incremental update. Extract ONLY useful information NEW since the previous flush. Use ## headings or respond NO_REPLY.\n\n--- Previous flush content ---\n\($0)"
+            } ?? Self.systemPrompt
+            let transportIDs = Set(record.codeModeTransportCallIDs ?? [])
+            let conversation = record.items.compactMap { item -> ConversationItem? in
+                switch item {
+                case .system, .reasoning, .backendToolCall:
+                    return nil
+                case .user(let user):
+                    return user.syntheticReason == nil ? item : nil
+                case .assistant(var assistant):
+                    assistant.toolCalls.removeAll { transportIDs.contains($0.id) }
+                    return assistant.content.isEmpty && assistant.toolCalls.isEmpty
+                        ? nil : .assistant(assistant)
+                case .toolResult(let result):
+                    return transportIDs.contains(result.toolCallId) ? nil : item
+                case .customToolOutput(let result):
+                    return transportIDs.contains(result.callId) ? nil : item
+                }
+            }
+            let closer = "Now write the memory summary as described in the system prompt."
+            let items = [.system(system)] + Array(conversation.suffix(20)) + [.user(closer)]
+            let route = await auxiliaryRoute(backend.configuration.flush.flushModel)
+            guard route.configuration.provider == record.currentProvider else {
+                throw LiveMemoryFlushError.rejected("memory model provider crosses the privacy boundary")
+            }
+            let response = try await route.sampler.sample(
+                OpenGrokLiveSamplingRequest(
+                    sessionID: ownerSessionID,
+                    turnID: "xai-flush-\(UUID().uuidString)",
+                    model: route.configuration.model,
+                    prompt: closer,
+                    items: items,
+                    tools: []
+                )
+            ) { _ in }
+            let content = response.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            let stripped = content.trimmingCharacters(in: .punctuationCharacters)
+            if content.isEmpty || stripped.caseInsensitiveCompare("NO_REPLY") == .orderedSame {
+                await backend.finishGeneratedFlush()
+                return .nothingToStore
+            }
+            guard content.split(whereSeparator: \.isNewline).contains(where: {
+                $0.hasPrefix("# ") || $0.hasPrefix("## ")
+            }) else {
+                throw LiveMemoryFlushError.rejected("memory summary does not contain a markdown heading")
+            }
+            let limited = String(content.prefix(max(1, backend.configuration.flush.maxFlushWriteChars)))
+            try await beforePersist?()
+            _ = try await authorizedRecord()
+            guard let path = try await backend.persistGeneratedFlush(
+                sessionID: ownerSessionID,
+                trigger: trigger,
+                content: limited
+            ) else {
+                await backend.finishGeneratedFlush()
+                return .duplicate
+            }
+            await backend.finishGeneratedFlush()
+            return .written(path: path.path)
+        } catch {
+            await backend.finishGeneratedFlush()
+            throw error
+        }
+    }
+
+    func rewrite(rawText: String, contextSummary: String) async throws -> String {
+        let combinedBytes = rawText.utf8.count + contextSummary.utf8.count
+        guard combinedBytes <= 32 * 1024 else {
+            throw LiveMemoryFlushError.rejected(
+                "memory note input too large (\(combinedBytes) bytes, max 32768)"
+            )
+        }
+        let record = try await authorizedRecord()
+        guard let backend else { throw LiveMemoryFlushError.rejected("memory is not enabled") }
+        let route = await auxiliaryRoute(backend.configuration.flush.flushModel)
+        guard route.configuration.provider == record.currentProvider else {
+            throw LiveMemoryFlushError.rejected("memory model provider crosses the privacy boundary")
+        }
+        let user = "Session context:\n\(contextSummary)\n\nRewrite this note as a memory entry:\n\n\(rawText)"
+        let response = try await route.sampler.sample(
+            OpenGrokLiveSamplingRequest(
+                sessionID: ownerSessionID,
+                turnID: "xai-memory-rewrite-\(UUID().uuidString)",
+                model: route.configuration.model,
+                prompt: user,
+                items: [.system(Self.rewritePrompt), .user(user)],
+                tools: []
+            )
+        ) { _ in }
+        _ = try await authorizedRecord()
+        guard !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw LiveMemoryFlushError.rejected("LLM returned empty response")
+        }
+        guard response.output.utf8.count > 32 * 1024 else { return response.output }
+        let suffix = "\n\n<!-- Open Grok truncated an oversized memory rewrite. -->"
+        let budget = 32 * 1024 - suffix.utf8.count
+        var output = ""
+        for scalar in response.output.unicodeScalars {
+            let next = String(scalar)
+            guard output.utf8.count + next.utf8.count <= budget else { break }
+            output.append(next)
+        }
+        return output + suffix
     }
 }
 
@@ -191,6 +412,8 @@ actor LiveMemoryBackend {
     /// searches walks the memory tree once rather than per call.
     private var didReindex = false
     private var completedSessionPaths: [String: String] = [:]
+    private var flushInFlight = false
+    private var previousFlushContent: String?
 
     /// Returns nil when memory is switched off, so every seam can hold an
     /// optional backend and a disabled session allocates nothing.
@@ -289,13 +512,8 @@ actor LiveMemoryBackend {
         didReindex = false
     }
 
-    /// Append a block to today's session log. Backs `/flush`.
-    ///
-    /// Rust's `/flush` asks an auxiliary model to write the summary. This port
-    /// has no auxiliary-model seam yet, so `/flush` writes what the caller
-    /// hands it — the storage half is real, the model-authored half is not.
-    /// The command reports that difference rather than implying a summary was
-    /// generated.
+    /// Append an explicit, user-supplied note to today's session log.
+    /// Model-generated `/flush` summaries use `persistGeneratedFlush`.
     func writeSessionLog(sessionID: String, content: String) throws {
         try storage.ensureInitialized()
         // `writeDailyLog` builds its filename from these three components and
@@ -324,6 +542,64 @@ actor LiveMemoryBackend {
         )
         index = nil
         didReindex = false
+    }
+
+    func beginGeneratedFlush() -> Bool {
+        guard !flushInFlight else { return false }
+        flushInFlight = true
+        return true
+    }
+
+    func finishGeneratedFlush() {
+        flushInFlight = false
+    }
+
+    var previousGeneratedFlush: String? { previousFlushContent }
+
+    func persistGeneratedFlush(sessionID: String, trigger: String, content: String) throws -> URL? {
+        try LiveConversationStore.validateSessionID(sessionID)
+        guard trigger == "slash_command" || trigger == "user_requested" else {
+            throw LiveMemoryFlushError.rejected("invalid memory flush trigger")
+        }
+        guard !storage.isEphemeral else {
+            throw LiveMemoryFlushError.rejected("workspace memory is not available")
+        }
+        guard content != previousFlushContent else { return nil }
+
+        try LiveSessionBusPresenceStore.ensureSecureDirectory(storage.globalDir)
+        try LiveSessionBusPresenceStore.ensureSecureDirectory(storage.workspaceDir)
+        try LiveSessionBusPresenceStore.ensureSecureDirectory(storage.sessionsDir)
+        try storage.ensureInitialized()
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        let path = storage.sessionsDir.appendingPathComponent(
+            "\(formatter.string(from: Date()))-\(trigger)-\(sessionID.prefix(8)).md"
+        )
+        let output: String
+        if FileManager.default.fileExists(atPath: path.path) {
+            try SecureFile.ensureOwnerOnlyPermissions(at: path)
+            output = try String(contentsOf: path, encoding: .utf8) + "\n\n---\n\n" + content
+        } else {
+            output = content
+        }
+        try SecureFile.write(at: path, contents: output)
+        guard try SecureFile.isOwnerOnly(at: path) else {
+            throw LiveMemoryFlushError.rejected("session memory log is not owner-private")
+        }
+        guard let index = openIndex() else {
+            throw LiveMemoryLifecycleError.indexUnavailable(path.path)
+        }
+        let result = try index.reindexFile(path: path, source: storage.classifySource(path))
+        guard result.added > 0 || result.updated > 0
+            || (try index.allIndexedPaths()).contains(path.path)
+        else {
+            throw LiveMemoryLifecycleError.summaryWasNotIndexed(path.path)
+        }
+        previousFlushContent = content
+        return path
     }
 
     /// Saves the upstream's local-only, structured shutdown summary exactly
@@ -754,11 +1030,8 @@ enum LiveMemoryCommands {
         return LiveMemoryFormatting.toolOutput(results)
     }
 
-    /// `/flush` — persist a note into today's session log.
-    ///
-    /// Rust generates the note with an auxiliary model call. This port writes
-    /// what the user supplies and says so, rather than silently doing less than
-    /// the command name promises.
+    /// Legacy `/flush <notes>` — preserve the explicit user-supplied variant.
+    /// Bare `/flush` is routed through the live model-backed coordinator.
     static func flush(
         _ argument: String,
         sessionID: String,
@@ -769,10 +1042,7 @@ enum LiveMemoryCommands {
         }
         let text = argument.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
-            return """
-            Usage: /flush <notes to persist for this session>
-            (Model-generated flush summaries are not implemented yet; this writes what you supply.)
-            """
+            return "Usage: /flush <notes to persist for this session>"
         }
         do {
             try await backend.writeSessionLog(sessionID: sessionID, content: text)

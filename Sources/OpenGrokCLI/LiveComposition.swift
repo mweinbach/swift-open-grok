@@ -3685,6 +3685,20 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     && securityContext.permissions.yoloPinReason == nil,
                 autoReviewEnabled: securityContext.permissions.defaultMode == .auto
             ),
+            parentHostedSearchPolicy: LiveHostedSearchComposition.policy(
+                environment: environment,
+                configuration: securityContext.document,
+                disableWebSearch: options.agentOptions.disableWebSearch,
+                toolPolicy: LiveAgentToolPolicy.resolveLaunchPolicy(
+                    tools: options.agentOptions.tools,
+                    disallowedTools: options.agentOptions.disallowedTools,
+                    profile: agentProfile?.toolPolicy
+                ),
+                permissionRules: securityContext.permissions.config.rules
+            ),
+            parentAPIBackend: samplingConfiguration.apiBackend,
+            parentSupportsBackendSearch: samplingConfiguration.tuning.supportsBackendSearch,
+            disableWebSearch: options.agentOptions.disableWebSearch,
             childSamplerFactory: { model, inheritedPermissions in
                 let resolution = try await LiveModelCatalogResolver(
                     environment: environment,
@@ -3700,7 +3714,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 return LiveSubagentHost.ChildSamplerRoute(
                     sampler: try makeSampler(childConfiguration),
                     provider: provider,
-                    codexPermissions: childConfiguration.codexPermissions
+                    codexPermissions: childConfiguration.codexPermissions,
+                    apiBackend: childConfiguration.apiBackend,
+                    supportsBackendSearch: childConfiguration.tuning.supportsBackendSearch
                 )
             }
         ))
@@ -4282,7 +4298,16 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 ),
                 mcp: mcpHandler,
                 sessionAdmin: sessionAdmin,
-                share: shareHandler
+                share: shareHandler,
+                memory: LiveMemoryACPHandler(
+                    gateway: gateway,
+                    ownerSessionID: foundation.sessionID,
+                    history: history,
+                    backend: foundation.toolExecutor.sessionServices?.memory,
+                    auxiliaryRoute: { explicit in
+                        await modelSwitch.auxiliaryRecapRoute(explicitModelID: explicit)
+                    }
+                )
             )
             // Inbound ext notifications land on the LIVE state, never a
             // mirror: yolo on the session permission-mode handle, swarm on
