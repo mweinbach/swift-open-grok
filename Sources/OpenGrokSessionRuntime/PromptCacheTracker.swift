@@ -208,6 +208,9 @@ public struct CacheTurnRecord: Codable, Sendable, Equatable {
     public var cacheHitRatePct: Double
     public var status: CacheStatus
     public var divergence: PrefixDivergence
+    public var provider: ModelProvider?
+    public var modelID: String?
+    public var requestGapMs: UInt64?
     public var diagnostic: String
     public var timestampRfc3339: String
 
@@ -220,6 +223,9 @@ public struct CacheTurnRecord: Codable, Sendable, Equatable {
         cacheHitRatePct: Double,
         status: CacheStatus,
         divergence: PrefixDivergence,
+        provider: ModelProvider? = nil,
+        modelID: String? = nil,
+        requestGapMs: UInt64? = nil,
         diagnostic: String,
         timestampRfc3339: String = ISO8601DateFormatter().string(from: Date())
     ) {
@@ -231,8 +237,27 @@ public struct CacheTurnRecord: Codable, Sendable, Equatable {
         self.cacheHitRatePct = cacheHitRatePct
         self.status = status
         self.divergence = divergence
+        self.provider = provider
+        self.modelID = modelID
+        self.requestGapMs = requestGapMs
         self.diagnostic = diagnostic
         self.timestampRfc3339 = timestampRfc3339
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case turnIdx
+        case loopIndex
+        case promptTokens
+        case cachedPromptTokens
+        case completionTokens
+        case cacheHitRatePct
+        case status
+        case divergence
+        case provider
+        case modelID = "modelId"
+        case requestGapMs
+        case diagnostic
+        case timestampRfc3339
     }
 }
 
@@ -252,6 +277,10 @@ public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
     public var breaks: Int
     public var steadyInputTokens: Int
     public var steadyCachedTokens: Int
+    public var supportedInputTokens: Int
+    public var supportedCachedTokens: Int
+    public var supportedHitRatePct: Double
+    public var noCacheSupportTurns: Int
     public var lastBreakDiagnostic: String?
 
     // Compatibility aliases:
@@ -281,6 +310,10 @@ public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
         steadyPromptTokens: Int? = nil,
         steadyInputTokens: Int = 0,
         steadyCachedTokens: Int = 0,
+        supportedInputTokens: Int = 0,
+        supportedCachedTokens: Int = 0,
+        supportedHitRatePct: Double = 0,
+        noCacheSupportTurns: Int = 0,
         lastBreakDiagnostic: String? = nil
     ) {
         let resolvedSteadyInput = steadyPromptTokens ?? steadyInputTokens
@@ -295,6 +328,10 @@ public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
         self.breaks = breaks
         self.steadyInputTokens = resolvedSteadyInput
         self.steadyCachedTokens = steadyCachedTokens
+        self.supportedInputTokens = supportedInputTokens
+        self.supportedCachedTokens = supportedCachedTokens
+        self.supportedHitRatePct = supportedHitRatePct
+        self.noCacheSupportTurns = noCacheSupportTurns
         self.lastBreakDiagnostic = lastBreakDiagnostic
     }
 
@@ -329,6 +366,14 @@ public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
         case steadyInputTokens = "steadyInputTokens"
         case steadyCachedTokens = "steady_cached_tokens"
         case steadyCachedTokensCamel = "steadyCachedTokens"
+        case supportedInputTokens = "supportedInputTokens"
+        case supportedInputTokensSnake = "supported_input_tokens"
+        case supportedCachedTokens = "supportedCachedTokens"
+        case supportedCachedTokensSnake = "supported_cached_tokens"
+        case supportedHitRatePct = "supportedHitRatePct"
+        case supportedHitRatePctSnake = "supported_hit_rate_pct"
+        case noCacheSupportTurns = "noCacheSupportTurns"
+        case noCacheSupportTurnsSnake = "no_cache_support_turns"
         case lastBreakDiagnostic = "last_break_diagnostic"
         case lastBreakDiagnosticCamel = "lastBreakDiagnostic"
     }
@@ -373,6 +418,18 @@ public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
         self.steadyCachedTokens = (try? c.decode(Int.self, forKey: .steadyCachedTokensCamel))
             ?? (try? c.decode(Int.self, forKey: .steadyCachedTokens))
             ?? 0
+        self.supportedInputTokens = (try? c.decode(Int.self, forKey: .supportedInputTokens))
+            ?? (try? c.decode(Int.self, forKey: .supportedInputTokensSnake))
+            ?? 0
+        self.supportedCachedTokens = (try? c.decode(Int.self, forKey: .supportedCachedTokens))
+            ?? (try? c.decode(Int.self, forKey: .supportedCachedTokensSnake))
+            ?? 0
+        self.supportedHitRatePct = (try? c.decode(Double.self, forKey: .supportedHitRatePct))
+            ?? (try? c.decode(Double.self, forKey: .supportedHitRatePctSnake))
+            ?? 0
+        self.noCacheSupportTurns = (try? c.decode(Int.self, forKey: .noCacheSupportTurns))
+            ?? (try? c.decode(Int.self, forKey: .noCacheSupportTurnsSnake))
+            ?? 0
         self.lastBreakDiagnostic = (try? c.decodeIfPresent(String.self, forKey: .lastBreakDiagnostic))
             ?? (try? c.decodeIfPresent(String.self, forKey: .lastBreakDiagnosticCamel))
     }
@@ -394,6 +451,10 @@ public struct SessionCacheSnapshot: Codable, Sendable, Equatable {
         try c.encode(steadyInputTokens, forKey: .steadyInputTokens)
         try c.encode(steadyCachedTokens, forKey: .steadyCachedTokens)
         try c.encode(steadyCachedTokens, forKey: .steadyCachedTokensCamel)
+        try c.encode(supportedInputTokens, forKey: .supportedInputTokens)
+        try c.encode(supportedCachedTokens, forKey: .supportedCachedTokens)
+        try c.encode(supportedHitRatePct, forKey: .supportedHitRatePct)
+        try c.encode(noCacheSupportTurns, forKey: .noCacheSupportTurns)
         try c.encodeIfPresent(lastBreakDiagnostic, forKey: .lastBreakDiagnostic)
     }
 }
@@ -570,6 +631,7 @@ private func findFirstCharDiff(_ a: String, _ b: String) -> Int {
 /// Actor managing turn-by-turn prompt cache tracking, divergence detection, and telemetry.
 public actor PromptCacheTracker {
     public private(set) var previousRequestSummary: RequestSummary?
+    private var previousRecordedAt: DispatchTime?
     public private(set) var turnRecords: [CacheTurnRecord] = []
     public private(set) var breakEvents: [CacheBreakEvent] = []
     public private(set) var snapshot: SessionCacheSnapshot = SessionCacheSnapshot()
@@ -609,6 +671,7 @@ public actor PromptCacheTracker {
     /// Reset tracking state for a new session.
     public func reset() {
         previousRequestSummary = nil
+        previousRecordedAt = nil
         turnRecords.removeAll()
         breakEvents.removeAll()
         snapshot = SessionCacheSnapshot()
@@ -975,8 +1038,19 @@ public actor PromptCacheTracker {
         cachedTokens: Int,
         completionTokens: Int = 0,
         currentRequestSummary: RequestSummary,
-        sessionId: String? = nil
+        sessionId: String? = nil,
+        provider: ModelProvider? = nil,
+        modelID: String? = nil,
+        requestStartedAt: DispatchTime? = nil
     ) -> CacheBreakEvent? {
+        let recordedAt = DispatchTime.now()
+        let requestGapMs = previousRecordedAt.map { previous -> UInt64 in
+            let requestStart = requestStartedAt ?? recordedAt
+            guard requestStart.uptimeNanoseconds >= previous.uptimeNanoseconds else {
+                return 0
+            }
+            return (requestStart.uptimeNanoseconds - previous.uptimeNanoseconds) / 1_000_000
+        }
         let divergence = Self.analyzePrefixDivergence(
             previous: previousRequestSummary,
             current: currentRequestSummary
@@ -1008,6 +1082,17 @@ public actor PromptCacheTracker {
         // Determine break reason & diagnostic
         let breakReason: CacheBreakReason?
         let diagnostic: String
+        let route: String
+        switch (provider, modelID) {
+        case let (provider?, modelID?):
+            route = "\(provider.asString)/\(modelID)"
+        case let (provider?, nil):
+            route = provider.asString
+        case let (nil, modelID?):
+            route = modelID
+        case (nil, nil):
+            route = "unknown route"
+        }
 
         switch status {
         case .firstTurn:
@@ -1029,7 +1114,23 @@ public actor PromptCacheTracker {
                 turnIndex: turnIndex
             )
             breakReason = reason
-            diagnostic = String(format: "Partial cache hit: %.1f%% (%d/%d tokens cached). %@", hitRatePct, cachedTokens, promptTokens, divergence.summaryDiagnostic)
+            var detail = String(
+                format: "Partial cache hit on %@: %.1f%% (%d/%d tokens cached). %@",
+                route,
+                hitRatePct,
+                cachedTokens,
+                promptTokens,
+                divergence.summaryDiagnostic
+            )
+            if divergence.isIntact, let requestGapMs {
+                let formattedGap = Self.formatRequestGap(requestGapMs)
+                if requestGapMs > 5 * 60 * 1_000 {
+                    detail += " The request followed a \(formattedGap) inter-request gap; provider cache expiry or eviction is likely, though a large appended segment can also lower the percentage."
+                } else {
+                    detail += " The request followed a \(formattedGap) inter-request gap with an intact prefix; this can reflect a large appended segment or provider-side cache routing or eviction."
+                }
+            }
+            diagnostic = detail
         case .break:
             let (reason, _, _) = Self.evaluateDivergence(
                 previous: previousRequestSummary,
@@ -1042,7 +1143,10 @@ public actor PromptCacheTracker {
             diagnostic = "Cache break: 0% hit rate. \(divergence.summaryDiagnostic)"
         case .noCacheSupport:
             breakReason = nil
-            diagnostic = "0 cached tokens reported (provider may not support prompt caching or cache expired)."
+            let gap = requestGapMs.map {
+                " after a \(Self.formatRequestGap($0)) inter-request gap"
+            } ?? ""
+            diagnostic = "0 cached tokens reported by \(route)\(gap) (prompt caching may be unsupported, expired, evicted, or unreported)."
         }
 
         // Update running snapshot totals
@@ -1054,6 +1158,10 @@ public actor PromptCacheTracker {
             snapshot.steadyInputTokens += promptTokens
             snapshot.steadyCachedTokens += cachedTokens
         }
+        if status != .firstTurn && status != .noCacheSupport {
+            snapshot.supportedInputTokens += promptTokens
+            snapshot.supportedCachedTokens += cachedTokens
+        }
 
         // Overall hit rate covers steady-state turns only: the cold first turn
         // cannot hit by definition and would permanently dilute the rate.
@@ -1061,6 +1169,12 @@ public actor PromptCacheTracker {
             snapshot.overallHitRatePct = (Double(snapshot.steadyCachedTokens) / Double(snapshot.steadyInputTokens)) * 100.0
         } else {
             snapshot.overallHitRatePct = 0.0
+        }
+        if snapshot.supportedInputTokens > 0 {
+            snapshot.supportedHitRatePct =
+                (Double(snapshot.supportedCachedTokens) / Double(snapshot.supportedInputTokens)) * 100.0
+        } else {
+            snapshot.supportedHitRatePct = 0.0
         }
         snapshot.cacheHitRate = snapshot.overallHitRatePct
 
@@ -1072,6 +1186,8 @@ public actor PromptCacheTracker {
         case .break:
             snapshot.breaks += 1
             snapshot.lastBreakDiagnostic = diagnostic
+        case .noCacheSupport:
+            snapshot.noCacheSupportTurns += 1
         default:
             break
         }
@@ -1100,6 +1216,9 @@ public actor PromptCacheTracker {
             cacheHitRatePct: (hitRatePct * 10.0).rounded() / 10.0,
             status: status,
             divergence: divergence,
+            provider: provider,
+            modelID: modelID,
+            requestGapMs: requestGapMs,
             diagnostic: diagnostic
         )
 
@@ -1110,8 +1229,16 @@ public actor PromptCacheTracker {
 
         // Store previous request summary
         previousRequestSummary = currentRequestSummary
+        previousRecordedAt = recordedAt
 
         return breakEvent
+    }
+
+    private nonisolated static func formatRequestGap(_ milliseconds: UInt64) -> String {
+        if milliseconds >= 60_000 {
+            return String(format: "%.1f minutes", Double(milliseconds) / 60_000)
+        }
+        return String(format: "%.1f seconds", Double(milliseconds) / 1_000)
     }
 
     /// Record a manual or externally detected cache break event.

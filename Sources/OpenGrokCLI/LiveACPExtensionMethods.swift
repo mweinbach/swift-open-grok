@@ -27,12 +27,14 @@
 //     the real `$OPENGROK_HOME/sessions` store), and `x.ai/share_session`
 //     (`LiveShareACPHandler`, LiveShareACPHandler.swift — authorize +
 //     upload through `LiveShareComposition.shareURL`, RAW
-//     `{"share_url":…}` via `to_raw_response`, share.rs:145-146). Every
-//     routed method's payload mirrors the upstream payload builders
+//     `{"share_url":…}` via `to_raw_response`, share.rs:145-146). The
+//     resident session also exposes `x.ai/session/cache` and its legacy alias
+//     through the same connection-owned prompt-cache tracker. Every routed
+//     method's payload mirrors the upstream payload builders
 //     byte-for-byte in copy (`acp_agent.rs:32-181`) inside upstream's
 //     `ExtMethodResult` envelope `{"result": <payload>}`
-//     (`session/result.rs:29-72`) — except the session-admin trio and
-//     share_session, whose upstream handlers answer RAW
+//     (`session/result.rs:29-72`) — except the session-admin trio,
+//     session/cache, and share_session, whose upstream handlers answer RAW
 //     (`to_raw_response`, extensions/mod.rs:69-73), mirrored here.
 //   * Everything else at the upstream pin falls through to the router's
 //     terminal arm and gets upstream's unknown-method error byte-exact
@@ -71,6 +73,7 @@ import OpenGrokACP
 import OpenGrokACPRuntime
 import OpenGrokModels
 import OpenGrokSamplingTypes
+import OpenGrokSessionRuntime
 import OpenGrokShared
 
 // MARK: - Router assembly
@@ -121,6 +124,26 @@ enum LiveACPExtensionRouter {
         if let sessionAdmin {
             for method in LiveSessionAdminACPHandler.methods {
                 router = router.register(exact: method, handler: sessionAdmin)
+            }
+            if let liveSessionID = sessionAdmin.liveSessionID {
+                let gateway = sessionAdmin.gateway
+                let cache = SessionCacheQuery(typedProvider: {
+                    (requestedSessionID: String) async throws -> SessionCacheResponse? in
+                    guard await gateway.sessionExists(AcpSessionId(requestedSessionID)) else {
+                        return nil
+                    }
+                    switch await LivePromptCacheTracking.shared.lookup(sessionID: liveSessionID) {
+                    case .unavailable:
+                        return SessionCacheResponse()
+                    case .ambiguous:
+                        return nil
+                    case .response(let response):
+                        return response
+                    }
+                })
+                for method in SessionCacheQuery.methods {
+                    router = router.register(exact: method, handler: cache)
+                }
             }
         }
         if let share {

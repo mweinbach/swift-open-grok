@@ -1682,6 +1682,7 @@ extension LiveInteractiveControllerRenderer {
         } else {
             try renderer.start()
         }
+        try startTerminalNotificationReporting()
         if let permissionCoordinator {
             await permissionCoordinator.setPresenter { [weak self] request in
                 await self?.showPermission(request)
@@ -2372,11 +2373,11 @@ extension LiveInteractiveControllerRenderer {
             conversation.upsertBlock(.usage(await waveEUsageBlock(report)))
         case .cache:
             // `/cache` (upstream Action::ShowCache, slash/commands/cache.rs)
-            let cacheResponse = sessionCacheResponse()
+            let cacheText = await currentSessionCacheBlockText()
             overlays.push(.sessionInfo(
                 id: "cache",
                 title: "Prompt Cache",
-                lines: Self.sessionCacheBlockText(cacheResponse)
+                lines: cacheText
                     .split(separator: "\n", omittingEmptySubsequences: false)
                     .map { PagerStyledLine(text: String($0)) }
             ))
@@ -2404,7 +2405,8 @@ extension LiveInteractiveControllerRenderer {
                 openGrokHome: openGrokHome,
                 sessionID: sessionID,
                 connections: mcpServers,
-                environment: environment
+                environment: environment,
+                projectTrusted: toolExecutor?.projectTrusted
             )))
         case .agentsModal(let initialTab):
             // `/config-agents` (alias `/agents`) and `/personas` — the
@@ -2503,9 +2505,31 @@ extension LiveInteractiveControllerRenderer {
                 content: content
             ))
         case .openLineViewer(let path, let lineRange):
-            let fileURL = URL(fileURLWithPath: path, relativeTo: URL(fileURLWithPath: workingDirectory)).standardizedFileURL
-            let content = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
-            let allLines = content.split(separator: "\n", omittingEmptySubsequences: false)
+            guard let fileURL = LivePromptFileReferences.validatedFileURL(
+                for: path,
+                workingDirectory: URL(fileURLWithPath: workingDirectory)
+            ) else {
+                appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Cannot open file reference: \(path)"
+                ))
+                return
+            }
+
+            let content: String
+            do {
+                content = try String(contentsOf: fileURL, encoding: .utf8)
+            } catch {
+                appendMessage(PagerMessage(
+                    role: .error,
+                    text: "Cannot open file reference: \(path) (\(error.localizedDescription))"
+                ))
+                return
+            }
+            let allLines = content.split(
+                omittingEmptySubsequences: false,
+                whereSeparator: { $0.isNewline }
+            )
             let styledLines: [PagerStyledLine]
             if let lineRange {
                 let start = max(0, min(lineRange.lowerBound - 1, allLines.count))
@@ -3187,6 +3211,7 @@ extension LiveInteractiveControllerRenderer {
         // Re-anchor every painted tick so idle extrapolation stays on the
         // same epoch as `PagerMotionSnapshot.seconds`.
         noteMotionClockAnchor(seconds: frame.seconds)
+        updateTerminalNotificationPresentation()
         if frame.demand == .slow {
             // The welcome shimmer advances at 12 fps of *frames*; a slow tick
             // that lands inside the same shimmer frame would repaint an
@@ -3281,8 +3306,42 @@ extension LiveInteractiveControllerRenderer {
 
     // MARK: - Prompt Cache & Usage Telemetry Formatting
 
-    func sessionCacheResponse() -> SessionCacheResponse {
-        SessionCacheResponse()
+    func sessionCacheResponse() async -> SessionCacheResponse? {
+        guard let conversationHistory else { return nil }
+        return await LivePromptCacheTracking.shared.observation(
+            history: conversationHistory,
+            sessionID: sessionID
+        )?.response
+    }
+
+    func currentSessionCacheBlockText() async -> String {
+        guard let conversationHistory else {
+            return "Prompt cache telemetry unavailable: this session has no active conversation runtime."
+        }
+
+        guard let observation = await LivePromptCacheTracking.shared.observation(
+            history: conversationHistory,
+            sessionID: sessionID
+        ) else {
+            if let usage = await conversationHistory.usageSnapshot,
+               usage.mainLoopModelCalls > 0 {
+                return "Prompt cache telemetry unavailable: this session has provider-reported usage, but its per-request cache diagnostics are not available."
+            }
+            return Self.sessionCacheBlockText(SessionCacheResponse())
+        }
+
+        if observation.response.summary.totalTurns == 0,
+           observation.unmeteredResponses > 0 {
+            let noun = observation.unmeteredResponses == 1 ? "request" : "requests"
+            return "Prompt cache telemetry unavailable: the provider did not report token usage for \(observation.unmeteredResponses) model \(noun)."
+        }
+
+        var result = Self.sessionCacheBlockText(observation.response)
+        if observation.unmeteredResponses > 0 {
+            let noun = observation.unmeteredResponses == 1 ? "request" : "requests"
+            result += "\n  Note: provider token usage was unavailable for \(observation.unmeteredResponses) model \(noun); those requests are excluded."
+        }
+        return result
     }
 
     /// Format thousands with comma separators (e.g. 2,500).
@@ -3303,13 +3362,23 @@ extension LiveInteractiveControllerRenderer {
         var rows: [String] = []
         if s.steadyPromptTokens > 0 {
             rows.append(
-                "  Cache hit rate: \(String(format: "%.1f", s.cacheHitRatePct))% (\(formatThousands(s.steadyCachedTokens)) of \(formatThousands(s.steadyPromptTokens)) steady-state input tokens cached; cold start excluded)"
+                "  All-provider hit rate: \(String(format: "%.1f", s.cacheHitRatePct))% (\(formatThousands(s.steadyCachedTokens)) of \(formatThousands(s.steadyPromptTokens)) steady-state input tokens cached; cold start excluded)"
             )
+            let noCacheNoun = s.noCacheSupportTurns == 1 ? "request" : "requests"
+            if s.supportedInputTokens > 0 {
+                rows.append(
+                    "  Supported hit rate:    \(String(format: "%.1f", s.supportedHitRatePct))% (\(formatThousands(s.supportedCachedTokens)) of \(formatThousands(s.supportedInputTokens)) cache-reporting input tokens cached; \(s.noCacheSupportTurns) no-cache \(noCacheNoun) excluded)"
+                )
+            } else {
+                rows.append(
+                    "  Supported hit rate:    n/a (no cache-reporting steady-state requests; \(s.noCacheSupportTurns) no-cache \(noCacheNoun) excluded)"
+                )
+            }
         } else {
-            rows.append("  Cache hit rate: n/a (cold-start request only so far)")
+            rows.append("  All-provider hit rate: n/a (cold-start request only so far)")
         }
         rows.append(
-            "  Turns tracked:  \(s.totalTurns) (\(s.hits) hits · \(s.partialHits) partial · \(s.breaks) breaks)"
+            "  Turns tracked:  \(s.totalTurns) (\(s.hits) hits · \(s.partialHits) partial · \(s.breaks) breaks · \(s.noCacheSupportTurns) no-cache)"
         )
 
         if let lastBreak = s.lastBreakDiagnostic, !lastBreak.isEmpty {
@@ -3322,6 +3391,10 @@ extension LiveInteractiveControllerRenderer {
                 if rec.status == .firstTurn {
                     rows.append(
                         "    Turn #\(rec.turnIdx) (loop \(rec.loopIndex)) — cold start (\(formatThousands(rec.promptTokens)) in) · \(rec.diagnostic)"
+                    )
+                } else if rec.status == .noCacheSupport {
+                    rows.append(
+                        "    Turn #\(rec.turnIdx) (loop \(rec.loopIndex)) — no cache reported (\(formatThousands(rec.promptTokens)) in) · \(rec.diagnostic)"
                     )
                 } else {
                     rows.append(

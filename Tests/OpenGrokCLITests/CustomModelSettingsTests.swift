@@ -241,7 +241,7 @@ struct CustomModelSettingsTests {
         )
 
         let text = LiveInteractiveControllerRenderer.sessionCacheBlockText(resp)
-        #expect(text.contains("Cache hit rate: n/a (cold-start request only so far)"))
+        #expect(text.contains("All-provider hit rate: n/a (cold-start request only so far)"))
         #expect(text.contains("Turn #1 (loop 0) — cold start (2,500 in)"))
         #expect(!text.contains("% hit ("))
     }
@@ -286,8 +286,8 @@ struct CustomModelSettingsTests {
         )
 
         let text = LiveInteractiveControllerRenderer.sessionCacheBlockText(resp)
-        #expect(text.contains("Cache hit rate: 85.0% (6,375 of 7,500 steady-state input tokens cached; cold start excluded)"))
-        #expect(text.contains("Turns tracked:  2 (1 hits · 0 partial · 0 breaks)"))
+        #expect(text.contains("All-provider hit rate: 85.0% (6,375 of 7,500 steady-state input tokens cached; cold start excluded)"))
+        #expect(text.contains("Turns tracked:  2 (1 hits · 0 partial · 0 breaks · 0 no-cache)"))
         #expect(text.contains("Turn #2 (loop 0) — 85.0% hit (7,500 in, 6,375 cached)"))
         #expect(text.contains("Remaining tokens are new content appended since the previous request."))
     }
