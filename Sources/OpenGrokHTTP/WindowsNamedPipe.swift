@@ -2,17 +2,231 @@ import Foundation
 import COpenGrokSockets
 
 public enum WindowsNamedPipeName {
+    public enum Namespace: String, Sendable, Hashable, CaseIterable {
+        case leader = "grok-leader-"
+        case sessionBus = "grok-sbus-"
+    }
+
     public static func leafName(forPath path: String) -> String {
+        leafName(forPath: path, namespace: .leader)
+    }
+
+    public static func leafName(forPath path: String, namespace: Namespace) -> String {
         let hash = SipHash13.hash(
-            Array(path.utf8),
+            WindowsPathHashPayload.bytes(for: path),
             key0: 0x6772_6f6b_6c65_6164,
             key1: 0x6572_5f70_6970_6521
         )
-        return String(format: "grok-leader-%016llx", hash)
+        return namespace.rawValue + String(format: "%016llx", hash)
     }
 
     public static func fullName(forPath path: String) -> String {
-        "\\\\.\\pipe\\\(leafName(forPath: path))"
+        fullName(forPath: path, namespace: .leader)
+    }
+
+    public static func fullName(forPath path: String, namespace: Namespace) -> String {
+        "\\\\.\\pipe\\\(leafName(forPath: path, namespace: namespace))"
+    }
+
+    public static func pipePath(
+        for path: String,
+        namespace: Namespace = .leader
+    ) -> String {
+        fullName(forPath: path, namespace: namespace)
+    }
+}
+
+/// Reproduces the Windows Rust Path hash independently of the current host,
+/// including derived Prefix discriminants and 64-bit native-width writes.
+private enum WindowsPathHashPayload {
+    private struct Prefix {
+        let discriminator: UInt64
+        let components: [ArraySlice<UInt8>]
+        let drive: UInt8?
+        let length: Int
+        let verbatim: Bool
+    }
+
+    static func bytes(for path: String) -> [UInt8] {
+        let source = Array(path.utf8)
+        var result: [UInt8] = []
+        result.reserveCapacity(source.count + 32)
+
+        let prefix = parsedPrefix(source)
+        if let prefix {
+            appendInteger(prefix.discriminator, to: &result)
+            for component in prefix.components {
+                appendInteger(UInt64(component.count), to: &result)
+                result.append(contentsOf: component)
+            }
+            if let drive = prefix.drive {
+                result.append(drive)
+            }
+        }
+
+        let offset = prefix?.length ?? 0
+        let verbatim = prefix?.verbatim ?? false
+        var componentStart = offset
+        var chunkBits: UInt64 = 0
+
+        for index in offset..<source.count {
+            let separator = verbatim
+                ? source[index] == 0x5c
+                : isSeparator(source[index])
+            guard separator else { continue }
+
+            if index > componentStart {
+                let count = index - componentStart
+                chunkBits = rotateRight(chunkBits &+ UInt64(count), by: 2)
+                result.append(contentsOf: source[componentStart..<index])
+            }
+
+            componentStart = index + 1
+            if !verbatim,
+               componentStart < source.count,
+               source[componentStart] == 0x2e,
+               componentStart + 1 == source.count
+                    || isSeparator(source[componentStart + 1])
+            {
+                componentStart += 1
+            }
+        }
+
+        if componentStart < source.count {
+            let count = source.count - componentStart
+            chunkBits = rotateRight(chunkBits &+ UInt64(count), by: 2)
+            result.append(contentsOf: source[componentStart...])
+        }
+
+        appendInteger(chunkBits, to: &result)
+        return result
+    }
+
+    private static func parsedPrefix(_ bytes: [UInt8]) -> Prefix? {
+        if bytes.count >= 2, isSeparator(bytes[0]), isSeparator(bytes[1]) {
+            if bytes.count >= 4,
+               bytes[2] == 0x3f,
+               isSeparator(bytes[3]),
+               !bytes[0..<4].contains(0x2f)
+            {
+                return verbatimPrefix(bytes)
+            }
+
+            if bytes.count >= 4, bytes[2] == 0x2e, isSeparator(bytes[3]) {
+                let (device, _) = nextComponent(bytes, startingAt: 4, verbatim: false)
+                return Prefix(
+                    discriminator: 3,
+                    components: [device],
+                    drive: nil,
+                    length: 4 + device.count,
+                    verbatim: false
+                )
+            }
+
+            let (server, next) = nextComponent(bytes, startingAt: 2, verbatim: false)
+            let (share, _) = nextComponent(bytes, startingAt: next, verbatim: false)
+            guard !server.isEmpty, !share.isEmpty else { return nil }
+            return Prefix(
+                discriminator: 4,
+                components: [server, share],
+                drive: nil,
+                length: 2 + server.count + 1 + share.count,
+                verbatim: false
+            )
+        }
+
+        guard bytes.count >= 2,
+              bytes[1] == 0x3a,
+              isASCIIAlpha(bytes[0]) else {
+            return nil
+        }
+        return Prefix(
+            discriminator: 5,
+            components: [],
+            drive: uppercasedASCII(bytes[0]),
+            length: 2,
+            verbatim: false
+        )
+    }
+
+    private static func verbatimPrefix(_ bytes: [UInt8]) -> Prefix {
+        if bytes.count >= 8,
+           bytes[4...6].elementsEqual([0x55, 0x4e, 0x43]),
+           isSeparator(bytes[7])
+        {
+            let (server, next) = nextComponent(bytes, startingAt: 8, verbatim: true)
+            let (share, _) = nextComponent(bytes, startingAt: next, verbatim: true)
+            return Prefix(
+                discriminator: 1,
+                components: [server, share],
+                drive: nil,
+                length: 8 + server.count + (share.isEmpty ? 0 : 1 + share.count),
+                verbatim: true
+            )
+        }
+
+        if bytes.count >= 6,
+           bytes[5] == 0x3a,
+           isASCIIAlpha(bytes[4]),
+           bytes.count == 6 || isSeparator(bytes[6])
+        {
+            return Prefix(
+                discriminator: 2,
+                components: [],
+                drive: uppercasedASCII(bytes[4]),
+                length: 6,
+                verbatim: true
+            )
+        }
+
+        let (component, _) = nextComponent(bytes, startingAt: 4, verbatim: true)
+        return Prefix(
+            discriminator: 0,
+            components: [component],
+            drive: nil,
+            length: 4 + component.count,
+            verbatim: true
+        )
+    }
+
+    private static func nextComponent(
+        _ bytes: [UInt8],
+        startingAt start: Int,
+        verbatim: Bool
+    ) -> (ArraySlice<UInt8>, Int) {
+        guard start < bytes.count else {
+            return (bytes[bytes.count..<bytes.count], bytes.count)
+        }
+
+        var end = start
+        while end < bytes.count {
+            let separator = verbatim ? bytes[end] == 0x5c : isSeparator(bytes[end])
+            if separator { break }
+            end += 1
+        }
+        return (bytes[start..<end], end < bytes.count ? end + 1 : end)
+    }
+
+    private static func appendInteger(_ value: UInt64, to bytes: inout [UInt8]) {
+        for shift in stride(from: 0, to: 64, by: 8) {
+            bytes.append(UInt8(truncatingIfNeeded: value >> UInt64(shift)))
+        }
+    }
+
+    private static func isSeparator(_ byte: UInt8) -> Bool {
+        byte == 0x5c || byte == 0x2f
+    }
+
+    private static func isASCIIAlpha(_ byte: UInt8) -> Bool {
+        (0x41...0x5a).contains(byte) || (0x61...0x7a).contains(byte)
+    }
+
+    private static func uppercasedASCII(_ byte: UInt8) -> UInt8 {
+        (0x61...0x7a).contains(byte) ? byte - 0x20 : byte
+    }
+
+    private static func rotateRight(_ value: UInt64, by amount: UInt64) -> UInt64 {
+        (value >> amount) | (value << (64 - amount))
     }
 }
 
