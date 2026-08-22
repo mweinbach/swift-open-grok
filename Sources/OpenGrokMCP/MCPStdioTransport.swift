@@ -194,7 +194,7 @@ private final class MCPStdioLineSink: @unchecked Sendable {
 
 // MARK: - Transport
 
-public actor MCPStdioTransport: MCPTransport {
+public actor MCPStdioTransport: MCPTransport, MCPProgressObservingTransport {
     private let configuration: MCPStdioTransportConfiguration
     private let launchTransform: ChildLaunchTransform
     private let process: Process
@@ -225,6 +225,21 @@ public actor MCPStdioTransport: MCPTransport {
         clientID: UInt64 = 0
     ) {
         eventEmitter.configure(events, serverName: serverName, clientID: clientID)
+    }
+
+    func observeProgress(
+        token: JsonRpcId,
+        onProgress: @escaping @Sendable (MCPProgressParams) async -> Void
+    ) -> MCPProgressObservation? {
+        eventEmitter.observeProgress(token: token, onProgress: onProgress)
+    }
+
+    func finishProgress(_ observation: MCPProgressObservation, cancelPending: Bool) async {
+        guard let delivery = eventEmitter.finishProgress(
+            observation,
+            cancelPending: cancelPending
+        ) else { return }
+        await delivery.value
     }
 
     /// Spawns the child. Safe to call repeatedly; only the first call starts it.

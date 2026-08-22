@@ -412,6 +412,50 @@ public actor MCPClient {
         try await requestTyped(method: MCPMethod.toolsCall, params: params)
     }
 
+    public func callTool(
+        _ params: MCPCallToolParams,
+        onProgress: @escaping @Sendable (MCPProgressParams) async -> Void
+    ) async throws -> MCPCallToolResult {
+        guard let progressTransport = transport as? any MCPProgressObservingTransport else {
+            return try await callTool(params)
+        }
+
+        var call = params
+        var metadata: [String: JSONValue]
+        if let existing = call.meta {
+            guard case .object(let values) = existing else {
+                throw MCPError.invalidRequest("MCP tool-call _meta must be an object")
+            }
+            metadata = values
+        } else {
+            metadata = [:]
+        }
+
+        let identifier = UUID().uuidString
+        let token = JsonRpcId.string(identifier)
+        metadata["progressToken"] = .string(identifier)
+        call.meta = .object(metadata)
+
+        guard let observation = await progressTransport.observeProgress(
+            token: token,
+            onProgress: onProgress
+        ) else {
+            throw MCPError.transportClosed
+        }
+
+        do {
+            let result: MCPCallToolResult = try await requestTyped(
+                method: MCPMethod.toolsCall,
+                params: call
+            )
+            await progressTransport.finishProgress(observation, cancelPending: false)
+            return result
+        } catch {
+            await progressTransport.finishProgress(observation, cancelPending: true)
+            throw error
+        }
+    }
+
     public func listResources(_ params: MCPListResourcesParams = MCPListResourcesParams()) async throws -> MCPListResourcesResult {
         try await requestTyped(method: MCPMethod.resourcesList, params: params)
     }

@@ -7,6 +7,19 @@ public protocol MCPTransport: Sendable {
     func close() async
 }
 
+struct MCPProgressObservation: Sendable {
+    let token: JsonRpcId
+    let identifier: UUID
+}
+
+protocol MCPProgressObservingTransport: MCPTransport {
+    func observeProgress(
+        token: JsonRpcId,
+        onProgress: @escaping @Sendable (MCPProgressParams) async -> Void
+    ) async -> MCPProgressObservation?
+    func finishProgress(_ observation: MCPProgressObservation, cancelPending: Bool) async
+}
+
 public enum MCPWireCodec {
     public static func encode(_ message: MCPWireMessage) throws -> Data {
         let encoder = JSONEncoder()
@@ -77,7 +90,7 @@ public protocol MCPAuthorizationProviding: Sendable {
     func handleUnauthorized(staleToken: String?) async -> Bool
 }
 
-public actor MCPHTTPTransport: MCPTransport {
+public actor MCPHTTPTransport: MCPTransport, MCPProgressObservingTransport {
     private let httpTransport: any HTTPTransport
     private let configuration: MCPHTTPTransportConfiguration
     private let authorization: (any MCPAuthorizationProviding)?
@@ -103,6 +116,21 @@ public actor MCPHTTPTransport: MCPTransport {
         clientID: UInt64 = 0
     ) {
         eventEmitter.configure(events, serverName: serverName, clientID: clientID)
+    }
+
+    func observeProgress(
+        token: JsonRpcId,
+        onProgress: @escaping @Sendable (MCPProgressParams) async -> Void
+    ) -> MCPProgressObservation? {
+        eventEmitter.observeProgress(token: token, onProgress: onProgress)
+    }
+
+    func finishProgress(_ observation: MCPProgressObservation, cancelPending: Bool) async {
+        guard let delivery = eventEmitter.finishProgress(
+            observation,
+            cancelPending: cancelPending
+        ) else { return }
+        await delivery.value
     }
 
     public func send(_ message: MCPWireMessage) async throws -> MCPWireMessage? {
@@ -273,8 +301,9 @@ public actor MCPHTTPTransport: MCPTransport {
     }
 }
 
-public actor MCPInMemoryTransport: MCPTransport {
+public actor MCPInMemoryTransport: MCPTransport, MCPProgressObservingTransport {
     private let server: MCPServer
+    private let eventEmitter = MCPTransportEventEmitter()
     private var isClosed = false
 
     public init(server: MCPServer) {
@@ -286,7 +315,30 @@ public actor MCPInMemoryTransport: MCPTransport {
         return try await server.handle(message)
     }
 
+    /// Inject a server-originated notification through this transport's own
+    /// correlation boundary, matching how stdio and SSE deliver notifications.
+    public func receiveServerNotification(_ notification: MCPNotification) {
+        guard !isClosed else { return }
+        eventEmitter.notification(notification)
+    }
+
+    func observeProgress(
+        token: JsonRpcId,
+        onProgress: @escaping @Sendable (MCPProgressParams) async -> Void
+    ) -> MCPProgressObservation? {
+        eventEmitter.observeProgress(token: token, onProgress: onProgress)
+    }
+
+    func finishProgress(_ observation: MCPProgressObservation, cancelPending: Bool) async {
+        guard let delivery = eventEmitter.finishProgress(
+            observation,
+            cancelPending: cancelPending
+        ) else { return }
+        await delivery.value
+    }
+
     public func close() {
         isClosed = true
+        eventEmitter.transportClosed()
     }
 }
