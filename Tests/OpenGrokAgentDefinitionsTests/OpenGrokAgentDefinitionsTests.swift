@@ -147,6 +147,72 @@ struct OpenGrokAgentDefinitionsTests {
         #expect(discovery.allSubagents(at: nested).first(where: { $0.name == "explore" })?.source == .builtin(.explore))
     }
 
+    @Test("non-git sibling-home discovery terminates and never imports parent project authority")
+    func nonGitSiblingHomeDiscoveryIsBoundedAndCwdOnly() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        let workspaceAgents = workspace.appendingPathComponent(".opengrok/agents", isDirectory: true)
+        let parentAgents = root.appendingPathComponent(".opengrok/agents", isDirectory: true)
+        let userAgents = home.appendingPathComponent(".opengrok/agents", isDirectory: true)
+        for directory in [home, workspaceAgents, parentAgents, userAgents] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        try writeAgent("workspace-agent", description: "workspace authority", to: workspaceAgents)
+        try writeAgent("parent-agent", description: "must never cross a non-git boundary", to: parentAgents)
+        try writeAgent("user-agent", description: "explicit user authority", to: userAgents)
+        try Data("WORKSPACE INSTRUCTIONS".utf8).write(to: workspace.appendingPathComponent("AGENTS.md"))
+        try Data("PARENT INSTRUCTIONS MUST NOT LEAK".utf8).write(to: root.appendingPathComponent("AGENTS.md"))
+
+        let environment = [
+            "HOME": home.path,
+            "OPENGROK_HOME": home.appendingPathComponent(".opengrok").path,
+        ]
+        let definitions = AgentDefinitionDiscovery(environment: environment)
+        #expect(definitions.projectAgentDirectories(at: workspace) == [workspaceAgents])
+        #expect(definitions.projectDirectoryChainForInstructions(at: workspace) == [workspace.standardizedFileURL])
+        #expect(definitions.byName("workspace-agent", in: workspace)?.description == "workspace authority")
+        #expect(definitions.byName("user-agent", in: workspace)?.description == "explicit user authority")
+        #expect(definitions.byName("parent-agent", in: workspace) == nil)
+
+        let instructions = AgentInstructionDiscovery(environment: environment).discover(at: workspace)
+        #expect(instructions.contains { $0.content == "WORKSPACE INSTRUCTIONS" })
+        #expect(!instructions.contains { $0.content == "PARENT INSTRUCTIONS MUST NOT LEAK" })
+    }
+
+    @Test("home-owned git roots do not turn unrelated home ancestors into project authority")
+    func homeGitRootDoesNotEscapeWorkspace() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let workspace = home.appendingPathComponent("workspace", isDirectory: true)
+        let homeAgents = home.appendingPathComponent(".opengrok/agents", isDirectory: true)
+        let workspaceAgents = workspace.appendingPathComponent(".opengrok/agents", isDirectory: true)
+        for directory in [home.appendingPathComponent(".git"), homeAgents, workspaceAgents] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        try writeAgent("workspace-agent", description: "workspace only", to: workspaceAgents)
+        try writeAgent("home-agent", description: "home user scope", to: homeAgents)
+        try Data("HOME INSTRUCTIONS MUST NOT BECOME PROJECT".utf8).write(
+            to: home.appendingPathComponent("AGENTS.md")
+        )
+        try Data("WORKSPACE INSTRUCTIONS".utf8).write(to: workspace.appendingPathComponent("AGENTS.md"))
+
+        let environment = [
+            "HOME": home.path,
+            "OPENGROK_HOME": home.appendingPathComponent(".opengrok").path,
+        ]
+        let discovery = AgentDefinitionDiscovery(environment: environment)
+        #expect(discovery.projectAgentDirectories(at: workspace) == [workspaceAgents])
+        #expect(discovery.projectDirectoryChainForInstructions(at: workspace) == [workspace.standardizedFileURL])
+        #expect(discovery.byName("home-agent", in: workspace)?.scope == .user)
+
+        let instructions = AgentInstructionDiscovery(environment: environment).discover(at: workspace)
+        #expect(instructions.contains { $0.content == "WORKSPACE INSTRUCTIONS" })
+        #expect(!instructions.contains { $0.content == "HOME INSTRUCTIONS MUST NOT BECOME PROJECT" })
+    }
+
     @Test("instruction discovery and prompt composition preserve order")
     func instructionPromptComposition() throws {
         let root = try makeTemporaryDirectory()

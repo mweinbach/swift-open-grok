@@ -203,16 +203,25 @@ public struct AgentDefinitionDiscovery: Sendable {
         var current: URL? = start
         var chain: [URL] = []
         var gitRoot: URL?
+        var visitedPaths = Set<String>()
 
         while let directory = current {
+            let directoryPath = directory.standardizedFileURL.resolvingSymlinksInPath().path
+            guard visitedPaths.insert(directoryPath).inserted else { break }
             chain.append(directory)
             if isHome(directory, home: home) { break }
             if isDirectory(directory.appendingPathComponent(".git")) || isFile(directory.appendingPathComponent(".git")) {
                 gitRoot = directory
                 break
             }
-            let parent = directory.deletingLastPathComponent()
-            current = parent == directory ? nil : parent
+            let candidate = directory.deletingLastPathComponent()
+            // NSURL can produce `/..`, `/../..`, ... above the root; comparing
+            // URL identities or canonical paths alone does not bound that walk.
+            guard candidate.path.count < directory.path.count else { break }
+            let parent = candidate.standardizedFileURL
+            let parentPath = parent.resolvingSymlinksInPath().path
+            guard parentPath != directoryPath else { break }
+            current = parent
         }
 
         guard let gitRoot else { return [start] }
@@ -480,16 +489,7 @@ public struct AgentInstructionDiscovery: Sendable {
 
 extension AgentDefinitionDiscovery {
     func projectDirectoryChainForInstructions(at cwd: URL) -> [URL] {
-        let start = cwd.standardizedFileURL
-        var current: URL? = start
-        var chain: [URL] = []
-        while let directory = current {
-            chain.append(directory)
-            if isDirectory(directory.appendingPathComponent(".git")) || isFile(directory.appendingPathComponent(".git")) { break }
-            let parent = directory.deletingLastPathComponent()
-            current = parent == directory ? nil : parent
-        }
-        return chain
+        projectDirectoryChain(at: cwd)
     }
 }
 
