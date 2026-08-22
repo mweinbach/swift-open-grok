@@ -127,11 +127,11 @@ struct CsiFragmentFilterTests {
         #expect(filter.filter(input) == [text("["), text("<"), text("3"), text("5")])
     }
 
-    @Test("Lone typed bracket renders immediately rather than waiting for another key")
-    func csiFilterLoneBracketEmittedImmediately() {
+    @Test("Lone bracket held across batch and emitted on follow-up non-CSI character")
+    func csiFilterLoneBracketHeldAndEmittedOnFollowUp() {
         var filter = CsiFragmentFilter()
-        #expect(filter.filter([text("[")]) == [text("[")])
-        #expect(filter.filter([text("a")]) == [text("a")])
+        #expect(filter.filter([text("[")]) == [])
+        #expect(filter.filter([text("a")]) == [text("["), text("a")])
     }
 
     @Test("Min coordinates 0;0;0M swallowed")

@@ -249,6 +249,36 @@ struct LiveSessionFoundationParityTests {
         #expect(listings.first?.title == "Canonical truth")
     }
 
+    @Test("compatibility sandbox pins can strengthen canonical state but never weaken or conflict")
+    func compatibilitySandboxPinsFailClosed() async throws {
+        let fixture = try LiveSessionFoundationDiskFixture()
+        defer { fixture.cleanup() }
+        var record = fixture.record(id: "sandbox-pinned")
+        record.sandboxProfile = "off"
+        let store = LiveConversationStore(openGrokHome: fixture.home)
+        try await store.save(record)
+
+        var compatibility = record
+        compatibility.sandboxProfile = "strict"
+        try JSONEncoder().encode(compatibility).write(to: fixture.mirrorURL(record.sessionID))
+        #expect(try await store.load(sessionID: record.sessionID).sandboxProfile == "strict")
+
+        record.sandboxProfile = "strict"
+        try await store.save(record)
+        compatibility.sandboxProfile = "off"
+        try JSONEncoder().encode(compatibility).write(to: fixture.mirrorURL(record.sessionID))
+        #expect(try await store.load(sessionID: record.sessionID).sandboxProfile == "strict")
+
+        compatibility.sandboxProfile = "workspace"
+        try JSONEncoder().encode(compatibility).write(to: fixture.mirrorURL(record.sessionID))
+        do {
+            _ = try await store.load(sessionID: record.sessionID)
+            Issue.record("conflicting equal-rank sandbox profiles were silently accepted")
+        } catch {
+            #expect(String(describing: error).contains("conflicting persisted sandbox profiles"))
+        }
+    }
+
     @Test("legacy migration keeps unknown export boundaries fail closed and can upgrade safely")
     func legacyMigrationPreservesExportBoundary() async throws {
         let fixture = try LiveSessionFoundationDiskFixture()

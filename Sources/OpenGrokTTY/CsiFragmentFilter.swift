@@ -34,6 +34,10 @@ public struct CsiFragmentFilter: Sendable {
 
     public init() {}
 
+    var hasPendingEscapePrefix: Bool {
+        state != .idle || lastEventWasEsc || hadEsc
+    }
+
     public mutating func reset() {
         state = .idle
         tentative.removeAll()
@@ -126,16 +130,6 @@ public struct CsiFragmentFilter: Sendable {
                 lastEventWasEsc = false
                 result.append(ev)
             }
-        }
-
-        // A typed `[` must render immediately. Upstream only retains deeper
-        // `[<...` prefixes between drain batches; carrying the lone bracket
-        // delays every array literal until the user presses another key.
-        if state == .bracket {
-            result.append(contentsOf: tentative)
-            tentative.removeAll()
-            state = .idle
-            hadEsc = false
         }
 
         return result

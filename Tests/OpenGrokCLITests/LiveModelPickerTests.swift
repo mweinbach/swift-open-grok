@@ -405,6 +405,18 @@ struct LiveModelCatalogEntryTests {
 struct LiveOpenCodeGoCatalogTests {
     @Test("picker entries come from the filtered shared catalog snapshot")
     func filteredSnapshotFeedsPicker() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "opengrok-picker-opencode-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let environment = [
+            "HOME": home.path,
+            "OPENGROK_HOME": home.path,
+            OpenCodeGoModels.apiKeyEnv: "fixture-opencode-key",
+        ]
+
         var info = ModelInfo.fallback(slug: "opencode-go:gpt-ish")
         info.id = "opencode-go:gpt-ish"
         info.model = "gpt-ish"
@@ -422,16 +434,20 @@ struct LiveOpenCodeGoCatalogTests {
             ]),
             descriptors: [],
             warnings: [],
-            credentialFingerprint: "fixture"
+            credentialFingerprint: "6016a36c568a0296"
         )
-        let store = LiveModelCatalogStore(input: CatalogResolutionInput())
+        let store = LiveModelCatalogStore(
+            input: CatalogResolutionInput(),
+            environment: environment,
+            openGrokHome: home
+        )
         store.applyOpenCodeGoCatalog(remote)
 
         let resolver = LiveModelCatalogResolver(
-            environment: [:],
-            openGrokHome: URL(fileURLWithPath: "/tmp/opengrok-tests", isDirectory: true),
+            environment: environment,
+            openGrokHome: home,
             sessionID: "fixture",
-            workingDirectory: URL(fileURLWithPath: "/tmp", isDirectory: true),
+            workingDirectory: home,
             catalogSource: { store.snapshot() }
         )
         #expect(!resolver.catalogEntries().contains { $0.id == "opencode-go:gpt-ish" })

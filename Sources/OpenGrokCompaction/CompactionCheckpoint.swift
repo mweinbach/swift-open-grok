@@ -355,8 +355,11 @@ public enum SessionUpdateRecord: Codable, Sendable, Equatable {
         // Case 1: Check for method / params envelope (e.g. `_x.ai/session/update`)
         if container.contains(.params) {
             let params = try container.nestedContainer(keyedBy: CodingKeys.self, forKey: .params)
-            if params.contains(.update) {
-                let update = try params.nestedContainer(keyedBy: CodingKeys.self, forKey: .update)
+            let updateKey: CodingKeys? = params.contains(.update)
+                ? .update
+                : (params.contains(.sessionUpdate) ? .sessionUpdate : nil)
+            if let updateKey {
+                let update = try params.nestedContainer(keyedBy: CodingKeys.self, forKey: updateKey)
                 if let updateType = try update.decodeIfPresent(String.self, forKey: .sessionUpdate) {
                     switch updateType {
                     case "compaction_checkpoint":

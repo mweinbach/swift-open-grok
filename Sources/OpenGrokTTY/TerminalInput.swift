@@ -1010,9 +1010,15 @@ public final class PosixTerminalInput: TerminalInput, @unchecked Sendable {
 
     private func enqueueDecoded(_ byte: UInt8) throws {
         let wasPasting = decoder.isBracketedPasteActive
+        let hadPendingEscape = decoder.hasPendingEscapeSequence || csiFilter.hasPendingEscapePrefix
         let rawEvents = try decoder.feed(byte)
         if !rawEvents.isEmpty {
             if wasPasting, decoder.isBracketedPasteActive {
+                eventQueue.append(contentsOf: rawEvents)
+            } else if byte == 0x5b, !hadPendingEscape, rawEvents == [.text("[")] {
+                // Only this raw-byte seam can distinguish a typed `[` from a
+                // CSI fragment. The reusable event filter must retain it for
+                // single-byte SGR/focus batches where that context is lost.
                 eventQueue.append(contentsOf: rawEvents)
             } else {
                 eventQueue.append(contentsOf: csiFilter.filter(rawEvents))

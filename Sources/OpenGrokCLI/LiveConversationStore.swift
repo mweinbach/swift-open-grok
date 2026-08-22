@@ -219,7 +219,8 @@ actor LiveConversationStore {
             if let persisted,
                try canonicalSummaryExists(for: persisted.summary)
             {
-                return try Self.record(from: persisted, requestedSessionID: sessionID)
+                let record = try Self.record(from: persisted, requestedSessionID: sessionID)
+                return try reconcileCompatibilitySandboxPin(record)
             }
 
             let url = fileURL(sessionID: sessionID)
@@ -481,6 +482,54 @@ actor LiveConversationStore {
         )
         return fileManager.fileExists(
             atPath: directory.appendingPathComponent("summary.json").path
+        )
+    }
+
+    private func reconcileCompatibilitySandboxPin(
+        _ canonical: LiveConversationRecord
+    ) throws -> LiveConversationRecord {
+        let compatibilityURL = fileURL(sessionID: canonical.sessionID)
+        guard fileManager.fileExists(atPath: compatibilityURL.path) else {
+            return canonical
+        }
+
+        let compatibility = try JSONDecoder().decode(
+            LiveConversationRecord.self,
+            from: Data(contentsOf: compatibilityURL)
+        )
+        guard compatibility.sessionID == canonical.sessionID else {
+            throw CLIApplicationError.failed("session file ID mismatch: \(canonical.sessionID)")
+        }
+        guard let compatibilityProfile = compatibility.sandboxProfile,
+              !compatibilityProfile.isEmpty
+        else { return canonical }
+
+        guard let canonicalProfile = canonical.sandboxProfile,
+              !canonicalProfile.isEmpty
+        else {
+            var result = canonical
+            result.sandboxProfile = compatibilityProfile
+            return result
+        }
+
+        let canonicalName = ProfileName(parsing: canonicalProfile)
+        let compatibilityName = ProfileName(parsing: compatibilityProfile)
+        guard canonicalName != compatibilityName else { return canonical }
+
+        let canonicalRank = SandboxMode.from(profile: canonicalName).rank
+        let compatibilityRank = SandboxMode.from(profile: compatibilityName).rank
+        if compatibilityRank > canonicalRank {
+            var result = canonical
+            result.sandboxProfile = compatibilityProfile
+            return result
+        }
+        if canonicalRank > compatibilityRank {
+            return canonical
+        }
+
+        throw CLIApplicationError.failed(
+            "conflicting persisted sandbox profiles '\(canonicalName.description)' "
+                + "and '\(compatibilityName.description)' for session \(canonical.sessionID)"
         )
     }
 
