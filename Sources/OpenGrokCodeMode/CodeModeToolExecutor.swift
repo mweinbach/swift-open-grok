@@ -60,7 +60,8 @@ public struct CodeModeToolRegistrySnapshot: Sendable, Equatable {
 public protocol CodeModeToolExecutor: Sendable {
     func executeNestedTool(
         _ invocation: CodeModeNestedToolCall,
-        cancellationToken: CodeModeCancellationToken
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
     ) async -> Result<JSONValue, CodeModeError>
 
     /// Surface an interim `notify(...)` message from a running cell as an
@@ -107,7 +108,8 @@ public struct CodeModeExecutorDelegate: CodeModeSessionDelegate {
 
     public func invokeTool(
         _ invocation: CodeModeNestedToolCall,
-        cancellationToken: CodeModeCancellationToken
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
     ) async -> Result<JSONValue, CodeModeError> {
         guard snapshot.definition(for: invocation.toolName) != nil else {
             return .failure(
@@ -116,7 +118,8 @@ public struct CodeModeExecutorDelegate: CodeModeSessionDelegate {
         }
         return await executor.executeNestedTool(
             invocation,
-            cancellationToken: cancellationToken
+            cancellationToken: cancellationToken,
+            progress: progress
         )
     }
 

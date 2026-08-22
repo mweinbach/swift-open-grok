@@ -30,6 +30,9 @@ private final class FakeToolExecutor: CodeModeToolExecutor, @unchecked Sendable 
     enum Behavior: Sendable {
         case respond(JSONValue)
         case fail(String)
+        case stream([NestedToolProgress], result: JSONValue)
+        case progressHandshake([NestedToolProgress], result: JSONValue)
+        case streamThenBlock([NestedToolProgress])
         /// Park until the cell's cancellation token fires, then report the
         /// cancellation — the shape a well-behaved host dispatcher has.
         case blockUntilCancelled
@@ -38,6 +41,8 @@ private final class FakeToolExecutor: CodeModeToolExecutor, @unchecked Sendable 
     private let lock = NSLock()
     private var behavior: Behavior
     private var invocations: [CodeModeNestedToolCall] = []
+    private var progressSinks: [NestedToolProgressSink] = []
+    private var pendingProgressAcknowledgement: CodeModeCancellationToken?
     private var observedCancellation = false
     private var notifications: [(callId: String, cellId: CellId, text: String)] = []
     private var closedCells: [CellId] = []
@@ -63,6 +68,10 @@ private final class FakeToolExecutor: CodeModeToolExecutor, @unchecked Sendable 
         synchronized { invocations }
     }
 
+    var recordedProgressSinks: [NestedToolProgressSink] {
+        synchronized { progressSinks }
+    }
+
     var sawCancellation: Bool {
         synchronized { observedCancellation }
     }
@@ -75,9 +84,17 @@ private final class FakeToolExecutor: CodeModeToolExecutor, @unchecked Sendable 
         synchronized { closedCells }
     }
 
-    private func recordInvocation(_ invocation: CodeModeNestedToolCall) -> Behavior {
+    func replaceBehavior(_ behavior: Behavior) {
+        synchronized { self.behavior = behavior }
+    }
+
+    private func recordInvocation(
+        _ invocation: CodeModeNestedToolCall,
+        progress: NestedToolProgressSink
+    ) -> Behavior {
         synchronized {
             invocations.append(invocation)
+            progressSinks.append(progress)
             return behavior
         }
     }
@@ -92,9 +109,10 @@ private final class FakeToolExecutor: CodeModeToolExecutor, @unchecked Sendable 
 
     func executeNestedTool(
         _ invocation: CodeModeNestedToolCall,
-        cancellationToken: CodeModeCancellationToken
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
     ) async -> Result<JSONValue, CodeModeError> {
-        let behavior = recordInvocation(invocation)
+        let behavior = recordInvocation(invocation, progress: progress)
         started.signal()
 
         switch behavior {
@@ -102,6 +120,31 @@ private final class FakeToolExecutor: CodeModeToolExecutor, @unchecked Sendable 
             return .success(value)
         case .fail(let message):
             return .failure(CodeModeError(message))
+        case .stream(let chunks, let result):
+            for chunk in chunks {
+                progress.push(chunk)
+            }
+            return .success(result)
+        case .progressHandshake(let chunks, let result):
+            for chunk in chunks {
+                let acknowledgement = CodeModeCancellationToken()
+                synchronized { pendingProgressAcknowledgement = acknowledgement }
+                cancellationToken.onCancel { acknowledgement.cancel() }
+                progress.push(chunk)
+                await acknowledgement.waitUntilCancelled()
+                guard !cancellationToken.isCancelled else {
+                    return .failure(CodeModeError("cancelled"))
+                }
+            }
+            synchronized { pendingProgressAcknowledgement = nil }
+            return .success(result)
+        case .streamThenBlock(let chunks):
+            for chunk in chunks {
+                progress.push(chunk)
+            }
+            await cancellationToken.waitUntilCancelled()
+            recordCancellation()
+            return .failure(CodeModeError("cancelled"))
         case .blockUntilCancelled:
             await cancellationToken.waitUntilCancelled()
             recordCancellation()
@@ -116,6 +159,9 @@ private final class FakeToolExecutor: CodeModeToolExecutor, @unchecked Sendable 
         cancellationToken: CodeModeCancellationToken
     ) async -> Result<Void, CodeModeError> {
         recordNotification(callId: callId, cellId: cellId, text: text)
+        if text == "progress-ack" {
+            synchronized { pendingProgressAcknowledgement }?.cancel()
+        }
         return .success(())
     }
 
@@ -402,6 +448,149 @@ struct CodeModeNestedDispatchTests {
     }
 }
 
+@Suite("Code mode nested tool progress lifecycle")
+struct CodeModeNestedProgressTests {
+    @Test("progress handlers run while the host tool is still waiting")
+    func progressHandlerAndRunningHostCanHandshake() async throws {
+        let executor = FakeToolExecutor(behavior: .progressHandshake([
+            .text("a"), .text("b"), .text("c")
+        ], result: .string("done")))
+        let codeMode = session(executor: executor)
+        defer { Task { _ = await codeMode.shutdown() } }
+
+        let response = try await runToFirstResponse(
+            codeMode,
+            execRequest(
+                """
+                const chunks = [];
+                const pending = tools.demo({});
+                pending.onProgress((chunk) => {
+                  chunks.push(chunk.text);
+                  notify("progress-ack");
+                });
+                text(JSON.stringify({ chunks, resolved: await pending }));
+                """,
+                tools: [demoDefinition],
+                yieldTimeMs: 1_000
+            )
+        )
+
+        #expect(texts(response) == [#"{"chunks":["a","b","c"],"resolved":"done"}"#])
+        #expect(executor.recordedNotifications.map { $0.text } == [
+            "progress-ack", "progress-ack", "progress-ack"
+        ])
+    }
+
+    @Test("real cells receive ordered text and structured progress through the executor")
+    func progressCrossesEveryRuntimeAndDelegateSeam() async throws {
+        let executor = FakeToolExecutor(behavior: .stream([
+            .text("first"),
+            .withPayload("second", .object(["step": .number(.int64(2))])),
+            .text("third"),
+        ], result: .string("done")))
+        let codeMode = session(executor: executor)
+        defer { Task { _ = await codeMode.shutdown() } }
+
+        let response = try await runToFirstResponse(
+            codeMode,
+            execRequest(
+                """
+                const chunks = [];
+                const pending = tools.demo({});
+                pending.onProgress((chunk) => {
+                  chunks.push([chunk.text, chunk.payload]);
+                });
+                text(JSON.stringify({ chunks, resolved: await pending }));
+                """,
+                tools: [demoDefinition]
+            )
+        )
+
+        #expect(texts(response) == [
+            #"{"chunks":[["first",null],["second",{"step":2}],["third",null]],"resolved":"done"}"#
+        ])
+        #expect(executor.recordedInvocations.count == 1)
+    }
+
+    @Test("throwing and absent JavaScript handlers never alter the nested result")
+    func observationalHandlersCannotFailTheInvocation() async throws {
+        let executor = FakeToolExecutor(behavior: .stream([
+            .text("ignored")
+        ], result: .string("done")))
+        let codeMode = session(executor: executor)
+        defer { Task { _ = await codeMode.shutdown() } }
+
+        let throwing = try await runToFirstResponse(
+            codeMode,
+            execRequest(
+                """
+                const pending = tools.demo({});
+                pending.onProgress(() => { throw new Error("observation failed"); });
+                text(String(await pending));
+                """,
+                tools: [demoDefinition]
+            )
+        )
+        #expect(texts(throwing) == ["done"])
+
+        let absent = try await runToFirstResponse(
+            codeMode,
+            execRequest("text(String(await tools.demo({})));", callId: "next", tools: [demoDefinition])
+        )
+        #expect(texts(absent) == ["done"])
+    }
+
+    @Test("terminating a cell closes stale progress before its call ID is reused")
+    func terminatedCellProgressCannotLeakIntoNextCell() async throws {
+        let executor = FakeToolExecutor(behavior: .streamThenBlock([.text("before-cancel")]))
+        let codeMode = session(executor: executor)
+        defer { Task { _ = await codeMode.shutdown() } }
+
+        let first = try await runToFirstResponse(
+            codeMode,
+            execRequest(
+                """
+                const pending = tools.demo({});
+                pending.onProgress((chunk) => text(chunk.text));
+                await pending;
+                """,
+                tools: [demoDefinition],
+                yieldTimeMs: 50
+            )
+        )
+        guard case .yielded(let firstCellID, _) = first else {
+            Issue.record("expected a yielded cell before cancellation")
+            return
+        }
+        #expect(texts(first) == ["before-cancel"])
+        let staleSink = try #require(executor.recordedProgressSinks.first)
+
+        let terminal = try requireSuccess(await codeMode.terminate(firstCellID))
+        guard case .liveCell(.terminated) = terminal else {
+            Issue.record("expected a terminated live cell")
+            return
+        }
+        #expect(staleSink.isClosed)
+        staleSink.push(.text("stale"))
+
+        executor.replaceBehavior(.stream([.text("fresh")], result: .null))
+        let second = try await runToFirstResponse(
+            codeMode,
+            execRequest(
+                """
+                const pending = tools.demo({});
+                pending.onProgress((chunk) => text(chunk.text));
+                await pending;
+                """,
+                callId: "next-cell",
+                tools: [demoDefinition]
+            )
+        )
+        #expect(texts(second) == ["fresh"])
+        #expect(executor.recordedInvocations.map(\.runtimeToolCallId) == ["tool-1", "tool-1"])
+    }
+}
+
 // MARK: - Termination
 
 @Suite("Code mode termination")
@@ -621,7 +810,7 @@ struct CodeModeProtocolProjectionTests {
         #expect(codeModeYieldTimeout(yieldTimeMs: 50) == 50)
         #expect(codeModeYieldTimeout(yieldTimeMs: 9_999) == 9_999)
         #expect(codeModeYieldTimeout(yieldTimeMs: 10_000) == 11_000)
-        #expect(codeModeYieldTimeout(yieldTimeMs: DEFAULT_EXEC_YIELD_TIME_MS) == 11_000)
+        #expect(codeModeYieldTimeout(yieldTimeMs: DEFAULT_EXEC_YIELD_TIME_MS) == 31_000)
         #expect(codeModeYieldTimeout(yieldTimeMs: 30_000) == 31_000)
     }
 

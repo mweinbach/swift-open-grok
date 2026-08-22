@@ -38,7 +38,8 @@ public struct NoopCodeModeSessionDelegate: CodeModeSessionDelegate {
 
     public func invokeTool(
         _ invocation: CodeModeNestedToolCall,
-        cancellationToken: CodeModeCancellationToken
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
     ) async -> Result<JSONValue, CodeModeError> {
         await cancellationToken.waitUntilCancelled()
         return .failure(CodeModeError("code mode nested tools are unavailable"))
@@ -251,7 +252,8 @@ private struct ProtocolDelegateBridge: CodeModeSessionRuntimeDelegate {
     func invokeTool(
         cellId: CellId,
         invocation: CodeModeCellToolCall,
-        cancellationToken: CodeModeCancellationToken
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
     ) async -> Result<JSONValue, CodeModeError> {
         await delegate.invokeTool(
             CodeModeNestedToolCall(
@@ -261,7 +263,8 @@ private struct ProtocolDelegateBridge: CodeModeSessionRuntimeDelegate {
                 toolKind: invocation.kind,
                 input: invocation.input
             ),
-            cancellationToken: cancellationToken
+            cancellationToken: cancellationToken,
+            progress: progress
         )
     }
 

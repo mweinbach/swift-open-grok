@@ -321,7 +321,7 @@ struct CodeModeDescriptionTests {
 
     @Test("defaults match Rust constants")
     func defaults() {
-        #expect(DEFAULT_EXEC_YIELD_TIME_MS == 10_000)
+        #expect(DEFAULT_EXEC_YIELD_TIME_MS == 30_000)
         #expect(DEFAULT_WAIT_YIELD_TIME_MS == 10_000)
         #expect(DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL == 10_000)
         #expect(CODE_MODE_PRAGMA_PREFIX == "// @exec:")
@@ -471,7 +471,8 @@ private final class RecordingDelegate: CodeModeSessionDelegate, @unchecked Senda
     /// the per-cell token rather than ambient Task cancellation alone.
     func invokeTool(
         _ invocation: CodeModeNestedToolCall,
-        cancellationToken: CodeModeCancellationToken
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
     ) async -> Result<JSONValue, CodeModeError> {
         lock.withLock {
             invokeTokens.append(cancellationToken)
@@ -560,7 +561,9 @@ private final class HarnessSession: CodeModeSession, @unchecked Sendable {
             toolKind: .function,
             input: .object(["x": .string("1")])
         )
-        return await delegate.invokeTool(invocation, cancellationToken: token)
+        let (progress, receiver) = nestedToolProgressChannel()
+        defer { receiver.close() }
+        return await delegate.invokeTool(invocation, cancellationToken: token, progress: progress)
     }
 
     /// Issue a notify callback for a live cell, propagating its token.

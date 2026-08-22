@@ -55,16 +55,7 @@
   },
   "notes": "Checked-in key-order fixtures for implemented foundation contracts, re-evaluated at the 9ed09e2a pin with per-key Rust file:line provenance.",
   "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
-  "portDrift": {
-    "DEFAULT_EXEC_YIELD_TIME_MS": {
-      "swift": 10000,
-      "reference": 30000,
-      "swiftSources": [
-        "Sources/OpenGrokCodeModeProtocol/Runtime.swift:26"
-      ],
-      "note": "Upstream raised the Code Mode exec yield default from 10s to 30s between the two pins. The Swift port still carries 10s. Owned by W1-S4 (OpenGrokCodeModeProtocol), not by the fixture slice."
-    }
-  },
+  "portDrift": {},
   "provenance": {
     "source": "xai-grok-config-types (ConfigSource, RuleAction) + xai-grok-code-mode-protocol (runtime defaults), cross-checked against OpenGrokConfigTypes/OpenGrokWorkspaceTypes/OpenGrokCodeModeProtocol",
     "referenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",

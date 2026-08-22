@@ -21,7 +21,8 @@ protocol CodeModeSessionRuntimeDelegate: Sendable {
     func invokeTool(
         cellId: CellId,
         invocation: CodeModeCellToolCall,
-        cancellationToken: CodeModeCancellationToken
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
     ) async -> Result<JSONValue, CodeModeError>
 
     func notify(
@@ -144,12 +145,14 @@ actor CodeModeSessionRuntime {
     fileprivate func invokeTool(
         cellId: CellId,
         invocation: CodeModeCellToolCall,
-        cancellationToken: CodeModeCancellationToken
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
     ) async -> Result<JSONValue, CodeModeError> {
         await delegate.invokeTool(
             cellId: cellId,
             invocation: invocation,
-            cancellationToken: cancellationToken
+            cancellationToken: cancellationToken,
+            progress: progress
         )
     }
 
@@ -201,12 +204,14 @@ private struct CellHostBridge: CodeModeCellHost {
 
     func invokeTool(
         _ invocation: CodeModeCellToolCall,
-        cancellationToken: CodeModeCancellationToken
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
     ) async -> Result<JSONValue, CodeModeError> {
         await runtime.invokeTool(
             cellId: cellId,
             invocation: invocation,
-            cancellationToken: cancellationToken
+            cancellationToken: cancellationToken,
+            progress: progress
         )
     }
 

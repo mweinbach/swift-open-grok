@@ -26,6 +26,8 @@
 //     `CodeModeSessionProvider` — translated to Swift `async`/`await` +
 //     `Sendable` protocols so the runtime crate (`OpenGrokCodeMode`) can
 //     implement them with actors (`Session.swift`).
+//   * Bounded, drop-oldest nested-tool progress channels and typed text /
+//     structured-payload chunks (`Progress.swift`).
 //
 // Rust crate mapping: xai-grok-code-mode-protocol
 // (crates/codegen/xai-grok-code-mode-protocol). See CRATE_MAP.md and

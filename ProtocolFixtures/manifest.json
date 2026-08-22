@@ -15,8 +15,8 @@
     },
     {
       "path": "ProtocolFixtures/config-workspace-codemode-keys.json",
-      "sizeBytes": 4500,
-      "sha256": "196f5969b83d980535859d58fbe59cc2edf6cd28e1f96f593bb35b97d5cd6f85"
+      "sizeBytes": 4108,
+      "sha256": "5ba4d3b1bc68c329af698842ada295c817706801d7ad75c433aded9dfd4961c6"
     },
     {
       "path": "ProtocolFixtures/crash-gcrx-format.json",
@@ -60,8 +60,8 @@
     },
     {
       "path": "ProtocolFixtures/PROVENANCE.json",
-      "sizeBytes": 8629,
-      "sha256": "9da3cb12df75cf11a50bf68245a412e0e3960877027f5e9de4a9be5710e7ecf8"
+      "sizeBytes": 8463,
+      "sha256": "42cc5b6689a7cbe0ca7c727fc44069f3acc0eed51c52a3085c1fc6407e3cad48"
     },
     {
       "path": "ProtocolFixtures/pty-process-signals.json",

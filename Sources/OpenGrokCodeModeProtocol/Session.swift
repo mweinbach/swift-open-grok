@@ -300,9 +300,12 @@ public protocol CodeModeSessionDelegate: Sendable {
     /// - Parameter cancellationToken: Per-cell cancellation handle. Cancelled
     ///   exactly once when the cell is terminated, completes, or the session
     ///   shuts down.
+    /// - Parameter progress: Bounded, observation-only channel for chunks
+    ///   produced before this invocation reaches its terminal result.
     func invokeTool(
         _ invocation: CodeModeNestedToolCall,
-        cancellationToken: CodeModeCancellationToken
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
     ) async -> Result<JSONValue, CodeModeError>
 
     /// Inject an extra `custom_tool_call_output` for the current `exec`

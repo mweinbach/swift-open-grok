@@ -351,6 +351,10 @@ extension JavaScriptCellRuntime {
                     id: id,
                     result: .failure(CodeModeError(errorText))
                 )
+            case .toolProgress(let id, let progress):
+                // Progress is observation-only: stale calls, absent handlers,
+                // and handler exceptions cannot fail the surrounding cell.
+                engine.deliverToolProgress(id: id, progress: progress)
             case .timeoutFired(let id):
                 dispatchError = engine.invokeTimeout(id: id)
             case .observePendingFrontier:
@@ -412,6 +416,7 @@ private final class JavaScriptCellEngine {
     private var storedValues: [String: JSONValue]
     private(set) var storedValueWrites: [String: JSONValue] = [:]
     private var pendingToolCalls: [String: (resolve: JSValue, reject: JSValue)] = [:]
+    private var pendingProgressCallbacks: [String: JSValue] = [:]
     private var pendingTimeouts: [UInt64: JSValue] = [:]
     private var nextToolCallId: UInt64 = 1
     private var nextTimeoutId: UInt64 = 1
@@ -602,6 +607,7 @@ private final class JavaScriptCellEngine {
     /// Drop JS references held for work that will never arrive.
     func releasePendingCallbacks() {
         pendingToolCalls.removeAll()
+        pendingProgressCallbacks.removeAll()
         pendingTimeouts.removeAll()
     }
 
@@ -634,9 +640,52 @@ private final class JavaScriptCellEngine {
 
         let id = "tool-\(nextToolCallId)"
         nextToolCallId = nextToolCallId == UInt64.max ? UInt64.max : nextToolCallId + 1
+        let subscribe: @convention(block) (JSValue?) -> Void = { [weak self] handler in
+            self?.registerProgressHandler(handler, callID: id)
+        }
+        promise.setObject(subscribe, forKeyedSubscript: "onProgress" as NSString)
+        guard promise.hasProperty("onProgress") else {
+            throwToJS("failed to attach onProgress to the tool promise")
+            return nil
+        }
         pendingToolCalls[id] = resolvers
         emit(.toolCall(id: id, name: tool.toolName, kind: tool.kind, input: input))
         return promise
+    }
+
+    /// `promise.onProgress(fn)` replaces the previous callback for this call.
+    /// Its contract and error match runtime/callbacks.rs:98-120.
+    private func registerProgressHandler(_ handler: JSValue?, callID: String) {
+        guard let handler,
+              handler.isObject,
+              let function = context.objectForKeyedSubscript("Function"),
+              handler.isInstance(of: function)
+        else {
+            throwToJS("onProgress expects a handler function")
+            return
+        }
+        guard pendingToolCalls[callID] != nil else { return }
+        pendingProgressCallbacks[callID] = handler
+    }
+
+    /// Delivers on the JavaScript thread only while the invocation remains
+    /// pending. Exceptions belong to the observation callback, never the cell.
+    func deliverToolProgress(id: String, progress: NestedToolProgress) {
+        guard pendingToolCalls[id] != nil else {
+            pendingProgressCallbacks.removeValue(forKey: id)
+            return
+        }
+        guard let callback = pendingProgressCallbacks[id],
+              let argument = jsValue(from: .object([
+                "text": .string(progress.text),
+                "payload": progress.payload ?? .null,
+              ]))
+        else { return }
+        watchdog?.armForEntry()
+        callback.call(withArguments: [argument])
+        if takeExceptionText() != nil {
+            return
+        }
     }
 
     /// Mirrors `resolve_tool_response` (runtime/module_loader.rs:66).
@@ -645,6 +694,7 @@ private final class JavaScriptCellEngine {
         guard let resolvers = pendingToolCalls.removeValue(forKey: id) else {
             return "unknown tool call `\(id)`"
         }
+        pendingProgressCallbacks.removeValue(forKey: id)
         switch result {
         case .success(let value):
             guard let bridged = jsValue(from: value) else {

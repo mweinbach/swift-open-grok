@@ -71,6 +71,7 @@ public enum JavaScriptPendingMode: Sendable, Hashable, Codable {
 public enum JavaScriptRuntimeCommand: Sendable, Codable {
     case toolResponse(id: String, result: JSONValue)
     case toolError(id: String, errorText: String)
+    case toolProgress(id: String, progress: NestedToolProgress)
     case timeoutFired(id: UInt64)
     case observePendingFrontier
     case terminate

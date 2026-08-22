@@ -35,7 +35,8 @@ import OpenGrokShared
 protocol CodeModeCellHost: Sendable {
     func invokeTool(
         _ invocation: CodeModeCellToolCall,
-        cancellationToken: CodeModeCancellationToken
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
     ) async -> Result<JSONValue, CodeModeError>
 
     func notify(
@@ -528,7 +529,22 @@ actor CodeModeCell {
         let runtime = self.runtime
         let callId = invocation.id
         toolTasks[id] = Task { [weak self] in
-            let result = await host.invokeTool(invocation, cancellationToken: token)
+            let (progressSink, progressReceiver) = nestedToolProgressChannel()
+            token.onCancel { progressReceiver.close() }
+            let forwarder = Task {
+                while !token.isCancelled,
+                      let progress = await progressReceiver.receive() {
+                    guard !token.isCancelled else { break }
+                    runtime.send(.toolProgress(id: callId, progress: progress))
+                }
+            }
+            let result = await host.invokeTool(
+                invocation,
+                cancellationToken: token,
+                progress: progressSink
+            )
+            progressReceiver.close()
+            await forwarder.value
             switch result {
             case .success(let value):
                 runtime.send(.toolResponse(id: callId, result: value))

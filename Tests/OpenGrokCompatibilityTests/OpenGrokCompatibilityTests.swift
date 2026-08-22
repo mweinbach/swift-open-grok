@@ -17,6 +17,7 @@ import Foundation
 import Testing
 
 import OpenGrokACP
+import OpenGrokCodeModeProtocol
 import OpenGrokDistributionSupport
 
 private let acceptedVerdicts: Set<String> = ["unchanged (verified)", "recaptured"]
@@ -486,25 +487,21 @@ struct RecapturedFixtureContentTests {
         // The one value that genuinely moved at this pin.
         let defaults = fixture["codeModeRuntimeDefaults"] as? [String: Int] ?? [:]
         #expect(defaults["DEFAULT_EXEC_YIELD_TIME_MS"] == 30000)
+        #expect(defaults["DEFAULT_EXEC_YIELD_TIME_MS"] == Int(DEFAULT_EXEC_YIELD_TIME_MS))
 
         // deny > ask > allow, unchanged.
         #expect(fixture["workspacePermissionOrder"] as? [String] == ["deny", "ask", "allow"])
         #expect(fixture["permissionRuleActionDefault"] as? String == "deny")
     }
 
-    @Test("known Swift-port drift is recorded rather than hidden")
-    func portDriftIsRecorded() throws {
-        // The Code Mode fixture still records the unresolved upstream default;
-        // the release-version drift is resolved by the shipped version seam.
-        for name in ["config-workspace-codemode-keys.json"] {
-            let fixture = try FixtureCorpus.json(name)
-            let drift = fixture["portDrift"] as? [String: Any] ?? [:]
-            #expect(!drift.isEmpty, "\(name) recaptured a moved value without recording port drift")
-        }
+    @Test("resolved Swift-port drift is removed from fixture provenance")
+    func resolvedPortDriftIsRemoved() throws {
+        let fixture = try FixtureCorpus.json("config-workspace-codemode-keys.json")
+        let drift = fixture["portDrift"] as? [String: Any] ?? [:]
+        #expect(drift.isEmpty)
 
         let provenance = try FixtureCorpus.json("PROVENANCE.json")
         let openDrift = provenance["openPortDrift"] as? [String] ?? []
-        #expect(openDrift.count == 1)
-        #expect(openDrift.contains { $0.contains("DEFAULT_EXEC_YIELD_TIME_MS") })
+        #expect(openDrift.isEmpty)
     }
 }

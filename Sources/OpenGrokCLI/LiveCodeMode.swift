@@ -66,10 +66,8 @@ func isLiveCodeModeDirectOnlyTool(_ name: String) -> Bool {
 
 /// Yield windows the shell sends. `exec` gets 30 s and `wait` 10 s
 /// (DEFAULT_EXEC_YIELD_TIME_MS / DEFAULT_WAIT_YIELD_TIME_MS,
-/// xai-grok-code-mode-protocol/src/runtime.rs:11). The protocol target's
-/// `DEFAULT_EXEC_YIELD_TIME_MS` is the engine-side fallback of 10 s; the
-/// 30 s choice belongs to the composition, so it is stated here.
-let LIVE_CODE_MODE_EXEC_YIELD_TIME_MS: UInt64 = 30_000
+/// xai-grok-code-mode-protocol/src/runtime.rs:11-12).
+let LIVE_CODE_MODE_EXEC_YIELD_TIME_MS: UInt64 = DEFAULT_EXEC_YIELD_TIME_MS
 let LIVE_CODE_MODE_WAIT_YIELD_TIME_MS: UInt64 = DEFAULT_WAIT_YIELD_TIME_MS
 
 // MARK: - Tool mode resolution
@@ -324,7 +322,8 @@ struct LiveCodeModeNestedExecutor: CodeModeToolExecutor {
 
     func executeNestedTool(
         _ invocation: CodeModeNestedToolCall,
-        cancellationToken: CodeModeCancellationToken
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
     ) async -> Result<JSONValue, CodeModeError> {
         let name = invocation.toolName.name
         // Matches Rust's synthetic id for a cell-issued call
@@ -346,7 +345,19 @@ struct LiveCodeModeNestedExecutor: CodeModeToolExecutor {
                 await toolExecutor.invoke(
                     sessionID: sessionID,
                     workingDirectory: workingDirectory,
-                    call: ToolCall(id: callID, name: name, arguments: arguments)
+                    call: ToolCall(id: callID, name: name, arguments: arguments),
+                    onOutput: { delta in
+                        guard !cancellationToken.isCancelled, !progress.isClosed else { return }
+                        progress.push(.text(delta.text))
+                        await emitter.send(.tool(OpenGrokShellToolUpdate(
+                            callID: delta.callID,
+                            name: name,
+                            input: arguments,
+                            output: delta.text,
+                            state: .running,
+                            outputOp: delta.op == .replace ? .replace : .append
+                        )))
+                    }
                 )
             }
         )

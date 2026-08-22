@@ -23,7 +23,7 @@ import OpenGrokShared
 
 /// Default yield budget (ms) for an `exec` call when the pragma does not
 /// override it. Mirrors `DEFAULT_EXEC_YIELD_TIME_MS` in the Rust crate.
-public let DEFAULT_EXEC_YIELD_TIME_MS: UInt64 = 10_000
+public let DEFAULT_EXEC_YIELD_TIME_MS: UInt64 = 30_000
 
 /// Default yield budget (ms) for a `wait` call.
 public let DEFAULT_WAIT_YIELD_TIME_MS: UInt64 = 10_000

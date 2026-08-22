@@ -44,7 +44,7 @@
         "crates/codegen/xai-grok-workspace-types/src/types/permission.rs",
         "crates/codegen/xai-grok-code-mode-protocol/src/runtime.rs"
       ],
-      "evidence": "git diff 70002584..650c1db7 is empty for the asserted ConfigSource, RuleAction, workspace permission, and Code Mode runtime-default surfaces. The 30_000ms exec default remains the one unresolved port drift recorded by this fixture."
+      "evidence": "git diff 70002584..650c1db7 is empty for the asserted ConfigSource, RuleAction, workspace permission, and Code Mode runtime-default surfaces. The Swift Code Mode exec default now matches the reference value of 30_000ms."
     },
     {
       "file": "crash-gcrx-format.json",
@@ -152,9 +152,7 @@
       "evidence": "git diff 70002584..650c1db7 is empty for the tracing and redaction surfaces asserted here; the denylist remains untouched."
     }
   ],
-  "openPortDrift": [
-    "Sources/OpenGrokCodeModeProtocol/Runtime.swift:26 still sets DEFAULT_EXEC_YIELD_TIME_MS to 10_000 while the reference is 30_000. Owned by W1-S4."
-  ],
+  "openPortDrift": [],
   "files": [
     "PROVENANCE.json",
     "acp-methods.json",
