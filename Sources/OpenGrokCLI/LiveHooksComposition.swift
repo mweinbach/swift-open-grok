@@ -52,10 +52,17 @@ public enum LiveHooksComposition {
         sessionId: String,
         workspaceRoot: URL,
         cwd: String? = nil,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        projectTrusted: Bool? = nil
     ) -> Loaded {
+        let canonicalWorkspaceRoot = workspaceRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let resolvedProjectTrust = projectTrusted ?? LiveSecurityContext.resolve(
+            workspaceRoot: canonicalWorkspaceRoot,
+            environment: environment,
+            isInteractive: false
+        ).projectTrusted
         let configPath = (userGrokHome(environment: environment)
-            ?? workspaceRoot).appendingPathComponent("config.toml")
+            ?? canonicalWorkspaceRoot).appendingPathComponent("config.toml")
 
         var specs: [HookSpec] = []
         var errors: [HookError] = []
@@ -80,8 +87,9 @@ public enum LiveHooksComposition {
         let discovered = HookSessionLoader.load(
             configDocument: nil,
             configPath: configPath,
-            workspaceRoot: workspaceRoot,
-            environment: environment
+            workspaceRoot: canonicalWorkspaceRoot,
+            environment: environment,
+            projectTrusted: resolvedProjectTrust
         )
         specs.append(contentsOf: discovered.registry.allHooks())
         errors.append(contentsOf: discovered.errors)
@@ -97,7 +105,7 @@ public enum LiveHooksComposition {
                 dispatcher: HookDispatcher(registry: result.registry, environment: environment),
                 context: HookSessionContext(
                     sessionId: sessionId,
-                    workspaceRoot: workspaceRoot,
+                    workspaceRoot: canonicalWorkspaceRoot,
                     cwd: cwd,
                     environment: environment
                 )

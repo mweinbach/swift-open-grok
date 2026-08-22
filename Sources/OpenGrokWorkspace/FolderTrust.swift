@@ -84,7 +84,10 @@ public func repoConfigsPresent(at cwd: URL) -> Bool {
         ".mcp.json",
         ".claude/settings.json",
         ".claude/settings.local.json",
+        ".cursor/hooks.json",
+        ".opengrok/hooks",
         ".opengrok/hooks.toml",
+        ".opengrok/lsp.json",
         ".opengrok/mcp.toml",
         // `.opengrok/config.toml` belongs here: it can declare `[mcp_servers]`
         // — the exact table `LiveMCPComposition.connectConfiguredServers` reads
@@ -96,11 +99,11 @@ public func repoConfigsPresent(at cwd: URL) -> Bool {
         ".envrc",
         "CLAUDE.md",
     ]
-    var dir = cwd
+    var dir = cwd.standardizedFileURL.resolvingSymlinksInPath()
     for _ in 0..<8 {
         for name in names {
             let candidate = dir.appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: candidate.path) {
+            if repositoryTrustMarkerPresentOrUncertain(candidate) {
                 return true
             }
         }
@@ -109,6 +112,30 @@ public func repoConfigsPresent(at cwd: URL) -> Bool {
         dir = parent
     }
     return false
+}
+
+private func repositoryTrustMarkerPresentOrUncertain(_ candidate: URL) -> Bool {
+    let manager = FileManager.default
+    if manager.fileExists(atPath: candidate.path) {
+        return true
+    }
+
+    do {
+        // fileExists follows symlinks, so a dangling hooks link looks absent.
+        // Reading the link's own attributes preserves the security marker.
+        _ = try manager.attributesOfItem(atPath: candidate.path)
+        return true
+    } catch {
+        let failure = error as NSError
+        if failure.domain == NSCocoaErrorDomain,
+           failure.code == NSFileReadNoSuchFileError || failure.code == NSFileNoSuchFileError {
+            // Foundation implementations disagree about whether attributes
+            // follow a dangling link; asking for the link itself is portable.
+            return (try? manager.destinationOfSymbolicLink(atPath: candidate.path)) != nil
+        }
+        // A marker we cannot inspect is not proof that the repository is safe.
+        return true
+    }
 }
 
 /// In-memory durable trust store with most-specific cascade for lookups.

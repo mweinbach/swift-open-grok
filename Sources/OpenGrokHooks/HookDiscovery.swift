@@ -64,7 +64,8 @@ public enum HookDiscovery {
     public static func load(
         globalSources: [HookSource] = [],
         projectSources: [HookSource] = [],
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        projectTrusted: Bool = false
     ) -> HookLoadResult {
         var specs: [HookSpec] = []
         var errors: [HookError] = []
@@ -76,11 +77,13 @@ public enum HookDiscovery {
             errors.append(contentsOf: result.errors)
             skippedEvents.append(contentsOf: result.skippedEvents)
         }
-        for source in projectSources {
-            let result = load(source: source, environment: environment)
-            specs.append(contentsOf: result.specs.map { prefix($0, with: "project/") })
-            errors.append(contentsOf: result.errors)
-            skippedEvents.append(contentsOf: result.skippedEvents)
+        if projectTrusted {
+            for source in projectSources {
+                let result = load(source: source, environment: environment)
+                specs.append(contentsOf: result.specs.map { prefix($0, with: "project/") })
+                errors.append(contentsOf: result.errors)
+                skippedEvents.append(contentsOf: result.skippedEvents)
+            }
         }
         return HookLoadResult(registry: registryFromSpecsDeduped(specs), errors: errors, skippedEvents: skippedEvents)
     }
@@ -88,20 +91,39 @@ public enum HookDiscovery {
     public static func load(
         globalDirectory: URL?,
         projectDirectory: URL?,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        projectTrusted: Bool = false
     ) -> HookLoadResult {
         let global = globalDirectory.map { [HookSource.directory($0)] } ?? []
         let project = projectDirectory.map { [HookSource.directory($0)] } ?? []
-        return load(globalSources: global, projectSources: project, environment: environment)
+        return load(
+            globalSources: global,
+            projectSources: project,
+            environment: environment,
+            projectTrusted: projectTrusted
+        )
     }
 
     public static func defaultDirectories(workspaceRoot: URL, environment: [String: String] = ProcessInfo.processInfo.environment) -> (global: URL, project: URL) {
-        (openGrokHome(environment: environment).appendingPathComponent("hooks"), workspaceRoot.appendingPathComponent(".opengrok/hooks"))
+        let canonicalRoot = workspaceRoot.standardizedFileURL.resolvingSymlinksInPath()
+        return (
+            openGrokHome(environment: environment).appendingPathComponent("hooks"),
+            canonicalRoot.appendingPathComponent(".opengrok/hooks")
+        )
     }
 
-    public static func loadDefaults(workspaceRoot: URL, environment: [String: String] = ProcessInfo.processInfo.environment) -> HookLoadResult {
+    public static func loadDefaults(
+        workspaceRoot: URL,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        projectTrusted: Bool = false
+    ) -> HookLoadResult {
         let directories = defaultDirectories(workspaceRoot: workspaceRoot, environment: environment)
-        return load(globalDirectory: directories.global, projectDirectory: directories.project, environment: environment)
+        return load(
+            globalDirectory: directories.global,
+            projectDirectory: projectTrusted ? directories.project : nil,
+            environment: environment,
+            projectTrusted: projectTrusted
+        )
     }
 
     public static func registryFromSpecsDeduped(_ specs: [HookSpec]) -> HookRegistry {

@@ -73,6 +73,7 @@ import OpenGrokHTTP
 import OpenGrokMCP
 import OpenGrokShared
 import OpenGrokToolRegistry
+import OpenGrokWorkspace
 
 // MARK: - Live MCP state
 
@@ -208,6 +209,9 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
     let userConfigPath: URL
     let openGrokHome: URL
     let environment: [String: String]
+    /// Snapshotted from the admin-owned source, never supplied by ACP params,
+    /// project configuration, or an environment-selected policy path.
+    let managedMCPPolicy: ManagedMCPPolicy
     // auth_trigger injectables — the E7 seams: a real HTTP transport and the
     // system browser in production; a scripted transport and a fake browser
     // driving the REAL loopback listener in tests.
@@ -223,6 +227,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         userConfigPath: URL,
         openGrokHome: URL,
         environment: [String: String],
+        managedMCPPolicy: ManagedMCPPolicy? = nil,
         makeHTTPTransport: @escaping @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() },
         openBrowser: (@Sendable (URL) -> Void)? = nil,
         authTimeoutSeconds: TimeInterval = mcpBrowserAuthTimeoutSeconds,
@@ -234,6 +239,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         self.userConfigPath = userConfigPath
         self.openGrokHome = openGrokHome
         self.environment = environment
+        self.managedMCPPolicy = managedMCPPolicy ?? LiveSecurityContext.currentManagedMCPPolicy()
         self.makeHTTPTransport = makeHTTPTransport
         self.openBrowser = openBrowser ?? { LiveAuthComposition.openInSystemBrowser($0) }
         self.authTimeoutSeconds = authTimeoutSeconds
@@ -259,6 +265,17 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         let entries = MCPACPServerEntry.parse(from: meta)
         guard !entries.isEmpty else { return }
 
+        var admitted: [MCPACPServerEntry] = []
+        for entry in entries {
+            let server = ManagedMCPServerIdentity(name: entry.name)
+            if let reason = managedMCPPolicy.blockReason(for: server) {
+                await state.record(MCPServerConnection(name: entry.name, failure: reason))
+            } else {
+                admitted.append(entry)
+            }
+        }
+        guard !admitted.isEmpty else { return }
+
         let identifier = sessionID.rawValue
         let requester = try await gateway.connectedReverseRequester()
         let invoker = ClosureMCPACPReverseInvoker { [requester] serverID, message, _ in
@@ -272,7 +289,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         }
         let registry = MCPACPBridgeRegistry(
             sessionID: identifier,
-            servers: entries,
+            servers: admitted,
             invoker: invoker
         )
         guard await state.beginSDKSession(registry, sessionID: identifier) else {
@@ -281,7 +298,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
 
         do {
             let configuredNames = Set(declarations().servers.map(\.name))
-            for entry in entries {
+            for entry in admitted {
                 let existingClient = await state.connections.client(named: entry.name)
                 if configuredNames.contains(entry.name) || existingClient != nil {
                     continue
@@ -378,7 +395,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
     static func trustGatedDeclarationSource(
         workspaceRoot: URL,
         environment: [String: String],
-        cli: CLIPermissionOptions
+        cli: CLIPermissionOptions,
+        managedSettingsPath: URL? = nil
     ) -> @Sendable () -> MCPConfigLoadResult {
         let root = workspaceRoot.standardizedFileURL
         return {
@@ -386,9 +404,24 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
                 workspaceRoot: root,
                 environment: environment,
                 isInteractive: false,
-                cli: cli
+                cli: cli,
+                managedSettingsPath: managedSettingsPath
             )
-            return MCPConfigLoader.load(from: security.document)
+            var loaded = MCPConfigLoader.load(from: security.document)
+            var problems = loaded.problems
+            loaded.servers.removeAll { declaration in
+                let server = ManagedMCPServerIdentity(
+                    name: declaration.name,
+                    transport: declaration.config.transport
+                )
+                guard let reason = security.managedMCPPolicy.blockReason(for: server) else {
+                    return false
+                }
+                problems.append(MCPConfigProblem(server: declaration.name, message: reason))
+                return true
+            }
+            loaded.problems = problems
+            return loaded
         }
     }
 
@@ -508,6 +541,11 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         let loaded = declarations()
         var servers: [JSONValue] = []
         for declaration in loaded.servers {
+            let identity = ManagedMCPServerIdentity(
+                name: declaration.name,
+                transport: declaration.config.transport
+            )
+            guard managedMCPPolicy.isServerAllowed(identity) else { continue }
             servers.append(await serverEntry(declaration, annotate: annotate))
         }
         return envelope(.object(["servers": .array(servers)]))
@@ -794,6 +832,13 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             // (acp_session_impl/mcp.rs:459).
             return authTriggerFailure("MCP server '\(serverName)' not found in config")
         }
+        let server = ManagedMCPServerIdentity(
+            name: declaration.name,
+            transport: declaration.config.transport
+        )
+        if let reason = managedMCPPolicy.blockReason(for: server) {
+            return authTriggerFailure(reason)
+        }
         guard case .streamableHttp = declaration.config.transport else {
             // The non-HTTP arm (acp_session_impl/mcp.rs:460-465).
             return authTriggerFailure("MCP server '\(serverName)' does not use OAuth")
@@ -856,7 +901,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             toolset: toolset,
             connections: connections,
             environment: environment,
-            makeHTTPTransport: { makeHTTPTransport() }
+            makeHTTPTransport: { makeHTTPTransport() },
+            managedMCPPolicy: managedMCPPolicy
         )
         await state.record(outcome)
         LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
@@ -901,6 +947,10 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         if let blank = MCPConfigLoader.blankTransportField(config) {
             throw invalidParams("invalid params: missing or empty '\(blank)'")
         }
+        let identity = ManagedMCPServerIdentity(name: serverName, transport: config.transport)
+        if let reason = managedMCPPolicy.blockReason(for: identity) {
+            throw invalidParams("MCP server '\(serverName)' blocked by managed policy: \(reason)")
+        }
 
         // 1. Persist — the same write `open-grok mcp add` lands
         //    (upsertMCPServer + writeConfigFile → user config.toml), the
@@ -941,7 +991,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             toolset: toolset,
             connections: connections,
             environment: environment,
-            makeHTTPTransport: { makeHTTPTransport() }
+            makeHTTPTransport: { makeHTTPTransport() },
+            managedMCPPolicy: managedMCPPolicy
         )
         await state.record(outcome)
         LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
@@ -984,6 +1035,19 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
 
         try await requireSession(sessionID)
 
+        if enabled,
+           let declaration = declarations().servers.first(where: { $0.name == serverName }) {
+            let identity = ManagedMCPServerIdentity(
+                name: declaration.name,
+                transport: declaration.config.transport
+            )
+            if let reason = managedMCPPolicy.blockReason(for: identity) {
+                throw invalidParams(
+                    "MCP server '\(serverName)' blocked by managed policy: \(reason)"
+                )
+            }
+        }
+
         // 1. Persist the enable/disable to config.toml FIRST (fail-closed).
         var root = LiveMCPComposition.loadForEdit(at: userConfigPath) ?? .table(TOMLTable())
         do {
@@ -1016,7 +1080,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
                 connections: connections,
                 environment: environment,
                 makeHTTPTransport: { makeHTTPTransport() },
-                disabledToolNames: disabledTools[serverName] ?? []
+                disabledToolNames: disabledTools[serverName] ?? [],
+                managedMCPPolicy: managedMCPPolicy
             )
             await state.record(outcome)
             if let failure = outcome.failure,

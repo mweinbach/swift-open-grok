@@ -216,6 +216,9 @@ struct LiveSecurityContext: Sendable {
     /// Requirements layers, kept so the sandbox can apply the same admin
     /// precedence the permission resolver did.
     var requirements: [TOMLValue]
+    /// Admin-owned MCP admission rules. This is deliberately resolved from
+    /// the protected system file, never from the merged project/user document.
+    var managedMCPPolicy: ManagedMCPPolicy
 
     /// Resolve for `workspaceRoot`.
     ///
@@ -230,8 +233,11 @@ struct LiveSecurityContext: Sendable {
         // `--trust`, parsed by the root CLI parser. This is the tier that lets
         // a scripted user authorize a command through the supported path
         // instead of an environment-variable bypass.
-        cli: CLIPermissionOptions = CLIPermissionOptions()
+        cli: CLIPermissionOptions = CLIPermissionOptions(),
+        managedSettingsPath: URL? = nil
     ) -> LiveSecurityContext {
+        let managedSettingsPath = managedSettingsPath ?? claudeManagedSettingsPath()
+        let managedMCPPolicy = ManagedMCPPolicy.load(from: managedSettingsPath)
         // One disk load, reused for the trust flag, the merge and the sandbox.
         let layers = try? ConfigLayers.load(environment: environment)
         // The base chain without the project tier, used to read the folder
@@ -316,7 +322,7 @@ struct LiveSecurityContext: Sendable {
         let permissions = resolvePermissions(PermissionResolutionInputs(
             permissionLayers: permissionLayers,
             requirementsLayers: requirements,
-            managedSettings: loadManagedSettingsPermissions(environment: environment),
+            managedSettings: loadManagedSettingsPermissions(at: managedSettingsPath),
             cwd: workspaceRoot,
             home: home,
             projectTrusted: projectTrusted,
@@ -330,8 +336,16 @@ struct LiveSecurityContext: Sendable {
             document: document,
             projectTrusted: projectTrusted,
             permissions: permissions,
-            requirements: requirements
+            requirements: requirements,
+            managedMCPPolicy: managedMCPPolicy
         )
+    }
+
+    /// Runtime reconnects and hub launches cannot inherit a caller-supplied
+    /// environment override: policy authority belongs solely to the canonical
+    /// admin-owned managed-settings.json path.
+    static func currentManagedMCPPolicy() -> ManagedMCPPolicy {
+        ManagedMCPPolicy.load(from: claudeManagedSettingsPath())
     }
 
     /// Apply the configured OS sandbox, if any.
@@ -370,10 +384,9 @@ struct LiveSecurityContext: Sendable {
     /// Vendor `managed-settings.json` — admin tier, so it is read regardless of
     /// folder trust.
     private static func loadManagedSettingsPermissions(
-        environment: [String: String]
+        at path: URL?
     ) -> ClaudeSettingsPermissions? {
-        _ = environment
-        guard let path = claudeManagedSettingsPath(),
+        guard let path,
               let data = try? Data(contentsOf: path) else { return nil }
         return parseClaudeSettingsJSON(data)
     }
@@ -523,4 +536,3 @@ actor LiveSessionDirectoryRegistry {
         directories[sessionID] ?? fallback.standardizedFileURL
     }
 }
-

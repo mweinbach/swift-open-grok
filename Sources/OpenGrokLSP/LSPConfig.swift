@@ -84,8 +84,25 @@ public struct LspServerConfig: Codable, Sendable, Equatable {
     }
 }
 
+public enum LSPServerConfigSource: Sendable, Equatable {
+    case user
+    case project
+}
+
+public struct SourcedLSPServerConfig: Sendable, Equatable {
+    public let configuration: LspServerConfig
+    public let source: LSPServerConfigSource
+
+    public init(configuration: LspServerConfig, source: LSPServerConfigSource) {
+        self.configuration = configuration
+        self.source = source
+    }
+}
+
 public enum LSPConfigLoader {
-    /// Load and merge user + project `lsp.json` files. Project wins on name collision.
+    /// A context-free merge cannot authorize repository-owned commands. Keep
+    /// this compatibility overload for already-trusted callers; executable
+    /// composition must use the workspace-aware, fail-closed overload below.
     public static func loadMerged(
         userConfigPath: URL?,
         projectConfigPath: URL?
@@ -104,12 +121,106 @@ public enum LSPConfigLoader {
         return servers
     }
 
+    /// Merge only the sources authorized for this exact canonical workspace.
+    /// Project configuration is denied until the caller supplies its resolved
+    /// folder-trust verdict; owner configuration remains available meanwhile.
+    public static func loadMerged(
+        userConfigPath: URL?,
+        projectConfigPath: URL?,
+        workspaceRoot: URL,
+        projectTrusted: Bool = false
+    ) -> [String: LspServerConfig] {
+        filterProjectServers(
+            loadSourced(
+                userConfigPath: userConfigPath,
+                projectConfigPath: projectConfigPath,
+                workspaceRoot: workspaceRoot,
+                projectTrusted: projectTrusted
+            ),
+            projectTrusted: projectTrusted
+        )
+    }
+
+    /// Preserve source provenance so a repository-owned file cannot become a
+    /// trusted owner config merely by being passed through another pathname.
+    public static func loadSourced(
+        userConfigPath: URL?,
+        projectConfigPath: URL?,
+        workspaceRoot: URL,
+        projectTrusted: Bool = false
+    ) -> [String: SourcedLSPServerConfig] {
+        guard workspaceRoot.isFileURL else { return [:] }
+        let canonicalWorkspace = workspaceRoot.standardizedFileURL.resolvingSymlinksInPath()
+        var servers: [String: SourcedLSPServerConfig] = [:]
+
+        if let userConfigPath,
+           let canonicalUserConfig = canonicalFileURL(userConfigPath) {
+            let source: LSPServerConfigSource = contains(
+                canonicalUserConfig,
+                inside: canonicalWorkspace
+            ) ? .project : .user
+            if source == .user || projectTrusted {
+                for (name, configuration) in loadFile(at: canonicalUserConfig) {
+                    servers[name] = SourcedLSPServerConfig(
+                        configuration: configuration,
+                        source: source
+                    )
+                }
+            }
+        }
+
+        guard projectTrusted,
+              let projectConfigPath,
+              let canonicalProjectConfig = canonicalFileURL(projectConfigPath),
+              contains(canonicalProjectConfig, inside: canonicalWorkspace)
+        else {
+            return servers
+        }
+
+        for (name, configuration) in loadFile(at: canonicalProjectConfig) {
+            servers[name] = SourcedLSPServerConfig(
+                configuration: configuration,
+                source: .project
+            )
+        }
+        return servers
+    }
+
+    public static func filterProjectServers(
+        _ sourced: [String: SourcedLSPServerConfig],
+        projectTrusted: Bool = false
+    ) -> [String: LspServerConfig] {
+        sourced.reduce(into: [:]) { accepted, entry in
+            guard projectTrusted || entry.value.source != .project else { return }
+            accepted[entry.key] = entry.value.configuration
+        }
+    }
+
     public static func loadFile(at url: URL) -> [String: LspServerConfig] {
         guard let data = try? Data(contentsOf: url) else { return [:] }
         guard let decoded = try? JSONDecoder().decode([String: LspServerConfig].self, from: data) else {
             return [:]
         }
         return decoded
+    }
+
+    private static func canonicalFileURL(_ url: URL) -> URL? {
+        guard url.isFileURL else { return nil }
+        return url.standardizedFileURL.resolvingSymlinksInPath()
+    }
+
+    private static func contains(_ candidate: URL, inside root: URL) -> Bool {
+        let candidateComponents = candidate.pathComponents
+        let rootComponents = root.pathComponents
+        guard candidateComponents.count > rootComponents.count else { return false }
+
+        return zip(rootComponents, candidateComponents).allSatisfy { root, candidate in
+            #if os(Windows)
+            return root.caseInsensitiveCompare(candidate) == .orderedSame
+            #else
+            return root == candidate
+            #endif
+        }
     }
 
     /// Resolve which configured server handles a file path by extension.

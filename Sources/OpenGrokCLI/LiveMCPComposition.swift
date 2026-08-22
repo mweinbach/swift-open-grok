@@ -22,6 +22,7 @@ import OpenGrokMCP
 import OpenGrokShared
 import OpenGrokToolRegistry
 import OpenGrokToolRuntime
+import OpenGrokWorkspace
 
 // MARK: - Hub bridge transport
 
@@ -788,7 +789,8 @@ public enum LiveMCPComposition {
         toolset: FinalizedToolset,
         connections: MCPSessionConnections,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        makeHTTPTransport: @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() }
+        makeHTTPTransport: @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() },
+        managedMCPPolicy: ManagedMCPPolicy? = nil
     ) async -> [MCPServerConnection] {
         guard let document else { return [] }
         let loaded = MCPConfigLoader.load(from: document)
@@ -810,7 +812,8 @@ public enum LiveMCPComposition {
                 connections: connections,
                 environment: environment,
                 makeHTTPTransport: makeHTTPTransport,
-                disabledToolNames: disabledToolsByServer[declaration.name] ?? []
+                disabledToolNames: disabledToolsByServer[declaration.name] ?? [],
+                managedMCPPolicy: managedMCPPolicy
             ))
         }
         return results
@@ -826,22 +829,17 @@ public enum LiveMCPComposition {
         cwd: String,
         environment: [String: String],
         connections: MCPSessionConnections,
-        makeHTTPTransport: @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() }
+        makeHTTPTransport: @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() },
+        managedMCPPolicy: ManagedMCPPolicy? = nil
     ) async -> [HubMCPClientEntry] {
-        let cwdURL = URL(fileURLWithPath: cwd)
-        let loaded: MCPConfigLoadResult
-        do {
-            loaded = try loadDeclarations(environment: environment, cwd: cwdURL)
-        } catch {
-            return []
-        }
-
-        var disabledServers = Set<String>()
-        if let layers = try? configLayers(environment: environment, cwd: cwdURL) {
-            for (_, document) in layers {
-                disabledServers.formUnion(disabledMCPServers(in: document))
-            }
-        }
+        let cwdURL = URL(fileURLWithPath: cwd).standardizedFileURL
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: cwdURL,
+            environment: environment,
+            isInteractive: false
+        )
+        let loaded = MCPConfigLoader.load(from: security.document)
+        let disabledServers = disabledMCPServers(in: security.document)
 
         var entries: [HubMCPClientEntry] = []
         for declaration in loaded.enabledServers {
@@ -852,7 +850,8 @@ public enum LiveMCPComposition {
                 declaration: declaration,
                 connections: connections,
                 environment: environment,
-                makeHTTPTransport: makeHTTPTransport
+                makeHTTPTransport: makeHTTPTransport,
+                managedMCPPolicy: managedMCPPolicy ?? security.managedMCPPolicy
             ) {
                 entries.append(entry)
             }
@@ -865,8 +864,16 @@ public enum LiveMCPComposition {
         declaration: MCPServerDeclaration,
         connections: MCPSessionConnections,
         environment: [String: String],
-        makeHTTPTransport: @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() }
+        makeHTTPTransport: @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() },
+        managedMCPPolicy: ManagedMCPPolicy? = nil
     ) async -> HubMCPClientEntry? {
+        let policy = managedMCPPolicy ?? LiveSecurityContext.currentManagedMCPPolicy()
+        let identity = ManagedMCPServerIdentity(
+            name: declaration.name,
+            transport: declaration.config.transport
+        )
+        guard policy.isServerAllowed(identity) else { return nil }
+
         var authorization: (any MCPAuthorizationProviding)?
         if let endpoint = declaration.oauthEligibleEndpoint(environment: environment),
            let home = userGrokHome(environment: environment)
@@ -941,8 +948,22 @@ public enum LiveMCPComposition {
         connections: MCPSessionConnections,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         makeHTTPTransport: @Sendable () -> any HTTPTransport = { URLSessionHTTPTransport() },
-        disabledToolNames: Set<String> = []
+        disabledToolNames: Set<String> = [],
+        managedMCPPolicy: ManagedMCPPolicy? = nil
     ) async -> MCPServerConnection {
+        let policy = managedMCPPolicy ?? LiveSecurityContext.currentManagedMCPPolicy()
+        let identity = ManagedMCPServerIdentity(
+            name: declaration.name,
+            transport: declaration.config.transport
+        )
+        guard policy.isServerAllowed(identity) else {
+            return MCPServerConnection(
+                name: declaration.name,
+                failure: policy.blockReason(for: identity)
+                    ?? "MCP server '\(declaration.name)' is blocked by managed policy"
+            )
+        }
+
         var authorization: (any MCPAuthorizationProviding)?
         if let endpoint = declaration.oauthEligibleEndpoint(environment: environment),
            let home = userGrokHome(environment: environment) {
@@ -1070,6 +1091,16 @@ public enum LiveMCPComposition {
                 known.isEmpty
                     ? "no MCP server named '\(name)' (none are configured)"
                     : "no MCP server named '\(name)' (configured: \(known.joined(separator: ", ")))"
+            )
+        }
+        let managedPolicy = LiveSecurityContext.currentManagedMCPPolicy()
+        let managedIdentity = ManagedMCPServerIdentity(
+            name: declaration.name,
+            transport: declaration.config.transport
+        )
+        if let reason = managedPolicy.blockReason(for: managedIdentity) {
+            throw CLIApplicationError.failed(
+                "MCP server '\(name)' blocked by managed policy: \(reason)"
             )
         }
         guard case .streamableHttp = declaration.config.transport else {

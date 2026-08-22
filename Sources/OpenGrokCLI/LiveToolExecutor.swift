@@ -235,6 +235,8 @@ struct LiveToolExecutor: Sendable {
     /// that predates them keeps compiling and simply advertises none of their
     /// tools; see `LiveSessionServices.swift`.
     let sessionServices: LiveSessionServices?
+    /// The resolved session verdict, shared with hook discovery and its UI.
+    let projectTrusted: Bool
     let hookPresentationStore: LiveHookPresentationStore
     /// The exact store backing the advertised `todo_write` handler. The
     /// renderer reads this actor through the executor so a successful tool
@@ -348,26 +350,28 @@ struct LiveToolExecutor: Sendable {
             workingDirectory: workingDirectory
         )
         let standardizedWorkingDirectory = workingDirectory.standardizedFileURL
-        let hookPresentationStore = LiveHookPresentationStore()
-        self.hookPresentationStore = hookPresentationStore
-        let hooks = LiveHooksComposition.load(
-            sessionId: sessionID,
-            workspaceRoot: standardizedWorkingDirectory,
-            environment: environment
-        )
-        hooks.gate?.setRunObserver { event, id, records in
-            Task {
-                await hookPresentationStore.record(event: event, id: id, records: records)
-            }
-        }
-        // Config precedence, folder trust and the permission policy, resolved
-        // once and shared by the file tools, `run_terminal_cmd` and MCP.
+        // Resolve folder trust before inspecting any repository-owned hook. A
+        // hooks-only clone is executable configuration even without config.toml.
         let security = securityContext ?? LiveSecurityContext.resolve(
             workspaceRoot: standardizedWorkingDirectory,
             environment: environment,
             isInteractive: fileAccessPolicy.isInteractive,
             cli: permissionOptions
         )
+        self.projectTrusted = security.projectTrusted
+        let hookPresentationStore = LiveHookPresentationStore()
+        self.hookPresentationStore = hookPresentationStore
+        let hooks = LiveHooksComposition.load(
+            sessionId: sessionID,
+            workspaceRoot: standardizedWorkingDirectory,
+            environment: environment,
+            projectTrusted: security.projectTrusted
+        )
+        hooks.gate?.setRunObserver { event, id, records in
+            Task {
+                await hookPresentationStore.record(event: event, id: id, records: records)
+            }
+        }
         // Deliberately `bootstrapFromDisk` rather than the security context's
         // already-loaded document: that document carries the project tier, and
         // upstream has no project layer for telemetry. Passing it would let a
@@ -638,7 +642,8 @@ struct LiveToolExecutor: Sendable {
             document: security.document,
             toolset: toolset,
             connections: mcpConnections,
-            environment: environment
+            environment: environment,
+            managedMCPPolicy: security.managedMCPPolicy
         )
         // LSP `pull_diagnostics` — after MCP so both share one search index
         // refresh, and before `toolDefinitions()` so the model list includes it.
@@ -646,7 +651,8 @@ struct LiveToolExecutor: Sendable {
             toolset: toolset,
             workingDirectory: standardizedWorkingDirectory,
             document: security.document,
-            environment: environment
+            environment: environment,
+            projectTrusted: security.projectTrusted
         )
         mcpSearchIndex.refresh(from: toolset)
         let fileToolDefinitions = fileToolBridge.toolDefinitions()

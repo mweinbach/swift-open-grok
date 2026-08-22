@@ -53,7 +53,8 @@ public enum LiveExtensionsComposition {
         openGrokHome: URL,
         sessionID: String,
         connections: [MCPServerConnection],
-        environment: [String: String]
+        environment: [String: String],
+        projectTrusted: Bool? = nil
     ) -> PagerExtensionsOverlay {
         PagerExtensionsOverlay(
             activeTab: tab,
@@ -61,7 +62,8 @@ public enum LiveExtensionsComposition {
                 workingDirectory: workingDirectory,
                 openGrokHome: openGrokHome,
                 sessionID: sessionID,
-                environment: environment
+                environment: environment,
+                projectTrusted: projectTrusted
             ),
             skills: skillRows(
                 workingDirectory: workingDirectory,
@@ -82,7 +84,8 @@ public enum LiveExtensionsComposition {
         openGrokHome: URL,
         sessionID: String,
         connections: [MCPServerConnection],
-        environment: [String: String]
+        environment: [String: String],
+        projectTrusted: Bool? = nil
     ) -> PagerExtensionsOverlay {
         var next = overlay
         switch tab {
@@ -91,7 +94,8 @@ public enum LiveExtensionsComposition {
                 workingDirectory: workingDirectory,
                 openGrokHome: openGrokHome,
                 sessionID: sessionID,
-                environment: environment
+                environment: environment,
+                projectTrusted: projectTrusted
             )
         case .skills:
             next.skills = skillRows(
@@ -119,13 +123,15 @@ public enum LiveExtensionsComposition {
         workingDirectory: String,
         openGrokHome: URL,
         sessionID: String,
-        environment: [String: String]
+        environment: [String: String],
+        projectTrusted: Bool? = nil
     ) -> [PagerExtensionsHookRow] {
         let loaded = LiveHooksComposition.load(
             sessionId: sessionID,
             workspaceRoot: URL(fileURLWithPath: workingDirectory),
             cwd: workingDirectory,
-            environment: environment
+            environment: environment,
+            projectTrusted: projectTrusted
         )
         let disabled = disabledHookNames(environment: environment)
         let isDefaultHome = isDefaultGrokHome(environment: environment)

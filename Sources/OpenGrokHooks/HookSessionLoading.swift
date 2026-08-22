@@ -50,7 +50,8 @@ public enum HookSessionLoader {
         configPath: URL,
         workspaceRoot: URL,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        includeFileDiscovery: Bool = true
+        includeFileDiscovery: Bool = true,
+        projectTrusted: Bool = false
     ) -> HookSessionLoadResult {
         var specs: [HookSpec] = []
         var errors: [HookError] = []
@@ -76,7 +77,8 @@ public enum HookSessionLoader {
         if includeFileDiscovery {
             let discovered = HookDiscovery.loadDefaults(
                 workspaceRoot: workspaceRoot,
-                environment: environment
+                environment: environment,
+                projectTrusted: projectTrusted
             )
             specs.append(contentsOf: discovered.registry.allHooks())
             errors.append(contentsOf: discovered.errors)
@@ -102,14 +104,16 @@ public enum HookSessionLoader {
         workspaceRoot: URL,
         cwd: String? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        includeFileDiscovery: Bool = true
+        includeFileDiscovery: Bool = true,
+        projectTrusted: Bool = false
     ) -> (gate: HookPermissionGate?, result: HookSessionLoadResult) {
         let result = load(
             configDocument: configDocument,
             configPath: configPath,
             workspaceRoot: workspaceRoot,
             environment: environment,
-            includeFileDiscovery: includeFileDiscovery
+            includeFileDiscovery: includeFileDiscovery,
+            projectTrusted: projectTrusted
         )
         guard !result.registry.isEmpty else { return (nil, result) }
         let gate = HookPermissionGate(

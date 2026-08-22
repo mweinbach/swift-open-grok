@@ -47,14 +47,20 @@ public enum LiveLspComposition {
         workingDirectory: URL,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         userConfigPath: URL? = nil,
-        projectConfigPath: URL? = nil
+        projectConfigPath: URL? = nil,
+        projectTrusted: Bool = false
     ) -> [String: LspServerConfig] {
         let user = userConfigPath ?? userGrokHome(environment: environment)?
             .appendingPathComponent("lsp.json")
         let project = projectConfigPath ?? workingDirectory
             .appendingPathComponent(".opengrok", isDirectory: true)
             .appendingPathComponent("lsp.json")
-        return LSPConfigLoader.loadMerged(userConfigPath: user, projectConfigPath: project)
+        return LSPConfigLoader.loadMerged(
+            userConfigPath: user,
+            projectConfigPath: project,
+            workspaceRoot: workingDirectory,
+            projectTrusted: projectTrusted
+        )
     }
 
     // MARK: - Tool specs
@@ -92,12 +98,14 @@ public enum LiveLspComposition {
         workingDirectory: URL,
         document: TOMLValue?,
         environment: [String: String] = ProcessInfo.processInfo.environment,
+        projectTrusted: Bool = false,
         servers: [String: LspServerConfig]? = nil
     ) -> LSPSession? {
         let enabled = resolveEnabled(document: document, environment: environment)
         let resolvedServers = servers ?? loadServers(
             workingDirectory: workingDirectory,
-            environment: environment
+            environment: environment,
+            projectTrusted: projectTrusted
         )
         guard enabled, !resolvedServers.isEmpty else { return nil }
 
