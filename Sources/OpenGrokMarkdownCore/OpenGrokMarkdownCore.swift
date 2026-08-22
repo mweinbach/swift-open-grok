@@ -562,6 +562,11 @@ private struct InlineParser {
                 index += 1
                 continue
             }
+            if (characters[index] == "$" || characters[index] == "\\"),
+               let math = consumeMath() {
+                result.append(math)
+                continue
+            }
             if characters[index] == "\\" && index + 1 < characters.count {
                 if characters[index + 1] == "\n" {
                     result.append(.hardBreak)
@@ -691,26 +696,9 @@ private struct InlineParser {
     }
 
     private mutating func consumeMath() -> MarkdownInline? {
-        let display = index + 1 < characters.count && characters[index + 1] == "$"
-        let delimiterLength = display ? 2 : 1
-        var cursor = index + delimiterLength
-        while cursor + delimiterLength <= characters.count {
-            if display {
-                if characters[cursor] == "$" && cursor + 1 < characters.count && characters[cursor + 1] == "$" {
-                    let content = String(characters[(index + delimiterLength)..<cursor])
-                    guard !content.isEmpty else { return nil }
-                    index = cursor + 2
-                    return .math(content, display: true)
-                }
-            } else if characters[cursor] == "$" {
-                let content = String(characters[(index + 1)..<cursor])
-                guard !content.isEmpty, !content.contains("\n") else { return nil }
-                index = cursor + 1
-                return .math(content, display: false)
-            }
-            cursor += 1
-        }
-        return nil
+        guard let match = InlineMathParser.parse(characters, at: index) else { return nil }
+        index = match.endIndex
+        return .math(match.source, display: match.display)
     }
 
     private mutating func consumeDelimited(

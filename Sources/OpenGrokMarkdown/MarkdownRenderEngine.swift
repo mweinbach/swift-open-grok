@@ -510,13 +510,19 @@ struct RenderEngine: Sendable {
                     nextLinkID += 1
                     visit(alt, bold: bold, italic: italic, strike: strike, code: code, link: TableCellLink(url: destination, id: linkID))
                 case let .math(val, display):
-                    let mathText = display ? "$$\(val)$$" : "$\(val)$"
+                    let renderedMath = configuration.pretty ? MarkdownMathRenderer.inline(val) : nil
+                    let mathText: String
+                    if configuration.pretty {
+                        mathText = renderedMath ?? val
+                    } else {
+                        mathText = display ? "$$\(val)$$" : "$\(val)$"
+                    }
                     spans.append(TableCellSpan(
                         text: mathText,
                         bold: bold,
-                        italic: italic,
+                        italic: italic || configuration.pretty && renderedMath != nil,
                         strikethrough: strike,
-                        code: code,
+                        code: code || configuration.pretty && renderedMath == nil,
                         link: link,
                         isHeader: isHeader
                     ))
@@ -563,7 +569,14 @@ struct RenderEngine: Sendable {
     ) {
         var lines = [line]
         var current = 0
-        appendInlines(inlines, to: &lines, current: &current, style: style, activeLink: activeLink)
+        appendInlines(
+            inlines,
+            to: &lines,
+            current: &current,
+            style: style,
+            activeLink: activeLink,
+            displayAsBlock: false
+        )
         line = lines[current]
     }
 
@@ -572,9 +585,10 @@ struct RenderEngine: Sendable {
         to lines: inout [WorkingLine],
         current: inout Int,
         style: MarkdownTextStyle,
-        activeLink: LinkContext?
+        activeLink: LinkContext?,
+        displayAsBlock: Bool = true
     ) {
-        for inline in inlines {
+        for (position, inline) in inlines.enumerated() {
             switch inline {
             case let .text(value):
                 lines[current].append(value, style: style, link: activeLink.map { InternalLink(range: 0..<0, url: $0.url, id: $0.id) })
@@ -584,15 +598,15 @@ struct RenderEngine: Sendable {
                 }
             case let .strong(children):
                 if !configuration.pretty { lines[current].append("**", style: .syntax) }
-                appendInlines(children, to: &lines, current: &current, style: .strong, activeLink: activeLink)
+                appendInlines(children, to: &lines, current: &current, style: .strong, activeLink: activeLink, displayAsBlock: displayAsBlock)
                 if !configuration.pretty { lines[current].append("**", style: .syntax) }
             case let .emphasis(children):
                 if !configuration.pretty { lines[current].append("*", style: .syntax) }
-                appendInlines(children, to: &lines, current: &current, style: .emphasis, activeLink: activeLink)
+                appendInlines(children, to: &lines, current: &current, style: .emphasis, activeLink: activeLink, displayAsBlock: displayAsBlock)
                 if !configuration.pretty { lines[current].append("*", style: .syntax) }
             case let .strikethrough(children):
                 if !configuration.pretty { lines[current].append("~~", style: .syntax) }
-                appendInlines(children, to: &lines, current: &current, style: .strikethrough, activeLink: activeLink)
+                appendInlines(children, to: &lines, current: &current, style: .strikethrough, activeLink: activeLink, displayAsBlock: displayAsBlock)
                 if !configuration.pretty { lines[current].append("~~", style: .syntax) }
             case let .code(value):
                 let backtick = String(repeating: Character(UnicodeScalar(96)!), count: 1)
@@ -607,7 +621,7 @@ struct RenderEngine: Sendable {
                 let context = LinkContext(url: destination, id: nextLinkID)
                 nextLinkID += 1
                 if !configuration.pretty { lines[current].append("[", style: .syntax) }
-                appendInlines(children, to: &lines, current: &current, style: .link, activeLink: context)
+                appendInlines(children, to: &lines, current: &current, style: .link, activeLink: context, displayAsBlock: false)
                 if !configuration.pretty {
                     lines[current].append("](" + destination + (title.map { " \"\($0)\"" } ?? "") + ")", style: .syntax)
                 } else if configuration.showLinkDestinations {
@@ -617,7 +631,7 @@ struct RenderEngine: Sendable {
                 let context = LinkContext(url: destination, id: nextLinkID)
                 nextLinkID += 1
                 if !configuration.pretty { lines[current].append("![", style: .syntax) }
-                appendInlines(alt, to: &lines, current: &current, style: .image, activeLink: context)
+                appendInlines(alt, to: &lines, current: &current, style: .image, activeLink: context, displayAsBlock: false)
                 if !configuration.pretty {
                     lines[current].append("](" + destination + (title.map { " \"\($0)\"" } ?? "") + ")", style: .syntax)
                 } else if configuration.showLinkDestinations {
@@ -626,8 +640,44 @@ struct RenderEngine: Sendable {
             case let .math(value, display):
                 if !configuration.pretty {
                     lines[current].append(display ? "$$\(value)$$" : "$\(value)$", style: .syntax)
+                } else if display && displayAsBlock && activeLink == nil {
+                    let rendered = MarkdownMathRenderer.display(value) ?? value
+                        .split(separator: "\n", omittingEmptySubsequences: false)
+                        .map(String.init)
+                    guard !rendered.isEmpty else { continue }
+
+                    if !lines[current].text.trimmingCharacters(in: .whitespaces).isEmpty {
+                        current += 1
+                        lines.append(WorkingLine(sourceLine: lines[current - 1].sourceLine))
+                    }
+
+                    for (offset, mathLine) in rendered.enumerated() {
+                        if offset > 0 {
+                            current += 1
+                            lines.append(WorkingLine(sourceLine: lines[current - 1].sourceLine + 1))
+                        }
+                        lines[current].append("  " + mathLine, style: style)
+                    }
+
+                    if position + 1 < inlines.count {
+                        current += 1
+                        lines.append(WorkingLine(sourceLine: lines[current - 1].sourceLine + 1))
+                    }
                 } else {
-                    lines[current].append(value, style: .plain)
+                    let rendered = MarkdownMathRenderer.inline(value) ?? value
+                    lines[current].append(
+                        rendered,
+                        style: style,
+                        link: activeLink.map { InternalLink(range: 0..<0, url: $0.url, id: $0.id) }
+                    )
+                    if let activeLink, !rendered.isEmpty {
+                        let end = lines[current].width
+                        lines[current].links[lines[current].links.count - 1] = InternalLink(
+                            range: (end - UnicodeDisplayWidth.width(of: rendered))..<end,
+                            url: activeLink.url,
+                            id: activeLink.id
+                        )
+                    }
                 }
             case .softBreak:
                 if configuration.pretty && configuration.collapseSoftBreaks {
