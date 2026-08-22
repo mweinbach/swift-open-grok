@@ -309,6 +309,16 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     private var parentPermissionHandle: PermissionHandle?
     private var parentUsageHistory: LiveConversationHistory?
 
+    /// Child samplers capture credentials when their route is resolved.
+    /// Unknown routes must therefore be cancelled on every provider mutation;
+    /// guessing from a model slug would allow a mislabeled route to survive.
+    private enum ChildProviderBinding: Sendable, Equatable {
+        case unresolved
+        case resolved(ModelProvider)
+        case revoked
+    }
+    private var shellChildProviderBindings: [String: ChildProviderBinding] = [:]
+
     /// Children whose `runChild` loop is live right now — the set the
     /// follow-up router consults before buffering. Upstream's analog is the
     /// child's session command channel staying open (`deliver_followup`,
@@ -1067,6 +1077,11 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             resumeFrom: resumeID,
             surfaceCompletion: true
         )
+        if antigravityModel == nil {
+            // Install before the coordinator hop: credential rotation can
+            // enter this actor while spawn admission is suspended.
+            shellChildProviderBindings[childID] = .unresolved
+        }
         do {
             try await coordinator.spawn(request) { [weak self] in
                 guard let self else {
@@ -1102,7 +1117,13 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                     )
                 }
             }
+            if case .revoked? = shellChildProviderBindings[childID] {
+                if await coordinator.cancel(.childID(childID)) == 0 {
+                    shellChildProviderBindings.removeValue(forKey: childID)
+                }
+            }
         } catch let error as OpenGrokCoordinatorError {
+            shellChildProviderBindings.removeValue(forKey: childID)
             bookkeeping.removeValue(forKey: childID)
             if let createdWorktree {
                 do {
@@ -1120,6 +1141,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             await emitActiveBackgroundWorkRemove(id: childID)
             return .failure(.failed(error.description))
         } catch {
+            shellChildProviderBindings.removeValue(forKey: childID)
             bookkeeping.removeValue(forKey: childID)
             if let createdWorktree {
                 do {
@@ -1310,10 +1332,23 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         resumeItems: [ConversationItem]?
     ) async -> OpenGrokChildResult {
         let startedAt = Date()
+        if shellChildProviderBindings[childID] == nil {
+            shellChildProviderBindings[childID] = .unresolved
+        }
+        defer { shellChildProviderBindings.removeValue(forKey: childID) }
+        guard !Task.isCancelled,
+              shellChildProviderBindings[childID] != .revoked
+        else {
+            return providerRotationCancellation(childID: childID, startedAt: startedAt)
+        }
+
         let samplingRoute: ChildSamplerRoute
         do {
             samplingRoute = try await resolveChildSamplerRoute(model: model)
         } catch {
+            if Task.isCancelled || shellChildProviderBindings[childID] == .revoked {
+                return providerRotationCancellation(childID: childID, startedAt: startedAt)
+            }
             return OpenGrokChildResult(
                 id: childID,
                 success: false,
@@ -1321,6 +1356,12 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 durationMS: Self.milliseconds(since: startedAt)
             )
         }
+        guard !Task.isCancelled,
+              shellChildProviderBindings[childID] != .revoked
+        else {
+            return providerRotationCancellation(childID: childID, startedAt: startedAt)
+        }
+        shellChildProviderBindings[childID] = .resolved(samplingRoute.provider)
         // Live-loop registration brackets the whole run: a follow-up that
         // arrives after the final drain but before this defer runs is
         // accepted and never seen — the same window upstream has, where
@@ -1879,6 +1920,45 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         return .notFound
     }
 
+    /// Revoke captured credentials before the provider's runtime changes.
+    /// Mark every matching entry before the first actor hop so an unresolved
+    /// factory cannot resume and issue a stale-credential sampling request
+    /// between child cancellations. Antigravity never enters this registry.
+    func cancelChildrenForProviderRuntimeChange(_ provider: ModelProvider) async -> Int {
+        let childIDs = shellChildProviderBindings.compactMap { childID, binding in
+            switch binding {
+            case .unresolved:
+                return childID
+            case .resolved(let childProvider):
+                return childProvider == provider ? childID : nil
+            case .revoked:
+                return nil
+            }
+        }
+        for childID in childIDs {
+            shellChildProviderBindings[childID] = .revoked
+        }
+
+        var cancelled = 0
+        for childID in childIDs {
+            cancelled += await coordinator.cancel(.childID(childID))
+        }
+        return cancelled
+    }
+
+    private func providerRotationCancellation(
+        childID: String,
+        startedAt: Date
+    ) -> OpenGrokChildResult {
+        OpenGrokChildResult(
+            id: childID,
+            success: false,
+            cancelled: true,
+            error: "Subagent was cancelled before its provider credentials changed",
+            durationMS: Self.milliseconds(since: startedAt)
+        )
+    }
+
     func knownSubagentIDs() async -> [String] {
         let active = await coordinator.listActive(parentSessionID: context.sessionID).map { $0.request.id }
         let completed = await coordinator.listCompleted().map { $0.request.id }
@@ -1889,6 +1969,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     /// tool surfaces they built (MCP connections, shell sessions).
     func shutdown() async {
         await coordinator.teardown(sessionID: context.sessionID)
+        shellChildProviderBindings.removeAll()
         // Chip must clear immediately on host death. Child tasks may still
         // be unwinding; their later removes hit the latch and stay silent.
         let outstanding = countedActiveBackgroundWorkIDs
