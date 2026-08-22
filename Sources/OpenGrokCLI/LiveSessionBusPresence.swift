@@ -510,7 +510,12 @@ enum LiveSessionBusPresenceStore {
             DWORD(PROCESS_QUERY_LIMITED_INFORMATION),
             false,
             DWORD(processID)
-        ), handle != INVALID_HANDLE_VALUE else { return false }
+        ), handle != INVALID_HANDLE_VALUE else {
+            // Like EPERM on Unix, an inaccessible process is evidence that its
+            // PID still exists; owner-only presence and peer SID checks remain
+            // the authority for whether its session can actually be reached.
+            return GetLastError() == DWORD(ERROR_ACCESS_DENIED)
+        }
         defer { CloseHandle(handle) }
         var exitCode: DWORD = 0
         guard GetExitCodeProcess(handle, &exitCode) else { return false }
