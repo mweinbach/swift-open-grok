@@ -28,9 +28,10 @@
 // interjection seam + per-child round-boundary buffers below), and `runChild`
 // hands each child a `LiveAgentCollaboration` with its team identity.
 //
-// Deliberately absent here (recorded in the slice report): worktree
-// isolation, the foreground await budget with auto-backgrounding, and durable
-// cross-process resume metadata. Antigravity CLI runners live in
+// Deliberately absent here (recorded in the slice report): the foreground
+// await budget with auto-backgrounding and durable cross-process resume
+// metadata. Real isolated worktrees are created by `LiveSubagentWorktree`.
+// Antigravity CLI runners live in
 // `LiveAntigravity.swift` / `LiveAntigravityRunner.swift` and branch from
 // `spawn` when the resolved model carries the `antigravity:` prefix. Ordinary
 // children resume from the conversation store; Antigravity children resume
@@ -276,9 +277,11 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         /// directory is gone — Shared/parent, not a stale sibling cwd
         /// (`resume_inherited_cwd`, subagent/mod.rs:1619-1622;
         /// `ResumeWorktreeAction::Shared`, handle_request.rs:462-468).
-        /// Worktree *creation* is still absent from this host; the field
-        /// only preserves a path already represented in bookkeeping.
         var worktreePath: URL? = nil
+        /// Distinguishes a real managed isolated checkout from older metadata
+        /// that merely recorded a path. A genuine isolated source never resumes
+        /// in the parent workspace if its checkout disappears or changes owner.
+        var worktreeIsolationEnforced: Bool = false
         var turns: UInt32 = 0
         var toolCalls: UInt32 = 0
         var toolsUsed: [String] = []
@@ -678,8 +681,29 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         // cwd/worktree wins (`select_override_cwd`, subagent/mod.rs:1623-1632).
         // Final child CWD is chosen after resume bookkeeping loads so a
         // resumed child cannot inherit the parent path by accident.
-        let sanitizedCwd = sanitizeOptionalArg(input.cwd)
+        var sanitizedCwd = sanitizeOptionalArg(input.cwd)
         let resumeID = sanitizeOptionalArg(input.resumeFrom)
+        if resumeID == nil,
+           input.isolation == .worktree,
+           let requestedCWD = sanitizedCwd {
+            let path = (requestedCWD as NSString).isAbsolutePath
+                ? requestedCWD
+                : context.workingDirectory.appendingPathComponent(requestedCWD)
+                    .standardizedFileURL.path
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                return .failure(.invalidCall(
+                    "cwd and isolation=\"worktree\" are mutually exclusive. "
+                        + "Use cwd to point the subagent at an existing directory, "
+                        + "or isolation=\"worktree\" to create a new isolated worktree, "
+                        + "but not both."
+                ))
+            }
+            // Rust drops a hallucinated/non-directory cwd when explicit
+            // worktree isolation can provide the real execution directory.
+            sanitizedCwd = nil
+        }
         let requestCWD: URL?
         if resumeID == nil, let sanitizedCwd {
             let path = (sanitizedCwd as NSString).isAbsolutePath
@@ -851,27 +875,6 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             runtime.model = source.model
         }
 
-        // Final child CWD: reusable worktree > resume-inherited/request cwd >
-        // parent (`resolve_child_cwd` / `select_override_cwd`,
-        // subagent/mod.rs:1590-1632). Caller cwd was already dropped above
-        // when `resume_from` is set. Recorded worktree *presence* is threaded
-        // separately from the reusable URL so a missing worktree falls
-        // through to Shared/parent instead of stale `childCWD`
-        // (`resume_inherited_cwd` checks `worktree_path.is_some()`,
-        // subagent/mod.rs:1621).
-        let resumedWorktree = Self.resumeWorktreePath(resumeSource?.worktreePath)
-        let overrideCWD: URL? = resumeID != nil
-            ? Self.resumeInheritedCWD(
-                sourceCWD: resumeSource?.childCWD,
-                recordedWorktreePath: resumeSource?.worktreePath
-            )
-            : requestCWD
-        let childCWD = Self.resolveChildCWD(
-            worktreePath: resumedWorktree,
-            overrideCWD: overrideCWD,
-            parentCWD: context.workingDirectory
-        )
-
         let childModel = runtime.model ?? context.parentModel
         let antigravityModel = LiveAntigravityComposition.stripModelPrefix(childModel)
         var antigravityRoster: [String] = []
@@ -934,6 +937,66 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             }
         }
 
+        // Resolve isolation before registering or launching a child. An
+        // explicit worktree must never silently run in the parent's checkout.
+        var resumedWorktree = Self.resumeWorktreePath(resumeSource?.worktreePath)
+        if let source = resumeSource, source.worktreeIsolationEnforced {
+            guard let recorded = resumedWorktree else {
+                return .failure(.invalidCall(
+                    "Cannot resume isolated subagent '\(resumeID ?? childID)': "
+                        + "its worktree is unavailable"
+                ))
+            }
+            do {
+                resumedWorktree = try await LiveSubagentWorktree.resume(
+                    recorded,
+                    sourceDirectory: context.workingDirectory,
+                    openGrokHome: context.openGrokHome
+                )
+            } catch {
+                return .failure(.invalidCall(
+                    "Cannot resume isolated subagent '\(resumeID ?? childID)': "
+                        + "its worktree is unsafe or unavailable: \(error)"
+                ))
+            }
+        }
+
+        let createdWorktree: LiveSubagentWorktree?
+        if resumeSource == nil, runtime.isolation == .worktree {
+            do {
+                createdWorktree = try await LiveSubagentWorktree.prepare(
+                    sourceDirectory: context.workingDirectory,
+                    openGrokHome: context.openGrokHome,
+                    childID: childID
+                )
+            } catch is CancellationError {
+                return .failure(.cancelled)
+            } catch {
+                if Task.isCancelled { return .failure(.cancelled) }
+                return .failure(.invalidCall(
+                    "worktree isolation is unavailable; refusing to use the "
+                        + "parent workspace: \(error)"
+                ))
+            }
+        } else {
+            createdWorktree = nil
+        }
+
+        // Final child CWD: new/reused worktree > resume-inherited/request cwd
+        // > parent (`resolve_child_cwd`, subagent/mod.rs:1590-1632).
+        let childWorktree = createdWorktree?.path ?? resumedWorktree
+        let overrideCWD: URL? = resumeID != nil
+            ? Self.resumeInheritedCWD(
+                sourceCWD: resumeSource?.childCWD,
+                recordedWorktreePath: resumeSource?.worktreePath
+            )
+            : requestCWD
+        let childCWD = Self.resolveChildCWD(
+            worktreePath: childWorktree,
+            overrideCWD: overrideCWD,
+            parentCWD: context.workingDirectory
+        )
+
         // The child's tool policy: the resolved definition after the nested
         // spawn/plan strip and the capability filter, so the child can never
         // hold a surface the policy removed — and it never sees a subagent
@@ -967,7 +1030,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             model: childModel,
             persona: runtime.persona,
             childCWD: childCWD,
-            worktreePath: resumedWorktree,
+            worktreePath: childWorktree,
+            worktreeIsolationEnforced:
+                createdWorktree != nil || resumeSource?.worktreeIsolationEnforced == true,
             liveItems: antigravityModel == nil ? [] : [
                 .user(input.prompt),
                 .assistant(AssistantItem(content: "Antigravity: Starting")),
@@ -982,7 +1047,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             subagentType: input.subagentType,
             description: input.description,
             childCWD: childCWD.path,
-            worktreePath: resumedWorktree?.path,
+            worktreePath: childWorktree?.path,
             owner: antigravityModel == nil ? .task : .antigravity,
             runInBackground: input.runInBackground,
             capabilityMode: runtime.capabilityMode?.rawValue,
@@ -1027,12 +1092,34 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             }
         } catch let error as OpenGrokCoordinatorError {
             bookkeeping.removeValue(forKey: childID)
+            if let createdWorktree {
+                do {
+                    try await createdWorktree.discard()
+                } catch {
+                    await emitActiveBackgroundWorkRemove(id: childID)
+                    return .failure(.failed(
+                        "subagent \(childID) could not be registered and its "
+                            + "isolated worktree could not be cleaned up: \(error)"
+                    ))
+                }
+            }
             // Spawn never reached the operation body — remove is a no-op
             // unless a future path upserts before this catch.
             await emitActiveBackgroundWorkRemove(id: childID)
             return .failure(.failed(error.description))
         } catch {
             bookkeeping.removeValue(forKey: childID)
+            if let createdWorktree {
+                do {
+                    try await createdWorktree.discard()
+                } catch {
+                    await emitActiveBackgroundWorkRemove(id: childID)
+                    return .failure(.failed(
+                        "subagent \(childID) could not be registered and its "
+                            + "isolated worktree could not be cleaned up: \(error)"
+                    ))
+                }
+            }
             await emitActiveBackgroundWorkRemove(id: childID)
             return .failure(.failed("subagent \(childID) could not be registered: \(error)"))
         }
@@ -1081,12 +1168,22 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 subagentType: input.subagentType,
                 toolCalls: stats?.terminalToolCalls ?? 0,
                 turns: stats?.terminalTurns ?? 0,
-                durationMs: result.durationMS
+                durationMs: result.durationMS,
+                worktreePath: stats?.worktreePath?.path
             )
             let encoded = (try? JSONEncoder().encode(output)).flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) } ?? .null
+            var modelText = output.toModelText()
+            if let worktreePath = output.worktreePath {
+                let worktreeTag = "\n\n<worktree_path>\(worktreePath)</worktree_path>"
+                if let metadata = modelText.range(of: "\n\n<subagent_meta>") {
+                    modelText.insert(contentsOf: worktreeTag, at: metadata.lowerBound)
+                } else {
+                    modelText += worktreeTag
+                }
+            }
             return .success(OpenGrokShellToolCallResult(
                 value: encoded,
-                promptText: output.toModelText()
+                promptText: modelText
             ))
         }
         if result.cancelled {
