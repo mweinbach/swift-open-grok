@@ -25,6 +25,11 @@ private struct MessagesBlockState {
     var signature: String = ""
 }
 
+private func saturatingMessageTokenSum(_ lhs: UInt32, _ rhs: UInt32) -> UInt32 {
+    let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+    return overflow ? .max : sum
+}
+
 /// Transform a raw Anthropic Messages stream into ``SamplingEvent``s.
 public func streamMessages(
     rawStream: AsyncStream<Result<MessageStreamEvent, SamplingError>>,
@@ -324,13 +329,17 @@ public func streamMessages(
                 modelId: finalModel
             )))
 
-            let promptTokens = finalInputTokens &+ finalCacheRead &+ finalCacheCreation
+            let promptTokens = saturatingMessageTokenSum(
+                saturatingMessageTokenSum(finalInputTokens, finalCacheRead),
+                finalCacheCreation
+            )
             let usage = TokenUsage(
                 promptTokens: promptTokens,
                 completionTokens: finalOutputTokens,
-                totalTokens: promptTokens &+ finalOutputTokens,
+                totalTokens: saturatingMessageTokenSum(promptTokens, finalOutputTokens),
                 reasoningTokens: 0,
-                cachedPromptTokens: finalCacheRead
+                cachedPromptTokens: finalCacheRead,
+                cacheCreationPromptTokens: finalCacheCreation
             )
 
             let metrics = InferenceLatencyStats.fromTimestamps(

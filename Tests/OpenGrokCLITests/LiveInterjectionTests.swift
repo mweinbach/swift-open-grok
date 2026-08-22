@@ -329,6 +329,8 @@ struct LiveInterjectionSessionActorTests {
             sessionID: sessionID,
             request: OpenGrokShellTurnRequest(promptID: "p1", text: "long turn", turnID: "t1")
         )
+        #expect(await store.waitForAgentRequests(atLeast: 1))
+
         var delivered = false
         let deliverDeadline = Date().addingTimeInterval(15)
         while !delivered, Date() < deliverDeadline {
@@ -336,6 +338,10 @@ struct LiveInterjectionSessionActorTests {
             if !delivered { try? await Task.sleep(nanoseconds: 10_000_000) }
         }
         #expect(delivered)
+        #expect(
+            !(await stack.interjections.isEmpty),
+            "the held sampler must leave the interjection pending until cancellation"
+        )
 
         try await shell.cancelTurn(handle)
         do {
@@ -353,6 +359,22 @@ struct LiveInterjectionSessionActorTests {
         #expect(
             await stack.interjections.isEmpty,
             "cancel must clear pending interjections (run_loop.rs:989-991)"
+        )
+
+        let liveItems = await stack.conversationHistory.items
+        #expect(!liveItems.contains { isInterjectionItem($0, text: "never mind") })
+        let reloaded = try await LiveConversationStore(openGrokHome: fixture.home)
+            .loadIfPresent(sessionID: foundation.sessionID)
+        #expect(
+            reloaded?.items.contains { item in
+                guard case .user(let user) = item else { return false }
+                return user.content == [.text(text: "long turn")]
+            } == true,
+            "cancellation must preserve the durably submitted prompt"
+        )
+        #expect(
+            reloaded?.items.contains { isInterjectionItem($0, text: "never mind") } == false,
+            "a cancelled pending interjection must never become durable conversation history"
         )
 
         // The dropped text must not leak into the next turn's request.

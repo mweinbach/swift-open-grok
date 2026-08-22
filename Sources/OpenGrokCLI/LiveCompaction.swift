@@ -206,7 +206,8 @@ actor LiveCompactionCoordinator {
     private let makeCodexTransport: @Sendable (
         OpenGrokLiveSamplingConfiguration,
         ResponsesRequestPolicy,
-        String?
+        String?,
+        CodexTurnStateCell?
     ) -> (any CodexCompactionTransport)?
     /// Off switches Codex sessions to the legacy unary `/responses/compact`
     /// protocol, which upstream documents as the compatibility option.
@@ -236,8 +237,10 @@ actor LiveCompactionCoordinator {
         makeCodexTransport: @escaping @Sendable (
             OpenGrokLiveSamplingConfiguration,
             ResponsesRequestPolicy,
-            String?
-        ) -> (any CodexCompactionTransport)? = { configuration, policy, cacheAffinityID in
+            String?,
+            CodexTurnStateCell?
+        ) -> (any CodexCompactionTransport)? = {
+            configuration, policy, cacheAffinityID, codexTurnState in
             guard configuration.provider == .codex else { return nil }
             var headers = configuration.extraHeaders
             let baseTransport = configuration.transport ?? URLSessionHTTPTransport()
@@ -275,6 +278,7 @@ actor LiveCompactionCoordinator {
                 headers: headers,
                 queryParams: configuration.queryParams,
                 cacheAffinityID: cacheAffinityID,
+                codexTurnState: codexTurnState,
                 requestPolicy: policy
             )
         }
@@ -743,6 +747,9 @@ actor LiveCompactionCoordinator {
             turnID: turnID ?? "compaction-\(UUID().uuidString)"
         )
         let cacheAffinityID = await history.cacheAffinityID
+        let codexTurnState = requestPolicy.turnID.flatMap { turnID in
+            snapshot.sampler.codexTurnState(sessionID: sessionID, turnID: turnID)
+        }
         return CompactionEngine(
             configuration: configuration,
             sampler: LiveCompactionSampler(
@@ -753,7 +760,8 @@ actor LiveCompactionCoordinator {
             codexTransport: makeCodexTransport(
                 snapshot.configuration,
                 requestPolicy,
-                cacheAffinityID
+                cacheAffinityID,
+                codexTurnState
             )
         )
     }

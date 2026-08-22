@@ -387,7 +387,6 @@ public final class SamplingClient: @unchecked Sendable {
                 statusCode = meta.statusCode
                 responseHeaders = meta.headers
                 metadata = extractModelMetadata(from: meta.headers)
-                providerAdapter.captureTurnState(from: meta.headers, into: codexTurnState)
                 break
             case .body(let data):
                 earlyBody.append(data)
@@ -413,6 +412,10 @@ public final class SamplingClient: @unchecked Sendable {
                 consumer: consumer
             )
         }
+
+        // A failed response must not win the turn's sticky-routing cell: its
+        // server shard rejected the request and is not a valid continuation.
+        providerAdapter.captureTurnState(from: responseHeaders, into: codexTurnState)
 
         let adapter = providerAdapter
         let turnState = codexTurnState

@@ -135,7 +135,8 @@ public struct CompletionTokensDetails: Codable, Sendable, Equatable, Hashable {
 /// `promptTokens` is always the FULL prompt size (uncached + cache reads +
 /// cache writes) and `cachedPromptTokens` is only the cache-hit subset; do
 /// not subtract. Cache writes (`cache_creation_input_tokens`, billed at
-/// ~1.25x) are folded into `promptTokens`, not into `cachedPromptTokens`.
+/// ~1.25x) remain part of `promptTokens` while also being preserved separately
+/// in `cacheCreationPromptTokens`; they are never cache hits.
 public struct TokenUsage: Codable, Sendable, Equatable, Hashable {
     public var promptTokens: UInt32
     public var completionTokens: UInt32
@@ -143,19 +144,23 @@ public struct TokenUsage: Codable, Sendable, Equatable, Hashable {
     public var reasoningTokens: UInt32
     /// Prompt tokens served from cache (the cache-hit subset).
     public var cachedPromptTokens: UInt32
+    /// Prompt tokens written to cache (a distinct subset of `promptTokens`).
+    public var cacheCreationPromptTokens: UInt32
 
     public init(
         promptTokens: UInt32 = 0,
         completionTokens: UInt32 = 0,
         totalTokens: UInt32 = 0,
         reasoningTokens: UInt32 = 0,
-        cachedPromptTokens: UInt32 = 0
+        cachedPromptTokens: UInt32 = 0,
+        cacheCreationPromptTokens: UInt32 = 0
     ) {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.totalTokens = totalTokens
         self.reasoningTokens = reasoningTokens
         self.cachedPromptTokens = cachedPromptTokens
+        self.cacheCreationPromptTokens = cacheCreationPromptTokens
     }
 
     public enum CodingKeys: String, CodingKey {
@@ -164,6 +169,7 @@ public struct TokenUsage: Codable, Sendable, Equatable, Hashable {
         case totalTokens = "total_tokens"
         case reasoningTokens = "reasoning_tokens"
         case cachedPromptTokens = "cached_prompt_tokens"
+        case cacheCreationPromptTokens = "cache_creation_prompt_tokens"
     }
 
     public init(from decoder: Decoder) throws {
@@ -173,6 +179,7 @@ public struct TokenUsage: Codable, Sendable, Equatable, Hashable {
         self.totalTokens = try c.decode(UInt32.self, forKey: .totalTokens)
         self.reasoningTokens = try c.decodeIfPresent(UInt32.self, forKey: .reasoningTokens) ?? 0
         self.cachedPromptTokens = try c.decodeIfPresent(UInt32.self, forKey: .cachedPromptTokens) ?? 0
+        self.cacheCreationPromptTokens = try c.decodeIfPresent(UInt32.self, forKey: .cacheCreationPromptTokens) ?? 0
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -182,6 +189,10 @@ public struct TokenUsage: Codable, Sendable, Equatable, Hashable {
         try c.encode(totalTokens, forKey: .totalTokens)
         try c.encodeIfPresent(reasoningTokens == 0 ? nil : reasoningTokens, forKey: .reasoningTokens)
         try c.encodeIfPresent(cachedPromptTokens == 0 ? nil : cachedPromptTokens, forKey: .cachedPromptTokens)
+        try c.encodeIfPresent(
+            cacheCreationPromptTokens == 0 ? nil : cacheCreationPromptTokens,
+            forKey: .cacheCreationPromptTokens
+        )
     }
 
     /// Construct from a Chat Completions `Usage` value.

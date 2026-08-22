@@ -26,6 +26,7 @@ public struct UsageTotals: Sendable, Equatable, Hashable {
     public var inputTokens: UInt64
     public var outputTokens: UInt64
     public var cachedReadTokens: UInt64
+    public var cachedCreationTokens: UInt64
     public var reasoningTokens: UInt64
     public var modelCalls: UInt64
     public var apiDurationMs: UInt64
@@ -41,11 +42,13 @@ public struct UsageTotals: Sendable, Equatable, Hashable {
         modelCalls: UInt64 = 0,
         apiDurationMs: UInt64 = 0,
         costUsdTicks: Int64? = nil,
-        costMissingCalls: UInt64 = 0
+        costMissingCalls: UInt64 = 0,
+        cachedCreationTokens: UInt64 = 0
     ) {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
         self.cachedReadTokens = cachedReadTokens
+        self.cachedCreationTokens = cachedCreationTokens
         self.reasoningTokens = reasoningTokens
         self.modelCalls = modelCalls
         self.apiDurationMs = apiDurationMs
@@ -89,7 +92,8 @@ public struct UsageTotals: Sendable, Equatable, Hashable {
             modelCalls: 1,
             apiDurationMs: apiDurationMs ?? 0,
             costUsdTicks: normalizedCost,
-            costMissingCalls: normalizedCost == nil ? 1 : 0
+            costMissingCalls: normalizedCost == nil ? 1 : 0,
+            cachedCreationTokens: UInt64(usage.cacheCreationPromptTokens)
         )
     }
 
@@ -98,6 +102,7 @@ public struct UsageTotals: Sendable, Equatable, Hashable {
         inputTokens = inputTokens.addingWithSaturate(other.inputTokens)
         outputTokens = outputTokens.addingWithSaturate(other.outputTokens)
         cachedReadTokens = cachedReadTokens.addingWithSaturate(other.cachedReadTokens)
+        cachedCreationTokens = cachedCreationTokens.addingWithSaturate(other.cachedCreationTokens)
         reasoningTokens = reasoningTokens.addingWithSaturate(other.reasoningTokens)
         modelCalls = modelCalls.addingWithSaturate(other.modelCalls)
         apiDurationMs = apiDurationMs.addingWithSaturate(other.apiDurationMs)

@@ -37,6 +37,7 @@ public enum ChatStateCommand: Sendable {
     case recordModelCallUsage(
         modelId: String?, usage: TokenUsage, apiDurationMs: UInt64?, costUsdTicks: Int64?
     )
+    case recordUnmeteredModelCall(reply: ActorReply<Void>)
     case recordSubagentUsage(
         byModel: [(model: String, totals: UsageTotals)],
         attributeToPrompt: Bool,
@@ -292,6 +293,12 @@ public final class ChatStateHandle: Sendable {
         } != nil
     }
 
+    public func recordUnmeteredModelCall() async -> Bool {
+        await query("RecordUnmeteredModelCall") { reply in
+            .recordUnmeteredModelCall(reply: reply)
+        } != nil
+    }
+
     public func recordSubagentUsage(
         byModel: [(model: String, totals: UsageTotals)],
         attributeToPrompt: Bool,
@@ -520,6 +527,7 @@ public actor ChatStateActor {
     public static func spawn(
         initialConversation: [ConversationItem],
         samplingConfig: SamplingConfig,
+        initialSessionUsage: UsageLedger? = nil,
         persistence: any ChatPersistence,
         eventSink: (@Sendable (ChatStateEvent) -> Void)? = nil,
         cancellationToken: ChatStateCancellationToken = ChatStateCancellationToken()
@@ -528,6 +536,7 @@ public actor ChatStateActor {
             initialConversation: initialConversation,
             samplingConfig: samplingConfig,
             pruningConfig: PruningConfig(),
+            initialSessionUsage: initialSessionUsage,
             persistence: persistence,
             eventSink: eventSink,
             cancellationToken: cancellationToken
@@ -539,6 +548,7 @@ public actor ChatStateActor {
         initialConversation: [ConversationItem],
         samplingConfig: SamplingConfig,
         pruningConfig: PruningConfig,
+        initialSessionUsage: UsageLedger? = nil,
         persistence: any ChatPersistence,
         eventSink: (@Sendable (ChatStateEvent) -> Void)? = nil,
         cancellationToken: ChatStateCancellationToken = ChatStateCancellationToken()
@@ -548,6 +558,7 @@ public actor ChatStateActor {
             initialConversation: initialConversation,
             samplingConfig: samplingConfig,
             pruningConfig: pruningConfig,
+            initialSessionUsage: initialSessionUsage,
             persistence: persistence,
             commandStream: stream,
             commandContinuation: continuation,
@@ -569,6 +580,7 @@ public actor ChatStateActor {
         initialConversation: [ConversationItem],
         samplingConfig: SamplingConfig,
         pruningConfig: PruningConfig,
+        initialSessionUsage: UsageLedger?,
         persistence: any ChatPersistence,
         commandStream: AsyncStream<ChatStateCommand>,
         commandContinuation: AsyncStream<ChatStateCommand>.Continuation,
@@ -581,7 +593,8 @@ public actor ChatStateActor {
         self.cancellationToken = cancellationToken
         self.state = ChatStateInternalState(
             conversation: initialConversation,
-            samplingConfig: samplingConfig
+            samplingConfig: samplingConfig,
+            initialSessionUsage: initialSessionUsage
         )
     }
 
@@ -609,6 +622,8 @@ public actor ChatStateActor {
     private func completeCommandAsDead(_ cmd: ChatStateCommand) {
         switch cmd {
         case .pushUserMessageAndAck(_, let reply):
+            reply.resumeDead()
+        case .recordUnmeteredModelCall(let reply):
             reply.resumeDead()
         case .recordSubagentUsage(_, _, _, let reply):
             reply.resumeDead()
@@ -703,6 +718,9 @@ public actor ChatStateActor {
             state.lastTurnUsage = usage
         case .recordModelCallUsage(let modelId, let usage, let apiDurationMs, let costUsdTicks):
             recordModelCallUsage(modelId: modelId, usage: usage, apiDurationMs: apiDurationMs, costUsdTicks: costUsdTicks)
+        case .recordUnmeteredModelCall(let reply):
+            recordUnmeteredModelCall()
+            reply.resume(returning: ())
         case .recordSubagentUsage(let byModel, let attributeToPrompt, let incomplete, let reply):
             recordSubagentUsage(byModel: byModel, attributeToPrompt: attributeToPrompt, incomplete: incomplete)
             reply.resume(returning: ())
@@ -974,6 +992,26 @@ public actor ChatStateActor {
         state.sessionUsage.recordMainLoopCall(
             modelId: model, usage: usage, apiDurationMs: apiDurationMs, costUsdTicks: costUsdTicks
         )
+    }
+
+    private func recordUnmeteredModelCall() {
+        if state.promptUsage == nil {
+            state.promptUsage = UsageLedger()
+        }
+        if let promptUsage = state.promptUsage {
+            recordUnmeteredModelCall(in: promptUsage)
+        }
+        recordUnmeteredModelCall(in: state.sessionUsage)
+    }
+
+    private func recordUnmeteredModelCall(in ledger: UsageLedger) {
+        if ledger.mainLoopModelCalls < UInt64.max {
+            ledger.mainLoopModelCalls += 1
+        }
+        if ledger.totals.modelCalls < UInt64.max {
+            ledger.totals.modelCalls += 1
+        }
+        ledger.markIncomplete()
     }
 
     private func recordSubagentUsage(
@@ -1329,9 +1367,24 @@ struct ChatStateInternalState {
     var harnessTraceBuffer: [ConversationItem] = []
     var harnessTraceTurns: [[ConversationItem]] = []
 
-    init(conversation: [ConversationItem], samplingConfig: SamplingConfig) {
+    init(
+        conversation: [ConversationItem],
+        samplingConfig: SamplingConfig,
+        initialSessionUsage: UsageLedger? = nil
+    ) {
         self.conversation = conversation
         self.samplingConfig = samplingConfig
+        if let initialSessionUsage {
+            // UsageLedger is reference-backed and callers may retain their
+            // persisted snapshot. The live actor must own an independent bill
+            // so resumed model calls cannot mutate the saved baseline.
+            self.sessionUsage = UsageLedger(
+                totals: initialSessionUsage.totals,
+                byModel: initialSessionUsage.byModel,
+                mainLoopModelCalls: initialSessionUsage.mainLoopModelCalls,
+                incomplete: initialSessionUsage.incomplete
+            )
+        }
     }
 
     /// Repair any dangling tool calls in the initial conversation and seed

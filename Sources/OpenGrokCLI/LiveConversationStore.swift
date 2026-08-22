@@ -3,6 +3,7 @@ import OpenGrokAgentCoordinator
 import OpenGrokAgentDefinitions
 import OpenGrokACPRuntime
 import OpenGrokAuth
+import OpenGrokChatState
 import OpenGrokCodeMode
 import OpenGrokCompaction
 import OpenGrokConfig
@@ -59,6 +60,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
     var currentModelID: String?
     var currentProvider: ModelProvider?
     var everUsedNonXAI: Bool?
+    var usageSnapshot: LiveSessionUsageSnapshot?
     /// User-chosen session title (`/rename`, upstream rename.rs:42-53).
     /// `nil` means "never renamed"; readers derive a title from the first
     /// real user turn instead. Optional so records written before this field
@@ -83,6 +85,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         currentModelID: String? = nil,
         currentProvider: ModelProvider? = nil,
         everUsedNonXAI: Bool? = nil,
+        usageSnapshot: LiveSessionUsageSnapshot? = nil,
         title: String? = nil,
         toolOutcomes: ToolCallOutcomeMap? = nil
     ) {
@@ -98,6 +101,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         self.currentModelID = currentModelID
         self.currentProvider = currentProvider
         self.everUsedNonXAI = everUsedNonXAI
+        self.usageSnapshot = usageSnapshot
         self.title = title
         self.toolOutcomes = toolOutcomes
     }
@@ -115,6 +119,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         case currentModelID = "current_model_id"
         case currentProvider = "current_provider"
         case everUsedNonXAI = "ever_used_codex"
+        case usageSnapshot = "session_usage"
         case title
         case toolOutcomes = "tool_outcomes"
     }
@@ -137,6 +142,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         currentModelID = try c.decodeIfPresent(String.self, forKey: .currentModelID)
         currentProvider = try c.decodeIfPresent(ModelProvider.self, forKey: .currentProvider)
         everUsedNonXAI = try c.decodeIfPresent(Bool.self, forKey: .everUsedNonXAI)
+        usageSnapshot = try c.decodeIfPresent(LiveSessionUsageSnapshot.self, forKey: .usageSnapshot)
         title = try c.decodeIfPresent(String.self, forKey: .title)
         toolOutcomes = try c.decodeIfPresent(ToolCallOutcomeMap.self, forKey: .toolOutcomes)
     }
@@ -155,6 +161,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         try c.encodeIfPresent(currentModelID, forKey: .currentModelID)
         try c.encodeIfPresent(currentProvider, forKey: .currentProvider)
         try c.encodeIfPresent(everUsedNonXAI, forKey: .everUsedNonXAI)
+        try c.encodeIfPresent(usageSnapshot, forKey: .usageSnapshot)
         try c.encodeIfPresent(title, forKey: .title)
         try c.encodeIfPresent(toolOutcomes, forKey: .toolOutcomes)
     }
@@ -577,6 +584,13 @@ actor LiveConversationStore {
         } else {
             extra["tool_outcomes"] = .null
         }
+        if let usageSnapshot = record.usageSnapshot {
+            extra["session_usage"] = try JSONValue.encode(usageSnapshot)
+        } else if extra["session_usage"] != nil {
+            // Copying a transcript creates a new bill; a null tombstone is
+            // required because document saves preserve unknown summary keys.
+            extra["session_usage"] = .null
+        }
         extra["swift_legacy_export_boundary_missing"] = .bool(record.everUsedNonXAI == nil)
 
         let previousSummary = existing?.summary.sessionSummary
@@ -640,6 +654,12 @@ actor LiveConversationStore {
         } else {
             toolOutcomes = nil
         }
+        let usageSnapshot: LiveSessionUsageSnapshot?
+        if let value = extra["session_usage"], value != .null {
+            usageSnapshot = try value.decode(LiveSessionUsageSnapshot.self)
+        } else {
+            usageSnapshot = nil
+        }
         let exportBoundaryMissing = extra["swift_legacy_export_boundary_missing"]?.boolValue == true
 
         return LiveConversationRecord(
@@ -657,6 +677,7 @@ actor LiveConversationStore {
                 : state.summary.currentModelID,
             currentProvider: provider,
             everUsedNonXAI: exportBoundaryMissing ? nil : state.summary.everUsedCodex,
+            usageSnapshot: usageSnapshot,
             title: extra["generated_title"]?.stringValue ?? extra["title"]?.stringValue,
             toolOutcomes: toolOutcomes
         )
@@ -991,17 +1012,42 @@ actor LiveConversationHistory {
     private var record: LiveConversationRecord
     private let store: LiveConversationStore
     private let exportBoundary: ExportBoundary
+    private var usageHandle: ChatStateHandle
+    private var usageCancellationToken: ChatStateCancellationToken
+    private var usageSamplingConfig: SamplingConfig
+    private var activeUsagePromptID: String?
 
     init(
         record: LiveConversationRecord,
         store: LiveConversationStore,
-        exportBoundary: ExportBoundary? = nil
+        exportBoundary: ExportBoundary? = nil,
+        samplingConfig: SamplingConfig? = nil
     ) {
+        let resolvedSamplingConfig = samplingConfig ?? SamplingConfig(
+            baseURL: "",
+            model: record.currentModelID ?? "",
+            provider: record.currentProvider ?? .defaultValue,
+            contextWindow: 1
+        )
+        let cancellationToken = ChatStateCancellationToken()
         self.record = record
         self.store = store
         self.exportBoundary = exportBoundary ?? ExportBoundary(
             everUsedNonXAI: record.everUsedNonXAI != false
         )
+        self.usageSamplingConfig = resolvedSamplingConfig
+        self.usageCancellationToken = cancellationToken
+        self.usageHandle = ChatStateActor.spawn(
+            initialConversation: record.items,
+            samplingConfig: resolvedSamplingConfig,
+            initialSessionUsage: record.usageSnapshot?.usageLedger,
+            persistence: NullChatPersistence(),
+            cancellationToken: cancellationToken
+        )
+    }
+
+    deinit {
+        usageCancellationToken.cancel()
     }
 
     var items: [ConversationItem] { record.items }
@@ -1012,12 +1058,33 @@ actor LiveConversationHistory {
 
     var sharedExportBoundary: ExportBoundary { exportBoundary }
 
+    var usageSnapshot: LiveSessionUsageSnapshot? { record.usageSnapshot }
+
     func snapshot() -> LiveConversationRecord { record }
 
     /// Switch the in-memory spine only after the replacement record is
     /// durably written. The old record remains available through the store.
     func replace(with record: LiveConversationRecord) throws {
         try LiveConversationStore.validateSessionID(record.sessionID)
+        usageCancellationToken.cancel()
+        let cancellationToken = ChatStateCancellationToken()
+        var samplingConfig = usageSamplingConfig
+        if let model = record.currentModelID {
+            samplingConfig.model = model
+        }
+        if let provider = record.currentProvider {
+            samplingConfig.provider = provider
+        }
+        usageSamplingConfig = samplingConfig
+        usageCancellationToken = cancellationToken
+        usageHandle = ChatStateActor.spawn(
+            initialConversation: record.items,
+            samplingConfig: samplingConfig,
+            initialSessionUsage: record.usageSnapshot?.usageLedger,
+            persistence: NullChatPersistence(),
+            cancellationToken: cancellationToken
+        )
+        activeUsagePromptID = nil
         self.record = record
         if record.everUsedNonXAI != false {
             self.exportBoundary.sync(everUsedNonXAI: true)
@@ -1039,6 +1106,7 @@ actor LiveConversationHistory {
         next.updatedAt = Date()
         try await store.save(next)
         record = next
+        usageHandle.replaceConversation(sanitized)
         return before.count - sanitized.count
     }
 
@@ -1070,6 +1138,12 @@ actor LiveConversationHistory {
         }
         try await store.save(next)
         record = next
+        if shouldSanitize {
+            usageHandle.replaceConversation(next.items)
+        }
+        usageSamplingConfig.model = modelID
+        usageSamplingConfig.provider = provider
+        usageHandle.updateSamplingConfig(usageSamplingConfig)
         exportBoundary.observe(provider)
         return shouldSanitize ? before.items.count - sanitized.count : 0
     }
@@ -1093,6 +1167,117 @@ actor LiveConversationHistory {
             throw CLIApplicationError.failed("conversation session mismatch: \(sessionID)")
         }
         record.items = items
+        record.updatedAt = Date()
+        try await store.save(record)
+        usageHandle.replaceConversation(items)
+    }
+
+    func beginUsagePrompt(_ promptID: String) async {
+        activeUsagePromptID = promptID
+        usageHandle.incrementPromptIndex()
+    }
+
+    func endUsagePrompt(_ promptID: String) async {
+        if activeUsagePromptID == promptID {
+            activeUsagePromptID = nil
+        }
+    }
+
+    func recordMainUsage(
+        modelID: String,
+        usage: TokenUsage?,
+        costUsdTicks: Int64?
+    ) async throws {
+        if let usage {
+            usageHandle.recordTokenUsage(totalTokens: UInt64(usage.totalTokens))
+            usageHandle.recordLastTurnUsage(usage)
+            usageHandle.recordModelCallUsage(
+                modelId: modelID,
+                usage: usage,
+                apiDurationMs: nil,
+                costUsdTicks: costUsdTicks
+            )
+        } else {
+            guard await usageHandle.recordUnmeteredModelCall() else {
+                throw CLIApplicationError.failed("session usage actor is unavailable")
+            }
+        }
+        try await persistUsageSnapshot()
+    }
+
+    func foldSubagentUsage(
+        byModel: [(model: String, totals: UsageTotals)],
+        parentPromptID: String?,
+        incomplete: Bool
+    ) async -> Bool {
+        guard !byModel.isEmpty || incomplete || parentPromptID == nil else { return true }
+        let attributable = parentPromptID != nil && parentPromptID == activeUsagePromptID
+        let applied = await usageHandle.recordSubagentUsage(
+            byModel: byModel,
+            attributeToPrompt: attributable,
+            incomplete: incomplete
+        )
+        guard applied else {
+            guard await markUsageIncomplete(prompt: attributable, session: true) else {
+                return false
+            }
+            return false
+        }
+
+        var unattributedPromptIDs = record.usageSnapshot?.unattributedPromptIDs ?? []
+        if let parentPromptID, !attributable {
+            unattributedPromptIDs.append(parentPromptID)
+        } else if parentPromptID == nil {
+            let marked = await usageHandle.markUsageIncomplete(
+                prompt: activeUsagePromptID != nil,
+                session: true
+            )
+            guard marked else { return false }
+        }
+
+        do {
+            try await persistUsageSnapshot(unattributedPromptIDs: unattributedPromptIDs)
+            return true
+        } catch {
+            guard await markUsageIncomplete(prompt: attributable, session: true) else {
+                return false
+            }
+            return false
+        }
+    }
+
+    func markUsageIncomplete(
+        prompt: Bool = true,
+        session: Bool = true
+    ) async -> Bool {
+        guard await usageHandle.markUsageIncomplete(prompt: prompt, session: session) else {
+            return false
+        }
+        do {
+            try await persistUsageSnapshot()
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func persistUsageSnapshot(
+        unattributedPromptIDs: [String]? = nil
+    ) async throws {
+        let result = await usageHandle.tryGetSessionUsage()
+        let ledger: UsageLedger
+        switch result {
+        case .success(let value):
+            ledger = value
+        case .failure:
+            throw CLIApplicationError.failed("session usage actor is unavailable")
+        }
+        record.usageSnapshot = LiveSessionUsageSnapshot(
+            ledger: ledger,
+            unattributedPromptIDs: unattributedPromptIDs
+                ?? record.usageSnapshot?.unattributedPromptIDs
+                ?? []
+        )
         record.updatedAt = Date()
         try await store.save(record)
     }
@@ -1199,6 +1384,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         // Interjections may merge into this turn from here on — the port of
         // `current_prompt_id` becoming Some for the Interject arm's
         // running-turn check (run_loop.rs:1968-1974).
+        await conversationHistory.beginUsagePrompt(request.promptID)
         await interjections.beginTurn()
         do {
             let result = try await sampleTurn(context: context, request: request, emit: emit)
@@ -1209,6 +1395,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             // (run_loop.rs:419 → auto_exit_turn); manual mode survives.
             await toolExecutor.swarmMode.autoExitTurn()
             await services?.endPrompt()
+            await conversationHistory.endUsagePrompt(request.promptID)
             return result
         } catch {
             if error is CancellationError {
@@ -1226,6 +1413,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             // leave the next unrelated turn in swarm mode.
             await toolExecutor.swarmMode.autoExitTurn()
             await services?.endPrompt()
+            await conversationHistory.endUsagePrompt(request.promptID)
             throw error
         }
     }
@@ -1384,6 +1572,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             sessionID: context.sessionID,
                             cacheAffinityID: await conversationHistory.cacheAffinityID,
                             turnID: context.turnID,
+                            logicalTurnID: context.turnID,
                             model: active.modelID,
                             prompt: request.text,
                             items: items,
@@ -1475,6 +1664,11 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 try await conversationHistory.commit(
                     sessionID: context.sessionID,
                     items: items
+                )
+                try await conversationHistory.recordMainUsage(
+                    modelID: active.modelID,
+                    usage: response.usage,
+                    costUsdTicks: response.costUsdTicks
                 )
                 let emittedText = await streamedText.hasEmitted
                 if !emittedText, !response.output.isEmpty {

@@ -109,7 +109,10 @@ private struct FoundationSubagentFixture {
         self.store = store
         let parentSampler = OpenGrokLiveSampler { request, _ in
             recorder.record(route: "parent", request: request)
-            return OpenGrokLiveSamplingResponse(output: "the child completed its delegated task")
+            return OpenGrokLiveSamplingResponse(
+                output: "the child completed its delegated task",
+                usage: TokenUsage(promptTokens: 21, completionTokens: 9, totalTokens: 30)
+            )
         }
 
         let childSamplerFactory: (
@@ -121,7 +124,8 @@ private struct FoundationSubagentFixture {
                 let sampler = OpenGrokLiveSampler { request, _ in
                     recorder.record(route: "child", request: request)
                     return OpenGrokLiveSamplingResponse(
-                        output: "the child completed its delegated task"
+                        output: "the child completed its delegated task",
+                        usage: TokenUsage(promptTokens: 21, completionTokens: 9, totalTokens: 30)
                     )
                 }
                 return LiveSubagentHost.ChildSamplerRoute(

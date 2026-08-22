@@ -247,6 +247,8 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
     /// Durable routing identity shared by forks; distinct from actual session identity.
     public let cacheAffinityID: String?
     public let turnID: String
+    /// Stable logical turn shared by its compaction and tool-follow-up requests.
+    public let logicalTurnID: String?
     public let model: String
     public let prompt: String
     public let items: [ConversationItem]
@@ -273,6 +275,7 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         sessionID: String,
         cacheAffinityID: String? = nil,
         turnID: String,
+        logicalTurnID: String? = nil,
         model: String,
         prompt: String,
         items: [ConversationItem]? = nil,
@@ -284,6 +287,7 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         self.sessionID = sessionID
         self.cacheAffinityID = cacheAffinityID
         self.turnID = turnID
+        self.logicalTurnID = logicalTurnID
         self.model = model
         self.prompt = prompt
         self.items = items ?? [.user(prompt)]
@@ -377,15 +381,21 @@ public struct OpenGrokLiveSamplingResponse: Sendable, Equatable {
     public let stopReason: String?
     public let items: [ConversationItem]
     public let toolCalls: [ToolCall]
+    public let usage: TokenUsage?
+    public let costUsdTicks: Int64?
 
     public init(
         output: String,
         stopReason: String? = nil,
         items: [ConversationItem]? = nil,
-        toolCalls: [ToolCall] = []
+        toolCalls: [ToolCall] = [],
+        usage: TokenUsage? = nil,
+        costUsdTicks: Int64? = nil
     ) {
         self.output = output
         self.stopReason = stopReason
+        self.usage = usage
+        self.costUsdTicks = costUsdTicks
         let resolvedItems = items ?? [.assistant(AssistantItem(
             content: output,
             toolCalls: toolCalls
@@ -402,6 +412,28 @@ public struct OpenGrokLiveSamplingResponse: Sendable, Equatable {
     }
 }
 
+private final class LiveCodexTurnStateRegistry: @unchecked Sendable {
+    private struct CurrentTurn {
+        let turnID: String
+        let cell: CodexTurnStateCell
+    }
+
+    private let lock = NSLock()
+    private var currentTurns: [String: CurrentTurn] = [:]
+
+    func state(sessionID: String, turnID: String) -> CodexTurnStateCell {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let current = currentTurns[sessionID], current.turnID == turnID {
+            return current.cell
+        }
+        let cell = CodexTurnStateCell()
+        currentTurns[sessionID] = CurrentTurn(turnID: turnID, cell: cell)
+        return cell
+    }
+}
+
 public struct OpenGrokLiveSampler: Sendable {
     public typealias Emit = @Sendable (OpenGrokLiveSamplingEvent) async -> Void
 
@@ -409,6 +441,7 @@ public struct OpenGrokLiveSampler: Sendable {
         OpenGrokLiveSamplingRequest,
         @escaping Emit
     ) async throws -> OpenGrokLiveSamplingResponse
+    private let codexTurnStateRegistry: LiveCodexTurnStateRegistry?
 
     public init(
         sample: @escaping @Sendable (
@@ -417,6 +450,18 @@ public struct OpenGrokLiveSampler: Sendable {
         ) async throws -> OpenGrokLiveSamplingResponse
     ) {
         self.sampleOperation = sample
+        self.codexTurnStateRegistry = nil
+    }
+
+    private init(
+        codexTurnStateRegistry: LiveCodexTurnStateRegistry?,
+        sample: @escaping @Sendable (
+            OpenGrokLiveSamplingRequest,
+            @escaping Emit
+        ) async throws -> OpenGrokLiveSamplingResponse
+    ) {
+        self.sampleOperation = sample
+        self.codexTurnStateRegistry = codexTurnStateRegistry
     }
 
     public func sample(
@@ -424,6 +469,10 @@ public struct OpenGrokLiveSampler: Sendable {
         emit: @escaping Emit
     ) async throws -> OpenGrokLiveSamplingResponse {
         try await sampleOperation(request, emit)
+    }
+
+    func codexTurnState(sessionID: String, turnID: String) -> CodexTurnStateCell? {
+        codexTurnStateRegistry?.state(sessionID: sessionID, turnID: turnID)
     }
 
     public static func production(
@@ -450,7 +499,7 @@ public struct OpenGrokLiveSampler: Sendable {
         // :3231-3233). Dropping any of them here silently reverts the model
         // to provider defaults — the audit that motivated this found NO
         // effort ever reaching an outbound request.
-        let client = try SamplingClient(config: SamplerConfig(
+        let samplerConfig = SamplerConfig(
             apiKey: configuration.apiKey,
             baseURL: configuration.baseURL,
             model: configuration.model,
@@ -470,14 +519,32 @@ public struct OpenGrokLiveSampler: Sendable {
             codexMultiAgentV2: configuration.tuning.codexMultiAgentV2,
             codexPermissions: configuration.codexPermissions,
             bearerResolver: bearerResolver
-        ), transport: transport)
-        return OpenGrokLiveSampler { request, emit in
+        )
+        let client = try SamplingClient(config: samplerConfig, transport: transport)
+        let codexTurnStateRegistry = configuration.provider == .codex
+            ? LiveCodexTurnStateRegistry()
+            : nil
+        return OpenGrokLiveSampler(codexTurnStateRegistry: codexTurnStateRegistry) { request, emit in
             await emit(.status("sampling"))
+            let turnClient: SamplingClient
+            if let codexTurnStateRegistry {
+                let state = codexTurnStateRegistry.state(
+                    sessionID: request.sessionID,
+                    turnID: request.logicalTurnID ?? request.turnID
+                )
+                turnClient = try SamplingClient(
+                    config: samplerConfig,
+                    transport: transport,
+                    codexTurnState: state
+                )
+            } else {
+                turnClient = client
+            }
             // Streamed events (text, reasoning, tool deltas, retries, backend
             // tools, typed failures) are forwarded as they arrive; the
             // collected response carries the final assistant bytes, so nothing
             // is re-emitted once the turn completes.
-            let response = try await client.streamConversation(ConversationRequest(
+            let response = try await turnClient.streamConversation(ConversationRequest(
                 items: request.items,
                 tools: request.tools,
                 toolChoice: request.tools.isEmpty ? nil : .auto,
@@ -496,7 +563,9 @@ public struct OpenGrokLiveSampler: Sendable {
                 output: output,
                 stopReason: response.stopReason?.asString,
                 items: response.items,
-                toolCalls: response.assistant()?.toolCalls ?? []
+                toolCalls: response.assistant()?.toolCalls ?? [],
+                usage: response.usage,
+                costUsdTicks: response.costUsdTicks
             )
         }
     }
@@ -3035,9 +3104,24 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             userID: credential.telemetryContext.userID,
             teamID: credential.telemetryContext.teamID
         )
+        let historySamplingConfiguration = OpenGrokSamplingTypes.SamplingConfig(
+            baseURL: samplingConfiguration.baseURL,
+            model: samplingConfiguration.model,
+            maxCompletionTokens: samplingConfiguration.tuning.maxCompletionTokens,
+            temperature: samplingConfiguration.tuning.temperature,
+            topP: samplingConfiguration.tuning.topP,
+            apiBackend: samplingConfiguration.apiBackend,
+            provider: samplingConfiguration.provider,
+            extraHeaders: samplingConfiguration.extraHeaders
+                .sorted { $0.key < $1.key }
+                .map { ($0.key, $0.value) },
+            contextWindow: samplingConfiguration.tuning.contextWindow ?? 0,
+            reasoningEffort: samplingConfiguration.tuning.reasoningEffort
+        )
         let launchHistory = LiveConversationHistory(
             record: conversationRecord,
-            store: conversationStore
+            store: conversationStore,
+            samplingConfig: historySamplingConfiguration
         )
         try await launchHistory.reconcileRoute(
             modelID: samplingConfiguration.model,
@@ -3131,6 +3215,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             environment: context.environment,
             makeSampler: dependencies.makeSampler
         )
+        if let subagentHost {
+            await subagentHost.installParentUsageHistory(launchHistory)
+        }
         // `ask_user_question` needs a human at a terminal. The caller passes
         // `interactiveSurfaceAvailable` derived from the constructed input and
         // sink, so the coordinator — and with it the advertised tool — exists

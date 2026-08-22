@@ -32,6 +32,7 @@ public final class HTTPCodexCompactionTransport: CodexUnaryCompactionTransport, 
     private let model: String
     private let queryParams: [String: String]
     private let cacheAffinityID: String?
+    private let codexTurnState: CodexTurnStateCell?
     private let requestPolicy: ResponsesRequestPolicy
     private let lock = NSLock()
     private var headers: [String: String]
@@ -43,6 +44,7 @@ public final class HTTPCodexCompactionTransport: CodexUnaryCompactionTransport, 
         headers: [String: String],
         queryParams: [String: String] = [:],
         cacheAffinityID: String? = nil,
+        codexTurnState: CodexTurnStateCell? = nil,
         requestPolicy: ResponsesRequestPolicy = ResponsesRequestPolicy()
     ) {
         self.transport = transport
@@ -51,6 +53,7 @@ public final class HTTPCodexCompactionTransport: CodexUnaryCompactionTransport, 
         self.headers = headers
         self.queryParams = queryParams
         self.cacheAffinityID = cacheAffinityID
+        self.codexTurnState = codexTurnState
         self.requestPolicy = requestPolicy
     }
 
@@ -92,6 +95,12 @@ public final class HTTPCodexCompactionTransport: CodexUnaryCompactionTransport, 
             case .metadata(let metadata):
                 sawMetadata = true
                 status = metadata.statusCode
+                if (200..<300).contains(status) {
+                    providerAdapter(.codex).captureTurnState(
+                        from: metadata.headers,
+                        into: codexTurnState
+                    )
+                }
             case .body(let data):
                 guard sawMetadata else {
                     errorBody.append(data)
@@ -102,6 +111,13 @@ public final class HTTPCodexCompactionTransport: CodexUnaryCompactionTransport, 
                     continue
                 }
                 for frame in parser.consume(data) {
+                    if providerAdapter(.codex).absorbResponseMetadata(
+                        eventName: "",
+                        data: frame,
+                        turnState: codexTurnState
+                    ) {
+                        continue
+                    }
                     guard let decoded = Self.decode(frame) else { continue }
                     try await onEvent(decoded)
                 }
@@ -112,6 +128,13 @@ public final class HTTPCodexCompactionTransport: CodexUnaryCompactionTransport, 
 
         if sawMetadata, (200..<300).contains(status) {
             for frame in parser.finish() {
+                if providerAdapter(.codex).absorbResponseMetadata(
+                    eventName: "",
+                    data: frame,
+                    turnState: codexTurnState
+                ) {
+                    continue
+                }
                 guard let decoded = Self.decode(frame) else { continue }
                 try await onEvent(decoded)
             }
@@ -132,6 +155,10 @@ public final class HTTPCodexCompactionTransport: CodexUnaryCompactionTransport, 
 
         let response = try await transport.send(makeRequest(request))
         try Self.validateResponse(status: response.metadata.statusCode, body: response.body)
+        providerAdapter(.codex).captureTurnState(
+            from: response.metadata.headers,
+            into: codexTurnState
+        )
 
         let value: JSONValue
         do {
@@ -205,6 +232,7 @@ public final class HTTPCodexCompactionTransport: CodexUnaryCompactionTransport, 
                 wireHeaders[header.name] = header.value
             }
         }
+        adapter.applyTurnStateHeader(&wireHeaders, turnState: codexTurnState)
 
         let projected = try projectBody(request)
         if let metadata = projected["client_metadata"]?[X_CODEX_TURN_METADATA_HEADER]?.stringValue {

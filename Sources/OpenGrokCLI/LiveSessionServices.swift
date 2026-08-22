@@ -226,27 +226,35 @@ struct LiveUsageReport: Sendable, Equatable {
     var quotaWindows: [ProviderQuotaWindow]
     var quotaFailures: [ProviderUsageFailure]
     var antigravityQuota: LiveAntigravityQuotaSummary? = nil
-    /// Estimated tokens spent across the whole session, including turns that
-    /// compaction has since replaced. See `LiveUsageComposition` for why this
-    /// is an estimate rather than a provider-reported total.
+    /// Transcript fallback for older fixtures and providers that have not
+    /// supplied a usage event. Never prefer it over a real session ledger.
     var estimatedSessionTokens: UInt64
     var turnCount: Int
     var promptCacheHitRatePct: Double? = nil
+    var sessionUsage: LiveSessionUsageSnapshot? = nil
+
+    var sessionUsageIsAuthoritative: Bool {
+        guard let sessionUsage else { return false }
+        return !sessionUsage.incomplete && !sessionUsage.totals.costIsPartial
+    }
+
+    var hasMeasuredSessionUsage: Bool {
+        guard let sessionUsage else { return false }
+        let totals = sessionUsage.totals
+        return totals.inputTokens > 0
+            || totals.outputTokens > 0
+            || totals.cachedReadTokens > 0
+            || totals.cacheCreationTokens > 0
+            || !sessionUsage.models.isEmpty
+    }
 }
 
 enum LiveUsageComposition {
     /// Assemble a usage report.
     ///
-    /// **On the token numbers**: these are estimates from
-    /// `OpenGrokTokenEstimation`, not provider-reported counts.
-    /// `ProviderSession.recordUsage` does maintain real per-route totals from
-    /// `TokenUsage`, but it is only fed on the ACP path —
-    /// `OpenGrokLiveSamplingResponse` carries no `TokenUsage`, so the
-    /// interactive and headless turn loops have no provider-reported figure to
-    /// report. Estimating is the honest option: the alternative is a `/usage`
-    /// that shows zero on the paths most people use. Closing that properly
-    /// means threading `TokenUsage` through the sampling response, which is a
-    /// change to a public type several sessions in flight already depend on.
+    /// Provider-reported session totals take precedence over transcript
+    /// estimates. The fallback remains for legacy sessions and test fixtures
+    /// that have not received a metered provider response.
     ///
     /// **On the quota windows**: `fetchCombinedProviderUsage` is real and
     /// wired, but nothing in the tree implements `ProviderUsageSource` yet — no
@@ -257,7 +265,8 @@ enum LiveUsageComposition {
         context: ContextUsage?,
         items: [ConversationItem],
         usageSources: [ModelProvider: any ProviderUsageSource] = [:],
-        cacheHitRatePct: Double? = nil
+        cacheHitRatePct: Double? = nil,
+        sessionUsage: LiveSessionUsageSnapshot? = nil
     ) async -> LiveUsageReport {
         let combined = usageSources.isEmpty
             ? CombinedProviderUsage(windows: [], failures: [])
@@ -269,7 +278,8 @@ enum LiveUsageComposition {
             antigravityQuota: LiveAntigravityCache.shared.quotaSummary(),
             estimatedSessionTokens: estimateTokens(items),
             turnCount: turnCount(items),
-            promptCacheHitRatePct: cacheHitRatePct
+            promptCacheHitRatePct: sessionUsage?.cacheHitRatePct ?? cacheHitRatePct,
+            sessionUsage: sessionUsage
         )
     }
 
@@ -330,7 +340,7 @@ enum LiveUsageComposition {
             )
         }
         lines.append("Turns:    \(report.turnCount)")
-        lines.append("Tokens:   ~\(report.estimatedSessionTokens) estimated this session")
+        appendSessionAccounting(report, to: &lines)
         if let hitRate = report.promptCacheHitRatePct {
             lines.append("Cache:    \(String(format: "%.1f", hitRate))% prompt cache hit rate")
         }
@@ -364,6 +374,83 @@ enum LiveUsageComposition {
             }
         }
         return lines.joined(separator: "\n")
+    }
+
+    static func appendSessionAccounting(
+        _ report: LiveUsageReport,
+        to lines: inout [String]
+    ) {
+        guard let usage = report.sessionUsage else {
+            lines.append("Tokens:   ~\(report.estimatedSessionTokens) estimated this session")
+            return
+        }
+
+        let totals = usage.totals
+        if report.hasMeasuredSessionUsage || !usage.incomplete {
+            lines.append("Tokens:   \(totals.totalTokens) provider-reported this session")
+            lines.append("Input:    \(totals.inputTokens) tokens")
+            lines.append("Output:   \(totals.outputTokens) tokens")
+            lines.append("Cache read:     \(totals.cachedReadTokens) input tokens")
+            lines.append("Cache creation: \(totals.cacheCreationTokens) input tokens")
+            if totals.reasoningTokens > 0 {
+                lines.append("Reasoning: \(totals.reasoningTokens) output tokens")
+            }
+        } else {
+            lines.append("Tokens:   unavailable (provider usage is incomplete)")
+        }
+        lines.append(
+            "Model calls: \(totals.modelCalls) "
+                + "(\(usage.mainLoopModelCalls) main-loop)"
+        )
+
+        if usage.incomplete {
+            lines.append("Accounting: incomplete; some model usage may be missing")
+        } else if totals.costIsPartial {
+            lines.append("Accounting: provider-reported tokens; cost reporting is incomplete")
+        }
+
+        if let ticks = usage.trustedCostUsdTicks {
+            lines.append("Cost:     \(formatUSDCost(ticks))")
+        } else if usage.incomplete {
+            lines.append("Cost:     unavailable (session usage is incomplete)")
+        } else if totals.costMissingCalls > 0 {
+            lines.append("Cost:     unavailable (provider cost reporting is incomplete)")
+        } else {
+            lines.append("Cost:     unavailable (provider did not report cost)")
+        }
+
+        if !usage.models.isEmpty {
+            lines.append("By model:")
+            for model in usage.models {
+                let modelTotals = model.totals
+                var line = "  \(model.modelID): \(modelTotals.totalTokens) tokens"
+                    + " (\(modelTotals.inputTokens) input, \(modelTotals.outputTokens) output,"
+                    + " \(modelTotals.cachedReadTokens) cache read,"
+                    + " \(modelTotals.cacheCreationTokens) cache creation,"
+                    + " \(modelTotals.modelCalls) calls)"
+                if usage.trustedCostUsdTicks != nil,
+                   !modelTotals.costIsPartial,
+                   let ticks = modelTotals.costUsdTicks,
+                   ticks > 0
+                {
+                    line += " · \(formatUSDCost(ticks))"
+                }
+                lines.append(line)
+            }
+        }
+
+        if !usage.unattributedPromptIDs.isEmpty {
+            lines.append(
+                "Late child usage: included in session totals; parent turns "
+                    + usage.unattributedPromptIDs.joined(separator: ", ")
+                    + " had already completed"
+            )
+        }
+    }
+
+    static func formatUSDCost(_ ticks: Int64) -> String {
+        let dollars = Double(ticks) / 10_000_000_000
+        return "$\(String(format: "%.10f", dollars)) (\(ticks) USD ticks)"
     }
 }
 

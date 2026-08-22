@@ -292,6 +292,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     var bookkeeping: [String: Bookkeeping] = [:]
     private var childExecutors: [String: LiveToolExecutor] = [:]
     private var parentPermissionHandle: PermissionHandle?
+    private var parentUsageHistory: LiveConversationHistory?
 
     /// Children whose `runChild` loop is live right now — the set the
     /// follow-up router consults before buffering. Upstream's analog is the
@@ -322,6 +323,12 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     /// fresh plan tracker and hooks; toggling the parent updates live children.
     func installParentPermissionHandle(_ handle: PermissionHandle) {
         parentPermissionHandle = handle
+    }
+
+    /// The root owns the only parent billing ledger; children must await its
+    /// acknowledged fold before becoming visible as completed.
+    func installParentUsageHistory(_ history: LiveConversationHistory) {
+        parentUsageHistory = history
     }
 
     // MARK: - Active background work (status-chip push)
@@ -1298,8 +1305,12 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             record.everUsedNonXAI = true
         }
         let history = LiveConversationHistory(record: record, store: context.conversationStore)
+        let logicalTurnID = "\(childID)-\(bookkeeping[childID]?.turns ?? 0)"
+        let activeChildren = await coordinator.listActive(parentSessionID: context.sessionID)
+        let parentPromptID = activeChildren.first { $0.request.id == childID }?.request.parentPromptID
+            ?? LiveSubagentParentPromptContext.promptID
+        await history.beginUsagePrompt(logicalTurnID)
 
-        var characters = prompt.count
         var stopHookContinuations = 0
         var stopHookActive = false
         var finalOutput = ""
@@ -1338,6 +1349,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                     sessionID: childID,
                     cacheAffinityID: context.parentCacheAffinityID ?? context.sessionID,
                     turnID: "\(childID)-\(bookkeeping[childID]?.turns ?? 0)",
+                    logicalTurnID: logicalTurnID,
                     model: model,
                     prompt: prompt,
                     items: items,
@@ -1356,9 +1368,24 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 terminalError = "\(error)"
                 break
             }
-            characters += response.output.count
             items.append(contentsOf: response.items)
             bookkeeping[childID]?.liveItems = items
+            do {
+                try await history.recordMainUsage(
+                    modelID: model,
+                    usage: response.usage,
+                    costUsdTicks: response.costUsdTicks
+                )
+            } catch {
+                let markedIncomplete = await history.markUsageIncomplete(
+                    prompt: true,
+                    session: true
+                )
+                terminalError = markedIncomplete
+                    ? "child agent usage could not be recorded: \(error)"
+                    : "child agent usage could not be recorded or marked incomplete: \(error)"
+                break
+            }
 
             guard !response.toolCalls.isEmpty else {
                 if stopHookContinuations < 8 {
@@ -1410,6 +1437,17 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             }
         }
 
+        if cancelled {
+            let markedIncomplete = await history.markUsageIncomplete(
+                prompt: true,
+                session: true
+            )
+            if !markedIncomplete {
+                terminalError = "Subagent was cancelled and its usage could not be marked incomplete"
+            }
+        }
+        await history.endUsagePrompt(logicalTurnID)
+
         let stats = bookkeeping[childID]
         bookkeeping[childID]?.liveItems = items
         bookkeeping[childID]?.terminalToolCalls = stats?.toolCalls
@@ -1420,6 +1458,28 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         if await persistChild(history: history, childID: childID, items: items) {
             bookkeeping[childID]?.model = model
         }
+        let childUsage = await history.usageSnapshot
+        if let parentUsageHistory {
+            let byModel = childUsage?.models.map {
+                (model: $0.modelID, totals: $0.totals.usageTotals)
+            } ?? []
+            let applied = await parentUsageHistory.foldSubagentUsage(
+                byModel: byModel,
+                parentPromptID: parentPromptID,
+                incomplete: childUsage?.incomplete ?? true
+            )
+            if !applied, let parentPromptID {
+                await coordinator.markUsageNotApplied(
+                    parentSessionID: context.sessionID,
+                    promptID: parentPromptID
+                )
+            }
+        } else if let parentPromptID {
+            await coordinator.markUsageNotApplied(
+                parentSessionID: context.sessionID,
+                promptID: parentPromptID
+            )
+        }
         await executor.shutdown()
         childExecutors.removeValue(forKey: childID)
 
@@ -1429,7 +1489,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             output: terminalError == nil ? finalOutput : Self.lastAssistantText(items),
             cancelled: cancelled,
             error: terminalError,
-            tokensUsed: UInt64(max(0, characters) / 4),
+            tokensUsed: childUsage?.totals.totalTokens ?? 0,
             durationMS: Self.milliseconds(since: startedAt)
         )
     }

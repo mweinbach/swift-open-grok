@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokChatState
 import OpenGrokPagerRender
 import OpenGrokSamplingTypes
 import OpenGrokSessionPersistence
@@ -436,6 +437,208 @@ struct LiveSessionFoundationParityTests {
     @Test("provider failure after a tool still leaves the assistant call and result durable")
     func laterProviderFailureRetainsToolResults() async throws {
         try await assertFailedTurnRetainsProgress(failureRound: 2, expectsTool: true)
+    }
+
+    @Test("real provider usage survives canonical resume without replaying earlier charges")
+    func providerUsagePersistsAndResumesExactly() async throws {
+        let fixture = try LiveSessionFoundationTurnFixture()
+        defer { fixture.cleanup() }
+        let firstUsage = TokenUsage(
+            promptTokens: 21,
+            completionTokens: 8,
+            totalTokens: 29,
+            reasoningTokens: 3,
+            cachedPromptTokens: 5,
+            cacheCreationPromptTokens: 4
+        )
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in
+                OpenGrokLiveSampler { _, _ in
+                    OpenGrokLiveSamplingResponse(
+                        output: "metered response",
+                        usage: firstUsage,
+                        costUsdTicks: 250_000
+                    )
+                }
+            }
+        )
+        let foundation = try await OpenGrokLiveApplicationLauncher.makeSessionFoundation(
+            options: fixture.options(),
+            context: fixture.context(),
+            dependencies: dependencies
+        )
+        let stack = await OpenGrokLiveApplicationLauncher.makeAgentStack(
+            foundation: foundation,
+            context: fixture.context(),
+            dependencies: dependencies
+        )
+        let shell = stack.shell
+        #expect(try await shell.start().state == .running)
+        let sessionID = SessionID(foundation.sessionID)
+        let descriptor = try await shell.createSession(OpenGrokShellSessionRequest(
+            sessionID: sessionID,
+            cwd: foundation.cwd,
+            providerConfiguration: foundation.providerConfiguration
+        ))
+        #expect(descriptor.sessionID == sessionID)
+        let handle = try await shell.submitTurn(
+            sessionID: sessionID,
+            request: OpenGrokShellTurnRequest(
+                promptID: "metered-prompt",
+                text: "account for this response",
+                turnID: "metered-turn"
+            )
+        )
+        let completed = try await shell.waitForTurn(
+            handle,
+            timeout: ShellDuration(timeInterval: 30)
+        )
+        #expect(completed.turnID == "metered-turn")
+
+        let first = try #require(await stack.conversationHistory.usageSnapshot)
+        #expect(first.totals.inputTokens == 21)
+        #expect(first.totals.outputTokens == 8)
+        #expect(first.totals.cachedReadTokens == 5)
+        #expect(first.totals.cacheCreationTokens == 4)
+        #expect(first.totals.reasoningTokens == 3)
+        #expect(first.mainLoopModelCalls == 1)
+        #expect(first.trustedCostUsdTicks == 250_000)
+        #expect(first.models.map(\.modelID) == ["grok-4.5"])
+
+        let documents = SessionDocumentStore(grokHome: fixture.disk.home)
+        let canonical = try #require(try documents.load(sessionID: foundation.sessionID))
+        let canonicalUsage = try #require(canonical.summary.extra["session_usage"])
+        #expect(try canonicalUsage.decode(LiveSessionUsageSnapshot.self) == first)
+
+        let restored = try await foundation.conversationStore.load(sessionID: foundation.sessionID)
+        let resumed = LiveConversationHistory(record: restored, store: foundation.conversationStore)
+        #expect(await resumed.usageSnapshot == first)
+        await resumed.beginUsagePrompt("resumed-prompt")
+        try await resumed.recordMainUsage(
+            modelID: "grok-4.5",
+            usage: TokenUsage(promptTokens: 7, completionTokens: 2, totalTokens: 9),
+            costUsdTicks: 50_000
+        )
+        await resumed.endUsagePrompt("resumed-prompt")
+        let second = try #require(await resumed.usageSnapshot)
+        #expect(second.totals.inputTokens == 28)
+        #expect(second.totals.outputTokens == 10)
+        #expect(second.totals.cacheCreationTokens == 4)
+        #expect(second.mainLoopModelCalls == 2)
+        #expect(second.trustedCostUsdTicks == 300_000)
+
+        #expect(await shell.shutdown().timedOut == false)
+        await foundation.toolExecutor.shutdown()
+    }
+
+    @Test("forked transcripts begin a new bill without inheriting parent session charges")
+    func forkedSessionResetsUsageLedger() async throws {
+        let fixture = try LiveSessionFoundationDiskFixture()
+        defer { fixture.cleanup() }
+        let record = fixture.record(id: "usage-parent")
+        let store = LiveConversationStore(openGrokHome: fixture.home)
+        let parent = LiveConversationHistory(record: record, store: store)
+        await parent.beginUsagePrompt("parent-prompt")
+        try await parent.recordMainUsage(
+            modelID: "grok-4.5",
+            usage: TokenUsage(promptTokens: 40, completionTokens: 9, totalTokens: 49),
+            costUsdTicks: 900_000
+        )
+        await parent.endUsagePrompt("parent-prompt")
+
+        let fork = try await store.fork(
+            sourceSessionID: record.sessionID,
+            destinationSessionID: "usage-fork",
+            workingDirectory: fixture.workspace
+        )
+        #expect(fork.usageSnapshot == nil)
+        let documents = SessionDocumentStore(grokHome: fixture.home)
+        let persistedFork = try #require(try documents.load(sessionID: fork.sessionID))
+        #expect(persistedFork.summary.extra["session_usage"] == .null)
+        #expect(try await store.load(sessionID: fork.sessionID).usageSnapshot == nil)
+
+        let forkHistory = LiveConversationHistory(record: fork, store: store)
+        await forkHistory.beginUsagePrompt("fork-prompt")
+        try await forkHistory.recordMainUsage(
+            modelID: "grok-4.5",
+            usage: TokenUsage(promptTokens: 3, completionTokens: 1, totalTokens: 4),
+            costUsdTicks: 20_000
+        )
+        let forkUsage = try #require(await forkHistory.usageSnapshot)
+        #expect(forkUsage.totals.inputTokens == 3)
+        #expect(forkUsage.mainLoopModelCalls == 1)
+        #expect(forkUsage.trustedCostUsdTicks == 20_000)
+    }
+
+    @Test("late child charges fold into the session without staining the next prompt")
+    func lateChildUsageKeepsPromptAttributionHonest() async throws {
+        let fixture = try LiveSessionFoundationDiskFixture()
+        defer { fixture.cleanup() }
+        let record = fixture.record(id: "late-child-usage")
+        let store = LiveConversationStore(openGrokHome: fixture.home)
+        let history = LiveConversationHistory(record: record, store: store)
+        await history.beginUsagePrompt("first-prompt")
+        try await history.recordMainUsage(
+            modelID: "grok-4.5",
+            usage: TokenUsage(promptTokens: 10, completionTokens: 2, totalTokens: 12),
+            costUsdTicks: 100_000
+        )
+        await history.endUsagePrompt("first-prompt")
+        await history.beginUsagePrompt("second-prompt")
+
+        let childTotals = UsageTotals(
+            inputTokens: 6,
+            outputTokens: 4,
+            cachedReadTokens: 2,
+            reasoningTokens: 1,
+            modelCalls: 1,
+            costUsdTicks: 80_000,
+            cachedCreationTokens: 3
+        )
+        #expect(await history.foldSubagentUsage(
+            byModel: [(model: "grok-child", totals: childTotals)],
+            parentPromptID: "first-prompt",
+            incomplete: false
+        ))
+
+        let usage = try #require(await history.usageSnapshot)
+        #expect(usage.totals.inputTokens == 16)
+        #expect(usage.totals.outputTokens == 6)
+        #expect(usage.totals.cacheCreationTokens == 3)
+        #expect(usage.mainLoopModelCalls == 1)
+        #expect(usage.incomplete == false)
+        #expect(usage.unattributedPromptIDs == ["first-prompt"])
+        #expect(usage.trustedCostUsdTicks == 180_000)
+        #expect(usage.models.map(\.modelID) == ["grok-4.5", "grok-child"])
+
+        let persisted = try await store.load(sessionID: record.sessionID)
+        #expect(persisted.usageSnapshot == usage)
+    }
+
+    @Test("successful unmetered provider rounds count honestly without invented tokens or cost")
+    func unmeteredResponsesMarkLedgerIncomplete() async throws {
+        let fixture = try LiveSessionFoundationDiskFixture()
+        defer { fixture.cleanup() }
+        let record = fixture.record(id: "unmetered-usage")
+        let store = LiveConversationStore(openGrokHome: fixture.home)
+        let history = LiveConversationHistory(record: record, store: store)
+        await history.beginUsagePrompt("unmetered-prompt")
+        try await history.recordMainUsage(
+            modelID: "grok-4.5",
+            usage: nil,
+            costUsdTicks: nil
+        )
+
+        let usage = try #require(await history.usageSnapshot)
+        #expect(usage.mainLoopModelCalls == 1)
+        #expect(usage.totals.modelCalls == 1)
+        #expect(usage.totals.inputTokens == 0)
+        #expect(usage.totals.outputTokens == 0)
+        #expect(usage.totals.costUsdTicks == nil)
+        #expect(usage.trustedCostUsdTicks == nil)
+        #expect(usage.incomplete)
+        #expect(usage.models.isEmpty)
+        #expect(try await store.load(sessionID: record.sessionID).usageSnapshot == usage)
     }
 
     @Test("unstreamed final assistant text is emitted once and streamed text is never duplicated")

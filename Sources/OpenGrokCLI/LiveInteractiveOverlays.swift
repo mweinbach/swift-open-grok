@@ -2354,8 +2354,8 @@ extension LiveInteractiveControllerRenderer {
         case .usage:
             // `/usage` (upstream usage.rs:59, `Action::ShowUsage`) appends the
             // typed Wave E usage block. The numbers come from
-            // `LiveUsageComposition`, which records authoritative quota data
-            // when available and marks the session-token fallback estimated.
+            // `LiveUsageComposition`, which prefers provider-reported session
+            // ledgers and explicitly marks incomplete or fallback accounting.
             let context: ContextUsage?
             if let compaction {
                 context = await compaction.usage()
@@ -3280,8 +3280,8 @@ extension LiveInteractiveControllerRenderer {
             )
         }
         lines.append("Turns:    \(actualReport.turnCount)")
-        lines.append("Tokens:   ~\(actualReport.estimatedSessionTokens) estimated this session")
-        if actualReport.turnCount == 1 || isColdStartOnly {
+        LiveUsageComposition.appendSessionAccounting(actualReport, to: &lines)
+        if isColdStartOnly || (actualReport.turnCount == 1 && actualReport.sessionUsage == nil) {
             lines.append("Cache hit rate: n/a (cold-start request only so far)")
         } else if let hitRate = actualReport.promptCacheHitRatePct {
             lines.append("Cache hit rate: \(String(format: "%.1f", hitRate))%")
