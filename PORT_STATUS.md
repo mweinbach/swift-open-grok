@@ -1,14 +1,14 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-21. The authoritative local macOS package gate exits 0 with **7,909 Swift Testing cases in 1,172 suites across 106 nonempty test-product summaries**, with no failures or recorded issues. The product build, the complete pager target, focused foundational live-seam suites, and isolated real-binary commands also pass. These are local results; they do not establish current Linux, Windows, remote CI, or release readiness.
+**As of:** 2026-08-22. The authoritative local macOS serial package gate passed **8,217 Swift Testing cases in 1,212 suites across 106 nonempty test-product summaries**, exit 0, after the provider, cross-process collaboration, MCP/ACP, native Messages, catalog-collision, and persistence-latency closures below. The unchanged 600-second verification ceiling remained in force; the complete run finished in approximately 394 seconds. These are local results; they do not establish current Linux, Windows, remote CI, or release readiness.
 
-**Overall state:** The executable and many foundational systems are live, but this is **not** complete parity with the current Rust reference. The previous blanket "100% LIVE" claim was incorrect: some audited facilities existed only as library types without production consumers, while newer upstream provider, session-collaboration, MCP, and Messages-streaming features are still absent or unwired. The verified closures and remaining gaps are enumerated below.
+**Overall state:** First-class RunInfra, direct Google Gemini, explicitly enabled OpenRouter, machine-local session collaboration, live MCP server changes, reverse ACP-hosted MCP servers, and native Messages output now reach the running executable. This remains **not complete parity** with the current Rust reference: ACP-hosted sessions intentionally reject peer auto-wake, the Windows session bus has no named-pipe implementation, and the executable version/reference pin were not advanced. Those boundaries and their security rationale are recorded below.
 **Destination was empty at baseline:** yes.
-**Original pinned reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`); historical forward sync `eb215dd0` (`v1.0.0-open-grok.63`).
+**Reference:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (release `v0.1.220-open-grok.58`); historical forward sync `eb215dd0` (`v1.0.0-open-grok.63`).
 **Current audited Rust snapshot:** `00db8a4b0205d9d477edf70bdffc47935f96d6f0`, product version `1.0.0-open-grok.80`, **159 commits beyond the original pin**. The Swift executable currently reports `1.0.0-open-grok.64`; this pass does not claim a version or reference-pin synchronization.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 
-## Foundational live-seam correction (2026-08-21)
+## Foundational live-seam correction (2026-08-21–22)
 
 The central failure mode in this wave was implementation without reachability: existing session, billing, permission, provider, and protocol types passed isolated tests while the running executable either bypassed them or silently discarded their results. Rust behaviors were enumerated first, then verified through executable/session seams.
 
@@ -16,12 +16,19 @@ The central failure mode in this wave was implementation without reachability: e
 
 | Command or surface | Result |
 |---|---|
-| `zsh workflows/swift-safe-verify.zsh build-tests` | exit 0 |
-| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | exit 0; product build completed in 2.72s |
-| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | exit 0; **7,909 tests / 1,172 suites / 106 nonempty product summaries**, no failures |
-| `zsh workflows/swift-safe-verify.zsh test-target OpenGrokPagerTests --no-parallel` | exit 0; **372 tests / 43 suites** |
-| Serialized focused session, subagent, billing, cache-creation, Codex turn-state, sandbox, compaction, interjection, and terminal filters | exit 0; **120 tests / 16 suites / 6 nonempty product summaries** |
-| Isolated helper health check; real `doctor`, `version --json`, `paths --json`, `models --json`, and `sessions list --json` | all exit 0; version `1.0.0-open-grok.64`; isolated home `/tmp/open-grok-verify-20260821-230331-92397` |
+| `zsh workflows/swift-safe-verify.zsh build-tests` | exit 0; includes every newly added production and test target |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel` | exit 0; **8,217 tests / 1,212 suites / 106 nonempty product summaries**, approximately **394s**, default 600s ceiling |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | exit 0; clean public executable product build in **1.84s** |
+| `OpenGrokCLITests` product inside the authoritative serial gate | exit 0; **1,725 tests / 260 suites**, **112.224s** |
+| `OpenGrokExecutableTests` product inside the authoritative serial gate | exit 0; **231 tests / 37 suites**, **157.435s** |
+| `OpenGrokModelsTests` product inside the authoritative serial gate | exit 0; **281 tests / 45 suites**, including canonical provider-namespace ownership and dynamic partition counts |
+| Focused provider identity, authentication, catalogs, settings, routing, and credential-isolation filters | exit 0; **149 tests / 17 suites / 9 nonempty product summaries** |
+| Focused real cross-process bus, collaboration tools, replay, recovery, and synthetic-provenance filters | exit 0; **75 tests / 11 suites / 5 nonempty product summaries** |
+| Focused MCP notifications, dynamic tools, supervised restarts, and connection-bound ACP SDK filters | exit 0; **46 tests / 6 suites / 3 nonempty product summaries** |
+| Focused native Messages provider, shell, pager, and real headless-output filters | exit 0; **36 tests / 6 suites / 5 nonempty product summaries** |
+| Real `models` command authenticated-provider regression filter | exit 0; **6 tests / 1 suite** |
+| Three real interactive model-picker, typed-selector, and ambiguous-selector regressions | exit 0; **3 tests / 1 suite**, **1.509s** after replacing impossible ANSI polling waits |
+| Isolated helper health check; real `doctor`, `version --json`, `paths --json`, provider `login`, `models --json`, and `sessions list --json` | all exit 0; version `1.0.0-open-grok.64`; isolated home `/tmp/open-grok-verify-20260822-001405-9432`; authenticated RunInfra/Gemini each publish four models while unapproved OpenRouter remains absent |
 
 The full gate exercised the current checkout, including pre-existing user-owned `Package.swift` and crash-handler worktree changes. Those unrelated changes were neither staged nor included in the foundational commits.
 
@@ -39,7 +46,7 @@ The full gate exercised the current checkout, including pre-existing user-owned 
 
    Resumed sessions also reconcile canonical and compatibility documents without allowing a weaker sandbox profile or ambiguous equal-rank profile to downgrade the persisted pin (`Sources/OpenGrokCLI/LiveConversationStore.swift:495`).
 
-2. **Durable Rust-compatible session authority:** live turns publish canonical cwd-bucketed session documents and ACP update journals; legacy mirrors migrate safely; interrupted turns preserve acknowledged prompts and tool results; recovery, rewind, fork isolation, hidden subagents, deletion, provider-neutral history, and durable cache-affinity identities are exercised through the live session seam.
+2. **Durable Rust-compatible session authority:** live turns publish canonical cwd-bucketed session documents and ACP update journals; legacy mirrors migrate safely; interrupted turns preserve acknowledged prompts and tool results; recovery, rewind, fork isolation, hidden subagents, deletion, provider-neutral history, and durable cache-affinity identities are exercised through the live session seam. Atomic persistence still restricts existing directories to `0700`, synchronizes temporary file contents before replacement, and synchronizes the destination directory afterward. It no longer re-flushes unchanged existing directories or the same inode after rename, and directory metadata uses upstream-compatible `fsync` instead of a full hardware-media flush (`Sources/OpenGrokSessionPersistence/RelocationFS.swift:94`; Rust `xai-grok-shell/src/session/storage/relocation/fs.rs:358`).
 
 3. **Provider-accurate root and child billing:** production no longer drops `ConversationResponse.usage` or `costUsdTicks`. Each live session owns a real `ChatStateHandle`; root calls and child folds preserve input, output, reasoning, cache-read, cache-creation, per-model, call-count, and cost data. Child accounting is acknowledged exactly once; late children affect the session without contaminating a later prompt; unknown or partial costs remain explicitly incomplete rather than appearing free. Canonical session summaries preserve cumulative bills and resume them without replay or double-counting; forks start a fresh bill. Both `/usage` text surfaces and the pager consume these real snapshots (`Sources/OpenGrokCLI/LiveUsageState.swift:6`, `LiveConversationStore.swift:1186`, `LiveSessionServices.swift:224`).
 
@@ -53,17 +60,36 @@ The full gate exercised the current checkout, including pre-existing user-owned 
 
 8. **Terminal, pager, and orchestration:** Kitty keys, modified Unicode, terminal focus, bounded bracketed paste, and split SGR/CSI fragments survive arbitrary input boundaries without delaying ordinary literal input. Pager EOF and steering tests now prove actual cancellation, queued execution, and preemption without relying on a racy optional overlay. Child workflow execution preserves provider isolation, prompt identity, cancellation, budget enforcement, hidden persistence, and stable logical turns across tool rounds.
 
-### Known remaining upstream gaps
+### Current Rust HEAD gap closures (2026-08-22)
 
-1. **RunInfra, direct Google Gemini, and OpenRouter remain absent as first-class providers.** Rust adds these typed providers and aliases in `crates/codegen/xai-grok-sampling-types/src/types.rs:1204`; its isolated credentials, catalogs, provider-specific wire policies, and settings live in `xai-grok-shell/src/{runinfra_models,gemini_models,openrouter_models}.rs`. Swift's provider enum still stops at its original nine (`Sources/OpenGrokSamplingTypes/ProviderTypes.swift:48`). OpenRouter-shaped reasoning parsing and the external Antigravity Gemini adapter do not implement these providers. The eventual port must atomically add typed identities, scoped credentials, catalog partitions, OpenRouter's explicit opt-in allowlist, trusted endpoints, settings, and executable tests.
+1. **RunInfra, direct Google Gemini, and OpenRouter are first-class live providers.** The provider enum, isolated authentication scopes, aliases, twelve-adapter registry, authenticated catalog partitions, BLAKE3 credential fingerprints, official endpoint policies, model settings/picker, usage labels, and real launch/model commands are connected (`Sources/OpenGrokSamplingTypes/ProviderTypes.swift:58`; `Sources/OpenGrokCLI/CLIRunner.swift:204`; Rust `crates/codegen/xai-grok-sampling-types/src/types.rs:1204` and `xai-grok-shell/src/{runinfra_models,gemini_models,openrouter_models}.rs`). RunInfra and Gemini expose four reviewed models only after their own credentials resolve; OpenRouter remains inaccessible without its own credential and explicit `[models].openrouter_enabled_models` selection. Live provider entries can replace an early configuration placeholder only inside their own canonical `provider:` namespace, preserving preexisting Wafer overrides without allowing forged cross-provider keys. The launched provider-qualified model is registered before asynchronous catalog refresh, so an explicit custom model cannot silently be replaced at startup. Disabling an active model rebuilds the real sampler. xAI web/image/video credentials can no longer inherit another provider's host (`Sources/OpenGrokCLI/LiveImageTools.swift:294`):
 
-2. **Machine-local cross-process session collaboration is absent.** Rust provides presence/socket discovery and real `list_sessions`, `read_session`, and `message_session` tools (`crates/codegen/xai-grok-shell/src/session_bus/presence.rs:1`; `crates/codegen/xai-grok-tools/src/implementations/grok_build/session_collaboration/mod.rs:90`). Swift only has same-session agent-team mailboxes and ACP persisted-session listing; neither is the live cross-process bus, and the three tools are not registered.
+   ```swift
+   return samplingProvider.profile.sessionAuth.isXai
+       ? samplingBaseURL
+       : "https://api.x.ai/v1"
+   ```
 
-3. **MCP server-change lifecycle is implemented-unwired.** Swift has MCP event value types, but its stdio/HTTP transports discard unmatched notifications instead of feeding the live dispatcher. Rust coalesces server tool/resource changes into ACP server status, refreshes toolsets, and schedules bounded restarts (`crates/codegen/xai-grok-shell/src/session/mcp_dispatcher.rs:1`); Swift's restart/event helpers must not be described as live until a real transport-to-session producer exists.
+2. **Machine-local cross-process collaboration is live on macOS/Linux.** Real root sessions publish owner-verified presence, 0700 directories, 0600 Unix sockets, five-second heartbeats, twenty-second stale cleanup, bounded 64 KiB wire frames, and 32 KiB peer-message bodies. `list_sessions`, `read_session`, and `message_session` traverse the actual authorization/execution pipeline, remain direct-only in Code Mode, and communicate across independent session stacks/processes (`Sources/OpenGrokCLI/LiveSessionBus.swift:106`; `Sources/OpenGrokAgentControlTools/SessionCollaborationTools.swift:231`; Rust `xai-grok-shell/src/session_bus/presence.rs:1`; `xai-grok-tools/src/implementations/grok_build/session_collaboration/mod.rs:90`). Peer input remains model-authored through the provider turn, durable journal, replay, and missing-history reconstruction (`Sources/OpenGrokShell/OpenGrokShell.swift:1133`):
 
-4. **In-process SDK MCP-over-ACP remains absent.** Rust implements reverse SDK MCP transport (`crates/codegen/xai-grok-mcp/src/acp_transport.rs:30`); Swift correctly withholds the unsupported `x.ai/mcp/sdk` capability (`Sources/OpenGrokCLI/LiveMCPACPHandlers.swift:57`).
+   ```swift
+   historyItem["synthetic_reason"] = .string("agent_message")
+   update["_meta"] = .object(["hideFromScrollback": .bool(true)])
+   ```
 
-5. **Native Messages streaming remains incomplete.** Cache reads and writes now reach real billing ledgers, but provider response-open metadata/signature events, provider message IDs, verbatim stop reasons, matched stop sequences, and genuine `streaming-messages-json` / `--include-partial-messages` `system`/`assistant`/`user`/`stream_event`/`result` framing are absent. The currently advertised Messages format still uses the generic flat JSON adapter (`Sources/OpenGrokCLI/LivePagerOutputs.swift:2070`; Rust `crates/codegen/xai-grok-pager/src/headless/reducer/messages/wire.rs:99`).
+   All fifteen upstream synthetic reasons and three prior-interruption reasons now use canonical Rust `snake_case`; historical Swift `camelCase` remains decodable.
+
+3. **MCP transport notifications now reach real sessions.** Stdio and HTTP/SSE preserve correlated responses while publishing server tool/resource changes; a bounded dispatcher coalesces notifications, suppresses stale clients, emits actual `x.ai/mcp/server_status`, refreshes tool/resource/search state, and supervises bounded cancellable restarts. Added or removed tools reach both the next real provider request and persistent Code Mode cells without losing JavaScript state or exposing direct-only collaboration tools (`Sources/OpenGrokMCP/McpEventDispatcher.swift:28`; `Sources/OpenGrokCLI/LiveToolExecutor.swift:877`; `Sources/OpenGrokCLI/LiveCodeMode.swift:505`; Rust `xai-grok-shell/src/session/mcp_dispatcher.rs:1`).
+
+4. **Client-provided MCP-over-ACP is live on stdio and WebSocket.** Session metadata registers SDK servers through the exact upstream reverse method `x.ai/mcp/sdk_call` with only `{serverId,message}`; the capability is advertised only when a real reverse sender and lifecycle hooks exist. Numeric/string request IDs, timeout/cancellation, duplicate server names across independent ACP sessions, session-close cleanup, and original-client connection binding are enforced (`Sources/OpenGrokMCP/MCPACPTransport.swift:85`; `Sources/OpenGrokACPRuntime/ACPNotificationGateway.swift:116`; `Sources/OpenGrokCLI/LiveMCPACPHandlers.swift:258`; Rust `xai-grok-mcp/src/acp_transport.rs:30`). Inbound SDK reverse calls remain rejected.
+
+5. **Native Messages streaming is live end to end.** Provider response-start IDs/models, uncached/cache-read/cache-creation usage, reasoning signatures, provider message IDs, exact raw stop reasons, matched stop sequences, and terminal usage survive the sampler, shell, pager, and real headless executable. `streaming-messages-json` now emits upstream `system`, `assistant`, `user`, and `result` envelopes; `--include-partial-messages` adds ordered native `stream_event` message/content/signature/delta/stop frames without changing plain or generic streaming JSON (`Sources/OpenGrokSampler/Events.swift:194`; `Sources/OpenGrokCLI/LivePagerOutputs.swift:2280`; Rust `xai-grok-pager/src/headless/reducer/messages/wire.rs:99`).
+
+### Recorded residual divergences
+
+1. **ACP-hosted sessions are discoverable/readable but reject incoming peer auto-wake.** ACP drives its existing provider-session actor directly rather than through the shell-owned turn loop; waking it through a second shell/driver would duplicate provider state and risk treating model-authored input as user consent. Discovery and transcript reads remain live, while `message_session` honestly returns `.rejected` for that unsupported ACP recipient.
+2. **The session bus has no Windows named-pipe transport.** Unix-domain collaboration is implemented for macOS/Linux; Windows explicitly fails closed rather than advertising an unavailable or less-secure cross-process bus. The separate existing Windows leader IPC does not close this distinct session-bus gap.
+3. **Rust HEAD is audited, not version-synchronized.** The original release-validation pin remains `650c1db7c2e73c59cec88bf3c6359751d6cef1bd`; Swift still reports `1.0.0-open-grok.64` while the audited Rust snapshot reports `.80`. No current Linux/Windows execution, remote CI result, or release readiness is asserted for this wave.
 
 ### Foundational commits
 
@@ -76,6 +102,18 @@ The full gate exercised the current checkout, including pre-existing user-owned 
 - `c3b6cbf` — Repair fail-closed session pins and fragmented terminal compatibility.
 - `7cba965` — Wire durable live usage accounting and isolated Codex turn state.
 - `a45dd1f` — Assert pager steering semantics without shutdown timing races.
+- `accdd61` — Preserve synthetic session provenance across wire and recovery.
+- `253b8eb` — Implement live MCP event dispatch and secure ACP SDK transport.
+- `da1c6dd` — Implement secure cross-process session collaboration foundations.
+- `8a86aa2` — Wire expanded providers, live collaboration, and native streaming.
+- `184ce87` — Expose authenticated provider catalogs through the real models command.
+- `4cfd102` — Preserve active models during asynchronous catalog refresh.
+- `7a2625c` — Verify native Messages and collaboration through executable seams.
+- `0e20b8b` — Preserve authenticated provider ownership of model namespaces.
+- `127d992` — Avoid redundant hardware flushes during durable session writes.
+- `fa588b0` — Parse executable terminal fixtures incrementally.
+- `9e31fdb` — Match Rust directory durability without redundant media flushes.
+- `a5c25b6` — Remove impossible interactive terminal polling waits.
 
 ## Local cross-platform closure (2026-08-17)
 
