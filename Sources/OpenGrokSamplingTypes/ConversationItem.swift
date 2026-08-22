@@ -127,32 +127,62 @@ public enum CustomToolOutputContent: Codable, Sendable, Equatable, Hashable {
 /// `.unknown` so old clients can still read sessions written by newer
 /// versions.
 public enum SyntheticReason: String, Codable, Sendable, Equatable, Hashable {
-    case compactionMeta
-    case systemReminder
-    case projectInstructions
-    case autoContinue
-    case autoRecovery
+    case compactionMeta = "compaction_meta"
+    case systemReminder = "system_reminder"
+    case projectInstructions = "project_instructions"
+    case autoContinue = "auto_continue"
+    case autoRecovery = "auto_recovery"
     case interjection
-    case taskCompleted
-    case subagentCompleted
-    case notificationDrain
-    case goalSummary
-    case goalClassifierNudge
-    case schedulerFired
+    case taskCompleted = "task_completed"
+    case subagentCompleted = "subagent_completed"
+    case notificationDrain = "notification_drain"
+    case goalSummary = "goal_summary"
+    case goalClassifierNudge = "goal_classifier_nudge"
+    case schedulerFired = "scheduler_fired"
     /// Mailbox message routed from another agent in the same collaboration
     /// team. Wakes the agent. Model-authored input, never user consent.
     /// Rust `SyntheticReason::AgentMessage`
     /// (`xai-grok-sampling-types/src/conversation.rs:126-128`, commit
     /// aa39b8cf) — tagged distinctly from `subagentCompleted` so trace
     /// tooling and compaction can tell peer traffic from lifecycle auto-wakes.
-    case agentMessage
+    case agentMessage = "agent_message"
+    /// Stop/SubagentStop hook feedback injected into the existing turn.
+    case stopHookFeedback = "stop_hook_feedback"
+    /// Session-relocation context appended without starting a prompt turn.
+    case workingDirectorySwitch = "working_directory_switch"
     case unknown
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         let raw = try container.decode(String.self)
-        // Mirror Rust `#[serde(other)]`: unknown variants collapse to .unknown.
-        self = SyntheticReason(rawValue: raw) ?? .unknown
+        if let canonical = SyntheticReason(rawValue: raw) {
+            self = canonical
+            return
+        }
+
+        // Older Swift sessions incorrectly persisted enum case spellings.
+        // Accept only those exact known values; future tags remain unknown
+        // rather than being normalized into trusted provenance accidentally.
+        switch raw {
+        case "compactionMeta": self = .compactionMeta
+        case "systemReminder": self = .systemReminder
+        case "projectInstructions": self = .projectInstructions
+        case "autoContinue": self = .autoContinue
+        case "autoRecovery": self = .autoRecovery
+        case "taskCompleted": self = .taskCompleted
+        case "subagentCompleted": self = .subagentCompleted
+        case "notificationDrain": self = .notificationDrain
+        case "goalSummary": self = .goalSummary
+        case "goalClassifierNudge": self = .goalClassifierNudge
+        case "schedulerFired": self = .schedulerFired
+        case "agentMessage": self = .agentMessage
+        default: self = .unknown
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
     }
 
     /// Whether a user item with this reason **starts a prompt turn** — i.e.
@@ -164,7 +194,7 @@ public enum SyntheticReason: String, Codable, Sendable, Equatable, Hashable {
             return true
         case .compactionMeta, .systemReminder, .projectInstructions,
              .autoContinue, .autoRecovery, .interjection,
-             .goalSummary, .unknown:
+             .goalSummary, .stopHookFeedback, .workingDirectorySwitch, .unknown:
             return false
         }
     }
@@ -174,15 +204,32 @@ public enum SyntheticReason: String, Codable, Sendable, Equatable, Hashable {
 /// preceding this *real* user message. Wire form: `snake_case`. Unknown
 /// variants deserialize as `.unknown` for forward compatibility.
 public enum PriorTurnInterrupt: String, Codable, Sendable, Equatable, Hashable {
-    case midTurnAbort
-    case permissionRejected
-    case permissionCancelled
+    case midTurnAbort = "mid_turn_abort"
+    case permissionRejected = "permission_rejected"
+    case permissionCancelled = "permission_cancelled"
     case unknown
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         let raw = try container.decode(String.self)
-        self = PriorTurnInterrupt(rawValue: raw) ?? .unknown
+        if let canonical = PriorTurnInterrupt(rawValue: raw) {
+            self = canonical
+            return
+        }
+
+        // Preserve real interruption provenance in sessions written before
+        // the Swift encoder used Rust's snake_case wire spelling.
+        switch raw {
+        case "midTurnAbort": self = .midTurnAbort
+        case "permissionRejected": self = .permissionRejected
+        case "permissionCancelled": self = .permissionCancelled
+        default: self = .unknown
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
     }
 }
 

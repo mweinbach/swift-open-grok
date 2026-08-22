@@ -40,12 +40,30 @@ struct AgentMessageSyntheticReasonTests {
         #expect(!SyntheticReason.interjection.startsPromptTurn)
     }
 
-    @Test("unknown reasons still collapse to .unknown")
-    func forwardCompatibility() throws {
+    @Test("peer provenance persists in Rust's canonical snake-case wire form")
+    func canonicalAgentMessageWireForm() throws {
+        let encoded = try JSONEncoder().encode(SyntheticReason.agentMessage)
+        #expect(String(decoding: encoded, as: UTF8.self) == #""agent_message""#)
         let decoded = try JSONDecoder().decode(
-            SyntheticReason.self, from: Data(#""agentMessage""#.utf8)
+            SyntheticReason.self, from: Data(#""agent_message""#.utf8)
         )
         #expect(decoded == .agentMessage)
+    }
+
+    @Test("legacy Swift peer provenance migrates without becoming real user input")
+    func legacyAgentMessageMigration() throws {
+        let legacy = try JSONDecoder().decode(
+            SyntheticReason.self, from: Data(#""agentMessage""#.utf8)
+        )
+        #expect(legacy == .agentMessage)
+        #expect(legacy.startsPromptTurn)
+
+        let migrated = try JSONEncoder().encode(legacy)
+        #expect(String(decoding: migrated, as: UTF8.self) == #""agent_message""#)
+    }
+
+    @Test("unknown reasons still collapse to .unknown")
+    func forwardCompatibility() throws {
         let unknown = try JSONDecoder().decode(
             SyntheticReason.self, from: Data(#""not_a_reason""#.utf8)
         )

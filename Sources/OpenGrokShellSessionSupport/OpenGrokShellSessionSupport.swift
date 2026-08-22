@@ -871,6 +871,7 @@ public enum SessionTranscriptProjector {
                         || contentMetadata?["bashCommand"] != nil
                         || contentMetadata?["hideFromScrollback"]?.boolValue == true
                         || contentMetadata?["hostTurn"]?.boolValue == true
+                        || updateMetadata?["hideFromScrollback"]?.boolValue == true
                         || updateMetadata?["host_turn"]?.boolValue == true
                         || updateMetadata?["hostTurn"]?.boolValue == true
                     if isHidden {

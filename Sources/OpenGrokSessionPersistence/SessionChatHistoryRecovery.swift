@@ -16,6 +16,7 @@ struct SessionChatHistoryRecovery {
     private var assistantToolCalls: [ToolCall] = []
     private var emittedToolResults = Set<String>()
     private var inUserTurn = false
+    private var userHiddenFromScrollback = false
     private var hasAssistantContent = false
 
     mutating func recover(from updates: [SessionUpdateEnvelope]) throws -> [JSONValue] {
@@ -58,10 +59,15 @@ struct SessionChatHistoryRecovery {
             inUserTurn = false
             return
         }
+        let hiddenFromScrollback = isHiddenFromScrollback(update: update, content: content)
+        if inUserTurn, hiddenFromScrollback != userHiddenFromScrollback {
+            flushUser()
+        }
         if !inUserTurn {
             flushAssistant()
             inUserTurn = true
         }
+        userHiddenFromScrollback = hiddenFromScrollback
         switch content["type"]?.stringValue {
         case "text":
             if let text = content["text"]?.stringValue {
@@ -130,9 +136,25 @@ struct SessionChatHistoryRecovery {
     }
 
     private mutating func flushUser() {
-        guard !userParts.isEmpty else { return }
-        history.append(.userWithParts(userParts))
+        guard !userParts.isEmpty else {
+            userHiddenFromScrollback = false
+            return
+        }
+        if userHiddenFromScrollback {
+            let text = userParts.compactMap { part -> String? in
+                guard case .text(let value) = part else { return nil }
+                return value
+            }.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+            let reason: SyntheticReason = text.hasPrefix("<agent_message ")
+                && text.contains("</agent_message>")
+                ? .agentMessage
+                : .unknown
+            history.append(.user(UserItem(content: userParts, syntheticReason: reason)))
+        } else {
+            history.append(.userWithParts(userParts))
+        }
         userParts.removeAll(keepingCapacity: true)
+        userHiddenFromScrollback = false
     }
 
     private mutating func flushAssistant() {
@@ -153,6 +175,7 @@ struct SessionChatHistoryRecovery {
         assistantToolCalls.removeAll(keepingCapacity: true)
         emittedToolResults.removeAll(keepingCapacity: true)
         inUserTurn = false
+        userHiddenFromScrollback = false
         hasAssistantContent = false
     }
 
@@ -166,6 +189,14 @@ struct SessionChatHistoryRecovery {
             || contentMetadata?["host_turn"]?.boolValue == true
             || updateMetadata?["hostTurn"]?.boolValue == true
             || updateMetadata?["host_turn"]?.boolValue == true
+    }
+
+    private func isHiddenFromScrollback(
+        update: [String: JSONValue],
+        content: [String: JSONValue]
+    ) -> Bool {
+        update["_meta"]?.objectValue?["hideFromScrollback"]?.boolValue == true
+            || content["_meta"]?.objectValue?["hideFromScrollback"]?.boolValue == true
     }
 
     private func encodeToolArguments(_ value: JSONValue?) -> String {
