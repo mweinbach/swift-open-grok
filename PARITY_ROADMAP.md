@@ -1,5 +1,12 @@
 # Parity Roadmap — remaining feature gap to full Rust parity
 
+**Current reference:** `538a16dfb6b5989d835bc1503b600b4d2be9aad6`
+(`1.0.0-open-grok.81`), reaudited 2026-08-22. The historical roadmap below
+preserves its original audit context; `PORT_STATUS.md` is authoritative for
+the current live classifications, verification evidence, intentional security
+divergences, and still-unverified platforms. `CRATE_MAP.md` now enumerates all
+93 root workspace members plus the separately rooted Markdown fuzz crate.
+
 **Produced:** 2026-08-06, from a seven-domain read-only audit swarm against reference pin
 `70002584da34e4c37ea14a3bce35341b7d04f9a7` (v0.1.220-open-grok.57), on the tree at the
 Wave 12 green gate (4,195 tests / 602 suites, exit 0). Domains: session/agent runtime,
@@ -8,9 +15,9 @@ distribution/announcements/voice, ACP/MCP/code-mode/workflow, config/CLI/setting
 Classifications follow the ledger convention: LIVE / IMPLEMENTED-UNWIRED / ABSENT /
 DIVERGED, judged at the live seam (`Sources/OpenGrokCLI`), never at the library.
 
-**Upstream drift note:** the reference clone already carries 2 commits past the pin
-(`650c1db7…`: a reasoning hardening + the `.58` release). Fold that micro-delta into
-whichever wave lands first.
+**Historical upstream drift note:** the original audit observed the `.58`
+micro-delta after its `.57` pin. Both historical snapshots have since been
+superseded by the current `.81` reference recorded above.
 
 **Wave 14 corrections (2026-08-07):** B3's "shared by in-pager `/login` … screen-mode
 relaunch" was wrong: upstream `/login` never suspends (in-TUI OAuth/device code) and

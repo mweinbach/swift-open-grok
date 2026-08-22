@@ -1,11 +1,11 @@
 # Rust Crate to SwiftPM Target Map
 
-**Baseline:** 2026-07-20 (inventory and reference pin refreshed 2026-08-04)
-**Reference pin:** `xai-org/grok-build` at `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (re-pinned **2026-08-08** from `70002584da34e4c37ea14a3bce35341b7d04f9a7`, itself re-pinned 2026-08-06 from `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05`). `ProtocolFixtures/` were re-evaluated and recaptured at the current `650c1db7…` ref; see `PORT_STATUS.md` for per-family evidence. The `.58` delta added no crates — the 84-package count below is unchanged (verified: `git diff 70002584..650c1db7` touches no `Cargo.toml`).
-**Count:** **83** root workspace packages from `cargo metadata` plus `xai-grok-markdown-fuzz` in its own nested workspace = **89 total** (was 84; five additional crates — `xai-grok-bundle`, `xai-grok-diag-server`, `xai-grok-workspace-daemon`, `xai-grok-pager-diff`, `xai-grok-session-search` — were found and ported 2026-08-14).
+**Baseline:** 2026-07-20 (upstream inventory refreshed 2026-08-22).
+**Reference pin:** `xai-org/grok-build` at `538a16dfb6b5989d835bc1503b600b4d2be9aad6` (release `1.0.0-open-grok.81`). The original historical reference was `650c1db7c2e73c59cec88bf3c6359751d6cef1bd`; current protocol fixtures and release provenance use the newer pin recorded in `PORT_STATUS.md`.
+**Count:** **93** root Cargo workspace packages plus `xai-grok-markdown-fuzz` in its own nested workspace = **94 mapped crates**. The August 22 Rust-first audit identified five real workspace crates omitted by the prior 89-row inventory: `xai-compaction-transcript`, `xai-fuzzy-file-search`, `xai-grok-active-sessions`, `xai-grok-foreign-sessions`, and `xai-grok-session-events`.
 
-**SwiftPM source/test inventory (committed tree, same method as `PORT_STATUS.md`, recounted 2026-08-04):**
-**99** `Sources/` targets · **8** matching the ≤15-non-comment-LOC placeholder rule, of which **7** are genuine placeholders and one is the thin `OpenGrokExecutable` `main` (C helpers excluded) · **101** `Tests/` targets · **12** zero-test · **89** with ≥1 test. The previously published **98 / 42 / 100 / 46** figures are superseded.
+**SwiftPM source/test inventory (directory recount, 2026-08-22):**
+**106** `Sources/` target directories and **106** `Tests/` target directories. Native helper targets are included in the source-directory count; the authoritative serial gate publishes separate executed test-product totals in `PORT_STATUS.md`.
 
 ## Mapping rules
 
@@ -99,21 +99,27 @@
 | 80 | `xai-tracing` | `crates/common/xai-tracing/Cargo.toml` | `OpenGrokTracing` | `W2-S1` | Structured spans, correlation, and redaction. |
 | 81 | `xai-tracing-macros` | `crates/codegen/xai-tracing-macros/Cargo.toml` | `OpenGrokTracing` | `W2-S1` | Rust tracing macros are absorbed into ordinary Swift tracing wrappers; no macro target needed. |
 | 82 | `xai-tty-utils` | `crates/codegen/xai-tty-utils/Cargo.toml` | `OpenGrokTTY` | `W2-S4` | TTY capabilities, raw mode, and console handling. |
-| 83 | `xai-workflow` | `crates/codegen/xai-workflow/Cargo.toml` | proposed `OpenGrokWorkflowEngine` | `W6-S5` (proposed) | **Added upstream since the old pin.** Native Rhai workflow engine: script engine, host bindings, run journal, run metadata, execution, and validation. Proposed as a **new target** rather than folded into the existing `OpenGrokWorkflow`, because that target was ported against the removed JavaScript workflow model — folding would hide a rewrite behind an unchanged name. If a later slice decides the Rhai engine and the workflow tool surface belong together, merge deliberately and record the decision here. |
+| 83 | `xai-workflow` | `crates/codegen/xai-workflow/Cargo.toml` | `OpenGrokWorkflow` | `W6-S5` | Native Rhai workflow engine, host bindings, run journal, execution, and validation are implemented in the existing workflow target. The previously proposed `OpenGrokWorkflowEngine` target was never created and is not needed. |
 | 84 | `xai-grok-extra-ca` | `crates/codegen/xai-grok-extra-ca/Cargo.toml` | `OpenGrokExtraCA` | `W2-S1` | **Implemented partial.** Opt-in PEM loading is default-off, cached once, capped at 1 MiB, validated into DER, and consumed centrally by `OpenGrokHTTP` for buffered, Darwin streaming, and WebSocket sessions. Linux FoundationNetworking still lacks a server-trust challenge/anchor-installation API, so Linux buffered and streaming requests remain strict system-root-only until a portable TLS backend lands. |
 | 85 | `xai-grok-bundle` | `crates/codegen/xai-grok-bundle/Cargo.toml` | `OpenGrokCLI` (SubagentBundleArchive, SubagentBundleCache, LiveBundleComposition) | — | Subagent bundle archive extraction (gzip/tar), bundle manifest/cache management, download lifecycle, ACP extension handler. Absorbed into `OpenGrokCLI`. |
 | 86 | `xai-grok-diag-server` | `crates/codegen/xai-grok-diag-server/Cargo.toml` | `OpenGrokDiagnostics` (DiagServer, DiagHandle, DiagServerTypes) | — | In-guest diagnostics HTTP server: TCP loopback + Unix domain sockets, `/ready`, `/statusz`, `/logs` endpoints. |
 | 87 | `xai-grok-workspace-daemon` | `crates/codegen/xai-grok-workspace-daemon/Cargo.toml` | `OpenGrokWorkspace` (WorkspaceDaemon, PidFile, PreviewSupervisor, PreviewScraper) | — | Process daemonization, single-instance pidfile locking, preview proxy supervision with exponential backoff, activity/metrics scraping. |
 | 88 | `xai-grok-pager-diff` | `crates/codegen/xai-grok-pager-diff/Cargo.toml` | `OpenGrokPagerRender` (PagerDiff) | — | Line-level LCS diff engine, hunk extraction, stitch-collapse for sequential file-state edits, unified-patch text generation for TUI tool edit cards. |
 | 89 | `xai-grok-session-search` | `crates/codegen/xai-grok-session-search/Cargo.toml` | `OpenGrokCLI` (LiveSessionSearch) | — | Session full-text search index, search gate integration, session discovery and ranking. |
+| 90 | `xai-compaction-transcript` | `crates/codegen/xai-compaction-transcript/Cargo.toml` | `OpenGrokChatState` | — | Compaction detail modes, segment/index naming, artifact classification, and Markdown segment/index rendering are folded into the chat-state target. |
+| 91 | `xai-fuzzy-file-search` | `crates/codegen/xai-fuzzy-file-search/Cargo.toml` | `OpenGrokWorkspace`, `OpenGrokCLI` | — | Bounded fuzzy file indexing, ignore/hidden-file policy, safe workspace traversal, prompt `@file` completion, and line-reference validation. |
+| 92 | `xai-grok-active-sessions` | `crates/codegen/xai-grok-active-sessions/Cargo.toml` | `OpenGrokShellSessionSupport`, `OpenGrokShell` | — | Process-safe active-session registry, canonical crash-recovery records, PID liveness, atomic ownership-restricted persistence, and startup cleanup. |
+| 93 | `xai-grok-foreign-sessions` | `crates/codegen/xai-grok-foreign-sessions/Cargo.toml` | `OpenGrokCLI` | — | Bounded Claude, Codex, and Cursor session discovery, capability-gated safe roots, title normalization, source filtering, and resume integration. |
+| 94 | `xai-grok-session-events` | `crates/codegen/xai-grok-session-events/Cargo.toml` | `OpenGrokSessionRuntime`, `OpenGrokSessionPersistence`, `OpenGrokCLI` | — | Owner-private canonical `events.jsonl`, typed session/turn/tool lifecycle events, local event tracking, and production session emission. |
 
 
-Rows 83–89 are appended in discovery order rather than inserted alphabetically, so existing row numbers stay stable across the re-pin.
+Rows 83–94 are appended in discovery order rather than inserted alphabetically, so existing row numbers stay stable across reference updates.
 
 ## Coverage checks
 
-- Mapped crate rows: **89**.
-- Unique Swift target owners in the plan: **106** committed, plus **1** proposed for the new upstream crate.
+- Mapped crate rows: **94**.
+- Root Cargo workspace members: **93**; separately rooted Markdown fuzz crate: **1**.
+- Swift source/test target directories: **106 / 106**; no nonexistent proposed workflow target is counted.
 - Uncovered crates: **0**.
 - `xai-grok-markdown-fuzz` is intentionally counted even though its manifest declares a nested standalone workspace and is absent from root `cargo metadata`.
 - Re-run the plan validation before changing target splits; any unmapped manifest or duplicate target/path owner is a release-blocking architecture error.
