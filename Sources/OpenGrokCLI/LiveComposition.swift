@@ -64,6 +64,8 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
     /// (spawn.rs:723-736, sampler_turn.rs:834-850) and the sampler backfills
     /// requests from it (client.rs:1806-1808, :3234-3236).
     public var serviceTier: String?
+    /// Explicit model override; nil preserves the session-wide streaming policy.
+    public var streamToolCalls: Bool?
     public var codexMultiAgentV2: Bool
     public var temperature: Float?
     public var topP: Float?
@@ -74,6 +76,7 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
         reasoningEffort: ReasoningEffort? = nil,
         reasoningSummary: ReasoningSummary? = nil,
         serviceTier: String? = nil,
+        streamToolCalls: Bool? = nil,
         codexMultiAgentV2: Bool = false,
         temperature: Float? = nil,
         topP: Float? = nil,
@@ -83,6 +86,7 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
         self.reasoningEffort = reasoningEffort
         self.reasoningSummary = reasoningSummary
         self.serviceTier = serviceTier
+        self.streamToolCalls = streamToolCalls
         self.codexMultiAgentV2 = codexMultiAgentV2
         self.temperature = temperature
         self.topP = topP
@@ -118,6 +122,7 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
             serviceTier: serviceTier.flatMap { tier in
                 info.serviceTiers.contains { $0.id == tier } ? tier : nil
             },
+            streamToolCalls: info.streamToolCalls,
             codexMultiAgentV2: info.codexMultiAgentV2,
             temperature: info.temperature,
             topP: info.topP,
@@ -137,6 +142,8 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     /// account pinning (`ChatGPT-Account-ID`, `X-OpenAI-Fedramp`) arrives here.
     public let extraHeaders: [String: String]
     public let queryParams: [String: String]
+    /// Launch-scoped configuration authority; never substitute process cwd/env.
+    public let environment: [String: String]
     /// Model-tuning facts from the catalog entry (effort, summary, sampling
     /// scalars). Defaults to empty for compositions with no catalog entry.
     public let tuning: OpenGrokLiveSamplingTuning
@@ -158,6 +165,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         apiBackend: ApiBackend = .chatCompletions,
         extraHeaders: [String: String] = [:],
         queryParams: [String: String] = [:],
+        environment: [String: String] = [:],
         tuning: OpenGrokLiveSamplingTuning = OpenGrokLiveSamplingTuning(),
         codexPermissions: CodexPermissions? = nil,
         bearerResolver: (any BearerResolver)? = nil,
@@ -171,6 +179,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         self.apiBackend = apiBackend
         self.extraHeaders = extraHeaders
         self.queryParams = queryParams
+        self.environment = environment
         self.tuning = tuning
         self.codexPermissions = provider == .codex ? codexPermissions : nil
         self.bearerResolver = bearerResolver
@@ -182,6 +191,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         lhs.model == rhs.model && lhs.baseURL == rhs.baseURL && lhs.apiKey == rhs.apiKey &&
         lhs.provider == rhs.provider && lhs.apiBackend == rhs.apiBackend &&
         lhs.extraHeaders == rhs.extraHeaders && lhs.queryParams == rhs.queryParams &&
+        lhs.environment == rhs.environment &&
         lhs.tuning == rhs.tuning && lhs.codexPermissions == rhs.codexPermissions
     }
 
@@ -194,6 +204,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
             apiBackend: apiBackend,
             extraHeaders: extraHeaders,
             queryParams: queryParams,
+            environment: environment,
             tuning: tuning,
             codexPermissions: permissions,
             bearerResolver: bearerResolver,
@@ -555,6 +566,12 @@ public struct OpenGrokLiveSampler: Sendable {
                 .map { (name: $0.key, value: $0.value) },
             queryParams: configuration.queryParams,
             contextWindow: configuration.tuning.contextWindow ?? 0,
+            streamToolCalls: shouldInjectStreamToolCalls(
+                configuration.tuning.streamToolCalls
+                    ?? resolveStreamToolCallsPreference(environment: configuration.environment),
+                provider: configuration.provider,
+                backend: configuration.apiBackend
+            ),
             reasoningEffort: configuredReasoningEffort,
             serviceTier: configuration.tuning.serviceTier,
             reasoningSummary: configuration.tuning.reasoningSummary,
@@ -1814,6 +1831,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         // `/logout` resolve auth paths and env-override
                         // statuses against it (AGENTS.md §2, applied to env).
                         environment: context.environment,
+                        codeModeActive: stack.toolSurface.isCodeMode,
                         toolExecutor: toolExecutor
                     )
                     let controller = OpenGrokPagerInteractiveController(
@@ -3082,50 +3100,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let announcements: LiveAnnouncementsComposition?
     }
 
-    private actor LiveACPBusPresenceRegistry {
-        private let bus: LiveSessionBus
-        private let rootSessionID: String
-        private let workingDirectory: URL
-        private let model: String
-        private var openSessions: Set<String> = []
-
-        init(
-            bus: LiveSessionBus,
-            rootSessionID: String,
-            workingDirectory: URL,
-            model: String
-        ) {
-            self.bus = bus
-            self.rootSessionID = rootSessionID
-            self.workingDirectory = workingDirectory
-            self.model = model
-        }
-
-        func opened(_ wireSessionID: String) async {
-            guard await bus.busEnabled else { return }
-            let wasEmpty = openSessions.isEmpty
-            openSessions.insert(wireSessionID)
-            guard wasEmpty else { return }
-            do {
-                try await bus.registerRootSession(
-                    sessionID: rootSessionID,
-                    cwd: workingDirectory,
-                    model: model,
-                    title: nil
-                )
-            } catch {
-                openSessions.remove(wireSessionID)
-                await bus.disable()
-            }
-        }
-
-        func closed(_ wireSessionID: String) async {
-            openSessions.remove(wireSessionID)
-            guard openSessions.isEmpty else { return }
-            await bus.unregisterRootSession(rootSessionID)
-        }
-    }
-
     static func makeSessionFoundation(
         options: CLIExecutionOptions,
         context: CLIApplicationContext,
@@ -3853,9 +3827,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 guard let bus else { return .rejected }
                 let targetID = SessionID(message.targetSession)
                 guard let session = await shell.lookupSession(targetID) else {
-                    // ACP roots have no shell-owned turn queue. They remain
-                    // discoverable/readable but reject peer wakeups until a
-                    // serialized, agent-authored ACP prompt path exists.
+                    // ACP replaces this callback with its connection-bound
+                    // bridge; shell roots never accept an unowned target.
                     return message.targetSession == rootSessionID ? .rejected : .unknownSession
                 }
 
@@ -3983,6 +3956,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             if let permissions = await foundation.toolExecutor.permissionHandle() {
                 await permissions.setPrompter(acpPermissionPrompter)
             }
+            // Carrier hosts attach their actual runtime after this factory
+            // returns; each opened wire session then captures that exact
+            // connection instead of following a later WebSocket reconnect.
+            let gateway = ACPNotificationGateway()
+            let acpPeerBridge = LiveACPPeerSessionBridge(
+                bus: foundation.sessionBus,
+                gateway: gateway,
+                interjections: stack.interjections,
+                rootSessionID: foundation.sessionID,
+                workingDirectory: foundation.cwd,
+                model: foundation.samplingConfiguration.model
+            )
+            await acpPeerBridge.install()
             let mouseReportingToggleEnabled = LiveInteractiveControllerRenderer
                 .resolveUIConfig(
                     workingDirectory: foundation.cwd,
@@ -4002,6 +3988,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 ),
                 skillCatalog: foundation.skillCatalog,
                 permissionPrompter: acpPermissionPrompter,
+                turnActivity: { sessionID, active in
+                    await acpPeerBridge.turnActivity(sessionID: sessionID, active: active)
+                },
                 shutdown: {
                     stack.sessionBusObserver?.cancel()
                     await foundation.sessionBus.stop()
@@ -4009,11 +3998,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     await foundation.toolExecutor.shutdown()
                 }
             )
-            // The notification gateway (Wave 15 item 5): the outbound handle
-            // the emitters below hold. The carrier composition attaches the
-            // runtime it builds, so everything emitted here rides the same
-            // stdio/ws channel `session/update` rides.
-            let gateway = ACPNotificationGateway()
             // The mailbox's accepted-send observer → client-facing
             // `SubagentMessage` on the root session's channel
             // (`on_agent_message`, subagent_coordinator.rs:154-193). Installed
@@ -4068,12 +4052,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 environment: launch.environment
             )
             await mcpHandler.attachLifecycle(sessionID: foundation.sessionID)
-            let acpBusPresence = LiveACPBusPresenceRegistry(
-                bus: foundation.sessionBus,
-                rootSessionID: foundation.sessionID,
-                workingDirectory: foundation.cwd,
-                model: foundation.samplingConfiguration.model
-            )
             // The session-admin trio operates on the SAME on-disk store the
             // launch path resumes from; the resident session's rename goes
             // through the live history actor so the next turn commit cannot
@@ -4172,11 +4150,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 permissionPrompter: acpPermissionPrompter,
                 onSessionOpened: { sessionID, meta in
                     try await mcpHandler.openSDKServers(sessionID: sessionID, meta: meta)
-                    await acpBusPresence.opened(sessionID.rawValue)
+                    try await acpPeerBridge.opened(sessionID)
                 },
                 onSessionClosed: { sessionID in
                     await mcpHandler.closeSDKServers(sessionID: sessionID)
-                    await acpBusPresence.closed(sessionID.rawValue)
+                    await acpPeerBridge.closed(sessionID)
                 },
                 permissionPipeline: permissionPipeline
             )
@@ -4550,6 +4528,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             apiBackend: apiBackend,
             extraHeaders: headers,
             queryParams: configuredEntry?.queryParams ?? [:],
+            environment: environment,
             tuning: tuning,
             bearerResolver: namedAuthResolver.map(NamedAuthBearerResolver.init),
             credentialProvider: credential.binding.authCredentialProvider
@@ -5089,7 +5068,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 model: sampling.model,
                 baseURL: sampling.baseURL,
                 apiBackend: sampling.apiBackend,
-                provider: sampling.provider
+                provider: sampling.provider,
+                streamToolCalls: sampling.tuning.streamToolCalls
             ),
             apiKey: sampling.apiKey,
             apiBaseURL: sampling.baseURL

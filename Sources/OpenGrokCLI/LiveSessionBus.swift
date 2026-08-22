@@ -275,10 +275,11 @@ actor LiveSessionBus: SessionCollaborationBackend {
         try publishPresence()
     }
 
+    @discardableResult
     func recordInboundDelivery(
         _ message: LiveSessionBusPeerMessage,
         status: LiveSessionBusPeerDeliveryStatus
-    ) throws {
+    ) throws -> SessionUpdateEnvelope {
         guard let session = sessions[message.targetSession] else {
             throw LiveSessionBusError.unknownSession(message.targetSession)
         }
@@ -305,6 +306,7 @@ actor LiveSessionBus: SessionCollaborationBackend {
             sessionID: message.targetSession,
             cwd: session.cwd
         )
+        return envelope
     }
 
     func listSessions() async throws -> ListSessionsOutput {

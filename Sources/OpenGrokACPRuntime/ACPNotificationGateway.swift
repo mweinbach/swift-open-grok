@@ -89,6 +89,18 @@ public struct ACPExtensionNotificationRouter: Sendable {
 /// strong runtime reference here would complete a cycle.
 public actor ACPNotificationGateway {
     public typealias ReverseRequester = @Sendable (String, JSONValue) async throws -> JSONValue
+    public typealias PeerPromptSubmitter = @Sendable (
+        AcpSessionId,
+        String,
+        String,
+        @escaping ACPAgentRuntime.PeerPromptPreparation
+    ) async throws -> ACPAgentRuntime.PeerPromptAdmission
+    public typealias PeerSessionUpdateSender = @Sendable (String, JSONValue) async throws -> Void
+
+    public struct PeerSessionConnection: Sendable {
+        public let submitPrompt: PeerPromptSubmitter
+        public let sendSessionUpdate: PeerSessionUpdateSender
+    }
 
     private weak var runtime: ACPAgentRuntime?
     /// Process-global monotonic event counter, the port of `EVENT_COUNTER`
@@ -130,6 +142,75 @@ public actor ACPNotificationGateway {
             }
             return try await runtime.requestClient(method: method, params: params)
         }
+    }
+
+    /// Capture this exact carrier once. Serve-mode reconnects repoint the
+    /// gateway; a session opened by the old carrier must never wake or emit
+    /// through the new client's runtime.
+    public func connectedPeerSession() async throws -> PeerSessionConnection {
+        guard let runtime else {
+            throw ACPRuntimeError.transport("no ACP runtime is attached")
+        }
+        guard await runtime.hasConnectedReverseClient() else {
+            throw ACPRuntimeError.transport("no ACP client is connected")
+        }
+
+        return PeerSessionConnection(
+            submitPrompt: { [weak self, weak runtime] sessionID, promptID, text, prepare in
+                guard let self,
+                      let runtime,
+                      await self.isCurrentConnectedRuntime(runtime)
+                else {
+                    throw ACPRuntimeError.transport("the owning ACP client has disconnected")
+                }
+                return try await runtime.submitPeerPrompt(
+                    sessionId: sessionID,
+                    promptID: promptID,
+                    text: text,
+                    prepare: prepare
+                )
+            },
+            sendSessionUpdate: { [weak self, weak runtime] sessionID, update in
+                guard let self, let runtime else {
+                    throw ACPRuntimeError.transport("the owning ACP runtime has disconnected")
+                }
+                try await self.sendBoundSessionUpdate(
+                    runtime: runtime,
+                    sessionID: sessionID,
+                    update: update
+                )
+            }
+        )
+    }
+
+    private func isCurrentConnectedRuntime(_ expectedRuntime: ACPAgentRuntime) async -> Bool {
+        guard runtime === expectedRuntime else { return false }
+        guard await expectedRuntime.hasConnectedReverseClient() else { return false }
+        return runtime === expectedRuntime
+    }
+
+    private func sendBoundSessionUpdate(
+        runtime expectedRuntime: ACPAgentRuntime,
+        sessionID: String,
+        update: JSONValue
+    ) async throws {
+        guard await isCurrentConnectedRuntime(expectedRuntime)
+        else {
+            throw ACPRuntimeError.transport("the owning ACP client is no longer connected")
+        }
+        eventCounter += 1
+        let params = JSONValue.object([
+            "sessionId": .string(sessionID),
+            "update": update,
+            "_meta": .object([
+                "eventId": .string("\(sessionID)-\(eventCounter)"),
+                "agentTimestampMs": .number(.int64(Int64(Date().timeIntervalSince1970 * 1000))),
+            ]),
+        ])
+        await expectedRuntime.sendExtensionNotification(
+            method: ACPXaiNotificationMethods.sessionNotification,
+            params: params
+        )
     }
 
     /// Correlated agent-to-client request on the actual attached ACP carrier.

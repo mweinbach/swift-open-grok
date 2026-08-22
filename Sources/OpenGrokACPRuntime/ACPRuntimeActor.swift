@@ -28,6 +28,13 @@ public actor ACPAgentRuntime {
     public typealias NotificationSink = @Sendable (ACPMessage) async -> Void
     public typealias SessionOpenedHook = @Sendable (AcpSessionId, AcpMeta?) async throws -> Void
     public typealias SessionClosedHook = @Sendable (AcpSessionId) async -> Void
+    public typealias PeerPromptPreparation = @Sendable () async throws -> Void
+
+    public enum PeerPromptAdmission: Sendable, Equatable {
+        case accepted
+        case busy
+        case unknownSession
+    }
 
     private let configuration: ACPAgentConfiguration
     private let store: any ACPSessionStore
@@ -49,6 +56,10 @@ public actor ACPAgentRuntime {
     private var state: ACPConnectionState = .connected
     private var authenticated = false
     private var activePrompts: [AcpSessionId: Task<PromptRunOutcome, Never>] = [:]
+    /// Durable prompt echoes suspend; reserve admission first so a peer cannot
+    /// start a second turn while the ordinary prompt is recording its input.
+    private var startingPrompts: Set<AcpSessionId> = []
+    private var peerPromptGenerations: [AcpSessionId: UUID] = [:]
     private var pendingRosterInteractions: [AcpSessionId: Int] = [:]
     private var rosterMetadata: [AcpSessionId: RosterMetadata] = [:]
     private var requestIDs: Set<AcpRequestId> = []
@@ -199,6 +210,8 @@ public actor ACPAgentRuntime {
             task.cancel()
         }
         activePrompts.removeAll()
+        startingPrompts.removeAll()
+        peerPromptGenerations.removeAll()
         let sessions = openedLifecycleSessions
         openedLifecycleSessions.removeAll()
         if let onSessionClosed {
@@ -656,6 +669,7 @@ public actor ACPAgentRuntime {
         guard var session = try await store.read(request.sessionId) else {
             throw ACPRuntimeError.sessionNotFound(request.sessionId)
         }
+        startingPrompts.remove(request.sessionId)
         activePrompts[request.sessionId]?.cancel()
         await promptDriver.cancel(sessionId: request.sessionId)
         session.closed = true
@@ -697,9 +711,12 @@ public actor ACPAgentRuntime {
         guard !session.closed else {
             throw ACPRuntimeError.sessionClosed(request.sessionId)
         }
-        guard activePrompts[request.sessionId] == nil else {
+        guard activePrompts[request.sessionId] == nil,
+              !startingPrompts.contains(request.sessionId)
+        else {
             throw ACPRuntimeError.sessionBusy(request.sessionId)
         }
+        startingPrompts.insert(request.sessionId)
 
         for block in request.prompt {
             await emit(
@@ -709,6 +726,12 @@ public actor ACPAgentRuntime {
                 ),
                 disposition: .durable
             )
+        }
+        guard state != .closed,
+              startingPrompts.contains(request.sessionId)
+        else {
+            startingPrompts.remove(request.sessionId)
+            throw ACPRuntimeError.requestCancelled
         }
 
         let driver = promptDriver
@@ -741,12 +764,113 @@ public actor ACPAgentRuntime {
             }
         }
         activePrompts[request.sessionId] = task
+        startingPrompts.remove(request.sessionId)
         await publishRosterUpsert(sessionId: request.sessionId, activity: .working)
         let outcome = await task.value
         activePrompts.removeValue(forKey: request.sessionId)
         await emitPromptComplete(request: request, outcome: outcome)
         await publishRosterUpsert(sessionId: request.sessionId)
         return try encode(outcome.response)
+    }
+
+    /// Admit a machine-local peer prompt onto this connection's existing ACP
+    /// turn driver. Returning before sampling completes matches the upstream
+    /// session actor's accepted-command acknowledgement.
+    public func submitPeerPrompt(
+        sessionId: AcpSessionId,
+        promptID: String,
+        text: String,
+        prepare: @escaping PeerPromptPreparation
+    ) async throws -> PeerPromptAdmission {
+        try requireReady()
+        guard promptID.hasPrefix("peer-message-") else {
+            throw ACPRuntimeError.invalidParams("peer prompts require a system-generated peer-message id")
+        }
+        guard openedLifecycleSessions.contains(sessionId) else {
+            return .unknownSession
+        }
+        guard let session = try await store.read(sessionId),
+              !session.closed,
+              state != .closed,
+              openedLifecycleSessions.contains(sessionId)
+        else {
+            return .unknownSession
+        }
+        guard activePrompts[sessionId] == nil,
+              !startingPrompts.contains(sessionId)
+        else {
+            return .busy
+        }
+
+        let request = PromptRequest(
+            sessionId: sessionId,
+            prompt: [.text(text)],
+            messageId: promptID,
+            meta: ["promptId": .string(promptID)]
+        )
+        let generation = UUID()
+        let driver = promptDriver
+        let runtime = self
+        let task = Task<PromptRunOutcome, Never> {
+            do {
+                try await prepare()
+                try Task.checkCancellation()
+                await runtime.emit(
+                    SessionNotification(
+                        sessionId: sessionId,
+                        update: .userMessageChunk(ContentChunk(
+                            content: .text(text),
+                            meta: ["hideFromScrollback": .bool(true)]
+                        ))
+                    ),
+                    disposition: .durable
+                )
+                await runtime.publishRosterUpsert(sessionId: sessionId, activity: .working)
+                let response = try await driver.run(
+                    context: ACPPromptContext(session: session, request: request),
+                    emit: { update, disposition in
+                        await runtime.emit(update, disposition: disposition)
+                    }
+                )
+                return PromptRunOutcome(response: response, failure: nil)
+            } catch is CancellationError {
+                return PromptRunOutcome(
+                    response: PromptResponse(stopReason: .cancelled, userMessageId: promptID),
+                    failure: nil
+                )
+            } catch {
+                return PromptRunOutcome(
+                    response: PromptResponse(stopReason: .refusal, userMessageId: promptID),
+                    failure: runtime.protocolError(for: error)
+                )
+            }
+        }
+        activePrompts[sessionId] = task
+        peerPromptGenerations[sessionId] = generation
+        Task { [weak runtime] in
+            let outcome = await task.value
+            await runtime?.finishPeerPrompt(
+                request: request,
+                generation: generation,
+                outcome: outcome
+            )
+        }
+        return .accepted
+    }
+
+    private func finishPeerPrompt(
+        request: PromptRequest,
+        generation: UUID,
+        outcome: PromptRunOutcome
+    ) async {
+        guard peerPromptGenerations[request.sessionId] == generation else { return }
+        peerPromptGenerations.removeValue(forKey: request.sessionId)
+        activePrompts.removeValue(forKey: request.sessionId)
+        guard state != .closed,
+              openedLifecycleSessions.contains(request.sessionId)
+        else { return }
+        await emitPromptComplete(request: request, outcome: outcome)
+        await publishRosterUpsert(sessionId: request.sessionId)
     }
 
     /// The `x.ai/session/prompt_complete` fire-and-forget broadcast the

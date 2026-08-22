@@ -167,6 +167,7 @@ public struct LiveACPPromptDriver: ACPPromptDriver {
     /// When set, each `session/prompt` binds this session id onto the reverse
     /// permission prompter so a gated tool call advertises the wire session.
     private let permissionPrompter: LiveACPPermissionPrompter?
+    private let turnActivity: (@Sendable (AcpSessionId, Bool) async -> Void)?
     public let shutdown: @Sendable () async -> Void
 
     public init(
@@ -174,12 +175,14 @@ public struct LiveACPPromptDriver: ACPPromptDriver {
         availableCommands: [AvailableCommand] = [],
         skillCatalog: [LiveSkills.SkillCommand] = [],
         permissionPrompter: LiveACPPermissionPrompter? = nil,
+        turnActivity: (@Sendable (AcpSessionId, Bool) async -> Void)? = nil,
         shutdown: @escaping @Sendable () async -> Void = {}
     ) {
         self.driver = driver
         self.availableCommands = availableCommands
         self.skillCatalog = skillCatalog
         self.permissionPrompter = permissionPrompter
+        self.turnActivity = turnActivity
         self.shutdown = shutdown
     }
 
@@ -208,6 +211,7 @@ public struct LiveACPPromptDriver: ACPPromptDriver {
         if let permissionPrompter {
             await permissionPrompter.beginTurn(context.request.sessionId)
         }
+        await turnActivity?(context.request.sessionId, true)
         do {
             let response = try await LiveACPPermissionPrompter.$activeSession.withValue(
                 context.request.sessionId
@@ -217,11 +221,13 @@ public struct LiveACPPromptDriver: ACPPromptDriver {
             if let permissionPrompter {
                 await permissionPrompter.endTurn(context.request.sessionId)
             }
+            await turnActivity?(context.request.sessionId, false)
             return response
         } catch {
             if let permissionPrompter {
                 await permissionPrompter.endTurn(context.request.sessionId)
             }
+            await turnActivity?(context.request.sessionId, false)
             throw error
         }
     }
