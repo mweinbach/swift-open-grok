@@ -71,6 +71,9 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
     /// `.pending` when the call has no paired output rather than inventing
     /// success. See `ToolCallOutcomeMap` — not a provider wire field.
     var toolOutcomes: ToolCallOutcomeMap?
+    /// Exact Code Mode wrapper identities; names alone can belong to plugins.
+    /// Optional so sessions predating transport provenance still decode.
+    var codeModeTransportCallIDs: [String]?
 
     init(
         sessionID: String,
@@ -87,7 +90,8 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         everUsedNonXAI: Bool? = nil,
         usageSnapshot: LiveSessionUsageSnapshot? = nil,
         title: String? = nil,
-        toolOutcomes: ToolCallOutcomeMap? = nil
+        toolOutcomes: ToolCallOutcomeMap? = nil,
+        codeModeTransportCallIDs: [String]? = nil
     ) {
         self.sessionID = sessionID
         self.workingDirectory = workingDirectory
@@ -104,6 +108,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         self.usageSnapshot = usageSnapshot
         self.title = title
         self.toolOutcomes = toolOutcomes
+        self.codeModeTransportCallIDs = codeModeTransportCallIDs
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -122,6 +127,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         case usageSnapshot = "session_usage"
         case title
         case toolOutcomes = "tool_outcomes"
+        case codeModeTransportCallIDs = "code_mode_transport_call_ids"
     }
 
     // Explicit so `tool_outcomes` cannot silently vanish on a future
@@ -145,6 +151,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         usageSnapshot = try c.decodeIfPresent(LiveSessionUsageSnapshot.self, forKey: .usageSnapshot)
         title = try c.decodeIfPresent(String.self, forKey: .title)
         toolOutcomes = try c.decodeIfPresent(ToolCallOutcomeMap.self, forKey: .toolOutcomes)
+        codeModeTransportCallIDs = try c.decodeIfPresent([String].self, forKey: .codeModeTransportCallIDs)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -164,6 +171,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         try c.encodeIfPresent(usageSnapshot, forKey: .usageSnapshot)
         try c.encodeIfPresent(title, forKey: .title)
         try c.encodeIfPresent(toolOutcomes, forKey: .toolOutcomes)
+        try c.encodeIfPresent(codeModeTransportCallIDs, forKey: .codeModeTransportCallIDs)
     }
 
     static func new(
@@ -409,7 +417,8 @@ actor LiveConversationStore {
             currentProvider: source.currentProvider,
             everUsedNonXAI: source.everUsedNonXAI,
             title: source.title,
-            toolOutcomes: source.toolOutcomes
+            toolOutcomes: source.toolOutcomes,
+            codeModeTransportCallIDs: source.codeModeTransportCallIDs
         )
 
         do {
@@ -549,13 +558,15 @@ actor LiveConversationStore {
             .prefix { pair in pair.0 == pair.1 }
             .count
         var updates = existing?.updates ?? []
+        let codeModeTransportCallIDs = Set(record.codeModeTransportCallIDs ?? [])
         let timestamp = UInt64(max(0, record.updatedAt.timeIntervalSince1970))
         for item in record.items.dropFirst(commonPrefixCount) {
             updates.append(contentsOf: try sessionUpdates(
                 for: item,
                 sessionID: record.sessionID,
                 timestamp: timestamp,
-                outcomes: record.toolOutcomes
+                outcomes: record.toolOutcomes,
+                codeModeTransportCallIDs: codeModeTransportCallIDs
             ))
         }
 
@@ -583,6 +594,11 @@ actor LiveConversationStore {
             extra["tool_outcomes"] = try JSONValue.encode(toolOutcomes)
         } else {
             extra["tool_outcomes"] = .null
+        }
+        if let codeModeTransportCallIDs = record.codeModeTransportCallIDs {
+            extra["code_mode_transport_call_ids"] = try JSONValue.encode(codeModeTransportCallIDs)
+        } else if extra["code_mode_transport_call_ids"] != nil {
+            extra["code_mode_transport_call_ids"] = .null
         }
         if let usageSnapshot = record.usageSnapshot {
             extra["session_usage"] = try JSONValue.encode(usageSnapshot)
@@ -654,6 +670,33 @@ actor LiveConversationStore {
         } else {
             toolOutcomes = nil
         }
+        let summaryTransportCallIDs: [String]
+        if let value = extra["code_mode_transport_call_ids"], value != .null {
+            summaryTransportCallIDs = try value.decode([String].self)
+        } else {
+            summaryTransportCallIDs = []
+        }
+        // The summary publishes after updates; a crash can therefore leave a
+        // valid but older summary beside newer marked secret-bearing lines.
+        let recoveredTransportCallIDs = state.updates.compactMap { envelope -> String? in
+            guard envelope.method == "session/update",
+                  let params = envelope.params.objectValue,
+                  params["_meta"]?.objectValue?["open-grok/codeModeTransport"]?.boolValue == true,
+                  let update = params["update"]?.objectValue,
+                  let tag = update["sessionUpdate"]?.stringValue,
+                  tag == "tool_call" || tag == "tool_call_update",
+                  let callID = update["toolCallId"]?.stringValue,
+                  !callID.isEmpty
+            else { return nil }
+            if tag == "tool_call",
+               update["title"]?.stringValue != "exec",
+               update["title"]?.stringValue != "wait" {
+                return nil
+            }
+            return callID
+        }
+        let allTransportCallIDs = Array(Set(summaryTransportCallIDs + recoveredTransportCallIDs)).sorted()
+        let codeModeTransportCallIDs: [String]? = allTransportCallIDs.isEmpty ? nil : allTransportCallIDs
         let usageSnapshot: LiveSessionUsageSnapshot?
         if let value = extra["session_usage"], value != .null {
             usageSnapshot = try value.decode(LiveSessionUsageSnapshot.self)
@@ -679,7 +722,8 @@ actor LiveConversationStore {
             everUsedNonXAI: exportBoundaryMissing ? nil : state.summary.everUsedCodex,
             usageSnapshot: usageSnapshot,
             title: extra["generated_title"]?.stringValue ?? extra["title"]?.stringValue,
-            toolOutcomes: toolOutcomes
+            toolOutcomes: toolOutcomes,
+            codeModeTransportCallIDs: codeModeTransportCallIDs
         )
     }
 
@@ -699,16 +743,24 @@ actor LiveConversationStore {
         for item: ConversationItem,
         sessionID: String,
         timestamp: UInt64,
-        outcomes: ToolCallOutcomeMap?
+        outcomes: ToolCallOutcomeMap?,
+        codeModeTransportCallIDs: Set<String>
     ) throws -> [SessionUpdateEnvelope] {
-        let wrap: ([String: JSONValue]) throws -> SessionUpdateEnvelope = { update in
-            try SessionUpdateEnvelope(
+        func wrap(
+            _ update: [String: JSONValue],
+            transportCallID: String? = nil
+        ) throws -> SessionUpdateEnvelope {
+            var params: [String: JSONValue] = [
+                "sessionId": .string(sessionID),
+                "update": .object(update),
+            ]
+            if let transportCallID, codeModeTransportCallIDs.contains(transportCallID) {
+                params["_meta"] = .object(["open-grok/codeModeTransport": .bool(true)])
+            }
+            return try SessionUpdateEnvelope(
                 timestamp: timestamp,
                 method: "session/update",
-                params: .object([
-                    "sessionId": .string(sessionID),
-                    "update": .object(update),
-                ])
+                params: .object(params)
             )
         }
 
@@ -759,7 +811,7 @@ actor LiveConversationStore {
                     "kind": .string("other"),
                     "status": .string("in_progress"),
                     "rawInput": rawInput,
-                ]))
+                ], transportCallID: call.id))
             }
             return updates
 
@@ -786,7 +838,7 @@ actor LiveConversationStore {
                     ])
                 ]),
                 "rawOutput": .object(["output": .string(result.content)]),
-            ])]
+            ], transportCallID: result.toolCallId)]
 
         case .system, .reasoning, .backendToolCall, .customToolOutput:
             return []
@@ -1335,6 +1387,20 @@ actor LiveConversationHistory {
     }
 
     var toolOutcomes: ToolCallOutcomeMap { record.toolOutcomes ?? ToolCallOutcomeMap() }
+
+    var codeModeTransportCallIDs: Set<String> {
+        Set(record.codeModeTransportCallIDs ?? [])
+    }
+
+    /// Set provenance before the assistant item is first committed: recording
+    /// it at dispatch is too late because the secret-bearing update is durable.
+    func recordCodeModeTransportCallIDs(_ callIDs: [String]) {
+        var known = Set(record.codeModeTransportCallIDs ?? [])
+        known.formUnion(callIDs.filter { !$0.isEmpty })
+        if !known.isEmpty {
+            record.codeModeTransportCallIDs = known.sorted()
+        }
+    }
 }
 
 private actor LiveSamplingTextEmission {
@@ -1693,6 +1759,14 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 }
                 }
                 guard let response else { throw CLIApplicationError.failed("sampling produced no response") }
+                if let codeMode {
+                    let transportCallIDs = response.toolCalls
+                        .filter { codeMode.isTransportCall($0) }
+                        .map(\.id)
+                    if !transportCallIDs.isEmpty {
+                        await conversationHistory.recordCodeModeTransportCallIDs(transportCallIDs)
+                    }
+                }
                 items.append(contentsOf: response.items)
                 try await conversationHistory.commit(
                     sessionID: context.sessionID,

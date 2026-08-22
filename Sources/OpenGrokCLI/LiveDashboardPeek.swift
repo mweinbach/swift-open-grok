@@ -79,21 +79,24 @@ struct LiveDashboardPeekCache: Sendable, Equatable {
     /// documents (empty `styledLines` → paint `text` verbatim).
     static func peekItems(
         from conversationItems: [ConversationItem],
-        toolOutcomes: ToolCallOutcomeMap = ToolCallOutcomeMap()
+        toolOutcomes: ToolCallOutcomeMap = ToolCallOutcomeMap(),
+        hiddenTransportCallIDs: Set<String> = []
     ) -> [PagerConversationItem] {
         // Same projection as `/resume` (`LiveTranscriptProjection`) so a peek
         // cannot invent success for unpaired calls or drop reasoning / backend
         // / custom-tool output that the live path would paint.
         LiveTranscriptProjection.project(
             conversationItems,
-            toolOutcomes: toolOutcomes
+            toolOutcomes: toolOutcomes,
+            hiddenTransportCallIDs: hiddenTransportCallIDs
         ).items
     }
 
     static func peekItems(from record: LiveConversationRecord) -> [PagerConversationItem] {
         peekItems(
             from: record.items,
-            toolOutcomes: record.toolOutcomes ?? ToolCallOutcomeMap()
+            toolOutcomes: record.toolOutcomes ?? ToolCallOutcomeMap(),
+            hiddenTransportCallIDs: Set(record.codeModeTransportCallIDs ?? [])
         )
     }
 }

@@ -835,6 +835,25 @@ public enum SessionTranscriptProjector {
     public static let maxToolMetadataCharacters = 100_000
 
     public static func project(_ updates: [SessionUpdate]) -> SessionTranscriptProjection {
+        // A terminal update may be the only marked line, so discover exact
+        // transport identities across the complete timeline before projection.
+        let hiddenTransportCallIDs = Set(updates.compactMap { update -> String? in
+            guard update.method == "session/update",
+                  let payload = update.params.objectValue,
+                  payload["_meta"]?.objectValue?["open-grok/codeModeTransport"]?.boolValue == true,
+                  let updateObject = payload["update"]?.objectValue,
+                  let tag = updateObject["sessionUpdate"]?.stringValue,
+                  tag == "tool_call" || tag == "tool_call_update",
+                  let callID = updateObject["toolCallId"]?.stringValue,
+                  !callID.isEmpty
+            else { return nil }
+            if tag == "tool_call",
+               updateObject["title"]?.stringValue != "exec",
+               updateObject["title"]?.stringValue != "wait" {
+                return nil
+            }
+            return callID
+        })
         var promptEvents: [PromptExtractEvent] = []
         var assistantMessages: [String] = []
         var toolMetadata: [String] = []
@@ -857,6 +876,12 @@ public enum SessionTranscriptProjector {
                 malformedUpdateCount = malformedUpdateCount.saturatingAdd(1)
                 promptEvents.append(.notUserMessage)
                 flushAssistant(&assistantCurrent, into: &assistantMessages)
+                continue
+            }
+            if update.method == "session/update",
+               (tag == "tool_call" || tag == "tool_call_update"),
+               let callID = updateObject["toolCallId"]?.stringValue,
+               hiddenTransportCallIDs.contains(callID) {
                 continue
             }
 
