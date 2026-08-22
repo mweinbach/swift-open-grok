@@ -36,6 +36,8 @@ public final class SamplingClient: @unchecked Sendable {
     private var bearerResolver: (any BearerResolver)?
     private let headerInjector: (any HeaderInjector)?
     private let codexTurnState: CodexTurnStateCell?
+    /// Kept provider-local even if an incorrectly assembled config carries it.
+    private let configuredCodexPermissions: CodexPermissions?
     private let forceHTTP1: Bool
     /// The Fireworks pacing gate (client.rs:1706-1708 reads the process
     /// global). Internal-and-settable is a port-added test seam upstream does
@@ -103,6 +105,7 @@ public final class SamplingClient: @unchecked Sendable {
         self.bearerResolver = config.bearerResolver
         self.headerInjector = config.headerInjector
         self.codexTurnState = turnState
+        self.configuredCodexPermissions = config.provider == .codex ? config.codexPermissions : nil
         self.forceHTTP1 = config.forceHTTP1
     }
 
@@ -142,13 +145,33 @@ public final class SamplingClient: @unchecked Sendable {
         DoomLoopSignalCollector?,
         [String]
     ) {
+        try await conversationStreamResponses(request, codexPermissions: configuredCodexPermissions)
+    }
+
+    /// Stream Responses with an explicit turn-scoped execution-policy value.
+    ///
+    /// Unlike the one-argument overload, `nil` deliberately removes an
+    /// inherited policy. Child turns use this to keep parent Codex permissions
+    /// from crossing a provider boundary.
+    public func conversationStreamResponses(
+        _ request: ConversationRequest,
+        codexPermissions: CodexPermissions?
+    ) async throws -> (
+        AsyncStream<Result<ResponsesStreamEvent, SamplingError>>,
+        ResponseModelMetadata?,
+        DoomLoopSignalCollector?,
+        [String]
+    ) {
         var req = request
         applyConversationDefaults(&req)
         let clientCustomToolNames = req.clientCustomToolNames()
         let policy = ResponsesRequestPolicy(
             multiAgentV2: defaults.codexMultiAgentV2,
             localEffort: req.reasoningEffort ?? defaults.reasoningEffort,
-            reasoningSummary: defaults.reasoningSummary
+            reasoningSummary: defaults.reasoningSummary,
+            codexPermissions: defaults.provider == .codex ? codexPermissions : nil,
+            sessionID: req.xGrokSessionId,
+            turnID: req.xGrokTurnIdx
         )
         var body = projectResponsesRequestBody(
             req,
@@ -336,6 +359,7 @@ public final class SamplingClient: @unchecked Sendable {
         if doomLoop != nil, providerAdapter.sendsDoomLoopOptIn {
             headers[DOOM_LOOP_CHECK_HEADER] = "1"
         }
+        applyCodexTurnMetadataHeader(&headers, body: body)
 
         let bodyData = try WireJSONEncoder.make().encode(body)
         let request = HTTPRequest(
@@ -541,6 +565,19 @@ public final class SamplingClient: @unchecked Sendable {
 
     // MARK: - Headers / URL
 
+    /// The HTTP header must be byte-identical to the body's canonical metadata
+    /// and can never survive on another provider or a policy-free request.
+    private func applyCodexTurnMetadataHeader(
+        _ headers: inout [String: String],
+        body: JSONValue
+    ) {
+        headers = headers.filter { $0.key.lowercased() != X_CODEX_TURN_METADATA_HEADER }
+        guard defaults.provider == .codex,
+              let metadata = body["client_metadata"]?[X_CODEX_TURN_METADATA_HEADER]?.stringValue
+        else { return }
+        headers[X_CODEX_TURN_METADATA_HEADER] = metadata
+    }
+
     private func buildHeaders(requestHeaders: ProviderRequestHeaders?) -> [String: String] {
         var headers = defaultHeaders
         if let resolver = bearerResolver {
@@ -609,7 +646,8 @@ public final class SamplingClient: @unchecked Sendable {
             turnIdx: req.xGrokTurnIdx,
             agentId: req.xGrokAgentId,
             deploymentId: req.xGrokDeploymentId,
-            userId: req.xGrokUserId
+            userId: req.xGrokUserId,
+            cacheAffinityId: req.xGrokCacheAffinityId
         )
     }
 
@@ -621,9 +659,12 @@ public final class SamplingClient: @unchecked Sendable {
         turnIdx: String?,
         agentId: String?,
         deploymentId: String?,
-        userId: String?
+        userId: String?,
+        cacheAffinityId: String? = nil
     ) -> ProviderRequestHeaders? {
-        guard providerAdapter.profile.requestMetadata == .xGrokHeaders else { return nil }
+        guard providerAdapter.profile.requestMetadata == .xGrokHeaders
+                || providerAdapter.profile.responsesDialect == .codex
+        else { return nil }
         return ProviderRequestHeaders(
             convId: convId ?? "",
             reqId: reqId ?? "",
@@ -632,7 +673,8 @@ public final class SamplingClient: @unchecked Sendable {
             turnIdx: turnIdx,
             agentId: agentId ?? "",
             deploymentId: deploymentId,
-            userId: userId
+            userId: userId,
+            cacheAffinityId: cacheAffinityId
         )
     }
 

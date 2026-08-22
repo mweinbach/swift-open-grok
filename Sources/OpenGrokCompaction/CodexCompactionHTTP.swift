@@ -9,8 +9,8 @@
 // `HTTPTransport` and feeds decoded SSE frames to whatever the caller supplies.
 //
 // It deliberately does NOT go through `SamplingClient`. A compaction request is
-// not a sampling turn: it carries `compaction_trigger`, a `comp_hash` the
-// sampler has no field for, and a beta header, and its response is a single
+// not a sampling turn: its final input is a `compaction_trigger`, it carries
+// a beta header, and its streamed response is a single
 // opaque item rather than assistant text. Routing it through the sampler would
 // mean widening the sampling request type for a body only this path sends.
 
@@ -26,10 +26,13 @@ import OpenGrokShared
 /// module has no business knowing how the live session authenticated, and a
 /// refreshed Codex OAuth token has to be able to replace them between attempts
 /// without rebuilding the transport.
-public final class HTTPCodexCompactionTransport: CodexCompactionTransport, @unchecked Sendable {
+public final class HTTPCodexCompactionTransport: CodexUnaryCompactionTransport, @unchecked Sendable {
     private let transport: any HTTPTransport
     private let baseURL: String
     private let model: String
+    private let queryParams: [String: String]
+    private let cacheAffinityID: String?
+    private let requestPolicy: ResponsesRequestPolicy
     private let lock = NSLock()
     private var headers: [String: String]
 
@@ -37,12 +40,18 @@ public final class HTTPCodexCompactionTransport: CodexCompactionTransport, @unch
         transport: any HTTPTransport,
         baseURL: String,
         model: String,
-        headers: [String: String]
+        headers: [String: String],
+        queryParams: [String: String] = [:],
+        cacheAffinityID: String? = nil,
+        requestPolicy: ResponsesRequestPolicy = ResponsesRequestPolicy()
     ) {
         self.transport = transport
         self.baseURL = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         self.model = model
         self.headers = headers
+        self.queryParams = queryParams
+        self.cacheAffinityID = cacheAffinityID
+        self.requestPolicy = requestPolicy
     }
 
     /// Swap in refreshed credentials after a 401, without losing the rest of
@@ -65,25 +74,12 @@ public final class HTTPCodexCompactionTransport: CodexCompactionTransport, @unch
         _ request: CodexCompactionRequest,
         onEvent: @Sendable (CodexCompactionStreamEvent) async throws -> Void
     ) async throws {
-        guard let url = URL(string: baseURL + request.endpointPath) else {
-            throw CodexCompactionTransportError.transport("invalid Codex endpoint: \(baseURL)\(request.endpointPath)")
+        guard request.protocolVersion == .remoteV2 else {
+            throw CodexCompactionTransportError.transport(
+                "legacy Codex compaction requires the unary response transport"
+            )
         }
-
-        var wireHeaders = currentHeaders()
-        wireHeaders["Content-Type"] = "application/json"
-        wireHeaders["Accept"] = "text/event-stream, application/json"
-        for header in request.headers {
-            wireHeaders[header.name] = header.value
-        }
-
-        let body = try encodeBody(request)
-        let httpRequest = HTTPRequest(
-            method: .post,
-            url: url,
-            headers: wireHeaders,
-            body: body,
-            idempotency: .nonIdempotent
-        )
+        let httpRequest = try makeRequest(request)
 
         var status = 0
         var sawMetadata = false
@@ -124,16 +120,128 @@ public final class HTTPCodexCompactionTransport: CodexCompactionTransport, @unch
         guard sawMetadata else {
             throw CodexCompactionTransportError.transport("no response headers from the Codex compaction endpoint")
         }
-        guard (200..<300).contains(status) else {
-            let message = Self.errorMessage(from: errorBody)
-            if status == 401 || status == 403 {
-                throw CodexCompactionTransportError.authentication(status: status)
-            }
-            throw CodexCompactionTransportError.http(status: status, message: message)
+        try Self.validateResponse(status: status, body: errorBody)
+    }
+
+    public func compactLegacy(_ request: CodexCompactionRequest) async throws -> [ConversationItem] {
+        guard request.protocolVersion == .legacyUnary else {
+            throw CodexCompactionTransportError.transport(
+                "streaming Codex compaction cannot use the unary response transport"
+            )
         }
+
+        let response = try await transport.send(makeRequest(request))
+        try Self.validateResponse(status: response.metadata.statusCode, body: response.body)
+
+        let value: JSONValue
+        do {
+            value = try JSONDecoder().decode(JSONValue.self, from: response.body)
+        } catch {
+            throw CodexCompactionTransportError.transport(
+                "could not decode the Codex compact response: \(error)"
+            )
+        }
+        guard let output = value["output"]?.arrayValue,
+              let history = codexCompactOutputToConversationItems(output),
+              !history.isEmpty
+        else {
+            throw CodexCompactionTransportError.transport(
+                "Codex compact response contained no replacement history"
+            )
+        }
+        return history
+    }
+
+    private static func validateResponse(status: Int, body: Data) throws {
+        guard !(200..<300).contains(status) else { return }
+        let message = Self.errorMessage(from: body)
+        if status == 401 || status == 403 {
+            throw CodexCompactionTransportError.authentication(status: status)
+        }
+        throw CodexCompactionTransportError.http(status: status, message: message)
+    }
+
+    private func makeRequest(_ request: CodexCompactionRequest) throws -> HTTPRequest {
+        let basePath = URL(string: baseURL)?.path
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
+        let endpointPrefix = basePath.isEmpty ? "/v1" : ""
+        guard let endpoint = URL(string: baseURL + endpointPrefix + request.endpointPath) else {
+            throw CodexCompactionTransportError.transport("invalid Codex endpoint: \(baseURL)\(request.endpointPath)")
+        }
+        var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
+        if !queryParams.isEmpty {
+            var items = components?.queryItems ?? []
+            items.append(contentsOf: queryParams.keys.sorted().compactMap { name in
+                queryParams[name].map { URLQueryItem(name: name, value: $0) }
+            })
+            components?.queryItems = items
+        }
+        guard let url = components?.url else {
+            throw CodexCompactionTransportError.transport("invalid Codex endpoint query parameters")
+        }
+
+        var wireHeaders = currentHeaders()
+        let adapter = providerAdapter(.codex)
+        adapter.sanitizeHeaders(&wireHeaders)
+        wireHeaders = wireHeaders.filter { name, _ in
+            let normalized = name.lowercased()
+            return normalized != X_CODEX_TURN_METADATA_HEADER
+                && normalized != CODEX_SESSION_ID_HEADER
+                && normalized != CODEX_THREAD_ID_HEADER
+                && normalized != CODEX_CLIENT_REQUEST_ID_HEADER
+        }
+        adapter.applySessionAffinityHeaders(
+            &wireHeaders,
+            sessionId: cacheAffinityID ?? requestPolicy.sessionID
+        )
+        wireHeaders["Content-Type"] = "application/json"
+        wireHeaders["Accept"] = request.protocolVersion == .remoteV2
+            ? "text/event-stream"
+            : "application/json"
+        for header in request.headers {
+            if header.name.lowercased() == "x-codex-beta-features" {
+                Self.mergeBetaFeature(header.value, into: &wireHeaders)
+            } else {
+                wireHeaders[header.name] = header.value
+            }
+        }
+
+        let projected = try projectBody(request)
+        if let metadata = projected["client_metadata"]?[X_CODEX_TURN_METADATA_HEADER]?.stringValue {
+            wireHeaders[X_CODEX_TURN_METADATA_HEADER] = metadata
+        }
+
+        return HTTPRequest(
+            method: .post,
+            url: url,
+            headers: wireHeaders,
+            body: try encodeProjectedBody(projected),
+            idempotency: .nonIdempotent
+        )
+    }
+
+    private static func mergeBetaFeature(_ feature: String, into headers: inout [String: String]) {
+        let matchingNames = headers.keys.filter { $0.lowercased() == "x-codex-beta-features" }
+        var features: [String] = []
+        for name in matchingNames {
+            if let value = headers.removeValue(forKey: name) {
+                for component in value.split(separator: ",") {
+                    let trimmed = component.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty && !features.contains(trimmed) {
+                        features.append(trimmed)
+                    }
+                }
+            }
+        }
+        if !features.contains(feature) { features.append(feature) }
+        headers["x-codex-beta-features"] = features.joined(separator: ",")
     }
 
     func encodeBody(_ request: CodexCompactionRequest) throws -> Data {
+        try encodeProjectedBody(projectBody(request))
+    }
+
+    private func projectBody(_ request: CodexCompactionRequest) throws -> JSONValue {
         // The history must go on the wire in the Responses shape, not in
         // `ConversationItem`'s own Codable form — that encoding is the on-disk
         // session format, and the two are not the same. Reusing the sampler's
@@ -142,28 +250,58 @@ public final class HTTPCodexCompactionTransport: CodexCompactionTransport, @unch
         // validates the compaction against the same conversation it would
         // sample from.
         let projected = projectResponsesRequestBody(
-            ConversationRequest(items: request.input, model: model),
+            ConversationRequest(
+                items: request.input,
+                model: model,
+                xGrokSessionId: cacheAffinityID ?? requestPolicy.sessionID,
+                xGrokTurnIdx: requestPolicy.turnID,
+                reasoningEffort: requestPolicy.localEffort,
+                serviceTier: request.serviceTier
+            ),
             model: model,
-            policy: ResponsesRequestPolicy(),
-            adapter: providerAdapter(.codex)
+            policy: requestPolicy,
+            adapter: providerAdapter(.codex),
+            applyResponseDefaults: request.protocolVersion == .remoteV2
         )
         guard case .object(var body) = projected else {
             throw CodexCompactionTransportError.transport("could not project the Codex compaction input")
         }
 
-        // The compaction-specific fields the projection knows nothing about.
-        body["stream"] = .bool(true)
-        body["compaction_trigger"] = .bool(request.compactionTrigger)
-        if let hash = request.compactionHash { body["comp_hash"] = .string(hash) }
+        body["parallel_tool_calls"] = .bool(true)
         if let instructions = request.instructions { body["instructions"] = .string(instructions) }
-        if let turnState = request.turnState { body["turn_state"] = .string(turnState) }
-        if let tier = request.serviceTier { body["service_tier"] = .string(tier) }
         if let cacheKey = request.promptCacheKey { body["prompt_cache_key"] = .string(cacheKey) }
         if !request.tools.isEmpty { body["tools"] = .array(request.tools) }
         if let reasoning = request.reasoning { body["reasoning"] = reasoning }
 
+        let allowedFields: Set<String>
+        switch request.protocolVersion {
+        case .remoteV2:
+            body["store"] = .bool(false)
+            body["stream"] = .bool(true)
+            if body["tool_choice"] == nil || body["tool_choice"] == .null {
+                body["tool_choice"] = .string("auto")
+            }
+            var input = body["input"]?.arrayValue ?? []
+            input.append(.object(["type": .string("compaction_trigger")]))
+            body["input"] = .array(input)
+            allowedFields = [
+                "model", "input", "instructions", "tools", "tool_choice",
+                "parallel_tool_calls", "reasoning", "service_tier", "prompt_cache_key",
+                "text", "include", "store", "stream", "client_metadata",
+            ]
+        case .legacyUnary:
+            allowedFields = [
+                "model", "input", "instructions", "tools", "parallel_tool_calls",
+                "reasoning", "service_tier", "prompt_cache_key", "text", "client_metadata",
+            ]
+        }
+        body = body.filter { allowedFields.contains($0.key) }
+        return .object(body)
+    }
+
+    private func encodeProjectedBody(_ body: JSONValue) throws -> Data {
         do {
-            return try WireJSONEncoder.make().encode(JSONValue.object(body))
+            return try WireJSONEncoder.make().encode(body)
         } catch {
             throw CodexCompactionTransportError.transport(
                 "could not encode the Codex compaction request: \(error)"

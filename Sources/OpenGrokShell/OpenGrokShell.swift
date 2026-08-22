@@ -662,10 +662,27 @@ public actor ProviderBackedACPPromptDriver: ACPPromptDriver {
             meta?["structuredOutputError"] = .string(structuredOutputError)
         }
         return PromptResponse(
-            stopReason: result.cancelled ? .cancelled : .endTurn,
+            stopReason: Self.stopReason(for: result),
             userMessageId: context.request.messageId ?? turnID,
             meta: meta
         )
+    }
+
+    static func stopReason(for result: OpenGrokShellTurnResult) -> OpenGrokACP.StopReason {
+        guard !result.cancelled else { return .cancelled }
+
+        switch result.stopReason?.lowercased() {
+        case "max_tokens", "max_output_tokens", "max_tokens_truncation", "length":
+            return .maxTokens
+        case "max_turn_requests":
+            return .maxTurnRequests
+        case "max_turns_reached", "cancelled", "canceled":
+            return .cancelled
+        case "refusal", "content_filter", "content_filtered":
+            return .refusal
+        default:
+            return .endTurn
+        }
     }
 
     public func cancel(sessionId: AcpSessionId) async {
@@ -827,6 +844,7 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         var summary: SessionSummary
         var phase: SessionLifecyclePhase
         var chatHistory: [JSONValue]
+        var persistedState: PersistedSessionState
         var activeTurnID: String?
     }
 
@@ -837,6 +855,7 @@ public actor OpenGrokShell: OpenGrokShellFacade {
     private var sessions: [SessionID: ManagedSession] = [:]
     private var turnTasks: [OpenGrokShellTurnKey: Task<Void, Never>] = [:]
     private var turnCommands: [OpenGrokShellTurnKey: String] = [:]
+    private var turnPromptIDs: [OpenGrokShellTurnKey: String] = [:]
     private var requestedCancellations: Set<OpenGrokShellTurnKey> = []
     private var cancellableTurns: Set<OpenGrokShellTurnKey> = []
     private var turnOutcomes: [OpenGrokShellTurnKey: OpenGrokShellTurnOutcome] = [:]
@@ -888,6 +907,18 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         guard sessions[request.sessionID] == nil else {
             throw OpenGrokShellError.duplicateSession(request.sessionID.rawValue)
         }
+        let restoredState: PersistedSessionState?
+        if request.restorePersistedState {
+            restoredState = try SessionDocumentStore(grokHome: configuration.openGrokHome).load(
+                sessionID: request.sessionID.rawValue,
+                cwd: request.cwd.path
+            )
+            if let restoredState, restoredState.summary.sessionID != request.sessionID {
+                throw OpenGrokShellError.invalidSessionID(restoredState.summary.sessionID.rawValue)
+            }
+        } else {
+            restoredState = nil
+        }
         let workspace = try configuration.workspaceFactory.makeWorkspace(
             sessionID: request.sessionID,
             cwd: request.cwd,
@@ -908,7 +939,7 @@ public actor OpenGrokShell: OpenGrokShellFacade {
             extensionHandler: nil
         )
         let now = configuration.now()
-        let summary = SessionSummary(
+        var summary = restoredState?.summary ?? SessionSummary(
             sessionID: request.sessionID,
             cwd: request.cwd.path,
             createdAt: now,
@@ -917,6 +948,11 @@ public actor OpenGrokShell: OpenGrokShellFacade {
             everUsedCodex: providerSnapshot.everUsedNonXAI,
             sessionKind: "shell"
         )
+        summary.cwd = request.cwd.path
+        summary.currentModelID = providerSnapshot.modelID
+        summary.everUsedCodex = summary.everUsedCodex || providerSnapshot.everUsedNonXAI
+        var persistedState = restoredState ?? PersistedSessionState(summary: summary)
+        persistedState.summary = summary
         let managed = ManagedSession(
             request: request,
             workspace: workspace,
@@ -925,27 +961,34 @@ public actor OpenGrokShell: OpenGrokShellFacade {
             mailbox: mailbox,
             summary: summary,
             phase: .idle,
-            chatHistory: [],
+            chatHistory: persistedState.chatHistory,
+            persistedState: persistedState,
             activeTurnID: nil
         )
         let acpSnapshot = ACPSessionSnapshot(
             sessionId: AcpSessionId(request.sessionID.rawValue),
             cwd: request.cwd.path,
             modelId: ModelId(providerSnapshot.modelID),
-            createdAt: timestamp(now),
-            updatedAt: timestamp(now)
+            createdAt: timestamp(summary.createdAt),
+            updatedAt: timestamp(summary.updatedAt)
         )
         try await acp.store.create(acpSnapshot)
         sessions[request.sessionID] = managed
-        try await persistSession(request.sessionID)
-        try await configuration.activeSessionRegistry.register(
-            ActiveSessionRecord(
-                sessionID: request.sessionID,
-                pid: configuration.processID,
-                cwd: request.cwd.path,
-                openedAt: now
+        do {
+            try await persistSession(request.sessionID)
+            try await configuration.activeSessionRegistry.register(
+                ActiveSessionRecord(
+                    sessionID: request.sessionID,
+                    pid: configuration.processID,
+                    cwd: request.cwd.path,
+                    openedAt: now
+                )
             )
-        )
+        } catch {
+            sessions.removeValue(forKey: request.sessionID)
+            await acp.runtime.close()
+            throw error
+        }
         let descriptor = await descriptor(for: managed)
         await eventHub.emit(.sessionCreated(descriptor))
         return descriptor
@@ -972,8 +1015,10 @@ public actor OpenGrokShell: OpenGrokShellFacade {
 
     public func submitTurn(sessionID: SessionID, request: OpenGrokShellTurnRequest) async throws -> OpenGrokShellTurnHandle {
         try requireRunning()
-        guard !request.promptID.isEmpty, !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw OpenGrokShellError.invalidTurnRequest("prompt id and text are required")
+        guard !request.promptID.isEmpty,
+              !request.turnID.isEmpty,
+              !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw OpenGrokShellError.invalidTurnRequest("prompt id, turn id, and text are required")
         }
         guard var session = sessions[sessionID] else {
             throw OpenGrokShellError.sessionNotFound(sessionID.rawValue)
@@ -981,31 +1026,67 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         guard session.activeTurnID == nil else {
             throw OpenGrokShellError.turnAlreadyActive(session.activeTurnID ?? request.turnID)
         }
+        let handle = OpenGrokShellTurnHandle(sessionID: sessionID, turnID: request.turnID)
+        let key = OpenGrokShellTurnKey(handle)
+        guard turnTasks[key] == nil, turnOutcomes[key] == nil else {
+            throw OpenGrokShellError.invalidTurnRequest("turn id has already been used: \(request.turnID)")
+        }
+        let previousSession = session
         let command = try await session.mailbox.enqueue(
             .prompt(promptID: request.promptID, text: request.text),
             owner: .client,
             issuedAtMS: milliseconds(configuration.now())
         )
-        guard try await session.mailbox.claimNext(by: "shell") != nil else {
+        guard try await session.mailbox.claimNext(by: "shell")?.commandID == command.commandID else {
             throw OpenGrokShellError.turnAlreadyActive(request.turnID)
         }
         session.activeTurnID = request.turnID
         session.phase = .sampling
-        session.summary.messageCount &+= 1
         session.summary.chatMessageCount &+= 1
         session.summary.updatedAt = configuration.now()
         session.chatHistory.append(.object([
-            "role": .string("user"),
-            "text": .string(request.text),
-            "prompt_id": .string(request.promptID)
+            "type": .string("user"),
+            "content": .array([
+                .object([
+                    "type": .string("text"),
+                    "text": .string(request.text)
+                ])
+            ])
         ]))
-        sessions[sessionID] = session
-        let handle = OpenGrokShellTurnHandle(sessionID: sessionID, turnID: request.turnID)
-        let key = OpenGrokShellTurnKey(handle)
+        do {
+            try appendPersistedUpdate(
+                .acp(.object([
+                    "sessionId": .string(sessionID.rawValue),
+                    "update": .object([
+                        "sessionUpdate": .string("user_message_chunk"),
+                        "content": .object([
+                            "type": .string("text"),
+                            "text": .string(request.text)
+                        ])
+                    ])
+                ])),
+                transcriptEvent: .userTextChunk(text: request.text, promptIndex: nil),
+                to: &session
+            )
+            sessions[sessionID] = session
+            try await persistSession(sessionID)
+        } catch {
+            sessions[sessionID] = previousSession
+            do {
+                guard try await session.mailbox.cancel(commandID: command.commandID, by: "shell") else {
+                    throw OpenGrokShellError.turnFailed("could not roll back unpersisted turn \(request.turnID)")
+                }
+            } catch let rollbackError {
+                throw OpenGrokShellError.turnFailed(
+                    "failed to persist turn \(request.turnID): \(error); rollback failed: \(rollbackError)"
+                )
+            }
+            throw error
+        }
         turnCommands[key] = command.commandID
+        turnPromptIDs[key] = request.promptID
         await eventHub.emit(.turnAccepted(handle))
         await eventHub.emit(.turnStarted(handle))
-        try? await persistSession(sessionID)
 
         let provider = session.providerSession
         let driver = configuration.turnDriver
@@ -1016,7 +1097,11 @@ public actor OpenGrokShell: OpenGrokShellFacade {
                 let result = try await driver.submit(providerSession: observed, request: request) { update in
                     await shell.receive(update: update, for: handle)
                 }
-                await shell.finishTurn(handle: handle, commandID: command.commandID, outcome: .completed(result))
+                await shell.finishTurn(
+                    handle: handle,
+                    commandID: command.commandID,
+                    outcome: result.cancelled ? .cancelled : .completed(result)
+                )
             } catch is CancellationError {
                 await shell.finishTurn(handle: handle, commandID: command.commandID, outcome: .cancelled)
             } catch {
@@ -1131,6 +1216,7 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         }
         turnTasks.removeAll()
         turnCommands.removeAll()
+        turnPromptIDs.removeAll()
         requestedCancellations.removeAll()
         cancellableTurns.removeAll()
         turnUpdateSequences.removeAll()
@@ -1165,7 +1251,55 @@ public actor OpenGrokShell: OpenGrokShellFacade {
 
     private func receive(update: OpenGrokShellTurnUpdateKind, for handle: OpenGrokShellTurnHandle) async {
         let key = OpenGrokShellTurnKey(handle)
-        guard turnTasks[key] != nil else { return }
+        guard turnTasks[key] != nil,
+              var session = sessions[handle.sessionID],
+              session.activeTurnID == handle.turnID else { return }
+        do {
+            switch update {
+            case let .assistantText(text):
+                try appendPersistedUpdate(
+                    .acp(.object([
+                        "sessionId": .string(handle.sessionID.rawValue),
+                        "update": .object([
+                            "sessionUpdate": .string("agent_message_chunk"),
+                            "content": .object([
+                                "type": .string("text"),
+                                "text": .string(text)
+                            ])
+                        ])
+                    ])),
+                    transcriptEvent: .assistantTextChunk(text: text),
+                    to: &session
+                )
+            case let .reasoning(text):
+                try appendPersistedUpdate(
+                    .acp(.object([
+                        "sessionId": .string(handle.sessionID.rawValue),
+                        "update": .object([
+                            "sessionUpdate": .string("agent_thought_chunk"),
+                            "content": .object([
+                                "type": .string("text"),
+                                "text": .string(text)
+                            ])
+                        ])
+                    ])),
+                    transcriptEvent: nil,
+                    to: &session
+                )
+            default:
+                break
+            }
+            sessions[handle.sessionID] = session
+        } catch {
+            guard let commandID = turnCommands[key] else { return }
+            turnTasks[key]?.cancel()
+            await finishTurn(
+                handle: handle,
+                commandID: commandID,
+                outcome: .failed("failed to record turn update: \(error)")
+            )
+            return
+        }
         let sequence = nextUpdateSequence(for: key)
         await eventHub.emit(.turnUpdate(OpenGrokShellTurnUpdate(turnID: handle.turnID, sequence: sequence, kind: update)))
     }
@@ -1180,34 +1314,119 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         cancellableTurns.insert(key)
         guard var session = sessions[handle.sessionID], session.activeTurnID == handle.turnID else { return }
         let wasCancelled = requestedCancellations.remove(key) != nil
-        turnTasks.removeValue(forKey: key)
-        turnCommands.removeValue(forKey: key)
-        turnUpdateSequences.removeValue(forKey: key)
+        session.summary.updatedAt = configuration.now()
+        let promptID = turnPromptIDs[key] ?? handle.turnID
+        let requestedOutcome: OpenGrokShellTurnOutcome = wasCancelled ? .cancelled : outcome
+        let terminalOutcome: OpenGrokShellTurnOutcome
+
+        do {
+            let stopReason: String
+            let agentResult: String?
+            let transcriptEvent: SessionTranscriptEvent
+
+            switch requestedOutcome {
+            case let .completed(result):
+                if !result.output.isEmpty {
+                    session.chatHistory.append(.object([
+                        "type": .string("assistant"),
+                        "content": .string(result.output)
+                    ]))
+                    session.summary.chatMessageCount &+= 1
+                }
+                try await session.mailbox.complete(commandID: commandID, by: "shell")
+                stopReason = ProviderBackedACPPromptDriver.stopReason(for: result).rawValue
+                agentResult = nil
+                transcriptEvent = .turnCompleted(kind: .completed)
+            case .cancelled:
+                guard try await session.mailbox.cancel(commandID: commandID, by: "shell") else {
+                    throw OpenGrokShellError.turnFailed("turn cancellation did not own command \(commandID)")
+                }
+                stopReason = "cancelled"
+                agentResult = nil
+                transcriptEvent = .turnCompleted(kind: .cancelled(category: nil, context: nil))
+            case let .failed(message):
+                try await session.mailbox.complete(commandID: commandID, by: "shell")
+                stopReason = "error"
+                agentResult = message
+                transcriptEvent = .custom(name: "turn_failed", payload: .string(message))
+            }
+
+            var update: [String: JSONValue] = [
+                "sessionUpdate": .string("turn_completed"),
+                "prompt_id": .string(promptID),
+                "stop_reason": .string(stopReason)
+            ]
+            if let agentResult {
+                update["agent_result"] = .string(agentResult)
+            }
+            try appendPersistedUpdate(
+                .xai(.object([
+                    "sessionId": .string(handle.sessionID.rawValue),
+                    "update": .object(update)
+                ])),
+                transcriptEvent: transcriptEvent,
+                to: &session
+            )
+            sessions[handle.sessionID] = session
+            try await persistSession(handle.sessionID)
+            guard let terminalUpdate = session.persistedState.updates.last else {
+                throw OpenGrokShellError.turnFailed("durable terminal was not recorded for \(handle.turnID)")
+            }
+            try appendCanonicalTerminalIfPublished(
+                terminalUpdate,
+                sessionID: handle.sessionID,
+                cwd: session.summary.cwd
+            )
+            terminalOutcome = requestedOutcome
+        } catch {
+            terminalOutcome = .failed("failed to durably complete turn \(handle.turnID): \(error)")
+        }
+
         session.activeTurnID = nil
         session.phase = .idle
-        session.summary.updatedAt = configuration.now()
         sessions[handle.sessionID] = session
-        if wasCancelled {
-            turnOutcomes[key] = .cancelled
-            _ = try? await session.mailbox.cancel(commandID: commandID, by: "shell")
+        turnTasks.removeValue(forKey: key)
+        turnCommands.removeValue(forKey: key)
+        turnPromptIDs.removeValue(forKey: key)
+        turnUpdateSequences.removeValue(forKey: key)
+        turnOutcomes[key] = terminalOutcome
+
+        switch terminalOutcome {
+        case let .completed(result):
+            await eventHub.emit(.turnCompleted(result))
+        case .cancelled:
             await eventHub.emit(.turnCancelled(handle))
-        } else {
-            switch outcome {
-            case let .completed(result):
-                turnOutcomes[key] = .completed(result)
-                try? await session.mailbox.complete(commandID: commandID, by: "shell")
-                await eventHub.emit(.turnCompleted(result))
-            case .cancelled:
-                turnOutcomes[key] = .cancelled
-                _ = try? await session.mailbox.cancel(commandID: commandID, by: "shell")
-                await eventHub.emit(.turnCancelled(handle))
-            case let .failed(message):
-                turnOutcomes[key] = .failed(message)
-                try? await session.mailbox.complete(commandID: commandID, by: "shell")
-                await eventHub.emit(.turnFailed(handle, message: message))
-            }
+        case let .failed(message):
+            await eventHub.emit(.turnFailed(handle, message: message))
         }
-        try? await persistSession(handle.sessionID)
+    }
+
+    private func appendPersistedUpdate(
+        _ update: OpenGrokShellSessionSupport.SessionUpdate,
+        transcriptEvent: SessionTranscriptEvent?,
+        to session: inout ManagedSession
+    ) throws {
+        let timestampMS = milliseconds(configuration.now())
+        session.persistedState.updates.append(try update.envelope(timestamp: timestampMS / 1_000))
+        if let transcriptEvent {
+            session.persistedState.transcript = session.persistedState.transcript.appending(
+                event: transcriptEvent,
+                timestampMS: timestampMS
+            )
+        }
+        session.summary.messageCount &+= 1
+    }
+
+    private func appendCanonicalTerminalIfPublished(
+        _ update: SessionUpdateEnvelope,
+        sessionID: SessionID,
+        cwd: String
+    ) throws {
+        let store = SessionDocumentStore(grokHome: configuration.openGrokHome)
+        let directory = try store.sessionDirectory(sessionID: sessionID.rawValue, cwd: cwd)
+        let summary = directory.appendingPathComponent(SessionDocumentStore.summaryFileName)
+        guard FileManager.default.fileExists(atPath: summary.path) else { return }
+        try store.appendUpdate(update, sessionID: sessionID.rawValue, cwd: cwd)
     }
 
     private func descriptor(for session: ManagedSession) async -> OpenGrokShellSessionDescriptor {
@@ -1226,11 +1445,10 @@ public actor OpenGrokShell: OpenGrokShellFacade {
     private func persistSession(_ sessionID: SessionID) async throws {
         guard let session = sessions[sessionID] else { return }
         let mailbox = await session.mailbox.snapshot()
-        let state = PersistedSessionState(
-            summary: session.summary,
-            chatHistory: session.chatHistory,
-            pendingCommands: mailbox.queued + (mailbox.inFlight.map { [$0] } ?? [])
-        )
+        var state = session.persistedState
+        state.summary = session.summary
+        state.chatHistory = session.chatHistory
+        state.pendingCommands = mailbox.queued + (mailbox.inFlight.map { [$0] } ?? [])
         try await configuration.sessionStateStore.save(state)
     }
 

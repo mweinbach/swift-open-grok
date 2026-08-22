@@ -42,6 +42,7 @@ public func streamChatCompletions(
             var reasoningAcc = ""
             // index → (id, name, arguments)
             var toolCallAcc: [UInt32: (String, String, String)] = [:]
+            var argumentsCompleteEmitted: Set<UInt32> = []
 
             var chunkIndex: UInt64 = 0
             var messageChunkCount: UInt64 = 0
@@ -102,12 +103,14 @@ public func streamChatCompletions(
                 }
 
                 var chunkHasContent = false
+                var finishSeen = false
 
                 for choice in chunk.choices {
                     firstChoiceSeen = true
                     if let fr = choice.finishReason {
                         finishReason = StopReason(from: fr)
                         chunkHasContent = true
+                        finishSeen = true
                     }
 
                     let delta = choice.delta
@@ -130,7 +133,8 @@ public func streamChatCompletions(
                         ))
                     }
 
-                    if let thought = delta.reasoningContent, !thought.isEmpty {
+                    let thought = delta.reasoningText
+                    if !thought.isEmpty {
                         if !firstTokenEmitted {
                             firstTokenEmitted = true
                             continuation.yield(.firstToken(requestId: requestId))
@@ -148,6 +152,17 @@ public func streamChatCompletions(
 
                     for tcDelta in delta.toolCalls {
                         chunkHasContent = true
+                        for earlierIndex in toolCallAcc.keys.sorted() where earlierIndex < tcDelta.index {
+                            guard argumentsCompleteEmitted.insert(earlierIndex).inserted,
+                                  let (id, name, _) = toolCallAcc[earlierIndex]
+                            else { continue }
+                            continuation.yield(.toolCallArgumentsComplete(
+                                requestId: requestId,
+                                toolIndex: earlierIndex,
+                                id: id,
+                                name: name
+                            ))
+                        }
                         var entry = toolCallAcc[tcDelta.index] ?? ("", "", "")
                         var idForEvent: String?
                         var nameForEvent: String?
@@ -178,6 +193,20 @@ public func streamChatCompletions(
                     }
                 }
 
+                if finishSeen {
+                    for index in toolCallAcc.keys.sorted() {
+                        guard argumentsCompleteEmitted.insert(index).inserted,
+                              let (id, name, _) = toolCallAcc[index]
+                        else { continue }
+                        continuation.yield(.toolCallArgumentsComplete(
+                            requestId: requestId,
+                            toolIndex: index,
+                            id: id,
+                            name: name
+                        ))
+                    }
+                }
+
                 if chunkHasContent {
                     lastContentChunkAt = .now
                 } else if remainingIdleTimeout(since: lastContentChunkAt, limit: idleTimeout) == nil {
@@ -186,6 +215,18 @@ public func streamChatCompletions(
                     continuation.finish()
                     return
                 }
+            }
+
+            for index in toolCallAcc.keys.sorted() {
+                guard argumentsCompleteEmitted.insert(index).inserted,
+                      let (id, name, _) = toolCallAcc[index]
+                else { continue }
+                continuation.yield(.toolCallArgumentsComplete(
+                    requestId: requestId,
+                    toolIndex: index,
+                    id: id,
+                    name: name
+                ))
             }
 
             let toolCalls: [ToolCall] = toolCallAcc.keys.sorted().compactMap { idx in
@@ -200,6 +241,12 @@ public func streamChatCompletions(
             var items: [ConversationItem] = []
             if firstChoiceSeen {
                 if !reasoningAcc.isEmpty {
+                    if usage?.reasoningTokens == 0 {
+                        let characterCount = reasoningAcc.unicodeScalars.count
+                        usage?.reasoningTokens = UInt32(clamping:
+                            characterCount / 4 + (characterCount.isMultiple(of: 4) ? 0 : 1)
+                        )
+                    }
                     items.append(.reasoning(synthesizedReasoningItem(reasoningAcc)))
                 }
                 items.append(.assistant(AssistantItem(

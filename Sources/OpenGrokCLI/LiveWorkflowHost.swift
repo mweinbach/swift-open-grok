@@ -29,7 +29,7 @@ actor LiveWorkflowHost: RhaiWorkflowHost {
     /// Slots handed out but not yet returned, plus slots already spent. Both
     /// count against `agentBudget`; `reserved` is what makes a `parallel()`
     /// fan-out fail *before* any agent runs rather than half way through.
-    private var spent: UInt64 = 0
+    private var spent: UInt64
     private var reserved: UInt64 = 0
     private var tokensUsed: UInt64 = 0
     private var agentSequence: UInt64 = 0
@@ -54,6 +54,7 @@ actor LiveWorkflowHost: RhaiWorkflowHost {
         self.concurrency = max(1, maxConcurrentAgents)
         self.maxConcurrentAgents = max(1, maxConcurrentAgents)
         self.gitDiff = gitDiff
+        self.spent = context.priorAgentsUsed
     }
 
     // MARK: - Budget

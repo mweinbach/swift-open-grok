@@ -4,8 +4,10 @@
 // Port of `crates/codegen/xai-grok-shell/src/session/storage/relocation/fs.rs`.
 
 import Foundation
+import OpenGrokConfig
 import OpenGrokPaths
 import OpenGrokFileUtils
+import OpenGrokShared
 
 #if canImport(Darwin)
 import Darwin
@@ -58,41 +60,13 @@ public enum RelocationFS: Sendable {
 
     // MARK: - CWD Encoding
 
-    /// Max bytes for a single directory name component.
-    private static let maxDirnameBytes = 255
-
     /// Encode a CWD string into a filesystem-safe directory name component.
     public static func encodeCwdDirname(_ cwd: String) -> String {
-        let urlEncoded = urlEncodePath(cwd)
-        if urlEncoded.utf8.count <= maxDirnameBytes {
-            return urlEncoded
-        }
-        // Fallback for long paths: slug + hash
-        let leaf = URL(fileURLWithPath: cwd).lastPathComponent
-        var slug = slugify(leaf, maxLen: 40)
-        if slug.isEmpty { slug = "workspace" }
-        let hashHex = String(format: "%016llx", UInt64(abs(cwd.hashValue)))
-        return "\(slug)-\(hashHex)"
+        OpenGrokConfig.encodeCwdDirname(cwd)
     }
 
     public static func urlEncodePath(_ s: String) -> String {
         OpenGrokPaths.urlEncodePath(s)
-    }
-
-    private static func slugify(_ input: String, maxLen: Int) -> String {
-        var result = ""
-        var prevDash = false
-        for c in input.lowercased() {
-            if c.isASCII && (c.isLetter || c.isNumber) {
-                result.append(c)
-                prevDash = false
-            } else if !prevDash {
-                result.append("-")
-                prevDash = true
-            }
-        }
-        let trimmed = result.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        return String(trimmed.prefix(maxLen))
     }
 
     // MARK: - Validation
@@ -220,10 +194,7 @@ public enum RelocationFS: Sendable {
             #endif
             try syncFile(tempURL)
 
-            if FileManager.default.fileExists(atPath: path.path) {
-                _ = try? FileManager.default.removeItem(at: path)
-            }
-            try FileManager.default.moveItem(at: tempURL, to: path)
+            try atomicallyReplaceItem(at: path, with: tempURL)
             try? syncFile(path)
             try? syncDirectory(parent)
         } catch {

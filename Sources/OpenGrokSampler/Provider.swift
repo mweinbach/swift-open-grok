@@ -15,6 +15,7 @@ public let X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state"
 public let CODEX_SESSION_ID_HEADER = "session-id"
 public let CODEX_THREAD_ID_HEADER = "thread-id"
 public let CODEX_CLIENT_REQUEST_ID_HEADER = "x-client-request-id"
+public let X_CODEX_TURN_METADATA_HEADER = "x-codex-turn-metadata"
 
 public let MULTI_AGENT_MODE_OPEN_TAG = "<multi_agent_mode>"
 public let MULTI_AGENT_MODE_CLOSE_TAG = "</multi_agent_mode>"
@@ -30,15 +31,24 @@ public struct ResponsesRequestPolicy: Sendable, Equatable {
     public var multiAgentV2: Bool
     public var localEffort: ReasoningEffort?
     public var reasoningSummary: ReasoningSummary?
+    public var codexPermissions: CodexPermissions?
+    public var sessionID: String?
+    public var turnID: String?
 
     public init(
         multiAgentV2: Bool = false,
         localEffort: ReasoningEffort? = nil,
-        reasoningSummary: ReasoningSummary? = nil
+        reasoningSummary: ReasoningSummary? = nil,
+        codexPermissions: CodexPermissions? = nil,
+        sessionID: String? = nil,
+        turnID: String? = nil
     ) {
         self.multiAgentV2 = multiAgentV2
         self.localEffort = localEffort
         self.reasoningSummary = reasoningSummary
+        self.codexPermissions = codexPermissions
+        self.sessionID = sessionID
+        self.turnID = turnID
     }
 }
 
@@ -52,6 +62,8 @@ public struct ProviderRequestHeaders: Sendable {
     public var agentId: String
     public var deploymentId: String?
     public var userId: String?
+    /// Overrides provider cache-affinity headers, never x-grok telemetry.
+    public var cacheAffinityId: String?
 
     public init(
         convId: String,
@@ -61,7 +73,8 @@ public struct ProviderRequestHeaders: Sendable {
         turnIdx: String? = nil,
         agentId: String,
         deploymentId: String? = nil,
-        userId: String? = nil
+        userId: String? = nil,
+        cacheAffinityId: String? = nil
     ) {
         self.convId = convId
         self.reqId = reqId
@@ -71,6 +84,7 @@ public struct ProviderRequestHeaders: Sendable {
         self.agentId = agentId
         self.deploymentId = deploymentId
         self.userId = userId
+        self.cacheAffinityId = cacheAffinityId
     }
 
     /// Apply x-grok identity headers into a mutable header bag.
@@ -177,7 +191,10 @@ extension ProviderAdapter {
     }
 
     public func applyRequestHeaders(_ headers: inout [String: String], request: ProviderRequestHeaders) {
-        applySessionAffinityHeaders(&headers, sessionId: request.sessionId)
+        applySessionAffinityHeaders(
+            &headers,
+            sessionId: request.cacheAffinityId ?? request.sessionId
+        )
         if profile.requestMetadata == .xGrokHeaders {
             request.applyXGrok(into: &headers)
         }
@@ -635,6 +652,10 @@ func isUnknownTopLevelResponseEvent(error: SamplingError, data: String) -> Bool 
 func patchCodexResponsesRequest(_ body: inout JSONValue, policy: ResponsesRequestPolicy) {
     patchCodexInstructionRoles(&body)
 
+    if let permissions = policy.codexPermissions {
+        patchCodexPermissions(&body, permissions: permissions, policy: policy)
+    }
+
     // Codex sandboxes `web_search` unless the request opts into live access;
     // grant it while leaving an explicit override untouched (provider.rs:
     // 594-607).
@@ -714,6 +735,49 @@ func patchCodexResponsesRequest(_ body: inout JSONValue, policy: ResponsesReques
 
     obj["input"] = .array(input)
     body = .object(obj)
+}
+
+/// Project the same truthful session policy into provider metadata and a
+/// developer instruction, matching `provider.rs:867-955`. Replacing existing
+/// permission instructions makes repeated provider patching idempotent.
+private func patchCodexPermissions(
+    _ body: inout JSONValue,
+    permissions: CodexPermissions,
+    policy: ResponsesRequestPolicy
+) {
+    guard case .object(var object) = body else { return }
+
+    var clientMetadata = object["client_metadata"]?.objectValue ?? [:]
+    clientMetadata[X_CODEX_TURN_METADATA_HEADER] = .string(
+        permissions.turnMetadata(sessionID: policy.sessionID, turnID: policy.turnID)
+    )
+    object["client_metadata"] = .object(clientMetadata)
+
+    guard case .array(var input) = object["input"] else {
+        body = .object(object)
+        return
+    }
+
+    input.removeAll { item in
+        item["role"]?.stringValue == "developer"
+            && responsesMessageText(item)?.contains("<permissions instructions>") == true
+    }
+
+    let instruction: JSONValue = .object([
+        "type": .string("message"),
+        "role": .string("developer"),
+        "content": .array([
+            .object([
+                "type": .string("input_text"),
+                "text": .string(permissions.renderedInstructions),
+            ]),
+        ]),
+    ])
+    let insertionIndex = input.firstIndex { $0["role"]?.stringValue == "user" } ?? input.count
+    input.insert(instruction, at: insertionIndex)
+
+    object["input"] = .array(input)
+    body = .object(object)
 }
 
 /// Fields DeepSeek's stateless Responses endpoint does not support. They are
@@ -881,5 +945,3 @@ private func isMultiAgentModeItem(_ item: JSONValue) -> Bool {
         return false
     }
 }
-
-

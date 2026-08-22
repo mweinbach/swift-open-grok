@@ -27,6 +27,7 @@ import OpenGrokSampler
 import OpenGrokSamplingTypes
 import OpenGrokSandbox
 import OpenGrokScheduler
+import OpenGrokSessionPersistence
 import OpenGrokSessionRuntime
 import OpenGrokShared
 import OpenGrokShell
@@ -49,6 +50,8 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
     var sessionID: String
     var workingDirectory: String
     var parentSessionID: String?
+    var sessionKind: String?
+    var cacheAffinityID: String?
     var createdAt: Date
     var updatedAt: Date
     var items: [ConversationItem]
@@ -71,6 +74,8 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         sessionID: String,
         workingDirectory: String,
         parentSessionID: String?,
+        sessionKind: String? = nil,
+        cacheAffinityID: String? = nil,
         createdAt: Date,
         updatedAt: Date,
         items: [ConversationItem],
@@ -84,6 +89,8 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         self.sessionID = sessionID
         self.workingDirectory = workingDirectory
         self.parentSessionID = parentSessionID
+        self.sessionKind = sessionKind
+        self.cacheAffinityID = cacheAffinityID
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.items = items
@@ -99,6 +106,8 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         case sessionID
         case workingDirectory
         case parentSessionID
+        case sessionKind = "session_kind"
+        case cacheAffinityID = "cache_affinity_id"
         case createdAt
         case updatedAt
         case items
@@ -119,6 +128,8 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         sessionID = try c.decode(String.self, forKey: .sessionID)
         workingDirectory = try c.decode(String.self, forKey: .workingDirectory)
         parentSessionID = try c.decodeIfPresent(String.self, forKey: .parentSessionID)
+        sessionKind = try c.decodeIfPresent(String.self, forKey: .sessionKind)
+        cacheAffinityID = try c.decodeIfPresent(String.self, forKey: .cacheAffinityID)
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         updatedAt = try c.decode(Date.self, forKey: .updatedAt)
         items = try c.decode([ConversationItem].self, forKey: .items)
@@ -135,6 +146,8 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         try c.encode(sessionID, forKey: .sessionID)
         try c.encode(workingDirectory, forKey: .workingDirectory)
         try c.encodeIfPresent(parentSessionID, forKey: .parentSessionID)
+        try c.encodeIfPresent(sessionKind, forKey: .sessionKind)
+        try c.encodeIfPresent(cacheAffinityID, forKey: .cacheAffinityID)
         try c.encode(createdAt, forKey: .createdAt)
         try c.encode(updatedAt, forKey: .updatedAt)
         try c.encode(items, forKey: .items)
@@ -169,12 +182,14 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
 
 actor LiveConversationStore {
     private let sessionsDirectory: URL
+    private let documentStore: SessionDocumentStore
     private let fileManager: FileManager
 
     init(openGrokHome: URL, fileManager: FileManager = .default) {
         self.sessionsDirectory = openGrokHome
             .appendingPathComponent("sessions", isDirectory: true)
             .standardizedFileURL
+        self.documentStore = SessionDocumentStore(grokHome: openGrokHome)
         self.fileManager = fileManager
     }
 
@@ -199,14 +214,28 @@ actor LiveConversationStore {
 
     func loadIfPresent(sessionID: String) throws -> LiveConversationRecord? {
         try Self.validateSessionID(sessionID)
-        let url = fileURL(sessionID: sessionID)
-        guard fileManager.fileExists(atPath: url.path) else { return nil }
         do {
-            let data = try Data(contentsOf: url)
-            let record = try JSONDecoder().decode(LiveConversationRecord.self, from: data)
-            guard record.sessionID == sessionID else {
-                throw CLIApplicationError.failed("session file ID mismatch: \(sessionID)")
+            let persisted = try documentStore.load(sessionID: sessionID)
+            if let persisted,
+               try canonicalSummaryExists(for: persisted.summary)
+            {
+                return try Self.record(from: persisted, requestedSessionID: sessionID)
             }
+
+            let url = fileURL(sessionID: sessionID)
+            if fileManager.fileExists(atPath: url.path) {
+                let data = try Data(contentsOf: url)
+                let record = try JSONDecoder().decode(LiveConversationRecord.self, from: data)
+                guard record.sessionID == sessionID else {
+                    throw CLIApplicationError.failed("session file ID mismatch: \(sessionID)")
+                }
+                try save(record)
+                return record
+            }
+
+            guard let persisted else { return nil }
+            let record = try Self.record(from: persisted, requestedSessionID: sessionID)
+            try save(record)
             return record
         } catch let error as CLIApplicationError {
             throw error
@@ -218,6 +247,19 @@ actor LiveConversationStore {
     func latest(workingDirectory: URL) throws -> LiveConversationRecord? {
         guard fileManager.fileExists(atPath: sessionsDirectory.path) else { return nil }
         let expectedDirectory = workingDirectory.standardizedFileURL.path
+        let canonicalRecords: [LiveConversationRecord]
+        do {
+            canonicalRecords = try documentStore.list(cwd: expectedDirectory).compactMap { summary in
+                guard let state = try documentStore.load(
+                    sessionID: summary.sessionID.rawValue,
+                    cwd: expectedDirectory
+                ) else { return nil }
+                return try Self.record(from: state, requestedSessionID: summary.sessionID.rawValue)
+            }
+        } catch {
+            throw CLIApplicationError.failed("failed to list sessions: \(error)")
+        }
+
         let urls: [URL]
         do {
             urls = try fileManager.contentsOfDirectory(
@@ -229,15 +271,26 @@ actor LiveConversationStore {
             throw CLIApplicationError.failed("failed to list sessions: \(error)")
         }
 
-        return urls
+        let canonicalIDs = Set(canonicalRecords.map(\.sessionID))
+        let legacyRecords = urls
             .filter { $0.pathExtension == "json" }
             .compactMap { url -> LiveConversationRecord? in
                 guard let data = try? Data(contentsOf: url),
                       let record = try? JSONDecoder().decode(LiveConversationRecord.self, from: data),
-                      URL(fileURLWithPath: record.workingDirectory).standardizedFileURL.path == expectedDirectory
+                      URL(fileURLWithPath: record.workingDirectory).standardizedFileURL.path == expectedDirectory,
+                      !canonicalIDs.contains(record.sessionID)
                 else { return nil }
+                if let directory = try? documentStore.sessionDirectory(
+                    sessionID: record.sessionID,
+                    cwd: record.workingDirectory
+                ), fileManager.fileExists(
+                    atPath: directory.appendingPathComponent("summary.json").path
+                ) {
+                    return nil
+                }
                 return record
             }
+        return (canonicalRecords + legacyRecords)
             .max { lhs, rhs in
                 if lhs.updatedAt == rhs.updatedAt {
                     return lhs.sessionID < rhs.sessionID
@@ -249,6 +302,13 @@ actor LiveConversationStore {
     func save(_ record: LiveConversationRecord) throws {
         try Self.validateSessionID(record.sessionID)
         do {
+            let existing = try documentStore.load(
+                sessionID: record.sessionID,
+                cwd: record.workingDirectory
+            )
+            let state = try Self.persistedState(for: record, preserving: existing)
+            try documentStore.save(state)
+
             try fileManager.createDirectory(
                 at: sessionsDirectory,
                 withIntermediateDirectories: true
@@ -331,6 +391,8 @@ actor LiveConversationStore {
             sessionID: destinationSessionID,
             workingDirectory: workingDirectory.standardizedFileURL.path,
             parentSessionID: source.sessionID,
+            sessionKind: "fork",
+            cacheAffinityID: source.cacheAffinityID ?? source.sessionID,
             createdAt: now,
             updatedAt: now,
             items: source.items,
@@ -347,13 +409,13 @@ actor LiveConversationStore {
                 at: sessionsDirectory,
                 withIntermediateDirectories: true
             )
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-            try writeLiveConversationDataAtomically(
-                encoder.encode(child),
-                to: destinationRecordURL,
-                fileManager: fileManager
+            try documentStore.copySession(
+                from: sourceSessionID,
+                sourceCWD: source.workingDirectory,
+                to: destinationSessionID,
+                destinationCWD: child.workingDirectory
             )
+            try save(child)
             if fileManager.fileExists(atPath: sourceRewindURL.path) {
                 let rewindBytes = try Data(contentsOf: sourceRewindURL)
                 try writeLiveConversationDataAtomically(
@@ -365,11 +427,40 @@ actor LiveConversationStore {
             let sourceSessionDir = sessionsDirectory.appendingPathComponent(sourceSessionID)
             let destinationSessionDir = sessionsDirectory.appendingPathComponent(destinationSessionID)
             if fileManager.fileExists(atPath: sourceSessionDir.path) {
-                _ = try? copyCheckpoints(from: sourceSessionDir, to: destinationSessionDir)
+                try copyCheckpoints(from: sourceSessionDir, to: destinationSessionDir)
+                try copyCheckpoints(
+                    from: sourceSessionDir,
+                    to: documentStore.sessionDirectory(
+                        sessionID: destinationSessionID,
+                        cwd: child.workingDirectory
+                    )
+                )
+            }
+            let sourceDocumentDirectory = try documentStore.sessionDirectory(
+                sessionID: sourceSessionID,
+                cwd: source.workingDirectory
+            )
+            if fileManager.fileExists(atPath: sourceDocumentDirectory.path) {
+                try copyCheckpoints(
+                    from: sourceDocumentDirectory,
+                    to: documentStore.sessionDirectory(
+                        sessionID: destinationSessionID,
+                        cwd: child.workingDirectory
+                    )
+                )
             }
         } catch {
+            if let destinationDocumentDirectory = try? documentStore.sessionDirectory(
+                sessionID: destinationSessionID,
+                cwd: child.workingDirectory
+            ) {
+                try? fileManager.removeItem(at: destinationDocumentDirectory)
+            }
             try? fileManager.removeItem(at: destinationRecordURL)
             try? fileManager.removeItem(at: destinationRewindURL)
+            try? fileManager.removeItem(
+                at: sessionsDirectory.appendingPathComponent(destinationSessionID, isDirectory: true)
+            )
             throw CLIApplicationError.failed(
                 "failed to fork session \(sourceSessionID) as \(destinationSessionID): \(error)"
             )
@@ -379,6 +470,252 @@ actor LiveConversationStore {
 
     private func fileURL(sessionID: String) -> URL {
         sessionsDirectory.appendingPathComponent(sessionID).appendingPathExtension("json")
+    }
+
+    private func canonicalSummaryExists(
+        for summary: OpenGrokShellSessionSupport.SessionSummary
+    ) throws -> Bool {
+        let directory = try documentStore.sessionDirectory(
+            sessionID: summary.sessionID.rawValue,
+            cwd: summary.cwd
+        )
+        return fileManager.fileExists(
+            atPath: directory.appendingPathComponent("summary.json").path
+        )
+    }
+
+    private static func persistedState(
+        for record: LiveConversationRecord,
+        preserving existing: PersistedSessionState?
+    ) throws -> PersistedSessionState {
+        let chatHistory = try record.items.map(JSONValue.encode)
+        let commonPrefixCount = zip(existing?.chatHistory ?? [], chatHistory)
+            .prefix { pair in pair.0 == pair.1 }
+            .count
+        var updates = existing?.updates ?? []
+        let timestamp = UInt64(max(0, record.updatedAt.timeIntervalSince1970))
+        for item in record.items.dropFirst(commonPrefixCount) {
+            updates.append(contentsOf: try sessionUpdates(
+                for: item,
+                sessionID: record.sessionID,
+                timestamp: timestamp,
+                outcomes: record.toolOutcomes
+            ))
+        }
+
+        var extra = existing?.summary.extra ?? [:]
+        if let cacheAffinityID = record.cacheAffinityID,
+           !cacheAffinityID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            extra["cache_affinity_id"] = .string(cacheAffinityID)
+        }
+        setMetadata("sandbox_profile", value: record.sandboxProfile, in: &extra)
+        if let provider = record.currentProvider {
+            extra["current_provider"] = try JSONValue.encode(provider)
+        } else {
+            extra["current_provider"] = .null
+        }
+        if let title = record.title {
+            let unchangedGeneratedTitle = existing?.summary.extra["generated_title"]?.stringValue
+                == title
+            extra["generated_title"] = .string(title)
+            if !unchangedGeneratedTitle {
+                extra["title_is_manual"] = .bool(true)
+            }
+        }
+        if let toolOutcomes = record.toolOutcomes {
+            extra["tool_outcomes"] = try JSONValue.encode(toolOutcomes)
+        } else {
+            extra["tool_outcomes"] = .null
+        }
+        extra["swift_legacy_export_boundary_missing"] = .bool(record.everUsedNonXAI == nil)
+
+        let previousSummary = existing?.summary.sessionSummary
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let summaryText = (previousSummary?.isEmpty == false ? previousSummary : nil)
+            ?? record.title
+            ?? record.items.lazy.compactMap { item -> String? in
+                guard case .user(let user) = item,
+                      user.syntheticReason == nil
+                else { return nil }
+                return item.textContent()
+            }.first
+            ?? ""
+        let summary = OpenGrokShellSessionSupport.SessionSummary(
+            sessionID: SessionID(record.sessionID),
+            cwd: record.workingDirectory,
+            sessionSummary: summaryText,
+            createdAt: record.createdAt,
+            updatedAt: record.updatedAt,
+            messageCount: UInt64(updates.count),
+            chatMessageCount: UInt64(chatHistory.count),
+            currentModelID: record.currentModelID ?? existing?.summary.currentModelID ?? "",
+            parentSessionID: record.parentSessionID,
+            nextTraceTurn: existing?.summary.nextTraceTurn ?? 0,
+            chatFormatVersion: existing?.summary.chatFormatVersion ?? chatFormatVersion,
+            everUsedCodex: record.everUsedNonXAI ?? existing?.summary.everUsedCodex ?? false,
+            sessionKind: record.sessionKind
+                ?? existing?.summary.sessionKind
+                ?? (record.parentSessionID == nil ? nil : "fork"),
+            extra: extra
+        )
+
+        return PersistedSessionState(
+            summary: summary,
+            chatHistory: chatHistory,
+            updates: updates,
+            transcript: existing?.transcript ?? SessionTranscript(),
+            toolHistory: existing?.toolHistory ?? [],
+            recovery: existing?.recovery ?? SessionRecoveryState(),
+            pendingCommands: existing?.pendingCommands ?? []
+        )
+    }
+
+    static func record(
+        from state: PersistedSessionState,
+        requestedSessionID: String
+    ) throws -> LiveConversationRecord {
+        guard state.summary.sessionID.rawValue == requestedSessionID else {
+            throw CLIApplicationError.failed("session file ID mismatch: \(requestedSessionID)")
+        }
+        let extra = state.summary.extra
+        let provider: ModelProvider?
+        if let value = extra["current_provider"], value != .null {
+            provider = try value.decode(ModelProvider.self)
+        } else {
+            provider = nil
+        }
+        let toolOutcomes: ToolCallOutcomeMap?
+        if let value = extra["tool_outcomes"], value != .null {
+            toolOutcomes = try value.decode(ToolCallOutcomeMap.self)
+        } else {
+            toolOutcomes = nil
+        }
+        let exportBoundaryMissing = extra["swift_legacy_export_boundary_missing"]?.boolValue == true
+
+        return LiveConversationRecord(
+            sessionID: state.summary.sessionID.rawValue,
+            workingDirectory: state.summary.cwd,
+            parentSessionID: state.summary.parentSessionID,
+            sessionKind: state.summary.sessionKind,
+            cacheAffinityID: extra["cache_affinity_id"]?.stringValue,
+            createdAt: state.summary.createdAt,
+            updatedAt: state.summary.updatedAt,
+            items: try state.chatHistory.map { try $0.decode(ConversationItem.self) },
+            sandboxProfile: extra["sandbox_profile"]?.stringValue,
+            currentModelID: state.summary.currentModelID.isEmpty
+                ? nil
+                : state.summary.currentModelID,
+            currentProvider: provider,
+            everUsedNonXAI: exportBoundaryMissing ? nil : state.summary.everUsedCodex,
+            title: extra["generated_title"]?.stringValue ?? extra["title"]?.stringValue,
+            toolOutcomes: toolOutcomes
+        )
+    }
+
+    private static func setMetadata(
+        _ key: String,
+        value: String?,
+        in metadata: inout [String: JSONValue]
+    ) {
+        if let value {
+            metadata[key] = .string(value)
+        } else {
+            metadata[key] = .null
+        }
+    }
+
+    private static func sessionUpdates(
+        for item: ConversationItem,
+        sessionID: String,
+        timestamp: UInt64,
+        outcomes: ToolCallOutcomeMap?
+    ) throws -> [SessionUpdateEnvelope] {
+        let wrap: ([String: JSONValue]) throws -> SessionUpdateEnvelope = { update in
+            try SessionUpdateEnvelope(
+                timestamp: timestamp,
+                method: "session/update",
+                params: .object([
+                    "sessionId": .string(sessionID),
+                    "update": .object(update),
+                ])
+            )
+        }
+
+        switch item {
+        case .user(let user):
+            return try user.content.compactMap { part in
+                guard case .text(let text) = part else { return nil }
+                var update: [String: JSONValue] = [
+                    "sessionUpdate": .string("user_message_chunk"),
+                    "content": .object([
+                        "type": .string("text"),
+                        "text": .string(text),
+                    ]),
+                ]
+                if let promptIndex = user.promptIndex {
+                    update["_meta"] = .object([
+                        "promptIndex": .number(.int64(Int64(promptIndex)))
+                    ])
+                }
+                return try wrap(update)
+            }
+
+        case .assistant(let assistant):
+            var updates: [SessionUpdateEnvelope] = []
+            if !assistant.content.isEmpty {
+                updates.append(try wrap([
+                    "sessionUpdate": .string("agent_message_chunk"),
+                    "content": .object([
+                        "type": .string("text"),
+                        "text": .string(assistant.content),
+                    ]),
+                ]))
+            }
+            for call in assistant.toolCalls {
+                let rawInput = (try? JSONDecoder().decode(
+                    JSONValue.self,
+                    from: Data(call.arguments.utf8)
+                )) ?? .string(call.arguments)
+                updates.append(try wrap([
+                    "sessionUpdate": .string("tool_call"),
+                    "toolCallId": .string(call.id),
+                    "title": .string(call.name),
+                    "kind": .string("other"),
+                    "status": .string("in_progress"),
+                    "rawInput": rawInput,
+                ]))
+            }
+            return updates
+
+        case .toolResult(let result):
+            let outcome = outcomes?.outcome(for: result.toolCallId)
+            let status: String
+            switch outcome {
+            case .failed, .denied, .cancelled:
+                status = "failed"
+            case .pending, .succeeded, nil:
+                status = "completed"
+            }
+            return [try wrap([
+                "sessionUpdate": .string("tool_call_update"),
+                "toolCallId": .string(result.toolCallId),
+                "status": .string(status),
+                "content": .array([
+                    .object([
+                        "type": .string("content"),
+                        "content": .object([
+                            "type": .string("text"),
+                            "text": .string(result.content),
+                        ]),
+                    ])
+                ]),
+                "rawOutput": .object(["output": .string(result.content)]),
+            ])]
+
+        case .system, .reasoning, .backendToolCall, .customToolOutput:
+            return []
+        }
     }
 }
 
@@ -622,6 +959,8 @@ actor LiveConversationHistory {
 
     var sessionID: String { record.sessionID }
 
+    var cacheAffinityID: String { record.cacheAffinityID ?? record.sessionID }
+
     var sharedExportBoundary: ExportBoundary { exportBoundary }
 
     func snapshot() -> LiveConversationRecord { record }
@@ -750,6 +1089,18 @@ actor LiveConversationHistory {
     }
 
     var toolOutcomes: ToolCallOutcomeMap { record.toolOutcomes ?? ToolCallOutcomeMap() }
+}
+
+private actor LiveSamplingTextEmission {
+    private(set) var hasEmitted = false
+
+    func record() {
+        hasEmitted = true
+    }
+
+    func reset() {
+        hasEmitted = false
+    }
 }
 
 struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
@@ -923,6 +1274,14 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             items.append(.user(wrapSystemReminder(structuredReminder)))
         }
 
+        // Rust acknowledges the user append before the provider request. A
+        // failed or interrupted first sample must therefore leave a resumable
+        // prompt instead of erasing the turn that the user actually submitted.
+        try await conversationHistory.commit(
+            sessionID: context.sessionID,
+            items: items
+        )
+
         // UserPromptSubmit fires once the user message is staged and before
         // the turn loop starts, matching upstream (turn.rs:919-927). Payload
         // carries the prompt text (event.rs:453-456).
@@ -953,21 +1312,39 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 // more to the prompt than the whole preceding turn did, and the
                 // request that dies at the context wall is usually the one after a
                 // large tool result, not the one that opened the turn.
-                items = await compactIfNeeded(items: items, emit: emit)
+                items = await compactIfNeeded(
+                    items: items,
+                    turnID: context.turnID,
+                    emit: emit
+                )
+                if items != (await conversationHistory.items) {
+                    try await conversationHistory.commit(
+                        sessionID: context.sessionID,
+                        items: items
+                    )
+                }
+                let streamedText = LiveSamplingTextEmission()
                 var response: OpenGrokLiveSamplingResponse?
                 while response == nil {
                     do {
+                        await streamedText.reset()
+                        let codexPermissions = await toolExecutor.currentCodexPermissions(
+                            provider: active.provider
+                        )
                         response = try await sampler.sample(OpenGrokLiveSamplingRequest(
                             sessionID: context.sessionID,
+                            cacheAffinityID: await conversationHistory.cacheAffinityID,
                             turnID: context.turnID,
                             model: active.modelID,
                             prompt: request.text,
                             items: items,
                             tools: advertisedTools,
-                            jsonSchema: nativeSchema
+                            jsonSchema: nativeSchema,
+                            codexPermissions: codexPermissions
                         )) { event in
                             switch event {
                             case .output(let text):
+                                await streamedText.record()
                                 await emit(.assistantText(text))
                             case .status(let status):
                                 await emit(.status(status))
@@ -982,6 +1359,10 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                                     name: name,
                                     argumentsDelta: argumentsDelta
                                 ))
+                            case .toolCallArgumentsComplete:
+                                // Arguments readiness is not completion: only
+                                // the final response can authorize dispatch.
+                                break
                             case .retrying(
                                 let attempt, let maxRetries, let kind, let reason
                             ):
@@ -1042,6 +1423,14 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 }
                 guard let response else { throw CLIApplicationError.failed("sampling produced no response") }
                 items.append(contentsOf: response.items)
+                try await conversationHistory.commit(
+                    sessionID: context.sessionID,
+                    items: items
+                )
+                let emittedText = await streamedText.hasEmitted
+                if !emittedText, !response.output.isEmpty {
+                    await emit(.assistantText(response.output))
+                }
 
                 guard !response.toolCalls.isEmpty else {
                     try Task.checkCancellation()
@@ -1107,6 +1496,12 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 for (callID, content) in structuredResults {
                     items.append(ConversationItem.toolResult(ToolResultItem(toolCallId: callID, content: content)))
                 }
+                if !structuredResults.isEmpty {
+                    try await conversationHistory.commit(
+                        sessionID: context.sessionID,
+                        items: items
+                    )
+                }
 
                 switch structuredStep {
                 case .complete(let result):
@@ -1142,11 +1537,20 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                         )
                     }
                     toolRoundCount += 1
-                    items.append(contentsOf: try await executeToolCalls(
-                        remainingCalls,
+                    let toolResults = try await LiveSubagentParentPromptContext.$promptID.withValue(
+                        request.promptID
+                    ) {
+                        try await executeToolCalls(
+                            remainingCalls,
+                            sessionID: context.sessionID,
+                            emit: emit
+                        )
+                    }
+                    items.append(contentsOf: toolResults)
+                    try await conversationHistory.commit(
                         sessionID: context.sessionID,
-                        emit: emit
-                    ))
+                        items: items
+                    )
                     let nextTurn = toolTurnCount + 1
                     if let limit = maxTurns, nextTurn > limit {
                         try await conversationHistory.commit(
@@ -1225,6 +1629,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     /// this whole path exists to remove.
     private func compactIfNeeded(
         items: [ConversationItem],
+        turnID: String,
         emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
     ) async -> [ConversationItem] {
         guard let compaction else { return items }
@@ -1237,7 +1642,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         // upstream's `TurnActivity::AutoCompacting` (`views/turn_status.rs:704`)
         // — same ellipsis character, and the renderer already gives a
         // `.status(text)` the spinner and the phase timer.
-        switch await compaction.compactIfNeeded(items: items, willCompact: {
+        switch await compaction.compactIfNeeded(items: items, turnID: turnID, willCompact: {
             // PreCompact fires once the coordinator has decided to compact
             // and before the work begins, matching upstream (compaction.rs:1488).
             // The automatic path's source is "auto" (event.rs:493-496).

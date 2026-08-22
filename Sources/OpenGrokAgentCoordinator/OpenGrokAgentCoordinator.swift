@@ -11,6 +11,7 @@ public enum OpenGrokChildOwner: String, Codable, Sendable, Hashable {
 public enum OpenGrokChildCancelTarget: Sendable, Hashable {
     case childID(String)
     case parentSession(String)
+    case parentPrompt(sessionID: String, promptID: String)
     case workflowRun(String)
 }
 
@@ -18,6 +19,10 @@ public struct OpenGrokChildRequest: Codable, Sendable, Hashable {
     public var id: String
     public var parentSessionID: String
     public var parentPromptID: String?
+    public var subagentType: String?
+    public var description: String?
+    public var childCWD: String?
+    public var worktreePath: String?
     public var workflowRunID: String?
     public var owner: OpenGrokChildOwner
     public var runInBackground: Bool
@@ -32,6 +37,10 @@ public struct OpenGrokChildRequest: Codable, Sendable, Hashable {
         case id
         case parentSessionID = "parent_session_id"
         case parentPromptID = "parent_prompt_id"
+        case subagentType = "subagent_type"
+        case description
+        case childCWD = "child_cwd"
+        case worktreePath = "worktree_path"
         case workflowRunID = "workflow_run_id"
         case owner
         case runInBackground = "run_in_background"
@@ -47,6 +56,10 @@ public struct OpenGrokChildRequest: Codable, Sendable, Hashable {
         id: String,
         parentSessionID: String,
         parentPromptID: String? = nil,
+        subagentType: String? = nil,
+        description: String? = nil,
+        childCWD: String? = nil,
+        worktreePath: String? = nil,
         workflowRunID: String? = nil,
         owner: OpenGrokChildOwner,
         runInBackground: Bool = false,
@@ -60,6 +73,10 @@ public struct OpenGrokChildRequest: Codable, Sendable, Hashable {
         self.id = id
         self.parentSessionID = parentSessionID
         self.parentPromptID = parentPromptID
+        self.subagentType = subagentType
+        self.description = description
+        self.childCWD = childCWD
+        self.worktreePath = worktreePath
         self.workflowRunID = workflowRunID
         self.owner = owner
         self.runInBackground = runInBackground
@@ -193,6 +210,7 @@ public actor OpenGrokAgentCoordinator {
         var request: OpenGrokChildRequest
         var task: Task<OpenGrokChildResult, Never>
         var cancellationRequested: Bool
+        var parentTornDown: Bool
     }
 
     private var active: [String: ActiveChild] = [:]
@@ -201,7 +219,7 @@ public actor OpenGrokAgentCoordinator {
     private var completions: [OpenGrokCompletion] = []
     private var blockedSessions = Set<String>()
     private var suppressedAutoWakeSessions = Set<String>()
-    private var usage: [String: UInt64] = [:]
+    private var usage: [String: [String: UInt64]] = [:]
     private var usageNotApplied = Set<String>()
 
     // MARK: Team-scoped mailboxes
@@ -289,7 +307,12 @@ public actor OpenGrokAgentCoordinator {
             throw OpenGrokCoordinatorError.spawnBlocked(request.parentSessionID)
         }
         let task = Task { await operation() }
-        active[request.id] = ActiveChild(request: request, task: task, cancellationRequested: false)
+        active[request.id] = ActiveChild(
+            request: request,
+            task: task,
+            cancellationRequested: false,
+            parentTornDown: false
+        )
         Task { [weak self] in
             let result = await task.value
             await self?.finish(requestID: request.id, result: result)
@@ -303,8 +326,17 @@ public actor OpenGrokAgentCoordinator {
         case .childID(let id):
             ids = active[id] == nil ? [] : [id]
         case .parentSession(let sessionID):
-            ids = active.values.filter { $0.request.parentSessionID == sessionID }.map { $0.request.id }
+            ids = active.values
+                .filter { $0.request.parentSessionID == sessionID && $0.request.owner != .workflow }
+                .map { $0.request.id }
             blockedSessions.insert(sessionID)
+        case .parentPrompt(let sessionID, let promptID):
+            ids = active.values
+                .filter {
+                    $0.request.parentSessionID == sessionID
+                        && $0.request.parentPromptID == promptID
+                }
+                .map { $0.request.id }
         case .workflowRun(let runID):
             ids = active.values.filter { $0.request.workflowRunID == runID }.map { $0.request.id }
         }
@@ -323,6 +355,9 @@ public actor OpenGrokAgentCoordinator {
         blockedSessions.remove(sessionID)
         suppressedAutoWakeSessions.remove(sessionID)
         completions.removeAll { $0.parentSessionID == sessionID }
+        let sessionPrefix = "\(sessionID)\n"
+        usage = usage.filter { !$0.key.hasPrefix(sessionPrefix) }
+        usageNotApplied = usageNotApplied.filter { !$0.hasPrefix(sessionPrefix) }
         // Rust `SubagentEvent::TeardownSession` drops the team's mailboxes and
         // closes its waiters as timed out (coordinator.rs:369-384).
         mailboxes = mailboxes.filter { $0.key.teamScopeID != sessionID }
@@ -333,6 +368,10 @@ public actor OpenGrokAgentCoordinator {
         }
         let ids = active.values.filter { $0.request.parentSessionID == sessionID }.map { $0.request.id }
         for id in ids {
+            // A late cancellation completion must not resurrect a deleted
+            // session's notification after its pending queue was cleared.
+            active[id]?.request.surfaceCompletion = false
+            active[id]?.parentTornDown = true
             active[id]?.cancellationRequested = true
             active[id]?.task.cancel()
         }
@@ -365,8 +404,10 @@ public actor OpenGrokAgentCoordinator {
         var remaining: [OpenGrokCompletion] = []
         for completion in completions {
             let matchesSession = parentSessionID == nil || completion.parentSessionID == parentSessionID
-            if matchesSession && !suppressIDs.contains(completion.childID) {
-                selected.append(completion)
+            if matchesSession {
+                if !suppressIDs.contains(completion.childID) {
+                    selected.append(completion)
+                }
             } else {
                 remaining.append(completion)
             }
@@ -397,12 +438,24 @@ public actor OpenGrokAgentCoordinator {
     }
 
     public func recordUsage(parentSessionID: String, promptID: String, childID: String, tokens: UInt64) {
-        usage[scopeKey(sessionID: parentSessionID, promptID: promptID)] = (usage[scopeKey(sessionID: parentSessionID, promptID: promptID)] ?? 0).saturatingAdd(tokens)
+        let key = scopeKey(sessionID: parentSessionID, promptID: promptID)
+        var scopedUsage = usage[key] ?? [:]
+        scopedUsage[childID] = (scopedUsage[childID] ?? 0).saturatingAdd(tokens)
+        usage[key] = scopedUsage
     }
 
     public func foldUsage(parentSessionID: String, promptID: String, childIDs: [String]) -> OpenGrokUsageFold {
         let key = scopeKey(sessionID: parentSessionID, promptID: promptID)
-        return OpenGrokUsageFold(parentSessionID: parentSessionID, promptID: promptID, tokensUsed: usage[key] ?? 0, childIDs: childIDs.sorted())
+        let uniqueChildIDs = Array(Set(childIDs)).sorted()
+        let tokensUsed = uniqueChildIDs.reduce(UInt64.zero) { total, childID in
+            total.saturatingAdd(usage[key]?[childID] ?? 0)
+        }
+        return OpenGrokUsageFold(
+            parentSessionID: parentSessionID,
+            promptID: promptID,
+            tokensUsed: tokensUsed,
+            childIDs: uniqueChildIDs
+        )
     }
 
     public func outstanding(parentSessionID: String, promptID: String) -> (liveIDs: [String], backgroundLive: Bool, usageNotApplied: Bool) {
@@ -429,6 +482,16 @@ public actor OpenGrokAgentCoordinator {
             finalResult.success = false
             finalResult.error = finalResult.error ?? "child cancelled"
         }
+        if !child.parentTornDown,
+           let promptID = child.request.parentPromptID,
+           !promptID.isEmpty {
+            recordUsage(
+                parentSessionID: child.request.parentSessionID,
+                promptID: promptID,
+                childID: requestID,
+                tokens: finalResult.tokensUsed
+            )
+        }
         let summary = OpenGrokChildSummary(request: child.request, state: finalResult.cancelled ? "cancelled" : (finalResult.success ? "completed" : "failed"), result: finalResult)
         completed[requestID] = summary
         completedOrder.removeAll { $0 == requestID }
@@ -454,10 +517,8 @@ public actor OpenGrokAgentCoordinator {
     /// (task/coordinator.rs:536-593). Rust reports `pending`, `active`, and
     /// `completed` children separately; this coordinator has no distinct
     /// pending phase — `spawn` publishes into `active` immediately — so the
-    /// pending rows have no Swift counterpart. `subagent_type`, `description`,
-    /// and `worktree_path` are likewise absent: `OpenGrokChildRequest` does not
-    /// carry them yet, and the wire omits `nil` optionals exactly as serde's
-    /// `skip_serializing_if` does.
+    /// pending rows have no Swift counterpart. Task metadata is retained on
+    /// the request so running and completed rows expose the same labels.
     /// Marked `async` even though the actor body never suspends: the
     /// signature must be IDENTICAL to the `AgentMailboxBackend` requirement.
     /// With a synchronous member, the protocol extension's no-backend
@@ -482,9 +543,10 @@ public actor OpenGrokAgentCoordinator {
                     agentID: child.request.id,
                     isRoot: false,
                     status: "running",
-                    subagentType: nil,
-                    description: nil,
-                    resumedFrom: child.request.resumeFrom
+                    subagentType: child.request.subagentType,
+                    description: child.request.description,
+                    resumedFrom: child.request.resumeFrom,
+                    worktreePath: child.request.worktreePath
                 )
             }
         children.append(contentsOf: completed.values
@@ -494,9 +556,10 @@ public actor OpenGrokAgentCoordinator {
                     agentID: summary.request.id,
                     isRoot: false,
                     status: summary.state,
-                    subagentType: nil,
-                    description: nil,
-                    resumedFrom: summary.request.resumeFrom
+                    subagentType: summary.request.subagentType,
+                    description: summary.request.description,
+                    resumedFrom: summary.request.resumeFrom,
+                    worktreePath: summary.request.worktreePath
                 )
             })
         children.sort { $0.agentID < $1.agentID }

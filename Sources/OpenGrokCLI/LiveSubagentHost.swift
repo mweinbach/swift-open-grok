@@ -43,6 +43,7 @@ import OpenGrokFileTools
 import OpenGrokHooks
 import OpenGrokHooksPluginTypes
 import OpenGrokInterjection
+import OpenGrokSampler
 import OpenGrokSamplingTypes
 import OpenGrokShared
 import OpenGrokShell
@@ -50,6 +51,7 @@ import OpenGrokShellBase
 import OpenGrokShellSessionSupport
 import OpenGrokSubagentResolution
 import OpenGrokToolTypes
+import OpenGrokWorkspace
 
 /// Outcome of a `kill_task` aimed at a subagent id. Mirrors Rust
 /// `SubagentCancelOutcome` (task/types.rs).
@@ -133,7 +135,31 @@ func resolveSubagentModelProvider(_ model: String) -> ModelProvider? {
     }
 }
 
+/// The root turn's prompt scope follows its tool batch across actor hops and
+/// task-group children without leaking into the session's next turn.
+enum LiveSubagentParentPromptContext {
+    @TaskLocal static var promptID: String?
+}
+
 actor LiveSubagentHost: LiveSubagentQuerying {
+    /// A child provider must bring its own endpoint, credentials, and adapter;
+    /// changing only the model on the parent's sampler is not provider routing.
+    struct ChildSamplerRoute: Sendable {
+        var sampler: OpenGrokLiveSampler
+        var provider: ModelProvider
+        var codexPermissions: CodexPermissions?
+
+        init(
+            sampler: OpenGrokLiveSampler,
+            provider: ModelProvider,
+            codexPermissions: CodexPermissions? = nil
+        ) {
+            self.sampler = sampler
+            self.provider = provider
+            self.codexPermissions = provider == .codex ? codexPermissions : nil
+        }
+    }
+
     /// Everything a child inherits from the root session, gathered once so
     /// `spawn` does not grow a dozen loose parameters. The sampler carries the
     /// parent's resolved credentials; the security context and sandbox
@@ -187,6 +213,17 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         var parentExportBoundary: ExportBoundary? = nil
         /// Persisted boundary sync callback to update parent session summary.
         var providerBoundarySync: (@Sendable (Bool) async throws -> Void)? = nil
+        /// Forks retain their source's prompt-cache route across child turns.
+        var parentCacheAffinityID: String? = nil
+        /// Authoritative parent provider from resolved model metadata.
+        var parentProvider: ModelProvider? = nil
+        /// The parent's applied execution policy, disclosed only to Codex.
+        var parentCodexPermissions: CodexPermissions? = nil
+        /// Resolves another model into its own provider transport and scoped
+        /// credentials. Cross-provider children fail closed when unavailable.
+        var childSamplerFactory: (
+            @Sendable (String, CodexPermissions?) async throws -> ChildSamplerRoute
+        )? = nil
     }
 
     /// The one coordinator per root session (scope item 1). Exposed
@@ -254,6 +291,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     }
     var bookkeeping: [String: Bookkeeping] = [:]
     private var childExecutors: [String: LiveToolExecutor] = [:]
+    private var parentPermissionHandle: PermissionHandle?
 
     /// Children whose `runChild` loop is live right now — the set the
     /// follow-up router consults before buffering. Upstream's analog is the
@@ -278,6 +316,12 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         self.context = context
         self.coordinator = OpenGrokAgentCoordinator()
         self.toolSpec = Self.makeToolSpec(context: context)
+    }
+
+    /// Children share the root's mutable approvals while retaining their own
+    /// fresh plan tracker and hooks; toggling the parent updates live children.
+    func installParentPermissionHandle(_ handle: PermissionHandle) {
+        parentPermissionHandle = handle
     }
 
     // MARK: - Active background work (status-chip push)
@@ -668,7 +712,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         let requestedModelSlug = sanitizeOptionalArg(input.model)
         let requestedAntigravityModel = requestedModelSlug
             .flatMap(LiveAntigravityComposition.stripModelPrefix)
-        if let requestedModel = requestedModelSlug,
+        if resumeID == nil,
+           let requestedModel = requestedModelSlug,
            requestedAntigravityModel == nil,
            !context.modelSlugs.contains(requestedModel) {
             return .failure(.invalidCall("subagent model \"\(requestedModel)\" is unavailable"))
@@ -926,6 +971,11 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         let request = OpenGrokChildRequest(
             id: childID,
             parentSessionID: context.sessionID,
+            parentPromptID: LiveSubagentParentPromptContext.promptID,
+            subagentType: input.subagentType,
+            description: input.description,
+            childCWD: childCWD.path,
+            worktreePath: resumedWorktree?.path,
             owner: antigravityModel == nil ? .task : .antigravity,
             runInBackground: input.runInBackground,
             capabilityMode: runtime.capabilityMode?.rawValue,
@@ -1144,6 +1194,17 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         resumeItems: [ConversationItem]?
     ) async -> OpenGrokChildResult {
         let startedAt = Date()
+        let samplingRoute: ChildSamplerRoute
+        do {
+            samplingRoute = try await resolveChildSamplerRoute(model: model)
+        } catch {
+            return OpenGrokChildResult(
+                id: childID,
+                success: false,
+                error: "child agent sampling route unavailable: \(error)",
+                durationMS: Self.milliseconds(since: startedAt)
+            )
+        }
         // Live-loop registration brackets the whole run: a follow-up that
         // arrives after the final drain but before this defer runs is
         // accepted and never seen — the same window upstream has, where
@@ -1173,6 +1234,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 // advertised matches them).
                 sessionServices: nil,
                 permissionOptions: context.permissionOptions,
+                inheritedPermissionHandle: parentPermissionHandle,
                 // The team mailbox, with the child's own identity. Upstream
                 // children always carry the quartet: the builder pushes the
                 // collaboration tools past the definition's tool list
@@ -1220,20 +1282,20 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         items.append(.user(prompt))
         bookkeeping[childID]?.liveItems = items
 
-        let childProvider = resolveSubagentModelProvider(model)
-        if let childProvider, !childProvider.profile.allowsXaiServices {
+        let childProvider = samplingRoute.provider
+        if !childProvider.profile.allowsXaiServices {
             context.parentExportBoundary?.observe(childProvider)
             try? await context.providerBoundarySync?(true)
         }
 
         var record = LiveConversationRecord.new(sessionID: childID, workingDirectory: cwd)
         record.parentSessionID = context.sessionID
-        if let childProvider {
-            record.currentProvider = childProvider
-            record.currentModelID = model
-            if !childProvider.profile.allowsXaiServices {
-                record.everUsedNonXAI = true
-            }
+        record.sessionKind = "subagent"
+        record.cacheAffinityID = context.parentCacheAffinityID ?? context.sessionID
+        record.currentProvider = childProvider
+        record.currentModelID = model
+        if !childProvider.profile.allowsXaiServices {
+            record.everUsedNonXAI = true
         }
         let history = LiveConversationHistory(record: record, store: context.conversationStore)
 
@@ -1262,16 +1324,26 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             // token is treated as no override so the parent sampler default
             // still applies — fail-open on the string, not fail-closed.
             let childEffort = runtime.reasoningEffort.flatMap(parseCanonicalEffortToken)
+            let childCodexPermissions: CodexPermissions?
+            if samplingRoute.provider == .codex, parentPermissionHandle != nil {
+                childCodexPermissions = await executor.currentCodexPermissions(
+                    provider: samplingRoute.provider
+                )
+            } else {
+                childCodexPermissions = samplingRoute.codexPermissions
+            }
             let response: OpenGrokLiveSamplingResponse
             do {
-                response = try await context.sampler.sample(OpenGrokLiveSamplingRequest(
+                response = try await samplingRoute.sampler.sample(OpenGrokLiveSamplingRequest(
                     sessionID: childID,
+                    cacheAffinityID: context.parentCacheAffinityID ?? context.sessionID,
                     turnID: "\(childID)-\(bookkeeping[childID]?.turns ?? 0)",
                     model: model,
                     prompt: prompt,
                     items: items,
                     tools: executor.tools,
-                    reasoningEffort: childEffort
+                    reasoningEffort: childEffort,
+                    codexPermissions: childCodexPermissions
                 )) { _ in
                     // A child's tokens stream to no pane; the parent reads the
                     // finished result, same as a workflow child.
@@ -1359,6 +1431,43 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             error: terminalError,
             tokensUsed: UInt64(max(0, characters) / 4),
             durationMS: Self.milliseconds(since: startedAt)
+        )
+    }
+
+    private func resolveChildSamplerRoute(model: String) async throws -> ChildSamplerRoute {
+        let parentProvider = context.parentProvider
+            ?? resolveSubagentModelProvider(context.parentModel)
+            ?? .xai
+
+        if model == context.parentModel {
+            return ChildSamplerRoute(
+                sampler: context.sampler,
+                provider: parentProvider,
+                codexPermissions: context.parentCodexPermissions
+            )
+        }
+
+        if let factory = context.childSamplerFactory {
+            let resolved = try await factory(model, context.parentCodexPermissions)
+            return ChildSamplerRoute(
+                sampler: resolved.sampler,
+                provider: resolved.provider,
+                codexPermissions: resolved.provider == .codex
+                    ? resolved.codexPermissions ?? context.parentCodexPermissions
+                    : nil
+            )
+        }
+
+        guard resolveSubagentModelProvider(model) == parentProvider
+        else {
+            throw CLIApplicationError.failed(
+                "subagent model \"\(model)\" requires an isolated provider sampling route"
+            )
+        }
+        return ChildSamplerRoute(
+            sampler: context.sampler,
+            provider: parentProvider,
+            codexPermissions: context.parentCodexPermissions
         )
     }
 

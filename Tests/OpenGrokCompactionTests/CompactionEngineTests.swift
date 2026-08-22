@@ -702,8 +702,11 @@ struct CodexCompactionSSETests {
 
         #expect(object["model"] as? String == "gpt-5-codex")
         #expect(object["stream"] as? Bool == true)
-        #expect(object["compaction_trigger"] as? Bool == true)
-        #expect(object["comp_hash"] as? String == "hash-abc")
+        #expect(object["store"] as? Bool == false)
+        #expect(object["tool_choice"] as? String == "auto")
+        #expect(object["include"] as? [String] == ["reasoning.encrypted_content"])
+        #expect(object["compaction_trigger"] == nil)
+        #expect(object["comp_hash"] == nil)
 
         // The history must be the Responses `input` array of typed messages —
         // `ConversationItem`'s own Codable form is the session-file encoding and
@@ -716,15 +719,16 @@ struct CodexCompactionSSETests {
         // (`OpenGrokSampler/Provider.swift:696`, "extract leading system
         // instructions to `instructions`"), exactly as it does for a normal
         // turn — which is the point of reusing the projection rather than
-        // hand-rolling a body here. So one input message, not two, and the
-        // system text is not lost but relocated.
+        // hand-rolling a body here. The remote V2 contract then appends its
+        // provider-native trigger as the final input item.
         #expect(object["instructions"] as? String == "sys")
         // `#require` rather than `#expect`: a shape mismatch must fail this
         // test, never trap on an out-of-range index and abort the whole run.
-        try #require(input.count == 1)
+        try #require(input.count == 2)
         #expect(input[0]["type"] as? String == "message")
         #expect(input[0]["role"] as? String == "user")
         #expect(input[0]["content"] as? String == "hello")
+        #expect(input[1]["type"] as? String == "compaction_trigger")
     }
 
     @Test("an error body is reported with the server's message, not the raw JSON")

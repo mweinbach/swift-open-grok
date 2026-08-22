@@ -436,7 +436,8 @@ public actor RelocationJournal {
                         let summaryURL = candidateSession.appendingPathComponent(RelocationFS.summaryFileName)
                         if let summaryData = try? Data(contentsOf: summaryURL),
                            let json = try? JSONSerialization.jsonObject(with: summaryData) as? [String: Any],
-                           let cwd = json["cwd"] as? String {
+                           let cwd = (json["cwd"] as? String)
+                               ?? ((json["info"] as? [String: Any])?["cwd"] as? String) {
                             if json["previous_cwd"] != nil {
                                 foundTarget = (cwd, candidateSession)
                             } else {

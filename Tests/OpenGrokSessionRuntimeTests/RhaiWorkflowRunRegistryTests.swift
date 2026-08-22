@@ -95,6 +95,35 @@ private actor ScriptedWorkflowHost: RhaiWorkflowHost {
     func gitDiffSince(commit: String) -> String { "" }
 }
 
+private actor WorkflowRunAdmissionGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+}
+
+private actor WorkflowRunContextCapture {
+    private(set) var value: RhaiWorkflowRunContext?
+
+    func record(_ context: RhaiWorkflowRunContext) {
+        value = context
+    }
+}
+
 private func temporaryDirectory() -> URL {
     let url = FileManager.default.temporaryDirectory
         .appendingPathComponent("workflow-registry-\(UUID().uuidString)", isDirectory: true)
@@ -262,6 +291,249 @@ struct RhaiWorkflowRunRegistryTests {
         #expect(try await registry.journalEntries(runID: record.runID).isEmpty)
     }
 
+    @Test("concurrent launches reserve their slots before actor suspension")
+    func concurrentLaunchesRespectActiveRunLimit() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let registry = RhaiWorkflowRunRegistry(store: WorkflowSessionStore(directory: directory))
+        let gate = WorkflowRunAdmissionGate()
+        let hostFactory = RhaiWorkflowHostFactory(make: { _ in
+            await gate.wait()
+            return ScriptedWorkflowHost()
+        })
+        let script = "complete(#{ ok: true })"
+
+        let outcomes = await withTaskGroup(
+            of: Result<WorkflowRunRecord, RhaiWorkflowRegistryError>.self,
+            returning: [Result<WorkflowRunRecord, RhaiWorkflowRegistryError>].self
+        ) { group in
+            for _ in 0..<(rhaiMaxActiveWorkflowRunsPerSession + 6) {
+                group.addTask {
+                    do {
+                        return .success(try await registry.start(
+                            script: script,
+                            hostFactory: hostFactory
+                        ))
+                    } catch let error as RhaiWorkflowRegistryError {
+                        return .failure(error)
+                    } catch {
+                        return .failure(.persistence(String(describing: error)))
+                    }
+                }
+            }
+
+            var outcomes: [Result<WorkflowRunRecord, RhaiWorkflowRegistryError>] = []
+            for await outcome in group {
+                outcomes.append(outcome)
+            }
+            return outcomes
+        }
+
+        var accepted: [WorkflowRunRecord] = []
+        var rejected: [RhaiWorkflowRegistryError] = []
+        for outcome in outcomes {
+            switch outcome {
+            case .success(let record): accepted.append(record)
+            case .failure(let error): rejected.append(error)
+            }
+        }
+        #expect(accepted.count == rhaiMaxActiveWorkflowRunsPerSession)
+        #expect(rejected.count == 6)
+        #expect(rejected.allSatisfy {
+            $0 == .tooManyActiveRuns(limit: rhaiMaxActiveWorkflowRunsPerSession)
+        })
+        #expect(try await registry.list().count == rhaiMaxActiveWorkflowRunsPerSession)
+
+        await gate.open()
+        for record in accepted {
+            let completed = try await registry.awaitCompletion(runID: record.runID)
+            #expect(completed.status == .completed)
+        }
+
+        let replacement = try await registry.start(script: script, hostFactory: hostFactory)
+        #expect(try await registry.awaitCompletion(runID: replacement.runID).status == .completed)
+    }
+
+    @Test("a paused run cannot resume while all four workflow slots are occupied")
+    func activeRunLimitAlsoAppliesToResume() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let registry = RhaiWorkflowRunRegistry(store: WorkflowSessionStore(directory: directory))
+        let pausedScript = "pause(\"user\", \"waiting\")"
+        let pausedRun = try await registry.start(
+            script: pausedScript,
+            hostFactory: RhaiWorkflowHostFactory(make: { _ in ScriptedWorkflowHost() })
+        )
+        let pausedRecord = try await registry.awaitCompletion(runID: pausedRun.runID)
+        #expect(pausedRecord.status == .paused)
+
+        let gate = WorkflowRunAdmissionGate()
+        let hostFactory = RhaiWorkflowHostFactory(make: { _ in
+            await gate.wait()
+            return ScriptedWorkflowHost()
+        })
+        var activeRuns: [WorkflowRunRecord] = []
+        for _ in 0..<rhaiMaxActiveWorkflowRunsPerSession {
+            let active = try await registry.start(
+                script: "complete(#{ ok: true })",
+                hostFactory: hostFactory
+            )
+            activeRuns.append(active)
+        }
+
+        await #expect(throws: RhaiWorkflowRegistryError.tooManyActiveRuns(
+            limit: rhaiMaxActiveWorkflowRunsPerSession
+        )) {
+            try await registry.resume(
+                runID: pausedRun.runID,
+                script: pausedScript,
+                hostFactory: hostFactory
+            )
+        }
+        #expect(try await registry.record(runID: pausedRun.runID) == pausedRecord)
+
+        await gate.open()
+        for active in activeRuns {
+            #expect(try await registry.awaitCompletion(runID: active.runID).status == .completed)
+        }
+    }
+
+    @Test("invalid initial or resumed agent budgets are rejected before persistence")
+    func invalidAgentBudgetsAreRejected() async throws {
+        let registry = RhaiWorkflowRunRegistry(store: WorkflowSessionStore())
+        let hostFactory = RhaiWorkflowHostFactory(make: { _ in ScriptedWorkflowHost() })
+
+        for invalid in [UInt64.zero, rhaiMaxAgentBudget + 1] {
+            await #expect(throws: RhaiWorkflowRegistryError.invalidAgentBudget(
+                requested: invalid,
+                maximum: rhaiMaxAgentBudget
+            )) {
+                try await registry.start(
+                    script: "complete(#{ ok: true })",
+                    agentBudget: invalid,
+                    hostFactory: hostFactory
+                )
+            }
+        }
+        #expect(try await registry.list().isEmpty)
+
+        let script = "pause(\"user\", \"waiting\")"
+        let run = try await registry.start(script: script, hostFactory: hostFactory)
+        let paused = try await registry.awaitCompletion(runID: run.runID)
+        await #expect(throws: RhaiWorkflowRegistryError.invalidAgentBudget(
+            requested: rhaiMaxAgentBudget + 1,
+            maximum: rhaiMaxAgentBudget
+        )) {
+            try await registry.resume(
+                runID: run.runID,
+                script: script,
+                agentBudget: rhaiMaxAgentBudget + 1,
+                hostFactory: hostFactory
+            )
+        }
+        #expect(try await registry.record(runID: run.runID) == paused)
+    }
+
+    @Test("a budget-limited run only resumes with a higher cumulative budget")
+    func budgetLimitedResumeRequiresRaisedBudget() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let registry = RhaiWorkflowRunRegistry(store: WorkflowSessionStore(directory: directory))
+        let script = """
+            agent("first", #{ label: "one" });
+            agent("second", #{ label: "two" });
+            agent("third", #{ label: "three" });
+            complete(#{ ok: true })
+            """
+        let originalHost = ScriptedWorkflowHost(budget: 2)
+        let run = try await registry.start(
+            script: script,
+            agentBudget: 2,
+            hostFactory: RhaiWorkflowHostFactory(make: { _ in originalHost })
+        )
+        let limited = try await registry.awaitCompletion(runID: run.runID)
+        #expect(limited.status == .budgetExceeded)
+        #expect(limited.agentsUsed == 2)
+        #expect(await originalHost.spawns.count == 2)
+
+        let unusedHostFactory = RhaiWorkflowHostFactory(make: { _ in ScriptedWorkflowHost() })
+        await #expect(throws: RhaiWorkflowRegistryError.budgetNotRaised(used: 2, limit: 2)) {
+            try await registry.resume(
+                runID: run.runID,
+                script: script,
+                hostFactory: unusedHostFactory
+            )
+        }
+        await #expect(throws: RhaiWorkflowRegistryError.budgetNotRaised(used: 2, limit: 2)) {
+            try await registry.resume(
+                runID: run.runID,
+                script: script,
+                agentBudget: 2,
+                hostFactory: unusedHostFactory
+            )
+        }
+        #expect(try await registry.record(runID: run.runID) == limited)
+
+        // The journal may have made it to disk after the manifest's previous
+        // accounting snapshot. Resume must trust the larger durable count.
+        var staleManifest = limited
+        staleManifest.agentsUsed = 0
+        try await registry.store.update(staleManifest)
+
+        let capturedContext = WorkflowRunContextCapture()
+        let resumedHost = ScriptedWorkflowHost(budget: 1)
+        let resumed = try await registry.resume(
+            runID: run.runID,
+            script: script,
+            agentBudget: 3,
+            hostFactory: RhaiWorkflowHostFactory(make: { context in
+                await capturedContext.record(context)
+                return resumedHost
+            })
+        )
+        #expect(resumed.status == .active)
+        #expect(resumed.agentBudget == 3)
+        #expect(resumed.agentsUsed == 2)
+
+        let completed = try await registry.awaitCompletion(runID: run.runID)
+        #expect(completed.status == .completed)
+        #expect(completed.agentBudget == 3)
+        #expect(completed.agentsUsed == 3)
+        #expect(await resumedHost.spawns.map(\.label) == ["three"])
+        let context = try #require(await capturedContext.value)
+        #expect(context.agentBudget == 3)
+        #expect(context.priorAgentsUsed == 2)
+    }
+
+    @Test("a run that spent the global maximum cannot be resumed")
+    func budgetAtGlobalMaximumIsNotResumable() async throws {
+        let store = WorkflowSessionStore()
+        let script = "pause(\"user\", \"waiting\")"
+        let arguments = JSONValue.object([:])
+        try await store.insert(WorkflowRunRecord(
+            runID: "wf_maxed",
+            workflowName: "maxed",
+            scriptHash: rhaiRequestHash(kind: "script", payload: .string(script)),
+            argumentsHash: rhaiRequestHash(kind: "arguments", payload: arguments),
+            status: .budgetExceeded,
+            agentBudget: rhaiMaxAgentBudget,
+            agentsUsed: rhaiMaxAgentBudget
+        ))
+        let registry = RhaiWorkflowRunRegistry(store: store)
+
+        await #expect(throws: RhaiWorkflowRegistryError.notResumable(
+            "maximum agent budget reached; start a new run"
+        )) {
+            try await registry.resume(
+                runID: "wf_maxed",
+                script: script,
+                agentBudget: rhaiMaxAgentBudget,
+                hostFactory: RhaiWorkflowHostFactory(make: { _ in ScriptedWorkflowHost() })
+            )
+        }
+        #expect(try await registry.record(runID: "wf_maxed").status == .budgetExceeded)
+    }
+
     @Test("a resumed run replays its journal instead of re-spawning")
     func resumeReplaysCachedPrefix() async throws {
         let directory = temporaryDirectory()
@@ -323,6 +595,38 @@ struct RhaiWorkflowRunRegistryTests {
                 hostFactory: RhaiWorkflowHostFactory(make: { _ in ScriptedWorkflowHost() })
             )
         }
+    }
+
+    @Test("resume refuses changed launch arguments before touching the journal")
+    func resumeRejectsChangedArguments() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let registry = RhaiWorkflowRunRegistry(store: WorkflowSessionStore(directory: directory))
+        let script = """
+            agent(args.objective, #{ label: "worker" });
+            pause("user", "waiting")
+            """
+        let originalArguments = JSONValue.object(["objective": .string("audit only")])
+        let run = try await registry.start(
+            script: script,
+            arguments: originalArguments,
+            hostFactory: RhaiWorkflowHostFactory(make: { _ in ScriptedWorkflowHost() })
+        )
+        let paused = try await registry.awaitCompletion(runID: run.runID)
+        #expect(paused.status == .paused)
+        let originalJournal = try await registry.journalEntries(runID: run.runID)
+
+        await #expect(throws: RhaiWorkflowRegistryError.argumentsMismatch(run.runID)) {
+            try await registry.resume(
+                runID: run.runID,
+                script: script,
+                arguments: .object(["objective": .string("modify production")]),
+                hostFactory: RhaiWorkflowHostFactory(make: { _ in ScriptedWorkflowHost() })
+            )
+        }
+
+        #expect(try await registry.record(runID: run.runID) == paused)
+        #expect(try await registry.journalEntries(runID: run.runID) == originalJournal)
     }
 
     @Test("the run view combines the journal with live phase and agent progress")

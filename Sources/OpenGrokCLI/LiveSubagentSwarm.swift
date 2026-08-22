@@ -1131,6 +1131,11 @@ extension LiveSubagentHost {
         let request = OpenGrokChildRequest(
             id: agentID,
             parentSessionID: context.sessionID,
+            parentPromptID: LiveSubagentParentPromptContext.promptID,
+            subagentType: input.subagentType,
+            description: input.description,
+            childCWD: childCWD.path,
+            worktreePath: resumedWorktree?.path,
             owner: .swarm,
             runInBackground: false,
             awaitToCompletion: true,

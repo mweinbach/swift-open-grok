@@ -132,6 +132,8 @@ public struct SamplerConfig: Sendable {
     public var clientVersion: String?
     public var supportsBackendSearch: Bool
     public var codexMultiAgentV2: Bool
+    /// Applied execution policy. Only the Codex provider may project it.
+    public var codexPermissions: CodexPermissions?
     public var compactionsRemaining: CompactionsRemaining?
     public var compactionAtTokens: CompactionAtTokens?
     public var doomLoopRecovery: DoomLoopRecoveryPolicy?
@@ -170,6 +172,7 @@ public struct SamplerConfig: Sendable {
         clientVersion: String? = nil,
         supportsBackendSearch: Bool = false,
         codexMultiAgentV2: Bool = false,
+        codexPermissions: CodexPermissions? = nil,
         compactionsRemaining: CompactionsRemaining? = nil,
         compactionAtTokens: CompactionAtTokens? = nil,
         doomLoopRecovery: DoomLoopRecoveryPolicy? = nil,
@@ -203,6 +206,7 @@ public struct SamplerConfig: Sendable {
         self.clientVersion = clientVersion
         self.supportsBackendSearch = supportsBackendSearch
         self.codexMultiAgentV2 = codexMultiAgentV2
+        self.codexPermissions = codexPermissions
         self.compactionsRemaining = compactionsRemaining
         self.compactionAtTokens = compactionAtTokens
         self.doomLoopRecovery = doomLoopRecovery
@@ -242,6 +246,7 @@ extension SamplerConfig: Codable {
         case clientVersion = "client_version"
         case supportsBackendSearch = "supports_backend_search"
         case codexMultiAgentV2 = "codex_multi_agent_v2"
+        case codexPermissions = "codex_permissions"
         case compactionsRemaining = "compactions_remaining"
         case compactionAtTokens = "compaction_at_tokens"
         case doomLoopRecovery = "doom_loop_recovery"
@@ -276,6 +281,7 @@ extension SamplerConfig: Codable {
             clientVersion: try c.decodeIfPresent(String.self, forKey: .clientVersion),
             supportsBackendSearch: try c.decodeIfPresent(Bool.self, forKey: .supportsBackendSearch) ?? false,
             codexMultiAgentV2: try c.decodeIfPresent(Bool.self, forKey: .codexMultiAgentV2) ?? false,
+            codexPermissions: try c.decodeIfPresent(CodexPermissions.self, forKey: .codexPermissions),
             compactionsRemaining: try c.decodeIfPresent(CompactionsRemaining.self, forKey: .compactionsRemaining),
             compactionAtTokens: try c.decodeIfPresent(CompactionAtTokens.self, forKey: .compactionAtTokens),
             doomLoopRecovery: try c.decodeIfPresent(DoomLoopRecoveryPolicy.self, forKey: .doomLoopRecovery)
@@ -310,6 +316,7 @@ extension SamplerConfig: Codable {
         try c.encodeIfPresent(clientVersion, forKey: .clientVersion)
         try c.encode(supportsBackendSearch, forKey: .supportsBackendSearch)
         try c.encode(codexMultiAgentV2, forKey: .codexMultiAgentV2)
+        try c.encodeIfPresent(codexPermissions, forKey: .codexPermissions)
         try c.encodeIfPresent(compactionsRemaining, forKey: .compactionsRemaining)
         try c.encodeIfPresent(compactionAtTokens, forKey: .compactionAtTokens)
         try c.encodeIfPresent(doomLoopRecovery, forKey: .doomLoopRecovery)

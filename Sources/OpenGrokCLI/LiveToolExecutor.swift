@@ -47,6 +47,7 @@ import OpenGrokWorkspace
 struct LiveToolExecutor: Sendable {
     let tools: [ToolSpec]
     let workingDirectory: URL
+    private let sessionEnvironment: [String: String]
     private let sessionDirectories: LiveSessionDirectoryRegistry
     private let composition: OpenGrokShellToolRuntimeComposition
     private let fileToolBridge: ToolBridge
@@ -75,6 +76,82 @@ struct LiveToolExecutor: Sendable {
     /// in isolation and miss a deleted `setPrompter` line.
     func toolPermissionPipeline() -> PermissionPipeline? {
         permissionPipeline
+    }
+
+    /// Provider policy is sampled from the live gate, not the launch flags:
+    /// `/auto` and `/yolo` can change between two requests in the same session.
+    func currentCodexPermissions(provider: ModelProvider) async -> CodexPermissions? {
+        guard provider == .codex else { return nil }
+        let handle = await permissionHandle()
+        let yoloMode = await handle?.yoloMode ?? false
+        let autoMode = await handle?.autoMode ?? false
+        let yoloPinned = await handle?.yoloPinReason != nil
+        return Self.codexPermissions(
+            provider: provider,
+            sandbox: sandbox,
+            workingDirectory: workingDirectory,
+            environment: sessionEnvironment,
+            alwaysApprove: yoloMode && !yoloPinned,
+            autoReviewEnabled: autoMode
+        )
+    }
+
+    static func codexPermissions(
+        provider: ModelProvider,
+        sandbox: LiveSandboxDecision,
+        workingDirectory: URL,
+        environment: [String: String],
+        alwaysApprove: Bool,
+        autoReviewEnabled: Bool
+    ) -> CodexPermissions? {
+        guard provider == .codex else { return nil }
+        let activeProfile = sandbox.enforced && OpenGrokSandbox.isSandboxActive()
+            ? OpenGrokSandbox.activeProfileName()
+            : nil
+        let sandboxMode: String
+        switch activeProfile {
+        case nil:
+            sandboxMode = "danger-full-access"
+        case "read-only", "readonly":
+            sandboxMode = "read-only"
+        default:
+            sandboxMode = "workspace-write"
+        }
+        let sandboxName: String
+        if activeProfile == nil {
+            sandboxName = "none"
+        } else {
+#if os(macOS)
+            sandboxName = "seatbelt"
+#elseif os(Linux)
+            sandboxName = "landlock"
+#elseif os(Windows)
+            sandboxName = "windows_sandbox"
+#else
+            sandboxName = "external"
+#endif
+        }
+        let writableRoots: [String]
+        if let activeProfile,
+           let profile = try? ProfileName(parsing: activeProfile).resolve(
+               workspace: workingDirectory,
+               config: loadSandboxConfig(workspace: workingDirectory, environment: environment),
+               environment: environment
+           )
+        {
+            writableRoots = profile.readWrite.map(\.path)
+        } else {
+            writableRoots = []
+        }
+        return CodexPermissions(
+            sandbox: sandboxName,
+            sandboxMode: sandboxMode,
+            sandboxProfile: activeProfile,
+            networkAccess: !OpenGrokSandbox.shouldRestrictChildNetwork(),
+            writableRoots: writableRoots,
+            approvalPolicy: alwaysApprove ? .never : .onRequest,
+            autoReviewEnabled: autoReviewEnabled
+        )
     }
     private let hookPermissionGate: HookPermissionGate?
     /// The OS sandbox this session runs under. `profileName` is what a session
@@ -196,6 +273,7 @@ struct LiveToolExecutor: Sendable {
         // construction sites that predate the flags keep compiling; a session
         // that passes nothing simply has no CLI permission tier.
         permissionOptions: CLIPermissionOptions = CLIPermissionOptions(),
+        inheritedPermissionHandle: PermissionHandle? = nil,
         sandboxAutoAllowBash: (@Sendable () -> Bool)? = nil,
         // Plan mode is a root-session interaction: a subagent calling
         // `exit_plan_mode` would present a plan dialog indistinguishable from
@@ -245,6 +323,7 @@ struct LiveToolExecutor: Sendable {
         monitorHost: LiveMonitorHost? = nil
     ) async throws {
         self.subagentHost = subagentHost
+        self.sessionEnvironment = environment
         let composition = OpenGrokShellToolRuntimeComposition(
             processBackend: processBackend,
             runtime: LiveRunTerminalToolRuntime(subagents: subagentHost)
@@ -330,6 +409,7 @@ struct LiveToolExecutor: Sendable {
             hooks: hooks.gate.map { $0 as any PreToolUseHookRunner } ?? FailOpenPreToolUseHookRunner(),
             hunkTracker: hunkTracker,
             resolved: security.permissions,
+            inheritedPermissionHandle: inheritedPermissionHandle,
             sandboxAutoAllowBash: sandboxPredicate
         )
         // The dedicated plan-approval view, root sessions only: a child's

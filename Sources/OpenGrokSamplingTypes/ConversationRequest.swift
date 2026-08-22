@@ -410,6 +410,9 @@ public struct ConversationRequest: Sendable, Equatable {
     public var xGrokConvId: String?
     public var xGrokReqId: String?
     public var xGrokSessionId: String?
+    /// Durable prompt-cache identity inherited by verbatim forks. Provider
+    /// affinity headers use this override; telemetry keeps `xGrokSessionId`.
+    public var xGrokCacheAffinityId: String?
     public var xGrokTurnIdx: String?
     public var xGrokAgentId: String?
     public var xGrokDeploymentId: String?
@@ -437,6 +440,7 @@ public struct ConversationRequest: Sendable, Equatable {
         xGrokConvId: String? = nil,
         xGrokReqId: String? = nil,
         xGrokSessionId: String? = nil,
+        xGrokCacheAffinityId: String? = nil,
         xGrokTurnIdx: String? = nil,
         xGrokAgentId: String? = nil,
         xGrokDeploymentId: String? = nil,
@@ -457,6 +461,7 @@ public struct ConversationRequest: Sendable, Equatable {
         self.xGrokConvId = xGrokConvId
         self.xGrokReqId = xGrokReqId
         self.xGrokSessionId = xGrokSessionId
+        self.xGrokCacheAffinityId = xGrokCacheAffinityId
         self.xGrokTurnIdx = xGrokTurnIdx
         self.xGrokAgentId = xGrokAgentId
         self.xGrokDeploymentId = xGrokDeploymentId

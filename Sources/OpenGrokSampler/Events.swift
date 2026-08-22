@@ -179,6 +179,16 @@ public enum SamplingEvent: Sendable, Equatable {
         argumentsDelta: String?
     )
 
+    /// One call's arguments are final, before the response itself completes.
+    /// Exactly one readiness hint follows the last delta for each tool index;
+    /// the canonical call still arrives in the terminal completed response.
+    case toolCallArgumentsComplete(
+        requestId: RequestId,
+        toolIndex: UInt32,
+        id: String?,
+        name: String?
+    )
+
     /// Streaming completed successfully.
     case completed(
         requestId: RequestId,

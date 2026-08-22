@@ -594,7 +594,9 @@ public func projectResponsesRequestBody(
     if let topP = req.topP {
         body["top_p"] = .number(.double(Double(topP)))
     }
-    if let key = adapter.promptCacheKey(sessionId: req.xGrokSessionId) {
+    if let key = adapter.promptCacheKey(
+        sessionId: req.xGrokCacheAffinityId ?? req.xGrokSessionId
+    ) {
         body["prompt_cache_key"] = .string(key)
     }
     // Every Responses dialect gets the base reasoning object — always present,

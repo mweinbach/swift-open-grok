@@ -908,12 +908,45 @@ public enum SessionTranscriptProjector {
                     "tool_call",
                     "tool_call_update",
                     "turn_complete",
+                    "turn_completed",
                     "usage_update"
                 ]
                 if !knownTags.contains(tag) {
                     malformedUpdateCount = malformedUpdateCount.saturatingAdd(1)
                 }
                 promptEvents.append(.notUserMessage)
+            }
+
+            if tag == "turn_completed" {
+                guard update.method == "_x.ai/session/update",
+                      let promptID = updateObject["prompt_id"]?.stringValue,
+                      !promptID.isEmpty,
+                      let stopReason = updateObject["stop_reason"]?.stringValue,
+                      !stopReason.isEmpty else {
+                    malformedUpdateCount = malformedUpdateCount.saturatingAdd(1)
+                    flushAssistant(&assistantCurrent, into: &assistantMessages)
+                    continue
+                }
+
+                switch stopReason {
+                case "cancelled", "canceled":
+                    transcriptEvents.append(.turnCompleted(kind: .cancelled(category: nil, context: nil)))
+                case "max_turns_reached":
+                    if let limit = updateObject["limit"]?.uint64Value {
+                        transcriptEvents.append(.turnCompleted(kind: .maxTurnsReached(limit: limit)))
+                    } else {
+                        transcriptEvents.append(.turnCompleted(
+                            kind: .cancelled(category: "max_turns_reached", context: nil)
+                        ))
+                    }
+                case "error":
+                    transcriptEvents.append(.custom(
+                        name: "turn_failed",
+                        payload: updateObject["agent_result"] ?? .null
+                    ))
+                default:
+                    transcriptEvents.append(.turnCompleted(kind: .completed))
+                }
             }
 
             if tag == "agent_message_chunk" {

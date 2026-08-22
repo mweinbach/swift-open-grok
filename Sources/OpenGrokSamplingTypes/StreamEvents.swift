@@ -71,6 +71,8 @@ public struct ChatChunkDelta: Codable, Sendable, Equatable, Hashable {
     public var role: Role?
     public var content: String?
     public var reasoningContent: String?
+    public var reasoning: String?
+    public var reasoningDetails: [OpenRouterReasoningDetail]
     public var toolCalls: [ToolCallDelta]
     public var toolCallId: String?
 
@@ -78,19 +80,24 @@ public struct ChatChunkDelta: Codable, Sendable, Equatable, Hashable {
         role: Role? = nil,
         content: String? = nil,
         reasoningContent: String? = nil,
+        reasoning: String? = nil,
+        reasoningDetails: [OpenRouterReasoningDetail] = [],
         toolCalls: [ToolCallDelta] = [],
         toolCallId: String? = nil
     ) {
         self.role = role
         self.content = content
         self.reasoningContent = reasoningContent
+        self.reasoning = reasoning
+        self.reasoningDetails = reasoningDetails
         self.toolCalls = toolCalls
         self.toolCallId = toolCallId
     }
 
     public enum CodingKeys: String, CodingKey {
-        case role, content
+        case role, content, reasoning
         case reasoningContent = "reasoning_content"
+        case reasoningDetails = "reasoning_details"
         case toolCalls = "tool_calls"
         case toolCallId = "tool_call_id"
     }
@@ -100,6 +107,11 @@ public struct ChatChunkDelta: Codable, Sendable, Equatable, Hashable {
         self.role = try c.decodeIfPresent(Role.self, forKey: .role)
         self.content = try c.decodeIfPresent(String.self, forKey: .content)
         self.reasoningContent = try c.decodeIfPresent(String.self, forKey: .reasoningContent)
+        self.reasoning = try c.decodeIfPresent(String.self, forKey: .reasoning)
+        self.reasoningDetails = try c.decodeIfPresent(
+            [OpenRouterReasoningDetail].self,
+            forKey: .reasoningDetails
+        ) ?? []
         // Handle null as empty vec, mirroring `deserialize_null_default`.
         if c.contains(.toolCalls) {
             self.toolCalls = try c.decodeIfPresent([ToolCallDelta].self, forKey: .toolCalls) ?? []
@@ -114,8 +126,79 @@ public struct ChatChunkDelta: Codable, Sendable, Equatable, Hashable {
         try c.encodeIfPresent(role, forKey: .role)
         try c.encodeIfPresent(content, forKey: .content)
         try c.encodeIfPresent(reasoningContent, forKey: .reasoningContent)
+        try c.encodeIfPresent(reasoning, forKey: .reasoning)
+        try c.encodeIfPresent(
+            reasoningDetails.isEmpty ? nil : reasoningDetails,
+            forKey: .reasoningDetails
+        )
         try c.encodeIfPresent(toolCalls.isEmpty ? nil : toolCalls, forKey: .toolCalls)
         try c.encodeIfPresent(toolCallId, forKey: .toolCallId)
+    }
+
+    /// Preserve provider precedence without trimming incremental fragments.
+    public var reasoningText: String {
+        if let reasoningContent, !reasoningContent.isEmpty {
+            return reasoningContent
+        }
+        if let reasoning, !reasoning.isEmpty {
+            return reasoning
+        }
+        return reasoningDetails.compactMap(\.displayText).joined()
+    }
+}
+
+/// Forward-compatible OpenRouter structured reasoning fragment.
+public struct OpenRouterReasoningDetail: Codable, Sendable, Equatable, Hashable {
+    public var type: String
+    public var text: String?
+    public var summary: String?
+    public var extra: [String: JSONValue]
+
+    public init(
+        type: String = "",
+        text: String? = nil,
+        summary: String? = nil,
+        extra: [String: JSONValue] = [:]
+    ) {
+        self.type = type
+        self.text = text
+        self.summary = summary
+        self.extra = extra
+    }
+
+    public var displayText: String? {
+        switch type {
+        case "reasoning.text":
+            return text
+        case "reasoning.summary":
+            return summary ?? text
+        default:
+            return nil
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: DynamicCodingKey.self)
+        self.type = try container.decodeIfPresent(String.self, forKey: DynamicCodingKey("type")) ?? ""
+        self.text = try container.decodeIfPresent(String.self, forKey: DynamicCodingKey("text"))
+        self.summary = try container.decodeIfPresent(String.self, forKey: DynamicCodingKey("summary"))
+        var extra: [String: JSONValue] = [:]
+        for key in container.allKeys where key.stringValue != "type"
+            && key.stringValue != "text" && key.stringValue != "summary"
+        {
+            extra[key.stringValue] = try container.decode(JSONValue.self, forKey: key)
+        }
+        self.extra = extra
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: DynamicCodingKey.self)
+        try container.encode(type, forKey: DynamicCodingKey("type"))
+        try container.encodeIfPresent(text, forKey: DynamicCodingKey("text"))
+        try container.encodeIfPresent(summary, forKey: DynamicCodingKey("summary"))
+        for (key, value) in extra where key != "type" && key != "text" && key != "summary" {
+            try container.encode(value, forKey: DynamicCodingKey(key))
+        }
     }
 }
 

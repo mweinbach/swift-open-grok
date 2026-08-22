@@ -1,5 +1,7 @@
 import Foundation
 import Testing
+import OpenGrokACP
+import OpenGrokSessionPersistence
 import OpenGrokShared
 import OpenGrokShellBase
 import OpenGrokShellSessionSupport
@@ -278,4 +280,283 @@ func duplicateLifecycleRequests() async throws {
     await driver.unblock()
     _ = try await shell.waitForTurn(first, timeout: ShellDuration(timeInterval: 1))
     _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+}
+
+@Test("completed turns persist assistant history and replayable terminal updates before returning")
+func completedTurnsPersistConversationAndTerminal() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let home = root.appendingPathComponent("home", isDirectory: true)
+    let sessionID = SessionID("durable-turn")
+    let provider = RecordingProvider(sessionID: sessionID.rawValue)
+    let driver = RecordingTurnDriver()
+    let backend = RecordingBackend()
+    let shell = makeShell(root: root, provider: provider, driver: driver, backend: backend)
+    _ = try await shell.start()
+    _ = try await shell.createSession(OpenGrokShellSessionRequest(sessionID: sessionID, cwd: root))
+
+    let handle = try await shell.submitTurn(
+        sessionID: sessionID,
+        request: OpenGrokShellTurnRequest(
+            promptID: "durable-prompt",
+            text: "remember this",
+            turnID: "durable-turn-id"
+        )
+    )
+    _ = try await shell.waitForTurn(handle, timeout: ShellDuration(timeInterval: 1))
+
+    let state = try #require(try await SessionStateStore(root: home).load(sessionID: sessionID))
+    #expect(state.chatHistory == [
+        .object([
+            "type": .string("user"),
+            "content": .array([
+                .object([
+                    "type": .string("text"),
+                    "text": .string("remember this")
+                ])
+            ])
+        ]),
+        .object([
+            "type": .string("assistant"),
+            "content": .string("accepted: remember this")
+        ])
+    ])
+    #expect(state.summary.chatMessageCount == 2)
+    #expect(state.pendingCommands.isEmpty)
+    #expect(state.updates.map(\.method) == [
+        "session/update",
+        "session/update",
+        "_x.ai/session/update"
+    ])
+    let terminal = try #require(state.updates.last)
+    #expect(terminal.timestamp == 1_700_000_000)
+    #expect(terminal.params["update"]?["sessionUpdate"] == .string("turn_completed"))
+    #expect(terminal.params["update"]?["prompt_id"] == .string("durable-prompt"))
+    #expect(terminal.params["update"]?["agent_result"] == nil)
+    #expect(state.transcript.entries.last?.event == .turnCompleted(kind: .completed))
+
+    _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+}
+
+@Test("resume restores canonical session history and metadata without replacing the canonical documents")
+func resumedSessionRestoresCanonicalStateAndPreservesMetadata() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let home = root.appendingPathComponent("home", isDirectory: true)
+    let sessionID = SessionID("resume-canonical")
+    let createdAt = Date(timeIntervalSince1970: 1_600_000_000)
+    let summary = SessionSummary(
+        sessionID: sessionID,
+        cwd: root.path,
+        sessionSummary: "Original title",
+        createdAt: createdAt,
+        updatedAt: createdAt.addingTimeInterval(5),
+        currentModelID: "previous-model",
+        nextTraceTurn: 27,
+        everUsedCodex: true,
+        sessionKind: "restored-kind",
+        extra: ["relocation_generation": .number(.uint64(8))]
+    )
+    let originalUpdate = try SessionUpdateEnvelope(
+        timestamp: 9,
+        method: "session/update",
+        params: .object([
+            "update": .object([
+                "sessionUpdate": .string("agent_message_chunk"),
+                "content": .object(["type": .string("text"), "text": .string("old reply")])
+            ])
+        ])
+    )
+    let originalHistory: [JSONValue] = [
+        .object([
+            "type": .string("user"),
+            "content": .array([
+                .object(["type": .string("text"), "text": .string("old prompt")])
+            ])
+        ]),
+        .object(["type": .string("assistant"), "content": .string("old reply")])
+    ]
+    let originalTranscript = SessionTranscript().appending(
+        event: .assistantTextChunk(text: "old reply"),
+        timestampMS: 10
+    )
+    let originalTool = SessionToolHistoryEntry(
+        entryID: "historical-tool",
+        sequence: 1,
+        timestampMS: 10,
+        toolCallID: "tool-call",
+        title: "Read historical file",
+        views: [.durableReplay]
+    )
+    let recovery = SessionRecoveryState(status: .recoverable, recoveryGeneration: 4)
+    let original = PersistedSessionState(
+        summary: summary,
+        chatHistory: originalHistory,
+        updates: [originalUpdate],
+        transcript: originalTranscript,
+        toolHistory: [originalTool],
+        recovery: recovery
+    )
+    let documents = SessionDocumentStore(grokHome: home)
+    try documents.save(original)
+
+    let provider = RecordingProvider(sessionID: sessionID.rawValue)
+    let driver = RecordingTurnDriver()
+    let backend = RecordingBackend()
+    let shell = makeShell(root: root, provider: provider, driver: driver, backend: backend)
+    _ = try await shell.start()
+    let descriptor = try await shell.createSession(
+        OpenGrokShellSessionRequest(sessionID: sessionID, cwd: root, restorePersistedState: true)
+    )
+
+    #expect(descriptor.createdAt == createdAt)
+    let restored = try #require(try await SessionStateStore(root: home).load(sessionID: sessionID))
+    #expect(restored.chatHistory == originalHistory)
+    #expect(restored.summary.createdAt == createdAt)
+    #expect(restored.summary.nextTraceTurn == 27)
+    #expect(restored.summary.currentModelID == "test-model")
+    #expect(restored.summary.everUsedCodex)
+    #expect(restored.summary.sessionKind == "restored-kind")
+    #expect(restored.summary.extra["relocation_generation"] == .number(.uint64(8)))
+    #expect(restored.updates == [originalUpdate])
+    #expect(restored.transcript == originalTranscript)
+    #expect(restored.toolHistory == [originalTool])
+    #expect(restored.recovery == recovery)
+
+    let handle = try await shell.submitTurn(
+        sessionID: sessionID,
+        request: OpenGrokShellTurnRequest(
+            promptID: "resumed-prompt",
+            text: "continue",
+            turnID: "resumed-turn"
+        )
+    )
+    _ = try await shell.waitForTurn(handle, timeout: ShellDuration(timeInterval: 1))
+
+    let canonical = try #require(try documents.load(sessionID: sessionID.rawValue, cwd: root.path))
+    #expect(canonical.chatHistory == originalHistory)
+    let terminals = canonical.updates.filter {
+        $0.params["update"]?["sessionUpdate"] == .string("turn_completed")
+    }
+    #expect(terminals.count == 1)
+    #expect(terminals.first?.params["update"]?["prompt_id"] == .string("resumed-prompt"))
+
+    let auxiliary = try #require(try await SessionStateStore(root: home).load(sessionID: sessionID))
+    #expect(auxiliary.chatHistory.count == originalHistory.count + 2)
+    #expect(auxiliary.toolHistory == [originalTool])
+    #expect(auxiliary.recovery == recovery)
+
+    _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+}
+
+@Test("unpersistable turn submission rolls back admission without starting the provider")
+func unpersistableTurnSubmissionRollsBack() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let home = root.appendingPathComponent("home", isDirectory: true)
+    let sessionID = SessionID("submit-persistence-failure")
+    let provider = RecordingProvider(sessionID: sessionID.rawValue)
+    let driver = RecordingTurnDriver()
+    let backend = RecordingBackend()
+    let shell = makeShell(root: root, provider: provider, driver: driver, backend: backend)
+    _ = try await shell.start()
+    _ = try await shell.createSession(OpenGrokShellSessionRequest(sessionID: sessionID, cwd: root))
+
+    let sessionDirectory = home.appendingPathComponent("sessions").appendingPathComponent(sessionID.rawValue)
+    let savedDirectory = home.appendingPathComponent("saved-submit-state")
+    try FileManager.default.moveItem(at: sessionDirectory, to: savedDirectory)
+    try Data("not a directory".utf8).write(to: sessionDirectory)
+
+    await #expect(throws: ShellSessionSupportError.self) {
+        _ = try await shell.submitTurn(
+            sessionID: sessionID,
+            request: OpenGrokShellTurnRequest(
+                promptID: "failed-prompt",
+                text: "must not run",
+                turnID: "failed-turn"
+            )
+        )
+    }
+    #expect(await provider.counts().begin == 0)
+    #expect(await shell.lookupSession(sessionID)?.phase == .idle)
+
+    try FileManager.default.removeItem(at: sessionDirectory)
+    try FileManager.default.moveItem(at: savedDirectory, to: sessionDirectory)
+    let handle = try await shell.submitTurn(
+        sessionID: sessionID,
+        request: OpenGrokShellTurnRequest(
+            promptID: "recovered-prompt",
+            text: "works after rollback",
+            turnID: "recovered-turn"
+        )
+    )
+    _ = try await shell.waitForTurn(handle, timeout: ShellDuration(timeInterval: 1))
+    _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+}
+
+@Test("terminal persistence failures surface instead of publishing a false successful completion")
+func terminalPersistenceFailureDoesNotPublishCompletion() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let home = root.appendingPathComponent("home", isDirectory: true)
+    let sessionID = SessionID("terminal-persistence-failure")
+    let provider = RecordingProvider(sessionID: sessionID.rawValue)
+    let driver = RecordingTurnDriver(block: true)
+    let backend = RecordingBackend()
+    let shell = makeShell(root: root, provider: provider, driver: driver, backend: backend)
+    let events = await shell.events()
+    _ = try await shell.start()
+    _ = try await shell.createSession(OpenGrokShellSessionRequest(sessionID: sessionID, cwd: root))
+    let handle = try await shell.submitTurn(
+        sessionID: sessionID,
+        request: OpenGrokShellTurnRequest(
+            promptID: "terminal-prompt",
+            text: "cannot finish durably",
+            turnID: "terminal-turn"
+        )
+    )
+
+    let sessionDirectory = home.appendingPathComponent("sessions").appendingPathComponent(sessionID.rawValue)
+    let savedDirectory = home.appendingPathComponent("saved-terminal-state")
+    try FileManager.default.moveItem(at: sessionDirectory, to: savedDirectory)
+    try Data("not a directory".utf8).write(to: sessionDirectory)
+    await driver.unblock()
+
+    do {
+        _ = try await shell.waitForTurn(handle, timeout: ShellDuration(timeInterval: 1))
+        Issue.record("the turn reported success despite its terminal persistence failure")
+    } catch let error as OpenGrokShellError {
+        guard case let .turnFailed(message) = error else { throw error }
+        #expect(message.contains("failed to durably complete turn terminal-turn"))
+    }
+
+    try FileManager.default.removeItem(at: sessionDirectory)
+    try FileManager.default.moveItem(at: savedDirectory, to: sessionDirectory)
+    _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+
+    var sawFailure = false
+    var sawCompletion = false
+    for try await event in events {
+        if case let .turnFailed(failed, _) = event, failed == handle { sawFailure = true }
+        if case let .turnCompleted(result) = event, result.turnID == handle.turnID { sawCompletion = true }
+    }
+    #expect(sawFailure)
+    #expect(!sawCompletion)
+}
+
+@Test("ACP prompt responses preserve provider max-token, refusal, and max-turn stop reasons")
+func providerStopReasonsReachACPClients() {
+    func result(_ reason: String?, cancelled: Bool = false) -> OpenGrokShellTurnResult {
+        OpenGrokShellTurnResult(
+            sessionID: SessionID("stop-reasons"),
+            turnID: "stop-turn",
+            output: "answer",
+            stopReason: reason,
+            cancelled: cancelled
+        )
+    }
+
+    #expect(ProviderBackedACPPromptDriver.stopReason(for: result("max_tokens")) == .maxTokens)
+    #expect(ProviderBackedACPPromptDriver.stopReason(for: result("length")) == .maxTokens)
+    #expect(ProviderBackedACPPromptDriver.stopReason(for: result("max_turn_requests")) == .maxTurnRequests)
+    #expect(ProviderBackedACPPromptDriver.stopReason(for: result("max_turns_reached")) == .cancelled)
+    #expect(ProviderBackedACPPromptDriver.stopReason(for: result("content_filter")) == .refusal)
+    #expect(ProviderBackedACPPromptDriver.stopReason(for: result("end_turn")) == .endTurn)
+    #expect(ProviderBackedACPPromptDriver.stopReason(for: result("end_turn", cancelled: true)) == .cancelled)
 }

@@ -2,11 +2,10 @@
 //
 // Live session management: the `open-grok sessions` CLI route.
 //
-// This reads the same on-disk store the interactive/headless runs write:
-// `$OPENGROK_HOME/sessions/<session-id>.json`, one `LiveConversationRecord`
-// per file (see `LiveConversationStore` in `LiveComposition.swift`). The
-// record type is shared rather than re-declared so the wire format cannot
-// drift between the writer and this reader.
+// This reads the canonical Rust-compatible cwd-bucket session documents the
+// interactive/headless runs write, while retaining flat Swift session files
+// as a compatibility migration surface. Canonical records always win when a
+// session has both representations.
 //
 // Rust reference (`/Users/mweinbach/Projects/grok-build`):
 //
@@ -32,6 +31,7 @@ import Foundation
 import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokSamplingTypes
+import OpenGrokSessionPersistence
 
 // MARK: - Catalog
 
@@ -91,12 +91,14 @@ public struct LiveSessionListing: Sendable, Equatable {
 /// which is what keeps them from diverging.
 struct LiveSessionCatalog {
     let sessionsDirectory: URL
+    private let documentStore: SessionDocumentStore
     private let fileManager: FileManager
 
     init(openGrokHome: URL, fileManager: FileManager = .default) {
         self.sessionsDirectory = openGrokHome
             .appendingPathComponent("sessions", isDirectory: true)
             .standardizedFileURL
+        self.documentStore = SessionDocumentStore(grokHome: openGrokHome)
         self.fileManager = fileManager
     }
 
@@ -107,23 +109,7 @@ struct LiveSessionCatalog {
     /// listing: a half-written session from a crashed run must not make
     /// `sessions list` unusable.
     func list() throws -> [LiveSessionListing] {
-        guard fileManager.fileExists(atPath: sessionsDirectory.path) else { return [] }
-        let urls: [URL]
-        do {
-            urls = try fileManager.contentsOfDirectory(
-                at: sessionsDirectory,
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            )
-        } catch {
-            throw CLIApplicationError.failed("failed to list sessions: \(error)")
-        }
-        return urls
-            .filter { $0.pathExtension == "json" }
-            .compactMap { url -> LiveConversationRecord? in
-                guard let data = try? Data(contentsOf: url) else { return nil }
-                return try? JSONDecoder().decode(LiveConversationRecord.self, from: data)
-            }
+        try records()
             .map(Self.listing(for:))
             .sorted { lhs, rhs in
                 if lhs.lastActivityAt == rhs.lastActivityAt {
@@ -142,6 +128,40 @@ struct LiveSessionCatalog {
     /// each record to a handful of fields as it goes.
     func records() throws -> [LiveConversationRecord] {
         guard fileManager.fileExists(atPath: sessionsDirectory.path) else { return [] }
+        var records: [LiveConversationRecord] = []
+        var sessionIDs = Set<String>()
+        do {
+            for summary in try documentStore.list() {
+                guard sessionIDs.insert(summary.sessionID.rawValue).inserted else {
+                    continue
+                }
+                let visibilityOverride = summary.extra["hidden"]?.boolValue
+                if visibilityOverride == true
+                    || (
+                        visibilityOverride == nil
+                            && summary.sessionKind?.hasPrefix("subagent") == true
+                    )
+                {
+                    continue
+                }
+                do {
+                    guard let state = try documentStore.load(
+                        sessionID: summary.sessionID.rawValue,
+                        cwd: summary.cwd
+                    ) else { continue }
+                    let record = try LiveConversationStore.record(
+                        from: state,
+                        requestedSessionID: summary.sessionID.rawValue
+                    )
+                    records.append(record)
+                } catch {
+                    continue
+                }
+            }
+        } catch {
+            throw CLIApplicationError.failed("failed to list sessions: \(error)")
+        }
+
         let urls: [URL]
         do {
             urls = try fileManager.contentsOfDirectory(
@@ -152,12 +172,31 @@ struct LiveSessionCatalog {
         } catch {
             throw CLIApplicationError.failed("failed to list sessions: \(error)")
         }
-        return urls
+        let legacy = urls
             .filter { $0.pathExtension == "json" }
             .compactMap { url -> LiveConversationRecord? in
-                guard let data = try? Data(contentsOf: url) else { return nil }
-                return try? JSONDecoder().decode(LiveConversationRecord.self, from: data)
+                guard let data = try? Data(contentsOf: url),
+                      let record = try? JSONDecoder().decode(
+                        LiveConversationRecord.self,
+                        from: data
+                      ),
+                      !sessionIDs.contains(record.sessionID)
+                else { return nil }
+                if let directory = try? documentStore.sessionDirectory(
+                    sessionID: record.sessionID,
+                    cwd: record.workingDirectory
+                ), fileManager.fileExists(
+                    atPath: directory.appendingPathComponent("summary.json").path
+                ) {
+                    return nil
+                }
+                guard sessionIDs.insert(record.sessionID).inserted else {
+                    return nil
+                }
+                return record
             }
+        records.append(contentsOf: legacy)
+        return records
     }
 
     /// Flattened search documents for every session.
@@ -167,9 +206,23 @@ struct LiveSessionCatalog {
 
     func load(sessionID: String) throws -> LiveSessionListing? {
         try LiveConversationStore.validateSessionID(sessionID)
-        let url = fileURL(sessionID: sessionID)
-        guard fileManager.fileExists(atPath: url.path) else { return nil }
         do {
+            if let state = try documentStore.load(sessionID: sessionID) {
+                let directory = try documentStore.sessionDirectory(
+                    sessionID: sessionID,
+                    cwd: state.summary.cwd
+                )
+                if fileManager.fileExists(
+                    atPath: directory.appendingPathComponent("summary.json").path
+                ) {
+                    return Self.listing(for: try LiveConversationStore.record(
+                        from: state,
+                        requestedSessionID: sessionID
+                    ))
+                }
+            }
+            let url = fileURL(sessionID: sessionID)
+            guard fileManager.fileExists(atPath: url.path) else { return nil }
             let record = try JSONDecoder().decode(
                 LiveConversationRecord.self,
                 from: try Data(contentsOf: url)
@@ -187,21 +240,59 @@ struct LiveSessionCatalog {
     func delete(sessionID: String) throws -> Bool {
         try LiveConversationStore.validateSessionID(sessionID)
         let url = fileURL(sessionID: sessionID)
-        guard fileManager.fileExists(atPath: url.path) else { return false }
+        let legacyDirectory = sessionsDirectory.appendingPathComponent(
+            sessionID,
+            isDirectory: true
+        )
+        let legacyState = legacyDirectory.appendingPathComponent("state.json")
         do {
-            try fileManager.removeItem(at: url)
+            let state = try documentStore.load(sessionID: sessionID)
+            var canonicalDirectories: Set<URL> = []
+            if let state {
+                let directory = try documentStore.sessionDirectory(
+                    sessionID: sessionID,
+                    cwd: state.summary.cwd
+                )
+                if fileManager.fileExists(
+                    atPath: directory.appendingPathComponent("summary.json").path
+                ) {
+                    canonicalDirectories.insert(directory)
+                }
+            }
+            for summary in try documentStore.list()
+                where summary.sessionID.rawValue == sessionID
+            {
+                canonicalDirectories.insert(try documentStore.sessionDirectory(
+                    sessionID: sessionID,
+                    cwd: summary.cwd
+                ))
+            }
+
+            guard !canonicalDirectories.isEmpty
+                || fileManager.fileExists(atPath: url.path)
+                || fileManager.fileExists(atPath: legacyState.path)
+            else { return false }
+
+            for canonicalDirectory in canonicalDirectories {
+                try fileManager.removeItem(at: canonicalDirectory)
+            }
+            if fileManager.fileExists(atPath: url.path) {
+                try fileManager.removeItem(at: url)
+            }
+            if fileManager.fileExists(atPath: legacyDirectory.path) {
+                try fileManager.removeItem(at: legacyDirectory)
+            }
+
+            let rewindURL = LiveRewindStore.rewindFileURL(
+                openGrokHome: sessionsDirectory.deletingLastPathComponent(),
+                sessionID: sessionID
+            )
+            if fileManager.fileExists(atPath: rewindURL.path) {
+                try fileManager.removeItem(at: rewindURL)
+            }
         } catch {
             throw CLIApplicationError.failed("failed to delete session \(sessionID): \(error)")
         }
-        // Rewind snapshots live beside the session as `<id>.rewind.jsonl` and
-        // hold verbatim copies of the user's source files. Leaving them behind
-        // after a delete would keep that content on disk with nothing left
-        // pointing at it, which is the opposite of what deleting a session
-        // means. Absent file is not an error: most sessions never record one.
-        try? fileManager.removeItem(at: LiveRewindStore.rewindFileURL(
-            openGrokHome: sessionsDirectory.deletingLastPathComponent(),
-            sessionID: sessionID
-        ))
         return true
     }
 
@@ -238,7 +329,7 @@ struct LiveSessionCatalog {
             // (upstream stores the rename as the session's summary,
             // `rename.rs:42-53`); sessions never renamed keep deriving.
             title: record.title ?? title,
-            model: model,
+            model: model ?? record.currentModelID,
             createdAt: record.createdAt,
             lastActivityAt: record.updatedAt,
             messageCount: record.items.count,

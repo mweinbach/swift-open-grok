@@ -31,6 +31,10 @@ public struct RhaiWorkflowRunContext: Sendable {
     public let workflowName: String
     public let arguments: JSONValue
     public let agentBudget: UInt64
+    /// Agent calls already durably recorded before this execution began.
+    /// Hosts seed their spent counter from this value so replaying a journal
+    /// cannot reset the run's lifetime agent budget.
+    public let priorAgentsUsed: UInt64
     /// Where the journal for this run lives, or `nil` for an in-memory store.
     public let journalURL: URL?
     /// Flipped by `cancel(runID:)`. The engine polls it between operations and
@@ -45,6 +49,7 @@ public struct RhaiWorkflowRunContext: Sendable {
         workflowName: String,
         arguments: JSONValue,
         agentBudget: UInt64,
+        priorAgentsUsed: UInt64 = 0,
         journalURL: URL?,
         cancellation: RhaiCancellationToken,
         progress: RhaiWorkflowProgressBoard = RhaiWorkflowProgressBoard()
@@ -53,6 +58,7 @@ public struct RhaiWorkflowRunContext: Sendable {
         self.workflowName = workflowName
         self.arguments = arguments
         self.agentBudget = agentBudget
+        self.priorAgentsUsed = priorAgentsUsed
         self.journalURL = journalURL
         self.cancellation = cancellation
         self.progress = progress
@@ -92,6 +98,10 @@ public enum RhaiWorkflowRegistryError: Error, Sendable, Hashable, CustomStringCo
     case missingRun(String)
     case notResumable(String)
     case scriptMismatch(String)
+    case argumentsMismatch(String)
+    case invalidAgentBudget(requested: UInt64, maximum: UInt64)
+    case budgetNotRaised(used: UInt64, limit: UInt64)
+    case tooManyActiveRuns(limit: Int)
     case persistence(String)
     case journal(String)
 
@@ -100,11 +110,21 @@ public enum RhaiWorkflowRegistryError: Error, Sendable, Hashable, CustomStringCo
         case .missingRun(let id): return "workflow run does not exist: \(id)"
         case .notResumable(let status): return "workflow run is not resumable (status \(status))"
         case .scriptMismatch(let id): return "workflow run \(id) was started from a different script"
+        case .argumentsMismatch(let id): return "workflow run \(id) launch arguments are immutable across resume"
+        case .invalidAgentBudget(let requested, let maximum):
+            return "workflow agent budget \(requested) must be between 1 and \(maximum)"
+        case .budgetNotRaised(let used, let limit):
+            return "workflow run is budget-limited at \(used) of \(limit) agents; resume it with an agent_budget above \(used)"
+        case .tooManyActiveRuns(let limit):
+            return "session already has the maximum of \(limit) active workflow runs"
         case .persistence(let message): return "workflow persistence failed: \(message)"
         case .journal(let message): return "workflow journal failed: \(message)"
         }
     }
 }
+
+/// `WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION` in upstream's workflow manager.
+public let rhaiMaxActiveWorkflowRunsPerSession = 4
 
 /// One run's live state, as the `/workflows` overlay and `workflow show` read it.
 public struct RhaiWorkflowRunView: Sendable, Hashable {
@@ -224,6 +244,10 @@ public actor RhaiWorkflowRunRegistry {
 
     public let store: WorkflowSessionStore
     private var live: [String: Live] = [:]
+    /// Actor reentrancy permits another launch while persistence or a status
+    /// sink suspends. Reserve its slot before either await so simultaneous
+    /// callers cannot all observe the same apparently available capacity.
+    private var reservedRunIDs: Set<String> = []
     /// Retained so `journal(runID:)` can answer for an in-memory registry, where
     /// there is no file to read back.
     private var journals: [String: RhaiJournal] = [:]
@@ -362,7 +386,10 @@ public actor RhaiWorkflowRunRegistry {
         limits: RhaiInterpreterLimits = RhaiInterpreterLimits()
     ) async throws -> WorkflowRunRecord {
         let name = try workflowName ?? Self.inferName(from: script)
+        try Self.validateAgentBudget(agentBudget)
         let runID = makeRunID()
+        try reserveLaunchSlot(for: runID)
+        defer { reservedRunIDs.remove(runID) }
         let journalURL: URL?
         do {
             journalURL = try await store.journalURL(for: runID)
@@ -411,6 +438,7 @@ public actor RhaiWorkflowRunRegistry {
         runID: String,
         script: String,
         arguments: JSONValue = .object([:]),
+        agentBudget: UInt64? = nil,
         hostFactory: RhaiWorkflowHostFactory,
         limits: RhaiInterpreterLimits = RhaiInterpreterLimits()
     ) async throws -> WorkflowRunRecord {
@@ -426,6 +454,12 @@ public actor RhaiWorkflowRunRegistry {
         guard record.scriptHash == rhaiRequestHash(kind: "script", payload: .string(script)) else {
             throw RhaiWorkflowRegistryError.scriptMismatch(runID)
         }
+        guard record.argumentsHash == rhaiRequestHash(kind: "arguments", payload: arguments) else {
+            throw RhaiWorkflowRegistryError.argumentsMismatch(runID)
+        }
+        if let agentBudget {
+            try Self.validateAgentBudget(agentBudget)
+        }
         let journalURL = record.journalPath.map { URL(fileURLWithPath: $0) }
         let journal: RhaiJournal
         if let journalURL {
@@ -437,6 +471,30 @@ public actor RhaiWorkflowRunRegistry {
         } else {
             journal = journals[runID] ?? RhaiJournal()
         }
+        // A journal append can survive a crash before the corresponding
+        // manifest update. Never lower either source's accounting.
+        record.agentsUsed = max(record.agentsUsed, journal.agentReservationCount)
+        if record.status == .budgetExceeded {
+            guard record.agentsUsed < rhaiMaxAgentBudget else {
+                throw RhaiWorkflowRegistryError.notResumable(
+                    "maximum agent budget reached; start a new run"
+                )
+            }
+            guard let agentBudget,
+                  agentBudget > record.agentBudget,
+                  agentBudget > record.agentsUsed
+            else {
+                throw RhaiWorkflowRegistryError.budgetNotRaised(
+                    used: record.agentsUsed,
+                    limit: record.agentBudget
+                )
+            }
+        }
+        if let agentBudget {
+            record.agentBudget = max(record.agentBudget, agentBudget)
+        }
+        try reserveLaunchSlot(for: runID)
+        defer { reservedRunIDs.remove(runID) }
         record.status = .active
         record.message = nil
         record.revision = record.revision.saturatingAdd(1)
@@ -475,6 +533,7 @@ public actor RhaiWorkflowRunRegistry {
             workflowName: record.workflowName,
             arguments: arguments,
             agentBudget: record.agentBudget,
+            priorAgentsUsed: record.agentsUsed,
             journalURL: journalURL,
             cancellation: cancellation,
             progress: board
@@ -503,7 +562,9 @@ public actor RhaiWorkflowRunRegistry {
     }
 
     private func finish(runID: String, outcome: RhaiWorkflowOutcome, journal: RhaiJournal) async {
-        live[runID] = nil
+        // A retiring run still owns its slot until durable state and status
+        // notifications settle, matching upstream's active + retiring count.
+        defer { live[runID] = nil }
         guard var record = try? await store.record(runID) else {
             // Persistence lost the row; still drop the chip membership if we
             // published an upsert for this id.
@@ -578,6 +639,26 @@ public actor RhaiWorkflowRunRegistry {
     }
 
     public func isRunning(_ runID: String) -> Bool { live[runID] != nil }
+
+    private func reserveLaunchSlot(for runID: String) throws {
+        guard live.count + reservedRunIDs.count < rhaiMaxActiveWorkflowRunsPerSession else {
+            throw RhaiWorkflowRegistryError.tooManyActiveRuns(
+                limit: rhaiMaxActiveWorkflowRunsPerSession
+            )
+        }
+        guard reservedRunIDs.insert(runID).inserted else {
+            throw RhaiWorkflowRegistryError.persistence("workflow run already exists: \(runID)")
+        }
+    }
+
+    private static func validateAgentBudget(_ budget: UInt64) throws {
+        guard budget > 0, budget <= rhaiMaxAgentBudget else {
+            throw RhaiWorkflowRegistryError.invalidAgentBudget(
+                requested: budget,
+                maximum: rhaiMaxAgentBudget
+            )
+        }
+    }
 
     // MARK: - Reading
 

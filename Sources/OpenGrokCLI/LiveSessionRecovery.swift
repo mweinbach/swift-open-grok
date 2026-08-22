@@ -662,12 +662,12 @@ actor LiveRewindCoordinator {
     // MARK: Capture
 
     /// Open a point for the prompt about to run.
-    func beginPrompt(text: String) {
+    func beginPrompt(text: String) async {
         // A turn that never closed (a crash, a cancelled turn) leaves its point
         // unpersisted. Closing it here rather than discarding it keeps the
         // snapshots that were collected before the interruption.
         if open != nil {
-            endPrompt()
+            await endPrompt()
         }
         open = LiveRewindPoint(
             promptIndex: nextPromptIndex,
@@ -724,7 +724,7 @@ actor LiveRewindCoordinator {
 
     /// Close the open point: re-read every tracked path to record the state the
     /// turn left behind, then persist.
-    func endPrompt() {
+    func endPrompt() async {
         guard var point = open else { return }
         open = nil
         openBytes = 0
@@ -744,8 +744,7 @@ actor LiveRewindCoordinator {
                 point.after.append(after)
             }
         }
-        let captured = point
-        Task { await store.append(captured) }
+        await store.append(point)
     }
 
     private func readSnapshot(

@@ -213,8 +213,12 @@ public func streamResponsesWithClientCustomTools(
             var completedOutputItems: [UInt32: JSONValue] = [:]
             var lastContentChunkAt = MonotonicInstant.now
             var outputToToolIndex: [UInt32: UInt32] = [:]
+            var outputToolIdentity: [UInt32: (id: String?, name: String?)] = [:]
             var funcArgsStarted: Set<UInt32> = []
             var customInputStarted: Set<UInt32> = []
+            var argumentsCompleteEmitted: Set<UInt32> = []
+            var backendOutputStarted: Set<UInt32> = []
+            var backendToolStarted: Set<String> = []
             var nextToolIndex: UInt32 = 0
             var citationFilter = DisplayCitationFilter()
             var streamedText = ""
@@ -355,13 +359,7 @@ public func streamResponsesWithClientCustomTools(
                     }
 
                 case .functionCallArgumentsDelta(let delta, _, let outputIndex):
-                    if !delta.isEmpty {
-                        let toolIndex = outputToToolIndex[outputIndex] ?? {
-                            let idx = nextToolIndex
-                            nextToolIndex += 1
-                            outputToToolIndex[outputIndex] = idx
-                            return idx
-                        }()
+                    if !delta.isEmpty, let toolIndex = outputToToolIndex[outputIndex] {
                         funcArgsStarted.insert(outputIndex)
                         continuation.yield(.toolCallDelta(
                             requestId: requestId,
@@ -373,30 +371,28 @@ public func streamResponsesWithClientCustomTools(
                     }
 
                 case .functionCallArgumentsDone(let arguments, _, let outputIndex):
-                    let toolIndex = outputToToolIndex[outputIndex] ?? {
-                        let idx = nextToolIndex
-                        nextToolIndex += 1
-                        outputToToolIndex[outputIndex] = idx
-                        return idx
-                    }()
-                    if !funcArgsStarted.contains(outputIndex) && !arguments.isEmpty {
-                        continuation.yield(.toolCallDelta(
-                            requestId: requestId,
-                            toolIndex: toolIndex,
-                            id: nil,
-                            name: nil,
-                            argumentsDelta: arguments
-                        ))
+                    if let toolIndex = outputToToolIndex[outputIndex] {
+                        if funcArgsStarted.insert(outputIndex).inserted && !arguments.isEmpty {
+                            continuation.yield(.toolCallDelta(
+                                requestId: requestId,
+                                toolIndex: toolIndex,
+                                id: nil,
+                                name: nil,
+                                argumentsDelta: arguments
+                            ))
+                        }
+                        if argumentsCompleteEmitted.insert(outputIndex).inserted {
+                            continuation.yield(.toolCallArgumentsComplete(
+                                requestId: requestId,
+                                toolIndex: toolIndex,
+                                id: nil,
+                                name: outputToolIdentity[outputIndex]?.name
+                            ))
+                        }
                     }
 
                 case .customToolCallInputDelta(let delta, _, let outputIndex):
-                    if !delta.isEmpty {
-                        let toolIndex = outputToToolIndex[outputIndex] ?? {
-                            let idx = nextToolIndex
-                            nextToolIndex += 1
-                            outputToToolIndex[outputIndex] = idx
-                            return idx
-                        }()
+                    if !delta.isEmpty, let toolIndex = outputToToolIndex[outputIndex] {
                         customInputStarted.insert(outputIndex)
                         continuation.yield(.toolCallDelta(
                             requestId: requestId,
@@ -409,7 +405,7 @@ public func streamResponsesWithClientCustomTools(
 
                 case .customToolCallInputDone(let input, let itemId, let outputIndex):
                     if let toolIndex = outputToToolIndex[outputIndex] {
-                        if !customInputStarted.contains(outputIndex) && !input.isEmpty {
+                        if customInputStarted.insert(outputIndex).inserted && !input.isEmpty {
                             continuation.yield(.toolCallDelta(
                                 requestId: requestId,
                                 toolIndex: toolIndex,
@@ -418,26 +414,47 @@ public func streamResponsesWithClientCustomTools(
                                 argumentsDelta: input
                             ))
                         }
+                        if argumentsCompleteEmitted.insert(outputIndex).inserted {
+                            continuation.yield(.toolCallArgumentsComplete(
+                                requestId: requestId,
+                                toolIndex: toolIndex,
+                                id: nil,
+                                name: nil
+                            ))
+                        }
                     } else if !itemId.isEmpty {
-                        continuation.yield(.backendToolCallStarted(
-                            requestId: requestId,
-                            callId: itemId,
-                            name: "x_search"
-                        ))
+                        let wasStarted = backendOutputStarted.contains(outputIndex)
+                            || backendToolStarted.contains(itemId)
+                        backendOutputStarted.insert(outputIndex)
+                        backendToolStarted.insert(itemId)
+                        if !wasStarted {
+                            continuation.yield(.backendToolCallStarted(
+                                requestId: requestId,
+                                callId: itemId,
+                                name: "x_search"
+                            ))
+                        }
                     }
 
                 case .outputItemAdded(let outputIndex, let item):
                     let itemType = item["type"]?.stringValue
-                    if itemType == "function_call" || itemType == "custom_tool_call" {
+                    let name = item["name"]?.stringValue
+                    let isClientCustomCall = itemType == "custom_tool_call"
+                        && name.map { customNameSet.contains($0) } == true
+                    if itemType == "function_call" || isClientCustomCall {
                         let toolIndex = nextToolIndex
                         nextToolIndex += 1
                         outputToToolIndex[outputIndex] = toolIndex
                         let id = item["call_id"]?.stringValue ?? item["id"]?.stringValue
-                        let name = item["name"]?.stringValue
-                        let args = item["arguments"]?.stringValue ?? item["input"]?.stringValue
-                        if let args, !args.isEmpty {
-                            funcArgsStarted.insert(outputIndex)
-                            customInputStarted.insert(outputIndex)
+                        outputToolIdentity[outputIndex] = (id: id, name: name)
+                        let args = (item["arguments"]?.stringValue ?? item["input"]?.stringValue)
+                            .flatMap { $0.isEmpty ? nil : $0 }
+                        if args != nil {
+                            if itemType == "function_call" {
+                                funcArgsStarted.insert(outputIndex)
+                            } else {
+                                customInputStarted.insert(outputIndex)
+                            }
                         }
                         continuation.yield(.toolCallDelta(
                             requestId: requestId,
@@ -448,24 +465,73 @@ public func streamResponsesWithClientCustomTools(
                         ))
                     } else if itemType == "web_search_call" || itemType == "x_search_call"
                                 || itemType == "code_interpreter_call"
+                                || itemType == "custom_tool_call"
                     {
                         let callId = item["id"]?.stringValue ?? "backend-\(outputIndex)"
-                        let name = itemType ?? "backend_tool"
-                        continuation.yield(.backendToolCallStarted(
-                            requestId: requestId,
-                            callId: callId,
-                            name: name
-                        ))
+                        let wasStarted = backendOutputStarted.contains(outputIndex)
+                            || backendToolStarted.contains(callId)
+                        backendOutputStarted.insert(outputIndex)
+                        backendToolStarted.insert(callId)
+                        if let callID = item["call_id"]?.stringValue {
+                            backendToolStarted.insert(callID)
+                        }
+                        if !wasStarted {
+                            continuation.yield(.backendToolCallStarted(
+                                requestId: requestId,
+                                callId: callId,
+                                name: itemType == "custom_tool_call" ? "x_search" : itemType ?? "backend_tool"
+                            ))
+                        }
                     }
 
                 case .outputItemDone(let outputIndex, let item):
                     completedOutputItems[outputIndex] = item
                     let itemType = item["type"]?.stringValue
-                    if itemType == "web_search_call" || itemType == "x_search_call"
+                    let itemName = item["name"]?.stringValue
+                    let isClientCustomCall = itemType == "custom_tool_call"
+                        && itemName.map { customNameSet.contains($0) } == true
+                    if (itemType == "function_call" || isClientCustomCall),
+                       let toolIndex = outputToToolIndex[outputIndex],
+                       argumentsCompleteEmitted.insert(outputIndex).inserted
+                    {
+                        let arguments = itemType == "function_call"
+                            ? item["arguments"]?.stringValue
+                            : item["input"]?.stringValue
+                        let needsCatchUp = itemType == "function_call"
+                            ? funcArgsStarted.insert(outputIndex).inserted
+                            : customInputStarted.insert(outputIndex).inserted
+                        if needsCatchUp, let arguments, !arguments.isEmpty {
+                            continuation.yield(.toolCallDelta(
+                                requestId: requestId,
+                                toolIndex: toolIndex,
+                                id: nil,
+                                name: nil,
+                                argumentsDelta: arguments
+                            ))
+                        }
+                        continuation.yield(.toolCallArgumentsComplete(
+                            requestId: requestId,
+                            toolIndex: toolIndex,
+                            id: isClientCustomCall ? item["call_id"]?.stringValue : nil,
+                            name: itemName
+                        ))
+                    } else if itemType == "web_search_call" || itemType == "x_search_call"
                         || itemType == "code_interpreter_call"
+                        || (itemType == "custom_tool_call" && !isClientCustomCall)
                     {
                         let callId = item["id"]?.stringValue ?? "backend-\(outputIndex)"
-                        let name = itemType ?? "backend_tool"
+                        let name = itemType == "custom_tool_call" ? "x_search" : itemType ?? "backend_tool"
+                        let wasStarted = backendOutputStarted.contains(outputIndex)
+                            || backendToolStarted.contains(callId)
+                        backendOutputStarted.insert(outputIndex)
+                        backendToolStarted.insert(callId)
+                        if !wasStarted {
+                            continuation.yield(.backendToolCallStarted(
+                                requestId: requestId,
+                                callId: callId,
+                                name: name
+                            ))
+                        }
                         continuation.yield(.backendToolCallCompleted(
                             requestId: requestId,
                             callId: callId,
@@ -595,9 +661,12 @@ public func streamResponsesWithClientCustomTools(
             }
 
             let usage = parseResponsesUsage(responseJSON["usage"])
-            let costUsdTicks = responseJSON["metadata"]?["xai.cost_usd_ticks"]?.stringValue
+            let metadataCostUsdTicks = responseJSON["metadata"]?["xai.cost_usd_ticks"]?.stringValue
                 .flatMap { Int64($0) }
                 .flatMap { reportedCostTicks($0) }
+            let usageCostUsdTicks = responseJSON["usage"]?["cost_in_usd_ticks"]?.intValue
+                .flatMap { reportedCostTicks(Int64($0)) }
+            let costUsdTicks = metadataCostUsdTicks ?? usageCostUsdTicks
 
             let metrics = InferenceLatencyStats.fromTimestamps(
                 streamStart: streamStart,
@@ -714,7 +783,19 @@ private func parseResponsesUsage(_ usage: JSONValue?) -> TokenUsage? {
     guard let usage else { return nil }
     let input = UInt32(usage["input_tokens"]?.intValue ?? 0)
     let output = UInt32(usage["output_tokens"]?.intValue ?? 0)
-    let total = UInt32(usage["total_tokens"]?.intValue ?? Int(input &+ output))
+    let cumulativeTotal = UInt32(usage["total_tokens"]?.intValue ?? Int(input &+ output))
+    let context = usage["context_details"]
+    let total: UInt32
+    if let rawContextInput = context?["input_tokens"]?.intValue,
+       let rawContextOutput = context?["output_tokens"]?.intValue,
+       let contextInput = UInt32(exactly: rawContextInput),
+       let contextOutput = UInt32(exactly: rawContextOutput)
+    {
+        let (contextTotal, overflow) = contextInput.addingReportingOverflow(contextOutput)
+        total = overflow ? .max : contextTotal
+    } else {
+        total = cumulativeTotal
+    }
     let reasoning = UInt32(usage["output_tokens_details"]?["reasoning_tokens"]?.intValue ?? 0)
     let cached = UInt32(usage["input_tokens_details"]?["cached_tokens"]?.intValue ?? 0)
     return TokenUsage(

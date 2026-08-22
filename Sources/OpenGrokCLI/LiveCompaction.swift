@@ -23,11 +23,15 @@
 // cannot produce differently shaped histories.
 
 import Foundation
+import OpenGrokAuth
 import OpenGrokChatState
 import OpenGrokCompaction
 import OpenGrokHTTP
 import OpenGrokModels
+import OpenGrokSampler
 import OpenGrokSamplingTypes
+import OpenGrokSessionPersistence
+import OpenGrokShellSessionSupport
 import OpenGrokTokenEstimation
 
 /// Adapts the live sampler to the compaction module's sampler protocol.
@@ -196,9 +200,14 @@ actor LiveCompactionCoordinator {
     private let modelSwitch: LiveModelSwitchCoordinator
     private var sessionID: String
     private let openGrokHome: URL
+    private let toolExecutor: LiveToolExecutor?
     /// Injection seam: production builds an HTTP transport from the live
     /// credential; tests supply a scripted one.
-    private let makeCodexTransport: @Sendable (OpenGrokLiveSamplingConfiguration) -> (any CodexCompactionTransport)?
+    private let makeCodexTransport: @Sendable (
+        OpenGrokLiveSamplingConfiguration,
+        ResponsesRequestPolicy,
+        String?
+    ) -> (any CodexCompactionTransport)?
     /// Off switches Codex sessions to the legacy unary `/responses/compact`
     /// protocol, which upstream documents as the compatibility option.
     private let codexRemoteV2Enabled: Bool
@@ -222,17 +231,51 @@ actor LiveCompactionCoordinator {
         modelSwitch: LiveModelSwitchCoordinator,
         sessionID: String,
         openGrokHome: URL,
+        toolExecutor: LiveToolExecutor? = nil,
         codexRemoteV2Enabled: Bool = true,
-        makeCodexTransport: @escaping @Sendable (OpenGrokLiveSamplingConfiguration) -> (any CodexCompactionTransport)? = {
-            configuration in
+        makeCodexTransport: @escaping @Sendable (
+            OpenGrokLiveSamplingConfiguration,
+            ResponsesRequestPolicy,
+            String?
+        ) -> (any CodexCompactionTransport)? = { configuration, policy, cacheAffinityID in
             guard configuration.provider == .codex else { return nil }
             var headers = configuration.extraHeaders
-            headers["Authorization"] = "Bearer \(configuration.apiKey)"
+            let baseTransport = configuration.transport ?? URLSessionHTTPTransport()
+            let transport: any HTTPTransport
+            if let credentials = configuration.credentialProvider {
+                credentials.apply(to: &headers, baseURL: configuration.baseURL)
+                guard headers.keys.contains(where: { $0.lowercased() == "authorization" }) else {
+                    return nil
+                }
+                transport = AuthRetryTransport(
+                    transport: baseTransport,
+                    credentials: credentials,
+                    maxRetries: 1
+                )
+            } else if let resolver = configuration.bearerResolver {
+                let reserved = Set(resolver.reservedHeaders.map { $0.lowercased() })
+                headers = headers.filter { name, _ in
+                    !reserved.contains(name.lowercased()) && name.lowercased() != "authorization"
+                }
+                guard let authorization = resolver.currentAuth() else { return nil }
+                headers["Authorization"] = "Bearer \(authorization.bearer)"
+                for header in authorization.extraHeaders {
+                    headers[header.name] = header.value
+                }
+                transport = baseTransport
+            } else {
+                guard !configuration.apiKey.isEmpty else { return nil }
+                headers["Authorization"] = "Bearer \(configuration.apiKey)"
+                transport = baseTransport
+            }
             return HTTPCodexCompactionTransport(
-                transport: URLSessionHTTPTransport(),
+                transport: transport,
                 baseURL: configuration.baseURL,
                 model: configuration.model,
-                headers: headers
+                headers: headers,
+                queryParams: configuration.queryParams,
+                cacheAffinityID: cacheAffinityID,
+                requestPolicy: policy
             )
         }
     ) {
@@ -240,6 +283,7 @@ actor LiveCompactionCoordinator {
         self.modelSwitch = modelSwitch
         self.sessionID = sessionID
         self.openGrokHome = openGrokHome
+        self.toolExecutor = toolExecutor
         self.codexRemoteV2Enabled = codexRemoteV2Enabled
         self.makeCodexTransport = makeCodexTransport
     }
@@ -330,7 +374,7 @@ actor LiveCompactionCoordinator {
     /// The data a `/usage` or `/context` readout renders.
     func usage(items: [ConversationItem]? = nil) async -> ContextUsage {
         let snapshot = await modelSwitch.snapshot()
-        let engine = makeEngine(snapshot: snapshot, items: items ?? [])
+        let engine = await makeEngine(snapshot: snapshot, items: items ?? [])
         // `??` takes its right side as an autoclosure, which cannot be async.
         let subject: [ConversationItem]
         if let items {
@@ -356,6 +400,7 @@ actor LiveCompactionCoordinator {
     /// status line at all.
     func compactIfNeeded(
         items: [ConversationItem],
+        turnID: String? = nil,
         willCompact: (@Sendable () async -> Void)? = nil
     ) async -> LiveCompactionResult {
         step &+= 1
@@ -363,7 +408,7 @@ actor LiveCompactionCoordinator {
             return .unableToCompact(reason: "compaction is suppressed after an earlier failure")
         }
         let snapshot = await modelSwitch.snapshot()
-        let engine = makeEngine(snapshot: snapshot, items: items)
+        let engine = await makeEngine(snapshot: snapshot, items: items, turnID: turnID)
         guard engine.trigger(items: items, step: step) != nil else {
             await maybePrefire(items: items)
             return .notNeeded(engine.usage(items: items, compactionCount: compactionCount))
@@ -421,9 +466,17 @@ actor LiveCompactionCoordinator {
                     autoCompactSuppressed = true
                     return .unableToCompact(reason: "history changed during compaction")
                 }
+                do {
+                    try await recordCompactionCheckpoint(
+                        preCompactionItems: items,
+                        replacement: sanitized
+                    )
+                } catch {
+                    autoCompactSuppressed = true
+                    return .unableToCompact(reason: "could not persist compaction checkpoint: \(error)")
+                }
                 compactionCount &+= 1
                 lastReport = report
-                recordCompactionCheckpoint(preCompactionItems: items, replacement: sanitized)
                 return .compacted(items: sanitized, report: report)
             }
         }
@@ -448,9 +501,17 @@ actor LiveCompactionCoordinator {
                 autoCompactSuppressed = true
                 return .unableToCompact(reason: "history changed during compaction")
             }
+            do {
+                try await recordCompactionCheckpoint(
+                    preCompactionItems: items,
+                    replacement: replacement
+                )
+            } catch {
+                autoCompactSuppressed = true
+                return .unableToCompact(reason: "could not persist compaction checkpoint: \(error)")
+            }
             compactionCount &+= 1
             lastReport = report
-            recordCompactionCheckpoint(preCompactionItems: items, replacement: replacement)
             return .compacted(items: replacement, report: report)
         }
     }
@@ -520,19 +581,22 @@ actor LiveCompactionCoordinator {
                     return .unableToCompact(reason: "the conversation changed during compaction")
                 }
                 do {
+                    try await recordCompactionCheckpoint(
+                        preCompactionItems: items,
+                        replacement: sanitized
+                    )
                     try await history.commit(sessionID: sessionID, items: sanitized)
                 } catch {
                     return .unableToCompact(reason: String(describing: error))
                 }
                 compactionCount &+= 1
                 lastReport = report
-                recordCompactionCheckpoint(preCompactionItems: items, replacement: sanitized)
                 return .compacted(items: sanitized, report: report)
             }
         }
 
         // 2. Fallback to standard single-pass compaction
-        let engine = makeEngine(snapshot: snapshot, items: items)
+        let engine = await makeEngine(snapshot: snapshot, items: items)
         switch await engine.compact(
             items: items,
             userContext: userContext,
@@ -552,13 +616,16 @@ actor LiveCompactionCoordinator {
                 return .unableToCompact(reason: "the conversation changed during compaction")
             }
             do {
+                try await recordCompactionCheckpoint(
+                    preCompactionItems: items,
+                    replacement: replacement
+                )
                 try await history.commit(sessionID: sessionID, items: replacement)
             } catch {
                 return .unableToCompact(reason: String(describing: error))
             }
             compactionCount &+= 1
             lastReport = report
-            recordCompactionCheckpoint(preCompactionItems: items, replacement: replacement)
             return .compacted(items: replacement, report: report)
         }
     }
@@ -570,7 +637,7 @@ actor LiveCompactionCoordinator {
     private func recordCompactionCheckpoint(
         preCompactionItems: [ConversationItem],
         replacement: [ConversationItem]
-    ) {
+    ) async throws {
         let originalUserInfo: String? = {
             if preCompactionItems.count > 1, case .user = preCompactionItems[1] {
                 return preCompactionItems[1].textContent()
@@ -589,39 +656,48 @@ actor LiveCompactionCoordinator {
             }
         }
 
-        let sessionDir = openGrokHome.appendingPathComponent("sessions").appendingPathComponent(sessionID)
-        guard let info = try? persistCompactionCheckpoint(
-            sessionDir: sessionDir,
-            promptIndex: promptIndexAtCompaction,
-            compactedHistory: replacement,
-            autoContinue: nil,
-            originalUserInfo: originalUserInfo
-        ) else { return }
-
-        let updateRecord = SessionUpdateRecord.checkpoint(
-            id: info.checkpointID,
-            promptIndex: info.promptIndexAtCompaction,
-            autoContinueText: nil
-        )
-        if let data = try? JSONEncoder().encode(updateRecord),
-           let line = String(data: data, encoding: .utf8) {
-            let updatesURL = sessionDir.appendingPathComponent("updates.jsonl")
-            if let handle = try? FileHandle(forWritingTo: updatesURL) {
-                handle.seekToEndOfFile()
-                if let lineData = (line + "\n").data(using: .utf8) {
-                    handle.write(lineData)
-                }
-                try? handle.close()
-            } else {
-                try? (line + "\n").write(to: updatesURL, atomically: true, encoding: .utf8)
-            }
+        let cwd: String
+        if let toolExecutor {
+            cwd = toolExecutor.workingDirectory.path
+        } else {
+            cwd = await history.snapshot().workingDirectory
         }
+
+        let checkpointID = UUID().uuidString.lowercased()
+        let createdAt = ISO8601DateFormatter().string(from: Date())
+        let checkpoint = CompactionCheckpointFile(
+            checkpointID: checkpointID,
+            promptIndexAtCompaction: promptIndexAtCompaction,
+            compactedHistory: replacement,
+            createdAt: createdAt,
+            originalUserInfo: originalUserInfo
+        )
+        let documentStore = SessionDocumentStore(grokHome: openGrokHome)
+        try documentStore.persistCheckpoint(checkpoint, sessionID: sessionID, cwd: cwd)
+
+        let update = try SessionUpdateEnvelope(
+            timestamp: UInt64(max(0, Date().timeIntervalSince1970)),
+            method: "_x.ai/session/update",
+            params: .object([
+                "sessionId": .string(sessionID),
+                "update": .object([
+                    "sessionUpdate": .string("compaction_checkpoint"),
+                    "checkpoint_id": .string(checkpointID),
+                    "prompt_index_at_compaction": .number(.int64(Int64(promptIndexAtCompaction))),
+                    "checkpoint_file": .string("compaction_checkpoints/\(checkpointID).json"),
+                    "schema_version": .number(.int64(Int64(checkpoint.schemaVersion))),
+                    "created_at": .string(createdAt),
+                ]),
+            ])
+        )
+        try documentStore.appendUpdate(update, sessionID: sessionID, cwd: cwd)
     }
 
     private func makeEngine(
         snapshot: LiveModelSwitchCoordinator.Snapshot,
-        items: [ConversationItem]
-    ) -> CompactionEngine<LiveCompactionSampler> {
+        items: [ConversationItem],
+        turnID: String? = nil
+    ) async -> CompactionEngine<LiveCompactionSampler> {
         let contract = LiveCompactionContract.resolve(
             model: snapshot.modelID,
             provider: snapshot.provider,
@@ -650,6 +726,23 @@ actor LiveCompactionCoordinator {
             // compaction is deliberately NOT excluded from priority routing.
             serviceTier: snapshot.configuration.serviceTier
         )
+        let codexPermissions: CodexPermissions?
+        if let toolExecutor {
+            codexPermissions = await toolExecutor.currentCodexPermissions(provider: snapshot.provider)
+        } else {
+            codexPermissions = snapshot.provider == .codex
+                ? snapshot.configuration.codexPermissions
+                : nil
+        }
+        let requestPolicy = ResponsesRequestPolicy(
+            multiAgentV2: snapshot.configuration.tuning.codexMultiAgentV2,
+            localEffort: snapshot.configuration.reasoningEffort,
+            reasoningSummary: snapshot.configuration.tuning.reasoningSummary,
+            codexPermissions: codexPermissions,
+            sessionID: sessionID,
+            turnID: turnID ?? "compaction-\(UUID().uuidString)"
+        )
+        let cacheAffinityID = await history.cacheAffinityID
         return CompactionEngine(
             configuration: configuration,
             sampler: LiveCompactionSampler(
@@ -657,7 +750,11 @@ actor LiveCompactionCoordinator {
                 model: snapshot.modelID,
                 sessionID: sessionID
             ),
-            codexTransport: makeCodexTransport(snapshot.configuration)
+            codexTransport: makeCodexTransport(
+                snapshot.configuration,
+                requestPolicy,
+                cacheAffinityID
+            )
         )
     }
 }

@@ -603,6 +603,8 @@ private struct ParityLiveTurnDriver: OpenGrokShellSamplingDriver, Sendable {
                 await emit(.toolCallDelta(
                     toolIndex: toolIndex, id: id, name: name, argumentsDelta: argumentsDelta
                 ))
+            case .toolCallArgumentsComplete:
+                break
             case .retrying(let attempt, let maxRetries, let kind, let reason):
                 await emit(.retrying(
                     attempt: attempt, maxRetries: maxRetries,

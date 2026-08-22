@@ -8,15 +8,11 @@
 // mirrored into a contentless `session_docs_fts` by triggers, ranked with
 // `bm25(session_docs_fts, 10.0, 1.0)` — title weighted 10×, content 1×.
 //
-// This port does a **bounded scan** instead of an FTS index, and that is a
-// deliberate choice rather than a shortcut. Rust needs the index because its
-// sessions live in a directory tree of append-only JSONL logs that it indexes
-// incrementally by byte offset. This port stores one flat JSON document per
-// session (`LiveConversationStore`), so the corpus is already exactly the set
-// of files a scan would open, and the scan is bounded by the same caps Rust
-// applies when *building* its index. Adding a SQLite mirror would introduce a
-// second source of truth — with its own schema version, bootstrap race, and
-// corruption-quarantine path — to answer a query over a few hundred files.
+// This port does a **bounded scan** instead of an FTS index. The live catalog
+// discovers canonical cwd-bucket JSONL sessions first, then deduplicates any
+// legacy flat compatibility mirrors. Scanning those authoritative records is
+// bounded by the same caps Rust applies when building its index, without
+// introducing a second persistence authority or bootstrap race.
 //
 // What is faithfully ported is everything the user can observe: the same
 // tokenization, the same prefix matching, the same AND-then-OR retry, the same
@@ -48,6 +44,8 @@ struct LiveSessionDocument: Sendable, Equatable {
     static func build(from record: LiveConversationRecord) -> LiveSessionDocument {
         var prompts: [String] = []
         var assistantText: [String] = []
+        var toolMetadata: [String] = []
+        var toolCallCount = 0
         var title: String?
         for item in record.items {
             switch item {
@@ -65,6 +63,24 @@ struct LiveSessionDocument: Sendable, Equatable {
             case .assistant(let assistant):
                 let text = assistant.content
                 if !text.isEmpty { assistantText.append(text) }
+                for call in assistant.toolCalls where toolCallCount < 200 {
+                    toolCallCount += 1
+                    toolMetadata.append(call.name)
+                    guard let data = call.arguments.data(using: .utf8),
+                          let object = try? JSONSerialization.jsonObject(with: data)
+                            as? [String: Any]
+                    else { continue }
+                    for key in ["path", "file_path", "file", "target_file"] {
+                        if let path = object[key] as? String, !path.isEmpty {
+                            toolMetadata.append(path)
+                        }
+                    }
+                    if let locations = object["locations"] as? [[String: Any]] {
+                        toolMetadata.append(contentsOf: locations.compactMap {
+                            $0["path"] as? String
+                        })
+                    }
+                }
             default:
                 continue
             }
@@ -73,6 +89,9 @@ struct LiveSessionDocument: Sendable, Equatable {
         let assistant = assistantText.joined(separator: "\n")
         if !assistant.isEmpty {
             content += "\n\n" + String(assistant.prefix(contentLimit))
+        }
+        if !toolMetadata.isEmpty {
+            content += "\n\n" + String(toolMetadata.joined(separator: "\n").prefix(contentLimit))
         }
         return LiveSessionDocument(
             sessionID: record.sessionID,

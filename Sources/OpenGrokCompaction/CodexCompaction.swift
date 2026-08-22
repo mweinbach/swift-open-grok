@@ -108,6 +108,34 @@ public struct CodexCompactionOutputItem: Codable, Sendable, Equatable, Hashable 
         self.encryptedContent = encryptedContent
     }
 
+    public init(from decoder: Decoder) throws {
+        let value = try JSONValue(from: decoder)
+        guard case .object(let object) = value,
+              let type = object["type"]?.stringValue,
+              !type.isEmpty
+        else {
+            throw DecodingError.dataCorrupted(DecodingError.Context(
+                codingPath: decoder.codingPath,
+                debugDescription: "Codex compaction output must contain a nonempty type"
+            ))
+        }
+
+        // Compaction items from the provider have neither an `id` nor a
+        // nested `raw` field. Their entire provider-native object is the
+        // replay payload; manufacturing an ID inside it changes the next
+        // request and invalidates the encrypted compaction contract.
+        self.id = object["id"]?.stringValue ?? ""
+        self.type = type
+        self.raw = value
+        self.encryptedContent = object["encrypted_content"]?.stringValue
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        // The typed ID is only a local sentinel. Preserve an ID-less provider
+        // object exactly instead of leaking the sentinel back onto the wire.
+        try raw.encode(to: encoder)
+    }
+
     public var isDurableCompactionItem: Bool { type == "compaction" }
 
     public func asConversationItem() -> ConversationItem {

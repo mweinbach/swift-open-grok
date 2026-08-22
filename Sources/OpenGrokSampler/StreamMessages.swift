@@ -229,6 +229,14 @@ public func streamMessages(
                             )
                         }
                     case .toolUse:
+                        if let toolIndex = blockToToolIndex[index] {
+                            continuation.yield(.toolCallArgumentsComplete(
+                                requestId: requestId,
+                                toolIndex: toolIndex,
+                                id: state.toolId,
+                                name: state.toolName
+                            ))
+                        }
                         assistantToolCalls.append(ToolCall(
                             id: state.toolId,
                             name: state.toolName,

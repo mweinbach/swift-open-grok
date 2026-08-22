@@ -140,6 +140,8 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     /// Model-tuning facts from the catalog entry (effort, summary, sampling
     /// scalars). Defaults to empty for compositions with no catalog entry.
     public let tuning: OpenGrokLiveSamplingTuning
+    /// The actually enforced execution policy, disclosed only to Codex.
+    public let codexPermissions: CodexPermissions?
     public let bearerResolver: (any BearerResolver)?
     public let credentialProvider: (any AuthCredentialProvider)?
     public let transport: (any HTTPTransport)?
@@ -157,6 +159,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         extraHeaders: [String: String] = [:],
         queryParams: [String: String] = [:],
         tuning: OpenGrokLiveSamplingTuning = OpenGrokLiveSamplingTuning(),
+        codexPermissions: CodexPermissions? = nil,
         bearerResolver: (any BearerResolver)? = nil,
         credentialProvider: (any AuthCredentialProvider)? = nil,
         transport: (any HTTPTransport)? = nil
@@ -169,6 +172,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         self.extraHeaders = extraHeaders
         self.queryParams = queryParams
         self.tuning = tuning
+        self.codexPermissions = provider == .codex ? codexPermissions : nil
         self.bearerResolver = bearerResolver
         self.credentialProvider = credentialProvider
         self.transport = transport
@@ -178,7 +182,24 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         lhs.model == rhs.model && lhs.baseURL == rhs.baseURL && lhs.apiKey == rhs.apiKey &&
         lhs.provider == rhs.provider && lhs.apiBackend == rhs.apiBackend &&
         lhs.extraHeaders == rhs.extraHeaders && lhs.queryParams == rhs.queryParams &&
-        lhs.tuning == rhs.tuning
+        lhs.tuning == rhs.tuning && lhs.codexPermissions == rhs.codexPermissions
+    }
+
+    func withCodexPermissions(_ permissions: CodexPermissions?) -> Self {
+        Self(
+            model: model,
+            baseURL: baseURL,
+            apiKey: apiKey,
+            provider: provider,
+            apiBackend: apiBackend,
+            extraHeaders: extraHeaders,
+            queryParams: queryParams,
+            tuning: tuning,
+            codexPermissions: permissions,
+            bearerResolver: bearerResolver,
+            credentialProvider: credentialProvider,
+            transport: transport
+        )
     }
 }
 
@@ -223,6 +244,8 @@ final class CredentialBearerResolver: BearerResolver, @unchecked Sendable {
 
 public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
     public let sessionID: String
+    /// Durable routing identity shared by forks; distinct from actual session identity.
+    public let cacheAffinityID: String?
     public let turnID: String
     public let model: String
     public let prompt: String
@@ -242,18 +265,24 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
     /// (nil request field → config fills in). Child subagent turns use this
     /// for `runtime.reasoningEffort` (Rust handle_request.rs:705-714).
     public let reasoningEffort: ReasoningEffort?
+    /// Session policy for this turn. Child requests can override the parent's
+    /// snapshot without exposing Codex metadata to a non-Codex provider.
+    public let codexPermissions: CodexPermissions?
 
     public init(
         sessionID: String,
+        cacheAffinityID: String? = nil,
         turnID: String,
         model: String,
         prompt: String,
         items: [ConversationItem]? = nil,
         tools: [ToolSpec] = [],
         jsonSchema: JSONValue? = nil,
-        reasoningEffort: ReasoningEffort? = nil
+        reasoningEffort: ReasoningEffort? = nil,
+        codexPermissions: CodexPermissions? = nil
     ) {
         self.sessionID = sessionID
+        self.cacheAffinityID = cacheAffinityID
         self.turnID = turnID
         self.model = model
         self.prompt = prompt
@@ -261,6 +290,7 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         self.tools = tools
         self.jsonSchema = jsonSchema
         self.reasoningEffort = reasoningEffort
+        self.codexPermissions = codexPermissions
     }
 }
 
@@ -274,6 +304,7 @@ public enum OpenGrokLiveSamplingEvent: Sendable, Equatable {
         name: String?,
         argumentsDelta: String?
     )
+    case toolCallArgumentsComplete(toolIndex: UInt32, id: String?, name: String?)
     case retrying(
         attempt: UInt32,
         maxRetries: UInt32,
@@ -313,6 +344,12 @@ enum LiveSamplingStreamMapper {
                 id: id,
                 name: name,
                 argumentsDelta: argumentsDelta
+            ))
+        case .toolCallArgumentsComplete(_, let toolIndex, let id, let name):
+            return .emit(.toolCallArgumentsComplete(
+                toolIndex: toolIndex,
+                id: id,
+                name: name
             ))
         case .retrying(_, let attempt, let maxRetries, let kind, let reason, _, _):
             return .emit(.retrying(
@@ -431,6 +468,7 @@ public struct OpenGrokLiveSampler: Sendable {
             serviceTier: configuration.tuning.serviceTier,
             reasoningSummary: configuration.tuning.reasoningSummary,
             codexMultiAgentV2: configuration.tuning.codexMultiAgentV2,
+            codexPermissions: configuration.codexPermissions,
             bearerResolver: bearerResolver
         ), transport: transport)
         return OpenGrokLiveSampler { request, emit in
@@ -446,9 +484,11 @@ public struct OpenGrokLiveSampler: Sendable {
                 model: request.model,
                 xGrokReqId: request.turnID,
                 xGrokSessionId: request.sessionID,
+                xGrokCacheAffinityId: request.cacheAffinityID,
+                xGrokTurnIdx: request.turnID,
                 reasoningEffort: request.reasoningEffort,
                 jsonSchema: request.jsonSchema
-            )) { event in
+            ), codexPermissions: request.codexPermissions ?? configuration.codexPermissions) { event in
                 await emit(event)
             }
             let output = response.assistantText()
@@ -479,6 +519,7 @@ extension SamplingClient {
         _ request: ConversationRequest,
         requestId: RequestId = .random(),
         idleTimeout: MonotonicDuration = .seconds(300),
+        codexPermissions: CodexPermissions? = nil,
         onEvent: @escaping @Sendable (OpenGrokLiveSamplingEvent) async -> Void
     ) async throws -> ConversationResponse {
         let events: AsyncStream<SamplingEvent>
@@ -493,7 +534,7 @@ extension SamplingClient {
             )
         case .responses:
             let (raw, metadata, doomLoop, customToolNames) =
-                try await conversationStreamResponses(request)
+                try await conversationStreamResponses(request, codexPermissions: codexPermissions)
             events = streamResponsesWithClientCustomTools(
                 rawStream: raw,
                 modelMetadata: metadata,
@@ -528,14 +569,56 @@ extension SamplingClient {
             try Task.checkCancellation()
             switch LiveSamplingStreamMapper.map(event) {
             case .emit(.output(let text)):
+                if var buffer = pendingToolDelta {
+                    if let flushed = toolDeltaCoalescer.flush() {
+                        buffer.arguments += flushed
+                    }
+                    if !buffer.arguments.isEmpty {
+                        await onEvent(.toolCallDelta(
+                            toolIndex: buffer.toolIndex,
+                            id: buffer.id,
+                            name: buffer.name,
+                            argumentsDelta: buffer.arguments
+                        ))
+                    }
+                    pendingToolDelta = nil
+                    toolDeltaCoalescer = LiveTextDeltaCoalescer()
+                }
+                if let batch = reasoningCoalescer.flush() {
+                    await onEvent(.reasoning(batch))
+                }
                 if let batch = textCoalescer.push(text) {
                     await onEvent(.output(batch))
                 }
             case .emit(.reasoning(let text)):
+                if var buffer = pendingToolDelta {
+                    if let flushed = toolDeltaCoalescer.flush() {
+                        buffer.arguments += flushed
+                    }
+                    if !buffer.arguments.isEmpty {
+                        await onEvent(.toolCallDelta(
+                            toolIndex: buffer.toolIndex,
+                            id: buffer.id,
+                            name: buffer.name,
+                            argumentsDelta: buffer.arguments
+                        ))
+                    }
+                    pendingToolDelta = nil
+                    toolDeltaCoalescer = LiveTextDeltaCoalescer()
+                }
+                if let batch = textCoalescer.flush() {
+                    await onEvent(.output(batch))
+                }
                 if let batch = reasoningCoalescer.push(text) {
                     await onEvent(.reasoning(batch))
                 }
             case .emit(.toolCallDelta(let toolIndex, let id, let name, let argumentsDelta)):
+                if let batch = textCoalescer.flush() {
+                    await onEvent(.output(batch))
+                }
+                if let batch = reasoningCoalescer.flush() {
+                    await onEvent(.reasoning(batch))
+                }
                 var buffer = pendingToolDelta ?? (
                     toolIndex: toolIndex,
                     id: id,
@@ -579,7 +662,55 @@ extension SamplingClient {
                     ))
                 }
                 pendingToolDelta = buffer
+            case .emit(.toolCallArgumentsComplete(let toolIndex, let id, let name)):
+                if let batch = textCoalescer.flush() {
+                    await onEvent(.output(batch))
+                }
+                if let batch = reasoningCoalescer.flush() {
+                    await onEvent(.reasoning(batch))
+                }
+                if var buffer = pendingToolDelta {
+                    if let flushed = toolDeltaCoalescer.flush() {
+                        buffer.arguments += flushed
+                    }
+                    if !buffer.arguments.isEmpty {
+                        await onEvent(.toolCallDelta(
+                            toolIndex: buffer.toolIndex,
+                            id: buffer.id,
+                            name: buffer.name,
+                            argumentsDelta: buffer.arguments.isEmpty ? nil : buffer.arguments
+                        ))
+                    }
+                    pendingToolDelta = nil
+                    toolDeltaCoalescer = LiveTextDeltaCoalescer()
+                }
+                await onEvent(.toolCallArgumentsComplete(
+                    toolIndex: toolIndex,
+                    id: id,
+                    name: name
+                ))
             case .emit(let other):
+                if let batch = textCoalescer.flush() {
+                    await onEvent(.output(batch))
+                }
+                if let batch = reasoningCoalescer.flush() {
+                    await onEvent(.reasoning(batch))
+                }
+                if var buffer = pendingToolDelta {
+                    if let flushed = toolDeltaCoalescer.flush() {
+                        buffer.arguments += flushed
+                    }
+                    if !buffer.arguments.isEmpty {
+                        await onEvent(.toolCallDelta(
+                            toolIndex: buffer.toolIndex,
+                            id: buffer.id,
+                            name: buffer.name,
+                            argumentsDelta: buffer.arguments
+                        ))
+                    }
+                    pendingToolDelta = nil
+                    toolDeltaCoalescer = LiveTextDeltaCoalescer()
+                }
                 await onEvent(other)
             case .completed(let response):
                 if let batch = textCoalescer.flush() {
@@ -592,7 +723,7 @@ extension SamplingClient {
                     if let flushed = toolDeltaCoalescer.flush() {
                         buffer.arguments += flushed
                     }
-                    if buffer.id != nil || buffer.name != nil || !buffer.arguments.isEmpty {
+                    if !buffer.arguments.isEmpty {
                         await onEvent(.toolCallDelta(
                             toolIndex: buffer.toolIndex,
                             id: buffer.id,
@@ -608,6 +739,19 @@ extension SamplingClient {
                 }
                 if let batch = reasoningCoalescer.flush() {
                     await onEvent(.reasoning(batch))
+                }
+                if var buffer = pendingToolDelta {
+                    if let flushed = toolDeltaCoalescer.flush() {
+                        buffer.arguments += flushed
+                    }
+                    if !buffer.arguments.isEmpty {
+                        await onEvent(.toolCallDelta(
+                            toolIndex: buffer.toolIndex,
+                            id: buffer.id,
+                            name: buffer.name,
+                            argumentsDelta: buffer.arguments
+                        ))
+                    }
                 }
                 // Emit typed failure before throwing so the UI can show kind
                 // (auth/rate-limit/…) rather than only `Turn failed: …`.
@@ -981,6 +1125,10 @@ extension OpenGrokLiveInteractiveInput {
             case .pageDown: keyCode = .pageDown
             case .insert: keyCode = .insert
             case .delete: keyCode = .delete
+            case .enter: keyCode = .enter
+            case .tab: keyCode = modifiers.contains(.shift) ? .backTab : .tab
+            case .backspace: keyCode = .backspace
+            case .escape: keyCode = .escape
             case .function(let number): keyCode = .f(number)
             }
             return [.key(KeyEvent(key: keyCode, modifiers: translate(modifiers)))]
@@ -1030,6 +1178,7 @@ extension OpenGrokLiveInteractiveInput {
         if modifiers.contains(.control) { translated.insert(.control) }
         if modifiers.contains(.alt) { translated.insert(.alt) }
         if modifiers.contains(.meta) { translated.insert(.meta) }
+        if modifiers.contains(.superKey) { translated.insert(.superKey) }
         return translated
     }
 }
@@ -2834,6 +2983,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             options: options,
             lookupWorkingDirectory: sourceCwd,
             workingDirectory: cwd,
+            openGrokHome: openGrokHome,
             store: conversationStore
         )
         let sessionID = conversationRecord.sessionID
@@ -2860,7 +3010,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             environment: context.environment
         )
         conversationRecord.sandboxProfile = sandboxDecision.profileName
-        let (samplingConfiguration, credential) = try await resolveSamplingConfiguration(
+        let (resolvedSamplingConfiguration, credential) = try await resolveSamplingConfiguration(
             options: options,
             profileModel: agentProfile?.model,
             conversationRecord: conversationRecord,
@@ -2868,6 +3018,17 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             workingDirectory: cwd,
             openGrokHome: openGrokHome,
             sessionID: sessionID
+        )
+        let samplingConfiguration = resolvedSamplingConfiguration.withCodexPermissions(
+            LiveToolExecutor.codexPermissions(
+                provider: resolvedSamplingConfiguration.provider,
+                sandbox: sandboxDecision,
+                workingDirectory: cwd,
+                environment: context.environment,
+                alwaysApprove: securityContext.permissions.alwaysApprove
+                    && securityContext.permissions.yoloPinReason == nil,
+                autoReviewEnabled: securityContext.permissions.defaultMode == .auto
+            )
         )
         let telemetryBootstrapContext = LiveTelemetryBootstrapContext(
             zeroDataRetention: credential.telemetryContext.zeroDataRetention,
@@ -2954,6 +3115,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             options: options,
             cwd: cwd,
             sessionID: sessionID,
+            parentCacheAffinityID: conversationRecord.cacheAffinityID ?? sessionID,
             openGrokHome: openGrokHome,
             agentProfile: agentProfile,
             samplingConfiguration: samplingConfiguration,
@@ -2966,7 +3128,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             telemetryBootstrapContext: telemetryBootstrapContext,
             imageToolContext: imageToolContext,
             webToolContext: webToolContext,
-            environment: context.environment
+            environment: context.environment,
+            makeSampler: dependencies.makeSampler
         )
         // `ask_user_question` needs a human at a terminal. The caller passes
         // `interactiveSurfaceAvailable` derived from the constructed input and
@@ -3073,6 +3236,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             schedulerHost: schedulerHost,
             monitorHost: monitorHost
         )
+        if let subagentHost,
+           let permissions = await toolExecutor.permissionHandle()
+        {
+            await subagentHost.installParentPermissionHandle(permissions)
+        }
         conversationRecord.sandboxProfile = sandboxDecision.profileName
         try await conversationStore.save(conversationRecord)
         return LiveSessionFoundation(
@@ -3118,6 +3286,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         options: CLIExecutionOptions,
         cwd: URL,
         sessionID: String,
+        parentCacheAffinityID: String,
         openGrokHome: URL,
         agentProfile: LiveAgentProfile?,
         samplingConfiguration: OpenGrokLiveSamplingConfiguration,
@@ -3130,7 +3299,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         telemetryBootstrapContext: LiveTelemetryBootstrapContext,
         imageToolContext: LiveImageToolContext,
         webToolContext: LiveWebToolContext,
-        environment: [String: String]
+        environment: [String: String],
+        makeSampler: @escaping @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler
     ) -> LiveSubagentHost? {
         guard !options.agentOptions.noSubagents else { return nil }
         var toggles: [String: Bool] = [:]
@@ -3185,7 +3355,35 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             basePersonas: SubagentPersonaLoader.basePersonas(
                 configDocument: securityContext.document,
                 openGrokHome: openGrokHome
-            )
+            ),
+            parentCacheAffinityID: parentCacheAffinityID,
+            parentProvider: samplingConfiguration.provider,
+            parentCodexPermissions: LiveToolExecutor.codexPermissions(
+                provider: .codex,
+                sandbox: sandboxDecision,
+                workingDirectory: cwd,
+                environment: environment,
+                alwaysApprove: securityContext.permissions.alwaysApprove
+                    && securityContext.permissions.yoloPinReason == nil,
+                autoReviewEnabled: securityContext.permissions.defaultMode == .auto
+            ),
+            childSamplerFactory: { model, inheritedPermissions in
+                let resolution = try await LiveModelCatalogResolver(
+                    environment: environment,
+                    openGrokHome: openGrokHome,
+                    sessionID: sessionID,
+                    workingDirectory: cwd
+                ).resolve(modelID: model)
+                let provider = resolution.sampling.provider
+                let childConfiguration = resolution.sampling.withCodexPermissions(
+                    provider == .codex ? inheritedPermissions : nil
+                )
+                return LiveSubagentHost.ChildSamplerRoute(
+                    sampler: try makeSampler(childConfiguration),
+                    provider: provider,
+                    codexPermissions: childConfiguration.codexPermissions
+                )
+            }
         ))
     }
 
@@ -3335,11 +3533,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 modelSwitch: modelSwitch
             )
         }
+        let remoteCompactionV2Enabled = OpenGrokConfig.envBool(
+            "OPENGROK_REMOTE_COMPACTION_V2",
+            environment: context.environment
+        ) ?? foundation.securityContext.document[
+            path: ["features", "remote_compaction_v2"]
+        ]?.boolValue ?? true
         let compaction = LiveCompactionCoordinator(
             history: conversationHistory,
             modelSwitch: modelSwitch,
             sessionID: foundation.sessionID,
-            openGrokHome: foundation.openGrokHome
+            openGrokHome: foundation.openGrokHome,
+            toolExecutor: foundation.toolExecutor,
+            codexRemoteV2Enabled: remoteCompactionV2Enabled
         )
         let interjections = LiveSessionInterjections()
         // Follow-up delivery needs the interjection actor, which is born
@@ -3628,6 +3834,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         options: CLIExecutionOptions,
         lookupWorkingDirectory: URL,
         workingDirectory: URL,
+        openGrokHome: URL,
         store: LiveConversationStore
     ) async throws -> LiveConversationRecord {
         if options.continueSession, options.resume != nil {
@@ -3641,7 +3848,30 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let sourceRecord: LiveConversationRecord?
         if let requestedResumeID, !requestedResumeID.isEmpty {
-            sourceRecord = try await store.load(sessionID: requestedResumeID)
+            if LiveSessionTitleResolver.looksLikeSessionID(requestedResumeID) {
+                sourceRecord = try await store.load(sessionID: requestedResumeID)
+            } else {
+                let isSafeID: Bool
+                do {
+                    try LiveConversationStore.validateSessionID(requestedResumeID)
+                    isSafeID = true
+                } catch {
+                    isSafeID = false
+                }
+                if isSafeID,
+                   let record = try await store.loadIfPresent(sessionID: requestedResumeID)
+                {
+                    sourceRecord = record
+                } else {
+                    let listings = try LiveSessionCatalog(openGrokHome: openGrokHome).list()
+                    let sessionID = try LiveSessionTitleResolver.resolve(
+                        value: requestedResumeID,
+                        in: listings,
+                        workingDirectory: lookupWorkingDirectory
+                    )
+                    sourceRecord = try await store.load(sessionID: sessionID)
+                }
+            }
         } else if options.resume != nil || options.loadSession != nil
                     || options.continueSession || options.forkSession {
             sourceRecord = try await store.latest(workingDirectory: lookupWorkingDirectory)

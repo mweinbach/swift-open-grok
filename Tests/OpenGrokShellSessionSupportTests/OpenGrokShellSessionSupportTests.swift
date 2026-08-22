@@ -78,6 +78,61 @@ struct ShellSessionTranscriptTests {
         #expect(projection.events.contains(.toolCall(title: "Read file", paths: ["/tmp/example.swift"])))
     }
 
+    @Test("durable Rust turn_completed terminals replay without being classified as malformed")
+    func durableTurnCompletedProjection() {
+        let updates: [SessionUpdate] = [
+            .acp(params(update: [
+                "sessionUpdate": .string("agent_message_chunk"),
+                "content": .object(["type": .string("text"), "text": .string("answer")])
+            ])),
+            .xai(params(update: [
+                "sessionUpdate": .string("turn_completed"),
+                "prompt_id": .string("prompt-completed"),
+                "stop_reason": .string("end_turn"),
+                "agent_result": .string("answer")
+            ])),
+            .xai(params(update: [
+                "sessionUpdate": .string("turn_completed"),
+                "prompt_id": .string("prompt-cancelled"),
+                "stop_reason": .string("cancelled")
+            ])),
+            .xai(params(update: [
+                "sessionUpdate": .string("turn_completed"),
+                "prompt_id": .string("prompt-limited"),
+                "stop_reason": .string("max_turns_reached"),
+                "limit": .number(.uint64(3))
+            ]))
+        ]
+
+        let projection = SessionTranscriptProjector.project(updates)
+        #expect(projection.assistantMessages == ["answer"])
+        #expect(projection.malformedUpdateCount == 0)
+        #expect(projection.events.contains(.turnCompleted(kind: .completed)))
+        #expect(projection.events.contains(.turnCompleted(
+            kind: .cancelled(category: nil, context: nil)
+        )))
+        #expect(projection.events.contains(.turnCompleted(kind: .maxTurnsReached(limit: 3))))
+    }
+
+    @Test("durable turn terminals reject malformed or ACP-routed terminal payloads")
+    func malformedDurableTurnCompletedProjection() {
+        let projection = SessionTranscriptProjector.project([
+            .xai(params(update: [
+                "sessionUpdate": .string("turn_completed"),
+                "stop_reason": .string("cancelled")
+            ])),
+            .acp(params(update: [
+                "sessionUpdate": .string("turn_completed"),
+                "prompt_id": .string("wrong-rail"),
+                "stop_reason": .string("end_turn")
+            ])),
+            .acp(params(update: ["sessionUpdate": .string("turn_complete")]))
+        ])
+
+        #expect(projection.malformedUpdateCount == 2)
+        #expect(projection.events.isEmpty)
+    }
+
     @Test("host turns, bash prompts, malformed payloads, and unmarked updates terminate prompt runs")
     func conservativePromptProjection() {
         let events: [PromptExtractEvent] = [

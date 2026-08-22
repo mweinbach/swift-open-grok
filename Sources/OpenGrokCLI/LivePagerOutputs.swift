@@ -316,7 +316,7 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
                 sessionID: shellSessionID,
                 cwd: sessionDirectory,
                 providerConfiguration: configuration,
-                restorePersistedState: false
+                restorePersistedState: true
             ))
             createdSessionIDs.insert(shellSessionID)
         }

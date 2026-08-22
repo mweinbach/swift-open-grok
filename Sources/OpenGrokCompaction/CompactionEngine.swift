@@ -306,6 +306,13 @@ public protocol CodexCompactionTransport: Sendable {
     ) async throws
 }
 
+/// The compatibility endpoint returns a complete replacement history in one
+/// JSON response. It cannot be represented as a V2 stream: doing so would
+/// discard every provider-native history item except the encrypted summary.
+public protocol CodexUnaryCompactionTransport: CodexCompactionTransport {
+    func compactLegacy(_ request: CodexCompactionRequest) async throws -> [ConversationItem]
+}
+
 /// A reference wrapper so `CodexCompactionV2Collector` — a value type by
 /// design, because its state machine is worth testing without a class — can be
 /// fed from a `@Sendable` event callback.
@@ -728,6 +735,41 @@ where Sampler.Item == ConversationItem {
             compactionHash: configuration.compactionHash,
             serviceTier: configuration.serviceTier
         )
+
+        if codexProtocol == .legacyUnary,
+           let unaryTransport = codexTransport as? any CodexUnaryCompactionTransport
+        {
+            do {
+                let replacement = try await unaryTransport.compactLegacy(request)
+                guard !replacement.isEmpty else {
+                    return degrade(
+                        items: items,
+                        tokensBefore: tokensBefore,
+                        detail: "Codex returned an empty replacement history"
+                    )
+                }
+                return .compacted(
+                    items: replacement,
+                    report: CompactionReport(
+                        kind: .codexLegacyUnary,
+                        itemsBefore: items.count,
+                        itemsAfter: replacement.count,
+                        tokensBefore: tokensBefore,
+                        tokensAfter: estimateTotalTokens(replacement),
+                        attempts: 1
+                    )
+                )
+            } catch let error as CodexCompactionTransportError {
+                return degrade(items: items, tokensBefore: tokensBefore, detail: error.message)
+            } catch {
+                return degrade(
+                    items: items,
+                    tokensBefore: tokensBefore,
+                    detail: String(describing: error)
+                )
+            }
+        }
+
         let result: CodexRemoteCompactionResult
         do {
             result = try await runCodexRemoteCompaction(

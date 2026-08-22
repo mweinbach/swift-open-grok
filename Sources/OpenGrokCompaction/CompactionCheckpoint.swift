@@ -340,6 +340,11 @@ public enum SessionUpdateRecord: Codable, Sendable, Equatable {
         case promptIndexAtCompaction = "prompt_index_at_compaction"
         case checkpointFile = "checkpoint_file"
         case autoContinue = "auto_continue"
+        case promptText = "prompt_text"
+        case update
+        case content
+        case metadata = "_meta"
+        case canonicalPromptIndex = "promptIndex"
         case method
         case params
     }
@@ -348,19 +353,62 @@ public enum SessionUpdateRecord: Codable, Sendable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
 
         // Case 1: Check for method / params envelope (e.g. `_x.ai/session/update`)
-        if let params = try? container.nestedContainer(keyedBy: CodingKeys.self, forKey: .params),
-           let update = try? params.nestedContainer(keyedBy: CodingKeys.self, forKey: .sessionUpdate) {
-            if let updateType = try? update.decode(String.self, forKey: .sessionUpdate) {
-                if updateType == "compaction_checkpoint" {
-                    let id = try update.decode(String.self, forKey: .checkpointID)
-                    let promptIndex = try update.decode(Int.self, forKey: .promptIndexAtCompaction)
-                    let autoText = try? update.nestedContainer(keyedBy: CodingKeys.self, forKey: .autoContinue).decode(String.self, forKey: .text)
-                    self = .checkpoint(id: id, promptIndex: promptIndex, autoContinueText: autoText)
-                    return
-                } else if updateType == "rewind_marker" {
-                    let target = try update.decode(Int.self, forKey: .targetPromptIndex)
-                    self = .rewindMarker(targetPromptIndex: target)
-                    return
+        if container.contains(.params) {
+            let params = try container.nestedContainer(keyedBy: CodingKeys.self, forKey: .params)
+            if params.contains(.update) {
+                let update = try params.nestedContainer(keyedBy: CodingKeys.self, forKey: .update)
+                if let updateType = try update.decodeIfPresent(String.self, forKey: .sessionUpdate) {
+                    switch updateType {
+                    case "compaction_checkpoint":
+                        let id = try update.decode(String.self, forKey: .checkpointID)
+                        let promptIndex = try update.decode(Int.self, forKey: .promptIndexAtCompaction)
+                        let autoText: String?
+                        if update.contains(.autoContinue) {
+                            let autoContinue = try update.nestedContainer(
+                                keyedBy: CodingKeys.self,
+                                forKey: .autoContinue
+                            )
+                            autoText = try autoContinue.decodeIfPresent(String.self, forKey: .promptText)
+                                ?? autoContinue.decodeIfPresent(String.self, forKey: .text)
+                        } else {
+                            autoText = nil
+                        }
+                        self = .checkpoint(id: id, promptIndex: promptIndex, autoContinueText: autoText)
+                        return
+                    case "rewind_marker":
+                        self = .rewindMarker(targetPromptIndex: try update.decode(
+                            Int.self,
+                            forKey: .targetPromptIndex
+                        ))
+                        return
+                    case "user_message_chunk", "agent_message_chunk":
+                        let content = try update.nestedContainer(
+                            keyedBy: CodingKeys.self,
+                            forKey: .content
+                        )
+                        guard try content.decodeIfPresent(String.self, forKey: .type) == "text" else {
+                            break
+                        }
+                        let text = try content.decode(String.self, forKey: .text)
+                        if updateType == "agent_message_chunk" {
+                            self = .agent(text: text)
+                            return
+                        }
+                        let promptIndex: Int?
+                        if update.contains(.metadata) {
+                            let metadata = try update.nestedContainer(
+                                keyedBy: CodingKeys.self,
+                                forKey: .metadata
+                            )
+                            promptIndex = try metadata.decodeIfPresent(Int.self, forKey: .canonicalPromptIndex)
+                        } else {
+                            promptIndex = nil
+                        }
+                        self = .user(text: text, promptIndex: promptIndex)
+                        return
+                    default:
+                        break
+                    }
                 }
             }
         }
@@ -370,7 +418,17 @@ public enum SessionUpdateRecord: Codable, Sendable, Equatable {
             if updateType == "compaction_checkpoint" {
                 let id = try container.decode(String.self, forKey: .checkpointID)
                 let promptIndex = try container.decode(Int.self, forKey: .promptIndexAtCompaction)
-                let autoText = try? container.nestedContainer(keyedBy: CodingKeys.self, forKey: .autoContinue).decode(String.self, forKey: .text)
+                let autoText: String?
+                if container.contains(.autoContinue) {
+                    let autoContinue = try container.nestedContainer(
+                        keyedBy: CodingKeys.self,
+                        forKey: .autoContinue
+                    )
+                    autoText = try autoContinue.decodeIfPresent(String.self, forKey: .promptText)
+                        ?? autoContinue.decodeIfPresent(String.self, forKey: .text)
+                } else {
+                    autoText = nil
+                }
                 self = .checkpoint(id: id, promptIndex: promptIndex, autoContinueText: autoText)
                 return
             } else if updateType == "rewind_marker" {
