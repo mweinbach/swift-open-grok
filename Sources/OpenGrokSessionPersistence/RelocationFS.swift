@@ -9,7 +9,9 @@ import OpenGrokPaths
 import OpenGrokFileUtils
 import OpenGrokShared
 
-#if canImport(Darwin)
+#if os(Windows)
+import WinSDK
+#elseif canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
@@ -199,7 +201,11 @@ public enum RelocationFS: Sendable {
             #endif
             try syncFile(tempURL)
 
+            #if os(Windows)
+            try replaceWindowsItemDurably(at: path, with: tempURL)
+            #else
             try atomicallyReplaceItem(at: path, with: tempURL)
+            #endif
             // Rename moves the already-synced inode; only its new directory
             // entry still needs a durability barrier.
             try? syncDirectory(parent)
@@ -208,6 +214,100 @@ public enum RelocationFS: Sendable {
             throw RelocationError.io(operation: "writeAtomicDurable", path: path.path, message: error.localizedDescription)
         }
     }
+
+    #if os(Windows)
+    static func windowsExtendedLengthPath(_ rawPath: String) throws -> String {
+        let path = rawPath.replacingOccurrences(of: "/", with: "\\")
+        guard !path.isEmpty, !path.unicodeScalars.contains("\0") else {
+            throw RelocationError.inconsistent("invalid Windows session path: \(rawPath)")
+        }
+
+        let extendedPrefix = "\\\\?\\"
+        let extendedUNCPrefix = "\\\\?\\UNC\\"
+        let uncRemainder: Substring?
+        let localPath: String?
+
+        if path.hasPrefix(extendedUNCPrefix) {
+            uncRemainder = path.dropFirst(extendedUNCPrefix.count)
+            localPath = nil
+        } else if path.hasPrefix(extendedPrefix) {
+            uncRemainder = nil
+            localPath = String(path.dropFirst(extendedPrefix.count))
+        } else if path.hasPrefix("\\\\.\\") {
+            throw RelocationError.inconsistent("refusing Windows device session path: \(rawPath)")
+        } else if path.hasPrefix("\\\\") {
+            uncRemainder = path.dropFirst(2)
+            localPath = nil
+        } else {
+            uncRemainder = nil
+            localPath = path
+        }
+
+        if let uncRemainder {
+            let components = uncRemainder.split(separator: "\\", omittingEmptySubsequences: true)
+            guard components.count >= 2,
+                  !components.contains(where: { $0 == "." || $0 == ".." })
+            else {
+                throw RelocationError.inconsistent("invalid Windows UNC session path: \(rawPath)")
+            }
+            return extendedUNCPrefix + components.joined(separator: "\\")
+        }
+
+        guard let localPath else {
+            throw RelocationError.inconsistent("invalid Windows session path: \(rawPath)")
+        }
+        let bytes = Array(localPath.utf8)
+        let isDriveLetter = bytes.first.map {
+            (65...90).contains($0) || (97...122).contains($0)
+        } ?? false
+        guard bytes.count >= 3, isDriveLetter, bytes[1] == 58, bytes[2] == 92 else {
+            throw RelocationError.inconsistent("Windows session path is not absolute: \(rawPath)")
+        }
+
+        let components = localPath.dropFirst(3).split(
+            separator: "\\",
+            omittingEmptySubsequences: true
+        )
+        guard !components.contains(where: { $0 == "." || $0 == ".." }) else {
+            throw RelocationError.inconsistent("Windows session path is not canonical: \(rawPath)")
+        }
+
+        return extendedPrefix + String(localPath.prefix(2)) + "\\"
+            + components.joined(separator: "\\")
+    }
+
+    private static func replaceWindowsItemDurably(at destination: URL, with source: URL) throws {
+        let sourcePath = try windowsExtendedLengthPath(source.standardizedFileURL.path)
+        let destinationPath = try windowsExtendedLengthPath(destination.standardizedFileURL.path)
+        let maximumAttempts = 40
+
+        for attempt in 0..<maximumAttempts {
+            let moved = sourcePath.withCString(encodedAs: UTF16.self) { sourcePointer in
+                destinationPath.withCString(encodedAs: UTF16.self) { destinationPointer in
+                    MoveFileExW(
+                        sourcePointer,
+                        destinationPointer,
+                        DWORD(MOVEFILE_REPLACE_EXISTING) | DWORD(MOVEFILE_WRITE_THROUGH)
+                    )
+                }
+            }
+            if moved { return }
+
+            let code = GetLastError()
+            let isTransientCollision = code == DWORD(ERROR_ACCESS_DENIED)
+                || code == DWORD(ERROR_SHARING_VIOLATION)
+                || code == DWORD(ERROR_LOCK_VIOLATION)
+            if !isTransientCollision || attempt == maximumAttempts - 1 {
+                throw RelocationError.io(
+                    operation: "MoveFileExW",
+                    path: destination.path,
+                    message: "Windows error \(code)"
+                )
+            }
+            Sleep(DWORD(min(attempt + 1, 10)))
+        }
+    }
+    #endif
 
     // MARK: - Atomic Publication (No-Replace)
 
