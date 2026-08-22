@@ -808,8 +808,18 @@ struct LiveAgentSwarmEndToEndTests {
         // the background-task family, in the XML's own vocabulary.
         let ids = agentIDs(in: xml)
         #expect(ids.count == 2)
-        let known = await foundation.subagentHost?.knownSubagentIDs() ?? []
+        let host = try #require(foundation.subagentHost)
+        let known = await host.knownSubagentIDs()
         #expect(Set(ids).isSubset(of: Set(known)))
+        let metadataStore = await host.durableSubagentMetadata
+        for id in ids {
+            let metadata = try #require(try metadataStore.load(id: id))
+            #expect(metadata.parentSessionID == foundation.sessionID)
+            #expect(metadata.childSessionID == id)
+            #expect(metadata.status == .completed)
+            #expect(metadata.modelRoute?.provider == "xai")
+            #expect(metadata.completedAt != nil)
+        }
     }
 
     @Test("resume_agent_ids continues a member's transcript with mode=\"resume\"")
@@ -865,6 +875,10 @@ struct LiveAgentSwarmEndToEndTests {
         // promises.
         let requests = fixture.responsesRequests()
         #expect(requests.count == 3)
+        guard requests.indices.contains(2) else {
+            Issue.record("resumed swarm did not reach the provider three times")
+            return
+        }
         let resumedBody = SwarmFixture.bodyText(requests[2])
         #expect(resumedBody.contains("probe one \(marker)") || resumedBody.contains("probe two \(marker)"))
         #expect(resumedBody.contains("continue \(marker)"))

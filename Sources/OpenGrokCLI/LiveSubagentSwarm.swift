@@ -1077,8 +1077,19 @@ extension LiveSubagentHost {
                     "Cannot resume from subagent '\(resumeID)': it is still running. Wait for it to complete before resuming."
                 )
             }
-            guard let source = bookkeeping[resumeID] else {
-                return failed(Self.resumeNotFoundMessage(resumeID))
+            let source: Bookkeeping
+            if let cached = bookkeeping[resumeID] {
+                source = cached
+            } else {
+                do {
+                    guard let recovered = try durableResumeBookkeeping(id: resumeID) else {
+                        return failed(Self.resumeNotFoundMessage(resumeID))
+                    }
+                    bookkeeping[resumeID] = recovered
+                    source = recovered
+                } catch {
+                    return failed("Cannot resume from subagent '\(resumeID)': \(error)")
+                }
             }
             do {
                 try validateResumeIdentity(
@@ -1151,6 +1162,14 @@ extension LiveSubagentHost {
         let memberModel = childModel
         let memberCWD = childCWD
         do {
+            // Swarm members bypass `spawn`, but share its provider-bound child
+            // runner. Publish their authentic parent-owned identity before the
+            // runner can persist its resolved provider route.
+            try persistSubagentStart(
+                id: agentID,
+                prompt: memberPrompt,
+                resumedFrom: member.resumeFrom
+            )
             // Swarm members are real coordinator children (`owner: .swarm`).
             // Rust `running_count` includes them when `workflow_run_id` is
             // absent; count each member once through the host helper so this
@@ -1164,7 +1183,7 @@ extension LiveSubagentHost {
                     )
                 }
                 return await self.withActiveBackgroundWorkCounting(for: request) {
-                    await self.runChild(
+                    let result = await self.runChild(
                         childID: agentID,
                         prompt: memberPrompt,
                         definition: definition,
@@ -1173,6 +1192,17 @@ extension LiveSubagentHost {
                         cwd: memberCWD,
                         resumeItems: inheritedItems
                     )
+                    do {
+                        try await self.persistSubagentCompletion(result)
+                    } catch {
+                        return OpenGrokChildResult(
+                            id: agentID,
+                            success: false,
+                            error: "could not persist durable subagent completion: \(error)",
+                            durationMS: result.durationMS
+                        )
+                    }
+                    return result
                 }
             }
         } catch let error as OpenGrokCoordinatorError {

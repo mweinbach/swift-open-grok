@@ -386,6 +386,8 @@ struct CodeModeCompositionTests {
         // are in the same class: a foreground spawn (or a parked cohort's
         // orchestration wait) parks the turn on the children
         // (`is_code_mode_direct_only_tool`, session/code_mode.rs:68-77).
+        // `swarm_wait` is the direct-only rejoin half of `agent_swarm`
+        // (code_mode.rs:79-80); a parked rejoin cannot run inside a cell.
         // Both collaboration surfaces are direct-only (code_mode.rs:88-94):
         // wait_agent parks on the team mailbox, while cross-session reads and
         // untrusted peer messages must stay outside nested JavaScript cells.
@@ -396,6 +398,7 @@ struct CodeModeCompositionTests {
                 "kill_command_or_subagent",
                 "spawn_subagent",
                 "agent_swarm",
+                "swarm_wait",
                 "list_agents",
                 "send_message",
                 "followup_task",
@@ -416,7 +419,7 @@ struct CodeModeCompositionTests {
         let exec = sampler.recordedRequests.first?.tools.first { $0.name == "exec" }
         #expect(exec?.description?.contains("### `read_file`") == true)
         for collaborationTool in [
-            "list_agents", "send_message", "followup_task", "wait_agent",
+            "swarm_wait", "list_agents", "send_message", "followup_task", "wait_agent",
             "list_sessions", "read_session", "message_session",
         ] {
             #expect(exec?.description?.contains("### `\(collaborationTool)`") == false)
