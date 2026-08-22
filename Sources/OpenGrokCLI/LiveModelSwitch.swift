@@ -95,6 +95,9 @@ struct LiveModelCatalogResolver: Sendable {
     /// this field exists to prevent, with no compiler error and no test
     /// failure. Requiring it turns that into a build error instead.
     let workingDirectory: URL
+    /// Session policy remains stable across provider switches and child
+    /// routes; only the destination provider controls its wire disclosure.
+    let doomLoopRecovery: DoomLoopRecoveryPolicy?
     let catalogSource: @Sendable () -> OrderedModelMap
     let authProviderDefinitions: @Sendable () -> [(String, AuthProviderConfig)]
     /// Injection seam for tests; production passes the real resolver.
@@ -108,6 +111,7 @@ struct LiveModelCatalogResolver: Sendable {
         openGrokHome: URL,
         sessionID: String,
         workingDirectory: URL,
+        doomLoopRecovery: DoomLoopRecoveryPolicy? = nil,
         catalogSource: @escaping @Sendable () -> OrderedModelMap = {
             resolveModelCatalog(input: .default)
         },
@@ -137,6 +141,7 @@ struct LiveModelCatalogResolver: Sendable {
         self.openGrokHome = openGrokHome
         self.sessionID = sessionID
         self.workingDirectory = workingDirectory
+        self.doomLoopRecovery = doomLoopRecovery
         self.catalogSource = catalogSource
         self.authProviderDefinitions = authProviderDefinitions
         self.makeCredentialResolver = makeCredentialResolver
@@ -334,6 +339,7 @@ struct LiveModelCatalogResolver: Sendable {
                     effortOverride: effort,
                     serviceTier: serviceTier
                 ),
+                doomLoopRecovery: doomLoopRecovery,
                 bearerResolver: namedAuthResolver.map(NamedAuthBearerResolver.init),
                 credentialProvider: credential.binding.authCredentialProvider
             ),
@@ -811,6 +817,7 @@ actor LiveModelSwitchCoordinator {
             queryParams: active.queryParams,
             environment: active.environment,
             tuning: tuning,
+            doomLoopRecovery: active.doomLoopRecovery,
             bearerResolver: active.bearerResolver,
             credentialProvider: active.credentialProvider,
             transport: active.transport

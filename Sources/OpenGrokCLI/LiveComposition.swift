@@ -147,6 +147,9 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     /// Model-tuning facts from the catalog entry (effort, summary, sampling
     /// scalars). Defaults to empty for compositions with no catalog entry.
     public let tuning: OpenGrokLiveSamplingTuning
+    /// Trusted session-frozen recovery policy; provider adapters decide
+    /// whether the provider may receive the xAI-specific detection header.
+    public let doomLoopRecovery: DoomLoopRecoveryPolicy?
     /// The actually enforced execution policy, disclosed only to Codex.
     public let codexPermissions: CodexPermissions?
     public let bearerResolver: (any BearerResolver)?
@@ -167,6 +170,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         queryParams: [String: String] = [:],
         environment: [String: String] = [:],
         tuning: OpenGrokLiveSamplingTuning = OpenGrokLiveSamplingTuning(),
+        doomLoopRecovery: DoomLoopRecoveryPolicy? = nil,
         codexPermissions: CodexPermissions? = nil,
         bearerResolver: (any BearerResolver)? = nil,
         credentialProvider: (any AuthCredentialProvider)? = nil,
@@ -181,6 +185,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         self.queryParams = queryParams
         self.environment = environment
         self.tuning = tuning
+        self.doomLoopRecovery = doomLoopRecovery
         self.codexPermissions = provider == .codex ? codexPermissions : nil
         self.bearerResolver = bearerResolver
         self.credentialProvider = credentialProvider
@@ -192,7 +197,8 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         lhs.provider == rhs.provider && lhs.apiBackend == rhs.apiBackend &&
         lhs.extraHeaders == rhs.extraHeaders && lhs.queryParams == rhs.queryParams &&
         lhs.environment == rhs.environment &&
-        lhs.tuning == rhs.tuning && lhs.codexPermissions == rhs.codexPermissions
+        lhs.tuning == rhs.tuning && lhs.doomLoopRecovery == rhs.doomLoopRecovery &&
+        lhs.codexPermissions == rhs.codexPermissions
     }
 
     func withCodexPermissions(_ permissions: CodexPermissions?) -> Self {
@@ -206,6 +212,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
             queryParams: queryParams,
             environment: environment,
             tuning: tuning,
+            doomLoopRecovery: doomLoopRecovery,
             codexPermissions: permissions,
             bearerResolver: bearerResolver,
             credentialProvider: credentialProvider,
@@ -577,6 +584,7 @@ public struct OpenGrokLiveSampler: Sendable {
             reasoningSummary: configuration.tuning.reasoningSummary,
             codexMultiAgentV2: configuration.tuning.codexMultiAgentV2,
             codexPermissions: configuration.codexPermissions,
+            doomLoopRecovery: configuration.doomLoopRecovery,
             bearerResolver: bearerResolver
         )
         let client = try SamplingClient(config: samplerConfig, transport: transport)
@@ -622,7 +630,10 @@ public struct OpenGrokLiveSampler: Sendable {
                 xGrokTurnIdx: request.turnID,
                 reasoningEffort: requestedReasoningEffort,
                 jsonSchema: request.jsonSchema
-            ), codexPermissions: request.codexPermissions ?? configuration.codexPermissions) { event in
+            ),
+                codexPermissions: request.codexPermissions ?? configuration.codexPermissions,
+                doomLoopRecovery: configuration.doomLoopRecovery
+            ) { event in
                 await emit(event)
             }
             let output = response.assistantText()
@@ -659,6 +670,49 @@ extension SamplingClient {
         requestId: RequestId = .random(),
         idleTimeout: MonotonicDuration = .seconds(300),
         codexPermissions: CodexPermissions? = nil,
+        doomLoopRecovery: DoomLoopRecoveryPolicy? = nil,
+        onEvent: @escaping @Sendable (OpenGrokLiveSamplingEvent) async -> Void
+    ) async throws -> ConversationResponse {
+        var recoveryAttempts: UInt32 = 0
+        while true {
+            try Task.checkCancellation()
+            let activePolicy = doomLoopRecovery.flatMap { policy in
+                recoveryAttempts < policy.maxRetries ? policy : nil
+            }
+            do {
+                return try await streamConversationAttempt(
+                    request,
+                    requestId: requestId,
+                    idleTimeout: idleTimeout,
+                    codexPermissions: codexPermissions,
+                    doomLoopRecovery: activePolicy,
+                    onEvent: onEvent
+                )
+            } catch let error as SamplingErrorInfo {
+                guard error.kind == .doomLoopDetected,
+                      let policy = doomLoopRecovery,
+                      recoveryAttempts < policy.maxRetries else {
+                    await onEvent(.failed(error))
+                    throw CLIApplicationError.failed(error.message)
+                }
+                recoveryAttempts += 1
+                await onEvent(.retrying(
+                    attempt: recoveryAttempts,
+                    maxRetries: policy.maxRetries,
+                    kind: .doomLoopDetected,
+                    reason: error.message
+                ))
+                try await doomLoopBackoff(retryCount: recoveryAttempts).sleep()
+            }
+        }
+    }
+
+    private func streamConversationAttempt(
+        _ request: ConversationRequest,
+        requestId: RequestId,
+        idleTimeout: MonotonicDuration,
+        codexPermissions: CodexPermissions?,
+        doomLoopRecovery: DoomLoopRecoveryPolicy?,
         onEvent: @escaping @Sendable (OpenGrokLiveSamplingEvent) async -> Void
     ) async throws -> ConversationResponse {
         let events: AsyncStream<SamplingEvent>
@@ -674,6 +728,9 @@ extension SamplingClient {
         case .responses:
             let (raw, metadata, doomLoop, customToolNames) =
                 try await conversationStreamResponses(request, codexPermissions: codexPermissions)
+            if doomLoopRecovery == nil {
+                doomLoop?.disarmAbort()
+            }
             events = streamResponsesWithClientCustomTools(
                 rawStream: raw,
                 modelMetadata: metadata,
@@ -871,6 +928,15 @@ extension SamplingClient {
                         ))
                     }
                 }
+                if let policy = doomLoopRecovery {
+                    let triggers = policy.confidentTriggers(response.doomLoopSignals)
+                    if !triggers.isEmpty {
+                        throw SamplingErrorInfo(from: .doomLoopDetected(
+                            triggers: triggers,
+                            abortedAtChunk: nil
+                        ))
+                    }
+                }
                 return response
             case .failed(let error):
                 if let batch = textCoalescer.flush() {
@@ -891,6 +957,9 @@ extension SamplingClient {
                             argumentsDelta: buffer.arguments
                         ))
                     }
+                }
+                if error.kind == .doomLoopDetected {
+                    throw error
                 }
                 // Emit typed failure before throwing so the UI can show kind
                 // (auth/rate-limit/…) rather than only `Turn failed: …`.
@@ -960,6 +1029,9 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
     public let makeImageTransport: @Sendable () -> any HTTPTransport
     public let workspaceRoute: LiveWorkspaceRouteDependencies
     public let shareRoute: LiveShareRouteDependencies
+    /// An already authenticated authoritative snapshot. Resolution never
+    /// fetches settings during startup or reads unreviewed remote fields.
+    public let remoteSettingsSnapshot: RemoteSettings?
     public let makeLeaderClient: @Sendable (
         LiveLeaderClientLaunchConfiguration
     ) async throws -> LiveLeaderClientLease
@@ -980,6 +1052,7 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
         },
         workspaceRoute: LiveWorkspaceRouteDependencies = .production(),
         shareRoute: LiveShareRouteDependencies = .production(),
+        remoteSettingsSnapshot: RemoteSettings? = nil,
         makeLeaderClient: @escaping @Sendable (
             LiveLeaderClientLaunchConfiguration
         ) async throws -> LiveLeaderClientLease = { configuration in
@@ -995,6 +1068,7 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
         self.makeImageTransport = makeImageTransport
         self.workspaceRoute = workspaceRoute
         self.shareRoute = shareRoute
+        self.remoteSettingsSnapshot = remoteSettingsSnapshot
         self.makeLeaderClient = makeLeaderClient
     }
 
@@ -3100,6 +3174,47 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let announcements: LiveAnnouncementsComposition?
     }
 
+    /// Resolve recovery once from reviewed authority, not from an arbitrary
+    /// project config or a startup network request. A provider switch inherits
+    /// this snapshot; provider adapters still withhold xAI-only wire fields.
+    static func resolveDoomLoopRecovery(
+        environment: [String: String],
+        document: TOMLValue,
+        remoteSettings: RemoteSettings? = nil
+    ) -> DoomLoopRecoveryPolicy? {
+        let remote = remoteSettings
+            .map(AllowlistedRemoteSettings.init(projecting:))?
+            .doomLoopRecovery
+        let enabled = BoolFlag(envVar: "GROK_DOOM_LOOP_RECOVERY")
+            .config(document[path: ["doom_loop_recovery", "enabled"]]?.boolValue)
+            .featureFlag(remote?.enabled)
+            .defaultValue(true)
+            .resolve(environment: environment)
+            .value
+        guard enabled else { return nil }
+
+        func configuredUnsigned(_ key: String) -> UInt32? {
+            document[path: ["doom_loop_recovery", key]]?.int64Value
+                .flatMap { UInt32(exactly: $0) }
+        }
+
+        let maxThreshold = configuredUnsigned("max_threshold")
+            ?? remote?.maxThreshold
+            ?? DoomLoopRecoveryPolicy.DEFAULT_MAX_THRESHOLD
+        let maxRetries = configuredUnsigned("max_retries")
+            ?? remote?.maxRetries
+            ?? DoomLoopRecoveryPolicy.DEFAULT_MAX_RETRIES
+        let windowTokens = configuredUnsigned("window_tokens")
+            ?? remote?.windowTokens
+            ?? DoomLoopRecoveryPolicy.DEFAULT_RECOVERY_WINDOW_TOKENS
+
+        return DoomLoopRecoveryPolicy(
+            maxThreshold: DoomLoopRecoveryPolicy.clampMaxThreshold(maxThreshold),
+            maxRetries: DoomLoopRecoveryPolicy.clampMaxRetries(maxRetries),
+            windowTokens: DoomLoopRecoveryPolicy.clampWindowTokens(windowTokens)
+        )
+    }
+
     static func makeSessionFoundation(
         options: CLIExecutionOptions,
         context: CLIApplicationContext,
@@ -3169,6 +3284,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             isInteractive: fileAccessPolicy.isInteractive,
             cli: options.common.permissions
         )
+        let doomLoopRecovery = resolveDoomLoopRecovery(
+            environment: context.environment,
+            document: securityContext.document,
+            remoteSettings: dependencies.remoteSettingsSnapshot
+        )
         // Bootstrap owns the first irreversible process-wide operation. It
         // happens after the persisted record and effective cwd are known, but
         // before sampler, process backend, hooks, MCP transports, or tools are
@@ -3187,7 +3307,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             environment: context.environment,
             workingDirectory: cwd,
             openGrokHome: openGrokHome,
-            sessionID: sessionID
+            sessionID: sessionID,
+            doomLoopRecovery: doomLoopRecovery
         )
         let samplingConfiguration = resolvedSamplingConfiguration.withCodexPermissions(
             LiveToolExecutor.codexPermissions(
@@ -3570,7 +3691,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     environment: environment,
                     openGrokHome: openGrokHome,
                     sessionID: sessionID,
-                    workingDirectory: cwd
+                    workingDirectory: cwd,
+                    doomLoopRecovery: samplingConfiguration.doomLoopRecovery
                 ).resolve(modelID: model)
                 let provider = resolution.sampling.provider
                 let childConfiguration = resolution.sampling.withCodexPermissions(
@@ -3698,6 +3820,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 openGrokHome: foundation.openGrokHome,
                 sessionID: foundation.sessionID,
                 workingDirectory: foundation.cwd,
+                doomLoopRecovery: foundation.samplingConfiguration.doomLoopRecovery,
                 catalogSource: { catalogStore.snapshot() },
                 authProviderDefinitions: { configuredProviderDefinitions }
             ),
@@ -4258,7 +4381,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         environment: [String: String],
         workingDirectory: URL,
         openGrokHome: URL,
-        sessionID: String
+        sessionID: String,
+        doomLoopRecovery: DoomLoopRecoveryPolicy?
     ) async throws -> (OpenGrokLiveSamplingConfiguration, LiveResolvedCredential) {
         let requestedProvider = try options.common.provider.map(resolveProvider)
         let embedded = embeddedDefaultModels()
@@ -4530,6 +4654,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             queryParams: configuredEntry?.queryParams ?? [:],
             environment: environment,
             tuning: tuning,
+            doomLoopRecovery: doomLoopRecovery,
             bearerResolver: namedAuthResolver.map(NamedAuthBearerResolver.init),
             credentialProvider: credential.binding.authCredentialProvider
         )

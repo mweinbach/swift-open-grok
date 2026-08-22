@@ -145,7 +145,7 @@ struct RemoteSettingsAllowlistTests {
             "external_otel_content_gates_locked", "privacy_notice_rollout",
             "privacy_banner_reshow_days", "announcements", "sharing_enabled",
             "workspace_command_enabled", "zdr_access_enabled", "gate_message",
-            "session_recap", "trace_upload_enabled", "two_pass_compaction_enabled",
+            "session_recap", "doom_loop_recovery", "trace_upload_enabled", "two_pass_compaction_enabled",
             "ask_user_question_enabled", "write_file_enabled", "cancel_rewind_enabled",
             "compaction_mode", "compaction_detail",
         ]

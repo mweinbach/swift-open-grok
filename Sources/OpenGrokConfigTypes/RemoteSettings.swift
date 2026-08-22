@@ -187,24 +187,34 @@ public struct CampaignOverride: Hashable, Sendable, Codable, Equatable {
 /// per-field in the resolver (env > TOML > remote > default).
 public struct DoomLoopRecoverySettings: Hashable, Sendable, Codable, Equatable {
     /// Send the `x-grok-doom-loop-check` header and parse the reported
-    /// triggers. `Some(false)` is a kill-switch; absent ⇒ client default (off).
+    /// triggers. `Some(false)` is a kill-switch; absent ⇒ client default (on).
     public var enabled: Bool?
     /// Highest `tail_repetition` threshold considered confident (clamped to
-    /// 2..=64). Absent ⇒ client default (8).
+    /// 2..=64). Absent ⇒ client default (32).
     public var maxThreshold: UInt32?
     /// Resample budget per turn (clamped to 0..=5). Absent ⇒ client default (2).
     public var maxRetries: UInt32?
+    /// Recent generated tokens inspected by the server. Absent ⇒ 1024;
+    /// out-of-range values select the largest safe window, 4096.
+    public var windowTokens: UInt32?
 
-    public init(enabled: Bool? = nil, maxThreshold: UInt32? = nil, maxRetries: UInt32? = nil) {
+    public init(
+        enabled: Bool? = nil,
+        maxThreshold: UInt32? = nil,
+        maxRetries: UInt32? = nil,
+        windowTokens: UInt32? = nil
+    ) {
         self.enabled = enabled
         self.maxThreshold = maxThreshold
         self.maxRetries = maxRetries
+        self.windowTokens = windowTokens
     }
 
     private enum CodingKeys: String, CodingKey {
         case enabled
         case maxThreshold = "max_threshold"
         case maxRetries = "max_retries"
+        case windowTokens = "window_tokens"
     }
 
     public init(from decoder: Decoder) throws {
@@ -212,6 +222,7 @@ public struct DoomLoopRecoverySettings: Hashable, Sendable, Codable, Equatable {
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled)
         maxThreshold = try c.decodeIfPresent(UInt32.self, forKey: .maxThreshold)
         maxRetries = try c.decodeIfPresent(UInt32.self, forKey: .maxRetries)
+        windowTokens = try c.decodeIfPresent(UInt32.self, forKey: .windowTokens)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -219,6 +230,7 @@ public struct DoomLoopRecoverySettings: Hashable, Sendable, Codable, Equatable {
         try c.encodeIfPresent(enabled, forKey: .enabled)
         try c.encodeIfPresent(maxThreshold, forKey: .maxThreshold)
         try c.encodeIfPresent(maxRetries, forKey: .maxRetries)
+        try c.encodeIfPresent(windowTokens, forKey: .windowTokens)
     }
 }
 

@@ -365,8 +365,10 @@ public final class SamplingClient: @unchecked Sendable {
     ) async throws -> (AsyncStream<Result<T, SamplingError>>, ResponseModelMetadata?) {
         let url = try makeURL(path: path)
         var headers = buildHeaders(requestHeaders: requestHeaders)
-        if doomLoop != nil, providerAdapter.sendsDoomLoopOptIn {
-            headers[DOOM_LOOP_CHECK_HEADER] = "1"
+        if doomLoop != nil,
+           providerAdapter.sendsDoomLoopOptIn,
+           let policy = defaults.doomLoopRecovery {
+            headers[DOOM_LOOP_CHECK_HEADER] = String(policy.windowTokens)
         }
         applyCodexTurnMetadataHeader(&headers, body: body)
 

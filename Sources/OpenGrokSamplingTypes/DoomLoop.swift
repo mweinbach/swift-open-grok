@@ -44,25 +44,36 @@ public struct DoomLoopRecoveryPolicy: Codable, Sendable, Equatable, Hashable {
     public var maxThreshold: UInt32
     /// Resample budget per turn before accepting the response as-is.
     public var maxRetries: UInt32
+    /// Number of recent generated tokens the inference service examines.
+    public var windowTokens: UInt32
 
     public static let MAX_THRESHOLD_RANGE: ClosedRange<UInt32> = 2...64
     public static let MAX_RETRIES_RANGE: ClosedRange<UInt32> = 0...5
-    public static let DEFAULT_MAX_THRESHOLD: UInt32 = 8
+    public static let WINDOW_TOKENS_RANGE: ClosedRange<UInt32> = 512...4096
+    public static let DEFAULT_MAX_THRESHOLD: UInt32 = 32
     public static let DEFAULT_MAX_RETRIES: UInt32 = 2
+    public static let DEFAULT_RECOVERY_WINDOW_TOKENS: UInt32 = 1024
 
-    public init(maxThreshold: UInt32, maxRetries: UInt32) {
+    public init(
+        maxThreshold: UInt32,
+        maxRetries: UInt32,
+        windowTokens: UInt32 = DoomLoopRecoveryPolicy.DEFAULT_RECOVERY_WINDOW_TOKENS
+    ) {
         self.maxThreshold = maxThreshold
         self.maxRetries = maxRetries
+        self.windowTokens = windowTokens
     }
 
     public init() {
         self.maxThreshold = Self.DEFAULT_MAX_THRESHOLD
         self.maxRetries = Self.DEFAULT_MAX_RETRIES
+        self.windowTokens = Self.DEFAULT_RECOVERY_WINDOW_TOKENS
     }
 
     public enum CodingKeys: String, CodingKey {
         case maxThreshold = "max_threshold"
         case maxRetries = "max_retries"
+        case windowTokens = "window_tokens"
     }
 
     public init(from decoder: Decoder) throws {
@@ -71,6 +82,8 @@ public struct DoomLoopRecoveryPolicy: Codable, Sendable, Equatable, Hashable {
         // must keep deserializing.
         self.maxThreshold = try c.decodeIfPresent(UInt32.self, forKey: .maxThreshold) ?? Self.DEFAULT_MAX_THRESHOLD
         self.maxRetries = try c.decodeIfPresent(UInt32.self, forKey: .maxRetries) ?? Self.DEFAULT_MAX_RETRIES
+        self.windowTokens = try c.decodeIfPresent(UInt32.self, forKey: .windowTokens)
+            ?? Self.DEFAULT_RECOVERY_WINDOW_TOKENS
     }
 
     /// Clamp a configured `maxThreshold` into `MAX_THRESHOLD_RANGE`.
@@ -81,6 +94,12 @@ public struct DoomLoopRecoveryPolicy: Codable, Sendable, Equatable, Hashable {
     /// Clamp a configured `maxRetries` into `MAX_RETRIES_RANGE`.
     public static func clampMaxRetries(_ value: UInt32) -> UInt32 {
         min(max(value, MAX_RETRIES_RANGE.lowerBound), MAX_RETRIES_RANGE.upperBound)
+    }
+
+    /// Invalid windows select the largest safe detector window; unlike the
+    /// threshold and retry settings, Rust does not clamp to the nearest bound.
+    public static func clampWindowTokens(_ value: UInt32) -> UInt32 {
+        WINDOW_TOKENS_RANGE.contains(value) ? value : WINDOW_TOKENS_RANGE.upperBound
     }
 
     /// A signal this policy treats as a real loop worth acting on: tail
