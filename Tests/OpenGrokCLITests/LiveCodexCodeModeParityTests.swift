@@ -96,6 +96,36 @@ struct LiveCodexCodeModeParityTests {
         #expect(LiveCodeModeCoordinator.execSource(native, provider: .xai) == nil)
     }
 
+    @Test("exclusive swarm refusals preserve native custom-tool response identity")
+    func exclusiveSwarmRefusalPreservesCustomTransport() throws {
+        let custom = ToolCall.custom(
+            callId: "call-native-exec",
+            itemId: "ctc-native-exec",
+            name: "exec",
+            input: "text('must not run')"
+        )
+        guard case .customToolOutput(let native) =
+            LiveShellSamplingDriver.swarmExclusiveBatchResult(for: custom)
+        else {
+            Issue.record("native custom calls require native custom refusal output")
+            return
+        }
+        #expect(native.callId == "call-native-exec")
+        #expect(native.itemId == "ctc-native-exec")
+        #expect(native.name == "exec")
+        #expect(native.content == [.text(text: LiveShellSamplingDriver.swarmExclusiveBatchError)])
+
+        let function = ToolCall(id: "call-function", name: "agent_swarm", arguments: "{}")
+        guard case .toolResult(let ordinary) =
+            LiveShellSamplingDriver.swarmExclusiveBatchResult(for: function)
+        else {
+            Issue.record("ordinary function calls require function refusal output")
+            return
+        }
+        #expect(ordinary.toolCallId == "call-function")
+        #expect(ordinary.content == LiveShellSamplingDriver.swarmExclusiveBatchError)
+    }
+
     @Test("freeform apply_patch retains its exact raw payload in the canonical function envelope")
     func freeformPatchArgumentsUseCanonicalSchema() throws {
         let raw = "*** Begin Patch\n*** Add File: example.txt\n+hello\n*** End Patch"

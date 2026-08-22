@@ -2256,6 +2256,21 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         + "then make one exclusive agent_swarm call for independent work; use "
         + "ordinary task calls for heterogeneous small work."
 
+    static func swarmExclusiveBatchResult(for call: ToolCall) -> ConversationItem {
+        if call.isCustom {
+            return .customToolOutput(CustomToolOutputItem(
+                callId: call.callId,
+                itemId: call.customItemId,
+                name: call.name,
+                content: [.text(text: swarmExclusiveBatchError)]
+            ))
+        }
+        return .toolResult(ToolResultItem(
+            toolCallId: call.callId,
+            content: swarmExclusiveBatchError
+        ))
+    }
+
     private func executeToolCalls(
         _ calls: [ToolCall],
         sessionID: String,
@@ -2274,12 +2289,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         // fixed refusal as its tool result and nothing executes.
         let swarmCall = calls.contains { $0.name == LiveSubagentHost.swarmToolName }
         if swarmCall, calls.count != 1 {
-            return calls.map {
-                ConversationItem.toolResult(ToolResultItem(
-                    toolCallId: $0.id,
-                    content: Self.swarmExclusiveBatchError
-                ))
-            }
+            return calls.map(Self.swarmExclusiveBatchResult)
         }
         if swarmCall {
             // A swarm call while the mode is off enters it with the `tool`
