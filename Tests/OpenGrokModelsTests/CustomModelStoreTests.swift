@@ -125,11 +125,128 @@ struct CustomModelStoreTests {
             try await store.upsertCustomModel(CustomModelEntry(key: "k1", modelId: "m1", maxOutputTokens: -10))
         }
 
+        await #expect(throws: CustomModelStoreError.invalidProvider("anthropic")) {
+            try await store.upsertCustomModel(
+                CustomModelEntry(key: "custom-claude", modelId: "claude", provider: "anthropic")
+            )
+        }
+
         // Valid complex key is accepted
         let validEntry = CustomModelEntry(key: "zai:glm-4.v1_alpha-2", modelId: "glm-4")
         try await store.upsertCustomModel(validEntry)
         let fetched = await store.getCustomModel(key: "zai:glm-4.v1_alpha-2")
         #expect(fetched?.modelId == "glm-4")
+    }
+
+    @Test("provider aliases normalize to their canonical persisted identity")
+    func providerAliasesAreCanonicalized() async throws {
+        let fileURL = makeTemporaryFileURL()
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = CustomModelStore(fileURL: fileURL)
+
+        try await store.upsertCustomModel(CustomModelEntry(
+            key: "meta:spark",
+            modelId: "muse-spark",
+            provider: " META_API "
+        ))
+
+        let persisted = try #require(await store.getCustomModel(key: "meta:spark"))
+        #expect(persisted.provider == "meta")
+        #expect(persisted.toModelInfo().provider == .meta)
+    }
+
+    @Test("Wafer and Z AI custom models inherit routable endpoints and key names")
+    func apiKeyProviderModelsInheritRequiredDefaults() async throws {
+        let fileURL = makeTemporaryFileURL()
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = CustomModelStore(fileURL: fileURL)
+
+        try await store.upsertCustomModel(CustomModelEntry(
+            key: "wafer:custom",
+            modelId: "custom-wafer",
+            provider: "wafer_ai"
+        ))
+        try await store.upsertCustomModel(CustomModelEntry(
+            key: "zai:custom",
+            modelId: "custom-glm",
+            provider: "z-ai"
+        ))
+
+        let wafer = try #require(await store.getCustomModel(key: "wafer:custom"))
+        #expect(wafer.baseUrl == WaferModels.apiBaseURL())
+        #expect(wafer.toModelEntry().envKey?.primary == WaferModels.apiKeyEnv)
+        #expect(wafer.toConfigModelOverride().envKey?.primary == WaferModels.apiKeyEnv)
+
+        let zai = try #require(await store.getCustomModel(key: "zai:custom"))
+        #expect(zai.baseUrl == ZaiModels.apiBaseURL())
+        #expect(zai.toModelEntry().envKey?.primary == ZaiModels.apiKeyEnv)
+        #expect(zai.toConfigModelOverride().envKey?.primary == ZaiModels.apiKeyEnv)
+    }
+
+    @Test("persisted custom models project into synchronous session catalog overrides")
+    func persistedModelsBecomeSynchronousCatalogOverrides() async throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("custom-model-catalog-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let store = CustomModelStore(grokHome: home)
+        try await store.upsertCustomModel(CustomModelEntry(
+            key: "zai:live-custom",
+            modelId: "glm-live-custom",
+            provider: "zai",
+            contextWindow: 128_000
+        ))
+
+        let overrides = try loadCustomModelOverrides(grokHome: home)
+        #expect(overrides.count == 1)
+        let (key, override) = try #require(overrides.first)
+        #expect(key == "zai:live-custom")
+        #expect(override.provider == .zai)
+        #expect(override.baseURL == ZaiModels.apiBaseURL())
+        #expect(override.envKey?.primary == ZaiModels.apiKeyEnv)
+
+        let catalog = resolveModelCatalog(input: CatalogResolutionInput(configModels: overrides))
+        #expect(catalog[key]?.info.model == "glm-live-custom")
+        #expect(catalog[key]?.info.provider == .zai)
+    }
+
+    @Test("unknown custom providers cannot enter a catalog through direct merging")
+    func unknownProvidersCannotBeMergedAsXAI() {
+        let poisoned = CustomModelEntry(
+            key: "poisoned-model",
+            modelId: "foreign-model",
+            provider: "anthropic",
+            baseUrl: "https://api.anthropic.com/v1"
+        )
+        var map = OrderedModelMap()
+        var infos: [ModelInfo] = []
+        var entries: [ModelEntry] = []
+
+        CustomModelStore.mergeCustomModels([poisoned], into: &map)
+        CustomModelStore.mergeCustomModels([poisoned], into: &infos)
+        CustomModelStore.mergeCustomModels([poisoned], into: &entries)
+        map.merge(customModels: [poisoned])
+        infos.merge(customModels: [poisoned])
+        entries.merge(customModels: [poisoned])
+
+        #expect(map.isEmpty)
+        #expect(infos.isEmpty)
+        #expect(entries.isEmpty)
+    }
+
+    @Test("corrupt persisted custom models cannot be silently replaced")
+    func corruptedStoreCannotBeOverwritten() async throws {
+        let fileURL = makeTemporaryFileURL()
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let original = "{ not valid custom model JSON"
+        try original.write(to: fileURL, atomically: true, encoding: .utf8)
+        let store = CustomModelStore(fileURL: fileURL)
+
+        await #expect(throws: CustomModelStoreError.self) {
+            try await store.upsertCustomModel(CustomModelEntry(key: "new-model", modelId: "m1"))
+        }
+        #expect(try String(contentsOf: fileURL, encoding: .utf8) == original)
     }
 
     // MARK: - CRUD Workflow

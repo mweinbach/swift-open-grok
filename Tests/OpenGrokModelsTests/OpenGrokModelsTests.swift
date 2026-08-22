@@ -89,6 +89,39 @@ struct EmbeddedDefaultModelsTests {
         #expect((try? parseEmbeddedDefaultModels(missing))?.models.first?.provider == .xai)
     }
 
+    @Test("embedded model backends and tool modes fail closed when explicitly invalid")
+    func unknownBackendAndToolModeFailLoud() {
+        let backend = #"""
+        {"default":"known","models":[{"model":"known","api_backend":"grpc"}]}
+        """#
+        let toolMode = #"""
+        {"default":"known","models":[{"model":"known","tool_mode":"automatic"}]}
+        """#
+
+        #expect(throws: ModelsError.self) {
+            _ = try parseEmbeddedDefaultModels(backend)
+        }
+        #expect(throws: ModelsError.self) {
+            _ = try parseEmbeddedDefaultModels(toolMode)
+        }
+    }
+
+    @Test("cached model metadata rejects unknown wire policies and zero context")
+    func cachedModelMetadataFailsClosed() throws {
+        let invalidDocuments = [
+            #"{"model":"known","api_backend":"grpc"}"#,
+            #"{"model":"known","tool_mode":"automatic"}"#,
+            #"{"model":"known","auth_scheme":"cookie"}"#,
+            #"{"model":"known","context_window":0}"#,
+        ]
+
+        for document in invalidDocuments {
+            #expect(throws: DecodingError.self) {
+                _ = try JSONDecoder().decode(ModelInfo.self, from: Data(document.utf8))
+            }
+        }
+    }
+
     @Test func defaultEntriesPreserveStableKeysAndCapabilities() {
         let map = defaultModelEntries()
         #expect(map["grok-4.5"] != nil)
@@ -648,6 +681,70 @@ struct RemoteModelParseTests {
         #expect(parseRemoteModelValue(obj, defaultBaseURL: "https://example.com") == nil)
     }
 
+    @Test("remote catalogs retain every supported provider and its aliases")
+    func parsesEverySupportedProvider() throws {
+        let providers: [(String, ModelProvider)] = [
+            ("xai", .xai),
+            ("openai", .codex),
+            ("moonshot_ai", .kimi),
+            ("fireworks_ai", .fireworks),
+            ("deep_seek", .deepseek),
+            ("meta_api", .meta),
+            ("opencode-go", .openCodeGo),
+            ("wafer_ai", .wafer),
+            ("z-ai", .zai),
+        ]
+
+        for (raw, expected) in providers {
+            let entry = try #require(parseRemoteModelValue(
+                ["model": "model-\(raw)", "provider": raw],
+                defaultBaseURL: "https://example.com/v1"
+            ))
+            #expect(entry.provider == expected)
+        }
+    }
+
+    @Test("unknown explicit API backends cannot silently become chat completions")
+    func rejectsUnknownExplicitBackend() {
+        for field in ["apiBackend", "api_backend"] {
+            let value: [String: Any] = [
+                "model": "future-model",
+                field: "grpc",
+            ]
+            #expect(parseRemoteModelValue(value, defaultBaseURL: "https://example.com") == nil)
+        }
+    }
+
+    @Test("unknown or malformed explicit tool modes reject the remote model")
+    func rejectsUnknownExplicitToolMode() {
+        let invalid: [Any] = ["automatic", 42, ["mode": "direct"]]
+        for raw in invalid {
+            let value: [String: Any] = [
+                "model": "future-model",
+                "toolMode": raw,
+            ]
+            #expect(parseRemoteModelValue(value, defaultBaseURL: "https://example.com") == nil)
+        }
+    }
+
+    @Test("a top-level null tool mode falls through to provider metadata")
+    func nullToolModeFallsThroughToProviderMetadata() throws {
+        let value: [String: Any] = [
+            "model": "gpt-5.6-sol",
+            "provider": "openai",
+            "apiBackend": "responses",
+            "toolMode": NSNull(),
+            "_meta": ["toolMode": "code_mode_only"],
+        ]
+
+        let parsed = try #require(parseRemoteModelValue(
+            value,
+            defaultBaseURL: "https://api.openai.com/v1"
+        ))
+        #expect(parsed.provider == .codex)
+        #expect(parsed.toolMode == .codeModeOnly)
+    }
+
     @Test func defaultsProviderToXaiWhenOmitted() {
         let obj: [String: Any] = [
             "model": "legacy-model",
@@ -928,7 +1025,7 @@ struct ModelsManagerTests {
             models: [CodexCatalogModel(priority: 1, visibility: .list, entry: entry)],
             accountFingerprint: "account-b"
         )
-        mgr.applyCodexCatalog(foreign)
+        #expect(!mgr.applyCodexCatalog(foreign))
         #expect(mgr.catalogSnapshot()["gpt-x"] == nil)
     }
 }
@@ -1497,4 +1594,3 @@ struct CodexParityRemediationTests {
         #expect(slugs == ["high-priority-wire-second", "medium-priority-wire-third", "low-priority-wire-first"])
     }
 }
-

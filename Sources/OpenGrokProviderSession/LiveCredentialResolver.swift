@@ -94,6 +94,10 @@ public enum LiveCredentialError: Error, Sendable, Equatable, CustomStringConvert
     case codexAuthRequired
     /// A Codex token refresh failed; the session must not proceed on the old token.
     case codexRefreshFailed(String)
+    /// An xAI account session could not renew an expired access token.
+    case xaiRefreshFailed(String)
+    /// Built-in account credentials must never leave their provider's hosts.
+    case untrustedCredentialEndpoint(provider: ModelProvider, baseURL: String)
 
     public var description: String {
         switch self {
@@ -103,6 +107,10 @@ public enum LiveCredentialError: Error, Sendable, Equatable, CustomStringConvert
             return codexAuthRequiredMessage
         case .codexRefreshFailed(let detail):
             return "Codex credentials could not be refreshed: \(detail)"
+        case .xaiRefreshFailed(let detail):
+            return "xAI credentials could not be refreshed: \(detail)"
+        case .untrustedCredentialEndpoint(let provider, let baseURL):
+            return "refusing to send \(provider.asString) account credentials to untrusted endpoint \(baseURL)"
         }
     }
 }
@@ -113,18 +121,21 @@ public struct LiveCredentialResolver: Sendable {
     public let openGrokHome: URL
     public let codexAuthFile: URL
     public let codexRefreshService: CodexTokenRefreshService
+    public let xaiTokenRefresher: (any TokenRefresher)?
 
     public init(
         environment: [String: String],
         openGrokHome: URL,
         codexAuthFile: URL? = nil,
-        codexRefreshService: CodexTokenRefreshService = .storeOnly
+        codexRefreshService: CodexTokenRefreshService = .storeOnly,
+        xaiTokenRefresher: (any TokenRefresher)? = nil
     ) {
         self.environment = environment
         self.openGrokHome = openGrokHome
         self.codexAuthFile = codexAuthFile
             ?? OpenGrokAuthPaths.codexAuthFileURL(environment: environment)
         self.codexRefreshService = codexRefreshService
+        self.xaiTokenRefresher = xaiTokenRefresher
     }
 
     /// Resolve the credential for `provider`.
@@ -149,12 +160,23 @@ public struct LiveCredentialResolver: Sendable {
         provider: ModelProvider,
         explicitAPIKey: String? = nil,
         baseURL: String? = nil,
+        forceRefresh: Bool = false,
         scope: String
     ) async throws -> LiveResolvedCredential {
         let explicit = Self.trimmed(explicitAPIKey)
 
         if provider == .xai {
-            return try await resolveXAI(explicitAPIKey: explicit, scope: scope)
+            let credential = try await resolveXAI(explicitAPIKey: explicit, scope: scope)
+            if credential.source != .explicitAPIKey,
+               let baseURL,
+               !trustedBuiltInSessionEndpoint(provider: provider, baseURL: baseURL)
+            {
+                throw LiveCredentialError.untrustedCredentialEndpoint(
+                    provider: provider,
+                    baseURL: baseURL
+                )
+            }
+            return credential
         }
 
         if let explicit {
@@ -167,7 +189,16 @@ public struct LiveCredentialResolver: Sendable {
         }
 
         if provider == .codex {
-            return try await resolveCodex(scope: scope)
+            if let baseURL,
+               !trustedBuiltInSessionEndpoint(provider: provider, baseURL: baseURL),
+               !isTrustedCodexInferenceBaseURL(baseURL, environment: environment)
+            {
+                throw LiveCredentialError.untrustedCredentialEndpoint(
+                    provider: provider,
+                    baseURL: baseURL
+                )
+            }
+            return try await resolveCodex(scope: scope, forceRefresh: forceRefresh)
         }
 
         let storedKeyEndpointTrusted = baseURL.map {
@@ -196,12 +227,14 @@ public struct LiveCredentialResolver: Sendable {
         provider: ModelProvider,
         explicitAPIKey: String? = nil,
         baseURL: String? = nil,
+        forceRefresh: Bool = false,
         scope: String
     ) async throws -> ProviderCredentialBinding {
         try await resolve(
             provider: provider,
             explicitAPIKey: explicitAPIKey,
             baseURL: baseURL,
+            forceRefresh: forceRefresh,
             scope: scope
         ).binding
     }
@@ -244,14 +277,38 @@ public struct LiveCredentialResolver: Sendable {
             config: config,
             environment: environment
         )
+        if let storedSession = await manager.currentOrExpired(),
+           let refresher = xaiTokenRefresher
+                ?? makeXAIOIDCTokenRefresher(auth: storedSession, config: config)
+        {
+            await manager.configureRefresher(refresher)
+        }
         let resolvedExplicitAPIKey = config.apiKeyAuthDisabled(environment: environment)
             ? nil
             : explicitAPIKey
-        let precedence = await resolveCredentialPrecedence(
+        var precedence = await resolveCredentialPrecedence(
             manager: manager,
             environment: environment,
             explicitAPIKey: resolvedExplicitAPIKey
         )
+
+        if precedence.deploymentKey == nil,
+           resolvedExplicitAPIKey == nil,
+           let session = precedence.session,
+           session.authMode != .apiKey,
+           isExpired(session, environment: environment)
+        {
+            do {
+                _ = try await manager.auth()
+            } catch {
+                throw LiveCredentialError.xaiRefreshFailed(Self.describe(error))
+            }
+            precedence = await resolveCredentialPrecedence(
+                manager: manager,
+                environment: environment,
+                explicitAPIKey: resolvedExplicitAPIKey
+            )
+        }
         let credentials = precedence.resolved
 
         if let deploymentKey = credentials.deploymentKey {
@@ -311,7 +368,10 @@ public struct LiveCredentialResolver: Sendable {
         )
     }
 
-    private func resolveCodex(scope: String) async throws -> LiveResolvedCredential {
+    private func resolveCodex(
+        scope: String,
+        forceRefresh: Bool
+    ) async throws -> LiveResolvedCredential {
         guard isCodexLoggedIn(at: codexAuthFile) else {
             throw LiveCredentialError.codexAuthRequired
         }
@@ -321,7 +381,7 @@ public struct LiveCredentialResolver: Sendable {
         )
         let credentials: CodexCredentials
         do {
-            credentials = try await provider.ensureFreshCredentials()
+            credentials = try await provider.ensureFreshCredentials(forceRefresh: forceRefresh)
         } catch let error as LiveCredentialError {
             throw error
         } catch {

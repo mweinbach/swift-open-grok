@@ -47,8 +47,43 @@ public struct CodexTokenRefreshService: Sendable {
 
     /// Store-only service that never performs network I/O. Intended for tests
     /// and for read-only status paths; it cannot renew an expired token.
-    public static let storeOnly = CodexTokenRefreshService { authFile, _ in
-        try loadCodexCredentials(at: authFile)
+    public static let storeOnly = CodexTokenRefreshService { authFile, force in
+        guard let store = try loadCodexStore(at: authFile), store.tokens != nil else {
+            return nil
+        }
+        guard !force, accessTokenIsFresh(store) else {
+            throw AuthError.protocolError(
+                "Codex OAuth credentials require a live refresh service; run `open-grok login --codex`"
+            )
+        }
+        return try loadCodexCredentials(at: authFile)
+    }
+}
+
+/// All live consumers of one OAuth store share a refresh flight. Without this
+/// process-wide seam a session turn, catalog fetch, and subagent can each
+/// redeem the same single-use refresh token before observing its replacement.
+private actor CodexCredentialRefreshCoordinator {
+    static let shared = CodexCredentialRefreshCoordinator()
+
+    private var inFlight: [String: Task<CodexCredentials?, Error>] = [:]
+
+    func refresh(
+        authFile: URL,
+        force: Bool,
+        service: CodexTokenRefreshService
+    ) async throws -> CodexCredentials? {
+        let key = authFile.standardizedFileURL.path
+        if let existing = inFlight[key] {
+            return try await existing.value
+        }
+
+        let task = Task {
+            try await service.refresh(authFile, force)
+        }
+        inFlight[key] = task
+        defer { inFlight[key] = nil }
+        return try await task.value
     }
 }
 
@@ -103,10 +138,11 @@ public final class CodexAuthCredentialProvider: AuthCredentialProvider, @uncheck
 
     public func refreshAfterUnauthorized() async -> Bool {
         let previous = (try? loadCodexCredentials(at: file))?.accessToken
-        guard let refreshed = try? await refreshService.refresh(file, true) else {
+        guard let previous,
+              let refreshed = try? await ensureFreshCredentials(forceRefresh: true)
+        else {
             return false
         }
-        guard acceptIdentity(refreshed.identity) else { return false }
         return refreshed.accessToken != previous
     }
 
@@ -119,16 +155,39 @@ public final class CodexAuthCredentialProvider: AuthCredentialProvider, @uncheck
     /// Credentials guaranteed to be within the freshness window, renewing them
     /// when required. Throws rather than returning a stale token.
     @discardableResult
-    public func ensureFreshCredentials() async throws -> CodexCredentials {
-        guard let store = try loadCodexStore(at: file), store.tokens != nil else {
+    public func ensureFreshCredentials(forceRefresh: Bool = false) async throws -> CodexCredentials {
+        guard let store = try loadCodexStore(at: file), let tokens = store.tokens else {
             throw AuthError.protocolError(codexAuthRequiredMessage)
         }
-        guard let credentials = try await refreshService.refresh(file, false) else {
+
+        // Pin before entering the refresh flight. A provider must never adopt
+        // an account another process logged into while its request was away.
+        guard acceptIdentity(credentialsFromTokens(tokens).identity) else {
+            throw AuthError.protocolError(
+                "Codex credentials changed account mid-session; run `open-grok login --codex`"
+            )
+        }
+
+        guard let credentials = try await CodexCredentialRefreshCoordinator.shared.refresh(
+            authFile: file,
+            force: forceRefresh,
+            service: refreshService
+        ) else {
             throw AuthError.protocolError(codexAuthRequiredMessage)
         }
         guard acceptIdentity(credentials.identity) else {
             throw AuthError.protocolError(
                 "Codex credentials changed account mid-session; run `open-grok login --codex`"
+            )
+        }
+
+        guard let refreshedStore = try loadCodexStore(at: file),
+              let refreshedTokens = refreshedStore.tokens,
+              refreshedTokens.accessToken == credentials.accessToken,
+              accessTokenIsFresh(refreshedStore)
+        else {
+            throw AuthError.protocolError(
+                "Codex OAuth refresh did not persist fresh credentials; run `open-grok login --codex`"
             )
         }
         return credentials

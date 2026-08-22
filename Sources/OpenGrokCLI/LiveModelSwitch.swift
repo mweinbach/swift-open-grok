@@ -843,6 +843,9 @@ final class LiveModelCatalogStore: @unchecked Sendable {
     /// a rebuild over a different transport would silently unhook the
     /// hermetic transport a test (or offline composition) injected.
     private let catalogTransport: any ModelCatalogTransport
+    /// OAuth refreshes must use the same injected transport as catalog fetches;
+    /// a store-only resolver can never recover from an expired or rejected token.
+    private let httpTransport: any HTTPTransport
     /// The service the LIVE Kimi partition actor is currently built against —
     /// the port of `effective_kimi_endpoint` (the endpoint of the resident
     /// `kimi_client`, agent/models.rs:1172-1174). Guarded by `lock`.
@@ -857,6 +860,7 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         let home = openGrokHome ?? Self.resolveOpenGrokHome(environment: environment)
         self.environment = environment
         self.openGrokHome = home
+        self.httpTransport = transport
         let catalogTransport = LiveModelCatalogHTTPTransport(transport: transport)
         self.catalogTransport = catalogTransport
         // The boot refreshers honor the configured `[models] kimi_endpoint`
@@ -867,7 +871,11 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         self.liveKimiEndpoint = bootKimiEndpoint
         manager = ModelsManager(
             input: input,
-            credentials: Self.credentialSnapshot(environment: environment, openGrokHome: home),
+            credentials: Self.credentialSnapshot(
+                environment: environment,
+                openGrokHome: home,
+                kimiEndpoint: bootKimiEndpoint
+            ),
             // Explicit, never defaulted: the manager's own cache managers
             // otherwise resolve against the PROCESS environment
             // (`OpenGrokStatePaths.stateDirectory(ProcessInfo...)`), and
@@ -877,6 +885,7 @@ final class LiveModelCatalogStore: @unchecked Sendable {
             grokHome: home,
             liveCatalogs: Self.buildRefreshers(
                 transport: catalogTransport,
+                httpTransport: transport,
                 environment: environment,
                 openGrokHome: home,
                 kimiEndpoint: bootKimiEndpoint
@@ -886,6 +895,7 @@ final class LiveModelCatalogStore: @unchecked Sendable {
 
     private static func buildRefreshers(
         transport: any ModelCatalogTransport,
+        httpTransport: any HTTPTransport,
         environment: [String: String],
         openGrokHome: URL,
         kimiEndpoint: KimiApiEndpoint
@@ -893,7 +903,14 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         let broker = LiveModelCatalogCredentialBroker(
             resolver: LiveCredentialResolver(
                 environment: environment,
-                openGrokHome: openGrokHome
+                openGrokHome: openGrokHome,
+                codexAuthFile: openGrokHome.appendingPathComponent(
+                    OpenGrokAuthPaths.codexAuthFileName
+                ),
+                codexRefreshService: .live(
+                    endpoints: CodexEndpoints.fromEnvironment(environment),
+                    transport: httpTransport
+                )
             ),
             environment: environment,
             kimiEndpoint: kimiEndpoint
@@ -903,7 +920,8 @@ final class LiveModelCatalogStore: @unchecked Sendable {
             broker: broker,
             grokHome: openGrokHome,
             kimiEndpoint: kimiEndpoint,
-            environment: environment
+            environment: environment,
+            codexBaseURL: codexInferenceBaseURL(environment: environment)
         )
     }
 
@@ -982,7 +1000,14 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         let broker = LiveModelCatalogCredentialBroker(
             resolver: LiveCredentialResolver(
                 environment: environment,
-                openGrokHome: openGrokHome
+                openGrokHome: openGrokHome,
+                codexAuthFile: openGrokHome.appendingPathComponent(
+                    OpenGrokAuthPaths.codexAuthFileName
+                ),
+                codexRefreshService: .live(
+                    endpoints: CodexEndpoints.fromEnvironment(environment),
+                    transport: httpTransport
+                )
             ),
             environment: environment,
             kimiEndpoint: kimiEndpoint
@@ -1011,11 +1036,13 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         }
         manager.updateLiveCatalogRefreshers(Self.buildRefreshers(
             transport: catalogTransport,
+            httpTransport: httpTransport,
             environment: environment,
             openGrokHome: openGrokHome,
             kimiEndpoint: endpoint
         ))
         lock.withLock { liveKimiEndpoint = endpoint }
+        refreshCredentialSnapshot()
         return await manager.refreshPartition(.kimi)
     }
 
@@ -1081,9 +1108,11 @@ final class LiveModelCatalogStore: @unchecked Sendable {
     /// publish gate and to the next background refresh, mirroring upstream's
     /// post-store `apply_meta_models` re-read (effects/mod.rs:832-861).
     func refreshCredentialSnapshot() {
+        let kimiEndpoint = lock.withLock { liveKimiEndpoint }
         manager.updateCredentials(Self.credentialSnapshot(
             environment: environment,
-            openGrokHome: openGrokHome
+            openGrokHome: openGrokHome,
+            kimiEndpoint: kimiEndpoint
         ))
     }
 
@@ -1096,17 +1125,16 @@ final class LiveModelCatalogStore: @unchecked Sendable {
     ///
     /// The task handle is retained (`backgroundRefreshTask`) so the
     /// reachability test can await completion instead of sleeping; production
-    /// callers ignore it. Upstream's xAI catalog-retry half
-    /// (`spawn_catalog_retry`) is deliberately not fired here: this store's
-    /// `ModelsManager` has no live xAI/Codex list transport wired yet, so the
-    /// call would be a silent no-op pretending to refresh.
+    /// callers ignore it. Codex starts beside the API-key partitions, matching
+    /// `set_gateway` (`agent/models.rs:645-657`); its own refresh remains
+    /// awaited inside this detached task, never on the interactive caller.
     func spawnBackgroundRefresh() {
         let manager = self.manager
-        // The per-partition outcomes are deliberately unread here: upstream's
-        // spawn is equally fire-and-forget, and the reachability test asserts
-        // the published catalog rather than the return value.
         let task = Task<Void, Never> {
-            await manager.refreshBackgroundPartitions()
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await manager.refreshCodexBlocking() }
+                group.addTask { await manager.refreshBackgroundPartitions() }
+            }
         }
         lock.lock()
         backgroundRefresh = task
@@ -1120,7 +1148,7 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         return backgroundRefresh
     }
 
-    private static func resolveOpenGrokHome(environment: [String: String]) -> URL {
+    fileprivate static func resolveOpenGrokHome(environment: [String: String]) -> URL {
         if let path = environment["OPENGROK_HOME"], !path.isEmpty {
             return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
         }
@@ -1130,34 +1158,58 @@ final class LiveModelCatalogStore: @unchecked Sendable {
             .standardizedFileURL
     }
 
-    /// The production credential snapshot for `applyMetaCatalog`'s publish
-    /// gate: the fingerprint of the key the Meta partition would fetch with
-    /// (`credential_fingerprint` over `select_api_key`, upstream
-    /// meta_models.rs:78-96), computed with the same
-    /// `liveCatalogCredentialFingerprint` the broker stamps onto fetched
-    /// catalogs — so a catalog fetched under one key cannot publish after the
-    /// key changes (`catalog_matches_current_credential` in
-    /// `refresh_meta_models`, agent/models.rs:806-820).
-    ///
-    /// Only the Meta fingerprint is populated here. The other partitions'
-    /// fingerprints stay `nil`, which keeps their publish gates in today's
-    /// accept-anything mode — activating them belongs to their own slices,
-    /// because a fingerprint that drifts from what their broker actually
-    /// resolves would silently block every publish for that provider.
+    /// Publish fences must describe exactly the credentials the live brokers
+    /// resolve, otherwise an account/key switch can publish another principal's
+    /// response or silently suppress every legitimate provider refresh.
     private static func credentialSnapshot(
         environment: [String: String],
-        openGrokHome: URL
+        openGrokHome: URL,
+        kimiEndpoint: KimiApiEndpoint
     ) -> EmptyCredentialSnapshot {
-        let metaKey = MetaModels.selectAPIKey(
-            baseURL: MetaModels.apiBaseURL(environment: environment),
-            environmentKey: environment[MetaModels.apiKeyEnv],
-            storedKey: readProviderAPIKey(
-                grokHome: openGrokHome,
-                provider: ModelProvider.meta.asString
-            )
+        let codexAuthFile = openGrokHome.appendingPathComponent(
+            OpenGrokAuthPaths.codexAuthFileName
         )
+        let resolver = LiveCredentialResolver(
+            environment: environment,
+            openGrokHome: openGrokHome,
+            codexAuthFile: codexAuthFile
+        )
+        let broker = LiveModelCatalogCredentialBroker(
+            resolver: resolver,
+            environment: environment,
+            kimiEndpoint: kimiEndpoint
+        )
+
+        let authFile: URL
+        if let override = environment["OPENGROK_AUTH_PATH"], !override.isEmpty {
+            authFile = URL(fileURLWithPath: override)
+        } else {
+            authFile = openGrokHome.appendingPathComponent(OpenGrokAuthPaths.authFileName)
+        }
+        let xaiSession: Bool
+        if let authStore = try? readAuthJSONOrEmpty(at: authFile) {
+            let scope = GrokComConfig.default(environment: environment).authScope
+            xaiSession = lookupAuth(authStore, scope: scope)?.isSessionAuth == true
+        } else {
+            xaiSession = false
+        }
+        let codexCredentials = try? loadCodexCredentials(at: codexAuthFile)
+
+        func fingerprint(_ partition: ModelCatalogPartition) -> String? {
+            broker.selectedAPIKey(for: partition).map(liveCatalogCredentialFingerprint)
+        }
+
         return EmptyCredentialSnapshot(
-            metaCredentialFingerprint: metaKey.map(liveCatalogCredentialFingerprint)
+            hasXaiSession: xaiSession,
+            hasCodexSession: codexCredentials != nil,
+            codexAccountFingerprint: codexCredentials.flatMap(liveCodexAccountFingerprint),
+            kimiCredentialFingerprint: fingerprint(.kimi),
+            fireworksCredentialFingerprint: fingerprint(.fireworks),
+            deepSeekCredentialFingerprint: fingerprint(.deepSeek),
+            metaCredentialFingerprint: fingerprint(.meta),
+            openCodeGoCredentialFingerprint: fingerprint(.openCodeGo),
+            waferCredentialFingerprint: fingerprint(.wafer),
+            zaiCredentialFingerprint: fingerprint(.zai)
         )
     }
 }
@@ -1219,7 +1271,55 @@ private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
     }
 
     func codexCredential(forceRefresh: Bool) async -> CodexCatalogCredential? {
-        nil
+        guard let resolved = try? await resolver.resolve(
+            provider: .codex,
+            baseURL: partitionBaseURL(for: .codex),
+            forceRefresh: forceRefresh,
+            scope: "catalog:codex"
+        ),
+        resolved.source == .codexOAuth,
+        let credentials = try? loadCodexCredentials(at: resolver.codexAuthFile),
+        credentials.accessToken == resolved.bearer,
+        resolved.extraHeaders["ChatGPT-Account-ID"] == credentials.accountID,
+        let fingerprint = liveCodexAccountFingerprint(credentials)
+        else {
+            return nil
+        }
+
+        return CodexCatalogCredential(
+            accessToken: credentials.accessToken,
+            accountID: credentials.accountID,
+            accountIsFedramp: credentials.accountIsFedramp,
+            fingerprint: fingerprint
+        )
+    }
+
+    /// Synchronous mirror of `LiveCredentialResolver.resolve` for the manager's
+    /// publish snapshot. Explicit env keys outrank stored keys; stored keys
+    /// never travel to a configured non-provider endpoint.
+    func selectedAPIKey(for partition: ModelCatalogPartition) -> String? {
+        guard partition != .codex else { return nil }
+        let provider = partition.provider
+        if let key = nonEmptyCredential(environmentKey(for: provider)) {
+            return key
+        }
+        guard trustedBuiltInSessionEndpoint(
+            provider: provider,
+            baseURL: partitionBaseURL(for: partition)
+        ) else {
+            return nil
+        }
+        return nonEmptyCredential(readProviderAPIKey(
+            grokHome: resolver.openGrokHome,
+            provider: provider.asString
+        ))
+    }
+
+    private func nonEmptyCredential(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty
+        else { return nil }
+        return value
     }
 
     private func environmentKey(for provider: ModelProvider) -> String? {
@@ -1262,7 +1362,7 @@ private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
     private func partitionBaseURL(for partition: ModelCatalogPartition) -> String {
         switch partition {
         case .codex:
-            return CodexModels.defaultInferenceBaseURL
+            return codexInferenceBaseURL(environment: environment)
         case .kimi:
             return KimiModels.apiBaseURL(kimiEndpoint, environment: environment)
         case .fireworks:
@@ -1279,6 +1379,25 @@ private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
             return ZaiModels.apiBaseURL(environment: environment)
         }
     }
+}
+
+/// Byte-for-byte principal identity from `codex_models.rs:916-937`: bearer
+/// rotation cannot invalidate a cache, and missing principal claims fail shut.
+private func liveCodexAccountFingerprint(_ credentials: CodexCredentials) -> String? {
+    guard credentials.accountID != nil
+        || credentials.chatgptUserID != nil
+        || credentials.email != nil
+    else { return nil }
+
+    var bytes = Array("open-grok-codex-model-cache-account-v1\0".utf8)
+    for component in [credentials.accountID, credentials.chatgptUserID, credentials.email] {
+        let value = Array((component ?? "").utf8)
+        var length = UInt64(value.count).littleEndian
+        withUnsafeBytes(of: &length) { bytes.append(contentsOf: $0) }
+        bytes.append(contentsOf: value)
+    }
+    bytes.append(credentials.isWorkspaceAccount ? 1 : 0)
+    return Blake3.hexDigest(bytes)
 }
 
 private func liveCatalogCredentialFingerprint(_ value: String) -> String {
@@ -1304,6 +1423,16 @@ func liveCatalogResolutionInput(
         workingDirectory: workingDirectory,
         environment: environment
     )
+    var modelOverrides = configured.modelOverrides
+    let openGrokHome = LiveModelCatalogStore.resolveOpenGrokHome(environment: environment)
+    let savedOverrides = (try? loadCustomModelOverrides(grokHome: openGrokHome)) ?? []
+    for (key, override) in savedOverrides {
+        if let index = modelOverrides.firstIndex(where: { $0.0 == key }) {
+            modelOverrides[index] = (key, override)
+        } else {
+            modelOverrides.append((key, override))
+        }
+    }
     let endpoints = EndpointsConfig(
         xaiApiBaseURL: document[path: ["endpoints", "xai_api_base_url"]]?.stringValue
             ?? XAI_API_BASE_URL_DEFAULT,
@@ -1317,7 +1446,7 @@ func liveCatalogResolutionInput(
             default: document[path: ["models", "default"]]?.stringValue,
             opencodeGoEnabledModels: enabled
         ),
-        configModels: configured.modelOverrides
+        configModels: modelOverrides
     )
 }
 

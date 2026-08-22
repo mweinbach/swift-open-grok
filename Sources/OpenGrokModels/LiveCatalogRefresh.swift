@@ -156,8 +156,8 @@ public extension ModelsManager {
             guard let catalog else {
                 return LiveCatalogRefreshOutcome(partition: .codex, published: false)
             }
-            applyCodexCatalog(catalog)
-            return LiveCatalogRefreshOutcome(partition: .codex, published: true)
+            let published = applyCodexCatalog(catalog)
+            return LiveCatalogRefreshOutcome(partition: .codex, published: published)
         } catch {
             return LiveCatalogRefreshOutcome(
                 partition: .codex,
@@ -175,6 +175,7 @@ public extension ModelsManager {
     ) async -> LiveCatalogRefreshOutcome {
         let refreshers = liveCatalogRefreshers
         do {
+            let published: Bool
             switch partition {
             case .codex:
                 return await refreshCodexBlocking(cancellation: cancellation)
@@ -184,7 +185,7 @@ public extension ModelsManager {
                       let result = try await actor.fetch(cancellation: cancellation) else {
                     return LiveCatalogRefreshOutcome(partition: partition, published: false)
                 }
-                applyKimiCatalog(
+                published = applyKimiCatalog(
                     KimiModelsCatalog(
                         entries: result.entries,
                         endpoint: kimiEndpointForRefresh,
@@ -197,7 +198,7 @@ public extension ModelsManager {
                       let result = try await actor.fetch(cancellation: cancellation) else {
                     return LiveCatalogRefreshOutcome(partition: partition, published: false)
                 }
-                applyFireworksCatalog(
+                published = applyFireworksCatalog(
                     FireworksModelsCatalog(
                         entries: result.entries,
                         credentialFingerprint: result.fingerprint
@@ -209,7 +210,7 @@ public extension ModelsManager {
                       let result = try await actor.fetch(cancellation: cancellation) else {
                     return LiveCatalogRefreshOutcome(partition: partition, published: false)
                 }
-                applyDeepSeekCatalog(
+                published = applyDeepSeekCatalog(
                     DeepSeekModelsCatalog(
                         entries: result.entries,
                         credentialFingerprint: result.fingerprint
@@ -221,7 +222,7 @@ public extension ModelsManager {
                       let result = try await actor.fetch(cancellation: cancellation) else {
                     return LiveCatalogRefreshOutcome(partition: partition, published: false)
                 }
-                applyMetaCatalog(
+                published = applyMetaCatalog(
                     MetaModelsCatalog(
                         entries: result.entries,
                         credentialFingerprint: result.fingerprint
@@ -233,14 +234,14 @@ public extension ModelsManager {
                       let catalog = try await actor.fetch(cancellation: cancellation) else {
                     return LiveCatalogRefreshOutcome(partition: partition, published: false)
                 }
-                applyOpenCodeGoCatalog(catalog)
+                published = applyOpenCodeGoCatalog(catalog)
 
             case .wafer:
                 guard let actor = refreshers.wafer,
                       let result = try await actor.fetch(cancellation: cancellation) else {
                     return LiveCatalogRefreshOutcome(partition: partition, published: false)
                 }
-                applyWaferCatalog(
+                published = applyWaferCatalog(
                     WaferModelsCatalog(
                         entries: result.entries,
                         credentialFingerprint: result.fingerprint
@@ -252,14 +253,14 @@ public extension ModelsManager {
                       let result = try await actor.fetch(cancellation: cancellation) else {
                     return LiveCatalogRefreshOutcome(partition: partition, published: false)
                 }
-                applyZaiCatalog(
+                published = applyZaiCatalog(
                     ZaiModelsCatalog(
                         entries: result.entries,
                         credentialFingerprint: result.fingerprint
                     )
                 )
             }
-            return LiveCatalogRefreshOutcome(partition: partition, published: true)
+            return LiveCatalogRefreshOutcome(partition: partition, published: published)
         } catch {
             return LiveCatalogRefreshOutcome(
                 partition: partition,

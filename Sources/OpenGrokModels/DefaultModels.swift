@@ -179,7 +179,17 @@ private func parseDefaultModelJSON(_ obj: [String: Any]) throws -> DefaultModelJ
     guard let model = obj["model"] as? String, !model.isEmpty else {
         throw ModelsError.invalidDefaultModels("entry missing non-empty 'model'")
     }
-    let apiBackend = WireCodec.apiBackend(obj["api_backend"] as? String) ?? .defaultValue
+    let apiBackend: ApiBackend
+    if let raw = obj["api_backend"] as? String {
+        guard let decoded = WireCodec.apiBackend(raw) else {
+            throw ModelsError.invalidDefaultModels(
+                "unknown API backend '\(raw)' for model '\(model)'"
+            )
+        }
+        apiBackend = decoded
+    } else {
+        apiBackend = .defaultValue
+    }
     // A missing provider defaults to xAI (`#[serde(default)]`,
     // `agent/config.rs:4115-4116`), but an unknown provider string fails hard
     // exactly as upstream serde does: silently misattributing an entry to xAI
@@ -201,7 +211,17 @@ private func parseDefaultModelJSON(_ obj: [String: Any]) throws -> DefaultModelJ
     } else {
         provider = .defaultValue
     }
-    let toolMode = WireCodec.toolMode(obj["tool_mode"] as? String)
+    let toolMode: ToolMode?
+    if let raw = obj["tool_mode"] as? String {
+        guard let decoded = WireCodec.toolMode(raw) else {
+            throw ModelsError.invalidDefaultModels(
+                "unknown tool mode '\(raw)' for model '\(model)'"
+            )
+        }
+        toolMode = decoded
+    } else {
+        toolMode = nil
+    }
     let envKey: EnvKeys?
     if let s = obj["env_key"] as? String {
         envKey = .one(s)

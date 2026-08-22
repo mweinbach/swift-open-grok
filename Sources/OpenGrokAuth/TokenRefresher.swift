@@ -108,6 +108,32 @@ public struct OIDCTokenRefresher: TokenRefresher {
     }
 }
 
+/// The same first-party refresh contract used by leader and session routes.
+/// Keeping construction beside the auth transport lets every live consumer
+/// renew its account without importing CLI-only composition helpers.
+public func makeXAIOIDCTokenRefresher(
+    auth: GrokAuth,
+    config: GrokComConfig,
+    transport: any HTTPTransport = URLSessionHTTPTransport()
+) -> (any TokenRefresher)? {
+    guard auth.authMode == .oidc,
+          auth.isXAIAuth,
+          let issuer = auth.oidcIssuer ?? config.effectiveOIDC?.issuer,
+          let clientID = auth.oidcClientID ?? config.effectiveOIDC?.clientID,
+          let tokenEndpoint = URL(
+              string: "\(issuer.trimmingCharacters(in: CharacterSet(charactersIn: "/")))/oauth2/token"
+          )
+    else {
+        return nil
+    }
+    return OIDCTokenRefresher(
+        tokenEndpoint: tokenEndpoint,
+        clientID: clientID,
+        issuer: issuer,
+        transport: transport
+    )
+}
+
 /// External binary refresher. Runs an injectible command runner.
 public struct ExternalTokenRefresher: TokenRefresher {
     public var command: String

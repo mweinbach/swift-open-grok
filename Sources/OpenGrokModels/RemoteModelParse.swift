@@ -107,20 +107,23 @@ public func parseRemoteModelValue(
         ?? meta.flatMap({ stringField($0, "agent_type") })
         ?? DEFAULT_AGENT_TYPE
 
-    let apiBackend = WireCodec.apiBackend(
-        stringField(value, "apiBackend") ?? stringField(value, "api_backend")
-    ) ?? .defaultValue
+    let apiBackend: ApiBackend
+    if let raw = stringField(value, "apiBackend") ?? stringField(value, "api_backend") {
+        guard let decoded = WireCodec.apiBackend(raw) else { return nil }
+        apiBackend = decoded
+    } else {
+        apiBackend = .defaultValue
+    }
 
     let providerRaw = stringField(value, "provider")
         ?? stringField(value, "modelProvider")
         ?? stringField(value, "model_provider")
         ?? meta.flatMap({ stringField($0, "provider") })
     let provider: ModelProvider
-    if let providerRaw,
-       let decoded = try? JSONDecoder().decode(
-           ModelProvider.self,
-           from: Data("\"\(providerRaw)\"".utf8)
-       ) {
+    if let providerRaw {
+        guard let encoded = try? JSONEncoder().encode(providerRaw),
+              let decoded = try? JSONDecoder().decode(ModelProvider.self, from: encoded)
+        else { return nil }
         provider = decoded
     } else {
         provider = .defaultValue
@@ -134,8 +137,11 @@ public func parseRemoteModelValue(
         meta?["tool_mode"]
     )
     let toolMode: ToolMode?
-    if let s = toolModeValue as? String {
-        toolMode = WireCodec.toolMode(s)
+    if let toolModeValue {
+        guard let raw = toolModeValue as? String,
+              let decoded = WireCodec.toolMode(raw)
+        else { return nil }
+        toolMode = decoded
     } else {
         toolMode = nil
     }
@@ -148,17 +154,6 @@ public func parseRemoteModelValue(
         ?? boolField(value, "supported_in_api")
         ?? meta.flatMap({ boolField($0, "supportedInApi") })
         ?? true
-
-    // Reject unknown explicit provider values that failed decode by checking
-    // a present-but-unparseable provider string.
-    if let providerRaw {
-        let lower = providerRaw.lowercased()
-        let known = ["xai", "codex", "openai", "openai_codex", "kimi", "moonshot",
-                     "moonshot_ai", "fireworks", "fireworks_ai"]
-        if !known.contains(lower) {
-            return nil
-        }
-    }
 
     return ModelEntryConfig(
         id: id,

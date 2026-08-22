@@ -1063,14 +1063,76 @@ struct ModelsManagerLiveRefreshTests {
             baseURL: WaferModels.apiBaseURLDefault
         )
 
-        manager.applyWaferCatalog(
+        let rejected = manager.applyWaferCatalog(
             WaferModelsCatalog(entries: entries, credentialFingerprint: "fp-stale")
         )
+        #expect(!rejected)
         #expect(manager.catalogSnapshot()["wafer:wafer-model"] == nil)
 
-        manager.applyWaferCatalog(
+        let accepted = manager.applyWaferCatalog(
             WaferModelsCatalog(entries: entries, credentialFingerprint: "fp-current")
         )
+        #expect(accepted)
         #expect(manager.catalogSnapshot()["wafer:wafer-model"] != nil)
+    }
+
+    @Test("a fetched catalog rejected by its credential gate reports unpublished")
+    func refreshOutcomeDoesNotClaimRejectedCatalogWasPublished() async throws {
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let broker = RecordingCredentialBroker()
+        await broker.setKey(.wafer, apiKey: "wafer-key", fingerprint: "fp-old")
+
+        let transport = MockCatalogTransport()
+        await transport.route(
+            matching: "pass.wafer.ai",
+            responses: [ok(try fixture("wafer_models.json"))]
+        )
+
+        let manager = ModelsManager(
+            credentials: EmptyCredentialSnapshot(waferCredentialFingerprint: "fp-current"),
+            grokHome: home,
+            liveCatalogs: LiveCatalogRefreshers.live(
+                transport: transport,
+                broker: broker,
+                grokHome: home
+            )
+        )
+
+        let result = await manager.refreshPartition(.wafer)
+        #expect(!result.published)
+        #expect(result.failure == nil)
+        #expect(manager.catalogSnapshot()["wafer:wafer-model"] == nil)
+    }
+
+    @Test("a Codex catalog rejected for a different account reports unpublished")
+    func codexRefreshOutcomeDoesNotClaimRejectedAccountWasPublished() async throws {
+        let home = try tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let broker = RecordingCredentialBroker()
+        await broker.setCodex(testCodexCredential)
+
+        let transport = MockCatalogTransport()
+        await transport.route(
+            matching: "/models",
+            responses: [ok(try fixture("codex_models.json"))]
+        )
+
+        let manager = ModelsManager(
+            credentials: EmptyCredentialSnapshot(
+                hasCodexSession: true,
+                codexAccountFingerprint: "fp-different-account"
+            ),
+            grokHome: home,
+            liveCatalogs: LiveCatalogRefreshers.live(
+                transport: transport,
+                broker: broker,
+                grokHome: home
+            )
+        )
+
+        let result = await manager.refreshCodexBlocking(forceOnline: true)
+        #expect(!result.published)
+        #expect(result.failure == nil)
     }
 }

@@ -244,19 +244,40 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         temperature = try c.decodeIfPresent(Float.self, forKey: .temperature)
         topP = try c.decodeIfPresent(Float.self, forKey: .topP)
         if let raw = try c.decodeIfPresent(String.self, forKey: .apiBackend) {
-            apiBackend = WireCodec.apiBackend(raw) ?? .defaultValue
+            guard let decoded = WireCodec.apiBackend(raw) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .apiBackend,
+                    in: c,
+                    debugDescription: "unknown API backend: \(raw)"
+                )
+            }
+            apiBackend = decoded
         } else {
             apiBackend = .defaultValue
         }
         provider = try c.decodeIfPresent(ModelProvider.self, forKey: .provider) ?? .defaultValue
         if let raw = try c.decodeIfPresent(String.self, forKey: .toolMode) {
-            toolMode = WireCodec.toolMode(raw)
+            guard let decoded = WireCodec.toolMode(raw) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .toolMode,
+                    in: c,
+                    debugDescription: "unknown tool mode: \(raw)"
+                )
+            }
+            toolMode = decoded
         } else {
             toolMode = nil
         }
         codexMultiAgentV2 = try c.decodeIfPresent(Bool.self, forKey: .codexMultiAgentV2) ?? false
         if let raw = try c.decodeIfPresent(String.self, forKey: .authScheme) {
-            authScheme = WireCodec.authScheme(raw) ?? .defaultValue
+            guard let decoded = WireCodec.authScheme(raw) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .authScheme,
+                    in: c,
+                    debugDescription: "unknown authentication scheme: \(raw)"
+                )
+            }
+            authScheme = decoded
         } else {
             authScheme = .defaultValue
         }
@@ -266,7 +287,14 @@ public struct ModelInfo: Sendable, Equatable, Codable {
             extraHeaders = []
         }
         let cw = try c.decodeIfPresent(UInt64.self, forKey: .contextWindow) ?? NEW_MODEL_DEFAULT_CONTEXT_WINDOW
-        contextWindow = max(1, cw)
+        guard cw > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .contextWindow,
+                in: c,
+                debugDescription: "context window must be greater than zero"
+            )
+        }
+        contextWindow = cw
         autoCompactThresholdPercent = try c.decodeIfPresent(UInt8.self, forKey: .autoCompactThresholdPercent)
         systemPromptLabel = try c.decodeIfPresent(String.self, forKey: .systemPromptLabel)
         useConcise = try c.decodeIfPresent(Bool.self, forKey: .useConcise) ?? false
@@ -1211,10 +1239,7 @@ extension OrderedModelMap {
 
     /// Merge custom models into this catalog map without duplicating or dropping provider entries.
     public mutating func merge(customModels: [CustomModelEntry]) {
-        for custom in customModels {
-            let entry = custom.toModelEntry()
-            self[custom.key] = entry
-        }
+        CustomModelStore.mergeCustomModels(customModels, into: &self)
     }
 
     /// Merge custom model entries into this catalog map.
@@ -1231,29 +1256,13 @@ extension OrderedModelMap {
 extension Array where Element == ModelInfo {
     /// Merge custom models into this `[ModelInfo]` list without duplicating or dropping provider entries.
     public mutating func merge(customModels: [CustomModelEntry]) {
-        for custom in customModels {
-            let customInfo = custom.toModelInfo()
-            let key = custom.key
-            if let idx = firstIndex(where: { ($0.id ?? $0.model) == key }) {
-                self[idx] = customInfo
-            } else {
-                append(customInfo)
-            }
-        }
+        CustomModelStore.mergeCustomModels(customModels, into: &self)
     }
 }
 
 extension Array where Element == ModelEntry {
     /// Merge custom models into this `[ModelEntry]` list without duplicating or dropping provider entries.
     public mutating func merge(customModels: [CustomModelEntry]) {
-        for custom in customModels {
-            let customEntry = custom.toModelEntry()
-            let key = custom.key
-            if let idx = firstIndex(where: { ($0.info.id ?? $0.info.model) == key }) {
-                self[idx] = customEntry
-            } else {
-                append(customEntry)
-            }
-        }
+        CustomModelStore.mergeCustomModels(customModels, into: &self)
     }
 }

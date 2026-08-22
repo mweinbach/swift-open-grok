@@ -156,6 +156,136 @@ struct CodexCredentialProviderTests {
         #expect(transport.recordedRequests.isEmpty)
     }
 
+    @Test("store-only credentials fail closed when the access token has expired")
+    func storeOnlyRejectsExpiredAccessToken() async throws {
+        let home = try codexProviderTempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let codexPath = home.appendingPathComponent(OpenGrokAuthPaths.codexAuthFileName)
+        try persistCodexTokens(
+            at: codexPath,
+            idToken: codexIDToken(),
+            accessToken: expiredAccessToken(),
+            refreshToken: "refresh-1",
+            accountID: "acct-1"
+        )
+
+        let provider = CodexAuthCredentialProvider(authFile: codexPath)
+        await #expect(throws: AuthError.self) {
+            _ = try await provider.ensureFreshCredentials()
+        }
+    }
+
+    @Test("a forced refresh rotates an otherwise fresh Codex bearer")
+    func forcedRefreshRotatesFreshBearer() async throws {
+        let home = try codexProviderTempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let codexPath = home.appendingPathComponent(OpenGrokAuthPaths.codexAuthFileName)
+        let idToken = codexIDToken()
+        try persistCodexTokens(
+            at: codexPath,
+            idToken: idToken,
+            accessToken: freshAccessToken(),
+            refreshToken: "refresh-1",
+            accountID: "acct-1"
+        )
+
+        let body = """
+        {"access_token":"forced-access","id_token":"\(idToken)","refresh_token":"refresh-2"}
+        """
+        let transport = MockHTTPTransport(responses: [
+            .init(metadata: HTTPResponseMetadata(statusCode: 200), body: Data(body.utf8)),
+        ])
+        let provider = CodexAuthCredentialProvider(
+            authFile: codexPath,
+            refreshService: .live(
+                endpoints: CodexEndpoints(issuer: "https://auth.example"),
+                transport: transport
+            )
+        )
+
+        let refreshed = try await provider.ensureFreshCredentials(forceRefresh: true)
+        #expect(refreshed.accessToken == "forced-access")
+        #expect(transport.recordedRequests.count == 1)
+    }
+
+    @Test("account identity is pinned before a refresh can replace the store")
+    func rejectsAccountChangedDuringInitialRefresh() async throws {
+        let home = try codexProviderTempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let codexPath = home.appendingPathComponent(OpenGrokAuthPaths.codexAuthFileName)
+        try persistCodexTokens(
+            at: codexPath,
+            idToken: codexIDToken(account: "acct-1", user: "user-1"),
+            accessToken: expiredAccessToken(),
+            refreshToken: "refresh-1",
+            accountID: "acct-1"
+        )
+
+        let service = CodexTokenRefreshService { authFile, _ in
+            try persistCodexTokens(
+                at: authFile,
+                idToken: codexIDToken(account: "acct-2", user: "user-2"),
+                accessToken: freshAccessToken(),
+                refreshToken: "refresh-2",
+                accountID: "acct-2"
+            )
+            return try loadCodexCredentials(at: authFile)
+        }
+        let provider = CodexAuthCredentialProvider(authFile: codexPath, refreshService: service)
+
+        await #expect(throws: AuthError.self) {
+            _ = try await provider.ensureFreshCredentials()
+        }
+        #expect(provider.expectedIdentity?.accountID == "acct-1")
+        #expect(provider.snapshot().token == nil)
+    }
+
+    @Test("concurrent sessions and catalog requests share one OAuth refresh")
+    func concurrentConsumersShareOneRefresh() async throws {
+        let home = try codexProviderTempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let codexPath = home.appendingPathComponent(OpenGrokAuthPaths.codexAuthFileName)
+        let idToken = codexIDToken()
+        try persistCodexTokens(
+            at: codexPath,
+            idToken: idToken,
+            accessToken: expiredAccessToken(),
+            refreshToken: "refresh-1",
+            accountID: "acct-1"
+        )
+
+        let probe = CodexRefreshFlightProbe()
+        let service = CodexTokenRefreshService { authFile, _ in
+            await probe.begin()
+            try persistCodexTokens(
+                at: authFile,
+                idToken: idToken,
+                accessToken: "shared-refreshed-access",
+                refreshToken: "refresh-2",
+                accountID: "acct-1"
+            )
+            return try loadCodexCredentials(at: authFile)
+        }
+        let firstProvider = CodexAuthCredentialProvider(authFile: codexPath, refreshService: service)
+        let first = Task { try await firstProvider.ensureFreshCredentials() }
+        await probe.waitUntilStarted()
+
+        let followers = (0..<8).map { _ in
+            let provider = CodexAuthCredentialProvider(authFile: codexPath, refreshService: service)
+            return Task { try await provider.ensureFreshCredentials() }
+        }
+        for _ in 0..<16 {
+            await Task.yield()
+        }
+        await probe.release()
+
+        #expect(try await first.value.accessToken == "shared-refreshed-access")
+        for follower in followers {
+            #expect(try await follower.value.accessToken == "shared-refreshed-access")
+        }
+        #expect(await probe.invocationCount == 1)
+    }
+
     @Test("a failed refresh throws instead of falling back to the stale token")
     func failsClosedOnRefreshFailure() async throws {
         let home = try codexProviderTempHome()
@@ -241,5 +371,39 @@ struct CodexCredentialProviderTests {
         #expect(!provider.hasUsableCredential())
         // Codex logout leaves the xAI store alone.
         #expect(readAPIKey(grokHome: home) == "xai-key")
+    }
+}
+
+private actor CodexRefreshFlightProbe {
+    private(set) var invocationCount = 0
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+
+    func begin() async {
+        invocationCount += 1
+        for waiter in startedWaiters {
+            waiter.resume()
+        }
+        startedWaiters.removeAll()
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilStarted() async {
+        guard invocationCount == 0 else { return }
+        await withCheckedContinuation { continuation in
+            startedWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        for waiter in releaseWaiters {
+            waiter.resume()
+        }
+        releaseWaiters.removeAll()
     }
 }

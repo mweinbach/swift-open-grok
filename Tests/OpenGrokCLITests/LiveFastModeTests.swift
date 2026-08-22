@@ -214,7 +214,7 @@ private struct FastRendererFixture {
         )
         store.applyFireworksCatalog(FireworksModelsCatalog(
             entries: FireworksModels.curatedCatalog(baseURL: fixture.server.url),
-            credentialFingerprint: "test-fireworks-key"
+            credentialFingerprint: "dd0c151528515300"
         ))
         return store
     }

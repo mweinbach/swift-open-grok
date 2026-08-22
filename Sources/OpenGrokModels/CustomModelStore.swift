@@ -20,6 +20,7 @@ public enum CustomModelStoreError: Error, CustomStringConvertible, Equatable, Se
     case keyContainsNewlines
     case modelIdContainsNewlines
     case invalidKeyCharacters(String)
+    case invalidProvider(String)
     case invalidContextWindow(Int)
     case invalidMaxOutputTokens(Int)
     case persistenceFailure(String)
@@ -36,6 +37,8 @@ public enum CustomModelStoreError: Error, CustomStringConvertible, Equatable, Se
             return "Custom model id must not contain newlines"
         case .invalidKeyCharacters(let key):
             return "Custom model key `\(key)` contains invalid characters (expected letters, digits, ':', '.', '-', '_')"
+        case .invalidProvider(let provider):
+            return "Custom model provider `\(provider)` is unsupported"
         case .invalidContextWindow(let window):
             return "Context window must be greater than 0, got \(window)"
         case .invalidMaxOutputTokens(let tokens):
@@ -172,7 +175,7 @@ public struct CustomModelEntry: Codable, Sendable, Identifiable, Equatable {
 
     /// Convert this custom model entry into a runtime `ModelInfo`.
     public func toModelInfo() -> ModelInfo {
-        let parsedProvider = parseCustomModelProvider(provider)
+        let parsedProvider = parseCustomModelProvider(provider) ?? .xai
         let defaultBackend: ApiBackend
         switch parsedProvider {
         case .codex, .meta:
@@ -196,7 +199,7 @@ public struct CustomModelEntry: Codable, Sendable, Identifiable, Equatable {
         var info = ModelInfo(
             id: key,
             model: modelId,
-            baseURL: baseUrl ?? "",
+            baseURL: baseUrl ?? customModelDefaultBaseURL(for: parsedProvider) ?? "",
             name: key,
             maxCompletionTokens: maxOutputTokens.map(UInt32.init),
             apiBackend: defaultBackend,
@@ -213,12 +216,16 @@ public struct CustomModelEntry: Codable, Sendable, Identifiable, Equatable {
 
     /// Convert this custom model entry into a runtime `ModelEntry`.
     public func toModelEntry() -> ModelEntry {
-        ModelEntry(info: toModelInfo())
+        let parsedProvider = parseCustomModelProvider(provider) ?? .xai
+        return ModelEntry(
+            info: toModelInfo(),
+            envKey: customModelDefaultEnvKey(for: parsedProvider)
+        )
     }
 
     /// Convert this custom model entry into a `ConfigModelOverride`.
     public func toConfigModelOverride() -> ConfigModelOverride {
-        let parsedProvider = parseCustomModelProvider(provider)
+        let parsedProvider = parseCustomModelProvider(provider) ?? .xai
         let effortOptions: [ReasoningEffortOption] = (reasoningEfforts ?? []).compactMap { str in
             let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             guard let effort = ReasoningEffort(rawValue: trimmed) else { return nil }
@@ -233,8 +240,9 @@ public struct CustomModelEntry: Codable, Sendable, Identifiable, Equatable {
 
         return ConfigModelOverride(
             model: modelId,
-            baseURL: baseUrl,
+            baseURL: baseUrl ?? customModelDefaultBaseURL(for: parsedProvider),
             name: key,
+            envKey: customModelDefaultEnvKey(for: parsedProvider),
             maxCompletionTokens: maxOutputTokens.map(UInt32.init),
             provider: parsedProvider,
             contextWindow: contextWindow.map(UInt64.init),
@@ -246,7 +254,7 @@ public struct CustomModelEntry: Codable, Sendable, Identifiable, Equatable {
 
 // MARK: - Helper Functions
 
-private func parseCustomModelProvider(_ raw: String) -> ModelProvider {
+private func parseCustomModelProvider(_ raw: String) -> ModelProvider? {
     switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
     case "xai": return .xai
     case "codex", "openai", "openai_codex": return .codex
@@ -257,7 +265,29 @@ private func parseCustomModelProvider(_ raw: String) -> ModelProvider {
     case "opencode_go", "opencode-go", "open_code_go": return .openCodeGo
     case "wafer", "wafer_ai": return .wafer
     case "zai", "z_ai", "z-ai", "zai_api", "glm": return .zai
-    default: return .xai
+    default: return nil
+    }
+}
+
+private func customModelDefaultBaseURL(for provider: ModelProvider) -> String? {
+    switch provider {
+    case .wafer:
+        return WaferModels.apiBaseURL()
+    case .zai:
+        return ZaiModels.apiBaseURL()
+    case .xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo:
+        return nil
+    }
+}
+
+private func customModelDefaultEnvKey(for provider: ModelProvider) -> EnvKeys? {
+    switch provider {
+    case .wafer:
+        return .single(WaferModels.apiKeyEnv)
+    case .zai:
+        return .single(ZaiModels.apiKeyEnv)
+    case .xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo:
+        return nil
     }
 }
 
@@ -296,6 +326,44 @@ private func validateCustomModelId(_ modelId: String) throws {
     if modelId.contains(where: { $0.isNewline }) {
         throw CustomModelStoreError.modelIdContainsNewlines
     }
+}
+
+/// Synchronously project persisted custom records onto the normal `[model.*]`
+/// catalog input. Session startup and settings reload are synchronous seams;
+/// leaving this read actor-only made a successfully saved model unreachable.
+public func loadCustomModelOverrides(
+    grokHome: URL
+) throws -> [(String, ConfigModelOverride)] {
+    let fileURL = grokHome.appendingPathComponent("custom_models.json")
+    return try loadValidatedCustomModels(at: fileURL).map { entry in
+        (entry.key, entry.toConfigModelOverride())
+    }
+}
+
+private func loadValidatedCustomModels(at fileURL: URL) throws -> [CustomModelEntry] {
+    guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
+
+    let data = try Data(contentsOf: fileURL)
+    guard !data.isEmpty else { return [] }
+
+    let decoder = JSONDecoder()
+    let decoded: [CustomModelEntry]
+    if let array = try? decoder.decode([CustomModelEntry].self, from: data) {
+        decoded = array
+    } else if let dict = try? decoder.decode([String: CustomModelEntry].self, from: data) {
+        decoded = Array(dict.values).sorted { $0.key < $1.key }
+    } else {
+        throw CustomModelStoreError.persistenceFailure("custom_models.json contains invalid JSON")
+    }
+
+    for entry in decoded {
+        try validateCustomModelKey(entry.key)
+        try validateCustomModelId(entry.modelId)
+        guard parseCustomModelProvider(entry.provider) != nil else {
+            throw CustomModelStoreError.invalidProvider(entry.provider)
+        }
+    }
+    return decoded
 }
 
 // MARK: - CustomModelStore
@@ -347,7 +415,7 @@ public actor CustomModelStore {
     /// Validates the entry, updates in-memory cache, and atomically persists to disk.
     public func upsertCustomModel(_ entry: CustomModelEntry) async throws {
         if !isLoaded {
-            _ = try? loadFromDisk()
+            try loadFromDisk()
         }
 
         let trimmedKey = entry.key.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -359,6 +427,11 @@ public actor CustomModelStore {
         try validateCustomModelKey(trimmedKey)
         try validateCustomModelId(trimmedModelId)
 
+        let providerName = trimmedProvider.isEmpty ? "xai" : trimmedProvider
+        guard let normalizedProvider = parseCustomModelProvider(providerName) else {
+            throw CustomModelStoreError.invalidProvider(providerName)
+        }
+
         if let cw = entry.contextWindow, cw <= 0 {
             throw CustomModelStoreError.invalidContextWindow(cw)
         }
@@ -369,20 +442,26 @@ public actor CustomModelStore {
         let normalizedEntry = CustomModelEntry(
             key: trimmedKey,
             modelId: trimmedModelId,
-            provider: trimmedProvider.isEmpty ? "xai" : trimmedProvider,
-            baseUrl: normalizedBaseUrl,
+            provider: normalizedProvider.asString,
+            baseUrl: normalizedBaseUrl ?? customModelDefaultBaseURL(for: normalizedProvider),
             contextWindow: entry.contextWindow,
             maxOutputTokens: entry.maxOutputTokens,
             reasoningEfforts: entry.reasoningEfforts
         )
 
+        let originalEntries = entries
         if let idx = entries.firstIndex(where: { $0.key == trimmedKey }) {
             entries[idx] = normalizedEntry
         } else {
             entries.append(normalizedEntry)
         }
 
-        try persistToDisk()
+        do {
+            try persistToDisk()
+        } catch {
+            entries = originalEntries
+            throw error
+        }
     }
 
     /// Delete a custom model entry by its key.
@@ -391,7 +470,7 @@ public actor CustomModelStore {
     @discardableResult
     public func deleteCustomModel(key: String) async throws -> Bool {
         if !isLoaded {
-            _ = try? loadFromDisk()
+            try loadFromDisk()
         }
 
         let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -399,16 +478,31 @@ public actor CustomModelStore {
             return false
         }
 
+        let originalEntries = entries
         entries.remove(at: idx)
-        try persistToDisk()
+        do {
+            try persistToDisk()
+        } catch {
+            entries = originalEntries
+            throw error
+        }
         return true
     }
 
     /// Clear all custom models from memory and disk.
     public func clearAll() async throws {
+        if !isLoaded {
+            try loadFromDisk()
+        }
+        let originalEntries = entries
         entries.removeAll()
         isLoaded = true
-        try persistToDisk()
+        do {
+            try persistToDisk()
+        } catch {
+            entries = originalEntries
+            throw error
+        }
     }
 
     /// Reload models from disk, replacing any in-memory state.
@@ -437,6 +531,7 @@ public actor CustomModelStore {
     /// new custom entries are appended.
     public static func mergeCustomModels(_ customModels: [CustomModelEntry], into catalog: inout [ModelInfo]) {
         for custom in customModels {
+            guard parseCustomModelProvider(custom.provider) != nil else { continue }
             let customInfo = custom.toModelInfo()
             if let idx = catalog.firstIndex(where: { ($0.id ?? $0.model) == custom.key }) {
                 catalog[idx] = customInfo
@@ -449,6 +544,7 @@ public actor CustomModelStore {
     /// Merge an array of `CustomModelEntry` into an `OrderedModelMap`.
     public static func mergeCustomModels(_ customModels: [CustomModelEntry], into map: inout OrderedModelMap) {
         for custom in customModels {
+            guard parseCustomModelProvider(custom.provider) != nil else { continue }
             let entry = custom.toModelEntry()
             map[custom.key] = entry
         }
@@ -457,6 +553,7 @@ public actor CustomModelStore {
     /// Merge an array of `CustomModelEntry` into an array of `ModelEntry`.
     public static func mergeCustomModels(_ customModels: [CustomModelEntry], into entries: inout [ModelEntry]) {
         for custom in customModels {
+            guard parseCustomModelProvider(custom.provider) != nil else { continue }
             let customEntry = custom.toModelEntry()
             if let idx = entries.firstIndex(where: { ($0.info.id ?? $0.info.model) == custom.key }) {
                 entries[idx] = customEntry
@@ -470,37 +567,10 @@ public actor CustomModelStore {
 
     @discardableResult
     private func loadFromDisk() throws -> [CustomModelEntry] {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            entries = []
-            isLoaded = true
-            return []
-        }
-
-        let data = try Data(contentsOf: fileURL)
-        if data.isEmpty {
-            entries = []
-            isLoaded = true
-            return []
-        }
-
-        let decoder = JSONDecoder()
-        if let array = try? decoder.decode([CustomModelEntry].self, from: data) {
-            entries = array
-            isLoaded = true
-            return array
-        }
-
-        if let dict = try? decoder.decode([String: CustomModelEntry].self, from: data) {
-            let list = Array(dict.values).sorted { $0.key < $1.key }
-            entries = list
-            isLoaded = true
-            return list
-        }
-
-        // If corrupted, initialize empty and mark loaded
-        entries = []
+        let decoded = try loadValidatedCustomModels(at: fileURL)
+        entries = decoded
         isLoaded = true
-        return []
+        return decoded
     }
 
     private func persistToDisk() throws {

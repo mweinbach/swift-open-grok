@@ -307,109 +307,125 @@ public final class ModelsManager: @unchecked Sendable {
         reselectAfterFetch(wasFirstFetch: wasFirst)
     }
 
-    public func applyCodexCatalog(_ catalog: CodexModelsCatalog?) {
+    @discardableResult
+    public func applyCodexCatalog(_ catalog: CodexModelsCatalog?) -> Bool {
         lock.lock()
         // Reject publish if account fingerprint no longer matches.
         if let catalog,
            let expected = credentials.codexAccountFingerprint,
            catalog.accountFingerprint != expected {
             lock.unlock()
-            return
+            return false
         }
         self.codexCatalog = catalog
         lock.unlock()
         reassemble()
+        return true
     }
 
-    public func applyKimiCatalog(_ catalog: KimiModelsCatalog?) {
+    @discardableResult
+    public func applyKimiCatalog(_ catalog: KimiModelsCatalog?) -> Bool {
         lock.lock()
         if let catalog,
            let expected = credentials.kimiCredentialFingerprint,
            catalog.credentialFingerprint != expected {
             lock.unlock()
-            return
+            return false
         }
         self.kimiCatalog = catalog
         lock.unlock()
         reassemble()
+        return true
     }
 
-    public func applyFireworksCatalog(_ catalog: FireworksModelsCatalog?) {
+    @discardableResult
+    public func applyFireworksCatalog(_ catalog: FireworksModelsCatalog?) -> Bool {
         lock.lock()
         if let catalog,
            let expected = credentials.fireworksCredentialFingerprint,
            catalog.credentialFingerprint != expected {
             lock.unlock()
-            return
+            return false
         }
         self.fireworksCatalog = catalog
         lock.unlock()
         reassemble()
+        return true
     }
 
-    public func applyDeepSeekCatalog(_ catalog: DeepSeekModelsCatalog?) {
+    @discardableResult
+    public func applyDeepSeekCatalog(_ catalog: DeepSeekModelsCatalog?) -> Bool {
         lock.lock()
         if let catalog,
            let expected = credentials.deepSeekCredentialFingerprint,
            catalog.credentialFingerprint != expected {
             lock.unlock()
-            return
+            return false
         }
         self.deepSeekCatalog = catalog
         lock.unlock()
         reassemble()
+        return true
     }
 
-    public func applyMetaCatalog(_ catalog: MetaModelsCatalog?) {
+    @discardableResult
+    public func applyMetaCatalog(_ catalog: MetaModelsCatalog?) -> Bool {
         lock.lock()
         if let catalog,
            let expected = credentials.metaCredentialFingerprint,
            catalog.credentialFingerprint != expected {
             lock.unlock()
-            return
+            return false
         }
         self.metaCatalog = catalog
         lock.unlock()
         reassemble()
+        return true
     }
 
-    public func applyOpenCodeGoCatalog(_ catalog: OpenCodeGoModelsCatalog?) {
+    @discardableResult
+    public func applyOpenCodeGoCatalog(_ catalog: OpenCodeGoModelsCatalog?) -> Bool {
         lock.lock()
         if let catalog,
            let expected = credentials.openCodeGoCredentialFingerprint,
            catalog.credentialFingerprint != expected {
             lock.unlock()
-            return
+            return false
         }
         self.openCodeGoCatalog = catalog
         lock.unlock()
         reassemble()
+        return true
     }
 
-    public func applyWaferCatalog(_ catalog: WaferModelsCatalog?) {
+    @discardableResult
+    public func applyWaferCatalog(_ catalog: WaferModelsCatalog?) -> Bool {
         lock.lock()
         if let catalog,
            let expected = credentials.waferCredentialFingerprint,
            catalog.credentialFingerprint != expected {
             lock.unlock()
-            return
+            return false
         }
         self.waferCatalog = catalog
         lock.unlock()
         reassemble()
+        return true
     }
 
-    public func applyZaiCatalog(_ catalog: ZaiModelsCatalog?) {
+    @discardableResult
+    public func applyZaiCatalog(_ catalog: ZaiModelsCatalog?) -> Bool {
         lock.lock()
         if let catalog,
            let expected = credentials.zaiCredentialFingerprint,
            catalog.credentialFingerprint != expected {
             lock.unlock()
-            return
+            return false
         }
         self.zaiCatalog = catalog
         lock.unlock()
         reassemble()
+        return true
     }
 
     /// Drop ONE provider's live catalog partition, report whether anything

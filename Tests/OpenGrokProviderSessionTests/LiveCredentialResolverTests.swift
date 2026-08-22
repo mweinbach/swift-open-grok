@@ -35,12 +35,14 @@ private struct ResolverFixture {
     }
 
     func resolver(
-        codexRefreshService: CodexTokenRefreshService = .storeOnly
+        codexRefreshService: CodexTokenRefreshService = .storeOnly,
+        xaiTokenRefresher: (any TokenRefresher)? = nil
     ) -> LiveCredentialResolver {
         LiveCredentialResolver(
             environment: environment,
             openGrokHome: home,
-            codexRefreshService: codexRefreshService
+            codexRefreshService: codexRefreshService,
+            xaiTokenRefresher: xaiTokenRefresher
         )
     }
 
@@ -91,6 +93,98 @@ struct LiveCredentialResolverTests {
         let resolved = try await fixture.resolver().resolve(provider: .xai, scope: "cli:test")
         #expect(resolved.bearer == "deploy-key")
         #expect(resolved.source == .deploymentKey)
+    }
+
+    @Test("expired xAI OAuth sessions refresh before a live turn starts")
+    func refreshesExpiredXAIAccountSession() async throws {
+        let fixture = try ResolverFixture()
+        defer { fixture.dispose() }
+        let config = GrokComConfig.default(environment: fixture.environment)
+        let expired = GrokAuth(
+            key: "expired-xai-access",
+            authMode: .oidc,
+            userID: "xai-user",
+            refreshToken: "xai-refresh",
+            expiresAt: Date().addingTimeInterval(-120),
+            oidcIssuer: config.effectiveOIDC?.issuer,
+            oidcClientID: config.effectiveOIDC?.clientID
+        )
+        try writeAuthJSON(at: fixture.authFile, store: [config.authScope: expired])
+
+        var refreshed = expired
+        refreshed.key = "refreshed-xai-access"
+        refreshed.expiresAt = Date().addingTimeInterval(3600)
+        let counter = CallCounter()
+        let refresher = MockTokenRefresher(outcome: .success(refreshed), callCount: counter)
+
+        let resolved = try await fixture.resolver(xaiTokenRefresher: refresher).resolve(
+            provider: .xai,
+            baseURL: "https://api.x.ai/v1",
+            scope: "cli:test"
+        )
+
+        #expect(resolved.source == .storedSession)
+        #expect(resolved.bearer == "refreshed-xai-access")
+        #expect(counter.count == 1)
+        #expect(try readAuthJSON(at: fixture.authFile)[config.authScope]?.key == "refreshed-xai-access")
+    }
+
+    @Test("an expired xAI OAuth session never falls back to its stale bearer")
+    func expiredXAISessionFailsClosedWhenRefreshFails() async throws {
+        let fixture = try ResolverFixture()
+        defer { fixture.dispose() }
+        let config = GrokComConfig.default(environment: fixture.environment)
+        let expired = GrokAuth(
+            key: "expired-xai-access",
+            authMode: .oidc,
+            userID: "xai-user",
+            refreshToken: "revoked-xai-refresh",
+            expiresAt: Date().addingTimeInterval(-120),
+            oidcIssuer: config.effectiveOIDC?.issuer,
+            oidcClientID: config.effectiveOIDC?.clientID
+        )
+        try writeAuthJSON(at: fixture.authFile, store: [config.authScope: expired])
+
+        let refresher = MockTokenRefresher(
+            outcome: .transientFailure(message: "identity provider unavailable")
+        )
+        await #expect(throws: LiveCredentialError.self) {
+            _ = try await fixture.resolver(xaiTokenRefresher: refresher).resolve(
+                provider: .xai,
+                baseURL: "https://api.x.ai/v1",
+                scope: "cli:test"
+            )
+        }
+    }
+
+    @Test("a live xAI account binding can renew its bearer after an HTTP 401")
+    func xaiBindingRefreshesAfterUnauthorized() async throws {
+        let fixture = try ResolverFixture()
+        defer { fixture.dispose() }
+        let config = GrokComConfig.default(environment: fixture.environment)
+        let current = GrokAuth(
+            key: "current-xai-access",
+            authMode: .oidc,
+            userID: "xai-user",
+            refreshToken: "xai-refresh",
+            expiresAt: Date().addingTimeInterval(3600),
+            oidcIssuer: config.effectiveOIDC?.issuer,
+            oidcClientID: config.effectiveOIDC?.clientID
+        )
+        try writeAuthJSON(at: fixture.authFile, store: [config.authScope: current])
+
+        var refreshed = current
+        refreshed.key = "after-401-xai-access"
+        let refresher = MockTokenRefresher(outcome: .success(refreshed))
+        let resolved = try await fixture.resolver(xaiTokenRefresher: refresher).resolve(
+            provider: .xai,
+            baseURL: "https://api.x.ai/v1",
+            scope: "cli:test"
+        )
+
+        let recovered = await resolved.binding.authCredentialProvider.refreshAfterUnauthorized()
+        #expect(recovered)
+        #expect(resolved.binding.authCredentialProvider.snapshot().token == "after-401-xai-access")
     }
 
     @Test("an explicit model API key outranks stored Codex OAuth")
@@ -204,6 +298,116 @@ struct LiveCredentialResolverTests {
             _ = try await fixture
                 .resolver(codexRefreshService: service)
                 .resolve(provider: .codex, scope: "cli:test")
+        }
+    }
+
+    @Test("a catalog 401 can force a fresh Codex bearer to rotate")
+    func forcesCodexRefreshForUnauthorizedCatalog() async throws {
+        let fixture = try ResolverFixture()
+        defer { fixture.dispose() }
+        try fixture.writeCodexCredentials()
+
+        let refreshes = RefreshCounter()
+        let service = CodexTokenRefreshService { authFile, force in
+            #expect(force)
+            await refreshes.increment()
+            guard let existing = try loadCodexStore(at: authFile),
+                  let tokens = existing.tokens
+            else {
+                throw AuthError.protocolError("Codex test credentials disappeared")
+            }
+            try persistCodexTokens(
+                at: authFile,
+                idToken: tokens.idToken,
+                accessToken: "forced-catalog-access",
+                refreshToken: "rotated-refresh",
+                accountID: tokens.accountID
+            )
+            return try loadCodexCredentials(at: authFile)
+        }
+
+        let resolved = try await fixture.resolver(codexRefreshService: service).resolve(
+            provider: .codex,
+            baseURL: CodexModels.defaultInferenceBaseURL,
+            forceRefresh: true,
+            scope: "catalog:codex"
+        )
+        #expect(resolved.bearer == "forced-catalog-access")
+        #expect(await refreshes.value == 1)
+    }
+
+    @Test("stored Codex OAuth never authenticates an untrusted model endpoint")
+    func refusesCodexOAuthOnUntrustedEndpoint() async throws {
+        let fixture = try ResolverFixture()
+        defer { fixture.dispose() }
+        try fixture.writeCodexCredentials()
+
+        let endpoint = "https://attacker.example/v1"
+        await #expect(
+            throws: LiveCredentialError.untrustedCredentialEndpoint(
+                provider: .codex,
+                baseURL: endpoint
+            )
+        ) {
+            _ = try await fixture.resolver().resolve(
+                provider: .codex,
+                baseURL: endpoint,
+                scope: "cli:test"
+            )
+        }
+    }
+
+    @Test("an explicitly configured Codex inference endpoint remains trusted")
+    func trustsExplicitCodexInferenceEndpoint() async throws {
+        let endpoint = "http://127.0.0.1:38561/v1"
+        let fixture = try ResolverFixture(extraEnvironment: [
+            codexInferenceBaseURLEnv: endpoint,
+        ])
+        defer { fixture.dispose() }
+        try fixture.writeCodexCredentials()
+
+        let resolved = try await fixture.resolver().resolve(
+            provider: .codex,
+            baseURL: endpoint,
+            scope: "cli:test"
+        )
+        #expect(resolved.source == .codexOAuth)
+        #expect(resolved.extraHeaders["ChatGPT-Account-ID"] == "acct-1")
+    }
+
+    @Test("a model-owned Codex API key may use its explicitly configured endpoint")
+    func explicitCodexAPIKeyMayUseCustomEndpoint() async throws {
+        let fixture = try ResolverFixture()
+        defer { fixture.dispose() }
+
+        let resolved = try await fixture.resolver().resolve(
+            provider: .codex,
+            explicitAPIKey: "user-selected-model-key",
+            baseURL: "https://proxy.example/v1",
+            scope: "cli:test"
+        )
+        #expect(resolved.source == .explicitAPIKey)
+        #expect(resolved.bearer == "user-selected-model-key")
+    }
+
+    @Test("stored xAI credentials never authenticate a foreign endpoint")
+    func refusesStoredXAICredentialsOnUntrustedEndpoint() async throws {
+        let fixture = try ResolverFixture()
+        defer { fixture.dispose() }
+        try storeAPIKey(grokHome: fixture.home, apiKey: "xai-stored-secret")
+
+        let endpoint = "https://attacker.example/v1"
+        await #expect(
+            throws: LiveCredentialError.untrustedCredentialEndpoint(
+                provider: .xai,
+                baseURL: endpoint
+            )
+        ) {
+            _ = try await fixture.resolver().resolve(
+                provider: .xai,
+                baseURL: endpoint,
+                scope: "cli:test"
+            )
         }
     }
 
