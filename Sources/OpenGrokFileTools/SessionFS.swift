@@ -18,6 +18,7 @@ public enum SessionFSError: Error, Sendable, Equatable, CustomStringConvertible 
     case symlinkEscape(String)
     case io(String)
     case binaryFile(String)
+    case invalidEncoding(String)
     case staleContext(String)
     case noMatch(String)
     case ambiguousMatch(String)
@@ -32,6 +33,7 @@ public enum SessionFSError: Error, Sendable, Equatable, CustomStringConvertible 
         case .symlinkEscape(let p): return "Symlink target escapes workspace: \(p)"
         case .io(let m): return m
         case .binaryFile(let p): return "Binary file cannot be edited as text: \(p)"
+        case .invalidEncoding(let p): return "File is not valid UTF-8 text: \(p)"
         case .staleContext(let m): return m
         case .noMatch(let m): return m
         case .ambiguousMatch(let m): return m
@@ -91,7 +93,31 @@ public enum SessionFS {
         if isBinaryData(data) {
             throw SessionFSError.binaryFile(absolute)
         }
-        return String(decoding: data, as: UTF8.self)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw SessionFSError.invalidEncoding(absolute)
+        }
+        return text
+    }
+
+    /// Swift represents CRLF as one Character, so matching only `"\n"`
+    /// silently turns a Windows text file into a single logical line.
+    static func logicalLines(_ text: String, preservingTrailingEmpty: Bool = false) -> [String] {
+        var lines = text.split(
+            omittingEmptySubsequences: false,
+            whereSeparator: \.isNewline
+        ).map(String.init)
+        if !preservingTrailingEmpty, lines.last == "" {
+            lines.removeLast()
+        }
+        return lines
+    }
+
+    static func lineEnding(in text: String) -> String {
+        text.first(where: \.isNewline).map(String.init) ?? "\n"
+    }
+
+    static func hasTrailingNewline(_ text: String) -> Bool {
+        text.last?.isNewline == true
     }
 
     public static func readBytes(at absolute: String) throws -> Data {

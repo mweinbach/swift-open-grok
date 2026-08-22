@@ -54,19 +54,67 @@ public enum LiveHooksComposition {
         cwd: String? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Loaded {
-        let document = try? loadEffectiveConfigDiskOnly(environment: environment)
         let configPath = (userGrokHome(environment: environment)
             ?? workspaceRoot).appendingPathComponent("config.toml")
 
-        let (gate, result) = HookSessionLoader.makeGate(
-            configDocument: document,
+        var specs: [HookSpec] = []
+        var errors: [HookError] = []
+        var skippedEvents: [String] = []
+        for layer in hookConfigLayers(environment: environment) {
+            let parsed = parseHooksFromTOML(
+                layer.hooks,
+                sourceName: layer.sourceName,
+                sourcePath: layer.path,
+                sourceKind: hookSourceKind(for: layer.provenance),
+                environment: environment
+            )
+            specs.append(contentsOf: parsed.specs.map { spec in
+                var configSpec = spec
+                configSpec.name = "config/" + configSpec.name
+                return configSpec
+            })
+            errors.append(contentsOf: parsed.errors)
+            skippedEvents.append(contentsOf: parsed.skippedEvents)
+        }
+
+        let discovered = HookSessionLoader.load(
+            configDocument: nil,
             configPath: configPath,
-            sessionId: sessionId,
             workspaceRoot: workspaceRoot,
-            cwd: cwd,
             environment: environment
         )
+        specs.append(contentsOf: discovered.registry.allHooks())
+        errors.append(contentsOf: discovered.errors)
+        skippedEvents.append(contentsOf: discovered.skippedEvents)
+        let result = HookSessionLoadResult(
+            registry: HookDiscovery.registryFromSpecsDeduped(specs),
+            errors: errors,
+            skippedEvents: skippedEvents
+        )
+        let gate: HookPermissionGate? = result.registry.isEmpty
+            ? nil
+            : HookPermissionGate(
+                dispatcher: HookDispatcher(registry: result.registry, environment: environment),
+                context: HookSessionContext(
+                    sessionId: sessionId,
+                    workspaceRoot: workspaceRoot,
+                    cwd: cwd,
+                    environment: environment
+                )
+            )
         return Loaded(gate: gate, result: result)
+    }
+
+    private static func hookSourceKind(for provenance: HookProvenance) -> HookSourceKind {
+        switch provenance {
+        case .systemManaged: return .systemManaged
+        case .managed: return .managed
+        case .requirements: return .requirements
+        case .user: return .user
+        case .file: return .file
+        case .plugin: return .plugin
+        case .unknown: return .unknown
+        }
     }
 
     /// Render load diagnostics for the session log. Empty when nothing to say.

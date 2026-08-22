@@ -100,7 +100,7 @@ public func patchTouchesAny(_ patch: TOMLTable, paths: [PatchPath]) -> Bool {
 
 /// Keys stripped from every applied patch so an override can't re-introduce a
 /// nested `version_overrides`/`campaigns` array or define the
-/// `auth_provider`/`model_providers` command tables.
+/// `auth_provider`/`model_providers`/`mcp_servers` command tables.
 /// This const owns the protected top-level keys for every override kind;
 /// `applyPatches` takes the strip list as a parameter so the strip step
 /// itself stays key-agnostic.
@@ -109,10 +109,20 @@ public let PATCH_STRIP_KEYS: [String] = [
     "campaigns",
     "auth_provider",
     "model_providers",
+    "mcp_servers",
+]
+
+/// Executable configuration nested under otherwise safe remote-patch tables.
+/// Protecting the ancestor too is essential: a scalar replacement would erase
+/// the existing trusted subtree even when the protected leaf is not present.
+public let PATCH_STRIP_PATHS: [PatchPath] = [
+    ["ui", "status_line"],
+    ["ui", "notifications", "hooks"],
 ]
 
 /// Deep-merge each patch in iteration order (later wins on a leaf), stripping
-/// `stripKeys` from every patch first. Mirrors Rust `apply_patches`.
+/// `stripKeys` and executable nested paths from every patch first.
+/// Mirrors Rust `apply_patches`.
 public func applyPatches(
     into config: inout TOMLValue,
     patches: [TOMLTable],
@@ -122,6 +132,30 @@ public func applyPatches(
         for key in stripKeys {
             patch.removeValue(forKey: key)
         }
-        deepMergeTOML(&config, overrides: .table(patch))
+        for path in PATCH_STRIP_PATHS {
+            stripProtectedPath(path[...], from: &patch)
+        }
+        var normalized = TOMLValue.table(patch)
+        normalizeConfigLayer(&normalized)
+        deepMergeTOML(&config, overrides: normalized)
     }
+}
+
+private func stripProtectedPath(_ path: ArraySlice<String>, from patch: inout TOMLTable) {
+    guard let key = path.first else { return }
+    let remaining = path.dropFirst()
+
+    guard !remaining.isEmpty else {
+        patch.removeValue(forKey: key)
+        return
+    }
+
+    guard let value = patch[key] else { return }
+    guard case var .table(nested) = value else {
+        patch.removeValue(forKey: key)
+        return
+    }
+
+    stripProtectedPath(remaining, from: &nested)
+    patch[key] = .table(nested)
 }

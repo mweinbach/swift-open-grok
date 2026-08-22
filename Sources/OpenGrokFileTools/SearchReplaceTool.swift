@@ -95,7 +95,7 @@ public enum SearchReplaceTool {
                     )
                 }
                 if fileExists {
-                    let prev = (try? SessionFS.readText(at: absolute)) ?? ""
+                    let prev = try SessionFS.readText(at: absolute)
                     previous = prev
                     // If the file existed and was non-empty, this is an overwrite, not a creation.
                     // The wire's `created` and the painter's `Creating ` prefix must be false there.
@@ -113,18 +113,30 @@ public enum SearchReplaceTool {
                 }
                 let text = try SessionFS.readText(at: absolute)
                 previous = text
+                let hasCRLF = text.contains("\r\n")
+                let matchText = hasCRLF
+                    ? text.replacingOccurrences(of: "\r\n", with: "\n")
+                    : text
 
                 var positions: [Int] = []
                 var searchOffset = 0
                 let oldLen = input.oldString.count
-                while searchOffset <= text.count {
-                    let startIdx = text.index(text.startIndex, offsetBy: searchOffset, limitedBy: text.endIndex) ?? text.endIndex
-                    if startIdx >= text.endIndex { break }
-                    guard let range = text.range(of: input.oldString, options: [], range: startIdx..<text.endIndex) else { break }
-                    let pos = text.distance(from: text.startIndex, to: range.lowerBound)
+                while searchOffset <= matchText.count {
+                    let startIdx = matchText.index(
+                        matchText.startIndex,
+                        offsetBy: searchOffset,
+                        limitedBy: matchText.endIndex
+                    ) ?? matchText.endIndex
+                    if startIdx >= matchText.endIndex { break }
+                    guard let range = matchText.range(
+                        of: input.oldString,
+                        options: [],
+                        range: startIdx..<matchText.endIndex
+                    ) else { break }
+                    let pos = matchText.distance(from: matchText.startIndex, to: range.lowerBound)
                     positions.append(pos)
                     let nextOffset = pos + oldLen
-                    if nextOffset >= text.count { break }
+                    if nextOffset >= matchText.count { break }
                     searchOffset = nextOffset
                     if oldLen == 0 { break }
                 }
@@ -146,12 +158,15 @@ public enum SearchReplaceTool {
                     )
                 }
                 let (computed, nPos) = SearchReplaceTool.replaceUsingPositions(
-                    text: text,
+                    text: matchText,
                     matchPositions: positions,
                     oldString: input.oldString,
                     newString: input.newString
                 )
-                newContent = computed
+                newContent = hasCRLF
+                    ? computed.replacingOccurrences(of: "\r\n", with: "\n")
+                        .replacingOccurrences(of: "\n", with: "\r\n")
+                    : computed
                 newPositions = nPos
                 replacements = positions.count
                 isNewFile = false
@@ -253,7 +268,7 @@ public enum SearchReplaceTool {
             return String(file.prefix(500))
         }
         let start = file.distance(from: file.startIndex, to: range.lowerBound)
-        let lines = file.split(separator: "\n", omittingEmptySubsequences: false)
+        let lines = SessionFS.logicalLines(file, preservingTrailingEmpty: true)
         var charCount = 0
         var lineIdx = 0
         for (i, line) in lines.enumerated() {
@@ -289,7 +304,7 @@ public enum SearchReplaceTool {
         var cur = ""
         for ch in text {
             cur.append(ch)
-            if ch == "\n" {
+            if ch.isNewline {
                 lines.append(cur)
                 cur = ""
             }
@@ -300,7 +315,7 @@ public enum SearchReplaceTool {
 
     static func computeLineRange(text: String, startPos: Int, inserted: String) -> (startLine: Int, endLine: Int) {
         let prefix = String(text.prefix(startPos))
-        let startLine = prefix.filter { $0 == "\n" }.count
+        let startLine = prefix.filter(\.isNewline).count
         let insertedLines = splitInclusive(inserted)
         let n = insertedLines.isEmpty ? 1 : insertedLines.count
         let endLine = startLine + n - 1
@@ -343,7 +358,7 @@ public enum SearchReplaceTool {
             prefix = ""
         } else {
             let upToPos = String(newContent.prefix(startPos))
-            if let lastNL = upToPos.lastIndex(of: "\n") {
+            if let lastNL = upToPos.lastIndex(where: \.isNewline) {
                 let afterNL = newContent.index(after: lastNL)
                 let startIdx = newContent.index(newContent.startIndex, offsetBy: startPos, limitedBy: newContent.endIndex) ?? newContent.endIndex
                 if afterNL < startIdx {

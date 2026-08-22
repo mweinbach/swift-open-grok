@@ -92,13 +92,16 @@ public enum FileToolSession {
     /// `planMode` the plan gate; both default to no-ops until the live session
     /// supplies real ones. `resolved` carries the rules sourced from config and
     /// Claude-compatible settings; without it the engine runs over an empty
-    /// policy, which is what it did before this was wired.
+    /// policy, which is what it did before this was wired. A child session may
+    /// inherit its parent's exact permission actor without sharing the parent's
+    /// plan-mode tracker, hooks, or other pipeline-local state.
     public static func makePipeline(
         policy: FileToolAccessPolicy,
         workspaceRoot: String,
         planMode: PlanModeTracker? = nil,
         hooks: any PreToolUseHookRunner = FailOpenPreToolUseHookRunner(),
         resolved: ResolvedPermissions? = nil,
+        inheritedPermissionHandle: PermissionHandle? = nil,
         sandboxAutoAllowBash: @Sendable @escaping () -> Bool = { false }
     ) -> PermissionPipeline {
         // The blanket-approval request (`OPENGROK_ALLOW_WRITES=1`) maps to
@@ -117,7 +120,7 @@ public enum FileToolSession {
         let blanketApproval =
             (policy.allowsAll || resolved?.alwaysApprove == true)
             && resolved?.yoloPinReason == nil
-        let permissions = PermissionHandle(
+        let permissions = inheritedPermissionHandle ?? PermissionHandle(
             config: mergedConfig(preset: policy.permissionConfig, resolved: resolved),
             yoloMode: blanketApproval && hasPolicy,
             yoloPinReason: resolved?.yoloPinReason,
@@ -150,6 +153,7 @@ public enum FileToolSession {
         promptIndex: Int = 0,
         allowedRoots: [String]? = nil,
         resolved: ResolvedPermissions? = nil,
+        inheritedPermissionHandle: PermissionHandle? = nil,
         sandboxAutoAllowBash: @Sendable @escaping () -> Bool = { false }
     ) -> ToolResources {
         let root = (workspaceRoot as NSString).standardizingPath
@@ -162,6 +166,7 @@ public enum FileToolSession {
                 planMode: planMode,
                 hooks: hooks,
                 resolved: resolved,
+                inheritedPermissionHandle: inheritedPermissionHandle,
                 sandboxAutoAllowBash: sandboxAutoAllowBash
             ),
             hunkTracker: hunkTracker,

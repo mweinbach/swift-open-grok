@@ -125,7 +125,7 @@ public actor PermissionHandle {
         self.sessionGrants = []
         self.bashPrefixGrants = []
         self.bashDisallows = []
-        self.allowAll = allowAll
+        self.allowAll = yoloPinReason == nil && allowAll
         self.allowEditsForSession = false
         self.editPolicy = .ask
         self.shellCwd = shellCwd
@@ -228,20 +228,8 @@ public actor PermissionHandle {
         toolCallId: String
     ) async -> PermissionDecision {
         lastMatchedRuleSource = nil
-        if allowAll {
-            record(
-                access: access,
-                toolName: toolName,
-                toolCallId: toolCallId,
-                decision: .allow,
-                autoApproved: true,
-                userPrompted: false,
-                reason: "allow_all"
-            )
-            return .allow
-        }
-
         var policyForcedPrompt = false
+        var policyAllowed = false
         var shellFileForcedPrompt = false
         var autoForcedPrompt = false
 
@@ -260,13 +248,9 @@ public actor PermissionHandle {
             case .ask:
                 policyForcedPrompt = true
             case .allow:
-                // Policy allow on the whole access short-circuits (YOLO not needed).
-                record(
-                    access: access, toolName: toolName, toolCallId: toolCallId,
-                    decision: .allow, autoApproved: true, userPrompted: false,
-                    reason: "policy_allow"
-                )
-                return .allow
+                // Bash can still touch a denied file or contain a denied
+                // command segment, so its allow cannot win before preflight.
+                policyAllowed = true
             case .followupMessage, .cancelled:
                 record(
                     access: access, toolName: toolName, toolCallId: toolCallId,
@@ -310,6 +294,28 @@ public actor PermissionHandle {
                     break
                 }
             }
+        }
+
+        if policyAllowed, !policyForcedPrompt {
+            record(
+                access: access, toolName: toolName, toolCallId: toolCallId,
+                decision: .allow, autoApproved: true, userPrompted: false,
+                reason: "policy_allow"
+            )
+            return .allow
+        }
+
+        if allowAll, !policyForcedPrompt {
+            record(
+                access: access,
+                toolName: toolName,
+                toolCallId: toolCallId,
+                decision: .allow,
+                autoApproved: true,
+                userPrompted: false,
+                reason: "allow_all"
+            )
+            return .allow
         }
 
         // Protected edit paths always force prompt (not YOLO-bypassable for safety lists

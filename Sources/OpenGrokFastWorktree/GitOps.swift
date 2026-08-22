@@ -386,6 +386,34 @@ public struct GitCommandResult: Sendable {
     public var stderr: String
 }
 
+private final class GitPipeReader: @unchecked Sendable {
+    private let handle: FileHandle
+    private let finished = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var output = Data()
+
+    init(_ handle: FileHandle) {
+        self.handle = handle
+    }
+
+    func start() {
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let bytes = handle.readDataToEndOfFile()
+            lock.lock()
+            output = bytes
+            lock.unlock()
+            finished.signal()
+        }
+    }
+
+    func result() -> Data {
+        finished.wait()
+        lock.lock()
+        defer { lock.unlock() }
+        return output
+    }
+}
+
 public func runGit(_ args: [String], cwd: URL) throws -> GitCommandResult {
     // Reject smuggled options in path-like args that are destinations.
     for arg in args {
@@ -425,9 +453,16 @@ public func runGit(_ args: [String], cwd: URL) throws -> GitCommandResult {
     } catch {
         throw FastWorktreeError.gitFailed("failed to spawn git: \(error)")
     }
+
+    // Git can fill either pipe before it exits. Drain both concurrently; a
+    // termination-first wait deadlocks on large status or ls-files results.
+    let stdoutReader = GitPipeReader(out.fileHandleForReading)
+    let stderrReader = GitPipeReader(err.fileHandleForReading)
+    stdoutReader.start()
+    stderrReader.start()
     finished.wait()
-    let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let stdout = String(data: stdoutReader.result(), encoding: .utf8) ?? ""
+    let stderr = String(data: stderrReader.result(), encoding: .utf8) ?? ""
     return GitCommandResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr)
 }
 

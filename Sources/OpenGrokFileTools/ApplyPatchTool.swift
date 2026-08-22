@@ -73,9 +73,10 @@ public enum ApplyPatchParser {
     private static let eofMarker = "*** End of File"
 
     public static func parse(_ patch: String) throws -> ParsedPatch {
-        var lines = patch.trimmingCharacters(in: .whitespacesAndNewlines)
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map(String.init)
+        var lines = SessionFS.logicalLines(
+            patch.trimmingCharacters(in: .whitespacesAndNewlines),
+            preservingTrailingEmpty: true
+        )
 
         // Lenient heredoc strip.
         if lines.count >= 4,
@@ -430,11 +431,24 @@ public enum ApplyPatchTool {
                     errors.append("Path escapes workspace: \(abs)")
                     continue
                 }
+                let previousContent: String?
+                if let current = overlay[abs] {
+                    previousContent = current
+                } else if SessionFS.fileExists(abs) {
+                    do {
+                        previousContent = try SessionFS.readText(at: abs)
+                    } catch {
+                        errors.append("Failed to read existing file: \(abs), \(error)")
+                        continue
+                    }
+                } else {
+                    previousContent = nil
+                }
                 let (a, r) = SearchReplaceTool.lineDiff(old: "", new: contents)
                 overlay[abs] = contents
                 validPaths.append(path)
                 results.append(ComputedFileResult(
-                    kind: .added, path: abs, moveTo: nil, oldContent: nil,
+                    kind: .added, path: abs, moveTo: nil, oldContent: previousContent,
                     newContent: contents, lineCounts: (a, r), shortLabel: "A \(abs)"
                 ))
             case .deleteFile(let path):
@@ -445,7 +459,7 @@ public enum ApplyPatchTool {
                 }
                 do {
                     let original = try await readCurrent(abs)
-                    overlay[abs] = nil
+                    overlay[abs] = .some(nil)
                     validPaths.append(path)
                     let (a, rm) = SearchReplaceTool.lineDiff(old: original, new: "")
                     results.append(ComputedFileResult(
@@ -485,7 +499,7 @@ public enum ApplyPatchTool {
                     }
                     if let movePath {
                         let dest = SessionFS.resolve(cwd: resources.cwd, path: movePath)
-                        overlay[abs] = nil
+                        overlay[abs] = .some(nil)
                         overlay[dest] = text
                         validPaths.append(path)
                         let (a, rm) = SearchReplaceTool.lineDiff(old: original, new: text)
@@ -521,7 +535,9 @@ public enum ApplyPatchTool {
     private static func commit(result: ComputedFileResult, resources: ToolResources) async throws {
         switch result.kind {
         case .added:
-            let prev: String? = SessionFS.fileExists(result.path) ? try? SessionFS.readText(at: result.path) : nil
+            let prev: String? = SessionFS.fileExists(result.path)
+                ? try SessionFS.readText(at: result.path)
+                : nil
             try await SessionFS.writeText(
                 absolute: result.path, content: result.newContent, resources: resources, previousContent: prev
             )
@@ -559,14 +575,17 @@ public enum ApplyPatchTool {
     }
 
     private static func applyChunk(_ chunk: UpdateChunk, to text: String) throws -> String {
-        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        if lines.last == "" { lines.removeLast() }
+        var lines = SessionFS.logicalLines(text)
+        let lineEnding = SessionFS.lineEnding(in: text)
 
         var searchFrom = 0
         if let ctx = chunk.changeContext {
-            if let idx = lines.firstIndex(of: ctx) {
-                searchFrom = idx + 1
+            guard let index = seekSequence(lines, pattern: [ctx], start: 0, atEndOfFile: false) else {
+                throw SessionFSError.staleContext(
+                    "Failed to find patch context '\(ctx)' (stale context). Re-read the file."
+                )
             }
+            searchFrom = index + 1
         }
         let old = chunk.oldLines
         guard !old.isEmpty || !chunk.newLines.isEmpty else { return text }
@@ -580,24 +599,79 @@ public enum ApplyPatchTool {
                 lines.append(contentsOf: chunk.newLines)
             }
         } else {
-            var found: Int?
-            if searchFrom < lines.count {
-                let window = lines[searchFrom...]
-                for i in window.indices {
-                    let end = i + old.count
-                    if end <= lines.count, Array(lines[i..<end]) == old {
-                        found = i
-                        break
-                    }
-                }
-            }
-            guard let at = found else {
+            guard let at = seekSequence(
+                lines,
+                pattern: old,
+                start: searchFrom,
+                atEndOfFile: chunk.isEndOfFile
+            ) else {
                 throw SessionFSError.staleContext(
                     "Failed to find expected lines in patch update (stale context). Re-read the file."
                 )
             }
             lines.replaceSubrange(at..<(at + old.count), with: chunk.newLines)
         }
-        return lines.joined(separator: "\n") + (text.hasSuffix("\n") ? "\n" : "")
+        return lines.joined(separator: lineEnding)
+            + (SessionFS.hasTrailingNewline(text) ? lineEnding : "")
+    }
+
+    private static func seekSequence(
+        _ lines: [String],
+        pattern: [String],
+        start: Int,
+        atEndOfFile: Bool
+    ) -> Int? {
+        guard !pattern.isEmpty else { return start }
+        guard pattern.count <= lines.count else { return nil }
+
+        let lastStart = lines.count - pattern.count
+        let firstStart = atEndOfFile ? lastStart : start
+        guard firstStart >= 0, firstStart <= lastStart else { return nil }
+
+        let comparisons: [(String, String) -> Bool] = [
+            { $0 == $1 },
+            { trimTrailingWhitespace($0) == trimTrailingWhitespace($1) },
+            {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                    == $1.trimmingCharacters(in: .whitespacesAndNewlines)
+            },
+            { normalizedPatchLine($0) == normalizedPatchLine($1) },
+        ]
+
+        for matches in comparisons {
+            for index in firstStart...lastStart {
+                let candidate = lines[index..<(index + pattern.count)]
+                if zip(candidate, pattern).allSatisfy({ matches($0.0, $0.1) }) {
+                    return index
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func trimTrailingWhitespace(_ text: String) -> String {
+        guard let last = text.lastIndex(where: { !$0.isWhitespace }) else { return "" }
+        return String(text[...last])
+    }
+
+    private static func normalizedPatchLine(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var normalized = String.UnicodeScalarView()
+
+        for scalar in trimmed.unicodeScalars {
+            switch scalar.value {
+            case 0x2010...0x2015, 0x2212:
+                normalized.append("-")
+            case 0x2018...0x201B:
+                normalized.append("'")
+            case 0x201C...0x201F:
+                normalized.append("\"")
+            case 0x00A0, 0x2002...0x200A, 0x202F, 0x205F, 0x3000:
+                normalized.append(" ")
+            default:
+                normalized.append(scalar)
+            }
+        }
+        return String(normalized)
     }
 }

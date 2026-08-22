@@ -250,10 +250,14 @@ public struct ToolRegistryBuilder: Sendable {
             }
 
             let description = toolConfig.descriptionOverride ?? entry.spec.description
+            let clientSchema = remapSchemaProperties(
+                entry.spec.inputSchema,
+                map: toolConfig.paramsNameOverrides ?? [:]
+            )
             let def = ToolDescription(name: clientName, description: description)
                 .withKind(entry.spec.kind.rawValue)
                 .withNamespace(entry.spec.namespace.rawValue)
-                .withArgumentsSchema(entry.spec.inputSchema)
+                .withArgumentsSchema(clientSchema)
 
             let reverseParams = reverseParamMap(toolConfig.paramsNameOverrides)
 
@@ -323,4 +327,29 @@ private func reverseParamMap(_ overrides: [String: String]?) -> [String: String]
         rev[client] = canonical
     }
     return rev
+}
+
+/// Model-facing overrides rename only top-level properties, exactly like the
+/// Rust registry. Nested object keys remain part of each tool's own contract.
+private func remapSchemaProperties(_ schema: JSONValue, map: [String: String]) -> JSONValue {
+    guard !map.isEmpty, case .object(var schemaObject) = schema else { return schema }
+
+    if case .object(let properties)? = schemaObject["properties"] {
+        var renamed: [String: JSONValue] = [:]
+        for (canonical, definition) in properties {
+            renamed[map[canonical] ?? canonical] = definition
+        }
+        schemaObject["properties"] = .object(renamed)
+    }
+
+    if case .array(let required)? = schemaObject["required"] {
+        schemaObject["required"] = .array(required.map { value in
+            guard case .string(let canonical) = value, let client = map[canonical] else {
+                return value
+            }
+            return .string(client)
+        })
+    }
+
+    return .object(schemaObject)
 }

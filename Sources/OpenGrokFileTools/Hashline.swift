@@ -133,8 +133,8 @@ public enum Hashline {
             let absolute = SessionFS.resolve(cwd: resources.cwd, path: path)
             try SessionFS.enforceRoots(absolute, roots: resources.allowedRoots)
             let text = try SessionFS.readText(at: absolute)
-            var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-            if lines.last == "" { lines.removeLast() }
+            var lines = SessionFS.logicalLines(text)
+            let lineEnding = SessionFS.lineEnding(in: text)
             let previous = text
             let ops = try parseOps(obj["edits"] ?? .array([]))
             // Apply from bottom to top so line numbers stay stable.
@@ -148,17 +148,18 @@ public enum Hashline {
             for (idx, op) in resolved {
                 switch op {
                 case .replace(_, let content):
-                    let newLines = content.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+                    let newLines = SessionFS.logicalLines(content, preservingTrailingEmpty: true)
                     lines.replaceSubrange(idx..<(idx + 1), with: newLines)
                 case .insertAfter(_, let content):
-                    let newLines = content.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+                    let newLines = SessionFS.logicalLines(content, preservingTrailingEmpty: true)
                     lines.insert(contentsOf: newLines, at: idx + 1)
                 case .delete:
                     lines.remove(at: idx)
                 }
             }
 
-            let newContent = lines.joined(separator: "\n") + (text.hasSuffix("\n") ? "\n" : "")
+            let newContent = lines.joined(separator: lineEnding)
+                + (SessionFS.hasTrailingNewline(text) ? lineEnding : "")
             try await SessionFS.writeText(
                 absolute: absolute,
                 content: newContent,

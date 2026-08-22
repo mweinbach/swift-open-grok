@@ -246,9 +246,11 @@ public actor PermissionPipeline {
                 reason: "remote_policy_denied"
             )
         }
-        if requireSandbox && !remotePolicyAvailable && isolation == .sandbox {
+        if requireSandbox && (isolation != .sandbox || !remotePolicyAvailable) {
             return PreparedToolAccess(
-                decision: .policyDeny("sandbox policy unavailable; refusing local fallback"),
+                decision: .policyDeny(
+                    "sandbox policy unavailable or required sandbox inactive; refusing local fallback"
+                ),
                 source: .sandboxRequired,
                 reason: "sandbox_unavailable"
             )

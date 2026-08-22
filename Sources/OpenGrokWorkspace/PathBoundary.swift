@@ -185,13 +185,17 @@ public struct FolderTrustStore: Sendable {
     private var untrustedRoots: Set<String>
 
     public init(trustedRoots: [URL] = []) {
-        self.trustedRoots = Set(trustedRoots.map { trustPathKey($0.path) })
+        let home = ProcessInfo.processInfo.environment["HOME"]
+        self.trustedRoots = Set(
+            trustedRoots.map { trustPathKey($0.path) }
+                .filter { !isUnsafeTrustRoot($0, home: home) }
+        )
         self.untrustedRoots = []
     }
 
     public mutating func trust(_ root: URL) {
         let key = trustPathKey(root.path)
-        if isUnsafeTrustRoot(key) { return }
+        if isUnsafeTrustRoot(key, home: ProcessInfo.processInfo.environment["HOME"]) { return }
         trustedRoots.insert(key)
         untrustedRoots.remove(key)
     }
@@ -204,6 +208,9 @@ public struct FolderTrustStore: Sendable {
 
     public func state(for root: URL) -> FolderTrustState {
         let key = trustPathKey(root.path)
+        if isUnsafeTrustRoot(key, home: ProcessInfo.processInfo.environment["HOME"]) {
+            return .untrusted
+        }
         if untrustedRoots.contains(key) { return .untrusted }
         if trustedRoots.contains(key) { return .trusted }
         // Parent trust does not automatically trust children (fail closed).
@@ -212,9 +219,39 @@ public struct FolderTrustStore: Sendable {
 }
 
 func trustPathKey(_ path: String) -> String {
-    var key = normalizeLexically(path).replacingOccurrences(of: "\\", with: "/")
+    var key = canonicalWorkspacePathKey(path)
     while key.count > 1, key.hasSuffix("/"), !key.hasSuffix(":/") {
         key.removeLast()
+    }
+    return key
+}
+
+/// Resolve existing ancestors before comparing security-sensitive path keys.
+///
+/// New files have no `realpath` yet, but their parents may already be symlink
+/// aliases. Resolving the deepest existing ancestor keeps those aliases on the
+/// same trust and resource-lock identity without rejecting legitimate creates.
+func canonicalWorkspacePathKey(_ path: String) -> String {
+    var key = normalizeLexically(path).replacingOccurrences(of: "\\", with: "/")
+    if key.hasPrefix("/") || isAbsolutePath(key) {
+        var ancestor = URL(fileURLWithPath: key)
+        var missingComponents: [String] = []
+
+        while !FileManager.default.fileExists(atPath: ancestor.path) {
+            let parent = ancestor.deletingLastPathComponent()
+            if parent.path == ancestor.path { break }
+            missingComponents.append(ancestor.lastPathComponent)
+            ancestor = parent
+        }
+
+        if let canonicalAncestor = try? resolveCanonicalPath(ancestor) {
+            var canonical = canonicalAncestor
+            for component in missingComponents.reversed() {
+                canonical.appendPathComponent(component)
+            }
+            key = normalizeLexically(canonical.path)
+                .replacingOccurrences(of: "\\", with: "/")
+        }
     }
     #if os(Windows)
     key = key.lowercased()

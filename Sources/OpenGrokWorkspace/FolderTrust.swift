@@ -8,6 +8,7 @@
 
 import Foundation
 import OpenGrokConfig
+import OpenGrokFileUtils
 import OpenGrokPaths
 
 // FolderTrustState + FolderTrustStore live in PathBoundary.swift (exact-match).
@@ -248,7 +249,14 @@ public struct PersistentFolderTrustStore: Sendable {
             if case .integer(let seconds)? = fields["decided_at"] {
                 decidedAt = Date(timeIntervalSince1970: TimeInterval(seconds))
             }
-            records[key] = DurableTrustStore.Record(trusted: trusted, decidedAt: decidedAt)
+            if let existing = records[key] {
+                records[key] = DurableTrustStore.Record(
+                    trusted: existing.trusted && trusted,
+                    decidedAt: decidedAt ?? existing.decidedAt
+                )
+            } else {
+                records[key] = DurableTrustStore.Record(trusted: trusted, decidedAt: decidedAt)
+            }
         }
         return DurableTrustStore(folders: records)
     }
@@ -257,20 +265,33 @@ public struct PersistentFolderTrustStore: Sendable {
         store.isTrusted(folder)
     }
 
-    /// Record a decision and flush. A store with no resolvable home silently
-    /// keeps the decision in memory only — never a hard failure at a prompt.
+    /// Persist before publishing a decision. A missing store, failed write, or
+    /// stale peer must never grant non-durable or clobbering folder trust.
     public mutating func record(_ folder: URL, trusted: Bool) throws {
+        guard let path else { return }
+        let key = trustPathKey(folder.path)
+        guard !isUnsafeTrustRoot(key, home: home) else { return }
+
+        let lock = try AdvisoryFileLock.acquire(at: path.appendingPathExtension("lock"))
+        defer { lock.release() }
+
+        var latest = PersistentFolderTrustStore.decode(path: path, home: home)
         if trusted {
-            store.setTrusted(folder, home: home)
+            latest.setTrusted(folder, home: home)
         } else {
-            store.setUntrusted(folder, home: home)
+            latest.setUntrusted(folder, home: home)
         }
-        try flush()
+        try Self.persist(latest, at: path)
+        store = latest
     }
 
     /// Serialize to `trusted_folders.toml` with `0600`, atomically.
     public func flush() throws {
         guard let path else { return }
+        try Self.persist(store, at: path)
+    }
+
+    private static func persist(_ store: DurableTrustStore, at path: URL) throws {
         var folders = TOMLTable()
         for (folder, record) in store.folders {
             var fields = TOMLTable()
@@ -286,7 +307,11 @@ public struct PersistentFolderTrustStore: Sendable {
             at: path.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try writeAtomically(path, contents: TOMLEncoder.encode(.table(root)), mode: 0o600)
+        try AtomicFile.write(
+            path,
+            contents: TOMLEncoder.encode(.table(root)),
+            options: AtomicWriteOptions(mode: 0o600)
+        )
     }
 }
 

@@ -98,6 +98,88 @@ private final class FakePTYAdapter: PTYAdapter, @unchecked Sendable {
     }
 }
 
+/// Mirrors the Windows Job Object wait: cancelling the Swift task does not
+/// release the waiter; only terminating the underlying process does.
+private final class CancellationIgnoringPTYProcess: PTYProcess, @unchecked Sendable {
+    let identifier = "pid:4343"
+    let processID: Int32? = 4343
+
+    private let lock = NSLock()
+    private var cancelled = false
+    private var rescued = false
+    private var waiters: [CheckedContinuation<ProcessExit, Never>] = []
+
+    var wasCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    var wasRescued: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return rescued
+    }
+
+    func resize(to size: TerminalSize) async throws {}
+
+    func write(_ data: Data) async throws {}
+
+    func output() -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream { continuation in continuation.finish() }
+    }
+
+    func signal(_ signal: ProcessSignal) async throws {
+        await cancel()
+    }
+
+    func waitForExit() async throws -> ProcessExit {
+        await withCheckedContinuation { continuation in
+            register(continuation)
+        }
+    }
+
+    func cancel() async {
+        terminate(rescued: false)
+    }
+
+    func rescue() async {
+        terminate(rescued: true)
+    }
+
+    private func register(_ continuation: CheckedContinuation<ProcessExit, Never>) {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            continuation.resume(returning: .signal(Int32(ProcessSignal.kill.portableValue)))
+            return
+        }
+        waiters.append(continuation)
+        lock.unlock()
+    }
+
+    private func terminate(rescued: Bool) {
+        lock.lock()
+        cancelled = true
+        self.rescued = self.rescued || rescued
+        let pending = waiters
+        waiters.removeAll()
+        lock.unlock()
+
+        for continuation in pending {
+            continuation.resume(returning: .signal(Int32(ProcessSignal.kill.portableValue)))
+        }
+    }
+}
+
+private struct CancellationIgnoringPTYAdapter: PTYAdapter {
+    let process: CancellationIgnoringPTYProcess
+
+    func spawn(_ spec: ProcessSpec) async throws -> any PTYProcess {
+        process
+    }
+}
+
 private func temporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
         .appendingPathComponent("opengrok-execution-tests-\(UUID().uuidString)", isDirectory: true)
@@ -168,7 +250,26 @@ func executionValidationDefaultsAndCaps() throws {
     #expect(capped.outputByteLimit == executionMaximumOutputByteLimit)
 
     let background = try validateExecutionRequest(ExecutionRequest(command: "sleep 1", isBackground: true))
-    #expect(background.timeoutMilliseconds == executionBackgroundMaximumTimeoutMilliseconds)
+    #expect(background.timeoutMilliseconds == 0)
+
+    let explicitlyUnbounded = try validateExecutionRequest(
+        ExecutionRequest(command: "sleep 1", timeoutMilliseconds: 0, isBackground: true)
+    )
+    #expect(explicitlyUnbounded.timeoutMilliseconds == 0)
+
+    let boundedBackground = try validateExecutionRequest(
+        ExecutionRequest(command: "sleep 1", timeoutMilliseconds: 250, isBackground: true)
+    )
+    #expect(boundedBackground.timeoutMilliseconds == 250)
+
+    let cappedBackground = try validateExecutionRequest(
+        ExecutionRequest(
+            command: "sleep 1",
+            timeoutMilliseconds: executionBackgroundMaximumTimeoutMilliseconds + 1,
+            isBackground: true
+        )
+    )
+    #expect(cappedBackground.timeoutMilliseconds == executionBackgroundMaximumTimeoutMilliseconds)
 }
 
 @Test("execution validation handles quotes and background operators deterministically")
@@ -260,6 +361,74 @@ func foregroundTimeout() async throws {
     #expect(value.timedOut)
     #expect(!value.cancelled)
     #expect(process.wasCancelled)
+}
+
+@Test("timeouts terminate a process before waiting on cancellation-insensitive adapters")
+func timeoutCancelsNonCooperativeProcessBeforeJoiningWaiter() async throws {
+    let home = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: home) }
+    let process = CancellationIgnoringPTYProcess()
+    let runtime = ExecutionToolRuntime(
+        adapter: CancellationIgnoringPTYAdapter(process: process),
+        outputHome: home
+    )
+
+    // A bounded rescue turns the original deadlock into a deterministic test
+    // failure rather than stranding the entire package verification run.
+    let rescue = Task {
+        do {
+            try await Task.sleep(nanoseconds: 750_000_000)
+            await process.rescue()
+        } catch {}
+    }
+    defer { rescue.cancel() }
+
+    let result = await runtime.execute(
+        ExecutionRequest(command: "sleep forever", timeoutMilliseconds: 5, toolCallId: "non-cooperative")
+    )
+    guard case .success(.foreground(let value)) = result else {
+        Issue.record("expected a timeout result, got \(result)")
+        return
+    }
+
+    #expect(value.timedOut)
+    #expect(process.wasCancelled)
+    #expect(!process.wasRescued)
+}
+
+@Test("background commands without a positive timeout stay alive until explicitly killed")
+func backgroundZeroTimeoutRemainsUnbounded() async throws {
+    let timeouts: [UInt64?] = [nil, 0]
+    for timeout in timeouts {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let process = FakePTYProcess(
+            chunks: [],
+            exit: .code(0),
+            delayNanoseconds: 100_000_000
+        )
+        let runtime = ExecutionToolRuntime(adapter: FakePTYAdapter(process: process), outputHome: home)
+        let result = await runtime.execute(ExecutionRequest(
+            command: "sleep forever",
+            timeoutMilliseconds: timeout,
+            isBackground: true,
+            toolCallId: timeout == nil ? "background-default" : "background-zero"
+        ))
+
+        guard case .success(.background(let handle)) = result else {
+            Issue.record("expected a background handle, got \(result)")
+            continue
+        }
+
+        let running = await runtime.waitForTask(handle.taskId, timeoutMilliseconds: 30)
+        #expect(running?.completed == false)
+        #expect(!process.wasCancelled)
+
+        let killed = await runtime.killTask(handle.taskId)
+        #expect(killed == .killed)
+        let finished = await runtime.waitForTask(handle.taskId, timeoutMilliseconds: 500)
+        #expect(finished?.completed == true)
+    }
 }
 
 @Test("background execution returns a task id and supports wait and kill outcomes")

@@ -238,8 +238,9 @@ public actor LocalWorkspaceOps {
             toolCallId: toolCallId
         )
         try ensureAllowed(prepared.decision)
-        // Path lock for mutations (serialize concurrent edits on same path).
-        let token = await locks.acquirePath(url.path)
+        // Writes exclude all file operations, matching upstream Write and
+        // StrReplace rather than racing reads through a different path alias.
+        let token = await locks.acquireExclusive()
         do {
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(),
@@ -278,9 +279,9 @@ public actor LocalWorkspaceOps {
         if remotePolicyDenied {
             throw WorkspaceRuntimeError.processDenied("remote policy denied this operation")
         }
-        if config.requireSandbox && !remotePolicyAvailable && config.isolation == .sandbox {
+        if config.requireSandbox && (config.isolation != .sandbox || !remotePolicyAvailable) {
             throw WorkspaceRuntimeError.sandboxRequired(
-                "sandbox policy unavailable; refusing local process fallback"
+                "sandbox policy unavailable or required sandbox inactive; refusing local process fallback"
             )
         }
         // YOLO pin never clears requireSandbox (checked above).

@@ -32,7 +32,9 @@ public enum WriteTool {
             if SessionFS.isDirectory(absolute) {
                 throw SessionFSError.isDirectory(absolute)
             }
-            let existingText: String? = SessionFS.fileExists(absolute) ? try? SessionFS.readText(at: absolute) : nil
+            let existingText: String? = SessionFS.fileExists(absolute)
+                ? try SessionFS.readText(at: absolute)
+                : nil
             let previous = existingText
             let existed = existingText != nil
             try await SessionFS.writeText(

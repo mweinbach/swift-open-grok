@@ -190,9 +190,13 @@ public enum WorktreeAutoGC {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            finished.signal()
+        }
         if (try? process.run()) != nil {
-            process.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            finished.wait()
             let output = String(decoding: data, as: UTF8.self)
             for line in output.split(separator: "\n") where line.first == "n" {
                 let path = String(line.dropFirst())

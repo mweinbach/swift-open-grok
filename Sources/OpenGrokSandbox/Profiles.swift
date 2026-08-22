@@ -237,9 +237,14 @@ public enum ProfileName: Sendable, Equatable, Hashable, CustomStringConvertible 
             }
             var denyURLs: [URL] = []
             for entry in profileConfig.deny {
+                if isGlobPattern(entry) {
+                    // Deny patterns are an enforcement boundary, not a best-
+                    // effort display hint: invalid patterns must stop launch.
+                    try validateDenyGlob(entry)
+                }
                 profile.denyEntries.append(entry)
                 // Exact (non-glob) paths resolve relative to workspace.
-                if !entry.contains("*") && !entry.contains("?") {
+                if !isGlobPattern(entry) {
                     let url: URL
                     if entry.hasPrefix("/") {
                         url = URL(fileURLWithPath: entry)
@@ -393,7 +398,17 @@ public func validateDenyGlob(_ glob: String) throws {
             "deny glob '\(glob)' uses unsupported metacharacter '\(c)' (brace alternation and backslash-escapes are not supported; use separate deny entries)"
         )
     }
-    for comp in glob.split(separator: "/", omittingEmptySubsequences: false) {
+    for (index, comp) in glob.split(separator: "/", omittingEmptySubsequences: false).enumerated() {
+        if comp.isEmpty && !(index == 0 && glob.hasPrefix("/")) {
+            throw SandboxError.profileInvalid(
+                "deny glob '\(glob)': empty path segments and trailing slashes are not supported"
+            )
+        }
+        if comp == "." || comp == ".." {
+            throw SandboxError.profileInvalid(
+                "deny glob '\(glob)': '.' and '..' path segments are not supported"
+            )
+        }
         if comp.contains("**") && comp != "**" {
             throw SandboxError.profileInvalid(
                 "deny glob '\(glob)': '**' must be its own path component (got segment '\(comp)')"
@@ -482,11 +497,9 @@ public func globTailToRegex(_ tail: String) -> String {
                 i += 1
             }
             while i < chars.count && chars[i] != "]" {
-                let cc = chars[i]
-                if "\\.[]{}()+-^$|".contains(cc) {
-                    out.append("\\")
-                }
-                out.append(cc)
+                // Character-class ranges must stay ranges (`[a-z]`), matching
+                // upstream's class passthrough rather than escaping `-`.
+                out.append(chars[i])
                 i += 1
             }
             if i < chars.count && chars[i] == "]" {
@@ -521,4 +534,3 @@ public func globToSeatbeltRegexes(workspace: URL, glob: String) throws -> [Strin
     }
     return regexes
 }
-

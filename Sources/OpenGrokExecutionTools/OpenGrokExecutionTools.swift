@@ -192,10 +192,13 @@ public func validateExecutionRequest(_ request: ExecutionRequest) throws -> Vali
     }
     let timeout: UInt64
     if request.isBackground {
-        timeout = min(
-            request.timeoutMilliseconds ?? executionBackgroundMaximumTimeoutMilliseconds,
-            executionBackgroundMaximumTimeoutMilliseconds
-        )
+        // Background jobs belong to the model until they exit or are killed.
+        // Zero is the explicit unbounded sentinel; omitted has the same
+        // meaning. Only an explicitly positive timeout installs a deadline.
+        let requestedTimeout = request.timeoutMilliseconds ?? 0
+        timeout = requestedTimeout == 0
+            ? 0
+            : min(requestedTimeout, executionBackgroundMaximumTimeoutMilliseconds)
     } else {
         let requestedTimeout = request.timeoutMilliseconds ?? 0
         timeout = min(
@@ -612,6 +615,23 @@ private enum ProcessRunError: Error {
     case timedOut
 }
 
+private final class ProcessTimeoutState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var expired = false
+
+    func markExpired() {
+        lock.lock()
+        expired = true
+        lock.unlock()
+    }
+
+    var hasExpired: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return expired
+    }
+}
+
 private enum ProcessRunner {
     static func run(
         process: any PTYProcess,
@@ -647,15 +667,26 @@ private enum ProcessRunner {
         var cancelled = false
         var exit: ProcessExit = .stillRunning
         do {
-            exit = try await withThrowingTaskGroup(of: ProcessExit.self) { group in
-                group.addTask { try await process.waitForExit() }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: request.timeoutMilliseconds * 1_000_000)
-                    throw ProcessRunError.timedOut
+            if request.timeoutMilliseconds == 0 {
+                exit = try await process.waitForExit()
+            } else {
+                let timeoutState = ProcessTimeoutState()
+                exit = try await withThrowingTaskGroup(of: ProcessExit.self) { group in
+                    group.addTask { try await process.waitForExit() }
+                    group.addTask {
+                        try await Task.sleep(nanoseconds: request.timeoutMilliseconds * 1_000_000)
+                        timeoutState.markExpired()
+                        // A Windows Job Object waits with WaitForSingleObject,
+                        // which does not observe Swift task cancellation. Kill
+                        // first so the group can actually join its waiter.
+                        await process.cancel()
+                        throw ProcessRunError.timedOut
+                    }
+                    let first = try await group.next()!
+                    group.cancelAll()
+                    return first
                 }
-                let first = try await group.next()!
-                group.cancelAll()
-                return first
+                timedOut = timeoutState.hasExpired
             }
         } catch is ProcessRunError {
             timedOut = true

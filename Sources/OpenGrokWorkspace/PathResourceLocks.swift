@@ -71,7 +71,7 @@ public actor PathResourceLockManager {
 
     /// Process / resource key lock (e.g. shell session id or command fingerprint).
     public func acquireProcess(_ key: String) async -> ResourceLockToken {
-        let k = canonicalizeKey(key)
+        let k = normalizeLexically(key)
         await waitUntilAvailable(for: .process(k))
         processKeys.insert(k)
         return ResourceLockToken(manager: self, kind: .process(k))
@@ -98,14 +98,13 @@ public actor PathResourceLockManager {
 
     private func canGrant(_ kind: ResourceLockKind) -> Bool {
         if exclusiveActive { return false }
-        if hasExclusiveWaiterAhead() { return false }
         switch kind {
         case .path(let p):
-            return !lockedPaths.contains(p)
+            return !hasExclusiveWaiterAhead() && !lockedPaths.contains(p)
         case .exclusive:
-            return lockedPaths.isEmpty && processKeys.isEmpty && !exclusiveActive
+            return !hasExclusiveWaiterAhead() && lockedPaths.isEmpty && processKeys.isEmpty
         case .process(let k):
-            return !processKeys.contains(k)
+            return !hasExclusiveWaiterAhead() && !processKeys.contains(k)
         }
     }
 
@@ -117,23 +116,31 @@ public actor PathResourceLockManager {
     }
 
     private func drainWaiters() {
-        var remaining: [Waiter] = []
-        for waiter in waiters {
-            if canGrant(waiter.kind) {
-                switch waiter.kind {
-                case .path(let p): lockedPaths.insert(p)
-                case .exclusive: exclusiveActive = true
-                case .process(let k): processKeys.insert(k)
-                }
+        while let waiter = waiters.first {
+            switch waiter.kind {
+            case .path(let path):
+                guard !exclusiveActive, !lockedPaths.contains(path) else { return }
+                waiters.removeFirst()
+                lockedPaths.insert(path)
                 waiter.continuation.resume()
-            } else {
-                remaining.append(waiter)
+
+            case .process(let key):
+                guard !exclusiveActive, !processKeys.contains(key) else { return }
+                waiters.removeFirst()
+                processKeys.insert(key)
+                waiter.continuation.resume()
+
+            case .exclusive:
+                guard !exclusiveActive, lockedPaths.isEmpty, processKeys.isEmpty else { return }
+                waiters.removeFirst()
+                exclusiveActive = true
+                waiter.continuation.resume()
+                return
             }
         }
-        waiters = remaining
     }
 
     private func canonicalizeKey(_ path: String) -> String {
-        normalizeLexically(path)
+        canonicalWorkspacePathKey(path)
     }
 }

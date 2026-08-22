@@ -133,8 +133,25 @@ public final class FinalizedToolset: @unchecked Sendable {
             return .failure(toolNotFound(clientName, detail: "tool not nested-callable: \(clientName)"))
         }
 
-        // Reverse-remap client param names → canonical.
-        let canonical = reverseRemap(args, map: tool.reverseParams)
+        // MCP historically accepts null/bare arguments and wraps them into a
+        // request object; normalize that compatibility shape before parsing.
+        let clientArguments = normalizeClientArguments(args, for: tool)
+
+        // Rust parses into the tool's typed arguments before it classifies
+        // access or runs hooks. A malformed edit must never prompt for an empty
+        // path, and a malformed remote call must never reach its server.
+        let canonical: JSONValue
+        do {
+            canonical = try ToolInputSchemaValidator(
+                schema: tool.inputSchema,
+                namespace: tool.namespace,
+                toolID: tool.id
+            ).normalize(reverseRemap(clientArguments, map: tool.reverseParams))
+        } catch let error as ToolInputValidationError {
+            return .failure(.invalidArguments(error.description))
+        } catch {
+            return .failure(.invalidArguments(String(describing: error)))
+        }
 
         // Build AccessKind for permission pipeline.
         let access = accessKind(for: tool, args: canonical)
@@ -276,6 +293,18 @@ private func reverseRemap(_ args: JSONValue, map: [String: String]) -> JSONValue
         out[canonical] = v
     }
     return .object(out)
+}
+
+private func normalizeClientArguments(_ args: JSONValue, for tool: FinalizedTool) -> JSONValue {
+    guard tool.namespace == .mcp else { return args }
+    switch args {
+    case .object:
+        return args
+    case .null:
+        return .object([:])
+    default:
+        return .object(["value": args])
+    }
 }
 
 private func accessKind(for tool: FinalizedTool, args: JSONValue) -> AccessKind {

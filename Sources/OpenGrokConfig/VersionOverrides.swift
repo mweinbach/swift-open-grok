@@ -41,8 +41,18 @@ public struct VersionOverrideMeta: ConfigOverrideMeta, Equatable, Sendable {
     public static func decode(from table: TOMLTable) throws -> VersionOverrideMeta {
         var min: String? = nil
         var max: String? = nil
-        if case let .string(s) = table["minimum_version"] { min = s }
-        if case let .string(s) = table["maximum_version"] { max = s }
+        if let value = table["minimum_version"] {
+            guard case let .string(parsed) = value else {
+                throw TOMLError(line: 0, column: 0, message: "minimum_version must be a string")
+            }
+            min = parsed
+        }
+        if let value = table["maximum_version"] {
+            guard case let .string(parsed) = value else {
+                throw TOMLError(line: 0, column: 0, message: "maximum_version must be a string")
+            }
+            max = parsed
+        }
         return VersionOverrideMeta(minimumVersion: min, maximumVersion: max)
     }
 }

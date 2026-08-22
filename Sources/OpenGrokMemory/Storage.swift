@@ -129,7 +129,9 @@ public struct MemoryStorage: Equatable, Sendable {
             throw MemoryError.unsupportedScope(scope)
         }
 
-        let existing = (try? String(contentsOf: path, encoding: .utf8)) ?? ""
+        let existing = FileManager.default.fileExists(atPath: path.path)
+            ? try String(contentsOf: path, encoding: .utf8)
+            : ""
         let output = existing.isEmpty ? normalized : "\(existing)\n\n\(normalized)"
         try writeAtomically(path, contents: output)
     }
@@ -213,7 +215,7 @@ public func normalizeMemoryContent(_ raw: String) -> String {
     guard !trimmed.isEmpty else { return "" }
     if trimmed.first == "#" { return trimmed }
 
-    guard let newline = trimmed.firstIndex(of: "\n") else {
+    guard let newline = trimmed.firstIndex(where: \.isNewline) else {
         return "## \(trimmed)"
     }
 
@@ -243,8 +245,11 @@ public func slugify(_ input: String, maxLength: Int) -> String {
 }
 
 private func memoryLines(_ content: String) -> [String] {
-    var lines = content.components(separatedBy: .newlines)
-    if content.last?.isNewline == true { _ = lines.popLast() }
+    var lines = content.split(
+        omittingEmptySubsequences: false,
+        whereSeparator: \.isNewline
+    ).map(String.init)
+    if lines.last == "" { lines.removeLast() }
     return lines
 }
 

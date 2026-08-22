@@ -34,12 +34,15 @@ public let REQUIREMENTS_FILENAME = "requirements.toml"
 /// Load and parse a TOML file, expanding `$VAR` references. Returns an empty
 /// table if the file is absent; throws `TOMLError` (wrapped) on a parse
 /// failure, with a snippet-free message (the source line may carry a secret).
-public func loadTomlFile(at path: URL) throws -> TOMLValue {
+public func loadTomlFile(
+    at path: URL,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) throws -> TOMLValue {
     do {
         let contents = try String(contentsOf: path, encoding: .utf8)
         do {
             var v = try parseTOML(contents)
-            expandEnvVarsInTOML(&v)
+            expandEnvVarsInTOML(&v, environment: environment)
             return v
         } catch let e as TOMLError {
             // The message is span-only and never echoes the source line.
@@ -83,9 +86,12 @@ public enum OpenGrokConfigIOError: Error, Equatable, Sendable, CustomStringConve
 
 /// `loadTomlFile` plus that layer's `[[version_overrides]]`. Use for grok
 /// config files; use `loadTomlFile` directly for unrelated TOML.
-public func loadConfigFile(at path: URL) throws -> TOMLValue {
-    var v = try loadTomlFile(at: path)
-    try applyVersionOverridesWithRegistered(&v)
+public func loadConfigFile(
+    at path: URL,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) throws -> TOMLValue {
+    var v = try loadTomlFile(at: path, environment: environment)
+    try applyVersionOverridesWithRegistered(&v, environment: environment)
     return v
 }
 
@@ -93,14 +99,22 @@ public func loadConfigFile(at path: URL) throws -> TOMLValue {
 public func loadFromDisk(
     environment: [String: String] = ProcessInfo.processInfo.environment
 ) throws -> TOMLValue {
-    try loadUserConfigLayer(home: userGrokHome(environment: environment), filename: "config.toml")
+    try loadUserConfigLayer(
+        home: userGrokHome(environment: environment),
+        filename: "config.toml",
+        environment: environment
+    )
 }
 
 /// Load `$OPENGROK_HOME/managed_config.toml` (the user managed-config layer).
 public func loadManagedConfig(
     environment: [String: String] = ProcessInfo.processInfo.environment
 ) throws -> TOMLValue {
-    try loadUserConfigLayer(home: userGrokHome(environment: environment), filename: MANAGED_CONFIG_FILENAME)
+    try loadUserConfigLayer(
+        home: userGrokHome(environment: environment),
+        filename: MANAGED_CONFIG_FILENAME,
+        environment: environment
+    )
 }
 
 /// Load a user-tier config layer from `<home>/<filename>`. With no resolvable
@@ -109,19 +123,25 @@ public func loadManagedConfig(
 /// untrusted project `.opengrok` to the user tier).
 public func loadUserConfigLayer(
     home: URL?,
-    filename: String
+    filename: String,
+    environment: [String: String] = ProcessInfo.processInfo.environment
 ) throws -> TOMLValue {
     guard let home = home else { return .table(TOMLTable()) }
-    return try loadConfigFile(at: home.appendingPathComponent(filename))
+    return try loadConfigFile(at: home.appendingPathComponent(filename), environment: environment)
 }
 
 /// Load `/etc/opengrok/managed_config.toml` (the system managed-config layer).
 /// Returns an empty table when no system config dir resolves (e.g. on Windows
 /// or when `/etc/opengrok` doesn't exist).
-public func loadSystemManagedConfig() throws -> TOMLValue {
+public func loadSystemManagedConfig(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) throws -> TOMLValue {
     guard let dir = systemConfigDir() else { return .table(TOMLTable()) }
-    var v = try loadTomlFile(at: dir.appendingPathComponent(MANAGED_CONFIG_FILENAME))
-    try applyVersionOverridesWithRegistered(&v)
+    var v = try loadTomlFile(
+        at: dir.appendingPathComponent(MANAGED_CONFIG_FILENAME),
+        environment: environment
+    )
+    try applyVersionOverridesWithRegistered(&v, environment: environment)
     return v
 }
 
@@ -140,8 +160,11 @@ public func projectConfigPath(cwd: URL) -> URL {
 /// Load `<cwd>/.opengrok/config.toml` (with that layer's `[[version_overrides]]`).
 /// Empty table if the file is missing — mirrors Rust shell
 /// `load_project_config`.
-public func loadProjectConfig(cwd: URL) throws -> TOMLValue {
-    try loadConfigFile(at: projectConfigPath(cwd: cwd))
+public func loadProjectConfig(
+    cwd: URL,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) throws -> TOMLValue {
+    try loadConfigFile(at: projectConfigPath(cwd: cwd), environment: environment)
 }
 
 /// Whether `configPath` is the user-global `$OPENGROK_HOME/config.toml` (or
@@ -163,25 +186,31 @@ public func isUserGrokConfigFile(
         || configPath.standardizedFileURL.path == userConfig.standardizedFileURL.path
 }
 
-/// Directory chain from `cwd` upward. When `stopAt` is set, walking stops at
-/// that ancestor (inclusive) — pass a git root to match Rust
-/// `RepoDirChain` / `find_project_configs`. Without a stop, walks until the
-/// filesystem root, capped by `maxDepth`.
+/// Directory chain from `cwd` upward to its git worktree root, inclusive.
+/// Outside a repository, only `cwd` is returned. An explicit `stopAt`
+/// preserves callers that already resolved the worktree root themselves.
 ///
 /// Returned **cwd-first** (nearest first). Callers that want repo-root-first
 /// reverse the array (see `findProjectConfigs`).
 public func projectDirChain(
     cwd: URL,
     stopAt: URL? = nil,
-    maxDepth: Int = 64
+    maxDepth: Int = 64,
+    environment: [String: String] = ProcessInfo.processInfo.environment
 ) -> [URL] {
-    var out: [URL] = []
-    var current = cwd.standardizedFileURL
+    guard maxDepth > 0 else { return [] }
+    let start = cwd.standardizedFileURL
     let stop = stopAt?.standardizedFileURL
+        ?? discoverProjectGitRoot(cwd: start, maxDepth: maxDepth, environment: environment)
+    guard let stop else { return [start] }
+
+    var out: [URL] = []
+    var current = start
+    let canonicalStop = stop.resolvingSymlinksInPath().standardizedFileURL.path
     var depth = 0
     while depth < maxDepth {
         out.append(current)
-        if let stop = stop, current.path == stop.path { break }
+        if current.resolvingSymlinksInPath().standardizedFileURL.path == canonicalStop { break }
         let parent = current.deletingLastPathComponent()
         // Strictly-shorter guard, not equality: NSURL-bridged URLs grow
         // "/.." above the root instead of repeating "/", so an equality
@@ -193,6 +222,31 @@ public func projectDirChain(
         depth += 1
     }
     return out
+}
+
+private func discoverProjectGitRoot(
+    cwd: URL,
+    maxDepth: Int,
+    environment: [String: String]
+) -> URL? {
+    var current = cwd.standardizedFileURL
+    let canonicalHome = defaultGrokHome(environment: environment)
+        .deletingLastPathComponent()
+        .resolvingSymlinksInPath()
+        .standardizedFileURL.path
+
+    for _ in 0..<maxDepth {
+        if FileManager.default.fileExists(atPath: current.appendingPathComponent(".git").path) {
+            let canonicalRoot = current.resolvingSymlinksInPath().standardizedFileURL.path
+            return canonicalRoot == canonicalHome ? nil : current
+        }
+
+        let parent = current.deletingLastPathComponent()
+        guard parent.path.count < current.path.count else { break }
+        current = parent
+    }
+
+    return nil
 }
 
 /// Find every existing `.opengrok/config.toml` from `cwd` up to `stopAt`
@@ -212,11 +266,18 @@ public func findProjectConfigs(
     maxDepth: Int = 64
 ) -> [URL] {
     let home = userHome ?? userGrokHome(environment: environment)
-    let chain = projectDirChain(cwd: cwd, stopAt: stopAt, maxDepth: maxDepth)
+    let chain = projectDirChain(
+        cwd: cwd,
+        stopAt: stopAt,
+        maxDepth: maxDepth,
+        environment: environment
+    )
     // `chain` is cwd-first; reverse so repo root comes first.
     return chain.reversed().compactMap { dir in
         let path = projectConfigPath(cwd: dir)
-        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else { return nil }
         if isUserGrokConfigFile(path, userHome: home, environment: environment) {
             return nil
         }
@@ -237,7 +298,8 @@ public func loadMergedProjectConfig(
         cwd: cwd, stopAt: stopAt, userHome: userHome, environment: environment
     ) {
         do {
-            let layer = try loadConfigFile(at: path)
+            var layer = try loadConfigFile(at: path, environment: environment)
+            normalizeConfigLayer(&layer)
             deepMergeTOML(&merged, overrides: layer)
         } catch {
             continue
@@ -368,14 +430,21 @@ public struct AuthorityComposition: Sendable {
     /// Effective table after the full authority merge.
     public func effective() -> TOMLValue {
         var merged = systemManaged
-        deepMergeTOML(&merged, overrides: managed)
-        deepMergeTOML(&merged, overrides: user)
-        deepMergeTOML(&merged, overrides: project)
-        deepMergeTOML(&merged, overrides: environment)
-        deepMergeTOML(&merged, overrides: cli)
-        if let req = userRequirements { deepMergeTOML(&merged, overrides: req) }
-        if let req = systemRequirements { deepMergeTOML(&merged, overrides: req) }
-        if let req = mdmRequirements { deepMergeTOML(&merged, overrides: req) }
+        normalizeConfigLayer(&merged)
+        for layer in [
+            managed,
+            user,
+            project,
+            environment,
+            cli,
+            userRequirements,
+            systemRequirements,
+            mdmRequirements,
+        ].compactMap({ $0 }) {
+            var normalized = layer
+            normalizeConfigLayer(&normalized)
+            deepMergeTOML(&merged, overrides: normalized)
+        }
         return merged
     }
 }
@@ -507,7 +576,7 @@ public struct ConfigLayers: Sendable {
     public static func load(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> ConfigLayers {
-        var systemManaged = try loadSystemManagedConfig()
+        var systemManaged = try loadSystemManagedConfig(environment: environment)
         let systemManagedCampaigns = takeCampaignEntries(from: &systemManaged, layer: "system_managed")
 
         var managed = try loadManagedConfig(environment: environment)
@@ -517,8 +586,8 @@ public struct ConfigLayers: Sendable {
         let userCampaigns = takeCampaignEntries(from: &user, layer: "user")
 
         var userRequirements = loadRequirements(environment: environment)
-        var systemRequirements = loadSystemRequirements()
-        var mdmRequirements = mdmRequirementsValue()
+        var systemRequirements = loadSystemRequirements(environment: environment)
+        var mdmRequirements = mdmRequirementsValue(environment: environment)
 
         // Highest-authority requirements tier first: `mergeCampaignEntries`
         // is first-id-wins, so a duplicate campaign id must resolve mdm >
@@ -540,6 +609,22 @@ public struct ConfigLayers: Sendable {
             var copy = req
             requirementsCampaigns.append(contentsOf: takeCampaignEntries(from: &copy, layer: "requirements"))
             userRequirements = copy
+        }
+
+        normalizeConfigLayer(&systemManaged)
+        normalizeConfigLayer(&managed)
+        normalizeConfigLayer(&user)
+        if var requirements = userRequirements {
+            normalizeConfigLayer(&requirements)
+            userRequirements = requirements
+        }
+        if var requirements = systemRequirements {
+            normalizeConfigLayer(&requirements)
+            systemRequirements = requirements
+        }
+        if var requirements = mdmRequirements {
+            normalizeConfigLayer(&requirements)
+            mdmRequirements = requirements
         }
 
         return ConfigLayers(
@@ -732,16 +817,47 @@ public func applyVersionOverridesWithRegistered(
     _ value: inout TOMLValue,
     environment: [String: String] = ProcessInfo.processInfo.environment
 ) throws {
+    let version: SemVerVersion
     do {
-        let version = try OpenGrokVersion.installedSemVer(environment: environment)
-        try applyVersionOverrides(&value, version: version)
+        version = try OpenGrokVersion.installedSemVer(environment: environment)
     } catch {
         // Broken GROK_TEST_VERSION in dev: strip the section without applying.
         if case var .table(t) = value {
             t.removeValue(forKey: VERSION_OVERRIDES_KEY)
             value = .table(t)
         }
+        return
     }
+
+    try applyVersionOverrides(&value, version: version)
+}
+
+// MARK: - Per-layer normalization
+
+/// Keep mutually exclusive web-search allow/block policies atomic across
+/// deep merges. Without the empty sibling, a higher-authority blocklist leaves
+/// an older allowlist in place and downstream resolution discards the blocklist.
+func normalizeConfigLayer(_ layer: inout TOMLValue) {
+    guard case var .table(root) = layer,
+          case var .table(toolset)? = root["toolset"],
+          case var .table(webSearch)? = toolset["web_search"] else {
+        return
+    }
+
+    let allowed = webSearch["allowed_domains"]?.arrayValue?.isEmpty == false
+    let excluded = webSearch["excluded_domains"]?.arrayValue?.isEmpty == false
+
+    if allowed && !excluded {
+        webSearch["excluded_domains"] = .array([])
+    } else if excluded && !allowed {
+        webSearch["allowed_domains"] = .array([])
+    } else {
+        return
+    }
+
+    toolset["web_search"] = .table(webSearch)
+    root["toolset"] = .table(toolset)
+    layer = .table(root)
 }
 
 // MARK: - deep_merge_toml
@@ -770,19 +886,22 @@ public func deepMergeTOML(_ base: inout TOMLValue, overrides: TOMLValue) {
 // MARK: - $VAR expansion
 
 /// Expand `$VAR` / `${VAR}` in all string values.
-public func expandEnvVarsInTOML(_ value: inout TOMLValue) {
+public func expandEnvVarsInTOML(
+    _ value: inout TOMLValue,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) {
     switch value {
     case var .string(s):
-        let expanded = expandEnvVarsInString(s)
+        let expanded = expandEnvVarsInString(s, environment: environment)
         if expanded != s { s = expanded }
         value = .string(s)
     case var .array(items):
-        for i in items.indices { expandEnvVarsInTOML(&items[i]) }
+        for i in items.indices { expandEnvVarsInTOML(&items[i], environment: environment) }
         value = .array(items)
     case var .table(t):
         for (k, v) in t.pairs {
             var copy = v
-            expandEnvVarsInTOML(&copy)
+            expandEnvVarsInTOML(&copy, environment: environment)
             t[k] = copy
         }
         value = .table(t)

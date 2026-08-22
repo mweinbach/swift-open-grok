@@ -45,6 +45,7 @@ struct OpenGrokMemoryChunkingTests {
         #expect(normalizeMemoryContent("# Existing\n\nBody") == "# Existing\n\nBody")
         #expect(normalizeMemoryContent("single note") == "## single note")
         #expect(normalizeMemoryContent("Title\n\nBody") == "## Title\n\nBody")
+        #expect(normalizeMemoryContent("Title\r\n\r\nBody") == "## Title\n\nBody")
         #expect(slugify("My Project / API", maxLength: 40) == "my-project-api")
     }
 }
@@ -94,6 +95,38 @@ struct OpenGrokMemoryStorageTests {
         #expect(throws: MemoryError.self) {
             _ = try storage.readFile(path: traversal)
         }
+    }
+
+    @Test("CRLF memory reads count each physical line exactly once")
+    func crlfMemoryLineWindows() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let storage = MemoryStorage.newFlat(
+            cwd: root,
+            root: root.appendingPathComponent("memory", isDirectory: true)
+        )
+        try storage.writeLongTerm(scope: .global, content: "one\r\ntwo\r\nthree\r\nfour\r\n")
+
+        #expect(try storage.readFile(path: storage.globalMemoryFile, from: 1, lines: 2) == "two\nthree")
+        #expect(try storage.readFile(path: storage.globalMemoryFile, from: 2) == "three\nfour")
+    }
+
+    @Test("memory append never replaces an existing invalid UTF-8 file")
+    func appendRejectsInvalidUTF8WithoutDataLoss() throws {
+        let root = try makeTemporaryDirectory()
+        defer { removeTemporaryDirectory(root) }
+        let storage = MemoryStorage.newFlat(
+            cwd: root,
+            root: root.appendingPathComponent("memory", isDirectory: true)
+        )
+        try FileManager.default.createDirectory(at: storage.globalDir, withIntermediateDirectories: true)
+        let original = Data([0x80, 0x81, 0x0A])
+        try original.write(to: storage.globalMemoryFile)
+
+        #expect(throws: (any Error).self) {
+            try storage.appendToMemory(scope: .global, content: "must not erase existing notes")
+        }
+        #expect(try Data(contentsOf: storage.globalMemoryFile) == original)
     }
 
     @Test("daily logs reject path separators and append with separators")

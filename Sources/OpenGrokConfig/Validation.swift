@@ -80,20 +80,20 @@ public func requirementsLayers(
     var out: [RequirementsLayer] = []
     if let userPath = userGrokHome(environment: environment)?
         .appendingPathComponent("requirements.toml"),
-       let value = loadRequirementsLayer(at: userPath)
+       let value = loadRequirementsLayer(at: userPath, environment: environment)
     {
         out.append(RequirementsLayer(value: value, source: .file(userPath), isSystem: false))
     }
     if let dir = systemConfigDir() {
         let sysPath = dir.appendingPathComponent("requirements.toml")
-        if let value = loadRequirementsLayer(at: sysPath) {
+        if let value = loadRequirementsLayer(at: sysPath, environment: environment) {
             out.append(RequirementsLayer(value: value, source: .file(sysPath), isSystem: true))
         }
     }
     // macOS MDM: OS-protected admin layer (forced values only). Pushed last so
     // it wins the deep-merge over the system file and cloud cache; `isSystem`
     // so security decisions trust it like the root-owned layer.
-    if let value = mdmRequirementsValue() {
+    if let value = mdmRequirementsValue(environment: environment) {
         out.append(RequirementsLayer(value: value, source: .mdm, isSystem: true))
     }
     return out
@@ -119,21 +119,32 @@ public func loadRequirements(
     environment: [String: String] = ProcessInfo.processInfo.environment
 ) -> TOMLValue? {
     guard let home = userGrokHome(environment: environment) else { return nil }
-    return loadRequirementsLayer(at: home.appendingPathComponent("requirements.toml"))
+    return loadRequirementsLayer(
+        at: home.appendingPathComponent("requirements.toml"),
+        environment: environment
+    )
 }
 
 /// The system `/etc/opengrok/requirements.toml` layer, or `nil` on platforms
 /// without a system config dir.
-public func loadSystemRequirements() -> TOMLValue? {
+public func loadSystemRequirements(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> TOMLValue? {
     guard let dir = systemConfigDir() else { return nil }
-    return loadRequirementsLayer(at: dir.appendingPathComponent("requirements.toml"))
+    return loadRequirementsLayer(
+        at: dir.appendingPathComponent("requirements.toml"),
+        environment: environment
+    )
 }
 
 /// Soft-fails on errors; fail-closed enforcement lives in `validateRequirements`.
-public func loadRequirementsLayer(at path: URL) -> TOMLValue? {
-    guard let v = try? loadTomlFile(at: path) else { return nil }
+public func loadRequirementsLayer(
+    at path: URL,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> TOMLValue? {
+    guard let v = try? loadTomlFile(at: path, environment: environment) else { return nil }
     guard case let .table(t) = v, !t.isEmpty else { return nil }
-    return normalizeRequirementsValue(v, source: path.path)
+    return normalizeRequirementsValue(v, source: path.path, environment: environment)
 }
 
 /// Strip `fail_closed` and apply `[[version_overrides]]` for a parsed
@@ -197,7 +208,7 @@ public func validateRequirementsLayer(
     at path: URL,
     environment: [String: String] = ProcessInfo.processInfo.environment
 ) throws {
-    guard let v = try? loadTomlFile(at: path) else { return }
+    guard let v = try? loadTomlFile(at: path, environment: environment) else { return }
     try validateRequirementsValue(v, source: .file(path), environment: environment)
 }
 

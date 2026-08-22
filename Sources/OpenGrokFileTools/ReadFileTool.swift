@@ -80,10 +80,7 @@ public enum ReadFileTool {
             }
 
             let text = try SessionFS.readText(at: absolute)
-            let allLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-            // Drop trailing empty from final newline for line counting parity.
-            var lines = allLines
-            if lines.last == "" { lines.removeLast() }
+            let lines = SessionFS.logicalLines(text)
 
             let start: Int
             if let offset = input.offset {
